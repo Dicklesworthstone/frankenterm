@@ -64,6 +64,16 @@ async fn recv_event(
         .expect(label)
 }
 
+async fn assert_listener_shutdown(
+    handle: task::JoinHandle<Result<(), NativeEventError>>,
+) {
+    runtime_async::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("listener shutdown timed out")
+        .expect("listener task failed")
+        .expect("listener returned a terminal error");
+}
+
 async fn write_line(socket_path: &std::path::Path, line: &str) {
     let mut stream = event_socket::connect(socket_path)
         .await
@@ -136,9 +146,7 @@ fn listener_decodes_wire_events_and_ignores_hello() {
 
         drop(stream);
         shutdown.store(true, Ordering::SeqCst);
-        let _ = runtime_async::timeout(Duration::from_secs(2), handle)
-            .await
-            .expect("listener shutdown timed out");
+        assert_listener_shutdown(handle).await;
     });
 }
 
@@ -178,9 +186,7 @@ fn listener_reports_truncated_output_as_recoverable_gap() {
         }
 
         shutdown.store(true, Ordering::SeqCst);
-        let _ = runtime_async::timeout(Duration::from_secs(2), handle)
-            .await
-            .expect("listener shutdown timed out");
+        assert_listener_shutdown(handle).await;
     });
 }
 
@@ -226,9 +232,7 @@ fn listener_skips_invalid_and_oversized_lines_then_recovers() {
 
         drop(stream);
         shutdown.store(true, Ordering::SeqCst);
-        let _ = runtime_async::timeout(Duration::from_secs(2), handle)
-            .await
-            .expect("listener shutdown timed out");
+        assert_listener_shutdown(handle).await;
     });
 }
 
@@ -289,9 +293,7 @@ fn listener_accepts_reconnect_and_rapid_events() {
 
         drop(stream);
         shutdown.store(true, Ordering::SeqCst);
-        let _ = runtime_async::timeout(Duration::from_secs(2), handle)
-            .await
-            .expect("listener shutdown timed out");
+        assert_listener_shutdown(handle).await;
     });
 }
 

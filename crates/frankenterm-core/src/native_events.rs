@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 #[cfg(any(unix, windows))]
+use std::sync::atomic::AtomicU64;
+#[cfg(any(unix, windows))]
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -26,7 +28,9 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 
 use crate::runtime_async::mpsc;
 #[cfg(any(unix, windows))]
-use crate::runtime_async::task::{JoinSet, JoinSetSettlement};
+use crate::runtime_async::{AcquireError, Semaphore, TryAcquireError};
+#[cfg(any(unix, windows))]
+use crate::runtime_async::task::{JoinErrorKind, JoinSet, JoinSetSettlement};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 #[cfg(any(unix, windows))]
@@ -42,6 +46,8 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const ACCEPT_ERROR_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
 #[cfg(any(unix, windows))]
 const ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_secs(1);
+#[cfg(any(unix, windows))]
+const MAX_CONCURRENT_NATIVE_CONNECTIONS: usize = 64;
 const EVENT_SEND_TIMEOUT: Duration = Duration::from_millis(25);
 #[cfg(any(unix, windows))]
 const NATIVE_CONNECTION_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -89,11 +95,86 @@ fn classify_native_connection_task_drain(
 }
 
 #[cfg(any(unix, windows))]
+fn native_listener_terminal_result(
+    listener_error: Option<NativeEventError>,
+    drain_outcome: NativeConnectionTaskDrainOutcome,
+) -> Result<(), NativeEventError> {
+    match drain_outcome {
+        NativeConnectionTaskDrainOutcome::Settled => listener_error.map_or(Ok(()), Err),
+        // Terminal-settlement failure takes precedence over the earlier loop
+        // failure because the listener no longer owns proof that every admitted
+        // connection task was destroyed. The earlier failure is logged at its
+        // source before the bounded drain begins.
+        NativeConnectionTaskDrainOutcome::TimedOut { .. } => {
+            Err(NativeEventError::ConnectionTaskDrainTimedOut)
+        }
+        NativeConnectionTaskDrainOutcome::Incomplete { .. } => {
+            Err(NativeEventError::ConnectionTaskDrainIncomplete)
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
 fn native_context_io_error(operation: &'static str) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::Interrupted,
         format!("native_event_context_interrupted:{operation}"),
     )
+}
+
+#[cfg(any(unix, windows))]
+fn record_native_connection_anomaly(counter: &mut u64) -> u64 {
+    *counter = (*counter).saturating_add(1);
+    *counter
+}
+
+#[cfg(any(unix, windows))]
+fn record_native_listener_anomaly(counter: &AtomicU64) -> u64 {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current == u64::MAX {
+            return current;
+        }
+        let next = current.saturating_add(1);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Debug, Default)]
+struct NativeListenerAnomalyCounters {
+    oversized_line_drops: AtomicU64,
+    backpressure_drops: AtomicU64,
+    malformed_event_drops: AtomicU64,
+    connections_with_drops: AtomicU64,
+    post_accept_io_failures: AtomicU64,
+    rejected_peers: AtomicU64,
+}
+
+#[cfg(any(unix, windows))]
+fn native_spawn_admission_is_transient(error: &crate::runtime_async::task::SpawnError) -> bool {
+    native_spawn_error_code_is_transient(error.code())
+}
+
+#[cfg(any(unix, windows))]
+fn native_spawn_error_code_is_transient(code: &str) -> bool {
+    // Asupersync publishes ASUP-E006 as the stable machine-readable identity
+    // of RegionAtCapacity. All other spawn failures require runtime repair or
+    // shutdown and must stop this listener rather than retrying blindly.
+    code == "ASUP-E006"
+}
+
+#[cfg(any(unix, windows))]
+fn native_spawn_error_may_be_shutdown_race(code: &str) -> bool {
+    matches!(code, "ASUP-E001" | "ASUP-E002" | "ASUP-E003")
 }
 
 #[cfg(any(unix, windows))]
@@ -430,6 +511,18 @@ pub enum NativeEventError {
     Security(#[from] NativeEventSecurityError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The runtime rejected an accepted connection task. The underlying spawn
+    /// error is deliberately not retained because it is executor-specific and
+    /// may contain data outside the finite listener telemetry contract.
+    #[error("native event connection task admission failed")]
+    ConnectionTaskAdmissionFailed,
+    /// The bounded shutdown drain elapsed before every connection task reached
+    /// terminal settlement.
+    #[error("native event connection task drain timed out")]
+    ConnectionTaskDrainTimedOut,
+    /// Task settlement stopped after a nonterminal observation failure.
+    #[error("native event connection task drain ended without terminal settlement")]
+    ConnectionTaskDrainIncomplete,
 }
 
 #[cfg(all(unix, feature = "native-wezterm"))]
@@ -846,15 +939,15 @@ impl NativeEventListener {
     /// # Errors
     ///
     /// Returns [`NativeEventError::ContextUnavailable`] when no ambient
-    /// context is installed.
+    /// context is installed. Otherwise propagates the finite listener failures
+    /// documented by [`run_with_cx`](Self::run_with_cx).
     pub async fn run(
         self,
         event_tx: mpsc::Sender<NativeEvent>,
         shutdown_flag: Arc<AtomicBool>,
     ) -> Result<(), NativeEventError> {
         let cx = crate::cx::Cx::current().ok_or(NativeEventError::ContextUnavailable)?;
-        self.run_with_cx(&cx, event_tx, shutdown_flag).await;
-        Ok(())
+        self.run_with_cx(&cx, event_tx, shutdown_flag).await
     }
 
     /// Run the accept loop against the caller's asupersync capability
@@ -876,29 +969,89 @@ impl NativeEventListener {
     /// [`run`](Self::run) is the ambient-context adapter and returns a typed
     /// [`NativeEventError::ContextUnavailable`] instead of silently disabling
     /// native events when no runtime capability context is installed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed I/O error after a permanent accept failure, a finite
+    /// admission error when the runtime rejects a connection task, or a finite
+    /// drain error when admitted connection tasks cannot be terminally settled.
+    /// The shared result contract also lets unsupported targets return
+    /// [`NativeEventSecurityError::PeerCredentialsUnavailable`] instead of
+    /// presenting a cfg-dependent API or silently claiming listener success.
     pub async fn run_with_cx(
         self,
         cx: &crate::cx::Cx,
         event_tx: mpsc::Sender<NativeEvent>,
         shutdown_flag: Arc<AtomicBool>,
-    ) {
+    ) -> Result<(), NativeEventError> {
         if cx.checkpoint().is_err() {
             debug!(
                 path = %self.socket_path.display(),
                 error_class = "native_event_context_interrupted",
                 "native event run aborted before accept loop"
             );
-            return;
+            return Ok(());
         }
 
         let mut connection_tasks = JoinSet::new();
+        let connection_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_NATIVE_CONNECTIONS));
+        let mut connection_capacity_waits = 0_u64;
         let mut accept_error_backoff = ACCEPT_ERROR_INITIAL_BACKOFF;
         let mut consecutive_accept_errors = 0_u64;
+        let mut consecutive_spawn_capacity_errors = 0_u64;
+        let mut spawn_capacity_backoff = ACCEPT_ERROR_INITIAL_BACKOFF;
+        let mut listener_error = None;
+        let anomaly_counters = Arc::new(NativeListenerAnomalyCounters::default());
 
         loop {
             if shutdown_flag.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
                 break;
             }
+
+            // Reserve task/memory capacity before accepting another client.
+            // A connection may retain a bounded line buffer while it waits for
+            // input, so accepting first would let a same-UID reconnect storm
+            // allocate an unbounded number of tasks. Contention stays in the
+            // kernel backlog and wakes promptly when a task releases a permit.
+            let connection_permit =
+                match Arc::clone(&connection_permits).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(TryAcquireError::NoPermits) => {
+                        connection_capacity_waits = connection_capacity_waits.saturating_add(1);
+                        if connection_capacity_waits.is_power_of_two() {
+                            warn!(
+                                connection_capacity_waits,
+                                max_connections = MAX_CONCURRENT_NATIVE_CONNECTIONS,
+                                "native event listener waiting for bounded connection capacity"
+                            );
+                        }
+                        match crate::runtime_async::timeout_with_cx(
+                            cx,
+                            ACCEPT_POLL_INTERVAL,
+                            Arc::clone(&connection_permits).acquire_owned_with_cx(cx),
+                        )
+                        .await
+                        {
+                            Ok(Ok(permit)) => permit,
+                            Ok(Err(AcquireError::Closed)) => {
+                                listener_error =
+                                    Some(NativeEventError::ConnectionTaskAdmissionFailed);
+                                break;
+                            }
+                            Ok(Err(_)) if cx.checkpoint().is_err() => break,
+                            Ok(Err(_)) => {
+                                listener_error =
+                                    Some(NativeEventError::ConnectionTaskAdmissionFailed);
+                                break;
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                    Err(TryAcquireError::Closed) => {
+                        listener_error = Some(NativeEventError::ConnectionTaskAdmissionFailed);
+                        break;
+                    }
+                };
 
             match crate::runtime_async::timeout_with_cx(
                 cx,
@@ -928,21 +1081,35 @@ impl NativeEventListener {
                     }
                     #[cfg(unix)]
                     if let Err(error) = validate_native_event_peer(stream.as_std()) {
-                        warn!(
-                            error = %error,
-                            path = %self.socket_path.display(),
-                            "rejected unauthenticated native event peer"
+                        let rejected_peers = record_native_listener_anomaly(
+                            &anomaly_counters.rejected_peers,
                         );
+                        if rejected_peers.is_power_of_two() {
+                            warn!(
+                                failure_class = ?error,
+                                rejected_peers,
+                                path = %self.socket_path.display(),
+                                "rejected unauthenticated native event peers reached sampled threshold"
+                            );
+                        }
                         drop(stream);
                         continue;
                     }
                     let tx = event_tx.clone();
                     let path = self.socket_path.display().to_string();
+                    let connection_anomalies = Arc::clone(&anomaly_counters);
                     match crate::runtime_async::task::try_spawn_with_cx(
                         cx,
                         move |child_cx| async move {
+                            let _connection_permit = connection_permit;
                             if let Err(err) =
-                                handle_connection_with_cx(child_cx, stream, tx).await
+                                handle_connection_with_cx(
+                                    child_cx,
+                                    stream,
+                                    tx,
+                                    &connection_anomalies,
+                                )
+                                .await
                             {
                                 // Split by error kind: clean client disconnects
                                 // exit the handler loop via `Ok(None)` from
@@ -961,17 +1128,59 @@ impl NativeEventListener {
                                         "native event connection cancelled"
                                     );
                                 } else {
-                                    warn!(
-                                        error = %err,
-                                        error_kind = ?err.kind(),
-                                        path = %path,
-                                        "native event connection closed with error"
+                                    let failures = record_native_listener_anomaly(
+                                        &connection_anomalies.post_accept_io_failures,
                                     );
+                                    if failures.is_power_of_two() {
+                                        warn!(
+                                            failure_count = failures,
+                                            error_kind = ?err.kind(),
+                                            path = %path,
+                                            "native event post-accept I/O failures reached sampled threshold"
+                                        );
+                                    }
                                 }
                             }
                         },
                     ) {
-                        Ok(handle) => connection_tasks.insert_handle(handle),
+                        Ok(handle) => {
+                            consecutive_spawn_capacity_errors = 0;
+                            spawn_capacity_backoff = ACCEPT_ERROR_INITIAL_BACKOFF;
+                            connection_tasks.insert_handle(handle);
+                        }
+                        Err(error) if native_spawn_admission_is_transient(&error) => {
+                            consecutive_spawn_capacity_errors =
+                                consecutive_spawn_capacity_errors.saturating_add(1);
+                            if consecutive_spawn_capacity_errors.is_power_of_two() {
+                                warn!(
+                                    error_code = error.code(),
+                                    consecutive_spawn_capacity_errors,
+                                    retry_backoff_ms = spawn_capacity_backoff.as_millis(),
+                                    path = %self.socket_path.display(),
+                                    "native event connection task region is at capacity; applying bounded retry backoff"
+                                );
+                            }
+                            if crate::runtime_async::sleep_with_cx(cx, spawn_capacity_backoff)
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            spawn_capacity_backoff = spawn_capacity_backoff
+                                .saturating_mul(2)
+                                .min(ACCEPT_ERROR_MAX_BACKOFF);
+                        }
+                        Err(error)
+                            if native_spawn_error_may_be_shutdown_race(error.code())
+                                && (shutdown_flag.load(Ordering::SeqCst)
+                                    || cx.checkpoint().is_err()) =>
+                        {
+                            debug!(
+                                error_code = error.code(),
+                                "native event connection spawn lost the normal runtime-shutdown race"
+                            );
+                            break;
+                        }
                         Err(error) => {
                             warn!(
                                 error_code = error.code(),
@@ -983,6 +1192,7 @@ impl NativeEventListener {
                             // unavailable. Fail the listener loop closed;
                             // polling remains active and a runtime restart is
                             // required to attempt a fresh listener.
+                            listener_error = Some(NativeEventError::ConnectionTaskAdmissionFailed);
                             break;
                         }
                     }
@@ -995,6 +1205,7 @@ impl NativeEventListener {
                             path = %self.socket_path.display(),
                             "native event listener stopped after permanent accept failure"
                         );
+                        listener_error = Some(NativeEventError::Io(err));
                         break;
                     }
                     consecutive_accept_errors = consecutive_accept_errors.saturating_add(1);
@@ -1059,15 +1270,21 @@ impl NativeEventListener {
                     match connection_tasks.drain_next_with_cx(&drain_cx).await {
                         Ok(Some(join_result)) => {
                             if let Err(err) = join_result {
-                                // Kept at debug! — after shutdown_flag or cx
-                                // cancel fires, task cancellation is expected.
-                                // A finite waker-registration failure is logged
-                                // once while JoinSet retains terminal authority
-                                // for subsequent trusted polls.
-                                debug!(
-                                    error = %err,
-                                    "native event connection task failed during shutdown"
-                                );
+                                match err.kind() {
+                                    JoinErrorKind::Aborted
+                                    | JoinErrorKind::ContextCancelled => {
+                                        debug!(
+                                            failure_class = ?err.kind(),
+                                            "native event connection task stopped during shutdown"
+                                        );
+                                    }
+                                    _ => {
+                                        warn!(
+                                            failure_class = ?err.kind(),
+                                            "native event connection task failure remained observable during trusted shutdown drain"
+                                        );
+                                    }
+                                }
                             }
                         }
                         Ok(None) => return Ok(()),
@@ -1083,10 +1300,11 @@ impl NativeEventListener {
                 "native event connection task drain context failed before terminal settlement"
             );
         }
-        match classify_native_connection_task_drain(
+        let drain_outcome = classify_native_connection_task_drain(
             drain_result.is_err(),
             connection_tasks.settlement(),
-        ) {
+        );
+        match drain_outcome {
             NativeConnectionTaskDrainOutcome::Settled => {}
             NativeConnectionTaskDrainOutcome::TimedOut {
                 active_tasks,
@@ -1115,6 +1333,7 @@ impl NativeEventListener {
                 );
             }
         }
+        native_listener_terminal_result(listener_error, drain_outcome)
     }
 }
 
@@ -1130,8 +1349,9 @@ pub struct NativeEventListener {
 #[cfg(not(any(unix, windows)))]
 impl NativeEventListener {
     /// Refuse listener creation on a target without authenticated transport.
-    pub async fn bind(_socket_path: PathBuf) -> Result<Self, NativeEventError> {
-        Err(NativeEventSecurityError::PeerCredentialsUnavailable.into())
+    pub async fn bind(socket_path: PathBuf) -> Result<Self, NativeEventError> {
+        let cx = crate::cx::Cx::current().ok_or(NativeEventError::ContextUnavailable)?;
+        Self::bind_with_cx(&cx, socket_path).await
     }
 
     /// Refuse listener creation on a target without authenticated transport.
@@ -1145,11 +1365,11 @@ impl NativeEventListener {
     /// This value cannot be constructed through the public API.
     pub async fn run(
         self,
-        _event_tx: mpsc::Sender<NativeEvent>,
-        _shutdown_flag: Arc<AtomicBool>,
+        event_tx: mpsc::Sender<NativeEvent>,
+        shutdown_flag: Arc<AtomicBool>,
     ) -> Result<(), NativeEventError> {
-        let _ = self;
-        Err(NativeEventSecurityError::PeerCredentialsUnavailable.into())
+        let cx = crate::cx::Cx::current().ok_or(NativeEventError::ContextUnavailable)?;
+        self.run_with_cx(&cx, event_tx, shutdown_flag).await
     }
 
     /// This value cannot be constructed through the public API.
@@ -1158,8 +1378,9 @@ impl NativeEventListener {
         _cx: &crate::cx::Cx,
         _event_tx: mpsc::Sender<NativeEvent>,
         _shutdown_flag: Arc<AtomicBool>,
-    ) {
+    ) -> Result<(), NativeEventError> {
         let _ = self;
+        Err(NativeEventSecurityError::PeerCredentialsUnavailable.into())
     }
 }
 
@@ -1256,6 +1477,7 @@ async fn handle_connection_with_cx(
     cx: crate::cx::Cx,
     stream: UnixStream,
     event_tx: mpsc::Sender<NativeEvent>,
+    listener_anomalies: &NativeListenerAnomalyCounters,
 ) -> Result<(), std::io::Error> {
     debug!("native event connection accepted (cx path)");
     cx.checkpoint()
@@ -1270,10 +1492,25 @@ async fn handle_connection_with_cx(
         socket_transport::buffered(stream),
         MAX_EVENT_LINE_BYTES.saturating_mul(2),
     );
+    let mut oversized_line_drops = 0_u64;
+    let mut backpressure_drops = 0_u64;
+    let mut malformed_event_drops = 0_u64;
 
     while let Some(line) = socket_transport::next_line_with_cx(&cx, &mut lines).await? {
         if line.len() > MAX_EVENT_LINE_BYTES {
-            warn!(len = line.len(), "native event line too large; dropping");
+            let connection_drop_count =
+                record_native_connection_anomaly(&mut oversized_line_drops);
+            let listener_drop_count = record_native_listener_anomaly(
+                &listener_anomalies.oversized_line_drops,
+            );
+            if listener_drop_count.is_power_of_two() {
+                warn!(
+                    connection_drop_count,
+                    listener_drop_count,
+                    line_bytes = line.len(),
+                    "native event oversized-line drops reached sampled threshold"
+                );
+            }
             continue;
         }
 
@@ -1291,10 +1528,20 @@ async fn handle_connection_with_cx(
                         // to warn so the loss is at least operator-visible rather
                         // than sinking into a filtered debug line; full per-pane
                         // gap injection for this path is tracked as a follow-up.
-                        warn!(
-                            event_kind,
-                            pane_id, "native event queue full; dropping event (cx path)"
+                        let connection_drop_count =
+                            record_native_connection_anomaly(&mut backpressure_drops);
+                        let listener_drop_count = record_native_listener_anomaly(
+                            &listener_anomalies.backpressure_drops,
                         );
+                        if listener_drop_count.is_power_of_two() {
+                            warn!(
+                                connection_drop_count,
+                                listener_drop_count,
+                                event_kind,
+                                pane_id,
+                                "native event backpressure drops reached sampled threshold"
+                            );
+                        }
                     }
                     EventDispatchOutcome::Closed => {
                         debug!(event_kind, pane_id, "native event channel closed (cx path)");
@@ -1302,15 +1549,47 @@ async fn handle_connection_with_cx(
                     }
                 }
             }
-            Ok(None) => {}
-            Err(err) => {
+            Ok(None) => {
+                debug!(
+                    event = "native_event_hello_received",
+                    "native event protocol hello received"
+                );
+            }
+            Err(_) => {
                 // Promoted from debug! — a malformed wire event is a
                 // protocol-level anomaly (version skew, corruption, or
                 // a hostile client writing to the native-events socket)
                 // and must not sink silently into a debug-level log
                 // that operators routinely filter out.
-                warn!(error = %err, "failed to decode native event (cx path)");
+                let connection_drop_count =
+                    record_native_connection_anomaly(&mut malformed_event_drops);
+                let listener_drop_count = record_native_listener_anomaly(
+                    &listener_anomalies.malformed_event_drops,
+                );
+                if listener_drop_count.is_power_of_two() {
+                    warn!(
+                        connection_drop_count,
+                        listener_drop_count,
+                        failure_class = "wire_decode_failure",
+                        "native event malformed-frame drops reached sampled threshold"
+                    );
+                }
             }
+        }
+    }
+
+    if oversized_line_drops > 0 || backpressure_drops > 0 || malformed_event_drops > 0 {
+        let anomalous_connections = record_native_listener_anomaly(
+            &listener_anomalies.connections_with_drops,
+        );
+        if anomalous_connections.is_power_of_two() {
+            warn!(
+                anomalous_connections,
+                oversized_line_drops,
+                backpressure_drops,
+                malformed_event_drops,
+                "native event connections with bounded input drops reached sampled threshold"
+            );
         }
     }
 
@@ -1530,6 +1809,145 @@ mod native_accept_error_classifier_tests {
             assert!(!native_accept_error_is_permanent(kind), "kind={kind:?}");
         }
     }
+
+    #[test]
+    fn permanent_accept_error_survives_a_successful_connection_task_drain() {
+        let result = native_listener_terminal_result(
+            Some(NativeEventError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "synthetic permanent accept failure",
+            ))),
+            NativeConnectionTaskDrainOutcome::Settled,
+        );
+
+        assert!(matches!(
+            result,
+            Err(NativeEventError::Io(error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn task_admission_error_survives_a_successful_connection_task_drain() {
+        let result = native_listener_terminal_result(
+            Some(NativeEventError::ConnectionTaskAdmissionFailed),
+            NativeConnectionTaskDrainOutcome::Settled,
+        );
+
+        assert!(matches!(
+            result,
+            Err(NativeEventError::ConnectionTaskAdmissionFailed)
+        ));
+        assert_eq!(
+            NativeEventError::ConnectionTaskAdmissionFailed.to_string(),
+            "native event connection task admission failed"
+        );
+    }
+
+    #[test]
+    fn incomplete_connection_task_drain_has_finite_terminal_precedence() {
+        let timed_out = native_listener_terminal_result(
+            None,
+            NativeConnectionTaskDrainOutcome::TimedOut {
+                active_tasks: 1,
+                unacknowledged_tasks: 0,
+            },
+        );
+        assert!(matches!(
+            timed_out,
+            Err(NativeEventError::ConnectionTaskDrainTimedOut)
+        ));
+
+        let incomplete = native_listener_terminal_result(
+            Some(NativeEventError::Io(std::io::Error::other(
+                "earlier listener failure must not hide orphan risk",
+            ))),
+            NativeConnectionTaskDrainOutcome::Incomplete {
+                active_tasks: 0,
+                unacknowledged_tasks: 1,
+            },
+        );
+        assert!(matches!(
+            incomplete,
+            Err(NativeEventError::ConnectionTaskDrainIncomplete)
+        ));
+    }
+
+    #[test]
+    fn connection_anomaly_counter_saturates_for_long_lived_clients() {
+        let mut counter = u64::MAX - 1;
+        assert_eq!(record_native_connection_anomaly(&mut counter), u64::MAX);
+        assert_eq!(record_native_connection_anomaly(&mut counter), u64::MAX);
+    }
+
+    #[test]
+    fn listener_anomaly_sampling_persists_across_connection_boundaries() {
+        let counter = AtomicU64::new(0);
+        let first_connection = record_native_listener_anomaly(&counter);
+        let second_connection = record_native_listener_anomaly(&counter);
+        let third_connection = record_native_listener_anomaly(&counter);
+        let fourth_connection = record_native_listener_anomaly(&counter);
+
+        assert!(first_connection.is_power_of_two());
+        assert!(second_connection.is_power_of_two());
+        assert!(!third_connection.is_power_of_two());
+        assert!(fourth_connection.is_power_of_two());
+        assert_eq!(counter.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn only_region_capacity_spawn_errors_are_retry_safe() {
+        assert!(native_spawn_error_code_is_transient("ASUP-E006"));
+        for permanent in [
+            "ASUP-E001",
+            "ASUP-E002",
+            "ASUP-E003",
+            "ASUP-E004",
+            "ASUP-E005",
+            "ASUP-E007",
+            "ASUP-E008",
+            "unknown",
+        ] {
+            assert!(!native_spawn_error_code_is_transient(permanent));
+        }
+    }
+
+    #[test]
+    fn runtime_lifecycle_spawn_errors_are_clean_only_after_shutdown_observation() {
+        for lifecycle_code in ["ASUP-E001", "ASUP-E002", "ASUP-E003"] {
+            assert!(native_spawn_error_may_be_shutdown_race(lifecycle_code));
+            assert!(!native_spawn_error_code_is_transient(lifecycle_code));
+        }
+        for non_lifecycle_code in [
+            "ASUP-E004",
+            "ASUP-E005",
+            "ASUP-E006",
+            "ASUP-E007",
+            "ASUP-E008",
+            "unknown",
+        ] {
+            assert!(!native_spawn_error_may_be_shutdown_race(non_lifecycle_code));
+        }
+    }
+
+    #[test]
+    fn native_connection_admission_is_strictly_bounded() {
+        let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_NATIVE_CONNECTIONS));
+        let mut held = Vec::with_capacity(MAX_CONCURRENT_NATIVE_CONNECTIONS);
+        for _ in 0..MAX_CONCURRENT_NATIVE_CONNECTIONS {
+            held.push(
+                Arc::clone(&permits)
+                    .try_acquire_owned()
+                    .expect("configured native connection permit"),
+            );
+        }
+        assert!(matches!(
+            Arc::clone(&permits).try_acquire_owned(),
+            Err(TryAcquireError::NoPermits)
+        ));
+        drop(held.pop().expect("one held permit must be available"));
+        assert!(Arc::clone(&permits).try_acquire_owned().is_ok());
+    }
 }
 
 #[cfg(all(
@@ -1676,8 +2094,11 @@ mod transport_roundtrip_tests {
             }
 
             shutdown.store(true, Ordering::SeqCst);
-            let result = crate::runtime_async::timeout(Duration::from_secs(2), handle).await;
-            assert!(result.is_ok(), "native event listener did not shut down");
+            crate::runtime_async::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("native event listener shutdown timed out")
+                .expect("native event listener task failed")
+                .expect("native event listener returned a terminal error");
             assert!(
                 !socket_path.exists(),
                 "native event transport path should be removed after shutdown"
@@ -2281,6 +2702,16 @@ mod tests {
             .expect(label)
     }
 
+    async fn assert_listener_shutdown(
+        handle: task::JoinHandle<Result<(), NativeEventError>>,
+    ) {
+        crate::runtime_async::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("listener shutdown timed out")
+            .expect("listener task failed")
+            .expect("listener returned a terminal error");
+    }
+
     // ── NativeEventListener ────────────────────────────────────────
 
     #[test]
@@ -2561,7 +2992,8 @@ mod tests {
             let wall_start = std::time::Instant::now();
             listener
                 .run_with_cx(&cx, event_tx, Arc::clone(&shutdown_flag))
-                .await;
+                .await
+                .expect("supported native event listener run must terminate cleanly");
 
             assert!(
                 wall_start.elapsed() < Duration::from_secs(1),
@@ -2617,7 +3049,7 @@ mod tests {
 
             drop(stream);
             shutdown.store(true, Ordering::SeqCst);
-            let _ = handle.await;
+            assert_listener_shutdown(handle).await;
         });
     }
 
@@ -2658,7 +3090,7 @@ mod tests {
 
             drop(stream);
             shutdown.store(true, Ordering::SeqCst);
-            let _ = handle.await;
+            assert_listener_shutdown(handle).await;
         });
     }
 
@@ -2701,7 +3133,7 @@ mod tests {
 
             drop(stream);
             shutdown.store(true, Ordering::SeqCst);
-            let _ = handle.await;
+            assert_listener_shutdown(handle).await;
         });
     }
 
@@ -2763,7 +3195,7 @@ mod tests {
 
             drop(stream_two);
             shutdown.store(true, Ordering::SeqCst);
-            let _ = handle.await;
+            assert_listener_shutdown(handle).await;
         });
     }
 
@@ -2804,7 +3236,7 @@ mod tests {
 
             drop(stream);
             shutdown.store(true, Ordering::SeqCst);
-            let _ = handle.await;
+            assert_listener_shutdown(handle).await;
         });
     }
 
@@ -2826,8 +3258,7 @@ mod tests {
             shutdown.store(true, Ordering::SeqCst);
 
             // Listener should exit within a few poll intervals
-            let result = crate::runtime_async::timeout(Duration::from_secs(2), handle).await;
-            assert!(result.is_ok(), "listener did not shut down in time");
+            assert_listener_shutdown(handle).await;
             #[cfg(unix)]
             assert!(
                 !socket_path.exists(),
@@ -2873,11 +3304,7 @@ mod tests {
             // Keep `stream` open and silent. Without explicit child abort the
             // listener's join drain blocks forever in the next line read.
             shutdown.store(true, Ordering::SeqCst);
-            let result = crate::runtime_async::timeout(Duration::from_secs(2), handle).await;
-            assert!(
-                result.is_ok(),
-                "listener must settle owned connection tasks during shutdown"
-            );
+            assert_listener_shutdown(handle).await;
             drop(stream);
         });
     }
@@ -3235,6 +3662,9 @@ mod tests {
             NativeEventError::SocketAlreadyExists("x".into()),
             NativeEventError::Security(NativeEventSecurityError::PeerCredentialsUnavailable),
             NativeEventError::Io(std::io::Error::other("test")),
+            NativeEventError::ConnectionTaskAdmissionFailed,
+            NativeEventError::ConnectionTaskDrainTimedOut,
+            NativeEventError::ConnectionTaskDrainIncomplete,
         ];
         for e in &errors {
             let dbg = format!("{:?}", e);
@@ -3662,7 +4092,7 @@ mod tests {
 
             drop(stream);
             shutdown.store(true, Ordering::SeqCst);
-            let _ = handle.await;
+            assert_listener_shutdown(handle).await;
         });
     }
 }

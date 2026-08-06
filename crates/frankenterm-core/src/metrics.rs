@@ -19,7 +19,8 @@ use crate::runtime::RuntimeHandle;
 use crate::runtime_async::io::AsyncWriteExt;
 use crate::runtime_async::net::{TcpListener, TcpStream};
 use crate::runtime_async::notify::Notify;
-use crate::runtime_async::task::{JoinErrorKind, JoinSet, JoinSetSettlement};
+use crate::runtime_async::task::{JoinErrorKind, JoinSet, JoinSetSettlement, SpawnError};
+use crate::runtime_async::{AcquireError, Semaphore, TryAcquireError};
 use tracing::{debug, warn};
 
 /// Boxed future for async trait-like APIs without additional dependencies.
@@ -421,8 +422,85 @@ impl MetricsServerHandle {
 }
 
 const METRICS_CONNECTION_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const METRICS_CONNECTION_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const METRICS_MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const METRICS_ACCEPT_ERROR_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
 const METRICS_ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+#[cfg(all(test, feature = "metrics"))]
+struct MetricsConnectionTestProbe {
+    active_tasks: std::sync::atomic::AtomicUsize,
+    total_admitted_tasks: std::sync::atomic::AtomicUsize,
+    capacity_waits: std::sync::atomic::AtomicUsize,
+    changed: Notify,
+}
+
+#[cfg(all(test, feature = "metrics"))]
+impl MetricsConnectionTestProbe {
+    fn new() -> Self {
+        Self {
+            active_tasks: std::sync::atomic::AtomicUsize::new(0),
+            total_admitted_tasks: std::sync::atomic::AtomicUsize::new(0),
+            capacity_waits: std::sync::atomic::AtomicUsize::new(0),
+            changed: Notify::new(),
+        }
+    }
+
+    fn task_started(self: &Arc<Self>) -> MetricsConnectionTestTaskGuard {
+        self.total_admitted_tasks.fetch_add(1, Ordering::SeqCst);
+        self.active_tasks.fetch_add(1, Ordering::SeqCst);
+        self.changed.notify_waiters();
+        MetricsConnectionTestTaskGuard {
+            probe: Arc::clone(self),
+        }
+    }
+
+    fn record_capacity_wait(&self) {
+        self.capacity_waits.fetch_add(1, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    fn active_tasks(&self) -> usize {
+        self.active_tasks.load(Ordering::SeqCst)
+    }
+
+    fn total_admitted_tasks(&self) -> usize {
+        self.total_admitted_tasks.load(Ordering::SeqCst)
+    }
+
+    fn capacity_waits(&self) -> usize {
+        self.capacity_waits.load(Ordering::SeqCst)
+    }
+
+    async fn wait_until<F>(&self, description: &'static str, predicate: F)
+    where
+        F: FnMut() -> bool,
+    {
+        crate::runtime_async::timeout(
+            Duration::from_secs(5),
+            self.changed.wait_until(predicate),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("timed out waiting for {description}: {error}"));
+    }
+}
+
+#[cfg(all(test, feature = "metrics"))]
+struct MetricsConnectionTestTaskGuard {
+    probe: Arc<MetricsConnectionTestProbe>,
+}
+
+#[cfg(all(test, feature = "metrics"))]
+impl Drop for MetricsConnectionTestTaskGuard {
+    fn drop(&mut self) {
+        self.probe.active_tasks.fetch_sub(1, Ordering::SeqCst);
+        self.probe.changed.notify_waiters();
+    }
+}
+
+fn metrics_spawn_admission_is_transient(error: &SpawnError) -> bool {
+    matches!(error, SpawnError::RegionAtCapacity { .. })
+}
 
 fn metrics_accept_error_is_permanent(error: &std::io::Error) -> bool {
     if matches!(
@@ -456,13 +534,16 @@ fn metrics_accept_error_is_permanent(error: &std::io::Error) -> bool {
     false
 }
 
+/// Shared bounded backoff state for transient accept and task-admission
+/// failures. Each lane owns a separate instance so a healthy accept does not
+/// erase a continuing region-capacity streak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MetricsAcceptErrorBackoff {
+struct MetricsRetryBackoff {
     retry_delay: Duration,
     consecutive_errors: u64,
 }
 
-impl MetricsAcceptErrorBackoff {
+impl MetricsRetryBackoff {
     const fn new() -> Self {
         Self {
             retry_delay: METRICS_ACCEPT_ERROR_INITIAL_BACKOFF,
@@ -578,6 +659,10 @@ pub struct MetricsServer {
     shutdown_flag: Arc<AtomicBool>,
     /// Must be set to `true` to bind on non-localhost addresses.
     allow_public_bind: bool,
+    #[cfg(all(test, feature = "metrics"))]
+    connection_test_probe: Option<Arc<MetricsConnectionTestProbe>>,
+    #[cfg(all(test, feature = "metrics"))]
+    connection_io_timeout: Duration,
 }
 
 impl MetricsServer {
@@ -594,6 +679,10 @@ impl MetricsServer {
             collector,
             shutdown_flag,
             allow_public_bind: false,
+            #[cfg(all(test, feature = "metrics"))]
+            connection_test_probe: None,
+            #[cfg(all(test, feature = "metrics"))]
+            connection_io_timeout: METRICS_CONNECTION_IO_TIMEOUT,
         }
     }
 
@@ -601,6 +690,18 @@ impl MetricsServer {
     #[must_use]
     pub fn with_dangerous_public_bind(mut self) -> Self {
         self.allow_public_bind = true;
+        self
+    }
+
+    #[cfg(all(test, feature = "metrics"))]
+    fn with_connection_test_probe(mut self, probe: Arc<MetricsConnectionTestProbe>) -> Self {
+        self.connection_test_probe = Some(probe);
+        self
+    }
+
+    #[cfg(all(test, feature = "metrics"))]
+    fn with_connection_io_timeout_for_test(mut self, timeout: Duration) -> Self {
+        self.connection_io_timeout = timeout;
         self
     }
 
@@ -660,12 +761,26 @@ impl MetricsServer {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let shutdown_notify = Arc::new(Notify::new());
         let task_shutdown_notify = Arc::clone(&shutdown_notify);
+        #[cfg(all(test, feature = "metrics"))]
+        let connection_test_probe = self.connection_test_probe.clone();
+        #[cfg(all(test, feature = "metrics"))]
+        let connection_io_timeout = self.connection_io_timeout;
+        #[cfg(not(all(test, feature = "metrics")))]
+        let connection_io_timeout = METRICS_CONNECTION_IO_TIMEOUT;
         let join = crate::runtime_async::task::spawn_with_cx(cx, move |accept_cx| async move {
             use futures::future::{Either, select};
 
             let accept_poll_interval = Duration::from_millis(250);
             let mut connection_tasks = JoinSet::new();
-            let mut accept_error_backoff = MetricsAcceptErrorBackoff::new();
+            // Do not let stalled scrapers consume the runtime's global task
+            // admission budget. Each connection also carries an I/O deadline
+            // below, but the semaphore is the fail-fast bound while those
+            // deadlines are pending.
+            let connection_permits =
+                Arc::new(Semaphore::new(METRICS_MAX_CONCURRENT_CONNECTIONS));
+            let mut connection_capacity_waits = 0_u64;
+            let mut accept_error_backoff = MetricsRetryBackoff::new();
+            let mut spawn_capacity_backoff = MetricsRetryBackoff::new();
             loop {
                 while let Some(join_result) = connection_tasks.try_join_next() {
                     if let Err(error) = join_result {
@@ -679,6 +794,62 @@ impl MetricsServer {
                 if shutdown_flag.load(Ordering::SeqCst) || accept_cx.checkpoint().is_err() {
                     break;
                 }
+
+                // Reserve bounded task capacity before accepting a socket. If
+                // all scrapers are stalled, leaving clients in the kernel
+                // backlog applies backpressure without an accept/drop/log hot
+                // loop on the runtime thread. The contended path wakes as soon
+                // as a permit is released and polls shutdown at most every
+                // accept interval.
+                let connection_permit =
+                    match Arc::clone(&connection_permits).try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(TryAcquireError::NoPermits) => {
+                            connection_capacity_waits =
+                                connection_capacity_waits.saturating_add(1);
+                            #[cfg(all(test, feature = "metrics"))]
+                            if let Some(probe) = connection_test_probe.as_ref() {
+                                probe.record_capacity_wait();
+                            }
+                            if connection_capacity_waits.is_power_of_two() {
+                                warn!(
+                                    connection_capacity_waits,
+                                    max_connections = METRICS_MAX_CONCURRENT_CONNECTIONS,
+                                    "Metrics listener waiting for bounded connection capacity"
+                                );
+                            }
+                            let shutdown_wait =
+                                std::pin::pin!(task_shutdown_notify.wait_until(|| {
+                                    shutdown_flag.load(Ordering::SeqCst)
+                                }));
+                            let capacity_wait = std::pin::pin!(
+                                crate::runtime_async::timeout_with_cx(
+                                    &accept_cx,
+                                    accept_poll_interval,
+                                    Arc::clone(&connection_permits)
+                                        .acquire_owned_with_cx(&accept_cx),
+                                )
+                            );
+                            match select(shutdown_wait, capacity_wait).await {
+                                Either::Left(((), _)) => break,
+                                Either::Right((Ok(Ok(permit)), _)) => permit,
+                                Either::Right((Ok(Err(AcquireError::Closed)), _)) => {
+                                    warn!(
+                                        "Metrics connection admission semaphore closed; stopping listener"
+                                    );
+                                    break;
+                                }
+                                Either::Right((Ok(Err(_)), _)) => break,
+                                Either::Right((Err(_), _)) => continue,
+                            }
+                        }
+                        Err(TryAcquireError::Closed) => {
+                            warn!(
+                                "Metrics connection admission semaphore closed; stopping listener"
+                            );
+                            break;
+                        }
+                    };
 
                 let shutdown_wait = std::pin::pin!(task_shutdown_notify.wait_until(|| {
                     shutdown_flag.load(Ordering::SeqCst)
@@ -704,18 +875,58 @@ impl MetricsServer {
                         }
                         let collector = Arc::clone(&collector);
                         let prefix = prefix.clone();
+                        #[cfg(all(test, feature = "metrics"))]
+                        let task_test_probe = connection_test_probe.as_ref().map(Arc::clone);
                         match crate::runtime_async::task::try_spawn_with_cx(
                             &accept_cx,
                             move |conn_cx| async move {
+                                let _connection_permit = connection_permit;
+                                #[cfg(all(test, feature = "metrics"))]
+                                let _connection_test_guard =
+                                    task_test_probe.map(|probe| probe.task_started());
                                 if let Err(err) =
-                                    handle_connection_with_cx(&conn_cx, socket, &prefix, collector)
-                                        .await
+                                    handle_connection_with_cx(
+                                        &conn_cx,
+                                        socket,
+                                        &prefix,
+                                        collector,
+                                        connection_io_timeout,
+                                    )
+                                    .await
                                 {
                                     debug!(error = %err, peer = %peer, "Metrics connection failed");
                                 }
                             },
                         ) {
-                            Ok(handle) => connection_tasks.insert_handle(handle),
+                            Ok(handle) => {
+                                spawn_capacity_backoff.reset();
+                                connection_tasks.insert_handle(handle);
+                            }
+                            Err(error) if metrics_spawn_admission_is_transient(&error) => {
+                                let (consecutive_spawn_capacity_errors, retry_delay) =
+                                    spawn_capacity_backoff.record_failure();
+                                if consecutive_spawn_capacity_errors.is_power_of_two() {
+                                    warn!(
+                                        error_code = error.code(),
+                                        consecutive_spawn_capacity_errors,
+                                        retry_backoff_ms = retry_delay.as_millis(),
+                                        "Metrics connection task region is at capacity; applying bounded retry backoff"
+                                    );
+                                }
+                                let shutdown_wait =
+                                    std::pin::pin!(task_shutdown_notify.wait_until(|| {
+                                        shutdown_flag.load(Ordering::SeqCst)
+                                    }));
+                                let retry_wait =
+                                    std::pin::pin!(crate::runtime_async::sleep_with_cx(
+                                        &accept_cx,
+                                        retry_delay,
+                                    ));
+                                match select(shutdown_wait, retry_wait).await {
+                                    Either::Left(((), _)) | Either::Right((Err(_), _)) => break,
+                                    Either::Right((Ok(()), _)) => {}
+                                }
+                            }
                             Err(error) => {
                                 warn!(
                                     error_code = error.code(),
@@ -810,41 +1021,164 @@ impl MetricsServer {
     }
 }
 
-/// ft-xbnl0.2.3 Cx-first sibling of [`handle_connection`].
+/// Handles one accepted metrics connection under an explicit capability
+/// context and one finite end-to-end I/O timeout.
 ///
 /// Pre-flight `cx.checkpoint()` folded into `crate::Error::RuntimeOperation`
 /// so a cancelled server shutdown interrupts the per-connection
-/// body before any TCP read. The read itself is not cx-aware
-/// (tokio/asupersync-compat `io::read` doesn't observe cx), but a
-/// cancel arriving between the accept in `start_with_cx` and the
-/// read will now bail the handler instead of reading 8KB from a
-/// dying connection.
+/// body before any TCP read. The underlying I/O primitive does not observe the
+/// Cx directly, so the complete read-and-response exchange shares one finite
+/// timeout and is followed by a structural checkpoint/budget classification.
 async fn handle_connection_with_cx(
     cx: &crate::cx::Cx,
     mut socket: TcpStream,
     prefix: &str,
     collector: Arc<dyn MetricsCollector>,
+    io_timeout: Duration,
 ) -> Result<()> {
-    cx.checkpoint().map_err(|err| {
-        crate::Error::runtime_cancelled("metrics handle_connection", err.to_string())
-    })?;
-    let mut buf = [0_u8; 8192];
-    let read_len = crate::runtime_async::io::read(&mut socket, &mut buf).await?;
-    if read_len == 0 {
-        return Ok(());
-    }
-    cx.checkpoint().map_err(|err| {
-        crate::Error::runtime_cancelled("metrics handle_connection_after_read", err.to_string())
-    })?;
-    let request_bytes = buf[..read_len].to_vec();
-    handle_connection_impl(socket, prefix, collector, request_bytes).await
+    metrics_connection_checkpoint(cx, "metrics handle_connection")?;
+    metrics_connection_io_with_cx(
+        cx,
+        "metrics connection I/O",
+        io_timeout,
+        async move {
+            let mut buf = [0_u8; 8192];
+            let read_len = crate::runtime_async::io::read(&mut socket, &mut buf).await?;
+            if read_len == 0 {
+                return Ok(());
+            }
+            metrics_connection_checkpoint(cx, "metrics handle_connection_after_read")?;
+            let request_bytes = buf[..read_len].to_vec();
+            handle_connection_impl(socket, prefix, collector, request_bytes).await
+        },
+    )
+    .await?
 }
 
-/// Shared response-formatting + write body. Factored out so both
-/// `handle_connection` and `handle_connection_with_cx` render the
-/// same HTTP responses byte-for-byte; the only difference between
-/// the two is whether cx.checkpoint gates entry and the post-read
-/// boundary.
+async fn metrics_connection_io_with_cx<F, T>(
+    cx: &crate::cx::Cx,
+    operation: &'static str,
+    io_timeout: Duration,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = T>,
+{
+    match crate::runtime_async::timeout_with_cx_typed(cx, io_timeout, future).await {
+        Ok(output) => {
+            metrics_connection_checkpoint(cx, operation)?;
+            Ok(output)
+        }
+        Err(crate::runtime_async::TimeoutError::Elapsed) => match cx.checkpoint() {
+            Err(error) => Err(metrics_context_error(cx, operation, Some(&error))),
+            Ok(()) => match metrics_context_source(cx, None) {
+                Some(source) => Err(crate::Error::RuntimeOperation { operation, source }),
+                None => Err(crate::Error::runtime_backend(
+                    operation,
+                    "metrics connection I/O timeout elapsed",
+                )),
+            },
+        },
+    }
+}
+
+fn metrics_connection_checkpoint(cx: &crate::cx::Cx, operation: &'static str) -> Result<()> {
+    match cx.checkpoint() {
+        Err(error) => Err(metrics_context_error(cx, operation, Some(&error))),
+        Ok(()) => match metrics_context_source(cx, None) {
+            Some(source) => Err(crate::Error::RuntimeOperation { operation, source }),
+            None => Ok(()),
+        },
+    }
+}
+
+fn metrics_context_error(
+    cx: &crate::cx::Cx,
+    operation: &'static str,
+    error: Option<&crate::runtime_async::ContextError>,
+) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation,
+        source: metrics_context_source(cx, error)
+            .unwrap_or(crate::error::RuntimeOperationSource::ContextFailure),
+    }
+}
+
+fn metrics_context_source(
+    cx: &crate::cx::Cx,
+    error: Option<&crate::runtime_async::ContextError>,
+) -> Option<crate::error::RuntimeOperationSource> {
+    use crate::error::RuntimeOperationSource;
+    use crate::outcome::CancelKind;
+    use crate::runtime_async::ContextErrorKind;
+
+    if let Some(error) = error {
+        match error.kind() {
+            ContextErrorKind::DeadlineExceeded => {
+                return Some(RuntimeOperationSource::DeadlineExceeded);
+            }
+            ContextErrorKind::CancelTimeout => {
+                return Some(RuntimeOperationSource::Cancelled(
+                    "capability cancellation cleanup timed out".to_string(),
+                ));
+            }
+            ContextErrorKind::PollQuotaExhausted => {
+                return Some(RuntimeOperationSource::PollQuotaExhausted);
+            }
+            ContextErrorKind::CostQuotaExhausted => {
+                return Some(RuntimeOperationSource::CostBudgetExhausted);
+            }
+            ContextErrorKind::Cancelled => {}
+            _ => return Some(RuntimeOperationSource::ContextFailure),
+        }
+    }
+
+    let root_source = match cx.root_cancel_cause().map(|reason| reason.kind) {
+        Some(CancelKind::Deadline | CancelKind::Timeout) => {
+            Some(RuntimeOperationSource::DeadlineExceeded)
+        }
+        Some(CancelKind::PollQuota) => Some(RuntimeOperationSource::PollQuotaExhausted),
+        Some(CancelKind::CostBudget) => Some(RuntimeOperationSource::CostBudgetExhausted),
+        Some(
+            CancelKind::User
+            | CancelKind::FailFast
+            | CancelKind::RaceLost
+            | CancelKind::ParentCancelled
+            | CancelKind::ResourceUnavailable
+            | CancelKind::Shutdown
+            | CancelKind::LinkedExit,
+        ) => Some(RuntimeOperationSource::Cancelled(
+            "capability context ended during metrics connection I/O".to_string(),
+        )),
+        None => None,
+    };
+    if root_source.is_some() {
+        return root_source;
+    }
+
+    // A budget-aware timer can be the first observer of an exhausted budget,
+    // before the Cx has materialized a root cancellation cause. Preserve the
+    // finite cause from the content-free budget snapshot rather than
+    // misreporting deadline, poll, or cost exhaustion as a generic I/O timeout.
+    let budget = cx.budget_stats();
+    if budget.deadline.at.is_some() && budget.deadline.remaining.is_none() {
+        Some(RuntimeOperationSource::DeadlineExceeded)
+    } else if budget.polls.remaining == Some(0) {
+        Some(RuntimeOperationSource::PollQuotaExhausted)
+    } else if budget.cost.remaining == Some(0) {
+        Some(RuntimeOperationSource::CostBudgetExhausted)
+    } else if error.is_some() {
+        Some(RuntimeOperationSource::Cancelled(
+            "capability context ended during metrics connection I/O".to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Shared response-formatting and write body for the Cx-aware connection
+/// handler. Keeping parsing/rendering below the timeout boundary makes the
+/// read, collection, formatting, and response write one bounded exchange.
 async fn handle_connection_impl(
     mut socket: TcpStream,
     prefix: &str,
@@ -1157,8 +1491,8 @@ mod pure_tests {
     }
 
     #[test]
-    fn metrics_accept_backoff_is_bounded_and_resets_after_success() {
-        let mut backoff = MetricsAcceptErrorBackoff::new();
+    fn metrics_retry_backoff_is_bounded_and_resets_after_success() {
+        let mut backoff = MetricsRetryBackoff::new();
         let mut previous_delay = Duration::ZERO;
         for expected_count in 1..=128 {
             let (count, delay) = backoff.record_failure();
@@ -1174,6 +1508,195 @@ mod pure_tests {
             backoff.record_failure(),
             (1, METRICS_ACCEPT_ERROR_INITIAL_BACKOFF),
         );
+    }
+
+    #[test]
+    fn metrics_connection_admission_is_bounded_and_releases_capacity() {
+        let permits = Arc::new(Semaphore::new(METRICS_MAX_CONCURRENT_CONNECTIONS));
+        let mut held = Vec::with_capacity(METRICS_MAX_CONCURRENT_CONNECTIONS);
+        for _ in 0..METRICS_MAX_CONCURRENT_CONNECTIONS {
+            held.push(
+                Arc::clone(&permits)
+                    .try_acquire_owned()
+                    .expect("configured metrics connection slot must be available"),
+            );
+        }
+        assert_eq!(permits.available_permits(), 0);
+        assert!(matches!(
+            Arc::clone(&permits).try_acquire_owned(),
+            Err(TryAcquireError::NoPermits)
+        ));
+
+        drop(held.pop());
+        assert!(Arc::clone(&permits).try_acquire_owned().is_ok());
+        assert!(
+            !METRICS_CONNECTION_IO_TIMEOUT.is_zero(),
+            "every admitted metrics connection must carry a finite I/O deadline"
+        );
+    }
+
+    #[test]
+    fn metrics_spawn_capacity_is_transient_but_runtime_loss_is_terminal() {
+        let cx = crate::cx::for_testing();
+        let at_capacity = SpawnError::RegionAtCapacity {
+            region: cx.region_id(),
+            limit: METRICS_MAX_CONCURRENT_CONNECTIONS,
+            live: METRICS_MAX_CONCURRENT_CONNECTIONS,
+        };
+        assert!(metrics_spawn_admission_is_transient(&at_capacity));
+        assert!(!metrics_spawn_admission_is_transient(
+            &SpawnError::RuntimeUnavailable
+        ));
+    }
+
+    #[test]
+    fn metrics_connection_spawn_admission_failure_drops_owned_resources() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let previous_handle = crate::runtime_async::current_runtime_handle();
+        crate::runtime_async::clear_runtime_handle();
+
+        let permits = Arc::new(Semaphore::new(1));
+        let connection_permit = Arc::clone(&permits)
+            .try_acquire_owned()
+            .expect("single metrics connection slot must be available");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(Arc::clone(&dropped));
+        let cx = crate::cx::for_testing();
+        let spawn_result = crate::runtime_async::task::try_spawn_with_cx(
+            &cx,
+            move |_connection_cx| async move {
+                let _connection_permit = connection_permit;
+                let _probe = probe;
+                std::future::pending::<()>().await;
+            },
+        );
+        let rejected = matches!(
+            spawn_result,
+            Err(crate::runtime_async::task::SpawnError::RuntimeUnavailable)
+        );
+
+        if let Some(previous_handle) = previous_handle {
+            crate::runtime_async::install_runtime_handle(previous_handle);
+        }
+
+        assert!(rejected, "missing runtime must reject connection admission");
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "rejected spawn must drop and release its owned connection permit"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "rejected spawn must drop every resource owned by its task closure"
+        );
+    }
+
+    #[test]
+    fn metrics_connection_context_errors_preserve_finite_cause_class() {
+        let live_cx = crate::cx::for_testing();
+        assert!(matches!(
+            metrics_context_error(&live_cx, "metrics test", None),
+            crate::Error::RuntimeOperation {
+                source: crate::error::RuntimeOperationSource::ContextFailure,
+                ..
+            }
+        ));
+
+        let cancelled_cx = crate::cx::for_testing();
+        cancelled_cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("content that must not cross the metrics error boundary"),
+        );
+        assert!(matches!(
+            metrics_context_error(&cancelled_cx, "metrics test", None),
+            crate::Error::RuntimeOperation {
+                source: crate::error::RuntimeOperationSource::Cancelled(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn metrics_connection_context_errors_preserve_checkpoint_error_kind() {
+        use crate::error::RuntimeOperationSource;
+        use crate::runtime_async::{ContextError, ContextErrorKind};
+
+        let cx = crate::cx::for_testing();
+        let cases = [
+            (
+                ContextErrorKind::DeadlineExceeded,
+                RuntimeOperationSource::DeadlineExceeded,
+            ),
+            (
+                ContextErrorKind::PollQuotaExhausted,
+                RuntimeOperationSource::PollQuotaExhausted,
+            ),
+            (
+                ContextErrorKind::CostQuotaExhausted,
+                RuntimeOperationSource::CostBudgetExhausted,
+            ),
+        ];
+
+        for (kind, expected) in cases {
+            let error = ContextError::new(kind)
+                .with_message("secret checkpoint detail must not cross the metrics boundary");
+            let actual = metrics_context_error(&cx, "metrics test", Some(&error));
+            assert!(
+                matches!(
+                    &actual,
+                    crate::Error::RuntimeOperation { source, .. } if *source == expected
+                ),
+                "checkpoint kind {kind:?} must retain its finite structural class"
+            );
+            assert!(
+                !actual.to_string().contains("secret checkpoint detail"),
+                "checkpoint detail must remain content-free"
+            );
+        }
+    }
+
+    #[test]
+    fn metrics_connection_context_errors_detect_unmaterialized_budget_exhaustion() {
+        use crate::error::RuntimeOperationSource;
+
+        let cases = [
+            (
+                crate::cx::Budget::new()
+                    .with_deadline(crate::runtime_async::RuntimeTime::ZERO),
+                RuntimeOperationSource::DeadlineExceeded,
+            ),
+            (
+                crate::cx::Budget::new().with_poll_quota(0),
+                RuntimeOperationSource::PollQuotaExhausted,
+            ),
+            (
+                crate::cx::Budget::new().with_cost_quota(0),
+                RuntimeOperationSource::CostBudgetExhausted,
+            ),
+        ];
+
+        for (budget, expected) in cases {
+            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+            assert!(
+                cx.root_cancel_cause().is_none(),
+                "test precondition: budget exhaustion must not yet be materialized as cancellation"
+            );
+            let actual = metrics_context_error(&cx, "metrics test", None);
+            assert!(
+                matches!(
+                    actual,
+                    crate::Error::RuntimeOperation { source, .. } if source == expected
+                ),
+                "content-free budget stats must preserve {expected:?} before cancellation materializes"
+            );
+        }
     }
 
     #[test]
@@ -1725,6 +2248,27 @@ mod tests {
         }
     }
 
+    const METRICS_TEST_REQUEST: &[u8] = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    async fn read_metrics_test_response(stream: &mut TcpStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        crate::runtime_async::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("metrics test response must arrive before the safety timeout")
+            .expect("metrics test response read must succeed");
+        response
+    }
+
+    async fn stop_metrics_test_server(
+        shutdown_flag: &Arc<AtomicBool>,
+        handle: MetricsServerHandle,
+    ) {
+        shutdown_flag.store(true, Ordering::SeqCst);
+        crate::runtime_async::timeout(Duration::from_secs(5), handle.wait())
+            .await
+            .expect("metrics test server must settle before the safety timeout");
+    }
+
     #[test]
     fn metrics_connection_drain_trusted_polls_registration_failure_to_settlement() {
         run_async_test(async {
@@ -1909,6 +2453,164 @@ mod tests {
 
             shutdown_flag.store(true, Ordering::SeqCst);
             handle.wait().await;
+        });
+    }
+
+    #[test]
+    fn metrics_server_caps_stalled_connections_and_admits_waiter_after_release() {
+        run_async_test(async {
+            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
+            let probe = Arc::new(MetricsConnectionTestProbe::new());
+            let server = MetricsServer::new(
+                "127.0.0.1:0",
+                "wa",
+                collector,
+                Arc::clone(&shutdown_flag),
+            )
+            .with_connection_test_probe(Arc::clone(&probe))
+            .with_connection_io_timeout_for_test(Duration::from_secs(30));
+            let handle = server.start().await.expect("start bounded metrics server");
+
+            let mut stalled_clients = Vec::with_capacity(METRICS_MAX_CONCURRENT_CONNECTIONS);
+            for _ in 0..METRICS_MAX_CONCURRENT_CONNECTIONS {
+                stalled_clients.push(
+                    TcpStream::connect(handle.local_addr())
+                        .await
+                        .expect("connect stalled metrics client"),
+                );
+            }
+            probe
+                .wait_until("all bounded metrics tasks to start", || {
+                    probe.active_tasks() == METRICS_MAX_CONCURRENT_CONNECTIONS
+                })
+                .await;
+            probe
+                .wait_until("metrics listener to enter capacity wait", || {
+                    probe.capacity_waits() > 0
+                })
+                .await;
+
+            let mut waiting_client = TcpStream::connect(handle.local_addr())
+                .await
+                .expect("connect waiting metrics client");
+            waiting_client
+                .write_all(METRICS_TEST_REQUEST)
+                .await
+                .expect("send waiting metrics request");
+            assert_eq!(
+                probe.total_admitted_tasks(),
+                METRICS_MAX_CONCURRENT_CONNECTIONS,
+                "the waiting client must remain in the kernel backlog while all permits are held"
+            );
+
+            let mut released_client = stalled_clients.swap_remove(0);
+            released_client
+                .write_all(METRICS_TEST_REQUEST)
+                .await
+                .expect("release one stalled metrics client");
+            let released_response = read_metrics_test_response(&mut released_client).await;
+            assert!(String::from_utf8_lossy(&released_response).contains("200 OK"));
+
+            probe
+                .wait_until("waiting metrics client admission after permit release", || {
+                    probe.total_admitted_tasks() == METRICS_MAX_CONCURRENT_CONNECTIONS + 1
+                })
+                .await;
+            let waiting_response = read_metrics_test_response(&mut waiting_client).await;
+            assert!(String::from_utf8_lossy(&waiting_response).contains("200 OK"));
+
+            stop_metrics_test_server(&shutdown_flag, handle).await;
+            assert_eq!(
+                probe.active_tasks(),
+                0,
+                "server shutdown must settle every remaining stalled connection task"
+            );
+        });
+    }
+
+    #[test]
+    fn metrics_server_shutdown_wakes_capacity_wait_and_settles_stalled_tasks() {
+        run_async_test(async {
+            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
+            let probe = Arc::new(MetricsConnectionTestProbe::new());
+            let server = MetricsServer::new(
+                "127.0.0.1:0",
+                "wa",
+                collector,
+                Arc::clone(&shutdown_flag),
+            )
+            .with_connection_test_probe(Arc::clone(&probe))
+            .with_connection_io_timeout_for_test(Duration::from_secs(30));
+            let handle = server.start().await.expect("start bounded metrics server");
+
+            let mut stalled_clients = Vec::with_capacity(METRICS_MAX_CONCURRENT_CONNECTIONS);
+            for _ in 0..METRICS_MAX_CONCURRENT_CONNECTIONS {
+                stalled_clients.push(
+                    TcpStream::connect(handle.local_addr())
+                        .await
+                        .expect("connect stalled metrics client"),
+                );
+            }
+            probe
+                .wait_until("all shutdown-test metrics tasks to start", || {
+                    probe.active_tasks() == METRICS_MAX_CONCURRENT_CONNECTIONS
+                })
+                .await;
+            probe
+                .wait_until("shutdown-test listener to enter capacity wait", || {
+                    probe.capacity_waits() > 0
+                })
+                .await;
+
+            stop_metrics_test_server(&shutdown_flag, handle).await;
+            assert_eq!(
+                probe.active_tasks(),
+                0,
+                "shutdown notification must wake the capacity wait and settle all handlers"
+            );
+        });
+    }
+
+    #[test]
+    fn metrics_server_drops_silent_connection_after_real_io_timeout() {
+        run_async_test(async {
+            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
+            let probe = Arc::new(MetricsConnectionTestProbe::new());
+            let server = MetricsServer::new(
+                "127.0.0.1:0",
+                "wa",
+                collector,
+                Arc::clone(&shutdown_flag),
+            )
+            .with_connection_test_probe(Arc::clone(&probe))
+            .with_connection_io_timeout_for_test(Duration::from_millis(25));
+            let handle = server.start().await.expect("start timeout metrics server");
+
+            let mut silent_client = TcpStream::connect(handle.local_addr())
+                .await
+                .expect("connect silent metrics client");
+            probe
+                .wait_until("silent metrics connection task to start", || {
+                    probe.active_tasks() == 1
+                })
+                .await;
+            probe
+                .wait_until("silent metrics connection I/O timeout", || {
+                    probe.active_tasks() == 0
+                })
+                .await;
+
+            let response = read_metrics_test_response(&mut silent_client).await;
+            assert!(
+                response.is_empty(),
+                "a client that sends no request must receive no bytes before the I/O timeout closes it"
+            );
+            assert_eq!(probe.total_admitted_tasks(), 1);
+
+            stop_metrics_test_server(&shutdown_flag, handle).await;
         });
     }
 
