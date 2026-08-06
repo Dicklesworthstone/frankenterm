@@ -15,7 +15,9 @@ use super::*;
 
 use crate::ingest::Osc133State;
 use crate::patterns::PatternEngine;
-use crate::runtime_async::sleep_with_cx;
+use crate::runtime_async::{
+    ContextError, ContextErrorKind, RuntimeTime, sleep_with_cx, timer_now_with_cx,
+};
 use std::collections::HashSet;
 use std::sync::{Mutex, MutexGuard};
 
@@ -140,16 +142,15 @@ impl WaitConditionResult {
     }
 }
 
-fn wait_clock_now(cx: &crate::cx::Cx) -> asupersync::Time {
-    cx.timer_driver()
-        .map_or_else(asupersync::time::wall_now, |driver| driver.now())
+fn wait_clock_now(cx: &crate::cx::Cx) -> RuntimeTime {
+    timer_now_with_cx(cx)
 }
 
 fn wait_deadline_after(
-    start: asupersync::Time,
+    start: RuntimeTime,
     timeout: Duration,
     label: &str,
-) -> crate::Result<asupersync::Time> {
+) -> crate::Result<RuntimeTime> {
     let timeout_nanos = u64::try_from(timeout.as_nanos()).map_err(|_| {
         crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
             "{label} timeout is too large: {timeout:?}"
@@ -160,22 +161,22 @@ fn wait_deadline_after(
             "{label} deadline overflows the runtime clock: start={start}, timeout={timeout:?}"
         )))
     })?;
-    Ok(asupersync::Time::from_nanos(deadline_nanos))
+    Ok(RuntimeTime::from_nanos(deadline_nanos))
 }
 
-fn wait_timed_out(deadline: asupersync::Time, now: asupersync::Time) -> bool {
+fn wait_timed_out(deadline: RuntimeTime, now: RuntimeTime) -> bool {
     now >= deadline
 }
 
-fn wait_remaining(deadline: asupersync::Time, now: asupersync::Time) -> Duration {
+fn wait_remaining(deadline: RuntimeTime, now: RuntimeTime) -> Duration {
     Duration::from_nanos(deadline.duration_since(now))
 }
 
-fn wait_elapsed(start: asupersync::Time, now: asupersync::Time) -> Duration {
+fn wait_elapsed(start: RuntimeTime, now: RuntimeTime) -> Duration {
     Duration::from_nanos(now.duration_since(start))
 }
 
-fn wait_elapsed_ms(start: asupersync::Time, now: asupersync::Time) -> u64 {
+fn wait_elapsed_ms(start: RuntimeTime, now: RuntimeTime) -> u64 {
     duration_millis_u64(wait_elapsed(start, now))
 }
 
@@ -183,14 +184,34 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn wait_cancelled(label: &str, err: impl std::fmt::Display) -> crate::Error {
+fn wait_context_failure_code(cx: &crate::cx::Cx, error: &ContextError) -> &'static str {
+    match error.kind() {
+        ContextErrorKind::DeadlineExceeded => "wait_deadline_exceeded",
+        ContextErrorKind::CancelTimeout => "wait_cancellation_cleanup_timeout",
+        ContextErrorKind::PollQuotaExhausted => "wait_poll_budget_exhausted",
+        ContextErrorKind::CostQuotaExhausted => "wait_cost_budget_exhausted",
+        ContextErrorKind::Cancelled => match cx.cancel_reason().map(|reason| reason.root_cause().kind) {
+            Some(crate::outcome::CancelKind::Timeout | crate::outcome::CancelKind::Deadline) => {
+                "wait_deadline_exceeded"
+            }
+            Some(crate::outcome::CancelKind::PollQuota) => "wait_poll_budget_exhausted",
+            Some(crate::outcome::CancelKind::CostBudget) => "wait_cost_budget_exhausted",
+            _ => "wait_context_cancelled",
+        },
+        _ => "wait_context_failure",
+    }
+}
+
+fn wait_cancelled(cx: &crate::cx::Cx, label: &str, error: &ContextError) -> crate::Error {
+    let failure_class = wait_context_failure_code(cx, error);
     crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
-        "{label} cancelled: {err}"
+        "{label} cancelled (error_class={failure_class})"
     )))
 }
 
 fn wait_checkpoint(cx: &crate::cx::Cx, label: &str) -> crate::Result<()> {
-    cx.checkpoint().map_err(|err| wait_cancelled(label, err))
+    cx.checkpoint()
+        .map_err(|err| wait_cancelled(cx, label, &err))
 }
 
 async fn wait_sleep_with_cx(
@@ -198,7 +219,7 @@ async fn wait_sleep_with_cx(
     duration: Duration,
     label: &str,
 ) -> crate::Result<()> {
-    Instant::now().checked_add(duration).ok_or_else(|| {
+    u64::try_from(duration.as_nanos()).map_err(|_| {
         crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
             "{label} duration is too large: {duration:?}"
         )))
@@ -207,9 +228,17 @@ async fn wait_sleep_with_cx(
     while !remaining.is_zero() {
         wait_checkpoint(cx, label)?;
         let chunk = remaining.min(Duration::from_millis(50));
-        sleep_with_cx(cx, chunk)
-            .await
-            .map_err(|err| wait_cancelled(label, err))?;
+        if sleep_with_cx(cx, chunk).await.is_err() {
+            if let Err(error) = cx.checkpoint() {
+                return Err(wait_cancelled(cx, label, &error));
+            }
+            return Err(crate::Error::Workflow(
+                crate::error::WorkflowError::Aborted(format!(
+                    "{label} timer failed (error_class=wait_timer_failed)"
+                )),
+            ));
+        }
+        wait_checkpoint(cx, label)?;
         remaining = remaining.saturating_sub(chunk);
     }
     Ok(())
@@ -467,26 +496,26 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
 
             // Get pane text
             let text = self.source.get_text_with_cx(cx, pane_id, false).await?;
+            wait_checkpoint(cx, "pattern wait after pane read")?;
             let tail = tail_text(&text, self.options.tail_lines);
 
             // Run pattern detection
             let detections = self.pattern_engine.detect(&tail);
 
             // Check for matching rule
-            if let Some(detection) = detections.iter().find(|d| d.rule_id == rule_id) {
+            if detections.iter().any(|detection| detection.rule_id == rule_id) {
                 let elapsed_ms = wait_elapsed_ms(start, wait_clock_now(cx));
                 tracing::info!(
                     pane_id,
                     rule_id,
                     elapsed_ms,
                     polls,
-                    matched_text = %detection.matched_text,
                     "pattern_wait matched"
                 );
                 return Ok(WaitConditionResult::Satisfied {
                     elapsed_ms,
                     polls,
-                    context: Some(format!("matched: {}", detection.matched_text)),
+                    context: Some(format!("matched rule {rule_id}")),
                 });
             }
 
@@ -540,7 +569,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         let idle_threshold = Duration::from_millis(idle_threshold_ms);
 
         // Track when we first observed idle state (for threshold)
-        let mut idle_since: Option<asupersync::Time> = None;
+        let mut idle_since: Option<RuntimeTime> = None;
         #[allow(unused_assignments)]
         let mut last_state_desc: Option<String> = None;
 
@@ -559,6 +588,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
 
             // Check idle state
             let (is_idle, state_desc) = self.check_idle_state(cx, pane_id).await?;
+            wait_checkpoint(cx, "pane idle wait after state read")?;
             last_state_desc = Some(state_desc.clone());
 
             if is_idle {
@@ -638,6 +668,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         if self.options.allow_idle_heuristics {
             // ft-xbnl0.2.3 tick 264: cx-first heuristic idle check.
             let text = self.source.get_text_with_cx(cx, pane_id, false).await?;
+            wait_checkpoint(cx, "pane idle heuristic after pane read")?;
             let (is_idle, desc) = heuristic_idle_check(&text, self.options.tail_lines);
             return Ok((is_idle, format!("heuristic:{desc}")));
         }
@@ -674,6 +705,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             polls += 1;
 
             let text = self.source.get_text_with_cx(cx, pane_id, false).await?;
+            wait_checkpoint(cx, "stable tail wait after pane read")?;
             let tail = tail_text(&text, self.options.tail_lines);
             let tail_hash = stable_hash(tail.as_bytes());
             let tail_len = tail.len();
@@ -765,6 +797,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         let result = waiter
             .wait_for_with_cx(cx, pane_id, &wait_matcher, timeout)
             .await?;
+        wait_checkpoint(cx, "text match wait after pane wait")?;
         match result {
             WaitResult::Matched { elapsed_ms, polls } => Ok(WaitConditionResult::Satisfied {
                 elapsed_ms,
@@ -778,9 +811,21 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 polls,
                 last_observed: Some(format!("timeout {}", matcher.description())),
             }),
-            WaitResult::Cancelled { reason, polls } => {
-                tracing::info!(pane_id, polls, reason = %reason, "text match wait cancelled");
-                Err(wait_cancelled("text match wait", reason))
+            WaitResult::Cancelled {
+                reason: _reason,
+                polls,
+            } => {
+                tracing::info!(pane_id, polls, "text match wait cancelled");
+                if let Err(error) = cx.checkpoint() {
+                    Err(wait_cancelled(cx, "text match wait", &error))
+                } else {
+                    Err(crate::Error::Workflow(
+                        crate::error::WorkflowError::Aborted(
+                            "text match wait cancelled (error_class=pane_wait_cancelled)"
+                                .to_string(),
+                        ),
+                    ))
+                }
             }
         }
     }
@@ -849,19 +894,22 @@ pub(super) fn heuristic_idle_check(text: &str, tail_lines: usize) -> (bool, Stri
 
     (
         false,
-        format!("no_prompt_detected(last={})", truncate_for_log(trimmed, 40)),
+        format!(
+            "no_prompt_detected(last_len={},last_hash={:016x})",
+            trimmed.len(),
+            stable_hash(trimmed.as_bytes())
+        ),
     )
 }
 
-/// Truncate string for logging, adding ellipsis if truncated.
+/// Test utility that truncates a string without splitting UTF-8.
 ///
 /// `max_len` is measured in bytes. When `s` exceeds the budget the
 /// prefix is cut at the largest UTF-8 char boundary at or below
 /// `max_len - 3` so multi-byte codepoints (Cyrillic, CJK, emoji) do
-/// not panic the slice. `truncate_for_log` is called with arbitrary
-/// pane output (see `no_prompt_detected(last=…)` at wait_execution
-/// line 621), so adversarial UTF-8 from the user's terminal must
-/// never crash the workflow runner.
+/// not panic the slice. Production wait diagnostics deliberately retain only
+/// structural lengths and hashes, never arbitrary pane content.
+#[cfg(test)]
 pub(super) fn truncate_for_log(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         return s.to_string();
@@ -918,6 +966,37 @@ mod tests {
                 texts.last().cloned().unwrap_or_default()
             };
             Box::pin(async move { Ok(text) })
+        }
+    }
+
+    struct CancelOnReadPaneSource {
+        cancel_cx: crate::cx::Cx,
+        text: String,
+    }
+
+    impl CancelOnReadPaneSource {
+        fn new(cancel_cx: crate::cx::Cx, text: impl Into<String>) -> Self {
+            Self {
+                cancel_cx,
+                text: text.into(),
+            }
+        }
+    }
+
+    impl crate::wezterm::PaneTextSource for CancelOnReadPaneSource {
+        type Fut<'a> =
+            std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            let cancel_cx = self.cancel_cx.clone();
+            let text = self.text.clone();
+            Box::pin(async move {
+                cancel_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("SECRET post-read cancellation detail"),
+                );
+                Ok(text)
+            })
         }
     }
 
@@ -2336,5 +2415,62 @@ mod tests {
             wall_start.elapsed() < Duration::from_secs(1),
             "virtual-time timeout must not consume five wall-clock seconds"
         );
+    }
+
+    fn post_read_cancellation_error(condition: WaitCondition) -> crate::Error {
+        let rt = test_runtime();
+        let cx = crate::cx::for_testing();
+        let source = CancelOnReadPaneSource::new(cx.clone(), "ERROR matching pane content");
+        let engine = PatternEngine::new();
+        let executor = WaitConditionExecutor::new(&source, &engine);
+
+        rt.block_on(executor.execute_with_cx(&cx, &condition, 1, Duration::from_secs(5)))
+            .expect_err("cancellation concurrent with pane-read completion must win")
+    }
+
+    fn assert_finite_post_read_cancellation(error: &crate::Error) {
+        let crate::Error::Workflow(crate::error::WorkflowError::Aborted(message)) = error else {
+            panic!("unexpected post-read cancellation error: {error:?}");
+        };
+        assert!(message.contains("wait_context_cancelled"), "{message}");
+        assert!(!message.contains("SECRET"), "{message}");
+        assert!(!message.contains("matching pane content"), "{message}");
+    }
+
+    #[test]
+    fn pattern_wait_rechecks_cx_after_pane_read_before_matching() {
+        let error = post_read_cancellation_error(WaitCondition::Pattern {
+            pane_id: None,
+            rule_id: "wezterm.error_detect".to_string(),
+        });
+        assert_finite_post_read_cancellation(&error);
+    }
+
+    #[test]
+    fn pane_idle_wait_rechecks_cx_after_heuristic_pane_read() {
+        let error = post_read_cancellation_error(WaitCondition::PaneIdle {
+            pane_id: None,
+            idle_threshold_ms: 0,
+        });
+        assert_finite_post_read_cancellation(&error);
+    }
+
+    #[test]
+    fn stable_tail_wait_rechecks_cx_after_pane_read_before_hashing() {
+        let error = post_read_cancellation_error(WaitCondition::StableTail {
+            pane_id: None,
+            stable_for_ms: 0,
+        });
+        assert_finite_post_read_cancellation(&error);
+    }
+
+    #[test]
+    fn heuristic_idle_diagnostic_never_contains_pane_text() {
+        let secret = "SECRET token-bearing terminal output";
+        let (_, diagnostic) = heuristic_idle_check(secret, 10);
+        assert!(diagnostic.contains("last_len="), "{diagnostic}");
+        assert!(diagnostic.contains("last_hash="), "{diagnostic}");
+        assert!(!diagnostic.contains("SECRET"), "{diagnostic}");
+        assert!(!diagnostic.contains("terminal output"), "{diagnostic}");
     }
 }
