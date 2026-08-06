@@ -22,6 +22,35 @@ use frankenterm_core::retry::{
 use frankenterm_core::runtime_async::sleep;
 use frankenterm_core::watchdog::{Component, HealthStatus, HeartbeatRegistry, WatchdogConfig};
 
+trait TestPoolMaintenance<C> {
+    async fn put(&self, conn: C);
+    async fn evict_idle(&self) -> usize;
+    async fn stats(&self) -> frankenterm_core::pool::PoolStats;
+}
+
+impl<C: Send + 'static> TestPoolMaintenance<C> for Pool<C> {
+    async fn put(&self, conn: C) {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        self.put_with_cx(&cx, conn)
+            .await
+            .expect("test pool return must succeed");
+    }
+
+    async fn evict_idle(&self) -> usize {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        self.evict_idle_with_cx(&cx)
+            .await
+            .expect("test pool eviction must succeed")
+    }
+
+    async fn stats(&self) -> frankenterm_core::pool::PoolStats {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        self.stats_with_cx(&cx)
+            .await
+            .expect("test pool stats snapshot must succeed")
+    }
+}
+
 fn run_async_test<F>(future: F)
 where
     F: std::future::Future<Output = ()>,

@@ -17,6 +17,43 @@ use std::time::Duration;
 
 use frankenterm_core::pool::{Pool, PoolConfig, PoolError, PoolStats};
 
+trait TestPoolMaintenance<C> {
+    async fn put(&self, conn: C);
+    async fn evict_idle(&self) -> usize;
+    async fn stats(&self) -> PoolStats;
+    async fn clear(&self);
+}
+
+impl<C: Send + 'static> TestPoolMaintenance<C> for Pool<C> {
+    async fn put(&self, conn: C) {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        self.put_with_cx(&cx, conn)
+            .await
+            .expect("test pool return must succeed");
+    }
+
+    async fn evict_idle(&self) -> usize {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        self.evict_idle_with_cx(&cx)
+            .await
+            .expect("test pool eviction must succeed")
+    }
+
+    async fn stats(&self) -> PoolStats {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        self.stats_with_cx(&cx)
+            .await
+            .expect("test pool stats snapshot must succeed")
+    }
+
+    async fn clear(&self) {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        self.clear_with_cx(&cx)
+            .await
+            .expect("test pool clear must succeed");
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Strategies
 // ────────────────────────────────────────────────────────────────────

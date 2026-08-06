@@ -146,8 +146,8 @@ impl From<LockAcquireError> for PoolError {
 /// A generic async connection pool.
 ///
 /// `C` is the connection type (e.g., a WezTerm mux client handle).
-/// Connections are created externally and added via [`Pool::put`]; the pool
-/// itself does not create connections — it manages their lifecycle.
+/// Connections are created externally and added via [`Pool::put_with_cx`];
+/// the pool itself does not create connections — it manages their lifecycle.
 pub struct Pool<C> {
     config: PoolConfig,
     idle: Arc<Mutex<VecDeque<PooledEntry<C>>>>,
@@ -159,16 +159,15 @@ pub struct Pool<C> {
 }
 
 impl<C: Send + 'static> Pool<C> {
-    fn classify_cx_failure(cx: &Cx) -> PoolError {
+    pub(crate) fn classify_cx_failure(cx: &Cx) -> PoolError {
         use crate::outcome::CancelKind;
 
         match cx.root_cancel_cause().map(|reason| reason.kind) {
-            Some(CancelKind::Deadline) => PoolError::DeadlineExceeded,
+            Some(CancelKind::Deadline | CancelKind::Timeout) => PoolError::DeadlineExceeded,
             Some(CancelKind::PollQuota) => PoolError::PollQuotaExhausted,
             Some(CancelKind::CostBudget) => PoolError::CostBudgetExhausted,
             Some(
                 CancelKind::User
-                | CancelKind::Timeout
                 | CancelKind::FailFast
                 | CancelKind::RaceLost
                 | CancelKind::ParentCancelled
@@ -323,20 +322,16 @@ impl<C: Send + 'static> Pool<C> {
         })
     }
 
-    /// Inner implementation for acquire without cx.
     /// Return a connection to the pool for reuse.
     ///
     /// If the pool's idle queue is already at capacity, the connection is
     /// dropped instead.
-    pub async fn put(&self, conn: C) {
-        let cx = Cx::current().unwrap_or_else(cx::for_request);
-        self.put_with_cx(&cx, conn)
-            .await
-            .expect("infallible ambient pool return failed");
-    }
-
-    /// Return a connection to the pool under an explicit `&Cx`
-    /// (ft-xbnl0.2.3 Cx-first entry point). The internal idle-pool
+    ///
+    /// The caller must supply the capability context. There is intentionally
+    /// no ambient convenience wrapper: returning a connection can wait for the
+    /// idle-queue lock, so cancellation must remain an ordinary typed result
+    /// rather than becoming a panic or being bypassed with a fresh context.
+    /// The internal idle-pool
     /// mutex acquire returns a typed error when the caller cancels. If that
     /// happens, `conn` is dropped instead of being leaked or crossing a panic
     /// boundary.
@@ -363,16 +358,10 @@ impl<C: Send + 'static> Pool<C> {
         Ok(())
     }
 
-    /// Evict idle connections that have exceeded the idle timeout.
-    pub async fn evict_idle(&self) -> usize {
-        let cx = Cx::current().unwrap_or_else(cx::for_request);
-        self.evict_idle_with_cx(&cx)
-            .await
-            .expect("infallible ambient pool eviction failed")
-    }
-
-    /// Evict expired idle connections under an explicit `&Cx`
-    /// (ft-xbnl0.2.3 Cx-first entry point).
+    /// Evict expired idle connections under an explicit `&Cx`.
+    ///
+    /// There is intentionally no ambient wrapper because eviction can wait on
+    /// the idle-queue lock and therefore must preserve cancellation as data.
     ///
     /// # Errors
     ///
@@ -386,16 +375,10 @@ impl<C: Send + 'static> Pool<C> {
         Ok(self.evict_expired(&mut idle))
     }
 
-    /// Get current pool statistics.
-    pub async fn stats(&self) -> PoolStats {
-        let cx = Cx::current().unwrap_or_else(cx::for_request);
-        self.stats_with_cx(&cx)
-            .await
-            .expect("infallible ambient pool stats failed")
-    }
-
-    /// Get current pool statistics under an explicit `&Cx`
-    /// (ft-xbnl0.2.3 Cx-first entry point).
+    /// Get current pool statistics under an explicit `&Cx`.
+    ///
+    /// There is intentionally no ambient wrapper because the snapshot takes
+    /// the idle-queue lock and therefore has a real cancellation failure mode.
     ///
     /// # Errors
     ///
@@ -420,16 +403,10 @@ impl<C: Send + 'static> Pool<C> {
         })
     }
 
-    /// Drain all idle connections from the pool.
-    pub async fn clear(&self) {
-        let cx = Cx::current().unwrap_or_else(cx::for_request);
-        self.clear_with_cx(&cx)
-            .await
-            .expect("infallible ambient pool clear failed");
-    }
-
-    /// Drain all idle connections under an explicit `&Cx`
-    /// (ft-xbnl0.2.3 Cx-first entry point).
+    /// Drain all idle connections under an explicit `&Cx`.
+    ///
+    /// There is intentionally no ambient wrapper because shutdown cleanup must
+    /// report cancellation instead of silently skipping work or panicking.
     ///
     /// # Errors
     ///
@@ -524,6 +501,46 @@ pub struct PoolAcquireGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test-only ergonomics for legacy assertions in this module. Product code
+    /// has no ambient maintenance API; every helper below creates an explicit
+    /// test context and asserts the typed result.
+    trait TestPoolMaintenance<C> {
+        async fn put(&self, conn: C);
+        async fn evict_idle(&self) -> usize;
+        async fn stats(&self) -> PoolStats;
+        async fn clear(&self);
+    }
+
+    impl<C: Send + 'static> TestPoolMaintenance<C> for Pool<C> {
+        async fn put(&self, conn: C) {
+            let cx = Cx::for_testing();
+            self.put_with_cx(&cx, conn)
+                .await
+                .expect("test pool return must succeed");
+        }
+
+        async fn evict_idle(&self) -> usize {
+            let cx = Cx::for_testing();
+            self.evict_idle_with_cx(&cx)
+                .await
+                .expect("test pool eviction must succeed")
+        }
+
+        async fn stats(&self) -> PoolStats {
+            let cx = Cx::for_testing();
+            self.stats_with_cx(&cx)
+                .await
+                .expect("test pool stats snapshot must succeed")
+        }
+
+        async fn clear(&self) {
+            let cx = Cx::for_testing();
+            self.clear_with_cx(&cx)
+                .await
+                .expect("test pool clear must succeed");
+        }
+    }
 
     fn run_async_test<F>(future: F)
     where
@@ -865,7 +882,7 @@ mod tests {
                 (
                     Cx::for_testing_with_budget(
                         crate::cx::Budget::new()
-                            .with_deadline(asupersync::types::Time::ZERO),
+                            .with_deadline(crate::runtime_async::RuntimeTime::ZERO),
                     ),
                     PoolError::DeadlineExceeded,
                 ),
@@ -892,6 +909,40 @@ mod tests {
                 assert_eq!(error, expected);
             }
         });
+    }
+
+    #[test]
+    fn pool_context_failure_classification_is_exhaustive_and_content_free() {
+        use crate::outcome::CancelKind;
+
+        const SECRET: &str = "SECRET pool cancellation classification";
+        let cases = [
+            (CancelKind::User, PoolError::Cancelled),
+            (CancelKind::Timeout, PoolError::DeadlineExceeded),
+            (CancelKind::Deadline, PoolError::DeadlineExceeded),
+            (CancelKind::PollQuota, PoolError::PollQuotaExhausted),
+            (CancelKind::CostBudget, PoolError::CostBudgetExhausted),
+            (CancelKind::FailFast, PoolError::Cancelled),
+            (CancelKind::RaceLost, PoolError::Cancelled),
+            (CancelKind::ParentCancelled, PoolError::Cancelled),
+            (CancelKind::ResourceUnavailable, PoolError::Cancelled),
+            (CancelKind::Shutdown, PoolError::Cancelled),
+            (CancelKind::LinkedExit, PoolError::Cancelled),
+        ];
+
+        for (kind, expected) in cases {
+            let cx = Cx::for_testing();
+            cx.cancel_with(kind, Some(SECRET));
+            let error = Pool::<String>::classify_cx_failure(&cx);
+            assert_eq!(error, expected, "unexpected class for {kind:?}");
+            assert!(!error.to_string().contains(SECRET));
+            assert!(!format!("{error:?}").contains(SECRET));
+        }
+
+        assert_eq!(
+            Pool::<String>::classify_cx_failure(&Cx::for_testing()),
+            PoolError::ContextFailure
+        );
     }
 
     #[test]
@@ -2127,9 +2178,9 @@ mod tests {
                 .expect_err("cancelled clear_with_cx must return a typed error");
             assert_eq!(clear_error, PoolError::Cancelled);
 
-            let ambient_stats = pool.stats().await;
-            assert_eq!(ambient_stats.idle_count, 0);
-            assert_eq!(ambient_stats.total_returned, 0);
+            let post_cancel_stats = pool.stats().await;
+            assert_eq!(post_cancel_stats.idle_count, 0);
+            assert_eq!(post_cancel_stats.total_returned, 0);
         });
     }
 

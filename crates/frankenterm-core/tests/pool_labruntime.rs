@@ -23,6 +23,35 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+trait TestPoolMaintenance<C> {
+    async fn put(&self, conn: C);
+    async fn stats(&self) -> frankenterm_core::pool::PoolStats;
+    async fn clear(&self);
+}
+
+impl<C: Send + 'static> TestPoolMaintenance<C> for Pool<C> {
+    async fn put(&self, conn: C) {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        self.put_with_cx(&cx, conn)
+            .await
+            .expect("test pool return must succeed");
+    }
+
+    async fn stats(&self) -> frankenterm_core::pool::PoolStats {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        self.stats_with_cx(&cx)
+            .await
+            .expect("test pool stats snapshot must succeed")
+    }
+
+    async fn clear(&self) {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        self.clear_with_cx(&cx)
+            .await
+            .expect("test pool clear must succeed");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

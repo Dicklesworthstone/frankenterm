@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crossbeam::queue::ArrayQueue;
 use serde::{Deserialize, Serialize};
 
-use crate::runtime_async::notify::Notify;
+use crate::runtime_async::{ContextError, ContextErrorKind, notify::Notify};
 
 // ── Reservation ────────────────────────────────────────────────────────────
 
@@ -111,8 +111,6 @@ impl Drop for Reservation {
 pub enum TxCancellationKind {
     /// Explicit user cancellation.
     User,
-    /// An operation-scoped timeout requested cancellation.
-    Timeout,
     /// A sibling failure triggered fail-fast cancellation.
     FailFast,
     /// Another branch won a structured race.
@@ -209,20 +207,22 @@ fn cx_cancel_error(cx: &crate::cx::Cx) -> TxChannelError {
     use crate::outcome::CancelKind;
 
     match cx.root_cancel_cause().map(|reason| reason.kind) {
-        Some(CancelKind::Deadline) => TxChannelError::DeadlineExceeded,
+        Some(CancelKind::Deadline | CancelKind::Timeout) => TxChannelError::DeadlineExceeded,
         Some(CancelKind::PollQuota) => TxChannelError::PollQuotaExhausted,
         Some(CancelKind::CostBudget) => TxChannelError::CostBudgetExhausted,
         Some(kind) => TxChannelError::Cancelled {
             kind: match kind {
                 CancelKind::User => TxCancellationKind::User,
-                CancelKind::Timeout => TxCancellationKind::Timeout,
                 CancelKind::FailFast => TxCancellationKind::FailFast,
                 CancelKind::RaceLost => TxCancellationKind::RaceLost,
                 CancelKind::ParentCancelled => TxCancellationKind::ParentCancelled,
                 CancelKind::ResourceUnavailable => TxCancellationKind::ResourceUnavailable,
                 CancelKind::Shutdown => TxCancellationKind::Shutdown,
                 CancelKind::LinkedExit => TxCancellationKind::LinkedExit,
-                CancelKind::Deadline | CancelKind::PollQuota | CancelKind::CostBudget => {
+                CancelKind::Timeout
+                | CancelKind::Deadline
+                | CancelKind::PollQuota
+                | CancelKind::CostBudget => {
                     unreachable!("budget causes are classified before cancellation kinds")
                 }
             },
@@ -233,20 +233,15 @@ fn cx_cancel_error(cx: &crate::cx::Cx) -> TxChannelError {
     }
 }
 
-fn cx_checkpoint_error(
-    cx: &crate::cx::Cx,
-    error: &asupersync::error::Error,
-) -> TxChannelError {
-    use asupersync::error::ErrorKind;
-
+fn cx_checkpoint_error(cx: &crate::cx::Cx, error: &ContextError) -> TxChannelError {
     if cx.root_cancel_cause().is_some() {
         return cx_cancel_error(cx);
     }
     match error.kind() {
-        ErrorKind::DeadlineExceeded => TxChannelError::DeadlineExceeded,
-        ErrorKind::PollQuotaExhausted => TxChannelError::PollQuotaExhausted,
-        ErrorKind::CostQuotaExhausted => TxChannelError::CostBudgetExhausted,
-        ErrorKind::Cancelled | ErrorKind::CancelTimeout => cx_cancel_error(cx),
+        ContextErrorKind::DeadlineExceeded => TxChannelError::DeadlineExceeded,
+        ContextErrorKind::PollQuotaExhausted => TxChannelError::PollQuotaExhausted,
+        ContextErrorKind::CostQuotaExhausted => TxChannelError::CostBudgetExhausted,
+        ContextErrorKind::Cancelled | ContextErrorKind::CancelTimeout => cx_cancel_error(cx),
         _ => TxChannelError::ContextFailure,
     }
 }
@@ -965,7 +960,7 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(async {
                 let (tx, rx) = tx_channel::<String>(4);
-                let cx = crate::cx::for_request();
+                let cx = crate::cx::Cx::for_testing();
 
                 // Reserve via Cx-first path.
                 let r = tx.reserve_with_cx(&cx).await.expect("reserve_with_cx");
@@ -1021,7 +1016,7 @@ mod tests {
 
                 let started = Instant::now();
                 let result = crate::runtime_async::timeout_with_cx(
-                    &crate::cx::for_request(),
+                    &crate::cx::Cx::for_testing(),
                     Duration::from_secs(2),
                     rx.recv_with_cx(&cx),
                 )
@@ -1064,7 +1059,7 @@ mod tests {
                 (
                     crate::cx::Cx::for_testing_with_budget(
                         crate::cx::Budget::new()
-                            .with_deadline(asupersync::types::Time::ZERO),
+                            .with_deadline(crate::runtime_async::RuntimeTime::ZERO),
                     ),
                     TxChannelError::DeadlineExceeded,
                 ),
@@ -1091,25 +1086,71 @@ mod tests {
                 assert_eq!(error, expected);
             }
 
-            let user_cx = crate::cx::Cx::for_testing();
-            user_cx.cancel_with(
-                crate::outcome::CancelKind::User,
-                Some(SECRET_SENTINEL),
-            );
-            let (tx, _rx) = tx_channel::<u32>(1);
-            let error = tx
-                .reserve_with_cx(&user_cx)
-                .await
-                .expect_err("user cancellation must reject reserve");
+            use crate::outcome::CancelKind;
+
+            let cancellation_cases = [
+                (
+                    CancelKind::User,
+                    TxChannelError::Cancelled {
+                        kind: TxCancellationKind::User,
+                    },
+                ),
+                (CancelKind::Timeout, TxChannelError::DeadlineExceeded),
+                (CancelKind::Deadline, TxChannelError::DeadlineExceeded),
+                (CancelKind::PollQuota, TxChannelError::PollQuotaExhausted),
+                (CancelKind::CostBudget, TxChannelError::CostBudgetExhausted),
+                (
+                    CancelKind::FailFast,
+                    TxChannelError::Cancelled {
+                        kind: TxCancellationKind::FailFast,
+                    },
+                ),
+                (
+                    CancelKind::RaceLost,
+                    TxChannelError::Cancelled {
+                        kind: TxCancellationKind::RaceLost,
+                    },
+                ),
+                (
+                    CancelKind::ParentCancelled,
+                    TxChannelError::Cancelled {
+                        kind: TxCancellationKind::ParentCancelled,
+                    },
+                ),
+                (
+                    CancelKind::ResourceUnavailable,
+                    TxChannelError::Cancelled {
+                        kind: TxCancellationKind::ResourceUnavailable,
+                    },
+                ),
+                (
+                    CancelKind::Shutdown,
+                    TxChannelError::Cancelled {
+                        kind: TxCancellationKind::Shutdown,
+                    },
+                ),
+                (
+                    CancelKind::LinkedExit,
+                    TxChannelError::Cancelled {
+                        kind: TxCancellationKind::LinkedExit,
+                    },
+                ),
+            ];
+
+            for (kind, expected) in cancellation_cases {
+                let cx = crate::cx::Cx::for_testing();
+                cx.cancel_with(kind, Some(SECRET_SENTINEL));
+                let error = cx_cancel_error(&cx);
+                assert_eq!(error, expected, "unexpected class for {kind:?}");
+                assert!(!error.to_string().contains(SECRET_SENTINEL));
+                assert!(!format!("{error:?}").contains(SECRET_SENTINEL));
+            }
+
             assert_eq!(
-                error,
+                cx_cancel_error(&crate::cx::Cx::for_testing()),
                 TxChannelError::Cancelled {
-                    kind: TxCancellationKind::User
+                    kind: TxCancellationKind::Unknown,
                 }
-            );
-            assert!(
-                !error.to_string().contains(SECRET_SENTINEL),
-                "finite channel errors must not expose cancellation reason text"
             );
         });
     }
@@ -1165,9 +1206,9 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(Box::new(move || close_tx.close()));
 
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::for_testing();
             let result = crate::runtime_async::timeout_with_cx(
-                &crate::cx::for_request(),
+                &crate::cx::Cx::for_testing(),
                 std::time::Duration::from_secs(1),
                 tx.reserve_with_cx(&cx),
             )
@@ -1195,9 +1236,9 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(Box::new(move || close_tx.close()));
 
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::for_testing();
             let result = crate::runtime_async::timeout_with_cx(
-                &crate::cx::for_request(),
+                &crate::cx::Cx::for_testing(),
                 std::time::Duration::from_secs(1),
                 rx.recv_with_cx(&cx),
             )

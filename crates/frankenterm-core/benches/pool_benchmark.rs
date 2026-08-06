@@ -89,13 +89,17 @@ fn bench_acquire_return(c: &mut Criterion) {
             |b, config| {
                 b.iter(|| {
                     rt.block_on(async {
+                        let cx = frankenterm_core::cx::Cx::current()
+                            .expect("benchmark runtime must expose its root Cx");
                         let pool = Pool::<DummyConn>::new(config.clone());
                         let result = pool.acquire().await.unwrap();
                         // Decompose via public API
                         let (conn, _guard) = result.into_parts();
                         let conn = conn.unwrap_or(DummyConn(42));
                         // Return connection to pool
-                        pool.put(conn).await;
+                        pool.put_with_cx(&cx, conn)
+                            .await
+                            .expect("benchmark pool return must succeed");
                     });
                 });
             },
@@ -122,9 +126,13 @@ fn bench_acquire_with_idle(c: &mut Criterion) {
             |b, config| {
                 b.iter(|| {
                     rt.block_on(async {
+                        let cx = frankenterm_core::cx::Cx::current()
+                            .expect("benchmark runtime must expose its root Cx");
                         let pool = Pool::<DummyConn>::new(config.clone());
                         // Pre-fill idle queue
-                        pool.put(DummyConn(1)).await;
+                        pool.put_with_cx(&cx, DummyConn(1))
+                            .await
+                            .expect("benchmark pool prefill must succeed");
                         // Acquire should get the idle connection
                         let result = pool.acquire().await.unwrap();
                         assert!(result.has_connection());
@@ -178,8 +186,12 @@ fn bench_pool_stats(c: &mut Criterion) {
             |b, config| {
                 b.iter(|| {
                     rt.block_on(async {
+                        let cx = frankenterm_core::cx::Cx::current()
+                            .expect("benchmark runtime must expose its root Cx");
                         let pool = Pool::<DummyConn>::new(config.clone());
-                        pool.stats().await
+                        pool.stats_with_cx(&cx)
+                            .await
+                            .expect("benchmark pool stats must succeed")
                     })
                 });
             },
@@ -198,6 +210,8 @@ fn bench_idle_eviction(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
             b.iter(|| {
                 rt.block_on(async {
+                    let cx = frankenterm_core::cx::Cx::current()
+                        .expect("benchmark runtime must expose its root Cx");
                     let config = PoolConfig {
                         max_size: count + 10,
                         // Zero timeout so everything is instantly evictable
@@ -207,10 +221,14 @@ fn bench_idle_eviction(c: &mut Criterion) {
                     let pool = Pool::<DummyConn>::new(config);
                     // Fill idle queue
                     for i in 0..count {
-                        pool.put(DummyConn(i as u64)).await;
+                        pool.put_with_cx(&cx, DummyConn(i as u64))
+                            .await
+                            .expect("benchmark pool prefill must succeed");
                     }
                     // Evict all
-                    pool.evict_idle().await
+                    pool.evict_idle_with_cx(&cx)
+                        .await
+                        .expect("benchmark pool eviction must succeed")
                 })
             });
         });
@@ -228,6 +246,8 @@ fn bench_pool_clear(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
             b.iter(|| {
                 rt.block_on(async {
+                    let cx = frankenterm_core::cx::Cx::current()
+                        .expect("benchmark runtime must expose its root Cx");
                     let config = PoolConfig {
                         max_size: count + 10,
                         idle_timeout: Duration::from_secs(300),
@@ -235,9 +255,13 @@ fn bench_pool_clear(c: &mut Criterion) {
                     };
                     let pool = Pool::<DummyConn>::new(config);
                     for i in 0..count {
-                        pool.put(DummyConn(i as u64)).await;
+                        pool.put_with_cx(&cx, DummyConn(i as u64))
+                            .await
+                            .expect("benchmark pool prefill must succeed");
                     }
-                    pool.clear().await;
+                    pool.clear_with_cx(&cx)
+                        .await
+                        .expect("benchmark pool clear must succeed");
                 });
             });
         });

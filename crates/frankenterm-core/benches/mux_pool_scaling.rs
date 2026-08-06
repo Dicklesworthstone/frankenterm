@@ -218,7 +218,7 @@ fn bench_health_check_overhead(c: &mut Criterion) {
             b.iter(|| {
                 let pool = Arc::clone(&pool);
                 compat_rt.block_on(async move {
-                    let cx = cx::for_testing();
+                    let cx = cx::Cx::current().expect("benchmark runtime must expose its root Cx");
                     Box::pin(pool.health_check_with_cx(&cx))
                         .await
                         .expect("health_check_with_cx");
@@ -288,13 +288,18 @@ fn bench_idle_eviction_scan(c: &mut Criterion) {
                 b.iter(|| {
                     let socket_path = socket_path.clone();
                     rt.block_on(async move {
+                        let cx = frankenterm_core::cx::Cx::current()
+                            .expect("benchmark runtime must expose its root Cx");
                         let pool = Arc::new(MuxPool::new(mux_pool_config(
                             socket_path,
                             size,
                             Duration::ZERO,
                         )));
                         prime_connections(Arc::clone(&pool), size).await;
-                        let evicted = pool.evict_idle().await;
+                        let evicted = pool
+                            .evict_idle_with_cx(&cx)
+                            .await
+                            .expect("benchmark mux pool eviction must succeed");
                         black_box(evicted);
                     });
                 });
@@ -332,7 +337,7 @@ fn bench_connection_factory_overhead(c: &mut Criterion) {
         b.iter(|| {
             let config = config.clone();
             compat_rt.block_on(async move {
-                let cx = cx::for_testing();
+                let cx = cx::Cx::current().expect("benchmark runtime must expose its root Cx");
                 let client = Box::pin(DirectMuxClient::connect_with_cx(&cx, config))
                     .await
                     .expect("direct mux connect with cx");
