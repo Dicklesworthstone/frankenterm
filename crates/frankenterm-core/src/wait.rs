@@ -932,6 +932,114 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wait_for_cx_timeout_uses_labruntime_clock_for_deadline_and_elapsed() {
+        const SEED: u64 = 0xAA17_F04C_C410_4041;
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let observed_task = Arc::clone(&observed);
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(SEED)
+                .with_auto_advance()
+                .worker_count(1)
+                .max_steps(100_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::Cx::current()
+                    .expect("LabRuntime task must install its virtual-time Cx");
+                let condition = WaitCondition::new("never ready", || async {
+                    WaitFor::<()>::not_ready(Some("pending".to_string()))
+                });
+                let error = wait_for_cx(
+                    &cx,
+                    condition,
+                    Duration::from_millis(35),
+                    Backoff {
+                        initial: Duration::from_millis(10),
+                        max: Duration::from_millis(20),
+                        factor: 2,
+                        max_retries: None,
+                    },
+                )
+                .await
+                .expect_err("virtual deadline must terminate the wait");
+                assert_eq!(error.termination, WaitTermination::ConfiguredTimeout);
+                assert!(error.elapsed >= Duration::from_millis(35));
+                *observed_task
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+            })
+            .expect("spawn virtual timeout wait task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        let report = runtime.run_with_auto_advance();
+
+        assert!(
+            report.oracle_report.all_passed(),
+            "LabRuntime oracles must all pass: {report:?}"
+        );
+        assert!(
+            observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "virtual-time timeout result must be observed"
+        );
+        assert!(runtime.now() >= asupersync::Time::from_millis(35));
+    }
+
+    #[test]
+    fn wait_for_cx_preserves_typed_cancellation_after_predicate_poll() {
+        const SEED: u64 = 0xAA17_F04C_C410_4042;
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_task = Arc::clone(&completed);
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(SEED)
+                .with_auto_advance()
+                .worker_count(1)
+                .max_steps(100_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::Cx::current()
+                    .expect("LabRuntime task must install its virtual-time Cx");
+                let cancel_target = cx.clone();
+                let condition = WaitCondition::new("cancel after first poll", move || {
+                    cancel_target.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("wait_for_cx typed cancellation regression"),
+                    );
+                    async { WaitFor::<()>::not_ready(Some("cancelled by predicate".to_string())) }
+                });
+                let error = wait_for_cx(
+                    &cx,
+                    condition,
+                    Duration::from_secs(5),
+                    Backoff::default(),
+                )
+                .await
+                .expect_err("cancelled context must not become timeout or success");
+                assert!(matches!(error.termination, WaitTermination::Cancelled { .. }));
+                completed_task.store(true, Ordering::SeqCst);
+            })
+            .expect("spawn cancellation wait task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        let report = runtime.run_with_auto_advance();
+
+        assert!(completed.load(Ordering::SeqCst));
+        assert!(
+            report.oracle_report.all_passed(),
+            "LabRuntime oracles must all pass: {report:?}"
+        );
+    }
+
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
