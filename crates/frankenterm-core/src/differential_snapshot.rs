@@ -1654,7 +1654,7 @@ mod tests {
                 pane_id: 1,
                 new_scrollback_ref: Some(ScrollbackRef {
                     output_segments_seq: 42,
-                    total_lines_captured: 500,
+                    total_segments_captured: 500,
                     last_capture_at: 1999,
                 }),
             }],
@@ -1663,7 +1663,7 @@ mod tests {
         base.apply_diff(&diff);
         let sb = base.pane_states[&1].scrollback_ref.as_ref().unwrap();
         assert_eq!(sb.output_segments_seq, 42);
-        assert_eq!(sb.total_lines_captured, 500);
+        assert_eq!(sb.total_segments_captured, 500);
     }
 
     #[test]
@@ -2258,7 +2258,7 @@ mod tests {
             pane_id: 1,
             new_scrollback_ref: Some(ScrollbackRef {
                 output_segments_seq: 10,
-                total_lines_captured: 200,
+                total_segments_captured: 200,
                 last_capture_at: 5000,
             }),
         };
@@ -2327,7 +2327,7 @@ mod tests {
                 pane_id: 999, // does not exist
                 new_scrollback_ref: Some(ScrollbackRef {
                     output_segments_seq: 50,
-                    total_lines_captured: 100,
+                    total_segments_captured: 100,
                     last_capture_at: 2000,
                 }),
             }],
@@ -2350,7 +2350,7 @@ mod tests {
         // First set a scrollback ref
         base.pane_states.get_mut(&1).unwrap().scrollback_ref = Some(ScrollbackRef {
             output_segments_seq: 10,
-            total_lines_captured: 100,
+            total_segments_captured: 100,
             last_capture_at: 1500,
         });
 
@@ -2481,7 +2481,7 @@ mod tests {
         let mut ps = make_pane_state(1, 24, 80);
         ps.scrollback_ref = Some(ScrollbackRef {
             output_segments_seq: 99,
-            total_lines_captured: 1000,
+            total_segments_captured: 1000,
             last_capture_at: 2000,
         });
         current.insert(1, ps);
@@ -2496,7 +2496,7 @@ mod tests {
                 assert_eq!(*pane_id, 1);
                 let sb = new_scrollback_ref.as_ref().unwrap();
                 assert_eq!(sb.output_segments_seq, 99);
-                assert_eq!(sb.total_lines_captured, 1000);
+                assert_eq!(sb.total_segments_captured, 1000);
             }
             other => panic!("expected PaneScrollbackChanged, got {:?}", other),
         }
@@ -2730,7 +2730,7 @@ mod tests {
                             if let Some(ps) = live_panes.get_mut(id) {
                                 ps.scrollback_ref = Some(ScrollbackRef {
                                     output_segments_seq: time as i64,
-                                    total_lines_captured: time,
+                                    total_segments_captured: time,
                                     last_capture_at: time,
                                 });
                                 engine.tracker_mut().mark_output(*id);
@@ -2796,7 +2796,7 @@ mod tests {
                             if let Some(ps) = live_panes.get_mut(id) {
                                 ps.scrollback_ref = Some(ScrollbackRef {
                                     output_segments_seq: time as i64,
-                                    total_lines_captured: time,
+                                    total_segments_captured: time,
                                     last_capture_at: time,
                                 });
                                 engine.tracker_mut().mark_output(*id);

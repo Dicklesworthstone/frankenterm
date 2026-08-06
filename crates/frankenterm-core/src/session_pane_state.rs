@@ -123,8 +123,10 @@ pub struct TerminalState {
 pub struct ScrollbackRef {
     /// Last captured sequence number in output_segments.
     pub output_segments_seq: i64,
-    /// Total lines captured for this pane.
-    pub total_lines_captured: u64,
+    /// Total `output_segments` rows captured for this pane.
+    ///
+    /// A segment is an arbitrary stream fragment, not a logical terminal line.
+    pub total_segments_captured: u64,
     /// When the last output was captured (epoch ms).
     pub last_capture_at: u64,
 }
@@ -200,7 +202,7 @@ impl PaneStateSnapshot {
         debug!(
             pane_id = self.pane_id,
             seq = scrollback.output_segments_seq,
-            lines = scrollback.total_lines_captured,
+            segments = scrollback.total_segments_captured,
             "Scrollback ref for pane"
         );
         self.scrollback_ref = Some(scrollback);
@@ -416,7 +418,7 @@ mod tests {
             .with_shell("zsh".to_string())
             .with_scrollback(ScrollbackRef {
                 output_segments_seq: 42,
-                total_lines_captured: 1000,
+                total_segments_captured: 1000,
                 last_capture_at: 1999,
             })
             .with_agent(AgentMetadata {
@@ -616,7 +618,7 @@ mod tests {
             })
             .with_scrollback(ScrollbackRef {
                 output_segments_seq: 10,
-                total_lines_captured: 500,
+                total_segments_captured: 500,
                 last_capture_at: 4999,
             })
             .with_agent(AgentMetadata {
@@ -633,7 +635,7 @@ mod tests {
                 .scrollback_ref
                 .as_ref()
                 .unwrap()
-                .total_lines_captured,
+                .total_segments_captured,
             500
         );
         assert_eq!(snapshot.agent.as_ref().unwrap().agent_type, "codex");
@@ -806,7 +808,7 @@ mod tests {
     fn scrollback_ref_serde_roundtrip() {
         let sr = ScrollbackRef {
             output_segments_seq: -5,
-            total_lines_captured: 999_999,
+            total_segments_captured: 999_999,
             last_capture_at: u64::MAX,
         };
         let json = serde_json::to_string(&sr).unwrap();

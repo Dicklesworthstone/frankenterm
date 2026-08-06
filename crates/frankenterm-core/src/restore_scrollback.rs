@@ -1,18 +1,19 @@
 //! Scrollback injection engine — restore terminal content into panes.
 //!
-//! After layout restoration creates empty panes, this module injects captured
-//! scrollback content so users see the same output they had before the mux
-//! server restart.
+//! Historical scrollback replay is intentionally unavailable until the mux
+//! exposes a terminal-output or render-state restoration channel.
 //!
 //! # Data flow
 //!
 //! ```text
-//! output_segments (DB) → ScrollbackData → ScrollbackInjector → send_text → pane
+//! terminal-state snapshot → safe mux output channel → restored pane
 //! ```
 //!
-//! Uses `WeztermInterface::send_text` for injection. Content is chunked to
-//! avoid overwhelming the terminal parser and injected concurrently across
-//! multiple panes via a semaphore.
+//! PTY input APIs such as `send_text` are categorically unsafe for historical
+//! output: captured bytes may contain shell commands, control characters, or
+//! partial stream fragments. The public injector therefore fails closed before
+//! touching a pane. Its data/report types remain as the contract surface for a
+//! future safe mux-owned implementation.
 //!
 //! # Pattern suppression
 //!
@@ -20,24 +21,33 @@
 //! from historical output). Callers should use [`InjectionGuard`] to suppress
 //! detection on target panes during injection.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
-use crate::runtime_async::Semaphore;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::warn;
 
 use crate::error::RuntimeOperationSource;
 use crate::wezterm::WeztermHandle;
 
 fn restore_scrollback_cancelled_error(
     operation: &'static str,
-    detail: impl Into<String>,
+    _detail: impl Into<String>,
 ) -> crate::Error {
     crate::Error::RuntimeOperation {
         operation,
-        source: RuntimeOperationSource::Cancelled(detail.into()),
+        // Cancellation causes may contain caller-controlled or capability
+        // internals. Keep this boundary finite and content-free.
+        source: RuntimeOperationSource::Cancelled("caller capability stopped".to_string()),
+    }
+}
+
+fn restore_scrollback_unsupported_error() -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation: "restore_scrollback.inject.no_safe_output_channel",
+        source: RuntimeOperationSource::Backend(
+            "historical terminal output cannot be restored through PTY input".to_string(),
+        ),
     }
 }
 
@@ -74,9 +84,11 @@ impl Default for InjectionConfig {
 // Scrollback data
 // =============================================================================
 
-/// Captured scrollback content for a single pane.
+/// Logical terminal lines for a future safe render-state restoration channel.
 ///
-/// Assembled from `output_segments` rows ordered by `seq`.
+/// Raw `output_segments` must not be converted with this type: each database
+/// row is an arbitrary stream fragment and may contain zero, one, or many
+/// lines, or end in the middle of a line.
 #[derive(Debug, Clone)]
 pub struct ScrollbackData {
     /// Ordered lines of terminal output (may include ANSI escapes).
@@ -86,11 +98,11 @@ pub struct ScrollbackData {
 }
 
 impl ScrollbackData {
-    /// Create from a list of content strings (e.g., from output_segments).
-    pub fn from_segments(segments: Vec<String>) -> Self {
-        let total_bytes = segments.iter().map(|s| s.len()).sum();
+    /// Create from already reconstructed logical terminal lines.
+    pub fn from_terminal_lines(lines: Vec<String>) -> Self {
+        let total_bytes = lines.iter().map(|line| line.len()).sum();
         Self {
-            lines: segments,
+            lines,
             total_bytes,
         }
     }
@@ -164,19 +176,22 @@ impl InjectionReport {
 /// The guard automatically clears suppression when dropped.
 #[derive(Debug)]
 pub struct InjectionGuard {
-    suppressed: Arc<std::sync::Mutex<HashSet<u64>>>,
+    suppressed: Arc<std::sync::Mutex<HashMap<u64, usize>>>,
     pane_ids: Vec<u64>,
 }
 
 impl InjectionGuard {
     /// Create a new injection guard that suppresses the given pane IDs.
-    pub fn new(suppressed: Arc<std::sync::Mutex<HashSet<u64>>>, pane_ids: Vec<u64>) -> Self {
+    pub fn new(
+        suppressed: Arc<std::sync::Mutex<HashMap<u64, usize>>>,
+        pane_ids: Vec<u64>,
+    ) -> Self {
         {
             let mut set = suppressed
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for &id in &pane_ids {
-                set.insert(id);
+                *set.entry(id).or_insert(0) += 1;
             }
         }
         Self {
@@ -186,11 +201,15 @@ impl InjectionGuard {
     }
 
     /// Check if a pane ID is currently suppressed.
-    pub fn is_suppressed(suppressed: &Arc<std::sync::Mutex<HashSet<u64>>>, pane_id: u64) -> bool {
+    pub fn is_suppressed(
+        suppressed: &Arc<std::sync::Mutex<HashMap<u64, usize>>>,
+        pane_id: u64,
+    ) -> bool {
         suppressed
             .lock()
             .expect("injection guard lock")
-            .contains(&pane_id)
+            .get(&pane_id)
+            .is_some_and(|count| *count > 0)
     }
 }
 
@@ -201,7 +220,15 @@ impl Drop for InjectionGuard {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for &id in &self.pane_ids {
-            set.remove(&id);
+            let remove = if let Some(count) = set.get_mut(&id) {
+                *count = count.saturating_sub(1);
+                *count == 0
+            } else {
+                false
+            };
+            if remove {
+                set.remove(&id);
+            }
         }
     }
 }
@@ -212,24 +239,24 @@ impl Drop for InjectionGuard {
 
 /// Engine that injects captured scrollback content into restored panes.
 pub struct ScrollbackInjector {
-    wezterm: WeztermHandle,
-    config: InjectionConfig,
+    _wezterm: WeztermHandle,
+    _config: InjectionConfig,
     /// Shared suppression set for pattern detection gating.
-    suppressed_panes: Arc<std::sync::Mutex<HashSet<u64>>>,
+    suppressed_panes: Arc<std::sync::Mutex<HashMap<u64, usize>>>,
 }
 
 impl ScrollbackInjector {
     /// Create a new scrollback injector.
     pub fn new(wezterm: WeztermHandle, config: InjectionConfig) -> Self {
         Self {
-            wezterm,
-            config,
-            suppressed_panes: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            _wezterm: wezterm,
+            _config: config,
+            suppressed_panes: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
     /// Get a reference to the suppressed panes set for pattern engine integration.
-    pub fn suppressed_panes(&self) -> &Arc<std::sync::Mutex<HashSet<u64>>> {
+    pub fn suppressed_panes(&self) -> &Arc<std::sync::Mutex<HashMap<u64, usize>>> {
         &self.suppressed_panes
     }
 
@@ -264,7 +291,7 @@ impl ScrollbackInjector {
         self.inject_with_cx(cx, pane_id_map, scrollbacks)
             .await
             .unwrap_or_else(|error| {
-                warn!(error = %error, "scrollback injection cancelled");
+                warn!(error = %error, "scrollback injection unavailable");
                 let mut skipped = scrollbacks.keys().copied().collect::<Vec<_>>();
                 skipped.sort_unstable();
                 InjectionReport {
@@ -276,16 +303,8 @@ impl ScrollbackInjector {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`inject`].
     ///
-    /// Pre-flight checkpoint gates the injection before any
-    /// `send_text` calls fire; a per-pane checkpoint inside the
-    /// loop makes cancellation responsive for large multi-pane
-    /// restorations where each pane may emit many chunks with
-    /// inter-chunk sleeps.
-    ///
-    /// Pre-flight and inter-pane cancellation return a structured
-    /// runtime error before more panes are touched. Per-pane
-    /// injection failures are still captured in the partial
-    /// `InjectionReport` gathered so far.
+    /// The caller's capability is checked first. An uncancelled request then
+    /// receives a structured unsupported-channel error; no pane API is called.
     pub async fn inject_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -298,222 +317,78 @@ impl ScrollbackInjector {
                 format!("pre-flight checkpoint failed: {err}"),
             )
         })?;
-
-        let mut report = InjectionReport::default();
-
-        let target_new_ids: Vec<u64> = scrollbacks
-            .keys()
-            .filter_map(|old_id| pane_id_map.get(old_id).copied())
-            .collect();
-
-        let _guard = InjectionGuard::new(self.suppressed_panes.clone(), target_new_ids);
-
-        info!(
-            panes = scrollbacks.len(),
-            concurrent = self.config.concurrent_injections,
-            "starting scrollback injection (cx-first)"
-        );
-
-        let semaphore = Arc::new(Semaphore::new(self.config.concurrent_injections));
-
-        for (old_id, scrollback) in scrollbacks {
-            cx.checkpoint().map_err(|err| {
-                restore_scrollback_cancelled_error(
-                    "restore_scrollback.inject.between_panes",
-                    format!("checkpoint before old pane {old_id} failed: {err}"),
-                )
-            })?;
-
-            let new_id = match pane_id_map.get(old_id) {
-                Some(&id) => id,
-                None => {
-                    debug!(old_pane = old_id, "pane not in id map, skipping");
-                    report.skipped.push(*old_id);
-                    continue;
-                }
-            };
-
-            let _permit = semaphore.acquire().await.expect("semaphore closed");
-
-            // ft-xbnl0.2.3 tick 295: route through cx-first inject_pane sibling.
-            match self
-                .inject_pane_with_cx(cx, *old_id, new_id, scrollback)
-                .await
-            {
-                Ok(stats) => report.successes.push(stats),
-                Err(e) => {
-                    warn!(old_pane = old_id, new_pane = new_id, error = %e, "injection failed");
-                    report.failures.push((*old_id, e.to_string()));
-                }
-            }
-        }
-
-        info!(
-            success = report.success_count(),
-            failed = report.failure_count(),
-            skipped = report.skipped.len(),
-            total_bytes = report.total_bytes(),
-            "scrollback injection complete (cx-first)"
-        );
-
-        Ok(report)
-    }
-
-    /// Inject scrollback into one pane under the caller's cx.
-    ///
-    /// Threads caller `&Cx` through the per-chunk send loop + inter-chunk
-    /// delays so a cx-cancel during a large-scrollback injection cleanly
-    /// aborts at the next chunk boundary rather than completing the full
-    /// injection before unwinding.
-    async fn inject_pane_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        old_pane_id: u64,
-        new_pane_id: u64,
-        scrollback: &ScrollbackData,
-    ) -> crate::Result<PaneInjectionStats> {
-        let mut data = scrollback.clone();
-        data.truncate(self.config.max_lines);
-
-        if data.lines.is_empty() {
-            return Ok(PaneInjectionStats {
-                old_pane_id,
-                new_pane_id,
-                lines_injected: 0,
-                bytes_written: 0,
-                chunks_sent: 0,
-            });
-        }
-
-        debug!(
-            old_pane = old_pane_id,
-            new_pane = new_pane_id,
-            lines = data.lines.len(),
-            bytes = data.total_bytes,
-            "injecting scrollback (cx-first)"
-        );
-
-        let content = build_injection_content(&data.lines);
-        let chunks = chunk_content(&content, self.config.chunk_size);
-        let mut bytes_written = 0;
-
-        for (i, chunk) in chunks.iter().enumerate() {
-            cx.checkpoint().map_err(|err| {
-                restore_scrollback_cancelled_error(
-                    "restore_scrollback.inject_pane.chunk_checkpoint",
-                    format!(
-                        "chunk {i}/{total} checkpoint for new pane {new_pane_id} failed: {err}",
-                        total = chunks.len()
-                    ),
-                )
-            })?;
-            self.wezterm
-                .send_text_with_cx(cx, new_pane_id, chunk)
-                .await?;
-            bytes_written += chunk.len();
-
-            if i < chunks.len() - 1 && self.config.inter_chunk_delay_ms > 0 {
-                let _ = crate::runtime_async::sleep_with_cx(
-                    cx,
-                    Duration::from_millis(self.config.inter_chunk_delay_ms),
-                )
-                .await;
-            }
-        }
-
-        Ok(PaneInjectionStats {
-            old_pane_id,
-            new_pane_id,
-            lines_injected: data.lines.len(),
-            bytes_written,
-            chunks_sent: chunks.len(),
-        })
+        let _ = (pane_id_map, scrollbacks);
+        Err(restore_scrollback_unsupported_error())
     }
 }
 
-// =============================================================================
-// Content building helpers
-// =============================================================================
-
-/// Build injection content from scrollback lines.
-///
-/// Prefixes with ANSI reset to prevent state contamination from
-/// the previous pane's terminal state.
+// These parser-boundary helpers are retained only as isolated test vectors for
+// a future safe mux output channel. They are deliberately absent from the
+// production build so no caller can turn reconstructed content into PTY input.
+#[cfg(test)]
 fn build_injection_content(lines: &[String]) -> String {
-    let mut content = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
-
-    // ANSI reset: clear all attributes, cursor home, clear screen.
+    let mut content = String::with_capacity(lines.iter().map(|line| line.len() + 1).sum());
     content.push_str("\x1b[0m\x1b[H\x1b[2J");
-
-    for (i, line) in lines.iter().enumerate() {
+    for (index, line) in lines.iter().enumerate() {
         content.push_str(line);
-        if i < lines.len() - 1 {
+        if index + 1 < lines.len() {
             content.push('\n');
         }
     }
-
     content
 }
 
-/// Split content into chunks at safe boundaries.
-///
-/// Avoids splitting in the middle of UTF-8 characters or ANSI escape sequences.
+#[cfg(test)]
 fn chunk_content(content: &str, chunk_size: usize) -> Vec<String> {
+    assert!(chunk_size > 0, "chunk size must be non-zero");
     if content.len() <= chunk_size {
         return vec![content.to_string()];
     }
-
     let mut chunks = Vec::new();
-    let bytes = content.as_bytes();
     let mut start = 0;
-
-    while start < bytes.len() {
-        let mut end = (start + chunk_size).min(bytes.len());
-
-        if end < bytes.len() {
-            // Walk back to a safe split point: avoid mid-UTF8 and mid-ANSI.
-            end = find_safe_split(content, start, end);
-        }
-
+    while start < content.len() {
+        let target = (start + chunk_size).min(content.len());
+        let end = if target < content.len() {
+            find_safe_split(content, start, target)
+        } else {
+            target
+        };
+        let end = if end == start {
+            content[start..]
+                .char_indices()
+                .nth(1)
+                .map_or(content.len(), |(offset, _)| start + offset)
+        } else {
+            end
+        };
         chunks.push(content[start..end].to_string());
         start = end;
     }
-
     chunks
 }
 
-/// Find a safe split point at or before `target`, not splitting UTF-8 or ANSI escapes.
+#[cfg(test)]
 fn find_safe_split(content: &str, start: usize, target: usize) -> usize {
-    // Walk back from target to find a char boundary.
     let mut pos = target;
     while pos > start && !content.is_char_boundary(pos) {
         pos -= 1;
     }
-
-    // Check if we're inside an ANSI escape sequence (ESC [ ... letter).
-    // Walk back to see if there's an unclosed ESC[.
     let slice = &content[start..pos];
     if let Some(last_esc) = slice.rfind('\x1b') {
         let after_esc = &slice[last_esc..];
-        // If the escape sequence isn't terminated (no letter after CSI params),
-        // split before the ESC.
         if after_esc.starts_with("\x1b[") && !has_csi_terminator(after_esc) {
             return start + last_esc;
         }
     }
-
     pos
 }
 
-/// Check if a CSI sequence (ESC[...) has a terminating letter.
-fn has_csi_terminator(seq: &str) -> bool {
-    // CSI sequences end with a letter in the range 0x40-0x7E.
-    for (i, b) in seq.bytes().enumerate() {
-        if i >= 2 && (0x40..=0x7E).contains(&b) {
-            return true;
-        }
-    }
-    false
+#[cfg(test)]
+fn has_csi_terminator(sequence: &str) -> bool {
+    sequence
+        .bytes()
+        .enumerate()
+        .any(|(index, byte)| index >= 2 && (0x40..=0x7e).contains(&byte))
 }
 
 // =============================================================================
@@ -557,7 +432,7 @@ mod tests {
     }
 
     fn mock_scrollback(lines: Vec<&str>) -> ScrollbackData {
-        ScrollbackData::from_segments(lines.into_iter().map(String::from).collect())
+        ScrollbackData::from_terminal_lines(lines.into_iter().map(String::from).collect())
     }
 
     #[test]
@@ -572,7 +447,7 @@ mod tests {
                 assert_eq!(operation, "restore_scrollback.test_checkpoint");
                 assert_eq!(
                     source,
-                    RuntimeOperationSource::Cancelled("caller cancelled".to_string())
+                    RuntimeOperationSource::Cancelled("caller capability stopped".to_string())
                 );
             }
             other => panic!("expected structured runtime operation, got {other:?}"),
@@ -582,8 +457,8 @@ mod tests {
     // --- ScrollbackData ---
 
     #[test]
-    fn scrollback_data_from_segments() {
-        let data = ScrollbackData::from_segments(vec!["hello".into(), "world".into()]);
+    fn scrollback_data_from_terminal_lines() {
+        let data = ScrollbackData::from_terminal_lines(vec!["hello".into(), "world".into()]);
         assert_eq!(data.lines.len(), 2);
         assert_eq!(data.total_bytes, 10);
     }
@@ -591,7 +466,7 @@ mod tests {
     #[test]
     fn scrollback_data_truncate() {
         let mut data =
-            ScrollbackData::from_segments(vec!["a".into(), "b".into(), "c".into(), "d".into()]);
+            ScrollbackData::from_terminal_lines(vec!["a".into(), "b".into(), "c".into(), "d".into()]);
         data.truncate(2);
         assert_eq!(data.lines, vec!["c", "d"]); // Keeps most recent.
         assert_eq!(data.total_bytes, 2);
@@ -599,7 +474,7 @@ mod tests {
 
     #[test]
     fn scrollback_data_truncate_noop() {
-        let mut data = ScrollbackData::from_segments(vec!["a".into(), "b".into()]);
+        let mut data = ScrollbackData::from_terminal_lines(vec!["a".into(), "b".into()]);
         data.truncate(10);
         assert_eq!(data.lines.len(), 2);
     }
@@ -652,7 +527,7 @@ mod tests {
 
     #[test]
     fn injection_guard_suppresses_and_clears() {
-        let set = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let set = Arc::new(std::sync::Mutex::new(HashMap::new()));
         assert!(!InjectionGuard::is_suppressed(&set, 42));
 
         {
@@ -744,7 +619,7 @@ mod tests {
     // --- Injection integration tests ---
 
     #[test]
-    fn inject_single_pane() {
+    fn inject_single_pane_fails_closed_without_pty_write() {
         run_async_test(async {
             let mock = Arc::new(MockWezterm::new());
             mock.add_default_pane(10).await;
@@ -758,20 +633,17 @@ mod tests {
 
             let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-            assert_eq!(report.success_count(), 1);
+            assert_eq!(report.success_count(), 0);
             assert_eq!(report.failure_count(), 0);
-            assert_eq!(report.successes[0].lines_injected, 3);
-            assert!(report.successes[0].bytes_written > 0);
+            assert_eq!(report.skipped, vec![1]);
 
-            // Verify content was sent to the mock pane.
             let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
-            assert!(text.contains("line1"));
-            assert!(text.contains("line3"));
+            assert!(text.is_empty(), "historical output must not reach PTY input");
         });
     }
 
     #[test]
-    fn inject_multiple_panes() {
+    fn inject_multiple_panes_all_fail_closed() {
         run_async_test(async {
             let mock = Arc::new(MockWezterm::new());
             mock.add_default_pane(10).await;
@@ -788,17 +660,16 @@ mod tests {
 
             let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-            assert_eq!(report.success_count(), 2);
+            assert_eq!(report.success_count(), 0);
             assert_eq!(report.failure_count(), 0);
+            assert_eq!(report.skipped, vec![1, 2]);
         });
     }
 
-    /// ft-xbnl0.2.3 Cx-first: `inject_with_cx` must produce an
-    /// equivalent `InjectionReport` to `inject` (same success/
-    /// failure counts) for an uncancelled cx. Verified on a
-    /// 2-pane injection where both panes are in the id_map.
+    /// The fallible Cx API exposes the unsupported-channel error instead of
+    /// converting it to the best-effort skipped report returned by `inject`.
     #[test]
-    fn inject_with_cx_matches_legacy() {
+    fn inject_with_cx_reports_missing_safe_output_channel() {
         run_async_test(async {
             let mock = Arc::new(MockWezterm::new());
             mock.add_default_pane(10).await;
@@ -814,15 +685,20 @@ mod tests {
             scrollbacks.insert(2, mock_scrollback(vec!["cx-pane2-output"]));
 
             let cx = crate::cx::for_request();
-            let report = injector
+            let error = injector
                 .inject_with_cx(&cx, &pane_id_map, &scrollbacks)
                 .await
-                .unwrap();
-
-            assert_eq!(report.success_count(), 2);
-            assert_eq!(report.failure_count(), 0);
-            assert!(report.skipped.is_empty());
-            assert!(report.total_bytes() > 0);
+                .expect_err("safe terminal-output channel is unavailable");
+            match error {
+                crate::Error::RuntimeOperation { operation, source } => {
+                    assert_eq!(
+                        operation,
+                        "restore_scrollback.inject.no_safe_output_channel"
+                    );
+                    assert!(matches!(source, RuntimeOperationSource::Backend(_)));
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
         });
     }
 
@@ -846,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn inject_empty_scrollback() {
+    fn inject_empty_scrollback_still_refuses_unsupported_operation() {
         run_async_test(async {
             let mock = Arc::new(MockWezterm::new());
             mock.add_default_pane(10).await;
@@ -856,18 +732,17 @@ mod tests {
             pane_id_map.insert(1_u64, 10_u64);
 
             let mut scrollbacks = HashMap::new();
-            scrollbacks.insert(1, ScrollbackData::from_segments(vec![]));
+            scrollbacks.insert(1, ScrollbackData::from_terminal_lines(vec![]));
 
             let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-            assert_eq!(report.success_count(), 1);
-            assert_eq!(report.successes[0].lines_injected, 0);
-            assert_eq!(report.successes[0].bytes_written, 0);
+            assert_eq!(report.success_count(), 0);
+            assert_eq!(report.skipped, vec![1]);
         });
     }
 
     #[test]
-    fn inject_truncates_large_scrollback() {
+    fn inject_large_scrollback_does_not_allocate_or_write_replay_content() {
         run_async_test(async {
             let mock = Arc::new(MockWezterm::new());
             mock.add_default_pane(10).await;
@@ -882,17 +757,15 @@ mod tests {
 
             let lines: Vec<String> = (0..100).map(|i| format!("line-{i}")).collect();
             let mut scrollbacks = HashMap::new();
-            scrollbacks.insert(1, ScrollbackData::from_segments(lines));
+            scrollbacks.insert(1, ScrollbackData::from_terminal_lines(lines));
 
             let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-            assert_eq!(report.success_count(), 1);
-            assert_eq!(report.successes[0].lines_injected, 3);
+            assert_eq!(report.success_count(), 0);
+            assert_eq!(report.skipped, vec![1]);
 
-            // Should have kept the last 3 lines (97, 98, 99).
             let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
-            assert!(text.contains("line-99"));
-            assert!(text.contains("line-97"));
+            assert!(text.is_empty());
         });
     }
 
@@ -932,7 +805,8 @@ mod tests {
 
             let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-            assert_eq!(report.success_count(), 1);
+            assert_eq!(report.success_count(), 0);
+            assert_eq!(report.skipped, vec![1]);
 
             // After injection: suppression cleared.
             assert!(!InjectionGuard::is_suppressed(&suppressed, 10));
@@ -943,7 +817,7 @@ mod tests {
 
     #[test]
     fn scrollback_data_from_empty_segments() {
-        let data = ScrollbackData::from_segments(vec![]);
+        let data = ScrollbackData::from_terminal_lines(vec![]);
         assert_eq!(data.lines.len(), 0);
         assert_eq!(data.total_bytes, 0);
     }
@@ -951,14 +825,14 @@ mod tests {
     #[test]
     fn scrollback_data_single_large_segment() {
         let big = "x".repeat(100_000);
-        let data = ScrollbackData::from_segments(vec![big.clone()]);
+        let data = ScrollbackData::from_terminal_lines(vec![big.clone()]);
         assert_eq!(data.lines.len(), 1);
         assert_eq!(data.total_bytes, 100_000);
     }
 
     #[test]
     fn scrollback_data_truncate_to_zero() {
-        let mut data = ScrollbackData::from_segments(vec!["a".into(), "b".into()]);
+        let mut data = ScrollbackData::from_terminal_lines(vec!["a".into(), "b".into()]);
         data.truncate(0);
         assert!(data.lines.is_empty());
         assert_eq!(data.total_bytes, 0);
@@ -966,7 +840,7 @@ mod tests {
 
     #[test]
     fn scrollback_data_truncate_to_exact_count() {
-        let mut data = ScrollbackData::from_segments(vec!["a".into(), "b".into(), "c".into()]);
+        let mut data = ScrollbackData::from_terminal_lines(vec!["a".into(), "b".into(), "c".into()]);
         data.truncate(3); // Exactly the count
         assert_eq!(data.lines.len(), 3);
         assert_eq!(data.total_bytes, 3);
@@ -975,7 +849,7 @@ mod tests {
     #[test]
     fn scrollback_data_truncate_to_one_keeps_last() {
         let mut data =
-            ScrollbackData::from_segments(vec!["first".into(), "middle".into(), "last".into()]);
+            ScrollbackData::from_terminal_lines(vec!["first".into(), "middle".into(), "last".into()]);
         data.truncate(1);
         assert_eq!(data.lines, vec!["last"]);
         assert_eq!(data.total_bytes, 4);
@@ -983,7 +857,7 @@ mod tests {
 
     #[test]
     fn scrollback_data_total_bytes_includes_all_segments() {
-        let data = ScrollbackData::from_segments(vec!["abc".into(), "de".into(), "f".into()]);
+        let data = ScrollbackData::from_terminal_lines(vec!["abc".into(), "de".into(), "f".into()]);
         assert_eq!(data.total_bytes, 6); // 3 + 2 + 1
     }
 
@@ -991,7 +865,7 @@ mod tests {
 
     #[test]
     fn injection_guard_empty_pane_list() {
-        let set = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let set = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let _guard = InjectionGuard::new(set.clone(), vec![]);
         // No panes suppressed
         assert!(!InjectionGuard::is_suppressed(&set, 1));
@@ -1000,7 +874,7 @@ mod tests {
 
     #[test]
     fn injection_guard_overlapping_guards() {
-        let set = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let set = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let guard1 = InjectionGuard::new(set.clone(), vec![1, 2]);
         let guard2 = InjectionGuard::new(set.clone(), vec![2, 3]);
 
@@ -1009,19 +883,19 @@ mod tests {
         assert!(InjectionGuard::is_suppressed(&set, 3));
 
         drop(guard1);
-        // guard1 removed 1 and 2, but guard2 still has 2 and 3
-        // NOTE: InjectionGuard removes its pane_ids on drop even if shared,
-        // so after guard1 drop, pane 2 is removed even though guard2 added it.
+        // Reference counts preserve pane 2 while guard2 remains active.
         assert!(!InjectionGuard::is_suppressed(&set, 1));
+        assert!(InjectionGuard::is_suppressed(&set, 2));
         assert!(InjectionGuard::is_suppressed(&set, 3));
 
         drop(guard2);
+        assert!(!InjectionGuard::is_suppressed(&set, 2));
         assert!(!InjectionGuard::is_suppressed(&set, 3));
     }
 
     #[test]
     fn injection_guard_duplicate_pane_ids() {
-        let set = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let set = Arc::new(std::sync::Mutex::new(HashMap::new()));
         {
             let _guard = InjectionGuard::new(set.clone(), vec![42, 42, 42]);
             assert!(InjectionGuard::is_suppressed(&set, 42));
@@ -1204,7 +1078,7 @@ mod tests {
     // --- Chunked injection ---
 
     #[test]
-    fn inject_with_small_chunks() {
+    fn chunk_configuration_cannot_reenable_pty_replay() {
         run_async_test(async {
             let mock = Arc::new(MockWezterm::new());
             mock.add_default_pane(10).await;
@@ -1228,12 +1102,11 @@ mod tests {
 
             let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-            assert_eq!(report.success_count(), 1);
-            assert!(report.successes[0].chunks_sent > 1);
+            assert_eq!(report.success_count(), 0);
+            assert_eq!(report.skipped, vec![1]);
 
-            // All content should arrive.
             let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
-            assert!(text.contains("multiple chunks"));
+            assert!(text.is_empty());
         });
     }
 }

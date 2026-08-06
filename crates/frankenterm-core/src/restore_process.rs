@@ -128,6 +128,41 @@ pub struct LaunchReport {
     pub skipped: usize,
     pub manual: usize,
     pub failed: usize,
+    /// Structured reason that execution stopped before every plan settled.
+    /// A canceled delay or mux operation must stop the sequence immediately;
+    /// callers use this field to leave the restore attempt unclean and require
+    /// reconciliation rather than treating a partial relaunch as success.
+    pub interruption: Option<LaunchInterruption>,
+}
+
+/// Phase at which a process relaunch sequence stopped cooperatively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchInterruptionPhase {
+    BeforePlan,
+    InterLaunchDelay,
+    ShellSettleDelay,
+    AgentSettleDelay,
+    MuxOperation,
+}
+
+/// Typed partial-result marker for a canceled process relaunch sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchInterruption {
+    /// Zero-based plan index that did not settle.
+    pub plan_index: usize,
+    pub phase: LaunchInterruptionPhase,
+    /// Capability/runtime detail only; never contains the persisted command.
+    pub detail: String,
+}
+
+#[derive(Debug)]
+enum LaunchStepError {
+    Failed(String),
+    Interrupted {
+        phase: LaunchInterruptionPhase,
+        detail: String,
+    },
 }
 
 // =============================================================================
@@ -202,8 +237,26 @@ impl ProcessLauncher {
         let delay = Duration::from_millis(self.config.launch_delay_ms);
 
         for (i, plan) in plans.iter().enumerate() {
+            if cx.checkpoint().is_err() {
+                report.interruption = Some(LaunchInterruption {
+                    plan_index: i,
+                    phase: LaunchInterruptionPhase::BeforePlan,
+                    detail: "caller capability stopped before plan".to_string(),
+                });
+                break;
+            }
             if i > 0 && !delay.is_zero() {
-                let _ = crate::runtime_async::sleep_with_cx(cx, delay).await;
+                if crate::runtime_async::sleep_with_cx(cx, delay)
+                    .await
+                    .is_err()
+                {
+                    report.interruption = Some(LaunchInterruption {
+                        plan_index: i,
+                        phase: LaunchInterruptionPhase::InterLaunchDelay,
+                        detail: "capability-aware inter-launch delay stopped".to_string(),
+                    });
+                    break;
+                }
             }
 
             let result = match &plan.action {
@@ -244,7 +297,20 @@ impl ProcessLauncher {
                 }
             };
 
-            self.record_result(&mut report, plan, result);
+            match result {
+                Ok(()) => self.record_result(&mut report, plan, Ok(())),
+                Err(LaunchStepError::Failed(error)) => {
+                    self.record_result(&mut report, plan, Err(error));
+                }
+                Err(LaunchStepError::Interrupted { phase, detail }) => {
+                    report.interruption = Some(LaunchInterruption {
+                        plan_index: i,
+                        phase,
+                        detail,
+                    });
+                    break;
+                }
+            }
         }
 
         info!(
@@ -253,6 +319,7 @@ impl ProcessLauncher {
             skipped = report.skipped,
             manual = report.manual,
             failed = report.failed,
+            interrupted = report.interruption.is_some(),
             "process re-launch complete"
         );
 
@@ -326,37 +393,13 @@ impl ProcessLauncher {
 
         // Check shell field
         if let Some(ref shell) = state.shell {
-            if self.config.launch_shells {
-                return (
-                    LaunchAction::LaunchShell {
-                        shell: shell.clone(),
-                        cwd,
-                    },
-                    None,
-                );
-            }
-            return (
-                LaunchAction::Skip {
-                    reason: "shell launch disabled".into(),
-                },
-                None,
-            );
-        }
-
-        // No process info at all — just cd to the working directory
-        if self.config.launch_shells && *cwd != *"/" {
-            return (
-                LaunchAction::LaunchShell {
-                    shell: default_shell(),
-                    cwd,
-                },
-                None,
-            );
+            return self.resolve_shell_action(shell, &cwd);
         }
 
         (
             LaunchAction::Skip {
-                reason: "no process information available".into(),
+                reason: "layout restore already created a shell at the restored working directory"
+                    .into(),
             },
             None,
         )
@@ -449,21 +492,7 @@ impl ProcessLauncher {
 
         // Common shells
         if is_shell(name) {
-            if self.config.launch_shells {
-                return (
-                    LaunchAction::LaunchShell {
-                        shell: name.clone(),
-                        cwd: cwd.to_path_buf(),
-                    },
-                    None,
-                );
-            }
-            return (
-                LaunchAction::Skip {
-                    reason: "shell launch disabled".into(),
-                },
-                None,
-            );
+            return self.resolve_shell_action(name, cwd);
         }
 
         // Interactive programs that need manual restart
@@ -493,6 +522,43 @@ impl ProcessLauncher {
         )
     }
 
+    fn resolve_shell_action(
+        &self,
+        shell: &str,
+        cwd: &Path,
+    ) -> (LaunchAction, Option<String>) {
+        if !self.config.launch_shells {
+            return (
+                LaunchAction::Skip {
+                    reason: "shell launch disabled".into(),
+                },
+                None,
+            );
+        }
+        let restored_shell = shell.rsplit('/').next().unwrap_or(shell);
+        let current_shell = default_shell();
+        let current_shell = current_shell.rsplit('/').next().unwrap_or(&current_shell);
+        if is_shell(restored_shell) && restored_shell == current_shell {
+            return (
+                LaunchAction::Skip {
+                    reason: "layout restore already created the default shell at the restored working directory"
+                        .into(),
+                },
+                None,
+            );
+        }
+        (
+            LaunchAction::Manual {
+                hint: format!(
+                    "Layout restored {} with the default shell; previous shell {shell:?} requires a mux-native argv spawn and was not typed through PTY input.",
+                    cwd.display()
+                ),
+                original_process: shell.to_string(),
+            },
+            Some("Automatic shell switching is unavailable without a mux-native argv channel.".to_string()),
+        )
+    }
+
     // -------------------------------------------------------------------------
     // Internal: execution
     // -------------------------------------------------------------------------
@@ -500,36 +566,17 @@ impl ProcessLauncher {
     /// Send shell launch commands to a pane.
     async fn launch_shell_cx(
         &self,
-        cx: &crate::cx::Cx,
-        pane_id: u64,
+        _cx: &crate::cx::Cx,
+        _pane_id: u64,
         shell: &str,
         cwd: &Path,
-    ) -> Result<(), String> {
-        // [ft-kegvt / ft-asoso] mirror launch_agent_cx: the shell name comes
-        // from the persisted pane snapshot (`PaneStateSnapshot.shell`) and is
-        // NOT validated against `is_shell` on the `state.shell` resolution
-        // path, so a tampered snapshot could smuggle CR/LF or an ANSI escape
-        // through `exec {shell}\r` into the interactive shell. Both restore
-        // launch paths must share the same defense-in-depth contract; reject
-        // before any send_text reaches the pane.
-        let safe_shell = sanitize_restored_command(shell)?;
-        let cd_cmd = format!("cd {}\r", shell_escape(cwd));
-        // ft-xbnl0.2.3 tick 294: cx-first send_text in launch_shell_cx.
-        self.wezterm
-            .send_text_with_cx(cx, pane_id, &cd_cmd)
-            .await
-            .map_err(|e| format!("send cd: {e}"))?;
-        let _ = crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50)).await;
-        let current_shell = default_shell();
-        if safe_shell != current_shell && !safe_shell.is_empty() {
-            let exec_cmd = format!("exec {safe_shell}\r");
-            self.wezterm
-                .send_text_with_cx(cx, pane_id, &exec_cmd)
-                .await
-                .map_err(|e| format!("send exec: {e}"))?;
-        }
-        info!(pane = pane_id, shell = %safe_shell, cwd = %cwd.display(), "shell launched");
-        Ok(())
+    ) -> Result<(), LaunchStepError> {
+        sanitize_restored_command(shell).map_err(LaunchStepError::Failed)?;
+        validate_restored_cwd(cwd).map_err(LaunchStepError::Failed)?;
+        Err(LaunchStepError::Failed(
+            "automatic shell switching requires a mux-native argv spawn channel; PTY command injection is refused"
+                .to_string(),
+        ))
     }
 
     /// Send agent launch command to a pane.
@@ -540,25 +587,46 @@ impl ProcessLauncher {
         command: &str,
         cwd: &Path,
         agent_type: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), LaunchStepError> {
         // [ft-kegvt] mirror launch_agent_legacy: sanitize before any
         // send_text hits the interactive shell. Both code paths must
         // share the same defense-in-depth contract.
-        let safe_command = sanitize_restored_command(command)?;
+        let safe_command =
+            sanitize_restored_command(command).map_err(LaunchStepError::Failed)?;
+        validate_restored_cwd(cwd).map_err(LaunchStepError::Failed)?;
         let cd_cmd = format!("cd {}\r", shell_escape(cwd));
         // ft-xbnl0.2.3 tick 294: cx-first send_text in launch_agent_cx.
         self.wezterm
-            .send_text_with_cx(cx, pane_id, &cd_cmd)
+            .send_text_with_options_with_cx(cx, pane_id, &cd_cmd, true, true)
             .await
-            .map_err(|e| format!("send cd: {e}"))?;
-        let _ = crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50)).await;
+            .map_err(|error| launch_mux_step_error(cx, "send cd", error))?;
+        crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50))
+            .await
+            .map_err(|_error| LaunchStepError::Interrupted {
+                phase: LaunchInterruptionPhase::AgentSettleDelay,
+                detail: "capability-aware agent settle delay stopped".to_string(),
+            })?;
         let full_cmd = format!("{safe_command}\r");
         self.wezterm
-            .send_text_with_cx(cx, pane_id, &full_cmd)
+            .send_text_with_options_with_cx(cx, pane_id, &full_cmd, true, true)
             .await
-            .map_err(|e| format!("send agent command: {e}"))?;
+            .map_err(|error| launch_mux_step_error(cx, "send agent command", error))?;
         info!(pane = pane_id, agent = %agent_type, cwd = %cwd.display(), "agent launched");
         Ok(())
+    }
+}
+
+fn launch_mux_step_error(
+    cx: &crate::cx::Cx,
+    operation: &'static str,
+    error: impl std::fmt::Display,
+) -> LaunchStepError {
+    match cx.checkpoint() {
+        Ok(()) => LaunchStepError::Failed(format!("{operation}: {error}")),
+        Err(_cancelled) => LaunchStepError::Interrupted {
+            phase: LaunchInterruptionPhase::MuxOperation,
+            detail: "caller capability stopped during mux operation".to_string(),
+        },
     }
 }
 
@@ -631,6 +699,25 @@ fn shell_escape(path: &Path) -> String {
     } else {
         s.into_owned()
     }
+}
+
+fn validate_restored_cwd(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "refusing restored working directory that is not absolute: {}",
+            path.display()
+        ));
+    }
+    let value = path.to_string_lossy();
+    for (index, ch) in value.char_indices() {
+        if ch.is_control() || matches!(ch as u32, 0x7f..=0x9f) {
+            return Err(format!(
+                "refusing restored working directory with terminal control {:#04x} at byte {index}",
+                ch as u32
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Sanitize a restored agent command before it's typed into the pane's
@@ -849,6 +936,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn execute_cx_precancel_stops_before_first_plan() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("restore process pre-cancel regression"),
+            );
+            let launcher = ProcessLauncher::new(
+                crate::wezterm::mock_wezterm_handle(),
+                LaunchConfig::default(),
+            );
+            let plans = vec![ProcessPlan {
+                old_pane_id: 1,
+                new_pane_id: 10,
+                action: LaunchAction::Manual {
+                    hint: "manual".to_string(),
+                    original_process: "tool".to_string(),
+                },
+                state_warning: None,
+            }];
+
+            let report = launcher.execute_cx(&cx, &plans).await;
+            let interruption = report
+                .interruption
+                .expect("pre-cancel must produce a typed interruption");
+            assert_eq!(interruption.plan_index, 0);
+            assert_eq!(interruption.phase, LaunchInterruptionPhase::BeforePlan);
+            assert!(report.results.is_empty());
+            assert_eq!(report.manual, 0);
+            assert_eq!(report.failed, 0);
+        });
+    }
+
     /// Create a minimal `PaneStateSnapshot` for testing.
     fn test_pane_state(pane_id: u64) -> PaneStateSnapshot {
         PaneStateSnapshot {
@@ -915,7 +1036,9 @@ mod tests {
     fn plan_shell_pane() {
         let launcher = test_launcher();
         let id_map = test_pane_id_map();
-        let states = vec![test_pane_state(1)];
+        let mut state = test_pane_state(1);
+        state.shell = Some(default_shell());
+        let states = vec![state];
 
         let plans = launcher.plan(&id_map, &states);
         assert_eq!(plans.len(), 1);
@@ -924,11 +1047,10 @@ mod tests {
         assert!(plans[0].state_warning.is_none());
 
         match &plans[0].action {
-            LaunchAction::LaunchShell { shell, cwd } => {
-                assert_eq!(shell, "bash");
-                assert_eq!(cwd, &PathBuf::from("/home/user/project"));
+            LaunchAction::Skip { reason } => {
+                assert!(reason.contains("already created"));
             }
-            other => panic!("expected LaunchShell, got {other:?}"),
+            other => panic!("expected structural shell Skip, got {other:?}"),
         }
     }
 
@@ -1122,12 +1244,11 @@ mod tests {
         state.foreground_process = None;
 
         let plans = launcher.plan(&id_map, &[state]);
-        // Should still launch a shell to cd to the working dir
         match &plans[0].action {
-            LaunchAction::LaunchShell { cwd, .. } => {
-                assert_eq!(cwd, &PathBuf::from("/home/user/project"));
+            LaunchAction::Skip { reason } => {
+                assert!(reason.contains("layout restore"));
             }
-            other => panic!("expected LaunchShell, got {other:?}"),
+            other => panic!("expected structural shell Skip, got {other:?}"),
         }
     }
 
@@ -1698,6 +1819,7 @@ mod tests {
             skipped: 2,
             manual: 1,
             failed: 0,
+            interruption: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         let report2: LaunchReport = serde_json::from_str(&json).unwrap();
@@ -2071,7 +2193,7 @@ mod tests {
         let plans = launcher.plan(&id_map, &[state]);
         match &plans[0].action {
             LaunchAction::Skip { reason } => {
-                assert!(reason.contains("no process information"));
+                assert!(reason.contains("layout restore"));
             }
             other => panic!("expected Skip, got {other:?}"),
         }
@@ -2085,17 +2207,21 @@ mod tests {
         let mut state = test_pane_state(1);
         state.shell = None;
         state.foreground_process = Some(ProcessInfo {
-            name: "zsh".into(),
+            name: default_shell()
+                .rsplit('/')
+                .next()
+                .unwrap_or("sh")
+                .to_string(),
             pid: Some(9999),
             argv: None,
         });
 
         let plans = launcher.plan(&id_map, &[state]);
         match &plans[0].action {
-            LaunchAction::LaunchShell { shell, .. } => {
-                assert_eq!(shell, "zsh");
+            LaunchAction::Skip { reason } => {
+                assert!(reason.contains("already created"));
             }
-            other => panic!("expected LaunchShell, got {other:?}"),
+            other => panic!("expected structural shell Skip, got {other:?}"),
         }
     }
 
@@ -2167,7 +2293,7 @@ mod tests {
         // should skip
         match &plans[0].action {
             LaunchAction::Skip { reason } => {
-                assert!(reason.contains("no process information"));
+                assert!(reason.contains("layout restore"));
             }
             other => panic!("expected Skip, got {other:?}"),
         }
@@ -2180,15 +2306,14 @@ mod tests {
 
         let mut state = test_pane_state(1);
         state.cwd = Some(String::new());
+        state.shell = Some(default_shell());
 
         let plans = launcher.plan(&id_map, &[state]);
         match &plans[0].action {
-            LaunchAction::LaunchShell { shell, cwd } => {
-                assert_eq!(shell, "bash");
-                assert_eq!(cwd, &PathBuf::from("/"));
-                assert!(cwd.is_absolute());
+            LaunchAction::Skip { reason } => {
+                assert!(reason.contains("already created"));
             }
-            other => panic!("expected LaunchShell, got {other:?}"),
+            other => panic!("expected structural shell Skip, got {other:?}"),
         }
     }
 

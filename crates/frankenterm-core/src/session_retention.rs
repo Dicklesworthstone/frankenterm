@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use tracing::{debug, info, warn};
 
 use crate::config::SessionRetentionConfig;
@@ -181,6 +181,65 @@ fn u64_to_sqlite_integer(value: u64) -> Result<i64, rusqlite::Error> {
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
+fn clean_authority_error(error: crate::session_restore::RestoreError) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+        error.to_string(),
+    )))
+}
+
+fn begin_retention_transaction(conn: &Connection) -> rusqlite::Result<Transaction<'_>> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+}
+
+/// Return whether a session has any restore attempt that lacks an explicit
+/// durable `resolved` lifecycle state. The metadata branch preserves fail-safe
+/// behavior for v37-era intent rows written under the overloaded
+/// `restore_receipt` role before the schema gained that type. Neither a linked
+/// outcome nor a later snapshot implies resolution: retrying external mux
+/// mutations without reconciliation can duplicate tabs, panes, or processes.
+pub(crate) fn has_unresolved_restore_intent(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM restore_attempt_lifecycle AS lifecycle
+             WHERE lifecycle.session_id = ?1
+               AND lifecycle.status <> 'resolved'
+         ) OR EXISTS (
+             SELECT 1
+             FROM session_checkpoints AS intent
+             WHERE intent.session_id = ?1
+               AND intent.checkpoint_role = 'restore_intent'
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM restore_attempt_lifecycle AS lifecycle
+                   WHERE lifecycle.intent_checkpoint_id = intent.id
+                     AND lifecycle.session_id = intent.session_id
+               )
+         ) OR EXISTS (
+             SELECT 1
+             FROM session_checkpoints AS intent
+             WHERE intent.session_id = ?1
+               AND intent.checkpoint_role = 'restore_receipt'
+               AND json_valid(intent.metadata_json)
+               AND json_extract(
+                       intent.metadata_json,
+                       '$.restore_attempt.phase'
+                   ) = 'intent'
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM restore_attempt_lifecycle AS lifecycle
+                   WHERE lifecycle.intent_checkpoint_id = intent.id
+                     AND lifecycle.session_id = intent.session_id
+               )
+         )",
+        [session_id],
+        |row| row.get::<_, bool>(0),
+    )
+}
+
 /// Fail closed when authority-table triggers could invalidate direct SQLite
 /// row-count receipts.
 ///
@@ -200,11 +259,13 @@ pub(crate) fn ensure_session_authority_tables_have_no_unaudited_triggers(
              (SELECT COUNT(*) FROM sqlite_schema
               WHERE type = 'trigger'
                 AND tbl_name COLLATE NOCASE
-                    IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state'))
+                    IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
+                        'restore_attempt_lifecycle'))
            + (SELECT COUNT(*) FROM sqlite_temp_schema
               WHERE type = 'trigger'
                 AND tbl_name COLLATE NOCASE
-                    IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state'))",
+                    IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
+                        'restore_attempt_lifecycle'))",
         [],
         |row| row.get(0),
     )?;
@@ -231,36 +292,54 @@ fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize,
     // clamping to i64::MAX would make nearly every closed session eligible.
     let cutoff_ms = u64_to_sqlite_integer(cutoff_ms)?;
 
-    let tx = conn.unchecked_transaction()?;
+    let tx = begin_retention_transaction(conn)?;
     ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
-    let deleted = tx.execute(
-        "DELETE FROM mux_sessions
-         WHERE MAX(
-                   created_at,
-                   COALESCE(last_checkpoint_at, created_at),
-                   COALESCE(
-                       (SELECT MAX(c.checkpoint_at)
-                        FROM session_checkpoints c
-                        WHERE c.session_id = mux_sessions.session_id),
-                       created_at
-                   )
-               ) < ?1
-         AND shutdown_clean = 1
-         AND EXISTS (
-             SELECT 1
-             FROM session_checkpoints AS clean
-             WHERE clean.id = mux_sessions.clean_checkpoint_id
-               AND clean.session_id = mux_sessions.session_id
-               AND clean.id = (
-                   SELECT latest.id
-                   FROM session_checkpoints AS latest
-                   WHERE latest.session_id = mux_sessions.session_id
-                   ORDER BY latest.checkpoint_at DESC, latest.id DESC
-                   LIMIT 1
-               )
-         )",
-        [cutoff_ms],
-    )?;
+    let candidates: Vec<(String, i64, Option<i64>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT session_id, shutdown_clean, clean_checkpoint_id
+             FROM mux_sessions
+             WHERE MAX(
+                       created_at,
+                       COALESCE(last_checkpoint_at, created_at),
+                       COALESCE(
+                           (SELECT MAX(c.checkpoint_at)
+                            FROM session_checkpoints c
+                            WHERE c.session_id = mux_sessions.session_id),
+                           created_at
+                       )
+                   ) < ?1
+               AND shutdown_clean = 1
+             ORDER BY session_id ASC",
+        )?;
+        stmt.query_map([cutoff_ms], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<_, _>>()?
+    };
+    let mut deleted = 0usize;
+    for (session_id, shutdown_clean, clean_checkpoint_id) in candidates {
+        if has_unresolved_restore_intent(&tx, &session_id)? {
+            continue;
+        }
+        if !crate::session_restore::assess_clean_authority(
+            &tx,
+            &session_id,
+            shutdown_clean,
+            clean_checkpoint_id,
+        )
+        .map_err(clean_authority_error)?
+        {
+            continue;
+        }
+        let affected = tx.execute(
+            "DELETE FROM mux_sessions WHERE session_id = ?1",
+            [&session_id],
+        )?;
+        if affected != 1 {
+            return Err(rusqlite::Error::StatementChangedRows(affected));
+        }
+        deleted = deleted.saturating_add(1);
+    }
     tx.commit()?;
     Ok(deleted)
 }
@@ -270,41 +349,13 @@ fn delete_excess_closed_sessions(
     conn: &Connection,
     max_count: usize,
 ) -> Result<usize, rusqlite::Error> {
-    let max_count = i64::try_from(max_count).unwrap_or(i64::MAX);
-    let tx = conn.unchecked_transaction()?;
+    let tx = begin_retention_transaction(conn)?;
     ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
-    let deleted = tx.execute(
-        "DELETE FROM mux_sessions
-         WHERE shutdown_clean = 1
-           AND EXISTS (
-               SELECT 1
-               FROM session_checkpoints AS clean
-               WHERE clean.id = mux_sessions.clean_checkpoint_id
-                 AND clean.session_id = mux_sessions.session_id
-                 AND clean.id = (
-                     SELECT latest.id
-                     FROM session_checkpoints AS latest
-                     WHERE latest.session_id = mux_sessions.session_id
-                     ORDER BY latest.checkpoint_at DESC, latest.id DESC
-                     LIMIT 1
-                 )
-           )
-         AND session_id NOT IN (
-             SELECT session_id FROM mux_sessions
+    let candidates: Vec<(String, i64, Option<i64>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT session_id, shutdown_clean, clean_checkpoint_id
+             FROM mux_sessions
              WHERE shutdown_clean = 1
-               AND EXISTS (
-                   SELECT 1
-                   FROM session_checkpoints AS clean
-                   WHERE clean.id = mux_sessions.clean_checkpoint_id
-                     AND clean.session_id = mux_sessions.session_id
-                     AND clean.id = (
-                         SELECT latest.id
-                         FROM session_checkpoints AS latest
-                         WHERE latest.session_id = mux_sessions.session_id
-                         ORDER BY latest.checkpoint_at DESC, latest.id DESC
-                         LIMIT 1
-                     )
-               )
              ORDER BY MAX(
                           created_at,
                           COALESCE(last_checkpoint_at, created_at),
@@ -315,11 +366,40 @@ fn delete_excess_closed_sessions(
                               created_at
                           )
                       ) DESC,
-                      session_id DESC
-             LIMIT ?1
-         )",
-        [max_count],
-    )?;
+                      session_id DESC",
+        )?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<_, _>>()?
+    };
+    let mut retained = 0usize;
+    let mut deleted = 0usize;
+    for (session_id, shutdown_clean, clean_checkpoint_id) in candidates {
+        if has_unresolved_restore_intent(&tx, &session_id)? {
+            continue;
+        }
+        if !crate::session_restore::assess_clean_authority(
+            &tx,
+            &session_id,
+            shutdown_clean,
+            clean_checkpoint_id,
+        )
+        .map_err(clean_authority_error)?
+        {
+            continue;
+        }
+        if retained < max_count {
+            retained = retained.saturating_add(1);
+            continue;
+        }
+        let affected = tx.execute(
+            "DELETE FROM mux_sessions WHERE session_id = ?1",
+            [&session_id],
+        )?;
+        if affected != 1 {
+            return Err(rusqlite::Error::StatementChangedRows(affected));
+        }
+        deleted = deleted.saturating_add(1);
+    }
     tx.commit()?;
     Ok(deleted)
 }
@@ -339,7 +419,7 @@ fn delete_sessions_by_size(
     // deletions committed even though this stage returned no accounting
     // result, and a concurrent cleanup could make us claim bytes for a row our
     // connection did not delete.
-    let tx = conn.unchecked_transaction()?;
+    let tx = begin_retention_transaction(conn)?;
     ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
 
     // Measure only checkpoints owned by a current session. Orphan checkpoints
@@ -373,25 +453,15 @@ fn delete_sessions_by_size(
     let mut deleted = 0_usize;
 
     // Get closed sessions ordered oldest first, with their checkpoint sizes
-    let sessions: Vec<(String, u64)> = {
+    let candidate_rows: Vec<(String, u64, i64, Option<i64>)> = {
         let mut stmt = tx.prepare(
-            "SELECT s.session_id, COALESCE(SUM(c.total_bytes), 0) as session_bytes
+            "SELECT s.session_id,
+                    COALESCE(SUM(c.total_bytes), 0) AS session_bytes,
+                    s.shutdown_clean,
+                    s.clean_checkpoint_id
              FROM mux_sessions s
              LEFT JOIN session_checkpoints c ON c.session_id = s.session_id
              WHERE s.shutdown_clean = 1
-               AND EXISTS (
-                   SELECT 1
-                   FROM session_checkpoints AS clean
-                   WHERE clean.id = s.clean_checkpoint_id
-                     AND clean.session_id = s.session_id
-                     AND clean.id = (
-                         SELECT latest.id
-                         FROM session_checkpoints AS latest
-                         WHERE latest.session_id = s.session_id
-                         ORDER BY latest.checkpoint_at DESC, latest.id DESC
-                         LIMIT 1
-                     )
-               )
              GROUP BY s.session_id
              HAVING COALESCE(SUM(c.total_bytes), 0) > 0
              ORDER BY MAX(
@@ -409,11 +479,33 @@ fn delete_sessions_by_size(
                 let session_bytes = u64::try_from(session_bytes).map_err(|_| {
                     rusqlite::Error::IntegralValueOutOfRange(1, session_bytes)
                 })?;
-                Ok((session_id, session_bytes))
+                Ok((
+                    session_id,
+                    session_bytes,
+                    row.get(2)?,
+                    row.get(3)?,
+                ))
             })?
             .collect::<Result<_, _>>()?;
         sessions
     };
+
+    let mut sessions = Vec::with_capacity(candidate_rows.len());
+    for (session_id, session_bytes, shutdown_clean, clean_checkpoint_id) in candidate_rows {
+        if has_unresolved_restore_intent(&tx, &session_id)? {
+            continue;
+        }
+        if crate::session_restore::assess_clean_authority(
+            &tx,
+            &session_id,
+            shutdown_clean,
+            clean_checkpoint_id,
+        )
+        .map_err(clean_authority_error)?
+        {
+            sessions.push((session_id, session_bytes));
+        }
+    }
 
     for (session_id, session_bytes) in sessions {
         if freed >= to_free {
@@ -468,8 +560,20 @@ fn cleanup_orphaned_data(conn: &Connection) -> Result<(usize, usize), rusqlite::
     // data was in fact collected. Naming both shapes in one child DELETE is
     // correct AND correctly counted under either FK setting. The transaction
     // makes both deletes commit atomically.
-    let tx = conn.unchecked_transaction()?;
+    let tx = begin_retention_transaction(conn)?;
     ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
+
+    // If an external writer disabled FK enforcement before deleting a session,
+    // remove its lifecycle rows first. Otherwise the deferred intent FK can
+    // correctly prevent the following checkpoint cleanup from erasing durable
+    // evidence whose parent session is already irretrievably absent.
+    tx.execute(
+        "DELETE FROM restore_attempt_lifecycle
+         WHERE session_id NOT IN (
+             SELECT session_id FROM mux_sessions
+         )",
+        [],
+    )?;
 
     // Orphaned pane_state rows: checkpoint already deleted, OR checkpoint is
     // itself a session-orphan that the next statement removes.
@@ -618,11 +722,7 @@ fn classify_session_cleanup_blocking_failure(
 
 /// Get current epoch time in milliseconds.
 fn epoch_ms() -> u64 {
-    let epoch_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    u64::try_from(epoch_ms).unwrap_or(u64::MAX)
+    crate::clock_anomaly::epoch_ms_u64("ft.session_retention.clock")
 }
 
 // =============================================================================
@@ -761,24 +861,7 @@ mod tests {
         )
         .unwrap();
         if shutdown_clean {
-            conn.execute(
-                "INSERT INTO session_checkpoints
-                 (session_id, checkpoint_at, checkpoint_type, state_hash,
-                  pane_count, total_bytes, metadata_json, checkpoint_role,
-                  topology_json)
-                 VALUES (?1, ?2, 'startup', 'restore', 0, 0,
-                         '{\"old_to_new\":{}}', 'restore_receipt', NULL)",
-                rusqlite::params![id, created_at],
-            )
-            .unwrap();
-            let receipt_id = conn.last_insert_rowid();
-            conn.execute(
-                "UPDATE mux_sessions
-                 SET last_checkpoint_at = ?2, clean_checkpoint_id = ?3
-                 WHERE session_id = ?1",
-                rusqlite::params![id, created_at, receipt_id],
-            )
-            .unwrap();
+            insert_v2_clean_receipt(conn, id, created_at);
         }
     }
 
@@ -803,22 +886,29 @@ mod tests {
         conn.execute(
             "INSERT INTO session_checkpoints
              (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
-             VALUES (?1, ?2, 'periodic', 'hash', 1, ?3)",
+             VALUES (?1, ?2, 'periodic', '0123456789abcdef', 1, ?3)",
             rusqlite::params![session_id, checkpoint_at, total_bytes],
         )
         .unwrap();
         let checkpoint_id = conn.last_insert_rowid();
+        let shutdown_clean: bool = conn
+            .query_row(
+                "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
         conn.execute(
             "UPDATE mux_sessions
              SET last_checkpoint_at = ?2,
-                 clean_checkpoint_id = CASE
-                     WHEN shutdown_clean = 1 THEN ?3
-                     ELSE NULL
-                 END
+                 clean_checkpoint_id = NULL
              WHERE session_id = ?1",
-            rusqlite::params![session_id, checkpoint_at, checkpoint_id],
+            rusqlite::params![session_id, checkpoint_at],
         )
         .unwrap();
+        if shutdown_clean {
+            insert_v2_clean_receipt(conn, session_id, checkpoint_at);
+        }
         checkpoint_id
     }
 
@@ -832,15 +922,60 @@ mod tests {
         .unwrap();
     }
 
+    fn insert_v2_clean_receipt(conn: &Connection, session_id: &str, checkpoint_at: i64) -> i64 {
+        let metadata_json = r#"{"old_to_new":{}}"#;
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+              total_bytes, metadata_json, checkpoint_role, topology_json)
+             VALUES (?1, ?2, 'startup', 'pending:rst2', 0, 0, ?3,
+                     'restore_receipt', NULL)",
+            rusqlite::params![session_id, checkpoint_at, metadata_json],
+        )
+        .unwrap();
+        let checkpoint_id = conn.last_insert_rowid();
+        let state_hash = crate::checkpoint_witness::checkpoint_witness(
+            crate::checkpoint_witness::CHECKPOINT_ROLE_RESTORE_RECEIPT,
+            session_id,
+            checkpoint_id,
+            checkpoint_at,
+            "startup",
+            0,
+            0,
+            Some(metadata_json),
+            None,
+            &[],
+        )
+        .expect("compute v2 clean receipt witness");
+        conn.execute(
+            "UPDATE session_checkpoints SET state_hash = ?1 WHERE id = ?2",
+            rusqlite::params![state_hash, checkpoint_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mux_sessions
+             SET shutdown_clean = 1,
+                 last_checkpoint_at = ?2,
+                 clean_checkpoint_id = ?3
+             WHERE session_id = ?1",
+            rusqlite::params![session_id, checkpoint_at, checkpoint_id],
+        )
+        .unwrap();
+        checkpoint_id
+    }
+
     fn count_sessions(conn: &Connection) -> i64 {
         conn.query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row.get(0))
             .unwrap()
     }
 
     fn count_checkpoints(conn: &Connection) -> i64 {
-        conn.query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
-            row.get(0)
-        })
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_checkpoints
+             WHERE checkpoint_role = 'snapshot'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap()
     }
 
@@ -876,6 +1011,144 @@ mod tests {
         let deleted = delete_sessions_by_age(&conn, 30).unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(count_sessions(&conn), 1);
+    }
+
+    #[test]
+    fn age_cleanup_never_deletes_session_with_corrupt_v2_clean_receipt() {
+        let conn = make_test_db();
+        let old = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer")
+            - 90 * 86_400_000;
+        insert_session(&conn, "corrupt-v2-clean", old, false);
+        let receipt_id = insert_v2_clean_receipt(&conn, "corrupt-v2-clean", old);
+        conn.execute(
+            "UPDATE session_checkpoints
+             SET metadata_json = '{\"old_to_new\":{\"1\":9}}'
+             WHERE id = ?1",
+            [receipt_id],
+        )
+        .expect("tamper clean receipt without recomputing witness");
+
+        assert_eq!(delete_sessions_by_age(&conn, 30).unwrap(), 0);
+        assert_eq!(count_sessions(&conn), 1);
+    }
+
+    #[test]
+    fn unresolved_restore_intent_remains_blocking_after_a_later_snapshot() {
+        let conn = make_test_db();
+        let now = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer");
+        let old = now - 90 * 86_400_000;
+        insert_session(&conn, "unresolved-restore", old, true);
+        let source_id = insert_checkpoint(
+            &conn,
+            "unresolved-restore",
+            old,
+            2 * 1_024 * 1_024,
+        );
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, metadata_json, checkpoint_role,
+                 topology_json
+             ) VALUES (
+                 'unresolved-restore', ?1, 'startup', 'pending:rsi2',
+                 0, 0,
+                 '{\"old_to_new\":{},\"restore_attempt\":{\"phase\":\"intent\"}}',
+                 'restore_intent', NULL
+             )",
+            [old + 1],
+        )
+        .expect("insert explicit unresolved restore intent");
+        let intent_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO restore_attempt_lifecycle (
+                 intent_checkpoint_id, session_id, source_checkpoint_id,
+                 status, created_at
+             ) VALUES (?1, 'unresolved-restore', ?2, 'intent', ?3)",
+            rusqlite::params![intent_id, source_id, old + 1],
+        )
+        .expect("bind authoritative unresolved lifecycle");
+
+        // The later snapshot and clean receipt make the ordinary clean-session
+        // authority valid again, but cannot resolve the older external-effect
+        // intent merely by displacing it from the latest-row position.
+        insert_checkpoint(
+            &conn,
+            "unresolved-restore",
+            old + 2,
+            2 * 1_024 * 1_024,
+        );
+        assert!(
+            has_unresolved_restore_intent(&conn, "unresolved-restore")
+                .expect("query unresolved intent"),
+            "intent {intent_id} must remain visible after later rows"
+        );
+
+        assert_eq!(delete_sessions_by_age(&conn, 30).unwrap(), 0);
+        assert_eq!(delete_excess_closed_sessions(&conn, 0).unwrap(), 0);
+        let size = delete_sessions_by_size(&conn, 1).unwrap();
+        assert_eq!(size.deleted, 0);
+        assert!(size.shortfall_bytes > 0);
+        assert_eq!(count_sessions(&conn), 1);
+    }
+
+    #[test]
+    fn linked_outcome_cannot_resolve_an_intent_without_lifecycle_authority() {
+        let conn = make_test_db();
+        let old = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer")
+            - 90 * 86_400_000;
+        insert_session(&conn, "missing-lifecycle", old, true);
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, metadata_json, checkpoint_role
+             ) VALUES (
+                 'missing-lifecycle', ?1, 'startup', 'pending:rsi2',
+                 0, 0, '{\"restore_attempt\":{\"phase\":\"intent\"}}',
+                 'restore_intent'
+             )",
+            [old + 1],
+        )
+        .expect("insert intent without lifecycle authority");
+        let intent_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, metadata_json, checkpoint_role,
+                 restore_intent_checkpoint_id
+             ) VALUES (
+                 'missing-lifecycle', ?1, 'startup', 'pending:rst2',
+                 0, 0, '{\"old_to_new\":{},\"restore_attempt\":{\"phase\":\"outcome\"}}',
+                 'restore_receipt', ?2
+             )",
+            rusqlite::params![old + 2, intent_id],
+        )
+        .expect("insert linked outcome without lifecycle transition");
+        insert_session(&conn, "foreign-lifecycle-owner", old, false);
+        conn.execute(
+            "INSERT INTO restore_attempt_lifecycle (
+                 intent_checkpoint_id, session_id, source_checkpoint_id,
+                 status, created_at, resolved_at
+             ) VALUES (?1, 'foreign-lifecycle-owner', ?2,
+                       'resolved', ?3, ?3)",
+            rusqlite::params![intent_id, intent_id + 100, old],
+        )
+        .expect("seed cross-session lifecycle corruption");
+        insert_v2_clean_receipt(&conn, "missing-lifecycle", old + 3);
+
+        assert!(
+            has_unresolved_restore_intent(&conn, "missing-lifecycle")
+                .expect("query missing lifecycle authority")
+        );
+        assert_eq!(delete_sessions_by_age(&conn, 30).unwrap(), 0);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM mux_sessions WHERE session_id = 'missing-lifecycle'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count protected missing-lifecycle session"),
+            1
+        );
     }
 
     #[test]
@@ -1291,7 +1564,7 @@ mod tests {
         conn.execute(
             "INSERT INTO session_checkpoints
              (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
-             VALUES ('orphan-sess', ?1, 'periodic', 'hash', 0, 0)",
+             VALUES ('orphan-sess', ?1, 'periodic', '0123456789abcdef', 0, 0)",
             [now],
         )
         .unwrap();
@@ -1347,7 +1620,7 @@ mod tests {
         conn.execute(
             "INSERT INTO session_checkpoints
              (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
-             VALUES ('orphan-sess', ?1, 'periodic', 'hash', 1, 0)",
+             VALUES ('orphan-sess', ?1, 'periodic', '0123456789abcdef', 1, 0)",
             [now],
         )
         .unwrap();
@@ -1375,6 +1648,48 @@ mod tests {
             count_pane_states(&conn),
             0,
             "no orphan pane_state may remain after one cleanup pass (ft-rt6ol)"
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_orphan_lifecycle_before_its_intent_checkpoint() {
+        let conn = make_test_db();
+        let now = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer");
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, metadata_json, checkpoint_role
+             ) VALUES (
+                 'orphan-attempt', ?1, 'startup', 'pending:rsi2',
+                 0, 0, '{\"restore_attempt\":{\"phase\":\"intent\"}}',
+                 'restore_intent'
+             )",
+            [now],
+        )
+        .expect("seed orphan restore intent");
+        let intent_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO restore_attempt_lifecycle (
+                 intent_checkpoint_id, session_id, source_checkpoint_id,
+                 status, created_at
+             ) VALUES (?1, 'orphan-attempt', ?2,
+                       'reconciliation_required', ?3)",
+            rusqlite::params![intent_id, intent_id + 1, now],
+        )
+        .expect("seed orphan restore lifecycle");
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        let (orphan_cp, orphan_ps) = cleanup_orphaned_data(&conn).unwrap();
+        assert_eq!((orphan_cp, orphan_ps), (1, 0));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM restore_attempt_lifecycle",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count retained lifecycle rows"),
+            0
         );
     }
 

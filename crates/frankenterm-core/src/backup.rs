@@ -2265,6 +2265,10 @@ mod tests {
                 response_json TEXT NOT NULL,
                 committed_at_ms INTEGER NOT NULL
             );
+            -- Projection-only redaction fixture, deliberately not a current
+            -- schema replica: this test needs only the sensitive column that
+            -- backup redaction rewrites. Current v38 checkpoint/lifecycle DDL
+            -- is exercised by storage and snapshot fixtures.
             CREATE TABLE session_checkpoints (
                 id INTEGER PRIMARY KEY,
                 metadata_json TEXT

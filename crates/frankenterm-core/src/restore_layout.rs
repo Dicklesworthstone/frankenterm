@@ -24,10 +24,10 @@ use crate::error::RuntimeOperationSource;
 use crate::session_topology::{PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot};
 use crate::wezterm::{SpawnTarget, SplitDirection, WeztermHandle};
 
-fn restore_cancelled_error(operation: &'static str, err: impl std::fmt::Display) -> crate::Error {
+fn restore_cancelled_error(operation: &'static str, _err: impl std::fmt::Display) -> crate::Error {
     crate::Error::RuntimeOperation {
         operation,
-        source: RuntimeOperationSource::Cancelled(err.to_string()),
+        source: RuntimeOperationSource::Cancelled("caller capability stopped".to_string()),
     }
 }
 
@@ -139,13 +139,19 @@ impl LayoutRestorer {
             cx.checkpoint().map_err(|err| {
                 restore_cancelled_error("restore_layout.restore.between_windows", err)
             })?;
-            match self.restore_window(window, win_idx, &mut result).await {
+            match self
+                .restore_window(cx, window, win_idx, &mut result)
+                .await
+            {
                 Ok(restored_any_tabs) => {
                     if restored_any_tabs {
                         result.windows_created += 1;
                     }
                 }
                 Err(e) => {
+                    cx.checkpoint().map_err(|err| {
+                        restore_cancelled_error("restore_layout.restore.window_failed", err)
+                    })?;
                     warn!(window_id = window.window_id, error = %e, "failed to restore window");
                     if !self.config.continue_on_error {
                         return Err(e);
@@ -168,6 +174,7 @@ impl LayoutRestorer {
     /// Restore a single window and all its tabs.
     async fn restore_window(
         &self,
+        cx: &crate::cx::Cx,
         window: &WindowSnapshot,
         win_idx: usize,
         result: &mut RestoreResult,
@@ -183,12 +190,15 @@ impl LayoutRestorer {
         let mut restored_any_tabs = false;
 
         for (tab_idx, tab) in window.tabs.iter().enumerate() {
+            cx.checkpoint().map_err(|err| {
+                restore_cancelled_error("restore_layout.restore_window.between_tabs", err)
+            })?;
             let target = SpawnTarget {
                 window_id: restored_window_id,
                 new_window: restored_window_id.is_none(),
             };
             match self
-                .restore_tab(tab, win_idx, tab_idx, target, result)
+                .restore_tab(cx, tab, win_idx, tab_idx, target, result)
                 .await
             {
                 Ok((window_id, active_pane_id)) => {
@@ -202,6 +212,9 @@ impl LayoutRestorer {
                     restored_any_tabs = true;
                 }
                 Err(e) => {
+                    cx.checkpoint().map_err(|err| {
+                        restore_cancelled_error("restore_layout.restore_window.tab_failed", err)
+                    })?;
                     record_failed_tree(result, &tab.pane_tree, &e.to_string());
                     warn!(tab_id = tab.tab_id, error = %e, "failed to restore tab");
                     if !self.config.continue_on_error {
@@ -212,7 +225,17 @@ impl LayoutRestorer {
         }
 
         if let Some(active_pane_id) = active_window_pane_id {
-            if let Err(e) = self.wezterm.activate_pane(active_pane_id).await {
+            cx.checkpoint().map_err(|err| {
+                restore_cancelled_error("restore_layout.restore_window.before_activate", err)
+            })?;
+            if let Err(e) = self
+                .wezterm
+                .activate_pane_with_cx(cx, active_pane_id)
+                .await
+            {
+                cx.checkpoint().map_err(|err| {
+                    restore_cancelled_error("restore_layout.restore_window.activate_failed", err)
+                })?;
                 debug!(pane_id = active_pane_id, error = %e, "failed to activate window pane");
             }
         }
@@ -223,6 +246,7 @@ impl LayoutRestorer {
     /// Restore a single tab with its pane tree.
     async fn restore_tab(
         &self,
+        cx: &crate::cx::Cx,
         tab: &TabSnapshot,
         win_idx: usize,
         tab_idx: usize,
@@ -236,6 +260,9 @@ impl LayoutRestorer {
             ?spawn_target,
             "restoring tab"
         );
+        cx.checkpoint().map_err(|err| {
+            restore_cancelled_error("restore_layout.restore_tab.preflight", err)
+        })?;
 
         // Get initial CWD from the first leaf in the pane tree.
         let initial_cwd = if self.config.restore_working_dirs {
@@ -247,14 +274,14 @@ impl LayoutRestorer {
         // Spawn the initial pane for this tab.
         let root_pane_id = self
             .wezterm
-            .spawn_targeted(initial_cwd.as_deref(), None, spawn_target)
+            .spawn_targeted_with_cx(cx, initial_cwd.as_deref(), None, spawn_target)
             .await?;
-        let root_pane = self.wezterm.get_pane(root_pane_id).await?;
+        let root_pane = self.wezterm.get_pane_with_cx(cx, root_pane_id).await?;
 
         debug!(root_pane_id, tab_idx, "spawned root pane for tab");
 
         // Recursively restore the pane tree within this tab.
-        self.restore_pane_tree(&tab.pane_tree, root_pane_id, result)
+        self.restore_pane_tree(cx, &tab.pane_tree, root_pane_id, result)
             .await?;
 
         let active_pane_id = tab
@@ -270,30 +297,26 @@ impl LayoutRestorer {
     /// requires boxing the future.
     fn restore_pane_tree<'a>(
         &'a self,
+        cx: &'a crate::cx::Cx,
         node: &'a PaneNode,
         current_pane_id: u64,
         result: &'a mut RestoreResult,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<()>> + Send + 'a>> {
         Box::pin(async move {
+            cx.checkpoint().map_err(|err| {
+                restore_cancelled_error("restore_layout.restore_pane_tree.node", err)
+            })?;
             match node {
-                PaneNode::Leaf { pane_id, cwd, .. } => {
+                PaneNode::Leaf { pane_id, .. } => {
                     result.pane_id_map.insert(*pane_id, current_pane_id);
                     result.panes_created += 1;
-
-                    if self.config.restore_working_dirs {
-                        if let Some(dir) = cwd {
-                            let path = normalize_cwd(dir);
-                            if !path.is_empty() {
-                                self.set_cwd(current_pane_id, &path).await;
-                            }
-                        }
-                    }
 
                     Ok(())
                 }
 
                 PaneNode::HSplit { children } => {
                     self.restore_split_children(
+                        cx,
                         children,
                         current_pane_id,
                         SplitDirection::Bottom,
@@ -304,6 +327,7 @@ impl LayoutRestorer {
 
                 PaneNode::VSplit { children } => {
                     self.restore_split_children(
+                        cx,
                         children,
                         current_pane_id,
                         SplitDirection::Right,
@@ -321,6 +345,7 @@ impl LayoutRestorer {
     /// is created by splitting from `current_pane_id` in the given direction.
     fn restore_split_children<'a>(
         &'a self,
+        cx: &'a crate::cx::Cx,
         children: &'a [(f64, PaneNode)],
         current_pane_id: u64,
         direction: SplitDirection,
@@ -333,11 +358,17 @@ impl LayoutRestorer {
 
             // First child uses the existing pane.
             let (_, first_child) = &children[0];
-            self.restore_pane_tree(first_child, current_pane_id, result)
+            self.restore_pane_tree(cx, first_child, current_pane_id, result)
                 .await?;
 
             // Remaining children: split from current_pane_id.
             for (i, (ratio, child)) in children.iter().enumerate().skip(1) {
+                cx.checkpoint().map_err(|err| {
+                    restore_cancelled_error(
+                        "restore_layout.restore_split_children.before_split",
+                        err,
+                    )
+                })?;
                 let percent = if self.config.restore_split_ratios {
                     let remaining_ratio: f64 = children[i..].iter().map(|(r, _)| r).sum();
                     if remaining_ratio > 0.0 {
@@ -358,7 +389,7 @@ impl LayoutRestorer {
 
                 match self
                     .wezterm
-                    .split_pane(current_pane_id, direction, cwd.as_deref(), percent)
+                    .split_pane_with_cx(cx, current_pane_id, direction, cwd.as_deref(), percent)
                     .await
                 {
                     Ok(new_pane_id) => {
@@ -369,9 +400,16 @@ impl LayoutRestorer {
                             percent,
                             "split pane created"
                         );
-                        self.restore_pane_tree(child, new_pane_id, result).await?;
+                        self.restore_pane_tree(cx, child, new_pane_id, result)
+                            .await?;
                     }
                     Err(e) => {
+                        cx.checkpoint().map_err(|err| {
+                            restore_cancelled_error(
+                                "restore_layout.restore_split_children.split_failed",
+                                err,
+                            )
+                        })?;
                         let leaf_ids = collect_leaf_ids(child);
                         warn!(
                             parent = current_pane_id,
@@ -393,13 +431,6 @@ impl LayoutRestorer {
         })
     }
 
-    /// Best-effort set working directory by sending a `cd` command.
-    async fn set_cwd(&self, pane_id: u64, path: &str) {
-        let cmd = format!("cd {}\n", shell_escape(path));
-        if let Err(e) = self.wezterm.send_text(pane_id, &cmd).await {
-            debug!(pane_id, path, error = %e, "failed to set cwd");
-        }
-    }
 }
 
 // =============================================================================
@@ -466,6 +497,7 @@ fn normalize_cwd(cwd: &str) -> String {
 }
 
 /// Minimal shell escaping for paths (wraps in single quotes).
+#[cfg(test)]
 fn shell_escape(s: &str) -> String {
     if s.contains('\'') {
         format!("'{}'", s.replace('\'', "'\\''"))
@@ -1328,10 +1360,11 @@ mod tests {
                 active_tab_index: None,
             };
             let mut result = RestoreResult::new();
+            let cx = crate::cx::for_request();
 
             assert!(
                 restorer
-                    .restore_window(&window, 0, &mut result)
+                    .restore_window(&cx, &window, 0, &mut result)
                     .await
                     .is_err()
             );
