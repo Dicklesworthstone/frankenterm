@@ -597,7 +597,7 @@ impl Workflow for HandleCompaction {
                         ctx_for_verified_send.expect("step 2 captures workflow context");
                     match submit_ctx.send_verified(&prompt).await {
                         Ok(submit) => verified_submit_step_result("handle_compaction", submit),
-                        Err(reason) => StepResult::abort(reason),
+                        Err(reason) => StepResult::abort(reason.to_string()),
                     }
                 }
 
@@ -1395,7 +1395,7 @@ impl Workflow for HandleUsageLimits {
                         &source,
                         || {
                             let mut c = ctx_clone.clone();
-                            async move { c.send_ctrl_c().await.map_err(ToString::to_string) }
+                            async move { c.send_ctrl_c().await.map_err(|error| error.to_string()) }
                         },
                         &options,
                     )
@@ -1721,14 +1721,9 @@ mod tests {
                     .await
                     .expect("seed pane");
 
-                let empty = HandleCompaction::wait_for_stable_output(
-                    storage.clone(),
-                    42,
-                    1,
-                    0,
-                )
-                .await
-                .expect("an empty target pane is immediately stable");
+                let empty = HandleCompaction::wait_for_stable_output(storage.clone(), 42, 1, 0)
+                    .await
+                    .expect("an empty target pane is immediately stable");
                 assert_eq!(empty.polls, 1);
                 assert_eq!(empty.last_activity_ms, None);
 
@@ -1736,14 +1731,10 @@ mod tests {
                     .append_segment(42, "recent activity", None)
                     .await
                     .expect("append target-pane activity");
-                let error = HandleCompaction::wait_for_stable_output(
-                    storage.clone(),
-                    42,
-                    u64::MAX,
-                    0,
-                )
-                .await
-                .expect_err("recent target-pane activity must honor the zero timeout");
+                let error =
+                    HandleCompaction::wait_for_stable_output(storage.clone(), 42, u64::MAX, 0)
+                        .await
+                        .expect_err("recent target-pane activity must honor the zero timeout");
                 assert!(error.contains("Stabilization timeout"));
                 assert!(error.contains(&segment.captured_at.to_string()));
 

@@ -498,13 +498,7 @@ impl WorkflowEngine {
         self.update_status_cx(
             &cx,
             storage,
-            WorkflowStatusUpdate::new(
-                execution_id,
-                status,
-                current_step,
-                wait_condition,
-                error,
-            ),
+            WorkflowStatusUpdate::new(execution_id, status, current_step, wait_condition, error),
         )
         .await
     }
@@ -575,13 +569,7 @@ impl WorkflowEngine {
         self.log_step_cx(
             &cx,
             storage,
-            WorkflowStepLogInput::new(
-                execution_id,
-                step_index,
-                step_name,
-                result,
-                started_at,
-            ),
+            WorkflowStepLogInput::new(execution_id, step_index, step_name, result, started_at),
         )
         .await
     }
@@ -1098,9 +1086,7 @@ pub(super) async fn fetch_workflow_start_action_id_with_cx(
         action_kind: Some("workflow_start".to_string()),
         ..Default::default()
     };
-    let mut rows = storage
-        .get_audit_actions_with_cx(cx, query)
-        .await?;
+    let mut rows = storage.get_audit_actions_with_cx(cx, query).await?;
     Ok(rows.pop().map(|row| row.id))
 }
 
@@ -2099,8 +2085,8 @@ mod tests {
     #[test]
     fn build_verification_refs_includes_wait_for() {
         let result = StepResult::wait_for_with_timeout(WaitCondition::pattern("test.rule"), 5000);
-        let refs = build_verification_refs(&result, None)
-            .expect("verification refs should serialize");
+        let refs =
+            build_verification_refs(&result, None).expect("verification refs should serialize");
         assert!(refs.is_some());
         let json: serde_json::Value = serde_json::from_str(&refs.unwrap()).unwrap();
         let arr = json.as_array().unwrap();
@@ -2115,8 +2101,8 @@ mod tests {
             WaitCondition::pane_idle(2000),
             10_000,
         );
-        let refs = build_verification_refs(&result, None)
-            .expect("verification refs should serialize");
+        let refs =
+            build_verification_refs(&result, None).expect("verification refs should serialize");
         assert!(refs.is_some());
         let json: serde_json::Value = serde_json::from_str(&refs.unwrap()).unwrap();
         let arr = json.as_array().unwrap();

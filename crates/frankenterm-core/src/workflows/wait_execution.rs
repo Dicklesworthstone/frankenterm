@@ -15,7 +15,7 @@ use super::*;
 
 use crate::ingest::Osc133State;
 use crate::patterns::PatternEngine;
-use crate::runtime_async::{sleep, sleep_with_cx};
+use crate::runtime_async::sleep_with_cx;
 use std::collections::HashSet;
 use std::sync::{Mutex, MutexGuard};
 
@@ -140,26 +140,43 @@ impl WaitConditionResult {
     }
 }
 
-fn wait_deadline_after(start: Instant, timeout: Duration, label: &str) -> Option<Instant> {
-    let deadline = start.checked_add(timeout);
-    if deadline.is_none() {
-        tracing::warn!(
-            timeout_ms = %timeout.as_millis(),
-            label,
-            "workflow wait timeout is too large for Instant; relying on max_polls"
-        );
-    }
-    deadline
+fn wait_clock_now(cx: &crate::cx::Cx) -> asupersync::Time {
+    cx.timer_driver()
+        .map_or_else(asupersync::time::wall_now, |driver| driver.now())
 }
 
-fn wait_timed_out(deadline: Option<Instant>, now: Instant) -> bool {
-    deadline.is_some_and(|deadline| now >= deadline)
+fn wait_deadline_after(
+    start: asupersync::Time,
+    timeout: Duration,
+    label: &str,
+) -> crate::Result<asupersync::Time> {
+    let timeout_nanos = u64::try_from(timeout.as_nanos()).map_err(|_| {
+        crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
+            "{label} timeout is too large: {timeout:?}"
+        )))
+    })?;
+    let deadline_nanos = start.as_nanos().checked_add(timeout_nanos).ok_or_else(|| {
+        crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
+            "{label} deadline overflows the runtime clock: start={start}, timeout={timeout:?}"
+        )))
+    })?;
+    Ok(asupersync::Time::from_nanos(deadline_nanos))
 }
 
-fn wait_remaining(deadline: Option<Instant>, now: Instant, fallback: Duration) -> Duration {
-    deadline
-        .map(|deadline| deadline.saturating_duration_since(now))
-        .unwrap_or(fallback)
+fn wait_timed_out(deadline: asupersync::Time, now: asupersync::Time) -> bool {
+    now >= deadline
+}
+
+fn wait_remaining(deadline: asupersync::Time, now: asupersync::Time) -> Duration {
+    Duration::from_nanos(deadline.duration_since(now))
+}
+
+fn wait_elapsed(start: asupersync::Time, now: asupersync::Time) -> Duration {
+    Duration::from_nanos(now.duration_since(start))
+}
+
+fn wait_elapsed_ms(start: asupersync::Time, now: asupersync::Time) -> u64 {
+    duration_millis_u64(wait_elapsed(start, now))
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {
@@ -172,39 +189,30 @@ fn wait_cancelled(label: &str, err: impl std::fmt::Display) -> crate::Error {
     )))
 }
 
-fn wait_checkpoint_maybe_cx(cx: Option<&crate::cx::Cx>, label: &str) -> crate::Result<()> {
-    if let Some(cx) = cx {
-        cx.checkpoint().map_err(|err| wait_cancelled(label, err))?;
-    }
-    Ok(())
+fn wait_checkpoint(cx: &crate::cx::Cx, label: &str) -> crate::Result<()> {
+    cx.checkpoint().map_err(|err| wait_cancelled(label, err))
 }
 
-async fn wait_sleep_maybe_cx(
-    cx: Option<&crate::cx::Cx>,
+async fn wait_sleep_with_cx(
+    cx: &crate::cx::Cx,
     duration: Duration,
     label: &str,
 ) -> crate::Result<()> {
-    let Some(cx) = cx else {
-        sleep(duration).await;
-        return Ok(());
-    };
-
-    let deadline = Instant::now().checked_add(duration).ok_or_else(|| {
+    Instant::now().checked_add(duration).ok_or_else(|| {
         crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
             "{label} duration is too large: {duration:?}"
         )))
     })?;
-    loop {
-        wait_checkpoint_maybe_cx(Some(cx), label)?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(());
-        }
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        wait_checkpoint(cx, label)?;
         let chunk = remaining.min(Duration::from_millis(50));
         sleep_with_cx(cx, chunk)
             .await
             .map_err(|err| wait_cancelled(label, err))?;
+        remaining = remaining.saturating_sub(chunk);
     }
+    Ok(())
 }
 
 /// Options for wait condition execution.
@@ -307,8 +315,8 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         context_pane_id: u64,
         timeout: Duration,
     ) -> crate::Result<WaitConditionResult> {
-        wait_checkpoint_maybe_cx(Some(cx), "wait execution")?;
-        self.execute_maybe_cx(Some(cx), condition, context_pane_id, timeout)
+        wait_checkpoint(cx, "wait execution")?;
+        self.execute_inner(cx, condition, context_pane_id, timeout)
             .await
     }
 
@@ -323,9 +331,9 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             .await
     }
 
-    async fn execute_maybe_cx(
+    async fn execute_inner(
         &self,
-        cx: Option<&crate::cx::Cx>,
+        cx: &crate::cx::Cx,
         condition: &WaitCondition,
         context_pane_id: u64,
         timeout: Duration,
@@ -361,7 +369,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 let dur = Duration::from_millis(*duration_ms);
                 if dur > timeout {
                     let timeout_ms = duration_millis_u64(timeout);
-                    wait_sleep_maybe_cx(cx, timeout, "sleep wait condition").await?;
+                    wait_sleep_with_cx(cx, timeout, "sleep wait condition").await?;
                     return Ok(WaitConditionResult::TimedOut {
                         elapsed_ms: timeout_ms,
                         polls: 0,
@@ -371,7 +379,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                     });
                 }
 
-                wait_sleep_maybe_cx(cx, dur, "sleep wait condition").await?;
+                wait_sleep_with_cx(cx, dur, "sleep wait condition").await?;
                 Ok(WaitConditionResult::Satisfied {
                     elapsed_ms: *duration_ms,
                     polls: 0,
@@ -394,25 +402,26 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                     });
                 };
 
-                let start = Instant::now();
-                let deadline = wait_deadline_after(start, timeout, "external");
+                let start = wait_clock_now(cx);
+                let deadline = wait_deadline_after(start, timeout, "external")?;
                 let mut polls = 0usize;
                 let mut interval = self.options.poll_initial;
                 loop {
-                    wait_checkpoint_maybe_cx(cx, "external signal wait")?;
+                    wait_checkpoint(cx, "external signal wait")?;
                     if registry.is_signaled(key) {
+                        let now = wait_clock_now(cx);
                         return Ok(WaitConditionResult::Satisfied {
-                            elapsed_ms: elapsed_ms(start),
+                            elapsed_ms: wait_elapsed_ms(start, now),
                             polls,
                             context: Some(format!("external signal '{key}' fired")),
                         });
                     }
 
                     polls += 1;
-                    let now = Instant::now();
+                    let now = wait_clock_now(cx);
                     if wait_timed_out(deadline, now) || polls >= self.options.max_polls {
                         return Ok(WaitConditionResult::TimedOut {
-                            elapsed_ms: elapsed_ms(start),
+                            elapsed_ms: wait_elapsed_ms(start, now),
                             polls,
                             last_observed: Some(format!(
                                 "external signal '{key}' not fired within {}ms",
@@ -421,10 +430,10 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                         });
                     }
 
-                    let remaining = wait_remaining(deadline, now, interval);
+                    let remaining = wait_remaining(deadline, now);
                     let sleep_duration = interval.min(remaining);
                     if !sleep_duration.is_zero() {
-                        wait_sleep_maybe_cx(cx, sleep_duration, "external signal wait").await?;
+                        wait_sleep_with_cx(cx, sleep_duration, "external signal wait").await?;
                     }
                     interval = interval.saturating_mul(2).min(self.options.poll_max);
                 }
@@ -438,13 +447,13 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
     /// for the specified rule_id. Stops early on match.
     async fn execute_pattern_wait(
         &self,
-        cx: Option<&crate::cx::Cx>,
+        cx: &crate::cx::Cx,
         pane_id: u64,
         rule_id: &str,
         timeout: Duration,
     ) -> crate::Result<WaitConditionResult> {
-        let start = Instant::now();
-        let deadline = wait_deadline_after(start, timeout, "pattern");
+        let start = wait_clock_now(cx);
+        let deadline = wait_deadline_after(start, timeout, "pattern")?;
         let mut polls = 0usize;
         let mut interval = self.options.poll_initial;
         let mut last_detection_summary: Option<String> = None;
@@ -452,18 +461,12 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         let timeout_ms = duration_millis_u64(timeout);
         tracing::info!(pane_id, rule_id, timeout_ms, "pattern_wait start");
 
-        // ft-xbnl0.2.3 tick 264: cx-first pattern-wait poll loop.
-        let poll_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         loop {
-            wait_checkpoint_maybe_cx(cx, "pattern wait")?;
+            wait_checkpoint(cx, "pattern wait")?;
             polls += 1;
 
             // Get pane text
-            let text_cx = cx.unwrap_or(&poll_cx);
-            let text = self
-                .source
-                .get_text_with_cx(text_cx, pane_id, false)
-                .await?;
+            let text = self.source.get_text_with_cx(cx, pane_id, false).await?;
             let tail = tail_text(&text, self.options.tail_lines);
 
             // Run pattern detection
@@ -471,7 +474,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
 
             // Check for matching rule
             if let Some(detection) = detections.iter().find(|d| d.rule_id == rule_id) {
-                let elapsed_ms = elapsed_ms(start);
+                let elapsed_ms = wait_elapsed_ms(start, wait_clock_now(cx));
                 tracing::info!(
                     pane_id,
                     rule_id,
@@ -494,9 +497,9 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             }
 
             // Check timeout
-            let now = Instant::now();
+            let now = wait_clock_now(cx);
             if wait_timed_out(deadline, now) || polls >= self.options.max_polls {
-                let elapsed_ms = elapsed_ms(start);
+                let elapsed_ms = wait_elapsed_ms(start, now);
                 tracing::info!(pane_id, rule_id, elapsed_ms, polls, "pattern_wait timeout");
                 return Ok(WaitConditionResult::TimedOut {
                     elapsed_ms,
@@ -506,10 +509,10 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             }
 
             // Sleep with backoff
-            let remaining = wait_remaining(deadline, now, interval);
+            let remaining = wait_remaining(deadline, now);
             let sleep_duration = interval.min(remaining);
             if !sleep_duration.is_zero() {
-                wait_sleep_maybe_cx(cx, sleep_duration, "pattern wait").await?;
+                wait_sleep_with_cx(cx, sleep_duration, "pattern wait").await?;
             }
 
             interval = interval.saturating_mul(2);
@@ -525,19 +528,19 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
     /// Fallback: Uses heuristic prompt matching if OSC 133 unavailable.
     async fn execute_pane_idle_wait(
         &self,
-        cx: Option<&crate::cx::Cx>,
+        cx: &crate::cx::Cx,
         pane_id: u64,
         idle_threshold_ms: u64,
         timeout: Duration,
     ) -> crate::Result<WaitConditionResult> {
-        let start = Instant::now();
-        let deadline = wait_deadline_after(start, timeout, "pane_idle");
+        let start = wait_clock_now(cx);
+        let deadline = wait_deadline_after(start, timeout, "pane_idle")?;
         let mut polls = 0usize;
         let mut interval = self.options.poll_initial;
         let idle_threshold = Duration::from_millis(idle_threshold_ms);
 
         // Track when we first observed idle state (for threshold)
-        let mut idle_since: Option<Instant> = None;
+        let mut idle_since: Option<asupersync::Time> = None;
         #[allow(unused_assignments)]
         let mut last_state_desc: Option<String> = None;
 
@@ -551,7 +554,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         );
 
         loop {
-            wait_checkpoint_maybe_cx(cx, "pane idle wait")?;
+            wait_checkpoint(cx, "pane idle wait")?;
             polls += 1;
 
             // Check idle state
@@ -560,11 +563,12 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
 
             if is_idle {
                 // Track idle duration
-                let idle_start = idle_since.get_or_insert_with(Instant::now);
-                let idle_duration = Instant::now().saturating_duration_since(*idle_start);
+                let now = wait_clock_now(cx);
+                let idle_start = idle_since.get_or_insert(now);
+                let idle_duration = wait_elapsed(*idle_start, now);
 
                 if idle_duration >= idle_threshold {
-                    let elapsed_ms = elapsed_ms(start);
+                    let elapsed_ms = wait_elapsed_ms(start, now);
                     tracing::info!(
                         pane_id,
                         elapsed_ms,
@@ -589,9 +593,9 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             }
 
             // Check timeout
-            let now = Instant::now();
+            let now = wait_clock_now(cx);
             if wait_timed_out(deadline, now) || polls >= self.options.max_polls {
-                let elapsed_ms = elapsed_ms(start);
+                let elapsed_ms = wait_elapsed_ms(start, now);
                 tracing::info!(pane_id, elapsed_ms, polls, "pane_idle_wait timeout");
                 return Ok(WaitConditionResult::TimedOut {
                     elapsed_ms,
@@ -601,10 +605,10 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             }
 
             // Sleep with backoff
-            let remaining = wait_remaining(deadline, now, interval);
+            let remaining = wait_remaining(deadline, now);
             let sleep_duration = interval.min(remaining);
             if !sleep_duration.is_zero() {
-                wait_sleep_maybe_cx(cx, sleep_duration, "pane idle wait").await?;
+                wait_sleep_with_cx(cx, sleep_duration, "pane idle wait").await?;
             }
 
             interval = interval.saturating_mul(2);
@@ -619,7 +623,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
     /// Returns (is_idle, description) for logging/debugging.
     async fn check_idle_state(
         &self,
-        cx: Option<&crate::cx::Cx>,
+        cx: &crate::cx::Cx,
         pane_id: u64,
     ) -> crate::Result<(bool, String)> {
         // Primary: Use OSC 133 state if available
@@ -633,12 +637,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         // Fallback: Use heuristic prompt detection
         if self.options.allow_idle_heuristics {
             // ft-xbnl0.2.3 tick 264: cx-first heuristic idle check.
-            let idle_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            let idle_cx = cx.unwrap_or(&idle_cx);
-            let text = self
-                .source
-                .get_text_with_cx(idle_cx, pane_id, false)
-                .await?;
+            let text = self.source.get_text_with_cx(cx, pane_id, false).await?;
             let (is_idle, desc) = heuristic_idle_check(&text, self.options.tail_lines);
             return Ok((is_idle, format!("heuristic:{desc}")));
         }
@@ -652,42 +651,39 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
     /// Waits until the tail content remains unchanged for `stable_for_ms`.
     async fn execute_stable_tail_wait(
         &self,
-        cx: Option<&crate::cx::Cx>,
+        cx: &crate::cx::Cx,
         pane_id: u64,
         stable_for_ms: u64,
         timeout: Duration,
     ) -> crate::Result<WaitConditionResult> {
-        let start = Instant::now();
-        let deadline = wait_deadline_after(start, timeout, "stable_tail");
+        let start = wait_clock_now(cx);
+        let deadline = wait_deadline_after(start, timeout, "stable_tail")?;
         let mut polls = 0usize;
         let mut interval = self.options.poll_initial;
         let stable_for = Duration::from_millis(stable_for_ms);
 
         let mut last_hash: Option<u64> = None;
-        let mut last_change_at = Instant::now();
+        let mut last_change_at = start;
         let mut last_tail_len: usize = 0;
 
         let timeout_ms = duration_millis_u64(timeout);
         tracing::info!(pane_id, stable_for_ms, timeout_ms, "stable_tail_wait start");
 
         loop {
-            wait_checkpoint_maybe_cx(cx, "stable tail wait")?;
+            wait_checkpoint(cx, "stable tail wait")?;
             polls += 1;
 
-            let text = if let Some(cx) = cx {
-                self.source.get_text_with_cx(cx, pane_id, false).await?
-            } else {
-                self.source.get_text(pane_id, false).await?
-            };
+            let text = self.source.get_text_with_cx(cx, pane_id, false).await?;
             let tail = tail_text(&text, self.options.tail_lines);
             let tail_hash = stable_hash(tail.as_bytes());
             let tail_len = tail.len();
 
             if let Some(prev_hash) = last_hash {
                 if prev_hash == tail_hash {
-                    let stable_duration = Instant::now().saturating_duration_since(last_change_at);
+                    let now = wait_clock_now(cx);
+                    let stable_duration = wait_elapsed(last_change_at, now);
                     if stable_duration >= stable_for {
-                        let elapsed_ms = elapsed_ms(start);
+                        let elapsed_ms = wait_elapsed_ms(start, now);
                         tracing::info!(
                             pane_id,
                             elapsed_ms,
@@ -708,10 +704,10 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                         });
                     }
                 } else {
-                    last_change_at = Instant::now();
+                    last_change_at = wait_clock_now(cx);
                 }
             } else {
-                last_change_at = Instant::now();
+                last_change_at = wait_clock_now(cx);
             }
 
             last_hash = Some(tail_hash);
@@ -719,9 +715,9 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 last_tail_len = tail_len;
             }
 
-            let now = Instant::now();
+            let now = wait_clock_now(cx);
             if wait_timed_out(deadline, now) || polls >= self.options.max_polls {
-                let elapsed_ms = elapsed_ms(start);
+                let elapsed_ms = wait_elapsed_ms(start, now);
                 tracing::info!(pane_id, elapsed_ms, polls, "stable_tail_wait timeout");
                 let last_observed = last_hash.map(|hash| {
                     let tail_len = last_tail_len;
@@ -737,10 +733,10 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 });
             }
 
-            let remaining = wait_remaining(deadline, now, interval);
+            let remaining = wait_remaining(deadline, now);
             let sleep_duration = interval.min(remaining);
             if !sleep_duration.is_zero() {
-                wait_sleep_maybe_cx(cx, sleep_duration, "stable tail wait").await?;
+                wait_sleep_with_cx(cx, sleep_duration, "stable tail wait").await?;
             }
 
             interval = interval.saturating_mul(2);
@@ -752,7 +748,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
 
     async fn execute_text_match_wait(
         &self,
-        cx: Option<&crate::cx::Cx>,
+        cx: &crate::cx::Cx,
         pane_id: u64,
         matcher: &TextMatch,
         timeout: Duration,
@@ -766,13 +762,9 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             max_polls: self.options.max_polls,
         });
 
-        let result = if let Some(cx) = cx {
-            waiter
-                .wait_for_with_cx(cx, pane_id, &wait_matcher, timeout)
-                .await?
-        } else {
-            waiter.wait_for(pane_id, &wait_matcher, timeout).await?
-        };
+        let result = waiter
+            .wait_for_with_cx(cx, pane_id, &wait_matcher, timeout)
+            .await?;
         match result {
             WaitResult::Matched { elapsed_ms, polls } => Ok(WaitConditionResult::Satisfied {
                 elapsed_ms,
@@ -1654,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn external_signal_wait_handles_unrepresentable_timeout() {
+    fn external_signal_wait_rejects_unrepresentable_timeout() {
         let rt = test_runtime();
         let source = MockPaneSource::new(vec![]);
         let engine = PatternEngine::new();
@@ -1672,17 +1664,14 @@ mod tests {
         let condition = WaitCondition::External {
             key: "never_fires".to_string(),
         };
-        let result = rt
+        let error = rt
             .block_on(executor.execute(&condition, 1, Duration::MAX))
-            .unwrap();
+            .expect_err("unrepresentable timeout must fail closed");
 
         assert!(
-            result.is_timed_out(),
-            "unrepresentable timeout should fall back to max_polls"
+            error.to_string().contains("timeout is too large"),
+            "unexpected overflow error: {error}"
         );
-        if let WaitConditionResult::TimedOut { polls, .. } = result {
-            assert_eq!(polls, 1);
-        }
     }
 
     // ========================================================================
@@ -2224,5 +2213,128 @@ mod tests {
             // PaneWaiter enforces max_polls, so total polls should be small
             assert!(polls <= 5, "should respect max_polls, got {polls}");
         }
+    }
+
+    #[test]
+    fn sleep_wait_uses_cx_virtual_time_without_wall_delay() {
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_task = std::sync::Arc::clone(&completed);
+        let wall_start = Instant::now();
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(7301)
+                .with_auto_advance()
+                .worker_count(2)
+                .max_steps(50_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::Cx::current().expect("LabRuntime task should expose Cx");
+                let source = MockPaneSource::new(Vec::new());
+                let engine = PatternEngine::new();
+                let executor = WaitConditionExecutor::new(&source, &engine);
+                let result = executor
+                    .execute_with_cx(
+                        &cx,
+                        &WaitCondition::Sleep { duration_ms: 5_000 },
+                        1,
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .expect("virtual-time sleep wait should complete");
+                assert!(result.is_satisfied());
+                assert_eq!(result.elapsed_ms(), Some(5_000));
+                completed_task.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .expect("spawn virtual-time wait task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+
+        let report = runtime.run_with_auto_advance();
+
+        assert!(
+            !matches!(
+                report.termination,
+                asupersync::lab::AutoAdvanceTermination::StuckBailout
+            ),
+            "LabRuntime wait should not get stuck: {:?}",
+            report.termination
+        );
+        assert!(
+            runtime.now() >= asupersync::Time::from_secs(5),
+            "virtual time should advance through the five-second wait"
+        );
+        assert!(
+            wall_start.elapsed() < Duration::from_secs(1),
+            "virtual-time wait must not consume five wall-clock seconds"
+        );
+        assert!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            "wait task should complete"
+        );
+    }
+
+    #[test]
+    fn external_wait_timeout_uses_same_cx_virtual_clock() {
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed_task = std::sync::Arc::clone(&observed);
+        let wall_start = Instant::now();
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(7302)
+                .with_auto_advance()
+                .worker_count(2)
+                .max_steps(50_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::Cx::current().expect("LabRuntime task should expose Cx");
+                let source = MockPaneSource::new(Vec::new());
+                let engine = PatternEngine::new();
+                let signals = ExternalSignalRegistry::new();
+                let executor =
+                    WaitConditionExecutor::new(&source, &engine).with_external_signals(&signals);
+                let result = executor
+                    .execute_with_cx(
+                        &cx,
+                        &WaitCondition::External {
+                            key: "never-fired".to_string(),
+                        },
+                        1,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .expect("virtual-time external wait should produce timeout result");
+                *observed_task.lock().expect("result lock") = Some(result);
+            })
+            .expect("spawn virtual-time external wait task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+
+        let report = runtime.run_with_auto_advance();
+        let result = observed
+            .lock()
+            .expect("result lock")
+            .take()
+            .expect("external wait task should store its result");
+
+        assert!(result.is_timed_out(), "unexpected result: {result:?}");
+        assert_eq!(result.elapsed_ms(), Some(5_000));
+        assert!(
+            !matches!(
+                report.termination,
+                asupersync::lab::AutoAdvanceTermination::StuckBailout
+            ),
+            "LabRuntime external wait should not get stuck: {:?}",
+            report.termination
+        );
+        assert!(
+            wall_start.elapsed() < Duration::from_secs(1),
+            "virtual-time timeout must not consume five wall-clock seconds"
+        );
     }
 }

@@ -1191,7 +1191,7 @@ async fn execute_atomic_descriptor_step(
                 Ok(InjectionResult::Error { error, .. }) => {
                     StepResult::abort(format!("Control send failed: {error}"))
                 }
-                Err(err) => StepResult::abort(err),
+                Err(err) => StepResult::abort(err.to_string()),
             }
         }
         DescriptorStep::Notify { message, id, .. } => {
