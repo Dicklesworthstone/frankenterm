@@ -86,7 +86,6 @@ fn inject_multiple_panes() {
 fn inject_skips_unmapped_panes() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let mock = Arc::new(MockWezterm::new());
         let injector = make_injector();
 
         let pane_id_map = HashMap::new();
@@ -164,7 +163,6 @@ fn inject_large_scrollback_does_not_write() {
 fn inject_no_scrollbacks() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let mock = Arc::new(MockWezterm::new());
         let injector = make_injector();
 
         let pane_id_map = HashMap::new();
