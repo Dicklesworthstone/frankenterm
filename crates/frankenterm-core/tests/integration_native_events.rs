@@ -1,13 +1,23 @@
-#![cfg(unix)]
+#![cfg(all(
+    unix,
+    any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
 
 use base64::Engine as _;
 use frankenterm_core::native_events::{
     NativeEvent, NativeEventError, NativeEventListener, NativePaneState, WireEvent, WirePaneState,
-    native_output_truncation_gap_reason,
+    native_output_truncation_gap_reason, validate_native_event_socket_endpoint,
 };
 use frankenterm_core::runtime_async::mpsc;
 use frankenterm_core::runtime_async::unix::{self as event_socket, AsyncWriteExt};
 use frankenterm_core::runtime_async::{self, CompatRuntime, RuntimeBuilder, task};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -310,6 +320,106 @@ fn bind_errors_and_drop_cleanup_are_public_contracts() {
             !socket_path.exists(),
             "socket path should be removed after listener drop"
         );
+    });
+}
+
+#[test]
+fn listener_enforces_private_directory_socket_and_owner_contracts() {
+    run_async_test(async {
+        let root = tempfile::tempdir().expect("tempdir");
+        let secure_parent = root.path().join("native-events-private");
+        let socket_path = secure_parent.join("events.sock");
+        let listener = NativeEventListener::bind(socket_path.clone())
+            .await
+            .expect("bind secure native event listener");
+
+        let parent_metadata = std::fs::symlink_metadata(&secure_parent)
+            .expect("read native event parent metadata");
+        let socket_metadata = std::fs::symlink_metadata(&socket_path)
+            .expect("read native event socket metadata");
+        assert_eq!(parent_metadata.permissions().mode() & 0o7777, 0o700);
+        assert_eq!(socket_metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(parent_metadata.uid(), socket_metadata.uid());
+        validate_native_event_socket_endpoint(&socket_path)
+            .expect("secured endpoint should pass GUI-side validation");
+
+        drop(listener);
+        assert!(!socket_path.exists());
+    });
+}
+
+#[test]
+fn listener_rejects_relative_paths_and_open_parent_directories() {
+    run_async_test(async {
+        let relative = NativeEventListener::bind(std::path::PathBuf::from("events.sock")).await;
+        assert!(matches!(
+            relative,
+            Err(NativeEventError::Security(
+                frankenterm_core::native_events::NativeEventSecurityError::RelativeSocketPath
+            ))
+        ));
+
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("make parent deliberately non-private");
+        let result = NativeEventListener::bind(root.path().join("events.sock")).await;
+        assert!(matches!(
+            result,
+            Err(NativeEventError::Security(
+                frankenterm_core::native_events::NativeEventSecurityError::ParentModeMismatch {
+                    actual_mode: 0o755
+                }
+            ))
+        ));
+    });
+}
+
+#[test]
+fn listener_rejects_symlinked_socket_parent() {
+    run_async_test(async {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real_parent = root.path().join("real-private-parent");
+        std::fs::create_dir(&real_parent).expect("create private parent");
+        std::fs::set_permissions(&real_parent, std::fs::Permissions::from_mode(0o700))
+            .expect("secure real parent");
+        let symlink_parent = root.path().join("linked-parent");
+        std::os::unix::fs::symlink(&real_parent, &symlink_parent)
+            .expect("create parent symlink");
+
+        let result = NativeEventListener::bind(symlink_parent.join("events.sock")).await;
+        assert!(matches!(
+            result,
+            Err(NativeEventError::Security(
+                frankenterm_core::native_events::NativeEventSecurityError::ParentNotDirectory
+            ))
+        ));
+        assert!(
+            !real_parent.join("events.sock").exists(),
+            "a rejected symlink parent must receive no socket side effect"
+        );
+    });
+}
+
+#[test]
+fn listener_drop_preserves_replacement_socket_identity() {
+    run_async_test(async {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket_path = root.path().join("identity.sock");
+        let displaced_path = root.path().join("identity.original.sock");
+        let listener = NativeEventListener::bind(socket_path.clone())
+            .await
+            .expect("bind original native event listener");
+
+        std::fs::rename(&socket_path, &displaced_path).expect("displace original socket path");
+        let replacement = std::os::unix::net::UnixListener::bind(&socket_path)
+            .expect("bind replacement socket");
+        drop(listener);
+
+        assert!(
+            socket_path.exists(),
+            "dropping the original listener must not unlink a replacement inode"
+        );
+        drop(replacement);
     });
 }
 

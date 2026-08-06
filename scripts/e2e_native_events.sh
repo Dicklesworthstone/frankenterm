@@ -1,29 +1,66 @@
 #!/usr/bin/env bash
 # e2e_native_events.sh — End-to-end validation of the native event bridge.
 #
-# Tests that frankenterm-gui pushes events to ft watch over the native
-# event socket, replacing polling with real-time push.
+# Tests authenticated native-bridge connection and disconnect lifecycle.
+# Raw pane-output bytes are not emitted by the current GUI bridge; polling
+# remains the authoritative text-capture path.
 #
 # Prerequisites:
 #   - frankenterm (CLI binary with ft watch subcommand) built and on PATH
 #   - frankenterm-gui built and on PATH (or use FRANKENTERM_GUI env var)
-#   - No other ft watch instance running on the same socket
+#   - A graphical session in which launching the GUI is acceptable
 #
-# Usage: ./scripts/e2e_native_events.sh
+# This test opens a real GUI window and may take focus. It is deliberately
+# guarded against accidental/agent execution.
+# Usage: FRANKENTERM_ALLOW_GUI_E2E=1 ./scripts/e2e_native_events.sh
 #
 # Exit codes:
 #   0 = all checks passed
 #   1 = one or more checks failed
+#   2 = disruptive GUI launch was not explicitly authorized
 
 set -euo pipefail
 
-SOCKET_PATH="${WEZTERM_FT_SOCKET:-/tmp/wa/events.sock}"
+if [ "${FRANKENTERM_ALLOW_GUI_E2E:-}" != "1" ]; then
+    echo "refusing to launch FrankenTerm GUI without FRANKENTERM_ALLOW_GUI_E2E=1" >&2
+    exit 2
+fi
+
 FT_GUI="${FRANKENTERM_GUI:-frankenterm-gui}"
 FT_CLI="${FRANKENTERM_CLI:-frankenterm}"
 LOG_DIR=$(mktemp -d /tmp/e2e-native-events.XXXXXX)
-CANARY="CANARY_$(date +%s)_$$"
+WORKSPACE_DIR="$LOG_DIR/workspace"
+NATIVE_RUNTIME_DIR="$WORKSPACE_DIR/native-runtime"
+SOCKET_PATH="$NATIVE_RUNTIME_DIR/events.sock"
+CONFIG_PATH="$WORKSPACE_DIR/ft.toml"
 PASS=0
 FAIL=0
+
+case "$(uname -s)" in
+    Darwin|Linux|FreeBSD|DragonFly) ;;
+    *)
+        echo "native event E2E requires an authenticated Unix peer-credential target" >&2
+        exit 1
+        ;;
+esac
+
+# Preserve relative executable paths before entering the isolated workspace.
+START_DIR=$(pwd -P)
+case "$FT_GUI" in
+    /*) ;;
+    */*) FT_GUI="$START_DIR/$FT_GUI" ;;
+esac
+case "$FT_CLI" in
+    /*) ;;
+    */*) FT_CLI="$START_DIR/$FT_CLI" ;;
+esac
+
+mkdir -m 700 "$WORKSPACE_DIR" "$NATIVE_RUNTIME_DIR"
+{
+    echo '[native]'
+    echo 'enabled = true'
+    printf 'socket_path = "%s"\n' "$SOCKET_PATH"
+} >"$CONFIG_PATH"
 
 # Invoked through the EXIT trap below.
 # shellcheck disable=SC2329
@@ -50,17 +87,20 @@ check() {
 
 echo "=== Native Event Bridge E2E Test ==="
 echo "Socket: $SOCKET_PATH"
-echo "Canary: $CANARY"
+echo "Config: $CONFIG_PATH"
 echo "Log dir: $LOG_DIR"
 echo ""
 
-# Step 1: Clean up any stale socket
-rm -f "$SOCKET_PATH"
-
-# Step 2: Start ft watch in foreground mode
+# Step 1: Start ft watch in foreground mode with an isolated, explicitly
+# enabled native-event configuration. The listener exclusively owns
+# authenticated, identity-pinned stale-socket cleanup; this harness must never
+# unlink a caller-selected path.
 echo "[step 1] Starting ft watch..."
-RUST_LOG=info "$FT_CLI" watch --foreground \
-    >"$LOG_DIR/watch-stdout.log" 2>"$LOG_DIR/watch-stderr.log" &
+(
+    cd "$WORKSPACE_DIR"
+    exec env RUST_LOG=info WEZTERM_FT_SOCKET="$SOCKET_PATH" \
+        "$FT_CLI" --config "$CONFIG_PATH" --workspace "$WORKSPACE_DIR" watch --foreground
+) >"$LOG_DIR/watch-stdout.log" 2>"$LOG_DIR/watch-stderr.log" &
 WATCH_PID=$!
 sleep 2
 
@@ -72,10 +112,15 @@ else
     exit 1
 fi
 
-# Step 3: Start frankenterm-gui
+# Step 2: Start frankenterm-gui from the same isolated directory. Its ft-core
+# configuration loader reads ./ft.toml; the explicit environment value is the
+# same path and cannot bypass disablement because the config enables native
+# events first.
 echo "[step 2] Starting frankenterm-gui..."
-RUST_LOG=info "$FT_GUI" \
-    >"$LOG_DIR/gui-stdout.log" 2>"$LOG_DIR/gui-stderr.log" &
+(
+    cd "$WORKSPACE_DIR"
+    exec env RUST_LOG=info WEZTERM_FT_SOCKET="$SOCKET_PATH" "$FT_GUI"
+) >"$LOG_DIR/gui-stdout.log" 2>"$LOG_DIR/gui-stderr.log" &
 GUI_PID=$!
 sleep 3
 
@@ -87,7 +132,7 @@ else
     exit 1
 fi
 
-# Step 4: Check that native event bridge connected
+# Step 3: Check that the authenticated native event bridge connected.
 if grep -q "Native event bridge: socket found" "$LOG_DIR/gui-stderr.log" 2>/dev/null; then
     check "GUI connected to native event socket" "pass"
 elif grep -q "native_bridge" "$LOG_DIR/gui-stderr.log" 2>/dev/null; then
@@ -96,14 +141,14 @@ else
     check "GUI connected to native event socket" "fail"
 fi
 
-# Step 5: Check ft watch logged native push mode
-if grep -q "native push events\|Native event listener bound" "$LOG_DIR/watch-stderr.log" 2>/dev/null; then
-    check "ft watch detected native push mode" "pass"
+# Step 4: Check ft watch bound the explicitly enabled listener.
+if grep -q "Starting explicitly enabled native event listener\|Native event listener bound" "$LOG_DIR/watch-stderr.log" 2>/dev/null; then
+    check "ft watch bound explicitly enabled native listener" "pass"
 else
-    check "ft watch detected native push mode" "fail"
+    check "ft watch bound explicitly enabled native listener" "fail"
 fi
 
-# Step 6: Kill GUI and verify ft watch stays alive
+# Step 5: Stop the harness-owned GUI and verify ft watch stays alive.
 echo "[step 3] Killing GUI, checking ft watch resilience..."
 kill "$GUI_PID" 2>/dev/null || true
 wait "$GUI_PID" 2>/dev/null || true

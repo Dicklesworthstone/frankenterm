@@ -56,25 +56,22 @@ fn classify_ipc_connection_task_drain(
     timed_out: bool,
     settlement: JoinSetSettlement,
 ) -> IpcConnectionTaskDrainOutcome {
-    let (active_tasks, unacknowledged_tasks) = match settlement {
-        JoinSetSettlement::Settled => (0, 0),
+    match settlement {
+        JoinSetSettlement::Settled => IpcConnectionTaskDrainOutcome::Settled,
         JoinSetSettlement::Incomplete {
             active_tasks,
             unacknowledged_tasks,
-        } => (active_tasks, unacknowledged_tasks),
-    };
-    if timed_out {
-        IpcConnectionTaskDrainOutcome::TimedOut {
+        } if timed_out => IpcConnectionTaskDrainOutcome::TimedOut {
             active_tasks,
             unacknowledged_tasks,
-        }
-    } else if active_tasks == 0 && unacknowledged_tasks == 0 {
-        IpcConnectionTaskDrainOutcome::Settled
-    } else {
-        IpcConnectionTaskDrainOutcome::Incomplete {
+        },
+        JoinSetSettlement::Incomplete {
             active_tasks,
             unacknowledged_tasks,
-        }
+        } => IpcConnectionTaskDrainOutcome::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        },
     }
 }
 
@@ -1272,17 +1269,29 @@ impl IpcServer {
             &drain_cx,
             IPC_CONNECTION_TASK_DRAIN_TIMEOUT,
             async {
-                while let Some(join_result) = connection_tasks.join_next().await {
-                    if let Err(join_err) = join_result {
-                        tracing::debug!(
-                            error = %join_err,
-                            "IPC client task failed during shutdown"
-                        );
+                loop {
+                    match connection_tasks.drain_next_with_cx(&drain_cx).await {
+                        Ok(Some(join_result)) => {
+                            if let Err(join_err) = join_result {
+                                tracing::debug!(
+                                    error = %join_err,
+                                    "IPC client task failed during shutdown"
+                                );
+                            }
+                        }
+                        Ok(None) => return Ok(()),
+                        Err(drain_error) => return Err(drain_error),
                     }
                 }
             },
         )
         .await;
+        if let Ok(Err(drain_error)) = &drain_result {
+            tracing::error!(
+                failure_class = ?drain_error.kind(),
+                "IPC connection task drain context failed before terminal settlement"
+            );
+        }
         match classify_ipc_connection_task_drain(
             drain_result.is_err(),
             connection_tasks.settlement(),
@@ -2385,9 +2394,9 @@ fn registry_lock_error_response(error: LockAcquireError) -> IpcResponse {
         ),
         LockAcquireError::Poisoned | LockAcquireError::PolledAfterCompletion => {
             IpcResponse::error_with_code(
-            "ipc.registry_lock_failed",
-            format!("pane registry lock failed: {error}"),
-            Some("Retry the request; restart the watcher if the failure persists.".to_string()),
+                "ipc.registry_lock_failed",
+                format!("pane registry lock failed: {error}"),
+                Some("Retry the request; restart the watcher if the failure persists.".to_string()),
             )
         }
     }
@@ -3557,9 +3566,19 @@ mod tests {
         );
         assert_eq!(
             classify_ipc_connection_task_drain(true, JoinSetSettlement::Settled),
+            IpcConnectionTaskDrainOutcome::Settled
+        );
+        assert_eq!(
+            classify_ipc_connection_task_drain(
+                true,
+                JoinSetSettlement::Incomplete {
+                    active_tasks: 2,
+                    unacknowledged_tasks: 1,
+                },
+            ),
             IpcConnectionTaskDrainOutcome::TimedOut {
-                active_tasks: 0,
-                unacknowledged_tasks: 0,
+                active_tasks: 2,
+                unacknowledged_tasks: 1,
             }
         );
     }

@@ -2,35 +2,55 @@
 //!
 //! Listens on a local socket for newline-delimited JSON events emitted by a
 //! vendored WezTerm build (feature-gated on the WezTerm side). Unix uses the
-//! existing Unix-domain-socket path; Windows uses the in-tree `frankenterm-uds`
-//! Windows transport.
+//! existing Unix-domain-socket path; supported Unix targets authenticate both
+//! endpoint ownership and peer credentials. Other targets fail closed until
+//! they provide an equivalent peer-identity contract.
 
 #![forbid(unsafe_code)]
 
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(any(unix, windows))]
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 #[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
+use std::os::fd::AsFd;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream as StdUnixStream;
 
 use crate::runtime_async::mpsc;
+#[cfg(any(unix, windows))]
 use crate::runtime_async::task::{JoinSet, JoinSetSettlement};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 #[cfg(any(unix, windows))]
 use socket_transport::{UnixListener, UnixStream};
+#[cfg(any(unix, windows))]
 use tracing::{debug, warn};
 
 const MAX_EVENT_LINE_BYTES: usize = 512 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+#[cfg(any(unix, windows))]
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(any(unix, windows))]
+const ACCEPT_ERROR_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
+#[cfg(any(unix, windows))]
+const ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_secs(1);
 const EVENT_SEND_TIMEOUT: Duration = Duration::from_millis(25);
+#[cfg(any(unix, windows))]
 const NATIVE_CONNECTION_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(unix)]
+const NATIVE_SOCKET_DIRECTORY_MODE: u32 = 0o700;
+#[cfg(unix)]
+const NATIVE_SOCKET_MODE: u32 = 0o600;
 
+#[cfg(any(unix, windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeConnectionTaskDrainOutcome {
     Settled,
@@ -44,37 +64,102 @@ enum NativeConnectionTaskDrainOutcome {
     },
 }
 
+#[cfg(any(unix, windows))]
 fn classify_native_connection_task_drain(
     timed_out: bool,
     settlement: JoinSetSettlement,
 ) -> NativeConnectionTaskDrainOutcome {
-    let (active_tasks, unacknowledged_tasks) = match settlement {
-        JoinSetSettlement::Settled => (0, 0),
+    match settlement {
+        JoinSetSettlement::Settled => NativeConnectionTaskDrainOutcome::Settled,
         JoinSetSettlement::Incomplete {
             active_tasks,
             unacknowledged_tasks,
-        } => (active_tasks, unacknowledged_tasks),
-    };
-    if timed_out {
-        NativeConnectionTaskDrainOutcome::TimedOut {
+        } if timed_out => NativeConnectionTaskDrainOutcome::TimedOut {
             active_tasks,
             unacknowledged_tasks,
-        }
-    } else if active_tasks == 0 && unacknowledged_tasks == 0 {
-        NativeConnectionTaskDrainOutcome::Settled
-    } else {
-        NativeConnectionTaskDrainOutcome::Incomplete {
+        },
+        JoinSetSettlement::Incomplete {
             active_tasks,
             unacknowledged_tasks,
-        }
+        } => NativeConnectionTaskDrainOutcome::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        },
     }
 }
 
+#[cfg(any(unix, windows))]
 fn native_context_io_error(operation: &'static str) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::Interrupted,
         format!("native_event_context_interrupted:{operation}"),
     )
+}
+
+#[cfg(any(unix, windows))]
+fn native_accept_error_is_permanent(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::InvalidData
+            | std::io::ErrorKind::Unsupported
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::BrokenPipe
+    )
+}
+
+/// Finite security failure classes for the local native-event transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum NativeEventSecurityError {
+    #[error("native event socket path must be absolute")]
+    RelativeSocketPath,
+    #[error("native event socket path has no parent directory")]
+    MissingSocketParent,
+    #[error("native event socket parent is not a real directory")]
+    ParentNotDirectory,
+    #[error("native event socket parent owner mismatch: expected uid {expected_uid}, got {actual_uid}")]
+    ParentOwnerMismatch {
+        expected_uid: u32,
+        actual_uid: u32,
+    },
+    #[error("native event socket parent mode must be 0700, got {actual_mode:#o}")]
+    ParentModeMismatch { actual_mode: u32 },
+    #[error("native event endpoint is not a Unix socket")]
+    EndpointNotSocket,
+    #[error("native event endpoint owner mismatch: expected uid {expected_uid}, got {actual_uid}")]
+    EndpointOwnerMismatch {
+        expected_uid: u32,
+        actual_uid: u32,
+    },
+    #[error("native event endpoint mode must be 0600, got {actual_mode:#o}")]
+    EndpointModeMismatch { actual_mode: u32 },
+    #[error("native event socket identity changed before cleanup")]
+    SocketIdentityChanged,
+    #[error("native event peer credentials are unavailable on this platform or build")]
+    PeerCredentialsUnavailable,
+    #[error("native event peer uid mismatch: expected {expected_uid}, got {actual_uid}")]
+    PeerUidMismatch {
+        expected_uid: u32,
+        actual_uid: u32,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeSocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl NativeSocketIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
 }
 
 /// Capture-gap reason prefix emitted when a native pane-output frame is
@@ -337,10 +422,234 @@ pub enum NativeEvent {
 pub enum NativeEventError {
     #[error("socket path is empty")]
     EmptySocketPath,
+    #[error("native event operation requires an ambient capability context")]
+    ContextUnavailable,
     #[error("socket path already exists: {0}")]
     SocketAlreadyExists(String),
+    #[error(transparent)]
+    Security(#[from] NativeEventSecurityError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+#[cfg(all(unix, feature = "native-wezterm"))]
+fn native_effective_uid() -> u32 {
+    nix::unistd::Uid::effective().as_raw()
+}
+
+#[cfg(all(unix, not(feature = "native-wezterm")))]
+fn native_effective_uid() -> Result<u32, NativeEventError> {
+    Err(NativeEventSecurityError::PeerCredentialsUnavailable.into())
+}
+
+#[cfg(all(unix, feature = "native-wezterm"))]
+fn native_peer_effective_uid<F: AsFd>(stream: &F) -> Result<u32, NativeEventError> {
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        return nix::sys::socket::getsockopt(
+            stream,
+            nix::sys::socket::sockopt::LocalPeerCred,
+        )
+        .map(|credentials| credentials.uid())
+        .map_err(|_| NativeEventSecurityError::PeerCredentialsUnavailable.into());
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        return nix::sys::socket::getsockopt(
+            stream,
+            nix::sys::socket::sockopt::PeerCredentials,
+        )
+        .map(|credentials| credentials.uid())
+        .map_err(|_| NativeEventSecurityError::PeerCredentialsUnavailable.into());
+    }
+
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "android",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        let _ = stream;
+        Err(NativeEventSecurityError::PeerCredentialsUnavailable.into())
+    }
+}
+
+/// Whether this target exposes a peer-credential socket option supported by
+/// the native-event authentication implementation.
+#[cfg(unix)]
+const fn native_peer_credentials_supported() -> bool {
+    cfg!(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+    ))
+}
+
+#[cfg(all(unix, not(feature = "native-wezterm")))]
+fn native_peer_effective_uid<F: AsFd>(_stream: &F) -> Result<u32, NativeEventError> {
+    Err(NativeEventSecurityError::PeerCredentialsUnavailable.into())
+}
+
+/// Require a connected native-event peer to run under this process's
+/// effective user ID. Credential lookup failures are fail-closed.
+///
+/// # Errors
+///
+/// Returns a finite [`NativeEventSecurityError`] when peer credentials are
+/// unavailable or the peer's effective user ID differs from this process.
+#[cfg(unix)]
+pub fn validate_native_event_peer<F: AsFd>(stream: &F) -> Result<(), NativeEventError> {
+    #[cfg(feature = "native-wezterm")]
+    let expected_uid = native_effective_uid();
+    #[cfg(not(feature = "native-wezterm"))]
+    let expected_uid = native_effective_uid()?;
+    let actual_uid = native_peer_effective_uid(stream)?;
+    validate_native_event_peer_uids(expected_uid, actual_uid)
+}
+
+#[cfg(unix)]
+fn validate_native_event_peer_uids(
+    expected_uid: u32,
+    actual_uid: u32,
+) -> Result<(), NativeEventError> {
+    if actual_uid != expected_uid {
+        return Err(NativeEventSecurityError::PeerUidMismatch {
+            expected_uid,
+            actual_uid,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_native_socket_parent(
+    socket_path: &Path,
+    expected_uid: u32,
+) -> Result<(), NativeEventError> {
+    if !socket_path.is_absolute() {
+        return Err(NativeEventSecurityError::RelativeSocketPath.into());
+    }
+    let parent = socket_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(NativeEventSecurityError::MissingSocketParent)?;
+    let metadata = std::fs::symlink_metadata(parent)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(NativeEventSecurityError::ParentNotDirectory.into());
+    }
+    if metadata.uid() != expected_uid {
+        return Err(NativeEventSecurityError::ParentOwnerMismatch {
+            expected_uid,
+            actual_uid: metadata.uid(),
+        }
+        .into());
+    }
+    let actual_mode = metadata.permissions().mode() & 0o7777;
+    if actual_mode != NATIVE_SOCKET_DIRECTORY_MODE {
+        return Err(NativeEventSecurityError::ParentModeMismatch { actual_mode }.into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_native_socket_parent(
+    socket_path: &Path,
+    expected_uid: u32,
+) -> Result<(), NativeEventError> {
+    if !socket_path.is_absolute() {
+        return Err(NativeEventSecurityError::RelativeSocketPath.into());
+    }
+    let parent = socket_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(NativeEventSecurityError::MissingSocketParent)?;
+    match std::fs::symlink_metadata(parent) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true).mode(NATIVE_SOCKET_DIRECTORY_MODE);
+            builder.create(parent)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    validate_native_socket_parent(socket_path, expected_uid)
+}
+
+#[cfg(unix)]
+fn native_socket_identity(
+    metadata: &std::fs::Metadata,
+    expected_uid: u32,
+    require_private_mode: bool,
+) -> Result<NativeSocketIdentity, NativeEventError> {
+    if !metadata.file_type().is_socket() {
+        return Err(NativeEventSecurityError::EndpointNotSocket.into());
+    }
+    if metadata.uid() != expected_uid {
+        return Err(NativeEventSecurityError::EndpointOwnerMismatch {
+            expected_uid,
+            actual_uid: metadata.uid(),
+        }
+        .into());
+    }
+    if require_private_mode {
+        let actual_mode = metadata.permissions().mode() & 0o7777;
+        if actual_mode != NATIVE_SOCKET_MODE {
+            return Err(NativeEventSecurityError::EndpointModeMismatch { actual_mode }.into());
+        }
+    }
+    Ok(NativeSocketIdentity::from_metadata(metadata))
+}
+
+/// Validate the filesystem half of the GUI-to-listener trust boundary before
+/// connection. The connected peer credential is validated separately after
+/// connect, closing the endpoint-replacement race.
+///
+/// # Errors
+///
+/// Returns a finite [`NativeEventSecurityError`] when the path, private parent
+/// directory, endpoint type, owner, or mode violates the native-event trust
+/// contract. Filesystem lookup failures are returned as [`NativeEventError::Io`].
+#[cfg(unix)]
+pub fn validate_native_event_socket_endpoint(
+    socket_path: &Path,
+) -> Result<(), NativeEventError> {
+    #[cfg(feature = "native-wezterm")]
+    let expected_uid = native_effective_uid();
+    #[cfg(not(feature = "native-wezterm"))]
+    let expected_uid = native_effective_uid()?;
+    validate_native_socket_parent(socket_path, expected_uid)?;
+    let metadata = std::fs::symlink_metadata(socket_path)?;
+    native_socket_identity(&metadata, expected_uid, true)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_native_socket_if_identity_matches(
+    socket_path: &Path,
+    expected_uid: u32,
+    expected_identity: NativeSocketIdentity,
+) -> Result<bool, NativeEventError> {
+    let metadata = match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let observed_identity = native_socket_identity(&metadata, expected_uid, false)?;
+    if observed_identity != expected_identity {
+        return Err(NativeEventSecurityError::SocketIdentityChanged.into());
+    }
+    std::fs::remove_file(socket_path)?;
+    Ok(true)
 }
 
 /// Pane state snapshot sent over the native event wire protocol.
@@ -404,29 +713,68 @@ pub enum WireEvent {
 }
 
 /// Local socket server that receives pane events from the frankenterm GUI process.
+#[cfg(any(unix, windows))]
 pub struct NativeEventListener {
     socket_path: PathBuf,
     listener: UnixListener,
+    #[cfg(unix)]
+    socket_identity: NativeSocketIdentity,
+    #[cfg(unix)]
+    effective_uid: u32,
 }
 
+#[cfg(any(unix, windows))]
 impl NativeEventListener {
+    /// Bind the authenticated native-event listener using the ambient
+    /// capability context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeEventError::ContextUnavailable`] when no ambient
+    /// context exists, a finite security error when the endpoint contract is
+    /// violated, or [`NativeEventError::Io`] for a filesystem/transport fault.
     pub async fn bind(socket_path: PathBuf) -> Result<Self, NativeEventError> {
-        let cx = crate::cx::Cx::current().ok_or_else(|| {
-            NativeEventError::Io(native_context_io_error("bind_context_unavailable"))
-        })?;
+        let cx = crate::cx::Cx::current().ok_or(NativeEventError::ContextUnavailable)?;
         Self::bind_with_cx(&cx, socket_path).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`bind`].
     ///
-    /// Multi-seam checkpoint structure before each filesystem /
-    /// syscall boundary: entry, stale-socket cleanup, parent-dir
-    /// creation, listener bind. Gives responsive cancellation
-    /// during socket setup — a cx-driven caller cancelled
-    /// mid-startup won't touch files it doesn't need to.
-    /// Cancellation surfaces as `NativeEventError::Io(Interrupted)`
-    /// so the caller's existing error-match arms continue to hold.
+    /// Multi-seam checkpoint structure surrounds parent-directory validation,
+    /// identity-pinned stale-socket cleanup, listener bind, and post-bind
+    /// permission hardening. A caller cancelled mid-startup does not receive
+    /// newly-created authority; cancellation surfaces as
+    /// `NativeEventError::Io(Interrupted)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a finite security error when an authenticated local transport
+    /// cannot be established, or [`NativeEventError::Io`] for cancellation and
+    /// filesystem/transport faults.
     pub async fn bind_with_cx(
+        cx: &crate::cx::Cx,
+        socket_path: PathBuf,
+    ) -> Result<Self, NativeEventError> {
+        #[cfg(windows)]
+        {
+            let _ = (cx, socket_path);
+            return Err(NativeEventSecurityError::PeerCredentialsUnavailable.into());
+        }
+
+        #[cfg(unix)]
+        {
+            return Self::bind_secure_unix_with_cx(cx, socket_path).await;
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (cx, socket_path);
+            Err(NativeEventSecurityError::PeerCredentialsUnavailable.into())
+        }
+    }
+
+    #[cfg(unix)]
+    async fn bind_secure_unix_with_cx(
         cx: &crate::cx::Cx,
         socket_path: PathBuf,
     ) -> Result<Self, NativeEventError> {
@@ -441,26 +789,51 @@ impl NativeEventListener {
 
         check("entry")?;
 
+        // Do not create a socket on Unix targets where the accepted peer could
+        // never be authenticated. Failing before parent validation/stale-path
+        // cleanup also guarantees this unsupported-target result has no
+        // filesystem side effects.
+        if !native_peer_credentials_supported() {
+            return Err(NativeEventSecurityError::PeerCredentialsUnavailable.into());
+        }
+
         if socket_path.as_os_str().is_empty() {
             return Err(NativeEventError::EmptySocketPath);
         }
 
-        check("before_stale_socket_cleanup")?;
-        maybe_cleanup_stale_socket(&socket_path)?;
-        check("after_stale_socket_cleanup")?;
+        #[cfg(feature = "native-wezterm")]
+        let effective_uid = native_effective_uid();
+        #[cfg(not(feature = "native-wezterm"))]
+        let effective_uid = native_effective_uid()?;
 
-        if let Some(parent) = socket_path.parent() {
-            check("before_parent_directory_creation")?;
-            std::fs::create_dir_all(parent)?;
-            check("after_parent_directory_creation")?;
-        }
+        check("before_parent_directory_creation")?;
+        prepare_native_socket_parent(&socket_path, effective_uid)?;
+        check("after_parent_directory_creation")?;
+
+        check("before_stale_socket_cleanup")?;
+        maybe_cleanup_stale_socket(&socket_path, effective_uid)?;
+        check("after_stale_socket_cleanup")?;
 
         check("before_listener_bind")?;
         let listener = socket_transport::bind_with_cx(cx, &socket_path).await?;
+        let metadata = std::fs::symlink_metadata(&socket_path)?;
+        let socket_identity = native_socket_identity(&metadata, effective_uid, false)?;
         let bound = Self {
             socket_path,
             listener,
+            socket_identity,
+            effective_uid,
         };
+        std::fs::set_permissions(
+            &bound.socket_path,
+            std::fs::Permissions::from_mode(NATIVE_SOCKET_MODE),
+        )?;
+        let secured_metadata = std::fs::symlink_metadata(&bound.socket_path)?;
+        let secured_identity =
+            native_socket_identity(&secured_metadata, bound.effective_uid, true)?;
+        if secured_identity != bound.socket_identity {
+            return Err(NativeEventSecurityError::SocketIdentityChanged.into());
+        }
         // If cancellation wins concurrently with listener creation, dropping
         // `bound` closes the listener and executes the socket-path cleanup
         // contract instead of returning newly-created authority to the caller.
@@ -468,15 +841,20 @@ impl NativeEventListener {
         Ok(bound)
     }
 
-    pub async fn run(self, event_tx: mpsc::Sender<NativeEvent>, shutdown_flag: Arc<AtomicBool>) {
-        let Some(cx) = crate::cx::Cx::current() else {
-            warn!(
-                error_class = "native_event_context_unavailable",
-                "native event listener requires an explicit runtime context"
-            );
-            return;
-        };
+    /// Run the listener using the ambient capability context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeEventError::ContextUnavailable`] when no ambient
+    /// context is installed.
+    pub async fn run(
+        self,
+        event_tx: mpsc::Sender<NativeEvent>,
+        shutdown_flag: Arc<AtomicBool>,
+    ) -> Result<(), NativeEventError> {
+        let cx = crate::cx::Cx::current().ok_or(NativeEventError::ContextUnavailable)?;
         self.run_with_cx(&cx, event_tx, shutdown_flag).await;
+        Ok(())
     }
 
     /// Run the accept loop against the caller's asupersync capability
@@ -495,8 +873,9 @@ impl NativeEventListener {
     /// (event_stream.rs), `WorkflowRunner::handle_detection_with_cx`,
     /// and `SurvivalModel::run_cx`.
     ///
-    /// The legacy [`run`](Self::run) entry point is preserved for
-    /// non-migrated callers; this is strictly additive.
+    /// [`run`](Self::run) is the ambient-context adapter and returns a typed
+    /// [`NativeEventError::ContextUnavailable`] instead of silently disabling
+    /// native events when no runtime capability context is installed.
     pub async fn run_with_cx(
         self,
         cx: &crate::cx::Cx,
@@ -513,6 +892,7 @@ impl NativeEventListener {
         }
 
         let mut connection_tasks = JoinSet::new();
+        let mut accept_error_backoff = ACCEPT_ERROR_INITIAL_BACKOFF;
 
         loop {
             if shutdown_flag.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
@@ -536,12 +916,23 @@ impl NativeEventListener {
             .await
             {
                 Ok(Ok((stream, _addr))) => {
+                    accept_error_backoff = ACCEPT_ERROR_INITIAL_BACKOFF;
                     // The accept future can become ready in the same scheduler
                     // turn as shutdown/cancellation. Revalidate before handing
                     // the accepted stream to a new owned task.
                     if !native_connection_spawn_allowed(cx, &shutdown_flag) {
                         drop(stream);
                         break;
+                    }
+                    #[cfg(unix)]
+                    if let Err(error) = validate_native_event_peer(stream.as_std()) {
+                        warn!(
+                            error = %error,
+                            path = %self.socket_path.display(),
+                            "rejected unauthenticated native event peer"
+                        );
+                        drop(stream);
+                        continue;
                     }
                     let tx = event_tx.clone();
                     let path = self.socket_path.display().to_string();
@@ -587,18 +978,39 @@ impl NativeEventListener {
                             );
                             // Continuing would accept and drop an unbounded
                             // stream of clients while task admission remains
-                            // unavailable. Fail the listener loop closed; the
-                            // runtime supervisor owns restart policy.
+                            // unavailable. Fail the listener loop closed;
+                            // polling remains active and a runtime restart is
+                            // required to attempt a fresh listener.
                             break;
                         }
                     }
                 }
                 Ok(Err(err)) => {
+                    if native_accept_error_is_permanent(err.kind()) {
+                        warn!(
+                            error = %err,
+                            error_kind = ?err.kind(),
+                            path = %self.socket_path.display(),
+                            "native event listener stopped after permanent accept failure"
+                        );
+                        break;
+                    }
                     warn!(
                         error = %err,
+                        error_kind = ?err.kind(),
+                        retry_backoff_ms = accept_error_backoff.as_millis(),
                         path = %self.socket_path.display(),
-                        "native event accept failed"
+                        "native event accept failed; applying bounded retry backoff"
                     );
+                    if crate::runtime_async::sleep_with_cx(cx, accept_error_backoff)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    accept_error_backoff = accept_error_backoff
+                        .saturating_mul(2)
+                        .min(ACCEPT_ERROR_MAX_BACKOFF);
                 }
                 // `timeout_with_cx` returns Err on either the poll
                 // interval elapsing OR the Cx being cancelled. Either
@@ -637,21 +1049,34 @@ impl NativeEventListener {
             &drain_cx,
             NATIVE_CONNECTION_TASK_DRAIN_TIMEOUT,
             async {
-                while let Some(join_result) = connection_tasks.join_next().await {
-                    if let Err(err) = join_result {
-                        // Kept at debug! — after shutdown_flag or cx cancel
-                        // fires, task cancellation is expected. A finite waker
-                        // registration failure is logged here once while the
-                        // JoinSet retains terminal authority for trusted polls.
-                        debug!(
-                            error = %err,
-                            "native event connection task failed during shutdown"
-                        );
+                loop {
+                    match connection_tasks.drain_next_with_cx(&drain_cx).await {
+                        Ok(Some(join_result)) => {
+                            if let Err(err) = join_result {
+                                // Kept at debug! — after shutdown_flag or cx
+                                // cancel fires, task cancellation is expected.
+                                // A finite waker-registration failure is logged
+                                // once while JoinSet retains terminal authority
+                                // for subsequent trusted polls.
+                                debug!(
+                                    error = %err,
+                                    "native event connection task failed during shutdown"
+                                );
+                            }
+                        }
+                        Ok(None) => return Ok(()),
+                        Err(drain_error) => return Err(drain_error),
                     }
                 }
             },
         )
         .await;
+        if let Ok(Err(drain_error)) = &drain_result {
+            warn!(
+                failure_class = ?drain_error.kind(),
+                "native event connection task drain context failed before terminal settlement"
+            );
+        }
         match classify_native_connection_task_drain(
             drain_result.is_err(),
             connection_tasks.settlement(),
@@ -687,6 +1112,52 @@ impl NativeEventListener {
     }
 }
 
+/// Fail-closed listener surface for targets without either Unix-domain sockets
+/// or the in-tree Windows transport. Keeping the type available lets
+/// `native-wezterm` remain a coherent feature while making admission
+/// impossible on unsupported targets.
+#[cfg(not(any(unix, windows)))]
+pub struct NativeEventListener {
+    _private: (),
+}
+
+#[cfg(not(any(unix, windows)))]
+impl NativeEventListener {
+    /// Refuse listener creation on a target without authenticated transport.
+    pub async fn bind(_socket_path: PathBuf) -> Result<Self, NativeEventError> {
+        Err(NativeEventSecurityError::PeerCredentialsUnavailable.into())
+    }
+
+    /// Refuse listener creation on a target without authenticated transport.
+    pub async fn bind_with_cx(
+        _cx: &crate::cx::Cx,
+        _socket_path: PathBuf,
+    ) -> Result<Self, NativeEventError> {
+        Err(NativeEventSecurityError::PeerCredentialsUnavailable.into())
+    }
+
+    /// This value cannot be constructed through the public API.
+    pub async fn run(
+        self,
+        _event_tx: mpsc::Sender<NativeEvent>,
+        _shutdown_flag: Arc<AtomicBool>,
+    ) -> Result<(), NativeEventError> {
+        let _ = self;
+        Err(NativeEventSecurityError::PeerCredentialsUnavailable.into())
+    }
+
+    /// This value cannot be constructed through the public API.
+    pub async fn run_with_cx(
+        self,
+        _cx: &crate::cx::Cx,
+        _event_tx: mpsc::Sender<NativeEvent>,
+        _shutdown_flag: Arc<AtomicBool>,
+    ) {
+        let _ = self;
+    }
+}
+
+#[cfg(any(unix, windows))]
 fn native_connection_spawn_allowed(
     cx: &crate::cx::Cx,
     shutdown_flag: &AtomicBool,
@@ -694,65 +1165,70 @@ fn native_connection_spawn_allowed(
     !shutdown_flag.load(Ordering::SeqCst) && cx.checkpoint().is_ok()
 }
 
+#[cfg(any(unix, windows))]
 impl Drop for NativeEventListener {
     fn drop(&mut self) {
-        #[cfg(any(unix, windows))]
-        if let Err(err) = std::fs::remove_file(&self.socket_path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                debug!(
-                    error = %err,
-                    path = %self.socket_path.display(),
-                    "failed to remove native event socket path on drop"
-                );
-            }
+        #[cfg(unix)]
+        if let Err(error) = remove_native_socket_if_identity_matches(
+            &self.socket_path,
+            self.effective_uid,
+            self.socket_identity,
+        ) {
+            warn!(
+                error = %error,
+                path = %self.socket_path.display(),
+                "refused to remove replaced native event socket path on drop"
+            );
         }
     }
 }
 
-fn maybe_cleanup_stale_socket(socket_path: &PathBuf) -> Result<(), NativeEventError> {
+#[cfg(unix)]
+fn maybe_cleanup_stale_socket(
+    socket_path: &Path,
+    effective_uid: u32,
+) -> Result<(), NativeEventError> {
     let metadata = match std::fs::symlink_metadata(socket_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(NativeEventError::Io(err)),
     };
+    let stale_identity = match native_socket_identity(&metadata, effective_uid, false) {
+        Ok(identity) => identity,
+        Err(NativeEventError::Security(NativeEventSecurityError::EndpointNotSocket)) => {
+            return Err(NativeEventError::SocketAlreadyExists(
+                socket_path.display().to_string(),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
 
-    #[cfg(unix)]
-    let is_socket = metadata.file_type().is_socket();
-    #[cfg(windows)]
-    let is_socket = false;
-
-    if !is_socket {
-        return Err(NativeEventError::SocketAlreadyExists(
-            socket_path.display().to_string(),
-        ));
-    }
-
-    #[cfg(unix)]
     match StdUnixStream::connect(socket_path) {
-        Ok(_stream) => Err(NativeEventError::SocketAlreadyExists(
-            socket_path.display().to_string(),
-        )),
+        Ok(stream) => {
+            validate_native_event_peer(&stream)?;
+            Err(NativeEventError::SocketAlreadyExists(
+                socket_path.display().to_string(),
+            ))
+        }
         Err(err)
             if matches!(
                 err.kind(),
                 std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
             ) =>
         {
-            std::fs::remove_file(socket_path)?;
-            debug!(
-                path = %socket_path.display(),
-                "removed stale native event socket path before bind"
-            );
+            if remove_native_socket_if_identity_matches(
+                socket_path,
+                effective_uid,
+                stale_identity,
+            )? {
+                debug!(
+                    path = %socket_path.display(),
+                    "removed identity-pinned stale native event socket before bind"
+                );
+            }
             Ok(())
         }
         Err(err) => Err(NativeEventError::Io(err)),
-    }
-
-    #[cfg(windows)]
-    {
-        Err(NativeEventError::SocketAlreadyExists(
-            socket_path.display().to_string(),
-        ))
     }
 }
 
@@ -769,6 +1245,7 @@ fn maybe_cleanup_stale_socket(socket_path: &PathBuf) -> Result<(), NativeEventEr
 /// `next_line_with_cx` (tick 160) replaces the line-read so a
 /// cancelled parent can also interrupt a slow client. The pre-
 /// flight checkpoint gates the handler's first iteration.
+#[cfg(any(unix, windows))]
 async fn handle_connection_with_cx(
     cx: crate::cx::Cx,
     stream: UnixStream,
@@ -988,7 +1465,119 @@ fn decode_wire_event(line: &str) -> Result<Option<NativeEvent>, String> {
     }
 }
 
-#[cfg(all(test, any(unix, windows), feature = "native-events-inline-tests"))]
+#[cfg(all(test, unix))]
+mod native_socket_security_classifier_tests {
+    use super::*;
+
+    #[test]
+    fn peer_uid_classifier_accepts_only_exact_effective_uid() {
+        assert!(validate_native_event_peer_uids(501, 501).is_ok());
+        assert!(matches!(
+            validate_native_event_peer_uids(501, 502),
+            Err(NativeEventError::Security(
+                NativeEventSecurityError::PeerUidMismatch {
+                    expected_uid: 501,
+                    actual_uid: 502
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    fn same_process_unix_pair_has_authenticated_peer_credentials() {
+        let (first, second) = StdUnixStream::pair().expect("create Unix stream pair");
+        validate_native_event_peer(&first).expect("first peer should match effective uid");
+        validate_native_event_peer(&second).expect("second peer should match effective uid");
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod native_accept_error_classifier_tests {
+    use super::*;
+
+    #[test]
+    fn permanent_accept_failures_stop_instead_of_hot_spinning() {
+        for kind in [
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::Unsupported,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotConnected,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            assert!(native_accept_error_is_permanent(kind), "kind={kind:?}");
+        }
+
+        for kind in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(!native_accept_error_is_permanent(kind), "kind={kind:?}");
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    unix,
+    not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))
+))]
+mod unsupported_unix_native_socket_tests {
+    use super::*;
+    use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
+
+    #[test]
+    fn listener_fails_before_creating_endpoint_without_peer_credentials() {
+        assert!(!native_peer_credentials_supported());
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build unsupported-Unix native-event test runtime");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("create private test directory");
+            let socket_path = directory.path().join("unsupported-native-events.sock");
+            let cx = crate::cx::for_testing();
+            let result = NativeEventListener::bind_with_cx(&cx, socket_path.clone()).await;
+            assert!(matches!(
+                result,
+                Err(NativeEventError::Security(
+                    NativeEventSecurityError::PeerCredentialsUnavailable
+                ))
+            ));
+            assert!(
+                !socket_path.exists(),
+                "unsupported target must fail before creating a socket"
+            );
+        });
+    }
+}
+
+#[cfg(all(
+    test,
+    unix,
+    feature = "native-events-inline-tests",
+    any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
 mod transport_roundtrip_tests {
     use super::socket_transport::{self as event_socket, AsyncWriteExt};
     use super::*;
@@ -1091,7 +1680,40 @@ mod transport_roundtrip_tests {
     }
 }
 
-#[cfg(all(test, unix, feature = "native-events-inline-tests"))]
+#[cfg(all(test, windows, feature = "native-events-inline-tests"))]
+mod unauthenticated_platform_tests {
+    use super::*;
+    use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
+
+    #[test]
+    fn windows_native_event_listener_fails_closed_without_peer_credentials() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build native-event fail-closed test runtime");
+        runtime.block_on(async {
+            let result = NativeEventListener::bind(PathBuf::from("events.sock")).await;
+            assert!(matches!(
+                result,
+                Err(NativeEventError::Security(
+                    NativeEventSecurityError::PeerCredentialsUnavailable
+                ))
+            ));
+        });
+    }
+}
+
+#[cfg(all(
+    test,
+    unix,
+    feature = "native-events-inline-tests",
+    any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
 mod tests {
     use super::socket_transport::{self as event_socket, AsyncWriteExt};
     use super::*;
@@ -1759,9 +2381,19 @@ mod tests {
         );
         assert_eq!(
             classify_native_connection_task_drain(true, JoinSetSettlement::Settled),
+            NativeConnectionTaskDrainOutcome::Settled
+        );
+        assert_eq!(
+            classify_native_connection_task_drain(
+                true,
+                JoinSetSettlement::Incomplete {
+                    active_tasks: 2,
+                    unacknowledged_tasks: 1,
+                },
+            ),
             NativeConnectionTaskDrainOutcome::TimedOut {
-                active_tasks: 0,
-                unacknowledged_tasks: 0,
+                active_tasks: 2,
+                unacknowledged_tasks: 1,
             }
         );
     }
@@ -2593,7 +3225,9 @@ mod tests {
     fn error_debug_all_variants() {
         let errors: Vec<NativeEventError> = vec![
             NativeEventError::EmptySocketPath,
+            NativeEventError::ContextUnavailable,
             NativeEventError::SocketAlreadyExists("x".into()),
+            NativeEventError::Security(NativeEventSecurityError::PeerCredentialsUnavailable),
             NativeEventError::Io(std::io::Error::other("test")),
         ];
         for e in &errors {
