@@ -1,4 +1,5 @@
-//! End-to-end snapshot/restore roundtrip tests with structured reports.
+//! Hermetic snapshot persistence and manual-restore contract tests with
+//! structured reports.
 //!
 //! These tests exercise `SnapshotEngine` capture + persistence and the
 //! session-restore query path (`session_restore`) against a real SQLite file.
@@ -58,11 +59,51 @@ struct PhaseReport {
 #[derive(Debug, Serialize)]
 struct PaneTestReport {
     pane_id: u64,
-    original_content_hash: String,
-    restored_content_hash: String,
-    content_match: bool,
-    layout_match: bool,
-    process_match: bool,
+    source_artifact_hash: String,
+    observed_artifact_hash: String,
+    checks: Vec<PaneContractCheck>,
+}
+
+impl PaneTestReport {
+    fn all_exercised_checks_pass(&self) -> bool {
+        self.checks
+            .iter()
+            .all(|check| check.status != PaneCheckStatus::Failed)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PaneContractCheck {
+    contract: &'static str,
+    status: PaneCheckStatus,
+}
+
+impl PaneContractCheck {
+    fn exercised(contract: &'static str, passed: bool) -> Self {
+        Self {
+            contract,
+            status: if passed {
+                PaneCheckStatus::Passed
+            } else {
+                PaneCheckStatus::Failed
+            },
+        }
+    }
+
+    const fn not_tested(contract: &'static str) -> Self {
+        Self {
+            contract,
+            status: PaneCheckStatus::NotTested,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PaneCheckStatus {
+    Passed,
+    Failed,
+    NotTested,
 }
 
 #[derive(Debug, Clone)]
@@ -454,9 +495,12 @@ fn e2e_snapshot_roundtrip_single_pane_report() {
 
         let pane_report = PaneTestReport {
             pane_id: pane.pane_id,
-            original_content_hash: pane_info_hash(&pane),
-            restored_content_hash: restored_state_hash(restored),
-            content_match: normalize_cwd(pane.cwd.as_deref()) == restored.cwd
+            source_artifact_hash: pane_info_hash(&pane),
+            observed_artifact_hash: restored_state_hash(restored),
+            checks: vec![
+                PaneContractCheck::exercised(
+                    "persisted_pane_state",
+                    normalize_cwd(pane.cwd.as_deref()) == restored.cwd
                 && pane.effective_rows()
                     == restored
                         .terminal_state
@@ -469,20 +513,27 @@ fn e2e_snapshot_roundtrip_single_pane_report() {
                         .as_ref()
                         .map(|t| u32::from(t.cols))
                         .unwrap_or_default(),
-            layout_match: checkpoint.pane_count == 1 && checkpoints.len() == 1,
-            process_match: restored.command.is_none(),
+                ),
+                PaneContractCheck::exercised(
+                    "checkpoint_shape",
+                    checkpoint.pane_count == 1 && checkpoints.len() == 1,
+                ),
+                PaneContractCheck::exercised(
+                    "captured_command_absent",
+                    restored.command.is_none(),
+                ),
+            ],
         };
         report.pane_reports.push(pane_report);
 
-        let success = report.pane_reports.iter().all(|pane_result| {
-            pane_result.content_match && pane_result.layout_match && pane_result.process_match
-        });
+        let success = report
+            .pane_reports
+            .iter()
+            .all(PaneTestReport::all_exercised_checks_pass);
         let passed_panes = report
             .pane_reports
             .iter()
-            .filter(|pane_result| {
-                pane_result.content_match && pane_result.layout_match && pane_result.process_match
-            })
+            .filter(|pane_result| pane_result.all_exercised_checks_pass())
             .count();
         let total_panes = report.pane_reports.len();
         add_phase(
@@ -513,11 +564,11 @@ fn e2e_snapshot_roundtrip_single_pane_report() {
 }
 
 #[test]
-fn e2e_snapshot_roundtrip_targeted_checkpoint_restore() {
+fn e2e_targeted_checkpoint_load_distinguishes_versions() {
     run_async_test(async {
         let run_start = Instant::now();
         let mut report = E2ETestReport {
-            test_name: "e2e_snapshot_roundtrip_targeted_checkpoint_restore".to_string(),
+            test_name: "e2e_targeted_checkpoint_load_distinguishes_versions".to_string(),
             phases: Vec::new(),
             total_duration_ms: 0,
             passed: false,
@@ -604,11 +655,22 @@ fn e2e_snapshot_roundtrip_targeted_checkpoint_restore() {
 
         report.pane_reports.push(PaneTestReport {
             pane_id: 0,
-            original_content_hash: old_hash.clone(),
-            restored_content_hash: new_hash.clone(),
-            content_match: checkpoint_versions_distinct,
-            layout_match: new_has_extra_pane,
-            process_match: latest_matches_new,
+            source_artifact_hash: old_hash.clone(),
+            observed_artifact_hash: new_hash.clone(),
+            checks: vec![
+                PaneContractCheck::exercised(
+                    "checkpoint_versions_distinct",
+                    checkpoint_versions_distinct,
+                ),
+                PaneContractCheck::exercised(
+                    "new_checkpoint_has_extra_pane",
+                    new_has_extra_pane,
+                ),
+                PaneContractCheck::exercised(
+                    "latest_checkpoint_selection",
+                    latest_matches_new,
+                ),
+            ],
         });
 
         let success = checkpoint_versions_distinct && new_has_extra_pane && latest_matches_new;
@@ -919,21 +981,34 @@ fn e2e_restore_bookkeeping_preserves_manual_restore_checkpoint() {
 
         report.pane_reports.push(PaneTestReport {
             pane_id: pane.pane_id,
-            original_content_hash: pane_info_hash(&pane),
-            restored_content_hash: restored_state_hash(latest_state),
-            content_match: latest_retains_capture && capture_state_preserved,
-            layout_match: startup_checkpoint_exists
-                && startup_checkpoint_distinct
-                && startup_mapping_matches,
-            process_match: session_clean
-                && clean_receipt_matches
-                && detect_cleared
-                && pty_input_untouched,
+            source_artifact_hash: pane_info_hash(&pane),
+            observed_artifact_hash: restored_state_hash(latest_state),
+            checks: vec![
+                PaneContractCheck::exercised(
+                    "capture_state_preserved",
+                    latest_retains_capture && capture_state_preserved,
+                ),
+                PaneContractCheck::exercised(
+                    "restore_receipt_mapping",
+                    startup_checkpoint_exists
+                        && startup_checkpoint_distinct
+                        && startup_mapping_matches,
+                ),
+                PaneContractCheck::exercised(
+                    "authority_settled_without_pty_input",
+                    session_clean
+                        && clean_receipt_matches
+                        && detect_cleared
+                        && pty_input_untouched,
+                ),
+            ],
         });
 
-        let success = report.pane_reports.iter().all(|pane_result| {
-            pane_result.content_match && pane_result.layout_match && pane_result.process_match
-        }) && summary.restored_count() == 1
+        let success = report
+            .pane_reports
+            .iter()
+            .all(PaneTestReport::all_exercised_checks_pass)
+            && summary.restored_count() == 1
             && summary.failed_count() == 0;
 
         report.total_duration_ms = run_start.elapsed().as_millis() as u64;
@@ -1031,11 +1106,11 @@ fn e2e_snapshot_fixture_topology_roundtrip() {
 }
 
 #[test]
-fn e2e_fixture_complex_layout_restore_executes_real_restore_flow() {
+fn e2e_fixture_complex_layout_executes_session_restorer_flow() {
     run_async_test(async {
         let run_start = Instant::now();
         let mut report = E2ETestReport {
-            test_name: "e2e_fixture_complex_layout_restore_executes_real_restore_flow".to_string(),
+            test_name: "e2e_fixture_complex_layout_executes_session_restorer_flow".to_string(),
             phases: Vec::new(),
             total_duration_ms: 0,
             passed: false,
@@ -1209,7 +1284,7 @@ fn e2e_fixture_complex_layout_restore_executes_real_restore_flow() {
 
             report.pane_reports.push(PaneTestReport {
                 pane_id: pane.pane_id,
-                original_content_hash: hash_text(
+                source_artifact_hash: hash_text(
                     &json!({
                         "window_id": pane.window_id,
                         "tab_id": pane.tab_id,
@@ -1217,7 +1292,7 @@ fn e2e_fixture_complex_layout_restore_executes_real_restore_flow() {
                     })
                     .to_string(),
                 ),
-                restored_content_hash: hash_text(
+                observed_artifact_hash: hash_text(
                     &json!({
                         "window_id": new_state.window_id,
                         "tab_id": new_state.tab_id,
@@ -1226,9 +1301,11 @@ fn e2e_fixture_complex_layout_restore_executes_real_restore_flow() {
                     })
                     .to_string(),
                 ),
-                content_match: cwd_matches,
-                layout_match: tab_consistent,
-                process_match: active_matches,
+                checks: vec![
+                    PaneContractCheck::exercised("local_cwd", cwd_matches),
+                    PaneContractCheck::exercised("tab_membership", tab_consistent),
+                    PaneContractCheck::exercised("active_selection", active_matches),
+                ],
             });
         }
 
@@ -1247,9 +1324,10 @@ fn e2e_fixture_complex_layout_restore_executes_real_restore_flow() {
             && unique_tabs.len() == 2
             && mapped_new_ids.len() == fixture_panes.len()
             && active_new_pane.is_active
-            && report.pane_reports.iter().all(|pane_result| {
-                pane_result.content_match && pane_result.layout_match && pane_result.process_match
-            });
+            && report
+                .pane_reports
+                .iter()
+                .all(PaneTestReport::all_exercised_checks_pass);
 
         add_phase(
             &mut report,
@@ -1420,11 +1498,16 @@ fn e2e_restore_rejects_unsafe_scrollback_before_mux_or_authority_effects() {
 
         report.pane_reports.push(PaneTestReport {
             pane_id: pane.pane_id,
-            original_content_hash: hash_text("first line\nsecond line\n"),
-            restored_content_hash: hash_text(""),
-            content_match: no_mux_effects,
-            layout_match: no_mux_effects && no_authority_effects,
-            process_match: no_mux_effects,
+            source_artifact_hash: hash_text("first line\nsecond line\n"),
+            observed_artifact_hash: hash_text(""),
+            checks: vec![
+                PaneContractCheck::exercised("mux_side_effects_absent", no_mux_effects),
+                PaneContractCheck::exercised(
+                    "authority_side_effects_absent",
+                    no_authority_effects,
+                ),
+                PaneContractCheck::not_tested("process_continuity"),
+            ],
         });
 
         add_phase(
@@ -1456,20 +1539,13 @@ fn e2e_restore_rejects_unsafe_scrollback_before_mux_or_authority_effects() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// [wa-bo6f] Save → restart → restore roundtrip tests.
+// [wa-bo6f] Persistence-boundary and manual-layout-restore tests.
 //
-// The existing `e2e_*` tests exercise capture + load paths but none of them
-// simulate the actual *restart* boundary — the moment where the mux process
-// (and the SnapshotEngine + SessionRestorer handles inside it) is torn down,
-// the only surviving state is the SQLite file, and a fresh process has to
-// reconstitute session identity from that file alone.
-//
-// The tests below close that gap: each one captures with engine A, drops
-// engine A entirely (the `{ let engine = ...; ... }` scope), then builds a
-// brand-new engine/restorer pair against the same DB and verifies that
-// session_id, pane_ids, scrollback bytes, and layout topology survive the
-// rebuild bit-identical. This is the "ft snapshot save → restart →
-// ft snapshot restore" invariant the bead calls out.
+// Each test captures with engine A, drops engine A, then builds fresh handles
+// against the same database. This proves persistence/query behavior and the
+// explicitly exercised manual layout subset only. It does not stop or start a
+// mux process, resume a process, replay scrollback, preserve render state, or
+// establish full-session continuity.
 //
 // Every test emits a structured E2ETestReport (JSON on [E2E_REPORT] lines)
 // with per-phase timing so a CI log alone is enough to diagnose a failure
@@ -1477,12 +1553,13 @@ fn e2e_restore_rejects_unsafe_scrollback_before_mux_or_authority_effects() {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn e2e_save_restart_restore_session_identity_survives_engine_rebuild() {
+fn e2e_persisted_session_identity_survives_engine_rebuild_and_manual_layout_restore() {
     run_async_test(async {
         let run_start = Instant::now();
         let mut report = E2ETestReport {
-            test_name: "e2e_save_restart_restore_session_identity_survives_engine_rebuild"
-                .to_string(),
+            test_name:
+                "e2e_persisted_session_identity_survives_engine_rebuild_and_manual_layout_restore"
+                    .to_string(),
             phases: Vec::new(),
             total_duration_ms: 0,
             passed: false,
@@ -1517,7 +1594,7 @@ fn e2e_save_restart_restore_session_identity_survives_engine_rebuild() {
             let snapshot = engine_a
                 .capture(&panes, SnapshotTrigger::Startup)
                 .await
-                .expect("capture pre-restart snapshot");
+                .expect("capture before handle rebuild");
             captured_session_id = snapshot.session_id.clone();
             captured_checkpoint_id = snapshot.checkpoint_id;
             captured_pane_count = snapshot.pane_count;
@@ -1533,11 +1610,11 @@ fn e2e_save_restart_restore_session_identity_survives_engine_rebuild() {
                     "trigger": "startup",
                 }),
             );
-            // engine_a drops here — simulates mux process exit.
+            // Only the engine handle drops here; no mux process is exercised.
         }
 
-        // ── Phase 2: restart (engine B + restorer built fresh on same DB).
-        let restart_start = Instant::now();
+        // ── Phase 2: rebuild engine/restorer handles on the same DB.
+        let rebuild_start = Instant::now();
         let _engine_b = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
         let restorer = SessionRestorer::new(
             db_path.clone(),
@@ -1549,8 +1626,8 @@ fn e2e_save_restart_restore_session_identity_survives_engine_rebuild() {
         );
         add_phase(
             &mut report,
-            "restart_rebuild_handles",
-            restart_start,
+            "rebuild_process_local_handles",
+            rebuild_start,
             "ok",
             json!({
                 "db_path": db_path.as_str(),
@@ -1562,12 +1639,12 @@ fn e2e_save_restart_restore_session_identity_survives_engine_rebuild() {
         let detect_start = Instant::now();
         let candidate = restorer
             .detect()
-            .expect("detect after restart must not error")
-            .expect("detect after restart must find the captured session");
+            .expect("detect after handle rebuild must not error")
+            .expect("detect after handle rebuild must find the captured session");
         let session_id_matches = candidate.session_id == captured_session_id;
         add_phase(
             &mut report,
-            "detect_unclean_session_after_restart",
+            "detect_unclean_session_after_handle_rebuild",
             detect_start,
             if session_id_matches { "ok" } else { "error" },
             json!({
@@ -1581,7 +1658,7 @@ fn e2e_save_restart_restore_session_identity_survives_engine_rebuild() {
         let load_start = Instant::now();
         let checkpoint = restorer
             .load_checkpoint(&candidate)
-            .expect("load checkpoint after restart");
+            .expect("load checkpoint after handle rebuild");
         let checkpoint_id_matches = checkpoint.checkpoint_id == captured_checkpoint_id;
         let pane_count_matches = checkpoint.pane_count == captured_pane_count;
 
@@ -1627,7 +1704,7 @@ fn e2e_save_restart_restore_session_identity_survives_engine_rebuild() {
                 .pane_states
                 .iter()
                 .find(|s| s.pane_id == pane.pane_id)
-                .expect("each captured pane must reappear post-restart");
+                .expect("each captured pane must reappear after handle rebuild");
             let content_match = normalize_cwd(pane.cwd.as_deref()) == restored_pane.cwd
                 && pane.effective_rows()
                     == restored_pane
@@ -1643,15 +1720,20 @@ fn e2e_save_restart_restore_session_identity_survives_engine_rebuild() {
                         .unwrap_or_default();
             report.pane_reports.push(PaneTestReport {
                 pane_id: pane.pane_id,
-                original_content_hash: pane_info_hash(pane),
-                restored_content_hash: restored_state_hash(restored_pane),
-                content_match,
-                layout_match: pane_count_matches && pane_ids_match,
-                process_match: true,
+                source_artifact_hash: pane_info_hash(pane),
+                observed_artifact_hash: restored_state_hash(restored_pane),
+                checks: vec![
+                    PaneContractCheck::exercised("persisted_pane_state", content_match),
+                    PaneContractCheck::exercised(
+                        "persisted_pane_identity_set",
+                        pane_count_matches && pane_ids_match,
+                    ),
+                    PaneContractCheck::not_tested("process_continuity"),
+                ],
             });
         }
 
-        // ── Phase 5: real restore flow, then confirm shutdown_clean flips.
+        // ── Phase 5: manual layout restore, then confirm authority settles.
         let restore_start = Instant::now();
         let wezterm = Arc::new(MockWezterm::new());
         let summary = restorer
@@ -1697,13 +1779,13 @@ fn e2e_save_restart_restore_session_identity_survives_engine_rebuild() {
             && report
                 .pane_reports
                 .iter()
-                .all(|p| p.content_match && p.layout_match);
+                .all(PaneTestReport::all_exercised_checks_pass);
         report.total_duration_ms = run_start.elapsed().as_millis() as u64;
         report.passed = success;
         report.failure_reason = if success {
             None
         } else {
-            Some("save → restart → restore identity/layout/detect-clear broke".to_string())
+            Some("persistence, manual layout restore, or authority settlement broke".to_string())
         };
         emit_report(&report);
         assert!(
@@ -1715,12 +1797,13 @@ fn e2e_save_restart_restore_session_identity_survives_engine_rebuild() {
 }
 
 #[test]
-fn e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild() {
+fn e2e_persisted_scrollback_bytes_survive_engine_rebuild_but_replay_is_rejected() {
     run_async_test(async {
         let run_start = Instant::now();
         let mut report = E2ETestReport {
-            test_name: "e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild"
-                .to_string(),
+            test_name:
+                "e2e_persisted_scrollback_bytes_survive_engine_rebuild_but_replay_is_rejected"
+                    .to_string(),
             phases: Vec::new(),
             total_duration_ms: 0,
             passed: false,
@@ -1772,7 +1855,7 @@ fn e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild() {
                     },
                 )
                 .await
-                .expect("capture pre-restart");
+                .expect("capture before handle rebuild");
             captured_session_id = snap.session_id.clone();
             captured_checkpoint_id = snap.checkpoint_id;
             add_phase(
@@ -1790,8 +1873,8 @@ fn e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild() {
             // engine_a dropped here.
         }
 
-        // ── restart: new engine + fail-closed restorer ───────────────
-        let restart_start = Instant::now();
+        // ── rebuild handles: new engine + fail-closed restorer ──────
+        let rebuild_start = Instant::now();
         let _engine_b = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
         let restorer = SessionRestorer::new(
             db_path.clone(),
@@ -1804,15 +1887,15 @@ fn e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild() {
         );
         add_phase(
             &mut report,
-            "restart_with_fail_closed_scrollback_restorer",
-            restart_start,
+            "rebuild_handles_with_fail_closed_scrollback_restorer",
+            rebuild_start,
             "ok",
             json!({ "restore_scrollback": true }),
         );
 
         let candidate = restorer
             .detect()
-            .expect("detect after restart")
+            .expect("detect after handle rebuild")
             .expect("candidate must exist");
         let checkpoint = restorer
             .load_checkpoint(&candidate)
@@ -1948,11 +2031,19 @@ fn e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild() {
 
         report.pane_reports.push(PaneTestReport {
             pane_id: pane.pane_id,
-            original_content_hash: expected_bytes_hash.clone(),
-            restored_content_hash: hash_text(&persisted_concatenated),
-            content_match: persisted_metadata_matches && persisted_bytes_match,
-            layout_match: no_mux_effects && no_authority_effects,
-            process_match: no_mux_effects,
+            source_artifact_hash: expected_bytes_hash.clone(),
+            observed_artifact_hash: hash_text(&persisted_concatenated),
+            checks: vec![
+                PaneContractCheck::exercised(
+                    "persisted_scrollback_bytes",
+                    persisted_metadata_matches && persisted_bytes_match,
+                ),
+                PaneContractCheck::exercised(
+                    "restore_side_effects_absent",
+                    no_mux_effects && no_authority_effects,
+                ),
+                PaneContractCheck::not_tested("process_continuity"),
+            ],
         });
         add_phase(
             &mut report,
@@ -1987,11 +2078,13 @@ fn e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild() {
 }
 
 #[test]
-fn e2e_save_restart_restore_nested_split_topology_preserved() {
+fn e2e_persisted_capture_topology_survives_engine_rebuild_and_maps_all_panes() {
     run_async_test(async {
         let run_start = Instant::now();
         let mut report = E2ETestReport {
-            test_name: "e2e_save_restart_restore_nested_split_topology_preserved".to_string(),
+            test_name:
+                "e2e_persisted_capture_topology_survives_engine_rebuild_and_maps_all_panes"
+                    .to_string(),
             phases: Vec::new(),
             total_duration_ms: 0,
             passed: false,
@@ -1999,8 +2092,9 @@ fn e2e_save_restart_restore_nested_split_topology_preserved() {
             pane_reports: Vec::new(),
         };
 
-        // Use the checked-in complex-layout fixture — it has the nested
-        // HSplit / VSplit / Leaf structure we need to prove layout round-trips.
+        // Use the checked-in complex-layout fixture as a source of pane,
+        // tab/window, and cwd identities. PaneInfo capture cannot observe the
+        // fixture's nested split tree, so this test does not claim that tree.
         let parse_start = Instant::now();
         let complex_json = std::fs::read_to_string(fixture_path("snapshot_complex_layout.json"))
             .expect("read complex layout fixture");
@@ -2022,8 +2116,8 @@ fn e2e_save_restart_restore_nested_split_topology_preserved() {
         let (_tmp, db_path) = setup_test_db();
 
         // Build PaneInfo inputs that mirror the fixture leaves. The engine
-        // synthesizes its own topology from them, but the leaf identity
-        // (pane_id / cwd) is what we want to prove survives the restart.
+        // synthesizes a capture topology from these flat observations; the
+        // persisted synthesized artifact is the authority tested below.
         let panes: Vec<PaneInfo> = fixture_panes
             .iter()
             .map(|fp| {
@@ -2041,24 +2135,25 @@ fn e2e_save_restart_restore_nested_split_topology_preserved() {
 
         let captured_session_id;
         let captured_checkpoint_id;
-        let captured_topology_json;
+        let captured_topology_hash;
         {
             let save_start = Instant::now();
             let engine_a = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
             let snap = engine_a
                 .capture(&panes, SnapshotTrigger::Startup)
                 .await
-                .expect("capture nested topology");
+                .expect("capture synthesized topology");
             captured_session_id = snap.session_id.clone();
             captured_checkpoint_id = snap.checkpoint_id;
             let conn = Connection::open(db_path.as_str()).expect("open db");
-            captured_topology_json = conn
+            let topology_json = conn
                 .query_row(
                     "SELECT topology_json FROM mux_sessions WHERE session_id = ?1",
                     params![captured_session_id],
                     |row| row.get::<_, String>(0),
                 )
                 .expect("read captured topology_json");
+            captured_topology_hash = hash_text(&topology_json);
             add_phase(
                 &mut report,
                 "save_via_engine_a",
@@ -2072,22 +2167,31 @@ fn e2e_save_restart_restore_nested_split_topology_preserved() {
             );
         }
 
-        // ── restart ─────────────────────────────────────────────────────
-        let restart_start = Instant::now();
+        // ── rebuild process-local handles ───────────────────────────────
+        let rebuild_start = Instant::now();
         let _engine_b = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
         let restorer = SessionRestorer::new(db_path.clone(), SessionRestoreConfig::default());
         add_phase(
             &mut report,
-            "restart_rebuild_handles",
-            restart_start,
+            "rebuild_process_local_handles",
+            rebuild_start,
             "ok",
             json!({}),
         );
 
-        // ── load + verify the persisted topology parses back into an
-        // identical-shape PaneNode tree (split kinds, depth, leaf pane_ids).
+        // ── load + verify the persisted capture artifact is parseable,
+        // stable under its own codec, and retains the captured pane set.
         let verify_start = Instant::now();
-        let reparsed_topology = TopologySnapshot::from_json(&captured_topology_json)
+        let reloaded_topology_json: String = Connection::open(db_path.as_str())
+            .expect("reopen database after handle rebuild")
+            .query_row(
+                "SELECT topology_json FROM mux_sessions WHERE session_id = ?1",
+                params![captured_session_id],
+                |row| row.get(0),
+            )
+            .expect("reload persisted topology_json");
+        let persisted_hash_match = hash_text(&reloaded_topology_json) == captured_topology_hash;
+        let reparsed_topology = TopologySnapshot::from_json(&reloaded_topology_json)
             .expect("persisted topology_json must re-parse");
         let reparsed_panes = collect_fixture_panes(&reparsed_topology);
         let reparsed_pane_ids: HashSet<u64> = reparsed_panes.iter().map(|p| p.pane_id).collect();
@@ -2105,14 +2209,20 @@ fn e2e_save_restart_restore_nested_split_topology_preserved() {
 
         add_phase(
             &mut report,
-            "verify_topology_tree_shape",
+            "verify_persisted_capture_topology",
             verify_start,
-            if pane_set_match && pane_count_match && window_count_match && topology_self_roundtrip {
+            if persisted_hash_match
+                && pane_set_match
+                && pane_count_match
+                && window_count_match
+                && topology_self_roundtrip
+            {
                 "ok"
             } else {
                 "error"
             },
             json!({
+                "persisted_hash_match": persisted_hash_match,
                 "pane_set_match": pane_set_match,
                 "pane_count_match": pane_count_match,
                 "window_count_match": window_count_match,
@@ -2121,10 +2231,10 @@ fn e2e_save_restart_restore_nested_split_topology_preserved() {
             }),
         );
 
-        // ── real restore + confirm layout_result carries every pane.
+        // ── manual layout restore + confirm every source pane is mapped.
         let candidate = restorer
             .detect()
-            .expect("detect after restart")
+            .expect("detect after handle rebuild")
             .expect("candidate must exist");
         let checkpoint = restorer
             .load_checkpoint(&candidate)
@@ -2134,12 +2244,12 @@ fn e2e_save_restart_restore_nested_split_topology_preserved() {
         let summary = restorer
             .restore(&candidate, &checkpoint, wezterm.clone())
             .await
-            .expect("restore nested topology");
+            .expect("restore persisted capture topology");
         let pane_id_map_complete = summary.layout_result.pane_id_map.len() == panes.len()
             && summary.layout_result.failed_panes.is_empty();
         add_phase(
             &mut report,
-            "restore_executes_cleanly_across_splits",
+            "manual_layout_restore_maps_all_panes",
             restore_start,
             if pane_id_map_complete { "ok" } else { "error" },
             json!({
@@ -2149,8 +2259,10 @@ fn e2e_save_restart_restore_nested_split_topology_preserved() {
             }),
         );
 
-        let success = pane_set_match
+        let success = persisted_hash_match
+            && pane_set_match
             && pane_count_match
+            && window_count_match
             && topology_self_roundtrip
             && pane_id_map_complete
             && summary.session_id == captured_session_id
@@ -2161,7 +2273,7 @@ fn e2e_save_restart_restore_nested_split_topology_preserved() {
         report.failure_reason = if success {
             None
         } else {
-            Some("nested topology did not survive save → restart → restore".to_string())
+            Some("persisted capture topology or manual pane mapping changed".to_string())
         };
         emit_report(&report);
         assert!(

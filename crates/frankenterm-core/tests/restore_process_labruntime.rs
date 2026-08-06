@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use common::fixtures::RuntimeFixture;
-use frankenterm_core::restore_process::{LaunchAction, LaunchConfig, ProcessLauncher, ProcessPlan};
+use frankenterm_core::restore_process::{LaunchAction, ProcessLauncher, ProcessPlan};
 use frankenterm_core::wezterm::MockWezterm;
 
 // ===========================================================================
@@ -24,7 +24,7 @@ fn execute_shell_launch_is_refused_without_pty_input() {
     rt.block_on(async {
         let mock = Arc::new(MockWezterm::new());
         mock.add_default_pane(100).await;
-        let launcher = ProcessLauncher::new(LaunchConfig::default());
+        let launcher = ProcessLauncher::new();
         let plans = vec![ProcessPlan {
             old_pane_id: 1,
             new_pane_id: 100,
@@ -51,7 +51,7 @@ fn execute_shell_launch_is_refused_without_pty_input() {
 fn execute_mixed_plan() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let launcher = ProcessLauncher::new(LaunchConfig::default());
+        let launcher = ProcessLauncher::new();
         let plans = vec![
             ProcessPlan {
                 old_pane_id: 1,
@@ -100,7 +100,7 @@ fn execute_mixed_plan() {
 fn execute_empty_plans() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let launcher = ProcessLauncher::new(LaunchConfig::default());
+        let launcher = ProcessLauncher::new();
         let report = launcher.execute(&[]);
         assert_eq!(report.results.len(), 0);
         assert_eq!(report.shells_launched, 0);
@@ -116,7 +116,7 @@ fn execute_empty_plans() {
 fn execute_skip_only() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let launcher = ProcessLauncher::new(LaunchConfig::default());
+        let launcher = ProcessLauncher::new();
         let plans = vec![
             ProcessPlan {
                 old_pane_id: 1,
@@ -152,7 +152,7 @@ fn execute_skip_only() {
 fn execute_manual_only() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let launcher = ProcessLauncher::new(LaunchConfig::default());
+        let launcher = ProcessLauncher::new();
         let plans = vec![ProcessPlan {
             old_pane_id: 1,
             new_pane_id: 100,
@@ -179,7 +179,7 @@ fn execute_legacy_agent_plan_is_refused() {
     rt.block_on(async {
         let mock = Arc::new(MockWezterm::new());
         mock.add_default_pane(100).await;
-        let launcher = ProcessLauncher::new(LaunchConfig::default());
+        let launcher = ProcessLauncher::new();
         let plans = vec![ProcessPlan {
             old_pane_id: 1,
             new_pane_id: 100,
@@ -208,7 +208,7 @@ fn execute_legacy_agent_plan_is_refused() {
 fn execute_report_result_order_preserved() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let launcher = ProcessLauncher::new(LaunchConfig::default());
+        let launcher = ProcessLauncher::new();
         let plans = vec![
             ProcessPlan {
                 old_pane_id: 1,

@@ -401,7 +401,7 @@ fn restore_activates_correct_pane() {
 }
 
 #[test]
-fn restore_empty_snapshot() {
+fn restore_empty_snapshot_fails_before_mux_effects() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let mock = Arc::new(MockWezterm::new());
@@ -413,11 +413,11 @@ fn restore_empty_snapshot() {
             windows: vec![],
         };
 
-        let result = restorer.restore(&snapshot).await.unwrap();
-
-        assert_eq!(result.windows_created, 0);
-        assert_eq!(result.tabs_created, 0);
-        assert_eq!(result.panes_created, 0);
+        restorer
+            .restore(&snapshot)
+            .await
+            .expect_err("empty topology has no restorable authority");
+        assert!(mock.list_panes().await.unwrap().is_empty());
     });
 }
 
@@ -465,10 +465,8 @@ fn restore_sets_cwd_from_file_uri() {
 
         assert_eq!(result.panes_created, 1);
         let new_id = result.pane_id_map[&1];
-        let text: String = WeztermInterface::get_text(&*mock, new_id, false)
-            .await
-            .unwrap();
-        assert!(text.contains("/home/agent/project"), "cwd should be set");
+        let pane = mock.pane_state(new_id).await.expect("restored pane state");
+        assert_eq!(pane.cwd, "/home/agent/project");
     });
 }
 
@@ -489,9 +487,10 @@ fn config_skip_cwd_restore() {
 
         assert_eq!(result.panes_created, 1);
         let new_id = result.pane_id_map[&1];
-        let text: String = WeztermInterface::get_text(&*mock, new_id, false)
-            .await
-            .unwrap();
-        assert!(!text.contains("cd "), "cwd should not be set");
+        let pane = mock.pane_state(new_id).await.expect("restored pane state");
+        assert_eq!(
+            pane.cwd, "/home/user",
+            "disabling cwd restore must preserve the mock backend default"
+        );
     });
 }

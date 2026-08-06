@@ -27,7 +27,7 @@
 //! 20. RestoreConfig double roundtrip (serialize -> deserialize -> serialize) stable
 //! 21. count_panes on topology with N single-leaf tabs equals N
 //! 22. LayoutRestorer restore on single leaf creates exactly 1 pane (async unit)
-//! 23. LayoutRestorer restore on empty topology creates 0 panes (async unit)
+//! 23. LayoutRestorer rejects empty topology before mux effects (async unit)
 //! 24. LayoutRestorer restore preserves pane_id_map size matching count_panes (async unit)
 //! 25. LayoutRestorer restore with splits creates correct pane count (async unit)
 
@@ -859,7 +859,7 @@ fn config_roundtrip_all_false() {
 // =========================================================================
 
 use frankenterm_core::restore_layout::LayoutRestorer;
-use frankenterm_core::wezterm::MockWezterm;
+use frankenterm_core::wezterm::{MockWezterm, WeztermInterface};
 use std::sync::Arc;
 
 /// Property 22: LayoutRestorer restore on single leaf creates exactly 1 pane
@@ -886,12 +886,12 @@ fn restore_single_leaf_creates_one_pane() {
     });
 }
 
-/// Property 23: LayoutRestorer restore on empty topology creates 0 panes
+/// Property 23: malformed empty topology fails before any mux effect.
 #[test]
-fn restore_empty_topology_creates_zero_panes() {
+fn restore_empty_topology_fails_before_mux_effects() {
     run_async_test(async {
         let mock = Arc::new(MockWezterm::new());
-        let restorer = LayoutRestorer::new(mock, RestoreConfig::default());
+        let restorer = LayoutRestorer::new(mock.clone(), RestoreConfig::default());
         let snapshot = TopologySnapshot {
             schema_version: 1,
             captured_at: 1000,
@@ -899,16 +899,11 @@ fn restore_empty_topology_creates_zero_panes() {
             windows: vec![],
         };
 
-        let result = restorer.restore(&snapshot).await.unwrap();
-
-        assert_eq!(
-            result.panes_created, 0,
-            "empty topology should create 0 panes"
-        );
-        assert_eq!(result.windows_created, 0);
-        assert_eq!(result.tabs_created, 0);
-        assert!(result.pane_id_map.is_empty());
-        assert!(result.failed_panes.is_empty());
+        restorer
+            .restore(&snapshot)
+            .await
+            .expect_err("empty topology has no restorable authority");
+        assert!(mock.list_panes().await.unwrap().is_empty());
     });
 }
 

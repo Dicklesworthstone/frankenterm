@@ -636,7 +636,7 @@ proptest! {
     ) {
         let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
-            let launcher = ProcessLauncher::new(LaunchConfig::default());
+            let launcher = ProcessLauncher::new();
 
             // Build consistent pane state and ID map
             let states: Vec<PaneStateSnapshot> = pane_ids
@@ -692,7 +692,7 @@ proptest! {
     ) {
         let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
-            let launcher = ProcessLauncher::new(LaunchConfig::default());
+            let launcher = ProcessLauncher::new();
 
             let states: Vec<PaneStateSnapshot> = (0..pane_count)
                 .map(|i| {
@@ -809,9 +809,9 @@ proptest! {
 // Property: edge cases
 // =============================================================================
 
-/// Empty topology snapshot restores with zero panes.
+/// Empty topology snapshot fails before any mux effect.
 #[test]
-fn empty_topology_restores_empty() {
+fn empty_topology_fails_before_mux_effects() {
     run_async_test(async {
         let topo = TopologySnapshot {
             schema_version: 1,
@@ -821,13 +821,12 @@ fn empty_topology_restores_empty() {
         };
 
         let mock = Arc::new(MockWezterm::new());
-        let restorer = LayoutRestorer::new(mock, RestoreConfig::default());
-        let result = restorer.restore(&topo).await.unwrap();
-
-        assert_eq!(result.pane_id_map.len(), 0);
-        assert_eq!(result.windows_created, 0);
-        assert_eq!(result.tabs_created, 0);
-        assert_eq!(result.panes_created, 0);
+        let restorer = LayoutRestorer::new(mock.clone(), RestoreConfig::default());
+        restorer
+            .restore(&topo)
+            .await
+            .expect_err("empty topology has no restorable authority");
+        assert!(mock.list_panes().await.unwrap().is_empty());
     });
 }
 
@@ -941,20 +940,15 @@ fn max_complexity_topology_restores() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(300))]
 
-    /// Enabled shell restoration remains manual until mux spawn can verify the
-    /// exact program and domain without PTY input.
+    /// Captured shells remain manual until mux spawn can verify the exact
+    /// program, argv, CWD, and domain without PTY input.
     #[test]
-    fn enabled_shells_require_manual_mux_native_spawn(
+    fn captured_shells_require_manual_mux_native_spawn(
         shell in arb_shell(),
     ) {
         let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
-            let launcher = ProcessLauncher::new(
-                LaunchConfig {
-                    launch_shells: true,
-                    ..LaunchConfig::default()
-                },
-            );
+            let launcher = ProcessLauncher::new();
 
             let state = PaneStateSnapshot {
                 schema_version: 1,
@@ -998,30 +992,25 @@ proptest! {
         })?;
     }
 
-    /// The historical shell knob is reserved/inert: captured shells still
-    /// require manual replacement rather than silently disappearing.
+    /// Manual disposition hints never expose raw argv or working directories.
     #[test]
-    fn disabled_shell_knob_still_reports_manual_replacement(
+    fn captured_shell_manual_hint_redacts_raw_argv_and_cwd(
         shell in arb_shell(),
+        canary in "[a-z]{1,20}",
     ) {
         let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
-            let launcher = ProcessLauncher::new(
-                LaunchConfig {
-                    launch_shells: false,
-                    ..LaunchConfig::default()
-                },
-            );
+            let launcher = ProcessLauncher::new();
 
             let state = PaneStateSnapshot {
                 schema_version: 1,
                 pane_id: 1,
                 captured_at: 1_700_000_000,
-                cwd: Some("/home/user".to_string()),
+                cwd: Some(format!("/raw-cwd-canary-{canary}")),
                 foreground_process: Some(ProcessInfo {
                     name: shell,
                     pid: Some(1234),
-                    argv: None,
+                    argv: Some(vec![format!("raw-argv-canary-{canary}")]),
                 }),
                 shell: Some("bash".to_string()),
                 terminal: TerminalState {
@@ -1044,10 +1033,11 @@ proptest! {
             match &plans[0].action {
                 LaunchAction::Manual { hint, .. } => {
                     prop_assert!(hint.contains("mux-native argv"));
+                    prop_assert!(!hint.contains("raw-"));
                 }
                 other => prop_assert!(
                     false,
-                    "expected Manual for reserved shell knob, got {:?}",
+                    "expected redacted Manual disposition, got {:?}",
                     other
                 ),
             }
