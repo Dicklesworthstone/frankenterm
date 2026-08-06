@@ -45,6 +45,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime_async::{ContextError, ContextErrorKind, notify::Notify};
 
+/// Next process-wide channel identity. Zero is the exhausted sentinel and is
+/// never issued as a channel identity.
+static NEXT_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a unique, monotonically increasing nonzero value.
+///
+/// The transition from `u64::MAX` to zero is deliberate: the caller that wins
+/// that transition receives `u64::MAX`, while every later caller observes the
+/// zero exhaustion sentinel and fails closed. Atomic modification order makes
+/// each nonzero value unique even under concurrent allocation.
+fn allocate_monotonic_nonzero(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current != 0).then_some(current.wrapping_add(1))
+        })
+        .ok()
+}
+
+fn allocate_channel_id(counter: &AtomicU64) -> u64 {
+    allocate_monotonic_nonzero(counter)
+        .expect("TxChannel process-wide channel identity space exhausted")
+}
+
 // ── Reservation ────────────────────────────────────────────────────────────
 
 /// A token representing a reserved slot in the channel.
@@ -146,6 +169,8 @@ pub enum TxChannelError {
     TimerFailure,
     /// Channel is at capacity (for try_reserve).
     Full,
+    /// This channel has issued every representable nonzero sequence number.
+    SequenceExhausted,
     /// Reservation belongs to a different channel.
     WrongChannel { expected: u64, actual: u64 },
     /// Reservation was already committed.
@@ -163,6 +188,7 @@ impl fmt::Display for TxChannelError {
             Self::ContextFailure => write!(f, "channel capability context failed"),
             Self::TimerFailure => write!(f, "channel capability timer failed"),
             Self::Full => write!(f, "channel full"),
+            Self::SequenceExhausted => write!(f, "channel sequence space exhausted"),
             Self::WrongChannel { expected, actual } => {
                 write!(f, "reservation for channel {actual}, expected {expected}")
             }
@@ -172,6 +198,8 @@ impl fmt::Display for TxChannelError {
         }
     }
 }
+
+impl std::error::Error for TxChannelError {}
 
 // ── Tx Channel ─────────────────────────────────────────────────────────────
 
@@ -262,13 +290,17 @@ impl<T> TxShared<T> {
 /// Construct a bounded transactional channel.
 ///
 /// # Panics
-/// Panics when `capacity == 0`.
+/// Panics when `capacity == 0` or the process has already allocated every
+/// representable nonzero channel identity. Identity exhaustion fails closed so
+/// a reservation can never validate against a different channel after wrap.
 pub fn tx_channel<T>(capacity: usize) -> (TxProducer<T>, TxConsumer<T>) {
     assert!(capacity > 0, "TxChannel capacity must be > 0");
 
-    // Use a simple atomic counter for channel IDs
-    static NEXT_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
-    let channel_id = NEXT_CHANNEL_ID.fetch_add(1, Ordering::Relaxed);
+    // The public constructor is intentionally infallible for API stability.
+    // Exhaustion is therefore a fail-closed invariant violation rather than a
+    // wrapped identity that could validate a reservation against the wrong
+    // channel.
+    let channel_id = allocate_channel_id(&NEXT_CHANNEL_ID);
 
     let rollback_state = Arc::new(RollbackState {
         active_reservations: AtomicU64::new(0),
@@ -310,7 +342,8 @@ impl<T> TxProducer<T> {
     /// Try to reserve a slot without blocking.
     ///
     /// Returns `Err(Full)` if the channel is at capacity, or `Err(Closed)`
-    /// if the channel has been closed.
+    /// if the channel has been closed. Returns `Err(SequenceExhausted)` after
+    /// this channel has issued every representable nonzero sequence number.
     pub fn try_reserve(&self) -> Result<Reservation, TxChannelError> {
         loop {
             if self.shared.closed.load(Ordering::Acquire) {
@@ -367,7 +400,21 @@ impl<T> TxProducer<T> {
             return Err(TxChannelError::Closed);
         }
 
-        let seq = self.shared.next_seq.fetch_add(1, Ordering::Relaxed);
+        let Some(seq) = allocate_monotonic_nonzero(&self.shared.next_seq) else {
+            // The capacity claim preceded sequence allocation. Roll it back
+            // before surfacing exhaustion so this terminal identity condition
+            // cannot leak a reservation slot or strand a waiting producer.
+            self.shared
+                .rollback_state
+                .active_reservations
+                .fetch_sub(1, Ordering::AcqRel);
+            self.shared.rollback_state.capacity_freed.notify_one();
+            self.shared
+                .rollback_state
+                .consumer_state_changed
+                .notify_waiters();
+            return Err(TxChannelError::SequenceExhausted);
+        };
 
         Ok(Reservation {
             seq,
@@ -1314,6 +1361,45 @@ mod tests {
     }
 
     #[test]
+    fn monotonic_identity_allocator_issues_max_once_then_fails_closed() {
+        let next = AtomicU64::new(u64::MAX);
+
+        assert_eq!(allocate_monotonic_nonzero(&next), Some(u64::MAX));
+        assert_eq!(next.load(Ordering::Relaxed), 0);
+        assert_eq!(allocate_monotonic_nonzero(&next), None);
+        assert_eq!(allocate_monotonic_nonzero(&next), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "TxChannel process-wide channel identity space exhausted")]
+    fn channel_identity_exhaustion_panics_instead_of_reusing_an_identity() {
+        let exhausted = AtomicU64::new(0);
+        let _ = allocate_channel_id(&exhausted);
+    }
+
+    #[test]
+    fn sequence_exhaustion_is_typed_and_rolls_back_capacity_claim() {
+        let (tx, _rx) = tx_channel::<u32>(1);
+        tx.shared.next_seq.store(u64::MAX, Ordering::Relaxed);
+
+        let final_reservation = tx
+            .try_reserve()
+            .expect("the final nonzero sequence must remain allocatable");
+        assert_eq!(final_reservation.seq(), u64::MAX);
+        drop(final_reservation);
+        assert_eq!(tx.active_reservations(), 0);
+        assert_eq!(tx.available(), 1);
+
+        assert_eq!(
+            tx.try_reserve()
+                .expect_err("sequence allocation after u64::MAX must fail closed"),
+            TxChannelError::SequenceExhausted
+        );
+        assert_eq!(tx.active_reservations(), 0);
+        assert_eq!(tx.available(), 1);
+    }
+
+    #[test]
     fn rollback_on_drop() {
         let (tx, _rx) = tx_channel::<String>(4);
 
@@ -1572,6 +1658,10 @@ mod tests {
             "channel capability timer failed"
         );
         assert_eq!(TxChannelError::Full.to_string(), "channel full");
+        assert_eq!(
+            TxChannelError::SequenceExhausted.to_string(),
+            "channel sequence space exhausted"
+        );
         assert_eq!(
             TxChannelError::WrongChannel {
                 expected: 1,

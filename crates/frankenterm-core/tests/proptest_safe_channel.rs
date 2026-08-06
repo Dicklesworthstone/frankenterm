@@ -73,6 +73,7 @@ fn arb_error() -> impl Strategy<Value = TxChannelError> {
         Just(TxChannelError::ContextFailure),
         Just(TxChannelError::TimerFailure),
         Just(TxChannelError::Full),
+        Just(TxChannelError::SequenceExhausted),
         (1..=100u64, 1..=100u64)
             .prop_map(|(expected, actual)| TxChannelError::WrongChannel { expected, actual }),
         (1..=1000u64).prop_map(|seq| TxChannelError::AlreadyCommitted { seq }),
