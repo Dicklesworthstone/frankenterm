@@ -2056,8 +2056,11 @@ impl WeztermClient {
     ) -> Result<u64> {
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
+            // Finish all fallible local request construction before allowing
+            // the guard to transition Open -> HalfOpen. A local ID rejection
+            // is not a backend probe and must not leave one unsettled.
+            let spawn = Self::mux_spawn_request(cwd, domain_name, target)?;
             if self.mux_circuit_guard() {
-                let spawn = Self::mux_spawn_request(cwd, domain_name, target)?;
                 match pool.spawn_v2_with_cx(cx, spawn).await {
                     Ok(response) => {
                         self.mux_circuit_record_success();
@@ -2148,8 +2151,10 @@ impl WeztermClient {
         );
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
+            // As with spawn, local protocol conversion must settle before the
+            // breaker admits a transport probe.
+            let split = Self::mux_split_request(pane_id, direction, cwd, percent)?;
             if self.mux_circuit_guard() {
-                let split = Self::mux_split_request(pane_id, direction, cwd, percent)?;
                 match pool.split_pane_with_cx(cx, split).await {
                     Ok(response) => {
                         self.mux_circuit_record_success();
@@ -6283,7 +6288,7 @@ mod tests {
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
-    fn mux_remote_error_does_not_trigger_circuit_breaker() {
+    fn mux_remote_error_records_healthy_framed_response_without_failure() {
         let err = crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteError(
             "invalid spawn domain".to_string(),
         ));
