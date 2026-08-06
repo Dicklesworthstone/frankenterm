@@ -907,8 +907,9 @@ impl StreamingTasks {
 
     fn insert_active(&mut self, pane_id: u64, task: StreamingTask) {
         if let Some(replaced) = self.tasks.insert(pane_id, task) {
-            replaced.handle.abort();
-            self.settling.insert_handle(replaced.handle);
+            let StreamingTask { handle, .. } = replaced;
+            handle.abort();
+            self.settling.insert_handle(handle);
             error!(
                 pane_id,
                 event = "streaming_task_active_slot_replaced",
@@ -920,21 +921,26 @@ impl StreamingTasks {
     fn reap_completed(&mut self) {
         while let Some(join_result) = self.settling.try_join_next() {
             if let Err(error) = join_result {
-                if matches!(
-                    error.kind(),
-                    JoinErrorKind::Aborted
-                        | JoinErrorKind::ContextCancelled
-                        | JoinErrorKind::WakerRegistrationFailed
-                ) {
-                    debug!(
-                        failure_class = ?error.kind(),
-                        "Vendored streaming task stopped"
-                    );
-                } else {
-                    warn!(
-                        failure_class = ?error.kind(),
-                        "Vendored streaming task failed"
-                    );
+                match error.kind() {
+                    JoinErrorKind::Aborted | JoinErrorKind::ContextCancelled => {
+                        debug!(
+                            failure_class = ?error.kind(),
+                            "Vendored streaming task stopped"
+                        );
+                    }
+                    JoinErrorKind::WakerRegistrationFailed => {
+                        warn!(
+                            event = "streaming_task_join_observation_quarantined",
+                            unacknowledged_tasks = self.settling.unacknowledged_len(),
+                            "Vendored streaming task join observation failed; terminal authority remains retained"
+                        );
+                    }
+                    _ => {
+                        warn!(
+                            failure_class = ?error.kind(),
+                            "Vendored streaming task failed"
+                        );
+                    }
                 }
             }
         }
@@ -943,8 +949,9 @@ impl StreamingTasks {
     fn abort_all_active(&mut self) {
         let active = std::mem::take(&mut self.tasks);
         for (_pane_id, task) in active {
-            task.handle.abort();
-            self.settling.insert_handle(task.handle);
+            let StreamingTask { handle, .. } = task;
+            handle.abort();
+            self.settling.insert_handle(handle);
         }
     }
 
@@ -1012,7 +1019,8 @@ impl Drop for StreamingTasks {
                 event = "streaming_tasks_dropped_before_settlement",
                 active_tasks,
                 already_settling_tasks,
-                unacknowledged_tasks = self.settling.len(),
+                remaining_tasks = self.settling.len(),
+                quarantined_unacknowledged_tasks = self.settling.unacknowledged_len(),
                 orphan_risk = true,
                 "Vendored streaming task owner dropped without terminal acknowledgement"
             );
@@ -10612,6 +10620,31 @@ mod tests {
                 "waker-registration failure must retain and trusted-drain streaming task ownership",
             );
             assert_eq!(tasks.settling.settlement(), JoinSetSettlement::Settled);
+        });
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn streaming_task_steady_reaper_retains_quarantined_terminal_authority() {
+        run_async_test(async {
+            let mut tasks = StreamingTasks::new();
+            tasks.settling.spawn(std::future::pending::<()>());
+            tasks.settling.force_join_registration_failure_for_test();
+            tasks.settling.abort_all();
+
+            for _ in 0..4_096 {
+                tasks.reap_completed();
+                if tasks.settling.settlement() == JoinSetSettlement::Settled {
+                    break;
+                }
+                crate::runtime_async::yield_now().await;
+            }
+
+            assert_eq!(
+                tasks.settling.settlement(),
+                JoinSetSettlement::Settled,
+                "steady-state reaping must trusted-poll quarantined handles after abort acknowledgement",
+            );
         });
     }
 
