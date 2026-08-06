@@ -405,6 +405,9 @@ pub type DeliveryRecord = NotificationDeliveryRecord;
 
 const WEBHOOK_DISPATCH_TARGET: &str = "webhook_dispatch";
 const WEBHOOK_CANCELLATION_ERROR: &str = "webhook_dispatch_cancelled";
+const WEBHOOK_DEADLINE_ERROR: &str = "webhook_dispatch_deadline_exceeded";
+const WEBHOOK_BUDGET_ERROR: &str = "webhook_dispatch_budget_exhausted";
+const WEBHOOK_CONTEXT_ERROR: &str = "webhook_dispatch_context_error";
 const WEBHOOK_TRANSPORT_ERROR: &str = "webhook_transport_error";
 const WEBHOOK_REMOTE_REJECTION: &str = "webhook_remote_rejected";
 const WEBHOOK_INVALID_TRANSPORT_RESULT: &str = "webhook_invalid_transport_result";
@@ -430,17 +433,52 @@ fn safe_delivery_error(result: &DeliveryResult) -> Option<&'static str> {
     }
 }
 
+fn checkpoint_error_class(
+    cx: &crate::cx::Cx,
+    error: &asupersync::error::Error,
+) -> &'static str {
+    use asupersync::error::ErrorKind;
+
+    match error.kind() {
+        ErrorKind::DeadlineExceeded => WEBHOOK_DEADLINE_ERROR,
+        ErrorKind::PollQuotaExhausted
+        | ErrorKind::CostQuotaExhausted
+        | ErrorKind::CancelTimeout => WEBHOOK_BUDGET_ERROR,
+        ErrorKind::Cancelled => match cx.cancel_reason().map(|reason| reason.root_cause().kind) {
+            Some(crate::outcome::CancelKind::Timeout | crate::outcome::CancelKind::Deadline) => {
+                WEBHOOK_DEADLINE_ERROR
+            }
+            Some(
+                crate::outcome::CancelKind::PollQuota
+                | crate::outcome::CancelKind::CostBudget,
+            ) => WEBHOOK_BUDGET_ERROR,
+            _ => WEBHOOK_CANCELLATION_ERROR,
+        },
+        _ => WEBHOOK_CONTEXT_ERROR,
+    }
+}
+
+fn is_dispatch_control_error(error: &str) -> bool {
+    matches!(
+        error,
+        WEBHOOK_CANCELLATION_ERROR
+            | WEBHOOK_DEADLINE_ERROR
+            | WEBHOOK_BUDGET_ERROR
+            | WEBHOOK_CONTEXT_ERROR
+    )
+}
+
 fn checkpoint_dispatch(
     cx: &crate::cx::Cx,
     target: impl Into<String>,
 ) -> std::result::Result<(), DeliveryRecord> {
-    cx.checkpoint().map_err(|_| DeliveryRecord {
+    cx.checkpoint().map_err(|error| DeliveryRecord {
         target: target.into(),
         accepted: false,
         status_code: 0,
         // Checkpoint diagnostics can include caller-controlled cancellation
-        // reasons. Persist only a finite class in notification records.
-        error: Some(WEBHOOK_CANCELLATION_ERROR.to_string()),
+        // reasons. Persist only the typed root-cause class, never raw detail.
+        error: Some(checkpoint_error_class(cx, &error).to_string()),
     })
 }
 
@@ -452,7 +490,7 @@ fn notification_delivery_error(success: bool, records: &[DeliveryRecord]) -> Opt
     let error = records
         .iter()
         .filter_map(|record| record.error.as_deref())
-        .find(|error| *error == WEBHOOK_CANCELLATION_ERROR)
+        .find(|error| is_dispatch_control_error(error))
         .unwrap_or("one_or_more_deliveries_failed");
     Some(error.to_owned())
 }
@@ -474,7 +512,8 @@ impl WebhookDispatcher {
     ///
     /// Returns a record for each endpoint that was attempted. If cancellation
     /// prevents or stops fanout, the final failed record targets
-    /// `webhook_dispatch` and carries the cancellation error.
+    /// `webhook_dispatch` and carries a finite cancellation, deadline, budget,
+    /// or context-error class.
     pub async fn dispatch(
         &self,
         detection: &Detection,
@@ -1182,6 +1221,48 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_poll_budget_is_not_misreported_as_user_cancellation() {
+        run_async_test(async {
+            let transport = AmbientOnlyTransport::success();
+            let endpoint = test_endpoint(
+                "budget-blocked",
+                "https://example.invalid/blocked",
+                WebhookTemplate::Generic,
+            );
+            let dispatcher = WebhookDispatcher::new(vec![endpoint], Box::new(transport.clone()));
+            let payload =
+                NotificationPayload::from_detection(&test_detection(), 3, &test_rendered(), 0);
+            let cx = crate::cx::Cx::for_request_with_budget(
+                crate::cx::Budget::new().with_poll_quota(0),
+            );
+
+            let delivery = dispatcher.send_with_cx(&cx, &payload).await;
+
+            assert!(!delivery.success);
+            assert_eq!(delivery.records.len(), 1);
+            assert_eq!(delivery.records[0].target, WEBHOOK_DISPATCH_TARGET);
+            assert_eq!(
+                delivery.records[0].error.as_deref(),
+                Some(WEBHOOK_BUDGET_ERROR)
+            );
+            assert_eq!(delivery.error.as_deref(), Some(WEBHOOK_BUDGET_ERROR));
+            assert!(
+                transport.requests().is_empty(),
+                "an exhausted poll budget must stop before transport dispatch"
+            );
+        });
+    }
+
+    #[test]
+    fn unknown_checkpoint_error_uses_finite_context_class() {
+        let cx = crate::cx::for_request();
+        let error = asupersync::error::Error::new(asupersync::error::ErrorKind::Internal)
+            .with_message("sentinel-private-context-detail");
+
+        assert_eq!(checkpoint_error_class(&cx, &error), WEBHOOK_CONTEXT_ERROR);
+    }
+
+    #[test]
     fn cancellation_during_default_transport_stops_later_endpoints() {
         run_async_test(async {
             let cx = crate::cx::for_request();
@@ -1239,8 +1320,9 @@ mod tests {
             let dispatcher = WebhookDispatcher::new(vec![endpoint], Box::new(transport));
             let payload =
                 NotificationPayload::from_detection(&test_detection(), 3, &test_rendered(), 0);
+            let cx = crate::cx::for_request();
 
-            let delivery = dispatcher.send_with_cx(&crate::cx::for_request(), &payload).await;
+            let delivery = dispatcher.send_with_cx(&cx, &payload).await;
 
             assert!(!delivery.success);
             assert_eq!(delivery.records.len(), 1);
@@ -1249,6 +1331,37 @@ mod tests {
             assert_eq!(
                 delivery.records[0].error.as_deref(),
                 Some(WEBHOOK_TRANSPORT_ERROR)
+            );
+            assert!(!format!("{delivery:?}").contains(SECRET));
+        });
+    }
+
+    #[test]
+    fn inconsistent_two_xx_transport_result_uses_invalid_result_class() {
+        run_async_test(async {
+            const SECRET: &str = "sentinel-inconsistent-two-xx-secret";
+            let transport = MockTransport::responding(DeliveryResult {
+                status_code: 204,
+                accepted: true,
+                error: Some(SECRET.to_string()),
+            });
+            let endpoint = test_endpoint(
+                "inconsistent-two-xx",
+                "https://example.invalid/hook",
+                WebhookTemplate::Generic,
+            );
+            let dispatcher = WebhookDispatcher::new(vec![endpoint], Box::new(transport));
+            let payload =
+                NotificationPayload::from_detection(&test_detection(), 3, &test_rendered(), 0);
+            let cx = crate::cx::for_request();
+
+            let delivery = dispatcher.send_with_cx(&cx, &payload).await;
+
+            assert!(!delivery.success);
+            assert!(!delivery.records[0].accepted);
+            assert_eq!(
+                delivery.records[0].error.as_deref(),
+                Some(WEBHOOK_INVALID_TRANSPORT_RESULT)
             );
             assert!(!format!("{delivery:?}").contains(SECRET));
         });
