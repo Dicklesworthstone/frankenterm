@@ -1936,6 +1936,17 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // ambiguous again, so this authority migration is forward-only.
         down_sql: None,
     },
+    Migration {
+        version: 38,
+        description: "Make checkpoint IDs non-reusable and model restore intent linkage",
+        // Applied by ensure_checkpoint_identity_v38_schema. Rebuilding the
+        // circularly referenced checkpoint table requires foreign_keys=OFF
+        // before BEGIN, so apply_migration_step uses the dedicated wrapper.
+        up_sql: "",
+        // Reverting to reusable rowids can silently alias durable clean and
+        // restore-attempt identities. This authority boundary is forward-only.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -2013,6 +2024,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         validate_current_ft_meta_authority(conn)?;
         validate_checkpoint_snapshot_authority_schema(conn)?;
         validate_clean_checkpoint_receipt_schema(conn)?;
+        validate_checkpoint_identity_v38_schema(conn)?;
         check_ft_version_compatibility(conn)?;
         // The overwhelmingly common reopen path is read-only and must not
         // acquire SQLite's singleton writer lock. If the optimistic probe
@@ -2197,6 +2209,37 @@ fn require_exact_column_descriptor(
         details: format!(
             "{context}: non-canonical {table}.{} descriptor: expected {expected:?}, found {actual:?}",
             expected.name
+        ),
+    }
+    .into())
+}
+
+fn require_exact_table_column_count(
+    conn: &Connection,
+    table: &str,
+    expected: usize,
+    context: &str,
+) -> Result<()> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    let mut actual = 0_usize;
+    while rows
+        .next()
+        .map_err(|error| StorageError::Database(error.to_string()))?
+        .is_some()
+    {
+        actual = actual.saturating_add(1);
+    }
+    if actual == expected {
+        return Ok(());
+    }
+    Err(StorageError::Corruption {
+        details: format!(
+            "{context}: non-canonical {table} column count: expected {expected}, found {actual}"
         ),
     }
     .into())
@@ -2395,6 +2438,15 @@ const CHECKPOINT_GLOBAL_SNAPSHOT_LATEST_INDEX_SQL: &str =
      ON session_checkpoints(checkpoint_at DESC, id DESC)
      WHERE checkpoint_role = 'snapshot';";
 
+const CHECKPOINT_ROLE_CAUSAL_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_checkpoints_session_role_causal
+     ON session_checkpoints(session_id, checkpoint_role, id DESC);";
+
+const CHECKPOINT_RESTORE_INTENT_OUTCOME_INDEX_SQL: &str =
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_restore_intent_outcome
+     ON session_checkpoints(restore_intent_checkpoint_id)
+     WHERE restore_intent_checkpoint_id IS NOT NULL;";
+
 const CLEAN_CHECKPOINT_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_mux_sessions_clean_checkpoint
      ON mux_sessions(clean_checkpoint_id);";
@@ -2426,13 +2478,30 @@ fn validate_checkpoint_snapshot_authority_columns(conn: &Connection) -> Result<(
         },
         "checkpoint snapshot authority",
     )?;
-    require_table_sql_fragment(
-        conn,
-        "session_checkpoints",
+    let table_sql = load_schema_object_sql(conn, "table", "session_checkpoints")?.ok_or_else(|| {
+        StorageError::Corruption {
+            details: "checkpoint snapshot authority: missing required table session_checkpoints"
+                .to_string(),
+        }
+    })?;
+    let compact_table_sql = compact_schema_sql(&table_sql);
+    let v36_role_check = compact_schema_sql(
         "checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
          CHECK(checkpoint_role IN ('snapshot','restore_receipt'))",
-        "checkpoint snapshot authority",
-    )?;
+    );
+    let v38_role_check = compact_schema_sql(
+        "checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
+         CHECK(checkpoint_role IN ('snapshot','restore_intent','restore_receipt'))",
+    );
+    if !compact_table_sql.contains(&v36_role_check)
+        && !compact_table_sql.contains(&v38_role_check)
+    {
+        return Err(StorageError::Corruption {
+            details: "checkpoint snapshot authority: session_checkpoints is missing a canonical checkpoint-role constraint"
+                .to_string(),
+        }
+        .into());
+    }
     Ok(())
 }
 
@@ -2517,17 +2586,48 @@ fn ensure_checkpoint_snapshot_authority_schema(conn: &Connection) -> Result<()> 
         "migration v36",
     )?;
 
-    // Before v36 SnapshotEngine rejected every empty pane list. Therefore an
-    // historical startup row with no pane rows is restore bookkeeping, not a
-    // legitimate empty terminal snapshot. The topology-null predicate makes
-    // this idempotent and prevents future explicit empty snapshots from being
-    // reclassified if this repair helper is ever rerun.
+    // Classify only the exact legacy receipt shape that the pre-v36 loader
+    // accepted. An empty startup snapshot alone is ambiguous: missing pane
+    // rows or metadata can also be corruption, and a migration must never mint
+    // clean authority from that negative evidence. JSON1 is already a schema
+    // dependency elsewhere in this database.
     conn.execute_batch(
         "UPDATE session_checkpoints AS checkpoint
          SET checkpoint_role = 'restore_receipt'
          WHERE checkpoint.checkpoint_role = 'snapshot'
            AND checkpoint.checkpoint_type = 'startup'
            AND checkpoint.topology_json IS NULL
+           AND checkpoint.total_bytes = 0
+           AND checkpoint.metadata_json IS NOT NULL
+           AND json_valid(checkpoint.metadata_json)
+           AND json_type(checkpoint.metadata_json) = 'object'
+           AND json_type(checkpoint.metadata_json, '$.old_to_new') = 'object'
+           AND checkpoint.pane_count = (
+               SELECT COUNT(*)
+               FROM json_each(checkpoint.metadata_json, '$.old_to_new')
+           )
+           AND NOT EXISTS (
+               SELECT 1
+               FROM json_each(checkpoint.metadata_json, '$.old_to_new') AS mapping
+               WHERE mapping.key = ''
+                  OR mapping.key GLOB '*[^0-9]*'
+                  OR length(mapping.key) > 19
+                  OR (length(mapping.key) = 19
+                      AND mapping.key > '9223372036854775807')
+                  OR mapping.type <> 'integer'
+                  OR mapping.value < 0
+           )
+           AND (
+               SELECT COUNT(DISTINCT mapping.value)
+               FROM json_each(checkpoint.metadata_json, '$.old_to_new') AS mapping
+           ) = checkpoint.pane_count
+           AND (
+               checkpoint.state_hash = 'restore'
+               OR (
+                   length(checkpoint.state_hash) = 16
+                   AND lower(checkpoint.state_hash) NOT GLOB '*[^0-9a-f]*'
+               )
+           )
            AND NOT EXISTS (
                SELECT 1
                FROM mux_pane_state AS pane_state
@@ -2547,7 +2647,7 @@ fn ensure_checkpoint_snapshot_authority_schema(conn: &Connection) -> Result<()> 
                FROM session_checkpoints AS newest
                WHERE newest.session_id = checkpoint.session_id
                  AND newest.checkpoint_role = 'snapshot'
-               ORDER BY newest.checkpoint_at DESC, newest.id DESC
+               ORDER BY newest.id DESC
                LIMIT 1
            );",
     )
@@ -2666,11 +2766,12 @@ fn ensure_clean_checkpoint_receipt_schema(conn: &Connection) -> Result<()> {
                FROM session_checkpoints AS checkpoint
                WHERE checkpoint.id = session.clean_checkpoint_id
                  AND checkpoint.session_id = session.session_id
+                 AND checkpoint.checkpoint_role IN ('snapshot', 'restore_receipt')
                  AND checkpoint.id = (
                      SELECT latest.id
                      FROM session_checkpoints AS latest
                      WHERE latest.session_id = session.session_id
-                     ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                     ORDER BY latest.id DESC
                      LIMIT 1
                  )
            );",
@@ -2688,6 +2789,755 @@ fn ensure_clean_checkpoint_receipt_schema(conn: &Connection) -> Result<()> {
         "migration v37",
     )?;
     validate_clean_checkpoint_receipt_schema(conn)
+}
+
+/// Schema v38: make checkpoint row identities durable across deletion and
+/// reserve an explicit, one-outcome-per-intent restore-attempt relation.
+const CHECKPOINT_SESSION_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_checkpoints_session
+     ON session_checkpoints(session_id, checkpoint_at);";
+
+const CHECKPOINT_V38_TABLE_SQL: &str = r"
+CREATE TABLE session_checkpoints_v38 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
+    checkpoint_at INTEGER NOT NULL,
+    checkpoint_type TEXT NOT NULL
+        CHECK(checkpoint_type IN ('periodic','event','shutdown','startup')),
+    state_hash TEXT NOT NULL,
+    pane_count INTEGER NOT NULL,
+    total_bytes INTEGER NOT NULL,
+    metadata_json TEXT,
+    checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
+        CHECK(checkpoint_role IN ('snapshot','restore_intent','restore_receipt')),
+    topology_json TEXT,
+    restore_intent_checkpoint_id INTEGER
+        -- Name the post-cutover authority directly. Foreign-key enforcement is
+        -- suspended for the rebuild, so this avoids depending on SQLite's
+        -- ALTER TABLE self-reference rewrite or legacy_alter_table setting.
+        REFERENCES session_checkpoints(id) ON DELETE CASCADE,
+    CHECK(checkpoint_role = 'restore_receipt' OR restore_intent_checkpoint_id IS NULL)
+);";
+
+const RESTORE_ATTEMPT_LIFECYCLE_TABLE_SQL: &str = r"
+CREATE TABLE restore_attempt_lifecycle (
+    intent_checkpoint_id INTEGER PRIMARY KEY
+        REFERENCES session_checkpoints(id)
+        ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
+    session_id TEXT NOT NULL
+        REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
+    source_checkpoint_id INTEGER NOT NULL,
+    outcome_checkpoint_id INTEGER
+        REFERENCES session_checkpoints(id) ON DELETE SET NULL,
+    status TEXT NOT NULL
+        CHECK(status IN ('intent','outcome_complete','resolved','reconciliation_required')),
+    created_at INTEGER NOT NULL,
+    resolved_at INTEGER,
+    CHECK(intent_checkpoint_id <> source_checkpoint_id),
+    CHECK(outcome_checkpoint_id IS NULL OR outcome_checkpoint_id <> intent_checkpoint_id),
+    CHECK(outcome_checkpoint_id IS NULL OR outcome_checkpoint_id <> source_checkpoint_id),
+    CHECK(created_at >= 0),
+    CHECK(resolved_at IS NULL OR resolved_at >= created_at),
+    CHECK(
+        (status = 'intent'
+            AND outcome_checkpoint_id IS NULL
+            AND resolved_at IS NULL)
+        OR (status = 'outcome_complete'
+            AND outcome_checkpoint_id IS NOT NULL
+            AND resolved_at IS NULL)
+        OR (status = 'reconciliation_required'
+            AND resolved_at IS NULL)
+        OR (status = 'resolved'
+            AND resolved_at IS NOT NULL)
+    )
+);";
+
+const RESTORE_ATTEMPT_SESSION_STATUS_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_restore_attempt_lifecycle_session_status
+     ON restore_attempt_lifecycle(session_id, status, intent_checkpoint_id);";
+
+const RESTORE_ATTEMPT_OUTCOME_INDEX_SQL: &str =
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_restore_attempt_lifecycle_outcome
+     ON restore_attempt_lifecycle(outcome_checkpoint_id)
+     WHERE outcome_checkpoint_id IS NOT NULL;";
+
+fn ensure_no_checkpoint_authority_triggers(conn: &Connection, context: &str) -> Result<()> {
+    let trigger_count: i64 = conn
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM sqlite_schema
+                  WHERE type = 'trigger'
+                    AND tbl_name COLLATE NOCASE
+                        IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
+                            'restore_attempt_lifecycle'))
+               + (SELECT COUNT(*) FROM sqlite_temp_schema
+                  WHERE type = 'trigger'
+                    AND tbl_name COLLATE NOCASE
+                        IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
+                            'restore_attempt_lifecycle'))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    if trigger_count == 0 {
+        return Ok(());
+    }
+    Err(StorageError::Corruption {
+        details: format!(
+            "{context}: refuses to rebuild checkpoint authority with {trigger_count} unaudited trigger(s)"
+        ),
+    }
+    .into())
+}
+
+fn checkpoint_v38_table_has_identity_surface(conn: &Connection) -> Result<bool> {
+    let Some(sql) = load_schema_object_sql(conn, "table", "session_checkpoints")? else {
+        return Ok(false);
+    };
+    Ok(compact_schema_sql(&sql).contains("integerprimarykeyautoincrement")
+        || table_has_column(
+            conn,
+            "session_checkpoints",
+            "restore_intent_checkpoint_id",
+        )?)
+}
+
+fn checkpoint_foreign_keys(
+    conn: &Connection,
+    table: &str,
+) -> Result<Vec<(String, String, String, String, String, String)>> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA foreign_key_list({table})"))
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    let mut foreign_keys = statement
+        .query_map([], |row| {
+            Ok((
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        })
+        .map_err(|error| StorageError::Database(error.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    foreign_keys.sort();
+    Ok(foreign_keys)
+}
+
+fn ensure_no_foreign_key_violations(conn: &Connection, context: &str) -> Result<()> {
+    let mut statement = conn
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    let first_violation = statement
+        .query_row([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .optional()
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    if let Some((table, rowid, parent, foreign_key_id)) = first_violation {
+        return Err(StorageError::Corruption {
+            details: format!(
+                "{context}: foreign-key violation table={table} rowid={rowid:?} parent={parent} foreign_key_id={foreign_key_id}"
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_restore_attempt_lifecycle_v38_schema(conn: &Connection) -> Result<()> {
+    require_exact_table_column_count(
+        conn,
+        "restore_attempt_lifecycle",
+        7,
+        "restore attempt lifecycle v38",
+    )?;
+    for expected in [
+        SqliteColumnDescriptor {
+            cid: 0,
+            name: "intent_checkpoint_id".to_string(),
+            declared_type: "INTEGER".to_string(),
+            not_null: false,
+            default_value: None,
+            primary_key: true,
+        },
+        SqliteColumnDescriptor {
+            cid: 1,
+            name: "session_id".to_string(),
+            declared_type: "TEXT".to_string(),
+            not_null: true,
+            default_value: None,
+            primary_key: false,
+        },
+        SqliteColumnDescriptor {
+            cid: 2,
+            name: "source_checkpoint_id".to_string(),
+            declared_type: "INTEGER".to_string(),
+            not_null: true,
+            default_value: None,
+            primary_key: false,
+        },
+        SqliteColumnDescriptor {
+            cid: 3,
+            name: "outcome_checkpoint_id".to_string(),
+            declared_type: "INTEGER".to_string(),
+            not_null: false,
+            default_value: None,
+            primary_key: false,
+        },
+        SqliteColumnDescriptor {
+            cid: 4,
+            name: "status".to_string(),
+            declared_type: "TEXT".to_string(),
+            not_null: true,
+            default_value: None,
+            primary_key: false,
+        },
+        SqliteColumnDescriptor {
+            cid: 5,
+            name: "created_at".to_string(),
+            declared_type: "INTEGER".to_string(),
+            not_null: true,
+            default_value: None,
+            primary_key: false,
+        },
+        SqliteColumnDescriptor {
+            cid: 6,
+            name: "resolved_at".to_string(),
+            declared_type: "INTEGER".to_string(),
+            not_null: false,
+            default_value: None,
+            primary_key: false,
+        },
+    ] {
+        require_exact_column_descriptor(
+            conn,
+            "restore_attempt_lifecycle",
+            &expected,
+            "restore attempt lifecycle v38",
+        )?;
+    }
+    for fragment in [
+        "status TEXT NOT NULL
+         CHECK(status IN ('intent','outcome_complete','resolved','reconciliation_required'))",
+        "intent_checkpoint_id INTEGER PRIMARY KEY
+         REFERENCES session_checkpoints(id)
+         ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED",
+        "CHECK(created_at >= 0)",
+        "CHECK(resolved_at IS NULL OR resolved_at >= created_at)",
+        "CHECK(intent_checkpoint_id <> source_checkpoint_id)",
+        "CHECK(outcome_checkpoint_id IS NULL OR outcome_checkpoint_id <> intent_checkpoint_id)",
+        "CHECK(outcome_checkpoint_id IS NULL OR outcome_checkpoint_id <> source_checkpoint_id)",
+        "status = 'intent'
+         AND outcome_checkpoint_id IS NULL
+         AND resolved_at IS NULL",
+        "status = 'outcome_complete'
+         AND outcome_checkpoint_id IS NOT NULL
+         AND resolved_at IS NULL",
+        "status = 'reconciliation_required'
+         AND resolved_at IS NULL",
+        "status = 'resolved'
+         AND resolved_at IS NOT NULL",
+    ] {
+        require_table_sql_fragment(
+            conn,
+            "restore_attempt_lifecycle",
+            fragment,
+            "restore attempt lifecycle v38",
+        )?;
+    }
+    for (name, canonical_sql) in [
+        (
+            "idx_restore_attempt_lifecycle_session_status",
+            RESTORE_ATTEMPT_SESSION_STATUS_INDEX_SQL,
+        ),
+        (
+            "idx_restore_attempt_lifecycle_outcome",
+            RESTORE_ATTEMPT_OUTCOME_INDEX_SQL,
+        ),
+    ] {
+        validate_exact_index(
+            conn,
+            name,
+            canonical_sql,
+            "restore attempt lifecycle v38",
+        )?;
+    }
+
+    let expected_foreign_keys = vec![
+        (
+            "mux_sessions".to_string(),
+            "session_id".to_string(),
+            "session_id".to_string(),
+            "NO ACTION".to_string(),
+            "CASCADE".to_string(),
+            "NONE".to_string(),
+        ),
+        (
+            "session_checkpoints".to_string(),
+            "intent_checkpoint_id".to_string(),
+            "id".to_string(),
+            "NO ACTION".to_string(),
+            "NO ACTION".to_string(),
+            "NONE".to_string(),
+        ),
+        (
+            "session_checkpoints".to_string(),
+            "outcome_checkpoint_id".to_string(),
+            "id".to_string(),
+            "NO ACTION".to_string(),
+            "SET NULL".to_string(),
+            "NONE".to_string(),
+        ),
+    ];
+    let actual_foreign_keys = checkpoint_foreign_keys(conn, "restore_attempt_lifecycle")?;
+    if actual_foreign_keys != expected_foreign_keys {
+        return Err(StorageError::Corruption {
+            details: format!(
+                "restore attempt lifecycle v38: non-canonical foreign keys: {actual_foreign_keys:?}"
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_identity_v38_schema(conn: &Connection) -> Result<()> {
+    require_exact_table_column_count(
+        conn,
+        "session_checkpoints",
+        11,
+        "checkpoint identity v38",
+    )?;
+    require_exact_column_descriptor(
+        conn,
+        "session_checkpoints",
+        &SqliteColumnDescriptor {
+            cid: 0,
+            name: "id".to_string(),
+            declared_type: "INTEGER".to_string(),
+            not_null: false,
+            default_value: None,
+            primary_key: true,
+        },
+        "checkpoint identity v38",
+    )?;
+    require_exact_column_descriptor(
+        conn,
+        "session_checkpoints",
+        &SqliteColumnDescriptor {
+            cid: 10,
+            name: "restore_intent_checkpoint_id".to_string(),
+            declared_type: "INTEGER".to_string(),
+            not_null: false,
+            default_value: None,
+            primary_key: false,
+        },
+        "checkpoint identity v38",
+    )?;
+    require_table_sql_fragment(
+        conn,
+        "session_checkpoints",
+        "id INTEGER PRIMARY KEY AUTOINCREMENT",
+        "checkpoint identity v38",
+    )?;
+    require_table_sql_fragment(
+        conn,
+        "session_checkpoints",
+        "checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
+         CHECK(checkpoint_role IN ('snapshot','restore_intent','restore_receipt'))",
+        "checkpoint identity v38",
+    )?;
+    require_table_sql_fragment(
+        conn,
+        "session_checkpoints",
+        "CHECK(checkpoint_role = 'restore_receipt' OR restore_intent_checkpoint_id IS NULL)",
+        "checkpoint identity v38",
+    )?;
+
+    for (name, canonical_sql) in [
+        ("idx_checkpoints_session", CHECKPOINT_SESSION_INDEX_SQL),
+        (
+            "idx_checkpoints_session_role_latest",
+            CHECKPOINT_ROLE_LATEST_INDEX_SQL,
+        ),
+        (
+            "idx_checkpoints_session_role_causal",
+            CHECKPOINT_ROLE_CAUSAL_INDEX_SQL,
+        ),
+        (
+            "idx_checkpoints_global_latest",
+            CHECKPOINT_GLOBAL_LATEST_INDEX_SQL,
+        ),
+        (
+            "idx_checkpoints_global_snapshot_latest",
+            CHECKPOINT_GLOBAL_SNAPSHOT_LATEST_INDEX_SQL,
+        ),
+        (
+            "idx_checkpoints_restore_intent_outcome",
+            CHECKPOINT_RESTORE_INTENT_OUTCOME_INDEX_SQL,
+        ),
+    ] {
+        validate_exact_index(conn, name, canonical_sql, "checkpoint identity v38")?;
+    }
+
+    let expected_checkpoint_foreign_keys = vec![
+        (
+            "mux_sessions".to_string(),
+            "session_id".to_string(),
+            "session_id".to_string(),
+            "NO ACTION".to_string(),
+            "CASCADE".to_string(),
+            "NONE".to_string(),
+        ),
+        (
+            "session_checkpoints".to_string(),
+            "restore_intent_checkpoint_id".to_string(),
+            "id".to_string(),
+            "NO ACTION".to_string(),
+            "CASCADE".to_string(),
+            "NONE".to_string(),
+        ),
+    ];
+    let actual_checkpoint_foreign_keys = checkpoint_foreign_keys(conn, "session_checkpoints")?;
+    if actual_checkpoint_foreign_keys != expected_checkpoint_foreign_keys {
+        return Err(StorageError::Corruption {
+            details: format!(
+                "checkpoint identity v38: non-canonical session_checkpoints foreign keys: {actual_checkpoint_foreign_keys:?}"
+            ),
+        }
+        .into());
+    }
+    validate_clean_checkpoint_receipt_column_and_foreign_key(conn)?;
+    let pane_foreign_keys = checkpoint_foreign_keys(conn, "mux_pane_state")?;
+    let expected_pane_foreign_keys = vec![(
+        "session_checkpoints".to_string(),
+        "checkpoint_id".to_string(),
+        "id".to_string(),
+        "NO ACTION".to_string(),
+        "CASCADE".to_string(),
+        "NONE".to_string(),
+    )];
+    if pane_foreign_keys != expected_pane_foreign_keys {
+        return Err(StorageError::Corruption {
+            details: format!(
+                "checkpoint identity v38: non-canonical mux_pane_state foreign keys: {pane_foreign_keys:?}"
+            ),
+        }
+        .into());
+    }
+    validate_restore_attempt_lifecycle_v38_schema(conn)?;
+    ensure_no_checkpoint_authority_triggers(conn, "checkpoint identity v38")
+}
+
+fn ensure_checkpoint_identity_v38_schema(conn: &Connection) -> Result<()> {
+    if checkpoint_v38_table_has_identity_surface(conn)? {
+        return validate_checkpoint_identity_v38_schema(conn);
+    }
+
+    validate_checkpoint_snapshot_authority_schema(conn)?;
+    validate_clean_checkpoint_receipt_schema(conn)?;
+    ensure_no_checkpoint_authority_triggers(conn, "migration v38")?;
+
+    let staging_exists: i64 = conn
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM sqlite_schema
+                  WHERE name IN (
+                      'session_checkpoints_v38',
+                      'restore_attempt_lifecycle'
+                  ))
+               + (SELECT COUNT(*) FROM sqlite_temp_schema
+                  WHERE name IN (
+                      'session_checkpoints_v38',
+                      'restore_attempt_lifecycle'
+                  ))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    if staging_exists != 0 {
+        return Err(StorageError::Corruption {
+            details: "migration v38: a v38 staging/lifecycle object already exists".to_string(),
+        }
+        .into());
+    }
+
+    let (source_count, source_max_id): (i64, Option<i64>) = conn
+        .query_row(
+            "SELECT COUNT(*), MAX(id) FROM session_checkpoints",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+
+    conn.execute_batch(CHECKPOINT_V38_TABLE_SQL)
+        .and_then(|()| {
+            conn.execute_batch(
+                "INSERT INTO session_checkpoints_v38 (
+                     id, session_id, checkpoint_at, checkpoint_type, state_hash,
+                     pane_count, total_bytes, metadata_json, checkpoint_role,
+                     topology_json, restore_intent_checkpoint_id
+                 )
+                 SELECT id, session_id, checkpoint_at, checkpoint_type, state_hash,
+                        pane_count, total_bytes, metadata_json, checkpoint_role,
+                        topology_json, NULL
+                 FROM session_checkpoints
+                 ORDER BY id ASC;",
+            )
+        })
+        .map_err(|error| {
+            StorageError::MigrationFailed(format!(
+                "migration v38: failed to create and populate checkpoint authority table: {error}"
+            ))
+        })?;
+
+    let copied_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM session_checkpoints_v38", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    let source_minus_copy: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT id, session_id, checkpoint_at, checkpoint_type, state_hash,
+                        pane_count, total_bytes, metadata_json, checkpoint_role, topology_json
+                 FROM session_checkpoints
+                 EXCEPT
+                 SELECT id, session_id, checkpoint_at, checkpoint_type, state_hash,
+                        pane_count, total_bytes, metadata_json, checkpoint_role, topology_json
+                 FROM session_checkpoints_v38
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    let copy_minus_source: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT id, session_id, checkpoint_at, checkpoint_type, state_hash,
+                        pane_count, total_bytes, metadata_json, checkpoint_role, topology_json
+                 FROM session_checkpoints_v38
+                 EXCEPT
+                 SELECT id, session_id, checkpoint_at, checkpoint_type, state_hash,
+                        pane_count, total_bytes, metadata_json, checkpoint_role, topology_json
+                 FROM session_checkpoints
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    if copied_count != source_count || source_minus_copy != 0 || copy_minus_source != 0 {
+        return Err(StorageError::Corruption {
+            details: format!(
+                "migration v38: checkpoint copy mismatch source_count={source_count} copied_count={copied_count} source_minus_copy={source_minus_copy} copy_minus_source={copy_minus_source}"
+            ),
+        }
+        .into());
+    }
+
+    conn.execute_batch(
+        "DROP TABLE session_checkpoints;
+         ALTER TABLE session_checkpoints_v38 RENAME TO session_checkpoints;",
+    )
+    .map_err(|error| {
+        StorageError::MigrationFailed(format!(
+            "migration v38: failed checkpoint authority cutover: {error}"
+        ))
+    })?;
+    for (name, drop_sql, canonical_sql) in [
+        (
+            "idx_checkpoints_session",
+            "DROP INDEX IF EXISTS idx_checkpoints_session;",
+            CHECKPOINT_SESSION_INDEX_SQL,
+        ),
+        (
+            "idx_checkpoints_session_role_latest",
+            "DROP INDEX IF EXISTS idx_checkpoints_session_role_latest;",
+            CHECKPOINT_ROLE_LATEST_INDEX_SQL,
+        ),
+        (
+            "idx_checkpoints_session_role_causal",
+            "DROP INDEX IF EXISTS idx_checkpoints_session_role_causal;",
+            CHECKPOINT_ROLE_CAUSAL_INDEX_SQL,
+        ),
+        (
+            "idx_checkpoints_global_latest",
+            "DROP INDEX IF EXISTS idx_checkpoints_global_latest;",
+            CHECKPOINT_GLOBAL_LATEST_INDEX_SQL,
+        ),
+        (
+            "idx_checkpoints_global_snapshot_latest",
+            "DROP INDEX IF EXISTS idx_checkpoints_global_snapshot_latest;",
+            CHECKPOINT_GLOBAL_SNAPSHOT_LATEST_INDEX_SQL,
+        ),
+        (
+            "idx_checkpoints_restore_intent_outcome",
+            "DROP INDEX IF EXISTS idx_checkpoints_restore_intent_outcome;",
+            CHECKPOINT_RESTORE_INTENT_OUTCOME_INDEX_SQL,
+        ),
+    ] {
+        ensure_exact_index(conn, name, drop_sql, canonical_sql, "migration v38")?;
+    }
+
+    conn.execute_batch(RESTORE_ATTEMPT_LIFECYCLE_TABLE_SQL)
+        .map_err(|error| {
+            StorageError::MigrationFailed(format!(
+                "migration v38: failed to create restore-attempt lifecycle: {error}"
+            ))
+        })?;
+    let legacy_intent_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM session_checkpoints AS intent
+             WHERE intent.checkpoint_role = 'restore_receipt'
+               AND json_valid(intent.metadata_json)
+               AND json_extract(
+                       intent.metadata_json,
+                       '$.restore_attempt.phase'
+                   ) = 'intent'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    conn.execute_batch(
+        "INSERT INTO restore_attempt_lifecycle (
+             intent_checkpoint_id, session_id, source_checkpoint_id,
+             outcome_checkpoint_id, status, created_at, resolved_at
+         )
+         SELECT intent.id,
+                intent.session_id,
+                source.id,
+                NULL,
+                'reconciliation_required',
+                intent.checkpoint_at,
+                NULL
+         FROM session_checkpoints AS intent
+         INNER JOIN session_checkpoints AS source
+             ON source.id = json_extract(
+                    intent.metadata_json,
+                    '$.restore_attempt.source_checkpoint_id'
+                )
+            AND source.session_id = intent.session_id
+            AND source.checkpoint_role = 'snapshot'
+            AND source.checkpoint_at = json_extract(
+                    intent.metadata_json,
+                    '$.restore_attempt.source_checkpoint_at'
+                )
+            AND source.state_hash = json_extract(
+                    intent.metadata_json,
+                    '$.restore_attempt.source_state_hash'
+                )
+         WHERE intent.checkpoint_role = 'restore_receipt'
+           AND intent.checkpoint_type = 'startup'
+           AND intent.pane_count = 0
+           AND intent.total_bytes = 0
+           AND intent.topology_json IS NULL
+           AND length(intent.state_hash) = 69
+           AND substr(intent.state_hash, 1, 5) = 'rst2:'
+           AND substr(intent.state_hash, 6) NOT GLOB '*[^0-9a-f]*'
+           AND json_valid(intent.metadata_json)
+           AND json_extract(
+                   intent.metadata_json,
+                   '$.restore_attempt.phase'
+               ) = 'intent'
+           AND json_type(
+                   intent.metadata_json,
+                   '$.restore_attempt.source_checkpoint_id'
+               ) = 'integer'
+           AND json_type(
+                   intent.metadata_json,
+                   '$.restore_attempt.source_checkpoint_at'
+               ) = 'integer'
+           AND json_extract(
+                   intent.metadata_json,
+                   '$.restore_attempt.source_checkpoint_role'
+               ) = 'snapshot'
+           AND json_type(
+                   intent.metadata_json,
+                   '$.restore_attempt.source_state_hash'
+               ) = 'text'
+           AND NOT EXISTS (
+               SELECT 1
+               FROM mux_pane_state AS pane
+               WHERE pane.checkpoint_id = intent.id
+           );",
+    )
+    .map_err(|error| {
+        StorageError::MigrationFailed(format!(
+            "migration v38: failed to backfill restore-attempt lifecycle: {error}"
+        ))
+    })?;
+    let backfilled_intent_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM restore_attempt_lifecycle", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    if backfilled_intent_count != legacy_intent_count {
+        return Err(StorageError::Corruption {
+            details: format!(
+                "migration v38: {legacy_intent_count} legacy restore intent(s) found but only {backfilled_intent_count} had a complete same-session source identity"
+            ),
+        }
+        .into());
+    }
+    for (name, drop_sql, canonical_sql) in [
+        (
+            "idx_restore_attempt_lifecycle_session_status",
+            "DROP INDEX IF EXISTS idx_restore_attempt_lifecycle_session_status;",
+            RESTORE_ATTEMPT_SESSION_STATUS_INDEX_SQL,
+        ),
+        (
+            "idx_restore_attempt_lifecycle_outcome",
+            "DROP INDEX IF EXISTS idx_restore_attempt_lifecycle_outcome;",
+            RESTORE_ATTEMPT_OUTCOME_INDEX_SQL,
+        ),
+    ] {
+        ensure_exact_index(conn, name, drop_sql, canonical_sql, "migration v38")?;
+    }
+
+    let staging_sequence_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_sequence
+             WHERE name = 'session_checkpoints_v38'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    if staging_sequence_rows != 0 {
+        return Err(StorageError::Corruption {
+            details: "migration v38: stale staging sqlite_sequence authority".to_string(),
+        }
+        .into());
+    }
+    if let Some(max_id) = source_max_id.filter(|id| *id > 0) {
+        let sequence: Option<i64> = conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'session_checkpoints'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StorageError::Database(error.to_string()))?;
+        if sequence.is_none_or(|sequence| sequence < max_id) {
+            return Err(StorageError::Corruption {
+                details: format!(
+                    "migration v38: sqlite_sequence is below preserved checkpoint high-water id {max_id}: {sequence:?}"
+                ),
+            }
+            .into());
+        }
+    }
+
+    validate_checkpoint_identity_v38_schema(conn)
 }
 
 fn ensure_workflow_step_logs_audit_action_id(conn: &Connection) -> Result<()> {
@@ -3599,6 +4449,64 @@ fn run_owned_migration_transaction(
     }
 }
 
+fn migration_foreign_keys_enabled(conn: &Connection) -> Result<bool> {
+    match frankenterm_sigpipe::catch_recoverable(
+        frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| {
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+        }),
+    ) {
+        Ok(Ok(enabled)) => Ok(enabled != 0),
+        Ok(Err(_)) | Err(_) => Err(poison_migration_connection_epoch(conn)),
+    }
+}
+
+fn set_migration_foreign_keys(conn: &Connection, enabled: bool) -> Result<()> {
+    if !migration_connection_is_autocommit(conn)? {
+        return Err(poison_migration_connection_epoch(conn));
+    }
+    let sql = if enabled {
+        "PRAGMA foreign_keys = ON"
+    } else {
+        "PRAGMA foreign_keys = OFF"
+    };
+    let applied = frankenterm_sigpipe::catch_recoverable(
+        frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| conn.execute_batch(sql)),
+    );
+    if !matches!(applied, Ok(Ok(())))
+        || migration_foreign_keys_enabled(conn)? != enabled
+    {
+        return Err(poison_migration_connection_epoch(conn));
+    }
+    Ok(())
+}
+
+/// Run a migration transaction that must rebuild a table participating in a
+/// circular foreign-key graph. SQLite ignores `PRAGMA foreign_keys` inside a
+/// transaction, and dropping the referenced table with enforcement enabled
+/// performs implicit deletes. Suspend enforcement before BEGIN, validate the
+/// complete graph before COMMIT, and restore the caller's connection setting
+/// only after transaction closure is authoritative.
+fn run_owned_migration_transaction_with_foreign_keys_suspended(
+    conn: &Connection,
+    context: &'static str,
+    operation: impl FnOnce(&Transaction<'_>) -> Result<()>,
+) -> Result<()> {
+    if !migration_connection_is_autocommit(conn)? || migration_connection_is_query_only(conn)? {
+        return Err(poison_migration_connection_epoch(conn));
+    }
+    let foreign_keys_were_enabled = migration_foreign_keys_enabled(conn)?;
+    set_migration_foreign_keys(conn, false)?;
+
+    let result = run_owned_migration_transaction(conn, context, operation);
+    if !migration_connection_is_autocommit(conn)? {
+        return Err(poison_migration_connection_epoch(conn));
+    }
+    set_migration_foreign_keys(conn, foreign_keys_were_enabled)?;
+    result
+}
+
 /// Atomically run the v0-existing-database init triple (ft-k542h):
 /// `repair_existing_v0_tables_before_schema_sql` → `SCHEMA_SQL` →
 /// `run_migrations(0)` → `ensure_ft_meta`, all inside one BEGIN IMMEDIATE /
@@ -3625,42 +4533,46 @@ fn run_v0_init_in_transaction(conn: &Connection, stamp_fresh_fts_index: bool) ->
         }
     }
 
-    run_owned_migration_transaction(conn, "v0 init", |transaction| {
-        repair_existing_v0_tables_before_schema_sql(transaction)?;
-        #[cfg(test)]
-        check_v0_init_fault(V0InitStep::RepairComplete)?;
+    run_owned_migration_transaction_with_foreign_keys_suspended(
+        conn,
+        "v0 init",
+        |transaction| {
+            repair_existing_v0_tables_before_schema_sql(transaction)?;
+            #[cfg(test)]
+            check_v0_init_fault(V0InitStep::RepairComplete)?;
 
-        transaction
-            .execute_batch(&schema_body)
-            .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
-        #[cfg(test)]
-        check_v0_init_fault(V0InitStep::SchemaSqlApplied)?;
-
-        run_migrations_in_existing_transaction(transaction, 0)?;
-        #[cfg(test)]
-        check_v0_init_fault(V0InitStep::MigrationsApplied)?;
-
-        ensure_ft_meta(transaction, SCHEMA_VERSION)?;
-        if stamp_fresh_fts_index {
-            // A genuinely fresh database has no historical postings to
-            // repair. Keep this authority stamp in the same transaction as
-            // schema creation so a failed update cannot expose a committed
-            // schema with an indeterminate index-version marker.
             transaction
-                .execute(
-                    "UPDATE fts_index_state
-                     SET index_version = ?1, updated_at = strftime('%s', 'now') * 1000
-                     WHERE id = 1",
-                    params![i64::from(super::FTS_INDEX_VERSION)],
-                )
-                .map_err(|_| {
-                    StorageError::MigrationFailed(
-                        "v0 init: failed to stamp fresh FTS index authority".to_string(),
+                .execute_batch(&schema_body)
+                .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
+            #[cfg(test)]
+            check_v0_init_fault(V0InitStep::SchemaSqlApplied)?;
+
+            run_migrations_in_existing_transaction(transaction, 0)?;
+            #[cfg(test)]
+            check_v0_init_fault(V0InitStep::MigrationsApplied)?;
+
+            ensure_ft_meta(transaction, SCHEMA_VERSION)?;
+            if stamp_fresh_fts_index {
+                // A genuinely fresh database has no historical postings to
+                // repair. Keep this authority stamp in the same transaction as
+                // schema creation so a failed update cannot expose a committed
+                // schema with an indeterminate index-version marker.
+                transaction
+                    .execute(
+                        "UPDATE fts_index_state
+                         SET index_version = ?1, updated_at = strftime('%s', 'now') * 1000
+                         WHERE id = 1",
+                        params![i64::from(super::FTS_INDEX_VERSION)],
                     )
-                })?;
-        }
-        Ok(())
-    })
+                    .map_err(|_| {
+                        StorageError::MigrationFailed(
+                            "v0 init: failed to stamp fresh FTS index authority".to_string(),
+                        )
+                    })?;
+            }
+            Ok(())
+        },
+    )
 }
 
 fn repair_existing_v0_tables_before_schema_sql(conn: &Connection) -> Result<()> {
@@ -3758,7 +4670,8 @@ pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result
     // deliberately forward-only, so the lowest reachable downgrade target is
     // the HIGHEST forward-only version crossed by the requested path. v34
     // protects durable retention-loss evidence; v36 protects row-local snapshot
-    // authority; v37 protects exact clean-checkpoint receipt identity. v37 is
+    // authority; v37 protects exact clean-checkpoint receipt identity; v38
+    // protects never-reused IDs and restore-attempt settlement evidence. V38 is
     // therefore the current downgrade floor.
     let mut steps = Vec::new();
     for migration in MIGRATIONS.iter().rev() {
@@ -3859,6 +4772,11 @@ fn apply_migration_mutation(
                     ensure_clean_checkpoint_receipt_schema(conn)?;
                     apply_raw_up_sql = false;
                 }
+                38 => {
+                    ensure_checkpoint_identity_v38_schema(conn)?;
+                    ensure_no_foreign_key_violations(conn, "migration v38")?;
+                    apply_raw_up_sql = false;
+                }
                 _ => {}
             }
             if apply_raw_up_sql && !migration.up_sql.is_empty() {
@@ -3907,6 +4825,14 @@ pub(crate) fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> R
         ))
         .into());
     };
+
+    if step.direction == MigrationDirection::Up && migration.version == 38 {
+        return run_owned_migration_transaction_with_foreign_keys_suspended(
+            conn,
+            "migration v38",
+            |transaction| apply_migration_mutation(transaction, step, migration),
+        );
+    }
 
     run_owned_migration_transaction(conn, "migration step", |transaction| {
         apply_migration_mutation(transaction, step, migration)
@@ -4398,6 +5324,14 @@ mod tests {
              PRAGMA user_version = 35;",
         )
         .expect("create canonical v35 checkpoint fixture");
+    }
+
+    fn create_v37_checkpoint_fixture(conn: &Connection) {
+        create_v35_checkpoint_fixture(conn);
+        ensure_checkpoint_snapshot_authority_schema(conn)
+            .expect("upgrade checkpoint fixture to v36");
+        ensure_clean_checkpoint_receipt_schema(conn).expect("upgrade checkpoint fixture to v37");
+        set_user_version(conn, 37).expect("stamp canonical v37 fixture");
     }
 
     fn table_descriptors(conn: &Connection, table: &str) -> Vec<SqliteColumnDescriptor> {
@@ -5594,12 +6528,20 @@ mod tests {
              ) VALUES ('session-a', 1, 200, 0, '{\"tab_order\":[2,1]}', 'test');
              INSERT INTO session_checkpoints (
                  id, session_id, checkpoint_at, checkpoint_type, state_hash,
-                 pane_count, total_bytes
+                 pane_count, total_bytes, metadata_json
              ) VALUES
-                 (1, 'session-a', 100, 'startup',  '1111111111111111', 0, 0),
-                 (2, 'session-a', 150, 'startup',  '2222222222222222', 1, 2),
-                 (3, 'session-a', 200, 'periodic', '3333333333333333', 1, 3),
-                 (4, 'session-a', 200, 'event',    '4444444444444444', 1, 4);
+                 (-1, 'session-a',  80, 'startup',  'restore',          0, 0,
+                      '{"old_to_new":{}}'),
+                 ( 0, 'session-a',  90, 'startup',  '0000000000000000', 0, 0,
+                      NULL),
+                 ( 1, 'session-a', 100, 'startup',  '1111111111111111', 1, 0,
+                      '{"old_to_new":{"7":8}}'),
+                 ( 2, 'session-a', 150, 'startup',  '2222222222222222', 1, 2,
+                      NULL),
+                 ( 3, 'session-a', 200, 'periodic', '3333333333333333', 1, 3,
+                      NULL),
+                 ( 4, 'session-a', 200, 'event',    '4444444444444444', 1, 4,
+                      NULL);
              INSERT INTO mux_pane_state (checkpoint_id, pane_id)
              VALUES (2, 20), (3, 30), (4, 40);",
         )
@@ -5627,6 +6569,18 @@ mod tests {
             rows,
             vec![
                 (
+                    -1,
+                    "restore_receipt".to_string(),
+                    None,
+                    "restore".to_string(),
+                ),
+                (
+                    0,
+                    "snapshot".to_string(),
+                    None,
+                    "0000000000000000".to_string(),
+                ),
+                (
                     1,
                     "restore_receipt".to_string(),
                     None,
@@ -5651,7 +6605,7 @@ mod tests {
                     "4444444444444444".to_string(),
                 ),
             ],
-            "only the deterministic newest snapshot receives legacy latest topology; witnesses stay byte-identical"
+            "only structurally proven legacy receipts are classified; the deterministic newest snapshot receives topology and witnesses stay byte-identical"
         );
 
         conn.execute(
@@ -5716,15 +6670,15 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_authority_v36_v37_fresh_and_upgrade_shapes_are_identical() {
+    fn checkpoint_authority_v36_to_v38_fresh_and_upgrade_shapes_are_identical() {
         let fresh = Connection::open_in_memory().expect("open fresh current fixture");
         initialize_schema(&fresh).expect("initialize fresh current schema");
 
         let upgraded = Connection::open_in_memory().expect("open v35 upgrade fixture");
         create_v35_checkpoint_fixture(&upgraded);
-        let plan = build_migration_plan(35, 37).expect("build v35-to-v37 authority plan");
-        apply_migration_plan(&upgraded, &plan).expect("apply v36 and v37 authority migrations");
-        assert_eq!(get_user_version(&upgraded).expect("upgraded user version"), 37);
+        let plan = build_migration_plan(35, 38).expect("build v35-to-v38 authority plan");
+        apply_migration_plan(&upgraded, &plan).expect("apply v36-to-v38 authority migrations");
+        assert_eq!(get_user_version(&upgraded).expect("upgraded user version"), 38);
 
         assert_eq!(
             table_descriptors(&upgraded, "session_checkpoints"),
@@ -5738,8 +6692,10 @@ mod tests {
         );
         for index_name in [
             "idx_checkpoints_session_role_latest",
+            "idx_checkpoints_session_role_causal",
             "idx_checkpoints_global_latest",
             "idx_checkpoints_global_snapshot_latest",
+            "idx_checkpoints_restore_intent_outcome",
         ] {
             assert_eq!(
                 compact_schema_sql(
@@ -5783,6 +6739,10 @@ mod tests {
             .expect("fresh v37 FK and index semantics");
         validate_clean_checkpoint_receipt_schema(&upgraded)
             .expect("upgraded v37 FK and index semantics");
+        validate_checkpoint_identity_v38_schema(&fresh)
+            .expect("fresh v38 identity and lifecycle semantics");
+        validate_checkpoint_identity_v38_schema(&upgraded)
+            .expect("upgraded v38 identity and lifecycle semantics");
     }
 
     #[test]
@@ -5951,6 +6911,19 @@ mod tests {
             still_drifted.contains("onsession_checkpoints(id)"),
             "current-schema validation must not silently mutate authority: {still_drifted}"
         );
+
+        let extra_lifecycle_column =
+            Connection::open_in_memory().expect("open lifecycle-drift fixture");
+        initialize_schema(&extra_lifecycle_column).expect("initialize lifecycle-drift fixture");
+        extra_lifecycle_column
+            .execute_batch(
+                "ALTER TABLE restore_attempt_lifecycle
+                 ADD COLUMN unaudited_state TEXT;",
+            )
+            .expect("seed unaudited lifecycle column");
+        let error = initialize_schema(&extra_lifecycle_column)
+            .expect_err("current lifecycle column drift must fail closed");
+        assert!(error.to_string().contains("non-canonical"));
     }
 
     #[test]
@@ -6113,8 +7086,418 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_authority_v36_and_v37_are_forward_only() {
-        for version in [36, 37] {
+    fn checkpoint_identity_v38_preserves_rows_relations_and_high_water() {
+        let conn = Connection::open_in_memory().expect("open v37 fixture");
+        create_v37_checkpoint_fixture(&conn);
+        conn.execute_batch(
+            "INSERT INTO mux_sessions (
+                 session_id, created_at, last_checkpoint_at, shutdown_clean,
+                 topology_json, ft_version, clean_checkpoint_id
+             ) VALUES ('v38-session', 1, NULL, 0, '{}', 'test', NULL);
+             INSERT INTO session_checkpoints (
+                 id, session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, metadata_json, checkpoint_role,
+                 topology_json
+             ) VALUES
+                 (7, 'v38-session', 100, 'periodic', '7777777777777777',
+                  1, 2, '{\"source\":\"snapshot\"}', 'snapshot', '{}'),
+                 (42, 'v38-session', 90, 'startup', 'restore',
+                  0, 0, '{\"old_to_new\":{}}', 'restore_receipt', NULL);
+             INSERT INTO mux_pane_state (checkpoint_id, pane_id)
+             VALUES (7, 700);
+             UPDATE mux_sessions
+             SET shutdown_clean = 1,
+                 last_checkpoint_at = 90,
+                 clean_checkpoint_id = 42
+             WHERE session_id = 'v38-session';",
+        )
+        .expect("seed nonempty v37 authority graph");
+
+        let plan = build_migration_plan(37, 38).expect("build v38 migration plan");
+        apply_migration_plan(&conn, &plan).expect("apply v38 migration");
+        assert_eq!(get_user_version(&conn).expect("read v38 user_version"), 38);
+        assert!(migration_foreign_keys_enabled(&conn).expect("read restored FK mode"));
+        validate_checkpoint_identity_v38_schema(&conn).expect("validate v38 authority schema");
+        ensure_no_foreign_key_violations(&conn, "v38 preservation regression")
+            .expect("preserved graph has no FK violations");
+
+        let preserved_rows = conn
+            .prepare(
+                "SELECT id, session_id, checkpoint_at, checkpoint_type, state_hash,
+                        pane_count, total_bytes, metadata_json, checkpoint_role,
+                        topology_json, restore_intent_checkpoint_id
+                 FROM session_checkpoints ORDER BY id",
+            )
+            .expect("prepare preserved checkpoint query")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                ))
+            })
+            .expect("query preserved checkpoints")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect preserved checkpoints");
+        assert_eq!(preserved_rows.len(), 2);
+        assert_eq!(preserved_rows[0].0, 7);
+        assert_eq!(preserved_rows[0].7.as_deref(), Some("{\"source\":\"snapshot\"}"));
+        assert_eq!(preserved_rows[0].9.as_deref(), Some("{}"));
+        assert_eq!(preserved_rows[0].10, None);
+        assert_eq!(preserved_rows[1].0, 42);
+        assert_eq!(preserved_rows[1].8, "restore_receipt");
+        assert_eq!(preserved_rows[1].10, None);
+        assert_eq!(
+            conn.query_row(
+                "SELECT clean_checkpoint_id FROM mux_sessions
+                 WHERE session_id = 'v38-session'",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .expect("read preserved clean pointer"),
+            Some(42)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT checkpoint_id FROM mux_pane_state WHERE pane_id = 700",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("read preserved pane relation"),
+            7
+        );
+
+        conn.execute("DELETE FROM session_checkpoints WHERE id = 42", [])
+            .expect("delete prior high-water row");
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, checkpoint_role, topology_json
+             ) VALUES (
+                 'v38-session', 80, 'event', 'aaaaaaaaaaaaaaaa',
+                 0, 0, 'snapshot', '{}'
+             )",
+            [],
+        )
+        .expect("allocate after deleted high-water row");
+        let first_new_id = conn.last_insert_rowid();
+        assert!(first_new_id > 42, "AUTOINCREMENT must not reuse deleted id 42");
+        conn.execute(
+            "DELETE FROM session_checkpoints WHERE id = ?1",
+            [first_new_id],
+        )
+        .expect("delete newly allocated high-water row");
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, checkpoint_role, topology_json
+             ) VALUES (
+                 'v38-session', 70, 'event', 'bbbbbbbbbbbbbbbb',
+                 0, 0, 'snapshot', '{}'
+             )",
+            [],
+        )
+        .expect("allocate after second high-water deletion");
+        assert!(conn.last_insert_rowid() > first_new_id);
+
+        ensure_checkpoint_identity_v38_schema(&conn).expect("v38 helper is idempotent");
+    }
+
+    #[test]
+    fn checkpoint_identity_v38_enforces_unique_intent_outcome_links_and_cascades() {
+        let conn = Connection::open_in_memory().expect("open v37 fixture");
+        create_v37_checkpoint_fixture(&conn);
+        conn.execute(
+            "INSERT INTO mux_sessions (
+                 session_id, created_at, shutdown_clean, topology_json, ft_version
+             ) VALUES ('attempt-session', 1, 0, '{}', 'test')",
+            [],
+        )
+        .expect("seed attempt session");
+        apply_migration_plan(
+            &conn,
+            &build_migration_plan(37, 38).expect("build v38 migration plan"),
+        )
+        .expect("apply v38 migration");
+
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, checkpoint_role, topology_json
+             ) VALUES (
+                 'attempt-session', 9, 'periodic', 'aaaaaaaaaaaaaaaa',
+                 0, 0, 'snapshot', '{}'
+             )",
+            [],
+        )
+        .expect("insert restore source snapshot");
+        let source_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, metadata_json, checkpoint_role
+             ) VALUES (
+                 'attempt-session', 10, 'startup', 'pending:rsi2',
+                 0, 0, '{\"restore_attempt\":{\"phase\":\"intent\"}}',
+                 'restore_intent'
+             )",
+            [],
+        )
+        .expect("insert restore intent");
+        let intent_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO restore_attempt_lifecycle (
+                 intent_checkpoint_id, session_id, source_checkpoint_id,
+                 status, created_at
+             ) VALUES (?1, 'attempt-session', ?2, 'intent', 10)",
+            rusqlite::params![intent_id, source_id],
+        )
+        .expect("insert authoritative intent lifecycle");
+        assert!(
+            conn.execute(
+                "UPDATE restore_attempt_lifecycle
+                 SET status = 'outcome_complete'
+                 WHERE intent_checkpoint_id = ?1",
+                [intent_id],
+            )
+            .is_err(),
+            "outcome_complete requires an exact outcome checkpoint identity"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE restore_attempt_lifecycle
+                 SET status = 'resolved'
+                 WHERE intent_checkpoint_id = ?1",
+                [intent_id],
+            )
+            .is_err(),
+            "resolved requires an explicit resolution timestamp"
+        );
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, metadata_json, checkpoint_role,
+                 restore_intent_checkpoint_id
+             ) VALUES (
+                 'attempt-session', 11, 'startup', 'pending:rst2',
+                 0, 0, '{\"old_to_new\":{}}', 'restore_receipt', ?1
+             )",
+            [intent_id],
+        )
+        .expect("insert uniquely linked outcome");
+        let outcome_id = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE restore_attempt_lifecycle
+             SET outcome_checkpoint_id = ?2,
+                 status = 'outcome_complete'
+             WHERE intent_checkpoint_id = ?1",
+            rusqlite::params![intent_id, outcome_id],
+        )
+        .expect("advance lifecycle to incomplete clean-binding outcome");
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM restore_attempt_lifecycle
+                 WHERE intent_checkpoint_id = ?1",
+                [intent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read outcome lifecycle"),
+            "outcome_complete"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO session_checkpoints (
+                     session_id, checkpoint_at, checkpoint_type, state_hash,
+                     pane_count, total_bytes, metadata_json, checkpoint_role,
+                     restore_intent_checkpoint_id
+                 ) VALUES (
+                     'attempt-session', 12, 'startup', 'pending:rst2',
+                     0, 0, '{\"old_to_new\":{}}', 'restore_receipt', ?1
+                 )",
+                [intent_id],
+            )
+            .is_err(),
+            "one intent must not acquire two durable outcomes"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO session_checkpoints (
+                     session_id, checkpoint_at, checkpoint_type, state_hash,
+                     pane_count, total_bytes, checkpoint_role,
+                     restore_intent_checkpoint_id
+                 ) VALUES (
+                     'attempt-session', 13, 'event', 'cccccccccccccccc',
+                     0, 0, 'snapshot', ?1
+                 )",
+                [intent_id],
+            )
+            .is_err(),
+            "snapshots cannot masquerade as restore outcomes"
+        );
+        conn.execute(
+            "UPDATE restore_attempt_lifecycle
+             SET status = 'resolved', resolved_at = 14
+             WHERE intent_checkpoint_id = ?1
+               AND outcome_checkpoint_id = ?2",
+            rusqlite::params![intent_id, outcome_id],
+        )
+        .expect("durably resolve restore attempt");
+        conn.execute(
+            "DELETE FROM mux_sessions WHERE session_id = 'attempt-session'",
+            [],
+        )
+        .expect("session cascade removes linked intent and outcome together");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count cascaded restore-attempt rows"),
+            0
+        );
+    }
+
+    #[test]
+    fn checkpoint_identity_v38_backfills_legacy_intent_as_reconciliation_required() {
+        let conn = Connection::open_in_memory().expect("open v37 fixture");
+        create_v37_checkpoint_fixture(&conn);
+        let source_hash = format!("snp2:{}", "a".repeat(64));
+        let intent_hash = format!("rst2:{}", "b".repeat(64));
+        let intent_metadata = format!(
+            "{{\"old_to_new\":{{}},\"restore_attempt\":{{\"phase\":\"intent\",\"source_checkpoint_at\":10,\"source_checkpoint_id\":5,\"source_checkpoint_role\":\"snapshot\",\"source_state_hash\":\"{source_hash}\"}}}}"
+        );
+        conn.execute(
+            "INSERT INTO mux_sessions (
+                 session_id, created_at, shutdown_clean, topology_json, ft_version
+             ) VALUES ('legacy-attempt', 1, 0, '{}', 'test')",
+            [],
+        )
+        .expect("seed legacy attempt session");
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 id, session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, checkpoint_role, topology_json
+             ) VALUES (
+                 5, 'legacy-attempt', 10, 'periodic', ?1,
+                 0, 0, 'snapshot', '{}'
+             )",
+            [source_hash.as_str()],
+        )
+        .expect("seed legacy attempt source");
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 id, session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, metadata_json, checkpoint_role,
+                 topology_json
+             ) VALUES (
+                 6, 'legacy-attempt', 11, 'startup', ?1,
+                 0, 0, ?2, 'restore_receipt', NULL
+             )",
+            rusqlite::params![intent_hash, intent_metadata],
+        )
+        .expect("seed overloaded v37 intent row");
+
+        apply_migration_plan(
+            &conn,
+            &build_migration_plan(37, 38).expect("build v38 migration plan"),
+        )
+        .expect("migrate legacy intent");
+        assert_eq!(
+            conn.query_row(
+                "SELECT session_id, source_checkpoint_id, outcome_checkpoint_id,
+                        status, created_at, resolved_at
+                 FROM restore_attempt_lifecycle
+                 WHERE intent_checkpoint_id = 6",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .expect("read backfilled lifecycle"),
+            (
+                "legacy-attempt".to_string(),
+                5,
+                None,
+                "reconciliation_required".to_string(),
+                11,
+                None,
+            ),
+            "migration must never infer resolution from latest-row or clean-pointer state"
+        );
+    }
+
+    #[test]
+    fn checkpoint_identity_v38_mutation_failure_rolls_back_and_restores_fk_mode() {
+        let conn = Connection::open_in_memory().expect("open v37 fixture");
+        create_v37_checkpoint_fixture(&conn);
+        conn.execute_batch(
+            "INSERT INTO mux_sessions (
+                 session_id, created_at, shutdown_clean, topology_json, ft_version
+             ) VALUES ('rollback-session', 1, 0, '{}', 'test');
+             INSERT INTO session_checkpoints (
+                 id, session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, checkpoint_role, topology_json
+             ) VALUES (
+                 9, 'rollback-session', 1, 'event', '9999999999999999',
+                 0, 0, 'snapshot', '{}'
+             );",
+        )
+        .expect("seed rollback fixture");
+        let step = build_migration_plan(37, 38)
+            .expect("build v38 plan")
+            .steps
+            .into_iter()
+            .next()
+            .expect("v38 step");
+        set_migration_transaction_fault_for_test(Some(
+            MigrationTransactionFault::MutationPanic,
+        ));
+        let error = apply_migration_step(&conn, &step)
+            .expect_err("synthetic post-mutation panic must roll v38 back");
+        assert!(error.to_string().contains("migration mutation panicked"));
+        assert_eq!(get_user_version(&conn).expect("rolled-back user_version"), 37);
+        assert!(migration_foreign_keys_enabled(&conn).expect("restored FK mode"));
+        assert!(
+            !checkpoint_v38_table_has_identity_surface(&conn)
+                .expect("inspect rolled-back checkpoint table"),
+            "rolled-back v37 table must not expose a partial v38 identity surface"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT id FROM session_checkpoints WHERE session_id = 'rollback-session'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("preserved source row"),
+            9
+        );
+        assert!(
+            !table_exists(&conn, "session_checkpoints_v38")
+                .expect("inspect rolled-back staging table")
+        );
+        assert!(
+            !table_exists(&conn, "restore_attempt_lifecycle")
+                .expect("inspect rolled-back lifecycle table")
+        );
+    }
+
+    #[test]
+    fn checkpoint_authority_v36_through_v38_are_forward_only() {
+        for version in [36, 37, 38] {
             let migration = MIGRATIONS
                 .iter()
                 .find(|migration| migration.version == version)
@@ -6127,6 +7510,8 @@ mod tests {
         assert!(build_migration_plan(36, 35).is_err());
         assert!(build_migration_plan(37, 36).is_err());
         assert!(build_migration_plan(37, 35).is_err());
+        assert!(build_migration_plan(38, 37).is_err());
+        assert!(build_migration_plan(38, 35).is_err());
     }
 
     #[test]

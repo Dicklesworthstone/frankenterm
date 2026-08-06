@@ -781,11 +781,7 @@ pub fn check_and_recover_wal_inner(
 // unchanged.
 
 fn now_epoch_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
+    crate::clock_anomaly::epoch_ms_i64("ft.storage.clock")
 }
 
 fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
@@ -1458,10 +1454,10 @@ pub struct SessionPaneStateRow {
 
 /// Exact durable identity returned by the storage checkpoint writer.
 ///
-/// The row ID alone is not sufficient authority: SQLite can reuse row IDs
-/// after deletion, and a newer checkpoint can supersede a prior one.  Clean
-/// shutdown admission therefore requires this complete receipt and validates
-/// every field inside the writer transaction.
+/// V38 makes row IDs non-reusable, but the ID alone is still insufficient
+/// authority: a newer checkpoint can supersede it and content can be corrupt.
+/// Clean shutdown admission therefore requires this complete receipt and
+/// validates every field inside the writer transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionCheckpointReceipt {
     /// Session that owns the committed checkpoint.
@@ -17878,11 +17874,7 @@ fn flush_segment_redactors(
 
 /// Get current timestamp in epoch milliseconds
 pub fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
+    crate::clock_anomaly::epoch_ms_i64("ft.storage.clock")
 }
 
 /// Get the current timestamp in epoch milliseconds, failing when the system
@@ -22012,6 +22004,18 @@ fn canonicalize_checkpoint_json_text(field: &'static str, raw: &str) -> Result<S
         .map_err(|error| checkpoint_json_error(field, error))
 }
 
+fn canonicalize_typed_checkpoint_json<T>(field: &'static str, raw: &str) -> Result<String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let _: T =
+        serde_json::from_str(raw).map_err(|error| checkpoint_json_error(field, error))?;
+    // Validate the required typed projection, but canonicalize the original
+    // value. Serde deliberately ignores unknown struct fields by default;
+    // serializing `T` here would silently discard forward-compatible state.
+    canonicalize_checkpoint_json_text(field, raw)
+}
+
 fn prepare_checkpoint_topology(
     raw: &str,
 ) -> Result<(crate::session_topology::TopologySnapshot, String)> {
@@ -22066,12 +22070,18 @@ fn prepare_session_checkpoint(
             .as_deref()
             .map(|json| canonicalize_checkpoint_json_text("pane environment", json))
             .transpose()?;
-        let terminal_state_json =
-            canonicalize_checkpoint_json_text("pane terminal state", &pane.terminal_state_json)?;
+        let terminal_state_json = canonicalize_typed_checkpoint_json::<
+            crate::session_pane_state::TerminalState,
+        >("pane terminal state", &pane.terminal_state_json)?;
         let agent_metadata_json = pane
             .agent_metadata_json
             .as_deref()
-            .map(|json| canonicalize_checkpoint_json_text("pane agent metadata", json))
+            .map(|json| {
+                canonicalize_typed_checkpoint_json::<crate::session_pane_state::AgentMetadata>(
+                    "pane agent metadata",
+                    json,
+                )
+            })
             .transpose()?;
         let pane_bytes = terminal_state_json
             .len()
@@ -22299,8 +22309,12 @@ fn insert_session_checkpoint_backend(
 /// without materializing one `RETURNING` row per deleted checkpoint, keeping
 /// cleanup memory bounded for very large sessions. The inner
 /// `id NOT IN (...)` subquery preserves the most-recent N snapshot rows using
-/// the canonical timestamp/ID tie-break; restore receipts have an independent
-/// lifecycle. Called from the writer-thread dispatcher.
+/// the durable, never-reused causal ID; timestamps remain presentation and age
+/// metadata. Restore bookkeeping has an independent lifecycle. Reaching zero
+/// checkpoint rows clears derived checkpoint summary fields but never deletes
+/// the mux-session authority row; session deletion requires an explicit,
+/// separately validated retention contract. Called from the writer-thread
+/// dispatcher.
 fn prune_session_checkpoints_backend(
     backend: &dyn StorageBackend,
     session_id: &str,
@@ -22319,10 +22333,16 @@ fn prune_session_checkpoints_backend(
                  WHERE session_id = ?1
                  AND checkpoint_role = 'snapshot'
                  AND id NOT IN (
+                     SELECT source_checkpoint_id
+                     FROM restore_attempt_lifecycle
+                     WHERE session_id = ?1
+                       AND status <> 'resolved'
+                 )
+                 AND id NOT IN (
                      SELECT id FROM session_checkpoints
                      WHERE session_id = ?1
                        AND checkpoint_role = 'snapshot'
-                     ORDER BY checkpoint_at DESC, id DESC
+                     ORDER BY id DESC
                      LIMIT ?2
                  )",
                 &[
@@ -22353,7 +22373,7 @@ fn prune_session_checkpoints_backend(
                          SELECT checkpoint_at
                          FROM session_checkpoints
                          WHERE session_id = ?1
-                         ORDER BY checkpoint_at DESC, id DESC
+                         ORDER BY id DESC
                          LIMIT 1
                      ),
                      topology_json = COALESCE(
@@ -22363,7 +22383,7 @@ fn prune_session_checkpoints_backend(
                              WHERE session_id = ?1
                                AND checkpoint_role = 'snapshot'
                                AND topology_json IS NOT NULL
-                             ORDER BY checkpoint_at DESC, id DESC
+                             ORDER BY id DESC
                              LIMIT 1
                          ),
                          topology_json
@@ -22379,7 +22399,7 @@ fn prune_session_checkpoints_backend(
                                     SELECT latest.id
                                     FROM session_checkpoints AS latest
                                     WHERE latest.session_id = mux_sessions.session_id
-                                    ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                                    ORDER BY latest.id DESC
                                     LIMIT 1
                                 )
                           )
@@ -22397,7 +22417,7 @@ fn prune_session_checkpoints_backend(
                                     SELECT latest.id
                                     FROM session_checkpoints AS latest
                                     WHERE latest.session_id = mux_sessions.session_id
-                                    ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                                    ORDER BY latest.id DESC
                                     LIMIT 1
                                 )
                           )
@@ -22412,29 +22432,212 @@ fn prune_session_checkpoints_backend(
                     storage_backend_error("Failed to reconcile pruned mux session", err)
                 })?;
 
-            if deleted > 0 {
-                if reconciled.is_none() {
-                    return Err(StorageError::Database(format!(
-                        "Pruned checkpoint rows for missing mux session {session_id}"
-                    ))
-                    .into());
-                }
-                execute_typed(
-                    backend,
-                    "DELETE FROM mux_sessions
-                     WHERE session_id = ?1
-                       AND NOT EXISTS (
-                           SELECT 1 FROM session_checkpoints
-                           WHERE session_id = ?1
-                       )",
-                    &[ToSqlValue::Text(session_id)],
-                )
-                .map_err(|err| storage_backend_error("Failed to prune empty mux session", err))?;
+            if deleted > 0 && reconciled.is_none() {
+                return Err(StorageError::Database(format!(
+                    "Pruned checkpoint rows for missing mux session {session_id}"
+                ))
+                .into());
             }
 
             Ok(deleted)
         },
     )
+}
+
+/// Recompute the exact v2 snapshot witness from the persisted projection.
+///
+/// The caller already owns the immediate writer transaction, so this read and
+/// the subsequent clean binding share one SQLite serialization point. The
+/// cheap checkpoint query rejects stale receipts before materializing pane
+/// rows; accepted candidates require a lossless cell backend because NULL and
+/// empty TEXT are distinct witness inputs.
+fn current_session_checkpoint_witness_matches_backend(
+    backend: &dyn StorageBackend,
+    receipt: &SessionCheckpointReceipt,
+) -> Result<bool> {
+    if !backend.supports_lossless_cells() {
+        return Err(StorageError::Database(format!(
+            "Backend {} cannot losslessly verify session checkpoint witnesses",
+            backend.backend_name()
+        ))
+        .into());
+    }
+
+    let checkpoint = backend
+        .query_row_cells(
+            "SELECT checkpoint_type, state_hash, pane_count, total_bytes,
+                    metadata_json, topology_json
+             FROM session_checkpoints AS checkpoint
+             WHERE checkpoint.id = ?1
+               AND checkpoint.session_id = ?2
+               AND checkpoint.checkpoint_at = ?3
+               AND checkpoint.checkpoint_role = 'snapshot'
+               AND checkpoint.state_hash = ?4
+               AND EXISTS (
+                   SELECT 1
+                   FROM mux_sessions AS session
+                   WHERE session.session_id = ?2
+                     AND session.last_checkpoint_at = ?3
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM restore_attempt_lifecycle AS lifecycle
+                   WHERE lifecycle.session_id = ?2
+                     AND lifecycle.status <> 'resolved'
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM session_checkpoints AS intent
+                   WHERE intent.session_id = ?2
+                     AND (
+                         intent.checkpoint_role = 'restore_intent'
+                         OR (
+                             intent.checkpoint_role = 'restore_receipt'
+                             AND json_valid(intent.metadata_json)
+                             AND json_extract(
+                                     intent.metadata_json,
+                                     '$.restore_attempt.phase'
+                                 ) = 'intent'
+                         )
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM restore_attempt_lifecycle AS lifecycle
+                         WHERE lifecycle.intent_checkpoint_id = intent.id
+                           AND lifecycle.session_id = intent.session_id
+                     )
+               )
+               AND checkpoint.id = (
+                   SELECT latest.id
+                   FROM session_checkpoints AS latest
+                   WHERE latest.session_id = ?2
+                   ORDER BY latest.id DESC
+                   LIMIT 1
+               )",
+            &[
+                ToSqlValue::Integer(receipt.checkpoint_id),
+                ToSqlValue::Text(receipt.session_id.as_str()),
+                ToSqlValue::Integer(receipt.checkpoint_at),
+                ToSqlValue::Text(receipt.state_hash.as_str()),
+            ],
+        )
+        .map_err(|error| {
+            storage_backend_error("Failed to load checkpoint witness authority", error)
+        })?;
+    let Some(checkpoint) = checkpoint else {
+        return Ok(false);
+    };
+    let checkpoint = CellRowReader::new(&checkpoint);
+    let checkpoint_type = checkpoint
+        .string(0)
+        .map_err(|error| storage_backend_error("Checkpoint witness type", error))?;
+    let stored_state_hash = checkpoint
+        .string(1)
+        .map_err(|error| storage_backend_error("Checkpoint witness hash", error))?;
+    let pane_count = checkpoint
+        .i64(2)
+        .map_err(|error| storage_backend_error("Checkpoint witness pane count", error))?;
+    let total_bytes = checkpoint
+        .i64(3)
+        .map_err(|error| storage_backend_error("Checkpoint witness byte count", error))?;
+    let metadata_json = checkpoint
+        .optional_string(4)
+        .map_err(|error| storage_backend_error("Checkpoint witness metadata", error))?;
+    let topology_json = checkpoint
+        .optional_string(5)
+        .map_err(|error| storage_backend_error("Checkpoint witness topology", error))?;
+
+    if pane_count < 0 || total_bytes < 0 || topology_json.is_none() {
+        return Ok(false);
+    }
+
+    let pane_rows = backend
+        .query_map_cells(
+            "SELECT pane_id, cwd, command, env_json, terminal_state_json,
+                    agent_metadata_json, scrollback_checkpoint_seq,
+                    last_output_at
+             FROM mux_pane_state
+             WHERE checkpoint_id = ?1
+             ORDER BY pane_id ASC, id ASC",
+            &[ToSqlValue::Integer(receipt.checkpoint_id)],
+        )
+        .map_err(|error| {
+            storage_backend_error("Failed to load checkpoint witness pane rows", error)
+        })?;
+    let mut panes = Vec::with_capacity(pane_rows.len());
+    for pane_row in pane_rows {
+        let pane_row = CellRowReader::new(&pane_row);
+        panes.push(PersistedPaneState {
+            pane_id: pane_row
+                .i64(0)
+                .map_err(|error| storage_backend_error("Checkpoint witness pane id", error))?,
+            cwd: pane_row
+                .optional_string(1)
+                .map_err(|error| storage_backend_error("Checkpoint witness pane cwd", error))?,
+            command: pane_row.optional_string(2).map_err(|error| {
+                storage_backend_error("Checkpoint witness pane command", error)
+            })?,
+            env_json: pane_row.optional_string(3).map_err(|error| {
+                storage_backend_error("Checkpoint witness pane environment", error)
+            })?,
+            terminal_state_json: pane_row.string(4).map_err(|error| {
+                storage_backend_error("Checkpoint witness pane terminal state", error)
+            })?,
+            agent_metadata_json: pane_row.optional_string(5).map_err(|error| {
+                storage_backend_error("Checkpoint witness pane agent metadata", error)
+            })?,
+            scrollback_checkpoint_seq: pane_row.optional_i64(6).map_err(|error| {
+                storage_backend_error("Checkpoint witness pane scrollback sequence", error)
+            })?,
+            last_output_at: pane_row.optional_i64(7).map_err(|error| {
+                storage_backend_error("Checkpoint witness pane last-output time", error)
+            })?,
+        });
+    }
+
+    let persisted_pane_count = match i64::try_from(panes.len()) {
+        Ok(count) => count,
+        Err(_) => return Ok(false),
+    };
+    if persisted_pane_count != pane_count {
+        return Ok(false);
+    }
+    let mut recomputed_total_bytes = 0_usize;
+    for pane in &panes {
+        let Some(pane_bytes) = pane
+            .terminal_state_json
+            .len()
+            .checked_add(pane.env_json.as_ref().map_or(0, String::len))
+            .and_then(|bytes| {
+                bytes.checked_add(pane.agent_metadata_json.as_ref().map_or(0, String::len))
+            })
+        else {
+            return Ok(false);
+        };
+        let Some(total) = recomputed_total_bytes.checked_add(pane_bytes) else {
+            return Ok(false);
+        };
+        recomputed_total_bytes = total;
+    }
+    if i64::try_from(recomputed_total_bytes).ok() != Some(total_bytes) {
+        return Ok(false);
+    }
+
+    let Ok(recomputed_state_hash) = checkpoint_witness(
+        CHECKPOINT_ROLE_SNAPSHOT,
+        receipt.session_id.as_str(),
+        receipt.checkpoint_id,
+        receipt.checkpoint_at,
+        checkpoint_type.as_str(),
+        pane_count,
+        total_bytes,
+        metadata_json.as_deref(),
+        topology_json.as_deref(),
+        &panes,
+    ) else {
+        return Ok(false);
+    };
+    Ok(recomputed_state_hash == stored_state_hash && stored_state_hash == receipt.state_hash)
 }
 
 /// br-ft-l1jgo writer-thread migration: replaces the legacy direct-rusqlite
@@ -22450,6 +22653,13 @@ fn mark_session_shutdown_clean_backend(
         WriterTransactionBeginMode::Immediate,
         "mark session shutdown clean",
         || {
+            if !current_session_checkpoint_witness_matches_backend(backend, receipt)? {
+                return Err(StorageError::Database(format!(
+                    "Checkpoint {} is not an intact latest durable receipt for session {}",
+                    receipt.checkpoint_id, receipt.session_id
+                ))
+                .into());
+            }
             let updated = backend
                 .query_row_typed(
                     "UPDATE mux_sessions
@@ -22469,7 +22679,7 @@ fn mark_session_shutdown_clean_backend(
                      SELECT latest.id
                      FROM session_checkpoints AS latest
                      WHERE latest.session_id = ?1
-                     ORDER BY latest.checkpoint_at DESC, latest.id DESC
+                     ORDER BY latest.id DESC
                      LIMIT 1
                  )
            )
@@ -22508,7 +22718,7 @@ fn get_latest_checkpoint_hash_backend(
             "SELECT state_hash FROM session_checkpoints
              WHERE session_id = ?1
                AND checkpoint_role = 'snapshot'
-             ORDER BY checkpoint_at DESC, id DESC LIMIT 1",
+             ORDER BY id DESC LIMIT 1",
             &[ToSqlValue::Text(session_id)],
         )
         .map_err(|err| storage_backend_error("Get latest checkpoint hash", err))?;
@@ -36785,6 +36995,172 @@ fn list_active_limit_windows_filters_expired_and_orders_deterministically() {
     });
 }
 
+/// A later snapshot is not negative evidence that an older external-effect
+/// restore attempt settled; only the lifecycle's explicit resolved state may
+/// permit the snapshot to become clean authority.
+#[test]
+fn clean_snapshot_binding_requires_all_restore_lifecycles_to_be_resolved() {
+    let mut conn = rusqlite::Connection::open_in_memory().expect("open clean-binding fixture");
+    initialize_schema(&conn).expect("initialize clean-binding fixture");
+    let session_id = "clean-binding-lifecycle";
+    let topology =
+        "{\"captured_at\":0,\"schema_version\":1,\"windows\":[],\"workspace_id\":null}";
+    conn.execute(
+        "INSERT INTO mux_sessions (
+             session_id, created_at, shutdown_clean, topology_json, ft_version
+         ) VALUES (?1, 1, 0, ?2, 'test')",
+        rusqlite::params![session_id, topology],
+    )
+    .expect("insert clean-binding session");
+
+    conn.execute(
+        "INSERT INTO session_checkpoints (
+             session_id, checkpoint_at, checkpoint_type, state_hash,
+             pane_count, total_bytes, checkpoint_role, topology_json
+         ) VALUES (?1, 10, 'periodic', 'pending:snp2', 0, 0,
+                   'snapshot', ?2)",
+        rusqlite::params![session_id, topology],
+    )
+    .expect("insert restore source snapshot");
+    let source_id = conn.last_insert_rowid();
+    let source_hash = checkpoint_witness(
+        CHECKPOINT_ROLE_SNAPSHOT,
+        session_id,
+        source_id,
+        10,
+        "periodic",
+        0,
+        0,
+        None,
+        Some(topology),
+        &[],
+    )
+    .expect("compute restore source witness");
+    conn.execute(
+        "UPDATE session_checkpoints SET state_hash = ?1 WHERE id = ?2",
+        rusqlite::params![source_hash.as_str(), source_id],
+    )
+    .expect("finalize restore source witness");
+
+    let intent_metadata = format!(
+        "{{\"old_to_new\":{{}},\"restore_attempt\":{{\"phase\":\"intent\",\"source_checkpoint_at\":10,\"source_checkpoint_id\":{source_id},\"source_checkpoint_role\":\"snapshot\",\"source_state_hash\":\"{source_hash}\"}}}}"
+    );
+    conn.execute(
+        "INSERT INTO session_checkpoints (
+             session_id, checkpoint_at, checkpoint_type, state_hash,
+             pane_count, total_bytes, metadata_json, checkpoint_role
+         ) VALUES (?1, 11, 'startup', 'pending:rsi2', 0, 0, ?2,
+                   'restore_intent')",
+        rusqlite::params![session_id, intent_metadata.as_str()],
+    )
+    .expect("insert unresolved restore intent");
+    let intent_id = conn.last_insert_rowid();
+    let intent_hash = checkpoint_witness(
+        crate::checkpoint_witness::CHECKPOINT_ROLE_RESTORE_INTENT,
+        session_id,
+        intent_id,
+        11,
+        "startup",
+        0,
+        0,
+        Some(intent_metadata.as_str()),
+        None,
+        &[],
+    )
+    .expect("compute restore intent witness");
+    conn.execute(
+        "UPDATE session_checkpoints SET state_hash = ?1 WHERE id = ?2",
+        rusqlite::params![intent_hash.as_str(), intent_id],
+    )
+    .expect("finalize restore intent witness");
+    conn.execute(
+        "INSERT INTO restore_attempt_lifecycle (
+             intent_checkpoint_id, session_id, source_checkpoint_id,
+             status, created_at
+         ) VALUES (?1, ?2, ?3, 'intent', 11)",
+        rusqlite::params![intent_id, session_id, source_id],
+    )
+    .expect("insert unresolved lifecycle");
+
+    conn.execute(
+        "INSERT INTO session_checkpoints (
+             session_id, checkpoint_at, checkpoint_type, state_hash,
+             pane_count, total_bytes, checkpoint_role, topology_json
+         ) VALUES (?1, 12, 'shutdown', 'pending:snp2', 0, 0,
+                   'snapshot', ?2)",
+        rusqlite::params![session_id, topology],
+    )
+    .expect("insert later shutdown snapshot");
+    let latest_id = conn.last_insert_rowid();
+    let latest_hash = checkpoint_witness(
+        CHECKPOINT_ROLE_SNAPSHOT,
+        session_id,
+        latest_id,
+        12,
+        "shutdown",
+        0,
+        0,
+        None,
+        Some(topology),
+        &[],
+    )
+    .expect("compute later shutdown witness");
+    conn.execute(
+        "UPDATE session_checkpoints SET state_hash = ?1 WHERE id = ?2",
+        rusqlite::params![latest_hash.as_str(), latest_id],
+    )
+    .expect("finalize later shutdown witness");
+    conn.execute(
+        "UPDATE mux_sessions SET last_checkpoint_at = 12 WHERE session_id = ?1",
+        [session_id],
+    )
+    .expect("bind latest checkpoint summary");
+    let receipt = SessionCheckpointReceipt {
+        session_id: session_id.to_string(),
+        checkpoint_id: latest_id,
+        checkpoint_at: 12,
+        state_hash: latest_hash,
+    };
+
+    let blocked = with_test_storage_backend(&mut conn, |backend| {
+        mark_session_shutdown_clean_backend(backend, &receipt)
+    });
+    assert!(
+        blocked.is_err(),
+        "a later snapshot cannot hide an unresolved restore intent"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("read blocked clean state"),
+        0
+    );
+
+    conn.execute(
+        "UPDATE restore_attempt_lifecycle
+         SET status = 'resolved', resolved_at = 13
+         WHERE intent_checkpoint_id = ?1",
+        [intent_id],
+    )
+    .expect("record explicit lifecycle resolution");
+    with_test_storage_backend(&mut conn, |backend| {
+        mark_session_shutdown_clean_backend(backend, &receipt)
+    })
+    .expect("resolved lifecycle permits exact snapshot clean binding");
+    assert_eq!(
+        conn.query_row(
+            "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("read resolved clean state"),
+        1
+    );
+}
+
 /// ft-xbnl0.2.3 Cx-first: tick 143 mux-session/checkpoint cluster —
 /// 8 storage cx-first siblings exercised end-to-end:
 /// `insert_mux_session_with_cx`,
@@ -36824,15 +37200,18 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
         //    below has something to remove.
         let mut first_receipt = None;
         let mut latest_receipt = None;
+        let mut latest_topology_json = None;
         for i in 0..3 {
-            let pane_states = if i == 0 {
+            let pane_states = if i == 2 {
                 vec![SessionPaneStateRow {
                     pane_id: 143,
                     cwd: Some("/tmp/tick143".to_string()),
                     command: Some("ft-test-shell".to_string()),
                     env_json: Some("{\"TERM\":\"xterm-256color\"}".to_string()),
-                    terminal_state_json: "{\"cursor\":[0,0]}".to_string(),
-                    agent_metadata_json: Some("{\"agent\":\"tick143\"}".to_string()),
+                    terminal_state_json:
+                        "{\"rows\":24,\"cols\":80,\"cursor_row\":0,\"cursor_col\":0,\"is_alt_screen\":false,\"title\":\"tick143\"}"
+                            .to_string(),
+                    agent_metadata_json: Some("{\"agent_type\":\"tick143\"}".to_string()),
                     scrollback_checkpoint_seq: Some(7),
                     last_output_at: Some(143_000),
                 }]
@@ -36870,6 +37249,13 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
                 })
                 .to_string()
             };
+            if i == 2 {
+                latest_topology_json = Some(
+                    prepare_checkpoint_topology(&topology_json)
+                        .expect("prepare expected latest topology")
+                        .1,
+                );
+            }
             let metadata_json = (i == 0).then(|| "{\"source\":\"tick143\"}".to_string());
             let receipt = storage
                 .insert_session_checkpoint_with_cx(
@@ -36891,6 +37277,8 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
         }
         let first_receipt = first_receipt.expect("three checkpoints yield a first receipt");
         let latest_receipt = latest_receipt.expect("three checkpoints yield a latest receipt");
+        let latest_topology_json =
+            latest_topology_json.expect("latest checkpoint carries pane topology");
         let latest_checkpoint_id = latest_receipt.checkpoint_id();
         let latest_state_hash = latest_receipt.state_hash().to_string();
 
@@ -36930,6 +37318,49 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
         );
 
         // 5. mark_session_shutdown_clean_with_cx — exact latest receipt only.
+        // A same-length, structurally valid pane-state mutation leaves the
+        // declared byte count unchanged and therefore exercises the full
+        // witness recomputation rather than only the structural preflight.
+        let tamper_conn = rusqlite::Connection::open(&db_path).expect("open pane tamper fixture");
+        let original_terminal_state: String = tamper_conn
+            .query_row(
+                "SELECT terminal_state_json
+                 FROM mux_pane_state
+                 WHERE checkpoint_id = ?1",
+                [latest_checkpoint_id],
+                |row| row.get(0),
+            )
+            .expect("read latest pane state before tamper");
+        let tampered_terminal_state =
+            original_terminal_state.replace("\"cursor_col\":0", "\"cursor_col\":1");
+        assert_ne!(tampered_terminal_state, original_terminal_state);
+        assert_eq!(tampered_terminal_state.len(), original_terminal_state.len());
+        tamper_conn
+            .execute(
+                "UPDATE mux_pane_state
+                 SET terminal_state_json = ?1
+                 WHERE checkpoint_id = ?2",
+                rusqlite::params![tampered_terminal_state, latest_checkpoint_id],
+            )
+            .expect("tamper latest pane state after checkpoint receipt");
+        drop(tamper_conn);
+        let tampered_close = storage
+            .mark_session_shutdown_clean_with_cx(&cx, latest_receipt.clone())
+            .await;
+        assert!(
+            tampered_close.is_err(),
+            "pane-state mutation must invalidate an otherwise exact receipt"
+        );
+        let repair_conn = rusqlite::Connection::open(&db_path).expect("open pane repair fixture");
+        repair_conn
+            .execute(
+                "UPDATE mux_pane_state
+                 SET terminal_state_json = ?1
+                 WHERE checkpoint_id = ?2",
+                rusqlite::params![original_terminal_state, latest_checkpoint_id],
+            )
+            .expect("restore exact pane-state witness bytes");
+        drop(repair_conn);
         storage
             .mark_session_shutdown_clean_with_cx(&cx, latest_receipt)
             .await
@@ -37007,7 +37438,7 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
             .expect("load committed checkpoint evidence");
         assert_eq!(role, "snapshot");
         assert_eq!(witness, latest_state_hash);
-        assert_eq!(topology.as_deref(), Some(empty_topology.as_str()));
+        assert_eq!(topology.as_deref(), Some(latest_topology_json.as_str()));
         let (shutdown_clean, clean_checkpoint_id): (i64, Option<i64>) = conn
             .query_row(
                 "SELECT shutdown_clean, clean_checkpoint_id
@@ -37026,7 +37457,7 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
 }
 
 #[test]
-fn prune_session_checkpoints_reclaims_checkpointed_empty_mux_session() {
+fn prune_session_checkpoints_preserves_mux_session_when_checkpoint_count_reaches_zero() {
     run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_prune_mux_session_{}.db", std::process::id()));
@@ -37213,9 +37644,18 @@ fn prune_session_checkpoints_reclaims_checkpointed_empty_mux_session() {
             )
             .expect("count pruned mux session");
         assert_eq!(
-            checkpointed_session_rows, 0,
-            "checkpointed mux session should be reclaimed once all checkpoints are pruned"
+            checkpointed_session_rows, 1,
+            "checkpoint pruning has no authority to delete its mux-session anchor"
         );
+        let checkpointed_authority: (Option<i64>, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT last_checkpoint_at, shutdown_clean, clean_checkpoint_id
+                 FROM mux_sessions WHERE session_id = ?1",
+                [checkpointed_session.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load checkpoint-pruned mux-session authority");
+        assert_eq!(checkpointed_authority, (None, 0, None));
 
         let pending_session_rows: i64 = conn
             .query_row(

@@ -12,8 +12,10 @@ use sha2::{Digest, Sha256};
 
 pub(crate) const SNAPSHOT_DEDUP_PREFIX: &str = "snpd2:";
 pub(crate) const SNAPSHOT_WITNESS_PREFIX: &str = "snp2:";
+pub(crate) const RESTORE_INTENT_WITNESS_PREFIX: &str = "rsi2:";
 pub(crate) const RESTORE_RECEIPT_WITNESS_PREFIX: &str = "rst2:";
 pub(crate) const CHECKPOINT_ROLE_SNAPSHOT: &str = "snapshot";
+pub(crate) const CHECKPOINT_ROLE_RESTORE_INTENT: &str = "restore_intent";
 pub(crate) const CHECKPOINT_ROLE_RESTORE_RECEIPT: &str = "restore_receipt";
 
 #[derive(Debug, thiserror::Error)]
@@ -240,7 +242,7 @@ fn frame_pane(
 ///
 /// The topology capture clock is excluded. Every other input is an exact
 /// column that the checkpoint transaction persists; process PID/argv, shell,
-/// and scrollback total-line counters therefore do not participate.
+/// and scrollback total-segment counters therefore do not participate.
 pub(crate) fn snapshot_dedup_witness(
     topology_json: &str,
     panes: &[PersistedPaneState],
@@ -257,7 +259,8 @@ pub(crate) fn snapshot_dedup_witness(
     Ok(framed.finish(SNAPSHOT_DEDUP_PREFIX))
 }
 
-/// Stable persisted checkpoint witness for a snapshot or restore receipt.
+/// Stable persisted checkpoint witness for a snapshot, restore intent, or
+/// restore outcome receipt.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn checkpoint_witness(
     role: &str,
@@ -275,6 +278,10 @@ pub(crate) fn checkpoint_witness(
         CHECKPOINT_ROLE_SNAPSHOT => (
             &b"frankenterm:snapshot-checkpoint:v2"[..],
             SNAPSHOT_WITNESS_PREFIX,
+        ),
+        CHECKPOINT_ROLE_RESTORE_INTENT => (
+            &b"frankenterm:restore-intent:v2"[..],
+            RESTORE_INTENT_WITNESS_PREFIX,
         ),
         CHECKPOINT_ROLE_RESTORE_RECEIPT => (
             &b"frankenterm:restore-receipt:v2"[..],
@@ -355,9 +362,25 @@ mod tests {
             &[],
         )
         .unwrap();
+        let intent = checkpoint_witness(
+            CHECKPOINT_ROLE_RESTORE_INTENT,
+            "sess",
+            7,
+            11,
+            "startup",
+            0,
+            0,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
         assert!(snapshot.starts_with(SNAPSHOT_WITNESS_PREFIX));
+        assert!(intent.starts_with(RESTORE_INTENT_WITNESS_PREFIX));
         assert!(receipt.starts_with(RESTORE_RECEIPT_WITNESS_PREFIX));
         assert_ne!(snapshot, receipt);
+        assert_ne!(snapshot, intent);
+        assert_ne!(intent, receipt);
     }
 
     #[test]

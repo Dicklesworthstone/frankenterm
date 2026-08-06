@@ -74,7 +74,11 @@
 /// whose durable receipt justified that claim. Deleting or pruning that row can
 /// now invalidate clean state deterministically instead of leaving a stale
 /// clean flag behind.
-pub const SCHEMA_VERSION: i32 = 37;
+/// Bumped 37 → 38 to make checkpoint identities non-reusable, introduce an
+/// explicit restore-intent role, and reserve a unique intent-to-outcome link.
+/// Causal authority now follows the never-reused checkpoint ID; wall-clock
+/// timestamps remain presentation and retention-age data.
+pub const SCHEMA_VERSION: i32 = 38;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -911,7 +915,7 @@ CREATE TABLE IF NOT EXISTS mux_sessions (
 
 -- Session checkpoints: individual checkpoint snapshots (many per session)
 CREATE TABLE IF NOT EXISTS session_checkpoints (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
     checkpoint_at INTEGER NOT NULL,        -- epoch ms
     checkpoint_type TEXT NOT NULL CHECK(checkpoint_type IN ('periodic','event','shutdown','startup')),
@@ -920,20 +924,72 @@ CREATE TABLE IF NOT EXISTS session_checkpoints (
     total_bytes INTEGER NOT NULL,          -- historical pane-state JSON byte estimate
     metadata_json TEXT,                    -- trigger reason / operator metadata
     checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
-        CHECK(checkpoint_role IN ('snapshot','restore_receipt')),
-    topology_json TEXT                     -- exact topology for this snapshot; NULL for receipts/legacy rows
+        CHECK(checkpoint_role IN ('snapshot','restore_intent','restore_receipt')),
+    topology_json TEXT,                    -- exact topology for this snapshot; NULL for intents/receipts/legacy rows
+    restore_intent_checkpoint_id INTEGER
+        REFERENCES session_checkpoints(id) ON DELETE CASCADE,
+    CHECK(checkpoint_role = 'restore_receipt' OR restore_intent_checkpoint_id IS NULL)
 );
 
 CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON session_checkpoints(session_id, checkpoint_at);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_session_role_latest
     ON session_checkpoints(session_id, checkpoint_role, checkpoint_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_session_role_causal
+    ON session_checkpoints(session_id, checkpoint_role, id DESC);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_global_latest
     ON session_checkpoints(checkpoint_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_global_snapshot_latest
     ON session_checkpoints(checkpoint_at DESC, id DESC)
     WHERE checkpoint_role = 'snapshot';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_restore_intent_outcome
+    ON session_checkpoints(restore_intent_checkpoint_id)
+    WHERE restore_intent_checkpoint_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_mux_sessions_clean_checkpoint
     ON mux_sessions(clean_checkpoint_id);
+
+-- Restore-attempt lifecycle: authoritative settlement state independent of
+-- whichever checkpoint happens to be latest after an interrupted attempt.
+CREATE TABLE IF NOT EXISTS restore_attempt_lifecycle (
+    intent_checkpoint_id INTEGER PRIMARY KEY
+        REFERENCES session_checkpoints(id)
+        ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
+    session_id TEXT NOT NULL
+        REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
+    -- Durable causal identity. Deliberately not an FK: resolved attempts must
+    -- not pin a potentially large source snapshot forever; unresolved source
+    -- deletion is blocked by the checkpoint-prune authority path while this
+    -- identity remains available for reconciliation even after resolution.
+    source_checkpoint_id INTEGER NOT NULL,
+    outcome_checkpoint_id INTEGER
+        REFERENCES session_checkpoints(id) ON DELETE SET NULL,
+    status TEXT NOT NULL
+        CHECK(status IN ('intent','outcome_complete','resolved','reconciliation_required')),
+    created_at INTEGER NOT NULL,
+    resolved_at INTEGER,
+    CHECK(intent_checkpoint_id <> source_checkpoint_id),
+    CHECK(outcome_checkpoint_id IS NULL OR outcome_checkpoint_id <> intent_checkpoint_id),
+    CHECK(outcome_checkpoint_id IS NULL OR outcome_checkpoint_id <> source_checkpoint_id),
+    CHECK(created_at >= 0),
+    CHECK(resolved_at IS NULL OR resolved_at >= created_at),
+    CHECK(
+        (status = 'intent'
+            AND outcome_checkpoint_id IS NULL
+            AND resolved_at IS NULL)
+        OR (status = 'outcome_complete'
+            AND outcome_checkpoint_id IS NOT NULL
+            AND resolved_at IS NULL)
+        OR (status = 'reconciliation_required'
+            AND resolved_at IS NULL)
+        OR (status = 'resolved'
+            AND resolved_at IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_restore_attempt_lifecycle_session_status
+    ON restore_attempt_lifecycle(session_id, status, intent_checkpoint_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_restore_attempt_lifecycle_outcome
+    ON restore_attempt_lifecycle(outcome_checkpoint_id)
+    WHERE outcome_checkpoint_id IS NOT NULL;
 
 -- Mux pane state: per-pane state snapshot, linked to a checkpoint
 CREATE TABLE IF NOT EXISTS mux_pane_state (
