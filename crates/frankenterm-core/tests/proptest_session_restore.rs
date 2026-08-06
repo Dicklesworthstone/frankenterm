@@ -4,8 +4,8 @@
 //! operations, and display formatting:
 //! - SessionRestoreConfig serde roundtrip preserves all fields
 //! - SessionRestoreConfig default values are correct
-//! - SessionRestoreConfig partial JSON deserialization (serde(default))
-//! - RestoreSummary count invariants: restored + failed == total
+//! - SessionRestoreConfig partial JSON deserialization via its explicit wire form
+//! - RestoreSummary count invariants: layout-settled + layout-failed == expected
 //! - RestoreSummary counts always >= 0 (usize semantics)
 //! - format_restore_summary contains session_id and count info
 //! - format_restore_summary includes failed pane details when present
@@ -25,7 +25,6 @@
 //! - RestoreResult pane_id_map keys are unique (HashMap invariant)
 //! - CheckpointData pane_states are loadable from DB
 //! - format_epoch_ms produces valid HH:MM:SS UTC format
-//! - RestoreError Display contains context message
 
 use proptest::prelude::*;
 use rusqlite::{Connection, params};
@@ -338,12 +337,10 @@ fn insert_pane_state(
 // ────────────────────────────────────────────────────────────────────
 
 fn arb_session_restore_config() -> impl Strategy<Value = SessionRestoreConfig> {
-    (any::<bool>(), any::<bool>(), 0usize..100_000).prop_map(
-        |(auto_restore, restore_scrollback, restore_max_lines)| SessionRestoreConfig {
+    (any::<bool>(), any::<bool>()).prop_map(
+        |(auto_restore, restore_scrollback)| SessionRestoreConfig {
             auto_restore,
             restore_scrollback,
-            restore_max_lines,
-            ..SessionRestoreConfig::default()
         },
     )
 }
@@ -455,7 +452,6 @@ fn arb_restore_summary() -> impl Strategy<Value = RestoreSummary> {
     )
         .prop_map(
             |(session_id, checkpoint_id, layout_result, pane_states, elapsed_ms)| {
-                let source_marked_clean = layout_result.failed_panes.is_empty();
                 RestoreSummary {
                     session_id,
                     checkpoint_id,
@@ -463,10 +459,12 @@ fn arb_restore_summary() -> impl Strategy<Value = RestoreSummary> {
                     outcome_checkpoint_id: checkpoint_id + 2,
                     layout_result,
                     pane_states,
-                    scrollback_result: None,
-                    scrollback_error: None,
                     process_launch_report: None,
-                    source_marked_clean,
+                    // This broad structural strategy deliberately generates
+                    // incomplete, unexpected, and colliding mappings and has
+                    // no process-disposition report. It must never fabricate
+                    // production clean authority.
+                    restore_authority_resolved: false,
                     elapsed_ms,
                 }
             },
@@ -605,8 +603,6 @@ proptest! {
             "auto_restore mismatch after roundtrip");
         prop_assert_eq!(config.restore_scrollback, deserialized.restore_scrollback,
             "restore_scrollback mismatch after roundtrip");
-        prop_assert_eq!(config.restore_max_lines, deserialized.restore_max_lines,
-            "restore_max_lines mismatch after roundtrip");
     }
 
     // ================================================================
@@ -617,8 +613,6 @@ proptest! {
         let config = SessionRestoreConfig::default();
         prop_assert!(!config.auto_restore, "default auto_restore should be false");
         prop_assert!(!config.restore_scrollback, "default restore_scrollback should be false");
-        prop_assert_eq!(config.restore_max_lines, 5000usize,
-            "default restore_max_lines should be 5000");
     }
 
     // ================================================================
@@ -633,8 +627,6 @@ proptest! {
             "explicit field should be preserved");
         prop_assert!(!config.restore_scrollback,
             "missing restore_scrollback should default to false");
-        prop_assert_eq!(config.restore_max_lines, 5000usize,
-            "missing restore_max_lines should default to 5000");
     }
 
     // ================================================================
@@ -647,7 +639,6 @@ proptest! {
 
         prop_assert_eq!(config.auto_restore, default_config.auto_restore);
         prop_assert_eq!(config.restore_scrollback, default_config.restore_scrollback);
-        prop_assert_eq!(config.restore_max_lines, default_config.restore_max_lines);
     }
 
     // ================================================================
@@ -655,13 +646,13 @@ proptest! {
     // ================================================================
     #[test]
     fn restore_summary_count_invariant(summary in arb_restore_summary()) {
-        let restored = summary.restored_count();
-        let failed = summary.failed_count();
-        let total = summary.total_count();
+        let restored = summary.layout_settled_pane_count();
+        let failed = summary.layout_failed_pane_count();
+        let total = summary.expected_pane_count();
 
         prop_assert_eq!(
             total, restored + failed,
-            "total_count ({}) must equal restored ({}) + failed ({})", total, restored, failed
+            "expected_pane_count ({}) must equal layout-settled ({}) + layout-failed ({})", total, restored, failed
         );
     }
 
@@ -671,9 +662,9 @@ proptest! {
     #[test]
     fn restore_summary_counts_non_negative(summary in arb_restore_summary()) {
         // usize is always >= 0, but we verify the methods work without panic
-        let _restored = summary.restored_count();
-        let _failed = summary.failed_count();
-        let _total = summary.total_count();
+        let _restored = summary.layout_settled_pane_count();
+        let _failed = summary.layout_failed_pane_count();
+        let _total = summary.expected_pane_count();
         // If we got here without panic, the invariant holds.
         prop_assert!(true);
     }
@@ -697,7 +688,11 @@ proptest! {
     #[test]
     fn format_summary_contains_counts(summary in arb_restore_summary()) {
         let text = format_restore_summary(&summary);
-        let expected = format!("{}/{}", summary.restored_count(), summary.total_count());
+        let expected = format!(
+            "{}/{}",
+            summary.layout_settled_pane_count(),
+            summary.expected_pane_count()
+        );
         prop_assert!(
             text.contains(&expected),
             "formatted summary should contain '{}', got: '{}'",
@@ -711,7 +706,7 @@ proptest! {
     #[test]
     fn format_summary_lists_failed_panes(summary in arb_restore_summary()) {
         let text = format_restore_summary(&summary);
-        if summary.failed_count() > 0 {
+        if summary.layout_failed_pane_count() > 0 {
             prop_assert!(
                 text.contains("Failed panes"),
                 "summary with failures should contain 'Failed panes'"
@@ -1274,7 +1269,6 @@ proptest! {
         let cloned = config.clone();
         prop_assert_eq!(cloned.auto_restore, config.auto_restore);
         prop_assert_eq!(cloned.restore_scrollback, config.restore_scrollback);
-        prop_assert_eq!(cloned.restore_max_lines, config.restore_max_lines);
     }
 
     // ================================================================
@@ -1379,10 +1373,8 @@ proptest! {
             outcome_checkpoint_id: 3,
             layout_result: layout,
             pane_states: vec![],
-            scrollback_result: None,
-            scrollback_error: None,
             process_launch_report: None,
-            source_marked_clean: true,
+            restore_authority_resolved: true,
             elapsed_ms: 50,
         };
         let formatted = format_restore_summary(&summary);

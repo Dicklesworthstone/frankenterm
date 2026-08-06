@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use frankenterm_core::config::SnapshotConfig;
-use frankenterm_core::restore_process::LaunchConfig;
 use frankenterm_core::session_restore::{
     CheckpointRole, RestoreError, RestoredPaneState, SessionRestoreConfig, SessionRestorer,
     load_checkpoint_by_id, load_latest_checkpoint, session_doctor, show_session,
@@ -38,7 +37,7 @@ where
     runtime.block_on(future);
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 struct E2ETestReport {
     test_name: String,
     phases: Vec<PhaseReport>,
@@ -46,6 +45,65 @@ struct E2ETestReport {
     passed: bool,
     failure_reason: Option<String>,
     pane_reports: Vec<PaneTestReport>,
+}
+
+const HERMETIC_NOT_TESTED_CONTRACTS: [&str; 13] = [
+    "mux_stop_start",
+    "authenticated_restart_execution",
+    "automatic_startup_restore",
+    "process_continuity",
+    "historical_scrollback_replay",
+    "terminal_render_state_replay",
+    "real_mux_geometry",
+    "user_tab_order_round_trip",
+    "real_mux_active_tab_identity",
+    "native_resize_zoom_rendering",
+    "native_keypress_latency",
+    "target_class_large_session_scale",
+    "full_session_continuity",
+];
+
+impl Serialize for E2ETestReport {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let exercised_checks_passed = self
+            .pane_reports
+            .iter()
+            .flat_map(|pane| pane.checks.iter())
+            .filter(|check| check.status == PaneCheckStatus::Passed)
+            .count();
+        let not_tested_contracts = HERMETIC_NOT_TESTED_CONTRACTS
+            .into_iter()
+            .chain(self.pane_reports
+            .iter()
+            .flat_map(|pane| pane.checks.iter())
+            .filter(|check| check.status == PaneCheckStatus::NotTested)
+            .map(|check| check.contract))
+            .collect::<std::collections::BTreeSet<_>>();
+        let pane_contract_checks_present = !self.pane_reports.is_empty();
+        let exercised_contracts_passed = self.passed
+            && self
+                .pane_reports
+                .iter()
+                .all(PaneTestReport::all_exercised_checks_pass);
+
+        let mut state = serializer.serialize_struct("E2ETestReport", 11)?;
+        state.serialize_field("test_name", &self.test_name)?;
+        state.serialize_field("scope", "hermetic_sqlite_mock_mux")?;
+        state.serialize_field("phases", &self.phases)?;
+        state.serialize_field("total_duration_ms", &self.total_duration_ms)?;
+        state.serialize_field("exercised_contracts_passed", &exercised_contracts_passed)?;
+        state.serialize_field("pane_contract_checks_present", &pane_contract_checks_present)?;
+        state.serialize_field("exercised_checks_passed", &exercised_checks_passed)?;
+        state.serialize_field("not_tested_contracts", &not_tested_contracts)?;
+        state.serialize_field("not_tested_contract_count", &not_tested_contracts.len())?;
+        state.serialize_field("failure_reason", &self.failure_reason)?;
+        state.serialize_field("pane_reports", &self.pane_reports)?;
+        state.end()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -68,8 +126,85 @@ impl PaneTestReport {
     fn all_exercised_checks_pass(&self) -> bool {
         self.checks
             .iter()
-            .all(|check| check.status != PaneCheckStatus::Failed)
+            .any(|check| check.status == PaneCheckStatus::Passed)
+            && self
+                .checks
+                .iter()
+                .all(|check| check.status != PaneCheckStatus::Failed)
     }
+}
+
+#[test]
+fn not_tested_only_pane_report_never_passes() {
+    let report = PaneTestReport {
+        pane_id: 1,
+        source_artifact_hash: "not-tested".to_string(),
+        observed_artifact_hash: "not-tested".to_string(),
+        checks: vec![
+            PaneContractCheck::not_tested("process_continuity"),
+            PaneContractCheck::not_tested("scrollback_render_replay"),
+        ],
+    };
+    assert!(!report.all_exercised_checks_pass());
+}
+
+#[test]
+fn one_unexercised_pane_prevents_a_passing_serialized_report() {
+    let report = E2ETestReport {
+        test_name: "mixed-contract-proof".to_string(),
+        phases: Vec::new(),
+        total_duration_ms: 0,
+        passed: true,
+        failure_reason: None,
+        pane_reports: vec![
+            PaneTestReport {
+                pane_id: 1,
+                source_artifact_hash: "not-tested".to_string(),
+                observed_artifact_hash: "not-tested".to_string(),
+                checks: vec![PaneContractCheck::not_tested("process_continuity")],
+            },
+            PaneTestReport {
+                pane_id: 2,
+                source_artifact_hash: "source".to_string(),
+                observed_artifact_hash: "observed".to_string(),
+                checks: vec![PaneContractCheck::exercised("checkpoint_shape", true)],
+            },
+        ],
+    };
+
+    let serialized = serde_json::to_value(report).expect("serialize proof report");
+    assert_eq!(
+        serialized["exercised_contracts_passed"].as_bool(),
+        Some(false)
+    );
+}
+
+#[test]
+fn passing_phase_only_report_does_not_fabricate_missing_pane_checks() {
+    let report = E2ETestReport {
+        test_name: "phase-only-contract-proof".to_string(),
+        phases: vec![PhaseReport {
+            phase: "topology_roundtrip".to_string(),
+            duration_ms: 0,
+            status: "passed".to_string(),
+            details: json!({"scope": "serialized_topology"}),
+        }],
+        total_duration_ms: 0,
+        passed: true,
+        failure_reason: None,
+        pane_reports: Vec::new(),
+    };
+
+    let serialized = serde_json::to_value(report).expect("serialize phase-only report");
+    assert_eq!(
+        serialized["exercised_contracts_passed"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        serialized["pane_contract_checks_present"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(serialized["exercised_checks_passed"].as_u64(), Some(0));
 }
 
 #[derive(Debug, Serialize)]
@@ -887,8 +1022,8 @@ fn e2e_restore_bookkeeping_preserves_manual_restore_checkpoint() {
             restore_start,
             "ok",
             json!({
-                "restored_count": summary.restored_count(),
-                "failed_count": summary.failed_count(),
+                "layout_settled_pane_count": summary.layout_settled_pane_count(),
+                "layout_failed_pane_count": summary.layout_failed_pane_count(),
                 "summary_checkpoint_id": summary.checkpoint_id,
             }),
         );
@@ -1008,8 +1143,8 @@ fn e2e_restore_bookkeeping_preserves_manual_restore_checkpoint() {
             .pane_reports
             .iter()
             .all(PaneTestReport::all_exercised_checks_pass)
-            && summary.restored_count() == 1
-            && summary.failed_count() == 0;
+            && summary.layout_settled_pane_count() == 1
+            && summary.layout_failed_pane_count() == 0;
 
         report.total_duration_ms = run_start.elapsed().as_millis() as u64;
         report.passed = success;
@@ -1234,8 +1369,8 @@ fn e2e_fixture_complex_layout_executes_session_restorer_flow() {
             restore_start,
             "ok",
             json!({
-                "restored_count": summary.restored_count(),
-                "failed_count": summary.failed_count(),
+                "layout_settled_pane_count": summary.layout_settled_pane_count(),
+                "layout_failed_pane_count": summary.layout_failed_pane_count(),
                 "windows_created": summary.layout_result.windows_created,
                 "tabs_created": summary.layout_result.tabs_created,
             }),
@@ -1315,8 +1450,8 @@ fn e2e_fixture_complex_layout_executes_session_restorer_flow() {
             .values()
             .copied()
             .collect();
-        let success = summary.restored_count() == fixture_panes.len()
-            && summary.failed_count() == 0
+        let success = summary.layout_settled_pane_count() == fixture_panes.len()
+            && summary.layout_failed_pane_count() == 0
             && summary.layout_result.windows_created == 1
             && summary.layout_result.tabs_created == 2
             && restored_panes.len() == fixture_panes.len()
@@ -1424,15 +1559,6 @@ fn e2e_restore_rejects_unsafe_scrollback_before_mux_or_authority_effects() {
             db_path.clone(),
             SessionRestoreConfig {
                 restore_scrollback: true,
-                process_relaunch: LaunchConfig {
-                    launch_agents: true,
-                    launch_delay_ms: 0,
-                    agent_commands: HashMap::from([(
-                        "codex".to_string(),
-                        "codex --resume".to_string(),
-                    )]),
-                    ..LaunchConfig::default()
-                },
                 ..SessionRestoreConfig::default()
             },
         );
@@ -1620,7 +1746,6 @@ fn e2e_persisted_session_identity_survives_engine_rebuild_and_manual_layout_rest
             db_path.clone(),
             SessionRestoreConfig {
                 restore_scrollback: false,
-                process_relaunch: LaunchConfig::default(),
                 ..SessionRestoreConfig::default()
             },
         );
@@ -1740,8 +1865,8 @@ fn e2e_persisted_session_identity_survives_engine_rebuild_and_manual_layout_rest
             .restore(&candidate, &checkpoint, wezterm.clone())
             .await
             .expect("restore must succeed against reconstituted DB");
-        let restore_ok = summary.restored_count() == captured_pane_count
-            && summary.failed_count() == 0
+        let restore_ok = summary.layout_settled_pane_count() == captured_pane_count
+            && summary.layout_failed_pane_count() == 0
             && summary.session_id == captured_session_id;
         add_phase(
             &mut report,
@@ -1749,8 +1874,8 @@ fn e2e_persisted_session_identity_survives_engine_rebuild_and_manual_layout_rest
             restore_start,
             if restore_ok { "ok" } else { "error" },
             json!({
-                "restored_count": summary.restored_count(),
-                "failed_count": summary.failed_count(),
+                "layout_settled_pane_count": summary.layout_settled_pane_count(),
+                "layout_failed_pane_count": summary.layout_failed_pane_count(),
                 "summary_session_id": summary.session_id,
                 "session_id_match": summary.session_id == captured_session_id,
             }),
@@ -1880,8 +2005,6 @@ fn e2e_persisted_scrollback_bytes_survive_engine_rebuild_but_replay_is_rejected(
             db_path.clone(),
             SessionRestoreConfig {
                 restore_scrollback: true,
-                restore_max_lines: 1_000,
-                process_relaunch: LaunchConfig::default(),
                 ..SessionRestoreConfig::default()
             },
         );
@@ -2253,8 +2376,8 @@ fn e2e_persisted_capture_topology_survives_engine_rebuild_and_maps_all_panes() {
             restore_start,
             if pane_id_map_complete { "ok" } else { "error" },
             json!({
-                "restored_count": summary.restored_count(),
-                "failed_count": summary.failed_count(),
+                "layout_settled_pane_count": summary.layout_settled_pane_count(),
+                "layout_failed_pane_count": summary.layout_failed_pane_count(),
                 "checkpoint_id_match": summary.checkpoint_id == captured_checkpoint_id,
             }),
         );

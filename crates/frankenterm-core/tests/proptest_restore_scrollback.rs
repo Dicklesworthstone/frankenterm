@@ -1,11 +1,9 @@
 //! Property-based tests for the `restore_scrollback` module.
 //!
 //! Covers `ScrollbackData` construction and truncation invariants,
-//! `InjectionReport` aggregation, and suppression-guard semantics.
+//! fail-closed `InjectionReport` defaults, and suppression-guard semantics.
 
-use frankenterm_core::restore_scrollback::{
-    InjectionGuard, InjectionReport, PaneInjectionStats, ScrollbackData,
-};
+use frankenterm_core::restore_scrollback::{InjectionGuard, InjectionReport, ScrollbackData};
 use proptest::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -16,27 +14,6 @@ use std::sync::{Arc, Mutex};
 
 fn arb_segments() -> impl Strategy<Value = Vec<String>> {
     proptest::collection::vec("[A-Za-z0-9 ]{0,50}", 0..20)
-}
-
-fn arb_pane_stats() -> impl Strategy<Value = PaneInjectionStats> {
-    (
-        0_u64..1000,
-        0_u64..1000,
-        0_usize..500,
-        0_usize..50000,
-        0_usize..100,
-    )
-        .prop_map(
-            |(old_pane_id, new_pane_id, lines_injected, bytes_written, chunks_sent)| {
-                PaneInjectionStats {
-                    old_pane_id,
-                    new_pane_id,
-                    lines_injected,
-                    bytes_written,
-                    chunks_sent,
-                }
-            },
-        )
 }
 
 // =========================================================================
@@ -115,48 +92,13 @@ proptest! {
 }
 
 // =========================================================================
-// InjectionReport — aggregation
+// InjectionReport — fail-closed aggregate surface
 // =========================================================================
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(30))]
 
-    /// success_count equals number of successes.
-    #[test]
-    fn prop_success_count(stats in proptest::collection::vec(arb_pane_stats(), 0..10)) {
-        let report = InjectionReport {
-            successes: stats.clone(),
-            failures: vec![],
-            ..InjectionReport::default()
-        };
-        prop_assert_eq!(report.success_count(), stats.len());
-    }
-
-    /// failure_count equals number of failures.
-    #[test]
-    fn prop_failure_count(n in 0_usize..10) {
-        let failures: Vec<(u64, String)> = (0..n).map(|i| (i as u64, "err".to_string())).collect();
-        let report = InjectionReport {
-            successes: vec![],
-            failures,
-            ..InjectionReport::default()
-        };
-        prop_assert_eq!(report.failure_count(), n);
-    }
-
-    /// total_bytes sums bytes_written across successes.
-    #[test]
-    fn prop_total_bytes(stats in proptest::collection::vec(arb_pane_stats(), 0..10)) {
-        let expected: usize = stats.iter().map(|s| s.bytes_written).sum();
-        let report = InjectionReport {
-            successes: stats,
-            failures: vec![],
-            ..InjectionReport::default()
-        };
-        prop_assert_eq!(report.total_bytes(), expected);
-    }
-
-    /// Default report has all zero counts.
+    /// The unavailable output channel has a finite zeroed default report.
     #[test]
     fn prop_default_report(_dummy in 0..1_u8) {
         let report = InjectionReport::default();
@@ -165,18 +107,8 @@ proptest! {
         prop_assert_eq!(report.total_bytes(), 0);
         prop_assert_eq!(report.skipped_count(), 0);
         prop_assert!(report.skipped_sample().is_empty());
-    }
-
-    /// total_bytes is zero when no successes.
-    #[test]
-    fn prop_total_bytes_no_successes(n in 0_usize..5) {
-        let failures: Vec<(u64, String)> = (0..n).map(|i| (i as u64, "err".to_string())).collect();
-        let report = InjectionReport {
-            successes: vec![],
-            failures,
-            ..InjectionReport::default()
-        };
-        prop_assert_eq!(report.total_bytes(), 0);
+        let debug = format!("{report:?}");
+        prop_assert!(debug.len() < 256);
     }
 }
 
@@ -371,105 +303,6 @@ proptest! {
 }
 
 // =========================================================================
-// InjectionReport — additional properties
-// =========================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(30))]
-
-    /// Report Debug never exposes backend failure text.
-    #[test]
-    fn prop_report_debug_redacts_failure_text(canary in "[A-Za-z0-9]{1,40}") {
-        let report = InjectionReport {
-            successes: vec![],
-            failures: vec![(7, canary.clone())],
-            ..InjectionReport::default()
-        };
-        let debug = format!("{report:?}");
-        prop_assert!(!debug.contains(&canary));
-        prop_assert!(debug.contains("failure_count: 1"));
-    }
-
-    /// total_lines sums lines_injected across successes.
-    #[test]
-    fn prop_total_lines(stats in proptest::collection::vec(arb_pane_stats(), 0..10)) {
-        let expected: usize = stats.iter().map(|s| s.lines_injected).sum();
-        let report = InjectionReport {
-            successes: stats,
-            failures: vec![],
-            ..InjectionReport::default()
-        };
-        let actual: usize = report.successes.iter().map(|s| s.lines_injected).sum();
-        prop_assert_eq!(actual, expected);
-    }
-
-    /// Mixed report with successes and failures has correct counts.
-    #[test]
-    fn prop_mixed_report(
-        n_success in 0_usize..5,
-        n_failure in 0_usize..5,
-    ) {
-        let successes: Vec<_> = (0..n_success).map(|i| PaneInjectionStats {
-            old_pane_id: i as u64,
-            new_pane_id: i as u64 + 100,
-            lines_injected: 10,
-            bytes_written: 100,
-            chunks_sent: 1,
-        }).collect();
-        let failures: Vec<_> = (0..n_failure).map(|i| (i as u64, "err".to_string())).collect();
-
-        let report = InjectionReport {
-            successes,
-            failures,
-            ..InjectionReport::default()
-        };
-        prop_assert_eq!(report.success_count(), n_success);
-        prop_assert_eq!(report.failure_count(), n_failure);
-        prop_assert_eq!(report.total_bytes(), n_success * 100);
-        prop_assert_eq!(report.skipped_count(), 0);
-    }
-
-    /// total_chunks sums chunks_sent across successes.
-    #[test]
-    fn prop_total_chunks(stats in proptest::collection::vec(arb_pane_stats(), 0..10)) {
-        let expected: usize = stats.iter().map(|s| s.chunks_sent).sum();
-        let report = InjectionReport {
-            successes: stats,
-            failures: vec![],
-            ..InjectionReport::default()
-        };
-        let actual: usize = report.successes.iter().map(|s| s.chunks_sent).sum();
-        prop_assert_eq!(actual, expected);
-    }
-}
-
-// =========================================================================
-// PaneInjectionStats — properties
-// =========================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(30))]
-
-    /// PaneInjectionStats Debug doesn't panic.
-    #[test]
-    fn prop_stats_debug(stats in arb_pane_stats()) {
-        let debug = format!("{:?}", stats);
-        prop_assert!(!debug.is_empty());
-    }
-
-    /// PaneInjectionStats Clone produces identical values.
-    #[test]
-    fn prop_stats_clone(stats in arb_pane_stats()) {
-        let cloned = stats.clone();
-        prop_assert_eq!(stats.old_pane_id, cloned.old_pane_id);
-        prop_assert_eq!(stats.new_pane_id, cloned.new_pane_id);
-        prop_assert_eq!(stats.lines_injected, cloned.lines_injected);
-        prop_assert_eq!(stats.bytes_written, cloned.bytes_written);
-        prop_assert_eq!(stats.chunks_sent, cloned.chunks_sent);
-    }
-}
-
-// =========================================================================
 // Unit tests
 // =========================================================================
 
@@ -495,31 +328,4 @@ fn scrollback_truncate_basic() {
     data.truncate(2);
     assert_eq!(data.lines, vec!["cc", "dd"]); // keeps most recent
     assert_eq!(data.total_bytes(), 4);
-}
-
-#[test]
-fn report_aggregation() {
-    let report = InjectionReport {
-        successes: vec![
-            PaneInjectionStats {
-                old_pane_id: 1,
-                new_pane_id: 10,
-                lines_injected: 100,
-                bytes_written: 5000,
-                chunks_sent: 2,
-            },
-            PaneInjectionStats {
-                old_pane_id: 2,
-                new_pane_id: 20,
-                lines_injected: 50,
-                bytes_written: 3000,
-                chunks_sent: 1,
-            },
-        ],
-        failures: vec![(3, "timeout".to_string())],
-        ..InjectionReport::default()
-    };
-    assert_eq!(report.success_count(), 2);
-    assert_eq!(report.failure_count(), 1);
-    assert_eq!(report.total_bytes(), 8000);
 }

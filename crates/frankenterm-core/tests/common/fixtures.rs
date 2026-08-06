@@ -328,6 +328,20 @@ pub struct RuntimeFixture {
     runtime: asupersync::runtime::Runtime,
 }
 
+struct RuntimeHandleRestoreGuard {
+    previous: Option<asupersync::runtime::RuntimeHandle>,
+}
+
+impl Drop for RuntimeHandleRestoreGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            frankenterm_core::runtime_async::install_runtime_handle(previous);
+        } else {
+            frankenterm_core::runtime_async::clear_runtime_handle();
+        }
+    }
+}
+
 impl RuntimeFixture {
     /// Create a single-threaded runtime fixture.
     #[must_use]
@@ -346,10 +360,10 @@ impl RuntimeFixture {
     where
         F: std::future::Future<Output = T>,
     {
+        let previous = frankenterm_core::runtime_async::current_runtime_handle();
         frankenterm_core::runtime_async::install_runtime_handle(self.runtime.handle());
-        let result = self.runtime.block_on(future);
-        frankenterm_core::runtime_async::clear_runtime_handle();
-        result
+        let _restore = RuntimeHandleRestoreGuard { previous };
+        self.runtime.block_on(future)
     }
 
     /// Get the runtime handle for spawning tasks.

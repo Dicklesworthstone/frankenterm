@@ -1,10 +1,9 @@
-//! Property-based tests for session restoration correctness.
+//! Property-based tests for snapshot and restore component contracts.
 //!
-//! Verifies the core isomorphism property:
-//!   for all valid mux states S, restore(snapshot(S)) ≈ S
-//!
-//! "Approximately equal" means structurally identical up to PIDs,
-//! timestamps, and trailing whitespace.
+//! The layout properties below prove complete, unique source-to-target pane
+//! mapping and aggregate creation counts against `MockWezterm`. They do not
+//! read back a restored split tree and therefore do not prove structural
+//! isomorphism, split-ratio fidelity, active-tab identity, or appearance.
 //!
 //! Bead: wa-rsaf.2
 
@@ -14,7 +13,9 @@ use std::sync::Arc;
 use proptest::prelude::*;
 
 use frankenterm_core::restore_layout::{LayoutRestorer, RestoreConfig};
-use frankenterm_core::restore_process::{LaunchAction, LaunchConfig, ProcessLauncher};
+use frankenterm_core::restore_process::{
+    LaunchAction, ProcessDispositionReason, ProcessLauncher,
+};
 use frankenterm_core::restore_scrollback::{ScrollbackData, ScrollbackInjector};
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::session_pane_state::{
@@ -104,23 +105,19 @@ fn arb_agent_type() -> impl Strategy<Value = String> {
 
 /// Generate a leaf PaneNode.
 fn arb_leaf() -> impl Strategy<Value = PaneNode> {
-    (
-        arb_pane_id(),
-        arb_dimensions(),
-        arb_cwd(),
-        arb_title(),
-        any::<bool>(),
+    (arb_pane_id(), arb_dimensions(), arb_cwd(), arb_title()).prop_map(
+        |(pane_id, (rows, cols), cwd, title)| PaneNode::Leaf {
+            pane_id,
+            rows,
+            cols,
+            cwd,
+            title,
+            // Tab generation establishes one coherent active authority after
+            // the recursive tree is complete. Leaves cannot independently
+            // claim focus while the tree is being assembled.
+            is_active: false,
+        },
     )
-        .prop_map(
-            |(pane_id, (rows, cols), cwd, title, is_active)| PaneNode::Leaf {
-                pane_id,
-                rows,
-                cols,
-                cwd,
-                title,
-                is_active,
-            },
-        )
 }
 
 /// Generate a recursive PaneNode tree.
@@ -153,15 +150,23 @@ fn arb_pane_tree() -> impl Strategy<Value = PaneNode> {
 
 /// Generate a TabSnapshot.
 fn arb_tab(tab_id: u64) -> impl Strategy<Value = TabSnapshot> {
-    (arb_pane_tree(), arb_title()).prop_map(move |(pane_tree, title)| {
-        let active_pane_id = first_leaf_id(&pane_tree);
-        TabSnapshot {
-            tab_id,
-            title,
-            pane_tree,
-            active_pane_id: Some(active_pane_id),
-        }
-    })
+    (arb_pane_tree(), arb_title(), any::<bool>()).prop_map(
+        move |(mut pane_tree, title, has_active_authority)| {
+            // Recursive leaf strategies cannot coordinate IDs or focus. Make
+            // IDs unique within the tab before assigning one coherent focus
+            // marker, or deliberately assign no marker at all.
+            let mut next_pane_id = 1;
+            reassign_pane_ids(&mut pane_tree, &mut next_pane_id);
+            let active_pane_id = has_active_authority.then(|| first_leaf_id(&pane_tree));
+            set_active_leaf(&mut pane_tree, active_pane_id);
+            TabSnapshot {
+                tab_id,
+                title,
+                pane_tree,
+                active_pane_id,
+            }
+        },
+    )
 }
 
 /// Generate a WindowSnapshot with 1-4 tabs.
@@ -296,6 +301,40 @@ fn first_leaf_id(node: &PaneNode) -> u64 {
     }
 }
 
+/// Set leaf focus to exactly the requested pane ID, or clear all markers.
+fn set_active_leaf(node: &mut PaneNode, active_pane_id: Option<u64>) {
+    match node {
+        PaneNode::Leaf {
+            pane_id,
+            is_active,
+            ..
+        } => {
+            *is_active = active_pane_id == Some(*pane_id);
+        }
+        PaneNode::HSplit { children } | PaneNode::VSplit { children } => {
+            for (_, child) in children {
+                set_active_leaf(child, active_pane_id);
+            }
+        }
+    }
+}
+
+/// Collect pane IDs whose leaves claim active authority.
+fn collect_active_leaf_ids(node: &PaneNode) -> Vec<u64> {
+    match node {
+        PaneNode::Leaf {
+            pane_id,
+            is_active: true,
+            ..
+        } => vec![*pane_id],
+        PaneNode::Leaf { .. } => Vec::new(),
+        PaneNode::HSplit { children } | PaneNode::VSplit { children } => children
+            .iter()
+            .flat_map(|(_, child)| collect_active_leaf_ids(child))
+            .collect(),
+    }
+}
+
 /// Collect all leaf pane IDs from a PaneNode tree.
 fn collect_leaf_ids(node: &PaneNode) -> Vec<u64> {
     match node {
@@ -336,8 +375,10 @@ fn deduplicate_topology(topo: &mut TopologySnapshot) {
     let mut counter = 1u64;
     for window in &mut topo.windows {
         for tab in &mut window.tabs {
+            let has_active_authority = tab.active_pane_id.is_some();
             reassign_pane_ids(&mut tab.pane_tree, &mut counter);
-            tab.active_pane_id = Some(first_leaf_id(&tab.pane_tree));
+            tab.active_pane_id = has_active_authority.then(|| first_leaf_id(&tab.pane_tree));
+            set_active_leaf(&mut tab.pane_tree, tab.active_pane_id);
         }
     }
 }
@@ -354,45 +395,6 @@ fn pane_nodes_approx_equal(a: &PaneNode, b: &PaneNode, tol: f64) -> bool {
                     .zip(bc.iter())
                     .all(|((ar, achild), (br, bchild))| {
                         (ar - br).abs() < tol && pane_nodes_approx_equal(achild, bchild, tol)
-                    })
-        }
-        _ => false,
-    }
-}
-
-/// Check structural equality of two PaneNode trees, ignoring pane IDs.
-/// Returns true if the trees have the same shape (same split types, same
-/// depths, same number of children at each level).
-#[allow(dead_code)]
-fn structurally_equal(a: &PaneNode, b: &PaneNode) -> bool {
-    match (a, b) {
-        (PaneNode::Leaf { .. }, PaneNode::Leaf { .. }) => true,
-        (PaneNode::HSplit { children: ac }, PaneNode::HSplit { children: bc })
-        | (PaneNode::VSplit { children: ac }, PaneNode::VSplit { children: bc }) => {
-            ac.len() == bc.len()
-                && ac
-                    .iter()
-                    .zip(bc.iter())
-                    .all(|((_, a_child), (_, b_child))| structurally_equal(a_child, b_child))
-        }
-        _ => false,
-    }
-}
-
-/// Check that ratios at each split level are approximately preserved.
-#[allow(dead_code)]
-fn ratios_approximately_equal(a: &PaneNode, b: &PaneNode, tolerance: f64) -> bool {
-    match (a, b) {
-        (PaneNode::Leaf { .. }, PaneNode::Leaf { .. }) => true,
-        (PaneNode::HSplit { children: ac }, PaneNode::HSplit { children: bc })
-        | (PaneNode::VSplit { children: ac }, PaneNode::VSplit { children: bc }) => {
-            ac.len() == bc.len()
-                && ac
-                    .iter()
-                    .zip(bc.iter())
-                    .all(|((ar, a_child), (br, b_child))| {
-                        (ar - br).abs() < tolerance
-                            && ratios_approximately_equal(a_child, b_child, tolerance)
                     })
         }
         _ => false,
@@ -462,16 +464,16 @@ proptest! {
 }
 
 // =============================================================================
-// Property: structural isomorphism
+// Property: per-tab source-pane mapping coverage
 // =============================================================================
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(300))]
 
-    /// Restoring a topology produces the same structural tree shape: split
-    /// directions and nesting depths are preserved. Pane IDs may differ.
+    /// Restoring a topology maps every source leaf in every tab. This does not
+    /// assert restored split direction, nesting, ratios, or appearance.
     #[test]
-    fn layout_structure_is_preserved(mut topo in arb_topology()) {
+    fn layout_restore_maps_every_source_leaf_per_tab(mut topo in arb_topology()) {
         deduplicate_topology(&mut topo);
         let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
@@ -487,7 +489,7 @@ proptest! {
 
             let result = restorer.restore(&topo).await.unwrap();
 
-            // Verify per-tab structure
+            // Verify per-tab source mapping coverage only.
             for window in &topo.windows {
                 for tab in &window.tabs {
                     let original_leaf_count = collect_leaf_ids(&tab.pane_tree).len();
@@ -628,8 +630,6 @@ proptest! {
     ) {
         let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
-            let launcher = ProcessLauncher::new();
-
             // Build consistent pane state and ID map
             let states: Vec<PaneStateSnapshot> = pane_ids
                 .iter()
@@ -664,8 +664,8 @@ proptest! {
                 .map(|(i, &old)| (old, 1000 + i as u64))
                 .collect();
 
-            let plan1 = launcher.plan(&id_map, &states);
-            let plan2 = launcher.plan(&id_map, &states);
+            let plan1 = ProcessLauncher::plan(&id_map, &states);
+            let plan2 = ProcessLauncher::plan(&id_map, &states);
 
             prop_assert_eq!(plan1.len(), plan2.len());
             for (p1, p2) in plan1.iter().zip(plan2.iter()) {
@@ -684,8 +684,6 @@ proptest! {
     ) {
         let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
-            let launcher = ProcessLauncher::new();
-
             let states: Vec<PaneStateSnapshot> = (0..pane_count)
                 .map(|i| {
                     let id = i as u64 + 1;
@@ -719,7 +717,7 @@ proptest! {
                 .map(|i| (i as u64 + 1, 100 + i as u64))
                 .collect();
 
-            let plans = launcher.plan(&id_map, &states);
+            let plans = ProcessLauncher::plan(&id_map, &states);
             prop_assert_eq!(plans.len(), pane_count);
 
             // Every mapped pane should appear in the plan
@@ -940,8 +938,6 @@ proptest! {
     ) {
         let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
-            let launcher = ProcessLauncher::new();
-
             let state = PaneStateSnapshot {
                 schema_version: 1,
                 pane_id: 1,
@@ -967,19 +963,15 @@ proptest! {
             };
 
             let id_map: HashMap<u64, u64> = std::iter::once((1, 100)).collect();
-            let plans = launcher.plan(&id_map, &[state]);
+            let plans = ProcessLauncher::plan(&id_map, &[state]);
 
             prop_assert_eq!(plans.len(), 1);
-            match &plans[0].action {
-                LaunchAction::Manual { hint, .. } => {
-                    prop_assert!(hint.contains("mux-native argv"));
-                }
-                other => prop_assert!(
-                    false,
-                    "expected Manual, got {:?}",
-                    other
+            prop_assert_eq!(
+                plans[0].action,
+                LaunchAction::Manual(
+                    ProcessDispositionReason::CapturedShellRequiresManualRecovery,
                 ),
-            }
+            );
             Ok(())
         })?;
     }
@@ -992,8 +984,6 @@ proptest! {
     ) {
         let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
-            let launcher = ProcessLauncher::new();
-
             let state = PaneStateSnapshot {
                 schema_version: 1,
                 pane_id: 1,
@@ -1019,20 +1009,16 @@ proptest! {
             };
 
             let id_map: HashMap<u64, u64> = std::iter::once((1, 100)).collect();
-            let plans = launcher.plan(&id_map, &[state]);
+            let plans = ProcessLauncher::plan(&id_map, &[state]);
 
             prop_assert_eq!(plans.len(), 1);
-            match &plans[0].action {
-                LaunchAction::Manual { hint, .. } => {
-                    prop_assert!(hint.contains("mux-native argv"));
-                    prop_assert!(!hint.contains("raw-"));
-                }
-                other => prop_assert!(
-                    false,
-                    "expected redacted Manual disposition, got {:?}",
-                    other
+            prop_assert_eq!(
+                plans[0].action,
+                LaunchAction::Manual(
+                    ProcessDispositionReason::CapturedShellRequiresManualRecovery,
                 ),
-            }
+            );
+            prop_assert!(!format!("{:?}", plans[0]).contains("raw-"));
             Ok(())
         })?;
     }
@@ -1072,44 +1058,34 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
-    /// Internal launch actions remain clone-stable without becoming a wire
+    /// Internal launch actions remain copy-stable without becoming a wire
     /// format that can expose raw commands, paths, or hints.
     #[test]
     fn launch_action_clone_preserves_internal_variant(
         variant in prop_oneof![
-            (arb_shell(), arb_cwd().prop_filter("need cwd", |c| c.is_some()))
-                .prop_map(|(shell, cwd)| LaunchAction::LaunchShell {
-                    shell,
-                    cwd: std::path::PathBuf::from(cwd.unwrap()),
-                }),
-            arb_agent_type().prop_map(|at| LaunchAction::LaunchAgent {
-                command: format!("{at} --headless"),
-                cwd: std::path::PathBuf::from("/home/user"),
-                agent_type: at,
-            }),
-            Just(LaunchAction::Skip { reason: "no process".into() }),
-            Just(LaunchAction::Manual {
-                hint: "Was running vim".into(),
-                original_process: "vim".into(),
-            }),
+            Just(LaunchAction::Skip(ProcessDispositionReason::DefaultShellCreated)),
+            Just(LaunchAction::Manual(ProcessDispositionReason::CapturedShellRequiresManualRecovery)),
+            Just(LaunchAction::Manual(ProcessDispositionReason::CapturedAgentRequiresManualRecovery)),
+            Just(LaunchAction::Manual(ProcessDispositionReason::CapturedInteractiveProgramRequiresManualRecovery)),
         ]
     ) {
-        let cloned = variant.clone();
-        prop_assert_eq!(&variant, &cloned);
+        let copied = variant;
+        prop_assert_eq!(variant, copied);
         let debug = format!("{variant:?}");
-        prop_assert!(debug.contains("redacted: true"));
+        prop_assert!(!debug.is_empty());
     }
 }
 
 #[test]
 fn launch_action_debug_omits_sensitive_payloads() {
-    let action = LaunchAction::LaunchAgent {
-        command: "raw-command-canary --token raw-secret-canary".to_string(),
-        cwd: std::path::PathBuf::from("/private/raw-path-canary"),
-        agent_type: "raw-agent-canary".to_string(),
-    };
+    let action = LaunchAction::Manual(
+        ProcessDispositionReason::CapturedAgentRequiresManualRecovery,
+    );
     let debug = format!("{action:?}");
-    assert_eq!(debug, "LaunchAgent { redacted: true }");
+    assert_eq!(
+        debug,
+        "Manual(CapturedAgentRequiresManualRecovery)"
+    );
     for canary in [
         "raw-command-canary",
         "raw-secret-canary",
@@ -1270,97 +1246,30 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// LaunchAction Clone produces equal value.
+    /// LaunchAction Copy produces an equal value.
     #[test]
     fn launch_action_clone_equal(
         variant in prop_oneof![
-            (arb_shell(), arb_cwd().prop_filter("need cwd", |c| c.is_some()))
-                .prop_map(|(shell, cwd)| LaunchAction::LaunchShell {
-                    shell,
-                    cwd: std::path::PathBuf::from(cwd.unwrap()),
-                }),
-            arb_agent_type().prop_map(|at| LaunchAction::LaunchAgent {
-                command: format!("{at} --headless"),
-                cwd: std::path::PathBuf::from("/home/user"),
-                agent_type: at,
-            }),
-            Just(LaunchAction::Skip { reason: "no process".into() }),
-            Just(LaunchAction::Manual {
-                hint: "Was running vim".into(),
-                original_process: "vim".into(),
-            }),
+            Just(LaunchAction::Skip(ProcessDispositionReason::DefaultShellCreated)),
+            Just(LaunchAction::Manual(ProcessDispositionReason::CapturedShellRequiresManualRecovery)),
+            Just(LaunchAction::Manual(ProcessDispositionReason::CapturedAgentRequiresManualRecovery)),
+            Just(LaunchAction::Manual(ProcessDispositionReason::CapturedInteractiveProgramRequiresManualRecovery)),
         ]
     ) {
-        let cloned = variant.clone();
-        prop_assert_eq!(&variant, &cloned);
+        let copied = variant;
+        prop_assert_eq!(variant, copied);
     }
 
     /// LaunchAction Debug is non-empty.
     #[test]
     fn launch_action_debug_non_empty(
         variant in prop_oneof![
-            Just(LaunchAction::Skip { reason: "test".into() }),
-            Just(LaunchAction::Manual { hint: "h".into(), original_process: "p".into() }),
+            Just(LaunchAction::Skip(ProcessDispositionReason::DefaultShellCreated)),
+            Just(LaunchAction::Manual(ProcessDispositionReason::CapturedForegroundProcessRequiresManualRecovery)),
         ]
     ) {
         let debug = format!("{:?}", variant);
         prop_assert!(!debug.is_empty());
-    }
-}
-
-// =============================================================================
-// Property: LaunchConfig serde roundtrip and defaults
-// =============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
-
-    /// LaunchConfig default has expected values.
-    #[test]
-    fn launch_config_default_values(_dummy in 0..1u8) {
-        let cfg = LaunchConfig::default();
-        prop_assert!(cfg.launch_shells, "default launch_shells should be true");
-        prop_assert!(!cfg.launch_agents, "default launch_agents should be false");
-        prop_assert_eq!(cfg.launch_delay_ms, 500);
-        prop_assert!(cfg.agent_commands.is_empty());
-    }
-
-    /// LaunchConfig serde roundtrip preserves fields.
-    #[test]
-    fn launch_config_serde_roundtrip(
-        launch_shells in any::<bool>(),
-        launch_agents in any::<bool>(),
-        delay_ms in 0u64..10000,
-    ) {
-        let cfg = LaunchConfig {
-            launch_shells,
-            launch_agents,
-            launch_delay_ms: delay_ms,
-            agent_commands: HashMap::new(),
-        };
-        let json = serde_json::to_string(&cfg).unwrap();
-        let deserialized: LaunchConfig = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(deserialized.launch_shells, cfg.launch_shells);
-        prop_assert_eq!(deserialized.launch_agents, cfg.launch_agents);
-        prop_assert_eq!(deserialized.launch_delay_ms, cfg.launch_delay_ms);
-    }
-
-    /// LaunchConfig Clone is field-identical.
-    #[test]
-    fn launch_config_clone(
-        launch_shells in any::<bool>(),
-        launch_agents in any::<bool>(),
-    ) {
-        let cfg = LaunchConfig {
-            launch_shells,
-            launch_agents,
-            launch_delay_ms: 200,
-            agent_commands: HashMap::new(),
-        };
-        let cloned = cfg.clone();
-        prop_assert_eq!(cloned.launch_shells, cfg.launch_shells);
-        prop_assert_eq!(cloned.launch_agents, cfg.launch_agents);
-        prop_assert_eq!(cloned.launch_delay_ms, cfg.launch_delay_ms);
     }
 }
 
@@ -1371,13 +1280,17 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(300))]
 
-    /// Generated tabs always have active_pane_id referencing a real leaf.
+    /// Generated tabs have exactly one matching active leaf or no authority.
     #[test]
-    fn tab_active_pane_id_valid(tab in arb_tab(0)) {
-        if let Some(active_id) = tab.active_pane_id {
-            let leaf_ids = collect_leaf_ids(&tab.pane_tree);
-            prop_assert!(leaf_ids.contains(&active_id),
-                "active_pane_id {} not found in leaf ids {:?}", active_id, leaf_ids);
+    fn tab_active_authority_is_consistent(tab in arb_tab(0)) {
+        let active_leaf_ids = collect_active_leaf_ids(&tab.pane_tree);
+        match tab.active_pane_id {
+            Some(active_id) => {
+                prop_assert_eq!(active_leaf_ids.as_slice(), &[active_id]);
+            }
+            None => {
+                prop_assert!(active_leaf_ids.is_empty());
+            }
         }
     }
 

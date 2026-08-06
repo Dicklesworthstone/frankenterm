@@ -1,45 +1,47 @@
-//! LabRuntime port of all `#[tokio::test]` async tests from `restore_process.rs`.
+//! Deterministic LabRuntime coverage for finite process-disposition reports.
 //!
 //! Feature-gated behind `asupersync-runtime`.
 //! Bead: ft-22x4r (Port existing async tests to LabRuntime)
 
 #![cfg(feature = "asupersync-runtime")]
 
-mod common;
+use frankenterm_core::restore_process::{
+    LAUNCH_RESULT_SAMPLE_CAP, LaunchAction, ProcessDispositionReason, ProcessLauncher, ProcessPlan,
+};
+use frankenterm_core::test_fixtures::lab_runtime::{
+    assert_ran_to_completion, lab_runtime_test_with_seed,
+};
 
-use std::path::PathBuf;
-use std::sync::Arc;
+const PROCESS_DISPOSITION_LAB_SEED: u64 = 0xF17E_D150_0517_10A0;
 
-use common::fixtures::RuntimeFixture;
-use frankenterm_core::restore_process::{LaunchAction, ProcessLauncher, ProcessPlan};
-use frankenterm_core::wezterm::MockWezterm;
+fn run_under_lab(test: impl FnOnce() + Send + 'static) {
+    let report = lab_runtime_test_with_seed(PROCESS_DISPOSITION_LAB_SEED, move |_cx| async move {
+        test();
+    });
+    assert_ran_to_completion(&report);
+    assert!(report.oracles_passed, "LabRuntime oracles must pass");
+}
 
 // ===========================================================================
-// 1. execute_shell_launch_is_refused_without_pty_input
+// 1. manual shell disposition has no external-effect path
 // ===========================================================================
 
 #[test]
-fn execute_shell_launch_is_refused_without_pty_input() {
-    let rt = RuntimeFixture::current_thread();
-    rt.block_on(async {
-        let mock = Arc::new(MockWezterm::new());
-        mock.add_default_pane(100).await;
-        let launcher = ProcessLauncher::new();
+fn execute_manual_shell_disposition_has_no_external_effect_path() {
+    run_under_lab(|| {
         let plans = vec![ProcessPlan {
             old_pane_id: 1,
             new_pane_id: 100,
-            action: LaunchAction::LaunchShell {
-                shell: "bash".into(),
-                cwd: PathBuf::from("/home/user"),
-            },
-            state_warning: None,
+            action: LaunchAction::Manual(
+                ProcessDispositionReason::CapturedShellRequiresManualRecovery,
+            ),
         }];
 
-        let report = launcher.execute(&plans);
-        assert_eq!(report.shells_launched, 0);
-        assert_eq!(report.failed, 1);
-        assert!(!report.results[0].success);
-        assert_eq!(mock.pane_state(100).await.unwrap().content, "");
+        let report = ProcessLauncher::execute(&plans);
+        assert_eq!(report.plans_total(), 1);
+        assert_eq!(report.plans_settled(), 1);
+        assert_eq!(report.manual_count(), 1);
+        assert_eq!(report.result_sample().len(), 1);
     });
 }
 
@@ -49,44 +51,34 @@ fn execute_shell_launch_is_refused_without_pty_input() {
 
 #[test]
 fn execute_mixed_plan() {
-    let rt = RuntimeFixture::current_thread();
-    rt.block_on(async {
-        let launcher = ProcessLauncher::new();
+    run_under_lab(|| {
         let plans = vec![
             ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 100,
-                action: LaunchAction::LaunchShell {
-                    shell: "secret-shell".into(),
-                    cwd: PathBuf::from("/secret/project"),
-                },
-                state_warning: None,
+                action: LaunchAction::Manual(
+                    ProcessDispositionReason::CapturedShellRequiresManualRecovery,
+                ),
             },
             ProcessPlan {
                 old_pane_id: 2,
                 new_pane_id: 200,
-                action: LaunchAction::Skip {
-                    reason: "secret-skip-reason".into(),
-                },
-                state_warning: None,
+                action: LaunchAction::Skip(ProcessDispositionReason::DefaultShellCreated),
             },
             ProcessPlan {
                 old_pane_id: 3,
                 new_pane_id: 300,
-                action: LaunchAction::Manual {
-                    hint: "secret-manual-hint".into(),
-                    original_process: "secret-process".into(),
-                },
-                state_warning: None,
+                action: LaunchAction::Manual(
+                    ProcessDispositionReason::CapturedInteractiveProgramRequiresManualRecovery,
+                ),
             },
         ];
 
-        let report = launcher.execute(&plans);
-        assert_eq!(report.shells_launched, 0);
-        assert_eq!(report.skipped, 1);
-        assert_eq!(report.manual, 1);
-        assert_eq!(report.failed, 1);
-        assert_eq!(report.results.len(), 3);
+        let report = ProcessLauncher::execute(&plans);
+        assert_eq!(report.skipped_count(), 1);
+        assert_eq!(report.manual_count(), 2);
+        assert_eq!(report.plans_settled(), 3);
+        assert_eq!(report.result_sample().len(), 3);
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("secret"));
     });
@@ -98,13 +90,11 @@ fn execute_mixed_plan() {
 
 #[test]
 fn execute_empty_plans() {
-    let rt = RuntimeFixture::current_thread();
-    rt.block_on(async {
-        let launcher = ProcessLauncher::new();
-        let report = launcher.execute(&[]);
-        assert_eq!(report.results.len(), 0);
-        assert_eq!(report.shells_launched, 0);
-        assert_eq!(report.failed, 0);
+    run_under_lab(|| {
+        let report = ProcessLauncher::execute(&[]);
+        assert_eq!(report.plans_total(), 0);
+        assert_eq!(report.plans_settled(), 0);
+        assert!(report.result_sample().is_empty());
     });
 }
 
@@ -114,33 +104,23 @@ fn execute_empty_plans() {
 
 #[test]
 fn execute_skip_only() {
-    let rt = RuntimeFixture::current_thread();
-    rt.block_on(async {
-        let launcher = ProcessLauncher::new();
+    run_under_lab(|| {
         let plans = vec![
             ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 100,
-                action: LaunchAction::Skip {
-                    reason: "disabled".into(),
-                },
-                state_warning: None,
+                action: LaunchAction::Skip(ProcessDispositionReason::DefaultShellCreated),
             },
             ProcessPlan {
                 old_pane_id: 2,
                 new_pane_id: 200,
-                action: LaunchAction::Skip {
-                    reason: "no info".into(),
-                },
-                state_warning: None,
+                action: LaunchAction::Skip(ProcessDispositionReason::DefaultShellCreated),
             },
         ];
-        let report = launcher.execute(&plans);
-        assert_eq!(report.skipped, 2);
-        assert_eq!(report.shells_launched, 0);
-        assert_eq!(report.agents_launched, 0);
-        assert_eq!(report.results.len(), 2);
-        assert!(report.results.iter().all(|r| r.success));
+        let report = ProcessLauncher::execute(&plans);
+        assert_eq!(report.skipped_count(), 2);
+        assert_eq!(report.plans_settled(), 2);
+        assert_eq!(report.result_sample().len(), 2);
     });
 }
 
@@ -150,53 +130,45 @@ fn execute_skip_only() {
 
 #[test]
 fn execute_manual_only() {
-    let rt = RuntimeFixture::current_thread();
-    rt.block_on(async {
-        let launcher = ProcessLauncher::new();
+    run_under_lab(|| {
         let plans = vec![ProcessPlan {
             old_pane_id: 1,
             new_pane_id: 100,
-            action: LaunchAction::Manual {
-                hint: "Restart vim manually".into(),
-                original_process: "vim".into(),
-            },
-            state_warning: None,
+            action: LaunchAction::Manual(
+                ProcessDispositionReason::CapturedInteractiveProgramRequiresManualRecovery,
+            ),
         }];
-        let report = launcher.execute(&plans);
-        assert_eq!(report.manual, 1);
-        assert_eq!(report.shells_launched, 0);
-        assert!(report.results[0].success);
+        let report = ProcessLauncher::execute(&plans);
+        assert_eq!(report.manual_count(), 1);
+        assert_eq!(report.plans_settled(), 1);
+        assert_eq!(report.result_sample().len(), 1);
     });
 }
 
 // ===========================================================================
-// 6. execute_legacy_agent_plan_is_refused
+// 6. large agent disposition report stays bounded
 // ===========================================================================
 
 #[test]
-fn execute_legacy_agent_plan_is_refused() {
-    let rt = RuntimeFixture::current_thread();
-    rt.block_on(async {
-        let mock = Arc::new(MockWezterm::new());
-        mock.add_default_pane(100).await;
-        let launcher = ProcessLauncher::new();
-        let plans = vec![ProcessPlan {
-            old_pane_id: 1,
-            new_pane_id: 100,
-            action: LaunchAction::LaunchAgent {
-                command: "secret-agent-command".into(),
-                cwd: PathBuf::from("/secret/agent/path"),
-                agent_type: "secret-agent-type".into(),
-            },
-            state_warning: Some("secret-state-warning".into()),
-        }];
-        let report = launcher.execute(&plans);
-        assert_eq!(report.agents_launched, 0);
-        assert_eq!(report.failed, 1);
-        assert!(!report.results[0].success);
-        assert_eq!(mock.pane_state(100).await.unwrap().content, "");
+fn execute_large_manual_plan_keeps_bounded_sample() {
+    run_under_lab(|| {
+        let plans = (0..1_000_u64)
+            .map(|pane_id| ProcessPlan {
+                old_pane_id: pane_id,
+                new_pane_id: pane_id.saturating_add(10_000),
+                action: LaunchAction::Manual(
+                    ProcessDispositionReason::CapturedAgentRequiresManualRecovery,
+                ),
+            })
+            .collect::<Vec<_>>();
+        let report = ProcessLauncher::execute(&plans);
+        assert_eq!(report.plans_total(), 1_000);
+        assert_eq!(report.plans_settled(), 1_000);
+        assert_eq!(report.manual_count(), 1_000);
+        assert_eq!(report.result_sample().len(), LAUNCH_RESULT_SAMPLE_CAP);
         let json = serde_json::to_string(&report).unwrap();
-        assert!(!json.contains("secret"));
+        assert!(!json.contains("command"));
+        assert!(!json.contains("cwd"));
     });
 }
 
@@ -206,30 +178,23 @@ fn execute_legacy_agent_plan_is_refused() {
 
 #[test]
 fn execute_report_result_order_preserved() {
-    let rt = RuntimeFixture::current_thread();
-    rt.block_on(async {
-        let launcher = ProcessLauncher::new();
+    run_under_lab(|| {
         let plans = vec![
             ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 100,
-                action: LaunchAction::LaunchShell {
-                    shell: "bash".into(),
-                    cwd: PathBuf::from("/a"),
-                },
-                state_warning: None,
+                action: LaunchAction::Manual(
+                    ProcessDispositionReason::CapturedShellRequiresManualRecovery,
+                ),
             },
             ProcessPlan {
                 old_pane_id: 2,
                 new_pane_id: 200,
-                action: LaunchAction::Skip {
-                    reason: "skip".into(),
-                },
-                state_warning: None,
+                action: LaunchAction::Skip(ProcessDispositionReason::DefaultShellCreated),
             },
         ];
-        let report = launcher.execute(&plans);
-        assert_eq!(report.results[0].old_pane_id, 1);
-        assert_eq!(report.results[1].old_pane_id, 2);
+        let report = ProcessLauncher::execute(&plans);
+        assert_eq!(report.result_sample()[0].old_pane_id, 1);
+        assert_eq!(report.result_sample()[1].old_pane_id, 2);
     });
 }

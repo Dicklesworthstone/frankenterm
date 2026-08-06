@@ -1,625 +1,85 @@
 //! Property-based tests for the `restore_process` module.
 //!
-//! Covers `LaunchConfig` serde roundtrips and defaults, raw-plan diagnostic
-//! redaction, `LaunchResult`/`LaunchReport` serde roundtrips, and
-//! `LaunchReport` default values.
-
-use std::collections::HashMap;
-use std::path::PathBuf;
+//! Covers finite classification and bounded aggregate-report invariants.
 
 use frankenterm_core::restore_process::{
-    LaunchAction, LaunchConfig, LaunchDisposition, LaunchInterruption, LaunchInterruptionPhase,
-    LaunchReport, LaunchResult, ProcessPlan,
+    LAUNCH_RESULT_SAMPLE_CAP, LaunchAction, ProcessDispositionReason, ProcessLauncher, ProcessPlan,
 };
 use proptest::prelude::*;
 
-// =========================================================================
-// Strategies
-// =========================================================================
-
-fn arb_pathbuf() -> impl Strategy<Value = PathBuf> {
-    "/[a-z]{3,10}(/[a-z]{3,10}){0,3}".prop_map(PathBuf::from)
-}
-
-fn arb_launch_action() -> impl Strategy<Value = LaunchAction> {
+fn finite_action() -> impl Strategy<Value = LaunchAction> {
     prop_oneof![
-        ("[a-z]{3,10}", arb_pathbuf(),)
-            .prop_map(|(shell, cwd)| LaunchAction::LaunchShell { shell, cwd }),
-        ("[a-z ]{5,30}", arb_pathbuf(), "[a-z_]{3,15}",).prop_map(|(command, cwd, agent_type)| {
-            LaunchAction::LaunchAgent {
-                command,
-                cwd,
-                agent_type,
-            }
-        }),
-        "[a-z ]{5,30}".prop_map(|reason| LaunchAction::Skip { reason }),
-        ("[A-Za-z ]{5,30}", "[a-z]{3,10}",).prop_map(|(hint, original_process)| {
-            LaunchAction::Manual {
-                hint,
-                original_process,
-            }
-        }),
+        Just(LaunchAction::Skip(
+            ProcessDispositionReason::DefaultShellCreated
+        )),
+        Just(LaunchAction::Manual(
+            ProcessDispositionReason::CapturedShellRequiresManualRecovery
+        )),
+        Just(LaunchAction::Manual(
+            ProcessDispositionReason::CapturedAgentRequiresManualRecovery
+        )),
+        Just(LaunchAction::Manual(
+            ProcessDispositionReason::CapturedInteractiveProgramRequiresManualRecovery
+        )),
+        Just(LaunchAction::Manual(
+            ProcessDispositionReason::CapturedForegroundProcessRequiresManualRecovery
+        )),
+        Just(LaunchAction::Manual(
+            ProcessDispositionReason::CapturedProcessStateUnavailableRequiresManualRecovery
+        )),
     ]
 }
 
-fn arb_launch_config() -> impl Strategy<Value = LaunchConfig> {
-    (any::<bool>(), any::<bool>(), 0_u64..5000).prop_map(
-        |(launch_shells, launch_agents, launch_delay_ms)| LaunchConfig {
-            launch_shells,
-            launch_agents,
-            launch_delay_ms,
-            agent_commands: HashMap::new(),
-        },
-    )
-}
-
-fn arb_process_plan() -> impl Strategy<Value = ProcessPlan> {
-    (
-        0_u64..1000,
-        0_u64..1000,
-        arb_launch_action(),
-        proptest::option::of("[A-Za-z ]{5,40}"),
-    )
-        .prop_map(
-            |(old_pane_id, new_pane_id, action, state_warning)| ProcessPlan {
-                old_pane_id,
-                new_pane_id,
-                action,
-                state_warning,
-            },
-        )
-}
-
-fn arb_launch_result() -> impl Strategy<Value = LaunchResult> {
-    (
-        0_u64..1000,
-        0_u64..1000,
-        prop_oneof![
-            Just(LaunchDisposition::Shell),
-            Just(LaunchDisposition::Agent),
-            Just(LaunchDisposition::Skip),
-            Just(LaunchDisposition::Manual),
-        ],
-        any::<bool>(),
-        proptest::option::of("[a-z ]{3,20}"),
-    )
-        .prop_map(
-            |(old_pane_id, new_pane_id, action, success, error)| LaunchResult {
-                old_pane_id,
-                new_pane_id,
-                action,
-                success,
-                error,
-            },
-        )
-}
-
-// =========================================================================
-// LaunchConfig — serde roundtrip
-// =========================================================================
-
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(30))]
-
-    /// LaunchConfig serde roundtrip preserves all fields.
     #[test]
-    fn prop_config_serde(config in arb_launch_config()) {
-        let json = serde_json::to_string(&config).unwrap();
-        let back: LaunchConfig = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back.launch_shells, config.launch_shells);
-        prop_assert_eq!(back.launch_agents, config.launch_agents);
-        prop_assert_eq!(back.launch_delay_ms, config.launch_delay_ms);
-    }
-
-    /// Default LaunchConfig has expected values.
-    #[test]
-    fn prop_config_defaults(_dummy in 0..1_u8) {
-        let config = LaunchConfig::default();
-        prop_assert!(config.launch_shells);
-        prop_assert!(!config.launch_agents);
-        prop_assert_eq!(config.launch_delay_ms, 500);
-        prop_assert!(config.agent_commands.is_empty());
-    }
-
-    /// LaunchConfig deserializes from empty JSON with defaults.
-    #[test]
-    fn prop_config_from_empty_json(_dummy in 0..1_u8) {
-        let back: LaunchConfig = serde_json::from_str("{}").unwrap();
-        prop_assert!(back.launch_shells);
-        prop_assert!(!back.launch_agents);
-        prop_assert_eq!(back.launch_delay_ms, 500);
-    }
-
-    /// LaunchConfig with agent_commands roundtrips.
-    #[test]
-    fn prop_config_with_commands(
-        agent_type in "[a-z_]{3,15}",
-        cmd in "[a-z /{}.]{5,30}",
+    fn report_totals_are_exact_and_sample_is_bounded(
+        actions in proptest::collection::vec(finite_action(), 0..2_000)
     ) {
-        let mut config = LaunchConfig::default();
-        config.agent_commands.insert(agent_type.clone(), cmd.clone());
-        let json = serde_json::to_string(&config).unwrap();
-        let back: LaunchConfig = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back.agent_commands.get(&agent_type), Some(&cmd));
-    }
-
-    /// LaunchConfig serde is deterministic.
-    #[test]
-    fn prop_config_deterministic(config in arb_launch_config()) {
-        let j1 = serde_json::to_string(&config).unwrap();
-        let j2 = serde_json::to_string(&config).unwrap();
-        prop_assert_eq!(&j1, &j2);
-    }
-}
-
-// =========================================================================
-// LaunchAction / ProcessPlan — diagnostic redaction
-// =========================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
-
-    /// LaunchAction diagnostics retain only the finite variant name.
-    #[test]
-    fn prop_action_debug_is_redacted(action in arb_launch_action()) {
-        let diagnostic = format!("{action:?}");
-        let expected = match action {
-            LaunchAction::LaunchShell { .. } => "LaunchShell { redacted: true }",
-            LaunchAction::LaunchAgent { .. } => "LaunchAgent { redacted: true }",
-            LaunchAction::Skip { .. } => "Skip { redacted: true }",
-            LaunchAction::Manual { .. } => "Manual { redacted: true }",
-        };
-        prop_assert_eq!(diagnostic, expected);
-    }
-
-    /// ProcessPlan diagnostics omit raw action payloads and state warnings.
-    #[test]
-    fn prop_plan_debug_is_redacted(plan in arb_process_plan()) {
-        let diagnostic = format!("{plan:?}");
-        let action = match plan.action {
-            LaunchAction::LaunchShell { .. } => "Shell",
-            LaunchAction::LaunchAgent { .. } => "Agent",
-            LaunchAction::Skip { .. } => "Skip",
-            LaunchAction::Manual { .. } => "Manual",
-        };
-        let expected = format!(
-            "ProcessPlan {{ old_pane_id: {}, new_pane_id: {}, action: {action}, has_state_warning: {} }}",
-            plan.old_pane_id,
-            plan.new_pane_id,
-            plan.state_warning.is_some()
+        let plans = actions
+            .into_iter()
+            .enumerate()
+            .map(|(index, action)| ProcessPlan {
+                old_pane_id: u64::try_from(index).expect("generated index fits u64"),
+                new_pane_id: u64::try_from(index.saturating_add(10_000))
+                    .expect("generated index fits u64"),
+                action,
+            })
+            .collect::<Vec<_>>();
+        let report = ProcessLauncher::execute(&plans);
+        prop_assert_eq!(report.plans_total(), plans.len());
+        prop_assert_eq!(report.plans_settled(), plans.len());
+        prop_assert_eq!(
+            report
+                .manual_count()
+                .saturating_add(report.skipped_count()),
+            report.plans_settled(),
         );
-        prop_assert_eq!(diagnostic, expected);
-    }
-}
-
-// =========================================================================
-// LaunchResult — serde roundtrip
-// =========================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(30))]
-
-    /// LaunchResult serde roundtrip preserves all fields.
-    #[test]
-    fn prop_result_serde(result in arb_launch_result()) {
-        let json = serde_json::to_string(&result).unwrap();
-        let back: LaunchResult = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back.old_pane_id, result.old_pane_id);
-        prop_assert_eq!(back.new_pane_id, result.new_pane_id);
-        prop_assert_eq!(back.action, result.action);
-        prop_assert_eq!(back.success, result.success);
-        prop_assert_eq!(&back.error, &result.error);
-    }
-}
-
-// =========================================================================
-// LaunchReport — serde roundtrip and defaults
-// =========================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(30))]
-
-    /// Default LaunchReport has all zero counts.
-    #[test]
-    fn prop_report_defaults(_dummy in 0..1_u8) {
-        let report = LaunchReport::default();
-        prop_assert!(report.results.is_empty());
-        prop_assert_eq!(report.shells_launched, 0);
-        prop_assert_eq!(report.agents_launched, 0);
-        prop_assert_eq!(report.skipped, 0);
-        prop_assert_eq!(report.manual, 0);
-        prop_assert_eq!(report.failed, 0);
+        prop_assert_eq!(
+            report.result_sample().len(),
+            plans.len().min(LAUNCH_RESULT_SAMPLE_CAP),
+        );
+        prop_assert!(report.interruption().is_none());
     }
 
-    /// LaunchReport serde roundtrip preserves counts.
     #[test]
-    fn prop_report_serde(
-        shells in 0_usize..10,
-        agents in 0_usize..10,
-        skipped in 0_usize..10,
-        manual in 0_usize..10,
-        failed in 0_usize..10,
+    fn report_sample_is_the_deterministic_plan_prefix(
+        actions in proptest::collection::vec(finite_action(), 0..500)
     ) {
-        let report = LaunchReport {
-            results: vec![],
-            shells_launched: shells,
-            agents_launched: agents,
-            skipped,
-            manual,
-            failed,
-            interruption: None,
-        };
-        let json = serde_json::to_string(&report).unwrap();
-        let back: LaunchReport = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back.shells_launched, shells);
-        prop_assert_eq!(back.agents_launched, agents);
-        prop_assert_eq!(back.skipped, skipped);
-        prop_assert_eq!(back.manual, manual);
-        prop_assert_eq!(back.failed, failed);
-    }
-
-    /// LaunchReport with results roundtrips.
-    #[test]
-    fn prop_report_with_results(result in arb_launch_result()) {
-        let report = LaunchReport {
-            results: vec![result.clone()],
-            shells_launched: 1,
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&report).unwrap();
-        let back: LaunchReport = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back.results.len(), 1);
-        prop_assert_eq!(back.results[0].old_pane_id, result.old_pane_id);
-        prop_assert_eq!(&back.results[0].action, &result.action);
-    }
-
-    /// LaunchReport serde is deterministic.
-    #[test]
-    fn prop_report_deterministic(
-        shells in 0_usize..10,
-        agents in 0_usize..10,
-    ) {
-        let report = LaunchReport {
-            results: vec![],
-            shells_launched: shells,
-            agents_launched: agents,
-            ..Default::default()
-        };
-        let j1 = serde_json::to_string(&report).unwrap();
-        let j2 = serde_json::to_string(&report).unwrap();
-        prop_assert_eq!(&j1, &j2);
-    }
-}
-
-// =========================================================================
-// Unit tests
-// =========================================================================
-
-#[test]
-fn launch_action_variants_distinct() {
-    let shell = LaunchAction::LaunchShell {
-        shell: "bash".to_string(),
-        cwd: PathBuf::from("/home"),
-    };
-    let agent = LaunchAction::LaunchAgent {
-        command: "claude".to_string(),
-        cwd: PathBuf::from("/project"),
-        agent_type: "claude_code".to_string(),
-    };
-    let skip = LaunchAction::Skip {
-        reason: "disabled".to_string(),
-    };
-    let manual = LaunchAction::Manual {
-        hint: "restart vim".to_string(),
-        original_process: "vim".to_string(),
-    };
-    assert_ne!(shell, agent);
-    assert_ne!(shell, skip);
-    assert_ne!(shell, manual);
-    assert_ne!(agent, skip);
-}
-
-#[test]
-fn config_partial_json_fills_defaults() {
-    let json = r#"{"launch_agents": true}"#;
-    let config: LaunchConfig = serde_json::from_str(json).unwrap();
-    assert!(config.launch_agents);
-    // Defaults for missing fields
-    assert!(config.launch_shells);
-    assert_eq!(config.launch_delay_ms, 500);
-}
-
-#[test]
-fn config_debug_redacts_reserved_agent_templates() {
-    let mut config = LaunchConfig::default();
-    config.agent_commands.insert(
-        "secret-agent-type".to_string(),
-        "secret command with /secret/cwd".to_string(),
-    );
-    let diagnostic = format!("{config:?}");
-    assert!(diagnostic.contains("reserved_agent_command_count: 1"));
-    assert!(!diagnostic.contains("secret"));
-}
-
-#[test]
-fn result_and_report_debug_redact_error_detail() {
-    let result = LaunchResult {
-        old_pane_id: 1,
-        new_pane_id: 2,
-        action: LaunchDisposition::Agent,
-        success: false,
-        error: Some("secret-error-detail".to_string()),
-    };
-    let report = LaunchReport {
-        results: vec![result],
-        failed: 1,
-        interruption: Some(LaunchInterruption {
-            plan_index: 0,
-            phase: LaunchInterruptionPhase::MuxOperation,
-            detail: "secret-interruption-detail".to_string(),
-        }),
-        ..LaunchReport::default()
-    };
-    let diagnostic = format!("{report:?}");
-    assert!(diagnostic.contains("has_error: true"));
-    assert!(diagnostic.contains("has_detail: true"));
-    assert!(!diagnostic.contains("secret"));
-}
-
-#[test]
-fn report_empty_roundtrip() {
-    let report = LaunchReport::default();
-    let json = serde_json::to_string(&report).unwrap();
-    let back: LaunchReport = serde_json::from_str(&json).unwrap();
-    assert_eq!(back.shells_launched, 0);
-    assert!(back.results.is_empty());
-}
-
-// =========================================================================
-// NEW: LaunchConfig Clone preserves all fields
-// =========================================================================
-
-proptest! {
-    #[test]
-    fn launch_config_clone_preserves(config in arb_launch_config()) {
-        let cloned = config.clone();
-        prop_assert_eq!(cloned.launch_shells, config.launch_shells);
-        prop_assert_eq!(cloned.launch_agents, config.launch_agents);
-        prop_assert_eq!(cloned.launch_delay_ms, config.launch_delay_ms);
-        prop_assert_eq!(cloned.agent_commands.len(), config.agent_commands.len());
-    }
-}
-
-// =========================================================================
-// NEW: LaunchConfig Debug non-empty
-// =========================================================================
-
-proptest! {
-    #[test]
-    fn launch_config_debug_nonempty(config in arb_launch_config()) {
-        let dbg = format!("{:?}", config);
-        prop_assert!(!dbg.is_empty());
-        prop_assert!(dbg.contains("LaunchConfig"));
-    }
-}
-
-// =========================================================================
-// NEW: LaunchAction Clone preserves
-// =========================================================================
-
-proptest! {
-    #[test]
-    fn launch_action_clone_preserves(action in arb_launch_action()) {
-        let cloned = action.clone();
-        prop_assert_eq!(cloned, action);
-    }
-}
-
-// =========================================================================
-// NEW: LaunchAction Debug non-empty
-// =========================================================================
-
-proptest! {
-    #[test]
-    fn launch_action_debug_nonempty(action in arb_launch_action()) {
-        let dbg = format!("{:?}", action);
-        prop_assert!(!dbg.is_empty());
-    }
-}
-
-// =========================================================================
-// NEW: LaunchAction PartialEq reflexive
-// =========================================================================
-
-proptest! {
-    #[test]
-    fn launch_action_eq_reflexive(action in arb_launch_action()) {
-        prop_assert_eq!(&action, &action);
-    }
-}
-
-// =========================================================================
-// NEW: ProcessPlan Clone preserves
-// =========================================================================
-
-proptest! {
-    #[test]
-    fn process_plan_clone_preserves(plan in arb_process_plan()) {
-        let cloned = plan.clone();
-        prop_assert_eq!(cloned.old_pane_id, plan.old_pane_id);
-        prop_assert_eq!(cloned.new_pane_id, plan.new_pane_id);
-        prop_assert_eq!(cloned.action, plan.action);
-        prop_assert_eq!(&cloned.state_warning, &plan.state_warning);
-    }
-}
-
-// =========================================================================
-// NEW: ProcessPlan Debug non-empty
-// =========================================================================
-
-proptest! {
-    #[test]
-    fn process_plan_debug_nonempty(plan in arb_process_plan()) {
-        let dbg = format!("{:?}", plan);
-        prop_assert!(!dbg.is_empty());
-        prop_assert!(dbg.contains("ProcessPlan"));
-    }
-}
-
-// =========================================================================
-// NEW: LaunchResult Clone preserves
-// =========================================================================
-
-proptest! {
-    #[test]
-    fn launch_result_clone_preserves(result in arb_launch_result()) {
-        let cloned = result.clone();
-        prop_assert_eq!(cloned.old_pane_id, result.old_pane_id);
-        prop_assert_eq!(cloned.new_pane_id, result.new_pane_id);
-        prop_assert_eq!(cloned.action, result.action);
-        prop_assert_eq!(cloned.success, result.success);
-        prop_assert_eq!(&cloned.error, &result.error);
-    }
-}
-
-// =========================================================================
-// NEW: LaunchResult Debug non-empty
-// =========================================================================
-
-proptest! {
-    #[test]
-    fn launch_result_debug_nonempty(result in arb_launch_result()) {
-        let dbg = format!("{:?}", result);
-        prop_assert!(!dbg.is_empty());
-        prop_assert!(dbg.contains("LaunchResult"));
-    }
-}
-
-// =========================================================================
-// NEW: LaunchReport Clone preserves counts
-// =========================================================================
-
-proptest! {
-    #[test]
-    fn launch_report_clone_preserves(
-        shells in 0_usize..10,
-        agents in 0_usize..10,
-        skipped in 0_usize..10,
-    ) {
-        let report = LaunchReport {
-            results: vec![],
-            shells_launched: shells,
-            agents_launched: agents,
-            skipped,
-            ..Default::default()
-        };
-        let cloned = report.clone();
-        prop_assert_eq!(cloned.shells_launched, shells);
-        prop_assert_eq!(cloned.agents_launched, agents);
-        prop_assert_eq!(cloned.skipped, skipped);
-        prop_assert_eq!(cloned.results.len(), 0);
-    }
-}
-
-// =========================================================================
-// NEW: LaunchReport Debug non-empty
-// =========================================================================
-
-proptest! {
-    #[test]
-    fn launch_report_debug_nonempty(
-        shells in 0_usize..10,
-        agents in 0_usize..10,
-    ) {
-        let report = LaunchReport {
-            results: vec![],
-            shells_launched: shells,
-            agents_launched: agents,
-            ..Default::default()
-        };
-        let dbg = format!("{:?}", report);
-        prop_assert!(!dbg.is_empty());
-        prop_assert!(dbg.contains("LaunchReport"));
-    }
-}
-
-// =========================================================================
-// NEW: LaunchResult serde deterministic
-// =========================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(30))]
-
-    #[test]
-    fn launch_result_serde_deterministic(result in arb_launch_result()) {
-        let j1 = serde_json::to_string(&result).unwrap();
-        let j2 = serde_json::to_string(&result).unwrap();
-        prop_assert_eq!(&j1, &j2);
-    }
-}
-
-// =========================================================================
-// NEW: LaunchReport with multiple results roundtrips
-// =========================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(20))]
-
-    #[test]
-    fn launch_report_multi_results_serde(
-        r1 in arb_launch_result(),
-        r2 in arb_launch_result(),
-    ) {
-        let report = LaunchReport {
-            results: vec![r1.clone(), r2.clone()],
-            shells_launched: 2,
-            agents_launched: 0,
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&report).unwrap();
-        let back: LaunchReport = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back.results.len(), 2);
-        prop_assert_eq!(back.results[0].old_pane_id, r1.old_pane_id);
-        prop_assert_eq!(back.results[1].old_pane_id, r2.old_pane_id);
-    }
-}
-
-// =========================================================================
-// Batch 15: additional property tests (DarkMill)
-// =========================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
-
-    /// LaunchConfig Debug is non-empty (ext).
-    #[test]
-    fn launch_config_debug_nonempty_ext(_dummy in 0..1u8) {
-        let config = LaunchConfig::default();
-        let debug = format!("{:?}", config);
-        prop_assert!(!debug.is_empty());
-    }
-
-    /// LaunchReport default has zero counts.
-    #[test]
-    fn launch_report_default_zero_counts(_dummy in 0..1u8) {
-        let report = LaunchReport::default();
-        prop_assert_eq!(report.shells_launched, 0);
-        prop_assert_eq!(report.agents_launched, 0);
-        prop_assert!(report.results.is_empty());
-    }
-
-    /// LaunchAction Clone preserves the raw in-memory value without exposing it.
-    #[test]
-    fn launch_action_clone_preserves_ext(action in arb_launch_action()) {
-        let cloned = action.clone();
-        prop_assert_eq!(action, cloned);
-    }
-
-    /// LaunchResult old_pane_id preserved through serde.
-    #[test]
-    fn launch_result_pane_id_preserved(result in arb_launch_result()) {
-        let json = serde_json::to_string(&result).unwrap();
-        let back: LaunchResult = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back.old_pane_id, result.old_pane_id);
+        let plans = actions
+            .into_iter()
+            .enumerate()
+            .map(|(index, action)| ProcessPlan {
+                old_pane_id: u64::try_from(index).expect("generated index fits u64"),
+                new_pane_id: u64::try_from(index.saturating_add(100)).expect("fits u64"),
+                action,
+            })
+            .collect::<Vec<_>>();
+        let first = ProcessLauncher::execute(&plans);
+        let second = ProcessLauncher::execute(&plans);
+        prop_assert_eq!(first.result_sample(), second.result_sample());
+        for (sample, plan) in first.result_sample().iter().zip(plans.iter()) {
+            prop_assert_eq!(sample.old_pane_id, plan.old_pane_id);
+            prop_assert_eq!(sample.new_pane_id, plan.new_pane_id);
+        }
     }
 }
