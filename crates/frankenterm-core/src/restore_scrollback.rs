@@ -956,7 +956,8 @@ mod tests {
         run_async_test(async {
             let injector = make_injector();
             let pane_id_map = HashMap::new();
-            let scrollbacks = (0..(INJECTION_SKIPPED_SAMPLE_CAP as u64 + 37))
+            let sample_cap = u64::try_from(INJECTION_SKIPPED_SAMPLE_CAP).unwrap();
+            let scrollbacks = (0..sample_cap + 37)
                 .rev()
                 .map(|pane_id| {
                     (
@@ -970,12 +971,8 @@ mod tests {
 
             assert_eq!(report.skipped_count(), scrollbacks.len());
             assert_eq!(report.skipped_sample().len(), INJECTION_SKIPPED_SAMPLE_CAP);
-            assert_eq!(
-                report.skipped_sample(),
-                (0..INJECTION_SKIPPED_SAMPLE_CAP as u64)
-                    .collect::<Vec<_>>()
-                    .as_slice()
-            );
+            let expected_sample = (0..sample_cap).collect::<Vec<_>>();
+            assert_eq!(report.skipped_sample(), expected_sample.as_slice());
         });
     }
 
