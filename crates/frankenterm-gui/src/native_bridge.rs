@@ -17,8 +17,7 @@
 ))]
 
 use frankenterm_core::native_events::{
-    NativeEventError, WireEvent, WirePaneState, validate_native_event_peer,
-    validate_native_event_socket_endpoint,
+    NativeEventError, WireEvent, validate_native_event_peer, validate_native_event_socket_endpoint,
 };
 use frankenterm_gui::terminal_pane_id_to_u64;
 use mux::pane::CachePolicy;
@@ -61,11 +60,6 @@ fn now_ms() -> u64 {
 
 /// A mux-to-wire event that's ready to serialize.
 enum BridgeEvent {
-    StateChange {
-        pane_id: u64,
-        state: WirePaneState,
-        timestamp_ms: u64,
-    },
     UserVar {
         pane_id: u64,
         name: String,
@@ -87,7 +81,6 @@ enum BridgeEvent {
 impl BridgeEvent {
     fn metadata(&self) -> (&'static str, u64) {
         match self {
-            Self::StateChange { pane_id, .. } => ("state_change", *pane_id),
             Self::UserVar { pane_id, .. } => ("user_var", *pane_id),
             Self::PaneCreated { pane_id, .. } => ("pane_created", *pane_id),
             Self::PaneDestroyed { pane_id, .. } => ("pane_destroyed", *pane_id),
@@ -96,15 +89,6 @@ impl BridgeEvent {
 
     fn into_wire_event(self) -> WireEvent {
         match self {
-            BridgeEvent::StateChange {
-                pane_id,
-                state,
-                timestamp_ms,
-            } => WireEvent::StateChange {
-                pane_id,
-                state,
-                ts: timestamp_ms,
-            },
             BridgeEvent::UserVar {
                 pane_id,
                 name,
@@ -763,17 +747,9 @@ mod tests {
         }
     }
 
-    fn test_state_event(pane_id: u64) -> BridgeEvent {
-        BridgeEvent::StateChange {
+    fn test_destroyed_event(pane_id: u64) -> BridgeEvent {
+        BridgeEvent::PaneDestroyed {
             pane_id,
-            state: WirePaneState {
-                title: "test".to_string(),
-                rows: 24,
-                cols: 80,
-                is_alt_screen: false,
-                cursor_row: 0,
-                cursor_col: 0,
-            },
             timestamp_ms: 42,
         }
     }
@@ -782,16 +758,16 @@ mod tests {
     fn bounded_queue_reports_every_delivery_loss_class() {
         let (tx, rx) = std_mpsc::sync_channel(1);
         assert_eq!(
-            enqueue_bridge_event(&tx, test_state_event(1)),
+            enqueue_bridge_event(&tx, test_destroyed_event(1)),
             BridgeQueueOutcome::Queued
         );
         assert_eq!(
-            enqueue_bridge_event(&tx, test_state_event(2)),
+            enqueue_bridge_event(&tx, test_destroyed_event(2)),
             BridgeQueueOutcome::DroppedFull
         );
         drop(rx);
         assert_eq!(
-            enqueue_bridge_event(&tx, test_state_event(3)),
+            enqueue_bridge_event(&tx, test_destroyed_event(3)),
             BridgeQueueOutcome::Closed
         );
     }
@@ -813,8 +789,8 @@ mod tests {
 
     #[test]
     fn wire_event_preserves_notification_occurrence_timestamp() {
-        match test_state_event(7).into_wire_event() {
-            WireEvent::StateChange { pane_id, ts, .. } => {
+        match test_destroyed_event(7).into_wire_event() {
+            WireEvent::PaneDestroyed { pane_id, ts } => {
                 assert_eq!(pane_id, 7);
                 assert_eq!(ts, 42);
             }
