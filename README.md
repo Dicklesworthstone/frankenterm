@@ -72,7 +72,15 @@ cargo install --profile release-interactive --git https://github.com/Dickleswort
 
 **The Solution.** `ft` is a **full terminal platform for agent swarms** with deep observability, deterministic eventing, policy-gated automation, machine-native control surfaces (Robot Mode + MCP), and a fail-closed operating-envelope contract. It captures bounded terminal-output deltas across observed panes and records explicit gaps whenever continuity cannot be established, detects state transitions via multi-pattern matching plus Bayesian change-point detection, triggers transactional workflows in response, and exposes those surfaces through a JSON API built for AI-to-AI orchestration. The closest analogy is Kubernetes for terminal-based AI agents: observe, detect, react, audit, and refuse admission outside the envelope justified by the telemetry and evidence currently available. That envelope is deliberately narrower than the eventual 200-pane target while target-class proof remains blocked.
 
-**Runtime model.** Fully `Cx`-aware, structured, cancel-correct async on **asupersync**. Direct `tokio` usage is **banned at the dependency level** via `cargo-deny` and at the type level via the `RuntimeProof` sealed trait. The `runtime_async` module is the canonical asupersync wrapper that every first-party crate imports. The dual-runtime era is over.
+**Runtime model.** `Cx`-aware async on **asupersync**, with project-owned
+structured-task and cancellation conventions. Direct `tokio` usage is
+**banned at the dependency level** via `cargo-deny` and at the type level via
+the `RuntimeProof` sealed trait. The `runtime_async` module is the canonical
+first-party async API; its implementation layer and explicitly audited
+integration seams may still name pinned asupersync types directly. The
+dual-runtime era is over. Cancellation responsiveness is an operation-level contract: a wait
+must checkpoint its `Cx` or explicitly race a cancellation signal; merely
+holding a `Cx` does not make every suspended primitive wake on cancellation.
 
 If you'd rather see commands than prose, jump straight to the [10-Minute Tour](#10-minute-tour) below.
 
@@ -529,7 +537,7 @@ The `ft attestation` family is a thin Rust wrapper over [`scripts/attestation-ve
 | Replay and forensics | Decision graph + diff + provenance | None | None | None |
 | Reality-check attestation bundles | Sigstore-signed slot manifest | None | None | None |
 | Incident bundles | Live collectors + publish-side snapshot | None | None | None |
-| Async runtime guarantees | asupersync, `Cx`-first, cancel-correct, `tokio` banned | tokio (no `Cx` model) | smol (no `Cx` model) | none of these guarantees |
+| Async runtime contract | asupersync, `Cx`-first, project-audited cancellation, `tokio` banned | tokio (no `Cx` model) | smol (no `Cx` model) | none of these project-specific contracts |
 | Unsafe code | `#![forbid(unsafe_code)]` workspace-wide | unsafe present | unsafe present | unsafe present |
 
 **When to use ft:**
@@ -683,7 +691,7 @@ The vendored `frankenterm/<crate>/` workspace members are first-class. There are
 ### Why not abstract over both WezTerm and (say) Zellij?
 
 1. **Mux semantics aren't interchangeable.** WezTerm's pane lifecycle, scrollback model, alt-screen handling, and PDU schema are concretely different from Zellij's or tmux's. Pretending otherwise produces an abstraction that's a worst-of-all-worlds compromise.
-2. **The asupersync runtime contract is tighter than upstream WezTerm assumes.** `ft` owns its own async story (Cx-first, cancel-correct, structured concurrency). Reusing the vendored crates means we can (and do) patch them when their runtime assumptions don't fit ours.
+2. **The asupersync runtime contract is tighter than upstream WezTerm assumes.** `ft` owns its own async story (`Cx`-first propagation, structured task ownership, and audited cancellation checkpoints/races). Reusing the vendored crates means we can (and do) patch them when their runtime assumptions don't fit ours.
 3. **Test/proof surfaces are easier on owned code.** RuntimeProof, the `asupersync_test!` macro, the Loom model, and the cargo-deny tokio ban only work because we control the entire dependency graph.
 4. **Bundle identity matters.** FrankenTerm.app is a distinct macOS bundle (separate bundle ID, separate icon, separate update channel). Side-by-side install with upstream WezTerm is intentional.
 
@@ -1377,7 +1385,7 @@ Operator-tunable runtime constants live under `[tuning]` sections such as `[tuni
 │ Operating-Envelope Planner │ Mission Objective Planner                │
 └───────────────────────────────────────────────────────────────────────┘
                                    │
-                  asupersync runtime (Cx-first, cancel-correct)
+                  asupersync runtime (Cx-first cancellation contract)
                                    ▼
 ┌───────────────────────────────────────────────────────────────────────┐
 │                  Ingest + Normalization Pipeline                      │
@@ -2548,21 +2556,39 @@ Non-dry-run apply spawns panes through the mux bridge with rollback on mid-apply
 
 ## Deep Dive: The `Cx` Cancellation Model
 
-`Cx` is asupersync's structured-concurrency cancellation primitive. It propagates cancellation through the call graph in a typed, deterministic way that tokio's `CancellationToken` doesn't.
+`Cx` is asupersync's capability and cancellation context. When FrankenTerm
+threads it explicitly through a call graph, it preserves typed cancellation,
+deadline, budget, and capability state at each audited operation boundary.
 
 ### What `Cx` is
 
-A `Cx` (cancellation context) is a token-bearing scope. When you spawn a child task with `spawn_with_cx(parent_cx, future)`, the child inherits the parent's cancellation; when the parent's `Cx` is cancelled, the child sees it through `cx.is_cancelled()` and through any cancellation-aware primitive it's awaiting (`sleep_with_cx`, `timeout_with_cx`, `recv_with_cx`, etc.).
+A `Cx` is a token-bearing scope. When you spawn a child task with the canonical
+`spawn_with_cx` wrapper, the child inherits the exact context and effective
+capability mask. Cancellation becomes observable through explicit checkpoints
+and operation-specific races. Budget-aware sleeps, timeouts, receives, and
+locks do not all share identical direct-cancellation wake behavior, so each
+wrapper documents its own contract.
 
 ### What this buys us
 
-- **Structured cancellation.** Cancellation is a tree, not a graph; child scopes inherit and cannot outlive their parent.
-- **Cancellation-aware primitives.** `sleep_with_cx` wakes early on cancel rather than ticking to completion. `timeout_with_cx` distinguishes timeout-exhaustion from parent-cancellation.
-- **Deterministic shutdown.** When the operator hits Ctrl-C, the root `Cx` cancels, every task scope rolls up cleanly, and no operations are left dangling.
+- **Monotone cancellation authority.** Explicit child tasks inherit the
+  parent's `Cx` and effective capability restrictions. Lifetime enforcement
+  still requires owned handles or a `JoinSet`; a `Cx` by itself does not
+  forcibly terminate a detached future.
+- **Budget-aware primitives with explicit direct-cancel handling.** The pinned
+  asupersync `budget_sleep` / `budget_timeout` primitives honor the `Cx` budget
+  deadline, but do not register a direct-cancellation wake. Callers that need
+  prompt cancellation checkpoint before/after bounded waits or race an
+  explicit cancellation signal, then classify timeout and cancellation from
+  the typed context state.
+- **Auditable shutdown.** When the operator hits Ctrl-C, the root `Cx` requests
+  cancellation and owned top-level handles are drained under a bounded budget.
+  Shutdown reports when acknowledgement or independently delegated/blocking
+  work remains unproven instead of claiming that no operation can survive.
 
 ### Pre-cancel vs mid-flight semantics
 
-asupersync's recv/acquire primitives observe pre-cancel cleanly but **not** mid-flight by default; a `recv` that's already past the cancellation check at the moment cancel arrives will complete its current iteration. The project standard for mid-flight cancel responsiveness is the **select-race pattern**: race the awaited operation against `cx.cancelled()`. See [`docs/specs/runtime-async-cancel-traces.md`](docs/proofs/runtime-async-cancel-traces.md) (Mazurkiewicz cancel-trace classes) for the formal model.
+asupersync's recv/acquire primitives observe pre-cancel cleanly but **not** mid-flight by default; a `recv` that's already past the cancellation check at the moment cancel arrives will complete its current iteration. The project standard for mid-flight cancel responsiveness is the **select-race pattern**: race the awaited operation against `cx.cancelled()`. See [`docs/proofs/runtime-async-cancel-traces.md`](docs/proofs/runtime-async-cancel-traces.md) (Mazurkiewicz cancel-trace classes) for the formal model.
 
 ### Cancellation is not a circuit-breaker failure
 
@@ -3039,16 +3065,21 @@ The full [`docs/tuning-reference.md`](docs/tuning-reference.md) catalogs every `
 
 ## Deep Dive: Signal Handling and Clean Shutdown
 
-`ft watch` aims for **clean shutdown** in every signal scenario. Operators should never have to manually clean up after Ctrl-C.
+`ft watch` attempts a bounded **clean shutdown** for catchable signals and
+reports an unclean result when task acknowledgement or storage flush does not
+finish. `SIGKILL`, blocking OS work, and independently delegated work remain
+outside that guarantee.
 
 ### SIGINT (Ctrl-C)
 
 1. The signal handler cancels the root `Cx`.
-2. Structured concurrency propagates the cancel through every task scope.
-3. In-flight captures complete their current step then exit (`Error::Cancelled`).
-4. The storage writer flushes the queued segments and commits the WAL.
-5. The file lock is released.
-6. The watcher writes a clean-shutdown marker to `ft_meta` so the next start doesn't trigger restore-on-startup.
+2. Owned tasks receive the cancellation context and observe it at their
+   operation-specific checkpoints or races.
+3. Top-level runtime handles are asked to settle within the shutdown budget.
+4. The storage writer is asked to flush queued segments and commit the WAL
+   within its bounded cleanup phase.
+5. On complete settlement, resources are released and the clean-shutdown state
+   can be recorded; otherwise the shutdown result stays explicitly unclean.
 
 ### SIGTERM
 
@@ -3064,7 +3095,12 @@ There's no clean path. The watcher is killed mid-flush. On the next start:
 
 ### Cancel-correctness in long ops
 
-A long-running tx prepare phase, a slow FTS5 query, or a stuck mux call all respect cancel through the `Cx` model. `timeout_with_cx` returns early on cancel; `sleep_with_cx` wakes immediately; `recv_with_cx` returns `Error::Cancelled` rather than blocking forever.
+Long operations are cancellation-responsive only when their implementation
+uses the operation-specific `Cx` contract: checkpoints at bounded progress
+boundaries, cancellation-aware I/O, or an explicit race against a cancellation
+signal. The pinned `sleep_with_cx` and `timeout_with_cx` helpers honor budget
+deadlines but do not themselves register a direct-cancellation wake, so callers
+must not rely on a bare long sleep/timeout for prompt shutdown.
 
 ### What Ctrl-C *won't* do
 
@@ -3149,15 +3185,15 @@ The `runtime_async` module re-exports asupersync primitives with project-curated
 | Primitive | Use case |
 |---|---|
 | `runtime_async::task::JoinHandle<T>` | Handle to a spawned task; `.await` yields the result |
-| `runtime_async::task::JoinError` | Returned when the spawned task panics or is aborted |
+| `runtime_async::task::JoinError` | Finite task failure, abort, context, deadline/budget, or completion-waker class |
 | `runtime_async::task::JoinSet<T>` | A collection of spawned tasks with structured awaiting |
 
 ### Cx-aware ergonomics
 
 | Helper | What it does |
 |---|---|
-| `sleep_with_cx(cx, duration)` | Sleeps, but wakes early on cancel |
-| `timeout_with_cx(cx, duration, future)` | Times out, distinguishing timeout-exhaustion from parent-cancellation |
+| `sleep_with_cx(cx, duration)` | Budget-bounded sleep; direct cancellation requires caller checkpoints or an explicit race |
+| `timeout_with_cx(cx, duration, future)` | Budget-bounded timeout; callers classify timeout vs cancellation from the typed `Cx` state |
 | `spawn_with_cx(parent_cx, future)` | Spawns a child task inheriting the parent's `Cx` |
 | `RuntimeBuilder` | Project-curated builder for the runtime handle used by the binary |
 
@@ -3717,10 +3753,20 @@ This section catalogues the non-obvious design decisions the project has made, t
 
 ### Why asupersync, not tokio?
 
-- **`Cx` cancellation propagation** is built into the runtime, not retrofitted via `CancellationToken`. Cancel-correctness is provable, not hand-coded.
-- **Structured concurrency** — task scopes have explicit lifetimes; orphan-task classes are eliminated by construction.
+- **`Cx` cancellation propagation** is built into the runtime rather than
+  retrofitted via `CancellationToken`. FrankenTerm still has to prove each
+  operation's checkpoints, wakeups, side-effect boundary, and settlement
+  behavior; propagation alone is not an end-to-end cancel-correctness proof.
+- **Structured task ownership** — explicit handles and `JoinSet` scopes make
+  task lifetime and terminal acknowledgement auditable. The project verifies
+  propagation and abort semantics at the wrapper boundary instead of claiming
+  that a detached handle is impossible by construction.
 - **Loom model** for `runtime_async` is published as an attestation slot (`proofs/loom-runtime-async`).
-- **The migration is done.** ft-xbnl0.2 epic is closed. Every first-party crate imports through `runtime_async`. The dual-runtime era is over.
+- **The dual-runtime migration is done.** Direct `tokio` use is banned and
+  `runtime_async` is the supported first-party async API. Its implementation
+  layer and explicitly audited integration seams may still name pinned
+  asupersync types directly; those references are not evidence that every
+  operation has completed its cancellation/ownership proof.
 
 ### Why `#![forbid(unsafe_code)]` workspace-wide?
 

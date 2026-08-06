@@ -104,12 +104,6 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("workflows/engine.rs", "find_incomplete"),
     ("workflows/engine.rs", "update_status"),
     ("workflows/engine.rs", "log_step"),
-    # workflows/engine.rs free-function audit-action helpers: each
-    # delegates to its `_with_cx` sibling.
-    ("workflows/engine.rs", "record_workflow_start_action"),
-    ("workflows/engine.rs", "fetch_workflow_start_action_id"),
-    ("workflows/engine.rs", "record_workflow_step_action"),
-    ("workflows/engine.rs", "record_workflow_terminal_action"),
     # workflows/runner.rs WorkflowRunner methods: each delegates to its
     # `_with_cx` sibling.
     ("workflows/runner.rs", "handle_detection"),
@@ -439,9 +433,9 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("retry.rs", "with_retry_outcome"),
     ("retry.rs", "with_retry_and_circuit"),
     ("retry.rs", "with_smart_retry"),
-    # pool.rs: connection-pool ergonomic wrappers around the
-    # `_with_cx` siblings that thread cancellation into the
-    # underlying acquire/release primitive ops.
+    # pool.rs: legacy acquire-only ergonomic wrappers around the `_with_cx`
+    # siblings. Fallible return/maintenance operations deliberately have no
+    # ambient wrappers.
     ("pool.rs", "try_acquire"),
     ("pool.rs", "acquire"),
     # cancellation_safe_channel.rs: the non-cx reserve/recv have
@@ -481,8 +475,6 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     # secrets.rs: storage scan for sensitive data.
     ("secrets.rs", "scan_storage"),
     ("secrets.rs", "scan_storage_incremental"),
-    # watchdog.rs: lifecycle methods on the supervised task.
-    ("watchdog.rs", "join"),
     # robot_sdk_contracts.rs: RPC dispatch entry points.
     ("robot_sdk_contracts.rs", "call"),
     ("robot_sdk_contracts.rs", "call_value"),
@@ -624,24 +616,10 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
 # exactly `let cx = ...for_request(); sibling(&cx, ...).await.expect("...")`,
 # with the exact expected panic message recorded here. Keeping this category
 # separate makes independent cleanup semantics visible in the census and
-# prevents it from becoming a general post-await escape hatch.
+# prevents it from becoming a general post-await escape hatch. The current
+# tree has no intentional production escape: this empty map is retained as a
+# fail-closed grammar and category ratchet for any future proposal.
 INDEPENDENT_CONTEXT_ADAPTERS: dict[tuple[str, str], str] = {
-    ("pool.rs", "put"): "infallible pool return failed under independent cleanup context",
-    ("pool.rs", "evict_idle"): (
-        "infallible pool eviction failed under independent cleanup context"
-    ),
-    ("pool.rs", "stats"): "infallible pool stats failed under independent snapshot context",
-    ("pool.rs", "clear"): "infallible pool clear failed under independent cleanup context",
-    ("vendored/mux_pool.rs", "evict_idle"): (
-        "infallible mux pool eviction failed under independent cleanup context"
-    ),
-    ("vendored/mux_pool.rs", "clear"): (
-        "infallible mux pool clear failed under independent cleanup context"
-    ),
-    ("vendored/mux_pool.rs", "stats"): (
-        "infallible mux pool stats failed under independent snapshot context"
-    ),
-    ("watchdog.rs", "check"): "fresh mux watchdog check context cannot be cancelled",
 }
 
 RAW_STRING_RE = re.compile(r"(?:br|cr|r)(?P<hashes>#{0,255})\"")
@@ -661,7 +639,7 @@ NEGATIVE_EVIDENCE = [
     "source-declared APIs only; procedural/attribute macro expansions require compiler-side proof",
     "type and module path resolution is lexical; shadowing/aliases require compiler-side proof",
     "proof parameters must be direct values; nested callback/container Cx types are rejected",
-    "wrapper proof accepts only the canonical ambient-Cx binding plus tail sibling await grammar",
+    "wrapper proof accepts only canonical ambient-Cx binding plus sibling await and optional literal expect grammar",
     "independent cleanup proof accepts only fresh for_request plus an exact literal expect adapter",
 ]
 
@@ -1431,19 +1409,23 @@ def _parse_wrapper(
         return None, "independent adapter must construct a fresh for_request Cx directly"
 
     tail_values = [token.value for token in tail]
-    if independent_expect is not None:
-        if len(tail_values) < 8 or tail_values[-4:] != [".", "expect", "(", ")"]:
-            return None, "independent adapter must end in one literal .expect(...)"
+    has_literal_expect = (
+        len(tail_values) >= 8
+        and tail_values[-4:] == [".", "expect", "(", ")"]
+    )
+    if independent_expect is not None and not has_literal_expect:
+        return None, "independent adapter must end in one literal .expect(...)"
+    if has_literal_expect:
         if site.raw_body is None:
-            return None, "independent adapter has no raw body for literal validation"
+            return None, "wrapper has no raw body for literal expect validation"
         raw_literal = site.raw_body[tail[-2].end : tail[-1].start].strip()
         try:
             decoded_literal = json.loads(raw_literal)
         except (json.JSONDecodeError, TypeError) as error:
-            return None, f"independent adapter expect argument is not one JSON-style string: {error}"
+            return None, f"wrapper expect argument is not one JSON-style string: {error}"
         if not isinstance(decoded_literal, str):
-            return None, "independent adapter expect argument must decode to a string"
-        if decoded_literal != independent_expect:
+            return None, "wrapper expect argument must decode to a string"
+        if independent_expect is not None and decoded_literal != independent_expect:
             return None, "independent adapter expect message differs from its exact allowlist entry"
         tail = tail[:-4]
         tail_values = [token.value for token in tail]
@@ -1488,7 +1470,7 @@ def _parse_wrapper(
 
 
 def parse_canonical_wrapper(site: FunctionSite) -> tuple[WrapperCall | None, str | None]:
-    """Accept only `let cx = ambient; exact_sibling(&cx, ...).await[;]`."""
+    """Accept ambient Cx + exact sibling await + optional literal expect."""
     return _parse_wrapper(site, None)
 
 
@@ -1560,6 +1542,43 @@ pub async fn run_with_cx(&self, cx: &crate::cx::Cx) {}
         call, error = parse_canonical_wrapper(wrapper_sites[0])
         if error or call != WrapperCall("run_with_cx", 0):
             failures.append(f"canonical wrapper was rejected: call={call!r}, error={error!r}")
+
+    wrapper_expect_source = """
+pub async fn run(&self) {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    self.run_with_cx(&cx)
+        .await
+        .expect("ambient wrapper failed");
+}
+pub async fn run_with_cx(&self, cx: &crate::cx::Cx) {}
+"""
+    wrapper_expect_sites, wrapper_expect_errors = discover_functions(wrapper_expect_source)
+    if wrapper_expect_errors or len(wrapper_expect_sites) != 2:
+        failures.append(
+            f"literal-expect wrapper fixture did not parse: {wrapper_expect_errors!r}"
+        )
+    else:
+        call, error = parse_canonical_wrapper(wrapper_expect_sites[0])
+        if error or call != WrapperCall("run_with_cx", 0):
+            failures.append(
+                f"literal-expect wrapper was rejected: call={call!r}, error={error!r}"
+            )
+
+        dynamic_expect_sites, _ = discover_functions(
+            wrapper_expect_source.replace('"ambient wrapper failed"', "failure_message")
+        )
+        if dynamic_expect_sites:
+            _, error = parse_canonical_wrapper(dynamic_expect_sites[0])
+            if error is None:
+                failures.append("ordinary wrapper accepted a dynamic expect message")
+
+        ordinary_unwrap_sites, _ = discover_functions(
+            wrapper_expect_source.replace('.expect("ambient wrapper failed")', ".unwrap()")
+        )
+        if ordinary_unwrap_sites:
+            _, error = parse_canonical_wrapper(ordinary_unwrap_sites[0])
+            if error is None:
+                failures.append("ordinary wrapper accepted unwrap instead of literal expect")
 
     independent_source = """
 pub async fn clear(&self) {
