@@ -10,6 +10,7 @@
 //! - Client sends: `{"type":"user_var","pane_id":1,"name":"FT_EVENT","value":"base64..."}\n`
 //! - Server responds: `{"ok":true}\n` or `{"ok":false,"error":"..."}\n`
 
+use crate::runtime_async::task::JoinSetSettlement;
 use crate::runtime_async::{LockAcquireError, RwLock};
 use crate::runtime_async::mpsc;
 use frankenterm_alloc::{allocator_backend, jemalloc_enabled, read_allocator_stats};
@@ -37,6 +38,45 @@ pub const MAX_MESSAGE_SIZE: usize = crate::tuning_config::IpcTuning::DEFAULT_MAX
 const IPC_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 #[cfg(any(unix, windows))]
 const IPC_CONNECTION_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpcConnectionTaskDrainOutcome {
+    Settled,
+    TimedOut {
+        active_tasks: usize,
+        unacknowledged_tasks: usize,
+    },
+    Incomplete {
+        active_tasks: usize,
+        unacknowledged_tasks: usize,
+    },
+}
+
+fn classify_ipc_connection_task_drain(
+    timed_out: bool,
+    settlement: JoinSetSettlement,
+) -> IpcConnectionTaskDrainOutcome {
+    let (active_tasks, unacknowledged_tasks) = match settlement {
+        JoinSetSettlement::Settled => (0, 0),
+        JoinSetSettlement::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        } => (active_tasks, unacknowledged_tasks),
+    };
+    if timed_out {
+        IpcConnectionTaskDrainOutcome::TimedOut {
+            active_tasks,
+            unacknowledged_tasks,
+        }
+    } else if active_tasks == 0 && unacknowledged_tasks == 0 {
+        IpcConnectionTaskDrainOutcome::Settled
+    } else {
+        IpcConnectionTaskDrainOutcome::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        }
+    }
+}
 
 #[cfg(any(unix, windows))]
 mod socket_transport {
@@ -1243,18 +1283,42 @@ impl IpcServer {
             },
         )
         .await;
-        if drain_result.is_err() {
-            tracing::error!(
-                event = "ipc_connection_task_drain_timeout",
-                remaining_tasks = connection_tasks.len(),
-                orphan_risk = true,
-                "IPC connection cancellation did not reach terminal acknowledgement before the bounded drain timeout"
-            );
-        } else {
-            tracing::debug!(
-                event = "ipc_connection_tasks_settled",
-                "IPC connection task cancellation reached terminal acknowledgement"
-            );
+        match classify_ipc_connection_task_drain(
+            drain_result.is_err(),
+            connection_tasks.settlement(),
+        ) {
+            IpcConnectionTaskDrainOutcome::Settled => {
+                tracing::debug!(
+                    event = "ipc_connection_tasks_settled",
+                    "IPC connection task cancellation reached terminal acknowledgement"
+                );
+            }
+            IpcConnectionTaskDrainOutcome::TimedOut {
+                active_tasks,
+                unacknowledged_tasks,
+            } => {
+                tracing::error!(
+                    event = "ipc_connection_task_drain_timeout",
+                    active_tasks,
+                    unacknowledged_tasks,
+                    remaining_tasks = connection_tasks.len(),
+                    orphan_risk = true,
+                    "IPC connection cancellation did not reach terminal acknowledgement before the bounded drain timeout"
+                );
+            }
+            IpcConnectionTaskDrainOutcome::Incomplete {
+                active_tasks,
+                unacknowledged_tasks,
+            } => {
+                tracing::error!(
+                    event = "ipc_connection_task_settlement_incomplete",
+                    active_tasks,
+                    unacknowledged_tasks,
+                    remaining_tasks = connection_tasks.len(),
+                    orphan_risk = true,
+                    "IPC connection task drain stopped after a nonterminal observation failure"
+                );
+            }
         }
 
         #[cfg(any(unix, windows))]
@@ -2294,13 +2358,38 @@ fn registry_lock_error_response(error: LockAcquireError) -> IpcResponse {
             "pane registry access was cancelled",
             None,
         ),
-        LockAcquireError::TimedOut { .. }
-        | LockAcquireError::Poisoned
-        | LockAcquireError::PolledAfterCompletion => IpcResponse::error_with_code(
+        LockAcquireError::DeadlineExceeded => IpcResponse::error_with_code(
+            "ipc.request_deadline_exceeded",
+            "pane registry access exceeded the request deadline",
+            Some("Retry with a longer request deadline.".to_string()),
+        ),
+        LockAcquireError::PollQuotaExhausted => IpcResponse::error_with_code(
+            "ipc.request_poll_quota_exhausted",
+            "pane registry access exhausted the request poll quota",
+            Some("Retry with a larger cooperative poll budget.".to_string()),
+        ),
+        LockAcquireError::CostBudgetExhausted => IpcResponse::error_with_code(
+            "ipc.request_cost_budget_exhausted",
+            "pane registry access exhausted the request cost budget",
+            Some("Retry with a larger request cost budget.".to_string()),
+        ),
+        LockAcquireError::ContextFailure => IpcResponse::error_with_code(
+            "ipc.request_context_failed",
+            "pane registry access failed its capability context",
+            None,
+        ),
+        LockAcquireError::TimedOut { .. } => IpcResponse::error_with_code(
+            "ipc.registry_lock_timed_out",
+            format!("pane registry lock timed out: {error}"),
+            Some("Retry the request; the registry lock was contended.".to_string()),
+        ),
+        LockAcquireError::Poisoned | LockAcquireError::PolledAfterCompletion => {
+            IpcResponse::error_with_code(
             "ipc.registry_lock_failed",
             format!("pane registry lock failed: {error}"),
             Some("Retry the request; restart the watcher if the failure persists.".to_string()),
-        ),
+            )
+        }
     }
 }
 
@@ -3445,6 +3534,72 @@ mod tests {
         assert!(json.contains("\"ok\":false"));
         assert!(json.contains("\"error_code\":\"ipc.test_error\""));
         assert!(json.contains("\"hint\":\"try again\""));
+    }
+
+    #[test]
+    fn ipc_connection_task_drain_requires_zero_active_and_unacknowledged_authority() {
+        assert_eq!(
+            classify_ipc_connection_task_drain(false, JoinSetSettlement::Settled),
+            IpcConnectionTaskDrainOutcome::Settled
+        );
+        assert_eq!(
+            classify_ipc_connection_task_drain(
+                false,
+                JoinSetSettlement::Incomplete {
+                    active_tasks: 0,
+                    unacknowledged_tasks: 1,
+                },
+            ),
+            IpcConnectionTaskDrainOutcome::Incomplete {
+                active_tasks: 0,
+                unacknowledged_tasks: 1,
+            }
+        );
+        assert_eq!(
+            classify_ipc_connection_task_drain(true, JoinSetSettlement::Settled),
+            IpcConnectionTaskDrainOutcome::TimedOut {
+                active_tasks: 0,
+                unacknowledged_tasks: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn registry_lock_error_response_preserves_finite_context_and_timeout_classes() {
+        let cases = [
+            (LockAcquireError::Cancelled, "ipc.request_cancelled"),
+            (
+                LockAcquireError::DeadlineExceeded,
+                "ipc.request_deadline_exceeded",
+            ),
+            (
+                LockAcquireError::PollQuotaExhausted,
+                "ipc.request_poll_quota_exhausted",
+            ),
+            (
+                LockAcquireError::CostBudgetExhausted,
+                "ipc.request_cost_budget_exhausted",
+            ),
+            (
+                LockAcquireError::ContextFailure,
+                "ipc.request_context_failed",
+            ),
+            (
+                LockAcquireError::TimedOut { deadline_nanos: 41 },
+                "ipc.registry_lock_timed_out",
+            ),
+            (LockAcquireError::Poisoned, "ipc.registry_lock_failed"),
+            (
+                LockAcquireError::PolledAfterCompletion,
+                "ipc.registry_lock_failed",
+            ),
+        ];
+
+        for (error, expected_code) in cases {
+            let response = registry_lock_error_response(error);
+            assert!(!response.ok);
+            assert_eq!(response.error_code.as_deref(), Some(expected_code));
+        }
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 
 use crate::runtime_async::mpsc;
-use crate::runtime_async::task::JoinHandle;
+use crate::runtime_async::task::{JoinSet, JoinSetSettlement};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 #[cfg(any(unix, windows))]
@@ -29,6 +29,46 @@ const MAX_EVENT_LINE_BYTES: usize = 512 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const EVENT_SEND_TIMEOUT: Duration = Duration::from_millis(25);
+const NATIVE_CONNECTION_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeConnectionTaskDrainOutcome {
+    Settled,
+    TimedOut {
+        active_tasks: usize,
+        unacknowledged_tasks: usize,
+    },
+    Incomplete {
+        active_tasks: usize,
+        unacknowledged_tasks: usize,
+    },
+}
+
+fn classify_native_connection_task_drain(
+    timed_out: bool,
+    settlement: JoinSetSettlement,
+) -> NativeConnectionTaskDrainOutcome {
+    let (active_tasks, unacknowledged_tasks) = match settlement {
+        JoinSetSettlement::Settled => (0, 0),
+        JoinSetSettlement::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        } => (active_tasks, unacknowledged_tasks),
+    };
+    if timed_out {
+        NativeConnectionTaskDrainOutcome::TimedOut {
+            active_tasks,
+            unacknowledged_tasks,
+        }
+    } else if active_tasks == 0 && unacknowledged_tasks == 0 {
+        NativeConnectionTaskDrainOutcome::Settled
+    } else {
+        NativeConnectionTaskDrainOutcome::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        }
+    }
+}
 
 fn native_context_io_error(operation: &'static str) -> std::io::Error {
     std::io::Error::new(
@@ -472,7 +512,7 @@ impl NativeEventListener {
             return;
         }
 
-        let mut connection_tasks: Vec<JoinHandle<()>> = Vec::new();
+        let mut connection_tasks = JoinSet::new();
 
         loop {
             if shutdown_flag.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
@@ -538,7 +578,7 @@ impl NativeEventListener {
                             }
                         },
                     ) {
-                        Ok(handle) => connection_tasks.push(handle),
+                        Ok(handle) => connection_tasks.insert_handle(handle),
                         Err(error) => {
                             warn!(
                                 error_code = error.code(),
@@ -568,14 +608,8 @@ impl NativeEventListener {
                 Err(_) => {}
             }
 
-            let mut index = 0;
-            while index < connection_tasks.len() {
-                if !connection_tasks[index].is_finished() {
-                    index += 1;
-                    continue;
-                }
-                let handle = connection_tasks.swap_remove(index);
-                if let Err(err) = handle.await {
+            while let Some(join_result) = connection_tasks.try_join_next() {
+                if let Err(err) = join_result {
                     // Split by error kind: cancellation during the
                     // steady-state accept loop is expected (cx-driven
                     // budget) and stays at `debug!`; a panic propagating
@@ -597,17 +631,56 @@ impl NativeEventListener {
         // A shutdown flag is independent from the parent Cx. Explicitly abort
         // every per-connection task before draining acknowledgements so a
         // quiet client blocked in a line read cannot hang listener shutdown.
-        for handle in &connection_tasks {
-            handle.abort();
-        }
-        while let Some(handle) = connection_tasks.pop() {
-            if let Err(err) = handle.await {
-                // Kept at debug! — after shutdown_flag or cx cancel fires,
-                // outstanding tasks are intentionally cancelled and their
-                // JoinError surface is expected noise.
-                debug!(
-                    error = %err,
-                    "native event connection task failed during shutdown"
+        connection_tasks.abort_all();
+        let drain_cx = crate::cx::for_request();
+        let drain_result = crate::runtime_async::timeout_with_cx(
+            &drain_cx,
+            NATIVE_CONNECTION_TASK_DRAIN_TIMEOUT,
+            async {
+                while let Some(join_result) = connection_tasks.join_next().await {
+                    if let Err(err) = join_result {
+                        // Kept at debug! — after shutdown_flag or cx cancel
+                        // fires, task cancellation is expected. A finite waker
+                        // registration failure is logged here once while the
+                        // JoinSet retains terminal authority for trusted polls.
+                        debug!(
+                            error = %err,
+                            "native event connection task failed during shutdown"
+                        );
+                    }
+                }
+            },
+        )
+        .await;
+        match classify_native_connection_task_drain(
+            drain_result.is_err(),
+            connection_tasks.settlement(),
+        ) {
+            NativeConnectionTaskDrainOutcome::Settled => {}
+            NativeConnectionTaskDrainOutcome::TimedOut {
+                active_tasks,
+                unacknowledged_tasks,
+            } => {
+                warn!(
+                    event = "native_event_connection_task_drain_timeout",
+                    active_tasks,
+                    unacknowledged_tasks,
+                    remaining_tasks = connection_tasks.len(),
+                    orphan_risk = true,
+                    "native event connection tasks missed bounded terminal settlement"
+                );
+            }
+            NativeConnectionTaskDrainOutcome::Incomplete {
+                active_tasks,
+                unacknowledged_tasks,
+            } => {
+                warn!(
+                    event = "native_event_connection_task_settlement_incomplete",
+                    active_tasks,
+                    unacknowledged_tasks,
+                    remaining_tasks = connection_tasks.len(),
+                    orphan_risk = true,
+                    "native event connection task drain stopped after a nonterminal observation failure"
                 );
             }
         }
@@ -1663,6 +1736,34 @@ mod tests {
             Some("SECRET post-accept cancellation detail"),
         );
         assert!(!native_connection_spawn_allowed(&cancelled_cx, &shutdown));
+    }
+
+    #[test]
+    fn native_connection_task_drain_never_claims_quarantined_authority_settled() {
+        assert_eq!(
+            classify_native_connection_task_drain(false, JoinSetSettlement::Settled),
+            NativeConnectionTaskDrainOutcome::Settled
+        );
+        assert_eq!(
+            classify_native_connection_task_drain(
+                false,
+                JoinSetSettlement::Incomplete {
+                    active_tasks: 0,
+                    unacknowledged_tasks: 1,
+                },
+            ),
+            NativeConnectionTaskDrainOutcome::Incomplete {
+                active_tasks: 0,
+                unacknowledged_tasks: 1,
+            }
+        );
+        assert_eq!(
+            classify_native_connection_task_drain(true, JoinSetSettlement::Settled),
+            NativeConnectionTaskDrainOutcome::TimedOut {
+                active_tasks: 0,
+                unacknowledged_tasks: 0,
+            }
+        );
     }
 
     #[test]
