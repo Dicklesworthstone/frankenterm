@@ -18,7 +18,7 @@ use crate::Result;
 use crate::circuit_breaker::{CircuitBreakerStatus, CircuitStateKind};
 use crate::concurrent_map::PaneMap;
 use crate::consistent_hash::HashRing;
-use crate::error::WeztermError;
+use crate::error::{StorageError, WeztermError};
 use crate::patterns::AgentType;
 use crate::watchdog::HealthStatus;
 use crate::wezterm::{
@@ -895,6 +895,10 @@ fn classify_backend_error(error: &crate::Error) -> ShardBackendErrorClass {
                 ShardBackendErrorClass::IndeterminateMutation
             }
         },
+        crate::Error::Storage(
+            StorageError::IndeterminateMutation { .. }
+            | StorageError::WriterSettlementIndeterminate { .. },
+        ) => ShardBackendErrorClass::IndeterminateMutation,
         crate::Error::RuntimeOperation {
             source: crate::error::RuntimeOperationSource::Cancelled(_),
             ..
@@ -1316,6 +1320,62 @@ impl ShardedWeztermClient {
                     source: finite_source,
                 },
             },
+            crate::Error::Storage(error) => crate::Error::Storage(match error {
+                StorageError::Database(_) => StorageError::Database(finite_detail()),
+                StorageError::WriterBackendEpochPoisoned => {
+                    StorageError::WriterBackendEpochPoisoned
+                }
+                StorageError::BackendEpochPoisoned => StorageError::BackendEpochPoisoned,
+                StorageError::MigrationEpochPoisoned => StorageError::MigrationEpochPoisoned,
+                StorageError::IndeterminateMutation { .. } => {
+                    StorageError::IndeterminateMutation { operation: op }
+                }
+                StorageError::WriterSettlementIndeterminate { .. } => {
+                    StorageError::WriterSettlementIndeterminate {
+                        phase: "shard_backend_writer_settlement",
+                    }
+                }
+                StorageError::WriterClosed => StorageError::WriterClosed,
+                StorageError::SubmitIdempotency(error) => {
+                    StorageError::SubmitIdempotency(error)
+                }
+                StorageError::ReservationConflict {
+                    pane_id,
+                    existing_id,
+                } => StorageError::ReservationConflict {
+                    pane_id,
+                    existing_id,
+                },
+                StorageError::InvalidEventDeliveryLeaseBatch(error) => {
+                    StorageError::InvalidEventDeliveryLeaseBatch(error)
+                }
+                StorageError::LeaseTokenConflict { event_id } => {
+                    StorageError::LeaseTokenConflict { event_id }
+                }
+                StorageError::LeaseOwnershipConflict { updated, expected } => {
+                    StorageError::LeaseOwnershipConflict { updated, expected }
+                }
+                StorageError::SequenceDiscontinuity { expected, actual } => {
+                    StorageError::SequenceDiscontinuity { expected, actual }
+                }
+                StorageError::MigrationFailed(_) => {
+                    StorageError::MigrationFailed(finite_detail())
+                }
+                StorageError::SchemaTooNew { current, supported } => {
+                    StorageError::SchemaTooNew { current, supported }
+                }
+                StorageError::WaTooOld { .. } => StorageError::WaTooOld {
+                    current: "redacted".to_owned(),
+                    min_compatible: "redacted".to_owned(),
+                },
+                StorageError::FtsQueryError(_) => {
+                    StorageError::FtsQueryError(finite_detail())
+                }
+                StorageError::Corruption { .. } => StorageError::Corruption {
+                    details: finite_detail(),
+                },
+                StorageError::NotFound(_) => StorageError::NotFound(finite_detail()),
+            }),
             crate::Error::PaneOperation {
                 pane_id: backend_pane_id,
                 source: crate::error::PaneOperationSource::PaneNotFound,
@@ -4855,6 +4915,56 @@ mod tests {
             classify_backend_error(&indeterminate),
             ShardBackendErrorClass::IndeterminateMutation
         );
+
+        for (storage_error, expected) in [
+            (
+                StorageError::IndeterminateMutation {
+                    operation: "hostile_static_operation_identity",
+                },
+                StorageError::IndeterminateMutation {
+                    operation: "custom_backend",
+                },
+            ),
+            (
+                StorageError::WriterSettlementIndeterminate {
+                    phase: "hostile_static_phase_identity",
+                },
+                StorageError::WriterSettlementIndeterminate {
+                    phase: "shard_backend_writer_settlement",
+                },
+            ),
+        ] {
+            let projected = client.backend_error(
+                ShardId(3),
+                "custom_backend",
+                None,
+                crate::Error::Storage(storage_error),
+            );
+            assert_eq!(projected.to_string(), expected.to_string());
+            assert!(!projected.to_string().contains("hostile_static"));
+            assert!(!crate::retry::is_retryable(&projected));
+            assert_eq!(
+                classify_backend_error(&projected),
+                ShardBackendErrorClass::IndeterminateMutation
+            );
+        }
+
+        let storage_backend_detail = client.backend_error(
+            ShardId(3),
+            "custom_backend",
+            None,
+            crate::Error::Storage(StorageError::Database(
+                "hostile-storage-secret".repeat(1_024),
+            )),
+        );
+        assert!(matches!(
+            &storage_backend_detail,
+            crate::Error::Storage(StorageError::Database(_))
+        ));
+        assert!(!storage_backend_detail
+            .to_string()
+            .contains("hostile-storage-secret"));
+        assert!(storage_backend_detail.to_string().len() < 256);
 
         let missing = client.backend_error(
             ShardId(3),

@@ -81,6 +81,8 @@ use crate::policy::Redactor;
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
 use crate::runtime_async::{RuntimeTime, RwLock, mpsc, task::JoinHandle, watch};
+#[cfg(any(feature = "native-wezterm", all(feature = "vendored", unix)))]
+use crate::runtime_async::task::{JoinErrorKind, JoinSet, JoinSetSettlement};
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
 use crate::sharding::{ShardId, try_decode_sharded_pane_id};
@@ -720,26 +722,20 @@ where
 /// RAII-guarded holder for the capture task's per-pane vendored streaming
 /// subtasks.
 ///
-/// The HashMap stores one generation- and route-bound `StreamingTask` per
-/// observed pane while the capture loop is routing work via the vendored
-/// (mux-socket) fast path.
-/// On a clean shutdown the capture loop explicitly drains this map and
-/// aborts each handle (see the `for (_pane_id, task) in drain()` block at
-/// the bottom of `spawn_capture_task`). However, if the capture future
-/// itself is dropped mid-flight — because a parent scope cancels the
-/// runtime JoinHandle, because an outer `select!` races to another branch,
-/// or because a panic unwinds through the capture loop — that explicit
-/// drain never runs and the child streaming subtasks become orphaned
-/// (the asupersync runtime detaches, rather than aborts, on bare
-/// `JoinHandle` drop). They keep holding the mux socket, capture_tx
-/// sender half, and shutdown_flag Arc indefinitely.
+/// The active map stores one generation- and route-bound `StreamingTask` per
+/// observed pane while the capture loop uses the vendored mux-socket fast path.
+/// Removed handles transfer into `settling`, so replacement remains nonblocking
+/// without discarding terminal authority. The capture loop opportunistically
+/// reaps completions and performs one bounded trusted drain on normal shutdown.
 ///
-/// Wrapping the map in this newtype makes cancellation-safe cleanup the
-/// default: `Drop::drop` aborts every still-live child regardless of how
-/// the capture future is dismantled.
+/// If the capture future itself is dropped mid-flight, `Drop` requests abort
+/// for both collections and emits finite orphan-risk telemetry. Synchronous
+/// drop cannot prove terminal acknowledgement; it is intentionally a last-resort
+/// fallback rather than the clean-shutdown contract.
 #[cfg(all(feature = "vendored", unix))]
 struct StreamingTasks {
     tasks: HashMap<u64, StreamingTask>,
+    settling: JoinSet<()>,
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -769,6 +765,64 @@ struct StreamingTask {
     lease: CaptureLease,
     token: StreamingTaskToken,
     handle: JoinHandle<()>,
+}
+
+#[cfg(all(feature = "vendored", unix))]
+struct RetiredStreamingTask {
+    identity: StreamingSubscriptionIdentity,
+    lease: CaptureLease,
+    token: StreamingTaskToken,
+}
+
+#[cfg(all(feature = "vendored", unix))]
+const STREAMING_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[cfg(all(feature = "vendored", unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamingTaskDrainOutcome {
+    Settled,
+    SettledWithFailure {
+        failure: JoinErrorKind,
+    },
+    TimedOut {
+        active_tasks: usize,
+        unacknowledged_tasks: usize,
+    },
+    Incomplete {
+        active_tasks: usize,
+        unacknowledged_tasks: usize,
+        drain_failure: Option<JoinErrorKind>,
+    },
+}
+
+#[cfg(all(feature = "vendored", unix))]
+fn classify_streaming_task_drain(
+    timed_out: bool,
+    drain_failure: Option<JoinErrorKind>,
+    terminal_failure: Option<JoinErrorKind>,
+    settlement: JoinSetSettlement,
+) -> StreamingTaskDrainOutcome {
+    match settlement {
+        JoinSetSettlement::Settled => terminal_failure.map_or(
+            StreamingTaskDrainOutcome::Settled,
+            |failure| StreamingTaskDrainOutcome::SettledWithFailure { failure },
+        ),
+        JoinSetSettlement::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        } if timed_out => StreamingTaskDrainOutcome::TimedOut {
+            active_tasks,
+            unacknowledged_tasks,
+        },
+        JoinSetSettlement::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        } => StreamingTaskDrainOutcome::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+            drain_failure,
+        },
+    }
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -824,7 +878,116 @@ impl StreamingTasks {
     fn new() -> Self {
         Self {
             tasks: HashMap::new(),
+            settling: JoinSet::new(),
         }
+    }
+
+    fn remove_for_settlement(
+        &mut self,
+        pane_id: &u64,
+        abort: bool,
+    ) -> Option<RetiredStreamingTask> {
+        let task = self.tasks.remove(pane_id)?;
+        let StreamingTask {
+            identity,
+            lease,
+            token,
+            handle,
+        } = task;
+        if abort {
+            handle.abort();
+        }
+        self.settling.insert_handle(handle);
+        Some(RetiredStreamingTask {
+            identity,
+            lease,
+            token,
+        })
+    }
+
+    fn insert_active(&mut self, pane_id: u64, task: StreamingTask) {
+        if let Some(replaced) = self.tasks.insert(pane_id, task) {
+            replaced.handle.abort();
+            self.settling.insert_handle(replaced.handle);
+            error!(
+                pane_id,
+                event = "streaming_task_active_slot_replaced",
+                "Vendored streaming task active slot was replaced without prior reconciliation"
+            );
+        }
+    }
+
+    fn reap_completed(&mut self) {
+        while let Some(join_result) = self.settling.try_join_next() {
+            if let Err(error) = join_result {
+                if matches!(
+                    error.kind(),
+                    JoinErrorKind::Aborted
+                        | JoinErrorKind::ContextCancelled
+                        | JoinErrorKind::WakerRegistrationFailed
+                ) {
+                    debug!(
+                        failure_class = ?error.kind(),
+                        "Vendored streaming task stopped"
+                    );
+                } else {
+                    warn!(
+                        failure_class = ?error.kind(),
+                        "Vendored streaming task failed"
+                    );
+                }
+            }
+        }
+    }
+
+    fn abort_all_active(&mut self) {
+        let active = std::mem::take(&mut self.tasks);
+        for (_pane_id, task) in active {
+            task.handle.abort();
+            self.settling.insert_handle(task.handle);
+        }
+    }
+
+    async fn abort_and_settle_all(&mut self) -> StreamingTaskDrainOutcome {
+        self.abort_all_active();
+        self.settling.abort_all();
+        let drain_cx = crate::cx::for_request();
+        let mut terminal_failure = None;
+        let drain_result = crate::runtime_async::timeout_with_cx(
+            &drain_cx,
+            STREAMING_TASK_DRAIN_TIMEOUT,
+            async {
+                loop {
+                    match self.settling.drain_next_with_cx(&drain_cx).await {
+                        Ok(Some(Ok(()))) => {}
+                        Ok(Some(Err(error))) => {
+                            if !matches!(
+                                error.kind(),
+                                JoinErrorKind::Aborted
+                                    | JoinErrorKind::ContextCancelled
+                                    | JoinErrorKind::WakerRegistrationFailed
+                            ) {
+                                terminal_failure = Some(error.kind());
+                            }
+                        }
+                        Ok(None) => return Ok(()),
+                        Err(error) => return Err(error.kind()),
+                    }
+                }
+            },
+        )
+        .await;
+        let timed_out = drain_result.is_err();
+        let drain_failure = match drain_result {
+            Ok(Err(failure)) => Some(failure),
+            Ok(Ok(())) | Err(_) => None,
+        };
+        classify_streaming_task_drain(
+            timed_out,
+            drain_failure,
+            terminal_failure,
+            self.settling.settlement(),
+        )
     }
 }
 
@@ -838,62 +1001,144 @@ impl std::ops::Deref for StreamingTasks {
 }
 
 #[cfg(all(feature = "vendored", unix))]
-impl std::ops::DerefMut for StreamingTasks {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.tasks
-    }
-}
-
-#[cfg(all(feature = "vendored", unix))]
 impl Drop for StreamingTasks {
     fn drop(&mut self) {
-        for (_pane_id, task) in self.tasks.drain() {
-            task.handle.abort();
+        let active_tasks = self.tasks.len();
+        let already_settling_tasks = self.settling.len();
+        self.abort_all_active();
+        self.settling.abort_all();
+        if !self.settling.is_empty() {
+            error!(
+                event = "streaming_tasks_dropped_before_settlement",
+                active_tasks,
+                already_settling_tasks,
+                unacknowledged_tasks = self.settling.len(),
+                orphan_risk = true,
+                "Vendored streaming task owner dropped without terminal acknowledgement"
+            );
         }
     }
 }
 
-/// Owns the native listener's nested accept loop and guarantees that dropping
-/// the outer coalescer future signals the child before its join handle can
-/// detach. Normal shutdown additionally awaits the child; the only
-/// non-acknowledging exit is the finite waker-registration containment failure,
-/// which preserves and re-aborts the handle on guard drop.
+#[cfg(feature = "native-wezterm")]
+const NATIVE_ACCEPT_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[cfg(feature = "native-wezterm")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeAcceptTaskSettlement {
+    Settled,
+    SettledWithFailure {
+        failure: JoinErrorKind,
+    },
+    TimedOut {
+        active_tasks: usize,
+        unacknowledged_tasks: usize,
+    },
+    Incomplete {
+        active_tasks: usize,
+        unacknowledged_tasks: usize,
+        drain_failure: Option<JoinErrorKind>,
+    },
+}
+
+#[cfg(feature = "native-wezterm")]
+fn classify_native_accept_task_settlement(
+    timed_out: bool,
+    drain_failure: Option<JoinErrorKind>,
+    terminal_failure: Option<JoinErrorKind>,
+    settlement: JoinSetSettlement,
+) -> NativeAcceptTaskSettlement {
+    match settlement {
+        JoinSetSettlement::Settled => terminal_failure.map_or(
+            NativeAcceptTaskSettlement::Settled,
+            |failure| NativeAcceptTaskSettlement::SettledWithFailure { failure },
+        ),
+        JoinSetSettlement::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        } if timed_out => NativeAcceptTaskSettlement::TimedOut {
+            active_tasks,
+            unacknowledged_tasks,
+        },
+        JoinSetSettlement::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        } => NativeAcceptTaskSettlement::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+            drain_failure,
+        },
+    }
+}
+
+/// Owns the native listener's nested accept loop. Normal shutdown requests an
+/// abort and uses the bounded trusted-poll JoinSet drain, so a caller-waker
+/// registration failure cannot be mistaken for terminal acknowledgement.
+/// If the one-second envelope expires, the returned finite outcome explicitly
+/// reports the still-owned active/quarantined authority before guard drop.
 #[cfg(feature = "native-wezterm")]
 struct AbortOnDropNativeAcceptTask {
-    handle: Option<JoinHandle<()>>,
+    tasks: JoinSet<()>,
 }
 
 #[cfg(feature = "native-wezterm")]
 impl AbortOnDropNativeAcceptTask {
     fn new(handle: JoinHandle<()>) -> Self {
-        Self {
-            handle: Some(handle),
-        }
+        let mut tasks = JoinSet::new();
+        tasks.insert_handle(handle);
+        Self { tasks }
     }
 
-    fn abort(&self) {
-        if let Some(handle) = &self.handle {
-            handle.abort();
-        }
+    fn abort(&mut self) {
+        self.tasks.abort_all();
     }
 
-    async fn abort_and_settle(
-        &mut self,
-    ) -> std::result::Result<(), crate::runtime_async::task::JoinError> {
+    async fn abort_and_settle(&mut self) -> NativeAcceptTaskSettlement {
         self.abort();
-        let result = match self.handle.as_mut() {
-            Some(handle) => handle.await,
-            None => return Ok(()),
+        let drain_cx = crate::cx::for_request();
+        let mut terminal_failure = None;
+        let drain_result = crate::runtime_async::timeout_with_cx(
+            &drain_cx,
+            NATIVE_ACCEPT_TASK_DRAIN_TIMEOUT,
+            async {
+                loop {
+                    match self.tasks.drain_next_with_cx(&drain_cx).await {
+                        Ok(Some(Ok(()))) => {}
+                        Ok(Some(Err(error))) => {
+                            if !matches!(
+                                error.kind(),
+                                JoinErrorKind::Aborted
+                                    | JoinErrorKind::ContextCancelled
+                                    | JoinErrorKind::WakerRegistrationFailed
+                            ) {
+                                terminal_failure = Some(error.kind());
+                            }
+                        }
+                        Ok(None) => return Ok(()),
+                        Err(error) => return Err(error.kind()),
+                    }
+                }
+            },
+        )
+        .await;
+        let timed_out = drain_result.is_err();
+        let drain_failure = match drain_result {
+            Ok(Err(failure)) => Some(failure),
+            Ok(Ok(())) | Err(_) => None,
         };
-        if !matches!(
-            &result,
-            Err(error)
-                if error.kind()
-                    == crate::runtime_async::task::JoinErrorKind::WakerRegistrationFailed
-        ) {
-            self.handle = None;
+        classify_native_accept_task_settlement(
+            timed_out,
+            drain_failure,
+            terminal_failure,
+            self.tasks.settlement(),
+        )
+    }
+
+    #[cfg(test)]
+    fn force_registration_failure_for_test(&self) {
+        if !self.tasks.is_empty() {
+            self.tasks.force_join_registration_failure_for_test();
         }
-        result
     }
 }
 
@@ -3582,14 +3827,14 @@ impl ObservationRuntime {
             Arc::clone(&capture_checkpoints),
         );
 
-        // Spawn native event listener if socket path is configured and the
-        // native-wezterm feature is compiled in. Auto-detection: always try
-        // to bind the socket regardless of config.native.enabled.
+        // Spawn the native event listener only when configuration explicitly
+        // enabled it and resolution therefore produced a socket path. The
+        // resolver deliberately ignores environment overrides while disabled.
         #[cfg(feature = "native-wezterm")]
         let native_handle = native_socket.map(|socket| {
             info!(
                 path = %socket.display(),
-                "Switching to native push events (auto-detected socket path)"
+                "Starting explicitly enabled native event listener"
             );
             self.spawn_native_event_task(socket, capture_ingress_tx.clone())
         });
@@ -5562,10 +5807,10 @@ impl ObservationRuntime {
             #[cfg(all(feature = "vendored", unix))]
             let (stream_exit_tx, mut stream_exit_rx) =
                 mpsc::channel::<StreamingTaskExit>(vendored_channel_capacity);
-            // Per-pane vendored streaming subtasks. Dropping the capture future
-            // (runtime shutdown, panic, outer select loss) aborts every still-live
-            // child via StreamingTasks::drop — the explicit drain below is kept
-            // as the fast path on clean shutdown but is no longer load-bearing.
+            // Per-pane vendored streaming subtasks. Normal removal transfers
+            // handles into a settlement set; clean shutdown bounded-drains it.
+            // Dropping the capture future remains an abort-and-telemetry fallback
+            // for panic/outer-cancellation paths that cannot await.
             #[cfg(all(feature = "vendored", unix))]
             let mut streaming_tasks: StreamingTasks = StreamingTasks::new();
             #[cfg(all(feature = "vendored", unix))]
@@ -5591,6 +5836,9 @@ impl ObservationRuntime {
             let mut poll_tasks = TailerPollTaskSet::new();
 
             loop {
+                #[cfg(all(feature = "vendored", unix))]
+                streaming_tasks.reap_completed();
+
                 if shutdown_flag.load(Ordering::SeqCst) {
                     debug!("Capture task: shutdown signal received");
                     break;
@@ -5616,7 +5864,7 @@ impl ObservationRuntime {
                     }
 
                     let task = streaming_tasks
-                        .remove(&pane_id)
+                        .remove_for_settlement(&pane_id, false)
                         .expect("current streaming exit has an active task");
                     let task_stamp = task.lease.stamp();
                     let binding_identity = capture_bindings.get(&pane_id).and_then(|binding| {
@@ -5961,9 +6209,7 @@ impl ObservationRuntime {
 
                     #[cfg(all(feature = "vendored", unix))]
                     for pane_id in &obsolete_bindings {
-                        if let Some(task) = streaming_tasks.remove(pane_id) {
-                            task.handle.abort();
-                        }
+                        let _ = streaming_tasks.remove_for_settlement(pane_id, true);
                     }
 
                     // Stop polling admission before revoking an obsolete pane.
@@ -6428,8 +6674,9 @@ impl ObservationRuntime {
                             })
                             .collect();
                         for (pane_id, has_replacement) in obsolete_streams {
-                            if let Some(task) = streaming_tasks.remove(&pane_id) {
-                                task.handle.abort();
+                            if let Some(task) =
+                                streaming_tasks.remove_for_settlement(&pane_id, true)
+                            {
                                 let task_stamp = task.lease.stamp();
                                 let binding_identity = capture_bindings.get(&pane_id).and_then(
                                     |binding| {
@@ -6677,7 +6924,7 @@ impl ObservationRuntime {
                                         .await;
                                     },
                                 );
-                                streaming_tasks.insert(
+                                streaming_tasks.insert_active(
                                     pane_id,
                                     StreamingTask {
                                         identity,
@@ -6872,8 +7119,42 @@ impl ObservationRuntime {
             drop(poll_tasks);
 
             #[cfg(all(feature = "vendored", unix))]
-            for (_pane_id, task) in streaming_tasks.drain() {
-                task.handle.abort();
+            match streaming_tasks.abort_and_settle_all().await {
+                StreamingTaskDrainOutcome::Settled => {}
+                StreamingTaskDrainOutcome::SettledWithFailure { failure } => {
+                    warn!(
+                        failure_class = ?failure,
+                        "Vendored streaming tasks settled after a task failure"
+                    );
+                }
+                StreamingTaskDrainOutcome::TimedOut {
+                    active_tasks,
+                    unacknowledged_tasks,
+                } => {
+                    error!(
+                        event = "streaming_task_drain_timeout",
+                        active_tasks,
+                        unacknowledged_tasks,
+                        remaining_tasks = streaming_tasks.settling.len(),
+                        orphan_risk = true,
+                        "Vendored streaming tasks missed bounded terminal settlement"
+                    );
+                }
+                StreamingTaskDrainOutcome::Incomplete {
+                    active_tasks,
+                    unacknowledged_tasks,
+                    drain_failure,
+                } => {
+                    error!(
+                        event = "streaming_task_settlement_incomplete",
+                        active_tasks,
+                        unacknowledged_tasks,
+                        drain_failure = ?drain_failure,
+                        remaining_tasks = streaming_tasks.settling.len(),
+                        orphan_risk = true,
+                        "Vendored streaming task drain ended without terminal settlement"
+                    );
+                }
             }
 
             // Graceful shutdown of all tailers
@@ -7218,11 +7499,40 @@ impl ObservationRuntime {
                 }
             }
 
-            if let Err(error) = accept_task.abort_and_settle().await {
-                warn!(
-                    failure_class = ?error.kind(),
-                    "Native event listener did not settle successfully"
-                );
+            match accept_task.abort_and_settle().await {
+                NativeAcceptTaskSettlement::Settled => {}
+                NativeAcceptTaskSettlement::SettledWithFailure { failure } => {
+                    warn!(
+                        failure_class = ?failure,
+                        "Native event listener settled after a task failure"
+                    );
+                }
+                NativeAcceptTaskSettlement::TimedOut {
+                    active_tasks,
+                    unacknowledged_tasks,
+                } => {
+                    warn!(
+                        event = "native_accept_task_drain_timeout",
+                        active_tasks,
+                        unacknowledged_tasks,
+                        orphan_risk = true,
+                        "Native event listener missed bounded terminal settlement"
+                    );
+                }
+                NativeAcceptTaskSettlement::Incomplete {
+                    active_tasks,
+                    unacknowledged_tasks,
+                    drain_failure,
+                } => {
+                    warn!(
+                        event = "native_accept_task_settlement_incomplete",
+                        active_tasks,
+                        unacknowledged_tasks,
+                        drain_failure = ?drain_failure,
+                        orphan_risk = true,
+                        "Native event listener drain failed before terminal settlement"
+                    );
+                }
             }
         })
     }
@@ -10212,6 +10522,113 @@ mod tests {
         if let Err(payload) = test_result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    #[cfg(feature = "native-wezterm")]
+    #[test]
+    fn native_accept_settlement_truth_gives_terminal_authority_precedence() {
+        assert_eq!(
+            classify_native_accept_task_settlement(
+                true,
+                None,
+                None,
+                JoinSetSettlement::Settled,
+            ),
+            NativeAcceptTaskSettlement::Settled,
+        );
+        assert_eq!(
+            classify_native_accept_task_settlement(
+                true,
+                None,
+                None,
+                JoinSetSettlement::Incomplete {
+                    active_tasks: 1,
+                    unacknowledged_tasks: 1,
+                },
+            ),
+            NativeAcceptTaskSettlement::TimedOut {
+                active_tasks: 1,
+                unacknowledged_tasks: 1,
+            },
+        );
+        assert_eq!(
+            classify_native_accept_task_settlement(
+                false,
+                Some(JoinErrorKind::ContextFailure),
+                None,
+                JoinSetSettlement::Incomplete {
+                    active_tasks: 0,
+                    unacknowledged_tasks: 1,
+                },
+            ),
+            NativeAcceptTaskSettlement::Incomplete {
+                active_tasks: 0,
+                unacknowledged_tasks: 1,
+                drain_failure: Some(JoinErrorKind::ContextFailure),
+            },
+        );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn streaming_task_drain_truth_gives_terminal_authority_precedence() {
+        assert_eq!(
+            classify_streaming_task_drain(
+                true,
+                None,
+                None,
+                JoinSetSettlement::Settled,
+            ),
+            StreamingTaskDrainOutcome::Settled,
+        );
+        assert_eq!(
+            classify_streaming_task_drain(
+                true,
+                None,
+                None,
+                JoinSetSettlement::Incomplete {
+                    active_tasks: 2,
+                    unacknowledged_tasks: 1,
+                },
+            ),
+            StreamingTaskDrainOutcome::TimedOut {
+                active_tasks: 2,
+                unacknowledged_tasks: 1,
+            },
+        );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn streaming_task_owner_trusted_drains_registration_failure() {
+        run_async_test(async {
+            let mut tasks = StreamingTasks::new();
+            tasks.settling.spawn(std::future::pending::<()>());
+            tasks.settling.force_join_registration_failure_for_test();
+
+            assert_eq!(
+                tasks.abort_and_settle_all().await,
+                StreamingTaskDrainOutcome::Settled,
+                "waker-registration failure must retain and trusted-drain streaming task ownership",
+            );
+            assert_eq!(tasks.settling.settlement(), JoinSetSettlement::Settled);
+        });
+    }
+
+    #[cfg(feature = "native-wezterm")]
+    #[test]
+    fn native_accept_guard_trusted_drain_settles_registration_failure() {
+        run_async_test(async {
+            let handle = crate::runtime_async::task::spawn(std::future::pending::<()>());
+            let mut guard = AbortOnDropNativeAcceptTask::new(handle);
+            guard.force_registration_failure_for_test();
+
+            assert_eq!(
+                guard.abort_and_settle().await,
+                NativeAcceptTaskSettlement::Settled,
+                "waker-registration failure must retain and trusted-poll the aborted task to terminal acknowledgement",
+            );
+        });
     }
 
     /// Like `run_async_test`, but runs the runtime on a dedicated thread so that

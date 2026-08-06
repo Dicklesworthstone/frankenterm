@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::runtime_async::{
     RuntimeTime,
     notify::Notify,
-    task::{self, JoinErrorKind, JoinHandle},
+    task::{self, JoinErrorKind, JoinHandle, JoinSet, JoinSetSettlement},
 };
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
@@ -345,15 +345,20 @@ impl HealthReport {
 }
 
 /// Handle returned by [`spawn_watchdog`] to control the monitor task.
+#[must_use = "watchdog tasks must be signalled and joined to prove terminal settlement"]
 pub struct WatchdogHandle {
-    task: JoinHandle<()>,
+    tasks: JoinSet<()>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     shutdown_notify: Arc<Notify>,
     #[cfg(test)]
     wait_entered: Arc<std::sync::atomic::AtomicBool>,
 }
 
-const WATCHDOG_JOIN_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(1);
+// Top-level watcher tasks can own their own bounded child drain. Keep this
+// envelope longer than the distributed listener's 500 ms accept poll plus its
+// one-second connection-task settlement bound, or the outer abort could cut
+// off the very acknowledgement drain it is meant to preserve.
+const WATCHDOG_JOIN_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Finite failure classes for watchdog task settlement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -361,8 +366,8 @@ pub enum WatchdogJoinError {
     /// The task reached a terminal failure rather than a normal exit.
     #[error("watchdog task failed with class {kind:?}")]
     TaskFailed { kind: JoinErrorKind },
-    /// The join waker could not be contained, so terminal acknowledgement was
-    /// not established even after abort was requested.
+    /// The bounded drain ended without a timeout but still could not establish
+    /// terminal acknowledgement (for example, its cleanup context failed).
     #[error("watchdog task settlement remained unacknowledged")]
     SettlementUnacknowledged,
     /// Abort was requested, but terminal acknowledgement missed its bound.
@@ -371,56 +376,147 @@ pub enum WatchdogJoinError {
 }
 
 impl WatchdogHandle {
+    /// Adopt a task governed by the supplied shared shutdown flag.
+    ///
+    /// This is used by top-level monitoring loops that already observe an
+    /// application-owned flag but still need the watchdog handle's bounded,
+    /// trusted terminal-drain contract.
+    pub fn adopt_shutdown_task(
+        task: JoinHandle<()>,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self::adopt_shutdown_task_with_notify(task, shutdown, Arc::new(Notify::new()))
+    }
+
+    /// Adopt a task whose cooperative shutdown wait uses the supplied notify.
+    ///
+    /// The task and this handle must share both `shutdown` and
+    /// `shutdown_notify`. [`Self::signal_shutdown`] then changes the durable
+    /// predicate before waking the task, avoiding both lost wakes and a polling
+    /// delay during bounded graceful settlement.
+    pub fn adopt_shutdown_task_with_notify(
+        task: JoinHandle<()>,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+        shutdown_notify: Arc<Notify>,
+    ) -> Self {
+        let mut tasks = JoinSet::new();
+        tasks.insert_handle(task);
+        Self {
+            tasks,
+            shutdown,
+            shutdown_notify,
+            #[cfg(test)]
+            wait_entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
     /// Signal the watchdog to stop.
     pub fn signal_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
         self.shutdown_notify.notify_waiters();
     }
 
+    #[cfg(test)]
+    fn force_registration_failure_for_test(&self) {
+        self.tasks.force_join_registration_failure_for_test();
+    }
+
     /// Signal shutdown and retain ownership until the task acknowledges either
     /// graceful completion or bounded abort settlement.
     ///
-    /// A cancelled caller cannot suppress cleanup. It skips the graceful wait,
-    /// requests task abort, and uses an independently bounded settlement
-    /// context so dropping this handle never silently detaches a live watchdog.
+    /// A cancelled caller cannot suppress cleanup. The handle substitutes an
+    /// independent finite context for the graceful phase, then requests abort
+    /// only if the task still has not settled. This gives nested task owners a
+    /// chance to run their own bounded drains before the outer future is
+    /// cancelled. Callers must await this method; `Drop` can request abort but
+    /// cannot synchronously prove acknowledgement from inside an executor.
     pub async fn join_with_cx(
         mut self,
         cx: &crate::cx::Cx,
     ) -> Result<(), WatchdogJoinError> {
         self.signal_shutdown();
 
-        if cx.checkpoint().is_ok() {
-            match crate::runtime_async::timeout_with_cx(
-                cx,
-                WATCHDOG_JOIN_SETTLEMENT_TIMEOUT,
-                &mut self.task,
-            )
-            .await
-            {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(error)) if error.kind() != JoinErrorKind::WakerRegistrationFailed => {
-                    return Err(WatchdogJoinError::TaskFailed { kind: error.kind() });
-                }
-                Ok(Err(_)) | Err(_) => {}
-            }
+        let independent_cx = if cx.checkpoint().is_ok() {
+            None
+        } else {
+            Some(crate::cx::for_request())
+        };
+        let graceful_cx = independent_cx.as_ref().unwrap_or(cx);
+        let mut terminal_failure = None;
+        let _graceful_result = crate::runtime_async::timeout_with_cx(
+            graceful_cx,
+            WATCHDOG_JOIN_SETTLEMENT_TIMEOUT,
+            self.drain_tasks_with_cx(graceful_cx, &mut terminal_failure),
+        )
+        .await;
+        if self.tasks.settlement() == JoinSetSettlement::Settled {
+            return terminal_failure.map_or(Ok(()), |kind| {
+                Err(WatchdogJoinError::TaskFailed { kind })
+            });
         }
 
-        self.task.abort();
+        self.abort_and_settle().await
+    }
+
+    /// Skip the cooperative grace interval, request abort immediately, and
+    /// retain ownership through the same bounded trusted terminal drain.
+    ///
+    /// This is appropriate for adopted tasks that do not observe the handle's
+    /// shutdown flag/notification directly. The caller Cx is accepted to keep
+    /// authority explicit, but cleanup uses an independent finite context so a
+    /// cancelled parent cannot suppress terminal acknowledgement.
+    pub async fn abort_and_join_with_cx(
+        mut self,
+        _cx: &crate::cx::Cx,
+    ) -> Result<(), WatchdogJoinError> {
+        self.signal_shutdown();
+        self.abort_and_settle().await
+    }
+
+    async fn abort_and_settle(&mut self) -> Result<(), WatchdogJoinError> {
+        self.tasks.abort_all();
         let settlement_cx = crate::cx::for_request();
-        match crate::runtime_async::timeout_with_cx(
+        let mut terminal_failure = None;
+        let settlement_result = crate::runtime_async::timeout_with_cx(
             &settlement_cx,
             WATCHDOG_JOIN_SETTLEMENT_TIMEOUT,
-            &mut self.task,
+            self.drain_tasks_with_cx(&settlement_cx, &mut terminal_failure),
         )
-        .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) if error.kind() == JoinErrorKind::Aborted => Ok(()),
-            Ok(Err(error)) if error.kind() == JoinErrorKind::WakerRegistrationFailed => {
+        .await;
+        match self.tasks.settlement() {
+            JoinSetSettlement::Settled => terminal_failure.map_or(Ok(()), |kind| {
+                Err(WatchdogJoinError::TaskFailed { kind })
+            }),
+            JoinSetSettlement::Incomplete { .. } if settlement_result.is_err() => {
+                Err(WatchdogJoinError::SettlementTimedOut)
+            }
+            JoinSetSettlement::Incomplete { .. } => {
                 Err(WatchdogJoinError::SettlementUnacknowledged)
             }
-            Ok(Err(error)) => Err(WatchdogJoinError::TaskFailed { kind: error.kind() }),
-            Err(_) => Err(WatchdogJoinError::SettlementTimedOut),
+        }
+    }
+
+    async fn drain_tasks_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        terminal_failure: &mut Option<JoinErrorKind>,
+    ) -> Result<(), JoinErrorKind> {
+        loop {
+            match self.tasks.drain_next_with_cx(cx).await {
+                Ok(Some(Ok(()))) => {}
+                Ok(Some(Err(error))) => {
+                    if !matches!(
+                        error.kind(),
+                        JoinErrorKind::Aborted
+                            | JoinErrorKind::ContextCancelled
+                            | JoinErrorKind::WakerRegistrationFailed
+                    ) {
+                        *terminal_failure = Some(error.kind());
+                    }
+                }
+                Ok(None) => return Ok(()),
+                Err(error) => return Err(error.kind()),
+            }
         }
     }
 }
@@ -429,7 +525,20 @@ impl Drop for WatchdogHandle {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
         self.shutdown_notify.notify_waiters();
-        self.task.abort();
+        self.tasks.abort_all();
+        if let JoinSetSettlement::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        } = self.tasks.settlement()
+        {
+            error!(
+                event = "watchdog_handle_dropped_before_settlement",
+                active_tasks,
+                unacknowledged_tasks,
+                orphan_risk = true,
+                "WatchdogHandle dropped without terminal acknowledgement; callers must await join_with_cx"
+            );
+        }
     }
 }
 
@@ -535,8 +644,10 @@ pub fn spawn_watchdog(
         })
     };
 
+    let mut tasks = JoinSet::new();
+    tasks.insert_handle(task);
     WatchdogHandle {
-        task,
+        tasks,
         shutdown: internal_shutdown,
         shutdown_notify: internal_shutdown_notify,
         #[cfg(test)]
@@ -898,95 +1009,119 @@ pub fn spawn_mux_watchdog(
     config: MuxWatchdogConfig,
     wezterm: crate::wezterm::WeztermHandle,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
-) -> JoinHandle<()> {
+) -> WatchdogHandle {
     let check_interval = config.check_interval;
     let failure_threshold = config.failure_threshold;
+    let internal_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let internal_flag = Arc::clone(&internal_shutdown);
+    let shutdown_notify = Arc::new(Notify::new());
+    let task_notify = Arc::clone(&shutdown_notify);
 
-    {
-        task::spawn_with_cx(cx, move |mux_watchdog_cx| async move {
-            let mut watchdog = MuxWatchdog::new(config, wezterm);
+    let task = task::spawn_with_cx(cx, move |mux_watchdog_cx| async move {
+        let mut watchdog = MuxWatchdog::new(config, wezterm);
 
-            info!("Mux watchdog started");
+        info!("Mux watchdog started");
 
-            loop {
-                if shutdown_flag.load(Ordering::SeqCst) {
+        loop {
+            if shutdown_flag.load(Ordering::SeqCst) || internal_flag.load(Ordering::SeqCst) {
+                info!("Mux watchdog shutting down");
+                break;
+            }
+
+            if mux_watchdog_cx.checkpoint().is_err() {
+                info!("Mux watchdog: cancelled via cx");
+                break;
+            }
+
+            let sample = match watchdog.check_cx(&mux_watchdog_cx).await {
+                Ok(sample) => sample,
+                Err(err) => {
+                    info!(error = %err, "Mux watchdog: interrupted during health check");
+                    break;
+                }
+            };
+
+            match sample.status {
+                HealthStatus::Healthy => {
+                    if watchdog.total_checks % 10 == 0 {
+                        info!(
+                            ping_ms = sample.ping_latency_ms,
+                            rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                            warning_count = sample.warning_count,
+                            warning_details = sample.watchdog_warnings.join(" | "),
+                            "Mux watchdog: healthy"
+                        );
+                    }
+                }
+                HealthStatus::Degraded => {
+                    warn!(
+                        consecutive_failures = watchdog.consecutive_failures,
+                        rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                        ping_ok = sample.ping_ok,
+                        warning_count = sample.warning_count,
+                        warning_details = sample.watchdog_warnings.join(" | "),
+                        "Mux watchdog: degraded"
+                    );
+                    crate::degradation::enter_degraded(
+                        crate::degradation::Subsystem::WeztermCli,
+                        format!(
+                            "Mux health degraded: {} consecutive failures, warnings={}",
+                            watchdog.consecutive_failures, sample.warning_count
+                        ),
+                    );
+                }
+                HealthStatus::Critical | HealthStatus::Hung => {
+                    error!(
+                        consecutive_failures = watchdog.consecutive_failures,
+                        rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                        ping_ok = sample.ping_ok,
+                        threshold = failure_threshold,
+                        warning_count = sample.warning_count,
+                        warning_details = sample.watchdog_warnings.join(" | "),
+                        "Mux watchdog: CRITICAL — mux server unresponsive or memory critical"
+                    );
+                    crate::degradation::enter_degraded(
+                        crate::degradation::Subsystem::WeztermCli,
+                        format!(
+                            "Mux health critical: {} consecutive failures, RSS={} MB, warnings={}",
+                            watchdog.consecutive_failures,
+                            sample.rss_bytes.map_or(0, |b| b / (1024 * 1024)),
+                            sample.warning_count
+                        ),
+                    );
+                }
+            }
+
+            use futures::future::{Either, select};
+            let shutdown_wait = std::pin::pin!(task_notify.wait_until(|| {
+                internal_flag.load(Ordering::SeqCst)
+            }));
+            let interval_wait = std::pin::pin!(crate::runtime_async::sleep_with_cx(
+                &mux_watchdog_cx,
+                check_interval,
+            ));
+            match select(shutdown_wait, interval_wait).await {
+                Either::Left(((), _)) => {
                     info!("Mux watchdog shutting down");
                     break;
                 }
-
-                if mux_watchdog_cx.checkpoint().is_err() {
-                    info!("Mux watchdog: cancelled via cx");
-                    break;
-                }
-
-                let sample = match watchdog.check_cx(&mux_watchdog_cx).await {
-                    Ok(sample) => sample,
-                    Err(err) => {
-                        info!(error = %err, "Mux watchdog: interrupted during health check");
-                        break;
-                    }
-                };
-
-                match sample.status {
-                    HealthStatus::Healthy => {
-                        if watchdog.total_checks % 10 == 0 {
-                            info!(
-                                ping_ms = sample.ping_latency_ms,
-                                rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
-                                warning_count = sample.warning_count,
-                                warning_details = sample.watchdog_warnings.join(" | "),
-                                "Mux watchdog: healthy"
-                            );
-                        }
-                    }
-                    HealthStatus::Degraded => {
-                        warn!(
-                            consecutive_failures = watchdog.consecutive_failures,
-                            rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
-                            ping_ok = sample.ping_ok,
-                            warning_count = sample.warning_count,
-                            warning_details = sample.watchdog_warnings.join(" | "),
-                            "Mux watchdog: degraded"
-                        );
-                        crate::degradation::enter_degraded(
-                            crate::degradation::Subsystem::WeztermCli,
-                            format!(
-                                "Mux health degraded: {} consecutive failures, warnings={}",
-                                watchdog.consecutive_failures, sample.warning_count
-                            ),
-                        );
-                    }
-                    HealthStatus::Critical | HealthStatus::Hung => {
-                        error!(
-                            consecutive_failures = watchdog.consecutive_failures,
-                            rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
-                            ping_ok = sample.ping_ok,
-                            threshold = failure_threshold,
-                            warning_count = sample.warning_count,
-                            warning_details = sample.watchdog_warnings.join(" | "),
-                            "Mux watchdog: CRITICAL — mux server unresponsive or memory critical"
-                        );
-                        crate::degradation::enter_degraded(
-                            crate::degradation::Subsystem::WeztermCli,
-                            format!(
-                                "Mux health critical: {} consecutive failures, RSS={} MB, warnings={}",
-                                watchdog.consecutive_failures,
-                                sample.rss_bytes.map_or(0, |b| b / (1024 * 1024)),
-                                sample.warning_count
-                            ),
-                        );
-                    }
-                }
-
-                if crate::runtime_async::sleep_with_cx(&mux_watchdog_cx, check_interval)
-                    .await
-                    .is_err()
-                {
+                Either::Right((Ok(()), _)) => {}
+                Either::Right((Err(_), _)) => {
                     info!("Mux watchdog: cancelled via cx");
                     break;
                 }
             }
-        })
+        }
+    });
+
+    let mut tasks = JoinSet::new();
+    tasks.insert_handle(task);
+    WatchdogHandle {
+        tasks,
+        shutdown: internal_shutdown,
+        shutdown_notify,
+        #[cfg(test)]
+        wait_entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }
 
@@ -1525,9 +1660,10 @@ mod tests {
     }
 
     /// ft-xbnl0.2.3 Cx-first: `join_with_cx` with a pre-cancelled
-    /// cx must retain ownership, abort, and terminally settle the task rather
-    /// than returning by detaching it. The 60-second interval proves shutdown
-    /// does not depend on the ordinary sleep deadline.
+    /// cx must retain ownership and terminally settle the task rather than
+    /// returning by detaching it. The 60-second interval proves the independent
+    /// graceful context plus shutdown notification does not depend on the
+    /// ordinary sleep deadline.
     #[test]
     fn watchdog_join_with_precancelled_cx_returns_quickly() {
         run_async_test(async {
@@ -1564,6 +1700,22 @@ mod tests {
                 elapsed < Duration::from_millis(500),
                 "join_with_cx on cancelled cx should settle quickly, took {elapsed:?}"
             );
+        });
+    }
+
+    #[test]
+    fn watchdog_join_trusted_drains_persistent_registration_failure() {
+        run_async_test(async {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let task = crate::runtime_async::task::spawn(std::future::pending::<()>());
+            let handle = WatchdogHandle::adopt_shutdown_task(task, shutdown);
+            handle.force_registration_failure_for_test();
+            let cx = crate::cx::for_testing();
+
+            handle
+                .join_with_cx(&cx)
+                .await
+                .expect("registration failure must retain, abort, and trusted-drain ownership");
         });
     }
 

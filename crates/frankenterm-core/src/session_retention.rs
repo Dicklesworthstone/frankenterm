@@ -27,6 +27,66 @@ use crate::config::SessionRetentionConfig;
 // the proptest_session_retention.rs proptest) need zero edits.
 pub use frankenterm_core_audit_types::session_retention_types::CleanupResult;
 
+/// Finite phase in which session-cleanup completion became unobservable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCleanupIndeterminatePhase {
+    /// The blocking cleanup task was admitted, but its terminal result was not
+    /// observed. The closure may still be running or may already have committed.
+    BlockingTaskSettlement,
+    /// The cleanup SQL pipeline returned an error after execution began. Earlier
+    /// autocommit statements may already be durable.
+    CleanupExecution,
+}
+
+impl SessionCleanupIndeterminatePhase {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::BlockingTaskSettlement => "blocking_task_settlement",
+            Self::CleanupExecution => "cleanup_execution",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionCleanupIndeterminatePhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+/// Finite asynchronous session-cleanup failure contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SessionCleanupError {
+    /// The caller was already cancelled, proving no blocking cleanup handoff
+    /// was admitted.
+    #[error("session cleanup cancelled before blocking handoff")]
+    CancelledBeforeHandoff,
+    /// SQLite could not open the cleanup connection, so no cleanup SQL ran.
+    #[error("session cleanup database open failed")]
+    DatabaseOpen,
+    /// The cleanup connection could not establish its required PRAGMAs, so the
+    /// cleanup pipeline was not invoked.
+    #[error("session cleanup database preparation failed")]
+    DatabasePreparation,
+    /// Cleanup may have durably changed SQLite state, but no authoritative
+    /// completion receipt is available. Callers must reconcile and must not
+    /// automatically retry.
+    #[error(
+        "session cleanup outcome is indeterminate during {phase}; reconcile durable state before retrying"
+    )]
+    IndeterminateCleanup {
+        /// Finite observation-loss phase; never a database path or SQL string.
+        phase: SessionCleanupIndeterminatePhase,
+    },
+}
+
+impl SessionCleanupError {
+    /// Whether durable state must be reconciled before any retry decision.
+    #[must_use]
+    pub const fn requires_reconciliation(self) -> bool {
+        matches!(self, Self::IndeterminateCleanup { .. })
+    }
+}
+
 /// Run the full session cleanup pipeline.
 ///
 /// Designed to be called from `runtime_async::spawn_blocking` since all
@@ -248,42 +308,85 @@ fn cleanup_orphaned_data(conn: &Connection) -> Result<(usize, usize), rusqlite::
 /// Run cleanup asynchronously via spawn_blocking.
 ///
 /// Convenience wrapper for use from async contexts.
+///
+/// # Errors
+///
+/// Returns the finite [`SessionCleanupError`] contract from
+/// [`cleanup_sessions_async_cx`].
 pub async fn cleanup_sessions_async(
     db_path: Arc<String>,
     config: SessionRetentionConfig,
-) -> Result<CleanupResult, String> {
+) -> Result<CleanupResult, SessionCleanupError> {
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     cleanup_sessions_async_cx(&cx, db_path, config).await
 }
 
 /// Run cleanup asynchronously under an explicit `&Cx` (ft-xbnl0.2.2).
 ///
-/// Cx-first entry point: caller-supplied cancellation is honored at the
-/// boundary before the blocking SQLite work. Once the closure starts, its
-/// transaction may commit; there is deliberately no post-join checkpoint that
-/// could report cancellation after durable cleanup already occurred.
+/// Cx-first entry point: caller-supplied cancellation is honored before the
+/// blocking handoff. After admission, cancellation, executor failure, or result
+/// loss is reported as [`SessionCleanupError::IndeterminateCleanup`], because
+/// the SQLite pipeline may still be running or may already have committed.
+///
+/// # Errors
+///
+/// Returns a finite [`SessionCleanupError`]. In particular, an indeterminate
+/// result requires durable-state reconciliation and is never retry-safe merely
+/// because the async join did not produce a receipt.
 pub async fn cleanup_sessions_async_cx(
     cx: &crate::cx::Cx,
     db_path: Arc<String>,
     config: SessionRetentionConfig,
-) -> Result<CleanupResult, String> {
+) -> Result<CleanupResult, SessionCleanupError> {
     // Honor caller cancellation before we hand work off to the blocking pool.
     cx.checkpoint()
-        .map_err(|_| "session cleanup cancelled before blocking handoff".to_string())?;
+        .map_err(|_| SessionCleanupError::CancelledBeforeHandoff)?;
 
-    let outcome = crate::runtime_async::spawn_blocking(move || {
-        let conn = Connection::open(db_path.as_str())
-            .map_err(|e| format!("Failed to open database: {e}"))?;
+    let outcome = crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+        let conn = Connection::open(db_path.as_str()).map_err(|error| {
+            warn!(error = %error, "session cleanup database open failed");
+            SessionCleanupError::DatabaseOpen
+        })?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
         )
-        .map_err(|e| format!("Failed to set PRAGMAs: {e}"))?;
-        cleanup_sessions(&conn, &config).map_err(|e| format!("Cleanup failed: {e}"))
+        .map_err(|error| {
+            warn!(error = %error, "session cleanup database preparation failed");
+            SessionCleanupError::DatabasePreparation
+        })?;
+        cleanup_sessions(&conn, &config).map_err(|error| {
+            // The cleanup pipeline currently performs several autocommit
+            // statements. Any earlier step may be durable when a later step
+            // fails, so a generic database error would fabricate retry safety.
+            warn!(error = %error, "session cleanup execution outcome is indeterminate");
+            SessionCleanupError::IndeterminateCleanup {
+                phase: SessionCleanupIndeterminatePhase::CleanupExecution,
+            }
+        })
     })
-    .await
-    .map_err(|e| format!("Task join error: {e}"))?;
+    .await;
 
-    outcome
+    match outcome {
+        Ok(result) => result,
+        Err(error) => Err(classify_session_cleanup_blocking_failure(error)),
+    }
+}
+
+fn classify_session_cleanup_blocking_failure(
+    error: crate::runtime_async::SpawnBlockingWithCxError,
+) -> SessionCleanupError {
+    match error {
+        crate::runtime_async::SpawnBlockingWithCxError::CancelledBeforeSpawn { .. } => {
+            SessionCleanupError::CancelledBeforeHandoff
+        }
+        crate::runtime_async::SpawnBlockingWithCxError::CancelledMidFlight { .. }
+        | crate::runtime_async::SpawnBlockingWithCxError::RuntimeFailure
+        | crate::runtime_async::SpawnBlockingWithCxError::CancellationWatcherTimerFailure => {
+            SessionCleanupError::IndeterminateCleanup {
+                phase: SessionCleanupIndeterminatePhase::BlockingTaskSettlement,
+            }
+        }
+    }
 }
 
 /// Get current epoch time in milliseconds.
@@ -336,17 +439,13 @@ mod tests {
                 let config = SessionRetentionConfig::default();
                 let result = cleanup_sessions_async_cx(&cx, bad_db, config).await;
                 match result {
-                    Err(msg) => {
-                        // Either Failed to open database or Cleanup failed — both
-                        // prove the Cx-first plumbing ran end to end without
-                        // deadlocking or burning real time.
-                        assert!(
-                            msg.contains("Failed to open database")
-                                || msg.contains("Cleanup failed"),
-                            "unexpected error surface: {msg}"
-                        );
+                    Err(SessionCleanupError::DatabaseOpen) => {
+                        // The finite open failure proves the Cx-first plumbing
+                        // ran end to end without deadlocking or burning real
+                        // time, while keeping the path out of the error surface.
                         observed_error_task.store(true, Ordering::SeqCst);
                     }
+                    Err(other) => panic!("unexpected error surface: {other}"),
                     Ok(_) => panic!("expected an error from nonexistent DB"),
                 }
             })
@@ -368,6 +467,51 @@ mod tests {
             wall_start.elapsed() < std::time::Duration::from_secs(2),
             "Cx-first cleanup must not burn real time; elapsed {:?}",
             wall_start.elapsed()
+        );
+    }
+
+    #[test]
+    fn blocking_settlement_classifier_never_fabricates_retry_safety() {
+        use crate::runtime_async::SpawnBlockingWithCxError;
+
+        let not_admitted = classify_session_cleanup_blocking_failure(
+            SpawnBlockingWithCxError::CancelledBeforeSpawn { kind: None },
+        );
+        assert_eq!(
+            not_admitted,
+            SessionCleanupError::CancelledBeforeHandoff
+        );
+        assert!(!not_admitted.requires_reconciliation());
+
+        let observation_losses = [
+            SpawnBlockingWithCxError::CancelledMidFlight { kind: None },
+            SpawnBlockingWithCxError::RuntimeFailure,
+            SpawnBlockingWithCxError::CancellationWatcherTimerFailure,
+        ];
+        for failure in observation_losses {
+            let classified = classify_session_cleanup_blocking_failure(failure);
+            assert_eq!(
+                classified,
+                SessionCleanupError::IndeterminateCleanup {
+                    phase: SessionCleanupIndeterminatePhase::BlockingTaskSettlement,
+                }
+            );
+            assert!(classified.requires_reconciliation());
+            let message = classified.to_string();
+            assert!(message.contains("reconcile durable state"));
+            assert!(!message.contains("None"));
+        }
+    }
+
+    #[test]
+    fn cleanup_execution_failure_is_content_free_and_requires_reconciliation() {
+        let error = SessionCleanupError::IndeterminateCleanup {
+            phase: SessionCleanupIndeterminatePhase::CleanupExecution,
+        };
+        assert!(error.requires_reconciliation());
+        assert_eq!(
+            error.to_string(),
+            "session cleanup outcome is indeterminate during cleanup_execution; reconcile durable state before retrying"
         );
     }
 

@@ -18,7 +18,7 @@ use crate::events::EventBus;
 use crate::runtime::RuntimeHandle;
 use crate::runtime_async::io::AsyncWriteExt;
 use crate::runtime_async::net::{TcpListener, TcpStream};
-use crate::runtime_async::task::JoinHandle;
+use crate::runtime_async::task::{JoinErrorKind, JoinSet, JoinSetSettlement};
 use tracing::{debug, warn};
 
 /// Boxed future for async trait-like APIs without additional dependencies.
@@ -386,8 +386,9 @@ impl MetricsCollector for FixedMetricsCollector {
 }
 
 /// Metrics server handle.
+#[must_use = "metrics server handles must be joined to prove terminal settlement"]
 pub struct MetricsServerHandle {
-    join: JoinHandle<()>,
+    task: crate::watchdog::WatchdogHandle,
     local_addr: SocketAddr,
 }
 
@@ -404,19 +405,105 @@ impl MetricsServerHandle {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`wait`].
     ///
-    /// Awaits the server task only if the cx is not already
-    /// cancelled. Unlike the watchdog's `join_with_cx` this
-    /// method cannot signal shutdown — the metrics server's
-    /// shutdown flag is owned by the caller, not the handle.
-    /// A cx-cancelled caller returns immediately but must still
-    /// flip the external `shutdown_flag` to make the background
-    /// task exit.
+    /// Signals the server's shared shutdown flag and retains task ownership
+    /// through graceful completion or bounded abort settlement. A pre-cancelled
+    /// caller is given an independent bounded cleanup context and cannot detach
+    /// the accept loop.
     pub async fn wait_with_cx(self, cx: &crate::cx::Cx) {
-        if cx.checkpoint().is_err() {
-            return;
+        if let Err(error) = self.task.join_with_cx(cx).await {
+            warn!(
+                error = %error,
+                "Metrics server task did not reach clean terminal settlement"
+            );
         }
-        let _ = self.join.await;
     }
+}
+
+const METRICS_CONNECTION_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetricsConnectionTaskDrainOutcome {
+    Settled,
+    TimedOut {
+        active_tasks: usize,
+        unacknowledged_tasks: usize,
+    },
+    Incomplete {
+        active_tasks: usize,
+        unacknowledged_tasks: usize,
+    },
+}
+
+fn classify_metrics_connection_task_drain(
+    timed_out: bool,
+    settlement: JoinSetSettlement,
+) -> MetricsConnectionTaskDrainOutcome {
+    match settlement {
+        JoinSetSettlement::Settled => MetricsConnectionTaskDrainOutcome::Settled,
+        JoinSetSettlement::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        } if timed_out => MetricsConnectionTaskDrainOutcome::TimedOut {
+            active_tasks,
+            unacknowledged_tasks,
+        },
+        JoinSetSettlement::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        } => MetricsConnectionTaskDrainOutcome::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        },
+    }
+}
+
+async fn settle_metrics_connection_tasks(
+    connection_tasks: &mut JoinSet<()>,
+) -> MetricsConnectionTaskDrainOutcome {
+    connection_tasks.abort_all();
+    let drain_cx = crate::cx::for_request();
+    let drain_result = crate::runtime_async::timeout_with_cx(
+        &drain_cx,
+        METRICS_CONNECTION_TASK_DRAIN_TIMEOUT,
+        async {
+            loop {
+                match connection_tasks.drain_next_with_cx(&drain_cx).await {
+                    Ok(Some(Ok(()))) => {}
+                    Ok(Some(Err(error))) => {
+                        if matches!(
+                            error.kind(),
+                            JoinErrorKind::Aborted
+                                | JoinErrorKind::ContextCancelled
+                                | JoinErrorKind::WakerRegistrationFailed
+                        ) {
+                            debug!(
+                                failure_class = ?error.kind(),
+                                "Metrics connection task stopped during server shutdown"
+                            );
+                        } else {
+                            warn!(
+                                failure_class = ?error.kind(),
+                                "Metrics connection task failed during server shutdown"
+                            );
+                        }
+                    }
+                    Ok(None) => return Ok(()),
+                    Err(drain_error) => return Err(drain_error),
+                }
+            }
+        },
+    )
+    .await;
+    if let Ok(Err(drain_error)) = &drain_result {
+        warn!(
+            failure_class = ?drain_error.kind(),
+            "Metrics connection task drain context failed before terminal settlement"
+        );
+    }
+    classify_metrics_connection_task_drain(
+        drain_result.is_err(),
+        connection_tasks.settlement(),
+    )
 }
 
 /// Minimal Prometheus metrics server.
@@ -505,10 +592,21 @@ impl MetricsServer {
         let local_addr = listener.local_addr()?;
         let prefix = sanitize_prefix(&self.prefix);
         let collector = Arc::clone(&self.collector);
+        let handle_shutdown_flag = Arc::clone(&self.shutdown_flag);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let join = crate::runtime_async::task::spawn_with_cx(cx, move |accept_cx| async move {
             let accept_poll_interval = Duration::from_millis(250);
+            let mut connection_tasks = JoinSet::new();
             loop {
+                while let Some(join_result) = connection_tasks.try_join_next() {
+                    if let Err(error) = join_result {
+                        warn!(
+                            failure_class = ?error.kind(),
+                            "Metrics connection task failed"
+                        );
+                    }
+                }
+
                 if shutdown_flag.load(Ordering::SeqCst) || accept_cx.is_cancel_requested() {
                     break;
                 }
@@ -521,9 +619,15 @@ impl MetricsServer {
                 .await
                 {
                     Ok(Ok((socket, peer))) => {
+                        if shutdown_flag.load(Ordering::SeqCst)
+                            || accept_cx.checkpoint().is_err()
+                        {
+                            drop(socket);
+                            break;
+                        }
                         let collector = Arc::clone(&collector);
                         let prefix = prefix.clone();
-                        crate::runtime_async::task::spawn_with_cx(
+                        connection_tasks.spawn_with_cx(
                             &accept_cx,
                             move |conn_cx| async move {
                                 if let Err(err) =
@@ -545,9 +649,45 @@ impl MetricsServer {
                     Err(_) => {}
                 }
             }
+
+            match settle_metrics_connection_tasks(&mut connection_tasks).await {
+                MetricsConnectionTaskDrainOutcome::Settled => {}
+                MetricsConnectionTaskDrainOutcome::TimedOut {
+                    active_tasks,
+                    unacknowledged_tasks,
+                } => {
+                    warn!(
+                        event = "metrics_connection_task_drain_timeout",
+                        active_tasks,
+                        unacknowledged_tasks,
+                        remaining_tasks = connection_tasks.len(),
+                        orphan_risk = true,
+                        "Metrics connection tasks missed bounded terminal settlement"
+                    );
+                }
+                MetricsConnectionTaskDrainOutcome::Incomplete {
+                    active_tasks,
+                    unacknowledged_tasks,
+                } => {
+                    warn!(
+                        event = "metrics_connection_task_settlement_incomplete",
+                        active_tasks,
+                        unacknowledged_tasks,
+                        remaining_tasks = connection_tasks.len(),
+                        orphan_risk = true,
+                        "Metrics connection task drain ended without terminal settlement"
+                    );
+                }
+            }
         });
 
-        Ok(MetricsServerHandle { join, local_addr })
+        Ok(MetricsServerHandle {
+            task: crate::watchdog::WatchdogHandle::adopt_shutdown_task(
+                join,
+                handle_shutdown_flag,
+            ),
+            local_addr,
+        })
     }
 }
 
@@ -849,6 +989,27 @@ fn escape_prometheus_label_value(value: &str) -> String {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
+
+    #[test]
+    fn metrics_connection_drain_truth_gives_settlement_precedence() {
+        assert_eq!(
+            classify_metrics_connection_task_drain(true, JoinSetSettlement::Settled),
+            MetricsConnectionTaskDrainOutcome::Settled,
+        );
+        assert_eq!(
+            classify_metrics_connection_task_drain(
+                true,
+                JoinSetSettlement::Incomplete {
+                    active_tasks: 2,
+                    unacknowledged_tasks: 1,
+                },
+            ),
+            MetricsConnectionTaskDrainOutcome::TimedOut {
+                active_tasks: 2,
+                unacknowledged_tasks: 1,
+            },
+        );
+    }
 
     // -----------------------------------------------------------------------
     // MetricsSnapshot defaults
@@ -1379,6 +1540,22 @@ mod tests {
     }
 
     #[test]
+    fn metrics_connection_drain_trusted_polls_registration_failure_to_settlement() {
+        run_async_test(async {
+            let mut connection_tasks = JoinSet::new();
+            connection_tasks.spawn(std::future::pending::<()>());
+            connection_tasks.force_join_registration_failure_for_test();
+
+            assert_eq!(
+                settle_metrics_connection_tasks(&mut connection_tasks).await,
+                MetricsConnectionTaskDrainOutcome::Settled,
+                "forced caller-waker registration failure must retain and trusted-drain the aborted connection task",
+            );
+            assert_eq!(connection_tasks.settlement(), JoinSetSettlement::Settled);
+        });
+    }
+
+    #[test]
     fn render_prometheus_includes_prefix() {
         run_async_test(async {
             let snapshot = MetricsSnapshot {
@@ -1609,12 +1786,9 @@ mod tests {
         });
     }
 
-    /// ft-xbnl0.2.3 Cx-first: `wait_with_cx` must return
-    /// quickly on a pre-cancelled cx, even if the server task
-    /// is still running. The caller is responsible for flipping
-    /// the shutdown flag to make the task exit; the handle
-    /// method only decouples the caller's blocking wait from
-    /// the task's eventual shutdown.
+    /// A pre-cancelled waiter must still signal shutdown and retain ownership
+    /// until the accept loop acknowledges terminal settlement. Returning early
+    /// by dropping the join handle would silently detach a live listener.
     #[test]
     fn metrics_server_wait_with_precancelled_cx_returns_quickly() {
         run_async_test(async {
@@ -1636,11 +1810,13 @@ mod tests {
 
             assert!(
                 elapsed < Duration::from_millis(500),
-                "wait_with_cx on cancelled cx should return quickly, took {elapsed:?}"
+                "wait_with_cx on cancelled cx should settle quickly, took {elapsed:?}"
             );
 
-            // Caller's responsibility to stop the background task.
-            shutdown_flag.store(true, Ordering::SeqCst);
+            assert!(
+                shutdown_flag.load(Ordering::SeqCst),
+                "wait_with_cx must signal the shared shutdown flag before joining"
+            );
         });
     }
 
