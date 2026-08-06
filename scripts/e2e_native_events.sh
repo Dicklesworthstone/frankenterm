@@ -30,6 +30,9 @@ fi
 
 set -euo pipefail
 umask 077
+SANITIZED_PATH=/usr/bin:/bin:/usr/sbin:/sbin
+PATH=$SANITIZED_PATH
+export PATH
 
 if [ "${FRANKENTERM_ALLOW_GUI_E2E:-}" != "1" ]; then
     echo "refusing to launch FrankenTerm GUI without FRANKENTERM_ALLOW_GUI_E2E=1" >&2
@@ -152,7 +155,7 @@ hash_file() {
 
 verify_atomic_candidate_root() {
     env -i \
-        "PATH=${PATH:-/usr/bin:/bin}" \
+        "PATH=$SANITIZED_PATH" \
         "LANG=${LANG:-C}" \
         "HOME=$LOG_DIR" \
         "TMPDIR=$LOG_DIR" \
@@ -164,7 +167,7 @@ verify_atomic_candidate_root() {
 
 verify_candidate_manifest_contract() {
     env -i \
-        "PATH=${PATH:-/usr/bin:/bin}" \
+        "PATH=$SANITIZED_PATH" \
         "LANG=${LANG:-C}" \
         "HOME=$LOG_DIR" \
         "TMPDIR=$LOG_DIR" \
@@ -393,7 +396,7 @@ mkdir -m 700 \
 } >"$CONFIG_PATH"
 
 BASE_HERMETIC_ENV=(
-    "PATH=${PATH:-/usr/bin:/bin}"
+    "PATH=$SANITIZED_PATH"
     "LANG=${LANG:-C}"
     "HOME=$HERMETIC_HOME"
     "XDG_CONFIG_HOME=$HERMETIC_XDG_CONFIG_HOME"

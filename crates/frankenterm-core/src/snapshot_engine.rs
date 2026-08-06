@@ -873,6 +873,17 @@ impl SnapshotEngine {
                 .read_with_cx(cx)
                 .await
                 .map_err(snapshot_lock_error)?;
+            if self
+                .snapshot_authority_reconciliation_required
+                .load(Ordering::Acquire)
+                || self
+                    .session_cleanup_reconciliation_required
+                    .load(Ordering::Acquire)
+            {
+                return Err(SnapshotError::AuthorityReconciliationRequired {
+                    operation: SnapshotAuthorityOperation::CheckpointCommit,
+                });
+            }
             if last.as_deref() == Some(&state_hash) {
                 saturating_telemetry_add(&self.telemetry.dedup_skips, 1);
                 capture_guard.complete_without_error();
@@ -1854,6 +1865,21 @@ impl SnapshotEngine {
                 .map_err(snapshot_lock_error)?
                 .clone()
         };
+        // The read may have waited behind a first capture. That capture can
+        // lose its result, latch reconciliation, and release the session lock
+        // without publishing an ID, so recheck before treating `None` as an
+        // authoritative no-op.
+        if self
+            .snapshot_authority_reconciliation_required
+            .load(Ordering::Acquire)
+            || self
+                .session_cleanup_reconciliation_required
+                .load(Ordering::Acquire)
+        {
+            return Err(SnapshotError::AuthorityReconciliationRequired {
+                operation: SnapshotAuthorityOperation::ShutdownMark,
+            });
+        }
         if let Some(id) = session_id {
             let db_path = Arc::clone(&self.db_path);
             self.spawn_blocking_authority_with_cx(

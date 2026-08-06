@@ -10013,10 +10013,31 @@ impl RuntimeHandle {
             }
         }
 
+        // These are point-in-time observations, not inferred values. In
+        // particular, an unclean join or flush must not claim that either
+        // queue is empty merely because shutdown has reached its summary
+        // phase. `capture_queue_depth` is the aggregate ingress/ring/in-flight
+        // observation maintained by the relay and persistence tasks;
+        // `write_queue_depth` reads the storage writer's live bounded channel.
+        let final_capture_queue = self.capture_queue_depth();
+        let final_write_queue = self.storage.write_queue_depth();
+        if final_capture_queue > 0 {
+            warnings.push(format!(
+                "Shutdown ended with {final_capture_queue} capture queue item(s) still observed"
+            ));
+            clean = false;
+        }
+        if final_write_queue > 0 {
+            warnings.push(format!(
+                "Shutdown ended with {final_write_queue} storage write queue item(s) still observed"
+            ));
+            clean = false;
+        }
+
         ShutdownSummary {
             elapsed_secs,
-            final_capture_queue: 0, // Channel is consumed
-            final_write_queue: 0,
+            final_capture_queue,
+            final_write_queue,
             segments_persisted,
             events_recorded,
             last_seq_by_pane,
@@ -13631,6 +13652,10 @@ mod tests {
         run_async_test_isolated(|| async {
             let (_dir, handle, dropped) =
                 runtime_handle_with_stubborn_tasks(Duration::from_millis(300)).await;
+            // Pin a non-zero aggregate queue observation. The synthetic
+            // stubborn tasks do not mutate runtime metrics, so shutdown must
+            // preserve this observed depth rather than manufacture zero.
+            handle.metrics.record_capture_queue_depth(7);
 
             let started = Instant::now();
             let summary = handle
@@ -13641,6 +13666,17 @@ mod tests {
             assert!(
                 !summary.clean,
                 "stubborn tasks should make shutdown summary unclean"
+            );
+            assert_eq!(
+                summary.final_capture_queue, 7,
+                "shutdown summary must report the observed capture queue depth"
+            );
+            assert!(
+                summary.warnings.iter().any(|warning| {
+                    warning.contains("7 capture queue item(s) still observed")
+                }),
+                "non-zero terminal capture depth must remain operator-visible: {:?}",
+                summary.warnings
             );
             assert!(
                 summary
