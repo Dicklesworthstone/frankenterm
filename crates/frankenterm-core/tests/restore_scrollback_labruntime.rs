@@ -42,11 +42,10 @@ fn inject_single_pane_fails_closed() {
         let mut scrollbacks = HashMap::new();
         scrollbacks.insert(1, mock_scrollback(vec!["line1", "line2", "line3"]));
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
-
-        assert_eq!(report.success_count(), 0);
-        assert_eq!(report.failure_count(), 0);
-        assert_eq!(report.skipped, vec![1]);
+        injector
+            .inject(&pane_id_map, &scrollbacks)
+            .await
+            .expect_err("mapped replay must report the unsupported safe-output channel");
 
         let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
         assert!(text.is_empty());
@@ -74,11 +73,10 @@ fn inject_multiple_panes() {
         scrollbacks.insert(1, mock_scrollback(vec!["pane1-output"]));
         scrollbacks.insert(2, mock_scrollback(vec!["pane2-output"]));
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
-
-        assert_eq!(report.success_count(), 0);
-        assert_eq!(report.failure_count(), 0);
-        assert_eq!(report.skipped, vec![1, 2]);
+        injector
+            .inject(&pane_id_map, &scrollbacks)
+            .await
+            .expect_err("mapped replay must report the unsupported safe-output channel");
     });
 }
 
@@ -98,7 +96,7 @@ fn inject_skips_unmapped_panes() {
         let mut scrollbacks = HashMap::new();
         scrollbacks.insert(1, mock_scrollback(vec!["data"]));
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
+        let report = injector.inject(&pane_id_map, &scrollbacks).await.unwrap();
 
         assert_eq!(report.success_count(), 0);
         assert_eq!(report.skipped.len(), 1);
@@ -124,10 +122,10 @@ fn inject_empty_scrollback() {
         let mut scrollbacks = HashMap::new();
         scrollbacks.insert(1, ScrollbackData::from_terminal_lines(vec![]));
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
-
-        assert_eq!(report.success_count(), 0);
-        assert_eq!(report.skipped, vec![1]);
+        injector
+            .inject(&pane_id_map, &scrollbacks)
+            .await
+            .expect_err("mapped empty replay still requires a safe output channel");
     });
 }
 
@@ -154,10 +152,10 @@ fn inject_large_scrollback_does_not_write() {
         let mut scrollbacks = HashMap::new();
         scrollbacks.insert(1, ScrollbackData::from_terminal_lines(lines));
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
-
-        assert_eq!(report.success_count(), 0);
-        assert_eq!(report.skipped, vec![1]);
+        injector
+            .inject(&pane_id_map, &scrollbacks)
+            .await
+            .expect_err("large mapped replay must fail before allocating replay content");
 
         let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
         assert!(text.is_empty());
@@ -178,7 +176,7 @@ fn inject_no_scrollbacks() {
         let pane_id_map = HashMap::new();
         let scrollbacks = HashMap::new();
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
+        let report = injector.inject(&pane_id_map, &scrollbacks).await.unwrap();
 
         assert_eq!(report.success_count(), 0);
         assert_eq!(report.failure_count(), 0);
@@ -191,7 +189,7 @@ fn inject_no_scrollbacks() {
 // ===========================================================================
 
 #[test]
-fn injection_guard_active_during_inject() {
+fn unsupported_injection_does_not_change_suppression_state() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let mock = Arc::new(MockWezterm::new());
@@ -207,10 +205,10 @@ fn injection_guard_active_during_inject() {
         let mut scrollbacks = HashMap::new();
         scrollbacks.insert(1, mock_scrollback(vec!["test"]));
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
-
-        assert_eq!(report.success_count(), 0);
-        assert_eq!(report.skipped, vec![1]);
+        injector
+            .inject(&pane_id_map, &scrollbacks)
+            .await
+            .expect_err("mapped replay must fail closed");
         assert!(!InjectionGuard::is_suppressed(&suppressed, 10));
     });
 }
@@ -243,10 +241,10 @@ fn chunk_settings_cannot_reenable_pty_replay() {
             ]),
         );
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
-
-        assert_eq!(report.success_count(), 0);
-        assert_eq!(report.skipped, vec![1]);
+        injector
+            .inject(&pane_id_map, &scrollbacks)
+            .await
+            .expect_err("chunk settings must not re-enable PTY replay");
 
         let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
         assert!(text.is_empty());

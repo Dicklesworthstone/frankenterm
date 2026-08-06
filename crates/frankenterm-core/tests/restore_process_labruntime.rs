@@ -12,26 +12,19 @@ use std::sync::Arc;
 
 use common::fixtures::RuntimeFixture;
 use frankenterm_core::restore_process::{LaunchAction, LaunchConfig, ProcessLauncher, ProcessPlan};
-use frankenterm_core::wezterm::{MockWezterm, WeztermHandle};
-
-async fn mock_with_panes(pane_ids: &[u64]) -> WeztermHandle {
-    let mock = MockWezterm::new();
-    for &id in pane_ids {
-        mock.add_default_pane(id).await;
-    }
-    Arc::new(mock) as WeztermHandle
-}
+use frankenterm_core::wezterm::MockWezterm;
 
 // ===========================================================================
-// 1. execute_shell_launch
+// 1. execute_shell_launch_is_refused_without_pty_input
 // ===========================================================================
 
 #[test]
-fn execute_shell_launch() {
+fn execute_shell_launch_is_refused_without_pty_input() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let wez = mock_with_panes(&[100]).await;
-        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+        let mock = Arc::new(MockWezterm::new());
+        mock.add_default_pane(100).await;
+        let launcher = ProcessLauncher::new(LaunchConfig::default());
         let plans = vec![ProcessPlan {
             old_pane_id: 1,
             new_pane_id: 100,
@@ -42,9 +35,11 @@ fn execute_shell_launch() {
             state_warning: None,
         }];
 
-        let report = launcher.execute(&plans).await;
-        assert_eq!(report.shells_launched, 1);
-        assert_eq!(report.failed, 0);
+        let report = launcher.execute(&plans);
+        assert_eq!(report.shells_launched, 0);
+        assert_eq!(report.failed, 1);
+        assert!(!report.results[0].success);
+        assert_eq!(mock.pane_state(100).await.unwrap().content, "");
     });
 }
 
@@ -56,15 +51,14 @@ fn execute_shell_launch() {
 fn execute_mixed_plan() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let wez = mock_with_panes(&[100, 200, 300]).await;
-        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+        let launcher = ProcessLauncher::new(LaunchConfig::default());
         let plans = vec![
             ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 100,
                 action: LaunchAction::LaunchShell {
-                    shell: "zsh".into(),
-                    cwd: PathBuf::from("/project"),
+                    shell: "secret-shell".into(),
+                    cwd: PathBuf::from("/secret/project"),
                 },
                 state_warning: None,
             },
@@ -72,7 +66,7 @@ fn execute_mixed_plan() {
                 old_pane_id: 2,
                 new_pane_id: 200,
                 action: LaunchAction::Skip {
-                    reason: "no process info".into(),
+                    reason: "secret-skip-reason".into(),
                 },
                 state_warning: None,
             },
@@ -80,19 +74,21 @@ fn execute_mixed_plan() {
                 old_pane_id: 3,
                 new_pane_id: 300,
                 action: LaunchAction::Manual {
-                    hint: "Was running vim".into(),
-                    original_process: "vim".into(),
+                    hint: "secret-manual-hint".into(),
+                    original_process: "secret-process".into(),
                 },
                 state_warning: None,
             },
         ];
 
-        let report = launcher.execute(&plans).await;
-        assert_eq!(report.shells_launched, 1);
+        let report = launcher.execute(&plans);
+        assert_eq!(report.shells_launched, 0);
         assert_eq!(report.skipped, 1);
         assert_eq!(report.manual, 1);
-        assert_eq!(report.failed, 0);
+        assert_eq!(report.failed, 1);
         assert_eq!(report.results.len(), 3);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("secret"));
     });
 }
 
@@ -104,9 +100,8 @@ fn execute_mixed_plan() {
 fn execute_empty_plans() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let wez = mock_with_panes(&[]).await;
-        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
-        let report = launcher.execute(&[]).await;
+        let launcher = ProcessLauncher::new(LaunchConfig::default());
+        let report = launcher.execute(&[]);
         assert_eq!(report.results.len(), 0);
         assert_eq!(report.shells_launched, 0);
         assert_eq!(report.failed, 0);
@@ -121,8 +116,7 @@ fn execute_empty_plans() {
 fn execute_skip_only() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let wez = mock_with_panes(&[]).await;
-        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+        let launcher = ProcessLauncher::new(LaunchConfig::default());
         let plans = vec![
             ProcessPlan {
                 old_pane_id: 1,
@@ -141,7 +135,7 @@ fn execute_skip_only() {
                 state_warning: None,
             },
         ];
-        let report = launcher.execute(&plans).await;
+        let report = launcher.execute(&plans);
         assert_eq!(report.skipped, 2);
         assert_eq!(report.shells_launched, 0);
         assert_eq!(report.agents_launched, 0);
@@ -158,8 +152,7 @@ fn execute_skip_only() {
 fn execute_manual_only() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let wez = mock_with_panes(&[]).await;
-        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+        let launcher = ProcessLauncher::new(LaunchConfig::default());
         let plans = vec![ProcessPlan {
             old_pane_id: 1,
             new_pane_id: 100,
@@ -169,7 +162,7 @@ fn execute_manual_only() {
             },
             state_warning: None,
         }];
-        let report = launcher.execute(&plans).await;
+        let report = launcher.execute(&plans);
         assert_eq!(report.manual, 1);
         assert_eq!(report.shells_launched, 0);
         assert!(report.results[0].success);
@@ -177,29 +170,33 @@ fn execute_manual_only() {
 }
 
 // ===========================================================================
-// 6. execute_agent_launch
+// 6. execute_legacy_agent_plan_is_refused
 // ===========================================================================
 
 #[test]
-fn execute_agent_launch() {
+fn execute_legacy_agent_plan_is_refused() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let wez = mock_with_panes(&[100]).await;
-        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+        let mock = Arc::new(MockWezterm::new());
+        mock.add_default_pane(100).await;
+        let launcher = ProcessLauncher::new(LaunchConfig::default());
         let plans = vec![ProcessPlan {
             old_pane_id: 1,
             new_pane_id: 100,
             action: LaunchAction::LaunchAgent {
-                command: "cd /proj && claude".into(),
-                cwd: PathBuf::from("/proj"),
-                agent_type: "claude_code".into(),
+                command: "secret-agent-command".into(),
+                cwd: PathBuf::from("/secret/agent/path"),
+                agent_type: "secret-agent-type".into(),
             },
-            state_warning: Some("new session warning".into()),
+            state_warning: Some("secret-state-warning".into()),
         }];
-        let report = launcher.execute(&plans).await;
-        assert_eq!(report.agents_launched, 1);
-        assert_eq!(report.failed, 0);
-        assert!(report.results[0].success);
+        let report = launcher.execute(&plans);
+        assert_eq!(report.agents_launched, 0);
+        assert_eq!(report.failed, 1);
+        assert!(!report.results[0].success);
+        assert_eq!(mock.pane_state(100).await.unwrap().content, "");
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("secret"));
     });
 }
 
@@ -211,14 +208,7 @@ fn execute_agent_launch() {
 fn execute_report_result_order_preserved() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let wez = mock_with_panes(&[100, 200]).await;
-        let launcher = ProcessLauncher::new(
-            wez,
-            LaunchConfig {
-                launch_delay_ms: 0,
-                ..Default::default()
-            },
-        );
+        let launcher = ProcessLauncher::new(LaunchConfig::default());
         let plans = vec![
             ProcessPlan {
                 old_pane_id: 1,
@@ -238,7 +228,7 @@ fn execute_report_result_order_preserved() {
                 state_warning: None,
             },
         ];
-        let report = launcher.execute(&plans).await;
+        let report = launcher.execute(&plans);
         assert_eq!(report.results[0].old_pane_id, 1);
         assert_eq!(report.results[1].old_pane_id, 2);
     });

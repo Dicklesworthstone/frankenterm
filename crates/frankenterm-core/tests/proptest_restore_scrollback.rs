@@ -120,7 +120,7 @@ proptest! {
     fn prop_from_terminal_lines_byte_count(segments in arb_segments()) {
         let expected_bytes: usize = segments.iter().map(|s| s.len()).sum();
         let data = ScrollbackData::from_terminal_lines(segments.clone());
-        prop_assert_eq!(data.total_bytes, expected_bytes);
+        prop_assert_eq!(data.total_bytes(), expected_bytes);
         prop_assert_eq!(data.lines.len(), segments.len());
     }
 
@@ -128,7 +128,7 @@ proptest! {
     #[test]
     fn prop_from_terminal_lines_empty(_dummy in 0..1_u8) {
         let data = ScrollbackData::from_terminal_lines(vec![]);
-        prop_assert_eq!(data.total_bytes, 0);
+        prop_assert_eq!(data.total_bytes(), 0);
         prop_assert!(data.lines.is_empty());
     }
 
@@ -159,7 +159,7 @@ proptest! {
         data2.truncate(max);
         data2.truncate(max); // second truncation
         prop_assert_eq!(&data1.lines, &data2.lines);
-        prop_assert_eq!(data1.total_bytes, data2.total_bytes);
+        prop_assert_eq!(data1.total_bytes(), data2.total_bytes());
     }
 
     /// truncate doesn't change data when max >= line count.
@@ -167,10 +167,10 @@ proptest! {
     fn prop_truncate_noop_when_within_limit(segments in arb_segments()) {
         let max = segments.len() + 10;
         let mut data = ScrollbackData::from_terminal_lines(segments.clone());
-        let original_bytes = data.total_bytes;
+        let original_bytes = data.total_bytes();
         data.truncate(max);
         prop_assert_eq!(data.lines.len(), segments.len());
-        prop_assert_eq!(data.total_bytes, original_bytes);
+        prop_assert_eq!(data.total_bytes(), original_bytes);
     }
 
     /// truncate updates total_bytes correctly.
@@ -179,7 +179,7 @@ proptest! {
         let mut data = ScrollbackData::from_terminal_lines(segments);
         data.truncate(max);
         let recalculated: usize = data.lines.iter().map(|s| s.len()).sum();
-        prop_assert_eq!(data.total_bytes, recalculated);
+        prop_assert_eq!(data.total_bytes(), recalculated);
     }
 }
 
@@ -361,7 +361,7 @@ proptest! {
     fn prop_single_line(content in "[A-Za-z0-9]{1,200}") {
         let data = ScrollbackData::from_terminal_lines(vec![content.clone()]);
         prop_assert_eq!(data.lines.len(), 1);
-        prop_assert_eq!(data.total_bytes, content.len());
+        prop_assert_eq!(data.total_bytes(), content.len());
         prop_assert_eq!(&data.lines[0], &content);
     }
 
@@ -371,7 +371,7 @@ proptest! {
         let mut data = ScrollbackData::from_terminal_lines(segments);
         data.truncate(0);
         prop_assert!(data.lines.is_empty());
-        prop_assert_eq!(data.total_bytes, 0);
+        prop_assert_eq!(data.total_bytes(), 0);
     }
 
     /// Truncating to 1 keeps only the last line.
@@ -382,7 +382,7 @@ proptest! {
         data.truncate(1);
         prop_assert_eq!(data.lines.len(), 1);
         prop_assert_eq!(&data.lines[0], &last);
-        prop_assert_eq!(data.total_bytes, last.len());
+        prop_assert_eq!(data.total_bytes(), last.len());
     }
 
     /// total_bytes is always the sum of line lengths.
@@ -390,7 +390,7 @@ proptest! {
     fn prop_total_bytes_invariant(segments in arb_segments()) {
         let data = ScrollbackData::from_terminal_lines(segments.clone());
         let sum: usize = segments.iter().map(|s| s.len()).sum();
-        prop_assert_eq!(data.total_bytes, sum);
+        prop_assert_eq!(data.total_bytes(), sum);
     }
 
     /// Truncation never increases total_bytes.
@@ -400,12 +400,12 @@ proptest! {
         max in 0_usize..30,
     ) {
         let original = ScrollbackData::from_terminal_lines(segments.clone());
-        let original_bytes = original.total_bytes;
+        let original_bytes = original.total_bytes();
 
         let mut data = ScrollbackData::from_terminal_lines(segments);
         data.truncate(max);
-        prop_assert!(data.total_bytes <= original_bytes,
-            "truncated bytes {} should not exceed original {}", data.total_bytes, original_bytes);
+        prop_assert!(data.total_bytes() <= original_bytes,
+            "truncated bytes {} should not exceed original {}", data.total_bytes(), original_bytes);
     }
 
     /// Truncation never increases line count.
@@ -434,7 +434,7 @@ proptest! {
         let data = ScrollbackData::from_terminal_lines(segments);
         let cloned = data.clone();
         prop_assert_eq!(&data.lines, &cloned.lines);
-        prop_assert_eq!(data.total_bytes, cloned.total_bytes);
+        prop_assert_eq!(data.total_bytes(), cloned.total_bytes());
     }
 }
 
@@ -597,7 +597,7 @@ fn scrollback_from_terminal_lines_basic() {
         "line3".to_string(),
     ]);
     assert_eq!(data.lines.len(), 3);
-    assert_eq!(data.total_bytes, 15); // 5 + 5 + 5
+    assert_eq!(data.total_bytes(), 15); // 5 + 5 + 5
 }
 
 #[test]
@@ -610,7 +610,7 @@ fn scrollback_truncate_basic() {
     ]);
     data.truncate(2);
     assert_eq!(data.lines, vec!["cc", "dd"]); // keeps most recent
-    assert_eq!(data.total_bytes, 4);
+    assert_eq!(data.total_bytes(), 4);
 }
 
 #[test]

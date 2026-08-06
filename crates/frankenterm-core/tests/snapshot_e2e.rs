@@ -12,7 +12,7 @@ use std::time::Instant;
 use frankenterm_core::config::SnapshotConfig;
 use frankenterm_core::restore_process::LaunchConfig;
 use frankenterm_core::session_restore::{
-    CheckpointRole, RestoredPaneState, SessionRestoreConfig, SessionRestorer,
+    CheckpointRole, RestoreError, RestoredPaneState, SessionRestoreConfig, SessionRestorer,
     load_checkpoint_by_id, load_latest_checkpoint, session_doctor, show_session,
 };
 use frankenterm_core::session_topology::{PaneNode, TopologySnapshot};
@@ -869,10 +869,10 @@ fn e2e_restore_bookkeeping_preserves_manual_restore_checkpoint() {
             .pane_id_map
             .get(&pane.pane_id)
             .expect("restored pane mapping must exist");
-        let banner_text = wezterm
+        let pane_text = wezterm
             .get_text(restored_new_pane_id, false)
             .await
-            .expect("read restore banner");
+            .expect("read restored pane text");
         let redetected = restorer
             .detect()
             .expect("detect after restore should succeed");
@@ -897,7 +897,7 @@ fn e2e_restore_bookkeeping_preserves_manual_restore_checkpoint() {
         let session_clean = shutdown_clean == 1;
         let clean_receipt_matches = clean_checkpoint_id == Some(startup_checkpoint_id);
         let detect_cleared = redetected.is_none();
-        let banner_written = banner_text.contains("Session restored");
+        let pty_input_untouched = pane_text.is_empty();
 
         add_phase(
             &mut report,
@@ -913,7 +913,7 @@ fn e2e_restore_bookkeeping_preserves_manual_restore_checkpoint() {
                 "session_clean": session_clean,
                 "clean_receipt_matches": clean_receipt_matches,
                 "detect_cleared": detect_cleared,
-                "banner_written": banner_written,
+                "pty_input_untouched": pty_input_untouched,
             }),
         );
 
@@ -928,7 +928,7 @@ fn e2e_restore_bookkeeping_preserves_manual_restore_checkpoint() {
             process_match: session_clean
                 && clean_receipt_matches
                 && detect_cleared
-                && banner_written,
+                && pty_input_untouched,
         });
 
         let success = report.pane_reports.iter().all(|pane_result| {
@@ -1282,11 +1282,12 @@ fn e2e_fixture_complex_layout_restore_executes_real_restore_flow() {
 }
 
 #[test]
-fn e2e_restore_replays_scrollback_then_relaunches_agent() {
+fn e2e_restore_rejects_unsafe_scrollback_before_mux_or_authority_effects() {
     run_async_test(async {
         let run_start = Instant::now();
         let mut report = E2ETestReport {
-            test_name: "e2e_restore_replays_scrollback_then_relaunches_agent".to_string(),
+            test_name: "e2e_restore_rejects_unsafe_scrollback_before_mux_or_authority_effects"
+                .to_string(),
             phases: Vec::new(),
             total_duration_ms: 0,
             passed: false,
@@ -1367,84 +1368,74 @@ fn e2e_restore_replays_scrollback_then_relaunches_agent() {
 
         let wezterm = Arc::new(MockWezterm::new());
         let restore_start = Instant::now();
-        let summary = restorer
+        let error = restorer
             .restore(&session, &checkpoint, wezterm.clone())
             .await
-            .expect("restore with scrollback + relaunch should succeed");
+            .expect_err("scrollback replay through PTY input must fail closed");
+        let safe_rejection = matches!(error, RestoreError::SafeScrollbackReplayUnavailable);
         add_phase(
             &mut report,
-            "restore",
+            "restore_safety_preflight",
             restore_start,
-            "ok",
+            if safe_rejection { "ok" } else { "error" },
             json!({
-                "restored_count": summary.restored_count(),
-                "scrollback_restored": summary.scrollback_restored_count(),
-                "scrollback_failed": summary.scrollback_failed_count(),
-                "scrollback_skipped": summary.scrollback_skipped_count(),
+                "safe_scrollback_rejection": safe_rejection,
+                "error_kind": if safe_rejection {
+                    "safe_scrollback_replay_unavailable"
+                } else {
+                    "unexpected"
+                },
             }),
         );
 
         let verify_start = Instant::now();
-        let new_pane_id = *summary
-            .layout_result
-            .pane_id_map
-            .get(&pane.pane_id)
-            .expect("restored pane mapping should exist");
-        let content = wezterm
-            .get_text(new_pane_id, false)
+        let panes = wezterm
+            .list_panes()
             .await
-            .expect("read restored pane content");
-        let expected_cd = format!(
-            "cd {}\r",
-            normalize_cwd_str(pane.cwd.as_deref().unwrap_or(""))
-        );
-        let first_line_offset = content.find("first line").expect("replayed first line");
-        let second_line_offset = content.find("second line").expect("replayed second line");
-        let banner_offset = content
-            .find("Session restored")
-            .expect("restore banner should exist");
-        let cd_offset = content.find(&expected_cd).expect("expected cd command");
-        let agent_offset = content
-            .find("codex --resume\r")
-            .expect("expected agent relaunch command");
+            .expect("list panes after safety rejection");
+        let authority_rows: i64 = Connection::open(db_path.as_str())
+            .expect("open restore safety verification database")
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM session_checkpoints
+                 WHERE session_id = ?1
+                   AND checkpoint_role IN ('restore_intent', 'restore_receipt')",
+                [snapshot.session_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("count restore authority rows");
         let redetected = restorer
             .detect()
-            .expect("detect after successful restore should work");
+            .expect("detect after rejected restore should work");
 
-        let content_order_ok = first_line_offset < second_line_offset
-            && second_line_offset < banner_offset
-            && banner_offset < cd_offset
-            && cd_offset < agent_offset;
-        let success = summary.restored_count() == 1
-            && summary.failed_count() == 0
-            && summary.scrollback_restored_count() == 1
-            && summary.scrollback_failed_count() == 0
-            && summary.scrollback_skipped_count() == 0
-            && summary.scrollback_error.is_none()
-            && content_order_ok
-            && redetected.is_none();
+        let no_mux_effects = panes.is_empty();
+        let no_authority_effects = authority_rows == 0;
+        let remains_restore_candidate = redetected
+            .as_ref()
+            .is_some_and(|candidate| candidate.session_id == snapshot.session_id);
+        let success = safe_rejection
+            && no_mux_effects
+            && no_authority_effects
+            && remains_restore_candidate;
 
         report.pane_reports.push(PaneTestReport {
             pane_id: pane.pane_id,
             original_content_hash: hash_text("first line\nsecond line\n"),
-            restored_content_hash: hash_text(&content),
-            content_match: content.contains("first line")
-                && content.contains("second line")
-                && content_order_ok,
-            layout_match: summary.restored_count() == 1 && summary.failed_count() == 0,
-            process_match: content.contains(&expected_cd) && content.contains("codex --resume\r"),
+            restored_content_hash: hash_text(""),
+            content_match: no_mux_effects,
+            layout_match: no_mux_effects && no_authority_effects,
+            process_match: no_mux_effects,
         });
 
         add_phase(
             &mut report,
-            "verify_content_and_relaunch_order",
+            "verify_no_external_or_authority_effects",
             verify_start,
             if success { "ok" } else { "error" },
             json!({
-                "new_pane_id": new_pane_id,
-                "content_order_ok": content_order_ok,
-                "banner_before_relaunch": banner_offset < cd_offset,
-                "detect_cleared": redetected.is_none(),
+                "mux_pane_count": panes.len(),
+                "restore_authority_rows": authority_rows,
+                "remains_restore_candidate": remains_restore_candidate,
             }),
         );
 
@@ -1453,7 +1444,7 @@ fn e2e_restore_replays_scrollback_then_relaunches_agent() {
         report.failure_reason = if success {
             None
         } else {
-            Some("scrollback replay + agent relaunch assertions failed".to_string())
+            Some("scrollback safety preflight mutated mux or restore authority".to_string())
         };
         emit_report(&report);
         assert!(
@@ -1799,7 +1790,7 @@ fn e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild() {
             // engine_a dropped here.
         }
 
-        // ── restart: new engine + restorer, restore_scrollback = true ────
+        // ── restart: new engine + fail-closed restorer ───────────────
         let restart_start = Instant::now();
         let _engine_b = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
         let restorer = SessionRestorer::new(
@@ -1813,7 +1804,7 @@ fn e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild() {
         );
         add_phase(
             &mut report,
-            "restart_with_scrollback_restorer",
+            "restart_with_fail_closed_scrollback_restorer",
             restart_start,
             "ok",
             json!({ "restore_scrollback": true }),
@@ -1828,86 +1819,152 @@ fn e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild() {
             .expect("load checkpoint");
         let wezterm = Arc::new(MockWezterm::new());
 
-        // ── restore via the real SessionRestorer flow ────────────────────
-        let restore_start = Instant::now();
-        let summary = restorer
-            .restore(&candidate, &checkpoint, wezterm.clone())
-            .await
-            .expect("restore with scrollback must succeed");
-        let new_pane_id = *summary
-            .layout_result
-            .pane_id_map
-            .get(&pane.pane_id)
-            .expect("pane id must be remapped");
+        // Verify the persisted source bytes and checkpoint boundary directly.
+        // They remain durable across the engine rebuild, but are not treated as
+        // authoritative logical lines or injected through PTY input.
+        let persistence_start = Instant::now();
+        let persisted_segments = {
+            let conn = Connection::open(db_path.as_str()).expect("open rebuilt scrollback db");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT seq, content, content_len
+                     FROM output_segments
+                     WHERE pane_id = ?1 AND seq <= ?2
+                     ORDER BY seq ASC",
+                )
+                .expect("prepare persisted scrollback query");
+            stmt.query_map(
+                params![
+                    i64::try_from(pane.pane_id).expect("fixture pane id fits i64"),
+                    2_i64
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("query persisted scrollback")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode persisted scrollback")
+        };
+        let persisted_concatenated: String = persisted_segments
+            .iter()
+            .map(|(_, content, _)| content.as_str())
+            .collect();
+        let persisted_metadata_matches = persisted_segments.len() == segments.len()
+            && persisted_segments.iter().zip(&segments).all(
+                |((actual_seq, actual_content, actual_len), (seq, content, _))| {
+                    *actual_seq == *seq
+                        && actual_content == content
+                        && usize::try_from(*actual_len).ok() == Some(content.len())
+                },
+            );
+        let checkpoint_boundary_matches = checkpoint
+            .pane_states
+            .iter()
+            .find(|state| state.pane_id == pane.pane_id)
+            .is_some_and(|state| state.scrollback_checkpoint_seq == Some(2));
+        let persisted_bytes_match = persisted_concatenated == expected_concatenated;
         add_phase(
             &mut report,
-            "restore_with_scrollback_replay",
-            restore_start,
-            if summary.scrollback_error.is_none() {
+            "verify_persisted_scrollback_bytes",
+            persistence_start,
+            if persisted_metadata_matches
+                && checkpoint_boundary_matches
+                && persisted_bytes_match
+            {
                 "ok"
             } else {
                 "error"
             },
             json!({
-                "restored_count": summary.restored_count(),
-                "scrollback_restored": summary.scrollback_restored_count(),
-                "scrollback_failed": summary.scrollback_failed_count(),
-                "scrollback_skipped": summary.scrollback_skipped_count(),
-                "new_pane_id": new_pane_id,
+                "segments": persisted_segments.len(),
+                "metadata_matches": persisted_metadata_matches,
+                "checkpoint_boundary_matches": checkpoint_boundary_matches,
+                "persisted_bytes_hash": hash_text(&persisted_concatenated),
             }),
         );
 
-        // ── verify each seeded byte appears in the replayed content, in
-        // the order it was written. MockWezterm.get_text returns the raw
-        // bytes that were sent to send_text, so substring + ordering checks
-        // are sufficient to prove byte preservation across the boundary.
-        let verify_start = Instant::now();
-        let replayed = wezterm
-            .get_text(new_pane_id, false)
+        // ── restore via the real SessionRestorer flow ────────────────────
+        let restore_start = Instant::now();
+        let error = restorer
+            .restore(&candidate, &checkpoint, wezterm.clone())
             .await
-            .expect("read replayed content");
-        let mut previous_offset: Option<usize> = None;
-        let mut all_segments_in_order = true;
-        for (_, content, _) in &segments {
-            let Some(offset) = replayed.find(content.as_str()) else {
-                all_segments_in_order = false;
-                break;
-            };
-            if let Some(prev) = previous_offset {
-                if offset < prev {
-                    all_segments_in_order = false;
-                    break;
-                }
-            }
-            previous_offset = Some(offset);
-        }
-        let replayed_has_expected_prefix = replayed.contains(&expected_concatenated);
-        let success = summary.scrollback_restored_count() == 1
-            && summary.scrollback_failed_count() == 0
-            && summary.scrollback_error.is_none()
-            && summary.session_id == captured_session_id
-            && summary.checkpoint_id == captured_checkpoint_id
-            && all_segments_in_order
-            && replayed_has_expected_prefix;
+            .expect_err("raw output fragments must not be replayed through PTY input");
+        let safe_rejection = matches!(error, RestoreError::SafeScrollbackReplayUnavailable);
+        add_phase(
+            &mut report,
+            "reject_unsafe_scrollback_replay",
+            restore_start,
+            if safe_rejection { "ok" } else { "error" },
+            json!({
+                "safe_scrollback_rejection": safe_rejection,
+                "error_kind": if safe_rejection {
+                    "safe_scrollback_replay_unavailable"
+                } else {
+                    "unexpected"
+                },
+            }),
+        );
+
+        // The capability preflight must reject before either mux mutation or
+        // durable restore-authority mutation.
+        let verify_start = Instant::now();
+        let panes = wezterm
+            .list_panes()
+            .await
+            .expect("list panes after scrollback safety rejection");
+        let authority_rows: i64 = Connection::open(db_path.as_str())
+            .expect("open restore authority verification database")
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM session_checkpoints
+                 WHERE session_id = ?1
+                   AND checkpoint_role IN ('restore_intent', 'restore_receipt')",
+                [captured_session_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("count restore authority rows");
+        let redetected = restorer
+            .detect()
+            .expect("detect after rejected scrollback restore");
+        let no_mux_effects = panes.is_empty();
+        let no_authority_effects = authority_rows == 0;
+        let remains_restore_candidate = redetected
+            .as_ref()
+            .is_some_and(|session| session.session_id == captured_session_id);
+        let success = safe_rejection
+            && persisted_metadata_matches
+            && checkpoint_boundary_matches
+            && persisted_bytes_match
+            && candidate.session_id == captured_session_id
+            && checkpoint.checkpoint_id == captured_checkpoint_id
+            && no_mux_effects
+            && no_authority_effects
+            && remains_restore_candidate;
 
         report.pane_reports.push(PaneTestReport {
             pane_id: pane.pane_id,
             original_content_hash: expected_bytes_hash.clone(),
-            restored_content_hash: hash_text(&replayed),
-            content_match: replayed_has_expected_prefix && all_segments_in_order,
-            layout_match: summary.restored_count() == 1 && summary.failed_count() == 0,
-            process_match: true,
+            restored_content_hash: hash_text(&persisted_concatenated),
+            content_match: persisted_metadata_matches && persisted_bytes_match,
+            layout_match: no_mux_effects && no_authority_effects,
+            process_match: no_mux_effects,
         });
         add_phase(
             &mut report,
-            "verify_scrollback_byte_preservation",
+            "verify_persistence_and_no_restore_side_effects",
             verify_start,
             if success { "ok" } else { "error" },
             json!({
                 "expected_bytes_hash": expected_bytes_hash,
-                "replayed_len": replayed.len(),
-                "all_segments_in_order": all_segments_in_order,
-                "replayed_has_expected_prefix": replayed_has_expected_prefix,
+                "persisted_len": persisted_concatenated.len(),
+                "mux_pane_count": panes.len(),
+                "restore_authority_rows": authority_rows,
+                "remains_restore_candidate": remains_restore_candidate,
             }),
         );
 
@@ -1916,7 +1973,9 @@ fn e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild() {
         report.failure_reason = if success {
             None
         } else {
-            Some("scrollback bytes did not survive the restart boundary".to_string())
+            Some(
+                "scrollback persistence or fail-closed restore boundary was violated".to_string(),
+            )
         };
         emit_report(&report);
         assert!(

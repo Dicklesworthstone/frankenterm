@@ -1,14 +1,15 @@
 //! Property-based tests for the `restore_process` module.
 //!
-//! Covers `LaunchConfig` serde roundtrips and defaults, `LaunchAction` tagged
-//! enum serde roundtrips, `ProcessPlan`/`LaunchResult`/`LaunchReport` serde
-//! roundtrips, and `LaunchReport` default values.
+//! Covers `LaunchConfig` serde roundtrips and defaults, raw-plan diagnostic
+//! redaction, `LaunchResult`/`LaunchReport` serde roundtrips, and
+//! `LaunchReport` default values.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use frankenterm_core::restore_process::{
-    LaunchAction, LaunchConfig, LaunchReport, LaunchResult, ProcessPlan,
+    LaunchAction, LaunchConfig, LaunchDisposition, LaunchInterruption, LaunchInterruptionPhase,
+    LaunchReport, LaunchResult, ProcessPlan,
 };
 use proptest::prelude::*;
 
@@ -73,7 +74,12 @@ fn arb_launch_result() -> impl Strategy<Value = LaunchResult> {
     (
         0_u64..1000,
         0_u64..1000,
-        arb_launch_action(),
+        prop_oneof![
+            Just(LaunchDisposition::Shell),
+            Just(LaunchDisposition::Agent),
+            Just(LaunchDisposition::Skip),
+            Just(LaunchDisposition::Manual),
+        ],
         any::<bool>(),
         proptest::option::of("[a-z ]{3,20}"),
     )
@@ -147,69 +153,42 @@ proptest! {
 }
 
 // =========================================================================
-// LaunchAction — tagged enum serde
+// LaunchAction / ProcessPlan — diagnostic redaction
 // =========================================================================
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
-    /// LaunchAction serde roundtrip preserves variant and fields.
+    /// LaunchAction diagnostics retain only the finite variant name.
     #[test]
-    fn prop_action_serde(action in arb_launch_action()) {
-        let json = serde_json::to_string(&action).unwrap();
-        let back: LaunchAction = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back, action);
-    }
-
-    /// LaunchAction JSON contains the "action" tag.
-    #[test]
-    fn prop_action_has_tag(action in arb_launch_action()) {
-        let json = serde_json::to_string(&action).unwrap();
-        prop_assert!(json.contains("\"action\""));
-    }
-
-    /// LaunchAction tag is snake_case.
-    #[test]
-    fn prop_action_tag_snake_case(action in arb_launch_action()) {
-        let json = serde_json::to_string(&action).unwrap();
-        let expected_tag = match &action {
-            LaunchAction::LaunchShell { .. } => "launch_shell",
-            LaunchAction::LaunchAgent { .. } => "launch_agent",
-            LaunchAction::Skip { .. } => "skip",
-            LaunchAction::Manual { .. } => "manual",
+    fn prop_action_debug_is_redacted(action in arb_launch_action()) {
+        let diagnostic = format!("{action:?}");
+        let expected = match action {
+            LaunchAction::LaunchShell { .. } => "LaunchShell { redacted: true }",
+            LaunchAction::LaunchAgent { .. } => "LaunchAgent { redacted: true }",
+            LaunchAction::Skip { .. } => "Skip { redacted: true }",
+            LaunchAction::Manual { .. } => "Manual { redacted: true }",
         };
-        prop_assert!(
-            json.contains(expected_tag),
-            "expected tag '{}' in JSON: {}",
-            expected_tag, json
+        prop_assert_eq!(diagnostic, expected);
+    }
+
+    /// ProcessPlan diagnostics omit raw action payloads and state warnings.
+    #[test]
+    fn prop_plan_debug_is_redacted(plan in arb_process_plan()) {
+        let diagnostic = format!("{plan:?}");
+        let action = match plan.action {
+            LaunchAction::LaunchShell { .. } => "Shell",
+            LaunchAction::LaunchAgent { .. } => "Agent",
+            LaunchAction::Skip { .. } => "Skip",
+            LaunchAction::Manual { .. } => "Manual",
+        };
+        let expected = format!(
+            "ProcessPlan {{ old_pane_id: {}, new_pane_id: {}, action: {action}, has_state_warning: {} }}",
+            plan.old_pane_id,
+            plan.new_pane_id,
+            plan.state_warning.is_some()
         );
-    }
-
-    /// LaunchAction serde is deterministic.
-    #[test]
-    fn prop_action_deterministic(action in arb_launch_action()) {
-        let j1 = serde_json::to_string(&action).unwrap();
-        let j2 = serde_json::to_string(&action).unwrap();
-        prop_assert_eq!(&j1, &j2);
-    }
-}
-
-// =========================================================================
-// ProcessPlan — serde roundtrip
-// =========================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(30))]
-
-    /// ProcessPlan serde roundtrip preserves all fields.
-    #[test]
-    fn prop_plan_serde(plan in arb_process_plan()) {
-        let json = serde_json::to_string(&plan).unwrap();
-        let back: ProcessPlan = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back.old_pane_id, plan.old_pane_id);
-        prop_assert_eq!(back.new_pane_id, plan.new_pane_id);
-        prop_assert_eq!(back.action, plan.action);
-        prop_assert_eq!(&back.state_warning, &plan.state_warning);
+        prop_assert_eq!(diagnostic, expected);
     }
 }
 
@@ -348,6 +327,43 @@ fn config_partial_json_fills_defaults() {
     // Defaults for missing fields
     assert!(config.launch_shells);
     assert_eq!(config.launch_delay_ms, 500);
+}
+
+#[test]
+fn config_debug_redacts_reserved_agent_templates() {
+    let mut config = LaunchConfig::default();
+    config.agent_commands.insert(
+        "secret-agent-type".to_string(),
+        "secret command with /secret/cwd".to_string(),
+    );
+    let diagnostic = format!("{config:?}");
+    assert!(diagnostic.contains("reserved_agent_command_count: 1"));
+    assert!(!diagnostic.contains("secret"));
+}
+
+#[test]
+fn result_and_report_debug_redact_error_detail() {
+    let result = LaunchResult {
+        old_pane_id: 1,
+        new_pane_id: 2,
+        action: LaunchDisposition::Agent,
+        success: false,
+        error: Some("secret-error-detail".to_string()),
+    };
+    let report = LaunchReport {
+        results: vec![result],
+        failed: 1,
+        interruption: Some(LaunchInterruption {
+            plan_index: 0,
+            phase: LaunchInterruptionPhase::MuxOperation,
+            detail: "secret-interruption-detail".to_string(),
+        }),
+        ..LaunchReport::default()
+    };
+    let diagnostic = format!("{report:?}");
+    assert!(diagnostic.contains("has_error: true"));
+    assert!(diagnostic.contains("has_detail: true"));
+    assert!(!diagnostic.contains("secret"));
 }
 
 #[test]
@@ -528,21 +544,6 @@ proptest! {
 }
 
 // =========================================================================
-// NEW: ProcessPlan serde deterministic
-// =========================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(30))]
-
-    #[test]
-    fn process_plan_serde_deterministic(plan in arb_process_plan()) {
-        let j1 = serde_json::to_string(&plan).unwrap();
-        let j2 = serde_json::to_string(&plan).unwrap();
-        prop_assert_eq!(&j1, &j2);
-    }
-}
-
-// =========================================================================
 // NEW: LaunchResult serde deterministic
 // =========================================================================
 
@@ -607,21 +608,11 @@ proptest! {
         prop_assert!(report.results.is_empty());
     }
 
-    /// LaunchAction Clone preserves variant (ext).
+    /// LaunchAction Clone preserves the raw in-memory value without exposing it.
     #[test]
     fn launch_action_clone_preserves_ext(action in arb_launch_action()) {
         let cloned = action.clone();
-        let j1 = serde_json::to_string(&action).unwrap();
-        let j2 = serde_json::to_string(&cloned).unwrap();
-        prop_assert_eq!(&j1, &j2);
-    }
-
-    /// ProcessPlan serde is deterministic (ext).
-    #[test]
-    fn process_plan_serde_deterministic_ext(plan in arb_process_plan()) {
-        let j1 = serde_json::to_string(&plan).unwrap();
-        let j2 = serde_json::to_string(&plan).unwrap();
-        prop_assert_eq!(&j1, &j2);
+        prop_assert_eq!(action, cloned);
     }
 
     /// LaunchResult old_pane_id preserved through serde.

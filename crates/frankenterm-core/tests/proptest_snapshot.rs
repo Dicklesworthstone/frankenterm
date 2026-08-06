@@ -576,13 +576,13 @@ proptest! {
             scrollback_map.insert(1u64, data);
 
             let id_map: HashMap<u64, u64> = std::iter::once((1, 1)).collect();
-            let report = injector.inject(&id_map, &scrollback_map).await;
+            let error = injector
+                .inject(&id_map, &scrollback_map)
+                .await
+                .expect_err("mapped replay must report the unsupported output channel");
+            prop_assert!(error.to_string().contains("cannot be restored through PTY input"));
 
-            prop_assert!(report.successes.is_empty());
-            prop_assert!(report.failures.is_empty());
-            prop_assert_eq!(report.skipped, vec![1]);
-
-            // Verify injected content matches original
+            // Verify historical content never reaches PTY input.
             let pane_content: String = WeztermInterface::get_text(&*mock, 1, false)
                 .await
                 .unwrap();
@@ -636,11 +636,7 @@ proptest! {
     ) {
         let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
-            let mock = Arc::new(MockWezterm::new());
-            let launcher = ProcessLauncher::new(
-                mock,
-                LaunchConfig::default(),
-            );
+            let launcher = ProcessLauncher::new(LaunchConfig::default());
 
             // Build consistent pane state and ID map
             let states: Vec<PaneStateSnapshot> = pane_ids
@@ -696,8 +692,7 @@ proptest! {
     ) {
         let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
-            let mock = Arc::new(MockWezterm::new());
-            let launcher = ProcessLauncher::new(mock, LaunchConfig::default());
+            let launcher = ProcessLauncher::new(LaunchConfig::default());
 
             let states: Vec<PaneStateSnapshot> = (0..pane_count)
                 .map(|i| {
@@ -946,16 +941,15 @@ fn max_complexity_topology_restores() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(300))]
 
-    /// Shell processes always produce LaunchShell actions (when shells enabled).
+    /// Enabled shell restoration remains manual until mux spawn can verify the
+    /// exact program and domain without PTY input.
     #[test]
-    fn shell_process_produces_launch_shell(
+    fn enabled_shells_require_manual_mux_native_spawn(
         shell in arb_shell(),
     ) {
         let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
-            let mock = Arc::new(MockWezterm::new());
             let launcher = ProcessLauncher::new(
-                mock,
                 LaunchConfig {
                     launch_shells: true,
                     ..LaunchConfig::default()
@@ -991,10 +985,12 @@ proptest! {
 
             prop_assert_eq!(plans.len(), 1);
             match &plans[0].action {
-                LaunchAction::LaunchShell { .. } => {} // expected
+                LaunchAction::Manual { hint, .. } => {
+                    prop_assert!(hint.contains("mux-native argv"));
+                }
                 other => prop_assert!(
                     false,
-                    "expected LaunchShell, got {:?}",
+                    "expected Manual, got {:?}",
                     other
                 ),
             }
@@ -1002,16 +998,15 @@ proptest! {
         })?;
     }
 
-    /// When shells are disabled, shell processes produce Skip actions.
+    /// The historical shell knob is reserved/inert: captured shells still
+    /// require manual replacement rather than silently disappearing.
     #[test]
-    fn disabled_shells_produce_skip(
+    fn disabled_shell_knob_still_reports_manual_replacement(
         shell in arb_shell(),
     ) {
         let rt = RuntimeBuilder::multi_thread().build().unwrap();
         rt.block_on(async {
-            let mock = Arc::new(MockWezterm::new());
             let launcher = ProcessLauncher::new(
-                mock,
                 LaunchConfig {
                     launch_shells: false,
                     ..LaunchConfig::default()
@@ -1047,10 +1042,12 @@ proptest! {
 
             prop_assert_eq!(plans.len(), 1);
             match &plans[0].action {
-                LaunchAction::Skip { .. } => {} // expected
+                LaunchAction::Manual { hint, .. } => {
+                    prop_assert!(hint.contains("mux-native argv"));
+                }
                 other => prop_assert!(
                     false,
-                    "expected Skip when shells disabled, got {:?}",
+                    "expected Manual for reserved shell knob, got {:?}",
                     other
                 ),
             }
@@ -1082,20 +1079,21 @@ proptest! {
     ) {
         let data = ScrollbackData::from_terminal_lines(lines.clone());
         let expected_bytes: usize = lines.iter().map(|l| l.len()).sum::<usize>();
-        prop_assert_eq!(data.total_bytes, expected_bytes);
+        prop_assert_eq!(data.total_bytes(), expected_bytes);
     }
 }
 
 // =============================================================================
-// Property: LaunchAction serde roundtrip
+// Property: LaunchAction remains internal and redacted
 // =============================================================================
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
-    /// LaunchAction variants survive serde roundtrip.
+    /// Internal launch actions remain clone-stable without becoming a wire
+    /// format that can expose raw commands, paths, or hints.
     #[test]
-    fn launch_action_serde_roundtrip(
+    fn launch_action_clone_preserves_internal_variant(
         variant in prop_oneof![
             (arb_shell(), arb_cwd().prop_filter("need cwd", |c| c.is_some()))
                 .prop_map(|(shell, cwd)| LaunchAction::LaunchShell {
@@ -1114,9 +1112,29 @@ proptest! {
             }),
         ]
     ) {
-        let json = serde_json::to_string(&variant).unwrap();
-        let deserialized: LaunchAction = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(&variant, &deserialized);
+        let cloned = variant.clone();
+        prop_assert_eq!(&variant, &cloned);
+        let debug = format!("{variant:?}");
+        prop_assert!(debug.contains("redacted: true"));
+    }
+}
+
+#[test]
+fn launch_action_debug_omits_sensitive_payloads() {
+    let action = LaunchAction::LaunchAgent {
+        command: "raw-command-canary --token raw-secret-canary".to_string(),
+        cwd: std::path::PathBuf::from("/private/raw-path-canary"),
+        agent_type: "raw-agent-canary".to_string(),
+    };
+    let debug = format!("{action:?}");
+    assert_eq!(debug, "LaunchAgent { redacted: true }");
+    for canary in [
+        "raw-command-canary",
+        "raw-secret-canary",
+        "raw-path-canary",
+        "raw-agent-canary",
+    ] {
+        assert!(!debug.contains(canary), "Debug leaked {canary}");
     }
 }
 
@@ -1198,7 +1216,7 @@ proptest! {
     fn scrollback_empty_input(_dummy in 0..1u8) {
         let data = ScrollbackData::from_terminal_lines(vec![]);
         prop_assert_eq!(data.lines.len(), 0);
-        prop_assert_eq!(data.total_bytes, 0);
+        prop_assert_eq!(data.total_bytes(), 0);
     }
 
     /// Single line preserves content exactly.
@@ -1207,7 +1225,7 @@ proptest! {
         let data = ScrollbackData::from_terminal_lines(vec![line.clone()]);
         prop_assert_eq!(data.lines.len(), 1);
         prop_assert_eq!(data.lines[0].as_str(), line.as_str());
-        prop_assert_eq!(data.total_bytes, line.len());
+        prop_assert_eq!(data.total_bytes(), line.len());
     }
 
     /// Truncation with max >= len is a no-op.
