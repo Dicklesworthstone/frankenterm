@@ -11,13 +11,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use common::fixtures::RuntimeFixture;
-use frankenterm_core::restore_scrollback::{
-    InjectionConfig, InjectionGuard, ScrollbackData, ScrollbackInjector,
-};
+use frankenterm_core::restore_scrollback::{InjectionGuard, ScrollbackData, ScrollbackInjector};
 use frankenterm_core::wezterm::{MockWezterm, WeztermInterface};
 
-fn make_injector(mock: Arc<MockWezterm>) -> ScrollbackInjector {
-    ScrollbackInjector::new(mock, InjectionConfig::default())
+fn make_injector() -> ScrollbackInjector {
+    ScrollbackInjector::new()
 }
 
 fn mock_scrollback(lines: Vec<&str>) -> ScrollbackData {
@@ -34,7 +32,7 @@ fn inject_single_pane_fails_closed() {
     rt.block_on(async {
         let mock = Arc::new(MockWezterm::new());
         mock.add_default_pane(10).await;
-        let injector = make_injector(mock.clone());
+        let injector = make_injector();
 
         let mut pane_id_map = HashMap::new();
         pane_id_map.insert(1_u64, 10_u64);
@@ -63,7 +61,7 @@ fn inject_multiple_panes() {
         let mock = Arc::new(MockWezterm::new());
         mock.add_default_pane(10).await;
         mock.add_default_pane(11).await;
-        let injector = make_injector(mock.clone());
+        let injector = make_injector();
 
         let mut pane_id_map = HashMap::new();
         pane_id_map.insert(1_u64, 10_u64);
@@ -89,7 +87,7 @@ fn inject_skips_unmapped_panes() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let mock = Arc::new(MockWezterm::new());
-        let injector = make_injector(mock.clone());
+        let injector = make_injector();
 
         let pane_id_map = HashMap::new();
 
@@ -99,8 +97,8 @@ fn inject_skips_unmapped_panes() {
         let report = injector.inject(&pane_id_map, &scrollbacks).await.unwrap();
 
         assert_eq!(report.success_count(), 0);
-        assert_eq!(report.skipped.len(), 1);
-        assert_eq!(report.skipped[0], 1);
+        assert_eq!(report.skipped_count(), 1);
+        assert_eq!(report.skipped_sample(), &[1]);
     });
 }
 
@@ -114,7 +112,7 @@ fn inject_empty_scrollback() {
     rt.block_on(async {
         let mock = Arc::new(MockWezterm::new());
         mock.add_default_pane(10).await;
-        let injector = make_injector(mock.clone());
+        let injector = make_injector();
 
         let mut pane_id_map = HashMap::new();
         pane_id_map.insert(1_u64, 10_u64);
@@ -130,7 +128,7 @@ fn inject_empty_scrollback() {
 }
 
 // ===========================================================================
-// 5. inject_truncates_large_scrollback
+// 5. large mapped scrollback fails before replay allocation or output
 // ===========================================================================
 
 #[test]
@@ -139,11 +137,7 @@ fn inject_large_scrollback_does_not_write() {
     rt.block_on(async {
         let mock = Arc::new(MockWezterm::new());
         mock.add_default_pane(10).await;
-        let config = InjectionConfig {
-            max_lines: 3,
-            ..Default::default()
-        };
-        let injector = ScrollbackInjector::new(mock.clone(), config);
+        let injector = ScrollbackInjector::new();
 
         let mut pane_id_map = HashMap::new();
         pane_id_map.insert(1_u64, 10_u64);
@@ -171,7 +165,7 @@ fn inject_no_scrollbacks() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let mock = Arc::new(MockWezterm::new());
-        let injector = make_injector(mock.clone());
+        let injector = make_injector();
 
         let pane_id_map = HashMap::new();
         let scrollbacks = HashMap::new();
@@ -180,7 +174,8 @@ fn inject_no_scrollbacks() {
 
         assert_eq!(report.success_count(), 0);
         assert_eq!(report.failure_count(), 0);
-        assert_eq!(report.skipped.len(), 0);
+        assert_eq!(report.skipped_count(), 0);
+        assert!(report.skipped_sample().is_empty());
     });
 }
 
@@ -194,7 +189,7 @@ fn unsupported_injection_does_not_change_suppression_state() {
     rt.block_on(async {
         let mock = Arc::new(MockWezterm::new());
         mock.add_default_pane(10).await;
-        let injector = make_injector(mock.clone());
+        let injector = make_injector();
         let suppressed = injector.suppressed_panes().clone();
 
         assert!(!InjectionGuard::is_suppressed(&suppressed, 10));
@@ -210,43 +205,5 @@ fn unsupported_injection_does_not_change_suppression_state() {
             .await
             .expect_err("mapped replay must fail closed");
         assert!(!InjectionGuard::is_suppressed(&suppressed, 10));
-    });
-}
-
-// ===========================================================================
-// 8. inject_with_small_chunks
-// ===========================================================================
-
-#[test]
-fn chunk_settings_cannot_reenable_pty_replay() {
-    let rt = RuntimeFixture::current_thread();
-    rt.block_on(async {
-        let mock = Arc::new(MockWezterm::new());
-        mock.add_default_pane(10).await;
-        let config = InjectionConfig {
-            chunk_size: 16,
-            inter_chunk_delay_ms: 0,
-            ..Default::default()
-        };
-        let injector = ScrollbackInjector::new(mock.clone(), config);
-
-        let mut pane_id_map = HashMap::new();
-        pane_id_map.insert(1_u64, 10_u64);
-
-        let mut scrollbacks = HashMap::new();
-        scrollbacks.insert(
-            1,
-            mock_scrollback(vec![
-                "this is a longer line that will require multiple chunks",
-            ]),
-        );
-
-        injector
-            .inject(&pane_id_map, &scrollbacks)
-            .await
-            .expect_err("chunk settings must not re-enable PTY replay");
-
-        let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
-        assert!(text.is_empty());
     });
 }
