@@ -1687,13 +1687,13 @@ mod tests {
 
     #[test]
     fn compute_next_step_empty_logs() {
-        assert_eq!(compute_next_step(&[]), 0);
+        assert_eq!(compute_next_step(&[]).expect("empty logs are valid"), 0);
     }
 
     #[test]
     fn compute_next_step_single_continue() {
         let logs = vec![make_step_log(0, "continue")];
-        assert_eq!(compute_next_step(&logs), 1);
+        assert_eq!(compute_next_step(&logs).expect("log is valid"), 1);
     }
 
     #[test]
@@ -1703,37 +1703,40 @@ mod tests {
             make_step_log(1, "continue"),
             make_step_log(2, "continue"),
         ];
-        assert_eq!(compute_next_step(&logs), 3);
+        assert_eq!(compute_next_step(&logs).expect("logs are valid"), 3);
     }
 
     #[test]
     fn compute_next_step_done_is_terminal() {
         let logs = vec![make_step_log(0, "continue"), make_step_log(1, "done")];
-        assert_eq!(compute_next_step(&logs), 2);
+        assert_eq!(compute_next_step(&logs).expect("logs are valid"), 2);
     }
 
     #[test]
     fn compute_next_step_saturates_corrupt_terminal_index() {
         let logs = vec![make_step_log(usize::MAX, "continue")];
-        assert_eq!(compute_next_step(&logs), usize::MAX);
+        assert_eq!(
+            compute_next_step(&logs).expect("terminal log is valid"),
+            usize::MAX
+        );
     }
 
     #[test]
     fn compute_next_step_retry_re_executes() {
         let logs = vec![make_step_log(0, "continue"), make_step_log(1, "retry")];
-        assert_eq!(compute_next_step(&logs), 1);
+        assert_eq!(compute_next_step(&logs).expect("logs are valid"), 1);
     }
 
     #[test]
     fn compute_next_step_wait_for_re_executes() {
         let logs = vec![make_step_log(0, "continue"), make_step_log(1, "wait_for")];
-        assert_eq!(compute_next_step(&logs), 1);
+        assert_eq!(compute_next_step(&logs).expect("logs are valid"), 1);
     }
 
     #[test]
     fn compute_next_step_only_non_terminal() {
         let logs = vec![make_step_log(0, "retry"), make_step_log(0, "retry")];
-        assert_eq!(compute_next_step(&logs), 0);
+        assert_eq!(compute_next_step(&logs).expect("logs are valid"), 0);
     }
 
     #[test]
@@ -1748,7 +1751,7 @@ mod tests {
         log2.id = 3;
         // Vec order differs from step order (the "out of order" part)
         let logs = vec![log2, log_item_0.clone(), log_item_1.clone()];
-        assert_eq!(compute_next_step(&logs), 3);
+        assert_eq!(compute_next_step(&logs).expect("logs are valid"), 3);
     }
 
     #[test]
@@ -1759,7 +1762,7 @@ mod tests {
             make_step_log(2, "retry"),
         ];
         // Highest completed is step_index 1, but most recent is retry at 2, so next is 2
-        assert_eq!(compute_next_step(&logs), 2);
+        assert_eq!(compute_next_step(&logs).expect("logs are valid"), 2);
     }
 
     #[test]
@@ -1781,7 +1784,7 @@ mod tests {
 
         let logs = vec![log_item_0.clone(), log_item_1.clone(), jump_log];
         // After jumping to 5, the next step should be 5
-        assert_eq!(compute_next_step(&logs), 5);
+        assert_eq!(compute_next_step(&logs).expect("jump log is valid"), 5);
     }
 
     #[test]
@@ -1806,7 +1809,39 @@ mod tests {
         log_item_1.id = 2;
 
         let logs = vec![log_item_0, log_item_1, jump_log];
-        assert_eq!(compute_next_step(&logs), 5);
+        assert_eq!(compute_next_step(&logs).expect("jump log is valid"), 5);
+    }
+
+    #[test]
+    fn compute_next_step_rejects_jump_without_result_data() {
+        let jump_log = make_step_log(2, "jump_to");
+
+        let error = compute_next_step(&[jump_log]).expect_err("missing target must fail closed");
+        assert!(
+            error.to_string().contains("has no result_data"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn compute_next_step_rejects_jump_with_malformed_result_data() {
+        let mut jump_log = make_step_log(2, "jump_to");
+        jump_log.result_data = Some("{not-json".to_string());
+
+        let error = compute_next_step(&[jump_log]).expect_err("malformed data must fail closed");
+        assert!(matches!(error, crate::Error::Json(_)));
+    }
+
+    #[test]
+    fn compute_next_step_rejects_jump_without_unsigned_target() {
+        let mut jump_log = make_step_log(2, "jump_to");
+        jump_log.result_data = Some(serde_json::json!({ "step": -1 }).to_string());
+
+        let error = compute_next_step(&[jump_log]).expect_err("invalid target must fail closed");
+        assert!(
+            error.to_string().contains("has no unsigned integer target"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -1829,7 +1864,10 @@ mod tests {
         let mut send_log = make_step_log(2, "send_text");
         send_log.id = 11;
 
-        assert_eq!(resolve_resume_step(&record, &[send_log]), 3);
+        assert_eq!(
+            resolve_resume_step(&record, &[send_log]).expect("resume state is valid"),
+            3
+        );
     }
 
     #[test]
@@ -1852,7 +1890,10 @@ mod tests {
         let mut wait_log = make_step_log(3, "wait_for");
         wait_log.id = 12;
 
-        assert_eq!(resolve_resume_step(&record, &[wait_log]), 4);
+        assert_eq!(
+            resolve_resume_step(&record, &[wait_log]).expect("resume state is valid"),
+            4
+        );
     }
 
     #[test]
@@ -1878,7 +1919,10 @@ mod tests {
         let mut wait_log = make_step_log(3, "wait_for");
         wait_log.id = 12;
 
-        assert_eq!(resolve_resume_step(&record, &[wait_log]), 3);
+        assert_eq!(
+            resolve_resume_step(&record, &[wait_log]).expect("resume state is valid"),
+            3
+        );
     }
 
     #[test]

@@ -2507,7 +2507,10 @@ steps:
     #[test]
     fn compute_next_step_empty_logs_returns_zero() {
         let logs: Vec<crate::storage::WorkflowStepLogRecord> = vec![];
-        assert_eq!(super::compute_next_step(&logs), 0);
+        assert_eq!(
+            super::compute_next_step(&logs).expect("empty log has a valid next step"),
+            0
+        );
     }
 
     #[test]
@@ -2529,7 +2532,10 @@ steps:
             completed_at: 1100,
             duration_ms: 100,
         }];
-        assert_eq!(super::compute_next_step(&logs), 1);
+        assert_eq!(
+            super::compute_next_step(&logs).expect("completed step has a valid successor"),
+            1
+        );
     }
 
     #[test]
@@ -2551,7 +2557,10 @@ steps:
             completed_at: 1100,
             duration_ms: 100,
         }];
-        assert_eq!(super::compute_next_step(&logs), 3);
+        assert_eq!(
+            super::compute_next_step(&logs).expect("valid jump result must resolve"),
+            3
+        );
     }
 
     #[test]
@@ -2575,7 +2584,10 @@ steps:
             duration_ms: 100,
         }];
         // Retry at step 1 means re-execute step 1
-        assert_eq!(super::compute_next_step(&logs), 1);
+        assert_eq!(
+            super::compute_next_step(&logs).expect("retry result has a valid next step"),
+            1
+        );
     }
 
     #[test]
@@ -2634,7 +2646,10 @@ steps:
             },
         ];
         // Highest completed is step_index 1, so next is 2
-        assert_eq!(super::compute_next_step(&logs), 2);
+        assert_eq!(
+            super::compute_next_step(&logs).expect("latest successful log must resolve"),
+            2
+        );
     }
 
     #[test]
@@ -2677,7 +2692,10 @@ steps:
             },
         ];
         // Highest completed is step_index 2, so next is 3
-        assert_eq!(super::compute_next_step(&logs), 3);
+        assert_eq!(
+            super::compute_next_step(&logs).expect("completed logs have a valid successor"),
+            3
+        );
     }
 
     #[test]
