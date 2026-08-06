@@ -110,7 +110,9 @@ fn setup_db() -> (String, Connection) {
              state_hash TEXT NOT NULL,
              pane_count INTEGER NOT NULL,
              total_bytes INTEGER NOT NULL,
-             metadata_json TEXT
+             metadata_json TEXT,
+             checkpoint_role TEXT NOT NULL DEFAULT 'snapshot',
+             topology_json TEXT
          );
 
          CREATE TABLE mux_pane_state (

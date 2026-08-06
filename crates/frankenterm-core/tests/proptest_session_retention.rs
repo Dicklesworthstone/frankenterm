@@ -49,6 +49,26 @@ fn insert_session(conn: &Connection, id: &str, created_at: i64, shutdown_clean: 
         params![id, created_at, shutdown_clean as i64],
     )
     .unwrap();
+    if shutdown_clean {
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash,
+              pane_count, total_bytes, metadata_json, checkpoint_role,
+              topology_json)
+             VALUES (?1, ?2, 'startup', 'restore', 0, 0,
+                     '{\"old_to_new\":{}}', 'restore_receipt', NULL)",
+            params![id, created_at],
+        )
+        .unwrap();
+        let receipt_id = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE mux_sessions
+             SET last_checkpoint_at = ?2, clean_checkpoint_id = ?3
+             WHERE session_id = ?1",
+            params![id, created_at, receipt_id],
+        )
+        .unwrap();
+    }
 }
 
 fn insert_checkpoint(
@@ -58,13 +78,37 @@ fn insert_checkpoint(
     total_bytes: i64,
 ) -> i64 {
     conn.execute(
+        "DELETE FROM session_checkpoints
+         WHERE id = (
+             SELECT clean_checkpoint_id
+             FROM mux_sessions
+             WHERE session_id = ?1
+         )
+           AND checkpoint_role = 'restore_receipt'
+           AND total_bytes = 0",
+        [session_id],
+    )
+    .unwrap();
+    conn.execute(
         "INSERT INTO session_checkpoints
          (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
          VALUES (?1, ?2, 'periodic', 'hash', 1, ?3)",
         params![session_id, checkpoint_at, total_bytes],
     )
     .unwrap();
-    conn.last_insert_rowid()
+    let checkpoint_id = conn.last_insert_rowid();
+    conn.execute(
+        "UPDATE mux_sessions
+         SET last_checkpoint_at = ?2,
+             clean_checkpoint_id = CASE
+                 WHEN shutdown_clean = 1 THEN ?3
+                 ELSE NULL
+             END
+         WHERE session_id = ?1",
+        params![session_id, checkpoint_at, checkpoint_id],
+    )
+    .unwrap();
+    checkpoint_id
 }
 
 fn insert_pane_state(conn: &Connection, checkpoint_id: i64, pane_id: u64) {

@@ -116,6 +116,7 @@ fn arb_shutdown_summary() -> impl Strategy<Value = ShutdownSummary> {
         0..100000u64,
         0..1000usize,
         0..1000usize,
+        proptest::bool::ANY,
         0..100000u64,
         0..1000000u64,
         prop::collection::vec((0..100u64, 0..10000i64), 0..10),
@@ -127,22 +128,31 @@ fn arb_shutdown_summary() -> impl Strategy<Value = ShutdownSummary> {
                 elapsed_secs,
                 final_capture_queue,
                 final_write_queue,
+                requested_quiescence_proof,
                 segments_persisted,
                 events_recorded,
                 last_seq_by_pane,
                 clean,
                 warnings,
             )| {
-                ShutdownSummary {
+                let (final_capture_queue, final_write_queue, clean) =
+                    if requested_quiescence_proof {
+                        (0, 0, true)
+                    } else {
+                        (final_capture_queue, final_write_queue, clean)
+                    };
+                ShutdownSummary::try_new(
                     elapsed_secs,
                     final_capture_queue,
                     final_write_queue,
+                    requested_quiescence_proof,
                     segments_persisted,
                     events_recorded,
                     last_seq_by_pane,
                     clean,
                     warnings,
-                }
+                )
+                .expect("strategy must generate only valid shutdown-summary authority states")
             },
         )
 }
@@ -380,13 +390,7 @@ proptest! {
     fn prop_shutdown_summary_serde_roundtrip(s in arb_shutdown_summary()) {
         let json = serde_json::to_string(&s).unwrap();
         let back: ShutdownSummary = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back.elapsed_secs, s.elapsed_secs);
-        prop_assert_eq!(back.final_capture_queue, s.final_capture_queue);
-        prop_assert_eq!(back.final_write_queue, s.final_write_queue);
-        prop_assert_eq!(back.segments_persisted, s.segments_persisted);
-        prop_assert_eq!(back.events_recorded, s.events_recorded);
-        prop_assert_eq!(back.clean, s.clean);
-        prop_assert_eq!(back.warnings, s.warnings);
+        prop_assert_eq!(back, s);
     }
 
     /// Property 9: CrashReport serde roundtrip
@@ -1198,21 +1202,24 @@ proptest! {
         segments in 0u64..1_000_000,
         clean in proptest::bool::ANY,
     ) {
-        let summary = ShutdownSummary {
-            elapsed_secs: elapsed,
-            final_capture_queue: 0,
-            final_write_queue: 0,
-            segments_persisted: segments,
-            events_recorded: 0,
-            last_seq_by_pane: vec![(1, 42)],
+        let summary = ShutdownSummary::try_new(
+            elapsed,
+            0,
+            0,
             clean,
-            warnings: vec![],
-        };
+            segments,
+            0,
+            vec![(1, 42)],
+            clean,
+            vec![],
+        )
+        .expect("clean zero-depth state is the only positive proof state");
         let json = serde_json::to_string(&summary).unwrap();
         let back: ShutdownSummary = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.elapsed_secs, elapsed);
         prop_assert_eq!(back.segments_persisted, segments);
-        prop_assert_eq!(back.clean, clean);
+        prop_assert_eq!(back.is_clean(), clean);
+        prop_assert_eq!(back.managed_queue_quiescence_proven(), clean);
     }
 
     // ── CR-53: HealthDiagnosticsData::from_health_snapshot classification ──

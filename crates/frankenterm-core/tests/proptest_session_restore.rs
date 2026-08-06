@@ -33,7 +33,7 @@ use rusqlite::{Connection, params};
 use frankenterm_core::restore_layout::RestoreResult;
 use frankenterm_core::session_pane_state::{AgentMetadata, TerminalState};
 use frankenterm_core::session_restore::{
-    CheckpointInfo, RestoreSummary, RestoredPaneState, SessionDoctorReport, SessionInfo,
+    CheckpointInfo, CheckpointRole, RestoreSummary, RestoredPaneState, SessionDoctorReport, SessionInfo,
     SessionRestoreConfig, format_restore_summary,
 };
 use frankenterm_core::session_retention::CleanupResult;
@@ -43,12 +43,13 @@ use frankenterm_core::session_retention::CleanupResult;
 // ────────────────────────────────────────────────────────────────────
 
 /// Create a temporary SQLite database with the session persistence schema.
-/// Returns (db_path, connection). The tempdir path is persisted for test use.
-fn setup_test_db() -> (String, Connection) {
+/// Returns the owning tempdir, database path, and connection.
+fn setup_test_db() -> (tempfile::TempDir, String, Connection) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db").to_string_lossy().to_string();
     let conn = Connection::open(&db_path).unwrap();
-    conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        .unwrap();
 
     conn.execute_batch(
         "CREATE TABLE mux_sessions (
@@ -59,23 +60,30 @@ fn setup_test_db() -> (String, Connection) {
             topology_json TEXT NOT NULL,
             window_metadata_json TEXT,
             ft_version TEXT NOT NULL,
-            host_id TEXT
+            host_id TEXT,
+            clean_checkpoint_id INTEGER
+                REFERENCES session_checkpoints(id) ON DELETE SET NULL
         );
 
         CREATE TABLE session_checkpoints (
             id INTEGER PRIMARY KEY,
-            session_id TEXT NOT NULL,
+            session_id TEXT NOT NULL REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
             checkpoint_at INTEGER NOT NULL,
-            checkpoint_type TEXT,
+            checkpoint_type TEXT NOT NULL
+                CHECK(checkpoint_type IN ('periodic','event','shutdown','startup')),
             state_hash TEXT NOT NULL,
             pane_count INTEGER NOT NULL,
             total_bytes INTEGER NOT NULL,
-            metadata_json TEXT
+            metadata_json TEXT,
+            checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
+                CHECK(checkpoint_role IN ('snapshot','restore_receipt')),
+            topology_json TEXT
         );
 
         CREATE TABLE mux_pane_state (
             id INTEGER PRIMARY KEY,
-            checkpoint_id INTEGER NOT NULL,
+            checkpoint_id INTEGER NOT NULL
+                REFERENCES session_checkpoints(id) ON DELETE CASCADE,
             pane_id INTEGER NOT NULL,
             cwd TEXT,
             command TEXT,
@@ -87,12 +95,13 @@ fn setup_test_db() -> (String, Connection) {
         );
 
         CREATE INDEX idx_checkpoints_session ON session_checkpoints(session_id, checkpoint_at);
+        CREATE INDEX idx_checkpoints_session_role_latest
+            ON session_checkpoints(session_id, checkpoint_role, checkpoint_at DESC, id DESC);
         CREATE INDEX idx_pane_state_checkpoint ON mux_pane_state(checkpoint_id);",
     )
     .unwrap();
 
-    let _ = dir.keep();
-    (db_path, conn)
+    (dir, db_path, conn)
 }
 
 fn insert_session(
@@ -117,6 +126,31 @@ fn insert_session(
         ],
     )
     .unwrap();
+    if shutdown_clean {
+        insert_clean_receipt(conn, session_id, created_at);
+    }
+}
+
+fn insert_clean_receipt(conn: &Connection, session_id: &str, checkpoint_at: i64) {
+    conn.execute(
+        "INSERT INTO session_checkpoints
+         (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+          total_bytes, metadata_json, checkpoint_role, topology_json)
+         VALUES (?1, ?2, 'startup', 'restore', 0, 0,
+                 '{\"old_to_new\":{}}', 'restore_receipt', NULL)",
+        params![session_id, checkpoint_at],
+    )
+    .unwrap();
+    let receipt_id = conn.last_insert_rowid();
+    conn.execute(
+        "UPDATE mux_sessions
+         SET shutdown_clean = 1,
+             last_checkpoint_at = ?2,
+             clean_checkpoint_id = ?3
+         WHERE session_id = ?1",
+        params![session_id, checkpoint_at, receipt_id],
+    )
+    .unwrap();
 }
 
 fn insert_checkpoint(
@@ -128,8 +162,12 @@ fn insert_checkpoint(
     checkpoint_type: Option<&str>,
 ) -> i64 {
     conn.execute(
-        "INSERT INTO session_checkpoints (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
-         VALUES (?1, ?2, ?3, 'hash123', ?4, ?5)",
+        "INSERT INTO session_checkpoints
+         (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+          total_bytes, checkpoint_role, topology_json)
+         SELECT ?1, ?2, ?3, '0000000000000000', ?4, ?5, 'snapshot', topology_json
+         FROM mux_sessions
+         WHERE session_id = ?1",
         params![
             session_id,
             checkpoint_at,
@@ -339,20 +377,25 @@ fn arb_checkpoint_info() -> impl Strategy<Value = CheckpointInfo> {
     (
         1i64..10000,
         0u64..2_000_000_000_000,
-        prop::option::of(prop_oneof![
+        prop_oneof![
             Just("periodic".to_string()),
             Just("event".to_string()),
             Just("shutdown".to_string()),
             Just("startup".to_string()),
-        ]),
+        ],
+        prop_oneof![
+            Just(CheckpointRole::Snapshot),
+            Just(CheckpointRole::RestoreReceipt),
+        ],
         0usize..50,
         0usize..1_000_000,
     )
         .prop_map(
-            |(id, checkpoint_at, checkpoint_type, pane_count, total_bytes)| CheckpointInfo {
+            |(id, checkpoint_at, checkpoint_type, checkpoint_role, pane_count, total_bytes)| CheckpointInfo {
                 id,
                 checkpoint_at,
                 checkpoint_type,
+                checkpoint_role,
                 pane_count,
                 total_bytes,
             },
@@ -712,7 +755,7 @@ proptest! {
         clean_count in 0usize..5,
         unclean_count in 0usize..5,
     ) {
-        let (db_path, conn) = setup_test_db();
+        let (_dir, db_path, conn) = setup_test_db();
 
         for i in 0..clean_count {
             insert_session(&conn, &format!("clean-{}", i), true, 1000 + i as i64, "0.1.0", None);
@@ -743,7 +786,7 @@ proptest! {
         clean_count in 0usize..5,
         unclean_count in 0usize..5,
     ) {
-        let (db_path, conn) = setup_test_db();
+        let (_dir, db_path, conn) = setup_test_db();
 
         for i in 0..clean_count {
             insert_session(&conn, &format!("c-{}", i), true, 1000 + i as i64, "0.1.0", None);
@@ -774,7 +817,7 @@ proptest! {
     fn db_load_latest_checkpoint_picks_newest(
         cp_count in 1usize..6,
     ) {
-        let (db_path, conn) = setup_test_db();
+        let (_dir, db_path, conn) = setup_test_db();
         insert_session(&conn, "sess-multi", false, 1000, "0.1.0", None);
 
         let mut latest_at = 0i64;
@@ -782,6 +825,16 @@ proptest! {
         for i in 0..cp_count {
             let at = 1000 + (i as i64) * 500;
             let id = insert_checkpoint(&conn, "sess-multi", at, i + 1, 1024, None);
+            for pane_id in 0..=i {
+                insert_pane_state(
+                    &conn,
+                    id,
+                    u64::try_from(pane_id).unwrap(),
+                    None,
+                    None,
+                    None,
+                );
+            }
             if at > latest_at {
                 latest_at = at;
                 latest_id = id;
@@ -812,7 +865,7 @@ proptest! {
         startup_delta in 1i64..1_000_000,
         pane_id in 0u64..1000,
     ) {
-        let (db_path, conn) = setup_test_db();
+        let (_dir, db_path, conn) = setup_test_db();
         insert_session(&conn, "sess-shadowed", false, 1000, "0.1.0", None);
 
         let capture_cp = insert_checkpoint(
@@ -827,8 +880,10 @@ proptest! {
 
         conn.execute(
             "INSERT INTO session_checkpoints
-             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
-             VALUES (?1, ?2, 'startup', 'restore', ?3, 0, ?4)",
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+              total_bytes, metadata_json, checkpoint_role, topology_json)
+             VALUES (?1, ?2, 'startup', 'restore', ?3, 0, ?4,
+                     'restore_receipt', NULL)",
             params![
                 "sess-shadowed",
                 capture_at + startup_delta,
@@ -858,7 +913,7 @@ proptest! {
     fn db_load_checkpoint_by_id_correct(
         pane_count in 0usize..5,
     ) {
-        let (db_path, conn) = setup_test_db();
+        let (_dir, db_path, conn) = setup_test_db();
         insert_session(&conn, "sess-byid", false, 1000, "0.1.0", None);
         let cp_id = insert_checkpoint(&conn, "sess-byid", 5000, pane_count, 2048, Some("periodic"));
 
@@ -889,15 +944,16 @@ proptest! {
         unclean_count in 0usize..4,
         cp_per_session in 0usize..3,
     ) {
-        let (db_path, conn) = setup_test_db();
+        let (_dir, db_path, conn) = setup_test_db();
 
         let total = clean_count + unclean_count;
         for i in 0..clean_count {
             let sid = format!("dc-{}", i);
-            insert_session(&conn, &sid, true, 1000 + i as i64, "0.1.0", None);
+            insert_session(&conn, &sid, false, 1000 + i as i64, "0.1.0", None);
             for j in 0..cp_per_session {
                 insert_checkpoint(&conn, &sid, 2000 + j as i64, 1, 512, None);
             }
+            insert_clean_receipt(&conn, &sid, 5000 + i as i64);
         }
         for i in 0..unclean_count {
             let sid = format!("du-{}", i);
@@ -918,7 +974,7 @@ proptest! {
             "unclean ({}) must be <= total ({})",
             report.unclean_sessions, report.total_sessions
         );
-        let expected_checkpoints = total * cp_per_session;
+        let expected_checkpoints = total * cp_per_session + clean_count;
         prop_assert_eq!(report.total_checkpoints, expected_checkpoints,
             "total_checkpoints mismatch: expected {}, got {}",
             expected_checkpoints, report.total_checkpoints);
@@ -933,7 +989,7 @@ proptest! {
     fn db_delete_session_cascades(
         pane_count in 1usize..5,
     ) {
-        let (db_path, conn) = setup_test_db();
+        let (_dir, db_path, conn) = setup_test_db();
         insert_session(&conn, "sess-del", false, 1000, "0.1.0", None);
         let cp_id = insert_checkpoint(&conn, "sess-del", 2000, pane_count, 1024, None);
 
@@ -968,7 +1024,7 @@ proptest! {
     // ================================================================
     #[test]
     fn db_delete_nonexistent_returns_false(session_id in "[a-z]{4,10}") {
-        let (db_path, _conn) = setup_test_db();
+        let (_dir, db_path, _conn) = setup_test_db();
         let deleted = frankenterm_core::session_restore::delete_session(&db_path, &session_id).unwrap();
         prop_assert!(!deleted, "deleting nonexistent session should return false");
     }
@@ -980,7 +1036,7 @@ proptest! {
     fn db_show_session_returns_data(
         cp_count in 0usize..5,
     ) {
-        let (db_path, conn) = setup_test_db();
+        let (_dir, db_path, conn) = setup_test_db();
         insert_session(&conn, "sess-show", false, 1000, "0.2.0", Some("host-abc"));
 
         for i in 0..cp_count {
@@ -1018,7 +1074,7 @@ proptest! {
             Just("gemini"),
         ],
     ) {
-        let (db_path, conn) = setup_test_db();
+        let (_dir, db_path, conn) = setup_test_db();
         insert_session(&conn, "sess-agent-rt", false, 1000, "0.1.0", None);
         let cp_id = insert_checkpoint(&conn, "sess-agent-rt", 5000, 1, 1024, None);
 
@@ -1099,7 +1155,8 @@ proptest! {
         let info = CheckpointInfo {
             id: 42,
             checkpoint_at: 5000,
-            checkpoint_type: Some("periodic".into()),
+            checkpoint_type: "periodic".into(),
+            checkpoint_role: CheckpointRole::Snapshot,
             pane_count,
             total_bytes,
         };
@@ -1176,7 +1233,7 @@ proptest! {
         base_created_at in 10_000i64..1_000_000,
         checkpoint_gap in 1i64..5_000,
     ) {
-        let (db_path, conn) = setup_test_db();
+        let (_dir, db_path, conn) = setup_test_db();
 
         insert_session(&conn, "older-created-newer-checkpoint", false, base_created_at, "0.1.0", Some("host-a"));
         insert_session(&conn, "newest-created-no-checkpoint", false, base_created_at + checkpoint_gap, "0.1.0", Some("host-b"));
@@ -1215,7 +1272,7 @@ proptest! {
         latest_pane_count in 1usize..5,
         latest_total_bytes in 1usize..100_000,
     ) {
-        let (db_path, conn) = setup_test_db();
+        let (_dir, db_path, conn) = setup_test_db();
         insert_session(&conn, "sess-projection", false, 1000, "0.4.0", Some("host-meta"));
 
         insert_checkpoint(&conn, "sess-projection", 2000, first_pane_count, 512, Some("periodic"));
@@ -1249,7 +1306,7 @@ proptest! {
         first_panes in 0usize..5,
         second_panes in 0usize..5,
     ) {
-        let (db_path, conn) = setup_test_db();
+        let (_dir, db_path, conn) = setup_test_db();
         insert_session(&conn, "sess-metadata", false, 1000, "0.5.0", Some("host-z"));
 
         let first_at = 2000i64;
@@ -1265,12 +1322,12 @@ proptest! {
         prop_assert_eq!(checkpoints.len(), 2);
 
         prop_assert_eq!(checkpoints[0].checkpoint_at, second_at as u64);
-        prop_assert_eq!(checkpoints[0].checkpoint_type.as_deref(), Some("shutdown"));
+        prop_assert_eq!(checkpoints[0].checkpoint_type.as_str(), "shutdown");
         prop_assert_eq!(checkpoints[0].pane_count, second_panes);
         prop_assert_eq!(checkpoints[0].total_bytes, second_bytes);
 
         prop_assert_eq!(checkpoints[1].checkpoint_at, first_at as u64);
-        prop_assert_eq!(checkpoints[1].checkpoint_type.as_deref(), Some("periodic"));
+        prop_assert_eq!(checkpoints[1].checkpoint_type.as_str(), "periodic");
         prop_assert_eq!(checkpoints[1].pane_count, first_panes);
         prop_assert_eq!(checkpoints[1].total_bytes, first_bytes);
     }

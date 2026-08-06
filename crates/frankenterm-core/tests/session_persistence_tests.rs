@@ -90,7 +90,8 @@ fn setup_test_db() -> (tempfile::NamedTempFile, Arc<String>) {
             topology_json TEXT NOT NULL,
             window_metadata_json TEXT,
             ft_version TEXT NOT NULL,
-            host_id TEXT
+            host_id TEXT,
+            clean_checkpoint_id INTEGER REFERENCES session_checkpoints(id) ON DELETE SET NULL
         );
         CREATE TABLE IF NOT EXISTS session_checkpoints (
             id INTEGER PRIMARY KEY,
@@ -100,7 +101,10 @@ fn setup_test_db() -> (tempfile::NamedTempFile, Arc<String>) {
             state_hash TEXT NOT NULL,
             pane_count INTEGER NOT NULL,
             total_bytes INTEGER NOT NULL,
-            metadata_json TEXT
+            metadata_json TEXT,
+            checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
+                CHECK(checkpoint_role IN ('snapshot','restore_receipt')),
+            topology_json TEXT
         );
         CREATE TABLE IF NOT EXISTS mux_pane_state (
             id INTEGER PRIMARY KEY,
@@ -115,6 +119,10 @@ fn setup_test_db() -> (tempfile::NamedTempFile, Arc<String>) {
             last_output_at INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON session_checkpoints(session_id, checkpoint_at);
+        CREATE INDEX IF NOT EXISTS idx_checkpoints_session_role_latest
+            ON session_checkpoints(session_id, checkpoint_role, checkpoint_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_mux_sessions_clean_checkpoint
+            ON mux_sessions(clean_checkpoint_id);
         CREATE INDEX IF NOT EXISTS idx_pane_state_checkpoint ON mux_pane_state(checkpoint_id);
         CREATE INDEX IF NOT EXISTS idx_pane_state_pane ON mux_pane_state(pane_id);
         PRAGMA foreign_keys = ON;
@@ -321,28 +329,64 @@ fn shutdown_marks_session_clean() {
 
         // Verify not yet clean
         let conn = Connection::open(db_path.as_str()).unwrap();
-        let clean: i64 = conn
+        let (clean, clean_checkpoint_id): (i64, Option<i64>) = conn
             .query_row(
-                "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
+                "SELECT shutdown_clean, clean_checkpoint_id
+                 FROM mux_sessions WHERE session_id = ?1",
                 [&r.session_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(clean, 0);
+        assert_eq!(clean_checkpoint_id, None);
         drop(conn);
 
         // Mark shutdown
-        engine.mark_shutdown().await.unwrap();
+        engine.close_after_checkpoint(&r).await.unwrap();
 
         let conn = Connection::open(db_path.as_str()).unwrap();
-        let clean: i64 = conn
+        let (clean, clean_checkpoint_id): (i64, Option<i64>) = conn
             .query_row(
-                "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
+                "SELECT shutdown_clean, clean_checkpoint_id
+                 FROM mux_sessions WHERE session_id = ?1",
+                [&r.session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(clean, 1);
+        assert_eq!(clean_checkpoint_id, Some(r.checkpoint_id));
+
+        let bound_witness: String = conn
+            .query_row(
+                "SELECT checkpoint.state_hash
+                 FROM mux_sessions AS session
+                 JOIN session_checkpoints AS checkpoint
+                   ON checkpoint.id = session.clean_checkpoint_id
+                  AND checkpoint.session_id = session.session_id
+                 WHERE session.session_id = ?1",
                 [&r.session_id],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(clean, 1);
+        assert_eq!(bound_witness, r.state_hash);
+        drop(conn);
+
+        // Any later checkpoint invalidates the old receipt atomically.
+        engine
+            .capture(&[make_pane_simple(1)], SnapshotTrigger::Manual)
+            .await
+            .unwrap();
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let (clean, clean_checkpoint_id): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT shutdown_clean, clean_checkpoint_id
+                 FROM mux_sessions WHERE session_id = ?1",
+                [&r.session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(clean, 0);
+        assert_eq!(clean_checkpoint_id, None);
     });
 }
 

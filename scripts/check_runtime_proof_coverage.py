@@ -18,8 +18,10 @@ body-validated allowlists and separate census categories. Nested types such as
 `Option<&Cx>` and `impl FnOnce(&Cx)` are not proof arguments.
 
 The script ratchets a baseline at `tests/runtime_proof_coverage_baseline.json`.
-A run fails (exit 1) on uncovered growth or an aggregate/category/per-file
-census collapse. Update the baseline only alongside an audited source change.
+A run fails (exit 1) on uncovered growth or a stable-site/category/per-file
+census collapse. Stable identities bind file, function, category, lexical
+scope, signature, and cfg source. Update the baseline only alongside an
+audited source change.
 
 Usage:
   scripts/check_runtime_proof_coverage.py
@@ -34,17 +36,33 @@ Cross-references:
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
+import hashlib
 import json
+import posixpath
 import re
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_ROOT = REPO_ROOT / "crates" / "frankenterm-core" / "src"
 BASELINE_PATH = (
     REPO_ROOT / "crates" / "frankenterm-core" / "tests" / "runtime_proof_coverage_baseline.json"
+)
+SITE_IDENTITY_ALGORITHM = (
+    "ft.runtime_proof_site_identity.v2;record=file,name,category,scope_sha256,"
+    "signature_sha256,cfg_sha256;digest=sha256(utf8(canonical-json(sort-keys,"
+    "compact-separators,ensure-ascii-false)));scope=outer-to-inner-list<rust-"
+    "token-list>;signature=rust-token-list;cfg={module_paths:sorted-list<root-"
+    "to-leaf-list<tagged-context-token-list>>,local:outer-to-inner-list<cfg-"
+    "attribute-token-list>};cfg-context-tags=@file-inner-cfg|@external-mod|"
+    "@external-mod-cfg|@unresolved-module-ancestry;rust-tokens=comments-and-"
+    "whitespace-elided,literals-preserved,crlf-normalized;aggregation=identical-"
+    "record-occurrence-count"
 )
 
 # Runtime-layer files that ARE the seal — they cannot take a
@@ -651,6 +669,10 @@ TOKEN_RE = re.compile(
 NEGATIVE_EVIDENCE = [
     "source-declared APIs only; procedural/attribute macro expansions require compiler-side proof",
     "type and module path resolution is lexical; shadowing/aliases require compiler-side proof",
+    "effective cfg ancestry is resolved lexically from lib.rs through conventional mod files and unescaped literal #[path] declarations; escaped or cfg_attr-selected paths, include-generated modules, and macro-generated module edges require compiler-side proof",
+    "cfg identity records syntactic module-path alternatives and local cfg/cfg_attr attributes; it does not evaluate target- or feature-specific rustc cfg truth values",
+    "source files unreachable from the lexical lib.rs module graph remain in the census with an explicit @unresolved-module-ancestry identity marker; their effective rustc cfg and build reachability are unproven",
+    "scope ownership is reconstructed lexically with delimiter-aware generic and const-expression handling; exotic braced expressions in item/control-flow headers require compiler-side proof",
     "proof parameters must be direct values; nested callback/container Cx types are rejected",
     "wrapper proof accepts only canonical ambient-Cx binding plus sibling await and optional literal expect grammar",
     "required-ambient wrapper proof accepts only Cx::current fail-closed acquisition plus the exact Cx sibling await",
@@ -672,17 +694,38 @@ class FunctionSite:
     line: int
     start: int
     signature: str
+    raw_signature: str
     param_text: str
     body: str | None
     raw_body: str | None
     scope: tuple[int, ...]
+    scope_headers: tuple[str, ...]
     cfg_key: tuple[tuple[str, ...], ...]
+    raw_cfg: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class WrapperCall:
     sibling_name: str
     cx_arg_index: int
+
+
+@dataclass(frozen=True)
+class ExternalModuleEdge:
+    parent: str
+    target: str
+    name: str
+    inline_modules: tuple[str, ...]
+    cfg_attributes: tuple[tuple[str, ...], ...]
+
+
+@dataclass(frozen=True)
+class ParsedRustSource:
+    clean: str
+    scan_code: str
+    tokens: tuple[Token, ...]
+    pairs: dict[int, int]
+    errors: tuple[str, ...]
 
 
 def _normal_name(value: str) -> str:
@@ -800,6 +843,87 @@ def tokenize(code: str) -> list[Token]:
     return [Token(match.group(0), match.start(), match.end()) for match in TOKEN_RE.finditer(code)]
 
 
+def _canonical_rust_tokens(source: str) -> tuple[str, ...]:
+    """Return a formatting-insensitive lexical token stream.
+
+    Comments and inter-token whitespace are not part of a site's semantic
+    identity. Literal spellings are retained verbatim (apart from newline
+    normalization) so cfg feature names and const values cannot collapse.
+    This is intentionally a lexer, not a Rust semantic frontend; the exact
+    remaining limits are recorded in ``NEGATIVE_EVIDENCE``.
+    """
+    values: list[str] = []
+    cursor = 0
+    while cursor < len(source):
+        if source[cursor].isspace():
+            cursor += 1
+            continue
+        if source.startswith("//", cursor):
+            end = source.find("\n", cursor + 2)
+            cursor = len(source) if end < 0 else end + 1
+            continue
+        if source.startswith("/*", cursor):
+            depth = 1
+            end = cursor + 2
+            while end < len(source) and depth:
+                if source.startswith("/*", end):
+                    depth += 1
+                    end += 2
+                elif source.startswith("*/", end):
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+            cursor = end
+            continue
+
+        raw = None
+        if source[cursor] in "bcr" and (
+            cursor == 0
+            or not (source[cursor - 1].isalnum() or source[cursor - 1] in "_#")
+        ):
+            raw = RAW_STRING_RE.match(source, cursor)
+        if raw:
+            terminator = '"' + raw.group("hashes")
+            closing = source.find(terminator, raw.end())
+            end = len(source) if closing < 0 else closing + len(terminator)
+            values.append(source[cursor:end].replace("\r\n", "\n").replace("\r", "\n"))
+            cursor = end
+            continue
+
+        string_prefix = 1 if source.startswith(("b\"", "c\""), cursor) else 0
+        if source[cursor + string_prefix : cursor + string_prefix + 1] == '"':
+            end = cursor + string_prefix + 1
+            while end < len(source):
+                if source[end] == "\\":
+                    end = min(end + 2, len(source))
+                elif source[end] == '"':
+                    end += 1
+                    break
+                else:
+                    end += 1
+            values.append(source[cursor:end].replace("\r\n", "\n").replace("\r", "\n"))
+            cursor = end
+            continue
+
+        char_start = cursor + 1 if source.startswith("b'", cursor) else cursor
+        if source[char_start : char_start + 1] == "'":
+            char_end = _char_literal_end(source, char_start)
+            if char_end is not None:
+                values.append(source[cursor:char_end])
+                cursor = char_end
+                continue
+
+        match = TOKEN_RE.match(source, cursor)
+        if match is None:
+            values.append(source[cursor])
+            cursor += 1
+        else:
+            values.append(match.group(0))
+            cursor = match.end()
+    return tuple(values)
+
+
 def delimiter_pairs(tokens: list[Token]) -> tuple[dict[int, int], list[str]]:
     pairs: dict[int, int] = {}
     errors: list[str] = []
@@ -861,7 +985,10 @@ def mask_macro_token_bodies(code: str) -> tuple[str, list[str]]:
                 f"macro token body at offset {tokens[group_index].start} contains an ambiguous "
                 "public async function declaration"
             )
-        ranges.append((tokens[group_index].start, tokens[closing].end))
+        # Preserve the outer delimiters as lexical item boundaries while
+        # blanking their token body. This prevents a following impl/trait
+        # header from absorbing a preceding braced macro item.
+        ranges.append((tokens[group_index].end, tokens[closing].start))
 
     # Declarative macro 2.0 has no `!`; mask its template body too.
     for index, token in enumerate(tokens):
@@ -886,7 +1013,7 @@ def mask_macro_token_bodies(code: str) -> tuple[str, list[str]]:
                 f"macro definition at offset {token.start} contains an ambiguous public async "
                 "function declaration"
             )
-        ranges.append((tokens[body_index].start, tokens[body_close].end))
+        ranges.append((tokens[body_index].end, tokens[body_close].start))
 
     chars = list(code)
     for start, end in ranges:
@@ -894,31 +1021,233 @@ def mask_macro_token_bodies(code: str) -> tuple[str, list[str]]:
     return "".join(chars), errors
 
 
-def _cfg_key(tokens: list[Token], pairs: dict[int, int], pub_index: int) -> tuple[tuple[str, ...], ...]:
-    attributes: list[tuple[str, ...]] = []
-    cursor = pub_index - 1
+def _parse_rust_source(source: str) -> ParsedRustSource:
+    clean, errors = sanitize_rust(source)
+    scan_code, macro_errors = mask_macro_token_bodies(clean)
+    errors.extend(macro_errors)
+    tokens = tuple(tokenize(scan_code))
+    pairs, pair_errors = delimiter_pairs(list(tokens))
+    errors.extend(pair_errors)
+    return ParsedRustSource(
+        clean=clean,
+        scan_code=scan_code,
+        tokens=tokens,
+        pairs=pairs,
+        errors=tuple(errors),
+    )
+
+
+def _attribute_chain_before(
+    source: str,
+    tokens: Sequence[Token],
+    pairs: dict[int, int],
+    item_index: int,
+) -> tuple[tuple[tuple[str, ...], str], ...]:
+    """Return outer attributes immediately preceding one item token."""
+    attributes: list[tuple[tuple[str, ...], str]] = []
+    cursor = item_index - 1
     while cursor >= 0 and tokens[cursor].value == "]":
         opening = pairs.get(cursor)
         if opening is None or opening == 0 or tokens[opening - 1].value != "#":
             break
-        content = tuple(_normal_name(token.value) for token in tokens[opening + 1 : cursor])
-        if content and content[0] in {"cfg", "cfg_attr"}:
-            attributes.append(content)
+        content = tuple(
+            _normal_name(token.value) for token in tokens[opening + 1 : cursor]
+        )
+        raw = source[tokens[opening - 1].start : tokens[cursor].end]
+        attributes.append((content, raw))
         cursor = opening - 2
     attributes.reverse()
     return tuple(attributes)
 
 
-def discover_functions(source: str) -> tuple[list[FunctionSite], list[str]]:
-    """Discover source-declared public async functions without scanning macro bodies."""
-    clean, errors = sanitize_rust(source)
-    scan_code, macro_errors = mask_macro_token_bodies(clean)
-    errors.extend(macro_errors)
-    tokens = tokenize(scan_code)
-    pairs, pair_errors = delimiter_pairs(tokens)
-    errors.extend(pair_errors)
+def _cfg_key(
+    source: str,
+    tokens: Sequence[Token],
+    pairs: dict[int, int],
+    pub_index: int,
+) -> tuple[tuple[str, ...], ...]:
+    return tuple(
+        content
+        for content, _ in _attribute_chain_before(source, tokens, pairs, pub_index)
+        if content and content[0] in {"cfg", "cfg_attr"}
+    )
 
+
+def _raw_cfg_attributes(
+    source: str,
+    tokens: Sequence[Token],
+    pairs: dict[int, int],
+    pub_index: int,
+) -> tuple[str, ...]:
+    return tuple(
+        raw
+        for content, raw in _attribute_chain_before(source, tokens, pairs, pub_index)
+        if content and content[0] in {"cfg", "cfg_attr"}
+    )
+
+
+def _cfg_attributes_in_range(
+    source: str,
+    tokens: Sequence[Token],
+    pairs: dict[int, int],
+    start: int,
+    end: int,
+    *,
+    inner: bool,
+) -> tuple[str, ...]:
+    attributes: list[str] = []
+    cursor = start
+    while cursor < end:
+        if tokens[cursor].value != "#":
+            cursor += 1
+            continue
+        bang = cursor + 1 < end and tokens[cursor + 1].value == "!"
+        bracket = cursor + 2 if bang else cursor + 1
+        if bang != inner or bracket >= end or tokens[bracket].value != "[":
+            cursor += 1
+            continue
+        closing = pairs.get(bracket)
+        if closing is None or closing >= end:
+            cursor += 1
+            continue
+        content = tuple(
+            _normal_name(token.value) for token in tokens[bracket + 1 : closing]
+        )
+        if content and content[0] in {"cfg", "cfg_attr"}:
+            attributes.append(source[tokens[cursor].start : tokens[closing].end])
+        cursor = closing + 1
+    return tuple(attributes)
+
+
+def _leading_inner_cfg_attributes(
+    source: str,
+    tokens: Sequence[Token],
+    pairs: dict[int, int],
+    opening: int | None,
+) -> tuple[str, ...]:
+    """Collect cfg-bearing inner attributes at a crate/module body start."""
+    cursor = 0 if opening is None else opening + 1
+    attributes: list[str] = []
+    while cursor + 2 < len(tokens):
+        if tokens[cursor].value != "#" or tokens[cursor + 1].value != "!":
+            break
+        bracket = cursor + 2
+        if tokens[bracket].value != "[":
+            break
+        closing = pairs.get(bracket)
+        if closing is None:
+            break
+        content = tuple(
+            _normal_name(token.value) for token in tokens[bracket + 1 : closing]
+        )
+        if content and content[0] in {"cfg", "cfg_attr"}:
+            attributes.append(source[tokens[cursor].start : tokens[closing].end])
+        cursor = closing + 1
+    return tuple(attributes)
+
+
+def _scope_header_start(
+    tokens: Sequence[Token],
+    pairs: dict[int, int],
+    opening: int,
+    parent_opening: int | None,
+) -> int:
+    """Find the first token of the lexical item owning one enclosing brace."""
+    lower_bound = 0 if parent_opening is None else parent_opening + 1
+    cursor = opening - 1
+    angle_depth = 0
+    while cursor >= lower_bound:
+        value = tokens[cursor].value
+        if value == ">":
+            right = cursor + 1
+            while right < opening and tokens[right].value == ">":
+                right += 1
+            following = tokens[right].value if right < opening else "{"
+            plausible = following in {
+                "{",
+                "where",
+                "for",
+                "::",
+                "+",
+                ",",
+                ";",
+                "=",
+                ":",
+            }
+            if not plausible and (
+                following == "(" or IDENT_RE.fullmatch(following)
+            ):
+                scan = cursor - 1
+                while scan >= lower_bound:
+                    candidate = tokens[scan].value
+                    if candidate in {")", "]", "}"}:
+                        paired = pairs.get(scan)
+                        if paired is not None and paired >= lower_bound:
+                            scan = paired - 1
+                            continue
+                    if candidate == "<":
+                        prefix = {
+                            _normal_name(token.value)
+                            for token in tokens[max(lower_bound, scan - 4) : scan]
+                        }
+                        plausible = bool(
+                            prefix
+                            & {
+                                "impl",
+                                "trait",
+                                "fn",
+                                "type",
+                                "struct",
+                                "enum",
+                                "union",
+                            }
+                        )
+                        break
+                    if candidate in {";", "{"}:
+                        break
+                    scan -= 1
+            if plausible:
+                angle_depth += 1
+            cursor -= 1
+            continue
+        if value == "<" and angle_depth:
+            angle_depth -= 1
+            cursor -= 1
+            continue
+        if value in {")", "]"}:
+            paired = pairs.get(cursor)
+            if paired is not None and paired >= lower_bound:
+                cursor = paired - 1
+                continue
+        if value == "}":
+            paired = pairs.get(cursor)
+            if paired is not None and paired >= lower_bound and angle_depth:
+                cursor = paired - 1
+                continue
+            return cursor + 1
+        if angle_depth == 0 and value == ";":
+            return cursor + 1
+        cursor -= 1
+    return lower_bound
+
+
+def discover_functions(
+    source: str,
+    parsed: ParsedRustSource | None = None,
+) -> tuple[list[FunctionSite], list[str]]:
+    """Discover source-declared public async functions without scanning macro bodies."""
+    parsed = _parse_rust_source(source) if parsed is None else parsed
+    clean = parsed.clean
+    tokens = parsed.tokens
+    pairs = parsed.pairs
+    errors = list(parsed.errors)
+
+    root_inner_cfg = _leading_inner_cfg_attributes(source, tokens, pairs, None)
     scopes: dict[int, tuple[int, ...]] = {}
+    scope_headers: dict[int, tuple[str, ...]] = {}
+    scope_cfg: dict[int, tuple[str, ...]] = {}
+    header_by_opening: dict[int, str] = {}
+    cfg_by_opening: dict[int, tuple[str, ...]] = {}
     brace_stack: list[int] = []
     for index, token in enumerate(tokens):
         if token.value == "}":
@@ -927,10 +1256,42 @@ def discover_functions(source: str) -> tuple[list[FunctionSite], list[str]]:
                 brace_stack.pop()
         if _normal_name(token.value) == "pub":
             scopes[index] = tuple(tokens[opening].start for opening in brace_stack)
+            scope_headers[index] = tuple(
+                header_by_opening[opening] for opening in brace_stack
+            )
+            scope_cfg[index] = (
+                root_inner_cfg
+                + tuple(
+                    attribute
+                    for opening in brace_stack
+                    for attribute in cfg_by_opening[opening]
+                )
+            )
         if token.value == "{":
+            parent = brace_stack[-1] if brace_stack else None
+            header_start = _scope_header_start(tokens, pairs, index, parent)
+            if header_start >= index:
+                header_by_opening[index] = ""
+                outer_cfg: tuple[str, ...] = ()
+            else:
+                header_by_opening[index] = source[
+                    tokens[header_start].start : token.start
+                ].strip()
+                outer_cfg = _cfg_attributes_in_range(
+                    source,
+                    tokens,
+                    pairs,
+                    header_start,
+                    index,
+                    inner=False,
+                )
+            cfg_by_opening[index] = outer_cfg + _leading_inner_cfg_attributes(
+                source, tokens, pairs, index
+            )
             brace_stack.append(index)
 
     sites: list[FunctionSite] = []
+    newline_offsets = [match.start() for match in re.finditer("\n", source)]
     qualifiers = {"default", "const", "async", "unsafe", "extern"}
     openings = {"(", "["}
     for pub_index, pub_token in enumerate(tokens):
@@ -1030,17 +1391,321 @@ def discover_functions(source: str) -> tuple[list[FunctionSite], list[str]]:
         sites.append(
             FunctionSite(
                 name=name,
-                line=source.count("\n", 0, pub_token.start) + 1,
+                line=bisect_right(newline_offsets, pub_token.start) + 1,
                 start=pub_token.start,
                 signature=clean[pub_token.start:signature_end],
+                raw_signature=source[pub_token.start:signature_end],
                 param_text=clean[tokens[param_open].end : tokens[param_close].start],
                 body=body,
                 raw_body=raw_body,
                 scope=scopes.get(pub_index, ()),
-                cfg_key=_cfg_key(tokens, pairs, pub_index),
+                scope_headers=scope_headers.get(pub_index, ()),
+                cfg_key=_cfg_key(source, tokens, pairs, pub_index),
+                raw_cfg=(
+                    scope_cfg.get(pub_index, root_inner_cfg)
+                    + _raw_cfg_attributes(source, tokens, pairs, pub_index)
+                ),
             )
         )
     return sites, errors
+
+
+def _module_item_start(
+    tokens: Sequence[Token], pairs: dict[int, int], mod_index: int
+) -> int:
+    """Return the visibility/item start immediately preceding ``mod``."""
+    cursor = mod_index - 1
+    if cursor >= 0 and tokens[cursor].value == ")":
+        opening = pairs.get(cursor)
+        if (
+            opening is not None
+            and opening > 0
+            and _normal_name(tokens[opening - 1].value) == "pub"
+        ):
+            return opening - 1
+    if cursor >= 0 and _normal_name(tokens[cursor].value) == "pub":
+        return cursor
+    return mod_index
+
+
+def _literal_path_attribute(raw: str) -> str | None:
+    match = re.fullmatch(
+        r'\s*#\s*\[\s*path\s*=\s*"([^"\\]*)"\s*\]\s*',
+        raw,
+        re.DOTALL,
+    )
+    return None if match is None else match.group(1)
+
+
+def _module_child_base(parent: str, inline_modules: tuple[str, ...]) -> str:
+    parent_dir = posixpath.dirname(parent)
+    filename = posixpath.basename(parent)
+    if filename in {"lib.rs", "main.rs", "mod.rs"}:
+        base = parent_dir
+    else:
+        base = posixpath.join(parent_dir, filename.removesuffix(".rs"))
+    return posixpath.join(base, *inline_modules) if inline_modules else base
+
+
+def _resolve_external_module(
+    parent: str,
+    name: str,
+    inline_modules: tuple[str, ...],
+    path_override: str | None,
+    known_files: set[str],
+) -> tuple[str | None, str | None]:
+    if path_override is not None:
+        if path_override.startswith("/"):
+            return None, f"{parent}::{name} has an absolute #[path], which is unsupported"
+        bases = [posixpath.dirname(parent)]
+        if inline_modules:
+            bases.append(_module_child_base(parent, inline_modules))
+        candidates = sorted(
+            {
+                posixpath.normpath(posixpath.join(base, path_override))
+                for base in bases
+            }
+        )
+        if any(
+            candidate == ".." or candidate.startswith("../")
+            for candidate in candidates
+        ):
+            return None, f"{parent}::{name} #[path] escapes the source root"
+        matches = [candidate for candidate in candidates if candidate in known_files]
+        if len(matches) == 1:
+            return matches[0], None
+        if not matches:
+            return None, (
+                f"{parent}::{name} #[path] target does not exist: "
+                f"{candidates!r}"
+            )
+        return None, f"{parent}::{name} #[path] target is ambiguous: {matches!r}"
+
+    base = _module_child_base(parent, inline_modules)
+    candidates = (
+        posixpath.join(base, f"{name}.rs"),
+        posixpath.join(base, name, "mod.rs"),
+    )
+    matches = [candidate for candidate in candidates if candidate in known_files]
+    if len(matches) == 1:
+        return matches[0], None
+    if not matches:
+        return None, (
+            f"{parent}::{name} external module has no conventional source file "
+            f"({candidates[0]} or {candidates[1]})"
+        )
+    return None, f"{parent}::{name} external module path is ambiguous: {matches!r}"
+
+
+def _external_module_edges(
+    sources: dict[str, str],
+    parsed_sources: dict[str, ParsedRustSource] | None = None,
+) -> tuple[list[ExternalModuleEdge], dict[str, tuple[tuple[str, ...], ...]], list[str]]:
+    """Parse conventional external-module edges and each file's inner cfg."""
+    known_files = set(sources)
+    edges: list[ExternalModuleEdge] = []
+    inner_cfg: dict[str, tuple[tuple[str, ...], ...]] = {}
+    errors: list[str] = []
+    for rel, source in sorted(sources.items()):
+        parsed = (
+            _parse_rust_source(source)
+            if parsed_sources is None
+            else parsed_sources[rel]
+        )
+        tokens = parsed.tokens
+        pairs = parsed.pairs
+        if parsed.errors:
+            # discover_functions reports the detailed parser errors. Mark the
+            # ancestry as unavailable without multiplying identical messages.
+            inner_cfg[rel] = ()
+            continue
+        inner_cfg[rel] = tuple(
+            _canonical_rust_tokens(attribute)
+            for attribute in _leading_inner_cfg_attributes(
+                source, tokens, pairs, None
+            )
+        )
+
+        inline_by_opening: dict[int, str] = {}
+        inline_cfg_by_opening: dict[int, tuple[tuple[str, ...], ...]] = {}
+        brace_stack: list[int] = []
+        for index, token in enumerate(tokens):
+            if token.value == "}":
+                opening = pairs.get(index)
+                if brace_stack and brace_stack[-1] == opening:
+                    brace_stack.pop()
+
+            if _normal_name(token.value) == "mod" and index + 2 < len(tokens):
+                name_token = tokens[index + 1]
+                terminator = tokens[index + 2].value
+                if IDENT_RE.fullmatch(name_token.value) and terminator in {"{", ";"}:
+                    name = _normal_name(name_token.value)
+                    if terminator == "{":
+                        inline_by_opening[index + 2] = name
+                        item_start = _module_item_start(tokens, pairs, index)
+                        attributes = _attribute_chain_before(
+                            source, tokens, pairs, item_start
+                        )
+                        inline_cfg_by_opening[index + 2] = tuple(
+                            _canonical_rust_tokens(raw)
+                            for content, raw in attributes
+                            if content and content[0] in {"cfg", "cfg_attr"}
+                        ) + tuple(
+                            _canonical_rust_tokens(raw)
+                            for raw in _leading_inner_cfg_attributes(
+                                source, tokens, pairs, index + 2
+                            )
+                        )
+                    else:
+                        item_start = _module_item_start(tokens, pairs, index)
+                        attributes = _attribute_chain_before(
+                            source, tokens, pairs, item_start
+                        )
+                        cfg_attributes = tuple(
+                            _canonical_rust_tokens(raw)
+                            for content, raw in attributes
+                            if content and content[0] in {"cfg", "cfg_attr"}
+                        )
+                        path_attributes = [
+                            raw
+                            for content, raw in attributes
+                            if content and content[0] == "path"
+                        ]
+                        if any(
+                            content
+                            and content[0] == "cfg_attr"
+                            and "path" in content
+                            for content, _ in attributes
+                        ):
+                            errors.append(
+                                f"{rel}::{name} uses cfg_attr-selected #[path], which "
+                                "requires compiler-side module resolution"
+                            )
+                            continue
+                        if len(path_attributes) > 1:
+                            errors.append(
+                                f"{rel}::{name} has multiple #[path] attributes"
+                            )
+                            continue
+                        path_override = None
+                        if path_attributes:
+                            path_override = _literal_path_attribute(path_attributes[0])
+                            if path_override is None:
+                                errors.append(
+                                    f"{rel}::{name} has a non-literal or escaped #[path]"
+                                )
+                                continue
+                        inline_modules = tuple(
+                            inline_by_opening[opening]
+                            for opening in brace_stack
+                            if opening in inline_by_opening
+                        )
+                        cfg_attributes = (
+                            tuple(
+                                attribute
+                                for opening in brace_stack
+                                for attribute in inline_cfg_by_opening.get(opening, ())
+                            )
+                            + cfg_attributes
+                        )
+                        target, resolution_error = _resolve_external_module(
+                            rel,
+                            name,
+                            inline_modules,
+                            path_override,
+                            known_files,
+                        )
+                        if resolution_error is not None:
+                            errors.append(resolution_error)
+                        elif target is not None:
+                            edges.append(
+                                ExternalModuleEdge(
+                                    parent=rel,
+                                    target=target,
+                                    name=name,
+                                    inline_modules=inline_modules,
+                                    cfg_attributes=cfg_attributes,
+                                )
+                            )
+            if token.value == "{":
+                brace_stack.append(index)
+    return edges, inner_cfg, errors
+
+
+def _effective_module_cfg_contexts(
+    sources: dict[str, str],
+    parsed_sources: dict[str, ParsedRustSource] | None = None,
+) -> tuple[
+    dict[str, tuple[tuple[tuple[str, ...], ...], ...]],
+    list[str],
+]:
+    """Resolve lexical module ancestry into deterministic cfg-context paths."""
+    edges, inner_cfg, errors = _external_module_edges(sources, parsed_sources)
+    contexts: dict[str, set[tuple[tuple[str, ...], ...]]] = {
+        rel: set() for rel in sources
+    }
+    if "lib.rs" not in sources:
+        errors.append("effective cfg ancestry has no lib.rs root")
+    else:
+        adjacency: dict[str, list[ExternalModuleEdge]] = {}
+        for edge in edges:
+            adjacency.setdefault(edge.parent, []).append(edge)
+        queue: list[tuple[str, tuple[str, ...], tuple[tuple[str, ...], ...]]] = [
+            ("lib.rs", ("lib.rs",), ())
+        ]
+        seen: set[tuple[str, tuple[str, ...], tuple[tuple[str, ...], ...]]] = set()
+        while queue:
+            rel, nodes, path = queue.pop()
+            state = (rel, nodes, path)
+            if state in seen:
+                continue
+            seen.add(state)
+            contexts[rel].add(path)
+            for edge in adjacency.get(rel, []):
+                if edge.target in nodes:
+                    errors.append(
+                        "effective cfg module graph contains a cycle: "
+                        + " -> ".join(nodes + (edge.target,))
+                    )
+                    continue
+                components = list(path)
+                components.extend(
+                    ("@file-inner-cfg", rel, *attribute)
+                    for attribute in inner_cfg.get(rel, ())
+                )
+                components.append(
+                    (
+                        "@external-mod",
+                        rel,
+                        *edge.inline_modules,
+                        edge.name,
+                        edge.target,
+                    )
+                )
+                components.extend(
+                    ("@external-mod-cfg", rel, edge.name, *attribute)
+                    for attribute in edge.cfg_attributes
+                )
+                queue.append(
+                    (
+                        edge.target,
+                        nodes + (edge.target,),
+                        tuple(components),
+                    )
+                )
+                if len(seen) + len(queue) > 100_000:
+                    errors.append("effective cfg module graph exceeded 100000 path states")
+                    queue.clear()
+                    break
+
+    resolved: dict[str, tuple[tuple[tuple[str, ...], ...], ...]] = {}
+    for rel in sorted(sources):
+        paths = contexts[rel]
+        if paths:
+            resolved[rel] = tuple(sorted(paths))
+        else:
+            resolved[rel] = ((('@unresolved-module-ancestry', rel),),)
+    return resolved, errors
 
 
 def _split_top_level(tokens: list[Token], separator: str) -> list[list[Token]]:
@@ -1949,8 +2614,19 @@ pub async fn run(&self) {
         if error is None:
             failures.append("stringify macro token body defeated the wrapper grammar")
 
+    baseline_identity = {
+        "file": "fixture.rs",
+        "name": "run",
+        "category": "required_ambient_wrapper",
+        "scope_sha256": "0" * 64,
+        "signature_sha256": "1" * 64,
+        "cfg_sha256": "2" * 64,
+        "occurrences": 1,
+    }
     baseline_fixture = {
-        "schema_version": 3,
+        "schema_version": 4,
+        "site_identity_algorithm": SITE_IDENTITY_ALGORITHM,
+        "site_identities": [baseline_identity],
         "total_sites": 1,
         "covered_sites": 0,
         "exempt_files_sites": 0,
@@ -1989,6 +2665,13 @@ pub async fn run(&self) {
                 "uncovered": 0,
             }
         },
+        "site_identity_algorithm": SITE_IDENTITY_ALGORITHM,
+        "site_identities": [
+            {
+                **baseline_identity,
+                "category": "independent_adapter",
+            }
+        ],
     }
     category_swap_errors = validate_baseline(live_category_swap, baseline_fixture)
     if not any("ordinary-wrapper census collapsed" in error for error in category_swap_errors):
@@ -2006,6 +2689,12 @@ pub async fn run(&self) {
                 "independent_adapter": 0,
             }
         },
+        "site_identities": [
+            {
+                **baseline_identity,
+                "category": "wrapper_exempt",
+            }
+        ],
     }
     strictness_errors = validate_baseline(live_strictness_downgrade, baseline_fixture)
     if not any("required-ambient wrapper census collapsed" in error for error in strictness_errors):
@@ -2030,7 +2719,669 @@ pub async fn run(&self) {
         failures.append(
             "baseline validator accepted required-ambient wrappers outside the wrapper subset"
         )
+    live_scope_swap = {
+        "total_sites": 1,
+        "covered_sites": 0,
+        "exempt_files_sites": 0,
+        "wrapper_exempt_sites": 1,
+        "required_ambient_wrapper_sites": 1,
+        "independent_context_adapter_sites": 0,
+        "uncovered_sites": 0,
+        "by_file": {
+            "fixture.rs": {
+                "total": 1,
+                "covered": 0,
+                "exempt": 0,
+                "wrapper_exempt": 1,
+                "required_ambient_wrapper": 1,
+                "independent_adapter": 0,
+                "uncovered": 0,
+            }
+        },
+        "site_identity_algorithm": SITE_IDENTITY_ALGORITHM,
+        "site_identities": [
+            {
+                **baseline_identity,
+                "scope_sha256": "f" * 64,
+            }
+        ],
+    }
+    scope_swap_errors = validate_baseline(live_scope_swap, baseline_fixture)
+    if not any("stable site identity disappeared or changed" in error for error in scope_swap_errors):
+        failures.append(
+            "schema-v4 identity ratchet allowed a wrapper to move between impl scopes"
+        )
+    live_scope_duplicate = {
+        **live_scope_swap,
+        "total_sites": 2,
+        "wrapper_exempt_sites": 2,
+        "required_ambient_wrapper_sites": 2,
+        "by_file": {
+            "fixture.rs": {
+                **live_scope_swap["by_file"]["fixture.rs"],
+                "total": 2,
+                "wrapper_exempt": 2,
+                "required_ambient_wrapper": 2,
+            }
+        },
+        "site_identities": [
+            baseline_identity,
+            {
+                **baseline_identity,
+                "scope_sha256": "f" * 64,
+            },
+        ],
+    }
+    duplicate_scope_errors = validate_baseline(
+        live_scope_duplicate,
+        baseline_fixture,
+    )
+    if not any("unbaselined privileged site identity" in error for error in duplicate_scope_errors):
+        failures.append(
+            "schema-v4 identity ratchet allowed a same-name wrapper in another impl scope"
+        )
+
+    const_generic_source = """
+impl<const N: usize> Foo<{ N }> {
+    pub async fn run(&self, cx: &Cx) {}
+}
+impl<const N: usize> Bar<{ N }> {
+    pub async fn run(&self, cx: &Cx) {}
+}
+"""
+    const_generic_sites, const_generic_errors = discover_functions(
+        const_generic_source
+    )
+    if const_generic_errors or len(const_generic_sites) != 2:
+        failures.append(
+            "schema-v4 const-generic scope fixture did not parse: "
+            f"{const_generic_errors!r}"
+        )
+    else:
+        const_generic_identities = [
+            _site_identity("fixture.rs", site, "wrapper_exempt")
+            for site in const_generic_sites
+        ]
+        if const_generic_identities[0] == const_generic_identities[1]:
+            failures.append(
+                "schema-v4 const-generic impl scopes collapsed to one identity"
+            )
+        if not all(
+            header.startswith("impl<const N: usize>")
+            for site in const_generic_sites
+            for header in site.scope_headers
+        ):
+            failures.append(
+                "schema-v4 const-generic impl scope header lost its owning item"
+            )
+
+    generic_parameter_source = """
+impl<const N: usize = { 1 }> Trait for Foo<N> {
+    pub async fn run(&self, cx: &Cx) {}
+}
+"""
+    generic_parameter_sites, generic_parameter_errors = discover_functions(
+        generic_parameter_source
+    )
+    if generic_parameter_errors or len(generic_parameter_sites) != 1:
+        failures.append(
+            "schema-v4 generic-parameter scope fixture did not parse: "
+            f"{generic_parameter_errors!r}"
+        )
+    elif not generic_parameter_sites[0].scope_headers[0].startswith("impl<const"):
+        failures.append(
+            "schema-v4 generic-parameter const block truncated its impl scope: "
+            f"{generic_parameter_sites[0].scope_headers!r}"
+        )
+
+    comparison_scope_source = """
+fn outer() {
+    { let _prior = 1; }
+    if left > right {
+        pub async fn run(cx: &Cx) {}
+    }
+}
+"""
+    comparison_scope_sites, comparison_scope_errors = discover_functions(
+        comparison_scope_source
+    )
+    if comparison_scope_errors or len(comparison_scope_sites) != 1:
+        failures.append(
+            "schema-v4 comparison scope fixture did not parse: "
+            f"{comparison_scope_errors!r}"
+        )
+    elif comparison_scope_sites[0].scope_headers[-1] != "if left > right":
+        failures.append(
+            "schema-v4 comparison operator was mistaken for a generic delimiter: "
+            f"{comparison_scope_sites[0].scope_headers!r}"
+        )
+
+    macro_boundary_source = """
+macro_rules! preceding_item {
+    () => {{ let _value = 1; }};
+}
+impl Foo {
+    pub async fn run(&self, cx: &Cx) {}
+}
+"""
+    macro_boundary_sites, macro_boundary_errors = discover_functions(
+        macro_boundary_source
+    )
+    if macro_boundary_errors or len(macro_boundary_sites) != 1:
+        failures.append(
+            "schema-v4 macro-boundary scope fixture did not parse: "
+            f"{macro_boundary_errors!r}"
+        )
+    elif macro_boundary_sites[0].scope_headers != ("impl Foo",):
+        failures.append(
+            "schema-v4 impl scope absorbed a preceding braced macro item: "
+            f"{macro_boundary_sites[0].scope_headers!r}"
+        )
+
+    formatted_source_a = """
+#[cfg(all(unix, feature = "x"))]
+impl<const N: usize> Foo<{ N }> {
+    pub async fn run(&self, cx: &Cx) {}
+}
+"""
+    formatted_source_b = """
+#[cfg( all( unix, feature="x" ) )]
+impl /* identity-neutral comment */ < const N : usize > Foo < { N } > {
+    pub  async /* another identity-neutral comment */ fn run (
+        & self,
+        cx : & Cx
+    ) { }
+}
+"""
+    formatted_a, formatted_a_errors = discover_functions(formatted_source_a)
+    formatted_b, formatted_b_errors = discover_functions(formatted_source_b)
+    if (
+        formatted_a_errors
+        or formatted_b_errors
+        or len(formatted_a) != 1
+        or len(formatted_b) != 1
+    ):
+        failures.append(
+            "schema-v4 semantic-format fixture did not parse: "
+            f"a={formatted_a_errors!r} b={formatted_b_errors!r}"
+        )
+    else:
+        formatted_identity_a = _site_identity(
+            "fixture.rs", formatted_a[0], "covered"
+        )
+        formatted_identity_b = _site_identity(
+            "fixture.rs", formatted_b[0], "covered"
+        )
+        if formatted_identity_a != formatted_identity_b:
+            failures.append(
+                "schema-v4 semantic identity changed for whitespace/comment-only edits"
+            )
+        signature_mutation, signature_mutation_errors = discover_functions(
+            formatted_source_a.replace("cx: &Cx", "cx: &mut Cx")
+        )
+        if signature_mutation_errors or len(signature_mutation) != 1:
+            failures.append(
+                "schema-v4 signature-mutation fixture did not parse: "
+                f"{signature_mutation_errors!r}"
+            )
+        elif _site_identity(
+            "fixture.rs", signature_mutation[0], "covered"
+        ) == formatted_identity_a:
+            failures.append(
+                "schema-v4 semantic identity ignored a meaningful signature change"
+            )
+
+    child_source = "#![cfg(unix)]\npub async fn run(cx: &Cx) {}\n"
+    module_sources_a = {
+        "lib.rs": '#[cfg(feature = "a")]\nmod child;\n',
+        "child.rs": child_source,
+    }
+    module_sources_b = {
+        "lib.rs": '#[cfg(feature = "b")]\nmod child;\n',
+        "child.rs": child_source,
+    }
+    module_context_a, module_errors_a = _effective_module_cfg_contexts(
+        module_sources_a
+    )
+    module_context_b, module_errors_b = _effective_module_cfg_contexts(
+        module_sources_b
+    )
+    child_sites, child_errors = discover_functions(child_source)
+    if module_errors_a or module_errors_b or child_errors or len(child_sites) != 1:
+        failures.append(
+            "schema-v4 inherited-cfg fixture did not parse: "
+            f"a={module_errors_a!r} b={module_errors_b!r} child={child_errors!r}"
+        )
+    else:
+        inherited_a = _site_identity(
+            "child.rs", child_sites[0], "covered", module_context_a["child.rs"]
+        )
+        inherited_b = _site_identity(
+            "child.rs", child_sites[0], "covered", module_context_b["child.rs"]
+        )
+        if inherited_a == inherited_b:
+            failures.append(
+                "schema-v4 identity ignored cfg on an external mod declaration"
+            )
+        inner_cfg_mutation, inner_cfg_errors = discover_functions(
+            child_source.replace("cfg(unix)", "cfg(windows)")
+        )
+        if inner_cfg_errors or len(inner_cfg_mutation) != 1:
+            failures.append(
+                "schema-v4 inner-cfg fixture did not parse: "
+                f"{inner_cfg_errors!r}"
+            )
+        elif _site_identity(
+            "child.rs",
+            inner_cfg_mutation[0],
+            "covered",
+            module_context_a["child.rs"],
+        ) == inherited_a:
+            failures.append("schema-v4 identity ignored a file inner cfg change")
+
+    multi_path_child_source = "pub async fn run(cx: &Cx) {}\n"
+    multi_path_context, multi_path_errors = _effective_module_cfg_contexts(
+        {
+            "lib.rs": (
+                '#[cfg(feature = "z")]\n'
+                '#[path = "shared.rs"]\n'
+                "mod z;\n"
+                '#[cfg(feature = "a")]\n'
+                '#[path = "shared.rs"]\n'
+                "mod a;\n"
+            ),
+            "shared.rs": multi_path_child_source,
+        }
+    )
+    multi_path_sites, multi_path_site_errors = discover_functions(
+        multi_path_child_source
+    )
+    multi_paths = multi_path_context["shared.rs"]
+    if (
+        multi_path_errors
+        or multi_path_site_errors
+        or len(multi_path_sites) != 1
+        or len(multi_paths) != 2
+    ):
+        failures.append(
+            "schema-v4 multi-path permutation fixture did not parse: "
+            f"context={multi_path_errors!r} site={multi_path_site_errors!r} "
+            f"paths={multi_paths!r}"
+        )
+    elif _site_identity(
+        "shared.rs", multi_path_sites[0], "covered", multi_paths
+    ) != _site_identity(
+        "shared.rs",
+        multi_path_sites[0],
+        "covered",
+        tuple(reversed(multi_paths)),
+    ):
+        failures.append(
+            "schema-v4 identity changed when equivalent module cfg paths were reordered"
+        )
+
+    path_context, path_errors = _effective_module_cfg_contexts(
+        {
+            "lib.rs": '#[cfg(unix)]\n#[path = "renamed.rs"]\nmod child;\n',
+            "renamed.rs": "pub async fn run(cx: &Cx) {}\n",
+        }
+    )
+    if path_errors or path_context["renamed.rs"] == (
+        (("@unresolved-module-ancestry", "renamed.rs"),),
+    ):
+        failures.append(
+            "schema-v4 literal #[path] module fixture was not resolved: "
+            f"{path_errors!r}"
+        )
+    inline_path_context, inline_path_errors = _effective_module_cfg_contexts(
+        {
+            "lib.rs": (
+                "#[cfg(feature = \"outer_a\")]\n"
+                "mod outer {\n"
+                "    #[cfg(unix)]\n"
+                "    #[path = \"renamed.rs\"]\n"
+                "    mod child;\n"
+                "}\n"
+            ),
+            "outer/renamed.rs": "pub async fn run(cx: &Cx) {}\n",
+        }
+    )
+    if inline_path_errors or inline_path_context["outer/renamed.rs"] == (
+        (("@unresolved-module-ancestry", "outer/renamed.rs"),),
+    ):
+        failures.append(
+            "schema-v4 inline literal #[path] module fixture was not resolved: "
+            f"{inline_path_errors!r}"
+        )
+    else:
+        inline_path_context_b, inline_path_errors_b = (
+            _effective_module_cfg_contexts(
+                {
+                    "lib.rs": (
+                        "#[cfg(feature = \"outer_b\")]\n"
+                        "mod outer {\n"
+                        "    #[cfg(unix)]\n"
+                        "    #[path = \"renamed.rs\"]\n"
+                        "    mod child;\n"
+                        "}\n"
+                    ),
+                    "outer/renamed.rs": "pub async fn run(cx: &Cx) {}\n",
+                }
+            )
+        )
+        inline_path_sites, inline_path_site_errors = discover_functions(
+            "pub async fn run(cx: &Cx) {}\n"
+        )
+        if (
+            inline_path_errors_b
+            or inline_path_site_errors
+            or len(inline_path_sites) != 1
+        ):
+            failures.append(
+                "schema-v4 inline enclosing-cfg fixture did not parse: "
+                f"context={inline_path_errors_b!r} site={inline_path_site_errors!r}"
+            )
+        elif _site_identity(
+            "outer/renamed.rs",
+            inline_path_sites[0],
+            "covered",
+            inline_path_context["outer/renamed.rs"],
+        ) == _site_identity(
+            "outer/renamed.rs",
+            inline_path_sites[0],
+            "covered",
+            inline_path_context_b["outer/renamed.rs"],
+        ):
+            failures.append(
+                "schema-v4 identity ignored cfg on an enclosing inline module"
+            )
+
+    exceptional_source = """
+pub async fn first(cx: &Cx) {}
+pub async fn second(cx: &Cx) {}
+"""
+    exceptional_sites, exceptional_errors = discover_functions(exceptional_source)
+    if exceptional_errors or len(exceptional_sites) != 2:
+        failures.append(
+            "schema-v4 exceptional-identity fixture did not parse: "
+            f"{exceptional_errors!r}"
+        )
+    else:
+        first_exceptional = _site_identity(
+            "fixture.rs", exceptional_sites[0], "exempt_file"
+        )
+        second_exceptional = _site_identity(
+            "fixture.rs", exceptional_sites[1], "exempt_file"
+        )
+        aggregated_duplicate = _aggregate_site_identities(
+            [first_exceptional, first_exceptional]
+        )
+        if len(aggregated_duplicate) != 1 or aggregated_duplicate[0].get(
+            "occurrences"
+        ) != 2:
+            failures.append(
+                "schema-v4 duplicate exceptional identities did not aggregate occurrences"
+            )
+
+        baseline_exceptional = {
+            "schema_version": 4,
+            "site_identity_algorithm": SITE_IDENTITY_ALGORITHM,
+            "site_identities": [{**first_exceptional, "occurrences": 1}],
+            "total_sites": 1,
+            "covered_sites": 0,
+            "exempt_files_sites": 1,
+            "wrapper_exempt_sites": 0,
+            "required_ambient_wrapper_sites": 0,
+            "independent_context_adapter_sites": 0,
+            "uncovered_sites": 0,
+            "by_file_counts": {
+                "fixture.rs": {
+                    "total": 1,
+                    "covered": 0,
+                    "exempt": 1,
+                    "wrapper_exempt": 0,
+                    "required_ambient_wrapper": 0,
+                    "independent_adapter": 0,
+                    "uncovered": 0,
+                }
+            },
+        }
+        live_exceptional = {
+            "site_identity_algorithm": SITE_IDENTITY_ALGORITHM,
+            "site_identities": [
+                {**first_exceptional, "occurrences": 1},
+                {**second_exceptional, "occurrences": 1},
+            ],
+            "total_sites": 2,
+            "covered_sites": 0,
+            "exempt_files_sites": 2,
+            "wrapper_exempt_sites": 0,
+            "required_ambient_wrapper_sites": 0,
+            "independent_context_adapter_sites": 0,
+            "uncovered_sites": 0,
+            "by_file": {
+                "fixture.rs": {
+                    "total": 2,
+                    "covered": 0,
+                    "exempt": 2,
+                    "wrapper_exempt": 0,
+                    "required_ambient_wrapper": 0,
+                    "independent_adapter": 0,
+                    "uncovered": 0,
+                }
+            },
+        }
+        exceptional_growth_errors = validate_baseline(
+            live_exceptional, baseline_exceptional
+        )
+        if not any(
+            "unbaselined privileged site identity" in error
+            for error in exceptional_growth_errors
+        ):
+            failures.append(
+                "schema-v4 identity ratchet allowed a new exempt-file identity"
+            )
+        duplicate_exceptional_live = {
+            **live_exceptional,
+            "site_identities": [{**first_exceptional, "occurrences": 2}],
+        }
+        duplicate_exceptional_errors = validate_baseline(
+            duplicate_exceptional_live, baseline_exceptional
+        )
+        if not any(
+            "unbaselined privileged site identity" in error
+            for error in duplicate_exceptional_errors
+        ):
+            failures.append(
+                "schema-v4 identity ratchet allowed a duplicate exempt-file occurrence"
+            )
+
+        malformed_category = {
+            **baseline_exceptional,
+            "site_identities": [
+                {
+                    **first_exceptional,
+                    "category": "covered",
+                    "occurrences": 1,
+                }
+            ],
+        }
+        coherent_mixed_live = {
+            **live_exceptional,
+            "covered_sites": 1,
+            "exempt_files_sites": 1,
+            "site_identities": [
+                {
+                    **first_exceptional,
+                    "category": "covered",
+                    "occurrences": 1,
+                },
+                {**second_exceptional, "occurrences": 1},
+            ],
+            "by_file": {
+                "fixture.rs": {
+                    **live_exceptional["by_file"]["fixture.rs"],
+                    "covered": 1,
+                    "exempt": 1,
+                }
+            },
+        }
+        malformed_category_errors = validate_baseline(
+            coherent_mixed_live, malformed_category
+        )
+        if not any(
+            "identity-derived covered_sites" in error
+            for error in malformed_category_errors
+        ):
+            failures.append(
+                "schema-v4 validator accepted identity/aggregate category disagreement"
+            )
+
+        malformed_file_identity = {
+            **first_exceptional,
+            "file": "other.rs",
+            "category": "covered",
+            "occurrences": 1,
+        }
+        malformed_file_baseline = {
+            **baseline_exceptional,
+            "covered_sites": 1,
+            "exempt_files_sites": 0,
+            "site_identities": [malformed_file_identity],
+            "by_file_counts": {
+                "fixture.rs": {
+                    **baseline_exceptional["by_file_counts"]["fixture.rs"],
+                    "covered": 1,
+                    "exempt": 0,
+                }
+            },
+        }
+        coherent_file_live = {
+            "site_identity_algorithm": SITE_IDENTITY_ALGORITHM,
+            "site_identities": [
+                malformed_file_identity,
+                {
+                    **second_exceptional,
+                    "category": "covered",
+                    "occurrences": 1,
+                },
+            ],
+            "total_sites": 2,
+            "covered_sites": 2,
+            "exempt_files_sites": 0,
+            "wrapper_exempt_sites": 0,
+            "required_ambient_wrapper_sites": 0,
+            "independent_context_adapter_sites": 0,
+            "uncovered_sites": 0,
+            "by_file": {
+                "other.rs": {
+                    "total": 1,
+                    "covered": 1,
+                    "exempt": 0,
+                    "wrapper_exempt": 0,
+                    "required_ambient_wrapper": 0,
+                    "independent_adapter": 0,
+                    "uncovered": 0,
+                },
+                "fixture.rs": {
+                    "total": 1,
+                    "covered": 1,
+                    "exempt": 0,
+                    "wrapper_exempt": 0,
+                    "required_ambient_wrapper": 0,
+                    "independent_adapter": 0,
+                    "uncovered": 0,
+                },
+            },
+        }
+        malformed_file_errors = validate_baseline(
+            coherent_file_live, malformed_file_baseline
+        )
+        if not any(
+            "identity-derived fixture.rs:covered" in error
+            for error in malformed_file_errors
+        ):
+            failures.append(
+                "schema-v4 validator accepted identity/per-file disagreement"
+            )
+
+    perf_site_count = 1_200
+    perf_source = "\n".join(
+        f"fn prior_{index}() {{ let _value = {index}; }}"
+        for index in range(perf_site_count)
+    )
+    perf_source += "\nimpl PerfFixture {\n"
+    perf_source += "\n".join(
+        f"pub async fn method_{index}(&self, cx: &Cx) {{}}"
+        for index in range(perf_site_count)
+    )
+    perf_source += "\n}\n"
+    perf_started = time.perf_counter()
+    perf_sites, perf_errors = discover_functions(perf_source)
+    perf_elapsed = time.perf_counter() - perf_started
+    if perf_errors or len(perf_sites) != perf_site_count:
+        failures.append(
+            "schema-v4 bounded performance fixture did not parse: "
+            f"sites={len(perf_sites)} errors={perf_errors!r}"
+        )
+    elif perf_elapsed > 5.0:
+        failures.append(
+            "schema-v4 cached scope discovery exceeded the generous 5s bound: "
+            f"{perf_elapsed:.3f}s"
+        )
     return failures
+
+
+def _identity_digest(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _site_identity(
+    rel: str,
+    site: FunctionSite,
+    category: str,
+    module_cfg_paths: tuple[tuple[tuple[str, ...], ...], ...] = ((),),
+) -> dict:
+    scope_tokens = [
+        list(_canonical_rust_tokens(header)) for header in site.scope_headers
+    ]
+    signature_tokens = list(_canonical_rust_tokens(site.raw_signature))
+    cfg_payload = {
+        "module_paths": [
+            [list(component) for component in path]
+            for path in sorted(module_cfg_paths)
+        ],
+        "local": [
+            list(_canonical_rust_tokens(attribute)) for attribute in site.raw_cfg
+        ],
+    }
+    return {
+        "file": rel,
+        "name": site.name,
+        "category": category,
+        "scope_sha256": _identity_digest(scope_tokens),
+        "signature_sha256": _identity_digest(signature_tokens),
+        "cfg_sha256": _identity_digest(cfg_payload),
+    }
+
+
+def _aggregate_site_identities(records: list[dict]) -> list[dict]:
+    counts: Counter[str] = Counter(
+        json.dumps(record, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        for record in records
+    )
+    aggregated: list[dict] = []
+    for encoded, occurrences in sorted(counts.items()):
+        record = json.loads(encoded)
+        record["occurrences"] = occurrences
+        aggregated.append(record)
+    return aggregated
 
 
 def audit() -> dict:
@@ -2046,6 +3397,8 @@ def audit() -> dict:
         "uncovered_examples": [],
         "wrapper_audit_errors": [],
         "negative_evidence": NEGATIVE_EVIDENCE,
+        "site_identity_algorithm": SITE_IDENTITY_ALGORITHM,
+        "site_identities": [],
     }
     if not SRC_ROOT.is_dir():
         results["wrapper_audit_errors"].append(f"source root does not exist: {SRC_ROOT}")
@@ -2055,6 +3408,17 @@ def audit() -> dict:
         results["wrapper_audit_errors"].append(f"source root contains no Rust files: {SRC_ROOT}")
         return results
     relative_files = {path.relative_to(SRC_ROOT).as_posix() for path in files}
+    sources = {
+        path.relative_to(SRC_ROOT).as_posix(): path.read_text(encoding="utf-8")
+        for path in files
+    }
+    parsed_sources = {
+        rel: _parse_rust_source(source) for rel, source in sources.items()
+    }
+    module_cfg_contexts, module_cfg_errors = _effective_module_cfg_contexts(
+        sources, parsed_sources
+    )
+    results["wrapper_audit_errors"].extend(module_cfg_errors)
     for exempt_file in sorted(EXEMPT_FILES):
         if exempt_file not in relative_files:
             results["wrapper_audit_errors"].append(
@@ -2096,8 +3460,9 @@ def audit() -> dict:
     for path in files:
         rel = path.relative_to(SRC_ROOT).as_posix()
         is_exempt_file = rel in EXEMPT_FILES
-        source = path.read_text(encoding="utf-8")
-        sites, parse_errors = discover_functions(source)
+        source = sources[rel]
+        module_cfg_paths = module_cfg_contexts[rel]
+        sites, parse_errors = discover_functions(source, parsed_sources[rel])
         results["wrapper_audit_errors"].extend(f"{rel}: {error}" for error in parse_errors)
 
         fn_names: Counter[str] = Counter(site.name for site in sites)
@@ -2115,12 +3480,18 @@ def audit() -> dict:
             if is_exempt_file:
                 results["exempt_files_sites"] += 1
                 local_exempt += 1
+                results["site_identities"].append(
+                    _site_identity(rel, site, "exempt_file", module_cfg_paths)
+                )
                 continue
             positions = proof_param_positions(site)
             if positions:
                 results["covered_sites"] += 1
                 local_covered += 1
                 covered_positions[site.start] = positions
+                results["site_identities"].append(
+                    _site_identity(rel, site, "covered", module_cfg_paths)
+                )
                 continue
             if (rel, site.name) in WRAPPER_EXEMPTIONS:
                 results["wrapper_exempt_sites"] += 1
@@ -2129,9 +3500,14 @@ def audit() -> dict:
                 if (rel, site.name) in REQUIRED_AMBIENT_CX_WRAPPERS:
                     results["required_ambient_wrapper_sites"] += 1
                     local_required_ambient += 1
+                    identity_category = "required_ambient_wrapper"
                     call, error = parse_required_ambient_wrapper(site)
                 else:
+                    identity_category = "wrapper_exempt"
                     call, error = parse_canonical_wrapper(site)
+                results["site_identities"].append(
+                    _site_identity(rel, site, identity_category, module_cfg_paths)
+                )
                 if error:
                     results["wrapper_audit_errors"].append(
                         f"{rel}:{site.line}::{site.name} {error}"
@@ -2145,6 +3521,11 @@ def audit() -> dict:
                 results["independent_context_adapter_sites"] += 1
                 local_independent += 1
                 independent_adapter_fn_names[site.name] += 1
+                results["site_identities"].append(
+                    _site_identity(
+                        rel, site, "independent_adapter", module_cfg_paths
+                    )
+                )
                 call, error = parse_independent_context_adapter(site, adapter_message)
                 if error:
                     results["wrapper_audit_errors"].append(
@@ -2156,6 +3537,9 @@ def audit() -> dict:
             results["uncovered_sites"] += 1
             local_uncovered += 1
             local_uncovered_lines.append((site.line, site.name))
+            results["site_identities"].append(
+                _site_identity(rel, site, "uncovered", module_cfg_paths)
+            )
             if len(results["uncovered_examples"]) < 25:
                 results["uncovered_examples"].append(
                     {"file": rel, "line": site.line, "fn": site.name}
@@ -2249,6 +3633,9 @@ def audit() -> dict:
             f"classification accounting mismatch: total={results['total_sites']} "
             f"classified={classified}"
         )
+    results["site_identities"] = _aggregate_site_identities(
+        results["site_identities"]
+    )
     return results
 
 
@@ -2260,9 +3647,11 @@ def load_baseline() -> dict | None:
 
 def save_baseline(audit_data: dict) -> None:
     payload = {
-        "schema_version": 3,
+        "schema_version": 4,
         "comment": "ft-3kv6e fail-closed census ratchet. Update only with an audited source "
                    "change. Generated by scripts/check_runtime_proof_coverage.py.",
+        "site_identity_algorithm": audit_data["site_identity_algorithm"],
+        "site_identities": audit_data["site_identities"],
         "uncovered_sites": audit_data["uncovered_sites"],
         "covered_sites": audit_data["covered_sites"],
         "exempt_files_sites": audit_data["exempt_files_sites"],
@@ -2300,32 +3689,289 @@ def _is_non_negative_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def _site_identity_counter(
+    records: object,
+    label: str,
+) -> tuple[Counter[str], list[str]]:
+    errors: list[str] = []
+    counts: Counter[str] = Counter()
+    if not isinstance(records, list) or not records:
+        return counts, [f"{label} site_identities must be a non-empty array"]
+    identity_fields = {
+        "file",
+        "name",
+        "category",
+        "scope_sha256",
+        "signature_sha256",
+        "cfg_sha256",
+        "occurrences",
+    }
+    allowed_categories = {
+        "covered",
+        "exempt_file",
+        "wrapper_exempt",
+        "required_ambient_wrapper",
+        "independent_adapter",
+        "uncovered",
+    }
+    for index, record in enumerate(records):
+        prefix = f"{label} site_identities[{index}]"
+        if not isinstance(record, dict):
+            errors.append(f"{prefix} must be an object")
+            continue
+        if set(record) != identity_fields:
+            missing = sorted(identity_fields - set(record))
+            extra = sorted(set(record) - identity_fields)
+            errors.append(
+                f"{prefix} fields differ (missing={missing!r}, extra={extra!r})"
+            )
+            continue
+        if not all(
+            isinstance(record[field], str) and record[field]
+            for field in ("file", "name", "category")
+        ):
+            errors.append(f"{prefix} file/name/category must be non-empty strings")
+            continue
+        if record["category"] not in allowed_categories:
+            errors.append(f"{prefix} has unknown category {record['category']!r}")
+            continue
+        invalid_digests = [
+            field
+            for field in ("scope_sha256", "signature_sha256", "cfg_sha256")
+            if not isinstance(record[field], str)
+            or re.fullmatch(r"[0-9a-f]{64}", record[field]) is None
+        ]
+        if invalid_digests:
+            errors.append(f"{prefix} has invalid SHA-256 fields: {invalid_digests!r}")
+            continue
+        occurrences = record["occurrences"]
+        if not _is_non_negative_int(occurrences) or occurrences == 0:
+            errors.append(f"{prefix} occurrences must be a positive integer")
+            continue
+        identity = {key: value for key, value in record.items() if key != "occurrences"}
+        encoded = json.dumps(
+            identity,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if encoded in counts:
+            errors.append(f"{prefix} duplicates an earlier aggregated identity")
+            continue
+        counts[encoded] = occurrences
+    return counts, errors
+
+
+def _identity_census(
+    identities: Counter[str],
+) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
+    aggregate = {
+        "total_sites": 0,
+        "covered_sites": 0,
+        "exempt_files_sites": 0,
+        "wrapper_exempt_sites": 0,
+        "required_ambient_wrapper_sites": 0,
+        "independent_context_adapter_sites": 0,
+        "uncovered_sites": 0,
+    }
+    per_file: dict[str, dict[str, int]] = {}
+    for encoded, occurrences in identities.items():
+        identity = json.loads(encoded)
+        rel = identity["file"]
+        category = identity["category"]
+        counts = per_file.setdefault(
+            rel,
+            {
+                "total": 0,
+                "covered": 0,
+                "exempt": 0,
+                "wrapper_exempt": 0,
+                "required_ambient_wrapper": 0,
+                "independent_adapter": 0,
+                "uncovered": 0,
+            },
+        )
+        aggregate["total_sites"] += occurrences
+        counts["total"] += occurrences
+        if category == "covered":
+            aggregate["covered_sites"] += occurrences
+            counts["covered"] += occurrences
+        elif category == "exempt_file":
+            aggregate["exempt_files_sites"] += occurrences
+            counts["exempt"] += occurrences
+        elif category in {"wrapper_exempt", "required_ambient_wrapper"}:
+            aggregate["wrapper_exempt_sites"] += occurrences
+            counts["wrapper_exempt"] += occurrences
+            if category == "required_ambient_wrapper":
+                aggregate["required_ambient_wrapper_sites"] += occurrences
+                counts["required_ambient_wrapper"] += occurrences
+        elif category == "independent_adapter":
+            aggregate["independent_context_adapter_sites"] += occurrences
+            counts["independent_adapter"] += occurrences
+        elif category == "uncovered":
+            aggregate["uncovered_sites"] += occurrences
+            counts["uncovered"] += occurrences
+    return aggregate, per_file
+
+
+def _identity_reconciliation_errors(
+    identities: Counter[str],
+    aggregate_record: object,
+    by_file_record: object,
+    label: str,
+) -> list[str]:
+    """Require identity authority to equal aggregate and per-file authority."""
+    errors: list[str] = []
+    if not isinstance(aggregate_record, dict):
+        return [f"{label} aggregate census must be an object"]
+    derived_aggregate, derived_by_file = _identity_census(identities)
+    for field, derived in derived_aggregate.items():
+        actual = aggregate_record.get(field)
+        if not _is_non_negative_int(actual):
+            errors.append(f"{label} aggregate field {field} must be a non-negative integer")
+        elif actual != derived:
+            errors.append(
+                f"{label} identity-derived {field}={derived} does not match "
+                f"aggregate {actual}"
+            )
+    if not isinstance(by_file_record, dict):
+        errors.append(f"{label} per-file census must be an object")
+        return errors
+
+    fields = {
+        "total",
+        "covered",
+        "exempt",
+        "wrapper_exempt",
+        "required_ambient_wrapper",
+        "independent_adapter",
+        "uncovered",
+    }
+    relevant_files = set(derived_by_file)
+    relevant_files.update(
+        rel
+        for rel, record in by_file_record.items()
+        if isinstance(rel, str)
+        and isinstance(record, dict)
+        and any(record.get(field, 0) for field in fields)
+    )
+    for rel in sorted(relevant_files):
+        actual = by_file_record.get(rel)
+        if not isinstance(actual, dict):
+            errors.append(f"{label} per-file identity census is missing {rel}")
+            continue
+        derived = derived_by_file.get(
+            rel,
+            {field: 0 for field in fields},
+        )
+        for field in sorted(fields):
+            value = actual.get(field)
+            if not _is_non_negative_int(value):
+                errors.append(
+                    f"{label} per-file {rel}:{field} must be a non-negative integer"
+                )
+            elif value != derived[field]:
+                errors.append(
+                    f"{label} identity-derived {rel}:{field}={derived[field]} "
+                    f"does not match per-file {value}"
+                )
+    return errors
+
+
 def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
-    """Reject uncovered growth and any aggregate/category/per-file census collapse."""
+    """Reject uncovered growth plus category, file, and stable-site identity collapse."""
     if baseline is None:
         return [f"required baseline is missing: {BASELINE_PATH}"]
     if not isinstance(baseline, dict):
         return ["baseline root must be a JSON object"]
-    if baseline.get("schema_version") != 3:
+    if baseline.get("schema_version") != 4:
         return [
-            f"{BASELINE_PATH.name} does not use census schema 3; run --update-baseline "
-            "only after reviewing the live schema-v3 census"
+            f"{BASELINE_PATH.name} does not use census schema 4; run --update-baseline "
+            "only after reviewing the live schema-v4 identity census"
         ]
     required = {
         "total_sites", "covered_sites", "exempt_files_sites", "wrapper_exempt_sites",
         "required_ambient_wrapper_sites",
         "independent_context_adapter_sites", "uncovered_sites", "by_file_counts",
+        "site_identity_algorithm", "site_identities",
     }
     missing = sorted(required - baseline.keys())
     if missing:
         return [f"baseline is missing required fields: {', '.join(missing)}"]
     errors: list[str] = []
-    numeric_fields = required - {"by_file_counts"}
+    numeric_fields = required - {
+        "by_file_counts", "site_identity_algorithm", "site_identities"
+    }
     for field in sorted(numeric_fields):
         if not _is_non_negative_int(baseline.get(field)):
             errors.append(f"baseline field {field} must be a non-negative integer")
     if errors:
         return errors
+    if baseline["site_identity_algorithm"] != SITE_IDENTITY_ALGORITHM:
+        errors.append(
+            "baseline site_identity_algorithm differs from the live schema-v4 algorithm"
+        )
+    if data.get("site_identity_algorithm") != SITE_IDENTITY_ALGORITHM:
+        errors.append("live site_identity_algorithm is missing or inconsistent")
+    baseline_identities, baseline_identity_errors = _site_identity_counter(
+        baseline["site_identities"], "baseline"
+    )
+    live_identities, live_identity_errors = _site_identity_counter(
+        data.get("site_identities"), "live"
+    )
+    errors.extend(baseline_identity_errors)
+    errors.extend(live_identity_errors)
+    if not baseline_identity_errors:
+        baseline_identity_total = sum(baseline_identities.values())
+        if baseline_identity_total != baseline["total_sites"]:
+            errors.append(
+                "baseline stable-site identity occurrences do not match total_sites: "
+                f"identities={baseline_identity_total} total={baseline['total_sites']}"
+            )
+    if not live_identity_errors:
+        live_identity_total = sum(live_identities.values())
+        if live_identity_total != data["total_sites"]:
+            errors.append(
+                "live stable-site identity occurrences do not match total_sites: "
+                f"identities={live_identity_total} total={data['total_sites']}"
+            )
+    if not baseline_identity_errors and not live_identity_errors:
+        for encoded, expected_occurrences in sorted(baseline_identities.items()):
+            live_occurrences = live_identities.get(encoded, 0)
+            if live_occurrences >= expected_occurrences:
+                continue
+            identity = json.loads(encoded)
+            errors.append(
+                "stable site identity disappeared or changed: "
+                f"{identity['file']}::{identity['name']} "
+                f"category={identity['category']} "
+                f"scope={identity['scope_sha256'][:12]} "
+                f"signature={identity['signature_sha256'][:12]} "
+                f"cfg={identity['cfg_sha256'][:12]} "
+                f"expected={expected_occurrences} live={live_occurrences}"
+            )
+        privileged_categories = {
+            "exempt_file",
+            "wrapper_exempt",
+            "required_ambient_wrapper",
+            "independent_adapter",
+        }
+        for encoded, live_occurrences in sorted(live_identities.items()):
+            identity = json.loads(encoded)
+            if identity["category"] not in privileged_categories:
+                continue
+            baseline_occurrences = baseline_identities.get(encoded, 0)
+            if live_occurrences > baseline_occurrences:
+                errors.append(
+                    "unbaselined privileged site identity: "
+                    f"{identity['file']}::{identity['name']} "
+                    f"category={identity['category']} "
+                    f"scope={identity['scope_sha256'][:12]} "
+                    f"signature={identity['signature_sha256'][:12]} "
+                    f"cfg={identity['cfg_sha256'][:12]} "
+                    f"baseline={baseline_occurrences} live={live_occurrences}; "
+                    "audit explicitly before --update-baseline"
+                )
     baseline_classified = (
         baseline["covered_sites"]
         + baseline["exempt_files_sites"]
@@ -2505,6 +4151,24 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
                     f"baseline per-file {file_field} sum {baseline_file_sums[file_field]} "
                     f"does not match aggregate {aggregate_field}={baseline[aggregate_field]}"
                 )
+    if not baseline_identity_errors and all_file_counts_valid:
+        errors.extend(
+            _identity_reconciliation_errors(
+                baseline_identities,
+                baseline,
+                by_file_counts,
+                "baseline",
+            )
+        )
+    if not live_identity_errors:
+        errors.extend(
+            _identity_reconciliation_errors(
+                live_identities,
+                data,
+                data.get("by_file"),
+                "live",
+            )
+        )
     for rel, live in sorted(data["by_file"].items()):
         if rel not in by_file_counts and live["uncovered"]:
             errors.append(
@@ -2586,7 +4250,10 @@ def main() -> int:
                     file=sys.stderr,
                 )
         return 1
-    print(f"Baseline ({BASELINE_PATH.name}) passed schema-v3 aggregate/category/per-file ratchets.")
+    print(
+        f"Baseline ({BASELINE_PATH.name}) passed schema-v4 "
+        "stable-site/category/per-file ratchets."
+    )
     return 0
 
 

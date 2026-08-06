@@ -410,6 +410,7 @@ proptest! {
     fn snapshot_result_construction(
         session_id in arb_session_id(),
         checkpoint_id in 1_i64..1_000_000,
+        checkpoint_at in 0_u64..10_000_000_000,
         pane_count in 0_usize..100,
         total_bytes in 0_usize..10_000_000,
         trigger in arb_trigger(),
@@ -417,6 +418,8 @@ proptest! {
         let result = SnapshotResult {
             session_id: session_id.clone(),
             checkpoint_id,
+            checkpoint_at,
+            state_hash: "snp2:property".to_string(),
             pane_count,
             total_bytes,
             trigger,
@@ -424,6 +427,7 @@ proptest! {
 
         prop_assert_eq!(&result.session_id, &session_id, "session_id mismatch");
         prop_assert_eq!(result.checkpoint_id, checkpoint_id, "checkpoint_id mismatch");
+        prop_assert_eq!(result.checkpoint_at, checkpoint_at, "checkpoint_at mismatch");
         prop_assert_eq!(result.pane_count, pane_count, "pane_count mismatch");
         prop_assert_eq!(result.total_bytes, total_bytes, "total_bytes mismatch");
         prop_assert_eq!(result.trigger, trigger, "trigger mismatch");
@@ -434,6 +438,7 @@ proptest! {
     fn snapshot_result_clone(
         session_id in arb_session_id(),
         checkpoint_id in 1_i64..1_000_000,
+        checkpoint_at in 0_u64..10_000_000_000,
         pane_count in 0_usize..100,
         total_bytes in 0_usize..10_000_000,
         trigger in arb_trigger(),
@@ -441,6 +446,8 @@ proptest! {
         let result = SnapshotResult {
             session_id,
             checkpoint_id,
+            checkpoint_at,
+            state_hash: "snp2:property".to_string(),
             pane_count,
             total_bytes,
             trigger,
@@ -449,6 +456,7 @@ proptest! {
 
         prop_assert_eq!(&result.session_id, &cloned.session_id, "session_id clone mismatch");
         prop_assert_eq!(result.checkpoint_id, cloned.checkpoint_id, "checkpoint_id clone mismatch");
+        prop_assert_eq!(result.checkpoint_at, cloned.checkpoint_at, "checkpoint_at clone mismatch");
         prop_assert_eq!(result.pane_count, cloned.pane_count, "pane_count clone mismatch");
         prop_assert_eq!(result.total_bytes, cloned.total_bytes, "total_bytes clone mismatch");
         prop_assert_eq!(result.trigger, cloned.trigger, "trigger clone mismatch");
@@ -464,6 +472,8 @@ proptest! {
         let result = SnapshotResult {
             session_id: "sess-test".to_string(),
             checkpoint_id,
+            checkpoint_at: 1_234,
+            state_hash: "snp2:property".to_string(),
             pane_count,
             total_bytes: 0,
             trigger,

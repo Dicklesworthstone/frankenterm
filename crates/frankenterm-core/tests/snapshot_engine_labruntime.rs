@@ -17,9 +17,13 @@ mod common;
 
 use common::fixtures::RuntimeFixture;
 use frankenterm_core::config::SnapshotConfig;
-use frankenterm_core::snapshot_engine::{SnapshotEngine, SnapshotError, SnapshotTrigger};
+use frankenterm_core::cx::{Budget, Cx};
+use frankenterm_core::snapshot_engine::{
+    SnapshotDeleteTarget, SnapshotEngine, SnapshotError, SnapshotTrigger,
+};
 use frankenterm_core::storage::StorageHandle;
 use frankenterm_core::wezterm::{PaneInfo, PaneSize};
+use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -237,11 +241,11 @@ fn snapshot_mark_shutdown_sets_flag() {
         let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
         let panes = vec![make_test_pane(1, 24, 80)];
 
-        engine
+        let receipt = engine
             .capture(&panes, SnapshotTrigger::Startup)
             .await
             .unwrap();
-        let result = engine.mark_shutdown().await;
+        let result = engine.close_after_checkpoint(&receipt).await;
         assert!(result.is_ok());
     });
 }
@@ -257,7 +261,9 @@ fn snapshot_shutdown_checkpoint_with_no_session() {
         let (_tmp, db_path, _storage) = setup_test_db().await;
         let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
 
-        let result = engine.mark_shutdown().await;
+        let result = engine
+            .shutdown_checkpoint(&[], Duration::from_secs(5))
+            .await;
         assert!(result.is_ok());
     });
 }
@@ -275,15 +281,13 @@ fn snapshot_shutdown_checkpoint_captures_and_marks() {
             .await
             .unwrap();
 
-        // Shutdown checkpoint with different panes to avoid NoChanges
+        // Shutdown always persists a final receipt, independent of periodic
+        // deduplication.
         let panes2 = vec![make_test_pane(1, 30, 100)];
-        let result = engine
+        let snap = engine
             .shutdown_checkpoint(&panes2, Duration::from_secs(5))
             .await
             .unwrap();
-        assert!(result.is_some());
-
-        let snap = result.unwrap();
         assert_eq!(snap.trigger, SnapshotTrigger::Shutdown);
     });
 }
@@ -429,12 +433,12 @@ fn snapshot_shutdown_returns_some_despite_same_panes() {
             .shutdown_checkpoint(&panes, Duration::from_secs(5))
             .await
             .unwrap();
-        assert!(result.is_some(), "Shutdown trigger bypasses dedup");
+        assert_eq!(result.trigger, SnapshotTrigger::Shutdown);
     });
 }
 
 #[test]
-fn snapshot_shutdown_with_empty_panes_errors() {
+fn snapshot_shutdown_with_empty_panes_commits_terminal_receipt() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let (_tmp, db_path, _storage) = setup_test_db().await;
@@ -447,13 +451,39 @@ fn snapshot_shutdown_with_empty_panes_errors() {
 
         let result = engine
             .shutdown_checkpoint(&[], Duration::from_secs(5))
-            .await;
-        assert!(result.is_err());
+            .await
+            .expect("an empty mux still requires a durable terminal checkpoint");
+        assert_eq!(result.trigger, SnapshotTrigger::Shutdown);
+        assert_eq!(result.pane_count, 0);
+
+        let connection = Connection::open(db_path.as_str()).expect("open snapshot database");
+        let persisted: (i64, Option<i64>, Option<i64>, Option<i64>, Option<String>) = connection
+            .query_row(
+                "SELECT shutdown_clean, clean_checkpoint_id, last_checkpoint_id, \
+                        last_checkpoint_at, state_hash \
+                 FROM mux_sessions WHERE session_id = ?1",
+                params![result.session_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("load terminal session receipt");
+        assert_eq!(persisted.0, 1);
+        assert_eq!(persisted.1, Some(result.checkpoint_id));
+        assert_eq!(persisted.2, Some(result.checkpoint_id));
+        assert_eq!(persisted.3, i64::try_from(result.checkpoint_at).ok());
+        assert_eq!(persisted.4.as_deref(), Some(result.state_hash.as_str()));
     });
 }
 
 #[test]
-fn snapshot_dedup_does_not_skip_shutdown_trigger() {
+fn snapshot_terminal_trigger_requires_shutdown_reservation() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let (_tmp, db_path, _storage) = setup_test_db().await;
@@ -465,8 +495,62 @@ fn snapshot_dedup_does_not_skip_shutdown_trigger() {
             .await
             .unwrap();
 
-        let r2 = engine.capture(&panes, SnapshotTrigger::Shutdown).await;
-        assert!(r2.is_ok(), "Shutdown bypasses dedup");
+        let direct = engine.capture(&panes, SnapshotTrigger::Shutdown).await;
+        assert!(
+            matches!(direct, Err(SnapshotError::ShuttingDown)),
+            "ordinary admission must not smuggle a terminal trigger"
+        );
+
+        let reserved = engine
+            .shutdown_checkpoint(&panes, Duration::from_secs(5))
+            .await;
+        assert!(reserved.is_ok(), "reserved shutdown bypasses dedup");
+    });
+}
+
+#[test]
+fn snapshot_delete_with_precancelled_cx_does_not_mutate() {
+    let rt = RuntimeFixture::current_thread();
+    rt.block_on(async {
+        let (_tmp, db_path, _storage) = setup_test_db().await;
+        let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+        let checkpoint = engine
+            .capture(
+                &[make_test_pane(41, 24, 80)],
+                SnapshotTrigger::Manual,
+            )
+            .await
+            .expect("fixture checkpoint");
+
+        let cx = Cx::for_testing_with_budget(Budget::new().with_poll_quota(0));
+        cx.cancel_with(
+            frankenterm_core::outcome::CancelKind::User,
+            Some("snapshot delete pre-cancel proof"),
+        );
+        let error = engine
+            .delete_checkpoint_with_cx(
+                &cx,
+                SnapshotDeleteTarget::Id(checkpoint.checkpoint_id),
+            )
+            .await
+            .expect_err("pre-cancelled delete must not reach SQLite");
+        assert!(matches!(error, SnapshotError::Cancelled));
+
+        let deleted = engine
+            .delete_checkpoint(SnapshotDeleteTarget::Id(checkpoint.checkpoint_id))
+            .await
+            .expect("a later live capability can delete the untouched row")
+            .expect("pre-cancelled call must have left the row present");
+        assert_eq!(deleted.identity.checkpoint_id, checkpoint.checkpoint_id);
+
+        let replacement = engine
+            .capture(
+                &[make_test_pane(41, 24, 80)],
+                SnapshotTrigger::Periodic,
+            )
+            .await
+            .expect("deleting the durable row must invalidate periodic dedup state");
+        assert_ne!(replacement.checkpoint_id, checkpoint.checkpoint_id);
     });
 }
 
@@ -515,6 +599,15 @@ fn snapshot_cleanup_with_zero_retention_deletes_all() {
             deleted, 3,
             "retention_count=0 should delete all checkpoints"
         );
+
+        let replacement = engine
+            .capture(
+                &[make_test_pane(2, 26, 80)],
+                SnapshotTrigger::Periodic,
+            )
+            .await
+            .expect("cleanup must invalidate a digest whose durable row may be gone");
+        assert_eq!(replacement.pane_count, 1);
     });
 }
 

@@ -480,7 +480,7 @@ fn labruntime_event_loop_startup_shutdown_is_clean() {
         // Verify clean shutdown
         let summary = handle.shutdown_with_summary().await;
         assert!(
-            summary.clean,
+            summary.is_clean(),
             "shutdown should be clean: warnings={:?}",
             summary.warnings
         );
@@ -564,7 +564,7 @@ fn labruntime_shutdown_propagation_drains_all_tasks() {
         // shutdown_with_summary should complete promptly
         let summary = handle.shutdown_with_summary().await;
         assert!(
-            summary.clean,
+            summary.is_clean(),
             "all tasks should drain cleanly after shutdown flag: warnings={:?}",
             summary.warnings
         );
@@ -636,7 +636,7 @@ fn labruntime_runtime_restart_after_clean_shutdown() {
 
         let summary_one = handle_one.shutdown_with_summary().await;
         assert!(
-            summary_one.clean,
+            summary_one.is_clean(),
             "first shutdown should be clean: warnings={:?}",
             summary_one.warnings
         );
@@ -663,7 +663,7 @@ fn labruntime_runtime_restart_after_clean_shutdown() {
 
         let summary_two = handle_two.shutdown_with_summary().await;
         assert!(
-            summary_two.clean,
+            summary_two.is_clean(),
             "second shutdown should be clean after restart: warnings={:?}",
             summary_two.warnings
         );

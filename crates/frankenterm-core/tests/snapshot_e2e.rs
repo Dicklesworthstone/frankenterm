@@ -12,11 +12,13 @@ use std::time::Instant;
 use frankenterm_core::config::SnapshotConfig;
 use frankenterm_core::restore_process::LaunchConfig;
 use frankenterm_core::session_restore::{
-    RestoredPaneState, SessionRestoreConfig, SessionRestorer, load_checkpoint_by_id,
-    load_latest_checkpoint, session_doctor, show_session,
+    CheckpointRole, RestoredPaneState, SessionRestoreConfig, SessionRestorer,
+    load_checkpoint_by_id, load_latest_checkpoint, session_doctor, show_session,
 };
 use frankenterm_core::session_topology::{PaneNode, TopologySnapshot};
-use frankenterm_core::snapshot_engine::{SnapshotEngine, SnapshotError, SnapshotTrigger};
+use frankenterm_core::snapshot_engine::{
+    SnapshotCaptureOptions, SnapshotEngine, SnapshotError, SnapshotTrigger,
+};
 use frankenterm_core::wezterm::{MockWezterm, PaneInfo, PaneSize, WeztermInterface};
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -88,7 +90,9 @@ fn setup_test_db() -> (tempfile::NamedTempFile, Arc<String>) {
             topology_json TEXT NOT NULL,
             window_metadata_json TEXT,
             ft_version TEXT NOT NULL,
-            host_id TEXT
+            host_id TEXT,
+            clean_checkpoint_id INTEGER
+                REFERENCES session_checkpoints(id) ON DELETE SET NULL
         );
 
         CREATE TABLE IF NOT EXISTS session_checkpoints (
@@ -99,7 +103,10 @@ fn setup_test_db() -> (tempfile::NamedTempFile, Arc<String>) {
             state_hash TEXT NOT NULL,
             pane_count INTEGER NOT NULL,
             total_bytes INTEGER NOT NULL,
-            metadata_json TEXT
+            metadata_json TEXT,
+            checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
+                CHECK(checkpoint_role IN ('snapshot','restore_receipt')),
+            topology_json TEXT
         );
 
         CREATE TABLE IF NOT EXISTS mux_pane_state (
@@ -127,6 +134,8 @@ fn setup_test_db() -> (tempfile::NamedTempFile, Arc<String>) {
         );
 
         CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON session_checkpoints(session_id, checkpoint_at);
+        CREATE INDEX IF NOT EXISTS idx_checkpoints_session_role_latest
+            ON session_checkpoints(session_id, checkpoint_role, checkpoint_at DESC, id DESC);
         CREATE INDEX IF NOT EXISTS idx_pane_state_checkpoint ON mux_pane_state(checkpoint_id);
         CREATE INDEX IF NOT EXISTS idx_pane_state_pane ON mux_pane_state(pane_id);
         CREATE INDEX IF NOT EXISTS idx_output_segments_pane_seq ON output_segments(pane_id, seq);
@@ -661,7 +670,10 @@ fn e2e_snapshot_dedup_retention_and_detect_cycle() {
         let detect_start = Instant::now();
         let restorer = SessionRestorer::new(db_path.clone(), SessionRestoreConfig::default());
         let detected_before_shutdown = restorer.detect().expect("detect before shutdown");
-        engine.mark_shutdown().await.expect("mark shutdown");
+        engine
+            .close_after_checkpoint(&manual_changed)
+            .await
+            .expect("close exact latest checkpoint");
         let detected_after_shutdown = restorer.detect().expect("detect after shutdown");
         add_phase(
             &mut report,
@@ -780,19 +792,24 @@ fn e2e_restore_bookkeeping_preserves_manual_restore_checkpoint() {
             show_session(db_path.as_str(), &snapshot.session_id).expect("show restored session");
 
         let verify_conn = Connection::open(db_path.as_str()).expect("open verification db");
-        let (startup_checkpoint_id, startup_metadata_json, shutdown_clean): (i64, String, i64) =
-            verify_conn
+        let (startup_checkpoint_id, startup_metadata_json, shutdown_clean, clean_checkpoint_id): (
+            i64,
+            String,
+            i64,
+            Option<i64>,
+        ) = verify_conn
                 .query_row(
-                    "SELECT c.id, c.metadata_json, s.shutdown_clean
+                    "SELECT c.id, c.metadata_json, s.shutdown_clean, s.clean_checkpoint_id
                      FROM session_checkpoints c
                      JOIN mux_sessions s ON s.session_id = c.session_id
-                     WHERE c.session_id = ?1 AND c.checkpoint_type = 'startup'
-                     ORDER BY c.checkpoint_at DESC
+                     WHERE c.session_id = ?1
+                       AND c.checkpoint_role = 'restore_receipt'
+                     ORDER BY c.checkpoint_at DESC, c.id DESC
                      LIMIT 1",
                     [snapshot.session_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
-                .expect("startup checkpoint should be recorded");
+                .expect("restore receipt should be recorded");
         let startup_metadata: Value =
             serde_json::from_str(&startup_metadata_json).expect("parse startup metadata");
         let restored_new_pane_id = *summary
@@ -821,11 +838,12 @@ fn e2e_restore_bookkeeping_preserves_manual_restore_checkpoint() {
                 .is_some_and(|state| u32::from(state.cols) == pane.effective_cols());
         let startup_checkpoint_exists = checkpoints
             .iter()
-            .any(|info| info.checkpoint_type.as_deref() == Some("startup"));
+            .any(|info| info.checkpoint_role == CheckpointRole::RestoreReceipt);
         let startup_checkpoint_distinct = startup_checkpoint_id != snapshot.checkpoint_id;
         let startup_mapping_matches = startup_metadata["old_to_new"][old_id_key.as_str()].as_u64()
             == Some(restored_new_pane_id);
         let session_clean = shutdown_clean == 1;
+        let clean_receipt_matches = clean_checkpoint_id == Some(startup_checkpoint_id);
         let detect_cleared = redetected.is_none();
         let banner_written = banner_text.contains("Session restored");
 
@@ -841,6 +859,7 @@ fn e2e_restore_bookkeeping_preserves_manual_restore_checkpoint() {
                 "startup_checkpoint_distinct": startup_checkpoint_distinct,
                 "startup_mapping_matches": startup_mapping_matches,
                 "session_clean": session_clean,
+                "clean_receipt_matches": clean_receipt_matches,
                 "detect_cleared": detect_cleared,
                 "banner_written": banner_written,
             }),
@@ -854,7 +873,10 @@ fn e2e_restore_bookkeeping_preserves_manual_restore_checkpoint() {
             layout_match: startup_checkpoint_exists
                 && startup_checkpoint_distinct
                 && startup_mapping_matches,
-            process_match: session_clean && detect_cleared && banner_written,
+            process_match: session_clean
+                && clean_receipt_matches
+                && detect_cleared
+                && banner_written,
         });
 
         let success = report.pane_reports.iter().all(|pane_result| {
@@ -996,15 +1018,18 @@ fn e2e_fixture_complex_layout_restore_executes_real_restore_flow() {
             .expect("insert fixture session");
             conn.execute(
                 "INSERT INTO session_checkpoints
-                 (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
-                 VALUES (?1, ?2, 'event', ?3, ?4, ?5, ?6)",
+                 (session_id, checkpoint_at, checkpoint_type, state_hash,
+                  pane_count, total_bytes, metadata_json, checkpoint_role,
+                  topology_json)
+                 VALUES (?1, ?2, 'event', ?3, ?4, ?5, ?6, 'snapshot', ?7)",
                 params![
                     session_id,
                     checkpoint_at,
-                    "fixture-complex-hash",
+                    "0123456789abcdef",
                     fixture_panes.len() as i64,
                     0i64,
                     json!({"fixture":"snapshot_complex_layout.json"}).to_string(),
+                    fixture_json,
                 ],
             )
             .expect("insert fixture checkpoint");
@@ -1221,9 +1246,22 @@ fn e2e_restore_replays_scrollback_then_relaunches_agent() {
         let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
         let pane = make_pane(7, 0, 0, 24, 80, "codex-agent", "file:///tmp/agents");
 
+        let seed_start = Instant::now();
+        {
+            let conn = Connection::open(db_path.as_str()).expect("open db for scrollback seed");
+            insert_output_segment(&conn, pane.pane_id, 0, "first line\n", 5_100);
+            insert_output_segment(&conn, pane.pane_id, 1, "second line\n", 5_200);
+        }
         let capture_start = Instant::now();
         let snapshot = engine
-            .capture(std::slice::from_ref(&pane), SnapshotTrigger::Startup)
+            .capture_with_options(
+                std::slice::from_ref(&pane),
+                SnapshotTrigger::Startup,
+                SnapshotCaptureOptions {
+                    include_scrollback: true,
+                    metadata: None,
+                },
+            )
             .await
             .expect("capture source snapshot");
         add_phase(
@@ -1238,30 +1276,6 @@ fn e2e_restore_replays_scrollback_then_relaunches_agent() {
             }),
         );
 
-        let seed_start = Instant::now();
-        {
-            let conn = Connection::open(db_path.as_str()).expect("open db for scrollback seed");
-            let agent_json = r#"{"agent_type":"codex","session_id":"sess-42","state":"running"}"#;
-            conn.execute(
-                "UPDATE mux_pane_state
-                 SET command = ?3,
-                     agent_metadata_json = ?4,
-                     scrollback_checkpoint_seq = ?5,
-                     last_output_at = ?6
-                 WHERE checkpoint_id = ?1 AND pane_id = ?2",
-                params![
-                    snapshot.checkpoint_id,
-                    pane.pane_id as i64,
-                    "codex",
-                    agent_json,
-                    1i64,
-                    5_200i64,
-                ],
-            )
-            .expect("seed pane restore metadata");
-            insert_output_segment(&conn, pane.pane_id, 0, "first line\n", 5_100);
-            insert_output_segment(&conn, pane.pane_id, 1, "second line\n", 5_200);
-        }
         add_phase(
             &mut report,
             "seed_scrollback_and_agent_metadata",
@@ -1701,33 +1715,23 @@ fn e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild() {
         {
             let save_start = Instant::now();
             let engine_a = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
-            let snap = engine_a
-                .capture(std::slice::from_ref(&pane), SnapshotTrigger::Startup)
-                .await
-                .expect("capture pre-restart");
-            captured_session_id = snap.session_id.clone();
-            captured_checkpoint_id = snap.checkpoint_id;
-
-            // Seed output_segments for this pane, plus the scrollback_checkpoint_seq
-            // pointer on the mux_pane_state row so the restore path knows where
-            // to stop replaying.
             let conn = Connection::open(db_path.as_str()).expect("seed scrollback db");
             for (seq, content, ts) in &segments {
                 insert_output_segment(&conn, pane.pane_id, *seq, content, *ts);
             }
-            conn.execute(
-                "UPDATE mux_pane_state
-                 SET scrollback_checkpoint_seq = ?3,
-                     last_output_at = ?4
-                 WHERE checkpoint_id = ?1 AND pane_id = ?2",
-                params![
-                    snap.checkpoint_id,
-                    pane.pane_id as i64,
-                    segments.last().map(|(s, _, _)| *s).unwrap_or(0),
-                    segments.last().map(|(_, _, t)| *t).unwrap_or(0),
-                ],
-            )
-            .expect("set scrollback pointer");
+            let snap = engine_a
+                .capture_with_options(
+                    std::slice::from_ref(&pane),
+                    SnapshotTrigger::Startup,
+                    SnapshotCaptureOptions {
+                        include_scrollback: true,
+                        metadata: None,
+                    },
+                )
+                .await
+                .expect("capture pre-restart");
+            captured_session_id = snap.session_id.clone();
+            captured_checkpoint_id = snap.checkpoint_id;
             add_phase(
                 &mut report,
                 "save_plus_scrollback_seed",
