@@ -248,10 +248,10 @@ impl WebServerConfig {
 
     /// Returns `true` when the configured host names or parses as loopback.
     ///
-    /// This is only the pre-bind admission check. The server separately checks
-    /// the address returned by the listener after hostname resolution, so a
-    /// surprising `localhost` resolver entry cannot cross the unauthenticated
-    /// control-plane boundary.
+    /// This is only the configuration-level admission check. Before creating a
+    /// listener, the framework resolves every candidate and rejects the whole
+    /// set if any address is non-loopback; it then binds one validated concrete
+    /// address and re-checks the resulting listener as defense in depth.
     fn is_localhost(&self) -> bool {
         let host = self
             .host

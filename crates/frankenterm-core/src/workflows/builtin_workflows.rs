@@ -1334,6 +1334,12 @@ impl HandleUsageLimits {
                         let mut tracker = match RATE_LIMIT_TRACKER.lock_with_cx(cx).await {
                             Ok(tracker) => tracker,
                             Err(_) => {
+                                if let Err(result) = usage_limit_checkpoint(
+                                    cx,
+                                    "after_rate_limit_tracker_lock",
+                                ) {
+                                    return result;
+                                }
                                 return usage_limit_failure(
                                     "rate_limit_tracker_lock",
                                     "rate_limit_tracker_unavailable",
@@ -1404,15 +1410,16 @@ impl HandleUsageLimits {
                     return usage_limit_failure("codex_exit", "codex_exit_failed");
                 }
 
-                let text = match source.get_text_with_cx(cx, pane_id, false).await {
+                let text_result = source.get_text_with_cx(cx, pane_id, false).await;
+                if let Err(result) = usage_limit_checkpoint(cx, "after_summary_read") {
+                    return result;
+                }
+                let text = match text_result {
                     Ok(text) => text,
                     Err(_) => {
                         return usage_limit_failure("summary_read", "pane_text_read_failed");
                     }
                 };
-                if let Err(result) = usage_limit_checkpoint(cx, "after_summary_read") {
-                    return result;
-                }
                 let tail = crate::wezterm::tail_text(&text, 200);
 
                 match parse_codex_session_summary(&tail) {
@@ -1456,6 +1463,12 @@ impl HandleUsageLimits {
                         let mut tracker = match RATE_LIMIT_TRACKER.lock_with_cx(cx).await {
                             Ok(tracker) => tracker,
                             Err(_) => {
+                                if let Err(result) = usage_limit_checkpoint(
+                                    cx,
+                                    "after_rate_limit_tracker_lock",
+                                ) {
+                                    return result;
+                                }
                                 return usage_limit_failure(
                                     "rate_limit_tracker_lock",
                                     "rate_limit_tracker_unavailable",

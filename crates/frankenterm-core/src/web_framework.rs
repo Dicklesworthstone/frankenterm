@@ -7,7 +7,7 @@ use crate::runtime_async::net::TcpListener;
 use crate::runtime_async::task::{self, JoinError, JoinErrorKind, JoinHandle};
 use crate::{Error, Result};
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
@@ -110,6 +110,27 @@ fn validate_unauthenticated_bound_addr(bound_addr: SocketAddr) -> Result<()> {
             "refusing resolved non-loopback web listener {bound_addr}: the current web API has no authentication boundary"
         ),
     ))
+}
+
+fn validate_unauthenticated_bind_candidates(
+    candidates: impl IntoIterator<Item = SocketAddr>,
+) -> Result<SocketAddr> {
+    let mut first = None;
+    for candidate in candidates {
+        validate_unauthenticated_bound_addr(candidate)?;
+        first.get_or_insert(candidate);
+    }
+    first.ok_or_else(|| {
+        Error::runtime_backend(
+            "web bind validation",
+            "web bind name resolved to no socket addresses",
+        )
+    })
+}
+
+fn resolve_unauthenticated_bind_addr(bind_addr: &str) -> Result<SocketAddr> {
+    let candidates = bind_addr.to_socket_addrs().map_err(Error::Io)?;
+    validate_unauthenticated_bind_candidates(candidates)
 }
 
 fn wake_listener(addr: SocketAddr) {
@@ -373,8 +394,17 @@ impl FrameworkWebRuntime {
             return rollback_started_app(&app, primary_error).await;
         }
 
+        let resolved_bind_addr = match resolve_unauthenticated_bind_addr(&bind_addr) {
+            Ok(address) => address,
+            Err(error) => return rollback_started_app(&app, error).await,
+        };
+        if let Err(err) = cx.checkpoint() {
+            let primary_error = web_cx_error(cx, "web start after bind resolution", &err);
+            return rollback_started_app(&app, primary_error).await;
+        }
+
         let app = Arc::new(app);
-        let listener = match TcpListener::bind(bind_addr.clone()).await {
+        let listener = match TcpListener::bind(resolved_bind_addr).await {
             Ok(listener) => listener,
             Err(err) => return rollback_started_app(app.as_ref(), Error::Io(err)).await,
         };
@@ -386,10 +416,10 @@ impl FrameworkWebRuntime {
             }
         };
 
-        // The configured `localhost` name is only a pre-bind candidate. Check
-        // the listener's resolved address before spawning the accept task so a
-        // surprising resolver entry never creates even a transient public
-        // unauthenticated listener.
+        // Candidate validation happens before bind. Retain this exact-address
+        // check as defense in depth against an unexpected listener/runtime
+        // substitution without claiming that a post-bind check alone could
+        // prevent transient exposure.
         if let Err(primary_error) = validate_unauthenticated_bound_addr(local_addr) {
             drop(listener);
             return rollback_started_app(app.as_ref(), primary_error).await;
@@ -401,7 +431,7 @@ impl FrameworkWebRuntime {
             return rollback_started_app(app.as_ref(), primary_error).await;
         }
 
-        let server_config = ServerConfig::new(bind_addr)
+        let server_config = ServerConfig::new(resolved_bind_addr.to_string())
             .with_keep_alive_timeout(WEB_KEEP_ALIVE_TIMEOUT)
             .with_drain_timeout(WEB_CONNECTION_DRAIN_TIMEOUT);
         let server = Arc::new(TcpServer::new(server_config));
@@ -614,8 +644,8 @@ mod tests {
     use super::{
         ConnectionDrainOutcome, ConnectionDrainTimerFailure, ResponseBody, StatusCode,
         WebCxFailureClass, classify_web_cx_failure, json_response_with_status,
-        listener_wake_addr, validate_unauthenticated_bound_addr, wait_for_connections_to_drain_with,
-        web_cx_error,
+        listener_wake_addr, validate_unauthenticated_bind_candidates,
+        validate_unauthenticated_bound_addr, wait_for_connections_to_drain_with, web_cx_error,
     };
     use crate::error::RuntimeOperationSource;
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
@@ -673,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn unauthenticated_listener_rejects_resolved_non_loopback_before_serve() {
+    fn unauthenticated_listener_rejects_resolved_non_loopback_before_bind() {
         let loopback: SocketAddr = "127.0.0.1:8080".parse().expect("valid loopback address");
         let public: SocketAddr = "192.0.2.1:8080".parse().expect("valid public address");
 
@@ -683,6 +713,36 @@ mod tests {
             .to_string();
         assert!(error.contains("192.0.2.1:8080"));
         assert!(error.contains("no authentication boundary"));
+    }
+
+    #[test]
+    fn unauthenticated_bind_candidates_reject_mixed_resolution() {
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().expect("valid loopback address");
+        let public: SocketAddr = "192.0.2.1:8080".parse().expect("valid public address");
+
+        let error = validate_unauthenticated_bind_candidates([loopback, public])
+            .expect_err("one public candidate must reject the entire resolution set")
+            .to_string();
+        assert!(error.contains("192.0.2.1:8080"));
+    }
+
+    #[test]
+    fn unauthenticated_bind_candidates_require_a_concrete_address() {
+        let error = validate_unauthenticated_bind_candidates(std::iter::empty())
+            .expect_err("an empty resolution set must fail closed")
+            .to_string();
+        assert!(error.contains("resolved to no socket addresses"));
+    }
+
+    #[test]
+    fn unauthenticated_bind_candidates_choose_first_validated_loopback() {
+        let first: SocketAddr = "127.0.0.2:8080".parse().expect("valid loopback address");
+        let second: SocketAddr = "[::1]:8080".parse().expect("valid loopback address");
+        assert_eq!(
+            validate_unauthenticated_bind_candidates([first, second])
+                .expect("an all-loopback resolution set is admissible"),
+            first
+        );
     }
 
     #[test]

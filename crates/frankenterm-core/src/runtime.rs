@@ -572,7 +572,7 @@ static RUNTIME_WAIT_FAILURES_TOTAL: std::sync::atomic::AtomicU64 =
 
 fn increment_saturating_atomic(counter: &std::sync::atomic::AtomicU64) -> u64 {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(1))
         })
         .unwrap_or_else(|current| current)
@@ -9257,7 +9257,7 @@ impl RuntimeHandle {
                     let Some(handle) = slot.as_mut() else {
                         continue;
                     };
-                    match handle.await {
+                    match (&mut *handle).await {
                         Ok(()) => false,
                         Err(error)
                             if error.kind()
@@ -9318,7 +9318,7 @@ impl RuntimeHandle {
                         let Some(handle) = slot.as_mut() else {
                             continue;
                         };
-                        match handle.await {
+                        match (&mut *handle).await {
                             Err(error)
                                 if error.kind()
                                     == crate::runtime_async::task::JoinErrorKind::WakerRegistrationFailed =>
