@@ -66,6 +66,9 @@ struct RollbackState {
     active_reservations: AtomicU64,
     /// Notify waiters that capacity has been freed.
     capacity_freed: Notify,
+    /// Notify consumers when a value is committed or the last outstanding
+    /// reservation is released after close.
+    consumer_state_changed: Notify,
 }
 
 impl Reservation {
@@ -96,6 +99,7 @@ impl Drop for Reservation {
                 .active_reservations
                 .fetch_sub(1, Ordering::Release);
             self.rollback_handle.capacity_freed.notify_one();
+            self.rollback_handle.consumer_state_changed.notify_waiters();
         }
     }
 }
@@ -107,6 +111,11 @@ impl Drop for Reservation {
 pub enum TxChannelError {
     /// Channel has been closed.
     Closed,
+    /// The caller's capability context was explicitly cancelled.
+    Cancelled,
+    /// The capability context or its timer failed for a reason other than
+    /// explicit cancellation (for example, an exhausted budget).
+    Context(String),
     /// Channel is at capacity (for try_reserve).
     Full,
     /// Reservation belongs to a different channel.
@@ -119,6 +128,8 @@ impl fmt::Display for TxChannelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Closed => write!(f, "channel closed"),
+            Self::Cancelled => write!(f, "channel operation cancelled"),
+            Self::Context(detail) => write!(f, "channel capability context failed: {detail}"),
             Self::Full => write!(f, "channel full"),
             Self::WrongChannel { expected, actual } => {
                 write!(f, "reservation for channel {actual}, expected {expected}")
@@ -144,16 +155,41 @@ struct TxShared<T> {
     next_seq: AtomicU64,
     /// Unique channel ID for reservation validation.
     channel_id: u64,
-    /// Consumer notification.
-    not_empty: Notify,
     /// Producer notification (capacity freed).
     rollback_state: Arc<RollbackState>,
+    #[cfg(test)]
+    before_reserve_wait: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_recv_wait: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    after_reservation_claim: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Envelope wrapping a committed value with metadata.
 struct TxEnvelope<T> {
     seq: u64,
     value: T,
+}
+
+fn cx_channel_error(cx: &crate::cx::Cx, detail: impl Into<String>) -> TxChannelError {
+    if cx.is_cancel_requested() {
+        TxChannelError::Cancelled
+    } else {
+        TxChannelError::Context(detail.into())
+    }
+}
+
+#[cfg(test)]
+impl<T> TxShared<T> {
+    fn fire_hook(slot: &std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>) {
+        let hook = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 /// Construct a bounded transactional channel.
@@ -170,6 +206,7 @@ pub fn tx_channel<T>(capacity: usize) -> (TxProducer<T>, TxConsumer<T>) {
     let rollback_state = Arc::new(RollbackState {
         active_reservations: AtomicU64::new(0),
         capacity_freed: Notify::new(),
+        consumer_state_changed: Notify::new(),
     });
 
     let shared = Arc::new(TxShared {
@@ -178,8 +215,13 @@ pub fn tx_channel<T>(capacity: usize) -> (TxProducer<T>, TxConsumer<T>) {
         closed: AtomicBool::new(false),
         next_seq: AtomicU64::new(1),
         channel_id,
-        not_empty: Notify::new(),
         rollback_state,
+        #[cfg(test)]
+        before_reserve_wait: std::sync::Mutex::new(None),
+        #[cfg(test)]
+        before_recv_wait: std::sync::Mutex::new(None),
+        #[cfg(test)]
+        after_reservation_claim: std::sync::Mutex::new(None),
     });
 
     (
@@ -238,6 +280,26 @@ impl<T> TxProducer<T> {
             std::hint::spin_loop();
         }
 
+        #[cfg(test)]
+        TxShared::<T>::fire_hook(&self.shared.after_reservation_claim);
+
+        // The initial close check and reservation claim are distinct atomics.
+        // Treat the successful claim as the linearization point only when the
+        // channel is still open; otherwise roll the claim back before exposing
+        // a Reservation to the caller.
+        if self.shared.closed.load(Ordering::Acquire) {
+            self.shared
+                .rollback_state
+                .active_reservations
+                .fetch_sub(1, Ordering::AcqRel);
+            self.shared.rollback_state.capacity_freed.notify_one();
+            self.shared
+                .rollback_state
+                .consumer_state_changed
+                .notify_waiters();
+            return Err(TxChannelError::Closed);
+        }
+
         let seq = self.shared.next_seq.fetch_add(1, Ordering::Relaxed);
 
         Ok(Reservation {
@@ -256,42 +318,50 @@ impl<T> TxProducer<T> {
         self.reserve_with_cx(&cx).await
     }
 
-    /// Cx-first [`Self::reserve`] (ft-xbnl0.2.3). Threads caller
-    /// `&Cx` through the wait loop via `cx.checkpoint()?` at the
-    /// top of each iteration. A pre-cancelled cx returns
-    /// `Err(Closed)` without touching the queue; a mid-wait
-    /// cancel breaks the caller out of the blocking
-    /// `capacity_freed.notified().await` and surfaces as
-    /// `Err(Closed)` too — matches the close-while-waiting
-    /// return shape so existing callers that handle `Closed`
-    /// don't need to special-case cancellation.
+    /// Cx-first [`Self::reserve`] (ft-xbnl0.2.3). Explicit cancellation is
+    /// reported as [`TxChannelError::Cancelled`], independently from a closed
+    /// channel. Other context failures retain their diagnostic detail in
+    /// [`TxChannelError::Context`].
+    ///
+    /// The capacity notification uses [`Notify::wait_until`] so close or
+    /// capacity release between the failed fast-path check and waiter
+    /// registration cannot be lost.
     pub async fn reserve_with_cx(&self, cx: &crate::cx::Cx) -> Result<Reservation, TxChannelError> {
         use futures::future::{Either, select};
         use std::time::Duration;
 
         loop {
-            if cx.checkpoint().is_err() {
-                return Err(TxChannelError::Closed);
-            }
+            cx.checkpoint()
+                .map_err(|error| cx_channel_error(cx, error.to_string()))?;
             match self.try_reserve() {
                 Ok(r) => return Ok(r),
                 Err(TxChannelError::Full) => {
-                    let notified =
-                        std::pin::pin!(self.shared.rollback_state.capacity_freed.notified());
+                    #[cfg(test)]
+                    TxShared::<T>::fire_hook(&self.shared.before_reserve_wait);
+
+                    let state_changed = std::pin::pin!(
+                        self.shared
+                            .rollback_state
+                            .capacity_freed
+                            .wait_until(|| self.is_closed() || self.available() > 0)
+                    );
                     let cancel_watcher = std::pin::pin!(async {
                         loop {
-                            if crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50))
-                                .await
-                                .is_err()
-                                || cx.is_cancel_requested()
-                            {
-                                return;
+                            if self.is_closed() {
+                                return Ok(());
                             }
+                            cx.checkpoint()
+                                .map_err(|error| cx_channel_error(cx, error.to_string()))?;
+                            crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50))
+                                .await
+                                .map_err(|error| cx_channel_error(cx, error))?;
                         }
                     });
 
-                    if let Either::Right(((), _)) = select(notified, cancel_watcher).await {
-                        return Err(TxChannelError::Closed);
+                    if let Either::Right((watch_result, _)) =
+                        select(state_changed, cancel_watcher).await
+                    {
+                        watch_result?;
                     }
                     if self.shared.closed.load(Ordering::Acquire) {
                         return Err(TxChannelError::Closed);
@@ -305,7 +375,10 @@ impl<T> TxProducer<T> {
     /// Commit a value through a reservation, delivering it to consumers.
     ///
     /// The reservation is consumed and marked as committed. The value is
-    /// placed in the channel and consumers are notified.
+    /// placed in the channel and consumers are notified. A reservation that
+    /// linearized before [`Self::close`] remains valid and may commit after
+    /// close; consumers therefore wait for both the queue to drain and all
+    /// outstanding reservations to resolve.
     pub fn commit(&self, reservation: &Reservation, value: T) -> Result<(), TxChannelError> {
         // Validate reservation
         if reservation.channel_id != self.shared.channel_id {
@@ -345,8 +418,13 @@ impl<T> TxProducer<T> {
             .active_reservations
             .fetch_sub(1, Ordering::Release);
 
-        // Notify consumers
-        self.shared.not_empty.notify_one();
+        // Notify consumers and capacity waiters. `consumer_state_changed` is
+        // also signalled when an uncommitted reservation drops, allowing a
+        // closed consumer to determine that the channel is fully drained.
+        self.shared
+            .rollback_state
+            .consumer_state_changed
+            .notify_one();
         self.shared.rollback_state.capacity_freed.notify_one();
         Ok(())
     }
@@ -365,7 +443,10 @@ impl<T> TxProducer<T> {
     /// Close the producer side. Consumers will drain remaining values.
     pub fn close(&self) {
         self.shared.closed.store(true, Ordering::Release);
-        self.shared.not_empty.notify_waiters();
+        self.shared
+            .rollback_state
+            .consumer_state_changed
+            .notify_waiters();
         self.shared.rollback_state.capacity_freed.notify_waiters();
     }
 
@@ -463,47 +544,87 @@ impl<T> TxConsumer<T> {
 
     /// Receive a value, blocking if the queue is empty.
     ///
-    /// Returns `None` if the channel is closed and all values have been consumed.
-    pub async fn recv(&self) -> Option<ReceivedValue<T>> {
+    /// Returns `Ok(None)` if the channel is closed, its queue is empty, and all
+    /// reservations created before close have committed or rolled back.
+    pub async fn recv(&self) -> Result<Option<ReceivedValue<T>>, TxChannelError> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.recv_with_cx(&cx).await
     }
 
-    /// Cx-first [`Self::recv`] (ft-xbnl0.2.3). Threads caller
-    /// `&Cx` through the wait loop. Returns `None` on
-    /// pre-cancel or mid-wait cancel — matches the
-    /// closed-and-drained return shape so existing callers
-    /// that check `None` need no changes.
-    pub async fn recv_with_cx(&self, cx: &crate::cx::Cx) -> Option<ReceivedValue<T>> {
+    /// Cx-first [`Self::recv`] (ft-xbnl0.2.3). Cancellation and other
+    /// capability-context failures are distinct from the closed-and-drained
+    /// `Ok(None)` outcome.
+    ///
+    /// The consumer-state notification uses [`Notify::wait_until`] so a close,
+    /// commit, or reservation rollback between the final state check and waiter
+    /// registration cannot be lost.
+    pub async fn recv_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<Option<ReceivedValue<T>>, TxChannelError> {
         use futures::future::{Either, select};
         use std::time::Duration;
 
         loop {
-            if cx.checkpoint().is_err() {
-                return None;
-            }
+            cx.checkpoint()
+                .map_err(|error| cx_channel_error(cx, error.to_string()))?;
             if let Some(rv) = self.try_recv() {
-                return Some(rv);
+                return Ok(Some(rv));
             }
-            if self.shared.closed.load(Ordering::Acquire) && self.shared.queue.is_empty() {
-                return None;
+            let drained = self.shared.closed.load(Ordering::Acquire)
+                && self.shared.queue.is_empty()
+                && self
+                    .shared
+                    .rollback_state
+                    .active_reservations
+                    .load(Ordering::Acquire)
+                    == 0;
+            if drained {
+                return Ok(None);
             }
-            let notified = std::pin::pin!(self.shared.not_empty.notified());
+
+            #[cfg(test)]
+            TxShared::<T>::fire_hook(&self.shared.before_recv_wait);
+
+            let state_changed = std::pin::pin!(
+                self.shared
+                    .rollback_state
+                    .consumer_state_changed
+                    .wait_until(|| {
+                        !self.shared.queue.is_empty()
+                            || (self.shared.closed.load(Ordering::Acquire)
+                                && self
+                                    .shared
+                                    .rollback_state
+                                    .active_reservations
+                                    .load(Ordering::Acquire)
+                                    == 0)
+                    })
+            );
             let cancel_watcher = std::pin::pin!(async {
                 loop {
-                    if crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50))
-                        .await
-                        .is_err()
-                        || cx.is_cancel_requested()
-                    {
-                        return;
+                    let drained = self.shared.closed.load(Ordering::Acquire)
+                        && self.shared.queue.is_empty()
+                        && self
+                            .shared
+                            .rollback_state
+                            .active_reservations
+                            .load(Ordering::Acquire)
+                            == 0;
+                    if drained {
+                        return Ok(());
                     }
+                    cx.checkpoint()
+                        .map_err(|error| cx_channel_error(cx, error.to_string()))?;
+                    crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50))
+                        .await
+                        .map_err(|error| cx_channel_error(cx, error))?;
                 }
             });
 
-            match select(notified, cancel_watcher).await {
+            match select(state_changed, cancel_watcher).await {
                 Either::Left(((), _)) => {}
-                Either::Right(((), _)) => return None,
+                Either::Right((watch_result, _)) => watch_result?,
             }
         }
     }
@@ -770,6 +891,7 @@ mod tests {
                 let rv = rx
                     .recv_with_cx(&cx)
                     .await
+                    .expect("recv_with_cx operation must succeed")
                     .expect("recv_with_cx must return value");
                 assert_eq!(rv.seq, 1);
                 assert_eq!(rv.value, "cx-hello");
@@ -821,9 +943,9 @@ mod tests {
                     "recv_with_cx must observe mid-wait cancellation promptly; took {elapsed:?}"
                 );
                 let inner = result.expect("outer timeout must not fire");
-                assert!(
-                    inner.is_none(),
-                    "cancelled recv_with_cx should fold cancellation into None, got {inner:?}"
+                assert_eq!(
+                    inner.expect_err("cancelled recv_with_cx must not report closed/drained"),
+                    TxChannelError::Cancelled
                 );
             });
         }));
@@ -834,6 +956,112 @@ mod tests {
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    #[test]
+    fn reserve_close_between_full_check_and_wait_registration_is_not_lost() {
+        use crate::runtime_async::CompatRuntime;
+
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        runtime.block_on(async {
+            let (tx, _rx) = tx_channel::<u32>(1);
+            let held = tx.try_reserve().expect("fill channel");
+            let close_tx = tx.clone();
+            *tx.shared
+                .before_reserve_wait
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Box::new(move || close_tx.close()));
+
+            let cx = crate::cx::for_request();
+            let result = crate::runtime_async::timeout_with_cx(
+                &crate::cx::for_request(),
+                std::time::Duration::from_secs(1),
+                tx.reserve_with_cx(&cx),
+            )
+            .await
+            .expect("reserve must not hang after close");
+            assert_eq!(result.expect_err("closed channel must reject reserve"), TxChannelError::Closed);
+            drop(held);
+        });
+    }
+
+    #[test]
+    fn recv_close_between_empty_check_and_wait_registration_is_not_lost() {
+        use crate::runtime_async::CompatRuntime;
+
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        runtime.block_on(async {
+            let (tx, rx) = tx_channel::<u32>(1);
+            let close_tx = tx.clone();
+            *rx.shared
+                .before_recv_wait
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Box::new(move || close_tx.close()));
+
+            let cx = crate::cx::for_request();
+            let result = crate::runtime_async::timeout_with_cx(
+                &crate::cx::for_request(),
+                std::time::Duration::from_secs(1),
+                rx.recv_with_cx(&cx),
+            )
+            .await
+            .expect("recv must not hang after close")
+            .expect("close is not a capability failure");
+            assert!(result.is_none(), "closed and drained channel must return None");
+        });
+    }
+
+    #[test]
+    fn try_reserve_rolls_back_when_close_wins_after_capacity_claim() {
+        let (tx, _rx) = tx_channel::<u32>(1);
+        let close_tx = tx.clone();
+        *tx.shared
+            .after_reservation_claim
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Box::new(move || close_tx.close()));
+
+        assert_eq!(
+            tx.try_reserve()
+                .expect_err("close after capacity claim must reject reservation"),
+            TxChannelError::Closed
+        );
+        assert_eq!(tx.active_reservations(), 0, "rejected claim must roll back");
+        assert_eq!(tx.available(), 1, "rejected claim must restore capacity");
+    }
+
+    #[test]
+    fn reservation_created_before_close_may_commit_and_consumer_drains_it() {
+        use crate::runtime_async::CompatRuntime;
+
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        runtime.block_on(async {
+            let (tx, rx) = tx_channel::<u32>(1);
+            let reservation = tx.try_reserve().expect("reserve before close");
+            tx.close();
+            tx.commit(&reservation, 42)
+                .expect("pre-close reservation remains commit-capable");
+
+            assert_eq!(
+                rx.recv().await.expect("recv value").expect("queued value").value,
+                42
+            );
+            assert!(
+                rx.recv().await.expect("recv drained state").is_none(),
+                "consumer must report drained only after the pre-close commit is consumed"
+            );
+        });
     }
 
     #[test]
@@ -1098,6 +1326,14 @@ mod tests {
     #[test]
     fn error_display() {
         assert_eq!(TxChannelError::Closed.to_string(), "channel closed");
+        assert_eq!(
+            TxChannelError::Cancelled.to_string(),
+            "channel operation cancelled"
+        );
+        assert_eq!(
+            TxChannelError::Context("deadline exhausted".to_string()).to_string(),
+            "channel capability context failed: deadline exhausted"
+        );
         assert_eq!(TxChannelError::Full.to_string(), "channel full");
         assert_eq!(
             TxChannelError::WrongChannel {

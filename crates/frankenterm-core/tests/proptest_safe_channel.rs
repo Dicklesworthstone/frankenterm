@@ -60,6 +60,8 @@ fn arb_channel_metadata() -> impl Strategy<Value = ChannelMetadata> {
 fn arb_error() -> impl Strategy<Value = TxChannelError> {
     prop_oneof![
         Just(TxChannelError::Closed),
+        Just(TxChannelError::Cancelled),
+        "[a-z ]{1,40}".prop_map(TxChannelError::Context),
         Just(TxChannelError::Full),
         (1..=100u64, 1..=100u64)
             .prop_map(|(expected, actual)| TxChannelError::WrongChannel { expected, actual }),
