@@ -412,6 +412,8 @@ impl Error {
                 | StorageError::WriterBackendEpochPoisoned
                 | StorageError::BackendEpochPoisoned
                 | StorageError::MigrationEpochPoisoned
+                | StorageError::IndeterminateMutation { .. }
+                | StorageError::WriterSettlementIndeterminate { .. }
                 | StorageError::WriterClosed
                 | StorageError::SequenceDiscontinuity { .. }
                 | StorageError::MigrationFailed(_)
@@ -640,6 +642,28 @@ pub enum StorageError {
     #[error("Storage migration connection epoch is poisoned; reopen storage before retrying")]
     MigrationEpochPoisoned,
 
+    /// A directly executed blocking mutation lost its completion result after
+    /// admission. The mutation may already have committed, so callers must
+    /// reconcile durable state before deciding whether a retry is safe.
+    #[error(
+        "Storage mutation '{operation}' has an indeterminate outcome; reconcile durable state before retrying"
+    )]
+    IndeterminateMutation {
+        /// Finite operation identity; never backend or caller-provided text.
+        operation: &'static str,
+    },
+
+    /// An admitted writer command or shutdown phase did not publish a terminal
+    /// result within its finite settlement envelope. Work may still complete
+    /// in the background, so callers must reconcile state before retrying.
+    #[error(
+        "Storage writer settlement phase '{phase}' is indeterminate; reconcile durable state before retrying"
+    )]
+    WriterSettlementIndeterminate {
+        /// Finite phase identity; never backend or caller-provided text.
+        phase: &'static str,
+    },
+
     /// The dedicated writer completed an orderly shutdown. Reusing the old
     /// handle cannot succeed; callers must open a fresh storage handle.
     #[error("Storage writer is closed; reopen storage before retrying")]
@@ -724,6 +748,20 @@ impl StorageError {
             .command("Diagnostics", "ft doctor")
             .alternative(
                 "Reopen FrankenTerm storage before retrying; the stopped migration connection is not reusable.",
+            ),
+            Self::IndeterminateMutation { operation } => Remediation::new(format!(
+                "Storage mutation '{operation}' may already have committed."
+            ))
+            .command("Diagnostics", "ft doctor")
+            .alternative(
+                "Read the affected durable state and reconcile it before retrying the mutation.",
+            ),
+            Self::WriterSettlementIndeterminate { phase } => Remediation::new(format!(
+                "Storage writer settlement phase '{phase}' did not produce a terminal result within its bounded envelope."
+            ))
+            .command("Diagnostics", "ft doctor")
+            .alternative(
+                "Inspect the affected durable state and writer health before retrying the command.",
             ),
             Self::WriterClosed => Remediation::new(
                 "The storage writer has already completed an orderly shutdown.",

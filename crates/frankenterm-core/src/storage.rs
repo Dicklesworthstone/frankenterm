@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::{
     collections::{HashMap, VecDeque, hash_map::DefaultHasher},
@@ -2120,12 +2120,187 @@ impl Drop for WriterQueueAdmission<'_> {
 const WRITER_TERMINAL_HEALTHY: u8 = 0;
 const WRITER_TERMINAL_BACKEND_EPOCH_POISONED: u8 = 1;
 const WRITER_TERMINAL_CLOSED_CLEANLY: u8 = 2;
+/// Maximum time an already-admitted writer operation may withhold its
+/// authoritative response before the caller receives an indeterminate result.
+/// The writer may still complete afterward; this bound protects async callers
+/// from a permanently wedged writer without fabricating retry safety.
+const WRITER_SETTLEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug)]
 enum WriteCommandSendError {
     Channel(Box<mpsc::SendError<WriteCommand>>),
     WriterBackendEpochPoisoned,
     WriterClosedCleanly,
+}
+
+/// Admission state for the writer shutdown command.
+///
+/// A terminal writer cannot acknowledge a newly constructed command because
+/// its receiver is already gone.  That is distinct from an admitted command
+/// whose acknowledgement channel later closes: only the former may bypass the
+/// acknowledgement phase and proceed to joining the retained writer handle.
+enum WriterShutdownAdmission {
+    Admitted(oneshot::Receiver<()>),
+    WriterAlreadyTerminal,
+}
+
+/// Durable ownership state for the storage writer's native join authority.
+///
+/// The native [`JoinHandle`] is removed from `Pending` only by blocking work
+/// that has actually started.  That worker publishes a terminal receipt back
+/// into this shared state before it returns.  Dropping or timing out an async
+/// waiter therefore cannot detach the writer or discard its eventual join
+/// outcome: a later shutdown caller observes `Joining` and waits for the same
+/// receipt, or observes `Completed` directly.
+enum WriterJoinState {
+    Pending(JoinHandle<()>),
+    Joining,
+    Completed(WriterJoinOutcome),
+}
+
+struct WriterJoinAuthority {
+    state: Mutex<WriterJoinState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterJoinOutcome {
+    Joined,
+    Panicked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterJoinDriveOutcome {
+    InProgress,
+    Completed(WriterJoinOutcome),
+    StatePoisoned,
+}
+
+impl WriterJoinAuthority {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self {
+            state: Mutex::new(WriterJoinState::Pending(handle)),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn outcome(&self) -> std::result::Result<Option<WriterJoinOutcome>, ()> {
+        let state = self.state.lock().map_err(|_| ())?;
+        Ok(match *state {
+            WriterJoinState::Completed(outcome) => Some(outcome),
+            WriterJoinState::Pending(_) | WriterJoinState::Joining => None,
+        })
+    }
+
+    /// Drive or observe the one native writer join.
+    ///
+    /// Exactly one blocking caller can atomically transition
+    /// `Pending -> Joining` and take the native handle. Other callers wait on
+    /// the predicate-aware condition variable for a bounded interval. The
+    /// join owner always publishes `Completed` before returning, including
+    /// after a writer panic or an unexpected unwind while disposing its panic
+    /// payload.
+    fn drive(&self, wait_timeout: std::time::Duration) -> WriterJoinDriveOutcome {
+        let (handle, mut lock_was_poisoned) = match self.state.lock() {
+            Ok(mut state) => match std::mem::replace(&mut *state, WriterJoinState::Joining) {
+                WriterJoinState::Pending(handle) => (Some(handle), false),
+                WriterJoinState::Joining => {
+                    *state = WriterJoinState::Joining;
+                    (None, false)
+                }
+                WriterJoinState::Completed(outcome) => {
+                    *state = WriterJoinState::Completed(outcome);
+                    return WriterJoinDriveOutcome::Completed(outcome);
+                }
+            },
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                match std::mem::replace(&mut *state, WriterJoinState::Joining) {
+                    WriterJoinState::Pending(handle) => (Some(handle), true),
+                    WriterJoinState::Joining => {
+                        *state = WriterJoinState::Joining;
+                        (None, true)
+                    }
+                    WriterJoinState::Completed(outcome) => {
+                        *state = WriterJoinState::Completed(outcome);
+                        return WriterJoinDriveOutcome::StatePoisoned;
+                    }
+                }
+            }
+        };
+
+        if let Some(handle) = handle {
+            let outcome = catch_recoverable(
+                RecoverablePanicSite::StorageWriter,
+                std::panic::AssertUnwindSafe(|| match handle.join() {
+                    Ok(()) => WriterJoinOutcome::Joined,
+                    Err(payload) => {
+                        // The payload is arbitrary user data. Dispose it only
+                        // inside the canonical recovery boundary surrounding
+                        // this closure so a panicking Drop cannot strand the
+                        // shared authority in `Joining`.
+                        drop(payload);
+                        WriterJoinOutcome::Panicked
+                    }
+                }),
+            )
+            .unwrap_or(WriterJoinOutcome::Panicked);
+
+            match self.state.lock() {
+                Ok(mut state) => *state = WriterJoinState::Completed(outcome),
+                Err(poisoned) => {
+                    lock_was_poisoned = true;
+                    *poisoned.into_inner() = WriterJoinState::Completed(outcome);
+                }
+            }
+            self.changed.notify_all();
+            return if lock_was_poisoned {
+                WriterJoinDriveOutcome::StatePoisoned
+            } else {
+                WriterJoinDriveOutcome::Completed(outcome)
+            };
+        }
+
+        let started = Instant::now();
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                lock_was_poisoned = true;
+                poisoned.into_inner()
+            }
+        };
+        loop {
+            if let WriterJoinState::Completed(outcome) = *state {
+                return if lock_was_poisoned {
+                    WriterJoinDriveOutcome::StatePoisoned
+                } else {
+                    WriterJoinDriveOutcome::Completed(outcome)
+                };
+            }
+
+            let Some(remaining) = wait_timeout.checked_sub(started.elapsed()) else {
+                return WriterJoinDriveOutcome::InProgress;
+            };
+            if remaining.is_zero() {
+                return WriterJoinDriveOutcome::InProgress;
+            }
+            match self.changed.wait_timeout(state, remaining) {
+                Ok((next, timed_out)) => {
+                    state = next;
+                    if timed_out.timed_out()
+                        && !matches!(*state, WriterJoinState::Completed(_))
+                    {
+                        return WriterJoinDriveOutcome::InProgress;
+                    }
+                }
+                Err(poisoned) => {
+                    lock_was_poisoned = true;
+                    let (next, _) = poisoned.into_inner();
+                    state = next;
+                }
+            }
+        }
+    }
 }
 
 /// Storage-local stable waker used by writer-queue reservations.
@@ -2737,8 +2912,8 @@ pub struct StorageHandle {
     read_pool_size: usize,
     /// Optional mmap mirror directory for segment fast-path reads.
     mmap_mirror_dir: Option<Arc<PathBuf>>,
-    /// Writer thread join handle (for shutdown) - shared to allow Clone
-    writer_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Durable writer join authority and terminal receipt, shared by clones.
+    writer_join_state: Arc<WriterJoinAuthority>,
     /// Semantic budget state for hybrid search guardrails/telemetry.
     semantic_budget_state: Arc<Mutex<SemanticBudgetState>>,
     /// Deterministic unit-test cancellation at the exact boundary after one
@@ -2747,12 +2922,20 @@ pub struct StorageHandle {
     test_cancel_after_batch: Arc<Mutex<Option<&'static str>>>,
     #[cfg(test)]
     test_cancel_shutdown_after_enqueue: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_cancel_shutdown_after_ack: Arc<AtomicBool>,
 }
 
 impl StorageHandle {
     #[cfg(test)]
     fn cancel_shutdown_after_enqueue_for_test(&self) {
         self.test_cancel_shutdown_after_enqueue
+            .store(true, AtomicOrdering::Release);
+    }
+
+    #[cfg(test)]
+    fn cancel_shutdown_after_ack_for_test(&self) {
+        self.test_cancel_shutdown_after_ack
             .store(true, AtomicOrdering::Release);
     }
 
@@ -2939,7 +3122,10 @@ impl StorageHandle {
         F: FnOnce() -> Result<T> + Send + 'static,
     {
         match crate::runtime_async::spawn_blocking_with_cx(cx, work).await {
-            Ok(result) => result,
+            Ok(result) => {
+                Self::checkpoint_storage_operation(cx, join_error_prefix)?;
+                result
+            }
             Err(
                 error
                 @ (SpawnBlockingWithCxError::CancelledBeforeSpawn { .. }
@@ -2959,7 +3145,57 @@ impl StorageHandle {
         }
     }
 
+    /// Execute a directly-backed storage mutation without claiming that a
+    /// post-admission cancellation is retry-safe.
+    ///
+    /// `CancelledBeforeSpawn` proves the closure never ran. Every other
+    /// wrapper-level failure can occur after the closure started and therefore
+    /// has an indeterminate durable outcome. An authoritative closure result,
+    /// including success, is returned unchanged and is not overwritten by a
+    /// cancellation that races after completion.
+    async fn spawn_blocking_storage_mutation_with_cx<T, F>(
+        cx: &crate::cx::Cx,
+        operation: &'static str,
+        work: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        match crate::runtime_async::spawn_blocking_with_cx(cx, work).await {
+            Ok(result) => result,
+            Err(error) => Err(Self::classify_blocking_storage_mutation_failure(
+                operation, error,
+            )),
+        }
+    }
+
+    fn classify_blocking_storage_mutation_failure(
+        operation: &'static str,
+        error: SpawnBlockingWithCxError,
+    ) -> crate::Error {
+        match error {
+            SpawnBlockingWithCxError::CancelledBeforeSpawn { .. } => {
+                crate::Error::Cancelled(format!(
+                    "{operation} cancelled before storage mutation admission"
+                ))
+            }
+            SpawnBlockingWithCxError::CancelledMidFlight { .. }
+            | SpawnBlockingWithCxError::RuntimeFailure
+            | SpawnBlockingWithCxError::CancellationWatcherTimerFailure => {
+                StorageError::IndeterminateMutation { operation }.into()
+            }
+        }
+    }
+
     async fn recv_writer_response<T>(rx: oneshot::Receiver<Result<T>>) -> Result<T> {
+        Self::recv_writer_response_with_timeout(rx, WRITER_SETTLEMENT_TIMEOUT).await
+    }
+
+    async fn recv_writer_response_with_timeout<T>(
+        rx: oneshot::Receiver<Result<T>>,
+        timeout: std::time::Duration,
+    ) -> Result<T> {
         // Once a command is admitted, the writer may already have committed
         // durable effects. Await its authoritative response on a live cleanup
         // context instead of an unrelated ambient Cx; surfacing ambient
@@ -2967,9 +3203,20 @@ impl StorageHandle {
         // not happen.
         let response_cx =
             crate::cx::Cx::for_request_with_budget(crate::cx::Budget::INFINITE);
-        crate::runtime_async::oneshot_recv_with_cx(&response_cx, rx)
-            .await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        let timeout_cx = crate::cx::for_request();
+        match crate::runtime_async::timeout_with_cx(
+            &timeout_cx,
+            timeout,
+            crate::runtime_async::oneshot_recv_with_cx(&response_cx, rx),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Err(StorageError::WriterSettlementIndeterminate {
+                phase: "command_response",
+            }
+            .into()),
+        }
     }
 
     async fn recv_writer_shutdown_ack_with_cx(
@@ -3007,19 +3254,19 @@ impl StorageHandle {
         });
         match select(ack, cancel_watcher).await {
             Either::Left((Ok(()), _)) => Ok(true),
-            Either::Left((Err(_), _)) => Err(StorageError::Database(
-                "storage shutdown acknowledgment channel closed".to_string(),
-            )
+            Either::Left((Err(_), _)) => Err(StorageError::WriterSettlementIndeterminate {
+                phase: "shutdown_acknowledgment",
+            }
             .into()),
             Either::Right((Ok(()), _)) => Ok(false),
-            Either::Right((Err(error), _)) => Err(StorageError::Database(format!(
-                "storage shutdown acknowledgment watcher failed: {error}"
-            ))
+            Either::Right((Err(_), _)) => Err(StorageError::WriterSettlementIndeterminate {
+                phase: "shutdown_acknowledgment_watcher",
+            }
             .into()),
         }
     }
 
-    async fn enqueue_writer_shutdown_cleanup(&self) -> oneshot::Receiver<()> {
+    async fn enqueue_writer_shutdown_cleanup(&self) -> Result<WriterShutdownAdmission> {
         let (tx, rx) = oneshot::channel();
         // Cleanup is an independent capability. It must never inherit the
         // cancellation that caused its caller to request teardown, and it may
@@ -3027,11 +3274,28 @@ impl StorageHandle {
         // or the writer has already reached a terminal state.
         let cleanup_cx =
             crate::cx::Cx::for_request_with_budget(crate::cx::Budget::INFINITE);
-        let _ = self
-            .write_tx
-            .send_with_cx(&cleanup_cx, WriteCommand::Shutdown { respond: tx })
-            .await;
-        rx
+        let timeout_cx = crate::cx::for_request();
+        match crate::runtime_async::timeout_with_cx(
+            &timeout_cx,
+            WRITER_SETTLEMENT_TIMEOUT,
+            self.write_tx
+                .send_with_cx(&cleanup_cx, WriteCommand::Shutdown { respond: tx }),
+        )
+        .await
+        {
+            Err(_) => Err(StorageError::WriterSettlementIndeterminate {
+                phase: "shutdown_admission",
+            }
+            .into()),
+            Ok(result) => match result {
+                Ok(()) => Ok(WriterShutdownAdmission::Admitted(rx)),
+                Err(
+                    WriteCommandSendError::WriterClosedCleanly
+                    | WriteCommandSendError::WriterBackendEpochPoisoned,
+                ) => Ok(WriterShutdownAdmission::WriterAlreadyTerminal),
+                Err(error) => Err(Self::writer_send_error("shutdown", error)),
+            },
+        }
     }
 
     /// Validate the retained writer terminal state after a caller has observed
@@ -3054,6 +3318,93 @@ impl StorageHandle {
                 "storage writer published unknown terminal state {unknown}"
             ))
             .into()),
+        }
+    }
+
+    fn completed_writer_join_outcome(&self) -> Result<Option<WriterJoinOutcome>> {
+        self.writer_join_state.outcome().map_err(|()| {
+            StorageError::Database("Writer join authority mutex poisoned".to_string()).into()
+        })
+    }
+
+    fn writer_join_outcome_result(&self, outcome: WriterJoinOutcome) -> Result<()> {
+        match outcome {
+            WriterJoinOutcome::Joined => self.completed_writer_terminal_result(),
+            WriterJoinOutcome::Panicked => {
+                Err(StorageError::Database("Writer thread panicked".to_string()).into())
+            }
+        }
+    }
+
+    async fn settle_writer_join_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        if let Some(outcome) = self.completed_writer_join_outcome()? {
+            return self.writer_join_outcome_result(outcome);
+        }
+
+        let authority = Arc::clone(&self.writer_join_state);
+        // Settlement is cleanup infrastructure, not caller work. The caller
+        // Cx is checked before this transfer; after the blocking closure
+        // starts it owns the sole native join authority and must publish its
+        // terminal receipt even if this bounded async wait expires.
+        let settlement_cx =
+            crate::cx::Cx::for_request_with_budget(crate::cx::Budget::INFINITE);
+        let timeout_cx = crate::cx::for_request();
+        let observed = crate::runtime_async::timeout_with_cx(
+            &timeout_cx,
+            timeout,
+            crate::runtime_async::spawn_blocking_with_cx(&settlement_cx, move || {
+                authority.drive(timeout)
+            }),
+        )
+        .await;
+
+        match observed {
+            Ok(Ok(WriterJoinDriveOutcome::Completed(outcome))) => {
+                self.writer_join_outcome_result(outcome)
+            }
+            Ok(Ok(WriterJoinDriveOutcome::StatePoisoned)) => Err(StorageError::Database(
+                "Writer join authority mutex poisoned".to_string(),
+            )
+            .into()),
+            Ok(Ok(WriterJoinDriveOutcome::InProgress)) | Err(_) => {
+                if let Some(outcome) = self.completed_writer_join_outcome()? {
+                    self.writer_join_outcome_result(outcome)
+                } else {
+                    Err(StorageError::WriterSettlementIndeterminate {
+                        phase: "shutdown_join_timeout",
+                    }
+                    .into())
+                }
+            }
+            Ok(Err(
+                SpawnBlockingWithCxError::CancelledBeforeSpawn { .. }
+                | SpawnBlockingWithCxError::CancelledMidFlight { .. },
+            )) => {
+                if let Some(outcome) = self.completed_writer_join_outcome()? {
+                    self.writer_join_outcome_result(outcome)
+                } else {
+                    Err(StorageError::WriterSettlementIndeterminate {
+                        phase: "shutdown_join_cancelled",
+                    }
+                    .into())
+                }
+            }
+            Ok(Err(
+                SpawnBlockingWithCxError::RuntimeFailure
+                | SpawnBlockingWithCxError::CancellationWatcherTimerFailure,
+            )) => {
+                if let Some(outcome) = self.completed_writer_join_outcome()? {
+                    self.writer_join_outcome_result(outcome)
+                } else {
+                    Err(StorageError::WriterSettlementIndeterminate {
+                        phase: "shutdown_join_runtime",
+                    }
+                    .into())
+                }
+            }
         }
     }
 
@@ -3172,9 +3523,9 @@ impl StorageHandle {
             })
         };
         let init_result = if let Some(cx) = cx {
-            Self::spawn_blocking_storage_with_cx_with_join_error(
+            Self::spawn_blocking_storage_mutation_with_cx(
                 cx,
-                "Storage open task join error",
+                "storage_open_and_initialize",
                 open_initialized_backend,
             )
             .await?
@@ -3240,7 +3591,7 @@ impl StorageHandle {
             backend_provider,
             read_pool_size: config.read_pool_size.max(1),
             mmap_mirror_dir: mmap_runtime.map(|runtime| Arc::new(runtime.base_dir)),
-            writer_handle: Arc::new(Mutex::new(Some(writer_handle))),
+            writer_join_state: Arc::new(WriterJoinAuthority::new(writer_handle)),
             semantic_budget_state: Arc::new(Mutex::new(SemanticBudgetState::new(
                 SemanticBudgetConfig::default(),
             ))),
@@ -3248,6 +3599,8 @@ impl StorageHandle {
             test_cancel_after_batch: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_cancel_shutdown_after_enqueue: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_cancel_shutdown_after_ack: Arc::new(AtomicBool::new(false)),
         };
         register_storage_backend_provider(handle.db_path.as_str(), &handle.backend_provider);
         Ok(handle)
@@ -7446,7 +7799,7 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
         let vector = vector.to_vec();
 
-        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+        Self::spawn_blocking_storage_mutation_with_cx(cx, "store_embedding", move || {
             // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
             pooled_backend(db_path.as_str(), |backend| {
                 execute_typed(
@@ -9475,29 +9828,28 @@ impl StorageHandle {
     ///
     /// Always uses a fresh, non-cancellable cleanup capability to enqueue the
     /// shutdown command, so cancellation can never suppress teardown. The
-    /// caller's Cx controls waiting for the acknowledgment and join. If that
-    /// wait is cancelled, this method returns [`crate::Error::Cancelled`];
-    /// `Ok(())` is reserved for a joined writer whose terminal state was
-    /// validated as clean.
+    /// caller's Cx controls waiting through the acknowledgment and the final
+    /// pre-transfer checkpoint. If that wait is cancelled, the native join
+    /// authority remains pending for a later shutdown call.
     ///
-    /// Note: if the cx stops the acknowledgment wait, the writer handle is left
-    /// in place (take is skipped), so a subsequent shutdown call can drive the
-    /// join. Once acknowledgment wins and the handle is taken, it is consumed
-    /// even if cancellation then wins the join wait.
-    ///
-    /// br-ft-cdcbv: the writer-thread join runs on the blocking
-    /// thread pool via `runtime_async::spawn_blocking` so the
-    /// executor is never stalled on a slow shutdown. The await
-    /// is also select-raced against the caller's Cx cancellation
-    /// watcher (50 ms poll period, matching
-    /// `distributed::race_with_cx_cancel`'s pattern) so a mid-
-    /// flight cancel returns a typed cancellation promptly. A join closure that
-    /// already started runs to completion in the background. If cancellation
-    /// wins before that closure starts, the queued closure may be skipped and
-    /// dropping its standard-library JoinHandle detaches (but does not stop)
-    /// the writer thread. In either case the handle is consumed once.
+    /// After the checkpoint succeeds, a shared cleanup authority owns writer
+    /// settlement. The native handle is taken only by blocking work that has
+    /// actually started, and its `Joined`/`Panicked` receipt is persisted in
+    /// shared state before that work returns. A bounded async timeout can
+    /// therefore report an indeterminate settlement without detaching the
+    /// native writer or losing its eventual result. Later calls observe or wait
+    /// for that same receipt. `Ok(())` is reserved for `Joined` plus a clean
+    /// published writer terminal state.
     pub async fn shutdown_with_cx(&self, cx: &crate::cx::Cx) -> Result<()> {
-        let rx = self.enqueue_writer_shutdown_cleanup().await;
+        // A previous settlement receipt is authoritative. Do not enqueue an
+        // impossible second command merely to manufacture a disconnected
+        // acknowledgment channel, and never infer native join completion from
+        // the writer's independently published terminal state alone.
+        if let Some(outcome) = self.completed_writer_join_outcome()? {
+            return self.writer_join_outcome_result(outcome);
+        }
+
+        let admission = self.enqueue_writer_shutdown_cleanup().await?;
         #[cfg(test)]
         if self
             .test_cancel_shutdown_after_enqueue
@@ -9508,10 +9860,33 @@ impl StorageHandle {
                 Some("deterministic cancellation after storage cleanup enqueue"),
             );
         }
-        if !Self::recv_writer_shutdown_ack_with_cx(cx, rx).await? {
-            return Err(crate::Error::Cancelled(
-                "storage shutdown cancelled before writer acknowledgment".to_string(),
-            ));
+        if let WriterShutdownAdmission::Admitted(rx) = admission {
+            let settlement_cx = crate::cx::for_request();
+            let acknowledged = crate::runtime_async::timeout_with_cx(
+                &settlement_cx,
+                WRITER_SETTLEMENT_TIMEOUT,
+                Self::recv_writer_shutdown_ack_with_cx(cx, rx),
+            )
+            .await
+            .map_err(|_| StorageError::WriterSettlementIndeterminate {
+                phase: "shutdown_acknowledgment_timeout",
+            })??;
+            if !acknowledged {
+                return Err(crate::Error::Cancelled(
+                    "storage shutdown cancelled before writer acknowledgment".to_string(),
+                ));
+            }
+        }
+
+        #[cfg(test)]
+        if self
+            .test_cancel_shutdown_after_ack
+            .swap(false, AtomicOrdering::AcqRel)
+        {
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("deterministic cancellation after storage shutdown acknowledgment"),
+            );
         }
 
         // The acknowledgment and cancellation watcher can become ready in
@@ -9525,46 +9900,8 @@ impl StorageHandle {
             ));
         }
 
-        let handle = self
-            .writer_handle
-            .lock()
-            .map_err(|_| StorageError::Database("Writer handle mutex poisoned".to_string()))?
-            .take();
-        if let Some(handle) = handle {
-            // Use the canonical Cx-aware blocking seam. Its watcher runs a
-            // full checkpoint after every sleep wake/error, including budget
-            // deadline expiry that does not latch `is_cancel_requested`.
-            match crate::runtime_async::spawn_blocking_with_cx(cx, move || {
-                handle.join().map_err(|_| ())
-            })
+        self.settle_writer_join_with_timeout(WRITER_SETTLEMENT_TIMEOUT)
             .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(())) => {
-                    return Err(StorageError::Database("Writer thread panicked".to_string()).into());
-                }
-                Err(
-                    SpawnBlockingWithCxError::CancelledBeforeSpawn { .. }
-                    | SpawnBlockingWithCxError::CancelledMidFlight { .. },
-                ) => {
-                    return Err(crate::Error::Cancelled(
-                        "storage shutdown cancelled while joining writer".to_string(),
-                    ));
-                }
-                Err(
-                    e
-                    @ (SpawnBlockingWithCxError::RuntimeFailure
-                    | SpawnBlockingWithCxError::CancellationWatcherTimerFailure),
-                ) => {
-                    return Err(StorageError::Database(format!(
-                        "Shutdown spawn_blocking error: {e}"
-                    ))
-                    .into());
-                }
-            }
-        }
-
-        self.completed_writer_terminal_result()
     }
 }
 
@@ -37748,6 +38085,119 @@ fn storage_shutdown_with_cx_fresh_cx_full_shutdown() {
 }
 
 #[test]
+fn blocking_storage_read_and_mutation_have_distinct_cancel_boundaries() {
+    run_storage_async_test(async {
+        let read_cx = crate::cx::for_testing();
+        let cancel_read = read_cx.clone();
+        let read = StorageHandle::spawn_blocking_storage_with_cx_with_join_error(
+            &read_cx,
+            "test_read",
+            move || {
+                cancel_read.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("cancel completed synthetic read"),
+                );
+                Ok(7_u64)
+            },
+        )
+        .await;
+        assert!(
+            matches!(read, Err(crate::Error::Cancelled(_))),
+            "a completed read must not be admitted after its caller cancelled: {read:?}"
+        );
+
+        let mutation_cx = crate::cx::for_testing();
+        let cancel_mutation = mutation_cx.clone();
+        let mutation = StorageHandle::spawn_blocking_storage_mutation_with_cx(
+            &mutation_cx,
+            "synthetic_mutation",
+            move || {
+                cancel_mutation.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("cancel completed synthetic mutation"),
+                );
+                Ok(11_u64)
+            },
+        )
+        .await;
+        assert_eq!(
+            mutation.expect("an authoritative mutation result must win a later cancellation"),
+            11
+        );
+    });
+}
+
+#[test]
+fn admitted_writer_response_has_a_finite_indeterminate_timeout() {
+    run_storage_async_test(async {
+        let (_sender, receiver) = oneshot::channel::<Result<u64>>();
+        let error = StorageHandle::recv_writer_response_with_timeout(
+            receiver,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect_err("a writer that withholds its response must not block forever");
+        assert!(matches!(
+            error,
+            crate::Error::Storage(StorageError::WriterSettlementIndeterminate {
+                phase: "command_response"
+            })
+        ));
+    });
+}
+
+#[test]
+fn blocking_storage_mutation_failure_taxonomy_prevents_blind_retry() {
+    let before = StorageHandle::classify_blocking_storage_mutation_failure(
+        "synthetic_mutation",
+        SpawnBlockingWithCxError::CancelledBeforeSpawn { kind: None },
+    );
+    assert!(matches!(before, crate::Error::Cancelled(_)));
+
+    for failure in [
+        SpawnBlockingWithCxError::CancelledMidFlight { kind: None },
+        SpawnBlockingWithCxError::RuntimeFailure,
+        SpawnBlockingWithCxError::CancellationWatcherTimerFailure,
+    ] {
+        let error = StorageHandle::classify_blocking_storage_mutation_failure(
+            "synthetic_mutation",
+            failure,
+        );
+        assert!(matches!(
+            error,
+            crate::Error::Storage(StorageError::IndeterminateMutation {
+                operation: "synthetic_mutation"
+            })
+        ));
+    }
+}
+
+#[test]
+fn storage_shutdown_with_cx_is_idempotent_after_clean_join() {
+    run_storage_async_test(async {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let db_path = directory.path().join("shutdown-idempotent.sqlite3");
+        let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+
+        let first_cx = crate::cx::for_testing();
+        storage.shutdown_with_cx(&first_cx).await.unwrap();
+        assert_eq!(
+            storage.completed_writer_join_outcome().unwrap(),
+            Some(WriterJoinOutcome::Joined),
+            "the first clean shutdown must retain an authoritative native join receipt"
+        );
+
+        let second_cx = crate::cx::for_testing();
+        storage.shutdown_with_cx(&second_cx).await.unwrap();
+        assert_eq!(
+            storage.write_tx.terminal_state.load(AtomicOrdering::Acquire),
+            WRITER_TERMINAL_CLOSED_CLEANLY,
+            "a repeated shutdown must report the retained clean terminal state"
+        );
+    });
+}
+
+#[test]
 fn storage_shutdown_with_cx_pre_cancel_still_enqueues_cleanup() {
     run_storage_async_test(async {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -37791,6 +38241,45 @@ fn storage_shutdown_with_cx_mid_cancel_after_enqueue_still_completes_cleanup() {
         assert!(matches!(cancelled, crate::Error::Cancelled(_)));
         assert!(caller_cx.is_cancel_requested());
         storage.shutdown().await.unwrap();
+        assert_eq!(
+            storage.write_tx.terminal_state.load(AtomicOrdering::Acquire),
+            WRITER_TERMINAL_CLOSED_CLEANLY
+        );
+    });
+}
+
+#[test]
+fn storage_shutdown_cancel_after_ack_preserves_handle_for_recovery_join() {
+    run_storage_async_test(async {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let db_path = directory.path().join("shutdown-cancel-after-ack.sqlite3");
+        let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+        let caller_cx = crate::cx::for_testing();
+        storage.cancel_shutdown_after_ack_for_test();
+
+        let cancelled = storage
+            .shutdown_with_cx(&caller_cx)
+            .await
+            .expect_err("cancellation after the writer ack must not report a joined shutdown");
+        assert!(matches!(cancelled, crate::Error::Cancelled(_)));
+        assert!(
+            matches!(
+                &*storage
+                    .writer_join_state
+                    .state
+                    .lock()
+                    .expect("writer join authority lock"),
+                WriterJoinState::Pending(_)
+            ),
+            "cancellation after acknowledgement must retain pending native join authority"
+        );
+
+        storage.shutdown().await.unwrap();
+        assert_eq!(
+            storage.completed_writer_join_outcome().unwrap(),
+            Some(WriterJoinOutcome::Joined),
+            "a fresh shutdown must retain the terminal join receipt"
+        );
         assert_eq!(
             storage.write_tx.terminal_state.load(AtomicOrdering::Acquire),
             WRITER_TERMINAL_CLOSED_CLEANLY
