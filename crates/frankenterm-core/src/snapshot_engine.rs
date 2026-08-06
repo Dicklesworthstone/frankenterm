@@ -305,6 +305,15 @@ pub struct SnapshotCheckpointIdentity {
     pub state_hash: String,
 }
 
+/// In-memory periodic-dedup hint bound to the exact durable row that made the
+/// hint safe. The database identity is revalidated before every skip because
+/// another engine or process may prune that row without access to this cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LastDedupCheckpoint {
+    dedup_hash: String,
+    identity: SnapshotCheckpointIdentity,
+}
+
 /// Transaction-local checkpoint deletion selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotDeleteTarget {
@@ -1388,6 +1397,19 @@ struct SnapshotAuthorityAttemptGuard {
     settled: bool,
 }
 
+/// Exclusive same-process admission for a read-only authority observation.
+/// Losing this guard never latches reconciliation because the guarded closure
+/// cannot mutate durable state; SQLite remains the cross-process serializer.
+struct SnapshotAuthorityReadGuard {
+    authority: Arc<SnapshotAuthorityState>,
+}
+
+impl Drop for SnapshotAuthorityReadGuard {
+    fn drop(&mut self) {
+        self.authority.in_progress.store(false, Ordering::Release);
+    }
+}
+
 impl SnapshotAuthorityAttemptGuard {
     fn handoff_state(&self) -> Arc<AtomicU8> {
         Arc::clone(&self.handoff_state)
@@ -1474,7 +1496,7 @@ pub struct SnapshotEngine {
     /// Current session ID (set on first capture).
     session_id: RwLock<Option<String>>,
     /// Stable semantic-state SHA-256 digest used for periodic deduplication.
-    last_dedup_hash: RwLock<Option<String>>,
+    last_dedup_hash: RwLock<Option<LastDedupCheckpoint>>,
     /// Atomic combined capture/shutdown lifecycle. One CAS both admits an
     /// ordinary capture and proves shutdown has not reserved the lane, closing
     /// the precheck-to-claim race that separate booleans cannot avoid.
@@ -1713,6 +1735,39 @@ impl SnapshotEngine {
             operation,
             handoff_state: Arc::new(AtomicU8::new(AUTHORITY_HANDOFF_PENDING)),
             settled: false,
+        })
+    }
+
+    /// Acquire the database-keyed lane for a read-only authority observation.
+    /// This is deliberately separate from mutation admission: cancellation or
+    /// executor failure cannot make a read indeterminate and therefore must
+    /// never poison the durable-mutation lane.
+    fn try_begin_snapshot_authority_read(
+        &self,
+        operation: SnapshotAuthorityOperation,
+    ) -> std::result::Result<SnapshotAuthorityReadGuard, SnapshotError> {
+        if self.authority_reconciliation_is_required() {
+            return Err(self.authority_reconciliation_error(operation));
+        }
+        if self
+            .snapshot_authority
+            .in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            if self.authority_reconciliation_is_required() {
+                return Err(self.authority_reconciliation_error(operation));
+            }
+            return Err(SnapshotError::AuthorityMutationInProgress { operation });
+        }
+        if self.authority_reconciliation_is_required() {
+            self.snapshot_authority
+                .in_progress
+                .store(false, Ordering::Release);
+            return Err(self.authority_reconciliation_error(operation));
+        }
+        Ok(SnapshotAuthorityReadGuard {
+            authority: Arc::clone(&self.snapshot_authority),
         })
     }
 
@@ -2082,20 +2137,43 @@ impl SnapshotEngine {
             trigger,
             SnapshotTrigger::Periodic | SnapshotTrigger::PeriodicFallback
         ) {
-            let last = self
-                .last_dedup_hash
-                .read_with_cx(cx)
-                .await
-                .map_err(snapshot_lock_error)?;
+            let cached_checkpoint = {
+                let last = self
+                    .last_dedup_hash
+                    .read_with_cx(cx)
+                    .await
+                    .map_err(snapshot_lock_error)?;
+                last.as_ref()
+                    .filter(|cached| cached.dedup_hash == dedup_hash)
+                    .cloned()
+            };
             if self.authority_reconciliation_is_required() {
                 return Err(self.authority_reconciliation_error(
                     SnapshotAuthorityOperation::CheckpointCommit,
                 ));
             }
-            if last.as_deref() == Some(&dedup_hash) {
-                saturating_telemetry_add(&self.telemetry.dedup_skips, 1);
-                capture_guard.complete_without_error();
-                return Err(SnapshotError::NoChanges);
+            if let Some(cached) = cached_checkpoint {
+                // A cache hit is only a hint. Another SnapshotEngine or process
+                // can delete/prune its row, so every skip revalidates the exact
+                // immutable commit receipt. Same-process mutations are held
+                // behind this read admission until the skip decision settles.
+                let authority_read = self.try_begin_snapshot_authority_read(
+                    SnapshotAuthorityOperation::CheckpointCommit,
+                )?;
+                let db_path = Arc::clone(&self.db_path);
+                let identity = cached.identity;
+                let still_durable = crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+                    exact_snapshot_checkpoint_exists_sync(db_path.as_str(), &identity)
+                })
+                .await
+                .map_err(classify_snapshot_pure_blocking_failure)?
+                .map_err(|error| SnapshotError::Database(error.to_string()))?;
+                if still_durable {
+                    saturating_telemetry_add(&self.telemetry.dedup_skips, 1);
+                    capture_guard.complete_without_error();
+                    return Err(SnapshotError::NoChanges);
+                }
+                drop(authority_read);
             }
         }
 
@@ -2155,7 +2233,16 @@ impl SnapshotEngine {
         if creates_session {
             *session_id_guard = Some(result.session_id.clone());
         }
-        *last_dedup_hash = Some(dedup_hash);
+        *last_dedup_hash = Some(LastDedupCheckpoint {
+            dedup_hash,
+            identity: SnapshotCheckpointIdentity {
+                checkpoint_id: result.checkpoint_id,
+                session_id: result.session_id.clone(),
+                checkpoint_at: now_ms,
+                checkpoint_role: CHECKPOINT_ROLE_SNAPSHOT.to_string(),
+                state_hash: result.state_hash.clone(),
+            },
+        });
 
         // 9. Record success telemetry
         saturating_telemetry_add(&self.telemetry.captures_succeeded, 1);
@@ -4010,6 +4097,53 @@ fn open_conn(db_path: &str) -> std::result::Result<Connection, rusqlite::Error> 
     // that accumulate forever. Same shape as ft-s4myu / session_restore.
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     Ok(conn)
+}
+
+/// Open a connection for an exact authority observation without issuing a
+/// write-capable journal-mode PRAGMA. The cached checkpoint can only exist
+/// after schema initialization, so validation must observe rather than repair.
+fn open_snapshot_query_conn(
+    db_path: &str,
+) -> std::result::Result<Connection, rusqlite::Error> {
+    #[cfg(any(unix, windows))]
+    let conn = Connection::open_with_flags_and_vfs(
+        db_path,
+        OpenFlags::default() | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+        SNAPSHOT_SQLITE_DEFAULT_VFS,
+    )?;
+    #[cfg(not(any(unix, windows)))]
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::default() | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+    )?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    Ok(conn)
+}
+
+fn exact_snapshot_checkpoint_exists_sync(
+    db_path: &str,
+    identity: &SnapshotCheckpointIdentity,
+) -> std::result::Result<bool, rusqlite::Error> {
+    let checkpoint_at = u64_to_sqlite_integer(identity.checkpoint_at)?;
+    let conn = open_snapshot_query_conn(db_path)?;
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM session_checkpoints
+             WHERE id = ?1
+               AND session_id = ?2
+               AND checkpoint_at = ?3
+               AND checkpoint_role = 'snapshot'
+               AND state_hash = ?4
+         )",
+        rusqlite::params![
+            identity.checkpoint_id,
+            identity.session_id.as_str(),
+            checkpoint_at,
+            identity.state_hash.as_str(),
+        ],
+        |row| row.get(0),
+    )
 }
 
 fn current_host_id() -> String {
