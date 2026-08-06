@@ -1,9 +1,10 @@
 # Session Persistence (Snapshots)
 
-ft’s session persistence system captures terminal backend mux state (current bridge: WezTerm) into SQLite snapshots so you can:
+ft’s partially supported session persistence system captures terminal backend
+mux state (current bridge: WezTerm) into SQLite snapshots so you can:
 
-- Recover after an unclean shutdown (crash / power loss)
-- Perform safer restarts by snapshotting first
+- Manually reconstruct the currently supported layout subset after an unclean shutdown
+- Preserve evidence before an operator-managed restart
 - Inspect and diff session state over time
 
 This system is designed for **mux topology + pane metadata**, not full process checkpointing.
@@ -24,8 +25,10 @@ identity. The migration contract is
 What it does **not** (currently) guarantee:
 
 - Restoring interactive in-process state (REPL variables, editor buffers, etc.)
-- Restoring authenticated agent sessions (Claude/Codex/Gemini will start fresh)
-- Perfect scrollback fidelity when capture data was already missing or truncated before the snapshot
+- Restarting shells, agents, or other foreground processes automatically
+- Restoring historical scrollback or terminal render state, regardless of capture quality
+- Preserving mux-domain identity, durable app-reopen tab order, titles, exact
+  cell geometry, or full window appearance
 
 ## Quick start
 
@@ -58,7 +61,7 @@ Triggers:
 
 - `--trigger manual` (default)
 - `--trigger pre_restart` (recommended before a manual restart)
-- `--trigger startup` (used by the watcher on startup)
+- `--trigger startup` (reserved trigger label; no production watcher caller currently captures it)
 
 ### 2) List snapshots
 
@@ -131,20 +134,29 @@ ft snapshot delete 123 --force
 
 ## Restore behavior
 
-### Automatic restore on startup (watcher)
+### Unclean-session detection
 
-On startup, `ft watch` checks for sessions that did not shut down cleanly (`shutdown_clean = 0`).
-If it finds one, it will **detect** that an unclean session exists and offer to restore from the latest checkpoint.
-
-This remains the most automatic restore path.
+`SessionRestorer` contains a fail-closed library path for detecting sessions
+whose `shutdown_clean` flag is `0`, but `ft watch` does not currently call it
+or offer an automatic restore prompt. Use `ft session doctor`, inspect the
+candidate checkpoint, and invoke `ft snapshot restore <id> --layout-only`
+manually. Startup notification/prompt integration remains tracked work.
 
 ### `ft snapshot restore`
 
-`ft snapshot restore <id>` recreates the saved mux layout from a specific checkpoint.
-By default it also replays captured scrollback for each pane up to the checkpoint’s recorded `scrollback_checkpoint_seq`.
-This restore path is currently supported only on Unix platforms.
+`ft snapshot restore <id>` attempts the currently supported subset of the saved
+mux layout from a specific checkpoint: windows, tabs, pane splits, local
+working directories, and active-pane/tab selection. It does not yet restore mux
+domain identity, titles, window appearance, exact cell geometry, terminal
+render state, historical scrollback, or processes.
 
-Use `--layout-only` when you want to restore the pane/window topology without replaying scrollback:
+The CLI currently forces layout-only operation on Unix. Captured
+`output_segments` remain persisted data, but they are arbitrary stream
+fragments rather than an authoritative terminal-state snapshot and are never
+sent through PTY input. The direct library path fails closed if scrollback
+restoration is requested. Non-Unix restore is rejected.
+
+Use `--layout-only` to state the current operator mode explicitly:
 
 ```bash
 ft snapshot restore 123 --layout-only
@@ -200,9 +212,10 @@ Notes:
   mux-native, argv-isolated spawn API.
 - Retention is enforced by both `retention_count` and `retention_days`.
 
-## Performance expectations
+## Performance budgets and proof status
 
-Criterion budgets for core snapshot components live in `crates/frankenterm-core/benches/snapshot_engine.rs`:
+Criterion budgets for isolated snapshot components live in
+`crates/frankenterm-core/benches/snapshot_engine.rs`:
 
 - Topology capture: **p50 < 1ms**
 - Pane state extraction: **p50 < 10µs per pane**
@@ -210,5 +223,9 @@ Criterion budgets for core snapshot components live in `crates/frankenterm-core/
 - SQLite transaction: **p50 < 10ms**
 - SQLite query + deserialize: **p50 < 5ms**
 
-End-to-end `ft snapshot save` time is usually dominated by backend bridge CLI latency (currently WezTerm) and pane count.
-As a rule of thumb, operators should expect a snapshot to complete in **well under a few seconds** for typical local sessions.
+These values are design budgets, not proof that the current release meets them
+on a particular machine or at large topology sizes. End-to-end save/restore
+also includes mux transport, SQLite authority transactions, topology size, and
+filesystem effects. Do not infer a production latency or scale support claim
+until the corresponding retained target-class benchmark/soak artifact is
+non-skipped and signed.

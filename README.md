@@ -353,7 +353,7 @@ Honest status of every shipped surface, without migration-era hand-waving.
 | Operating envelope | **Supported** | `ft.operating_envelope.v1` planner contract + golden fixtures; fails closed on missing or critical-pressure telemetry |
 | Mission objective planner | **Supported** | Capacity-aware planner for safe swarm orchestration (ft-auy2g) |
 | Incident bundles | **Supported** | Wired to live collectors; publish-side snapshot path; beads coordination snapshot included |
-| Session persistence | **Partially supported with backend prerequisite** | Snapshots, session inspection, and `ft session doctor` are cross-platform. Unix-only live restore currently rebuilds the supported layout subset; historical scrollback, process/agent state, stable mux-domain identity, exact tab order/focus, and full window appearance are not restored. |
+| Session persistence | **Partially supported with backend prerequisite** | Snapshots, session inspection, and `ft session doctor` are cross-platform. Unix-only live restore currently rebuilds windows, tabs, splits, local CWDs, and active-pane/tab selection. Historical scrollback, process/agent state, stable mux-domain identity, durable app-reopen tab ordering, titles, exact cell geometry, and full window appearance are not restored. |
 | Reality-check + attestation | **Supported** | `ft attestation verify` / `show` ship as a thin Rust wrapper over `scripts/attestation-verify.sh`. Signed bundles live in `docs/attestations/` |
 | Deferred proof queue | **Supported with fail-closed proof prerequisite** | `ft proof queue/status/replay/attach` and `ft robot proof status` expose source-landed proof intents. Replay executes only through remote-required RCH when admission is explicitly `admitted`; local Cargo is never substituted. Release-slot evidence stays under `docs/attestations/proofs/deferred-proof-replay.json`; current W8.2 remote proof remains blocked on RCH admission. |
 | Web API / SSE | **Supported behind `--features web`** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
@@ -1033,7 +1033,7 @@ ft snapshot diff <id1> <id2>     # compare two snapshots
 ft session list                  # list saved sessions
 ft session show <session_id>     # show session + checkpoints
 ft session doctor                # health check for session persistence
-ft watch                         # startup detection + restore prompt for unclean shutdowns
+ft watch                         # observe panes; startup restore prompting is not wired yet
 ```
 
 `ft snapshot restore` and `ft restart` are wired on Unix, but currently force
@@ -1041,8 +1041,10 @@ layout-only behavior. Historical output is never written through PTY input,
 and shell/agent replacement remains a reported manual disposition until the
 mux exposes safe render-state and argv-isolated spawn channels. The
 `--layout-only` flag is therefore an explicit statement of the only supported
-mode, not a switch from a working scrollback-replay mode. Use `ft watch` for
-unclean-session detection and restore prompting.
+mode, not a switch from a working scrollback-replay mode. The library can find
+unclean sessions, but the production `ft watch` startup path does not yet call
+that detector or offer a restore prompt; use the explicit snapshot/session
+commands to inspect and start a manual restore.
 
 ### Configuration
 
@@ -1753,11 +1755,15 @@ Several subsystems use space-efficient probabilistic data structures to avoid co
 
 ## Deep Dive: Session Persistence and Restore
 
-When `ft watch` starts, it checks for sessions that did not shut down cleanly (`shutdown_clean = 0` in the database). If found, it loads the latest checkpoint and offers to restore the mux topology:
+The session-restoration library can identify sessions that did not shut down
+cleanly (`shutdown_clean = 0`), load a checkpoint, and drive a manual restore:
 
 ```
 Database → SessionCandidate → RestoreDecision → LayoutRestorer → RestoreSummary
 ```
+
+That detector is not currently wired into production `ft watch` startup, so
+FrankenTerm does not yet provide an automatic startup prompt or restore.
 
 Each checkpoint records:
 - Topology snapshot (which panes existed, their tab/window arrangement)
@@ -1765,7 +1771,13 @@ Each checkpoint records:
 - Per-pane agent metadata (agent type, session ID, CWD, process info)
 - Curated environment variables (redacted for sensitive values)
 
-The restore process creates new panes in the current mux server, maps old pane IDs to new ones, and optionally replays scrollback content. The ID mapping is recorded as a "startup" checkpoint so subsequent operations can correlate pre-crash and post-restore pane identifiers.
+The current Unix restore path creates new panes in the current mux server and
+maps old pane IDs to new ones for the supported layout subset. It never replays
+historical output through PTY input and never restarts captured processes;
+those processes receive finite manual dispositions. A same-session durable
+intent/outcome/lifecycle chain records the mapping and keeps interrupted or
+partial attempts unclean for explicit reconciliation instead of silently
+retrying unknown external effects.
 
 Scheduled backups use the SQLite online backup API for consistent snapshots. Backup archives include the database binary, a JSON manifest with SHA-256 checksums, and optional SQL text dumps. Retention and rotation are configurable by day count and maximum backup count, with 5-field cron scheduling support.
 
@@ -2959,13 +2971,13 @@ These four words refer to four distinct mechanisms. They are often conflated; th
 | Concept | What it captures | Why | Restored how? | Lives where? |
 |---|---|---|---|---|
 | **Snapshot** | Mux topology + per-pane terminal state at a point in time | "What did the swarm look like?" | `ft snapshot restore <id>` (Unix) re-creates panes in the current mux | `session_checkpoints` + `mux_pane_state` tables |
-| **Session checkpoint** | Persistent session-progress markers | Resume-after-unclean-shutdown | `ft watch` auto-prompts; `ft restart` (Unix) replays | `session_checkpoints` table |
+| **Session checkpoint** | Persistent session-progress markers | Diagnose and manually recover after an unclean shutdown | Inspect with `ft session`; explicitly restore a selected snapshot/checkpoint (Unix layout subset) | `session_checkpoints` table |
 | **Recording** | Time-ordered event log of *everything* that happened | "What did the swarm *do*?" | Deterministic replay via the replay subsystem | `.ft/recorder-log/events.log` (append-log backend) |
 | **Backup** | The whole `ft.db` + manifest as a portable archive | Disaster recovery, host migration | `ft backup import` | `[backup].destination` directory (default `~/.local/share/ft/backups`) |
 
 ### When to use which
 
-- **Crashed and want my panes back?** Snapshot restore (or `ft watch` will offer it automatically on unclean shutdown detection).
+- **Crashed and want my panes back?** Inspect saved sessions/checkpoints and explicitly invoke snapshot restore; `ft watch` does not yet offer this automatically.
 - **Want to debug a workflow that fired in a way you didn't expect?** Recording + replay; you can re-run with the exact inputs and step through.
 - **Moving to a new host or recovering from disk loss?** Backup. Always backup before major upgrades; the migration engine will create a safety backup automatically but explicit is better.
 - **Need a quick "what did this fleet look like 3 hours ago" answer?** Snapshot. They're cheap to take and labeled.
@@ -3096,7 +3108,9 @@ Identical to SIGINT in steady state. The shutdown deadline is configurable; if t
 There's no clean path. The watcher is killed mid-flush. On the next start:
 - The file lock is detected as stale (PID no longer exists).
 - The clean-shutdown marker is absent.
-- `ft watch` triggers restore-on-startup, offering to restore the most recent checkpoint.
+- The persisted unclean marker remains available to the session inspection
+  commands. Automatic `ft watch` startup detection/prompting is not wired yet;
+  recovery is an explicit operator action.
 - The DB is opened in WAL recovery mode; SQLite reconstructs consistent state from the WAL.
 
 ### Cancel-correctness in long ops

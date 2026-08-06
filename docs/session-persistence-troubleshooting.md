@@ -2,7 +2,10 @@
 
 This guide covers the most common snapshot/restore failure modes and how to diagnose them quickly.
 
-Session persistence is a shipped `ft` feature, but live snapshot/restore still depends on the current WezTerm-backed mux interop boundary. Start with `ft doctor`, `ft status --health`, and `ft session doctor` before assuming the failure is in the snapshot data itself.
+Snapshot capture, inspection, and doctor surfaces ship, while live restore is
+only partially supported and depends on the current WezTerm-backed mux
+boundary. Start with `ft doctor`, `ft status --health`, and `ft session doctor`
+before assuming the failure is in the snapshot data itself.
 
 ## 1) `ft snapshot save`: “No panes found” / “Failed to list panes”
 
@@ -34,35 +37,33 @@ Session persistence is a shipped `ft` feature, but live snapshot/restore still d
 
 ## 2) “Restore didn’t happen” after a crash/restart
 
-`ft snapshot restore <checkpoint_id>` is wired for manual restores. `ft watch` remains the restore-on-startup path when you want ft to detect unclean shutdowns automatically.
+`ft snapshot restore <checkpoint_id>` is wired for manual layout-only restores.
+The `SessionRestorer` library can detect unclean sessions, but production
+`ft watch` does not yet call that detector or offer a startup restore prompt.
 
 **What to do**
 
-1) For restore-on-startup, run the watcher:
-   ```bash
-   ft watch
-   ```
-2) Re-check operator health surfaces:
+1) Re-check operator health surfaces:
    ```bash
    ft doctor
    ft status --health
    ft session doctor
    ```
-3) For a direct/manual restore, list recent checkpoints and restore one explicitly:
+2) List recent checkpoints and restore one explicitly:
    ```bash
    ft snapshot list --limit 10
    ft snapshot restore <checkpoint_id>
    ```
-4) State the currently supported layout-only mode explicitly:
+3) State the currently supported layout-only mode explicitly:
    ```bash
    ft snapshot restore <checkpoint_id> --layout-only
    ```
-5) Check whether ft sees unclean sessions:
+4) Check whether ft sees unclean sessions:
    ```bash
    ft session doctor
    ft session list
    ```
-6) Inspect the latest checkpoint for a session:
+5) Inspect the latest checkpoint for a session:
    ```bash
    ft session show <session_id>
    ```
@@ -135,6 +136,26 @@ Session persistence is a shipped `ft` feature, but live snapshot/restore still d
 - Use `ft record` / `ft reproduce` when you need a reproducible historical artifact
 - Do not treat `--layout-only` as an optional performance mode: the CLI forces
   it until a mux-owned output or render-state restoration channel exists
+
+## 6) Panes returned, but shells, agents, or interactive programs did not
+
+This is the expected boundary of the current restore path. Recreating a pane
+starts its default shell at the validated local working directory; it does not
+resume the process, agent conversation, in-flight command, TUI state, job
+control state, environment, or remote-domain attachment that occupied the old
+pane. Process classification produces finite manual dispositions only.
+
+**What to do**
+
+- Treat every restored pane as a new process boundary, even if its layout and
+  working directory match the snapshot
+- Inspect the saved session metadata to determine what previously occupied the
+  pane, then resume it through that program's own supported recovery mechanism
+- Do not put command templates or credentials in
+  `[snapshots.process_relaunch]`; those historical keys are inert and are being
+  retired rather than executed through PTY input
+- Do not interpret a completed layout restore as process, agent, scrollback,
+  render-state, or full-session continuity
 
 ## Minimal “what do I run?” checklist
 

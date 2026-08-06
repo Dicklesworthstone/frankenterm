@@ -39,13 +39,17 @@ This document explains how ft captures and restores session state for crash reco
 ### Restore
 
 - `frankenterm_core::session_restore`
-  - Detects unclean sessions (`shutdown_clean = 0`)
+  - Provides library support for detecting unclean sessions (`shutdown_clean = 0`)
   - Loads the latest checkpoint
   - Coordinates layout restoration, the fail-closed scrollback capability
     check, and process-disposition classification
+  - Is not currently called by the production `ft watch` startup path
 
 - `frankenterm_core::restore_layout::LayoutRestorer`
-  - Recreates windows/tabs/splits via backend bridge CLI operations (current: WezTerm)
+  - Recreates the supported windows/tabs/splits/local-CWD/active-selection subset
+    via mux operations (current backend: WezTerm/FrankenTerm)
+  - Does not restore mux-domain identity, durable app-reopen tab order, titles,
+    exact cell geometry, terminal render state, or full window appearance
   - Produces an old-pane-id → new-pane-id mapping
 
 - `frankenterm_core::restore_scrollback`
@@ -72,17 +76,20 @@ backend bridge cli list (current: `wezterm cli list`) → Vec<PaneInfo>
   → retention pruning
 ```
 
-### Restore on startup
+### Current manual restore flow
 
 ```text
-ft watch startup
-  → find sessions where shutdown_clean = 0
-  → load_latest_checkpoint(session_id)
+ft session doctor / ft snapshot list
+  → operator selects an exact checkpoint
+  → ft snapshot restore <id> --layout-only
   → LayoutRestorer recreates topology
   → restore_scrollback capability check (mapped replay fails closed)
   → restore_process disposition classification
-  → mark session shutdown_clean = 1
+  → exact intent/outcome/lifecycle authority settles clean or reconciliation-required
 ```
+
+`ft watch` startup notification/prompt wiring is pending. The presence of the
+library detector is not evidence that automatic startup recovery ships.
 
 ## SQLite schema (conceptual)
 
@@ -143,4 +150,6 @@ Snapshot performance budgets are encoded as Criterion metadata in:
 
 - `crates/frankenterm-core/benches/snapshot_engine.rs`
 
-These are used as “operator expectations” and as a regression target during development.
+These are development budgets, not target-class production evidence or an
+operator latency guarantee. Support claims require retained, non-skipped
+benchmark/soak artifacts for the relevant topology and machine class.

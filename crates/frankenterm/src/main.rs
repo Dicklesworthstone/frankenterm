@@ -713,13 +713,15 @@ SEE ALSO:
         timeout: u64,
     },
 
-    /// Safely restart the WezTerm mux server (snapshot → stop → start → layout restore)
+    /// Restart the mux server with layout-only restoration and explicit data-loss acknowledgement
     #[command(after_help = r#"EXAMPLES:
-    ft restart                        Safe restart with layout restoration
-    ft restart --dry-run              Show what would happen
-    ft restart --skip-restore         Restart without restoring layout
-    ft restart --layout-only          Explicitly select the only safe restore mode
-    ft restart --stop-timeout 30      Custom stop timeout
+    ft restart --dry-run              Preview the disruptive operation and continuity gaps
+    ft restart --acknowledge-process-and-scrollback-loss
+                                      Restart with explicit acknowledgement
+    ft restart --acknowledge-process-and-scrollback-loss --skip-restore
+                                      Restart without restoring layout
+    ft restart --acknowledge-process-and-scrollback-loss --stop-timeout 30
+                                      Use a custom stop timeout
 
 SEE ALSO:
     ft snapshot   Save/restore snapshots manually
@@ -738,9 +740,13 @@ SEE ALSO:
         #[arg(long)]
         skip_restore: bool,
 
-        /// Explicit no-op: layout-only is currently the only safe restore mode
+        /// Explicit no-op: layout-only is currently the only supported restore mode
         #[arg(long)]
         layout_only: bool,
+
+        /// Acknowledge that processes and historical scrollback will not be restored
+        #[arg(long)]
+        acknowledge_process_and_scrollback_loss: bool,
 
         /// Show what would happen without executing
         #[arg(long)]
@@ -22460,6 +22466,11 @@ fn snapshot_trigger_from_cli_label(
 
 const SCROLLBACK_REPLAY_DISABLED_REASON: &str =
     "disabled because the mux API has no safe terminal-output restoration channel";
+const PROCESS_RESTORATION_DISABLED_REASON: &str =
+    "unavailable because the mux API has no argv-isolated process restoration channel";
+const SESSION_CONTINUITY_INCOMPLETE_REASON: &str =
+    "historical processes and scrollback are not restored";
+const RESTART_ACKNOWLEDGEMENT_FLAG: &str = "--acknowledge-process-and-scrollback-loss";
 
 fn bounded_restore_diagnostic(error: impl std::fmt::Display) -> String {
     bounded_terminal_diagnostic(&error.to_string(), 1_000, 4_096)
@@ -22485,13 +22496,78 @@ fn restore_scrollback_json(
     })
 }
 
-fn process_relaunch_summary_json(
+fn process_disposition_report_is_consistent(
+    summary: &frankenterm_core::session_restore::RestoreSummary,
+) -> bool {
+    summary.process_launch_report.as_ref().is_some_and(|report| {
+        use frankenterm_core::restore_process::LaunchDisposition;
+
+        let mut expected_shells = 0usize;
+        let mut expected_agents = 0usize;
+        let mut expected_manual = 0usize;
+        let mut expected_skipped = 0usize;
+        let mut expected_failed = 0usize;
+        for result in &report.results {
+            if result.success {
+                if result.error.is_some() {
+                    return false;
+                }
+                match &result.action {
+                    LaunchDisposition::Shell => expected_shells += 1,
+                    LaunchDisposition::Agent => expected_agents += 1,
+                    LaunchDisposition::Manual => expected_manual += 1,
+                    LaunchDisposition::Skip => expected_skipped += 1,
+                }
+            } else {
+                if result.error.is_none() {
+                    return false;
+                }
+                expected_failed += 1;
+            }
+        }
+
+        report.shells_launched == expected_shells
+            && report.agents_launched == expected_agents
+            && report.manual == expected_manual
+            && report.skipped == expected_skipped
+            && report.failed == expected_failed
+    })
+}
+
+fn process_restoration_completed_successfully(
+    summary: &frankenterm_core::session_restore::RestoreSummary,
+) -> bool {
+    summary.process_launch_report.as_ref().is_some_and(|report| {
+        process_disposition_report_is_consistent(summary)
+            && report.interruption.is_none()
+            && report.manual == 0
+            && report.skipped == 0
+            && report.failed == 0
+            && report.results.len() == report.shells_launched.saturating_add(report.agents_launched)
+    })
+}
+
+fn process_disposition_completed_successfully(
+    summary: &frankenterm_core::session_restore::RestoreSummary,
+) -> bool {
+    summary.process_launch_report.as_ref().is_none_or(|report| {
+        process_disposition_report_is_consistent(summary)
+            && report.interruption.is_none()
+            && report.failed == 0
+    })
+}
+
+fn process_disposition_summary_json(
     summary: &frankenterm_core::session_restore::RestoreSummary,
 ) -> serde_json::Value {
     summary.process_launch_report.as_ref().map_or_else(
         || {
             serde_json::json!({
                 "evaluated": false,
+                "internally_consistent": true,
+                "disposition_complete": true,
+                "process_restoration_complete": false,
+                "restoration_unavailable_reason": PROCESS_RESTORATION_DISABLED_REASON,
                 "settled_plans": 0,
                 "shells_launched": 0,
                 "agents_launched": 0,
@@ -22504,6 +22580,10 @@ fn process_relaunch_summary_json(
         |report| {
             serde_json::json!({
                 "evaluated": true,
+                "internally_consistent": process_disposition_report_is_consistent(summary),
+                "disposition_complete": process_disposition_completed_successfully(summary),
+                "process_restoration_complete": process_restoration_completed_successfully(summary),
+                "restoration_unavailable_reason": PROCESS_RESTORATION_DISABLED_REASON,
                 "settled_plans": report.results.len(),
                 "shells_launched": report.shells_launched,
                 "agents_launched": report.agents_launched,
@@ -22516,58 +22596,68 @@ fn process_relaunch_summary_json(
     )
 }
 
-fn restore_completed_successfully(
+fn layout_restored_successfully(
+    summary: &frankenterm_core::session_restore::RestoreSummary,
+) -> bool {
+    summary.failed_count() == 0
+        && summary.layout_result.failed_panes.is_empty()
+}
+
+fn authority_finalized_successfully(
     summary: &frankenterm_core::session_restore::RestoreSummary,
 ) -> bool {
     summary.source_marked_clean
         && summary.intent_checkpoint_id > summary.checkpoint_id
         && summary.outcome_checkpoint_id > summary.intent_checkpoint_id
-        && summary.failed_count() == 0
-        && summary.layout_result.failed_panes.is_empty()
-        && scrollback_replay_invariant_holds(summary)
-        && summary.process_launch_report.as_ref().is_none_or(|report| {
-            use frankenterm_core::restore_process::LaunchDisposition;
-
-            let mut expected_shells = 0usize;
-            let mut expected_agents = 0usize;
-            let mut expected_manual = 0usize;
-            let mut expected_skipped = 0usize;
-            let mut expected_failed = 0usize;
-            for result in &report.results {
-                if result.success {
-                    if result.error.is_some() {
-                        return false;
-                    }
-                    match &result.action {
-                        LaunchDisposition::Shell => expected_shells += 1,
-                        LaunchDisposition::Agent => expected_agents += 1,
-                        LaunchDisposition::Manual => expected_manual += 1,
-                        LaunchDisposition::Skip => expected_skipped += 1,
-                    }
-                } else {
-                    if result.error.is_none() {
-                        return false;
-                    }
-                    expected_failed += 1;
-                }
-            }
-
-            report.interruption.is_none()
-                && expected_failed == 0
-                && report.shells_launched == expected_shells
-                && report.agents_launched == expected_agents
-                && report.manual == expected_manual
-                && report.skipped == expected_skipped
-                && report.failed == expected_failed
-        })
 }
 
-fn print_process_relaunch_summary(
+fn layout_authority_completed_successfully(
+    summary: &frankenterm_core::session_restore::RestoreSummary,
+) -> bool {
+    layout_restored_successfully(summary) && authority_finalized_successfully(summary)
+}
+
+fn restore_operation_completed_successfully(
+    summary: &frankenterm_core::session_restore::RestoreSummary,
+) -> bool {
+    layout_authority_completed_successfully(summary)
+        && scrollback_replay_invariant_holds(summary)
+        && process_disposition_completed_successfully(summary)
+}
+
+fn process_continuity_preserved(
+    _summary: &frankenterm_core::session_restore::RestoreSummary,
+) -> bool {
+    // A restarted mux cannot preserve the identity or in-memory state of the
+    // processes it stopped. Replacement is not continuity.
+    false
+}
+
+fn scrollback_continuity_preserved(
+    _summary: &frankenterm_core::session_restore::RestoreSummary,
+) -> bool {
+    // Historical output restoration has no supported mux channel.
+    false
+}
+
+fn session_continuity_completed_successfully(
+    summary: &frankenterm_core::session_restore::RestoreSummary,
+) -> bool {
+    // Stopping the mux ends the original processes, and historical terminal
+    // output is deliberately not captured or replayed. Keep these predicates
+    // explicit so replacement processes or layout success cannot be mislabeled
+    // as continuity of the original session.
+    restore_operation_completed_successfully(summary)
+        && process_continuity_preserved(summary)
+        && scrollback_continuity_preserved(summary)
+}
+
+fn print_process_disposition_summary(
     summary: &frankenterm_core::session_restore::RestoreSummary,
 ) {
     if let Some(report) = summary.process_launch_report.as_ref() {
         println!(
-            "Process relaunch: {} settled plans; {} shells, {} agents, {} manual, {} skipped, {} failed, interrupted={}",
+            "Process disposition: {} settled plans; {} restored shells, {} restored agents, {} manual, {} skipped, {} failed, interrupted={}; process_restoration_complete={}",
             report.results.len(),
             report.shells_launched,
             report.agents_launched,
@@ -22575,7 +22665,10 @@ fn print_process_relaunch_summary(
             report.skipped,
             report.failed,
             report.interruption.is_some(),
+            process_restoration_completed_successfully(summary),
         );
+    } else {
+        println!("Process disposition: not evaluated; {PROCESS_RESTORATION_DISABLED_REASON}.");
     }
 }
 
@@ -22615,10 +22708,17 @@ fn snapshot_restore_dry_run_json(
             "enabled": false,
             "reason": SCROLLBACK_REPLAY_DISABLED_REASON,
         },
-        "process_replacement": {
+        "process_restoration": {
             "available": false,
-            "reason": "mux_native_argv_spawn_unavailable",
+            "reason": PROCESS_RESTORATION_DISABLED_REASON,
         },
+        "layout_restored": false,
+        "authority_finalized": false,
+        "process_continuity": false,
+        "scrollback_continuity": false,
+        "full_session_continuity": false,
+        "session_continuity_complete": false,
+        "session_continuity_incomplete_reason": SESSION_CONTINUITY_INCOMPLETE_REASON,
     })
 }
 
@@ -22636,7 +22736,8 @@ fn snapshot_restore_plan_lines(
         format!("  Pane count: {}", checkpoint.pane_count),
         format!("  layout_only={}", options.layout_only),
         format!("  Scrollback replay: {SCROLLBACK_REPLAY_DISABLED_REASON}"),
-        "  Process replacement: unavailable without mux-native argv spawn".to_string(),
+        format!("  Process restoration: {PROCESS_RESTORATION_DISABLED_REASON}"),
+        format!("  Session continuity: incomplete; {SESSION_CONTINUITY_INCOMPLETE_REASON}"),
         "Dry-run requested; no actions were executed.".to_string(),
     ]
 }
@@ -22671,7 +22772,14 @@ impl SnapshotRestoreAbort {
 fn snapshot_restore_abort_json(abort: &SnapshotRestoreAbort) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "ok": false,
-        "complete": false,
+        "operation_complete": false,
+        "layout_authority_complete": false,
+        "layout_restored": false,
+        "authority_finalized": false,
+        "process_continuity": false,
+        "scrollback_continuity": false,
+        "full_session_continuity": false,
+        "session_continuity_complete": false,
         "phase": abort.phase,
         "checkpoint_id": abort.checkpoint_id,
         "error": abort.error,
@@ -22696,11 +22804,17 @@ struct SnapshotRestoreWorkflowResult {
 #[cfg(unix)]
 fn snapshot_restore_result_json(result: &SnapshotRestoreWorkflowResult) -> serde_json::Value {
     let summary = &result.summary;
-    let complete = restore_completed_successfully(summary);
+    let operation_complete = restore_operation_completed_successfully(summary);
+    let layout_restored = layout_restored_successfully(summary);
+    let authority_finalized = authority_finalized_successfully(summary);
+    let process_continuity = process_continuity_preserved(summary);
+    let scrollback_continuity = scrollback_continuity_preserved(summary);
+    let layout_authority_complete = layout_authority_completed_successfully(summary);
+    let session_continuity_complete = session_continuity_completed_successfully(summary);
 
     serde_json::json!({
-        "ok": complete,
-        "phase": if complete { "complete" } else { "restore_partial" },
+        "ok": operation_complete,
+        "phase": if operation_complete { "layout_authority_complete" } else { "restore_partial" },
         "checkpoint_id": summary.checkpoint_id,
         "intent_checkpoint_id": summary.intent_checkpoint_id,
         "outcome_checkpoint_id": summary.outcome_checkpoint_id,
@@ -22709,11 +22823,23 @@ fn snapshot_restore_result_json(result: &SnapshotRestoreWorkflowResult) -> serde
         "restored_panes": summary.restored_count(),
         "failed_panes": summary.failed_count(),
         "total_panes": summary.total_count(),
-        "complete": complete,
+        "operation_complete": operation_complete,
+        "layout_authority_complete": layout_authority_complete,
+        "layout_restored": layout_restored,
+        "authority_finalized": authority_finalized,
+        "process_continuity": process_continuity,
+        "scrollback_continuity": scrollback_continuity,
+        "full_session_continuity": session_continuity_complete,
+        "session_continuity_complete": session_continuity_complete,
+        "session_continuity_incomplete_reason": if session_continuity_complete {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(SESSION_CONTINUITY_INCOMPLETE_REASON.to_string())
+        },
         "source_marked_clean": summary.source_marked_clean,
         "elapsed_ms": summary.elapsed_ms,
         "scrollback": restore_scrollback_json(summary),
-        "process_relaunch": process_relaunch_summary_json(summary),
+        "process_disposition": process_disposition_summary_json(summary),
     })
 }
 
@@ -22732,10 +22858,12 @@ fn print_snapshot_restore_abort_plain(abort: &SnapshotRestoreAbort) {
 fn print_snapshot_restore_result_plain(result: &SnapshotRestoreWorkflowResult) {
     let summary = &result.summary;
 
-    let status = if restore_completed_successfully(summary) {
-        "complete"
+    let status = if restore_operation_completed_successfully(summary) {
+        "layout and authority complete; session continuity incomplete"
+    } else if layout_authority_completed_successfully(summary) {
+        "layout and authority complete; disposition/replay reconciliation required; session continuity incomplete"
     } else {
-        "partial; reconciliation required"
+        "layout/authority partial; reconciliation required; session continuity incomplete"
     };
     println!(
         "Snapshot restore {status}: {}/{} panes in {}ms (checkpoint #{})",
@@ -22744,13 +22872,18 @@ fn print_snapshot_restore_result_plain(result: &SnapshotRestoreWorkflowResult) {
         summary.elapsed_ms,
         summary.checkpoint_id
     );
+    println!(
+        "Outcome: layout_restored={}, authority_finalized={}, process_continuity=false, scrollback_continuity=false, full_session_continuity=false",
+        layout_restored_successfully(summary),
+        authority_finalized_successfully(summary),
+    );
     print_scrollback_restore_summary(summary);
-    print_process_relaunch_summary(summary);
+    print_process_disposition_summary(summary);
     println!(
         "Restore receipts: intent #{}; outcome #{}",
         summary.intent_checkpoint_id, summary.outcome_checkpoint_id
     );
-    if !restore_completed_successfully(summary) {
+    if !restore_operation_completed_successfully(summary) {
         eprintln!(
             "Restore did not settle cleanly. Inspect `ft session show {}` and `ft session doctor`; do not blindly replay while a durable restore intent may remain unresolved.",
             summary.session_id,
@@ -22851,6 +22984,7 @@ struct RestartWorkflowOptions {
     start_timeout_secs: u64,
     skip_restore: bool,
     layout_only: bool,
+    acknowledge_process_and_scrollback_loss: bool,
     wezterm_timeout_secs: u64,
 }
 
@@ -22861,6 +22995,16 @@ impl RestartWorkflowOptions {
 
     fn start_timeout(self) -> Duration {
         Duration::from_secs(self.start_timeout_secs)
+    }
+}
+
+fn validate_restart_acknowledgement(options: RestartWorkflowOptions) -> Result<(), &'static str> {
+    if options.acknowledge_process_and_scrollback_loss {
+        Ok(())
+    } else {
+        Err(
+            "restart refused: processes and historical scrollback will not be restored; pass --acknowledge-process-and-scrollback-loss only after accepting that loss",
+        )
     }
 }
 
@@ -22887,6 +23031,18 @@ fn restart_dry_run_json(options: RestartWorkflowOptions) -> serde_json::Value {
     serde_json::json!({
         "ok": true,
         "dry_run": true,
+        "execution_acknowledgement": {
+            "required": true,
+            "provided": options.acknowledge_process_and_scrollback_loss,
+            "flag": RESTART_ACKNOWLEDGEMENT_FLAG,
+        },
+        "layout_restored": false,
+        "authority_finalized": false,
+        "process_continuity": false,
+        "scrollback_continuity": false,
+        "full_session_continuity": false,
+        "session_continuity_complete": false,
+        "session_continuity_incomplete_reason": SESSION_CONTINUITY_INCOMPLETE_REASON,
         "planned": {
             "snapshot_trigger": "pre_restart",
             "stop_timeout_secs": options.stop_timeout_secs,
@@ -22897,9 +23053,9 @@ fn restart_dry_run_json(options: RestartWorkflowOptions) -> serde_json::Value {
                 "enabled": false,
                 "reason": SCROLLBACK_REPLAY_DISABLED_REASON,
             },
-            "process_replacement": {
+            "process_restoration": {
                 "available": false,
-                "reason": "mux_native_argv_spawn_unavailable",
+                "reason": PROCESS_RESTORATION_DISABLED_REASON,
             },
         },
         "version": frankenterm_core::VERSION,
@@ -22909,6 +23065,13 @@ fn restart_dry_run_json(options: RestartWorkflowOptions) -> serde_json::Value {
 fn restart_plan_lines(options: RestartWorkflowOptions) -> Vec<String> {
     let mut lines = vec![
         "Restart plan:".to_string(),
+        format!(
+            "  Execution acknowledgement: required via {RESTART_ACKNOWLEDGEMENT_FLAG}; provided={}",
+            options.acknowledge_process_and_scrollback_loss
+        ),
+        format!(
+            "  Session continuity: incomplete; {SESSION_CONTINUITY_INCOMPLETE_REASON}"
+        ),
         "  1. Capture pre-restart snapshot".to_string(),
         format!(
             "  2. Stop `frankenterm-mux-server` (timeout: {}s)",
@@ -22930,7 +23093,7 @@ fn restart_plan_lines(options: RestartWorkflowOptions) -> Vec<String> {
             "     Scrollback replay: {SCROLLBACK_REPLAY_DISABLED_REASON}"
         ));
         lines.push(
-            "     Process replacement: unavailable without mux-native argv spawn".to_string(),
+            format!("     Process restoration: {PROCESS_RESTORATION_DISABLED_REASON}"),
         );
     }
     lines.push("Dry-run requested; no actions were executed.".to_string());
@@ -23002,7 +23165,14 @@ impl RestartWorkflowAbort {
 fn restart_abort_json(abort: &RestartWorkflowAbort) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "ok": false,
-        "complete": false,
+        "operation_complete": false,
+        "layout_authority_complete": false,
+        "layout_restored": false,
+        "authority_finalized": false,
+        "process_continuity": false,
+        "scrollback_continuity": false,
+        "full_session_continuity": false,
+        "session_continuity_complete": false,
         "phase": abort.phase,
         "error": &abort.error,
     });
@@ -23036,6 +23206,13 @@ fn restart_abort_json(abort: &RestartWorkflowAbort) -> serde_json::Value {
 fn restart_restore_summary_json(
     summary: &frankenterm_core::session_restore::RestoreSummary,
 ) -> serde_json::Value {
+    let operation_complete = restore_operation_completed_successfully(summary);
+    let layout_restored = layout_restored_successfully(summary);
+    let authority_finalized = authority_finalized_successfully(summary);
+    let process_continuity = process_continuity_preserved(summary);
+    let scrollback_continuity = scrollback_continuity_preserved(summary);
+    let layout_authority_complete = layout_authority_completed_successfully(summary);
+    let session_continuity_complete = session_continuity_completed_successfully(summary);
     serde_json::json!({
         "session_id": summary.session_id,
         "checkpoint_id": summary.checkpoint_id,
@@ -23043,9 +23220,21 @@ fn restart_restore_summary_json(
         "outcome_checkpoint_id": summary.outcome_checkpoint_id,
         "restored_panes": summary.restored_count(),
         "failed_panes": summary.failed_count(),
-        "complete": restore_completed_successfully(summary),
+        "operation_complete": operation_complete,
+        "layout_authority_complete": layout_authority_complete,
+        "layout_restored": layout_restored,
+        "authority_finalized": authority_finalized,
+        "process_continuity": process_continuity,
+        "scrollback_continuity": scrollback_continuity,
+        "full_session_continuity": session_continuity_complete,
+        "session_continuity_complete": session_continuity_complete,
+        "session_continuity_incomplete_reason": if session_continuity_complete {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(SESSION_CONTINUITY_INCOMPLETE_REASON.to_string())
+        },
         "source_marked_clean": summary.source_marked_clean,
-        "process_relaunch": process_relaunch_summary_json(summary),
+        "process_disposition": process_disposition_summary_json(summary),
         "elapsed_ms": summary.elapsed_ms,
     })
 }
@@ -23074,7 +23263,7 @@ impl RestartWorkflowResult {
     fn completed_successfully(&self) -> bool {
         match self {
             Self::SkippedRestore { .. } => true,
-            Self::Restored { summary, .. } => restore_completed_successfully(summary),
+            Self::Restored { summary, .. } => restore_operation_completed_successfully(summary),
             Self::RestoreFailed { .. } => false,
         }
     }
@@ -23088,9 +23277,16 @@ fn restart_result_json(result: &RestartWorkflowResult) -> serde_json::Value {
             layout_only,
         } => serde_json::json!({
             "ok": true,
-            "complete": true,
-            "phase": "complete",
-            "restored": false,
+            "operation_complete": true,
+            "phase": "restart_complete_restore_skipped",
+            "layout_authority_complete": false,
+            "layout_restored": false,
+            "authority_finalized": false,
+            "process_continuity": false,
+            "scrollback_continuity": false,
+            "full_session_continuity": false,
+            "session_continuity_complete": false,
+            "session_continuity_incomplete_reason": SESSION_CONTINUITY_INCOMPLETE_REASON,
             "restore_attempted": false,
             "skip_restore": true,
             "layout_only": layout_only,
@@ -23101,12 +23297,29 @@ fn restart_result_json(result: &RestartWorkflowResult) -> serde_json::Value {
             summary,
             layout_only,
         } => {
-            let complete = restore_completed_successfully(summary);
+            let operation_complete = restore_operation_completed_successfully(summary);
+            let layout_restored = layout_restored_successfully(summary);
+            let authority_finalized = authority_finalized_successfully(summary);
+            let process_continuity = process_continuity_preserved(summary);
+            let scrollback_continuity = scrollback_continuity_preserved(summary);
+            let layout_authority_complete = layout_authority_completed_successfully(summary);
+            let session_continuity_complete = session_continuity_completed_successfully(summary);
             serde_json::json!({
-                "ok": complete,
-                "phase": if complete { "complete" } else { "restore_partial" },
-                "complete": complete,
-                "restored": complete,
+                "ok": operation_complete,
+                "phase": if operation_complete { "layout_authority_complete" } else { "restore_partial" },
+                "operation_complete": operation_complete,
+                "layout_authority_complete": layout_authority_complete,
+                "layout_restored": layout_restored,
+                "authority_finalized": authority_finalized,
+                "process_continuity": process_continuity,
+                "scrollback_continuity": scrollback_continuity,
+                "full_session_continuity": session_continuity_complete,
+                "session_continuity_complete": session_continuity_complete,
+                "session_continuity_incomplete_reason": if session_continuity_complete {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(SESSION_CONTINUITY_INCOMPLETE_REASON.to_string())
+                },
                 "restore_attempted": true,
                 "layout_only": layout_only,
                 "snapshot": restart_snapshot_json(snapshot, true),
@@ -23122,9 +23335,16 @@ fn restart_result_json(result: &RestartWorkflowResult) -> serde_json::Value {
             let error = bounded_restore_diagnostic(error);
             serde_json::json!({
                 "ok": false,
-                "complete": false,
+                "operation_complete": false,
                 "phase": "restore_failed",
-                "restored": false,
+                "layout_authority_complete": false,
+                "layout_restored": false,
+                "authority_finalized": false,
+                "process_continuity": false,
+                "scrollback_continuity": false,
+                "full_session_continuity": false,
+                "session_continuity_complete": false,
+                "session_continuity_incomplete_reason": SESSION_CONTINUITY_INCOMPLETE_REASON,
                 "restore_attempted": true,
                 "layout_only": layout_only,
                 "error": error,
@@ -23173,30 +23393,40 @@ fn print_restart_result_plain(result: &RestartWorkflowResult) {
     match result {
         RestartWorkflowResult::SkippedRestore { snapshot, .. } => {
             println!(
-                "Restart complete (restore skipped). Snapshot: session={} checkpoint={}",
+                "Mux restart complete; layout restore skipped and session continuity is incomplete. Snapshot: session={} checkpoint={}",
                 snapshot.session_id, snapshot.checkpoint_id
+            );
+            println!(
+                "Outcome: layout_restored=false, authority_finalized=false, process_continuity=false, scrollback_continuity=false, full_session_continuity=false"
             );
         }
         RestartWorkflowResult::Restored { summary, .. } => {
-            let status = if restore_completed_successfully(summary) {
-                "complete"
+            let status = if restore_operation_completed_successfully(summary) {
+                "layout and authority complete; session continuity incomplete"
+            } else if layout_authority_completed_successfully(summary) {
+                "layout and authority complete; disposition/replay reconciliation required; session continuity incomplete"
             } else {
-                "partial; reconciliation required"
+                "layout/authority partial; reconciliation required; session continuity incomplete"
             };
             println!(
-                "Restart {status}: restored {}/{} panes in {}ms (checkpoint #{})",
+                "Restart {status}: layout restored for {}/{} panes in {}ms (checkpoint #{})",
                 summary.restored_count(),
                 summary.total_count(),
                 summary.elapsed_ms,
                 summary.checkpoint_id
             );
+            println!(
+                "Outcome: layout_restored={}, authority_finalized={}, process_continuity=false, scrollback_continuity=false, full_session_continuity=false",
+                layout_restored_successfully(summary),
+                authority_finalized_successfully(summary),
+            );
             print_scrollback_restore_summary(summary);
-            print_process_relaunch_summary(summary);
+            print_process_disposition_summary(summary);
             println!(
                 "Restore receipts: intent #{}; outcome #{}",
                 summary.intent_checkpoint_id, summary.outcome_checkpoint_id
             );
-            if !restore_completed_successfully(summary) {
+            if !restore_operation_completed_successfully(summary) {
                 eprintln!(
                     "Inspect `ft session show {}` and `ft session doctor`; do not blindly replay while a durable restore intent may remain unresolved.",
                     summary.session_id,
@@ -23252,6 +23482,11 @@ where
             Output = anyhow::Result<frankenterm_core::session_restore::RestoreSummary>,
         >,
 {
+    validate_restart_acknowledgement(options).map_err(|error| {
+        RestartWorkflowAbort::new("acknowledgement", error).with_hint(format!(
+            "Re-run with {RESTART_ACKNOWLEDGEMENT_FLAG} only after accepting that historical processes and scrollback will be lost."
+        ))
+    })?;
     let options = RestartWorkflowOptions {
         layout_only: true,
         ..options
@@ -23307,6 +23542,12 @@ async fn execute_restart_workflow(
     options: RestartWorkflowOptions,
 ) -> Result<RestartWorkflowResult, RestartWorkflowAbort> {
     use frankenterm_core::snapshot_engine::{SnapshotEngine, SnapshotTrigger};
+
+    validate_restart_acknowledgement(options).map_err(|error| {
+        RestartWorkflowAbort::new("acknowledgement", error).with_hint(format!(
+            "Re-run with {RESTART_ACKNOWLEDGEMENT_FLAG} only after accepting that historical processes and scrollback will be lost."
+        ))
+    })?;
 
     let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let lock_db_path = db_path.to_string();
@@ -53857,6 +54098,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             start_timeout,
             skip_restore,
             layout_only,
+            acknowledge_process_and_scrollback_loss,
             dry_run,
             format,
         }) => {
@@ -53870,6 +54112,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     let _ = layout_only;
                     true
                 },
+                acknowledge_process_and_scrollback_loss,
                 wezterm_timeout_secs: config.cli.timeout_seconds,
             };
 
@@ -53887,6 +54130,31 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 return Ok(());
             }
 
+            if let Err(error) = validate_restart_acknowledgement(restart_options) {
+                if emit_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": false,
+                            "operation_complete": false,
+                            "layout_authority_complete": false,
+                            "layout_restored": false,
+                            "authority_finalized": false,
+                            "process_continuity": false,
+                            "scrollback_continuity": false,
+                            "full_session_continuity": false,
+                            "session_continuity_complete": false,
+                            "phase": "acknowledgement",
+                            "error": error,
+                            "required_flag": RESTART_ACKNOWLEDGEMENT_FLAG,
+                        }))?
+                    );
+                } else {
+                    eprintln!("{error}");
+                }
+                std::process::exit(2);
+            }
+
             #[cfg(not(unix))]
             {
                 let _ = (
@@ -53894,6 +54162,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     start_timeout,
                     skip_restore,
                     layout_only,
+                    acknowledge_process_and_scrollback_loss,
                     emit_json,
                     restart_options,
                 );
@@ -69661,7 +69930,7 @@ async fn handle_snapshot_command(
             {
                 Ok(result) => {
                     let completed_successfully =
-                        restore_completed_successfully(&result.summary);
+                        restore_operation_completed_successfully(&result.summary);
                     if output_format.is_structured() {
                         print_snapshot_session_structured_output(
                             &snapshot_restore_result_json(&result),
@@ -75519,13 +75788,14 @@ mod tests {
             start_timeout_secs: 10,
             skip_restore: false,
             layout_only: true,
+            acknowledge_process_and_scrollback_loss: true,
             wezterm_timeout_secs: 5,
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn restart_capture_omits_scrollback_without_safe_output_channel() {
+    fn restart_capture_omits_scrollback_without_output_restoration_channel() {
         let mut normal_options = sample_restart_options();
         normal_options.layout_only = false;
         let normal = restart_snapshot_capture_options(normal_options);
@@ -75555,6 +75825,60 @@ mod tests {
         skip_restore_options.skip_restore = true;
         let skip_restore = restart_snapshot_capture_options(skip_restore_options);
         assert!(!skip_restore.include_scrollback);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_without_loss_acknowledgement_invokes_no_mutating_phase() {
+        run_async_test(async {
+            use std::sync::atomic::{AtomicU8, Ordering};
+
+            let mut options = sample_restart_options();
+            options.acknowledge_process_and_scrollback_loss = false;
+            let calls = std::sync::Arc::new(AtomicU8::new(0));
+
+            let abort = execute_restart_post_preflight(
+                options,
+                {
+                    let calls = std::sync::Arc::clone(&calls);
+                    move || async move {
+                        calls.fetch_or(0b0001, Ordering::SeqCst);
+                        Ok(sample_restart_snapshot_result())
+                    }
+                },
+                {
+                    let calls = std::sync::Arc::clone(&calls);
+                    move |_| async move {
+                        calls.fetch_or(0b0010, Ordering::SeqCst);
+                        Ok(vec![111])
+                    }
+                },
+                {
+                    let calls = std::sync::Arc::clone(&calls);
+                    move |_, _| async move {
+                        calls.fetch_or(0b0100, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+                {
+                    let calls = std::sync::Arc::clone(&calls);
+                    move |_, _| async move {
+                        calls.fetch_or(0b1000, Ordering::SeqCst);
+                        Ok(sample_restart_restore_summary())
+                    }
+                },
+            )
+            .await
+            .expect_err("restart without explicit loss acknowledgement must be refused");
+
+            assert_eq!(abort.phase, "acknowledgement");
+            assert!(abort.error.contains(RESTART_ACKNOWLEDGEMENT_FLAG));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "capture, stop, start, and restore closures must remain untouched"
+            );
+        });
     }
 
     #[cfg(unix)]
@@ -76047,17 +76371,18 @@ mod tests {
             Some(SCROLLBACK_REPLAY_DISABLED_REASON)
         );
         assert_eq!(
-            payload["process_replacement"]["available"].as_bool(),
+            payload["process_restoration"]["available"].as_bool(),
             Some(false)
         );
         assert_eq!(
-            payload["process_replacement"]["reason"].as_str(),
-            Some("mux_native_argv_spawn_unavailable")
+            payload["process_restoration"]["reason"].as_str(),
+            Some(PROCESS_RESTORATION_DISABLED_REASON)
         );
+        assert_eq!(payload["session_continuity_complete"].as_bool(), Some(false));
     }
 
     #[test]
-    fn snapshot_restore_plan_lines_report_unavailable_process_replacement() {
+    fn snapshot_restore_plan_lines_report_unavailable_process_restoration() {
         let mut options = sample_snapshot_restore_options();
         options.layout_only = true;
 
@@ -76081,7 +76406,12 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("Process replacement: unavailable"))
+                .any(|line| line.contains("Process restoration: unavailable"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Session continuity: incomplete"))
         );
         assert_eq!(
             lines.last().map(String::as_str),
@@ -76091,10 +76421,25 @@ mod tests {
 
     #[test]
     fn restart_dry_run_json_includes_plan_fields() {
-        let payload = restart_dry_run_json(sample_restart_options());
+        let mut options = sample_restart_options();
+        options.acknowledge_process_and_scrollback_loss = false;
+        let payload = restart_dry_run_json(options);
 
         assert_eq!(payload["ok"].as_bool(), Some(true));
         assert_eq!(payload["dry_run"].as_bool(), Some(true));
+        assert_eq!(
+            payload["execution_acknowledgement"]["required"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            payload["execution_acknowledgement"]["provided"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["execution_acknowledgement"]["flag"].as_str(),
+            Some(RESTART_ACKNOWLEDGEMENT_FLAG)
+        );
+        assert_eq!(payload["session_continuity_complete"].as_bool(), Some(false));
         assert_eq!(
             payload["planned"]["snapshot_trigger"].as_str(),
             Some("pre_restart")
@@ -76112,12 +76457,12 @@ mod tests {
             Some(SCROLLBACK_REPLAY_DISABLED_REASON)
         );
         assert_eq!(
-            payload["planned"]["process_replacement"]["available"].as_bool(),
+            payload["planned"]["process_restoration"]["available"].as_bool(),
             Some(false)
         );
         assert_eq!(
-            payload["planned"]["process_replacement"]["reason"].as_str(),
-            Some("mux_native_argv_spawn_unavailable")
+            payload["planned"]["process_restoration"]["reason"].as_str(),
+            Some(PROCESS_RESTORATION_DISABLED_REASON)
         );
         assert_eq!(payload["version"].as_str(), Some(frankenterm_core::VERSION),);
     }
@@ -76130,6 +76475,16 @@ mod tests {
         let lines = restart_plan_lines(options);
 
         assert!(lines.iter().any(|line| line == "Restart plan:"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(RESTART_ACKNOWLEDGEMENT_FLAG))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Session continuity: incomplete"))
+        );
         assert!(
             lines
                 .iter()
@@ -76155,7 +76510,9 @@ mod tests {
         );
 
         assert_eq!(payload["ok"].as_bool(), Some(false));
-        assert_eq!(payload["complete"].as_bool(), Some(false));
+        assert_eq!(payload["operation_complete"].as_bool(), Some(false));
+        assert_eq!(payload["layout_authority_complete"].as_bool(), Some(false));
+        assert_eq!(payload["session_continuity_complete"].as_bool(), Some(false));
         assert_eq!(payload["phase"].as_str(), Some("preflight"));
         assert_eq!(payload["checkpoint_id"].as_i64(), Some(42));
         assert_eq!(payload["error"].as_str(), Some("lock held"));
@@ -76167,14 +76524,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn restore_completion_requires_clean_and_internally_consistent_evidence() {
+    fn layout_authority_completion_is_separate_from_process_and_session_continuity() {
         let mut summary = sample_restart_restore_summary();
         summary.source_marked_clean = true;
-        assert!(!restore_completed_successfully(&summary));
+        assert!(!layout_authority_completed_successfully(&summary));
 
         summary.layout_result.pane_id_map.insert(3, 103);
         summary.layout_result.failed_panes.clear();
-        assert!(!restore_completed_successfully(&summary));
+        assert!(layout_authority_completed_successfully(&summary));
+        assert!(!restore_operation_completed_successfully(&summary));
+        summary.scrollback_result = None;
+        assert!(layout_authority_completed_successfully(&summary));
+        assert!(!restore_operation_completed_successfully(&summary));
+        assert!(!process_disposition_report_is_consistent(&summary));
+        assert!(!process_restoration_completed_successfully(&summary));
+        assert!(!session_continuity_completed_successfully(&summary));
+
+        summary.scrollback_error = Some("unexpected replay path".to_string());
+        assert!(layout_authority_completed_successfully(&summary));
+        assert!(!restore_operation_completed_successfully(&summary));
+        summary.scrollback_error = None;
+        assert!(layout_authority_completed_successfully(&summary));
+
+        summary
+            .layout_result
+            .failed_panes
+            .push((3, "inconsistent backend failure".to_string()));
+        assert!(!layout_authority_completed_successfully(&summary));
+        summary.layout_result.failed_panes.clear();
+        assert!(layout_authority_completed_successfully(&summary));
+
+        summary.outcome_checkpoint_id = summary.intent_checkpoint_id;
+        assert!(!layout_authority_completed_successfully(&summary));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manual_process_disposition_never_implies_process_or_session_continuity() {
+        use frankenterm_core::restore_process::LaunchDisposition;
+
+        let mut summary = sample_restart_restore_summary();
+        summary.source_marked_clean = true;
+        summary.layout_result.pane_id_map.insert(3, 103);
+        summary.layout_result.failed_panes.clear();
         summary.scrollback_result = None;
 
         {
@@ -76182,14 +76574,34 @@ mod tests {
                 .process_launch_report
                 .as_mut()
                 .expect("sample process launch report");
+            report.results[0].action = LaunchDisposition::Manual;
             report.results[0].success = true;
             report.results[0].error = None;
             report.shells_launched = 0;
-            report.agents_launched = 1;
+            report.agents_launched = 0;
+            report.manual = 1;
             report.failed = 0;
             report.interruption = None;
         }
-        assert!(restore_completed_successfully(&summary));
+        assert!(layout_authority_completed_successfully(&summary));
+        assert!(process_disposition_report_is_consistent(&summary));
+        assert!(process_disposition_completed_successfully(&summary));
+        assert!(restore_operation_completed_successfully(&summary));
+        assert!(!process_restoration_completed_successfully(&summary));
+        assert!(!session_continuity_completed_successfully(&summary));
+
+        {
+            let report = summary
+                .process_launch_report
+                .as_mut()
+                .expect("sample process launch report");
+            report.results[0].action = LaunchDisposition::Agent;
+            report.agents_launched = 1;
+            report.manual = 0;
+        }
+        assert!(process_disposition_report_is_consistent(&summary));
+        assert!(process_restoration_completed_successfully(&summary));
+        assert!(!session_continuity_completed_successfully(&summary));
 
         {
             let report = summary
@@ -76197,34 +76609,66 @@ mod tests {
                 .as_mut()
                 .expect("sample process launch report");
             report.shells_launched = 1;
-            report.agents_launched = 0;
         }
-        assert!(!restore_completed_successfully(&summary));
+        assert!(!process_disposition_report_is_consistent(&summary));
+        assert!(!process_disposition_completed_successfully(&summary));
+        assert!(!restore_operation_completed_successfully(&summary));
+        assert!(!process_restoration_completed_successfully(&summary));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_json_reports_layout_success_without_claiming_manual_process_continuity() {
+        use frankenterm_core::restore_process::LaunchDisposition;
+
+        let mut summary = sample_restart_restore_summary();
+        summary.source_marked_clean = true;
+        summary.layout_result.pane_id_map.insert(3, 103);
+        summary.layout_result.failed_panes.clear();
+        summary.scrollback_result = None;
         {
             let report = summary
                 .process_launch_report
                 .as_mut()
                 .expect("sample process launch report");
+            report.results[0].action = LaunchDisposition::Manual;
+            report.results[0].success = true;
+            report.results[0].error = None;
             report.shells_launched = 0;
-            report.agents_launched = 1;
+            report.agents_launched = 0;
+            report.manual = 1;
+            report.failed = 0;
+            report.interruption = None;
         }
-        assert!(restore_completed_successfully(&summary));
 
-        summary.scrollback_error = Some("unexpected replay path".to_string());
-        assert!(!restore_completed_successfully(&summary));
-        summary.scrollback_error = None;
-        assert!(restore_completed_successfully(&summary));
+        let payload = restart_result_json(&RestartWorkflowResult::Restored {
+            snapshot: sample_restart_snapshot_result(),
+            summary: Box::new(summary),
+            layout_only: true,
+        });
 
-        summary
-            .layout_result
-            .failed_panes
-            .push((3, "inconsistent backend failure".to_string()));
-        assert!(!restore_completed_successfully(&summary));
-        summary.layout_result.failed_panes.clear();
-        assert!(restore_completed_successfully(&summary));
-
-        summary.outcome_checkpoint_id = summary.intent_checkpoint_id;
-        assert!(!restore_completed_successfully(&summary));
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(payload["operation_complete"].as_bool(), Some(true));
+        assert_eq!(
+            payload["phase"].as_str(),
+            Some("layout_authority_complete")
+        );
+        assert_eq!(payload["layout_authority_complete"].as_bool(), Some(true));
+        assert_eq!(payload["layout_restored"].as_bool(), Some(true));
+        assert_eq!(payload["authority_finalized"].as_bool(), Some(true));
+        assert_eq!(payload["process_continuity"].as_bool(), Some(false));
+        assert_eq!(payload["scrollback_continuity"].as_bool(), Some(false));
+        assert_eq!(payload["full_session_continuity"].as_bool(), Some(false));
+        assert_eq!(payload["session_continuity_complete"].as_bool(), Some(false));
+        assert!(payload.get("restored").is_none());
+        assert_eq!(
+            payload["restore"]["process_disposition"]["manual"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            payload["restore"]["process_disposition"]["process_restoration_complete"].as_bool(),
+            Some(false)
+        );
     }
 
     #[cfg(unix)]
@@ -76245,7 +76689,9 @@ mod tests {
         assert_eq!(payload["restored_panes"].as_u64(), Some(2));
         assert_eq!(payload["failed_panes"].as_u64(), Some(1));
         assert_eq!(payload["total_panes"].as_u64(), Some(3));
-        assert_eq!(payload["complete"].as_bool(), Some(false));
+        assert_eq!(payload["operation_complete"].as_bool(), Some(false));
+        assert_eq!(payload["layout_authority_complete"].as_bool(), Some(false));
+        assert_eq!(payload["session_continuity_complete"].as_bool(), Some(false));
         assert_eq!(payload["source_marked_clean"].as_bool(), Some(false));
         assert_eq!(payload["elapsed_ms"].as_u64(), Some(2500));
         assert_eq!(payload["scrollback"]["enabled"].as_bool(), Some(false));
@@ -76255,14 +76701,18 @@ mod tests {
         );
         assert_eq!(payload["scrollback"]["bytes_written"].as_u64(), Some(0));
         assert_eq!(
-            payload["process_relaunch"]["settled_plans"].as_u64(),
+            payload["process_disposition"]["settled_plans"].as_u64(),
             Some(1)
         );
-        assert_eq!(payload["process_relaunch"]["failed"].as_u64(), Some(1));
-        assert_eq!(payload["process_relaunch"]["interrupted"].as_bool(), Some(true));
+        assert_eq!(payload["process_disposition"]["failed"].as_u64(), Some(1));
+        assert_eq!(payload["process_disposition"]["interrupted"].as_bool(), Some(true));
+        assert_eq!(
+            payload["process_disposition"]["process_restoration_complete"].as_bool(),
+            Some(false)
+        );
         for forbidden_field in ["results", "action", "command", "cwd", "hint", "detail"] {
             assert!(
-                payload["process_relaunch"].get(forbidden_field).is_none(),
+                payload["process_disposition"].get(forbidden_field).is_none(),
                 "raw process field must not be emitted: {forbidden_field}"
             );
         }
@@ -76279,9 +76729,14 @@ mod tests {
         });
 
         assert_eq!(payload["ok"].as_bool(), Some(true));
-        assert_eq!(payload["complete"].as_bool(), Some(true));
-        assert_eq!(payload["phase"].as_str(), Some("complete"));
-        assert_eq!(payload["restored"].as_bool(), Some(false));
+        assert_eq!(payload["operation_complete"].as_bool(), Some(true));
+        assert_eq!(
+            payload["phase"].as_str(),
+            Some("restart_complete_restore_skipped")
+        );
+        assert_eq!(payload["layout_authority_complete"].as_bool(), Some(false));
+        assert_eq!(payload["session_continuity_complete"].as_bool(), Some(false));
+        assert!(payload.get("restored").is_none());
         assert_eq!(payload["restore_attempted"].as_bool(), Some(false));
         assert_eq!(payload["skip_restore"].as_bool(), Some(true));
     }
@@ -76299,7 +76754,9 @@ mod tests {
         );
 
         assert_eq!(payload["ok"].as_bool(), Some(false));
-        assert_eq!(payload["complete"].as_bool(), Some(false));
+        assert_eq!(payload["operation_complete"].as_bool(), Some(false));
+        assert_eq!(payload["layout_authority_complete"].as_bool(), Some(false));
+        assert_eq!(payload["session_continuity_complete"].as_bool(), Some(false));
         assert_eq!(payload["phase"].as_str(), Some("stop"));
         assert_eq!(payload["error"].as_str(), Some("mux shutdown timed out"));
         assert_eq!(
@@ -76351,8 +76808,10 @@ mod tests {
 
         assert_eq!(payload["ok"].as_bool(), Some(false));
         assert_eq!(payload["phase"].as_str(), Some("restore_partial"));
-        assert_eq!(payload["complete"].as_bool(), Some(false));
-        assert_eq!(payload["restored"].as_bool(), Some(false));
+        assert_eq!(payload["operation_complete"].as_bool(), Some(false));
+        assert_eq!(payload["layout_authority_complete"].as_bool(), Some(false));
+        assert_eq!(payload["session_continuity_complete"].as_bool(), Some(false));
+        assert!(payload.get("restored").is_none());
         assert_eq!(payload["restore_attempted"].as_bool(), Some(true));
         assert_eq!(payload["snapshot"]["pane_count"].as_u64(), Some(3));
         assert_eq!(payload["restore"]["restored_panes"].as_u64(), Some(2));
@@ -76373,7 +76832,7 @@ mod tests {
         assert_eq!(payload["scrollback"]["skipped_panes"].as_u64(), Some(0));
         assert_eq!(payload["scrollback"]["bytes_written"].as_u64(), Some(0));
         assert_eq!(
-            payload["restore"]["process_relaunch"]["interrupted"].as_bool(),
+            payload["restore"]["process_disposition"]["interrupted"].as_bool(),
             Some(true)
         );
         let encoded = serde_json::to_string(&payload).expect("serialize redacted restart result");
@@ -76391,9 +76850,11 @@ mod tests {
         });
 
         assert_eq!(payload["ok"].as_bool(), Some(false));
-        assert_eq!(payload["complete"].as_bool(), Some(false));
+        assert_eq!(payload["operation_complete"].as_bool(), Some(false));
         assert_eq!(payload["phase"].as_str(), Some("restore_failed"));
-        assert_eq!(payload["restored"].as_bool(), Some(false));
+        assert_eq!(payload["layout_authority_complete"].as_bool(), Some(false));
+        assert_eq!(payload["session_continuity_complete"].as_bool(), Some(false));
+        assert!(payload.get("restored").is_none());
         assert_eq!(payload["layout_only"].as_bool(), Some(true));
         assert_eq!(payload["error"].as_str(), Some("restore planner mismatch"));
         assert_eq!(
@@ -76419,6 +76880,33 @@ mod tests {
                 .is_err(),
             "snapshot restore must not advertise an unavailable process-launch action"
         );
+    }
+
+    #[test]
+    fn restart_loss_acknowledgement_is_explicit_and_never_implicit() {
+        let without_ack = Cli::try_parse_from(["ft", "restart"])
+            .expect("restart syntax without acknowledgement should parse for a truthful refusal");
+        match without_ack.command.as_deref() {
+            Some(Commands::Restart {
+                acknowledge_process_and_scrollback_loss,
+                ..
+            }) => assert!(!acknowledge_process_and_scrollback_loss),
+            _ => panic!("expected restart command"),
+        }
+
+        let with_ack = Cli::try_parse_from([
+            "ft",
+            "restart",
+            RESTART_ACKNOWLEDGEMENT_FLAG,
+        ])
+        .expect("documented restart acknowledgement flag should parse");
+        match with_ack.command.as_deref() {
+            Some(Commands::Restart {
+                acknowledge_process_and_scrollback_loss,
+                ..
+            }) => assert!(acknowledge_process_and_scrollback_loss),
+            _ => panic!("expected restart command"),
+        }
     }
 
     fn sample_cli_mission() -> frankenterm_core::plan::Mission {
