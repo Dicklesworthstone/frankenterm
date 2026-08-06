@@ -893,6 +893,7 @@ impl NativeEventListener {
 
         let mut connection_tasks = JoinSet::new();
         let mut accept_error_backoff = ACCEPT_ERROR_INITIAL_BACKOFF;
+        let mut consecutive_accept_errors = 0_u64;
 
         loop {
             if shutdown_flag.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
@@ -917,6 +918,7 @@ impl NativeEventListener {
             {
                 Ok(Ok((stream, _addr))) => {
                     accept_error_backoff = ACCEPT_ERROR_INITIAL_BACKOFF;
+                    consecutive_accept_errors = 0;
                     // The accept future can become ready in the same scheduler
                     // turn as shutdown/cancellation. Revalidate before handing
                     // the accepted stream to a new owned task.
@@ -995,13 +997,17 @@ impl NativeEventListener {
                         );
                         break;
                     }
-                    warn!(
-                        error = %err,
-                        error_kind = ?err.kind(),
-                        retry_backoff_ms = accept_error_backoff.as_millis(),
-                        path = %self.socket_path.display(),
-                        "native event accept failed; applying bounded retry backoff"
-                    );
+                    consecutive_accept_errors = consecutive_accept_errors.saturating_add(1);
+                    if consecutive_accept_errors.is_power_of_two() {
+                        warn!(
+                            error = %err,
+                            error_kind = ?err.kind(),
+                            consecutive_accept_errors,
+                            retry_backoff_ms = accept_error_backoff.as_millis(),
+                            path = %self.socket_path.display(),
+                            "native event accept failed; applying bounded retry backoff"
+                        );
+                    }
                     if crate::runtime_async::sleep_with_cx(cx, accept_error_backoff)
                         .await
                         .is_err()

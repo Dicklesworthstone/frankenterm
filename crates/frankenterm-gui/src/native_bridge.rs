@@ -1,8 +1,9 @@
 //! Native event bridge — emitter side.
 //!
-//! Connects to the ft watch daemon's Unix domain socket and pushes
-//! mux events as newline-delimited JSON [`WireEvent`] messages.
-//! This replaces the polling-based capture loop with real-time push.
+//! Connects to the ft watch daemon's authenticated Unix-domain socket and
+//! pushes best-effort mux state/lifecycle hints as newline-delimited JSON
+//! [`WireEvent`] messages. Polling remains authoritative for pane-output text
+//! because mux output notifications do not carry raw PTY bytes.
 
 use frankenterm_core::native_events::{
     NativeEventError, WireEvent, WirePaneState, validate_native_event_peer,
@@ -49,19 +50,23 @@ enum BridgeEvent {
     StateChange {
         pane_id: u64,
         state: WirePaneState,
+        timestamp_ms: u64,
     },
     UserVar {
         pane_id: u64,
         name: String,
         value: String,
+        timestamp_ms: u64,
     },
     PaneCreated {
         pane_id: u64,
         domain: String,
         cwd: Option<String>,
+        timestamp_ms: u64,
     },
     PaneDestroyed {
         pane_id: u64,
+        timestamp_ms: u64,
     },
 }
 
@@ -71,37 +76,50 @@ impl BridgeEvent {
             Self::StateChange { pane_id, .. } => ("state_change", *pane_id),
             Self::UserVar { pane_id, .. } => ("user_var", *pane_id),
             Self::PaneCreated { pane_id, .. } => ("pane_created", *pane_id),
-            Self::PaneDestroyed { pane_id } => ("pane_destroyed", *pane_id),
+            Self::PaneDestroyed { pane_id, .. } => ("pane_destroyed", *pane_id),
         }
     }
 
     fn into_wire_event(self) -> WireEvent {
-        let ts = now_ms();
         match self {
-            BridgeEvent::StateChange { pane_id, state } => {
-                WireEvent::StateChange { pane_id, state, ts }
-            }
+            BridgeEvent::StateChange {
+                pane_id,
+                state,
+                timestamp_ms,
+            } => WireEvent::StateChange {
+                pane_id,
+                state,
+                ts: timestamp_ms,
+            },
             BridgeEvent::UserVar {
                 pane_id,
                 name,
                 value,
+                timestamp_ms,
             } => WireEvent::UserVar {
                 pane_id,
                 name,
                 value,
-                ts,
+                ts: timestamp_ms,
             },
             BridgeEvent::PaneCreated {
                 pane_id,
                 domain,
                 cwd,
+                timestamp_ms,
             } => WireEvent::PaneCreated {
                 pane_id,
                 domain,
                 cwd,
-                ts,
+                ts: timestamp_ms,
             },
-            BridgeEvent::PaneDestroyed { pane_id } => WireEvent::PaneDestroyed { pane_id, ts },
+            BridgeEvent::PaneDestroyed {
+                pane_id,
+                timestamp_ms,
+            } => WireEvent::PaneDestroyed {
+                pane_id,
+                ts: timestamp_ms,
+            },
         }
     }
 }
@@ -170,33 +188,12 @@ pub struct NativeEventBridge {
 impl NativeEventBridge {
     /// Start the native event bridge.
     ///
-    /// Connects to the socket at `socket_path`, subscribes to mux events,
-    /// and forwards them as newline-delimited JSON.
-    ///
-    /// Returns `None` if the socket path doesn't exist or can't be connected to
-    /// (graceful degradation when ft watch is not running).
+    /// Subscribes to mux events immediately and starts a bounded reconnect loop
+    /// for `socket_path`. The endpoint need not exist yet; each eventual connect
+    /// revalidates endpoint metadata and peer credentials before sending.
+    /// Returns `None` only if local thread/subscription setup fails.
     pub fn start(socket_path: &Path) -> Option<Self> {
         let socket_path = socket_path.to_path_buf();
-
-        // Try initial connection to verify the socket exists
-        match connect_authenticated_native_event_socket(&socket_path) {
-            Ok(stream) => {
-                drop(stream);
-                log::info!(
-                    "Native event bridge: socket found at {}",
-                    socket_path.display()
-                );
-            }
-            Err(e) => {
-                log::info!(
-                    "Native event bridge: socket not available at {} ({}), \
-                     running without native events",
-                    socket_path.display(),
-                    e
-                );
-                return None;
-            }
-        }
 
         let (tx, rx) = std_mpsc::sync_channel::<BridgeEvent>(EVENT_CHANNEL_CAPACITY);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -450,11 +447,13 @@ fn handle_mux_notification(
                 pane_id: terminal_pane_id_to_u64(*pane_id),
                 domain,
                 cwd,
+                timestamp_ms: now_ms(),
             })
         }
 
         MuxNotification::PaneRemoved(pane_id) => Some(BridgeEvent::PaneDestroyed {
             pane_id: terminal_pane_id_to_u64(*pane_id),
+            timestamp_ms: now_ms(),
         }),
 
         MuxNotification::TabTitleChanged { tab_id, .. } => {
@@ -482,6 +481,7 @@ fn handle_mux_notification(
             pane_id: terminal_pane_id_to_u64(*pane_id),
             name: name.clone(),
             value: value.clone(),
+            timestamp_ms: now_ms(),
         }),
 
         // Ignore other notifications for now
@@ -507,6 +507,7 @@ fn build_state_change_event(pane_id: PaneId) -> Option<BridgeEvent> {
             cursor_row: terminal_u32_from_stable_delta(cursor.y),
             cursor_col: terminal_u32_from_usize(cursor.x),
         },
+        timestamp_ms: now_ms(),
     })
 }
 
@@ -565,6 +566,7 @@ mod tests {
                 cursor_row: 0,
                 cursor_col: 0,
             },
+            timestamp_ms: 42,
         }
     }
 
@@ -584,6 +586,30 @@ mod tests {
             enqueue_bridge_event(&tx, test_state_event(3)),
             BridgeQueueOutcome::Closed
         );
+    }
+
+    #[test]
+    fn wire_event_preserves_notification_occurrence_timestamp() {
+        match test_state_event(7).into_wire_event() {
+            WireEvent::StateChange { pane_id, ts, .. } => {
+                assert_eq!(pane_id, 7);
+                assert_eq!(ts, 42);
+            }
+            other => panic!("unexpected bridge wire event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicitly_enabled_bridge_starts_before_endpoint_exists() {
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = TestMuxGuard::install(mux);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket_path = directory.path().join("listener-not-started-yet.sock");
+        assert!(!socket_path.exists());
+
+        let bridge = NativeEventBridge::start(&socket_path)
+            .expect("missing endpoint should enter bounded reconnect mode");
+        drop(bridge);
     }
 
     #[test]

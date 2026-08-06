@@ -2959,7 +2959,7 @@ impl WeztermClient {
         }
     }
 
-    #[cfg(all(feature = "vendored", unix))]
+    #[cfg(all(test, feature = "vendored", unix))]
     fn mux_error_is_circuit_breaker_trigger(err: &crate::vendored::MuxPoolError) -> bool {
         matches!(
             Self::mux_error_circuit_evidence(err),
@@ -6316,6 +6316,68 @@ mod tests {
             "invalid spawn domain".to_string(),
         ));
         assert_mux_recovery_axes(&err, MuxCircuitEvidence::SuccessfulResponse, false);
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_circuit_evidence_distinguishes_framed_response_from_local_rejection() {
+        use crate::vendored::{DirectMuxError, MuxPoolError};
+
+        let aligned = MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse {
+            expected: "UnitResponse".to_string(),
+            got: "PaneResponse".to_string(),
+        });
+        assert_mux_recovery_axes(&aligned, MuxCircuitEvidence::SuccessfulResponse, false);
+
+        let prewrite = MuxPoolError::Mux(DirectMuxError::ProvenPreWriteRejection(Box::new(
+            DirectMuxError::RemoteError("synthetic nested error".to_string()),
+        )));
+        assert_mux_recovery_axes(&prewrite, MuxCircuitEvidence::Ignore, false);
+
+        let abandoned = MuxPoolError::Mux(DirectMuxError::InFlightScopeAbandoned(Box::new(
+            DirectMuxError::RemoteError("synthetic nested error".to_string()),
+        )));
+        assert_mux_recovery_axes(&abandoned, MuxCircuitEvidence::BackendFailure, false);
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn framed_mux_rejection_resets_failure_streak_and_closes_half_open_probe() {
+        let mut client = WeztermClient::new();
+        client.mux_circuit_breaker = Arc::new(Mutex::new(CircuitBreaker::with_name(
+            "mux_framed_rejection_settlement_test",
+            CircuitBreakerConfig::new(2, 1, Duration::ZERO),
+        )));
+        let remote = crate::vendored::MuxPoolError::Mux(
+            crate::vendored::DirectMuxError::RemoteError("finite rejection".to_string()),
+        );
+
+        client.mux_circuit_record_evidence(MuxCircuitEvidence::BackendFailure);
+        client.mux_circuit_record_error(&remote);
+        let status = match client.mux_circuit_breaker.lock() {
+            Ok(guard) => guard.status(),
+            Err(poisoned) => poisoned.into_inner().status(),
+        };
+        assert_eq!(status.state, CircuitStateKind::Closed);
+        assert_eq!(status.consecutive_failures, 0);
+
+        client.mux_circuit_record_evidence(MuxCircuitEvidence::BackendFailure);
+        client.mux_circuit_record_evidence(MuxCircuitEvidence::BackendFailure);
+        let open_status = match client.mux_circuit_breaker.lock() {
+            Ok(guard) => guard.status(),
+            Err(poisoned) => poisoned.into_inner().status(),
+        };
+        assert_eq!(open_status.state, CircuitStateKind::Open);
+        // The guard observes the zero cooldown and transitions to HalfOpen
+        // while admitting the probe.
+        assert!(client.mux_circuit_guard());
+        client.mux_circuit_record_error(&remote);
+        let status = match client.mux_circuit_breaker.lock() {
+            Ok(guard) => guard.status(),
+            Err(poisoned) => poisoned.into_inner().status(),
+        };
+        assert_eq!(status.state, CircuitStateKind::Closed);
+        assert_eq!(status.consecutive_failures, 0);
     }
 
     #[cfg(all(feature = "vendored", unix))]
