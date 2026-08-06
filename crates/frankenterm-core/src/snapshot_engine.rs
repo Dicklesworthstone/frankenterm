@@ -274,16 +274,34 @@ pub enum SnapshotError {
     /// the capture race.
     #[error("snapshot capture cancelled via capability context")]
     Cancelled,
-    #[error("snapshot synchronization failed: {0}")]
-    LockAcquire(String),
+    #[error("snapshot capability deadline exceeded")]
+    DeadlineExceeded,
+    #[error("snapshot capability poll quota exhausted")]
+    PollQuotaExhausted,
+    #[error("snapshot capability cost budget exhausted")]
+    CostBudgetExhausted,
+    #[error("snapshot capability context failed")]
+    ContextFailure,
+    #[error("snapshot lock acquisition timed out at {deadline_nanos}ns")]
+    LockTimedOut { deadline_nanos: u64 },
+    #[error("snapshot lock is poisoned")]
+    LockPoisoned,
+    #[error("snapshot lock acquisition future polled after completion")]
+    LockPolledAfterCompletion,
 }
 
 fn snapshot_lock_error(error: LockAcquireError) -> SnapshotError {
     match error {
         LockAcquireError::Cancelled => SnapshotError::Cancelled,
-        LockAcquireError::TimedOut { .. }
-        | LockAcquireError::Poisoned
-        | LockAcquireError::PolledAfterCompletion => SnapshotError::LockAcquire(error.to_string()),
+        LockAcquireError::DeadlineExceeded => SnapshotError::DeadlineExceeded,
+        LockAcquireError::PollQuotaExhausted => SnapshotError::PollQuotaExhausted,
+        LockAcquireError::CostBudgetExhausted => SnapshotError::CostBudgetExhausted,
+        LockAcquireError::ContextFailure => SnapshotError::ContextFailure,
+        LockAcquireError::TimedOut { deadline_nanos } => {
+            SnapshotError::LockTimedOut { deadline_nanos }
+        }
+        LockAcquireError::Poisoned => SnapshotError::LockPoisoned,
+        LockAcquireError::PolledAfterCompletion => SnapshotError::LockPolledAfterCompletion,
     }
 }
 
@@ -1785,6 +1803,60 @@ mod tests {
     use super::*;
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder, sleep, timeout};
     use crate::wezterm::PaneSize;
+
+    #[test]
+    fn snapshot_lock_errors_preserve_finite_failure_identity() {
+        let cases = [
+            (LockAcquireError::Cancelled, SnapshotError::Cancelled),
+            (
+                LockAcquireError::DeadlineExceeded,
+                SnapshotError::DeadlineExceeded,
+            ),
+            (
+                LockAcquireError::PollQuotaExhausted,
+                SnapshotError::PollQuotaExhausted,
+            ),
+            (
+                LockAcquireError::CostBudgetExhausted,
+                SnapshotError::CostBudgetExhausted,
+            ),
+            (
+                LockAcquireError::ContextFailure,
+                SnapshotError::ContextFailure,
+            ),
+            (
+                LockAcquireError::TimedOut { deadline_nanos: 73 },
+                SnapshotError::LockTimedOut { deadline_nanos: 73 },
+            ),
+            (
+                LockAcquireError::Poisoned,
+                SnapshotError::LockPoisoned,
+            ),
+            (
+                LockAcquireError::PolledAfterCompletion,
+                SnapshotError::LockPolledAfterCompletion,
+            ),
+        ];
+
+        for (lock_error, expected_error) in cases {
+            let actual_error = snapshot_lock_error(lock_error);
+            assert_eq!(
+                std::mem::discriminant(&actual_error),
+                std::mem::discriminant(&expected_error)
+            );
+            if let (
+                SnapshotError::LockTimedOut {
+                    deadline_nanos: actual,
+                },
+                SnapshotError::LockTimedOut {
+                    deadline_nanos: expected,
+                },
+            ) = (actual_error, expected_error)
+            {
+                assert_eq!(actual, expected);
+            }
+        }
+    }
 
     async fn recv_trigger(rx: &mut mpsc::Receiver<SnapshotTrigger>) -> SnapshotTrigger {
         let cx = crate::cx::for_testing();

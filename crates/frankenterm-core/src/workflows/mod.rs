@@ -176,14 +176,21 @@ pub struct CxPolicyInjector {
 }
 
 fn injector_lock_error(operation: &'static str, error: LockAcquireError) -> crate::Error {
-    match error {
-        LockAcquireError::Cancelled => crate::Error::runtime_cancelled(operation, error.to_string()),
-        LockAcquireError::TimedOut { .. }
-        | LockAcquireError::Poisoned
-        | LockAcquireError::PolledAfterCompletion => {
-            crate::Error::runtime_backend(operation, error.to_string())
+    use crate::error::RuntimeOperationSource;
+
+    let source = match error {
+        LockAcquireError::Cancelled => {
+            RuntimeOperationSource::Cancelled("lock acquisition cancelled".to_string())
         }
-    }
+        LockAcquireError::DeadlineExceeded => RuntimeOperationSource::DeadlineExceeded,
+        LockAcquireError::PollQuotaExhausted => RuntimeOperationSource::PollQuotaExhausted,
+        LockAcquireError::CostBudgetExhausted => RuntimeOperationSource::CostBudgetExhausted,
+        LockAcquireError::ContextFailure => RuntimeOperationSource::ContextFailure,
+        LockAcquireError::TimedOut { .. } => RuntimeOperationSource::LockTimedOut,
+        LockAcquireError::Poisoned => RuntimeOperationSource::LockPoisoned,
+        LockAcquireError::PolledAfterCompletion => RuntimeOperationSource::PolledAfterCompletion,
+    };
+    crate::Error::RuntimeOperation { operation, source }
 }
 
 impl CxPolicyInjector {
@@ -352,6 +359,56 @@ mod tests {
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn injector_lock_errors_preserve_finite_failure_identity() {
+        use crate::error::RuntimeOperationSource;
+
+        let cases = [
+            (
+                LockAcquireError::Cancelled,
+                RuntimeOperationSource::Cancelled("lock acquisition cancelled".to_string()),
+            ),
+            (
+                LockAcquireError::DeadlineExceeded,
+                RuntimeOperationSource::DeadlineExceeded,
+            ),
+            (
+                LockAcquireError::PollQuotaExhausted,
+                RuntimeOperationSource::PollQuotaExhausted,
+            ),
+            (
+                LockAcquireError::CostBudgetExhausted,
+                RuntimeOperationSource::CostBudgetExhausted,
+            ),
+            (
+                LockAcquireError::ContextFailure,
+                RuntimeOperationSource::ContextFailure,
+            ),
+            (
+                LockAcquireError::TimedOut { deadline_nanos: 73 },
+                RuntimeOperationSource::LockTimedOut,
+            ),
+            (
+                LockAcquireError::Poisoned,
+                RuntimeOperationSource::LockPoisoned,
+            ),
+            (
+                LockAcquireError::PolledAfterCompletion,
+                RuntimeOperationSource::PolledAfterCompletion,
+            ),
+        ];
+
+        for (lock_error, expected_source) in cases {
+            match injector_lock_error("workflow.injector.test", lock_error) {
+                crate::Error::RuntimeOperation { operation, source } => {
+                    assert_eq!(operation, "workflow.injector.test");
+                    assert_eq!(source, expected_source);
+                }
+                other => panic!("expected RuntimeOperation, got {other:?}"),
+            }
         }
     }
 

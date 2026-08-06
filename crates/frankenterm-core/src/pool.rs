@@ -107,6 +107,8 @@ pub enum PoolError {
     CostBudgetExhausted,
     /// A capability checkpoint failed without a stable typed cause.
     ContextFailure,
+    /// The lock's own logical acquisition deadline elapsed.
+    LockTimedOut { deadline_nanos: u64 },
     /// The semaphore acquire future was polled after it had completed.
     PolledAfterCompletion,
     /// The idle-queue lock failed for a non-cancellation reason.
@@ -127,6 +129,9 @@ impl std::fmt::Display for PoolError {
                 write!(f, "connection pool capability cost budget exhausted")
             }
             Self::ContextFailure => write!(f, "connection pool capability context failed"),
+            Self::LockTimedOut { deadline_nanos } => {
+                write!(f, "connection pool lock timed out at {deadline_nanos}ns")
+            }
             Self::PolledAfterCompletion => {
                 write!(f, "connection pool acquire future polled after completion")
             }
@@ -148,6 +153,7 @@ impl std::error::Error for PoolError {
             | Self::PollQuotaExhausted
             | Self::CostBudgetExhausted
             | Self::ContextFailure
+            | Self::LockTimedOut { .. }
             | Self::PolledAfterCompletion => None,
         }
     }
@@ -157,7 +163,16 @@ impl From<LockAcquireError> for PoolError {
     fn from(error: LockAcquireError) -> Self {
         match error {
             LockAcquireError::Cancelled => Self::Cancelled,
-            other => Self::LockAcquire(other),
+            LockAcquireError::DeadlineExceeded => Self::DeadlineExceeded,
+            LockAcquireError::PollQuotaExhausted => Self::PollQuotaExhausted,
+            LockAcquireError::CostBudgetExhausted => Self::CostBudgetExhausted,
+            LockAcquireError::ContextFailure => Self::ContextFailure,
+            LockAcquireError::TimedOut { deadline_nanos } => {
+                Self::LockTimedOut { deadline_nanos }
+            }
+            LockAcquireError::Poisoned | LockAcquireError::PolledAfterCompletion => {
+                Self::LockAcquire(error)
+            }
         }
     }
 }
@@ -200,12 +215,8 @@ impl<C: Send + 'static> Pool<C> {
         }
     }
 
-    fn classify_lock_failure(cx: &Cx, error: LockAcquireError) -> PoolError {
-        if error == LockAcquireError::Cancelled {
-            Self::classify_cx_failure(cx)
-        } else {
-            PoolError::LockAcquire(error)
-        }
+    fn classify_lock_failure(_cx: &Cx, error: LockAcquireError) -> PoolError {
+        error.into()
     }
 
     fn classify_acquire_failure(
@@ -379,8 +390,9 @@ impl<C: Send + 'static> Pool<C> {
     ///
     /// # Errors
     ///
-    /// Returns [`PoolError::Cancelled`] when `cx` is cancelled, or
-    /// [`PoolError::LockAcquire`] for another lock-acquisition failure.
+    /// Preserves the caller's exact cancellation, deadline, quota, context, or
+    /// lock-timeout class. Poisoning and invalid future reuse remain structural
+    /// [`PoolError::LockAcquire`] failures.
     pub async fn put_with_cx(&self, cx: &Cx, conn: C) -> Result<(), PoolError> {
         let mut idle = self
             .idle
@@ -932,6 +944,10 @@ mod tests {
             "connection pool lock acquisition failed: lock is poisoned"
         );
         assert_eq!(
+            PoolError::LockTimedOut { deadline_nanos: 17 }.to_string(),
+            "connection pool lock timed out at 17ns"
+        );
+        assert_eq!(
             PoolError::PolledAfterCompletion.to_string(),
             "connection pool acquire future polled after completion"
         );
@@ -948,6 +964,46 @@ mod tests {
             PoolError::PolledAfterCompletion
         );
         assert_ne!(PoolError::PolledAfterCompletion, PoolError::Cancelled);
+    }
+
+    #[test]
+    fn pool_lock_failure_preserves_every_finite_context_and_timeout_class() {
+        let cx = Cx::for_testing();
+        let cases = [
+            (LockAcquireError::Cancelled, PoolError::Cancelled),
+            (
+                LockAcquireError::DeadlineExceeded,
+                PoolError::DeadlineExceeded,
+            ),
+            (
+                LockAcquireError::PollQuotaExhausted,
+                PoolError::PollQuotaExhausted,
+            ),
+            (
+                LockAcquireError::CostBudgetExhausted,
+                PoolError::CostBudgetExhausted,
+            ),
+            (
+                LockAcquireError::ContextFailure,
+                PoolError::ContextFailure,
+            ),
+            (
+                LockAcquireError::TimedOut { deadline_nanos: 23 },
+                PoolError::LockTimedOut { deadline_nanos: 23 },
+            ),
+            (
+                LockAcquireError::Poisoned,
+                PoolError::LockAcquire(LockAcquireError::Poisoned),
+            ),
+            (
+                LockAcquireError::PolledAfterCompletion,
+                PoolError::LockAcquire(LockAcquireError::PolledAfterCompletion),
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(Pool::<String>::classify_lock_failure(&cx, error), expected);
+        }
     }
 
     #[test]

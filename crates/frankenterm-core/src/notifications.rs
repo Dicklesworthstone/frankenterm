@@ -69,15 +69,23 @@ use crate::runtime_async::LockAcquireError;
 use crate::storage::{StorageHandle, StoredEvent};
 
 fn notification_lock_error(error: LockAcquireError) -> crate::Error {
-    match error {
+    use crate::error::RuntimeOperationSource;
+
+    let source = match error {
         LockAcquireError::Cancelled => {
-            crate::Error::runtime_cancelled("notification.mute_store", error.to_string())
+            RuntimeOperationSource::Cancelled("lock acquisition cancelled".to_string())
         }
-        LockAcquireError::TimedOut { .. }
-        | LockAcquireError::Poisoned
-        | LockAcquireError::PolledAfterCompletion => {
-            crate::Error::runtime_backend("notification.mute_store", error.to_string())
-        }
+        LockAcquireError::DeadlineExceeded => RuntimeOperationSource::DeadlineExceeded,
+        LockAcquireError::PollQuotaExhausted => RuntimeOperationSource::PollQuotaExhausted,
+        LockAcquireError::CostBudgetExhausted => RuntimeOperationSource::CostBudgetExhausted,
+        LockAcquireError::ContextFailure => RuntimeOperationSource::ContextFailure,
+        LockAcquireError::TimedOut { .. } => RuntimeOperationSource::LockTimedOut,
+        LockAcquireError::Poisoned => RuntimeOperationSource::LockPoisoned,
+        LockAcquireError::PolledAfterCompletion => RuntimeOperationSource::PolledAfterCompletion,
+    };
+    crate::Error::RuntimeOperation {
+        operation: "notification.mute_store",
+        source,
     }
 }
 
@@ -572,6 +580,56 @@ mod tests {
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn notification_lock_errors_preserve_finite_failure_identity() {
+        use crate::error::RuntimeOperationSource;
+
+        let cases = [
+            (
+                LockAcquireError::Cancelled,
+                RuntimeOperationSource::Cancelled("lock acquisition cancelled".to_string()),
+            ),
+            (
+                LockAcquireError::DeadlineExceeded,
+                RuntimeOperationSource::DeadlineExceeded,
+            ),
+            (
+                LockAcquireError::PollQuotaExhausted,
+                RuntimeOperationSource::PollQuotaExhausted,
+            ),
+            (
+                LockAcquireError::CostBudgetExhausted,
+                RuntimeOperationSource::CostBudgetExhausted,
+            ),
+            (
+                LockAcquireError::ContextFailure,
+                RuntimeOperationSource::ContextFailure,
+            ),
+            (
+                LockAcquireError::TimedOut { deadline_nanos: 73 },
+                RuntimeOperationSource::LockTimedOut,
+            ),
+            (
+                LockAcquireError::Poisoned,
+                RuntimeOperationSource::LockPoisoned,
+            ),
+            (
+                LockAcquireError::PolledAfterCompletion,
+                RuntimeOperationSource::PolledAfterCompletion,
+            ),
+        ];
+
+        for (lock_error, expected_source) in cases {
+            match notification_lock_error(lock_error) {
+                crate::Error::RuntimeOperation { operation, source } => {
+                    assert_eq!(operation, "notification.mute_store");
+                    assert_eq!(source, expected_source);
+                }
+                other => panic!("expected RuntimeOperation, got {other:?}"),
+            }
         }
     }
 

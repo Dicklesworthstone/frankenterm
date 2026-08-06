@@ -695,15 +695,19 @@ fn recording_runtime_error(operation: &'static str, detail: impl Into<String>) -
 }
 
 fn recording_lock_error(operation: &'static str, error: LockAcquireError) -> crate::Error {
-    match error {
-        LockAcquireError::Cancelled => crate::Error::RuntimeOperation {
-            operation,
-            source: RuntimeOperationSource::Cancelled(error.to_string()),
-        },
-        LockAcquireError::TimedOut { .. }
-        | LockAcquireError::Poisoned
-        | LockAcquireError::PolledAfterCompletion => recording_runtime_error(operation, error.to_string()),
-    }
+    let source = match error {
+        LockAcquireError::Cancelled => {
+            RuntimeOperationSource::Cancelled("lock acquisition cancelled".to_string())
+        }
+        LockAcquireError::DeadlineExceeded => RuntimeOperationSource::DeadlineExceeded,
+        LockAcquireError::PollQuotaExhausted => RuntimeOperationSource::PollQuotaExhausted,
+        LockAcquireError::CostBudgetExhausted => RuntimeOperationSource::CostBudgetExhausted,
+        LockAcquireError::ContextFailure => RuntimeOperationSource::ContextFailure,
+        LockAcquireError::TimedOut { .. } => RuntimeOperationSource::LockTimedOut,
+        LockAcquireError::Poisoned => RuntimeOperationSource::LockPoisoned,
+        LockAcquireError::PolledAfterCompletion => RuntimeOperationSource::PolledAfterCompletion,
+    };
+    crate::Error::RuntimeOperation { operation, source }
 }
 
 impl RecordingManager {
@@ -1470,6 +1474,54 @@ mod tests {
                 }
             }
             other => panic!("expected RuntimeOperation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recording_lock_errors_preserve_finite_failure_identity() {
+        let cases = [
+            (
+                LockAcquireError::Cancelled,
+                RuntimeOperationSource::Cancelled("lock acquisition cancelled".to_string()),
+            ),
+            (
+                LockAcquireError::DeadlineExceeded,
+                RuntimeOperationSource::DeadlineExceeded,
+            ),
+            (
+                LockAcquireError::PollQuotaExhausted,
+                RuntimeOperationSource::PollQuotaExhausted,
+            ),
+            (
+                LockAcquireError::CostBudgetExhausted,
+                RuntimeOperationSource::CostBudgetExhausted,
+            ),
+            (
+                LockAcquireError::ContextFailure,
+                RuntimeOperationSource::ContextFailure,
+            ),
+            (
+                LockAcquireError::TimedOut { deadline_nanos: 73 },
+                RuntimeOperationSource::LockTimedOut,
+            ),
+            (
+                LockAcquireError::Poisoned,
+                RuntimeOperationSource::LockPoisoned,
+            ),
+            (
+                LockAcquireError::PolledAfterCompletion,
+                RuntimeOperationSource::PolledAfterCompletion,
+            ),
+        ];
+
+        for (lock_error, expected_source) in cases {
+            match recording_lock_error("recording.test", lock_error) {
+                crate::Error::RuntimeOperation { operation, source } => {
+                    assert_eq!(operation, "recording.test");
+                    assert_eq!(source, expected_source);
+                }
+                other => panic!("expected RuntimeOperation, got {other:?}"),
+            }
         }
     }
 
