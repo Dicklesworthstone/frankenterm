@@ -1012,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_agent_pane_is_manual_with_reserved_setting_enabled() {
+    fn plan_agent_pane_is_manual_without_launch_configuration() {
         let launcher = ProcessLauncher::new();
         let id_map = test_pane_id_map();
 
@@ -1040,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_agent_ignores_reserved_command_template() {
+    fn plan_agent_manual_hint_contains_no_command_or_cwd() {
         let launcher = ProcessLauncher::new();
         let id_map = test_pane_id_map();
 
@@ -1133,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_shell_setting_is_reserved_and_still_manual() {
+    fn plan_shell_is_always_manual() {
         let launcher = ProcessLauncher::new();
         let id_map = test_pane_id_map();
         let states = vec![test_pane_state(1)];
@@ -2252,7 +2252,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_gemini_agent_is_manual_with_reserved_setting_enabled() {
+    fn plan_gemini_agent_is_manual() {
         let launcher = ProcessLauncher::new();
         let id_map = test_pane_id_map();
 

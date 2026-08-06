@@ -954,6 +954,16 @@ pub enum SplitDirection {
     Bottom,
 }
 
+/// Normalize a percentage split to the non-degenerate mux range.
+///
+/// One-percent panes are valid: the mux converts percentage requests to at
+/// least one terminal cell and its constraint solver rejects impossible
+/// layouts. Keeping the full 1..=99 range is required to reproduce heavily
+/// asymmetric saved layouts without silently distorting them to 10..=90.
+const fn normalize_split_percent(percent: u8) -> u8 {
+    percent.clamp(1, 99)
+}
+
 /// Target for spawning a new root pane/tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SpawnTarget {
@@ -1352,7 +1362,7 @@ impl WeztermClient {
                 target_is_second,
                 top_level: false,
                 size: percent
-                    .map(|pct| mux::tab::SplitSize::Percent(pct.clamp(10, 90)))
+                    .map(|pct| mux::tab::SplitSize::Percent(normalize_split_percent(pct)))
                     .unwrap_or_default(),
             },
             command: None,
@@ -2115,7 +2125,7 @@ impl WeztermClient {
     /// * `pane_id` - The pane to split from
     /// * `direction` - Direction to split: "left", "right", "top", "bottom"
     /// * `cwd` - Optional working directory for the new pane
-    /// * `percent` - Optional percentage of the split (10-90)
+    /// * `percent` - Optional percentage of the split (normalized to 1-99)
     ///
     /// # Returns
     /// The pane ID of the newly created pane
@@ -2135,7 +2145,7 @@ impl WeztermClient {
     /// through the unsettled mutation runner, pane-error mapping, and final
     /// receipt settlement so `wezterm cli split-pane` honors cancellation,
     /// budget, virtual time, and exactly-once circuit-breaker accounting. The
-    /// argv construction (direction flag, cwd, percent clamp to 10-90) is
+    /// argv construction (direction flag, cwd, percent normalization to 1-99) is
     /// identical to the legacy path so both variants produce the exact same
     /// command line for the same inputs.
     pub async fn split_pane_with_cx(
@@ -2193,8 +2203,8 @@ impl WeztermClient {
 
         let percent_arg;
         if let Some(pct) = percent {
-            let clamped = pct.clamp(10, 90);
-            percent_arg = format!("--percent={clamped}");
+            let normalized = normalize_split_percent(pct);
+            percent_arg = format!("--percent={normalized}");
             args.push(&percent_arg);
         }
 
@@ -4760,6 +4770,18 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::sync::Arc;
+
+    #[test]
+    fn split_percent_preserves_full_non_degenerate_range() {
+        assert_eq!(normalize_split_percent(0), 1);
+        assert_eq!(normalize_split_percent(1), 1);
+        assert_eq!(normalize_split_percent(7), 7);
+        assert_eq!(normalize_split_percent(50), 50);
+        assert_eq!(normalize_split_percent(99), 99);
+        assert_eq!(normalize_split_percent(100), 99);
+        assert_eq!(normalize_split_percent(u8::MAX), 99);
+    }
+
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,

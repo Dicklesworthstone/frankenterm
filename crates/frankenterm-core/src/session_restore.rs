@@ -5196,6 +5196,29 @@ mod tests {
     }
 
     #[test]
+    fn periodic_snapshot_cannot_authorize_clean_shutdown() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-periodic-clean", false);
+        let checkpoint_id = insert_checkpoint(&conn, "sess-periodic-clean", 5000, 0);
+        seal_checkpoint_v2(&conn, checkpoint_id);
+        conn.execute(
+            "UPDATE mux_sessions
+             SET shutdown_clean = 1,
+                 clean_checkpoint_id = ?2,
+                 last_checkpoint_at = 5000
+             WHERE session_id = ?1",
+            params!["sess-periodic-clean", checkpoint_id],
+        )
+        .unwrap();
+
+        let candidates = find_unclean_sessions(&db_path).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_id, "sess-periodic-clean");
+        let listed = list_sessions(&db_path).unwrap();
+        assert!(!listed[0].shutdown_clean);
+    }
+
+    #[test]
     fn detect_unclean_session() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-crash", false);
@@ -6582,6 +6605,111 @@ mod tests {
     }
 
     #[test]
+    fn orphaned_restore_intent_blocks_retry_before_mux_effects() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-orphaned-intent", false);
+        set_single_pane_topology(&conn, "sess-orphaned-intent", 17, "/restore");
+        let checkpoint_id = insert_checkpoint(&conn, "sess-orphaned-intent", 5000, 1);
+        insert_pane_state(&conn, checkpoint_id, 17, Some("/restore"), Some("bash"));
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = 5000
+             WHERE session_id = 'sess-orphaned-intent'",
+            [],
+        )
+        .unwrap();
+        let checkpoint = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .unwrap()
+            .unwrap();
+        let source = RestoreIntentSource {
+            checkpoint_id,
+            checkpoint_at: checkpoint.checkpoint_at,
+            checkpoint_role: checkpoint.checkpoint_role,
+            state_hash: checkpoint.state_hash,
+            pane_count: checkpoint.pane_count,
+        };
+        let intent = persist_restore_intent_unclean(
+            &db_path,
+            "sess-orphaned-intent",
+            &source,
+        )
+        .expect("persist exact restore intent");
+        conn.execute(
+            "DELETE FROM restore_attempt_lifecycle WHERE intent_checkpoint_id = ?1",
+            [intent.checkpoint_id],
+        )
+        .unwrap();
+
+        let restorer = SessionRestorer::new(
+            Arc::new(db_path),
+            SessionRestoreConfig::default(),
+        );
+        let wezterm = Arc::new(MockWezterm::new());
+        let error = run_async_test(restorer.detect_and_restore(wezterm.clone()))
+            .expect_err("an orphaned intent requires explicit reconciliation");
+        assert!(matches!(
+            error,
+            RestoreError::RestoreAttemptRequiresReconciliation {
+                ref session_id,
+                intent_checkpoint_id,
+                outcome_checkpoint_id: None,
+                ref status,
+            } if session_id == "sess-orphaned-intent"
+                && intent_checkpoint_id == intent.checkpoint_id
+                && status == "orphaned_intent"
+        ));
+        assert!(
+            run_async_test(wezterm.list_panes()).unwrap().is_empty(),
+            "orphaned-intent admission must not mutate the mux"
+        );
+    }
+
+    #[test]
+    fn clean_session_race_rejects_stale_restore_before_mux_effects() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-clean-race", false);
+        set_single_pane_topology(&conn, "sess-clean-race", 23, "/restore");
+        let checkpoint_id = insert_checkpoint(&conn, "sess-clean-race", 5000, 1);
+        insert_pane_state(&conn, checkpoint_id, 23, Some("/restore"), Some("bash"));
+        conn.execute(
+            "UPDATE session_checkpoints SET checkpoint_type = 'shutdown' WHERE id = ?1",
+            [checkpoint_id],
+        )
+        .unwrap();
+        seal_checkpoint_v2(&conn, checkpoint_id);
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = 5000
+             WHERE session_id = 'sess-clean-race'",
+            [],
+        )
+        .unwrap();
+
+        let restorer = SessionRestorer::new(
+            Arc::new(db_path.clone()),
+            SessionRestoreConfig::default(),
+        );
+        let session = restorer.detect().unwrap().expect("initially unclean session");
+        let checkpoint = restorer.load_checkpoint(&session).unwrap();
+
+        conn.execute(
+            "UPDATE mux_sessions
+             SET shutdown_clean = 1, clean_checkpoint_id = ?2, last_checkpoint_at = 5000
+             WHERE session_id = ?1",
+            params!["sess-clean-race", checkpoint_id],
+        )
+        .unwrap();
+        let wezterm = Arc::new(MockWezterm::new());
+        let error = run_async_test(restorer.restore(
+            &session,
+            &checkpoint,
+            wezterm.clone(),
+        ))
+        .expect_err("a clean-session race must invalidate stale restore admission");
+        assert!(matches!(error, RestoreError::Bookkeeping(_)));
+        assert!(run_async_test(wezterm.list_panes()).unwrap().is_empty());
+        assert!(find_unclean_sessions(&db_path).unwrap().is_empty());
+    }
+
+    #[test]
     fn session_restorer_rejects_scrollback_before_intent_or_mux_effects() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-scrollback", false);
@@ -6792,6 +6920,40 @@ mod tests {
         assert_eq!(summary.restored_count(), 2);
         assert_eq!(summary.failed_count(), 1);
         assert_eq!(summary.total_count(), 3);
+    }
+
+    #[test]
+    fn restore_summary_counts_mapped_activation_failure_once_without_backend_text() {
+        let summary = RestoreSummary {
+            session_id: "sess-activation-failure".to_string(),
+            checkpoint_id: 1,
+            intent_checkpoint_id: 2,
+            outcome_checkpoint_id: 3,
+            layout_result: RestoreResult {
+                pane_id_map: HashMap::from([(7, 70)]),
+                failed_panes: vec![
+                    (7, "sensitive backend detail".to_string()),
+                    (7, "duplicate sensitive detail".to_string()),
+                    (999, "unexpected sensitive detail".to_string()),
+                ],
+                windows_created: 1,
+                tabs_created: 1,
+                panes_created: 1,
+            },
+            pane_states: vec![summary_pane_state(7)],
+            scrollback_result: None,
+            scrollback_error: None,
+            process_launch_report: None,
+            source_marked_clean: false,
+            elapsed_ms: 1,
+        };
+
+        assert_eq!(summary.failed_count(), 1);
+        assert_eq!(summary.restored_count(), 0);
+        let formatted = format_restore_summary(&summary);
+        assert!(formatted.contains("pane 7: layout restoration reported failure"));
+        assert!(formatted.contains("1 unexpected failures"));
+        assert!(!formatted.contains("sensitive backend detail"));
     }
 
     #[test]
@@ -7211,6 +7373,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pane_state_count, 0);
+    }
+
+    #[test]
+    fn delete_session_reports_cleanup_for_lifecycle_only_rows() {
+        let (db_path, conn, _dir) = setup_test_db();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO restore_attempt_lifecycle (
+                 intent_checkpoint_id, session_id, source_checkpoint_id,
+                 outcome_checkpoint_id, status, created_at, resolved_at
+             ) VALUES (999, 'sess-lifecycle-only', 998, NULL, 'intent', 1000, NULL)",
+            [],
+        )
+        .unwrap();
+
+        assert!(delete_session(&db_path, "sess-lifecycle-only").unwrap());
+        let lifecycle_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM restore_attempt_lifecycle
+                 WHERE session_id = 'sess-lifecycle-only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lifecycle_count, 0);
     }
 
     // ---------------------------------------------------------------
