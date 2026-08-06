@@ -66,7 +66,7 @@ impl fmt::Display for WebhookTemplate {
 }
 
 /// Configuration for a single webhook endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WebhookEndpointConfig {
     /// Display name for logging/status.
     pub name: String,
@@ -92,6 +92,41 @@ pub struct WebhookEndpointConfig {
     /// Per-endpoint enabled flag. Defaults to true.
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+impl fmt::Debug for WebhookEndpointConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebhookEndpointConfig")
+            .field("name", &self.name)
+            .field("url_scheme", &webhook_url_scheme(&self.url))
+            .field("template", &self.template)
+            .field("event_pattern_count", &self.events.len())
+            .field("header_count", &self.headers.len())
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
+/// Return a finite, non-secret URL-scheme class for diagnostics.
+///
+/// Webhook paths and queries commonly contain bearer credentials. Even the
+/// authority can contain user-info, so logs and Debug output deliberately
+/// expose no caller-controlled URL component. Prefix inspection is bounded so
+/// an enormous custom scheme cannot create proportional diagnostic work.
+fn webhook_url_scheme(url: &str) -> &'static str {
+    if url
+        .get(.."https://".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        "https"
+    } else if url
+        .get(.."http://".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        "http"
+    } else {
+        "unknown"
+    }
 }
 
 fn default_true() -> bool {
@@ -268,14 +303,29 @@ fn render_discord(p: &WebhookPayload) -> serde_json::Value {
 // ============================================================================
 
 /// Result of a webhook delivery attempt.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeliveryResult {
     /// HTTP status code (or 0 if connection failed).
     pub status_code: u16,
     /// Whether the delivery was accepted (2xx).
     pub accepted: bool,
-    /// Error message (if delivery failed).
+    /// Transport-private error detail (if delivery failed).
+    ///
+    /// This value is untrusted and may contain the credential-bearing request
+    /// URL. [`WebhookDispatcher`] converts it to a finite error class before
+    /// logging or copying it into a delivery record, and this type's `Debug`
+    /// implementation exposes only whether detail is present.
     pub error: Option<String>,
+}
+
+impl fmt::Debug for DeliveryResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeliveryResult")
+            .field("status_code", &self.status_code)
+            .field("accepted", &self.accepted)
+            .field("error_present", &self.error.is_some())
+            .finish()
+    }
 }
 
 impl DeliveryResult {
@@ -354,17 +404,43 @@ pub struct WebhookDispatcher {
 pub type DeliveryRecord = NotificationDeliveryRecord;
 
 const WEBHOOK_DISPATCH_TARGET: &str = "webhook_dispatch";
-const WEBHOOK_CANCELLATION_PREFIX: &str = "webhook dispatch cancelled";
+const WEBHOOK_CANCELLATION_ERROR: &str = "webhook_dispatch_cancelled";
+const WEBHOOK_TRANSPORT_ERROR: &str = "webhook_transport_error";
+const WEBHOOK_REMOTE_REJECTION: &str = "webhook_remote_rejected";
+const WEBHOOK_INVALID_TRANSPORT_RESULT: &str = "webhook_invalid_transport_result";
+
+fn delivery_was_accepted(result: &DeliveryResult) -> bool {
+    result.accepted
+        && (200..300).contains(&result.status_code)
+        && result.error.is_none()
+}
+
+fn safe_delivery_error(result: &DeliveryResult) -> Option<&'static str> {
+    if delivery_was_accepted(result) {
+        None
+    } else if result.status_code == 0 {
+        Some(WEBHOOK_TRANSPORT_ERROR)
+    } else if !(200..300).contains(&result.status_code) {
+        Some(WEBHOOK_REMOTE_REJECTION)
+    } else {
+        // A 2xx response paired with `accepted = false` or any error detail is
+        // internally inconsistent. Fail closed rather than allowing a buggy or
+        // adversarial transport to turn that malformed result into success.
+        Some(WEBHOOK_INVALID_TRANSPORT_RESULT)
+    }
+}
 
 fn checkpoint_dispatch(
     cx: &crate::cx::Cx,
     target: impl Into<String>,
 ) -> std::result::Result<(), DeliveryRecord> {
-    cx.checkpoint().map_err(|err| DeliveryRecord {
+    cx.checkpoint().map_err(|_| DeliveryRecord {
         target: target.into(),
         accepted: false,
         status_code: 0,
-        error: Some(format!("{WEBHOOK_CANCELLATION_PREFIX}: {err}")),
+        // Checkpoint diagnostics can include caller-controlled cancellation
+        // reasons. Persist only a finite class in notification records.
+        error: Some(WEBHOOK_CANCELLATION_ERROR.to_string()),
     })
 }
 
@@ -376,7 +452,7 @@ fn notification_delivery_error(success: bool, records: &[DeliveryRecord]) -> Opt
     let error = records
         .iter()
         .filter_map(|record| record.error.as_deref())
-        .find(|error| error.starts_with(WEBHOOK_CANCELLATION_PREFIX))
+        .find(|error| *error == WEBHOOK_CANCELLATION_ERROR)
         .unwrap_or("one_or_more_deliveries_failed");
     Some(error.to_owned())
 }
@@ -465,15 +541,25 @@ impl WebhookDispatcher {
             return records;
         }
 
-        let mut matching_endpoints = self
-            .endpoints
-            .iter()
-            .filter(|endpoint| {
-                endpoint.enabled && endpoint.matches_event_type(&payload.event_type)
-            })
-            .peekable();
+        // Keep only an integer cursor across await points. Holding a filtered
+        // iterator there needlessly retains a predicate closure whose `&&T`
+        // lifetime is harder for the async state machine to prove, and a
+        // repeated full-tail search would make large endpoint sets quadratic.
+        // Each successive `position` starts after the current match, so every
+        // configured endpoint is inspected at most once.
+        let mut next_endpoint_index = self.endpoints.iter().position(|endpoint| {
+            endpoint.enabled && endpoint.matches_event_type(&payload.event_type)
+        });
 
-        while let Some(endpoint) = matching_endpoints.next() {
+        while let Some(endpoint_index) = next_endpoint_index {
+            let following_endpoint_index = self.endpoints[endpoint_index + 1..]
+                .iter()
+                .position(|endpoint| {
+                    endpoint.enabled && endpoint.matches_event_type(&payload.event_type)
+                })
+                .map(|relative_index| endpoint_index + 1 + relative_index);
+            let endpoint = &self.endpoints[endpoint_index];
+
             if let Err(record) = checkpoint_dispatch(cx, WEBHOOK_DISPATCH_TARGET) {
                 records.push(record);
                 return records;
@@ -491,7 +577,7 @@ impl WebhookDispatcher {
 
             tracing::debug!(
                 endpoint = %endpoint.name,
-                url = %endpoint.url,
+                url_scheme = webhook_url_scheme(&endpoint.url),
                 template = %endpoint.template,
                 rule_id = %payload.event_type,
                 "dispatching webhook"
@@ -506,8 +592,10 @@ impl WebhookDispatcher {
                 .transport
                 .send_with_cx(cx, &endpoint.url, &endpoint.headers, &body)
                 .await;
+            let accepted = delivery_was_accepted(&result);
+            let safe_error = safe_delivery_error(&result);
 
-            if result.accepted {
+            if accepted {
                 tracing::info!(
                     endpoint = %endpoint.name,
                     status = result.status_code,
@@ -517,16 +605,16 @@ impl WebhookDispatcher {
                 tracing::warn!(
                     endpoint = %endpoint.name,
                     status = result.status_code,
-                    error = ?result.error,
+                    error_class = ?safe_error,
                     "webhook delivery failed"
                 );
             }
 
             records.push(DeliveryRecord {
                 target: endpoint.name.clone(),
-                accepted: result.accepted,
+                accepted,
                 status_code: result.status_code,
-                error: result.error,
+                error: safe_error.map(str::to_owned),
             });
 
             // The transport fallback may not observe Cx cancellation while a
@@ -534,12 +622,13 @@ impl WebhookDispatcher {
             // endpoint remains. Once the final intended side effect has
             // completed, a concurrent late cancellation must not create a
             // false failure that could invite duplicate delivery.
-            if matching_endpoints.peek().is_some() {
+            if following_endpoint_index.is_some() {
                 if let Err(record) = checkpoint_dispatch(cx, WEBHOOK_DISPATCH_TARGET) {
                     records.push(record);
                     return records;
                 }
             }
+            next_endpoint_index = following_endpoint_index;
         }
 
         records
@@ -661,19 +750,19 @@ mod tests {
 
     impl MockTransport {
         fn success() -> Self {
+            Self::responding(DeliveryResult::ok(200))
+        }
+
+        fn responding(response: DeliveryResult) -> Self {
             Self {
                 requests: Arc::new(Mutex::new(Vec::new())),
                 cx_requests: Arc::new(Mutex::new(Vec::new())),
-                response: DeliveryResult::ok(200),
+                response,
             }
         }
 
         fn failure(status: u16, error: &str) -> Self {
-            Self {
-                requests: Arc::new(Mutex::new(Vec::new())),
-                cx_requests: Arc::new(Mutex::new(Vec::new())),
-                response: DeliveryResult::err(status, error),
-            }
+            Self::responding(DeliveryResult::err(status, error))
         }
 
         fn requests(&self) -> Vec<MockRequest> {
@@ -1053,6 +1142,7 @@ mod tests {
     #[test]
     fn precancelled_cx_blocks_default_transport_and_surfaces_cancellation() {
         run_async_test(async {
+            const SECRET: &str = "sentinel-private-webhook-cancellation-reason";
             let transport = AmbientOnlyTransport::success();
             let endpoints = vec![test_endpoint(
                 "blocked",
@@ -1065,7 +1155,7 @@ mod tests {
             let cx = crate::cx::for_request();
             cx.cancel_with(
                 crate::outcome::CancelKind::User,
-                Some("pre-cancelled webhook dispatch test"),
+                Some(SECRET),
             );
 
             let delivery = dispatcher.send_with_cx(&cx, &payload).await;
@@ -1074,19 +1164,16 @@ mod tests {
             assert_eq!(delivery.records.len(), 1);
             assert_eq!(delivery.records[0].target, WEBHOOK_DISPATCH_TARGET);
             assert!(!delivery.records[0].accepted);
-            assert!(
-                delivery.records[0]
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.starts_with(WEBHOOK_CANCELLATION_PREFIX))
+            assert_eq!(
+                delivery.records[0].error.as_deref(),
+                Some(WEBHOOK_CANCELLATION_ERROR)
             );
-            assert!(
-                delivery
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.starts_with(WEBHOOK_CANCELLATION_PREFIX)),
-                "NotificationDelivery must surface cancellation, not a generic failure"
+            assert_eq!(
+                delivery.error.as_deref(),
+                Some(WEBHOOK_CANCELLATION_ERROR),
+                "NotificationDelivery must surface a finite cancellation class"
             );
+            assert!(!format!("{delivery:?}").contains(SECRET));
             assert!(
                 transport.requests().is_empty(),
                 "pre-cancelled dispatch must not enter the default transport"
@@ -1127,13 +1214,43 @@ mod tests {
             assert!(records[0].accepted, "the completed first attempt is retained");
             assert_eq!(records[1].target, WEBHOOK_DISPATCH_TARGET);
             assert!(!records[1].accepted);
-            assert!(
-                records[1]
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.starts_with(WEBHOOK_CANCELLATION_PREFIX))
+            assert_eq!(
+                records[1].error.as_deref(),
+                Some(WEBHOOK_CANCELLATION_ERROR)
             );
             assert!(records.iter().all(|record| record.target != "must-not-run"));
+        });
+    }
+
+    #[test]
+    fn inconsistent_transport_success_fails_closed_with_finite_error() {
+        run_async_test(async {
+            const SECRET: &str = "sentinel-inconsistent-transport-secret";
+            let transport = MockTransport::responding(DeliveryResult {
+                status_code: 0,
+                accepted: true,
+                error: Some(format!("https://hooks.invalid/{SECRET}")),
+            });
+            let endpoint = test_endpoint(
+                "inconsistent",
+                "https://example.invalid/hook",
+                WebhookTemplate::Generic,
+            );
+            let dispatcher = WebhookDispatcher::new(vec![endpoint], Box::new(transport));
+            let payload =
+                NotificationPayload::from_detection(&test_detection(), 3, &test_rendered(), 0);
+
+            let delivery = dispatcher.send_with_cx(&crate::cx::for_request(), &payload).await;
+
+            assert!(!delivery.success);
+            assert_eq!(delivery.records.len(), 1);
+            assert!(!delivery.records[0].accepted);
+            assert_eq!(delivery.records[0].status_code, 0);
+            assert_eq!(
+                delivery.records[0].error.as_deref(),
+                Some(WEBHOOK_TRANSPORT_ERROR)
+            );
+            assert!(!format!("{delivery:?}").contains(SECRET));
         });
     }
 
@@ -1202,7 +1319,11 @@ mod tests {
     #[test]
     fn dispatcher_records_failures() {
         run_async_test(async {
-            let transport = MockTransport::failure(500, "Internal Server Error");
+            const SECRET: &str = "sentinel-transport-error-webhook-credential";
+            let transport = MockTransport::failure(
+                500,
+                &format!("request to https://hooks.invalid/{SECRET} was rejected"),
+            );
             let endpoints = vec![test_endpoint(
                 "broken",
                 "http://localhost",
@@ -1217,7 +1338,8 @@ mod tests {
             assert_eq!(records.len(), 1);
             assert!(!records[0].accepted);
             assert_eq!(records[0].status_code, 500);
-            assert!(records[0].error.is_some());
+            assert_eq!(records[0].error.as_deref(), Some(WEBHOOK_REMOTE_REJECTION));
+            assert!(!format!("{:?}", records[0]).contains(SECRET));
         });
     }
 
@@ -1681,10 +1803,13 @@ url = "http://localhost:8080/hook"
 
     #[test]
     fn delivery_result_debug() {
-        let r = DeliveryResult::ok(200);
+        const SECRET: &str = "sentinel-delivery-result-secret";
+        let r = DeliveryResult::err(0, format!("https://hooks.invalid/{SECRET}"));
         let dbg = format!("{r:?}");
         assert!(dbg.contains("DeliveryResult"));
-        assert!(dbg.contains("200"));
+        assert!(dbg.contains("error_present: true"));
+        assert!(!dbg.contains(SECRET));
+        assert!(!dbg.contains("hooks.invalid"));
     }
 
     #[test]
@@ -1932,10 +2057,47 @@ url = "http://localhost:8080/hook"
 
     #[test]
     fn endpoint_config_debug() {
-        let ep = test_endpoint("dbg", "http://d.com", WebhookTemplate::Discord);
+        const SECRET: &str = "sentinel-webhook-secret-never-log";
+        let mut ep = test_endpoint(
+            "dbg",
+            &format!("https://hooks.example.invalid/services/{SECRET}?token={SECRET}"),
+            WebhookTemplate::Discord,
+        );
+        ep.headers
+            .insert("Authorization".to_string(), format!("Bearer {SECRET}"));
+        ep.headers
+            .insert(format!("X-Secret-{SECRET}"), "opaque".to_string());
         let dbg = format!("{ep:?}");
         assert!(dbg.contains("WebhookEndpointConfig"));
         assert!(dbg.contains("dbg"));
+        assert!(dbg.contains("https"));
+        assert!(dbg.contains("header_count: 2"));
+        assert!(!dbg.contains(SECRET));
+        assert!(!dbg.contains("hooks.example.invalid"));
+        assert!(!dbg.contains("Authorization"));
+    }
+
+    #[test]
+    fn webhook_log_scheme_never_exposes_url_credentials() {
+        const SECRET: &str = "sentinel-webhook-path-credential";
+        let url = format!(
+            "https://user:{SECRET}@hooks.example.invalid/services/{SECRET}?token={SECRET}"
+        );
+
+        let diagnostic = webhook_url_scheme(&url);
+
+        assert_eq!(diagnostic, "https");
+        assert!(!diagnostic.contains(SECRET));
+        assert!(!diagnostic.contains("hooks.example.invalid"));
+        assert_eq!(webhook_url_scheme("HtTpS://example.invalid"), "https");
+        assert_eq!(webhook_url_scheme("hTtP://example.invalid"), "http");
+        assert_eq!(webhook_url_scheme("1nvalid://example.invalid"), "unknown");
+        assert_eq!(webhook_url_scheme("missing-delimiter"), "unknown");
+
+        let enormous_custom_scheme = format!("{}-{SECRET}://example.invalid", "x".repeat(32_768));
+        let custom_diagnostic = webhook_url_scheme(&enormous_custom_scheme);
+        assert_eq!(custom_diagnostic, "unknown");
+        assert!(!custom_diagnostic.contains(SECRET));
     }
 
     #[test]

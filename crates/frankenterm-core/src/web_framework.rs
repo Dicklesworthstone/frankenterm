@@ -156,13 +156,20 @@ where
     }
 }
 
-async fn wait_for_connections_to_drain(server: &TcpServer) -> ConnectionDrainOutcome {
-    let wait_cx = crate::cx::for_request();
+async fn wait_for_connections_to_drain(
+    cx: &crate::cx::Cx,
+    server: &TcpServer,
+) -> ConnectionDrainOutcome {
     wait_for_connections_to_drain_with(
         || server.current_connections(),
         WEB_CONNECTION_DRAIN_TIMEOUT,
         WEB_CONNECTION_DRAIN_POLL_INTERVAL,
-        |duration| crate::runtime_async::sleep_with_cx(&wait_cx, duration),
+        // `sleep_with_cx` deliberately ignores direct cancellation and only
+        // respects the supplied runtime budget, so this bounded cleanup wait
+        // completes after caller cancellation without minting a fresh
+        // full-capability test context. An exhausted budget is reported as a
+        // truthful timer failure instead of escalating authority.
+        |duration| crate::runtime_async::sleep_with_cx(cx, duration),
     )
     .await
 }
@@ -307,8 +314,7 @@ impl FrameworkWebRuntime {
             let primary_error = Error::runtime_cancelled("web start after spawn", err.to_string());
             runtime.signal_shutdown();
             let join_result = runtime.join_handle_mut().await;
-            let cleanup_cx = crate::cx::for_request();
-            if let Err(cleanup_error) = runtime.finish_with_cx(&cleanup_cx, join_result).await {
+            if let Err(cleanup_error) = runtime.finish_with_cx(cx, join_result).await {
                 warn!(
                     target: "wa.web",
                     error = %cleanup_error,
@@ -348,6 +354,13 @@ impl FrameworkWebRuntime {
     /// drain and framework shutdown hooks. Cleanup is unconditional. Error
     /// precedence is server join failure, then a drain-timer failure or drain
     /// timeout with live connections, then cleanup-context cancellation.
+    /// Only connection draining is bounded: pinned FastAPI exposes shutdown
+    /// hooks as one opaque future, so an arbitrary async hook can still wait
+    /// indefinitely. Dropping that future on a timeout would silently discard
+    /// later cleanup hooks, while detaching it would lose structured ownership;
+    /// ft-interactive-systems-performance-4tenz.33.2 tracks the required owned
+    /// hook-runner API. Do not describe this method as an end-to-end bounded
+    /// lifecycle boundary until that blocker closes.
     ///
     /// Dropping this future before cleanup completes invokes the runtime's
     /// synchronous Drop fallback, which signals shutdown and wakes the listener.
@@ -371,7 +384,7 @@ impl FrameworkWebRuntime {
         // would prevent connection tasks from making progress on a
         // current-thread runtime.
         self.server.shutdown();
-        let deferred_drain_error = match wait_for_connections_to_drain(&self.server).await {
+        let deferred_drain_error = match wait_for_connections_to_drain(cx, &self.server).await {
             ConnectionDrainOutcome::Drained => None,
             ConnectionDrainOutcome::TimedOut {
                 remaining_connections,
