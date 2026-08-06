@@ -18,7 +18,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 
 use crate::runtime_async::mpsc;
-use crate::runtime_async::task::JoinSet;
+use crate::runtime_async::task::JoinHandle;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 #[cfg(any(unix, windows))]
@@ -29,6 +29,13 @@ const MAX_EVENT_LINE_BYTES: usize = 512 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const EVENT_SEND_TIMEOUT: Duration = Duration::from_millis(25);
+
+fn native_context_io_error(operation: &'static str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        format!("native_event_context_interrupted:{operation}"),
+    )
+}
 
 /// Capture-gap reason prefix emitted when a native pane-output frame is
 /// truncated at the [`MAX_OUTPUT_BYTES`] decode bound (ft-wtd5g). The
@@ -55,8 +62,38 @@ mod socket_transport {
     pub use crate::runtime_async::unix::{AsyncWriteExt, connect};
     #[cfg(unix)]
     pub use crate::runtime_async::unix::{
-        UnixListener, UnixStream, bind, buffered, lines_with_max_length, next_line_with_cx,
+        LineReader, UnixListener, UnixStream, buffered, lines_with_max_length,
     };
+
+    #[cfg(unix)]
+    pub async fn bind_with_cx<P: AsRef<std::path::Path>>(
+        cx: &crate::cx::Cx,
+        path: P,
+    ) -> std::io::Result<UnixListener> {
+        cx.checkpoint()
+            .map_err(|_| super::native_context_io_error("listener_bind"))?;
+        UnixListener::bind(path).await
+    }
+
+    #[cfg(unix)]
+    pub async fn next_line_with_cx<T>(
+        cx: &crate::cx::Cx,
+        lines: &mut LineReader<T>,
+    ) -> std::io::Result<Option<String>>
+    where
+        T: crate::runtime_async::unix::AsyncRead + Unpin,
+    {
+        let result = crate::runtime_async::unix::next_line_with_cx(cx, lines).await;
+        cx.checkpoint()
+            .map_err(|_| super::native_context_io_error("connection_read"))?;
+        result.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                super::native_context_io_error("connection_read")
+            } else {
+                error
+            }
+        })
+    }
 
     #[cfg(windows)]
     mod windows {
@@ -76,7 +113,9 @@ mod socket_transport {
         pub type LineReader<T> = asupersync::io::Lines<BufReader<T>>;
 
         pub async fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let cx = crate::cx::Cx::current().ok_or_else(|| {
+                super::super::native_context_io_error("listener_bind_context_unavailable")
+            })?;
             bind_with_cx(&cx, path).await
         }
 
@@ -84,19 +123,17 @@ mod socket_transport {
             cx: &crate::cx::Cx,
             path: P,
         ) -> io::Result<UnixListener> {
-            cx.checkpoint().map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    format!("bind cancelled: {err}"),
-                )
-            })?;
+            cx.checkpoint()
+                .map_err(|_| super::super::native_context_io_error("listener_bind"))?;
             let inner = frankenterm_uds::UnixListener::bind(path)?;
             inner.set_nonblocking(true)?;
             Ok(UnixListener { inner })
         }
 
         pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let cx = crate::cx::Cx::current().ok_or_else(|| {
+                super::super::native_context_io_error("connect_context_unavailable")
+            })?;
             connect_with_cx(&cx, path).await
         }
 
@@ -104,47 +141,57 @@ mod socket_transport {
             cx: &crate::cx::Cx,
             path: P,
         ) -> io::Result<UnixStream> {
-            cx.checkpoint().map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    format!("connect cancelled: {err}"),
-                )
-            })?;
-            let stream = UnixStream::connect(path)?;
-            stream.set_nonblocking(true)?;
+            cx.checkpoint()
+                .map_err(|_| super::super::native_context_io_error("connect"))?;
+            let stream_result = UnixStream::connect(path);
+            cx.checkpoint()
+                .map_err(|_| super::super::native_context_io_error("connect"))?;
+            let stream = stream_result?;
+            let nonblocking_result = stream.set_nonblocking(true);
+            cx.checkpoint()
+                .map_err(|_| super::super::native_context_io_error("connect"))?;
+            nonblocking_result?;
             Ok(stream)
         }
 
         impl UnixListener {
             pub async fn accept(&self) -> io::Result<(UnixStream, ())> {
-                let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let cx = crate::cx::Cx::current().ok_or_else(|| {
+                    super::super::native_context_io_error("accept_context_unavailable")
+                })?;
                 self.accept_with_cx(&cx).await
             }
 
             pub async fn accept_with_cx(&self, cx: &crate::cx::Cx) -> io::Result<(UnixStream, ())> {
                 loop {
-                    cx.checkpoint().map_err(|err| {
-                        io::Error::new(
-                            io::ErrorKind::Interrupted,
-                            format!("accept cancelled: {err}"),
-                        )
-                    })?;
+                    cx.checkpoint()
+                        .map_err(|_| super::super::native_context_io_error("accept"))?;
                     match self.inner.accept() {
                         Ok((stream, _addr)) => {
-                            stream.set_nonblocking(true)?;
+                            let nonblocking_result = stream.set_nonblocking(true);
+                            cx.checkpoint()
+                                .map_err(|_| super::super::native_context_io_error("accept"))?;
+                            nonblocking_result?;
                             return Ok((stream, ()));
                         }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                            crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(1))
-                                .await
-                                .map_err(|err| {
-                                    io::Error::new(
-                                        io::ErrorKind::Interrupted,
-                                        format!("accept wait cancelled: {err}"),
-                                    )
-                                })?;
+                            let sleep_result = crate::runtime_async::sleep_with_cx(
+                                cx,
+                                Duration::from_millis(1),
+                            )
+                            .await;
+                            cx.checkpoint().map_err(|_| {
+                                super::super::native_context_io_error("accept_wait")
+                            })?;
+                            sleep_result.map_err(|_| {
+                                super::super::native_context_io_error("accept_wait")
+                            })?;
                         }
-                        Err(err) => return Err(err),
+                        Err(err) => {
+                            cx.checkpoint()
+                                .map_err(|_| super::super::native_context_io_error("accept"))?;
+                            return Err(err);
+                        }
                     }
                 }
             }
@@ -174,17 +221,16 @@ mod socket_transport {
         {
             use asupersync::stream::StreamExt;
 
-            cx.checkpoint().map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    format!("next_line cancelled: {err}"),
-                )
-            })?;
-            match lines.next().await {
+            cx.checkpoint()
+                .map_err(|_| super::super::native_context_io_error("connection_read"))?;
+            let result: io::Result<Option<String>> = match lines.next().await {
                 Some(Ok(line)) => Ok(Some(line)),
                 Some(Err(err)) => Err(err),
                 None => Ok(None),
-            }
+            };
+            cx.checkpoint()
+                .map_err(|_| super::super::native_context_io_error("connection_read"))?;
+            result
         }
     }
 
@@ -325,7 +371,9 @@ pub struct NativeEventListener {
 
 impl NativeEventListener {
     pub async fn bind(socket_path: PathBuf) -> Result<Self, NativeEventError> {
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        let cx = crate::cx::Cx::current().ok_or_else(|| {
+            NativeEventError::Io(native_context_io_error("bind_context_unavailable"))
+        })?;
         Self::bind_with_cx(&cx, socket_path).await
     }
 
@@ -343,52 +391,66 @@ impl NativeEventListener {
         socket_path: PathBuf,
     ) -> Result<Self, NativeEventError> {
         let check = |stage: &str| -> Result<(), NativeEventError> {
-            cx.checkpoint().map_err(|err| {
+            cx.checkpoint().map_err(|_| {
                 NativeEventError::Io(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
-                    format!("native_events bind cancelled {stage}: {err}"),
+                    format!("native_event_context_interrupted:bind_{stage}"),
                 ))
             })
         };
 
-        check("at entry")?;
+        check("entry")?;
 
         if socket_path.as_os_str().is_empty() {
             return Err(NativeEventError::EmptySocketPath);
         }
 
-        check("before stale-socket cleanup")?;
+        check("before_stale_socket_cleanup")?;
         maybe_cleanup_stale_socket(&socket_path)?;
+        check("after_stale_socket_cleanup")?;
 
         if let Some(parent) = socket_path.parent() {
-            check("before parent-dir creation")?;
+            check("before_parent_directory_creation")?;
             std::fs::create_dir_all(parent)?;
+            check("after_parent_directory_creation")?;
         }
 
-        check("before listener bind")?;
-        let listener = socket_transport::bind(&socket_path).await?;
-        Ok(Self {
+        check("before_listener_bind")?;
+        let listener = socket_transport::bind_with_cx(cx, &socket_path).await?;
+        let bound = Self {
             socket_path,
             listener,
-        })
+        };
+        // If cancellation wins concurrently with listener creation, dropping
+        // `bound` closes the listener and executes the socket-path cleanup
+        // contract instead of returning newly-created authority to the caller.
+        check("after_listener_bind")?;
+        Ok(bound)
     }
 
     pub async fn run(self, event_tx: mpsc::Sender<NativeEvent>, shutdown_flag: Arc<AtomicBool>) {
-        // Keep one request-rooted cancellation chain for the full accept loop.
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        let Some(cx) = crate::cx::Cx::current() else {
+            warn!(
+                error_class = "native_event_context_unavailable",
+                "native event listener requires an explicit runtime context"
+            );
+            return;
+        };
         self.run_with_cx(&cx, event_tx, shutdown_flag).await;
     }
 
     /// Run the accept loop against the caller's asupersync capability
     /// context (ft-xbnl0.2.3 Cx-first entry point).
     ///
-    /// Short-circuits before entering the loop if `cx` is already
-    /// cancelled — an operator who has abandoned the watch should not
+    /// Short-circuits before entering the loop if `cx` is already cancelled
+    /// or budget-exhausted — an operator who has abandoned the watch should not
     /// bind subscribers or spawn per-connection tasks. While the loop
-    /// runs each accept poll is bound to the caller's `Cx` via
-    /// [`crate::runtime_async::timeout_with_cx`], so budget-driven
-    /// cancellation from the outer scope cuts the poll wait
-    /// deterministically under `LabRuntime` virtual time. Matches the
+    /// runs each accept poll is bounded via
+    /// [`crate::runtime_async::timeout_with_cx`]. The loop checks the caller's
+    /// context before each accept and again after a successful accept, so it
+    /// cannot spawn a connection task after observed cancellation. Direct
+    /// mid-wait cancellation is observed on a subsequent poll; it is not by
+    /// itself a wakeup source. Matches the
     /// Cx-first pattern landed by `EventWaiter::wait_with_cx`
     /// (event_stream.rs), `WorkflowRunner::handle_detection_with_cx`,
     /// and `SurvivalModel::run_cx`.
@@ -401,62 +463,102 @@ impl NativeEventListener {
         event_tx: mpsc::Sender<NativeEvent>,
         shutdown_flag: Arc<AtomicBool>,
     ) {
-        if cx.is_cancel_requested() {
+        if cx.checkpoint().is_err() {
             debug!(
                 path = %self.socket_path.display(),
-                "native event run aborted: capability context already cancelled"
+                error_class = "native_event_context_interrupted",
+                "native event run aborted before accept loop"
             );
             return;
         }
 
-        let mut connection_tasks = JoinSet::new();
+        let mut connection_tasks: Vec<JoinHandle<()>> = Vec::new();
 
         loop {
-            if shutdown_flag.load(Ordering::SeqCst) || cx.is_cancel_requested() {
+            if shutdown_flag.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
                 break;
             }
 
             match crate::runtime_async::timeout_with_cx(
                 cx,
                 ACCEPT_POLL_INTERVAL,
-                self.listener.accept(),
+                async {
+                    #[cfg(unix)]
+                    {
+                        self.listener.accept().await
+                    }
+                    #[cfg(windows)]
+                    {
+                        self.listener.accept_with_cx(cx).await
+                    }
+                },
             )
             .await
             {
                 Ok(Ok((stream, _addr))) => {
+                    // The accept future can become ready in the same scheduler
+                    // turn as shutdown/cancellation. Revalidate before handing
+                    // the accepted stream to a new owned task.
+                    if !native_connection_spawn_allowed(cx, &shutdown_flag) {
+                        drop(stream);
+                        break;
+                    }
                     let tx = event_tx.clone();
                     let path = self.socket_path.display().to_string();
-                    connection_tasks.spawn_with_cx(cx, move |child_cx| async move {
-                        if let Err(err) = handle_connection_with_cx(child_cx, stream, tx).await {
-                            // Split by error kind: clean client disconnects
-                            // exit the handler loop via `Ok(None)` from
-                            // `next_line_with_cx`, so they never reach this
-                            // arm — but `Interrupted` here means the cx was
-                            // cancelled (shutdown / budget), which is
-                            // expected noise. Every other kind is a real
-                            // post-accept I/O fault that operators need to
-                            // see in production, where `debug!` is routinely
-                            // filtered. Promote those to `warn!` with
-                            // structured context.
-                            if err.kind() == std::io::ErrorKind::Interrupted {
-                                debug!(
-                                    error = %err,
-                                    path = %path,
-                                    "native event connection cancelled"
-                                );
-                            } else {
-                                warn!(
-                                    error = %err,
-                                    error_kind = ?err.kind(),
-                                    path = %path,
-                                    "native event connection closed with error"
-                                );
+                    match crate::runtime_async::task::try_spawn_with_cx(
+                        cx,
+                        move |child_cx| async move {
+                            if let Err(err) =
+                                handle_connection_with_cx(child_cx, stream, tx).await
+                            {
+                                // Split by error kind: clean client disconnects
+                                // exit the handler loop via `Ok(None)` from
+                                // `next_line_with_cx`, so they never reach this
+                                // arm — but `Interrupted` here means the cx was
+                                // cancelled (shutdown / budget), which is
+                                // expected noise. Every other kind is a real
+                                // post-accept I/O fault that operators need to
+                                // see in production, where `debug!` is routinely
+                                // filtered. Promote those to `warn!` with
+                                // structured context.
+                                if err.kind() == std::io::ErrorKind::Interrupted {
+                                    debug!(
+                                        error_class = "native_event_context_interrupted",
+                                        path = %path,
+                                        "native event connection cancelled"
+                                    );
+                                } else {
+                                    warn!(
+                                        error = %err,
+                                        error_kind = ?err.kind(),
+                                        path = %path,
+                                        "native event connection closed with error"
+                                    );
+                                }
                             }
+                        },
+                    ) {
+                        Ok(handle) => connection_tasks.push(handle),
+                        Err(error) => {
+                            warn!(
+                                error_code = error.code(),
+                                path = %self.socket_path.display(),
+                                "native event connection task admission failed"
+                            );
+                            // Continuing would accept and drop an unbounded
+                            // stream of clients while task admission remains
+                            // unavailable. Fail the listener loop closed; the
+                            // runtime supervisor owns restart policy.
+                            break;
                         }
-                    });
+                    }
                 }
                 Ok(Err(err)) => {
-                    warn!(error = %err, path = %self.socket_path.display(), "native event accept failed");
+                    warn!(
+                        error = %err,
+                        path = %self.socket_path.display(),
+                        "native event accept failed"
+                    );
                 }
                 // `timeout_with_cx` returns Err on either the poll
                 // interval elapsing OR the Cx being cancelled. Either
@@ -466,18 +568,21 @@ impl NativeEventListener {
                 Err(_) => {}
             }
 
-            while let Some(join_result) = connection_tasks.try_join_next() {
-                if let Err(err) = join_result {
+            let mut index = 0;
+            while index < connection_tasks.len() {
+                if !connection_tasks[index].is_finished() {
+                    index += 1;
+                    continue;
+                }
+                let handle = connection_tasks.swap_remove(index);
+                if let Err(err) = handle.await {
                     // Split by error kind: cancellation during the
                     // steady-state accept loop is expected (cx-driven
                     // budget) and stays at `debug!`; a panic propagating
                     // out of `handle_connection_with_cx` is a real fault
                     // that must not sink below warn-level for operators.
                     if err.is_cancelled() {
-                        debug!(
-                            error = %err,
-                            "native event connection task cancelled"
-                        );
+                        debug!(error = %err, "native event connection task cancelled");
                     } else {
                         warn!(
                             error = %err,
@@ -489,15 +594,31 @@ impl NativeEventListener {
             }
         }
 
-        while let Some(join_result) = connection_tasks.join_next().await {
-            if let Err(err) = join_result {
+        // A shutdown flag is independent from the parent Cx. Explicitly abort
+        // every per-connection task before draining acknowledgements so a
+        // quiet client blocked in a line read cannot hang listener shutdown.
+        for handle in &connection_tasks {
+            handle.abort();
+        }
+        while let Some(handle) = connection_tasks.pop() {
+            if let Err(err) = handle.await {
                 // Kept at debug! — after shutdown_flag or cx cancel fires,
                 // outstanding tasks are intentionally cancelled and their
                 // JoinError surface is expected noise.
-                debug!(error = %err, "native event connection task failed during shutdown");
+                debug!(
+                    error = %err,
+                    "native event connection task failed during shutdown"
+                );
             }
         }
     }
+}
+
+fn native_connection_spawn_allowed(
+    cx: &crate::cx::Cx,
+    shutdown_flag: &AtomicBool,
+) -> bool {
+    !shutdown_flag.load(Ordering::SeqCst) && cx.checkpoint().is_ok()
 }
 
 impl Drop for NativeEventListener {
@@ -581,12 +702,8 @@ async fn handle_connection_with_cx(
     event_tx: mpsc::Sender<NativeEvent>,
 ) -> Result<(), std::io::Error> {
     debug!("native event connection accepted (cx path)");
-    cx.checkpoint().map_err(|err| {
-        std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            format!("native handle_connection cancelled pre-read: {err}"),
-        )
-    })?;
+    cx.checkpoint()
+        .map_err(|_| native_context_io_error("connection_pre_read"))?;
     // ft-kccj8: the default lines() cap is 64 KiB — far below
     // MAX_EVENT_LINE_BYTES (512 KiB) — so the warn-and-skip branch below
     // was unreachable and any 64 KiB..512 KiB event killed the whole
@@ -670,7 +787,7 @@ async fn dispatch_event_with_timeout(
     event: NativeEvent,
     send_timeout: Duration,
 ) -> EventDispatchOutcome {
-    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    let cx = crate::cx::for_testing();
     dispatch_event_with_timeout_with_cx(&cx, event_tx, event, send_timeout).await
 }
 
@@ -678,9 +795,10 @@ async fn dispatch_event_with_timeout(
 ///
 /// Threads the caller's cx into the `event_tx.reserve(cx)` wait,
 /// replacing the orphan `cx::for_request()` that severed the
-/// cancellation chain from `run_with_cx`'s parent. Also uses
-/// `timeout_with_cx` so a cx-cancel unblocks the reserve wait
-/// immediately rather than waiting for the full `send_timeout`.
+/// cancellation chain from `run_with_cx`'s parent. The explicit Cx is checked
+/// again after reserve, so a ready permit is never committed after an observed
+/// cancellation. Prompt mid-wait cancellation still depends on the reserve or
+/// timeout future being repolled; direct cancellation alone is not a wakeup.
 async fn dispatch_event_with_timeout_with_cx(
     cx: &crate::cx::Cx,
     event_tx: &mpsc::Sender<NativeEvent>,
@@ -689,6 +807,12 @@ async fn dispatch_event_with_timeout_with_cx(
 ) -> EventDispatchOutcome {
     match crate::runtime_async::timeout_with_cx(cx, send_timeout, event_tx.reserve(cx)).await {
         Ok(Ok(permit)) => {
+            // Reserving capacity is an await boundary. Do not commit an event
+            // if cancellation/budget exhaustion won concurrently with the
+            // permit becoming ready.
+            if cx.checkpoint().is_err() {
+                return EventDispatchOutcome::Backpressure;
+            }
             permit.send(event);
             EventDispatchOutcome::Sent
         }
@@ -1502,17 +1626,16 @@ mod tests {
             let cx = crate::cx::for_testing();
             cx.cancel_with(
                 crate::outcome::CancelKind::User,
-                Some("pre-cancel native_events bind"),
+                Some("SECRET pre-cancel native_events bind detail"),
             );
 
             let result = NativeEventListener::bind_with_cx(&cx, socket_path.clone()).await;
             match result {
                 Err(NativeEventError::Io(err)) => {
                     assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
-                    assert!(
-                        err.to_string().contains("cancelled"),
-                        "error should mention cancellation: {err}"
-                    );
+                    let message = err.to_string();
+                    assert_eq!(message, "native_event_context_interrupted:bind_entry");
+                    assert!(!message.contains("SECRET"), "{message}");
                 }
                 Err(other) => fail(format!("expected Io(Interrupted), got: {other}")),
                 Ok(_) => fail("bind_with_cx should fail on cancelled cx"),
@@ -1520,6 +1643,55 @@ mod tests {
             assert!(
                 !socket_path.exists(),
                 "socket must not exist after cancelled bind"
+            );
+        });
+    }
+
+    #[test]
+    fn accepted_connection_requires_live_context_and_open_shutdown_gate() {
+        let active_cx = crate::cx::for_testing();
+        let shutdown = AtomicBool::new(false);
+        assert!(native_connection_spawn_allowed(&active_cx, &shutdown));
+
+        shutdown.store(true, Ordering::SeqCst);
+        assert!(!native_connection_spawn_allowed(&active_cx, &shutdown));
+
+        shutdown.store(false, Ordering::SeqCst);
+        let cancelled_cx = crate::cx::for_testing();
+        cancelled_cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("SECRET post-accept cancellation detail"),
+        );
+        assert!(!native_connection_spawn_allowed(&cancelled_cx, &shutdown));
+    }
+
+    #[test]
+    fn cancelled_dispatch_never_commits_a_reserved_event() {
+        run_async_test(async {
+            let (event_tx, mut event_rx) = mpsc::channel(1);
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("SECRET dispatch cancellation detail"),
+            );
+            let event = NativeEvent::PaneDestroyed {
+                pane_id: 7,
+                timestamp_ms: 11,
+            };
+
+            assert_eq!(
+                dispatch_event_with_timeout_with_cx(
+                    &cx,
+                    &event_tx,
+                    event,
+                    Duration::from_millis(50),
+                )
+                .await,
+                EventDispatchOutcome::Backpressure
+            );
+            assert!(
+                event_rx.try_recv().is_err(),
+                "cancelled dispatch must not publish the event"
             );
         });
     }
@@ -1547,7 +1719,8 @@ mod tests {
         run_async_test(async {
             let dir = tempfile::tempdir().expect("tempdir");
             let socket_path = dir.path().join("active.sock");
-            let _active_listener = event_socket::bind(&socket_path)
+            let active_cx = crate::cx::for_testing();
+            let _active_listener = event_socket::bind_with_cx(&active_cx, &socket_path)
                 .await
                 .expect("bind active socket");
 
@@ -1921,6 +2094,52 @@ mod tests {
                 !socket_path.exists(),
                 "socket path should be removed after listener shutdown"
             );
+        });
+    }
+
+    #[test]
+    fn shutdown_aborts_and_drains_a_quiet_accepted_connection() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("shutdown-quiet-connection.sock");
+            let listener = NativeEventListener::bind(socket_path.clone())
+                .await
+                .expect("bind listener");
+            let (event_tx, mut event_rx) = mpsc::channel(8);
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
+
+            let mut stream = event_socket::connect(socket_path)
+                .await
+                .expect("connect quiet stream");
+            stream
+                .write_all(r#"{"type":"pane_destroyed","pane_id":73,"ts":900}"#.as_bytes())
+                .await
+                .expect("write event");
+            stream.write_all(b"\n").await.expect("write newline");
+            let delivered = recv_event(
+                &mut event_rx,
+                Duration::from_secs(2),
+                "accepted connection event",
+            )
+            .await;
+            assert!(matches!(
+                delivered,
+                NativeEvent::PaneDestroyed {
+                    pane_id: 73,
+                    timestamp_ms: 900
+                }
+            ));
+
+            // Keep `stream` open and silent. Without explicit child abort the
+            // listener's join drain blocks forever in the next line read.
+            shutdown.store(true, Ordering::SeqCst);
+            let result = crate::runtime_async::timeout(Duration::from_secs(2), handle).await;
+            assert!(
+                result.is_ok(),
+                "listener must settle owned connection tasks during shutdown"
+            );
+            drop(stream);
         });
     }
 
