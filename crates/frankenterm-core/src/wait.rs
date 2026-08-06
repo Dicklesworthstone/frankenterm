@@ -114,6 +114,41 @@ where
 }
 
 /// Timeout error returned by wait helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitBudgetKind {
+    /// The capability-context deadline elapsed.
+    Deadline,
+    /// The context's cooperative poll quota was exhausted.
+    PollQuota,
+    /// The context's cost quota was exhausted.
+    CostQuota,
+    /// Cancellation cleanup exceeded its own budget.
+    CancellationCleanup,
+}
+
+/// Typed reason a wait stopped before its predicate became ready.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitTermination {
+    /// The caller-requested timeout elapsed on the same clock used for sleeps.
+    ConfiguredTimeout,
+    /// The configured retry ceiling was reached.
+    RetryLimit,
+    /// The caller explicitly cancelled the capability context.
+    Cancelled { detail: String },
+    /// A capability-context deadline or quota was exhausted.
+    CapabilityBudget {
+        /// Exact exhausted budget class.
+        kind: WaitBudgetKind,
+        /// Backend diagnostic retained for operators.
+        detail: String,
+    },
+    /// A non-budget capability-context checkpoint failed.
+    CapabilityFailure { detail: String },
+    /// The Cx timer failed while waiting between polls.
+    TimerFailure { detail: String },
+}
+
+/// Error returned by wait helpers.
 #[derive(Debug, Clone)]
 pub struct WaitError {
     /// Condition that was expected to become true.
@@ -124,6 +159,8 @@ pub struct WaitError {
     pub retries: usize,
     /// Elapsed time while waiting.
     pub elapsed: Duration,
+    /// Typed reason the wait terminated.
+    pub termination: WaitTermination,
 }
 
 impl fmt::Display for WaitError {
@@ -131,16 +168,47 @@ impl fmt::Display for WaitError {
         let last = self.last_observed.as_deref().unwrap_or("<none>");
         write!(
             f,
-            "timeout waiting for {} after {}ms (retries={}, last_observed={})",
+            "wait for {} stopped after {}ms (retries={}, last_observed={}, termination={:?})",
             self.expected,
             self.elapsed.as_millis(),
             self.retries,
-            last
+            last,
+            self.termination
         )
     }
 }
 
 impl std::error::Error for WaitError {}
+
+fn wait_termination_from_checkpoint(error: &asupersync::error::Error) -> WaitTermination {
+    use asupersync::error::ErrorKind;
+
+    let detail = error.to_string();
+    match error.kind() {
+        ErrorKind::Cancelled => WaitTermination::Cancelled { detail },
+        ErrorKind::DeadlineExceeded => WaitTermination::CapabilityBudget {
+            kind: WaitBudgetKind::Deadline,
+            detail,
+        },
+        ErrorKind::PollQuotaExhausted => WaitTermination::CapabilityBudget {
+            kind: WaitBudgetKind::PollQuota,
+            detail,
+        },
+        ErrorKind::CostQuotaExhausted => WaitTermination::CapabilityBudget {
+            kind: WaitBudgetKind::CostQuota,
+            detail,
+        },
+        ErrorKind::CancelTimeout => WaitTermination::CapabilityBudget {
+            kind: WaitBudgetKind::CancellationCleanup,
+            detail,
+        },
+        _ => WaitTermination::CapabilityFailure { detail },
+    }
+}
+
+fn elapsed_on_cx_clock(cx: &crate::cx::Cx, start: asupersync::Time) -> Duration {
+    Duration::from_nanos(crate::runtime_async::timer_now_with_cx(cx).duration_since(start))
+}
 
 /// Wait for a predicate to become true within a timeout using backoff.
 pub async fn wait_for<P>(
@@ -158,9 +226,11 @@ where
 /// Wait for a predicate under an explicit `&Cx` (ft-xbnl0.2.2 Cx-first
 /// API).
 ///
-/// All inter-poll sleeps bind to the provided capability context so
-/// cancellation, budget, and virtual time propagate cleanly into the
-/// backoff delay.
+/// Deadline measurement, elapsed reporting, and inter-poll sleeps all use the
+/// timer carried by the provided capability context (falling back together to
+/// the wall clock when it has no timer driver). Cancellation, budget failure,
+/// configured timeout, retry exhaustion, and timer failure remain distinct in
+/// [`WaitError::termination`].
 pub async fn wait_for_cx<P>(
     cx: &crate::cx::Cx,
     mut predicate: P,
@@ -171,8 +241,8 @@ where
     P: WaitPredicate + Send,
 {
     let expected = predicate.describe();
-    let start = Instant::now();
-    let deadline = start.checked_add(timeout);
+    let start = crate::runtime_async::timer_now_with_cx(cx);
+    let deadline = start + timeout;
     let mut retries = 0usize;
     let mut delay = backoff.initial;
     let mut last_observed = None;
@@ -181,12 +251,13 @@ where
         // Gate every predicate attempt with the full capability checkpoint.
         // This catches cancellation and exhausted/deadline budgets before a
         // potentially side-effecting predicate is invoked.
-        if cx.checkpoint().is_err() {
+        if let Err(error) = cx.checkpoint() {
             return Err(WaitError {
                 expected,
-                last_observed: Some("cancelled".to_string()),
+                last_observed,
                 retries,
-                elapsed: Instant::now().saturating_duration_since(start),
+                elapsed: elapsed_on_cx_clock(cx, start),
+                termination: wait_termination_from_checkpoint(&error),
             });
         }
         retries = retries.saturating_add(1);
@@ -199,36 +270,56 @@ where
             }
         }
 
-        let now = Instant::now();
-        let timeout_reached = deadline.is_some_and(|deadline| now >= deadline);
+        let now = crate::runtime_async::timer_now_with_cx(cx);
+        let timeout_reached = now >= deadline;
         let retries_exhausted = backoff.max_retries.is_some_and(|max| retries >= max);
         if timeout_reached || retries_exhausted {
             return Err(WaitError {
                 expected,
                 last_observed,
                 retries,
-                elapsed: now.saturating_duration_since(start),
+                elapsed: Duration::from_nanos(now.duration_since(start)),
+                termination: if timeout_reached {
+                    WaitTermination::ConfiguredTimeout
+                } else {
+                    WaitTermination::RetryLimit
+                },
             });
         }
 
-        let remaining = deadline
-            .map(|deadline| deadline.saturating_duration_since(now))
-            .unwrap_or(delay);
+        // The predicate may itself have requested cancellation. Check again
+        // before sleeping because `sleep_with_cx` observes budget deadlines
+        // but does not directly short-circuit on a cancellation flag.
+        if let Err(error) = cx.checkpoint() {
+            return Err(WaitError {
+                expected,
+                last_observed,
+                retries,
+                elapsed: elapsed_on_cx_clock(cx, start),
+                termination: wait_termination_from_checkpoint(&error),
+            });
+        }
+
+        let remaining = Duration::from_nanos(deadline.duration_since(now));
         let sleep_for = if delay > remaining { remaining } else { delay };
         if !sleep_for.is_zero() {
             // Tick 209 (ft-xbnl0.2.3): honor sleep_with_cx result.
             // Previously `let _ = ...` swallowed cancel during
             // backoff; the next iteration would call predicate.check
             // anyway even though the caller had abandoned the wait.
-            if crate::runtime_async::sleep_with_cx(cx, sleep_for)
-                .await
-                .is_err()
-            {
+            if let Err(timer_error) = crate::runtime_async::sleep_with_cx(cx, sleep_for).await {
+                let termination = match cx.checkpoint() {
+                    Err(checkpoint_error) => wait_termination_from_checkpoint(&checkpoint_error),
+                    Ok(()) => WaitTermination::TimerFailure {
+                        detail: timer_error,
+                    },
+                };
                 return Err(WaitError {
                     expected,
-                    last_observed: Some("cancelled".to_string()),
+                    last_observed,
                     retries,
-                    elapsed: Instant::now().saturating_duration_since(start),
+                    elapsed: elapsed_on_cx_clock(cx, start),
+                    termination,
                 });
             }
         }
@@ -791,7 +882,8 @@ mod tests {
         let (task_id, _handle) = runtime
             .state
             .create_task(region, asupersync::Budget::INFINITE, async move {
-                let cx = crate::cx::for_request();
+                let cx = crate::cx::Cx::current()
+                    .expect("LabRuntime task must install its virtual-time Cx");
                 let poll_count = std::sync::Arc::new(AtomicUsize::new(0));
                 let poll_count_inner = std::sync::Arc::clone(&poll_count);
 
@@ -920,6 +1012,7 @@ mod tests {
             last_observed: Some("connecting".to_string()),
             retries: 5,
             elapsed: Duration::from_millis(3200),
+            termination: WaitTermination::ConfiguredTimeout,
         };
         let msg = err.to_string();
         assert!(
@@ -941,6 +1034,7 @@ mod tests {
             last_observed: None,
             retries: 1,
             elapsed: Duration::from_millis(100),
+            termination: WaitTermination::ConfiguredTimeout,
         };
         let msg = err.to_string();
         assert!(
@@ -1826,6 +1920,7 @@ mod tests {
             last_observed: Some("pending".to_string()),
             retries: 3,
             elapsed: Duration::from_millis(500),
+            termination: WaitTermination::ConfiguredTimeout,
         };
         let debug = format!("{:?}", err);
         assert!(debug.contains("WaitError"), "debug: {}", debug);
@@ -1840,6 +1935,7 @@ mod tests {
             last_observed: Some("connecting".to_string()),
             retries: 7,
             elapsed: Duration::from_secs(2),
+            termination: WaitTermination::RetryLimit,
         };
         let cloned = err.clone();
         assert_eq!(cloned.expected, "ready");
@@ -1855,6 +1951,7 @@ mod tests {
             last_observed: None,
             retries: 0,
             elapsed: Duration::ZERO,
+            termination: WaitTermination::ConfiguredTimeout,
         };
         // Verify it implements std::error::Error
         let _: &dyn std::error::Error = &err;
@@ -1867,6 +1964,7 @@ mod tests {
             last_observed: None,
             retries: 0,
             elapsed: Duration::ZERO,
+            termination: WaitTermination::ConfiguredTimeout,
         };
         let msg = err.to_string();
         assert!(msg.contains("0ms"), "should show 0ms: {}", msg);
@@ -1880,6 +1978,7 @@ mod tests {
             last_observed: Some("still waiting".to_string()),
             retries: 1000,
             elapsed: Duration::from_secs(3600),
+            termination: WaitTermination::RetryLimit,
         };
         let msg = err.to_string();
         assert!(msg.contains("3600000"), "should show elapsed ms: {}", msg);
@@ -1894,6 +1993,7 @@ mod tests {
             last_observed: Some("<error: timeout>".to_string()),
             retries: 1,
             elapsed: Duration::from_millis(10),
+            termination: WaitTermination::ConfiguredTimeout,
         };
         let msg = err.to_string();
         assert!(msg.contains("value == \"hello world\""), "msg: {}", msg);

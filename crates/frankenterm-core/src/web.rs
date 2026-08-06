@@ -284,17 +284,16 @@ impl WebServerHandle {
     ///
     /// Signals shutdown and, while the accept task is live, pokes the listener
     /// so a blocked accept loop wakes up. Once shutdown has begun, joining the
-    /// server, draining connections, and running framework shutdown hooks use a
-    /// fresh cleanup context and cannot be skipped by cancellation of the
-    /// caller's context. Caller cancellation is surfaced only after cleanup
-    /// completes; a server-join or cleanup failure takes precedence over
-    /// cancellation.
+    /// server, draining connections, and running framework shutdown hooks
+    /// cannot be skipped by cancellation of the caller's context: the finish
+    /// path reuses its runtime drivers and capabilities but does not checkpoint
+    /// direct cancellation until cleanup completes. A server-join or cleanup
+    /// failure takes precedence over cancellation.
     /// If the shutdown future itself is dropped, the owned runtime's Drop
     /// fallback still signals shutdown and wakes the listener, but Rust Drop
     /// cannot await connection drain or async hooks.
     ///
-    /// Tick 101 established the consuming shutdown seam; cleanup now
-    /// deliberately uses an independent Cx rather than the caller's Cx.
+    /// Tick 101 established the consuming shutdown seam.
     pub async fn shutdown_with_cx(self, cx: &crate::cx::Cx) -> Result<()> {
         let WebServerHandle {
             mut runtime,
@@ -302,16 +301,12 @@ impl WebServerHandle {
         } = self;
         runtime.signal_shutdown();
 
-        // Graceful shutdown is a consuming cleanup boundary. The caller's Cx
-        // may already be cancelled, but that must never strand the framework
-        // runtime or bypass its drain and shutdown hooks.
+        // Graceful shutdown is a consuming cleanup boundary. `finish_with_cx`
+        // performs drains and hooks before its sole checkpoint, so even an
+        // already-cancelled caller cannot bypass cleanup. Reusing the caller Cx
+        // also preserves its runtime drivers and attenuated capabilities.
         let result = runtime.join_handle_mut().await;
-        let cleanup_cx = crate::cx::for_request();
-        runtime.finish_with_cx(&cleanup_cx, result).await?;
-
-        cx.checkpoint()
-            .map_err(|err| crate::Error::runtime_cancelled("web shutdown", err.to_string()))?;
-        Ok(())
+        runtime.finish_with_cx(cx, result).await
     }
 }
 

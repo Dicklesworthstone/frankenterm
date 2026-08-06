@@ -83,8 +83,10 @@ fn validate_bind_config(config: &WebServerConfig) -> Result<()> {
 /// honors caller cancellation. After startup succeeds, every exit path owns
 /// the server until it has joined, drained, and run framework shutdown hooks.
 /// Caller cancellation triggers graceful shutdown, but is surfaced only after
-/// cleanup completes under an independent context. A server-join or cleanup
-/// failure takes precedence over the shutdown-wait or caller-cancellation error.
+/// cleanup completes. The cleanup path reuses the caller's runtime drivers and
+/// capabilities without checking direct cancellation until drains and hooks
+/// finish. A server-join or cleanup failure takes precedence over the
+/// shutdown-wait or caller-cancellation error.
 /// Dropping the run future invokes the runtime's synchronous signal-and-wake
 /// fallback; full drain and async hooks require awaiting this function.
 pub async fn run_web_server_with_cx(cx: &crate::cx::Cx, config: WebServerConfig) -> Result<()> {
@@ -106,17 +108,14 @@ pub async fn run_web_server_with_cx(cx: &crate::cx::Cx, config: WebServerConfig)
         }
     };
 
-    // Once start succeeds, graceful cleanup is mandatory. In particular, a
-    // cancelled caller Cx must not suppress drain or framework shutdown hooks.
-    let cleanup_cx = crate::cx::for_request();
-    runtime.finish_with_cx(&cleanup_cx, join_result).await?;
+    // Once start succeeds, graceful cleanup is mandatory. `finish_with_cx`
+    // does not checkpoint until after drain and hooks, so caller cancellation
+    // cannot suppress cleanup and no fresh full-capability context is needed.
+    runtime.finish_with_cx(cx, join_result).await?;
 
     if let Some(result) = shutdown_result {
         result?;
     }
-
-    cx.checkpoint()
-        .map_err(|err| Error::runtime_cancelled("run_web_server", err.to_string()))?;
 
     Ok(())
 }

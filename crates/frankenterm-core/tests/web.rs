@@ -773,8 +773,9 @@ mod web_tests {
     /// `wait_for_shutdown_signal_with_cx` checks the caller context every
     /// 100 ms via `sleep_with_cx`, so cx-cancel must wake the shutdown branch,
     /// which then runs `signal_shutdown` (including listener wake), followed by
-    /// drain and hooks under an independent cleanup context. Only after that
-    /// cleanup completes may the outer future return the cancellation error.
+    /// drain and hooks before checking cancellation at the finish boundary.
+    /// Only after that cleanup completes may the outer future return the
+    /// cancellation error.
     ///
     /// This pins the orchestrator-level cx→shutdown wiring that was
     /// previously only covered by the pre-cancel pre-bind path.
