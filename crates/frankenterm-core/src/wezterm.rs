@@ -1203,7 +1203,7 @@ pub struct WeztermClient {
     list_panes_cache: Arc<Mutex<ListPanesCliCache>>,
 }
 
-/// Pre/post generation fence around mux mutations that change pane-list
+/// Pre/post epoch fence around mux mutations that change pane-list
 /// topology or selection metadata. Dropping the future also drops this guard,
 /// so cancellation cannot leave an in-flight list result cacheable.
 struct ListPanesMutationFence<'a> {
@@ -1552,7 +1552,7 @@ impl WeztermClient {
         // CLI path: check the time-windowed cache before spawning a subprocess.
         // Multiple callers (discovery, snapshot engine, watchdog) independently
         // call list_panes() and each would spawn a separate `wezterm cli list`
-        // process. The generation fence prevents an in-flight pre-mutation
+        // process. The epoch fence prevents an in-flight pre-mutation
         // response from repopulating the cache after topology changes.
         let cache_token = match self.probe_list_panes_cache() {
             ListPanesCacheProbe::Hit(panes) => {
@@ -4871,6 +4871,62 @@ mod tests {
         assert_eq!(normalize_split_percent(u8::MAX), 99);
     }
 
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_split_request_applies_endpoint_normalization_in_every_direction() {
+        let directions = [
+            (
+                SplitDirection::Left,
+                mux::tab::SplitDirection::Horizontal,
+                false,
+            ),
+            (
+                SplitDirection::Right,
+                mux::tab::SplitDirection::Horizontal,
+                true,
+            ),
+            (
+                SplitDirection::Top,
+                mux::tab::SplitDirection::Vertical,
+                false,
+            ),
+            (
+                SplitDirection::Bottom,
+                mux::tab::SplitDirection::Vertical,
+                true,
+            ),
+        ];
+        let percentages = [
+            (Some(0), 1),
+            (Some(1), 1),
+            (Some(99), 99),
+            (Some(100), 99),
+        ];
+
+        for (direction, expected_direction, expected_target_is_second) in directions {
+            for (percent, expected_percent) in percentages {
+                let request = WeztermClient::mux_split_request(7, direction, None, percent)
+                    .expect("bounded pane id must produce a direct split request");
+                assert_eq!(request.split_request.direction, expected_direction);
+                assert_eq!(
+                    request.split_request.target_is_second,
+                    expected_target_is_second
+                );
+                assert_eq!(
+                    request.split_request.size,
+                    mux::tab::SplitSize::Percent(expected_percent)
+                );
+            }
+
+            let default_request = WeztermClient::mux_split_request(7, direction, None, None)
+                .expect("bounded pane id must produce a default split request");
+            assert_eq!(
+                default_request.split_request.size,
+                mux::tab::SplitSize::Percent(50)
+            );
+        }
+    }
+
     fn cache_test_pane(pane_id: u64) -> PaneInfo {
         serde_json::from_value(serde_json::json!({
             "pane_id": pane_id,
@@ -4883,74 +4939,111 @@ mod tests {
     #[test]
     fn list_panes_cache_invalidation_rejects_stale_in_flight_publish() {
         let client = WeztermClient::new();
-        let generation = match client.probe_list_panes_cache() {
-            ListPanesCacheProbe::Miss { generation } => generation,
+        let token = match client.probe_list_panes_cache() {
+            ListPanesCacheProbe::Miss(token) => token,
             ListPanesCacheProbe::Hit(_) => panic!("new client cache must be empty"),
         };
 
         client.invalidate_list_panes_cache();
         assert!(
-            !client.publish_list_panes_cache(generation, vec![cache_test_pane(1)]),
+            !client.publish_list_panes_cache(token, vec![cache_test_pane(1)]),
             "a pre-mutation list result must not repopulate the cache"
         );
         assert!(matches!(
             client.probe_list_panes_cache(),
-            ListPanesCacheProbe::Miss { .. }
+            ListPanesCacheProbe::Miss(_)
         ));
     }
 
     #[test]
-    fn list_panes_cache_generation_does_not_pin_at_u64_max() {
+    fn list_panes_cache_request_ordinal_rollover_rotates_epoch() {
         let client = WeztermClient::new();
+        let old_token = match client.probe_list_panes_cache() {
+            ListPanesCacheProbe::Miss(token) => token,
+            ListPanesCacheProbe::Hit(_) => panic!("new client cache must be empty"),
+        };
         {
             let mut cache = client
                 .list_panes_cache
                 .lock()
                 .unwrap_or_else(record_poison_and_recover);
-            cache.generation = u64::MAX;
+            cache.next_request_ordinal = u64::MAX;
         }
 
-        client.invalidate_list_panes_cache();
-        assert!(matches!(
-            client.probe_list_panes_cache(),
-            ListPanesCacheProbe::Miss { generation: 0 }
-        ));
+        let new_token = match client.probe_list_panes_cache() {
+            ListPanesCacheProbe::Miss(token) => token,
+            ListPanesCacheProbe::Hit(_) => panic!("rollover probe must miss"),
+        };
+        assert_eq!(new_token.request_ordinal, 0);
+        assert!(!Arc::ptr_eq(&old_token.epoch, &new_token.epoch));
         assert!(
-            !client.publish_list_panes_cache(u64::MAX, vec![cache_test_pane(1)]),
-            "the pre-wrap generation must remain stale after invalidation"
+            !client.publish_list_panes_cache(old_token, vec![cache_test_pane(1)]),
+            "the pre-rollover epoch must remain stale"
         );
+        assert!(client.publish_list_panes_cache(new_token, vec![cache_test_pane(2)]));
+    }
+
+    #[test]
+    fn list_panes_cache_rejects_older_same_epoch_publish_after_newer_result() {
+        let client = WeztermClient::new();
+        let older = match client.probe_list_panes_cache() {
+            ListPanesCacheProbe::Miss(token) => token,
+            ListPanesCacheProbe::Hit(_) => panic!("new client cache must be empty"),
+        };
+        let newer = match client.probe_list_panes_cache() {
+            ListPanesCacheProbe::Miss(token) => token,
+            ListPanesCacheProbe::Hit(_) => panic!("concurrent miss must not be a hit"),
+        };
+
+        assert!(client.publish_list_panes_cache(newer, vec![cache_test_pane(2)]));
+        assert!(
+            !client.publish_list_panes_cache(older, vec![cache_test_pane(1)]),
+            "an older response must not overwrite a newer published snapshot"
+        );
+        match client.probe_list_panes_cache() {
+            ListPanesCacheProbe::Hit(panes) => assert_eq!(panes[0].pane_id, 2),
+            ListPanesCacheProbe::Miss(_) => panic!("newer result must remain cached"),
+        }
     }
 
     #[test]
     fn list_panes_mutation_fence_clears_before_and_after_mutation() {
         let client = WeztermClient::new();
-        let initial_generation = match client.probe_list_panes_cache() {
-            ListPanesCacheProbe::Miss { generation } => generation,
+        let initial_token = match client.probe_list_panes_cache() {
+            ListPanesCacheProbe::Miss(token) => token,
             ListPanesCacheProbe::Hit(_) => panic!("new client cache must be empty"),
         };
-        assert!(client.publish_list_panes_cache(
-            initial_generation,
-            vec![cache_test_pane(1)],
-        ));
+        assert!(client.publish_list_panes_cache(initial_token, vec![cache_test_pane(1)]));
 
-        let during_generation = {
+        let during_token = {
             let _fence = client.begin_list_panes_mutation_fence();
-            let generation = match client.probe_list_panes_cache() {
-                ListPanesCacheProbe::Miss { generation } => generation,
+            match client.probe_list_panes_cache() {
+                ListPanesCacheProbe::Miss(token) => token,
                 ListPanesCacheProbe::Hit(_) => panic!("pre-mutation fence must clear cache"),
-            };
-            assert!(client.publish_list_panes_cache(generation, vec![cache_test_pane(1)]));
-            generation
+            }
         };
 
         assert!(
-            !client.publish_list_panes_cache(during_generation, vec![cache_test_pane(1)]),
+            !client.publish_list_panes_cache(during_token, vec![cache_test_pane(1)]),
             "a list result observed during mutation must not survive post-mutation fencing"
         );
         assert!(matches!(
             client.probe_list_panes_cache(),
-            ListPanesCacheProbe::Miss { .. }
+            ListPanesCacheProbe::Miss(_)
         ));
+    }
+
+    #[test]
+    fn list_panes_cache_fence_is_shared_across_client_clones() {
+        let client = WeztermClient::new();
+        let clone = client.clone();
+        let token = match client.probe_list_panes_cache() {
+            ListPanesCacheProbe::Miss(token) => token,
+            ListPanesCacheProbe::Hit(_) => panic!("new client cache must be empty"),
+        };
+
+        clone.invalidate_list_panes_cache();
+        assert!(!client.publish_list_panes_cache(token, vec![cache_test_pane(1)]));
     }
 
     fn run_async_test<F>(future: F)
