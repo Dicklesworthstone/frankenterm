@@ -9,7 +9,8 @@
 use std::collections::BTreeSet;
 
 use frankenterm_core::cancellation_safe_channel::{
-    ChannelMetadata, ReserveGuard, TxChannelError, TxChannelMetrics, TxChannelRegistry, tx_channel,
+    ChannelMetadata, ReserveGuard, TxCancellationKind, TxChannelError, TxChannelMetrics,
+    TxChannelRegistry, tx_channel,
 };
 use proptest::prelude::*;
 
@@ -60,8 +61,17 @@ fn arb_channel_metadata() -> impl Strategy<Value = ChannelMetadata> {
 fn arb_error() -> impl Strategy<Value = TxChannelError> {
     prop_oneof![
         Just(TxChannelError::Closed),
-        Just(TxChannelError::Cancelled),
-        "[a-z ]{1,40}".prop_map(TxChannelError::Context),
+        Just(TxChannelError::Cancelled {
+            kind: TxCancellationKind::User,
+        }),
+        Just(TxChannelError::Cancelled {
+            kind: TxCancellationKind::Shutdown,
+        }),
+        Just(TxChannelError::DeadlineExceeded),
+        Just(TxChannelError::PollQuotaExhausted),
+        Just(TxChannelError::CostBudgetExhausted),
+        Just(TxChannelError::ContextFailure),
+        Just(TxChannelError::TimerFailure),
         Just(TxChannelError::Full),
         (1..=100u64, 1..=100u64)
             .prop_map(|(expected, actual)| TxChannelError::WrongChannel { expected, actual }),

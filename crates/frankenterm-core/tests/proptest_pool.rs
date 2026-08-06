@@ -72,6 +72,11 @@ fn arb_pool_error() -> impl Strategy<Value = PoolError> {
         Just(PoolError::AcquireTimeout),
         Just(PoolError::Closed),
         Just(PoolError::Cancelled),
+        Just(PoolError::DeadlineExceeded),
+        Just(PoolError::PollQuotaExhausted),
+        Just(PoolError::CostBudgetExhausted),
+        Just(PoolError::ContextFailure),
+        Just(PoolError::PolledAfterCompletion),
     ]
 }
 

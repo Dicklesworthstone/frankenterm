@@ -80,6 +80,16 @@ pub enum PoolError {
     /// The caller's explicit capability context was cancelled during a pool
     /// operation.
     Cancelled,
+    /// The caller's capability-context deadline elapsed.
+    DeadlineExceeded,
+    /// The caller's cooperative poll quota was exhausted.
+    PollQuotaExhausted,
+    /// The caller's cost budget was exhausted.
+    CostBudgetExhausted,
+    /// A capability checkpoint failed without a stable typed cause.
+    ContextFailure,
+    /// The semaphore acquire future was polled after it had completed.
+    PolledAfterCompletion,
     /// The idle-queue lock failed for a non-cancellation reason.
     LockAcquire(LockAcquireError),
 }
@@ -90,6 +100,17 @@ impl std::fmt::Display for PoolError {
             Self::AcquireTimeout => write!(f, "connection pool acquire timeout"),
             Self::Closed => write!(f, "connection pool is closed"),
             Self::Cancelled => write!(f, "connection pool operation cancelled"),
+            Self::DeadlineExceeded => write!(f, "connection pool capability deadline exceeded"),
+            Self::PollQuotaExhausted => {
+                write!(f, "connection pool capability poll quota exhausted")
+            }
+            Self::CostBudgetExhausted => {
+                write!(f, "connection pool capability cost budget exhausted")
+            }
+            Self::ContextFailure => write!(f, "connection pool capability context failed"),
+            Self::PolledAfterCompletion => {
+                write!(f, "connection pool acquire future polled after completion")
+            }
             Self::LockAcquire(error) => {
                 write!(f, "connection pool lock acquisition failed: {error}")
             }
@@ -101,7 +122,14 @@ impl std::error::Error for PoolError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::LockAcquire(error) => Some(error),
-            Self::AcquireTimeout | Self::Closed | Self::Cancelled => None,
+            Self::AcquireTimeout
+            | Self::Closed
+            | Self::Cancelled
+            | Self::DeadlineExceeded
+            | Self::PollQuotaExhausted
+            | Self::CostBudgetExhausted
+            | Self::ContextFailure
+            | Self::PolledAfterCompletion => None,
         }
     }
 }
@@ -131,8 +159,50 @@ pub struct Pool<C> {
 }
 
 impl<C: Send + 'static> Pool<C> {
+    fn classify_cx_failure(cx: &Cx) -> PoolError {
+        use crate::outcome::CancelKind;
+
+        match cx.root_cancel_cause().map(|reason| reason.kind) {
+            Some(CancelKind::Deadline) => PoolError::DeadlineExceeded,
+            Some(CancelKind::PollQuota) => PoolError::PollQuotaExhausted,
+            Some(CancelKind::CostBudget) => PoolError::CostBudgetExhausted,
+            Some(
+                CancelKind::User
+                | CancelKind::Timeout
+                | CancelKind::FailFast
+                | CancelKind::RaceLost
+                | CancelKind::ParentCancelled
+                | CancelKind::ResourceUnavailable
+                | CancelKind::Shutdown
+                | CancelKind::LinkedExit,
+            ) => PoolError::Cancelled,
+            None => PoolError::ContextFailure,
+        }
+    }
+
+    fn classify_lock_failure(cx: &Cx, error: LockAcquireError) -> PoolError {
+        if error == LockAcquireError::Cancelled {
+            Self::classify_cx_failure(cx)
+        } else {
+            PoolError::LockAcquire(error)
+        }
+    }
+
+    fn classify_acquire_failure(
+        cx: &Cx,
+        error: crate::runtime_async::AcquireError,
+    ) -> PoolError {
+        match error {
+            crate::runtime_async::AcquireError::Closed => PoolError::Closed,
+            crate::runtime_async::AcquireError::Cancelled => Self::classify_cx_failure(cx),
+            crate::runtime_async::AcquireError::PolledAfterCompletion => {
+                PoolError::PolledAfterCompletion
+            }
+        }
+    }
+
     fn checkpoint_explicit_cx(cx: &Cx) -> Result<(), PoolError> {
-        cx.checkpoint().map_err(|_| PoolError::Cancelled)
+        cx.checkpoint().map_err(|_| Self::classify_cx_failure(cx))
     }
 
     /// Create a new pool with the given configuration.
@@ -176,7 +246,7 @@ impl<C: Send + 'static> Pool<C> {
                         .idle
                         .lock_with_cx(cx)
                         .await
-                        .map_err(PoolError::from)?;
+                        .map_err(|error| Self::classify_lock_failure(cx, error))?;
                     self.evict_expired(&mut idle);
                     idle.pop_front().map(|e| e.conn)
                 };
@@ -221,25 +291,14 @@ impl<C: Send + 'static> Pool<C> {
 
         let permit = match acquire_result {
             Ok(Ok(permit)) => permit,
-            Ok(Err(crate::runtime_async::AcquireError::Closed)) => {
-                return Err(PoolError::Closed);
-            }
-            Ok(Err(crate::runtime_async::AcquireError::Cancelled)) => {
-                return Err(PoolError::Cancelled);
-            }
-            // No permit was acquired, so treat misuse of a completed acquire
-            // future the same as a cancelled acquire at the pool boundary.
-            Ok(Err(crate::runtime_async::AcquireError::PolledAfterCompletion)) => {
-                return Err(PoolError::Cancelled);
-            }
+            Ok(Err(error)) => return Err(Self::classify_acquire_failure(cx, error)),
             Err(_timeout_err) => {
-                // `timeout_with_cx` returns Err on either the timeout
-                // elapsing OR the caller's Cx being cancelled. A
-                // caller-cancelled Cx should surface as Cancelled, not
-                // AcquireTimeout — otherwise an operator who abandoned
-                // the pool wait would get a misleading timeout metric.
-                if cx.is_cancel_requested() {
-                    return Err(PoolError::Cancelled);
+                // A configured acquire timeout does not mutate the caller's
+                // Cx. A tighter caller deadline/quota does, and a checkpoint
+                // exposes its finite root-cause class without consulting or
+                // reflecting free-form cancellation reason text.
+                if cx.checkpoint().is_err() {
+                    return Err(Self::classify_cx_failure(cx));
                 }
                 self.stats_timeouts.fetch_add(1, Ordering::Relaxed);
                 return Err(PoolError::AcquireTimeout);
@@ -253,7 +312,7 @@ impl<C: Send + 'static> Pool<C> {
                 .idle
                 .lock_with_cx(cx)
                 .await
-                .map_err(PoolError::from)?;
+                .map_err(|error| Self::classify_lock_failure(cx, error))?;
             self.evict_expired(&mut idle);
             idle.pop_front().map(|e| e.conn)
         };
@@ -291,7 +350,7 @@ impl<C: Send + 'static> Pool<C> {
             .idle
             .lock_with_cx(cx)
             .await
-            .map_err(PoolError::from)?;
+            .map_err(|error| Self::classify_lock_failure(cx, error))?;
         self.evict_expired(&mut idle);
         if idle.len() < self.config.max_size {
             idle.push_back(PooledEntry {
@@ -323,7 +382,7 @@ impl<C: Send + 'static> Pool<C> {
             .idle
             .lock_with_cx(cx)
             .await
-            .map_err(PoolError::from)?;
+            .map_err(|error| Self::classify_lock_failure(cx, error))?;
         Ok(self.evict_expired(&mut idle))
     }
 
@@ -346,7 +405,7 @@ impl<C: Send + 'static> Pool<C> {
             .idle
             .lock_with_cx(cx)
             .await
-            .map_err(PoolError::from)?
+            .map_err(|error| Self::classify_lock_failure(cx, error))?
             .len();
         let acquired = self.stats_acquired.load(Ordering::Relaxed);
         let returned = self.stats_returned.load(Ordering::Relaxed);
@@ -380,7 +439,7 @@ impl<C: Send + 'static> Pool<C> {
             .idle
             .lock_with_cx(cx)
             .await
-            .map_err(PoolError::from)?;
+            .map_err(|error| Self::classify_lock_failure(cx, error))?;
         let count = idle.len() as u64;
         idle.clear();
         self.stats_evicted.fetch_add(count, Ordering::Relaxed);
@@ -780,6 +839,59 @@ mod tests {
             PoolError::LockAcquire(LockAcquireError::Poisoned).to_string(),
             "connection pool lock acquisition failed: lock is poisoned"
         );
+        assert_eq!(
+            PoolError::PolledAfterCompletion.to_string(),
+            "connection pool acquire future polled after completion"
+        );
+    }
+
+    #[test]
+    fn pool_acquire_invariant_error_is_not_reported_as_cancellation() {
+        let cx = Cx::for_testing();
+        assert_eq!(
+            Pool::<String>::classify_acquire_failure(
+                &cx,
+                crate::runtime_async::AcquireError::PolledAfterCompletion,
+            ),
+            PoolError::PolledAfterCompletion
+        );
+        assert_ne!(PoolError::PolledAfterCompletion, PoolError::Cancelled);
+    }
+
+    #[test]
+    fn pool_checkpoint_preserves_deadline_and_quota_classes() {
+        run_async_test(async {
+            let cases = [
+                (
+                    Cx::for_testing_with_budget(
+                        crate::cx::Budget::new()
+                            .with_deadline(asupersync::types::Time::ZERO),
+                    ),
+                    PoolError::DeadlineExceeded,
+                ),
+                (
+                    Cx::for_testing_with_budget(
+                        crate::cx::Budget::new().with_poll_quota(0),
+                    ),
+                    PoolError::PollQuotaExhausted,
+                ),
+                (
+                    Cx::for_testing_with_budget(
+                        crate::cx::Budget::new().with_cost_quota(0),
+                    ),
+                    PoolError::CostBudgetExhausted,
+                ),
+            ];
+
+            for (cx, expected) in cases {
+                let pool = Pool::<String>::new(test_config(1));
+                let error = pool
+                    .try_acquire_with_cx(&cx)
+                    .await
+                    .expect_err("exhausted Cx must reject pool acquisition");
+                assert_eq!(error, expected);
+            }
+        });
     }
 
     #[test]
