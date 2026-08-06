@@ -2285,7 +2285,7 @@ pub mod task {
         forwarding: std::sync::Arc<super::ContainedForwardingWaker>,
         completion_waker: std::task::Waker,
         #[cfg(test)]
-        fail_next_registration: std::sync::atomic::AtomicBool,
+        force_registration_failure: std::sync::atomic::AtomicBool,
     }
 
     impl<T> Future for JoinHandle<T> {
@@ -2297,8 +2297,8 @@ pub mod task {
             // remains stable across every poll and whose callback is contained.
             #[cfg(test)]
             if self
-                .fail_next_registration
-                .swap(false, Ordering::AcqRel)
+                .force_registration_failure
+                .load(Ordering::Acquire)
             {
                 self.abort_handle.abort();
                 self.forwarding.clear();
@@ -2313,16 +2313,22 @@ pub mod task {
                 return Poll::Ready(Err(JoinError::waker_registration_failed()));
             }
 
-            let inner_poll = {
-                let this = self.as_mut().get_mut();
-                let completion_waker = &this.completion_waker;
-                let inner = &mut this.inner;
-                let mut completion_cx = Context::from_waker(completion_waker);
-                frankenterm_sigpipe::catch_recoverable(
-                    frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
-                    std::panic::AssertUnwindSafe(|| inner.as_mut().poll(&mut completion_cx)),
-                )
-            };
+            self.as_mut().get_mut().poll_inner_with_trusted_waker()
+        }
+    }
+
+    impl<T> JoinHandle<T> {
+        /// Poll only the scheduler-owned inner join with the stable contained
+        /// completion waker. This bypasses caller-waker registration and is
+        /// reserved for retaining terminal authority after registration itself
+        /// failed. A `Pending` result is not settlement and the handle must be
+        /// retained for a later trusted poll.
+        fn poll_inner_with_trusted_waker(&mut self) -> Poll<Result<T, JoinError>> {
+            let mut completion_cx = Context::from_waker(&self.completion_waker);
+            let inner_poll = frankenterm_sigpipe::catch_recoverable(
+                frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+                std::panic::AssertUnwindSafe(|| self.inner.as_mut().poll(&mut completion_cx)),
+            );
             match inner_poll {
                 Ok(Poll::Ready(Ok(value))) => {
                     self.forwarding.clear();
@@ -2345,9 +2351,7 @@ pub mod task {
                 }
             }
         }
-    }
 
-    impl<T> JoinHandle<T> {
         /// Returns `true` once the task has actually reached a terminal state.
         pub fn is_finished(&self) -> bool {
             self.inner.is_finished()
@@ -2364,8 +2368,9 @@ pub mod task {
         }
 
         #[cfg(test)]
-        fn fail_next_registration_for_test(&self) {
-            self.fail_next_registration.store(true, Ordering::Release);
+        fn force_registration_failure_for_test(&self) {
+            self.force_registration_failure
+                .store(true, Ordering::Release);
         }
     }
 
@@ -2378,17 +2383,36 @@ pub mod task {
         }
     }
 
-    /// Minimal JoinSet implementation backed by a Vec of JoinHandles.
+    /// Finite ownership state for a [`JoinSet`] drain.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum JoinSetSettlement {
+        /// Every task handle reached terminal acknowledgement and was removed.
+        Settled,
+        /// The set still owns task handles that have not terminally settled.
+        Incomplete {
+            /// Handles whose caller-waker observation path remains usable.
+            active_tasks: usize,
+            /// Aborted handles retained after caller-waker registration failed.
+            unacknowledged_tasks: usize,
+        },
+    }
+
+    /// Minimal JoinSet implementation backed by owned `JoinHandle` vectors.
     ///
     /// Provides the subset of tokio::task::JoinSet API used in frankenterm.
     pub struct JoinSet<T> {
         handles: Vec<JoinHandle<T>>,
+        /// Handles for which caller-waker registration failed after abort was
+        /// requested but before terminal acknowledgement was observable. They
+        /// are polled only through the trusted inner completion waker.
+        unacknowledged: Vec<JoinHandle<T>>,
     }
 
     impl<T: Send + 'static> Default for JoinSet<T> {
         fn default() -> Self {
             Self {
                 handles: Vec::new(),
+                unacknowledged: Vec::new(),
             }
         }
     }
@@ -2413,39 +2437,117 @@ pub mod task {
             self.handles.push(super::task::spawn_with_cx(cx, task));
         }
 
+        /// Adopt an already-admitted task handle while preserving this set's
+        /// terminal-drain ownership contract.
+        pub(crate) fn insert_handle(&mut self, handle: JoinHandle<T>) {
+            self.handles.push(handle);
+        }
+
         pub fn len(&self) -> usize {
-            self.handles.len()
+            self.handles
+                .len()
+                .saturating_add(self.unacknowledged.len())
         }
 
         pub fn is_empty(&self) -> bool {
-            self.handles.is_empty()
+            self.handles.is_empty() && self.unacknowledged.is_empty()
         }
 
-        /// Await the next completed task. Returns `None` if the set is empty.
+        /// Number of aborted handles still awaiting terminal acknowledgement
+        /// after caller-waker registration failed.
+        pub fn unacknowledged_len(&self) -> usize {
+            self.unacknowledged.len()
+        }
+
+        /// Snapshot whether every owned task has terminally settled.
+        pub fn settlement(&self) -> JoinSetSettlement {
+            if self.is_empty() {
+                JoinSetSettlement::Settled
+            } else {
+                JoinSetSettlement::Incomplete {
+                    active_tasks: self.handles.len(),
+                    unacknowledged_tasks: self.unacknowledged.len(),
+                }
+            }
+        }
+
+        fn poll_finished_unacknowledged(&mut self) -> Option<Result<T, JoinError>> {
+            for index in 0..self.unacknowledged.len() {
+                if !self.unacknowledged[index].is_finished() {
+                    continue;
+                }
+                if let Poll::Ready(result) =
+                    self.unacknowledged[index].poll_inner_with_trusted_waker()
+                {
+                    self.unacknowledged.swap_remove(index);
+                    return Some(result);
+                }
+            }
+            None
+        }
+
+        fn settle_or_quarantine_registration_failure(
+            &mut self,
+            index: usize,
+            observation_error: JoinError,
+        ) -> Result<T, JoinError> {
+            match self.handles[index].poll_inner_with_trusted_waker() {
+                Poll::Ready(result) => {
+                    self.handles.swap_remove(index);
+                    result
+                }
+                Poll::Pending => {
+                    let handle = self.handles.swap_remove(index);
+                    self.unacknowledged.push(handle);
+                    Err(observation_error)
+                }
+            }
+        }
+
+        fn poll_active(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<T, JoinError>>> {
+            for index in 0..self.handles.len() {
+                let poll = Pin::new(&mut self.handles[index]).poll(cx);
+                match poll {
+                    Poll::Ready(Err(error))
+                        if error.kind() == JoinErrorKind::WakerRegistrationFailed =>
+                    {
+                        let result =
+                            self.settle_or_quarantine_registration_failure(index, error);
+                        return Poll::Ready(Some(result));
+                    }
+                    Poll::Ready(result) => {
+                        self.handles.swap_remove(index);
+                        return Poll::Ready(Some(result));
+                    }
+                    Poll::Pending => {}
+                }
+            }
+            Poll::Pending
+        }
+
+        /// Await the next completed task.
+        ///
         /// A [`JoinErrorKind::WakerRegistrationFailed`] observation requests
-        /// task abort but is not terminal acknowledgement, so the handle stays
-        /// in the set for a later drain attempt.
+        /// abort and polls once through a trusted internal waker. If terminal
+        /// acknowledgement is not ready, the handle is quarantined and the
+        /// finite observation error is returned exactly once. A later call can
+        /// drain it after [`JoinHandle::is_finished`] becomes true. `None` can
+        /// therefore mean either an empty set or that only unacknowledged
+        /// quarantined handles remain; callers making a settlement claim must
+        /// inspect [`Self::settlement`].
         pub async fn join_next(&mut self) -> Option<Result<T, JoinError>> {
-            if self.handles.is_empty() {
+            if self.is_empty() {
                 return None;
             }
 
             std::future::poll_fn(|cx| {
-                for i in 0..self.handles.len() {
-                    let mut pinned = std::pin::Pin::new(&mut self.handles[i]);
-                    if let std::task::Poll::Ready(result) = pinned.as_mut().poll(cx) {
-                        if matches!(
-                            &result,
-                            Err(error)
-                                if error.kind() == JoinErrorKind::WakerRegistrationFailed
-                        ) {
-                            return std::task::Poll::Ready(Some(result));
-                        }
-                        self.handles.swap_remove(i);
-                        return std::task::Poll::Ready(Some(result));
-                    }
+                if let Some(result) = self.poll_finished_unacknowledged() {
+                    return Poll::Ready(Some(result));
                 }
-                std::task::Poll::Pending
+                if self.handles.is_empty() {
+                    return Poll::Ready(None);
+                }
+                self.poll_active(cx)
             })
             .await
         }
@@ -2460,9 +2562,8 @@ pub mod task {
         /// Returns `Some(Err(JoinError))` on context failure. The finite
         /// `JoinErrorKind` preserves cancellation-vs-budget distinctions
         /// without copying caller-provided cancellation text.
-        /// `WakerRegistrationFailed` is an observation failure rather than a
-        /// terminal task result, so that class is returned without removing
-        /// the handle from this set.
+        /// `WakerRegistrationFailed` follows the same one-shot quarantine and
+        /// trusted-terminal-poll contract as [`Self::join_next`].
         ///
         /// Note the local shadowing of `cx`: the poll_fn closure
         /// receives a `std::task::Context` also conventionally
@@ -2492,7 +2593,7 @@ pub mod task {
             &mut self,
             caller_cx: &crate::cx::Cx,
         ) -> Option<Result<T, JoinError>> {
-            if self.handles.is_empty() {
+            if self.is_empty() {
                 return None;
             }
             if caller_cx.checkpoint().is_err() {
@@ -2505,21 +2606,13 @@ pub mod task {
                         JoinError::from_context_failure(caller_cx),
                     )));
                 }
-                for i in 0..self.handles.len() {
-                    let mut pinned = std::pin::Pin::new(&mut self.handles[i]);
-                    if let std::task::Poll::Ready(result) = pinned.as_mut().poll(cx) {
-                        if matches!(
-                            &result,
-                            Err(error)
-                                if error.kind() == JoinErrorKind::WakerRegistrationFailed
-                        ) {
-                            return std::task::Poll::Ready(Some(result));
-                        }
-                        self.handles.swap_remove(i);
-                        return std::task::Poll::Ready(Some(result));
-                    }
+                if let Some(result) = self.poll_finished_unacknowledged() {
+                    return Poll::Ready(Some(result));
                 }
-                std::task::Poll::Pending
+                if self.handles.is_empty() {
+                    return Poll::Ready(None);
+                }
+                self.poll_active(cx)
             })
             .await
         }
@@ -2528,10 +2621,13 @@ pub mod task {
         ///
         /// Checks if any handle is finished and returns its result.
         /// Returns `None` if the set is empty or no task has completed.
-        /// A [`JoinErrorKind::WakerRegistrationFailed`] observation leaves the
-        /// handle in the set because abort has only been requested, not yet
-        /// terminally acknowledged.
+        /// A [`JoinErrorKind::WakerRegistrationFailed`] observation uses the
+        /// same trusted-poll/quarantine contract as [`Self::join_next`], so a
+        /// repeated caller cannot spin on the same nonterminal error.
         pub fn try_join_next(&mut self) -> Option<Result<T, JoinError>> {
+            if let Some(result) = self.poll_finished_unacknowledged() {
+                return Some(result);
+            }
             // Find the first finished handle
             let pos = self.handles.iter().position(|h| h.is_finished());
             if let Some(idx) = pos {
@@ -2543,7 +2639,7 @@ pub mod task {
                     std::task::Poll::Ready(Err(error))
                         if error.kind() == JoinErrorKind::WakerRegistrationFailed =>
                     {
-                        Some(Err(error))
+                        Some(self.settle_or_quarantine_registration_failure(idx, error))
                     }
                     std::task::Poll::Ready(result) => {
                         self.handles.swap_remove(idx);
@@ -2569,23 +2665,23 @@ pub mod task {
         /// terminal acknowledgements with `join_next`. A returned aborted
         /// handle means the corresponding task future has been dropped.
         pub fn abort_all(&mut self) {
-            for handle in &self.handles {
+            for handle in self.handles.iter().chain(&self.unacknowledged) {
                 handle.abort();
             }
         }
 
         #[cfg(test)]
-        pub(crate) fn fail_next_join_registration_for_test(&self) {
+        pub(crate) fn force_join_registration_failure_for_test(&self) {
             self.handles
                 .first()
                 .expect("JoinSet registration-failure test requires one handle")
-                .fail_next_registration_for_test();
+                .force_registration_failure_for_test();
         }
     }
 
     impl<T> Drop for JoinSet<T> {
         fn drop(&mut self) {
-            for handle in &self.handles {
+            for handle in self.handles.iter().chain(&self.unacknowledged) {
                 handle.abort();
             }
         }
