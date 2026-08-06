@@ -21428,29 +21428,175 @@ fn print_snapshot_session_structured_output<T: serde::Serialize>(
     Ok(false)
 }
 
-fn resolve_checkpoint_id(db_path: &str, snapshot_id: &str) -> anyhow::Result<i64> {
-    if snapshot_id.eq_ignore_ascii_case("latest") {
-        let conn = rusqlite::Connection::open(db_path)?;
-        let latest_id: i64 = conn
-            .query_row(
-                "SELECT id FROM session_checkpoints ORDER BY checkpoint_at DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    anyhow::anyhow!(
-                        "No snapshots found. Capture one first with `ft snapshot save`."
-                    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointResolveScope {
+    Snapshot,
+    Any,
+}
+
+#[derive(Debug)]
+enum CheckpointResolveError {
+    InvalidId(String),
+    NotFound {
+        requested: String,
+        scope: CheckpointResolveScope,
+    },
+    WrongRole {
+        checkpoint_id: i64,
+        role: String,
+    },
+    Database(rusqlite::Error),
+}
+
+impl std::fmt::Display for CheckpointResolveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidId(value) => write!(formatter, "Invalid snapshot ID: {value}"),
+            Self::NotFound { requested, scope } => match (requested.as_str(), scope) {
+                ("latest", CheckpointResolveScope::Snapshot) => formatter.write_str(
+                    "No snapshots found. Capture one first with `ft snapshot save`.",
+                ),
+                ("latest", CheckpointResolveScope::Any) => {
+                    formatter.write_str("No checkpoints found.")
                 }
-                other => anyhow::anyhow!("Failed to query latest snapshot: {other}"),
-            })?;
-        return Ok(latest_id);
+                (_, CheckpointResolveScope::Snapshot) => {
+                    write!(formatter, "Snapshot checkpoint `{requested}` was not found.")
+                }
+                (_, CheckpointResolveScope::Any) => {
+                    write!(formatter, "Checkpoint `{requested}` was not found.")
+                }
+            },
+            Self::WrongRole {
+                checkpoint_id,
+                role,
+            } => write!(
+                formatter,
+                "Checkpoint `{checkpoint_id}` has role `{role}` and cannot be used as a snapshot."
+            ),
+            Self::Database(error) => write!(formatter, "Failed to query checkpoints: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CheckpointResolveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Database(error) => Some(error),
+            Self::InvalidId(_)
+            | Self::NotFound { .. }
+            | Self::WrongRole { .. } => None,
+        }
+    }
+}
+
+fn resolve_checkpoint_id(
+    db_path: &str,
+    snapshot_id: &str,
+    scope: CheckpointResolveScope,
+) -> Result<i64, CheckpointResolveError> {
+    if snapshot_id.eq_ignore_ascii_case("latest") {
+        let conn = rusqlite::Connection::open(db_path).map_err(CheckpointResolveError::Database)?;
+        let latest_id = match scope {
+            CheckpointResolveScope::Snapshot => conn.query_row(
+                "SELECT id
+                 FROM session_checkpoints
+                 WHERE checkpoint_role = 'snapshot'
+                 ORDER BY checkpoint_at DESC, id DESC
+                 LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            ),
+            CheckpointResolveScope::Any => conn.query_row(
+                "SELECT id
+                 FROM session_checkpoints
+                 ORDER BY checkpoint_at DESC, id DESC
+                 LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            ),
+        };
+        return latest_id.map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => CheckpointResolveError::NotFound {
+                requested: "latest".to_string(),
+                scope,
+            },
+            other => CheckpointResolveError::Database(other),
+        });
     }
 
-    snapshot_id
+    let checkpoint_id = snapshot_id
         .parse::<i64>()
-        .map_err(|_| anyhow::anyhow!("Invalid snapshot ID: {snapshot_id}"))
+        .map_err(|_| CheckpointResolveError::InvalidId(snapshot_id.to_string()))?;
+    if scope == CheckpointResolveScope::Any {
+        return Ok(checkpoint_id);
+    }
+
+    let conn = rusqlite::Connection::open(db_path).map_err(CheckpointResolveError::Database)?;
+    let checkpoint_role = conn.query_row(
+        "SELECT checkpoint_role FROM session_checkpoints WHERE id = ?1",
+        [checkpoint_id],
+        |row| row.get::<_, String>(0),
+    );
+    match checkpoint_role {
+        Ok(role) if role == "snapshot" => Ok(checkpoint_id),
+        Ok(role) => Err(CheckpointResolveError::WrongRole {
+            checkpoint_id,
+            role,
+        }),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Err(CheckpointResolveError::NotFound {
+            requested: snapshot_id.to_string(),
+            scope,
+        }),
+        Err(error) => Err(CheckpointResolveError::Database(error)),
+    }
+}
+
+fn load_checkpoint_identity(
+    db_path: &str,
+    checkpoint_id: i64,
+    scope: CheckpointResolveScope,
+) -> anyhow::Result<Option<frankenterm_core::snapshot_engine::SnapshotCheckpointIdentity>> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let role_predicate = match scope {
+        CheckpointResolveScope::Snapshot => "AND checkpoint_role = 'snapshot'",
+        CheckpointResolveScope::Any => "",
+    };
+    let row = conn.query_row(
+        &format!(
+            "SELECT session_id, checkpoint_at, checkpoint_role, state_hash
+             FROM session_checkpoints
+             WHERE id = ?1 {role_predicate}"
+        ),
+        [checkpoint_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        },
+    );
+    match row {
+        Ok((session_id, checkpoint_at, checkpoint_role, state_hash)) => {
+            let checkpoint_at = u64::try_from(checkpoint_at).map_err(|_| {
+                anyhow::anyhow!(
+                    "session_checkpoints.checkpoint_at was negative for checkpoint {checkpoint_id}"
+                )
+            })?;
+            Ok(Some(
+                frankenterm_core::snapshot_engine::SnapshotCheckpointIdentity {
+                    checkpoint_id,
+                    session_id,
+                    checkpoint_at,
+                    checkpoint_role,
+                    state_hash,
+                },
+            ))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn robot_checkpoint_error_response(
@@ -21477,19 +21623,24 @@ fn robot_checkpoint_not_found(
 fn robot_checkpoint_resolve_id(
     db_path: &str,
     checkpoint_id: &str,
+    scope: CheckpointResolveScope,
     elapsed_ms: u64,
 ) -> RobotJsonResult<i64> {
-    Ok(
-        resolve_checkpoint_id(db_path, checkpoint_id).map_err(|err| {
-            let message = err.to_string();
-            let code = if message.contains("No snapshots found") {
-                ROBOT_ERR_CHECKPOINT_NOT_FOUND
-            } else {
+    resolve_checkpoint_id(db_path, checkpoint_id, scope).map_err(|error| {
+        let code = match &error {
+            CheckpointResolveError::NotFound { .. } => ROBOT_ERR_CHECKPOINT_NOT_FOUND,
+            CheckpointResolveError::Database(_) => ROBOT_ERR_STORAGE,
+            CheckpointResolveError::InvalidId(_) | CheckpointResolveError::WrongRole { .. } => {
                 ROBOT_ERR_INVALID_ARGS
-            };
-            robot_checkpoint_error_response(code, message, None, elapsed_ms)
-        })?,
-    )
+            }
+        };
+        Box::new(robot_checkpoint_error_response(
+            code,
+            error.to_string(),
+            None,
+            elapsed_ms,
+        ))
+    })
 }
 
 fn robot_checkpoint_nonnegative_u64(field: &str, value: i64) -> anyhow::Result<u64> {
@@ -21509,50 +21660,19 @@ fn robot_checkpoint_label_from_metadata(metadata_json: Option<&str>) -> Option<S
         .map(str::to_string)
 }
 
-fn persist_robot_checkpoint_metadata(
-    db_path: &str,
-    checkpoint_id: i64,
+fn robot_checkpoint_metadata(
     label: Option<&str>,
     include_scrollback: bool,
     pane_ids: &[u64],
-) -> anyhow::Result<()> {
-    let conn = rusqlite::Connection::open(db_path)?;
-    let existing_metadata = match conn.query_row(
-        "SELECT metadata_json FROM session_checkpoints WHERE id = ?1",
-        [checkpoint_id],
-        |row| row.get::<_, Option<String>>(0),
-    ) {
-        Ok(metadata) => metadata,
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            return Err(anyhow::anyhow!("checkpoint {checkpoint_id} disappeared"));
+) -> serde_json::Value {
+    serde_json::json!({
+        "robot_checkpoint": {
+            "label": label,
+            "include_scrollback": include_scrollback,
+            "pane_ids": pane_ids,
+            "created_by": "ft robot checkpoint save",
         }
-        Err(err) => return Err(err.into()),
-    };
-
-    let mut metadata = existing_metadata
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    if let Some(object) = metadata.as_object_mut() {
-        object.insert(
-            "robot_checkpoint".to_string(),
-            serde_json::json!({
-                "label": label,
-                "include_scrollback": include_scrollback,
-                "pane_ids": pane_ids,
-                "created_by": "ft robot checkpoint save",
-            }),
-        );
-    }
-
-    conn.execute(
-        "UPDATE session_checkpoints SET metadata_json = ?1 WHERE id = ?2",
-        rusqlite::params![metadata.to_string(), checkpoint_id],
-    )?;
-
-    Ok(())
+    })
 }
 
 fn robot_checkpoint_scrollback_included(db_path: &str, checkpoint_id: i64) -> anyhow::Result<bool> {
@@ -21584,8 +21704,8 @@ fn robot_checkpoint_list_data(
     let limit_i64 = i64::try_from(limit).map_err(|_| anyhow::anyhow!("limit is too large"))?;
     let offset_i64 = i64::try_from(offset).map_err(|_| anyhow::anyhow!("offset is too large"))?;
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, checkpoint_at, checkpoint_type, pane_count, total_bytes,
-                state_hash, metadata_json
+        "SELECT id, session_id, checkpoint_at, checkpoint_type, checkpoint_role,
+                pane_count, total_bytes, state_hash, metadata_json
          FROM session_checkpoints
          ORDER BY checkpoint_at DESC, id DESC
          LIMIT ?1 OFFSET ?2",
@@ -21596,10 +21716,11 @@ fn robot_checkpoint_list_data(
             row.get::<_, String>(1)?,
             row.get::<_, i64>(2)?,
             row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
+            row.get::<_, String>(4)?,
             row.get::<_, i64>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, Option<String>>(7)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, Option<String>>(8)?,
         ))
     })?;
 
@@ -21610,6 +21731,7 @@ fn robot_checkpoint_list_data(
             session_id,
             checkpoint_at,
             checkpoint_type,
+            checkpoint_role,
             pane_count,
             total_bytes,
             state_hash,
@@ -21624,6 +21746,7 @@ fn robot_checkpoint_list_data(
             "size_bytes": robot_checkpoint_nonnegative_u64("session_checkpoints.total_bytes", total_bytes)?,
             "created_at": robot_checkpoint_nonnegative_u64("session_checkpoints.checkpoint_at", checkpoint_at)?,
             "checkpoint_type": checkpoint_type,
+            "checkpoint_role": checkpoint_role,
             "content_hash": state_hash,
         }));
     }
@@ -21644,8 +21767,8 @@ fn robot_checkpoint_show_data(
 ) -> anyhow::Result<Option<serde_json::Value>> {
     let conn = rusqlite::Connection::open(db_path)?;
     let checkpoint = match conn.query_row(
-        "SELECT id, session_id, checkpoint_at, checkpoint_type, pane_count, total_bytes,
-                state_hash, metadata_json
+        "SELECT id, session_id, checkpoint_at, checkpoint_type, checkpoint_role,
+                pane_count, total_bytes, state_hash, metadata_json
          FROM session_checkpoints
          WHERE id = ?1",
         [checkpoint_id],
@@ -21655,10 +21778,11 @@ fn robot_checkpoint_show_data(
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
+                row.get::<_, String>(4)?,
                 row.get::<_, i64>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         },
     ) {
@@ -21672,6 +21796,7 @@ fn robot_checkpoint_show_data(
         session_id,
         checkpoint_at,
         checkpoint_type,
+        checkpoint_role,
         pane_count,
         total_bytes,
         state_hash,
@@ -21682,7 +21807,7 @@ fn robot_checkpoint_show_data(
         "SELECT pane_id, cwd, command, scrollback_checkpoint_seq
          FROM mux_pane_state
          WHERE checkpoint_id = ?1
-         ORDER BY pane_id",
+         ORDER BY pane_id, id",
     )?;
     let rows = stmt.query_map([id], |row| {
         Ok((
@@ -21718,38 +21843,37 @@ fn robot_checkpoint_show_data(
         "size_bytes": robot_checkpoint_nonnegative_u64("session_checkpoints.total_bytes", total_bytes)?,
         "created_at": robot_checkpoint_nonnegative_u64("session_checkpoints.checkpoint_at", checkpoint_at)?,
         "checkpoint_type": checkpoint_type,
+        "checkpoint_role": checkpoint_role,
         "content_hash": state_hash,
         "panes": panes,
     })))
 }
 
-fn robot_checkpoint_delete_data(
+async fn robot_checkpoint_delete_data(
     db_path: &str,
-    checkpoint_id: i64,
+    snapshot_config: frankenterm_core::config::SnapshotConfig,
+    target: frankenterm_core::snapshot_engine::SnapshotDeleteTarget,
 ) -> anyhow::Result<Option<serde_json::Value>> {
-    let conn = rusqlite::Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-    let total_bytes = match conn.query_row(
-        "SELECT total_bytes FROM session_checkpoints WHERE id = ?1",
-        [checkpoint_id],
-        |row| row.get::<_, i64>(0),
-    ) {
-        Ok(total_bytes) => total_bytes,
-        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
+    use frankenterm_core::snapshot_engine::SnapshotEngine;
+    use std::sync::Arc;
 
-    conn.execute(
-        "DELETE FROM session_checkpoints WHERE id = ?1",
-        [checkpoint_id],
-    )?;
+    let engine = SnapshotEngine::new(Arc::new(db_path.to_string()), snapshot_config);
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let Some(deleted) = engine.delete_checkpoint_with_cx(&cx, target).await? else {
+        return Ok(None);
+    };
+    let checkpoint_id = deleted.identity.checkpoint_id;
 
     Ok(Some(serde_json::json!({
         "family": "checkpoint",
         "action": "delete",
         "checkpoint_id": checkpoint_id.to_string(),
         "numeric_checkpoint_id": checkpoint_id,
-        "bytes_freed": robot_checkpoint_nonnegative_u64("session_checkpoints.total_bytes", total_bytes)?,
+        "session_id": deleted.identity.session_id,
+        "checkpoint_role": deleted.identity.checkpoint_role,
+        "checkpoint_at": deleted.identity.checkpoint_at,
+        "recorded_payload_bytes": deleted.recorded_payload_bytes,
+        "invalidated_clean_state": deleted.invalidated_clean_state,
         "audit_receipt": {
             "operation": "robot.checkpoint.delete",
             "target": checkpoint_id.to_string(),
@@ -21801,12 +21925,20 @@ async fn robot_checkpoint_save_data(
 
     let engine = SnapshotEngine::new(Arc::new(db_path.clone()), config.snapshots.clone());
     let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let requested_pane_ids = pane_ids.unwrap_or_default();
     let result = engine
-        .capture_with_cx_options(
+        .capture_with_options_with_cx(
             &cx,
             &panes,
             frankenterm_core::snapshot_engine::SnapshotTrigger::Manual,
-            SnapshotCaptureOptions { include_scrollback },
+            SnapshotCaptureOptions {
+                include_scrollback,
+                metadata: Some(robot_checkpoint_metadata(
+                    label,
+                    include_scrollback,
+                    requested_pane_ids,
+                )),
+            },
         )
         .await
         .map_err(|err| {
@@ -21817,28 +21949,32 @@ async fn robot_checkpoint_save_data(
                 elapsed_ms,
             )
         })?;
-    let scrollback_included = robot_checkpoint_scrollback_included(&db_path, result.checkpoint_id)
+    let scrollback_verification =
+        robot_checkpoint_scrollback_included(&db_path, result.checkpoint_id);
+
+    engine
+        .close_after_checkpoint_with_cx(&cx, &result)
+        .await
         .map_err(|err| {
             robot_checkpoint_error_response(
                 ROBOT_ERR_STORAGE,
-                format!("Checkpoint scrollback verification failed: {err}"),
-                None,
+                format!(
+                    "Checkpoint {} committed but one-shot session close failed: {err}",
+                    result.checkpoint_id
+                ),
+                Some(
+                    "Reconcile the committed checkpoint before retrying this save.".to_string(),
+                ),
                 elapsed_ms,
             )
         })?;
-
-    let requested_pane_ids = pane_ids.unwrap_or_default();
-    persist_robot_checkpoint_metadata(
-        &db_path,
-        result.checkpoint_id,
-        label,
-        include_scrollback,
-        requested_pane_ids,
-    )
-    .map_err(|err| {
+    let scrollback_included = scrollback_verification.map_err(|err| {
         robot_checkpoint_error_response(
             ROBOT_ERR_STORAGE,
-            format!("Checkpoint metadata update failed: {err}"),
+            format!(
+                "Checkpoint {} committed and closed, but scrollback verification failed: {err}",
+                result.checkpoint_id
+            ),
             None,
             elapsed_ms,
         )
@@ -21854,7 +21990,7 @@ async fn robot_checkpoint_save_data(
         "pane_count": result.pane_count,
         "bytes_persisted": u64::try_from(result.total_bytes).unwrap_or(u64::MAX),
         "scrollback_included": scrollback_included,
-        "created_at": now_ms(),
+        "created_at": result.checkpoint_at,
         "trigger": format!("{:?}", result.trigger),
         "audit_receipt": {
             "operation": "robot.checkpoint.save",
@@ -21902,7 +22038,12 @@ async fn handle_robot_checkpoint_command(
         }
         RobotCheckpointCommands::Show { checkpoint_id } => {
             let checkpoint_id_i64 =
-                match robot_checkpoint_resolve_id(&db_path, checkpoint_id, elapsed_ms) {
+                match robot_checkpoint_resolve_id(
+                    &db_path,
+                    checkpoint_id,
+                    CheckpointResolveScope::Any,
+                    elapsed_ms,
+                ) {
                     Ok(id) => id,
                     Err(response) => return *response,
                 };
@@ -21918,12 +22059,25 @@ async fn handle_robot_checkpoint_command(
             }
         }
         RobotCheckpointCommands::Delete { checkpoint_id } => {
-            let checkpoint_id_i64 =
-                match robot_checkpoint_resolve_id(&db_path, checkpoint_id, elapsed_ms) {
-                    Ok(id) => id,
-                    Err(response) => return *response,
-                };
-            match robot_checkpoint_delete_data(&db_path, checkpoint_id_i64) {
+            use frankenterm_core::snapshot_engine::{
+                SnapshotCheckpointRoleScope, SnapshotDeleteTarget,
+            };
+            let target = if checkpoint_id.eq_ignore_ascii_case("latest") {
+                SnapshotDeleteTarget::Latest(SnapshotCheckpointRoleScope::Any)
+            } else {
+                match checkpoint_id.parse::<i64>() {
+                    Ok(id) => SnapshotDeleteTarget::Id(id),
+                    Err(_) => {
+                        return robot_checkpoint_error_response(
+                            ROBOT_ERR_INVALID_ARGS,
+                            format!("Invalid snapshot ID: {checkpoint_id}"),
+                            None,
+                            elapsed_ms,
+                        );
+                    }
+                }
+            };
+            match robot_checkpoint_delete_data(&db_path, config.snapshots.clone(), target).await {
                 Ok(Some(data)) => RobotResponse::success(data, elapsed_ms),
                 Ok(None) => robot_checkpoint_not_found(checkpoint_id, elapsed_ms),
                 Err(err) => robot_checkpoint_error_response(
@@ -21939,7 +22093,12 @@ async fn handle_robot_checkpoint_command(
             dry_run,
         } => {
             let checkpoint_id_i64 =
-                match robot_checkpoint_resolve_id(&db_path, checkpoint_id, elapsed_ms) {
+                match robot_checkpoint_resolve_id(
+                    &db_path,
+                    checkpoint_id,
+                    CheckpointResolveScope::Snapshot,
+                    elapsed_ms,
+                ) {
                     Ok(id) => id,
                     Err(response) => return *response,
                 };
@@ -22097,7 +22256,7 @@ fn load_session_show_pane_lookup(
 
     let checkpoint_id = checkpoint.checkpoint_id;
     let checkpoint_at = checkpoint.checkpoint_at;
-    let checkpoint_type = checkpoint.checkpoint_type;
+    let checkpoint_type = Some(checkpoint.checkpoint_type);
     if checkpoint.pane_states.is_empty() {
         return Ok(SessionShowPaneLookup::NoCheckpointData {
             requested_pane_id: pane_id,
@@ -22200,9 +22359,11 @@ fn snapshot_trigger_from_cli_label(
 
     match trigger {
         "manual" | "event" => SnapshotTrigger::Manual,
-        // `pre_restart` currently persists as the existing shutdown-class
-        // checkpoint type so restart/save surfaces stay schema-compatible.
-        "pre_restart" | "pre_shutdown" | "shutdown" => SnapshotTrigger::Shutdown,
+        // One-shot CLI saves close their exact receipt after capture, but they
+        // do not own the runtime's sticky terminal-capture reservation.
+        // Preserve the requested label in atomic metadata instead of
+        // smuggling a terminal trigger through ordinary admission.
+        "pre_restart" | "pre_shutdown" | "shutdown" => SnapshotTrigger::Manual,
         "startup" => SnapshotTrigger::Startup,
         _ => SnapshotTrigger::Manual,
     }
@@ -22459,6 +22620,30 @@ impl RestartWorkflowOptions {
 
     fn start_timeout(self) -> Duration {
         Duration::from_secs(self.start_timeout_secs)
+    }
+}
+
+#[cfg(unix)]
+fn restart_snapshot_capture_options(
+    options: RestartWorkflowOptions,
+) -> frankenterm_core::snapshot_engine::SnapshotCaptureOptions {
+    // A normal restart restores bounded scrollback from durable
+    // `output_segments`, so it needs a checkpoint-local max-sequence ref.
+    // `--layout-only` explicitly disables that restore phase; avoid the
+    // per-pane aggregate scans over long-running output histories there.
+    let include_scrollback = !options.layout_only;
+    frankenterm_core::snapshot_engine::SnapshotCaptureOptions {
+        include_scrollback,
+        metadata: Some(serde_json::json!({
+            "operation": "pre_restart",
+            "recovery_state": "unclean_until_restart_outcome",
+            "include_scrollback": include_scrollback,
+            "scrollback_ref_policy": if include_scrollback {
+                "linked_for_bounded_restore"
+            } else {
+                "omitted_for_layout_only"
+            },
+        })),
     }
 }
 
@@ -22833,8 +23018,10 @@ async fn execute_restart_workflow(
             .with_hint("Wait for the other snapshot restore or restart to finish, then retry.")
     })?;
 
-    let snapshot_engine =
-        SnapshotEngine::new(Arc::new(db_path.to_string()), snapshot_config.clone());
+    let snapshot_engine = Arc::new(SnapshotEngine::new(
+        Arc::new(db_path.to_string()),
+        snapshot_config.clone(),
+    ));
     let wezterm =
         frankenterm_core::wezterm::wezterm_handle_with_timeout(options.wezterm_timeout_secs);
 
@@ -22850,14 +23037,21 @@ async fn execute_restart_workflow(
 
     let process_relaunch = snapshot_config.process_relaunch.clone();
     let wezterm_timeout_secs = options.wezterm_timeout_secs;
-    execute_restart_post_preflight(
+    let capture_options = restart_snapshot_capture_options(options);
+    let capture_engine = Arc::clone(&snapshot_engine);
+    let result = execute_restart_post_preflight(
         options,
         move || async move {
             // ft-xbnl0.2.3 tick 273: cx-first snapshot capture.
             let snapshot_cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
-            snapshot_engine
-                .capture_with_cx(&snapshot_cx, &panes, SnapshotTrigger::Shutdown)
+            capture_engine
+                .capture_with_options_with_cx(
+                    &snapshot_cx,
+                    &panes,
+                    SnapshotTrigger::Manual,
+                    capture_options,
+                )
                 .await
                 .map_err(anyhow::Error::from)
         },
@@ -22882,7 +23076,30 @@ async fn execute_restart_workflow(
             }
         },
     )
-    .await
+    .await?;
+
+    if let RestartWorkflowResult::SkippedRestore { snapshot, .. } = &result {
+        let close_cx = frankenterm_core::cx::Cx::current()
+            .unwrap_or_else(frankenterm_core::cx::for_request);
+        snapshot_engine
+            .close_after_checkpoint_with_cx(&close_cx, snapshot)
+            .await
+            .map_err(|error| {
+                RestartWorkflowAbort::new(
+                    "finalize",
+                    format!(
+                        "mux restarted and restore was explicitly skipped, but checkpoint {} could not be marked clean: {error}",
+                        snapshot.checkpoint_id
+                    ),
+                )
+                .with_snapshot(snapshot)
+                .with_hint(
+                    "The pre-restart checkpoint remains recovery-eligible; reconcile it before retrying.",
+                )
+            })?;
+    }
+
+    Ok(result)
 }
 
 #[cfg(unix)]
@@ -35924,7 +36141,7 @@ async fn settle_watcher_background_task(
     handle: frankenterm_core::watchdog::WatchdogHandle,
     cleanup_cx: &frankenterm_core::cx::Cx,
     abort_first: bool,
-) {
+) -> anyhow::Result<()> {
     let result = if abort_first {
         handle.abort_and_join_with_cx(cleanup_cx).await
     } else {
@@ -35936,25 +36153,55 @@ async fn settle_watcher_background_task(
             error = %error,
             "Watcher background task did not reach terminal acknowledgement"
         );
+        return Err(anyhow::anyhow!(
+            "watcher background task {label} did not settle: {error}"
+        ));
     }
+    Ok(())
 }
 
 struct SnapshotBackgroundTasks {
     bridge: frankenterm_core::watchdog::WatchdogHandle,
     scheduler: frankenterm_core::watchdog::WatchdogHandle,
+    scheduler_failure: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 async fn settle_snapshot_background_tasks(
     tasks: SnapshotBackgroundTasks,
     cleanup_cx: &frankenterm_core::cx::Cx,
-) {
+) -> Vec<anyhow::Error> {
     // The bridge owns delivery of the durable watch-channel shutdown signal.
     // Settle it first so the scheduler can observe that signal and exit through
     // its own cleanup path. WatchdogHandle retains the two-second fallback abort
     // for either task if cooperative acknowledgement stalls.
-    settle_watcher_background_task("snapshot_shutdown_bridge", tasks.bridge, cleanup_cx, false)
-        .await;
-    settle_watcher_background_task("snapshot_scheduler", tasks.scheduler, cleanup_cx, false).await;
+    let mut failures = Vec::new();
+    if let Err(error) = settle_watcher_background_task(
+        "snapshot_shutdown_bridge",
+        tasks.bridge,
+        cleanup_cx,
+        false,
+    )
+    .await
+    {
+        failures.push(error);
+    }
+    if let Err(error) =
+        settle_watcher_background_task("snapshot_scheduler", tasks.scheduler, cleanup_cx, false)
+            .await
+    {
+        failures.push(error);
+    }
+    let scheduler_failure = tasks
+        .scheduler_failure
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(error) = scheduler_failure {
+        failures.push(anyhow::anyhow!(
+            "snapshot scheduler exited without a normal shutdown receipt: {error}"
+        ));
+    }
+    failures
 }
 
 /// Run the observation watcher daemon.
@@ -36763,7 +37010,7 @@ async fn run_watcher(
     };
 
     // Start snapshot engine for session persistence
-    let (snapshot_engine, snapshot_task_handles): (
+    let (snapshot_engine, mut snapshot_task_handles): (
         Option<Arc<frankenterm_core::snapshot_engine::SnapshotEngine>>,
         Option<SnapshotBackgroundTasks>,
     ) = if config.snapshots.enabled {
@@ -36804,6 +37051,8 @@ async fn run_watcher(
             bridge_task,
             bridge_shutdown_owner,
         );
+        let scheduler_failure = Arc::new(std::sync::Mutex::new(None::<String>));
+        let task_scheduler_failure = Arc::clone(&scheduler_failure);
         let scheduler_task = frankenterm_core::runtime_async::task::spawn(async move {
             if let Err(error) = engine_for_loop
                 .run_periodic(snap_shutdown_rx, move || async move {
@@ -36812,18 +37061,19 @@ async fn run_watcher(
                     // ft-xbnl0.2.3 tick 284: cx-first periodic list_panes probe.
                     let probe_cx = frankenterm_core::cx::Cx::current()
                         .unwrap_or_else(frankenterm_core::cx::for_request);
-                    wez.list_panes_with_cx(&probe_cx).await.ok()
+                    wez.list_panes_with_cx(&probe_cx).await.map_err(|error| {
+                        frankenterm_core::snapshot_engine::SnapshotError::PaneList(
+                            error.to_string(),
+                        )
+                    })
                 })
                 .await
             {
-                match error {
-                    frankenterm_core::snapshot_engine::SnapshotError::Cancelled => {
-                        tracing::info!("snapshot scheduler cancelled");
-                    }
-                    other => {
-                        tracing::warn!(%other, "snapshot scheduler failed");
-                    }
-                }
+                tracing::warn!(%error, "snapshot scheduler failed");
+                *task_scheduler_failure
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(error.to_string());
             }
         });
         let scheduler_handle = frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
@@ -36836,6 +37086,7 @@ async fn run_watcher(
             Some(SnapshotBackgroundTasks {
                 bridge: bridge_handle,
                 scheduler: scheduler_handle,
+                scheduler_failure,
             }),
         )
     } else {
@@ -36961,135 +37212,194 @@ async fn run_watcher(
         tracing::info!("Received Ctrl+C, initiating graceful shutdown");
     }
 
-    // Graceful shutdown
+    // Graceful shutdown. Every authority-bearing producer/consumer must reach
+    // terminal acknowledgement before the final snapshot can be certified.
     let background_shutdown_cx = frankenterm_core::cx::for_request();
+    let mut shutdown_failures = Vec::<anyhow::Error>::new();
     if let Some((shutdown_tx, ipc_task)) = ipc_handle {
-        let _ = shutdown_tx.try_send(());
-        settle_watcher_background_task(
+        if let Err(error) = shutdown_tx.try_send(()) {
+            shutdown_failures.push(anyhow::anyhow!(
+                "failed to publish IPC shutdown intent: {error}"
+            ));
+        }
+        if let Err(error) = settle_watcher_background_task(
             "ipc_server",
             ipc_task,
             &background_shutdown_cx,
             false,
         )
-        .await;
-    }
-
-    // Snapshot engine: capture final state before tearing down runtime
-    if let Some(ref engine) = snapshot_engine {
-        let wez =
-            frankenterm_core::wezterm::wezterm_handle_with_timeout(config.cli.timeout_seconds);
-        // ft-xbnl0.2.3 tick 288: cx-first shutdown list_panes + checkpoint.
-        let shutdown_snap_cx =
-            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-        match wez.list_panes_with_cx(&shutdown_snap_cx).await {
-            Ok(panes) if !panes.is_empty() => {
-                match engine
-                    .shutdown_checkpoint_with_cx(&shutdown_snap_cx, &panes, Duration::from_secs(5))
-                    .await
-                {
-                    Ok(Some(snap)) => {
-                        tracing::info!(
-                            panes = snap.pane_count,
-                            bytes = snap.total_bytes,
-                            "Shutdown checkpoint captured"
-                        );
-                    }
-                    Ok(None) => {
-                        tracing::debug!("Shutdown checkpoint skipped (no changes)");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Shutdown checkpoint failed");
-                    }
-                }
-            }
-            _ => {
-                // No panes available, just mark shutdown (ft-xbnl0.2.3 tick 242: cx-first).
-                let shutdown_cx = frankenterm_core::cx::Cx::current()
-                    .unwrap_or_else(frankenterm_core::cx::for_request);
-                let _ = engine.mark_shutdown_with_cx(&shutdown_cx).await;
-            }
+        .await
+        {
+            shutdown_failures.push(error);
         }
     }
 
     tracing::info!("Shutting down observation runtime...");
     handle.signal_shutdown();
-    if let Some(notification_handle) = notification_handle {
-        settle_watcher_background_task(
+    if let Some(snapshot_tasks) = snapshot_task_handles.take() {
+        shutdown_failures
+            .extend(settle_snapshot_background_tasks(snapshot_tasks, &background_shutdown_cx).await);
+    }
+
+    if let Some(notification_handle) = notification_handle
+        && let Err(error) = settle_watcher_background_task(
             "notification_pipeline",
             notification_handle,
             &background_shutdown_cx,
             true,
         )
-        .await;
+        .await
+    {
+        shutdown_failures.push(error);
     }
-    if let Some(workflow_runner_handle) = workflow_runner_handle {
-        settle_watcher_background_task(
+    if let Some(workflow_runner_handle) = workflow_runner_handle
+        && let Err(error) = settle_watcher_background_task(
             "workflow_runner",
             workflow_runner_handle,
             &background_shutdown_cx,
             false,
         )
-        .await;
+        .await
+    {
+        shutdown_failures.push(error);
     }
-    settle_watcher_background_task(
+    if let Err(error) = settle_watcher_background_task(
         "saved_search_scheduler",
         saved_search_scheduler_handle,
         &background_shutdown_cx,
         true,
     )
-    .await;
-    if let Some(snapshot_task_handles) = snapshot_task_handles {
-        settle_snapshot_background_tasks(snapshot_task_handles, &background_shutdown_cx).await;
+    .await
+    {
+        shutdown_failures.push(error);
     }
-    if let Some(distributed_listener_handle) = distributed_listener_handle {
-        settle_watcher_background_task(
+    if let Some(distributed_listener_handle) = distributed_listener_handle
+        && let Err(error) = settle_watcher_background_task(
             "distributed_listener",
             distributed_listener_handle,
             &background_shutdown_cx,
             false,
         )
-        .await;
+        .await
+    {
+        shutdown_failures.push(error);
     }
-    settle_watcher_background_task(
+    if let Err(error) = settle_watcher_background_task(
         "mux_watchdog",
         mux_watchdog_handle,
         &background_shutdown_cx,
         false,
     )
-    .await;
-    settle_watcher_background_task(
+    .await
+    {
+        shutdown_failures.push(error);
+    }
+    if let Err(error) = settle_watcher_background_task(
         "orphan_reaper",
         orphan_reaper_handle,
         &background_shutdown_cx,
         true,
     )
-    .await;
-    if let Some(backup_handle) = scheduled_backup_handle {
-        settle_watcher_background_task(
+    .await
+    {
+        shutdown_failures.push(error);
+    }
+    if let Some(backup_handle) = scheduled_backup_handle
+        && let Err(error) = settle_watcher_background_task(
             "scheduled_backup",
             backup_handle,
             &background_shutdown_cx,
             true,
         )
-        .await;
+        .await
+    {
+        shutdown_failures.push(error);
     }
     #[cfg(feature = "metrics")]
     if let Some(metrics_handle) = metrics_handle {
         metrics_handle.wait_with_cx(&background_shutdown_cx).await;
     }
+
     match Arc::try_unwrap(handle) {
         Ok(handle) => handle.shutdown().await,
         Err(handle) => {
+            let strong_count = Arc::strong_count(&handle);
             tracing::warn!(
-                strong_count = Arc::strong_count(&handle),
-                "Runtime handle still has outstanding references; skipping join"
+                strong_count,
+                "Runtime handle still has outstanding references; shutdown is unverified"
             );
+            shutdown_failures.push(anyhow::anyhow!(
+                "observation runtime retained {strong_count} owners and could not be joined"
+            ));
         }
     }
 
-    tracing::info!("Watcher shutdown complete");
+    // Only a fully settled pipeline may publish the terminal checkpoint and
+    // exact-receipt clean mark. A genuine empty pane observation is still a
+    // terminal snapshot; a listing error is not evidence of emptiness.
+    if shutdown_failures.is_empty()
+        && let Some(ref engine) = snapshot_engine
+    {
+        let wez =
+            frankenterm_core::wezterm::wezterm_handle_with_timeout(config.cli.timeout_seconds);
+        let shutdown_snap_cx = frankenterm_core::cx::Cx::current()
+            .unwrap_or_else(frankenterm_core::cx::for_request);
+        match wez.list_panes_with_cx(&shutdown_snap_cx).await {
+            Ok(panes) => match engine
+                .shutdown_checkpoint_with_cx(&shutdown_snap_cx, &panes, Duration::from_secs(5))
+                .await
+            {
+                Ok(snapshot) => {
+                    tracing::info!(
+                        panes = snapshot.pane_count,
+                        bytes = snapshot.total_bytes,
+                        checkpoint_id = snapshot.checkpoint_id,
+                        "Shutdown checkpoint and clean mark settled"
+                    );
+                }
+                Err(error) => {
+                    let detail = if let Some(checkpoint) = error.committed_shutdown_checkpoint() {
+                        format!(
+                            "shutdown checkpoint {} committed, but its clean mark failed: {error}",
+                            checkpoint.checkpoint_id
+                        )
+                    } else {
+                        format!(
+                            "shutdown checkpoint failed before a terminal receipt was published: {error}"
+                        )
+                    };
+                    tracing::warn!(%error, "Snapshot session remains unclean");
+                    shutdown_failures.push(anyhow::anyhow!(detail));
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "Failed to list panes for shutdown checkpoint; snapshot session remains unclean"
+                );
+                shutdown_failures.push(anyhow::anyhow!(
+                    "failed to list panes for the shutdown checkpoint: {error}"
+                ));
+            }
+        }
+    }
 
-    Ok(())
+    if shutdown_failures.is_empty() {
+        tracing::info!("Watcher shutdown complete");
+        Ok(())
+    } else {
+        let details = shutdown_failures
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        tracing::error!(
+            failure_count = shutdown_failures.len(),
+            %details,
+            "Watcher shutdown did not reach a clean authority boundary"
+        );
+        Err(anyhow::anyhow!(details))
+    }
 }
 
 fn maybe_trigger_e2e_watcher_panic_once(layout: &frankenterm_core::config::WorkspaceLayout) {
@@ -68084,7 +68394,7 @@ async fn handle_snapshot_command(
     layout: &frankenterm_core::config::WorkspaceLayout,
     config: &frankenterm_core::config::Config,
 ) -> anyhow::Result<()> {
-    use frankenterm_core::snapshot_engine::SnapshotEngine;
+    use frankenterm_core::snapshot_engine::{SnapshotCaptureOptions, SnapshotEngine};
     use std::sync::Arc;
 
     let db_path = Arc::new(layout.db_path.to_string_lossy().to_string());
@@ -68092,7 +68402,7 @@ async fn handle_snapshot_command(
     match command {
         SnapshotCommands::Save {
             trigger,
-            label: _label,
+            label,
             format,
         } => {
             let output_format = resolve_snapshot_session_output_format(&format);
@@ -68123,10 +68433,44 @@ async fn handle_snapshot_command(
             let snap_save_cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
             match engine
-                .capture_with_cx(&snap_save_cx, &panes, snap_trigger)
+                .capture_with_options_with_cx(
+                    &snap_save_cx,
+                    &panes,
+                    snap_trigger,
+                    SnapshotCaptureOptions {
+                        include_scrollback: false,
+                        metadata: Some(serde_json::json!({
+                            "cli_snapshot": {
+                                "requested_trigger": trigger,
+                                "label": label,
+                            }
+                        })),
+                    },
+                )
                 .await
             {
                 Ok(result) => {
+                    if let Err(error) = engine
+                        .close_after_checkpoint_with_cx(&snap_save_cx, &result)
+                        .await
+                    {
+                        let message = format!(
+                            "snapshot {} committed but one-shot session close failed: {error}",
+                            result.checkpoint_id
+                        );
+                        if !print_snapshot_session_structured_output(
+                            &serde_json::json!({
+                                "ok": false,
+                                "error": &message,
+                                "checkpoint_id": result.checkpoint_id,
+                                "session_id": &result.session_id,
+                            }),
+                            output_format,
+                        )? {
+                            eprintln!("Snapshot failed: {message}");
+                        }
+                        std::process::exit(1);
+                    }
                     let resp = serde_json::json!({
                         "ok": true,
                         "session_id": result.session_id,
@@ -68162,51 +68506,57 @@ async fn handle_snapshot_command(
         } => {
             let output_format = resolve_snapshot_session_output_format(&format);
             let conn = rusqlite::Connection::open(db_path.as_str())?;
-
-            let query = if let Some(ref sid) = session {
-                format!(
-                    "SELECT sc.id, sc.session_id, sc.checkpoint_at, sc.checkpoint_type, \
-                     sc.pane_count, sc.total_bytes, sc.state_hash \
-                     FROM session_checkpoints sc \
-                     WHERE sc.session_id = '{}' \
-                     ORDER BY sc.checkpoint_at DESC LIMIT {}",
-                    sid.replace('\'', "''"),
-                    limit
-                )
-            } else {
-                format!(
-                    "SELECT sc.id, sc.session_id, sc.checkpoint_at, sc.checkpoint_type, \
-                     sc.pane_count, sc.total_bytes, sc.state_hash \
-                     FROM session_checkpoints sc \
-                     ORDER BY sc.checkpoint_at DESC LIMIT {}",
-                    limit
-                )
-            };
-
-            let mut stmt = conn.prepare(&query)?;
-            let rows = stmt.query_map([], |row| {
+            let limit_i64 = i64::try_from(limit)
+                .map_err(|_| anyhow::anyhow!("snapshot list limit is too large"))?;
+            let map_row = |row: &rusqlite::Row<'_>| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
-            })?;
-
-            let snapshots: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+            };
+            let snapshots = if let Some(ref session_id) = session {
+                let mut stmt = conn.prepare(
+                    "SELECT sc.id, sc.session_id, sc.checkpoint_at,
+                            sc.checkpoint_type, sc.checkpoint_role,
+                            sc.pane_count, sc.total_bytes, sc.state_hash
+                     FROM session_checkpoints AS sc
+                     WHERE sc.session_id = ?1
+                       AND sc.checkpoint_role = 'snapshot'
+                     ORDER BY sc.checkpoint_at DESC, sc.id DESC
+                     LIMIT ?2",
+                )?;
+                stmt.query_map(rusqlite::params![session_id, limit_i64], map_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT sc.id, sc.session_id, sc.checkpoint_at,
+                            sc.checkpoint_type, sc.checkpoint_role,
+                            sc.pane_count, sc.total_bytes, sc.state_hash
+                     FROM session_checkpoints AS sc
+                     WHERE sc.checkpoint_role = 'snapshot'
+                     ORDER BY sc.checkpoint_at DESC, sc.id DESC
+                     LIMIT ?1",
+                )?;
+                stmt.query_map([limit_i64], map_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
 
             if output_format.is_structured() {
                 let items: Vec<serde_json::Value> = snapshots
                     .iter()
-                    .map(|(id, session_id, at, cp_type, panes, bytes, hash)| {
+                    .map(|(id, session_id, at, cp_type, cp_role, panes, bytes, hash)| {
                         serde_json::json!({
                             "checkpoint_id": id,
                             "session_id": session_id,
                             "checkpoint_at": at,
                             "checkpoint_type": cp_type,
+                            "checkpoint_role": cp_role,
                             "pane_count": panes,
                             "total_bytes": bytes,
                             "state_hash": hash,
@@ -68229,7 +68579,7 @@ async fn handle_snapshot_command(
                     "ID", "Session", "Type", "Panes", "Bytes"
                 );
                 println!("{}", "-".repeat(70));
-                for (id, session_id, _at, cp_type, panes, bytes, _hash) in &snapshots {
+                for (id, session_id, _at, cp_type, _cp_role, panes, bytes, _hash) in &snapshots {
                     let short_session = truncate_id(session_id, 34);
                     println!(
                         "{:<6} {:<36} {:<10} {:<6} {:<10}",
@@ -68252,8 +68602,10 @@ async fn handle_snapshot_command(
 
             // Get checkpoint metadata
             let checkpoint = conn.query_row(
-                "SELECT id, session_id, checkpoint_at, checkpoint_type, pane_count, total_bytes, state_hash \
-                 FROM session_checkpoints WHERE id = ?1",
+                "SELECT id, session_id, checkpoint_at, checkpoint_type,
+                        checkpoint_role, pane_count, total_bytes, state_hash
+                 FROM session_checkpoints
+                 WHERE id = ?1 AND checkpoint_role = 'snapshot'",
                 [cp_id],
                 |row| {
                     Ok((
@@ -68261,52 +68613,70 @@ async fn handle_snapshot_command(
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(4)?,
                         row.get::<_, i64>(5)?,
-                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             );
 
-            let (id, session_id, at, cp_type, pane_count, total_bytes, hash) = match checkpoint {
-                Ok(cp) => cp,
-                Err(_) => {
-                    if !print_snapshot_session_structured_output(
-                        &serde_json::json!({"ok": false, "error": format!("Snapshot {cp_id} not found")}),
-                        output_format,
-                    )? {
-                        eprintln!("Snapshot {} not found", cp_id);
+            let (id, session_id, at, cp_type, cp_role, pane_count, total_bytes, hash) =
+                match checkpoint {
+                    Ok(cp) => cp,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        let response = serde_json::json!({
+                            "ok": false,
+                            "error": format!("Snapshot {cp_id} not found"),
+                        });
+                        if !print_snapshot_session_structured_output(&response, output_format)? {
+                            eprintln!("Snapshot {cp_id} not found");
+                        }
+                        std::process::exit(1);
                     }
-                    std::process::exit(1);
-                }
-            };
+                    Err(error) => return Err(error.into()),
+                };
 
-            // Get pane states
-            let pane_query = if let Some(pane_id) = pane {
-                format!(
-                    "SELECT pane_id, cwd, command, terminal_state_json, agent_metadata_json \
-                     FROM mux_pane_state WHERE checkpoint_id = {} AND pane_id = {}",
-                    id, pane_id
-                )
+            // Bind identifiers rather than interpolating them into SQL. Keep
+            // separate static statements so the pane-specific path retains a
+            // direct equality predicate for SQLite's indexes.
+            let pane_states = if let Some(pane_id) = pane {
+                let pane_id = i64::try_from(pane_id)
+                    .map_err(|_| anyhow::anyhow!("Pane ID is too large for SQLite"))?;
+                let mut stmt = conn.prepare(
+                    "SELECT pane_id, cwd, command, terminal_state_json, agent_metadata_json
+                     FROM mux_pane_state
+                     WHERE checkpoint_id = ?1 AND pane_id = ?2
+                     ORDER BY pane_id, id",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![id, pane_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
             } else {
-                format!(
-                    "SELECT pane_id, cwd, command, terminal_state_json, agent_metadata_json \
-                     FROM mux_pane_state WHERE checkpoint_id = {}",
-                    id
-                )
+                let mut stmt = conn.prepare(
+                    "SELECT pane_id, cwd, command, terminal_state_json, agent_metadata_json
+                     FROM mux_pane_state
+                     WHERE checkpoint_id = ?1
+                     ORDER BY pane_id, id",
+                )?;
+                let rows = stmt.query_map([id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
             };
-
-            let mut stmt = conn.prepare(&pane_query)?;
-            let pane_rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                ))
-            })?;
-            let pane_states: Vec<_> = pane_rows.filter_map(|r| r.ok()).collect();
 
             if output_format.is_structured() {
                 let panes_json: Vec<serde_json::Value> = pane_states
@@ -68334,6 +68704,7 @@ async fn handle_snapshot_command(
                     "session_id": session_id,
                     "checkpoint_at": at,
                     "checkpoint_type": cp_type,
+                    "checkpoint_role": cp_role,
                     "pane_count": pane_count,
                     "total_bytes": total_bytes,
                     "state_hash": hash,
@@ -68344,6 +68715,7 @@ async fn handle_snapshot_command(
                 println!("Snapshot #{id}");
                 println!("  Session:  {session_id}");
                 println!("  Type:     {cp_type}");
+                println!("  Role:     {cp_role}");
                 println!("  Panes:    {pane_count}");
                 println!("  Bytes:    {total_bytes}");
                 println!("  Hash:     {hash}");
@@ -68399,14 +68771,14 @@ async fn handle_snapshot_command(
             // wholly added/removed with no indication the snapshot is absent.
             // Mirrors the existence check in the `Delete` arm below.
             let checkpoint_exists = |cp_id: i64| -> anyhow::Result<bool> {
-                Ok(conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM session_checkpoints WHERE id = ?1",
-                        [cp_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .map(|c| c > 0)
-                    .unwrap_or(false))
+                let count = conn.query_row(
+                    "SELECT COUNT(*)
+                     FROM session_checkpoints
+                     WHERE id = ?1 AND checkpoint_role = 'snapshot'",
+                    [cp_id],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                Ok(count > 0)
             };
             for cp_id in [cp1, cp2] {
                 if !checkpoint_exists(cp_id)? {
@@ -68418,12 +68790,14 @@ async fn handle_snapshot_command(
             // Get pane IDs for each checkpoint
             let get_pane_ids = |cp_id: i64| -> anyhow::Result<Vec<i64>> {
                 let mut stmt = conn.prepare(
-                    "SELECT pane_id FROM mux_pane_state WHERE checkpoint_id = ?1 ORDER BY pane_id",
+                    "SELECT pane_id
+                     FROM mux_pane_state
+                     WHERE checkpoint_id = ?1
+                     ORDER BY pane_id, id",
                 )?;
                 let ids: Vec<i64> = stmt
                     .query_map([cp_id], |row| row.get(0))?
-                    .filter_map(|r| r.ok())
-                    .collect();
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
                 Ok(ids)
             };
 
@@ -68433,9 +68807,12 @@ async fn handle_snapshot_command(
             let set1: std::collections::HashSet<i64> = panes1.iter().copied().collect();
             let set2: std::collections::HashSet<i64> = panes2.iter().copied().collect();
 
-            let added: Vec<i64> = set2.difference(&set1).copied().collect();
-            let removed: Vec<i64> = set1.difference(&set2).copied().collect();
-            let common: Vec<i64> = set1.intersection(&set2).copied().collect();
+            let mut added: Vec<i64> = set2.difference(&set1).copied().collect();
+            let mut removed: Vec<i64> = set1.difference(&set2).copied().collect();
+            let mut common: Vec<i64> = set1.intersection(&set2).copied().collect();
+            added.sort_unstable();
+            removed.sort_unstable();
+            common.sort_unstable();
 
             if output_format.is_structured() {
                 let resp = serde_json::json!({
@@ -68468,29 +68845,24 @@ async fn handle_snapshot_command(
         }
 
         SnapshotCommands::Delete { snapshot_id, force } => {
-            let conn = rusqlite::Connection::open(db_path.as_str())?;
-            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
             let cp_id: i64 = snapshot_id
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Invalid snapshot ID: {snapshot_id}"))?;
 
-            // Check it exists
-            let exists: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM session_checkpoints WHERE id = ?1",
-                    [cp_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map(|c| c > 0)
-                .unwrap_or(false);
-
-            if !exists {
+            let Some(identity) = load_checkpoint_identity(
+                db_path.as_str(),
+                cp_id,
+                CheckpointResolveScope::Snapshot,
+            )? else {
                 eprintln!("Snapshot {cp_id} not found");
                 std::process::exit(1);
-            }
+            };
 
             if !force {
-                eprint!("Delete snapshot #{cp_id}? [y/N] ");
+                eprint!(
+                    "Delete snapshot #{} from session {} (captured at {})? [y/N] ",
+                    identity.checkpoint_id, identity.session_id, identity.checkpoint_at
+                );
                 use std::io::Read;
                 let mut buf = [0u8; 1];
                 let _ = std::io::stdin().read(&mut buf);
@@ -68500,8 +68872,28 @@ async fn handle_snapshot_command(
                 }
             }
 
-            conn.execute("DELETE FROM session_checkpoints WHERE id = ?1", [cp_id])?;
-            println!("Deleted snapshot #{cp_id}");
+            let engine = SnapshotEngine::new(db_path.clone(), config.snapshots.clone());
+            let delete_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            match engine
+                .delete_checkpoint_with_cx(
+                    &delete_cx,
+                    frankenterm_core::snapshot_engine::SnapshotDeleteTarget::Exact(identity),
+                )
+                .await?
+            {
+                Some(deleted) => {
+                    println!(
+                        "Deleted snapshot #{} (recorded payload estimate: {} bytes)",
+                        deleted.identity.checkpoint_id, deleted.recorded_payload_bytes
+                    );
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "Snapshot {cp_id} changed after confirmation; nothing was deleted"
+                    ));
+                }
+            }
         }
 
         SnapshotCommands::Restore {
@@ -68518,7 +68910,11 @@ async fn handle_snapshot_command(
                 wezterm_timeout_secs: config.cli.timeout_seconds,
             };
 
-            let checkpoint_id = match resolve_checkpoint_id(db_path.as_str(), &snapshot_id) {
+            let checkpoint_id = match resolve_checkpoint_id(
+                db_path.as_str(),
+                &snapshot_id,
+                CheckpointResolveScope::Snapshot,
+            ) {
                 Ok(id) => id,
                 Err(e) => {
                     if !print_snapshot_session_structured_output(
@@ -68704,14 +69100,14 @@ async fn handle_session_command(
             println!("\nCheckpoints ({}):", checkpoints.len());
 
             for cp in &checkpoints {
-                let cp_type = cp.checkpoint_type.as_deref().unwrap_or("unknown");
                 println!(
-                    "  #{:<6} {} {:>3} panes  {:>8}  type={}",
+                    "  #{:<6} {} {:>3} panes  {:>8}  type={} role={}",
                     cp.id,
                     format_epoch_display(cp.checkpoint_at),
                     cp.pane_count,
                     format_bytes(cp.total_bytes),
-                    cp_type,
+                    cp.checkpoint_type,
+                    cp.checkpoint_role,
                 );
             }
 
@@ -72960,16 +73356,18 @@ mod tests {
                     scheduler_task,
                     scheduler_shutdown,
                 ),
+                scheduler_failure: Arc::new(std::sync::Mutex::new(None)),
             };
             let cleanup_cx = frankenterm_core::cx::for_testing();
             let timeout_cx = frankenterm_core::cx::for_testing();
-            frankenterm_core::runtime_async::timeout_with_cx(
+            let failures = frankenterm_core::runtime_async::timeout_with_cx(
                 &timeout_cx,
                 Duration::from_secs(1),
                 settle_snapshot_background_tasks(tasks, &cleanup_cx),
             )
             .await
             .expect("cooperative bridge-first snapshot settlement must remain bounded");
+            assert!(failures.is_empty(), "settlement failures: {failures:?}");
             assert_eq!(phase.load(std::sync::atomic::Ordering::SeqCst), 2);
         });
     }
@@ -73049,6 +73447,8 @@ mod tests {
         let conn = rusqlite::Connection::open(&db_path).expect("open session show sqlite db");
         conn.execute_batch(
             "
+            PRAGMA foreign_keys = ON;
+
             CREATE TABLE mux_sessions (
                 session_id TEXT PRIMARY KEY,
                 created_at INTEGER NOT NULL,
@@ -73057,23 +73457,29 @@ mod tests {
                 topology_json TEXT NOT NULL,
                 window_metadata_json TEXT,
                 ft_version TEXT NOT NULL,
-                host_id TEXT
+                host_id TEXT,
+                clean_checkpoint_id INTEGER REFERENCES session_checkpoints(id) ON DELETE SET NULL
             );
 
             CREATE TABLE session_checkpoints (
                 id INTEGER PRIMARY KEY,
-                session_id TEXT NOT NULL,
+                session_id TEXT NOT NULL REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
                 checkpoint_at INTEGER NOT NULL,
-                checkpoint_type TEXT,
+                checkpoint_type TEXT NOT NULL
+                    CHECK(checkpoint_type IN ('periodic','event','shutdown','startup')),
                 state_hash TEXT NOT NULL,
                 pane_count INTEGER NOT NULL,
                 total_bytes INTEGER NOT NULL,
-                metadata_json TEXT
+                metadata_json TEXT,
+                checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
+                    CHECK(checkpoint_role IN ('snapshot','restore_receipt')),
+                topology_json TEXT
             );
 
             CREATE TABLE mux_pane_state (
                 id INTEGER PRIMARY KEY,
-                checkpoint_id INTEGER NOT NULL,
+                checkpoint_id INTEGER NOT NULL
+                    REFERENCES session_checkpoints(id) ON DELETE CASCADE,
                 pane_id INTEGER NOT NULL,
                 cwd TEXT,
                 command TEXT,
@@ -73111,8 +73517,13 @@ mod tests {
         pane_count: usize,
     ) -> i64 {
         conn.execute(
-            "INSERT INTO session_checkpoints (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
-             VALUES (?1, ?2, 'periodic', 'hash123', ?3, 1024)",
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+              total_bytes, checkpoint_role, topology_json)
+             SELECT ?1, ?2, 'periodic', '0000000000000000', ?3, 1024,
+                    'snapshot', topology_json
+             FROM mux_sessions
+             WHERE session_id = ?1",
             rusqlite::params![session_id, checkpoint_at, pane_count as i64],
         )
         .expect("insert session show test checkpoint");
@@ -73170,11 +73581,32 @@ mod tests {
 
         conn.execute(
             "INSERT INTO session_checkpoints
-             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
-             VALUES (?1, ?2, 'event', 'hash123', 1, ?3, ?4)",
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+              total_bytes, metadata_json, checkpoint_role, topology_json)
+             SELECT ?1, ?2, 'event', '0000000000000000', 1, ?3, ?4,
+                    'snapshot', topology_json
+             FROM mux_sessions
+             WHERE session_id = ?1",
             rusqlite::params![session_id, checkpoint_at, total_bytes, metadata_json],
         )
         .expect("insert robot checkpoint test checkpoint");
+        conn.last_insert_rowid()
+    }
+
+    fn insert_robot_restore_receipt_for_test(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        checkpoint_at: i64,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+              total_bytes, metadata_json, checkpoint_role, topology_json)
+             VALUES (?1, ?2, 'startup', 'restore', 0, 0, ?3,
+                     'restore_receipt', NULL)",
+            rusqlite::params![session_id, checkpoint_at, r#"{"old_to_new":{}}"#],
+        )
+        .expect("insert robot restore receipt test checkpoint");
         conn.last_insert_rowid()
     }
 
@@ -73205,70 +73637,117 @@ mod tests {
 
     #[test]
     fn robot_checkpoint_table_adapter_lists_shows_and_deletes() {
-        let (_dir, layout, conn) = setup_robot_checkpoint_test_workspace();
-        let db_path = layout.db_path.to_string_lossy().to_string();
+        run_async_test(async {
+            let (_dir, layout, conn) = setup_robot_checkpoint_test_workspace();
+            let db_path = layout.db_path.to_string_lossy().to_string();
 
-        insert_session_for_session_show_test(&conn, "sess-robot-checkpoint", false);
-        let older =
-            insert_robot_checkpoint_for_test(&conn, "sess-robot-checkpoint", 1000, None, 128);
-        insert_robot_checkpoint_pane_for_test(&conn, older, 7, Some("/old"), Some("bash"), None);
-        let newer = insert_robot_checkpoint_for_test(
-            &conn,
-            "sess-robot-checkpoint",
-            2000,
-            Some("manual save"),
-            2048,
-        );
-        insert_robot_checkpoint_pane_for_test(
-            &conn,
-            newer,
-            42,
-            Some("/workspace"),
-            Some("codex"),
-            Some(12),
-        );
+            insert_session_for_session_show_test(&conn, "sess-robot-checkpoint", false);
+            let older =
+                insert_robot_checkpoint_for_test(&conn, "sess-robot-checkpoint", 1000, None, 128);
+            insert_robot_checkpoint_pane_for_test(
+                &conn,
+                older,
+                7,
+                Some("/old"),
+                Some("bash"),
+                None,
+            );
+            let newer = insert_robot_checkpoint_for_test(
+                &conn,
+                "sess-robot-checkpoint",
+                2000,
+                Some("manual save"),
+                2048,
+            );
+            insert_robot_checkpoint_pane_for_test(
+                &conn,
+                newer,
+                42,
+                Some("/workspace"),
+                Some("codex"),
+                Some(12),
+            );
 
-        let list = robot_checkpoint_list_data(&db_path, 10, 0).expect("list checkpoints");
-        assert_eq!(list["family"].as_str(), Some("checkpoint"));
-        assert_eq!(list["action"].as_str(), Some("list"));
-        assert_eq!(list["total"].as_u64(), Some(2));
-        let newer_id = newer.to_string();
-        assert_eq!(
-            list["checkpoints"][0]["checkpoint_id"].as_str(),
-            Some(newer_id.as_str())
-        );
-        assert_eq!(
-            list["checkpoints"][0]["label"].as_str(),
-            Some("manual save")
-        );
-        assert_eq!(list["checkpoints"][0]["size_bytes"].as_u64(), Some(2048));
+            let list = robot_checkpoint_list_data(&db_path, 10, 0).expect("list checkpoints");
+            assert_eq!(list["family"].as_str(), Some("checkpoint"));
+            assert_eq!(list["action"].as_str(), Some("list"));
+            assert_eq!(list["total"].as_u64(), Some(2));
+            let newer_id = newer.to_string();
+            assert_eq!(
+                list["checkpoints"][0]["checkpoint_id"].as_str(),
+                Some(newer_id.as_str())
+            );
+            assert_eq!(
+                list["checkpoints"][0]["label"].as_str(),
+                Some("manual save")
+            );
+            assert_eq!(list["checkpoints"][0]["size_bytes"].as_u64(), Some(2048));
 
-        let shown = robot_checkpoint_show_data(&db_path, newer)
-            .expect("show checkpoint")
-            .expect("checkpoint exists");
-        assert_eq!(shown["family"].as_str(), Some("checkpoint"));
-        assert_eq!(shown["action"].as_str(), Some("show"));
-        assert_eq!(shown["checkpoint_id"].as_str(), Some(newer_id.as_str()));
-        assert_eq!(shown["label"].as_str(), Some("manual save"));
-        assert_eq!(shown["panes"][0]["pane_id"].as_u64(), Some(42));
-        assert_eq!(
-            shown["panes"][0]["working_dir"].as_str(),
-            Some("/workspace")
-        );
-        assert_eq!(shown["panes"][0]["command"].as_str(), Some("codex"));
-        assert_eq!(shown["panes"][0]["has_scrollback"].as_bool(), Some(true));
+            let shown = robot_checkpoint_show_data(&db_path, newer)
+                .expect("show checkpoint")
+                .expect("checkpoint exists");
+            assert_eq!(shown["family"].as_str(), Some("checkpoint"));
+            assert_eq!(shown["action"].as_str(), Some("show"));
+            assert_eq!(shown["checkpoint_id"].as_str(), Some(newer_id.as_str()));
+            assert_eq!(shown["label"].as_str(), Some("manual save"));
+            assert_eq!(shown["panes"][0]["pane_id"].as_u64(), Some(42));
+            assert_eq!(
+                shown["panes"][0]["working_dir"].as_str(),
+                Some("/workspace")
+            );
+            assert_eq!(shown["panes"][0]["command"].as_str(), Some("codex"));
+            assert_eq!(shown["panes"][0]["has_scrollback"].as_bool(), Some(true));
 
-        let deleted = robot_checkpoint_delete_data(&db_path, newer)
+            let receipt =
+                insert_robot_restore_receipt_for_test(&conn, "sess-robot-checkpoint", 3000);
+            let receipt_list =
+                robot_checkpoint_list_data(&db_path, 10, 0).expect("list all checkpoint roles");
+            assert_eq!(receipt_list["total"].as_u64(), Some(3));
+            assert_eq!(
+                receipt_list["checkpoints"][0]["numeric_checkpoint_id"].as_i64(),
+                Some(receipt)
+            );
+            assert_eq!(
+                receipt_list["checkpoints"][0]["checkpoint_role"].as_str(),
+                Some("restore_receipt")
+            );
+            let shown_receipt = robot_checkpoint_show_data(&db_path, receipt)
+                .expect("show restore receipt")
+                .expect("restore receipt exists");
+            assert_eq!(
+                shown_receipt["checkpoint_role"].as_str(),
+                Some("restore_receipt")
+            );
+            let deleted_receipt = robot_checkpoint_delete_data(
+                &db_path,
+                frankenterm_core::config::SnapshotConfig::default(),
+                frankenterm_core::snapshot_engine::SnapshotDeleteTarget::Id(receipt),
+            )
+            .await
+            .expect("delete restore receipt")
+            .expect("restore receipt deleted");
+            assert_eq!(
+                deleted_receipt["checkpoint_role"].as_str(),
+                Some("restore_receipt")
+            );
+
+            let deleted = robot_checkpoint_delete_data(
+                &db_path,
+                frankenterm_core::config::SnapshotConfig::default(),
+                frankenterm_core::snapshot_engine::SnapshotDeleteTarget::Id(newer),
+            )
+            .await
             .expect("delete checkpoint")
             .expect("checkpoint deleted");
-        assert_eq!(deleted["family"].as_str(), Some("checkpoint"));
-        assert_eq!(deleted["action"].as_str(), Some("delete"));
-        assert_eq!(deleted["bytes_freed"].as_u64(), Some(2048));
-        assert!(
-            robot_checkpoint_show_data(&db_path, newer)
-                .expect("show after delete")
-                .is_none()
-        );
+            assert_eq!(deleted["family"].as_str(), Some("checkpoint"));
+            assert_eq!(deleted["action"].as_str(), Some("delete"));
+            assert_eq!(deleted["recorded_payload_bytes"].as_u64(), Some(2048));
+            assert!(
+                robot_checkpoint_show_data(&db_path, newer)
+                    .expect("show after delete")
+                    .is_none()
+            );
+        });
     }
 
     #[test]
@@ -73277,18 +73756,91 @@ mod tests {
         let db_path = layout.db_path.to_string_lossy().to_string();
 
         let latest_error =
-            robot_checkpoint_resolve_id(&db_path, "latest", 5).expect_err("latest is absent");
+            robot_checkpoint_resolve_id(
+                &db_path,
+                "latest",
+                CheckpointResolveScope::Any,
+                5,
+            )
+            .expect_err("latest is absent");
         assert_eq!(
             latest_error.error_code.as_deref(),
             Some(ROBOT_ERR_CHECKPOINT_NOT_FOUND)
         );
 
         let invalid_error =
-            robot_checkpoint_resolve_id(&db_path, "not-a-number", 5).expect_err("invalid id");
+            robot_checkpoint_resolve_id(
+                &db_path,
+                "not-a-number",
+                CheckpointResolveScope::Any,
+                5,
+            )
+            .expect_err("invalid id");
         assert_eq!(
             invalid_error.error_code.as_deref(),
             Some(ROBOT_ERR_INVALID_ARGS)
         );
+
+        let inaccessible_db = layout
+            .ft_dir
+            .join("missing-parent")
+            .join("checkpoints.db");
+        let storage_error = robot_checkpoint_resolve_id(
+            inaccessible_db.to_string_lossy().as_ref(),
+            "latest",
+            CheckpointResolveScope::Any,
+            5,
+        )
+        .expect_err("database open failure is not an argument error");
+        assert_eq!(
+            storage_error.error_code.as_deref(),
+            Some(ROBOT_ERR_STORAGE)
+        );
+    }
+
+    #[test]
+    fn checkpoint_resolver_honors_role_scope_and_id_tiebreak() {
+        let (_dir, layout, conn) = setup_robot_checkpoint_test_workspace();
+        let db_path = layout.db_path.to_string_lossy().to_string();
+        insert_session_for_session_show_test(&conn, "sess-resolver", false);
+
+        let first_snapshot =
+            insert_robot_checkpoint_for_test(&conn, "sess-resolver", 4000, None, 10);
+        let second_snapshot =
+            insert_robot_checkpoint_for_test(&conn, "sess-resolver", 4000, None, 20);
+        let receipt = insert_robot_restore_receipt_for_test(&conn, "sess-resolver", 4000);
+
+        assert_eq!(
+            resolve_checkpoint_id(&db_path, "latest", CheckpointResolveScope::Any)
+                .expect("resolve latest checkpoint across roles"),
+            receipt
+        );
+        assert_eq!(
+            resolve_checkpoint_id(&db_path, "latest", CheckpointResolveScope::Snapshot)
+                .expect("resolve latest snapshot"),
+            second_snapshot
+        );
+        assert!(second_snapshot > first_snapshot);
+        assert_eq!(
+            resolve_checkpoint_id(
+                &db_path,
+                &receipt.to_string(),
+                CheckpointResolveScope::Any,
+            )
+            .expect("resolve numeric receipt without a role restriction"),
+            receipt
+        );
+        assert!(matches!(
+            resolve_checkpoint_id(
+                &db_path,
+                &receipt.to_string(),
+                CheckpointResolveScope::Snapshot,
+            ),
+            Err(CheckpointResolveError::WrongRole {
+                checkpoint_id,
+                role,
+            }) if checkpoint_id == receipt && role == "restore_receipt"
+        ));
     }
 
     #[test]
@@ -73313,6 +73865,8 @@ mod tests {
                 Some("zsh"),
                 None,
             );
+            let restore_receipt =
+                insert_robot_restore_receipt_for_test(&conn, "sess-robot-rollback", 4000);
 
             let config = frankenterm_core::config::Config::default();
             let dry_run = handle_robot_checkpoint_command(
@@ -73335,6 +73889,48 @@ mod tests {
                 Some(checkpoint_id)
             );
 
+            let latest_dry_run = handle_robot_checkpoint_command(
+                &RobotCheckpointCommands::Rollback {
+                    checkpoint_id: "latest".to_string(),
+                    dry_run: true,
+                },
+                &layout,
+                &config,
+                8,
+            )
+            .await;
+            assert!(latest_dry_run.ok);
+            assert_eq!(
+                latest_dry_run
+                    .data
+                    .as_ref()
+                    .and_then(|data| data["plan"]["snapshot"]["checkpoint_id"].as_i64()),
+                Some(checkpoint_id),
+                "latest rollback must skip the newer restore receipt"
+            );
+
+            let receipt_dry_run = handle_robot_checkpoint_command(
+                &RobotCheckpointCommands::Rollback {
+                    checkpoint_id: restore_receipt.to_string(),
+                    dry_run: true,
+                },
+                &layout,
+                &config,
+                8,
+            )
+            .await;
+            assert!(!receipt_dry_run.ok);
+            assert_eq!(
+                receipt_dry_run.error_code.as_deref(),
+                Some(ROBOT_ERR_INVALID_ARGS)
+            );
+            assert!(
+                receipt_dry_run
+                    .error
+                    .as_deref()
+                    .is_some_and(|message| message.contains("restore_receipt"))
+            );
+
             let apply = handle_robot_checkpoint_command(
                 &RobotCheckpointCommands::Rollback {
                     checkpoint_id: checkpoint_id.to_string(),
@@ -73354,7 +73950,7 @@ mod tests {
 
             let missing = handle_robot_checkpoint_command(
                 &RobotCheckpointCommands::Show {
-                    checkpoint_id: (checkpoint_id + 1).to_string(),
+                    checkpoint_id: (restore_receipt + 1).to_string(),
                 },
                 &layout,
                 &config,
@@ -73387,8 +73983,10 @@ mod tests {
 
         conn.execute(
             "INSERT INTO session_checkpoints
-             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
-             VALUES (?1, ?2, 'startup', 'restore', ?3, 0, ?4)",
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+              total_bytes, metadata_json, checkpoint_role, topology_json)
+             VALUES (?1, ?2, 'startup', 'restore', ?3, 0, ?4,
+                     'restore_receipt', NULL)",
             rusqlite::params![
                 "sess-shadowed",
                 2000i64,
@@ -73472,7 +74070,8 @@ mod tests {
         let checkpoints = vec![frankenterm_core::session_restore::CheckpointInfo {
             id: 17,
             checkpoint_at: 2000,
-            checkpoint_type: Some("periodic".to_string()),
+            checkpoint_type: "periodic".to_string(),
+            checkpoint_role: frankenterm_core::session_restore::CheckpointRole::Snapshot,
             pane_count: 1,
             total_bytes: 1024,
         }];
@@ -73719,20 +74318,20 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_trigger_cli_aliases_preserve_restart_semantics() {
+    fn snapshot_trigger_cli_aliases_do_not_bypass_terminal_admission() {
         use frankenterm_core::snapshot_engine::SnapshotTrigger;
 
         assert_eq!(
             snapshot_trigger_from_cli_label("pre_restart"),
-            SnapshotTrigger::Shutdown
+            SnapshotTrigger::Manual
         );
         assert_eq!(
             snapshot_trigger_from_cli_label("pre_shutdown"),
-            SnapshotTrigger::Shutdown
+            SnapshotTrigger::Manual
         );
         assert_eq!(
             snapshot_trigger_from_cli_label("shutdown"),
-            SnapshotTrigger::Shutdown
+            SnapshotTrigger::Manual
         );
         assert_eq!(
             snapshot_trigger_from_cli_label("manual"),
@@ -73782,9 +74381,11 @@ mod tests {
         SnapshotResult {
             session_id: "session-restart".to_string(),
             checkpoint_id: 42,
+            checkpoint_at: 1_735_689_600_000,
+            state_hash: "snp2:sample-restart".to_string(),
             pane_count: 3,
             total_bytes: 4096,
-            trigger: SnapshotTrigger::Shutdown,
+            trigger: SnapshotTrigger::Manual,
         }
     }
 
@@ -73831,8 +74432,16 @@ mod tests {
             checkpoint_id: 42,
             session_id: "session-restart".to_string(),
             checkpoint_at: 1_735_689_600,
-            checkpoint_type: Some("shutdown".to_string()),
+            checkpoint_type: "shutdown".to_string(),
+            checkpoint_role: frankenterm_core::session_restore::CheckpointRole::Snapshot,
+            verification:
+                frankenterm_core::session_restore::CheckpointVerification::VerifiedV2,
+            topology_json: Some(
+                r#"{"schema_version":1,"captured_at":1735689600,"windows":[]}"#
+                    .to_string(),
+            ),
             pane_count: 3,
+            total_bytes: 0,
             pane_states: Vec::new(),
         }
     }
@@ -73854,6 +74463,41 @@ mod tests {
             launch_agents: true,
             wezterm_timeout_secs: 5,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_capture_links_scrollback_only_when_restore_will_use_it() {
+        let normal = restart_snapshot_capture_options(sample_restart_options());
+        assert!(normal.include_scrollback);
+        let normal_metadata = normal.metadata.expect("normal restart metadata");
+        assert_eq!(normal_metadata["include_scrollback"].as_bool(), Some(true));
+        assert_eq!(
+            normal_metadata["scrollback_ref_policy"].as_str(),
+            Some("linked_for_bounded_restore")
+        );
+
+        let mut layout_only_options = sample_restart_options();
+        layout_only_options.layout_only = true;
+        let layout_only = restart_snapshot_capture_options(layout_only_options);
+        assert!(!layout_only.include_scrollback);
+        let layout_only_metadata = layout_only.metadata.expect("layout-only restart metadata");
+        assert_eq!(
+            layout_only_metadata["include_scrollback"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            layout_only_metadata["scrollback_ref_policy"].as_str(),
+            Some("omitted_for_layout_only")
+        );
+
+        let mut skip_restore_options = sample_restart_options();
+        skip_restore_options.skip_restore = true;
+        let skip_restore = restart_snapshot_capture_options(skip_restore_options);
+        assert!(
+            skip_restore.include_scrollback,
+            "a skipped immediate restore must retain full manual-recovery capability"
+        );
     }
 
     #[cfg(unix)]
