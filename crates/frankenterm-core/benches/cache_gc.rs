@@ -181,9 +181,10 @@ fn bench_gc_report_generation(c: &mut Criterion) {
 
             let report = serde_json::json!({
                 "active_panes": 50,
-                "vacuum_threshold": 0.20,
+                "manual_vacuum_advisory_threshold": 0.20,
                 "free_ratio": 0.11,
-                "vacuumed": false,
+                "automatic_vacuum": false,
+                "manual_vacuum_advised": false,
                 "caches": caches,
             });
             black_box(report.to_string());

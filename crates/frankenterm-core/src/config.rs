@@ -4283,7 +4283,14 @@ pub struct SessionRetentionConfig {
     /// Maximum number of closed sessions to retain (0 = unlimited).
     pub max_closed_sessions: usize,
 
-    /// Maximum total session data size in MB (0 = unlimited).
+    /// Maximum summed snapshot pane-state JSON estimate in MB (0 = unlimited).
+    ///
+    /// This is a logical retention budget over `session_checkpoints.total_bytes`,
+    /// which historically counts serialized terminal, environment, and agent
+    /// metadata JSON written by the snapshot engine. It is not a complete
+    /// checkpoint-payload, database-file-size, or resident-memory limit;
+    /// topology, cwd, command, startup-checkpoint metadata, SQLite page, index,
+    /// WAL, freelist, and unrelated-table bytes are outside this estimate.
     pub max_total_size_mb: u64,
 
     /// Run cleanup every N hours (0 = only on startup).

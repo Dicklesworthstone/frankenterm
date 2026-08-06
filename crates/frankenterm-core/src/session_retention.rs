@@ -7,7 +7,8 @@
 //!
 //! 1. Delete sessions older than `max_age_days` (skip active sessions)
 //! 2. Delete excess closed sessions beyond `max_closed_sessions` (oldest first)
-//! 3. If total size exceeds `max_total_size_mb`, delete oldest closed sessions
+//! 3. If the summed snapshot pane-state JSON estimate exceeds
+//!    `max_total_size_mb`, delete oldest closed sessions
 //! 4. Clean orphaned data (pane_state without checkpoint, checkpoint without session)
 //!
 //! Cascade: session deletion cascades to checkpoints -> pane_state via FK.
@@ -27,6 +28,12 @@ use crate::config::SessionRetentionConfig;
 // the proptest_session_retention.rs proptest) need zero edits.
 pub use frankenterm_core_audit_types::session_retention_types::CleanupResult;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SizeCleanupOutcome {
+    deleted: usize,
+    shortfall_bytes: u64,
+}
+
 /// Finite phase in which session-cleanup completion became unobservable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionCleanupIndeterminatePhase {
@@ -34,7 +41,7 @@ pub enum SessionCleanupIndeterminatePhase {
     /// observed. The closure may still be running or may already have committed.
     BlockingTaskSettlement,
     /// The cleanup SQL pipeline returned an error after execution began. Earlier
-    /// autocommit statements may already be durable.
+    /// independently committed phases may already be durable.
     CleanupExecution,
 }
 
@@ -126,12 +133,20 @@ pub fn cleanup_sessions(
 
     // 3. Delete by size budget
     if config.max_total_size_mb > 0 {
-        result.deleted_by_size = delete_sessions_by_size(conn, config.max_total_size_mb)?;
-        if result.deleted_by_size > 0 {
-            info!(
-                deleted = result.deleted_by_size,
+        let size_outcome = delete_sessions_by_size(conn, config.max_total_size_mb)?;
+        result.deleted_by_size = size_outcome.deleted;
+        if size_outcome.shortfall_bytes > 0 {
+            warn!(
+                deleted = size_outcome.deleted,
+                shortfall_bytes = size_outcome.shortfall_bytes,
                 max_mb = config.max_total_size_mb,
-                "Cleaned up sessions by size budget"
+                "Session size budget remains above its configured limit because no more closed sessions are eligible"
+            );
+        } else if size_outcome.deleted > 0 {
+            info!(
+                deleted = size_outcome.deleted,
+                max_mb = config.max_total_size_mb,
+                "Applied session size budget"
             );
         }
     }
@@ -148,35 +163,78 @@ pub fn cleanup_sessions(
         );
     }
 
-    // 5. VACUUM only if significant cleanup was performed
-    let total_deleted = result.total_sessions_deleted();
-    if total_deleted >= 10 {
-        debug!("Running VACUUM after significant cleanup ({total_deleted} sessions deleted)");
-        // VACUUM can be expensive; only run if we freed a meaningful amount
-        if let Err(e) = conn.execute_batch("VACUUM") {
-            warn!(error = %e, "VACUUM failed (non-critical)");
-        } else {
-            result.vacuumed = true;
-        }
-    }
-
+    // Deliberately leave freed pages on SQLite's freelist for reuse. Full
+    // VACUUM rewrites the entire database and can monopolize the interactive
+    // writer for an unbounded interval; retention cleanup must never trigger
+    // it implicitly. The runtime's ordinary online-maintenance lane owns
+    // PASSIVE WAL checkpointing and PRAGMA optimize. Physical compaction, when
+    // explicitly requested by an operator, remains a separate disruptive
+    // maintenance operation.
     Ok(result)
+}
+
+fn u64_to_sqlite_integer(value: u64) -> Result<i64, rusqlite::Error> {
+    i64::try_from(value)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+fn ensure_retention_tables_have_no_unaudited_triggers(
+    conn: &Connection,
+) -> Result<(), rusqlite::Error> {
+    let trigger_count: i64 = conn.query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM sqlite_schema
+              WHERE type = 'trigger'
+                AND tbl_name COLLATE NOCASE
+                    IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state'))
+           + (SELECT COUNT(*) FROM sqlite_temp_schema
+              WHERE type = 'trigger'
+                AND tbl_name COLLATE NOCASE
+                    IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state'))",
+        [],
+        |row| row.get(0),
+    )?;
+    if trigger_count == 0 {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::other(
+                "session retention refuses unaudited triggers on authoritative tables",
+            ),
+        )))
+    }
 }
 
 /// Delete closed sessions older than `max_age_days`.
 ///
-/// Active sessions (shutdown_clean = 0 with recent checkpoints) are preserved.
+/// Active sessions (`shutdown_clean = 0`) are preserved. Closed-session age is
+/// measured from its latest checkpoint when present, so a long-running session
+/// is not deleted immediately after a recent clean shutdown merely because it
+/// was originally created before the age cutoff.
 fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize, rusqlite::Error> {
     let cutoff_ms = epoch_ms().saturating_sub(max_age_days.saturating_mul(86_400_000));
-    let cutoff_ms = i64::try_from(cutoff_ms).unwrap_or(i64::MAX);
+    // An unrepresentable future cutoff must fail without deleting anything;
+    // clamping to i64::MAX would make nearly every closed session eligible.
+    let cutoff_ms = u64_to_sqlite_integer(cutoff_ms)?;
 
-    let deleted = conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    ensure_retention_tables_have_no_unaudited_triggers(&tx)?;
+    let deleted = tx.execute(
         "DELETE FROM mux_sessions
-         WHERE created_at < ?1
+         WHERE MAX(
+                   created_at,
+                   COALESCE(last_checkpoint_at, created_at),
+                   COALESCE(
+                       (SELECT MAX(c.checkpoint_at)
+                        FROM session_checkpoints c
+                        WHERE c.session_id = mux_sessions.session_id),
+                       created_at
+                   )
+               ) < ?1
          AND shutdown_clean = 1",
         [cutoff_ms],
     )?;
-
+    tx.commit()?;
     Ok(deleted)
 }
 
@@ -186,29 +244,60 @@ fn delete_excess_closed_sessions(
     max_count: usize,
 ) -> Result<usize, rusqlite::Error> {
     let max_count = i64::try_from(max_count).unwrap_or(i64::MAX);
-    let deleted = conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    ensure_retention_tables_have_no_unaudited_triggers(&tx)?;
+    let deleted = tx.execute(
         "DELETE FROM mux_sessions
          WHERE shutdown_clean = 1
          AND session_id NOT IN (
              SELECT session_id FROM mux_sessions
              WHERE shutdown_clean = 1
-             ORDER BY COALESCE(last_checkpoint_at, created_at) DESC
+             ORDER BY MAX(
+                          created_at,
+                          COALESCE(last_checkpoint_at, created_at),
+                          COALESCE(
+                              (SELECT MAX(c.checkpoint_at)
+                               FROM session_checkpoints c
+                               WHERE c.session_id = mux_sessions.session_id),
+                              created_at
+                          )
+                      ) DESC,
+                      session_id DESC
              LIMIT ?1
          )",
         [max_count],
     )?;
-
+    tx.commit()?;
     Ok(deleted)
 }
 
-/// Delete oldest closed sessions until total session data size is under budget.
-fn delete_sessions_by_size(conn: &Connection, max_total_mb: u64) -> Result<usize, rusqlite::Error> {
+/// Delete oldest closed sessions until the summed snapshot pane-state JSON
+/// estimate is under budget. This preserves the historical
+/// `session_checkpoints.total_bytes` contract; it does not claim to include
+/// every checkpoint column or measure SQLite file/WAL/index bytes.
+fn delete_sessions_by_size(
+    conn: &Connection,
+    max_total_mb: u64,
+) -> Result<SizeCleanupOutcome, rusqlite::Error> {
     let max_bytes = max_total_mb.saturating_mul(1_024).saturating_mul(1_024);
 
-    // Get total size of session data
-    let (total_bytes, minimum_bytes): (i64, i64) = conn.query_row(
-        "SELECT COALESCE(SUM(total_bytes), 0), COALESCE(MIN(total_bytes), 0)
-         FROM session_checkpoints",
+    // Keep the measurement, candidate set, and deletions in one transaction.
+    // Without this boundary, a later DELETE failure left earlier session
+    // deletions committed even though this stage returned no accounting
+    // result, and a concurrent cleanup could make us claim bytes for a row our
+    // connection did not delete.
+    let tx = conn.unchecked_transaction()?;
+    ensure_retention_tables_have_no_unaudited_triggers(&tx)?;
+
+    // Measure only checkpoints owned by a current session. Orphan checkpoints
+    // are reclaimed by `cleanup_orphaned_data`; counting them here would make
+    // an ineligible orphan inflate `to_free`, evict valid closed sessions, and
+    // still leave a false shortfall because no candidate could release those
+    // orphan bytes. Keep total and minimum validation on this same universe.
+    let (total_bytes, minimum_bytes): (i64, i64) = tx.query_row(
+        "SELECT COALESCE(SUM(c.total_bytes), 0), COALESCE(MIN(c.total_bytes), 0)
+         FROM session_checkpoints c
+         INNER JOIN mux_sessions s ON s.session_id = c.session_id",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -222,7 +311,7 @@ fn delete_sessions_by_size(conn: &Connection, max_total_mb: u64) -> Result<usize
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, total_bytes))?;
 
     if total_bytes <= max_bytes {
-        return Ok(0);
+        return Ok(SizeCleanupOutcome::default());
     }
 
     // Need to free: total_bytes - max_bytes
@@ -231,49 +320,71 @@ fn delete_sessions_by_size(conn: &Connection, max_total_mb: u64) -> Result<usize
     let mut deleted = 0_usize;
 
     // Get closed sessions ordered oldest first, with their checkpoint sizes
-    let mut stmt = conn.prepare(
-        "SELECT s.session_id, COALESCE(SUM(c.total_bytes), 0) as session_bytes
-         FROM mux_sessions s
-         LEFT JOIN session_checkpoints c ON c.session_id = s.session_id
-         WHERE s.shutdown_clean = 1
-         GROUP BY s.session_id
-         ORDER BY COALESCE(s.last_checkpoint_at, s.created_at) ASC",
-    )?;
+    let sessions: Vec<(String, u64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT s.session_id, COALESCE(SUM(c.total_bytes), 0) as session_bytes
+             FROM mux_sessions s
+             LEFT JOIN session_checkpoints c ON c.session_id = s.session_id
+             WHERE s.shutdown_clean = 1
+             GROUP BY s.session_id
+             HAVING COALESCE(SUM(c.total_bytes), 0) > 0
+             ORDER BY MAX(
+                          s.created_at,
+                          COALESCE(s.last_checkpoint_at, s.created_at),
+                          COALESCE(MAX(c.checkpoint_at), s.created_at)
+                      ) ASC,
+                      s.session_id ASC",
+        )?;
 
-    let sessions: Vec<(String, u64)> = stmt
-        .query_map([], |row| {
-            let session_id = row.get(0)?;
-            let session_bytes: i64 = row.get(1)?;
-            let session_bytes = u64::try_from(session_bytes).map_err(|_| {
-                rusqlite::Error::IntegralValueOutOfRange(1, session_bytes)
-            })?;
-            Ok((session_id, session_bytes))
-        })?
-        .collect::<Result<_, _>>()?;
+        let sessions = stmt
+            .query_map([], |row| {
+                let session_id = row.get(0)?;
+                let session_bytes: i64 = row.get(1)?;
+                let session_bytes = u64::try_from(session_bytes).map_err(|_| {
+                    rusqlite::Error::IntegralValueOutOfRange(1, session_bytes)
+                })?;
+                Ok((session_id, session_bytes))
+            })?
+            .collect::<Result<_, _>>()?;
+        sessions
+    };
 
     for (session_id, session_bytes) in sessions {
         if freed >= to_free {
             break;
         }
 
-        conn.execute(
+        let affected = tx.execute(
             "DELETE FROM mux_sessions WHERE session_id = ?1",
             [&session_id],
         )?;
 
+        // The candidate query names one primary-key row. A trigger that ignores
+        // it (or any other non-exact effect) means the size target was not
+        // enforced as measured, so roll back rather than return false cleanup
+        // accounting.
+        if affected != 1 {
+            return Err(rusqlite::Error::StatementChangedRows(affected));
+        }
+
         freed = freed.saturating_add(session_bytes);
         deleted = deleted.saturating_add(1);
 
-        debug!(
-            session_id = %session_id,
-            freed_bytes = session_bytes,
-            total_freed = freed,
-            target = to_free,
-            "Deleted session for size budget"
-        );
     }
 
-    Ok(deleted)
+    tx.commit()?;
+    if deleted > 0 {
+        debug!(
+            deleted,
+            freed_bytes = freed,
+            target_bytes = to_free,
+            "Committed bounded session set for size budget"
+        );
+    }
+    Ok(SizeCleanupOutcome {
+        deleted,
+        shortfall_bytes: to_free.saturating_sub(freed),
+    })
 }
 
 /// Clean orphaned data that lost its parent reference.
@@ -292,6 +403,7 @@ fn cleanup_orphaned_data(conn: &Connection) -> Result<(usize, usize), rusqlite::
     // correct AND correctly counted under either FK setting. The transaction
     // makes both deletes commit atomically.
     let tx = conn.unchecked_transaction()?;
+    ensure_retention_tables_have_no_unaudited_triggers(&tx)?;
 
     // Orphaned pane_state rows: checkpoint already deleted, OR checkpoint is
     // itself a session-orphan that the next statement removes.
@@ -370,9 +482,10 @@ pub async fn cleanup_sessions_async_cx(
             SessionCleanupError::DatabasePreparation
         })?;
         cleanup_sessions(&conn, &config).map_err(|error| {
-            // The cleanup pipeline currently performs several autocommit
-            // statements. Any earlier step may be durable when a later step
-            // fails, so a generic database error would fabricate retry safety.
+            // The cleanup pipeline currently commits policy phases
+            // independently. Any earlier phase may be durable when a later
+            // phase fails, so a generic database error would fabricate retry
+            // safety until exact partial receipts/continuations land.
             warn!(error = %error, "session cleanup execution outcome is indeterminate");
             SessionCleanupError::IndeterminateCleanup {
                 phase: SessionCleanupIndeterminatePhase::CleanupExecution,
@@ -406,10 +519,11 @@ fn classify_session_cleanup_blocking_failure(
 
 /// Get current epoch time in milliseconds.
 fn epoch_ms() -> u64 {
-    std::time::SystemTime::now()
+    let epoch_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_millis();
+    u64::try_from(epoch_ms).unwrap_or(u64::MAX)
 }
 
 // =============================================================================
@@ -618,6 +732,60 @@ mod tests {
         assert_eq!(count_sessions(&conn), 1);
     }
 
+    #[test]
+    fn age_cleanup_uses_recent_checkpoint_for_long_lived_closed_session() {
+        let conn = make_test_db();
+        let now = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer");
+        let created_at = now - 90 * 86_400_000;
+        insert_session(&conn, "long-lived-recently-closed", created_at, true);
+        insert_checkpoint(
+            &conn,
+            "long-lived-recently-closed",
+            now - 1_000,
+            1_024,
+        );
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = ?1 WHERE session_id = ?2",
+            rusqlite::params![now - 1_000, "long-lived-recently-closed"],
+        )
+        .unwrap();
+
+        let deleted = delete_sessions_by_age(&conn, 30).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(count_sessions(&conn), 1);
+    }
+
+    #[test]
+    fn age_cleanup_uses_authoritative_recency_when_cached_metadata_is_stale() {
+        let conn = make_test_db();
+        let now = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer");
+        let old = now - 90 * 86_400_000;
+
+        insert_session(&conn, "recent-created-corrupt-cache", now - 1_000, true);
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = -1 WHERE session_id = ?1",
+            ["recent-created-corrupt-cache"],
+        )
+        .unwrap();
+
+        insert_session(&conn, "recent-checkpoint-stale-cache", old, true);
+        insert_checkpoint(
+            &conn,
+            "recent-checkpoint-stale-cache",
+            now - 500,
+            1_024,
+        );
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = ?1 WHERE session_id = ?2",
+            rusqlite::params![old, "recent-checkpoint-stale-cache"],
+        )
+        .unwrap();
+
+        let deleted = delete_sessions_by_age(&conn, 30).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(count_sessions(&conn), 2);
+    }
+
     // ---- Count-based cleanup ----
 
     #[test]
@@ -646,6 +814,44 @@ mod tests {
         assert_eq!(kept, vec!["sess-4", "sess-3", "sess-2"]);
     }
 
+    #[test]
+    fn count_cleanup_breaks_equal_timestamps_deterministically() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        for id in ["sess-a", "sess-c", "sess-b"] {
+            insert_session(&conn, id, now, true);
+        }
+
+        let deleted = delete_excess_closed_sessions(&conn, 1).unwrap();
+        assert_eq!(deleted, 2);
+        let retained: String = conn
+            .query_row("SELECT session_id FROM mux_sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained, "sess-c");
+    }
+
+    #[test]
+    fn count_cleanup_orders_by_authoritative_checkpoint_recency() {
+        let conn = make_test_db();
+        let now = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer");
+        let old = now - 90 * 86_400_000;
+        insert_session(&conn, "recent-by-created", now - 10_000, true);
+        insert_session(&conn, "recent-by-checkpoint", old, true);
+        insert_checkpoint(&conn, "recent-by-checkpoint", now - 1_000, 1_024);
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = -1 WHERE session_id = ?1",
+            ["recent-by-checkpoint"],
+        )
+        .unwrap();
+
+        let deleted = delete_excess_closed_sessions(&conn, 1).unwrap();
+        assert_eq!(deleted, 1);
+        let retained: String = conn
+            .query_row("SELECT session_id FROM mux_sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained, "recent-by-checkpoint");
+    }
+
     // ---- Size-based cleanup ----
 
     #[test]
@@ -661,8 +867,9 @@ mod tests {
         }
 
         // Total: 1200KB. Budget: 1MB (1024KB). Need to free 176KB → delete oldest.
-        let deleted = delete_sessions_by_size(&conn, 1).unwrap();
-        assert_eq!(deleted, 1); // Deletes oldest (400KB > 176KB needed)
+        let outcome = delete_sessions_by_size(&conn, 1).unwrap();
+        assert_eq!(outcome.deleted, 1); // Deletes oldest (400KB > 176KB needed)
+        assert_eq!(outcome.shortfall_bytes, 0);
         assert_eq!(count_sessions(&conn), 2);
     }
 
@@ -674,8 +881,36 @@ mod tests {
         insert_session(&conn, "small", now, true);
         insert_checkpoint(&conn, "small", now, 1024); // 1KB
 
-        let deleted = delete_sessions_by_size(&conn, 1).unwrap();
-        assert_eq!(deleted, 0);
+        let outcome = delete_sessions_by_size(&conn, 1).unwrap();
+        assert_eq!(outcome, SizeCleanupOutcome::default());
+    }
+
+    #[test]
+    fn size_cleanup_evicts_by_authoritative_checkpoint_recency() {
+        let conn = make_test_db();
+        let now = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer");
+        let old = now - 90 * 86_400_000;
+        insert_session(&conn, "genuinely-old", old, true);
+        insert_checkpoint(&conn, "genuinely-old", old, 700 * 1_024);
+        insert_session(&conn, "recent-checkpoint-stale-cache", old - 1, true);
+        insert_checkpoint(
+            &conn,
+            "recent-checkpoint-stale-cache",
+            now - 1_000,
+            700 * 1_024,
+        );
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = -1 WHERE session_id = ?1",
+            ["recent-checkpoint-stale-cache"],
+        )
+        .unwrap();
+
+        let outcome = delete_sessions_by_size(&conn, 1).unwrap();
+        assert_eq!(outcome.deleted, 1);
+        let retained: String = conn
+            .query_row("SELECT session_id FROM mux_sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained, "recent-checkpoint-stale-cache");
     }
 
     #[test]
@@ -692,6 +927,183 @@ mod tests {
             rusqlite::Error::IntegralValueOutOfRange(1, -1)
         ));
         assert_eq!(count_sessions(&conn), 1);
+    }
+
+    #[test]
+    fn sqlite_timestamp_conversion_rejects_values_that_would_wrap_or_overdelete() {
+        assert_eq!(
+            u64_to_sqlite_integer(u64::try_from(i64::MAX).unwrap()).unwrap(),
+            i64::MAX
+        );
+        assert!(u64_to_sqlite_integer(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn size_cleanup_rolls_back_partial_deletes_when_a_later_delete_fails() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        for i in 0..3 {
+            let id = format!("sess-{i}");
+            insert_session(&conn, &id, now + i * 1000, true);
+            insert_checkpoint(&conn, &id, now + i * 1000, 700 * 1024);
+        }
+        conn.execute_batch(
+            "CREATE TABLE synthetic_delete_guard (
+                 session_id TEXT PRIMARY KEY
+                     REFERENCES mux_sessions(session_id) ON DELETE RESTRICT
+             );
+             INSERT INTO synthetic_delete_guard(session_id) VALUES ('sess-1');",
+        )
+        .unwrap();
+
+        delete_sessions_by_size(&conn, 1)
+            .expect_err("the second candidate must abort the size-cleanup transaction");
+        assert_eq!(count_sessions(&conn), 3);
+        assert_eq!(count_checkpoints(&conn), 3);
+    }
+
+    #[test]
+    fn size_cleanup_rejects_unaudited_ignore_trigger_before_mutation() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        for i in 0..2 {
+            let id = format!("sess-{i}");
+            insert_session(&conn, &id, now + i * 1000, true);
+            insert_checkpoint(&conn, &id, now + i * 1000, 700 * 1024);
+        }
+        conn.execute_batch(
+            "CREATE TRIGGER ignore_first_size_delete
+             BEFORE DELETE ON mux_sessions
+             WHEN OLD.session_id = 'sess-0'
+             BEGIN
+                 SELECT RAISE(IGNORE);
+             END;",
+        )
+        .unwrap();
+
+        let error = delete_sessions_by_size(&conn, 1)
+            .expect_err("an unaudited ignore trigger must fail before any deletion");
+        assert!(matches!(
+            error,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+        assert_eq!(count_sessions(&conn), 2);
+        assert_eq!(count_checkpoints(&conn), 2);
+    }
+
+    #[test]
+    fn size_cleanup_rejects_temp_schema_triggers_before_mutation() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        insert_session(&conn, "sess-temp", now, true);
+        insert_checkpoint(&conn, "sess-temp", now, 2 * 1024 * 1024);
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER ignore_temp_size_delete
+             BEFORE DELETE ON mux_sessions
+             BEGIN
+                 SELECT RAISE(IGNORE);
+             END;",
+        )
+        .unwrap();
+
+        delete_sessions_by_size(&conn, 1)
+            .expect_err("TEMP triggers on authoritative tables must fail closed");
+        assert_eq!(count_sessions(&conn), 1);
+        assert_eq!(count_checkpoints(&conn), 1);
+    }
+
+    #[test]
+    fn retention_trigger_guard_is_identifier_case_insensitive() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        insert_session(&conn, "sess-case", now, true);
+        insert_checkpoint(&conn, "sess-case", now, 2 * 1024 * 1024);
+        conn.execute_batch(
+            "CREATE TRIGGER ignore_uppercase_size_delete
+             BEFORE DELETE ON MUX_SESSIONS
+             BEGIN
+                 SELECT RAISE(IGNORE);
+             END;",
+        )
+        .unwrap();
+
+        delete_sessions_by_size(&conn, 1)
+            .expect_err("identifier casing must not bypass the persistent trigger guard");
+        assert_eq!(count_sessions(&conn), 1);
+
+        conn.execute_batch(
+            "DROP TRIGGER ignore_uppercase_size_delete;
+             CREATE TEMP TRIGGER ignore_mixed_case_size_delete
+             BEFORE DELETE ON MuX_sEsSiOnS
+             BEGIN
+                 SELECT RAISE(IGNORE);
+             END;",
+        )
+        .unwrap();
+        delete_sessions_by_size(&conn, 1)
+            .expect_err("identifier casing must not bypass the TEMP trigger guard");
+        assert_eq!(count_sessions(&conn), 1);
+        assert_eq!(count_checkpoints(&conn), 1);
+    }
+
+    #[test]
+    fn size_cleanup_reports_shortfall_when_active_data_alone_exceeds_budget() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        insert_session(&conn, "active-large", now, false);
+        insert_checkpoint(&conn, "active-large", now, 2 * 1024 * 1024);
+        insert_session(&conn, "closed-small", now - 1, true);
+        insert_checkpoint(&conn, "closed-small", now - 1, 400 * 1024);
+
+        let outcome = delete_sessions_by_size(&conn, 1).unwrap();
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(outcome.shortfall_bytes, 1024 * 1024);
+        assert_eq!(count_sessions(&conn), 1);
+    }
+
+    #[test]
+    fn size_cleanup_preserves_closed_sessions_that_cannot_free_measured_bytes() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        insert_session(&conn, "active-large", now, false);
+        insert_checkpoint(&conn, "active-large", now, 2 * 1024 * 1024);
+        insert_session(&conn, "closed-without-checkpoint", now - 1, true);
+
+        let outcome = delete_sessions_by_size(&conn, 1).unwrap();
+        assert_eq!(outcome.deleted, 0);
+        assert_eq!(outcome.shortfall_bytes, 1024 * 1024);
+        assert_eq!(count_sessions(&conn), 2);
+    }
+
+    #[test]
+    fn size_cleanup_excludes_orphan_bytes_from_eviction_and_shortfall() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        insert_session(&conn, "valid-closed", now, true);
+        insert_checkpoint(&conn, "valid-closed", now, 400 * 1024);
+
+        // Simulate legacy/corrupt orphan data. Its 2 MiB is reclaimed by the
+        // orphan phase, not by evicting an unrelated valid session.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
+             VALUES ('orphan-session', ?1, 'periodic', 'orphan', 0, ?2)",
+            rusqlite::params![now, 2 * 1024 * 1024],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        let outcome = delete_sessions_by_size(&conn, 1).unwrap();
+        assert_eq!(outcome, SizeCleanupOutcome::default());
+        assert_eq!(count_sessions(&conn), 1);
+        assert_eq!(count_checkpoints(&conn), 2);
+
+        let (orphan_checkpoints, orphan_pane_states) = cleanup_orphaned_data(&conn).unwrap();
+        assert_eq!(orphan_checkpoints, 1);
+        assert_eq!(orphan_pane_states, 0);
+        assert_eq!(count_sessions(&conn), 1);
+        assert_eq!(count_checkpoints(&conn), 1);
     }
 
     // ---- Cascade delete ----
@@ -834,7 +1246,6 @@ mod tests {
 
         let result = cleanup_sessions(&conn, &config).unwrap();
         assert_eq!(result.total_sessions_deleted(), 0);
-        assert!(!result.vacuumed);
     }
 
     #[test]
@@ -914,23 +1325,19 @@ mod tests {
             deleted_by_size: 3,
             orphaned_checkpoints: 4,
             orphaned_pane_states: 5,
-            vacuumed: true,
         };
         let dbg = format!("{result:?}");
         assert!(dbg.contains("CleanupResult"));
-        assert!(dbg.contains("vacuumed: true"));
     }
 
     #[test]
     fn cleanup_result_clone() {
         let result = CleanupResult {
             deleted_by_age: 10,
-            vacuumed: true,
             ..Default::default()
         };
         let result2 = result.clone();
         assert_eq!(result2.deleted_by_age, 10);
-        assert!(result2.vacuumed);
         assert_eq!(result2.total_sessions_deleted(), 10);
     }
 
@@ -953,19 +1360,8 @@ mod tests {
             deleted_by_size: 0,
             orphaned_checkpoints: 1,
             orphaned_pane_states: 0,
-            vacuumed: false,
         };
         assert!(result.any_work_done());
-    }
-
-    #[test]
-    fn cleanup_result_vacuumed_not_counted_as_work() {
-        // vacuumed alone doesn't mean work was done (no deletions)
-        let result = CleanupResult {
-            vacuumed: true,
-            ..Default::default()
-        };
-        assert!(!result.any_work_done());
     }
 
     // ====================================================================
@@ -1021,7 +1417,6 @@ mod tests {
         let result = cleanup_sessions(&conn, &config).unwrap();
         assert_eq!(result.total_sessions_deleted(), 0);
         assert!(!result.any_work_done());
-        assert!(!result.vacuumed);
     }
 
     // ====================================================================
@@ -1051,18 +1446,27 @@ mod tests {
     }
 
     // ====================================================================
-    // VACUUM threshold
+    // Online cleanup must not perform physical compaction
     // ====================================================================
 
     #[test]
-    fn cleanup_vacuum_triggers_at_10_deletions() {
+    fn cleanup_leaves_reclaimable_pages_for_sqlite_reuse_after_many_deletions() {
         let conn = make_test_db();
         let now = epoch_ms() as i64;
         let old = now - 31 * 86_400_000;
 
-        // Create 11 old closed sessions
-        for i in 0..11 {
-            insert_session(&conn, &format!("old-{i}"), old, true);
+        // Large inline topology values make the deleted rows occupy enough
+        // pages for freelist_count to be a deterministic physical-compaction
+        // witness. Full VACUUM would drive this count back to zero.
+        let payload = "x".repeat(32 * 1024);
+        for i in 0..12 {
+            conn.execute(
+                "INSERT INTO mux_sessions
+                 (session_id, created_at, shutdown_clean, topology_json, ft_version)
+                 VALUES (?1, ?2, 1, ?3, '0.1.0')",
+                rusqlite::params![format!("old-{i}"), old, &payload],
+            )
+            .unwrap();
         }
 
         let config = SessionRetentionConfig {
@@ -1072,30 +1476,19 @@ mod tests {
             cleanup_interval_hours: 24,
         };
         let result = cleanup_sessions(&conn, &config).unwrap();
-        assert_eq!(result.deleted_by_age, 11);
-        assert!(result.vacuumed);
-    }
+        assert_eq!(result.deleted_by_age, 12);
+        let reusable_pages: i64 = conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            reusable_pages > 0,
+            "retention cleanup must preserve freed pages for SQLite reuse"
+        );
 
-    #[test]
-    fn cleanup_no_vacuum_under_10_deletions() {
-        let conn = make_test_db();
-        let now = epoch_ms() as i64;
-        let old = now - 31 * 86_400_000;
-
-        // Create 5 old closed sessions
-        for i in 0..5 {
-            insert_session(&conn, &format!("old-{i}"), old, true);
-        }
-
-        let config = SessionRetentionConfig {
-            max_age_days: 30,
-            max_closed_sessions: 0,
-            max_total_size_mb: 0,
-            cleanup_interval_hours: 24,
-        };
-        let result = cleanup_sessions(&conn, &config).unwrap();
-        assert_eq!(result.deleted_by_age, 5);
-        assert!(!result.vacuumed);
+        // A sentinel interactive write must remain available immediately after
+        // cleanup; physical compaction is not part of this operation.
+        insert_session(&conn, "interactive-sentinel", now, false);
+        assert_eq!(count_sessions(&conn), 1);
     }
 
     // ── Batch: DarkBadger wa-1u90p.7.1 ───────────────────────────────────
@@ -1110,7 +1503,6 @@ mod tests {
         assert_eq!(r.deleted_by_size, 0);
         assert_eq!(r.orphaned_checkpoints, 0);
         assert_eq!(r.orphaned_pane_states, 0);
-        assert!(!r.vacuumed);
         assert_eq!(r.total_sessions_deleted(), 0);
         assert!(!r.any_work_done());
     }
@@ -1186,18 +1578,19 @@ mod tests {
         let conn = make_test_db();
         let now = epoch_ms() as i64;
 
-        // 4 sessions × 400KB = 1600KB. Budget: 500KB. Need to free ~1100KB.
+        // 4 sessions × 400 KiB = 1600 KiB.
         for i in 0..4 {
             let id = format!("big-{i}");
             insert_session(&conn, &id, now + i * 1000, true);
             insert_checkpoint(&conn, &id, now + i * 1000, 400 * 1024);
         }
 
-        // Budget: 0.5 MB = 512KB. Need to free ~1088KB → delete 3 sessions (3×400KB)
-        let deleted = delete_sessions_by_size(&conn, 1).unwrap();
-        // Should have deleted at least 2 (800KB frees enough)
-        assert!(deleted >= 2, "Expected >=2 deletions, got {}", deleted);
-        assert!(count_sessions(&conn) <= 2);
+        // Budget: 1 MiB = 1024 KiB. Total is 1600 KiB, so freeing 576 KiB
+        // deterministically deletes the two oldest 400 KiB sessions.
+        let outcome = delete_sessions_by_size(&conn, 1).unwrap();
+        assert_eq!(outcome.deleted, 2);
+        assert_eq!(outcome.shortfall_bytes, 0);
+        assert_eq!(count_sessions(&conn), 2);
     }
 
     // ── Excess closed: mixed active and closed ──
@@ -1331,8 +1724,8 @@ mod tests {
             insert_session(&conn, &format!("nochk-{i}"), now + i * 1000, true);
         }
 
-        let deleted = delete_sessions_by_size(&conn, 1).unwrap();
-        assert_eq!(deleted, 0);
+        let outcome = delete_sessions_by_size(&conn, 1).unwrap();
+        assert_eq!(outcome, SizeCleanupOutcome::default());
         assert_eq!(count_sessions(&conn), 5);
     }
 
@@ -1390,56 +1783,28 @@ mod tests {
         assert_eq!(cloned.cleanup_interval_hours, 6);
     }
 
-    // ── Vacuum exact threshold ──
-
-    #[test]
-    fn cleanup_vacuum_exactly_10_deletions() {
-        let conn = make_test_db();
-        let now = epoch_ms() as i64;
-        let old = now - 31 * 86_400_000;
-
-        for i in 0..10 {
-            insert_session(&conn, &format!("v-{i}"), old, true);
-        }
-
-        let config = SessionRetentionConfig {
-            max_age_days: 30,
-            max_closed_sessions: 0,
-            max_total_size_mb: 0,
-            cleanup_interval_hours: 24,
-        };
-        let result = cleanup_sessions(&conn, &config).unwrap();
-        assert_eq!(result.deleted_by_age, 10);
-        assert!(result.vacuumed); // threshold is >= 10
-    }
-
-    #[test]
-    fn cleanup_vacuum_9_deletions_no_vacuum() {
-        let conn = make_test_db();
-        let now = epoch_ms() as i64;
-        let old = now - 31 * 86_400_000;
-
-        for i in 0..9 {
-            insert_session(&conn, &format!("nv-{i}"), old, true);
-        }
-
-        let config = SessionRetentionConfig {
-            max_age_days: 30,
-            max_closed_sessions: 0,
-            max_total_size_mb: 0,
-            cleanup_interval_hours: 24,
-        };
-        let result = cleanup_sessions(&conn, &config).unwrap();
-        assert_eq!(result.deleted_by_age, 9);
-        assert!(!result.vacuumed); // under threshold
-    }
-
     // ── epoch_ms additional ──
 
     #[test]
-    fn epoch_ms_monotonic_across_calls() {
-        let a = epoch_ms();
-        let b = epoch_ms();
-        assert!(b >= a, "epoch_ms should be monotonic");
+    fn epoch_ms_is_a_saturating_system_time_conversion() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let observed = u128::from(epoch_ms());
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+
+        // Wall time is allowed to step in either direction. Only assert an
+        // ordinary-range conversion when both surrounding observations form
+        // an ordered interval; otherwise the clock moved and there is no
+        // monotonic contract to test.
+        if before <= after && after <= u128::from(u64::MAX) {
+            assert!((before..=after).contains(&observed));
+        } else {
+            assert!(observed <= u128::from(u64::MAX));
+        }
     }
 }

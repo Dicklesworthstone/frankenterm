@@ -382,7 +382,6 @@ fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
         0usize..50,
         0usize..50,
         0usize..50,
-        any::<bool>(),
     )
         .prop_map(
             |(
@@ -391,7 +390,6 @@ fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
                 deleted_by_size,
                 orphaned_checkpoints,
                 orphaned_pane_states,
-                vacuumed,
             )| {
                 CleanupResult {
                     deleted_by_age,
@@ -399,7 +397,6 @@ fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
                     deleted_by_size,
                     orphaned_checkpoints,
                     orphaned_pane_states,
-                    vacuumed,
                 }
             },
         )

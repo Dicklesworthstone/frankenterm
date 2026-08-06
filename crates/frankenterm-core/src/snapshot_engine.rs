@@ -43,9 +43,34 @@ use crate::wezterm::PaneInfo;
 // Telemetry
 // =============================================================================
 
+/// Add to a cumulative telemetry counter without allowing a long-running
+/// process to wrap at `u64::MAX` and make the reported value move backwards.
+fn saturating_telemetry_add(counter: &AtomicU64, delta: u64) {
+    if delta == 0 {
+        return;
+    }
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current == u64::MAX {
+            return;
+        }
+        let next = current.saturating_add(delta);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// Operational telemetry counters for the snapshot engine.
 ///
-/// Uses `AtomicU64` because `SnapshotEngine` methods take `&self`.
+/// Uses `AtomicU64` because `SnapshotEngine` methods take `&self`. Cumulative
+/// counters saturate at `u64::MAX` rather than wrapping backwards.
 pub struct SnapshotEngineTelemetry {
     /// Total capture() attempts.
     captures_attempted: AtomicU64,
@@ -65,7 +90,8 @@ pub struct SnapshotEngineTelemetry {
     triggers_accepted: AtomicU64,
     /// Total panes captured across all successful snapshots.
     panes_captured: AtomicU64,
-    /// Total bytes persisted across all successful snapshots.
+    /// Historical terminal/environment/agent pane-state JSON byte estimate
+    /// across successful snapshots; not total SQLite or checkpoint bytes.
     bytes_persisted: AtomicU64,
 }
 
@@ -88,6 +114,12 @@ impl SnapshotEngineTelemetry {
     }
 
     /// Snapshot the current counter values.
+    ///
+    /// Each counter is monotonic and saturating, but the relaxed loads are an
+    /// intentionally approximate telemetry read rather than one cross-counter
+    /// transaction. A concurrent update can therefore make relationships such
+    /// as `triggers_accepted <= triggers_emitted` transiently inconsistent in a
+    /// single sample; consumers must compare each counter independently.
     #[must_use]
     pub fn snapshot(&self) -> SnapshotEngineTelemetrySnapshot {
         SnapshotEngineTelemetrySnapshot {
@@ -173,7 +205,8 @@ pub struct SnapshotEngineTelemetrySnapshot {
     pub triggers_accepted: u64,
     /// Total panes captured across all successful snapshots.
     pub panes_captured: u64,
-    /// Total bytes persisted across all successful snapshots.
+    /// Historical terminal/environment/agent pane-state JSON byte estimate
+    /// across successful snapshots; not total SQLite or checkpoint bytes.
     pub bytes_persisted: u64,
 }
 
@@ -239,7 +272,8 @@ pub struct SnapshotResult {
     pub checkpoint_id: i64,
     /// Number of panes captured.
     pub pane_count: usize,
-    /// Total serialized bytes.
+    /// Historical serialized terminal/environment/agent pane-state JSON byte
+    /// estimate. This excludes topology, cwd, command, and SQLite overhead.
     pub total_bytes: usize,
     /// What triggered this snapshot.
     pub trigger: SnapshotTrigger,
@@ -258,6 +292,8 @@ pub struct SnapshotCaptureOptions {
 pub enum SnapshotError {
     #[error("snapshot already in progress")]
     InProgress,
+    #[error("snapshot scheduler already running for this engine")]
+    SchedulerInProgress,
     #[error("no panes found")]
     NoPanes,
     #[error("no changes since last snapshot")]
@@ -309,6 +345,60 @@ fn snapshot_lock_error(error: LockAcquireError) -> SnapshotError {
 // SnapshotEngine
 // =============================================================================
 
+/// Retry-safe automatic session-cleanup failures and admission contention are
+/// retried soon enough to recover without waiting for the normal hours-long
+/// cadence, but not on every 250 ms intelligent-scheduler poll.
+const SESSION_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// Per-scheduler automatic session-cleanup cadence state.
+///
+/// `last_authoritative_success` advances only after a typed successful cleanup
+/// receipt. `retry_deferred_at` rate-limits admission contention and failures
+/// that are explicitly safe to retry. Indeterminate outcomes are governed by
+/// the engine-owned sticky reconciliation latch instead of this schedule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SessionCleanupSchedule {
+    last_authoritative_success: Option<Instant>,
+    retry_deferred_at: Option<Instant>,
+}
+
+impl SessionCleanupSchedule {
+    fn defer_retry(&mut self, now: Instant) {
+        self.retry_deferred_at = Some(now);
+    }
+
+    fn record_authoritative_success(&mut self, now: Instant) {
+        self.last_authoritative_success = Some(now);
+        self.retry_deferred_at = None;
+    }
+}
+
+/// Exclusive authority for one automatic session-cleanup attempt.
+///
+/// Dropping an unsettled guard means the async attempt disappeared before it
+/// published a typed outcome. Its durable effect is therefore unknown and the
+/// engine must fail closed exactly like an explicit indeterminate result.
+struct SessionCleanupAttemptGuard<'a> {
+    in_progress: &'a AtomicBool,
+    reconciliation_required: &'a AtomicBool,
+    settled: bool,
+}
+
+impl SessionCleanupAttemptGuard<'_> {
+    fn settle(mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for SessionCleanupAttemptGuard<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.reconciliation_required.store(true, Ordering::Release);
+        }
+        self.in_progress.store(false, Ordering::Release);
+    }
+}
+
 /// Central orchestrator for mux session state capture.
 ///
 /// Thread-safe: `in_progress` guard prevents concurrent captures.
@@ -325,6 +415,17 @@ pub struct SnapshotEngine {
     last_state_hash: RwLock<Option<String>>,
     /// Guard: true while a capture is running.
     in_progress: AtomicBool,
+    /// Exactly one scheduler invocation owns this engine at a time. Cadence
+    /// state is scheduler-local, so admitting two periodic loops would let a
+    /// contender repeat retention cleanup after the first loop succeeds.
+    scheduler_in_progress: AtomicBool,
+    /// Sticky safety latch set when session-retention cleanup may have changed
+    /// durable state without publishing an authoritative completion result.
+    /// This belongs to the engine rather than one scheduler invocation so a
+    /// same-engine scheduler restart cannot blindly repeat the cleanup.
+    session_cleanup_reconciliation_required: AtomicBool,
+    /// Exclusive admission flag for automatic session-retention cleanup.
+    session_cleanup_in_progress: AtomicBool,
     /// External trigger ingress sender for intelligent scheduling mode.
     trigger_tx: mpsc::Sender<SnapshotTrigger>,
     /// Runtime-owned receiver, taken by `run_periodic`.
@@ -343,6 +444,9 @@ impl SnapshotEngine {
             session_id: RwLock::new(None),
             last_state_hash: RwLock::new(None),
             in_progress: AtomicBool::new(false),
+            scheduler_in_progress: AtomicBool::new(false),
+            session_cleanup_reconciliation_required: AtomicBool::new(false),
+            session_cleanup_in_progress: AtomicBool::new(false),
             trigger_tx,
             trigger_rx: Mutex::new(Some(trigger_rx)),
             telemetry: SnapshotEngineTelemetry::new(),
@@ -354,14 +458,10 @@ impl SnapshotEngine {
     /// Returns `false` when the trigger queue is full or no receiver is active.
     #[must_use]
     pub fn emit_trigger(&self, trigger: SnapshotTrigger) -> bool {
-        self.telemetry
-            .triggers_emitted
-            .fetch_add(1, Ordering::Relaxed);
+        saturating_telemetry_add(&self.telemetry.triggers_emitted, 1);
         let accepted = self.trigger_tx.try_send(trigger).is_ok();
         if accepted {
-            self.telemetry
-                .triggers_accepted
-                .fetch_add(1, Ordering::Relaxed);
+            saturating_telemetry_add(&self.telemetry.triggers_accepted, 1);
         }
         accepted
     }
@@ -458,22 +558,16 @@ impl SnapshotEngine {
         trigger: SnapshotTrigger,
         options: SnapshotCaptureOptions,
     ) -> std::result::Result<SnapshotResult, SnapshotError> {
-        self.telemetry
-            .captures_attempted
-            .fetch_add(1, Ordering::Relaxed);
+        saturating_telemetry_add(&self.telemetry.captures_attempted, 1);
 
         if cx.checkpoint().is_err() {
-            self.telemetry
-                .capture_errors
-                .fetch_add(1, Ordering::Relaxed);
+            saturating_telemetry_add(&self.telemetry.capture_errors, 1);
             return Err(SnapshotError::Cancelled);
         }
 
         // 1. Guard: prevent concurrent captures
         if self.in_progress.swap(true, Ordering::SeqCst) {
-            self.telemetry
-                .capture_errors
-                .fetch_add(1, Ordering::Relaxed);
+            saturating_telemetry_add(&self.telemetry.capture_errors, 1);
             return Err(SnapshotError::InProgress);
         }
         struct InProgressGuard<'a>(&'a AtomicBool);
@@ -485,9 +579,7 @@ impl SnapshotEngine {
         let _guard = InProgressGuard(&self.in_progress);
 
         if panes.is_empty() {
-            self.telemetry
-                .capture_errors
-                .fetch_add(1, Ordering::Relaxed);
+            saturating_telemetry_add(&self.telemetry.capture_errors, 1);
             return Err(SnapshotError::NoPanes);
         }
 
@@ -504,9 +596,10 @@ impl SnapshotEngine {
         let pane_ids: Vec<u64> = panes.iter().map(|p| p.pane_id).collect();
         let detection_pane_ids = pane_ids.clone();
         let db_path_for_detections = Arc::clone(&self.db_path);
-        let cutoff_ms: i64 =
-            i64::try_from(now_ms.saturating_sub(STATE_DETECTION_MAX_AGE.as_millis() as u64))
-                .unwrap_or(i64::MAX);
+        let detection_max_age_ms =
+            u64::try_from(STATE_DETECTION_MAX_AGE.as_millis()).unwrap_or(u64::MAX);
+        let cutoff_ms: i64 = i64::try_from(now_ms.saturating_sub(detection_max_age_ms))
+            .unwrap_or(i64::MAX);
 
         let detections_by_pane = Self::spawn_blocking_db_best_effort(move || {
             load_latest_detections_by_pane_sync(
@@ -566,7 +659,7 @@ impl SnapshotEngine {
                 .await
                 .map_err(snapshot_lock_error)?;
             if last.as_deref() == Some(&state_hash) {
-                self.telemetry.dedup_skips.fetch_add(1, Ordering::Relaxed);
+                saturating_telemetry_add(&self.telemetry.dedup_skips, 1);
                 return Err(SnapshotError::NoChanges);
             }
         }
@@ -617,15 +710,15 @@ impl SnapshotEngine {
         *last_state_hash = Some(state_hash);
 
         // 10. Record success telemetry
-        self.telemetry
-            .captures_succeeded
-            .fetch_add(1, Ordering::Relaxed);
-        self.telemetry
-            .panes_captured
-            .fetch_add(pane_count as u64, Ordering::Relaxed);
-        self.telemetry
-            .bytes_persisted
-            .fetch_add(result.2 as u64, Ordering::Relaxed);
+        saturating_telemetry_add(&self.telemetry.captures_succeeded, 1);
+        saturating_telemetry_add(
+            &self.telemetry.panes_captured,
+            u64::try_from(pane_count).unwrap_or(u64::MAX),
+        );
+        saturating_telemetry_add(
+            &self.telemetry.bytes_persisted,
+            u64::try_from(result.2).unwrap_or(u64::MAX),
+        );
 
         Ok(SnapshotResult {
             session_id: result.0,
@@ -663,7 +756,7 @@ impl SnapshotEngine {
         &self,
         cx: &crate::cx::Cx,
     ) -> std::result::Result<usize, SnapshotError> {
-        self.telemetry.cleanup_runs.fetch_add(1, Ordering::Relaxed);
+        saturating_telemetry_add(&self.telemetry.cleanup_runs, 1);
 
         if cx.checkpoint().is_err() {
             tracing::debug!(
@@ -680,9 +773,10 @@ impl SnapshotEngine {
             cleanup_sync(&db_path, retention_count, retention_days)
         })
         .await?;
-        self.telemetry
-            .cleanup_removed
-            .fetch_add(removed as u64, Ordering::Relaxed);
+        saturating_telemetry_add(
+            &self.telemetry.cleanup_removed,
+            u64::try_from(removed).unwrap_or(u64::MAX),
+        );
 
         Ok(removed)
     }
@@ -893,29 +987,55 @@ impl SnapshotEngine {
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
     {
+        if self
+            .scheduler_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(SnapshotError::SchedulerInProgress);
+        }
+        struct SchedulerGuard<'a>(&'a AtomicBool);
+        impl Drop for SchedulerGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _scheduler_guard = SchedulerGuard(&self.scheduler_in_progress);
+
         // ft-0yuxe: drive `[snapshots.session_retention]` cleanup from the live
-        // snapshot scheduler. Tracks the last run so the configured
-        // `cleanup_interval_hours` cadence is honored across both scheduling
-        // modes (None = never run yet → triggers the startup pass).
-        let mut last_session_cleanup: Option<Instant> = None;
-        // An indeterminate cleanup may already have committed. Suppress every
-        // automatic retry for the lifetime of this scheduler so a lost receipt
-        // cannot trigger another deletion pass without operator reconciliation.
-        let mut session_cleanup_reconciliation_required = false;
+        // snapshot scheduler. Normal cadence advances only after an
+        // authoritative success; retry-safe failures and admission contention
+        // use a bounded retry delay shared by both scheduling modes.
+        let mut session_cleanup_schedule = SessionCleanupSchedule::default();
         match self.config.scheduling.mode {
             SnapshotSchedulingMode::Periodic => {
                 let interval_secs = self.config.interval_seconds.max(30);
                 let interval = Duration::from_secs(interval_secs);
-                let mut is_first = true;
+                let mut last_snapshot_completion = None;
 
                 loop {
-                    if !is_first {
+                    let now = Instant::now();
+                    let next_wait = periodic_scheduler_wait_duration(
+                        &session_cleanup_schedule,
+                        self.config.session_retention.cleanup_interval_hours,
+                        self.session_cleanup_reconciliation_required
+                            .load(Ordering::Acquire),
+                        last_snapshot_completion,
+                        interval,
+                        now,
+                    );
+
+                    if !next_wait.is_zero() {
                         // ft-xbnl0.2.3 tick 296: cx-first timeout wrapping
                         // shutdown.changed(cx) — both the outer interval-timeout
                         // AND the inner shutdown wait now honor cx-cancel.
                         let shutdown_fut = shutdown.changed(cx);
-                        let shutdown_wait =
-                            crate::runtime_async::timeout_with_cx(cx, interval, shutdown_fut).await;
+                        let shutdown_wait = crate::runtime_async::timeout_with_cx(
+                            cx,
+                            next_wait,
+                            shutdown_fut,
+                        )
+                        .await;
                         if cx.is_cancel_requested() {
                             return Err(SnapshotError::Cancelled);
                         }
@@ -923,23 +1043,41 @@ impl SnapshotEngine {
                             tracing::info!("snapshot engine shutting down");
                             break;
                         }
+                        // The independent cleanup and snapshot deadlines can
+                        // wake this loop for different reasons. Recompute both
+                        // after every timer wake rather than coupling cleanup
+                        // cadence to a snapshot capture.
+                        continue;
                     }
 
                     if cx.checkpoint().is_err() {
                         tracing::info!("snapshot engine run_periodic: cx cancelled, exiting");
                         return Err(SnapshotError::Cancelled);
                     }
+                    if *shutdown.borrow() {
+                        tracing::info!("snapshot engine shutting down before cleanup");
+                        break;
+                    }
 
-                    self.maybe_run_session_cleanup(
-                        cx,
-                        &mut last_session_cleanup,
-                        &mut session_cleanup_reconciliation_required,
-                    )
-                    .await;
+                    self.maybe_run_session_cleanup(cx, &mut session_cleanup_schedule)
+                        .await;
                     cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
+                    if *shutdown.borrow() {
+                        tracing::info!("snapshot engine shutting down after cleanup");
+                        break;
+                    }
 
-                    let trigger = if is_first {
-                        is_first = false;
+                    let now = Instant::now();
+                    let snapshot_is_due = last_snapshot_completion.is_none_or(|last| {
+                        now.saturating_duration_since(last) >= interval
+                    });
+                    if !snapshot_is_due {
+                        // Cleanup-only wake: do not manufacture an unrelated
+                        // pane snapshot or move the snapshot cadence.
+                        continue;
+                    }
+
+                    let trigger = if last_snapshot_completion.is_none() {
                         SnapshotTrigger::Startup
                     } else {
                         SnapshotTrigger::Periodic
@@ -947,9 +1085,15 @@ impl SnapshotEngine {
                     self.capture_from_provider_with_cx(cx, &pane_provider, trigger)
                         .await?;
                     cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
+                    last_snapshot_completion = Some(Instant::now());
                 }
             }
             SnapshotSchedulingMode::Intelligent => {
+                if *shutdown.borrow() {
+                    tracing::info!("snapshot engine shutting down before startup cleanup");
+                    return Ok(());
+                }
+
                 let mut trigger_rx = {
                     let mut guard = self.trigger_rx.lock().await;
                     match guard.take() {
@@ -962,6 +1106,17 @@ impl SnapshotEngine {
                         }
                     }
                 };
+
+                // Retention has its own startup contract. Attempt it before
+                // pane capture so a transient capture/provider failure cannot
+                // suppress cleanup for the entire scheduler invocation.
+                self.maybe_run_session_cleanup(cx, &mut session_cleanup_schedule)
+                    .await;
+                cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
+                if *shutdown.borrow() {
+                    tracing::info!("snapshot engine shutting down after startup cleanup");
+                    return Ok(());
+                }
 
                 self.capture_from_provider_with_cx(
                     cx,
@@ -1006,14 +1161,18 @@ impl SnapshotEngine {
                         );
                         return Err(SnapshotError::Cancelled);
                     }
+                    if *shutdown.borrow() {
+                        tracing::info!("snapshot engine shutting down before cleanup");
+                        break;
+                    }
 
-                    self.maybe_run_session_cleanup(
-                        cx,
-                        &mut last_session_cleanup,
-                        &mut session_cleanup_reconciliation_required,
-                    )
-                    .await;
+                    self.maybe_run_session_cleanup(cx, &mut session_cleanup_schedule)
+                        .await;
                     cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
+                    if *shutdown.borrow() {
+                        tracing::info!("snapshot engine shutting down after cleanup");
+                        break;
+                    }
 
                     // ft-83kc7: read the shutdown FLAG, do not wait for a change
                     // event with a zero-duration timeout.
@@ -1038,11 +1197,6 @@ impl SnapshotEngine {
                     // value is monotonic for a shutdown latch. Shutdown latency
                     // stays bounded by the trigger wait-step below (<= 250 ms),
                     // exactly as the previous code intended.
-                    if *shutdown.borrow() {
-                        tracing::info!("snapshot engine shutting down");
-                        break;
-                    }
-
                     let fallback_wait = next_fallback_at
                         .map(|deadline| deadline.saturating_duration_since(Instant::now()))
                         .unwrap_or(Duration::from_millis(250));
@@ -1131,39 +1285,59 @@ impl SnapshotEngine {
     /// fixes inside it — were inert: closed sessions, checkpoints, and pane
     /// state grew unbounded.
     ///
-    /// `cleanup_interval_hours == 0` means "only on startup": the first call
-    /// (when `last_cleanup` is `None`) always runs, and subsequent calls are
-    /// skipped. A positive value reruns every N hours. The DB connection is
-    /// opened fresh inside the cleanup engine (a blocking SQLite pipeline run on
-    /// the blocking pool). If its authoritative completion is lost, the
-    /// scheduler latches `reconciliation_required` and suppresses all further
-    /// automatic cleanup attempts for this process lifetime.
+    /// `cleanup_interval_hours == 0` means "one authoritative startup
+    /// completion": admission contention or a typed retry-safe failure is
+    /// retried after [`SESSION_CLEANUP_RETRY_DELAY`], while the first successful
+    /// receipt ends automatic cleanup for this scheduler invocation. A positive
+    /// value reruns every N hours after authoritative success. The DB connection
+    /// is opened fresh inside the cleanup engine (a blocking SQLite pipeline run
+    /// on the blocking pool). If its authoritative completion is lost, the
+    /// engine latches `session_cleanup_reconciliation_required` and suppresses
+    /// all further automatic cleanup attempts for this engine instance's
+    /// lifetime, including after a same-engine scheduler restart.
     async fn maybe_run_session_cleanup(
         &self,
         cx: &crate::cx::Cx,
-        last_cleanup: &mut Option<Instant>,
-        reconciliation_required: &mut bool,
+        schedule: &mut SessionCleanupSchedule,
     ) {
-        if *reconciliation_required {
+        if self
+            .session_cleanup_reconciliation_required
+            .load(Ordering::Acquire)
+        {
             return;
         }
         let interval_hours = self.config.session_retention.cleanup_interval_hours;
-        if !session_cleanup_due(*last_cleanup, interval_hours, Instant::now()) {
+        if !session_cleanup_due(schedule, interval_hours, Instant::now()) {
             return;
         }
-        *last_cleanup = Some(Instant::now());
+
+        let Some(cleanup_attempt) = self.try_begin_session_cleanup() else {
+            if !self
+                .session_cleanup_reconciliation_required
+                .load(Ordering::Acquire)
+            {
+                schedule.defer_retry(Instant::now());
+                tracing::debug!(
+                    retry_delay_seconds = SESSION_CLEANUP_RETRY_DELAY.as_secs(),
+                    "Session retention cleanup admission is busy; retry deferred"
+                );
+            }
+            return;
+        };
 
         let db_path = Arc::clone(&self.db_path);
         let config = self.config.session_retention.clone();
         match crate::session_retention::cleanup_sessions_async_cx(cx, db_path, config).await {
             Ok(result) => {
+                schedule.record_authoritative_success(Instant::now());
                 let total = result.total_sessions_deleted();
                 if total > 0 || result.orphaned_checkpoints > 0 || result.orphaned_pane_states > 0 {
                     tracing::info!(
                         sessions_deleted = total,
                         orphaned_checkpoints = result.orphaned_checkpoints,
                         orphaned_pane_states = result.orphaned_pane_states,
-                        vacuumed = result.vacuumed,
+                        physical_compaction_attempted = false,
+                        free_space_policy = "sqlite_freelist_reuse",
                         interval_hours,
                         "Session retention cleanup completed"
                     );
@@ -1176,13 +1350,16 @@ impl SnapshotEngine {
             }
             Err(e) => {
                 let current_requires_reconciliation = e.requires_reconciliation();
-                let reconciliation_latched =
-                    latch_session_cleanup_reconciliation(reconciliation_required, e);
+                let historical_reconciliation_latched = self
+                    .session_cleanup_reconciliation_required
+                    .load(Ordering::Acquire);
+                let reconciliation_latched = self.latch_session_cleanup_reconciliation(e);
                 if current_requires_reconciliation {
                     tracing::warn!(
                         error = %e,
                         current_requires_reconciliation = true,
-                        historical_reconciliation_latched = reconciliation_latched,
+                        historical_reconciliation_latched,
+                        reconciliation_latched,
                         automatic_retry_suppressed = true,
                         "Session retention cleanup outcome is indeterminate; reconcile durable state before restarting cleanup"
                     );
@@ -1190,20 +1367,73 @@ impl SnapshotEngine {
                     tracing::warn!(
                         error = %e,
                         current_requires_reconciliation = false,
-                        historical_reconciliation_latched = true,
+                        historical_reconciliation_latched,
+                        reconciliation_latched = true,
                         automatic_retry_suppressed = true,
                         "Session retention cleanup failed after an earlier indeterminate outcome; historical reconciliation remains required"
                     );
                 } else {
+                    schedule.defer_retry(Instant::now());
                     tracing::warn!(
                         error = %e,
                         current_requires_reconciliation = false,
-                        historical_reconciliation_latched = false,
-                        "Session retention cleanup failed"
+                        historical_reconciliation_latched,
+                        reconciliation_latched = false,
+                        retry_delay_seconds = SESSION_CLEANUP_RETRY_DELAY.as_secs(),
+                        "Session retention cleanup failed; retry deferred"
                     );
                 }
             }
         }
+        cleanup_attempt.settle();
+    }
+
+    /// Acquire exclusive authority for an automatic cleanup attempt. A second
+    /// scheduler sharing this engine cannot enter cleanup concurrently.
+    fn try_begin_session_cleanup(&self) -> Option<SessionCleanupAttemptGuard<'_>> {
+        if self
+            .session_cleanup_reconciliation_required
+            .load(Ordering::Acquire)
+        {
+            return None;
+        }
+        self.session_cleanup_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+
+        // Pair with an unsettled predecessor's release stores. The admission
+        // flag becomes available only after that predecessor latches unknown
+        // effects, but retain this explicit recheck to keep the ordering
+        // contract visible and fail closed if another authority sets the latch.
+        if self
+            .session_cleanup_reconciliation_required
+            .load(Ordering::Acquire)
+        {
+            self.session_cleanup_in_progress
+                .store(false, Ordering::Release);
+            return None;
+        }
+
+        Some(SessionCleanupAttemptGuard {
+            in_progress: &self.session_cleanup_in_progress,
+            reconciliation_required: &self.session_cleanup_reconciliation_required,
+            settled: false,
+        })
+    }
+
+    /// Monotonically latch cleanup reconciliation after any outcome whose
+    /// durable effects are indeterminate. Retry-safe failures must never clear
+    /// a latch set by an earlier observation loss.
+    fn latch_session_cleanup_reconciliation(
+        &self,
+        error: crate::session_retention::SessionCleanupError,
+    ) -> bool {
+        if error.requires_reconciliation() {
+            self.session_cleanup_reconciliation_required
+                .store(true, Ordering::Release);
+        }
+        self.session_cleanup_reconciliation_required
+            .load(Ordering::Acquire)
     }
 
     /// Legacy non-cx scheduler body for builds without
@@ -1420,7 +1650,10 @@ fn load_latest_detections_by_pane_sync(
                    confidence,
                    extracted,
                    matched_text,
-                   ROW_NUMBER() OVER (PARTITION BY pane_id ORDER BY detected_at DESC) AS rn
+                   ROW_NUMBER() OVER (
+                       PARTITION BY pane_id
+                       ORDER BY detected_at DESC, id DESC
+                   ) AS rn
             FROM events
             WHERE pane_id IN ({placeholders})
               AND detected_at >= ?
@@ -1437,7 +1670,10 @@ fn load_latest_detections_by_pane_sync(
         Err(err) => return Err(err),
     };
 
-    let mut params: Vec<i64> = pane_ids.iter().map(|id| *id as i64).collect();
+    let mut params = Vec::with_capacity(pane_ids.len().saturating_add(1));
+    for &pane_id in pane_ids {
+        params.push(u64_to_sqlite_integer(pane_id)?);
+    }
     params.push(cutoff_ms);
 
     let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
@@ -1467,7 +1703,8 @@ fn load_latest_detections_by_pane_sync(
             span: (0, 0),
         };
 
-        out.insert(pane_id as u64, vec![detection]);
+        let pane_id = sqlite_integer_to_u64(0, pane_id)?;
+        out.insert(pane_id, vec![detection]);
     }
 
     Ok(out)
@@ -1486,7 +1723,7 @@ fn load_latest_scrollback_refs_sync(
     let conn = open_conn(db_path).map_err(|error| error.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT MAX(seq), COUNT(*), MAX(captured_at)
+            "SELECT MIN(seq), MAX(seq), COUNT(*), MIN(captured_at), MAX(captured_at)
              FROM output_segments
              WHERE pane_id = ?1",
         )
@@ -1496,23 +1733,46 @@ fn load_latest_scrollback_refs_sync(
     for &pane_id in pane_ids {
         let pane_id_i64 = i64::try_from(pane_id)
             .map_err(|_| format!("pane_id {pane_id} exceeds sqlite integer range"))?;
-        let (max_seq, segment_count, last_capture_at): (Option<i64>, i64, Option<i64>) = stmt
+        let (min_seq, max_seq, segment_count, min_capture_at, last_capture_at): (
+            Option<i64>,
+            Option<i64>,
+            i64,
+            Option<i64>,
+            Option<i64>,
+        ) = stmt
             .query_row([pane_id_i64], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })
             .map_err(|error| error.to_string())?;
 
+        let Some(min_seq) = min_seq else {
+            continue;
+        };
         let Some(output_segments_seq) = max_seq else {
+            continue;
+        };
+        let Some(min_capture_at) = min_capture_at else {
             continue;
         };
         let Some(last_capture_at) = last_capture_at else {
             continue;
         };
-        if output_segments_seq < 0 || segment_count <= 0 || last_capture_at < 0 {
+        if min_seq < 0
+            || output_segments_seq < 0
+            || segment_count <= 0
+            || min_capture_at < 0
+            || last_capture_at < 0
+        {
             return Err(format!(
                 "invalid scrollback segment metadata for pane_id={pane_id}: \
-                 max_seq={output_segments_seq}, count={segment_count}, \
-                 last_capture_at={last_capture_at}"
+                 min_seq={min_seq}, max_seq={output_segments_seq}, count={segment_count}, \
+                 min_capture_at={min_capture_at}, last_capture_at={last_capture_at}"
             ));
         }
 
@@ -1520,8 +1780,10 @@ fn load_latest_scrollback_refs_sync(
             pane_id,
             ScrollbackRef {
                 output_segments_seq,
-                total_lines_captured: segment_count as u64,
-                last_capture_at: last_capture_at as u64,
+                total_lines_captured: u64::try_from(segment_count)
+                    .map_err(|error| error.to_string())?,
+                last_capture_at: u64::try_from(last_capture_at)
+                    .map_err(|error| error.to_string())?,
             },
         );
     }
@@ -1556,24 +1818,36 @@ fn severity_from_db(severity: &str) -> Severity {
 // =============================================================================
 
 fn epoch_ms() -> u64 {
-    SystemTime::now()
+    let epoch_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_millis();
+    u64::try_from(epoch_ms).unwrap_or(u64::MAX)
 }
 
 /// Decide whether `[snapshots.session_retention]` cleanup is due (ft-0yuxe).
 ///
-/// * `last_cleanup == None` — cleanup has never run this process; the startup
-///   pass is always due, even when `interval_hours == 0`.
-/// * `interval_hours == 0` — "only on startup": never due again after the first
-///   run.
-/// * otherwise — due once `interval_hours` have elapsed since the last run.
+/// * a retry deferral younger than [`SESSION_CLEANUP_RETRY_DELAY`] is not due;
+/// * no authoritative success — the startup pass is due, including when
+///   `interval_hours == 0`;
+/// * `interval_hours == 0` — never due again after authoritative success;
+/// * otherwise — due once `interval_hours` have elapsed since authoritative
+///   success.
 ///
 /// Uses `saturating_duration_since` so a non-monotonic `now < prev` reads as
 /// zero elapsed (not due) rather than panicking.
-fn session_cleanup_due(last_cleanup: Option<Instant>, interval_hours: u64, now: Instant) -> bool {
-    match last_cleanup {
+fn session_cleanup_due(
+    schedule: &SessionCleanupSchedule,
+    interval_hours: u64,
+    now: Instant,
+) -> bool {
+    if schedule.retry_deferred_at.is_some_and(|deferred_at| {
+        now.saturating_duration_since(deferred_at) < SESSION_CLEANUP_RETRY_DELAY
+    }) {
+        return false;
+    }
+
+    match schedule.last_authoritative_success {
         None => true,
         Some(prev) => {
             interval_hours > 0
@@ -1583,15 +1857,49 @@ fn session_cleanup_due(last_cleanup: Option<Instant>, interval_hours: u64, now: 
     }
 }
 
-/// Monotonically latch cleanup reconciliation after any outcome whose durable
-/// effects are indeterminate. Retry-safe failures must never clear a latch set
-/// by an earlier observation loss.
-fn latch_session_cleanup_reconciliation(
-    reconciliation_required: &mut bool,
-    error: crate::session_retention::SessionCleanupError,
-) -> bool {
-    *reconciliation_required |= error.requires_reconciliation();
-    *reconciliation_required
+/// Return the monotonic wait until the next automatic cleanup decision.
+/// `None` means an interval-zero scheduler already obtained its authoritative
+/// startup receipt and has no further cleanup deadline. A zero duration means
+/// cleanup is due now.
+fn session_cleanup_wait_duration(
+    schedule: &SessionCleanupSchedule,
+    interval_hours: u64,
+    now: Instant,
+) -> Option<Duration> {
+    if let Some(deferred_at) = schedule.retry_deferred_at {
+        let elapsed = now.saturating_duration_since(deferred_at);
+        if elapsed < SESSION_CLEANUP_RETRY_DELAY {
+            return Some(SESSION_CLEANUP_RETRY_DELAY - elapsed);
+        }
+    }
+
+    match schedule.last_authoritative_success {
+        None => Some(Duration::ZERO),
+        Some(_) if interval_hours == 0 => None,
+        Some(last_success) => {
+            let interval = Duration::from_secs(interval_hours.saturating_mul(3600));
+            Some(interval.saturating_sub(now.saturating_duration_since(last_success)))
+        }
+    }
+}
+
+fn periodic_scheduler_wait_duration(
+    cleanup_schedule: &SessionCleanupSchedule,
+    cleanup_interval_hours: u64,
+    cleanup_reconciliation_required: bool,
+    last_snapshot_completion: Option<Instant>,
+    snapshot_interval: Duration,
+    now: Instant,
+) -> Duration {
+    let snapshot_wait = last_snapshot_completion.map_or(Duration::ZERO, |last| {
+        snapshot_interval.saturating_sub(now.saturating_duration_since(last))
+    });
+    let cleanup_wait = if cleanup_reconciliation_required {
+        None
+    } else {
+        session_cleanup_wait_duration(cleanup_schedule, cleanup_interval_hours, now)
+    };
+    cleanup_wait.map_or(snapshot_wait, |wait| wait.min(snapshot_wait))
 }
 
 /// Generate a time-ordered session ID (UUID v7-like: timestamp prefix + random).
@@ -1637,6 +1945,45 @@ fn compute_state_hash(panes: &[PaneInfo]) -> String {
 // SQLite operations (sync, run inside spawn_blocking)
 // =============================================================================
 
+fn u64_to_sqlite_integer(value: u64) -> std::result::Result<i64, rusqlite::Error> {
+    i64::try_from(value)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+fn usize_to_sqlite_integer(value: usize) -> std::result::Result<i64, rusqlite::Error> {
+    i64::try_from(value)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+fn sqlite_integer_to_u64(
+    column: usize,
+    value: i64,
+) -> std::result::Result<u64, rusqlite::Error> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
+fn snapshot_integer_overflow(detail: &'static str) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(detail)))
+}
+
+fn snapshot_serialization_error(error: serde_json::Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+}
+
+fn require_exactly_one_changed_row(affected: usize) -> std::result::Result<(), rusqlite::Error> {
+    if affected == 1 {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::StatementChangedRows(affected))
+    }
+}
+
 fn open_conn(db_path: &str) -> std::result::Result<Connection, rusqlite::Error> {
     let conn = Connection::open(db_path)?;
     // [ft-rfpk6] Enable foreign_keys so cleanup_sync's DELETE on
@@ -1657,31 +2004,32 @@ fn create_session_sync(
     topology_json: &str,
     ft_version: &str,
 ) -> std::result::Result<(), rusqlite::Error> {
+    let now_ms = u64_to_sqlite_integer(now_ms)?;
     let conn = open_conn(db_path)?;
     let host_id = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("HOST"))
         .unwrap_or_default();
-    conn.execute(
+    let inserted = conn.execute(
         "INSERT INTO mux_sessions (session_id, created_at, topology_json, ft_version, host_id)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![
             session_id,
-            now_ms as i64,
+            now_ms,
             topology_json,
             ft_version,
             host_id
         ],
     )?;
-    Ok(())
+    require_exactly_one_changed_row(inserted)
 }
 
 fn mark_shutdown_sync(db_path: &str, session_id: &str) -> std::result::Result<(), rusqlite::Error> {
     let conn = open_conn(db_path)?;
-    conn.execute(
+    let updated = conn.execute(
         "UPDATE mux_sessions SET shutdown_clean = 1 WHERE session_id = ?1",
         [session_id],
     )?;
-    Ok(())
+    require_exactly_one_changed_row(updated)
 }
 
 /// Save a checkpoint with all pane states in a single transaction.
@@ -1696,7 +2044,7 @@ fn save_checkpoint_sync(
     pane_states: &[PaneStateSnapshot],
 ) -> std::result::Result<(String, i64, usize), rusqlite::Error> {
     struct SerializedPaneState {
-        pane_id: u64,
+        pane_id: i64,
         cwd: Option<String>,
         command: Option<String>,
         terminal_json: String,
@@ -1706,39 +2054,62 @@ fn save_checkpoint_sync(
         last_output_at: Option<i64>,
     }
 
+    let now_ms = u64_to_sqlite_integer(now_ms)?;
     let conn = open_conn(db_path)?;
 
     // Serialize all pane states and compute total bytes
-    let mut serialized_states: Vec<SerializedPaneState> = Vec::new();
+    let mut serialized_states: Vec<SerializedPaneState> =
+        Vec::with_capacity(pane_states.len());
     let mut total_bytes: usize = 0;
 
     for ps in pane_states {
-        let terminal_json = match serde_json::to_string(&ps.terminal) {
-            Ok(json) => json,
-            Err(e) => {
-                tracing::error!(error = %e, pane_id = ps.pane_id, "terminal state serialization failed; skipping pane");
-                continue; // Skip this pane rather than silently storing empty state
-            }
-        };
-        let env_json = ps.env.as_ref().and_then(|e| {
-            serde_json::to_string(e)
-                .inspect_err(|e| tracing::warn!(error = %e, "snapshot env serialization failed"))
-                .ok()
-        });
-        let agent_json = ps.agent.as_ref().and_then(|a| {
-            serde_json::to_string(a)
-                .inspect_err(|e| tracing::warn!(error = %e, "snapshot agent serialization failed"))
-                .ok()
-        });
-        let scrollback_seq = ps.scrollback_ref.as_ref().map(|s| s.output_segments_seq);
-        let last_output_at = ps.scrollback_ref.as_ref().map(|s| s.last_capture_at as i64);
+        // A checkpoint is an authoritative all-pane restore point. Never
+        // publish a successful but silently partial checkpoint when any pane
+        // component cannot be serialized.
+        let terminal_json =
+            serde_json::to_string(&ps.terminal).map_err(snapshot_serialization_error)?;
+        let env_json = ps
+            .env
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(snapshot_serialization_error)?;
+        let agent_json = ps
+            .agent
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(snapshot_serialization_error)?;
+        let scrollback_seq = ps
+            .scrollback_ref
+            .as_ref()
+            .map(|scrollback| {
+                if scrollback.output_segments_seq < 0 {
+                    Err(snapshot_integer_overflow(
+                        "snapshot scrollback sequence cannot be negative",
+                    ))
+                } else {
+                    Ok(scrollback.output_segments_seq)
+                }
+            })
+            .transpose()?;
+        let last_output_at = ps
+            .scrollback_ref
+            .as_ref()
+            .map(|scrollback| u64_to_sqlite_integer(scrollback.last_capture_at))
+            .transpose()?;
 
-        total_bytes += terminal_json.len()
-            + env_json.as_ref().map_or(0, |s| s.len())
-            + agent_json.as_ref().map_or(0, |s| s.len());
+        let serialized_bytes = terminal_json
+            .len()
+            .checked_add(env_json.as_ref().map_or(0, String::len))
+            .and_then(|bytes| bytes.checked_add(agent_json.as_ref().map_or(0, String::len)))
+            .ok_or_else(|| snapshot_integer_overflow("snapshot pane-state byte count overflow"))?;
+        total_bytes = total_bytes
+            .checked_add(serialized_bytes)
+            .ok_or_else(|| snapshot_integer_overflow("snapshot total byte count overflow"))?;
 
         serialized_states.push(SerializedPaneState {
-            pane_id: ps.pane_id,
+            pane_id: u64_to_sqlite_integer(ps.pane_id)?,
             cwd: ps.cwd.clone(),
             command: ps.foreground_process.as_ref().map(|p| p.name.clone()),
             terminal_json,
@@ -1748,24 +2119,28 @@ fn save_checkpoint_sync(
             last_output_at,
         });
     }
-
     let tx = conn.unchecked_transaction()?;
+    let total_changes_before: i64 =
+        tx.query_row("SELECT total_changes()", [], |row| row.get(0))?;
     let persisted_pane_count = serialized_states.len();
+    let persisted_pane_count_sql = usize_to_sqlite_integer(persisted_pane_count)?;
+    let total_bytes_sql = usize_to_sqlite_integer(total_bytes)?;
 
     // Insert checkpoint
-    tx.execute(
+    let inserted_checkpoint = tx.execute(
         "INSERT INTO session_checkpoints
          (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params![
             session_id,
-            now_ms as i64,
+            now_ms,
             checkpoint_type,
             state_hash,
-            persisted_pane_count as i64,
-            total_bytes as i64,
+            persisted_pane_count_sql,
+            total_bytes_sql,
         ],
     )?;
+    require_exactly_one_changed_row(inserted_checkpoint)?;
 
     let checkpoint_id = tx.last_insert_rowid();
 
@@ -1779,9 +2154,9 @@ fn save_checkpoint_sync(
         )?;
 
         for ps in &serialized_states {
-            stmt.execute(rusqlite::params![
+            let inserted_pane = stmt.execute(rusqlite::params![
                 checkpoint_id,
-                ps.pane_id as i64,
+                ps.pane_id,
                 ps.cwd.as_deref(),
                 ps.command.as_deref(),
                 ps.env_json.as_deref(),
@@ -1790,15 +2165,33 @@ fn save_checkpoint_sync(
                 ps.scrollback_seq,
                 ps.last_output_at,
             ])?;
+            require_exactly_one_changed_row(inserted_pane)?;
         }
     } // drop stmt before commit
 
-    tx.execute(
+    let updated_session = tx.execute(
         "UPDATE mux_sessions
          SET last_checkpoint_at = ?1, topology_json = ?2
          WHERE session_id = ?3",
-        rusqlite::params![now_ms as i64, topology_json, session_id],
+        rusqlite::params![now_ms, topology_json, session_id],
     )?;
+    require_exactly_one_changed_row(updated_session)?;
+
+    // Direct execute counts deliberately exclude trigger side effects. The
+    // connection-wide DML delta therefore proves that the transaction changed
+    // exactly the checkpoint, its pane rows, and the session authority row.
+    // Avoid re-reading every just-written JSON payload here: that doubled
+    // large-session I/O and allocation while the SQLite writer lock was held.
+    let total_changes_after: i64 =
+        tx.query_row("SELECT total_changes()", [], |row| row.get(0))?;
+    let expected_changes = persisted_pane_count_sql
+        .checked_add(2)
+        .ok_or_else(|| snapshot_integer_overflow("snapshot expected DML count overflow"))?;
+    if total_changes_after.checked_sub(total_changes_before) != Some(expected_changes) {
+        return Err(snapshot_integer_overflow(
+            "snapshot transaction performed unexpected DML",
+        ));
+    }
 
     tx.commit()?;
 
@@ -1813,7 +2206,12 @@ fn cleanup_sync(
     retention_days: u64,
 ) -> std::result::Result<usize, rusqlite::Error> {
     let conn = open_conn(db_path)?;
-    let cutoff_ms = epoch_ms().saturating_sub(retention_days * 86_400_000);
+    let cutoff_ms = epoch_ms().saturating_sub(retention_days.saturating_mul(86_400_000));
+    let cutoff_ms = u64_to_sqlite_integer(cutoff_ms)?;
+    // A count above SQLite's signed integer range means "retain everything"
+    // for any representable database, so clamp rather than wrapping negative
+    // or turning a safe no-op policy into a permanent cleanup failure.
+    let retention_count = i64::try_from(retention_count).unwrap_or(i64::MAX);
 
     // Wrap both DELETEs in a transaction so a concurrent checkpoint insert
     // between them cannot be incorrectly deleted by the second statement.
@@ -1822,7 +2220,7 @@ fn cleanup_sync(
     // Delete checkpoints older than retention_days
     let deleted_by_age: usize = tx.execute(
         "DELETE FROM session_checkpoints WHERE checkpoint_at < ?1",
-        [cutoff_ms as i64],
+        [cutoff_ms],
     )?;
 
     // Keep only the latest retention_count checkpoints per session.
@@ -1842,11 +2240,13 @@ fn cleanup_sync(
              )
              WHERE checkpoint_rank > ?1
          )",
-        [retention_count as i64],
+        [retention_count],
     )?;
 
     tx.commit()?;
-    Ok(deleted_by_age + deleted_by_count)
+    deleted_by_age
+        .checked_add(deleted_by_count)
+        .ok_or_else(|| snapshot_integer_overflow("snapshot cleanup deletion count overflow"))
 }
 
 // =============================================================================
@@ -1858,6 +2258,86 @@ mod tests {
     use super::*;
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder, sleep, timeout};
     use crate::wezterm::PaneSize;
+
+    #[test]
+    fn sqlite_integer_conversions_reject_wrapping_values_and_corrupt_rows() {
+        let sqlite_max_as_u64 = u64::try_from(i64::MAX).unwrap();
+        assert_eq!(u64_to_sqlite_integer(sqlite_max_as_u64).unwrap(), i64::MAX);
+        assert!(u64_to_sqlite_integer(u64::MAX).is_err());
+        assert!(sqlite_integer_to_u64(0, -1).is_err());
+        assert_eq!(
+            sqlite_integer_to_u64(0, i64::MAX).unwrap(),
+            sqlite_max_as_u64
+        );
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert!(usize_to_sqlite_integer(usize::MAX).is_err());
+        }
+    }
+
+    #[test]
+    fn scrollback_loader_rejects_negative_db_metadata_and_oversized_pane_ids() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap();
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE output_segments (
+                 pane_id INTEGER NOT NULL,
+                 seq INTEGER NOT NULL,
+                 captured_at INTEGER NOT NULL
+             );
+             INSERT INTO output_segments (pane_id, seq, captured_at)
+             VALUES (7, 0, -1), (7, 1, 2);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let negative_timestamp = load_latest_scrollback_refs_sync(db_path, &[7])
+            .expect_err("a masked negative captured_at must not wrap to u64");
+        assert!(negative_timestamp.contains("min_capture_at=-1"));
+
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE output_segments SET captured_at = 1 WHERE pane_id = 7;",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE output_segments SET seq = -1 WHERE pane_id = 7 AND seq = 0",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let negative_sequence = load_latest_scrollback_refs_sync(db_path, &[7])
+            .expect_err("a masked negative scrollback sequence must fail closed");
+        assert!(negative_sequence.contains("min_seq=-1"));
+
+        let oversized_pane_id = load_latest_scrollback_refs_sync(db_path, &[u64::MAX])
+            .expect_err("an unrepresentable pane id must not wrap to a SQLite integer");
+        assert!(oversized_pane_id.contains("exceeds sqlite integer range"));
+    }
+
+    #[test]
+    fn sqlite_snapshot_mutations_require_one_authoritative_row() {
+        assert!(require_exactly_one_changed_row(1).is_ok());
+        assert!(matches!(
+            require_exactly_one_changed_row(0),
+            Err(rusqlite::Error::StatementChangedRows(0))
+        ));
+        assert!(matches!(
+            require_exactly_one_changed_row(2),
+            Err(rusqlite::Error::StatementChangedRows(2))
+        ));
+
+        let (_tmp, db_path) = setup_test_db();
+        let error = mark_shutdown_sync(db_path.as_str(), "missing-session")
+            .expect_err("a missing session cannot be reported as cleanly shut down");
+        assert!(matches!(
+            error,
+            rusqlite::Error::StatementChangedRows(0)
+        ));
+    }
 
     #[test]
     fn snapshot_lock_errors_preserve_finite_failure_identity() {
@@ -1921,13 +2401,50 @@ mod tests {
     }
 
     // ft-0yuxe: the scheduler drives `[snapshots.session_retention]` cleanup on
-    // the configured cadence. Pin the cadence decision so it always runs on
-    // startup, honors `cleanup_interval_hours`, and treats `0` as startup-only.
+    // the configured cadence. Pin startup, retry deferral, and authoritative
+    // completion semantics independently of wall time or SQLite.
     #[test]
-    fn session_cleanup_due_runs_on_startup_then_honors_interval() {
+    fn session_cleanup_due_retries_safely_then_honors_success_cadence() {
+        let base = Instant::now();
+        let mut schedule = SessionCleanupSchedule::default();
+
+        // Startup remains due until an authoritative success is recorded.
+        assert!(session_cleanup_due(&schedule, 0, base));
+        assert!(session_cleanup_due(&schedule, 24, base));
+
+        // Admission contention and retry-safe errors defer attempts without
+        // fabricating a successful startup cleanup, including interval=0.
+        schedule.defer_retry(base);
+        assert!(schedule.last_authoritative_success.is_none());
+        assert!(!session_cleanup_due(&schedule, 0, base));
+        assert_eq!(
+            session_cleanup_wait_duration(&schedule, 0, base),
+            Some(SESSION_CLEANUP_RETRY_DELAY),
+            "periodic scheduling must expose the independent retry deadline"
+        );
+        let before_retry = base
+            .checked_add(SESSION_CLEANUP_RETRY_DELAY - Duration::from_nanos(1))
+            .expect("retry boundary fits in Instant");
+        assert!(!session_cleanup_due(&schedule, 24, before_retry));
+        assert_eq!(
+            session_cleanup_wait_duration(&schedule, 24, before_retry),
+            Some(Duration::from_nanos(1))
+        );
+        let at_retry = base
+            .checked_add(SESSION_CLEANUP_RETRY_DELAY)
+            .expect("retry boundary fits in Instant");
+        assert!(session_cleanup_due(&schedule, 0, at_retry));
+        assert!(session_cleanup_due(&schedule, 24, at_retry));
+        assert_eq!(
+            session_cleanup_wait_duration(&schedule, 24, at_retry),
+            Some(Duration::ZERO)
+        );
+
+        schedule.record_authoritative_success(base);
+        assert!(schedule.retry_deferred_at.is_none());
+
         // Build `now` far ahead of `base` so the elapsed-time subtractions are
         // safe regardless of system uptime (Instant is monotonic from boot).
-        let base = Instant::now();
         let now = base
             .checked_add(Duration::from_secs(100 * 3600))
             .expect("base + 100h fits in Instant");
@@ -1935,34 +2452,60 @@ mod tests {
             .checked_sub(Duration::from_secs(3600))
             .expect("now - 1h fits in Instant");
 
-        // Startup pass (never run before) is always due, even with interval 0.
+        // interval_hours == 0 => only-on-startup: never due again after an
+        // authoritative success.
         assert!(
-            session_cleanup_due(None, 0, now),
-            "startup must run with interval=0"
-        );
-        assert!(
-            session_cleanup_due(None, 24, now),
-            "startup must run with interval=24"
-        );
-
-        // interval_hours == 0 => only-on-startup: never due again after a run.
-        assert!(
-            !session_cleanup_due(Some(base), 0, now),
+            !session_cleanup_due(&schedule, 0, now),
             "interval=0 must not rerun after startup"
         );
+        assert_eq!(session_cleanup_wait_duration(&schedule, 0, now), None);
 
         // A configured interval reruns once that many hours have elapsed.
         assert!(
-            session_cleanup_due(Some(base), 24, now),
+            session_cleanup_due(&schedule, 24, now),
             "100h elapsed >= 24h interval must be due"
         );
+        let mut recent_success = SessionCleanupSchedule::default();
+        recent_success.record_authoritative_success(one_hour_ago);
         assert!(
-            !session_cleanup_due(Some(one_hour_ago), 24, now),
+            !session_cleanup_due(&recent_success, 24, now),
             "1h elapsed < 24h interval must not be due"
         );
-        assert!(
-            !session_cleanup_due(Some(now), 24, now),
-            "0 elapsed < 24h interval must not be due"
+        assert_eq!(
+            session_cleanup_wait_duration(&recent_success, 24, now),
+            Some(Duration::from_secs(23 * 3600))
+        );
+    }
+
+    #[test]
+    fn periodic_reconciliation_latch_waits_for_snapshot_instead_of_hot_looping() {
+        let now = Instant::now();
+        let schedule = SessionCleanupSchedule::default();
+        let snapshot_interval = Duration::from_secs(30);
+
+        assert_eq!(
+            periodic_scheduler_wait_duration(
+                &schedule,
+                0,
+                false,
+                Some(now),
+                snapshot_interval,
+                now,
+            ),
+            Duration::ZERO,
+            "an unlatch startup cleanup is immediately due"
+        );
+        assert_eq!(
+            periodic_scheduler_wait_duration(
+                &schedule,
+                0,
+                true,
+                Some(now),
+                snapshot_interval,
+                now,
+            ),
+            snapshot_interval,
+            "a reconciliation latch must suppress cleanup's zero deadline"
         );
     }
 
@@ -1972,30 +2515,261 @@ mod tests {
             SessionCleanupError, SessionCleanupIndeterminatePhase,
         };
 
-        let mut required = false;
+        let engine = SnapshotEngine::new(
+            Arc::new(":memory:".to_owned()),
+            SnapshotConfig::default(),
+        );
         for retry_safe in [
             SessionCleanupError::CancelledBeforeHandoff,
             SessionCleanupError::DatabaseOpen,
             SessionCleanupError::DatabasePreparation,
         ] {
-            assert!(!latch_session_cleanup_reconciliation(
-                &mut required,
-                retry_safe
-            ));
+            assert!(!engine.latch_session_cleanup_reconciliation(retry_safe));
         }
 
-        assert!(latch_session_cleanup_reconciliation(
-            &mut required,
+        assert!(engine.latch_session_cleanup_reconciliation(
             SessionCleanupError::IndeterminateCleanup {
                 phase: SessionCleanupIndeterminatePhase::BlockingTaskSettlement,
             }
         ));
         let later_retry_safe = SessionCleanupError::DatabaseOpen;
         assert!(!later_retry_safe.requires_reconciliation());
-        assert!(latch_session_cleanup_reconciliation(
-            &mut required,
-            later_retry_safe
-        ));
+        assert!(engine.latch_session_cleanup_reconciliation(later_retry_safe));
+        assert!(
+            engine
+                .session_cleanup_reconciliation_required
+                .load(Ordering::Acquire),
+            "a same-engine scheduler restart must observe the sticky latch"
+        );
+    }
+
+    #[test]
+    fn session_cleanup_reconciliation_latch_survives_same_engine_scheduler_restart() {
+        run_async_test(async {
+            use crate::session_retention::{
+                SessionCleanupError, SessionCleanupIndeterminatePhase,
+            };
+
+            let engine = SnapshotEngine::new(
+                Arc::new(":memory:".to_owned()),
+                SnapshotConfig::default(),
+            );
+            assert!(engine.latch_session_cleanup_reconciliation(
+                SessionCleanupError::IndeterminateCleanup {
+                    phase: SessionCleanupIndeterminatePhase::CleanupExecution,
+                }
+            ));
+
+            // A restarted scheduler begins with fresh cadence state. The
+            // engine-owned latch must still stop cleanup before touching that
+            // state or opening the database.
+            let cx = crate::cx::for_testing();
+            let mut restarted_scheduler_schedule = SessionCleanupSchedule::default();
+            engine
+                .maybe_run_session_cleanup(&cx, &mut restarted_scheduler_schedule)
+                .await;
+            assert_eq!(
+                restarted_scheduler_schedule,
+                SessionCleanupSchedule::default(),
+                "the sticky latch must stop cleanup before cadence state changes"
+            );
+        });
+    }
+
+    #[test]
+    fn session_cleanup_admission_contention_defers_without_claiming_startup_success() {
+        run_async_test(async {
+            let mut config = SnapshotConfig::default();
+            config.session_retention.cleanup_interval_hours = 0;
+            let engine = SnapshotEngine::new(Arc::new(":memory:".to_owned()), config);
+            let owner = engine
+                .try_begin_session_cleanup()
+                .expect("first scheduler owns cleanup admission");
+            let mut competing_schedule = SessionCleanupSchedule::default();
+            let cx = crate::cx::for_testing();
+
+            engine
+                .maybe_run_session_cleanup(&cx, &mut competing_schedule)
+                .await;
+
+            assert!(competing_schedule.last_authoritative_success.is_none());
+            assert!(
+                competing_schedule.retry_deferred_at.is_some(),
+                "admission contention must schedule a bounded retry"
+            );
+            assert!(
+                !engine
+                    .session_cleanup_reconciliation_required
+                    .load(Ordering::Acquire),
+                "known admission contention has no unknown durable effect"
+            );
+            owner.settle();
+        });
+    }
+
+    #[test]
+    fn session_cleanup_retry_safe_failure_defers_interval_zero_startup_retry() {
+        run_async_test(async {
+            let mut config = SnapshotConfig::default();
+            config.session_retention.cleanup_interval_hours = 0;
+            let engine = SnapshotEngine::new(Arc::new(":memory:".to_owned()), config);
+            let mut schedule = SessionCleanupSchedule::default();
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("session cleanup retry-safe scheduling test"),
+            );
+
+            engine
+                .maybe_run_session_cleanup(&cx, &mut schedule)
+                .await;
+
+            assert!(schedule.last_authoritative_success.is_none());
+            assert!(schedule.retry_deferred_at.is_some());
+            assert!(
+                !session_cleanup_due(&schedule, 0, Instant::now()),
+                "retry-safe failure must not hot-loop on the intelligent scheduler"
+            );
+            assert!(
+                !engine
+                    .session_cleanup_reconciliation_required
+                    .load(Ordering::Acquire),
+                "cancelled-before-handoff is retry-safe and must not latch reconciliation"
+            );
+            assert!(
+                !engine.session_cleanup_in_progress.load(Ordering::Acquire),
+                "typed retry-safe completion must release cleanup admission"
+            );
+        });
+    }
+
+    #[test]
+    fn session_cleanup_authoritative_success_advances_interval_zero_cadence() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let mut config = SnapshotConfig::default();
+            config.session_retention.cleanup_interval_hours = 0;
+            let engine = SnapshotEngine::new(db_path, config);
+            let mut schedule = SessionCleanupSchedule::default();
+            let cx = crate::cx::for_testing();
+
+            engine
+                .maybe_run_session_cleanup(&cx, &mut schedule)
+                .await;
+
+            let first_success = schedule
+                .last_authoritative_success
+                .expect("successful cleanup must advance normal cadence");
+            assert!(schedule.retry_deferred_at.is_none());
+            assert!(!session_cleanup_due(&schedule, 0, Instant::now()));
+
+            engine
+                .maybe_run_session_cleanup(&cx, &mut schedule)
+                .await;
+            assert_eq!(
+                schedule.last_authoritative_success,
+                Some(first_success),
+                "interval=0 must not run again after authoritative startup success"
+            );
+        });
+    }
+
+    #[test]
+    fn session_cleanup_admission_is_exclusive_and_abandonment_latches_reconciliation() {
+        let engine = SnapshotEngine::new(
+            Arc::new(":memory:".to_owned()),
+            SnapshotConfig::default(),
+        );
+
+        let attempt = engine
+            .try_begin_session_cleanup()
+            .expect("first scheduler owns cleanup admission");
+        assert!(
+            engine.try_begin_session_cleanup().is_none(),
+            "a concurrent scheduler must not enter cleanup"
+        );
+        attempt.settle();
+
+        {
+            let _abandoned_attempt = engine
+                .try_begin_session_cleanup()
+                .expect("settlement releases cleanup admission");
+        }
+        assert!(
+            engine
+                .session_cleanup_reconciliation_required
+                .load(Ordering::Acquire),
+            "dropping an unclassified attempt must fail closed"
+        );
+        assert!(engine.try_begin_session_cleanup().is_none());
+    }
+
+    #[test]
+    fn scheduler_admission_is_exclusive_and_released_on_shutdown() {
+        run_async_test_isolated(|| async {
+            use std::sync::atomic::AtomicUsize;
+
+            let (_tmp, db_path) = setup_test_db();
+            let engine = Arc::new(SnapshotEngine::new(
+                db_path,
+                SnapshotConfig {
+                    interval_seconds: 30,
+                    ..SnapshotConfig::default()
+                },
+            ));
+            let provider_calls = Arc::new(AtomicUsize::new(0));
+            let first_provider_calls = Arc::clone(&provider_calls);
+            let (first_shutdown_tx, first_shutdown_rx) = watch::channel(false);
+            let first_engine = Arc::clone(&engine);
+            let first_cx = crate::cx::for_testing();
+            let first_task = crate::runtime_async::task::spawn(async move {
+                first_engine
+                    .run_periodic_with_cx(&first_cx, first_shutdown_rx, move || {
+                        let provider_calls = Arc::clone(&first_provider_calls);
+                        async move {
+                            provider_calls.fetch_add(1, Ordering::Relaxed);
+                            Some(vec![make_test_pane(1, 24, 80)])
+                        }
+                    })
+                    .await
+            });
+
+            crate::runtime_async::timeout(Duration::from_secs(5), async {
+                while provider_calls.load(Ordering::Relaxed) == 0 {
+                    crate::runtime_async::yield_now().await;
+                }
+            })
+            .await
+            .expect("first scheduler must acquire admission and capture startup state");
+
+            let (_second_shutdown_tx, second_shutdown_rx) = watch::channel(false);
+            let second = engine
+                .run_periodic_with_cx(
+                    &crate::cx::for_testing(),
+                    second_shutdown_rx,
+                    || async { Some(vec![make_test_pane(2, 24, 80)]) },
+                )
+                .await;
+            assert!(matches!(second, Err(SnapshotError::SchedulerInProgress)));
+
+            first_shutdown_tx.send(true).unwrap();
+            crate::runtime_async::timeout(Duration::from_secs(5), first_task)
+                .await
+                .expect("first scheduler must observe shutdown")
+                .expect("first scheduler task must not panic")
+                .expect("first scheduler must stop cleanly");
+
+            let (_restart_shutdown_tx, restart_shutdown_rx) = watch::channel(true);
+            engine
+                .run_periodic_with_cx(
+                    &crate::cx::for_testing(),
+                    restart_shutdown_rx,
+                    || async { panic!("initially stopped restart must not call provider") },
+                )
+                .await
+                .expect("normal scheduler exit must release admission for restart");
+            assert!(!engine.scheduler_in_progress.load(Ordering::Acquire));
+        });
     }
 
     fn run_async_test<F>(future: F)
@@ -2433,6 +3207,226 @@ mod tests {
             .unwrap();
         assert_eq!(checkpoint_at, 2000);
         assert_eq!(pane_count, 1);
+
+        let mut corrupt_pane =
+            PaneStateSnapshot::from_pane_info(&make_test_pane(8, 24, 80), 3000, false);
+        corrupt_pane.scrollback_ref = Some(ScrollbackRef {
+            output_segments_seq: -1,
+            total_lines_captured: 1,
+            last_capture_at: 3000,
+        });
+        let error = save_checkpoint_sync(
+            db_path.as_str(),
+            "sess-atomic",
+            3000,
+            "event",
+            "state-hash-corrupt",
+            r#"{"version":"corrupt"}"#,
+            &[corrupt_pane],
+        )
+        .expect_err("a negative scrollback sequence cannot be persisted");
+        assert!(matches!(
+            error,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+
+        let checkpoint_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            checkpoint_count, 1,
+            "invalid metadata must not add a checkpoint"
+        );
+    }
+
+    #[test]
+    fn save_checkpoint_total_bytes_matches_historical_json_contract_exactly() {
+        let (_tmp, db_path) = setup_test_db();
+        create_session_sync(
+            db_path.as_str(),
+            "sess-bytes",
+            1_000,
+            r#"{"version":"bytes"}"#,
+            crate::VERSION,
+        )
+        .unwrap();
+
+        let mut pane =
+            PaneStateSnapshot::from_pane_info(&make_test_pane(9, 24, 80), 2_000, false);
+        pane.terminal.title = "終端🙂".to_owned();
+        pane.cwd = Some("/ignored/路径".to_owned());
+        pane.foreground_process = Some(crate::session_pane_state::ProcessInfo {
+            name: "ignored-command".to_owned(),
+            pid: Some(42),
+            argv: None,
+        });
+        pane.env = Some(crate::session_pane_state::CapturedEnv {
+            vars: std::collections::HashMap::from([(
+                "LANG".to_owned(),
+                "日本語.UTF-8".to_owned(),
+            )]),
+            redacted_count: 0,
+        });
+        pane.agent = Some(crate::session_pane_state::AgentMetadata {
+            agent_type: "codex-δ".to_owned(),
+            session_id: Some("会話🙂".to_owned()),
+            state: Some("working".to_owned()),
+        });
+
+        let expected = serde_json::to_string(&pane.terminal).unwrap().len()
+            + serde_json::to_string(pane.env.as_ref().unwrap()).unwrap().len()
+            + serde_json::to_string(pane.agent.as_ref().unwrap()).unwrap().len();
+        let (_session_id, checkpoint_id, receipt_bytes) = save_checkpoint_sync(
+            db_path.as_str(),
+            "sess-bytes",
+            2_000,
+            "event",
+            "state-hash-bytes",
+            r#"{"version":"bytes-2"}"#,
+            &[pane],
+        )
+        .unwrap();
+        assert_eq!(receipt_bytes, expected);
+
+        let persisted_bytes: i64 = Connection::open(db_path.as_str())
+            .unwrap()
+            .query_row(
+                "SELECT total_bytes FROM session_checkpoints WHERE id = ?1",
+                [checkpoint_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted_bytes, i64::try_from(expected).unwrap());
+    }
+
+    #[test]
+    fn save_checkpoint_sync_rolls_back_if_session_update_is_ignored() {
+        let (_tmp, db_path) = setup_test_db();
+        create_session_sync(
+            db_path.as_str(),
+            "sess-rollback",
+            1000,
+            r#"{"version":"old"}"#,
+            crate::VERSION,
+        )
+        .unwrap();
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER ignore_snapshot_session_update
+             BEFORE UPDATE OF last_checkpoint_at ON mux_sessions
+             WHEN OLD.session_id = 'sess-rollback'
+             BEGIN
+                 SELECT RAISE(IGNORE);
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let pane = PaneStateSnapshot::from_pane_info(&make_test_pane(9, 24, 80), 2000, false);
+        let error = save_checkpoint_sync(
+            db_path.as_str(),
+            "sess-rollback",
+            2000,
+            "event",
+            "state-hash-ignored-update",
+            r#"{"version":"new"}"#,
+            &[pane],
+        )
+        .expect_err("an ignored authority-row update must abort the checkpoint transaction");
+        assert!(matches!(error, rusqlite::Error::StatementChangedRows(0)));
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let checkpoint_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let pane_state_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let (last_checkpoint_at, topology_json): (Option<i64>, String) = conn
+            .query_row(
+                "SELECT last_checkpoint_at, topology_json
+                 FROM mux_sessions WHERE session_id = 'sess-rollback'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(checkpoint_count, 0);
+        assert_eq!(pane_state_count, 0);
+        assert_eq!(last_checkpoint_at, None);
+        assert_eq!(topology_json, r#"{"version":"old"}"#);
+    }
+
+    #[test]
+    fn save_checkpoint_sync_rejects_and_rolls_back_extra_trigger_dml() {
+        let (_tmp, db_path) = setup_test_db();
+        create_session_sync(
+            db_path.as_str(),
+            "sess-authority",
+            1000,
+            r#"{"version":"old"}"#,
+            crate::VERSION,
+        )
+        .unwrap();
+        create_session_sync(
+            db_path.as_str(),
+            "sess-unrelated",
+            1000,
+            r#"{"version":"unrelated"}"#,
+            crate::VERSION,
+        )
+        .unwrap();
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER mutate_unrelated_session_after_checkpoint
+             AFTER INSERT ON session_checkpoints
+             BEGIN
+                 UPDATE mux_sessions
+                 SET topology_json = '{\"triggered\":true}'
+                 WHERE session_id = 'sess-unrelated';
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let pane = PaneStateSnapshot::from_pane_info(&make_test_pane(10, 24, 80), 2000, false);
+        let error = save_checkpoint_sync(
+            db_path.as_str(),
+            "sess-authority",
+            2000,
+            "event",
+            "state-hash-extra-dml",
+            r#"{"version":"new"}"#,
+            &[pane],
+        )
+        .expect_err("unexpected trigger DML must invalidate the checkpoint receipt");
+        assert!(matches!(
+            error,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let checkpoint_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let unrelated_topology: String = conn
+            .query_row(
+                "SELECT topology_json FROM mux_sessions WHERE session_id = 'sess-unrelated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoint_count, 0);
+        assert_eq!(unrelated_topology, r#"{"version":"unrelated"}"#);
     }
 
     #[test]
@@ -3100,6 +4094,9 @@ mod tests {
             session_id: RwLock::new(None),
             last_state_hash: RwLock::new(None),
             in_progress: AtomicBool::new(false),
+            scheduler_in_progress: AtomicBool::new(false),
+            session_cleanup_reconciliation_required: AtomicBool::new(false),
+            session_cleanup_in_progress: AtomicBool::new(false),
             trigger_tx,
             trigger_rx: Mutex::new(None),
             telemetry: SnapshotEngineTelemetry::new(),
@@ -3712,6 +4709,10 @@ mod tests {
         assert_eq!(
             SnapshotError::InProgress.to_string(),
             "snapshot already in progress"
+        );
+        assert_eq!(
+            SnapshotError::SchedulerInProgress.to_string(),
+            "snapshot scheduler already running for this engine"
         );
         assert_eq!(SnapshotError::NoPanes.to_string(), "no panes found");
         assert_eq!(
@@ -4639,9 +5640,9 @@ mod tests {
     #[test]
     fn telemetry_snapshot_serde_roundtrip() {
         let telem = SnapshotEngineTelemetry::new();
-        telem.captures_attempted.fetch_add(5, Ordering::Relaxed);
-        telem.captures_succeeded.fetch_add(3, Ordering::Relaxed);
-        telem.dedup_skips.fetch_add(2, Ordering::Relaxed);
+        saturating_telemetry_add(&telem.captures_attempted, 5);
+        saturating_telemetry_add(&telem.captures_succeeded, 3);
+        saturating_telemetry_add(&telem.dedup_skips, 2);
 
         let snap = telem.snapshot();
         let json = serde_json::to_string(&snap).unwrap();
@@ -4649,5 +5650,14 @@ mod tests {
         assert_eq!(parsed.captures_attempted, 5);
         assert_eq!(parsed.captures_succeeded, 3);
         assert_eq!(parsed.dedup_skips, 2);
+    }
+
+    #[test]
+    fn telemetry_add_saturates_instead_of_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        saturating_telemetry_add(&counter, 10);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        saturating_telemetry_add(&counter, 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 }

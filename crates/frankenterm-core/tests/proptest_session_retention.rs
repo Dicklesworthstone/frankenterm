@@ -2,7 +2,7 @@
 //!
 //! Verifies cleanup invariants across arbitrary session configurations:
 //!
-//! - CleanupResult::total_sessions_deleted == age + count + size (always)
+//! - CleanupResult::total_sessions_deleted is the saturating age + count + size sum
 //! - CleanupResult::any_work_done iff total > 0 OR orphans > 0
 //! - CleanupResult::default is all zeros and not any_work_done
 //! - SessionRetentionConfig serde roundtrip (JSON and TOML)
@@ -11,7 +11,7 @@
 //! - After count cleanup, closed session count <= max_closed_sessions
 //! - Cleanup with all policies disabled deletes nothing
 //! - Orphan cleanup removes all orphaned rows
-//! - VACUUM only triggered when >= 10 sessions deleted
+//! - Online cleanup remains writable across arbitrary deletion counts
 //! - Idempotency: second cleanup yields zero additional deletions
 //! - Session deletion count never exceeds initial closed session count
 //! - Size cleanup respects budget after completion
@@ -155,21 +155,19 @@ fn total_checkpoint_bytes(conn: &Connection) -> i64 {
 
 fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
     (
+        any::<usize>(),
+        any::<usize>(),
+        any::<usize>(),
         0..100usize,
         0..100usize,
-        0..100usize,
-        0..100usize,
-        0..100usize,
-        any::<bool>(),
     )
         .prop_map(
-            |(age, count, size, orphan_cp, orphan_ps, vacuumed)| CleanupResult {
+            |(age, count, size, orphan_cp, orphan_ps)| CleanupResult {
                 deleted_by_age: age,
                 deleted_by_count: count,
                 deleted_by_size: size,
                 orphaned_checkpoints: orphan_cp,
                 orphaned_pane_states: orphan_ps,
-                vacuumed,
             },
         )
 }
@@ -191,7 +189,7 @@ fn arb_session_mix() -> impl Strategy<Value = (usize, usize)> {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// 1. CleanupResult::total_sessions_deleted == age + count + size
+// 1. CleanupResult::total_sessions_deleted is the saturating component sum
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
@@ -199,11 +197,14 @@ proptest! {
 
     #[test]
     fn total_sessions_deleted_is_sum_of_components(result in arb_cleanup_result()) {
-        let expected = result.deleted_by_age + result.deleted_by_count + result.deleted_by_size;
+        let expected = result
+            .deleted_by_age
+            .saturating_add(result.deleted_by_count)
+            .saturating_add(result.deleted_by_size);
         prop_assert_eq!(
             result.total_sessions_deleted(),
             expected,
-            "total_sessions_deleted must equal age({}) + count({}) + size({})",
+            "total_sessions_deleted must equal saturating age({}) + count({}) + size({})",
             result.deleted_by_age, result.deleted_by_count, result.deleted_by_size
         );
     }
@@ -233,6 +234,60 @@ proptest! {
     }
 }
 
+#[test]
+fn online_cleanup_leaves_reclaimed_pages_on_freelist_without_compaction() {
+    let file = tempfile::NamedTempFile::new().expect("create retention database");
+    let conn = Connection::open(file.path()).expect("open retention database");
+    conn.execute_batch("PRAGMA auto_vacuum = NONE; PRAGMA foreign_keys = ON;")
+        .expect("configure retention database");
+    conn.execute_batch(SCHEMA_SQL)
+        .expect("create retention schema");
+
+    let now = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer");
+    let old = now - 90 * 86_400_000;
+    insert_session(&conn, "large-old-session", old, true);
+    let checkpoint_id = insert_checkpoint(&conn, "large-old-session", old, 2 * 1024 * 1024);
+    let large_state = "x".repeat(2 * 1024 * 1024);
+    conn.execute(
+        "INSERT INTO mux_pane_state
+         (checkpoint_id, pane_id, terminal_state_json)
+         VALUES (?1, 1, ?2)",
+        params![checkpoint_id, large_state],
+    )
+    .expect("materialize reclaimable database pages");
+
+    let pages_before: i64 = conn
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .expect("read page count before cleanup");
+    let freelist_before: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .expect("read freelist before cleanup");
+
+    let config = SessionRetentionConfig {
+        max_age_days: 30,
+        max_closed_sessions: 0,
+        max_total_size_mb: 0,
+        cleanup_interval_hours: 0,
+    };
+    let result = cleanup_sessions(&conn, &config).expect("logical cleanup succeeds");
+    assert_eq!(result.deleted_by_age, 1);
+
+    let pages_after: i64 = conn
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .expect("read page count after cleanup");
+    let freelist_after: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .expect("read freelist after cleanup");
+    assert_eq!(
+        pages_after, pages_before,
+        "online retention must not rewrite/truncate the database like VACUUM"
+    );
+    assert!(
+        freelist_after > freelist_before,
+        "logically reclaimed pages must remain available for SQLite reuse"
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────
 // 3. CleanupResult::default is all zeros and not any_work_done
 // ────────────────────────────────────────────────────────────────────
@@ -248,7 +303,6 @@ proptest! {
         prop_assert_eq!(result.deleted_by_size, 0usize, "default size should be 0");
         prop_assert_eq!(result.orphaned_checkpoints, 0usize, "default orphan_cp should be 0");
         prop_assert_eq!(result.orphaned_pane_states, 0usize, "default orphan_ps should be 0");
-        prop_assert!(!result.vacuumed, "default vacuumed should be false");
         prop_assert!(!result.any_work_done(), "default should report no work done");
         prop_assert_eq!(result.total_sessions_deleted(), 0usize, "default total should be 0");
     }
@@ -689,14 +743,14 @@ proptest! {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// 12. VACUUM only triggered when >= 10 sessions deleted
+// 12. Online cleanup remains writable across arbitrary deletion counts
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
     #[test]
-    fn vacuum_threshold_respected(
+    fn online_cleanup_remains_writable(
         num_old in 0..25usize,
     ) {
         let conn = make_test_db();
@@ -717,20 +771,9 @@ proptest! {
 
         let result = cleanup_sessions(&conn, &config).unwrap();
         let total_deleted = result.total_sessions_deleted();
-
-        if total_deleted >= 10 {
-            prop_assert!(
-                result.vacuumed,
-                "VACUUM should run when {} >= 10 sessions deleted",
-                total_deleted
-            );
-        } else {
-            prop_assert!(
-                !result.vacuumed,
-                "VACUUM should NOT run when {} < 10 sessions deleted",
-                total_deleted
-            );
-        }
+        prop_assert_eq!(total_deleted, num_old);
+        insert_session(&conn, "interactive-sentinel", now, false);
+        prop_assert_eq!(count_active_sessions(&conn), 1);
     }
 }
 
@@ -1099,7 +1142,6 @@ proptest! {
 
         prop_assert_eq!(result.total_sessions_deleted(), 0usize, "empty db has nothing to delete");
         prop_assert!(!result.any_work_done(), "empty db should report no work done");
-        prop_assert!(!result.vacuumed, "empty db should not vacuum");
     }
 }
 
@@ -1178,14 +1220,13 @@ proptest! {
         prop_assert_eq!(cloned.deleted_by_size, result.deleted_by_size, "size preserved");
         prop_assert_eq!(cloned.orphaned_checkpoints, result.orphaned_checkpoints, "orphan_cp preserved");
         prop_assert_eq!(cloned.orphaned_pane_states, result.orphaned_pane_states, "orphan_ps preserved");
-        prop_assert_eq!(cloned.vacuumed, result.vacuumed, "vacuumed preserved");
         prop_assert_eq!(cloned.total_sessions_deleted(), result.total_sessions_deleted(), "total preserved");
         prop_assert_eq!(cloned.any_work_done(), result.any_work_done(), "any_work_done preserved");
     }
 }
 
 // ────────────────────────────────────────────────────────────────────
-// 23. any_work_done false requires all zeros (except vacuumed)
+// 23. any_work_done false requires all counters to be zero
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
@@ -1309,7 +1350,10 @@ proptest! {
         let result = cleanup_sessions(&conn, &config).unwrap();
 
         // The sum of all categories must equal total_sessions_deleted
-        let sum = result.deleted_by_age + result.deleted_by_count + result.deleted_by_size;
+        let sum = result
+            .deleted_by_age
+            .saturating_add(result.deleted_by_count)
+            .saturating_add(result.deleted_by_size);
         prop_assert_eq!(
             sum,
             result.total_sessions_deleted(),
@@ -1479,7 +1523,6 @@ proptest! {
         prop_assert_eq!(cloned.deleted_by_size, result.deleted_by_size);
         prop_assert_eq!(cloned.orphaned_checkpoints, result.orphaned_checkpoints);
         prop_assert_eq!(cloned.orphaned_pane_states, result.orphaned_pane_states);
-        prop_assert_eq!(cloned.vacuumed, result.vacuumed);
     }
 }
 
@@ -1552,7 +1595,10 @@ proptest! {
 
     #[test]
     fn total_sessions_deleted_equals_sum(result in arb_cleanup_result()) {
-        let sum = result.deleted_by_age + result.deleted_by_count + result.deleted_by_size;
+        let sum = result
+            .deleted_by_age
+            .saturating_add(result.deleted_by_count)
+            .saturating_add(result.deleted_by_size);
         prop_assert_eq!(result.total_sessions_deleted(), sum,
             "total_sessions_deleted {} should equal sum of components {}",
             result.total_sessions_deleted(), sum);
@@ -1571,7 +1617,6 @@ proptest! {
         let result = CleanupResult::default();
         prop_assert!(!result.any_work_done());
         prop_assert_eq!(result.total_sessions_deleted(), 0);
-        prop_assert!(!result.vacuumed);
     }
 }
 
