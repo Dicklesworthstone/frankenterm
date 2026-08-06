@@ -21,6 +21,19 @@ use frankenterm_core::wezterm::{
 use common::fixtures::RuntimeFixture;
 use std::sync::Arc;
 
+trait TestMuxWatchdogCheck {
+    async fn check(&mut self) -> frankenterm_core::watchdog::MuxHealthSample;
+}
+
+impl TestMuxWatchdogCheck for MuxWatchdog {
+    async fn check(&mut self) -> frankenterm_core::watchdog::MuxHealthSample {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        self.check_cx(&cx)
+            .await
+            .expect("test mux watchdog check must succeed")
+    }
+}
+
 // ===========================================================================
 // Local FailingMockWezterm (mirrors #[cfg(test)]-gated version in wezterm.rs)
 // ===========================================================================
@@ -345,8 +358,9 @@ fn mux_watchdog_escalates_on_critical_watchdog_warning() {
 fn mux_watchdog_warning_probe_failure_marks_degraded() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
+        const SECRET: &str = "SECRET watchdog backend failure";
         let mock = Arc::new(frankenterm_core::wezterm::MockWezterm::new());
-        mock.set_watchdog_warning_error(Some("probe transport unavailable".to_string()))
+        mock.set_watchdog_warning_error(Some(SECRET.to_string()))
             .await;
         let wezterm: WeztermHandle = mock;
         let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
@@ -355,6 +369,10 @@ fn mux_watchdog_warning_probe_failure_marks_degraded() {
         assert!(sample.ping_ok);
         assert_eq!(sample.status, HealthStatus::Degraded);
         assert_eq!(sample.warning_count, 1);
-        assert!(sample.watchdog_warnings[0].contains("failed to query"));
+        assert_eq!(
+            sample.watchdog_warnings[0],
+            "backend watchdog warning probe failed"
+        );
+        assert!(!format!("{sample:?}").contains(SECRET));
     });
 }

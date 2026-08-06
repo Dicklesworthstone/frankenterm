@@ -3,9 +3,9 @@
 //! Keeps framework dependency boundaries explicit and centralized.
 //! Re-exports are consumed by web.rs sub-modules during migration.
 
+use crate::runtime_async::net::TcpListener;
+use crate::runtime_async::task::{self, JoinError, JoinErrorKind, JoinHandle};
 use crate::{Error, Result};
-use asupersync::net::TcpListener;
-use asupersync::runtime::{JoinHandle, Runtime};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -35,7 +35,8 @@ pub use fastapi::prelude::{
 };
 
 #[doc(hidden)]
-pub type FrameworkServerJoinResult = std::result::Result<(), ServerError>;
+pub type FrameworkServerJoinResult =
+    std::result::Result<std::result::Result<(), ServerError>, JoinError>;
 
 /// Idle request reads are deliberately short for the localhost-only control
 /// plane. Besides releasing abandoned sockets promptly, this leaves enough
@@ -126,8 +127,124 @@ enum ConnectionDrainOutcome {
     },
     TimerFailed {
         remaining_connections: u64,
-        error: String,
+        failure: ConnectionDrainTimerFailure,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionDrainTimerFailure {
+    InvalidPollInterval,
+    WaitFailed,
+}
+
+impl ConnectionDrainTimerFailure {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidPollInterval => "web_connection_drain_invalid_poll_interval",
+            Self::WaitFailed => "web_connection_drain_timer_wait_failed",
+        }
+    }
+}
+
+fn web_server_failure_code(error: &ServerError) -> &'static str {
+    match error {
+        ServerError::Io(_) => "web_server_io_failure",
+        ServerError::Parse(_) => "web_server_parse_failure",
+        ServerError::Http2(_) => "web_server_http2_failure",
+        ServerError::Shutdown => "web_server_shutdown",
+        ServerError::ConnectionLimitReached => "web_server_connection_limit_reached",
+        ServerError::KeepAliveTimeout => "web_server_keep_alive_timeout",
+    }
+}
+
+fn web_server_join_failure_code(error: &JoinError) -> &'static str {
+    match error.kind() {
+        JoinErrorKind::Aborted => "web_server_task_aborted",
+        JoinErrorKind::ContextCancelled => "web_server_task_context_cancelled",
+        JoinErrorKind::DeadlineExceeded => "web_server_task_deadline_exceeded",
+        JoinErrorKind::PollQuotaExhausted => "web_server_task_poll_budget_exhausted",
+        JoinErrorKind::CostBudgetExhausted => "web_server_task_cost_budget_exhausted",
+        JoinErrorKind::ContextFailure => "web_server_task_context_failure",
+        JoinErrorKind::TaskFailed => "web_server_task_failed",
+        JoinErrorKind::WakerRegistrationFailed => {
+            "web_server_task_waker_registration_failed"
+        }
+    }
+}
+
+/// Finite capability-context failure classes used by the web lifecycle seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WebCxFailureClass {
+    /// Explicit caller or parent cancellation.
+    Cancelled,
+    /// The bounded cleanup period after cancellation was exhausted.
+    CancellationCleanupTimeout,
+    /// Wall/virtual-time deadline exhaustion.
+    DeadlineExceeded,
+    /// Cooperative poll quota exhaustion.
+    PollBudgetExhausted,
+    /// Cost quota exhaustion.
+    CostBudgetExhausted,
+    /// An unclassified capability-context failure.
+    Context,
+}
+
+impl WebCxFailureClass {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Cancelled => "web_context_cancelled",
+            Self::CancellationCleanupTimeout => "web_context_cancellation_cleanup_timeout",
+            Self::DeadlineExceeded => "web_context_deadline_exceeded",
+            Self::PollBudgetExhausted => "web_context_poll_budget_exhausted",
+            Self::CostBudgetExhausted => "web_context_cost_budget_exhausted",
+            Self::Context => "web_context_failure",
+        }
+    }
+}
+
+/// Classify an asupersync failure without retaining its free-text detail.
+pub(crate) fn classify_web_cx_failure(
+    cx: &crate::cx::Cx,
+    error: &crate::runtime_async::ContextError,
+) -> WebCxFailureClass {
+    use crate::runtime_async::ContextErrorKind;
+
+    match error.kind() {
+        ContextErrorKind::DeadlineExceeded => WebCxFailureClass::DeadlineExceeded,
+        ContextErrorKind::CancelTimeout => WebCxFailureClass::CancellationCleanupTimeout,
+        ContextErrorKind::PollQuotaExhausted => WebCxFailureClass::PollBudgetExhausted,
+        ContextErrorKind::CostQuotaExhausted => WebCxFailureClass::CostBudgetExhausted,
+        ContextErrorKind::Cancelled => match cx.cancel_reason().map(|reason| reason.root_cause().kind) {
+            Some(crate::outcome::CancelKind::Timeout | crate::outcome::CancelKind::Deadline) => {
+                WebCxFailureClass::DeadlineExceeded
+            }
+            Some(crate::outcome::CancelKind::PollQuota) => {
+                WebCxFailureClass::PollBudgetExhausted
+            }
+            Some(crate::outcome::CancelKind::CostBudget) => {
+                WebCxFailureClass::CostBudgetExhausted
+            }
+            _ => WebCxFailureClass::Cancelled,
+        },
+        _ => WebCxFailureClass::Context,
+    }
+}
+
+/// Convert a capability failure into a finite project error.
+pub(crate) fn web_cx_error(
+    cx: &crate::cx::Cx,
+    operation: &'static str,
+    error: &crate::runtime_async::ContextError,
+) -> Error {
+    let class = classify_web_cx_failure(cx, error);
+    match class {
+        WebCxFailureClass::Cancelled => Error::runtime_cancelled(operation, class.code()),
+        WebCxFailureClass::CancellationCleanupTimeout
+        | WebCxFailureClass::DeadlineExceeded
+        | WebCxFailureClass::PollBudgetExhausted
+        | WebCxFailureClass::CostBudgetExhausted
+        | WebCxFailureClass::Context => Error::runtime_backend(operation, class.code()),
+    }
 }
 
 async fn wait_for_connections_to_drain_with<C, W, WaitFuture>(
@@ -155,14 +272,14 @@ where
         if poll_interval.is_zero() {
             return ConnectionDrainOutcome::TimerFailed {
                 remaining_connections,
-                error: "connection-drain poll interval must be non-zero".to_string(),
+                failure: ConnectionDrainTimerFailure::InvalidPollInterval,
             };
         }
         let wait_duration = poll_interval.min(remaining);
-        if let Err(error) = wait(wait_duration).await {
+        if wait(wait_duration).await.is_err() {
             return ConnectionDrainOutcome::TimerFailed {
                 remaining_connections,
-                error,
+                failure: ConnectionDrainTimerFailure::WaitFailed,
             };
         }
         remaining = remaining.saturating_sub(wait_duration);
@@ -177,11 +294,11 @@ async fn wait_for_connections_to_drain(
         || server.current_connections(),
         WEB_CONNECTION_DRAIN_TIMEOUT,
         WEB_CONNECTION_DRAIN_POLL_INTERVAL,
-        // `sleep_with_cx` deliberately ignores direct cancellation and only
-        // respects the supplied runtime budget, so this bounded cleanup wait
-        // completes after caller cancellation without minting a fresh
-        // full-capability test context. An exhausted budget is reported as a
-        // truthful timer failure instead of escalating authority.
+        // `sleep_with_cx` does not register a direct-cancellation wake once a
+        // sleep is pending, but its entry/exit checkpoints can still reject an
+        // already-cancelled or exhausted caller context. Report that as a
+        // truthful timer failure; runtime-owned bounded cleanup authority is a
+        // separate lifecycle concern and must not be emulated by minting here.
         |duration| crate::runtime_async::sleep_with_cx(cx, duration),
     )
     .await
@@ -235,25 +352,24 @@ impl FrameworkWebRuntime {
         app: App,
     ) -> Result<(SocketAddr, Self)> {
         cx.checkpoint()
-            .map_err(|err| Error::runtime_cancelled("web start", err.to_string()))?;
+            .map_err(|err| web_cx_error(cx, "web start", &err))?;
 
         match app.run_startup_hooks().await {
             StartupOutcome::Success => {}
             StartupOutcome::PartialSuccess { warnings } => {
                 warn!(target: "wa.web", warnings, "web startup hooks had warnings");
             }
-            StartupOutcome::Aborted(err) => {
+            StartupOutcome::Aborted(_err) => {
                 let primary_error = Error::runtime_backend(
                     "web startup hooks",
-                    format!("web startup aborted: {err}"),
+                    "web_startup_hook_aborted",
                 );
                 return rollback_started_app(&app, primary_error).await;
             }
         }
 
         if let Err(err) = cx.checkpoint() {
-            let primary_error =
-                Error::runtime_cancelled("web start before bind", err.to_string());
+            let primary_error = web_cx_error(cx, "web start before bind", &err);
             return rollback_started_app(&app, primary_error).await;
         }
 
@@ -281,7 +397,7 @@ impl FrameworkWebRuntime {
 
         if let Err(err) = cx.checkpoint() {
             drop(listener);
-            let primary_error = Error::runtime_cancelled("web start after bind", err.to_string());
+            let primary_error = web_cx_error(cx, "web start after bind", &err);
             return rollback_started_app(app.as_ref(), primary_error).await;
         }
 
@@ -289,35 +405,25 @@ impl FrameworkWebRuntime {
             .with_keep_alive_timeout(WEB_KEEP_ALIVE_TIMEOUT)
             .with_drain_timeout(WEB_CONNECTION_DRAIN_TIMEOUT);
         let server = Arc::new(TcpServer::new(server_config));
-        let Some(runtime_handle) = Runtime::current_handle() else {
-            drop(listener);
-            let primary_error =
-                Error::runtime_backend("web runtime", "unavailable during startup");
-            return rollback_started_app(app.as_ref(), primary_error).await;
-        };
-
         if let Err(err) = cx.checkpoint() {
             drop(listener);
-            let primary_error =
-                Error::runtime_cancelled("web start before serve", err.to_string());
+            let primary_error = web_cx_error(cx, "web start before serve", &err);
             return rollback_started_app(app.as_ref(), primary_error).await;
         }
 
         let join = {
             let serve_server = Arc::clone(&server);
             let serve_app = Arc::clone(&app);
-            let child_cx = cx.clone();
-            let serve = async move {
+            match task::try_spawn_with_cx(cx, move |child_cx| async move {
                 serve_server
                     .serve_on_app_concurrent(&child_cx, listener, serve_app)
                     .await
-            };
-            match runtime_handle.try_spawn(serve) {
+            }) {
                 Ok(join) => join,
                 Err(err) => {
                     let primary_error = Error::runtime_backend(
                         "web runtime spawn",
-                        format!("server task admission failed: {err}"),
+                        err.code(),
                     );
                     return rollback_started_app(app.as_ref(), primary_error).await;
                 }
@@ -333,7 +439,7 @@ impl FrameworkWebRuntime {
         };
 
         if let Err(err) = cx.checkpoint() {
-            let primary_error = Error::runtime_cancelled("web start after spawn", err.to_string());
+            let primary_error = web_cx_error(cx, "web start after spawn", &err);
             runtime.signal_shutdown();
             let join_result = runtime.join_handle_mut().await;
             if let Err(cleanup_error) = runtime.finish_with_cx(cx, join_result).await {
@@ -375,7 +481,8 @@ impl FrameworkWebRuntime {
     /// Defers any non-shutdown join error until after a bounded connection
     /// drain and framework shutdown hooks. Cleanup is unconditional. Error
     /// precedence is server join failure, then a drain-timer failure or drain
-    /// timeout with live connections, then cleanup-context cancellation.
+    /// timeout with live connections, then a finite cleanup-context control
+    /// failure (cancellation, deadline, budget, or context failure).
     /// Only connection draining is bounded: pinned FastAPI exposes shutdown
     /// hooks as one opaque future, so an arbitrary async hook can still wait
     /// indefinitely. Dropping that future on a timeout would silently discard
@@ -395,8 +502,15 @@ impl FrameworkWebRuntime {
         result: FrameworkServerJoinResult,
     ) -> Result<()> {
         let deferred_join_error = match result {
-            Ok(()) | Err(ServerError::Shutdown) => None,
-            Err(err) => Some(Error::runtime_backend("web server", err.to_string())),
+            Ok(Ok(())) | Ok(Err(ServerError::Shutdown)) => None,
+            Ok(Err(err)) => Some(Error::runtime_backend(
+                "web server",
+                web_server_failure_code(&err),
+            )),
+            Err(err) => Some(Error::runtime_backend(
+                "web server task",
+                web_server_join_failure_code(&err),
+            )),
         };
 
         // The App-aware concurrent accept loop performs its own bounded drain
@@ -429,20 +543,19 @@ impl FrameworkWebRuntime {
             }
             ConnectionDrainOutcome::TimerFailed {
                 remaining_connections,
-                error,
+                failure,
             } => {
+                let timer_error = match cx.checkpoint() {
+                    Ok(()) => Error::runtime_backend("web server drain timer", failure.code()),
+                    Err(error) => web_cx_error(cx, "web server drain timer", &error),
+                };
                 warn!(
                     target: "wa.web",
                     active_connections = remaining_connections,
-                    error = %error,
+                    failure_class = failure.code(),
                     "web server connection-drain timer failed"
                 );
-                Some(Error::runtime_backend(
-                    "web server drain timer",
-                    format!(
-                        "timer failed with {remaining_connections} active connection(s): {error}"
-                    ),
-                ))
+                Some(timer_error)
             }
         };
         self.app.run_shutdown_hooks().await;
@@ -455,9 +568,8 @@ impl FrameworkWebRuntime {
             return Err(error);
         }
 
-        cx.checkpoint().map_err(|err| {
-            Error::runtime_cancelled("web finish after shutdown", err.to_string())
-        })?;
+        cx.checkpoint()
+            .map_err(|err| web_cx_error(cx, "web finish after shutdown", &err))?;
         Ok(())
     }
 }
@@ -487,7 +599,7 @@ pub fn json_response_with_status<T: serde::Serialize>(status: StatusCode, payloa
 /// Build an SSE streaming response with standard headers.
 pub fn sse_stream_response<S>(stream: S) -> Response
 where
-    S: asupersync::stream::Stream<Item = Vec<u8>> + Send + 'static,
+    S: crate::runtime_async::stream::Stream<Item = Vec<u8>> + Send + 'static,
 {
     Response::with_status(StatusCode::OK)
         .header("content-type", b"text/event-stream".to_vec())
@@ -500,10 +612,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionDrainOutcome, ResponseBody, StatusCode, json_response_with_status,
-        listener_wake_addr, validate_unauthenticated_bound_addr,
-        wait_for_connections_to_drain_with,
+        ConnectionDrainOutcome, ConnectionDrainTimerFailure, ResponseBody, StatusCode,
+        WebCxFailureClass, classify_web_cx_failure, json_response_with_status,
+        listener_wake_addr, validate_unauthenticated_bound_addr, wait_for_connections_to_drain_with,
+        web_cx_error,
     };
+    use crate::error::RuntimeOperationSource;
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
     use std::cell::Cell;
     use std::net::SocketAddr;
@@ -596,9 +710,10 @@ mod tests {
             outcome,
             ConnectionDrainOutcome::TimerFailed {
                 remaining_connections: 3,
-                error: "drain-timer-sentinel".to_string(),
+                failure: ConnectionDrainTimerFailure::WaitFailed,
             }
         );
+        assert!(!format!("{outcome:?}").contains("drain-timer-sentinel"));
         assert_eq!(connection_checks.get(), 1);
         assert_eq!(timer_calls.get(), 1, "timer failure must not spin or retry");
     }
@@ -624,9 +739,128 @@ mod tests {
             outcome,
             ConnectionDrainOutcome::TimerFailed {
                 remaining_connections: 2,
-                error: "connection-drain poll interval must be non-zero".to_string(),
+                failure: ConnectionDrainTimerFailure::InvalidPollInterval,
             }
         );
         assert_eq!(timer_calls.get(), 0);
+    }
+
+    #[test]
+    fn web_cx_failure_classes_preserve_deadline_budget_and_cleanup_identity() {
+        use crate::runtime_async::{ContextError, ContextErrorKind};
+
+        let cx = crate::cx::for_request();
+        let cases = [
+            (
+                ContextErrorKind::DeadlineExceeded,
+                WebCxFailureClass::DeadlineExceeded,
+            ),
+            (
+                ContextErrorKind::CancelTimeout,
+                WebCxFailureClass::CancellationCleanupTimeout,
+            ),
+            (
+                ContextErrorKind::PollQuotaExhausted,
+                WebCxFailureClass::PollBudgetExhausted,
+            ),
+            (
+                ContextErrorKind::CostQuotaExhausted,
+                WebCxFailureClass::CostBudgetExhausted,
+            ),
+            (ContextErrorKind::Internal, WebCxFailureClass::Context),
+        ];
+
+        for (kind, expected) in cases {
+            let error = ContextError::new(kind).with_message("secret-context-detail");
+            assert_eq!(classify_web_cx_failure(&cx, &error), expected);
+        }
+    }
+
+    #[test]
+    fn cancelled_error_kind_preserves_every_root_cancel_class_without_detail_leak() {
+        use crate::outcome::CancelKind;
+
+        const SECRET: &str = "sentinel-private-web-root-cancel-detail";
+        let cases = [
+            (CancelKind::Timeout, WebCxFailureClass::DeadlineExceeded),
+            (CancelKind::Deadline, WebCxFailureClass::DeadlineExceeded),
+            (
+                CancelKind::PollQuota,
+                WebCxFailureClass::PollBudgetExhausted,
+            ),
+            (
+                CancelKind::CostBudget,
+                WebCxFailureClass::CostBudgetExhausted,
+            ),
+            (CancelKind::User, WebCxFailureClass::Cancelled),
+            (CancelKind::FailFast, WebCxFailureClass::Cancelled),
+            (CancelKind::RaceLost, WebCxFailureClass::Cancelled),
+            (CancelKind::ParentCancelled, WebCxFailureClass::Cancelled),
+            (
+                CancelKind::ResourceUnavailable,
+                WebCxFailureClass::Cancelled,
+            ),
+            (CancelKind::Shutdown, WebCxFailureClass::Cancelled),
+            (CancelKind::LinkedExit, WebCxFailureClass::Cancelled),
+        ];
+
+        for (kind, expected) in cases {
+            let cx = crate::cx::for_request();
+            cx.cancel_with(kind, Some(SECRET));
+            let source = crate::runtime_async::ContextError::new(
+                crate::runtime_async::ContextErrorKind::Cancelled,
+            )
+            .with_message(SECRET);
+
+            assert_eq!(classify_web_cx_failure(&cx, &source), expected);
+            let mapped = web_cx_error(&cx, "web root-cancel matrix", &source);
+            assert!(!mapped.to_string().contains(SECRET));
+            match (expected, mapped) {
+                (
+                    WebCxFailureClass::Cancelled,
+                    crate::Error::RuntimeOperation {
+                        source: RuntimeOperationSource::Cancelled(detail),
+                        ..
+                    },
+                ) => assert_eq!(detail, expected.code()),
+                (
+                    WebCxFailureClass::DeadlineExceeded
+                    | WebCxFailureClass::PollBudgetExhausted
+                    | WebCxFailureClass::CostBudgetExhausted,
+                    crate::Error::RuntimeOperation {
+                        source: RuntimeOperationSource::Backend(detail),
+                        ..
+                    },
+                ) => assert_eq!(detail, expected.code()),
+                (_, other) => panic!(
+                    "root cancel class {expected:?} mapped to unexpected error {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn web_cx_error_discards_caller_controlled_cancellation_detail() {
+        const SECRET: &str = "sentinel-private-web-cancellation-reason";
+        let cx = crate::cx::for_request();
+        cx.cancel_with(crate::outcome::CancelKind::User, Some(SECRET));
+        let source = crate::runtime_async::ContextError::new(
+            crate::runtime_async::ContextErrorKind::Cancelled,
+        )
+            .with_message(SECRET);
+
+        let error = web_cx_error(&cx, "web test operation", &source);
+
+        match error {
+            crate::Error::RuntimeOperation {
+                operation,
+                source: RuntimeOperationSource::Cancelled(detail),
+            } => {
+                assert_eq!(operation, "web test operation");
+                assert_eq!(detail, WebCxFailureClass::Cancelled.code());
+                assert!(!detail.contains(SECRET));
+            }
+            other => panic!("expected finite runtime cancellation, got {other:?}"),
+        }
     }
 }

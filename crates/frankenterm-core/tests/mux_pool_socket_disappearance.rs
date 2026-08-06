@@ -49,6 +49,27 @@ use frankenterm_core::vendored::{
 };
 use std::time::Duration;
 
+trait TestMuxPoolMaintenance {
+    async fn stats(&self) -> frankenterm_core::vendored::MuxPoolStats;
+    async fn clear(&self);
+}
+
+impl TestMuxPoolMaintenance for MuxPool {
+    async fn stats(&self) -> frankenterm_core::vendored::MuxPoolStats {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        self.stats_with_cx(&cx)
+            .await
+            .expect("test mux pool stats snapshot must succeed")
+    }
+
+    async fn clear(&self) {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        self.clear_with_cx(&cx)
+            .await
+            .expect("test mux pool clear must succeed");
+    }
+}
+
 /// ft-7v53r: detect the pre-existing fixture limitation where the
 /// system-installed `wezterm-mux-server` (homebrew, /opt/homebrew/bin)
 /// speaks a codec version that ft's vendored codec cannot complete

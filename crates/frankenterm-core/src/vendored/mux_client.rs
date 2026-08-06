@@ -4059,6 +4059,7 @@ impl DirectMuxClient {
             .map(|decoded| decoded.into_parts().0)
     }
 
+    #[cfg(test)]
     async fn read_next_pdu_with_retention_metadata(
         &mut self,
     ) -> Result<codec::DecodedPduWithRetentionMetadata, DirectMuxError> {
@@ -4438,6 +4439,7 @@ fn should_auto_fallback_to_always(
         && matches!(decision.connection, MuxConnectionDisposition::Discard)
 }
 
+#[cfg(test)]
 async fn unix_stream_read(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::Result<usize> {
     io::read(stream, buf).await
 }

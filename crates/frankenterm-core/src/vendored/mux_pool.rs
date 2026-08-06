@@ -84,12 +84,19 @@ impl MuxPoolError {
         )
     }
 
-    /// Whether this error represents cooperative cancellation rather than a
-    /// completed mux health or protocol failure.
+    /// Whether this error represents a caller-context interruption
+    /// (cancellation or budget exhaustion) rather than a completed mux health
+    /// or protocol failure.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         match self {
-            Self::Pool(PoolError::Cancelled) => true,
+            Self::Pool(
+                PoolError::Cancelled
+                | PoolError::DeadlineExceeded
+                | PoolError::PollQuotaExhausted
+                | PoolError::CostBudgetExhausted
+                | PoolError::ContextFailure,
+            ) => true,
             Self::Mux(error) => mux_recovery_decision(error).cancelled,
             Self::Pool(_) | Self::IndeterminateMutation(_) => false,
         }
@@ -346,7 +353,11 @@ impl MuxPool {
 
     fn checkpoint_cx(cx: &Cx) -> Result<(), MuxPoolError> {
         cx.checkpoint()
-            .map_err(|_| MuxPoolError::Pool(PoolError::Cancelled))
+            .map_err(|_| MuxPoolError::Pool(Self::pool_context_error(cx)))
+    }
+
+    fn pool_context_error(cx: &Cx) -> PoolError {
+        Pool::<DirectMuxClient>::classify_cx_failure(cx)
     }
 
     fn render_batch_timeout_error(&self) -> MuxPoolError {
@@ -356,13 +367,9 @@ impl MuxPool {
     }
 
     fn render_interruption_error(&self, cx: &Cx) -> MuxPoolError {
-        if matches!(
-            cx.cancel_reason().map(|reason| reason.kind),
-            Some(CancelKind::Deadline)
-        ) {
-            self.render_batch_timeout_error()
-        } else {
-            MuxPoolError::Pool(PoolError::Cancelled)
+        match cx.root_cancel_cause().map(|reason| reason.kind) {
+            Some(CancelKind::Deadline | CancelKind::Timeout) => self.render_batch_timeout_error(),
+            _ => MuxPoolError::Pool(Self::pool_context_error(cx)),
         }
     }
 
@@ -475,18 +482,7 @@ impl MuxPool {
         Ok(())
     }
 
-    /// Acquire a client from the pool or create a new one.
-    ///
-    /// Returns the client and a guard that holds the concurrency slot.
-    /// The guard must be dropped after the client is returned (or discarded).
-    /// Used directly by tests and by `execute_with_recovery_inner`.
-    #[allow(dead_code)]
-    async fn acquire_client(&self) -> Result<(DirectMuxClient, PoolAcquireGuard), MuxPoolError> {
-        let cx = Cx::current().unwrap_or_else(cx::for_request);
-        self.acquire_client_with_cx(&cx).await
-    }
-
-    /// Acquire a client using an explicit capability context.
+    /// Acquire a client using the caller's explicit capability context.
     async fn acquire_client_with_cx(
         &self,
         cx: &Cx,
@@ -525,23 +521,8 @@ impl MuxPool {
         Ok((client, guard))
     }
 
-    /// Acquire a client without an explicit capability context.
-    /// Return a healthy client to the pool for reuse.
-    ///
-    /// Legacy ambient path retained alongside the cx-first sibling
-    /// `return_client_with_cx` (below). Current production MuxPool
-    /// ops route through the cx-first path.
-    #[allow(dead_code)]
-    async fn return_client(&self, client: DirectMuxClient) {
-        tracing::trace!(
-            subsystem = "mux_pool",
-            event = "release",
-            "returned mux connection to pool"
-        );
-        self.pool.put(client).await;
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::return_client`].
+    /// Return a healthy client to the pool under the caller's explicit
+    /// capability context.
     ///
     /// Routes through `ConnectionPool::put_with_cx` so cancellation during
     /// the idle-pool mutex acquire is a typed return failure rather than a
@@ -557,13 +538,22 @@ impl MuxPool {
                     "returned mux connection to pool (cx path)"
                 );
             }
-            Err(error @ PoolError::Cancelled) => {
+            Err(error)
+                if matches!(
+                    &error,
+                    PoolError::Cancelled
+                        | PoolError::DeadlineExceeded
+                        | PoolError::PollQuotaExhausted
+                        | PoolError::CostBudgetExhausted
+                        | PoolError::ContextFailure
+                ) =>
+            {
                 tracing::debug!(
                     subsystem = "mux_pool",
                     event = "release_drop",
                     explicit_cx = true,
                     error = %error,
-                    "dropped mux connection because its cancelled caller could not return it"
+                    "dropped mux connection because its interrupted caller could not return it"
                 );
             }
             Err(error) => {
@@ -1251,17 +1241,11 @@ impl MuxPool {
     }
 
     /// Evict idle connections that have exceeded the idle timeout.
-    pub async fn evict_idle(&self) -> usize {
-        let cx = Cx::current().unwrap_or_else(cx::for_request);
-        self.evict_idle_with_cx(&cx)
-            .await
-            .expect("infallible ambient mux pool eviction failed")
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::evict_idle`].
     ///
     /// Routes through `ConnectionPool::evict_idle_with_cx` so periodic
     /// eviction surfaces cancellation without panicking on the idle mutex.
+    /// Callers must supply the governing context; a fresh cleanup context
+    /// would regain authority after parent cancellation.
     ///
     /// # Errors
     ///
@@ -1281,17 +1265,10 @@ impl MuxPool {
     }
 
     /// Clear all idle connections from the pool.
-    pub async fn clear(&self) {
-        let cx = Cx::current().unwrap_or_else(cx::for_request);
-        self.clear_with_cx(&cx)
-            .await
-            .expect("infallible ambient mux pool clear failed");
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::clear`].
     ///
     /// Routes through `ConnectionPool::clear_with_cx` so shutdown paths that
     /// invoke a pool-wide flush receive typed cancellation instead of a panic.
+    /// Callers must supply the governing context.
     ///
     /// # Errors
     ///
@@ -1307,18 +1284,11 @@ impl MuxPool {
         Ok(())
     }
 
-    /// Get pool statistics.
-    pub async fn stats(&self) -> MuxPoolStats {
-        let cx = Cx::current().unwrap_or_else(cx::for_request);
-        self.stats_with_cx(&cx)
-            .await
-            .expect("infallible ambient mux pool stats failed")
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::stats`].
+    /// Get pool statistics under the caller's explicit capability context.
     ///
     /// Routes through `ConnectionPool::stats_with_cx` so a telemetry exporter
-    /// running under a cancelled parent cx receives a typed error.
+    /// running under a cancelled parent cx receives a typed error. Callers must
+    /// not substitute a new context after cancellation.
     ///
     /// # Errors
     ///
@@ -1352,6 +1322,37 @@ mod tests {
         CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, ListPanesResponse,
         Pdu, SpawnResponse, SpawnV2, SplitPane, StreamingPduBuffer, UnitResponse,
     };
+
+    /// Test-only maintenance helpers. The production pool deliberately exposes
+    /// only explicit-Cx maintenance operations.
+    trait TestMuxPoolMaintenance {
+        async fn evict_idle(&self) -> usize;
+        async fn clear(&self);
+        async fn stats(&self) -> MuxPoolStats;
+    }
+
+    impl TestMuxPoolMaintenance for MuxPool {
+        async fn evict_idle(&self) -> usize {
+            let cx = Cx::for_testing();
+            self.evict_idle_with_cx(&cx)
+                .await
+                .expect("test mux pool eviction must succeed")
+        }
+
+        async fn clear(&self) {
+            let cx = Cx::for_testing();
+            self.clear_with_cx(&cx)
+                .await
+                .expect("test mux pool clear must succeed");
+        }
+
+        async fn stats(&self) -> MuxPoolStats {
+            let cx = Cx::for_testing();
+            self.stats_with_cx(&cx)
+                .await
+                .expect("test mux pool stats snapshot must succeed")
+        }
+    }
 
     async fn unix_stream_read(
         stream: &mut compat_unix::UnixStream,
@@ -2209,9 +2210,12 @@ mod tests {
                 pipeline_timeout: Duration::from_secs(5),
             };
             let pool = MuxPool::new(config);
+            let cx = Cx::for_testing();
 
-            let (mut predecessor, predecessor_guard) =
-                pool.acquire_client().await.expect("acquire predecessor");
+            let (mut predecessor, predecessor_guard) = pool
+                .acquire_client_with_cx(&cx)
+                .await
+                .expect("acquire predecessor");
             let predecessor_id = predecessor.connection_id();
             let old_render = predecessor
                 .get_pane_render_changes(77)
@@ -2227,11 +2231,13 @@ mod tests {
                 error,
                 DirectMuxError::AlignedUnexpectedResponse { .. }
             ));
-            pool.return_client(predecessor).await;
+            pool.return_client_with_cx(&cx, predecessor).await;
             drop(predecessor_guard);
 
-            let (mut successor, successor_guard) =
-                pool.acquire_client().await.expect("acquire successor");
+            let (mut successor, successor_guard) = pool
+                .acquire_client_with_cx(&cx)
+                .await
+                .expect("acquire successor");
             let successor_id = successor.connection_id();
             assert_eq!(
                 predecessor_id, successor_id,
@@ -2244,7 +2250,7 @@ mod tests {
             assert_eq!(reused_render.seqno, 99);
             assert!(reused_render.title.starts_with("connection-1-"));
 
-            pool.return_client(successor).await;
+            pool.return_client_with_cx(&cx, successor).await;
             drop(successor_guard);
             let stats = pool.stats().await;
             assert_eq!(stats.connections_created, 1);
@@ -2986,9 +2992,10 @@ mod tests {
                 pipeline_timeout: Duration::from_secs(5),
             };
             let pool = Arc::new(MuxPool::new(config));
+            let cx = Cx::for_testing();
 
             // Acquire the only slot via internal method
-            let (client, _guard) = pool.acquire_client().await.expect("acquire");
+            let (client, _guard) = pool.acquire_client_with_cx(&cx).await.expect("acquire");
 
             // Second acquire should timeout
             let pool2 = pool.clone();
@@ -3002,7 +3009,7 @@ mod tests {
             }
 
             // Return the first client and drop the guard
-            pool.return_client(client).await;
+            pool.return_client_with_cx(&cx, client).await;
             drop(_guard);
         });
     }
@@ -3668,6 +3675,54 @@ mod tests {
     }
 
     #[test]
+    fn render_timeout_cancel_kind_uses_batch_timeout_class() {
+        let pool = MuxPool::new(MuxPoolConfig {
+            pipeline_timeout: Duration::from_secs(5),
+            ..MuxPoolConfig::default()
+        });
+        let cx = Cx::for_testing();
+        cx.cancel_with(
+            crate::outcome::CancelKind::Timeout,
+            Some("SECRET mux render timeout classification"),
+        );
+
+        let error = pool.render_interruption_error(&cx);
+        assert!(matches!(
+            &error,
+            MuxPoolError::Mux(DirectMuxError::BatchTimeout { timeout_ms: 5_000 })
+        ));
+        assert!(!error.to_string().contains("SECRET"));
+        assert!(!format!("{error:?}").contains("SECRET"));
+    }
+
+    #[test]
+    fn mux_pool_context_interruptions_do_not_count_as_backend_health_failures() {
+        for error in [
+            PoolError::Cancelled,
+            PoolError::DeadlineExceeded,
+            PoolError::PollQuotaExhausted,
+            PoolError::CostBudgetExhausted,
+            PoolError::ContextFailure,
+        ] {
+            assert!(
+                MuxPoolError::Pool(error.clone()).is_cancelled(),
+                "context interruption must stop health accounting: {error:?}"
+            );
+        }
+
+        for error in [
+            PoolError::AcquireTimeout,
+            PoolError::Closed,
+            PoolError::PolledAfterCompletion,
+        ] {
+            assert!(
+                !MuxPoolError::Pool(error.clone()).is_cancelled(),
+                "backend/pool lifecycle failure must remain observable: {error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn pool_batch_render_pipeline_depth_one() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -4144,7 +4199,10 @@ mod tests {
             let client = DirectMuxClient::connect_with_cx(&cx, pool.mux_config.clone())
                 .await
                 .expect("seed mux client");
-            pool.pool.put(client).await;
+            pool.pool
+                .put_with_cx(&cx, client)
+                .await
+                .expect("seed mux client into pool");
 
             let err = pool
                 .execute_with_recovery_with_cx(&cx, "cancelled-op", |_client| {
@@ -5299,7 +5357,7 @@ mod tests {
 
         /// 7. `clear` on an empty pool is a safe no-op and does not
         ///    touch any counter. The production code routes clear()
-        ///    through Pool::clear which is async — verifying it under
+        ///    through `Pool::clear_with_cx` — verifying it under
         ///    LabRuntime pins the cross-runtime quiescence contract.
         #[test]
         fn mux_pool_clear_empty_is_noop_under_labruntime() {
@@ -5377,14 +5435,14 @@ mod tests {
                     .expect_err("cancelled health check must fail");
                 assert!(health_error.is_cancelled());
 
-                let ambient_stats = pool.stats().await;
-                assert_eq!(ambient_stats.pool.idle_count, 0);
-                assert_eq!(ambient_stats.pool.total_evicted, 0);
+                let post_cancel_stats = pool.stats().await;
+                assert_eq!(post_cancel_stats.pool.idle_count, 0);
+                assert_eq!(post_cancel_stats.pool.total_evicted, 0);
                 assert_eq!(
-                    ambient_stats.health_checks, 0,
+                    post_cancel_stats.health_checks, 0,
                     "cancelled health checks must not publish completed-check telemetry"
                 );
-                assert_eq!(ambient_stats.health_check_failures, 0);
+                assert_eq!(post_cancel_stats.health_check_failures, 0);
             });
         }
     }

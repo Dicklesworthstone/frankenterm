@@ -338,16 +338,6 @@ impl WatchdogHandle {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
-    /// Wait for the watchdog task to finish.
-    pub async fn join(self) {
-        // Consuming shutdown cleanup must retain its join-before-return
-        // postcondition even when the surrounding request was cancelled.
-        let cx = crate::cx::for_request();
-        self.join_with_cx(&cx).await;
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`join`].
-    ///
     /// Signals shutdown unconditionally, then awaits the task handle only if
     /// the cx is not already cancelled. A cancelled caller can therefore stop
     /// waiting without detaching a watchdog that was never asked to exit.
@@ -367,11 +357,13 @@ impl WatchdogHandle {
 /// perform forced restarts; that will be added in a future iteration.
 ///
 /// # Arguments
+/// * `cx` – governing capability context inherited by the monitor task.
 /// * `heartbeats` – shared heartbeat registry updated by runtime tasks.
 /// * `config` – staleness thresholds and check interval.
 /// * `shutdown_flag` – external shutdown signal (e.g. from `ObservationRuntime`).
 #[must_use]
 pub fn spawn_watchdog(
+    cx: &crate::cx::Cx,
     heartbeats: Arc<HeartbeatRegistry>,
     config: WatchdogConfig,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -381,8 +373,7 @@ pub fn spawn_watchdog(
     let check_interval = config.check_interval;
 
     let task = {
-        let parent_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        task::spawn_with_cx(&parent_cx, move |watchdog_cx| async move {
+        task::spawn_with_cx(cx, move |watchdog_cx| async move {
             loop {
                 if shutdown_flag.load(Ordering::SeqCst) || internal_flag.load(Ordering::SeqCst) {
                     info!("Watchdog: shutdown signal received");
@@ -491,7 +482,7 @@ pub struct MuxHealthSample {
     pub ping_latency_ms: Option<u64>,
     /// Resident set size in bytes (None if unavailable).
     pub rss_bytes: Option<u64>,
-    /// Backend-specific warning lines surfaced by `WeztermInterface::watchdog_warnings`.
+    /// Backend-specific warning lines surfaced by `MuxInterface::watchdog_warnings`.
     #[serde(default)]
     pub watchdog_warnings: Vec<String>,
     /// Number of warning lines captured during this check.
@@ -512,6 +503,30 @@ pub struct MuxHealthReport {
     pub total_failures: u64,
 }
 
+/// Finite failure classes for an interrupted mux health check.
+///
+/// Cancellation reasons are deliberately not retained: they can contain
+/// operator-supplied text and must not cross watchdog telemetry or log
+/// boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MuxWatchdogCheckError {
+    /// Explicit or structural cancellation stopped the check.
+    #[error("mux watchdog check cancelled")]
+    Cancelled,
+    /// A deadline or timeout budget stopped the check.
+    #[error("mux watchdog check deadline exceeded")]
+    DeadlineExceeded,
+    /// The cooperative poll quota was exhausted.
+    #[error("mux watchdog check poll quota exhausted")]
+    PollQuotaExhausted,
+    /// The operation cost budget was exhausted.
+    #[error("mux watchdog check cost budget exhausted")]
+    CostBudgetExhausted,
+    /// A checkpoint failed without a stable typed root cause.
+    #[error("mux watchdog capability context failed")]
+    ContextFailure,
+}
+
 /// Mux server watchdog — monitors mux server health and reports to DegradationManager.
 pub struct MuxWatchdog {
     config: MuxWatchdogConfig,
@@ -526,7 +541,8 @@ pub struct MuxWatchdog {
 #[derive(Debug, Clone)]
 enum WarningProbeOutcome {
     Ok(Vec<String>),
-    Error(String),
+    BackendFailure,
+    Timeout,
 }
 
 fn warning_status_from_line(line: &str) -> Option<HealthStatus> {
@@ -572,6 +588,28 @@ fn warning_status_from_lines(lines: &[String]) -> Option<HealthStatus> {
 }
 
 impl MuxWatchdog {
+    fn classify_cx_failure(cx: &crate::cx::Cx) -> MuxWatchdogCheckError {
+        use crate::outcome::CancelKind;
+
+        match cx.root_cancel_cause().map(|reason| reason.kind) {
+            Some(CancelKind::Deadline | CancelKind::Timeout) => {
+                MuxWatchdogCheckError::DeadlineExceeded
+            }
+            Some(CancelKind::PollQuota) => MuxWatchdogCheckError::PollQuotaExhausted,
+            Some(CancelKind::CostBudget) => MuxWatchdogCheckError::CostBudgetExhausted,
+            Some(
+                CancelKind::User
+                | CancelKind::FailFast
+                | CancelKind::RaceLost
+                | CancelKind::ParentCancelled
+                | CancelKind::ResourceUnavailable
+                | CancelKind::Shutdown
+                | CancelKind::LinkedExit,
+            ) => MuxWatchdogCheckError::Cancelled,
+            None => MuxWatchdogCheckError::ContextFailure,
+        }
+    }
+
     /// Create a new mux watchdog.
     #[must_use]
     pub fn new(mut config: MuxWatchdogConfig, wezterm: crate::wezterm::WeztermHandle) -> Self {
@@ -588,27 +626,18 @@ impl MuxWatchdog {
         }
     }
 
-    /// Run a single health check and return the sample.
-    pub async fn check(&mut self) -> MuxHealthSample {
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.check_cx(&cx)
-            .await
-            .expect("infallible ambient mux watchdog check failed")
-    }
-
-    /// Run a single health check under an explicit `&Cx` (ft-xbnl0.2.2
-    /// Cx-first API).
+    /// Run a single health check under an explicit `&Cx`.
     ///
     /// Both the WezTerm pane-list ping and the watchdog-warnings probe use
     /// [`crate::runtime_async::timeout_with_cx`] so cancellation, budget,
-    /// and virtual time flow through the caller's capability context.
+    /// and virtual time flow through the caller's capability context. There is
+    /// intentionally no ambient wrapper: watchdog I/O must never regain
+    /// authority by constructing an independent context after cancellation.
     pub async fn check_cx(
         &mut self,
         cx: &crate::cx::Cx,
-    ) -> crate::Result<MuxHealthSample> {
-        cx.checkpoint().map_err(|err| {
-            crate::Error::Cancelled(format!("mux watchdog check cancelled before ping: {err}"))
-        })?;
+    ) -> Result<MuxHealthSample, MuxWatchdogCheckError> {
+        cx.checkpoint().map_err(|_| Self::classify_cx_failure(cx))?;
         let now = epoch_ms();
         let start = std::time::Instant::now();
 
@@ -627,9 +656,7 @@ impl MuxWatchdog {
             self.wezterm.list_panes_with_cx(cx),
         )
         .await;
-        cx.checkpoint().map_err(|err| {
-            crate::Error::Cancelled(format!("mux watchdog check cancelled during ping: {err}"))
-        })?;
+        cx.checkpoint().map_err(|_| Self::classify_cx_failure(cx))?;
         let ping_ok = matches!(ping_result, Ok(Ok(_)));
 
         let ping_latency_ms = if ping_ok {
@@ -639,11 +666,7 @@ impl MuxWatchdog {
         };
 
         let rss_bytes = get_mux_server_rss_with_cx(cx).await;
-        cx.checkpoint().map_err(|err| {
-            crate::Error::Cancelled(format!(
-                "mux watchdog check cancelled during RSS probe: {err}"
-            ))
-        })?;
+        cx.checkpoint().map_err(|_| Self::classify_cx_failure(cx))?;
 
         // Tick 211 (ft-xbnl0.2.3): route the warning probe through
         // `watchdog_warnings_with_cx(cx)` (added this tick). Default
@@ -658,20 +681,11 @@ impl MuxWatchdog {
             self.wezterm.watchdog_warnings_with_cx(cx),
         )
         .await;
-        cx.checkpoint().map_err(|err| {
-            crate::Error::Cancelled(format!(
-                "mux watchdog check cancelled during warning probe: {err}"
-            ))
-        })?;
+        cx.checkpoint().map_err(|_| Self::classify_cx_failure(cx))?;
         let warning_probe = match warning_probe_result {
             Ok(Ok(lines)) => WarningProbeOutcome::Ok(lines),
-            Ok(Err(err)) => WarningProbeOutcome::Error(format!(
-                "failed to query backend watchdog warnings: {err}"
-            )),
-            Err(_) => WarningProbeOutcome::Error(format!(
-                "timed out querying backend watchdog warnings after {} ms",
-                self.config.ping_timeout.as_millis()
-            )),
+            Ok(Err(_)) => WarningProbeOutcome::BackendFailure,
+            Err(_) => WarningProbeOutcome::Timeout,
         };
 
         self.total_checks += 1;
@@ -688,7 +702,12 @@ impl MuxWatchdog {
     ) -> MuxHealthSample {
         let mut watchdog_warnings = match warning_probe {
             WarningProbeOutcome::Ok(lines) => lines,
-            WarningProbeOutcome::Error(err) => vec![err],
+            WarningProbeOutcome::BackendFailure => {
+                vec!["backend watchdog warning probe failed".to_string()]
+            }
+            WarningProbeOutcome::Timeout => {
+                vec!["backend watchdog warning probe timed out".to_string()]
+            }
         };
         watchdog_warnings.retain(|line| !line.trim().is_empty());
 
@@ -753,9 +772,11 @@ impl MuxWatchdog {
     }
 }
 
-/// Spawn the mux watchdog as a background task.
+/// Spawn the mux watchdog as a background task under the caller's explicit
+/// capability context.
 #[must_use]
 pub fn spawn_mux_watchdog(
+    cx: &crate::cx::Cx,
     config: MuxWatchdogConfig,
     wezterm: crate::wezterm::WeztermHandle,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -764,8 +785,7 @@ pub fn spawn_mux_watchdog(
     let failure_threshold = config.failure_threshold;
 
     {
-        let parent_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        task::spawn_with_cx(&parent_cx, move |mux_watchdog_cx| async move {
+        task::spawn_with_cx(cx, move |mux_watchdog_cx| async move {
             let mut watchdog = MuxWatchdog::new(config, wezterm);
 
             info!("Mux watchdog started");
@@ -783,12 +803,8 @@ pub fn spawn_mux_watchdog(
 
                 let sample = match watchdog.check_cx(&mux_watchdog_cx).await {
                     Ok(sample) => sample,
-                    Err(crate::Error::Cancelled(reason)) => {
-                        info!(%reason, "Mux watchdog: cancelled during health check");
-                        break;
-                    }
                     Err(err) => {
-                        error!(error = %err, "Mux watchdog: health check failed");
+                        info!(error = %err, "Mux watchdog: interrupted during health check");
                         break;
                     }
                 };
@@ -856,24 +872,8 @@ pub fn spawn_mux_watchdog(
     }
 }
 
-/// Get the RSS (resident set size) of the wezterm-mux-server process.
-///
-/// Legacy ambient path preserved alongside the cx-first sibling
-/// [`get_mux_server_rss_with_cx`] used by the cx-first `check_inner`
-/// watchdog body. The historical `#[cfg(not(feature = "asupersync-runtime"))]`
-/// fallback that invoked this ambient variant was retired in ft-nm5nc
-/// (asupersync is the sole runtime); the function is kept as
-/// `#[allow(dead_code)]` until a follow-up cleanup confirms no
-/// out-of-tree caller still depends on it.
-#[allow(dead_code)]
-async fn get_mux_server_rss() -> Option<u64> {
-    crate::runtime_async::spawn_blocking(get_mux_server_rss_sync)
-        .await
-        .ok()
-        .flatten()
-}
-
-/// ft-xbnl0.2.3 Cx-first sibling of [`get_mux_server_rss`].
+/// Get the RSS (resident set size) of the FrankenTerm mux-server process under
+/// the caller's explicit capability context.
 ///
 /// Pre-flight `cx.checkpoint()` gates spawning the blocking
 /// `pgrep`/`ps` fan-out. On a cancelled caller cx the function
@@ -893,14 +893,14 @@ async fn get_mux_server_rss_with_cx(cx: &crate::cx::Cx) -> Option<u64> {
         .flatten()
 }
 
-/// Synchronous RSS lookup for wezterm-mux-server.
+/// Synchronous RSS lookup for `frankenterm-mux-server`.
 #[cfg(target_os = "macos")]
 fn get_mux_server_rss_sync() -> Option<u64> {
     use std::process::Command;
 
     // Find the mux server PID
     let pgrep = Command::new("pgrep")
-        .args(["-f", "wezterm-mux-server"])
+        .args(["-f", "frankenterm-mux-server"])
         .output()
         .ok()?;
 
@@ -923,17 +923,17 @@ fn get_mux_server_rss_sync() -> Option<u64> {
 
     let rss_kb: u64 = String::from_utf8_lossy(&ps.stdout).trim().parse().ok()?;
 
-    Some(rss_kb * 1024) // Convert KB to bytes
+    rss_kb.checked_mul(1024) // Convert KB to bytes without wrapping.
 }
 
-/// Synchronous RSS lookup for wezterm-mux-server.
+/// Synchronous RSS lookup for `frankenterm-mux-server`.
 #[cfg(target_os = "linux")]
 fn get_mux_server_rss_sync() -> Option<u64> {
     use std::process::Command;
 
     // Find the mux server PID
     let pgrep = Command::new("pgrep")
-        .args(["-f", "wezterm-mux-server"])
+        .args(["-f", "frankenterm-mux-server"])
         .output()
         .ok()?;
 
@@ -954,7 +954,7 @@ fn get_mux_server_rss_sync() -> Option<u64> {
             // Format: "12345 kB"
             let kb_str = rest.split_whitespace().next()?;
             let rss_kb: u64 = kb_str.parse().ok()?;
-            return Some(rss_kb * 1024); // Convert KB to bytes
+            return rss_kb.checked_mul(1024); // Convert KB to bytes without wrapping.
         }
     }
 
@@ -978,6 +978,32 @@ fn epoch_ms() -> u64 {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    /// Test-only convenience surfaces. Production callers must pass their
+    /// governing `Cx` directly to the explicit APIs.
+    trait TestMuxWatchdogCheck {
+        async fn check(&mut self) -> MuxHealthSample;
+    }
+
+    impl TestMuxWatchdogCheck for MuxWatchdog {
+        async fn check(&mut self) -> MuxHealthSample {
+            let cx = crate::cx::Cx::for_testing();
+            self.check_cx(&cx)
+                .await
+                .expect("test mux watchdog check must succeed")
+        }
+    }
+
+    trait TestWatchdogJoin {
+        async fn join(self);
+    }
+
+    impl TestWatchdogJoin for WatchdogHandle {
+        async fn join(self) {
+            let cx = crate::cx::Cx::for_testing();
+            self.join_with_cx(&cx).await;
+        }
+    }
 
     /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove the Cx-first
     /// `MuxWatchdog::check_cx` path runs under seed-locked virtual-time
@@ -1003,7 +1029,7 @@ mod tests {
         let (task_id, _handle) = runtime
             .state
             .create_task(region, asupersync::Budget::INFINITE, async move {
-                let cx = crate::cx::for_request();
+                let cx = crate::cx::for_testing();
                 let config = MuxWatchdogConfig::default();
                 let wezterm = crate::wezterm::mock_wezterm_handle();
                 let mut watchdog = MuxWatchdog::new(config, wezterm);
@@ -1055,14 +1081,67 @@ mod tests {
 
             let result = watchdog.check_cx(&cx).await;
 
-            assert!(
-                matches!(result, Err(crate::Error::Cancelled(_))),
-                "pre-cancelled check must report cancellation: {result:?}"
-            );
+            assert!(matches!(result, Err(MuxWatchdogCheckError::Cancelled)));
             assert_eq!(watchdog.total_checks, 0);
             assert_eq!(watchdog.consecutive_failures, 3);
             assert_eq!(watchdog.total_failures, 7);
             assert!(watchdog.history.is_empty());
+        });
+    }
+
+    #[test]
+    fn mux_watchdog_context_failures_are_exhaustive_finite_and_content_free() {
+        use crate::outcome::CancelKind;
+
+        run_async_test(async {
+            const SECRET: &str = "SECRET mux watchdog cancellation reason";
+            let cases = [
+                (CancelKind::User, MuxWatchdogCheckError::Cancelled),
+                (CancelKind::Timeout, MuxWatchdogCheckError::DeadlineExceeded),
+                (
+                    CancelKind::Deadline,
+                    MuxWatchdogCheckError::DeadlineExceeded,
+                ),
+                (
+                    CancelKind::PollQuota,
+                    MuxWatchdogCheckError::PollQuotaExhausted,
+                ),
+                (
+                    CancelKind::CostBudget,
+                    MuxWatchdogCheckError::CostBudgetExhausted,
+                ),
+                (CancelKind::FailFast, MuxWatchdogCheckError::Cancelled),
+                (CancelKind::RaceLost, MuxWatchdogCheckError::Cancelled),
+                (
+                    CancelKind::ParentCancelled,
+                    MuxWatchdogCheckError::Cancelled,
+                ),
+                (
+                    CancelKind::ResourceUnavailable,
+                    MuxWatchdogCheckError::Cancelled,
+                ),
+                (CancelKind::Shutdown, MuxWatchdogCheckError::Cancelled),
+                (CancelKind::LinkedExit, MuxWatchdogCheckError::Cancelled),
+            ];
+
+            for (kind, expected) in cases {
+                let cx = crate::cx::Cx::for_testing();
+                cx.cancel_with(kind, Some(SECRET));
+                let mut watchdog = MuxWatchdog::new(
+                    MuxWatchdogConfig::default(),
+                    crate::wezterm::mock_wezterm_handle(),
+                );
+
+                let error = watchdog
+                    .check_cx(&cx)
+                    .await
+                    .expect_err("pre-cancelled watchdog check must fail");
+                assert_eq!(error, expected, "unexpected class for {kind:?}");
+                assert!(!error.to_string().contains(SECRET));
+                assert!(!format!("{error:?}").contains(SECRET));
+                assert_eq!(watchdog.total_checks, 0);
+                assert!(watchdog.history.is_empty());
+            }
         });
     }
 
@@ -1199,7 +1278,9 @@ mod tests {
                 ..WatchdogConfig::default()
             };
 
-            let handle = spawn_watchdog(Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
+            let cx = crate::cx::Cx::for_testing();
+            let handle =
+                spawn_watchdog(&cx, Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
 
             // Let it run a few ticks.
             crate::runtime_async::sleep(Duration::from_millis(50)).await;
@@ -1229,7 +1310,9 @@ mod tests {
                 ..WatchdogConfig::default()
             };
 
-            let handle = spawn_watchdog(Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
+            let cx = crate::cx::Cx::for_testing();
+            let handle =
+                spawn_watchdog(&cx, Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
             crate::runtime_async::sleep(Duration::from_millis(30)).await;
 
             let cx = crate::cx::for_testing();
@@ -1259,7 +1342,9 @@ mod tests {
                 ..WatchdogConfig::default()
             };
 
-            let handle = spawn_watchdog(Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
+            let cx = crate::cx::Cx::for_testing();
+            let handle =
+                spawn_watchdog(&cx, Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
 
             let cx = crate::cx::for_testing();
             cx.cancel_with(
@@ -1679,7 +1764,9 @@ mod tests {
                 ..WatchdogConfig::default()
             };
 
-            let handle = spawn_watchdog(Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
+            let cx = crate::cx::Cx::for_testing();
+            let handle =
+                spawn_watchdog(&cx, Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
 
             crate::runtime_async::sleep(Duration::from_millis(30)).await;
 
@@ -1967,8 +2054,9 @@ mod tests {
     #[test]
     fn mux_watchdog_warning_probe_failure_marks_degraded() {
         run_async_test(async {
+            const SECRET: &str = "SECRET watchdog backend failure";
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
-            mock.set_watchdog_warning_error(Some("probe transport unavailable".to_string()))
+            mock.set_watchdog_warning_error(Some(SECRET.to_string()))
                 .await;
             let wezterm: crate::wezterm::WeztermHandle = mock;
             let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
@@ -1977,7 +2065,11 @@ mod tests {
             assert!(sample.ping_ok);
             assert_eq!(sample.status, HealthStatus::Degraded);
             assert_eq!(sample.warning_count, 1);
-            assert!(sample.watchdog_warnings[0].contains("failed to query"));
+            assert_eq!(
+                sample.watchdog_warnings[0],
+                "backend watchdog warning probe failed"
+            );
+            assert!(!format!("{sample:?}").contains(SECRET));
         });
     }
 

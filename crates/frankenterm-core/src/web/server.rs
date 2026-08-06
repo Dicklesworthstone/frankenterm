@@ -4,7 +4,7 @@
 
 use super::{WebServerConfig, WebServerHandle, build_app};
 use crate::runtime_async::signal;
-use crate::web_framework::FrameworkWebRuntime;
+use crate::web_framework::{FrameworkWebRuntime, web_cx_error};
 use crate::{Error, Result};
 use std::io::Write;
 use std::net::SocketAddr;
@@ -24,8 +24,9 @@ pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle
 /// Threads the caller's cx through to
 /// `FrameworkWebRuntime::start_with_cx` so the accept loop
 /// inherits the caller's capability context (not a fresh
-/// per-request one). Cancellation/budget/virtual-time propagate
-/// into every accepted connection.
+/// per-request one). The framework receives that context for accepted
+/// connections; complete per-connection task ownership and settlement remain
+/// separately tracked by the web-lifecycle campaign.
 ///
 /// Tick 101 upgraded this from a simple pre-flight delegate to
 /// a true cx-threading entry point.
@@ -34,7 +35,7 @@ pub async fn start_web_server_with_cx(
     config: WebServerConfig,
 ) -> Result<WebServerHandle> {
     cx.checkpoint()
-        .map_err(|err| Error::runtime_cancelled("start_web_server", err.to_string()))?;
+        .map_err(|err| web_cx_error(cx, "start_web_server", &err))?;
 
     validate_bind_config(&config)?;
     let bind_addr = config.bind_addr();
@@ -89,12 +90,14 @@ fn write_listening_announcement(
 /// ft-xbnl0.2.3 Cx-first sibling of [`run_web_server`].
 ///
 /// Routes the initial bind through [`start_web_server_with_cx`] so startup
-/// honors caller cancellation. After startup succeeds, every exit path owns
-/// the server until it has joined, drained, and run framework shutdown hooks.
+/// honors caller cancellation. After startup succeeds, every normally awaited
+/// exit path retains the server until it has joined, attempted its bounded
+/// drain, and run framework shutdown hooks.
 /// Caller cancellation triggers graceful shutdown, but is surfaced only after
-/// cleanup completes. The cleanup path reuses the caller's runtime drivers and
-/// capabilities without checking direct cancellation until drains and hooks
-/// finish. A server-join or cleanup failure takes precedence over the
+/// the cleanup attempt. The cleanup path reuses the caller's runtime drivers
+/// and capabilities; a pre-cancelled or exhausted context can make its timer
+/// wait fail, which is reported rather than replaced with freshly minted
+/// authority. A server-join or cleanup failure takes precedence over the
 /// shutdown-wait or caller-cancellation error.
 /// Dropping the run future invokes the runtime's synchronous signal-and-wake
 /// fallback; full drain and async hooks require awaiting this function.
@@ -123,9 +126,10 @@ pub async fn run_web_server_with_cx(cx: &crate::cx::Cx, config: WebServerConfig)
         }
     };
 
-    // Once start succeeds, graceful cleanup is mandatory. `finish_with_cx`
-    // does not checkpoint until after drain and hooks, so caller cancellation
-    // cannot suppress cleanup and no fresh full-capability context is needed.
+    // Once start succeeds, cleanup is mandatory. `finish_with_cx` always runs
+    // shutdown hooks after its drain attempt. A cancelled or exhausted caller
+    // can make the drain timer fail, but cannot skip the hook invocation and is
+    // never replaced with freshly minted authority.
     runtime.finish_with_cx(cx, join_result).await?;
 
     if let Some(result) = shutdown_result {
@@ -139,19 +143,20 @@ pub async fn run_web_server_with_cx(cx: &crate::cx::Cx, config: WebServerConfig)
 async fn wait_for_cx_cancellation(cx: &crate::cx::Cx) -> Result<()> {
     loop {
         cx.checkpoint()
-            .map_err(|err| Error::runtime_cancelled("web shutdown wait", err.to_string()))?;
-        if let Err(sleep_error) =
-            crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(100)).await
+            .map_err(|err| web_cx_error(cx, "web shutdown wait", &err))?;
+        if crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(100))
+            .await
+            .is_err()
         {
             if let Err(cancel_error) = cx.checkpoint() {
-                return Err(Error::runtime_cancelled(
-                    "web shutdown wait",
-                    cancel_error.to_string(),
-                ));
+                return Err(web_cx_error(cx, "web shutdown wait", &cancel_error));
             }
+            // Runtime timer detail is intentionally discarded: the caller gets
+            // a finite class, and the unused raw string cannot leak capability
+            // or backend data through this control-plane boundary.
             return Err(Error::runtime_backend(
                 "web shutdown wait sleep",
-                sleep_error,
+                "web_shutdown_wait_sleep_failed",
             ));
         }
     }
@@ -170,7 +175,7 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     use futures::pin_mut;
 
     cx.checkpoint()
-        .map_err(|err| Error::runtime_cancelled("web shutdown wait", err.to_string()))?;
+        .map_err(|err| web_cx_error(cx, "web shutdown wait", &err))?;
 
     let mut term = signal::unix::signal(SignalKind::terminate())
         .map_err(|e| Error::runtime_backend("web sigterm handler", e.to_string()))?;
@@ -204,7 +209,7 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     use futures::pin_mut;
 
     cx.checkpoint()
-        .map_err(|err| Error::runtime_cancelled("web shutdown wait", err.to_string()))?;
+        .map_err(|err| web_cx_error(cx, "web shutdown wait", &err))?;
 
     let cancel_fut = wait_for_cx_cancellation(cx);
     let ctrl_c = signal::ctrl_c();

@@ -37,6 +37,19 @@ use common::fixtures::RuntimeFixture;
 use common::wezterm_subprocess::{WeztermSubprocessFixture, should_run};
 use frankenterm_core::watchdog::{HealthStatus, MuxWatchdog, MuxWatchdogConfig};
 
+trait TestMuxWatchdogCheck {
+    async fn check(&mut self) -> frankenterm_core::watchdog::MuxHealthSample;
+}
+
+impl TestMuxWatchdogCheck for MuxWatchdog {
+    async fn check(&mut self) -> frankenterm_core::watchdog::MuxHealthSample {
+        let cx = frankenterm_core::cx::Cx::for_testing();
+        self.check_cx(&cx)
+            .await
+            .expect("test mux watchdog check must succeed")
+    }
+}
+
 /// Emit a structured JSON-line trace per the no-mocks skill.
 fn log(test: &str, phase: &str, body: serde_json::Value) {
     let line = serde_json::json!({
