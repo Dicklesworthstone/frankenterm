@@ -7007,6 +7007,159 @@ mod tests {
             .expect("snapshot trigger recv should succeed")
     }
 
+    #[test]
+    fn checkpoint_cleanup_cadence_is_monotonic_bounded_and_retry_safe() {
+        let base = Instant::now();
+        let interval = checkpoint_cleanup_interval(120);
+        assert_eq!(checkpoint_cleanup_interval(0), CHECKPOINT_CLEANUP_MIN_INTERVAL);
+        assert_eq!(interval, Duration::from_secs(120));
+        assert_eq!(
+            checkpoint_cleanup_interval(u64::MAX),
+            CHECKPOINT_CLEANUP_MAX_INTERVAL
+        );
+
+        let mut cadence = CheckpointCleanupCadence::new();
+        assert!(checkpoint_cleanup_due(&cadence, interval, base));
+        assert_eq!(
+            checkpoint_cleanup_wait_duration(&cadence, interval, base),
+            Duration::ZERO,
+            "a database without an authoritative cleanup receipt is due immediately"
+        );
+
+        cadence.last_authoritative_success = Some(base);
+        let before_due = base
+            .checked_add(interval - Duration::from_nanos(1))
+            .expect("cleanup cadence boundary fits in Instant");
+        assert!(!checkpoint_cleanup_due(&cadence, interval, before_due));
+        assert_eq!(
+            checkpoint_cleanup_wait_duration(&cadence, interval, before_due),
+            Duration::from_nanos(1)
+        );
+        let at_due = base
+            .checked_add(interval)
+            .expect("cleanup cadence boundary fits in Instant");
+        assert!(checkpoint_cleanup_due(&cadence, interval, at_due));
+
+        cadence.retry_deferred_at = Some(at_due);
+        assert!(!checkpoint_cleanup_due(&cadence, interval, at_due));
+        assert_eq!(
+            checkpoint_cleanup_wait_duration(&cadence, interval, at_due),
+            CHECKPOINT_CLEANUP_RETRY_DELAY
+        );
+        let at_retry = at_due
+            .checked_add(CHECKPOINT_CLEANUP_RETRY_DELAY)
+            .expect("cleanup retry boundary fits in Instant");
+        assert!(checkpoint_cleanup_due(&cadence, interval, at_retry));
+
+        cadence.retry_deferred_at = None;
+        cadence.last_authoritative_success = Some(at_due);
+        assert!(
+            !checkpoint_cleanup_due(&cadence, interval, base),
+            "a synthetic backwards observation must read as zero elapsed"
+        );
+        assert_eq!(
+            checkpoint_cleanup_wait_duration(&cadence, interval, base),
+            interval
+        );
+    }
+
+    #[test]
+    fn checkpoint_cleanup_admission_is_shared_and_drop_defers_retry() {
+        let (_tmp, db_path) = setup_test_db();
+        let first = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let second = SnapshotEngine::new(db_path, SnapshotConfig::default());
+        assert!(Arc::ptr_eq(
+            &first.snapshot_authority,
+            &second.snapshot_authority
+        ));
+
+        let claimed_at = Instant::now();
+        let abandoned = first
+            .try_begin_automatic_checkpoint_cleanup(claimed_at)
+            .expect("the shared startup cleanup should be due");
+        assert!(
+            second
+                .try_begin_automatic_checkpoint_cleanup(claimed_at)
+                .is_none(),
+            "a peer engine must not duplicate an admitted cleanup scan"
+        );
+        drop(abandoned);
+
+        let retry_deferred_at = {
+            let cadence = first
+                .snapshot_authority
+                .checkpoint_cleanup_cadence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(!cadence.in_progress, "drop must release shared admission");
+            cadence
+                .retry_deferred_at
+                .expect("an unfinished attempt must publish retry deferral")
+        };
+        let before_retry = retry_deferred_at
+            .checked_add(CHECKPOINT_CLEANUP_RETRY_DELAY - Duration::from_nanos(1))
+            .expect("cleanup retry boundary fits in Instant");
+        assert!(
+            second
+                .try_begin_automatic_checkpoint_cleanup(before_retry)
+                .is_none(),
+            "retry deferral must suppress a hot loop"
+        );
+        let at_retry = retry_deferred_at
+            .checked_add(CHECKPOINT_CLEANUP_RETRY_DELAY)
+            .expect("cleanup retry boundary fits in Instant");
+        let retry = second
+            .try_begin_automatic_checkpoint_cleanup(at_retry)
+            .expect("an abandoned cleanup must become admissible at the retry boundary");
+        drop(retry);
+    }
+
+    #[test]
+    fn automatic_checkpoint_cleanup_telemetry_counts_scans_not_cadence_checks() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let first = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let second = SnapshotEngine::new(db_path, SnapshotConfig::default());
+            let cx = crate::cx::for_testing();
+
+            first
+                .maybe_run_checkpoint_cleanup_with_cx(&cx)
+                .await
+                .expect("shared startup cleanup");
+            assert_eq!(first.telemetry().snapshot().cleanup_runs, 1);
+
+            second
+                .maybe_run_checkpoint_cleanup_with_cx(&cx)
+                .await
+                .expect("cadence skip");
+            assert_eq!(
+                second.telemetry().snapshot().cleanup_runs,
+                0,
+                "a shared-cadence skip must not be reported as a full cleanup scan"
+            );
+
+            {
+                let mut cadence = second
+                    .snapshot_authority
+                    .checkpoint_cleanup_cadence
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                cadence.last_authoritative_success = None;
+                cadence.retry_deferred_at = None;
+            }
+            second
+                .maybe_run_checkpoint_cleanup_with_cx(&cx)
+                .await
+                .expect("forced due cleanup");
+            assert_eq!(second.telemetry().snapshot().cleanup_runs, 1);
+            assert_eq!(
+                first.telemetry().snapshot().cleanup_runs,
+                1,
+                "each engine's counter must report only its own executed cleanup attempts"
+            );
+        });
+    }
+
     // ft-0yuxe: the scheduler drives `[snapshots.session_retention]` cleanup on
     // the configured cadence. Pin startup, retry deferral, and authoritative
     // completion semantics independently of wall time or SQLite.
