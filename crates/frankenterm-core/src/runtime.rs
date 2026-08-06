@@ -81,7 +81,6 @@ use crate::policy::Redactor;
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
 use crate::runtime_async::{RuntimeTime, RwLock, mpsc, task::JoinHandle, watch};
-#[cfg(any(feature = "native-wezterm", all(feature = "vendored", unix)))]
 use crate::runtime_async::task::{JoinErrorKind, JoinSet, JoinSetSettlement};
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
@@ -581,15 +580,17 @@ fn increment_saturating_atomic(counter: &std::sync::atomic::AtomicU64) -> u64 {
         .saturating_add(1)
 }
 
-fn runtime_context_failure_kind(runtime_cx: &RuntimeLoopCx) -> RuntimeWaitFailureKind {
+fn runtime_cancel_or_budget_failure_kind(
+    runtime_cx: &RuntimeLoopCx,
+) -> Option<RuntimeWaitFailureKind> {
     use crate::outcome::CancelKind;
 
-    match runtime_cx.root_cancel_cause().map(|reason| reason.kind) {
+    let root_failure = match runtime_cx.root_cancel_cause().map(|reason| reason.kind) {
         Some(CancelKind::Deadline | CancelKind::Timeout) => {
-            RuntimeWaitFailureKind::DeadlineExceeded
+            Some(RuntimeWaitFailureKind::DeadlineExceeded)
         }
-        Some(CancelKind::PollQuota) => RuntimeWaitFailureKind::PollQuotaExhausted,
-        Some(CancelKind::CostBudget) => RuntimeWaitFailureKind::CostBudgetExhausted,
+        Some(CancelKind::PollQuota) => Some(RuntimeWaitFailureKind::PollQuotaExhausted),
+        Some(CancelKind::CostBudget) => Some(RuntimeWaitFailureKind::CostBudgetExhausted),
         Some(
             CancelKind::User
             | CancelKind::FailFast
@@ -598,8 +599,56 @@ fn runtime_context_failure_kind(runtime_cx: &RuntimeLoopCx) -> RuntimeWaitFailur
             | CancelKind::ResourceUnavailable
             | CancelKind::Shutdown
             | CancelKind::LinkedExit,
-        ) => RuntimeWaitFailureKind::ContextCancelled,
-        None => RuntimeWaitFailureKind::ContextFailure,
+        ) => Some(RuntimeWaitFailureKind::ContextCancelled),
+        None => None,
+    };
+    if root_failure.is_some() {
+        return root_failure;
+    }
+
+    // A timer may be the first observer of budget exhaustion, before the Cx
+    // materializes a root cancellation cause. Preserve the finite class from
+    // the content-free accounting snapshot at every runtime wait boundary.
+    let budget = runtime_cx.budget_stats();
+    if budget.deadline.at.is_some() && budget.deadline.remaining.is_none() {
+        Some(RuntimeWaitFailureKind::DeadlineExceeded)
+    } else if budget.polls.remaining == Some(0) {
+        Some(RuntimeWaitFailureKind::PollQuotaExhausted)
+    } else if budget.cost.remaining == Some(0) {
+        Some(RuntimeWaitFailureKind::CostBudgetExhausted)
+    } else {
+        None
+    }
+}
+
+fn runtime_context_failure_kind(runtime_cx: &RuntimeLoopCx) -> RuntimeWaitFailureKind {
+    runtime_cancel_or_budget_failure_kind(runtime_cx)
+        .unwrap_or(RuntimeWaitFailureKind::ContextFailure)
+}
+
+fn runtime_context_error_kind(
+    runtime_cx: &RuntimeLoopCx,
+    error: &crate::runtime_async::ContextError,
+) -> RuntimeWaitFailureKind {
+    use crate::runtime_async::ContextErrorKind;
+
+    match error.kind() {
+        ContextErrorKind::DeadlineExceeded => RuntimeWaitFailureKind::DeadlineExceeded,
+        ContextErrorKind::PollQuotaExhausted => RuntimeWaitFailureKind::PollQuotaExhausted,
+        ContextErrorKind::CostQuotaExhausted => RuntimeWaitFailureKind::CostBudgetExhausted,
+        ContextErrorKind::Cancelled => runtime_cancel_or_budget_failure_kind(runtime_cx)
+            .unwrap_or(RuntimeWaitFailureKind::ContextCancelled),
+        ContextErrorKind::CancelTimeout => RuntimeWaitFailureKind::ContextFailure,
+        _ => RuntimeWaitFailureKind::ContextFailure,
+    }
+}
+
+fn runtime_checkpoint_failure(
+    runtime_cx: &RuntimeLoopCx,
+) -> Option<RuntimeWaitFailureKind> {
+    match runtime_cx.checkpoint() {
+        Err(error) => Some(runtime_context_error_kind(runtime_cx, &error)),
+        Ok(()) => runtime_cancel_or_budget_failure_kind(runtime_cx),
     }
 }
 
@@ -618,19 +667,16 @@ async fn runtime_sleep(
     runtime_cx: &RuntimeLoopCx,
     duration: Duration,
 ) -> std::result::Result<(), RuntimeWaitFailureKind> {
-    crate::runtime_async::sleep_with_cx(runtime_cx, duration)
+    if crate::runtime_async::sleep_with_cx(runtime_cx, duration)
         .await
-        .map_err(|_| {
-            if runtime_cx.checkpoint().is_err() {
-                runtime_context_failure_kind(runtime_cx)
-            } else {
-                RuntimeWaitFailureKind::TimerFailure
-            }
-        })?;
-    if runtime_cx.checkpoint().is_err() {
-        return Err(runtime_context_failure_kind(runtime_cx));
+        .is_err()
+    {
+        return Err(
+            runtime_checkpoint_failure(runtime_cx)
+                .unwrap_or(RuntimeWaitFailureKind::TimerFailure),
+        );
     }
-    Ok(())
+    runtime_checkpoint_failure(runtime_cx).map_or(Ok(()), Err)
 }
 
 const SHUTDOWN_AWARE_SLEEP_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -686,21 +732,21 @@ async fn runtime_timeout<F>(
 where
     F: Future,
 {
-    if runtime_cx.checkpoint().is_err() {
-        return Err(RuntimeTimeoutFailure::Context(
-            runtime_context_failure_kind(runtime_cx),
-        ));
+    if let Some(failure) = runtime_checkpoint_failure(runtime_cx) {
+        return Err(RuntimeTimeoutFailure::Context(failure));
     }
 
-    match crate::runtime_async::timeout_with_cx(runtime_cx, duration, future).await {
-        Ok(_output) if runtime_cx.checkpoint().is_err() => Err(RuntimeTimeoutFailure::Context(
-            runtime_context_failure_kind(runtime_cx),
-        )),
-        Ok(output) => Ok(output),
-        Err(_) if runtime_cx.checkpoint().is_err() => Err(RuntimeTimeoutFailure::Context(
-            runtime_context_failure_kind(runtime_cx),
-        )),
-        Err(_) => Err(RuntimeTimeoutFailure::Elapsed),
+    match crate::runtime_async::timeout_with_cx_typed(runtime_cx, duration, future).await {
+        Ok(output) => match runtime_checkpoint_failure(runtime_cx) {
+            Some(failure) => Err(RuntimeTimeoutFailure::Context(failure)),
+            None => Ok(output),
+        },
+        Err(crate::runtime_async::TimeoutError::Elapsed) => {
+            match runtime_checkpoint_failure(runtime_cx) {
+                Some(failure) => Err(RuntimeTimeoutFailure::Context(failure)),
+                None => Err(RuntimeTimeoutFailure::Elapsed),
+            }
+        }
     }
 }
 
@@ -968,13 +1014,13 @@ impl StreamingTasks {
                     match self.settling.drain_next_with_cx(&drain_cx).await {
                         Ok(Some(Ok(()))) => {}
                         Ok(Some(Err(error))) => {
-                            if !matches!(
-                                error.kind(),
-                                JoinErrorKind::Aborted
-                                    | JoinErrorKind::ContextCancelled
-                                    | JoinErrorKind::WakerRegistrationFailed
-                            ) {
-                                terminal_failure = Some(error.kind());
+                            match error.kind() {
+                                JoinErrorKind::Aborted | JoinErrorKind::ContextCancelled => {}
+                                JoinErrorKind::WakerRegistrationFailed => {
+                                    terminal_failure
+                                        .get_or_insert(JoinErrorKind::WakerRegistrationFailed);
+                                }
+                                other => terminal_failure = Some(other),
                             }
                         }
                         Ok(None) => return Ok(()),
@@ -1030,6 +1076,10 @@ impl Drop for StreamingTasks {
 
 #[cfg(feature = "native-wezterm")]
 const NATIVE_ACCEPT_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(feature = "native-wezterm")]
+const NATIVE_ACCEPT_TASK_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(feature = "native-wezterm")]
+const NATIVE_EVENT_QUEUE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(feature = "native-wezterm")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1079,8 +1129,10 @@ fn classify_native_accept_task_settlement(
     }
 }
 
-/// Owns the native listener's nested accept loop. Normal shutdown requests an
-/// abort and uses the bounded trusted-poll JoinSet drain, so a caller-waker
+/// Owns the native listener's nested accept loop. Normal shutdown first lets
+/// the listener observe its shared shutdown flag and settle its own connection
+/// tasks; abort is reserved for bounded escalation or direct cancellation.
+/// Both paths use the trusted-poll JoinSet drain, so a caller-waker
 /// registration failure cannot be mistaken for terminal acknowledgement.
 /// If the one-second envelope expires, the returned finite outcome explicitly
 /// reports the still-owned active/quarantined authority before guard drop.
@@ -1103,6 +1155,10 @@ impl AbortOnDropNativeAcceptTask {
 
     async fn abort_and_settle(&mut self) -> NativeAcceptTaskSettlement {
         self.abort();
+        self.settle().await
+    }
+
+    async fn settle(&mut self) -> NativeAcceptTaskSettlement {
         let drain_cx = crate::cx::for_request();
         let mut terminal_failure = None;
         let drain_result = crate::runtime_async::timeout_with_cx(
@@ -1113,13 +1169,13 @@ impl AbortOnDropNativeAcceptTask {
                     match self.tasks.drain_next_with_cx(&drain_cx).await {
                         Ok(Some(Ok(()))) => {}
                         Ok(Some(Err(error))) => {
-                            if !matches!(
-                                error.kind(),
-                                JoinErrorKind::Aborted
-                                    | JoinErrorKind::ContextCancelled
-                                    | JoinErrorKind::WakerRegistrationFailed
-                            ) {
-                                terminal_failure = Some(error.kind());
+                            match error.kind() {
+                                JoinErrorKind::Aborted | JoinErrorKind::ContextCancelled => {}
+                                JoinErrorKind::WakerRegistrationFailed => {
+                                    terminal_failure
+                                        .get_or_insert(JoinErrorKind::WakerRegistrationFailed);
+                                }
+                                other => terminal_failure = Some(other),
                             }
                         }
                         Ok(None) => return Ok(()),
@@ -3898,12 +3954,14 @@ impl ObservationRuntime {
                     };
 
                     let loop_cx = runtime_loop_cx();
-                    let handle = spawn_runtime_task(&loop_cx, move |_task_cx| async move {
+                    let handle = spawn_runtime_task(&loop_cx, move |task_cx| async move {
+                        let pane_provider_cx = task_cx.clone();
                         if let Err(error) = engine
-                            .run_periodic(shutdown_rx, move || {
+                            .run_periodic_with_cx(&task_cx, shutdown_rx, move || {
                                 let wez = wezterm.clone();
+                                let pane_provider_cx = pane_provider_cx.clone();
                                 async move {
-                                    match wez.list_panes().await {
+                                    match wez.list_panes_with_cx(&pane_provider_cx).await {
                                         Ok(panes) => Some(panes),
                                         Err(e) => {
                                             warn!(
@@ -7170,6 +7228,32 @@ impl ObservationRuntime {
         })
     }
 
+    #[cfg(feature = "native-wezterm")]
+    fn native_event_listener_error_class(
+        error: &crate::native_events::NativeEventError,
+    ) -> &'static str {
+        match error {
+            crate::native_events::NativeEventError::EmptySocketPath => "empty_socket_path",
+            crate::native_events::NativeEventError::ContextUnavailable => {
+                "context_unavailable"
+            }
+            crate::native_events::NativeEventError::SocketAlreadyExists(_) => {
+                "socket_already_exists"
+            }
+            crate::native_events::NativeEventError::Security(_) => "security_failure",
+            crate::native_events::NativeEventError::Io(_) => "io_failure",
+            crate::native_events::NativeEventError::ConnectionTaskAdmissionFailed => {
+                "connection_task_admission_failed"
+            }
+            crate::native_events::NativeEventError::ConnectionTaskDrainTimedOut => {
+                "connection_task_drain_timeout"
+            }
+            crate::native_events::NativeEventError::ConnectionTaskDrainIncomplete => {
+                "connection_task_drain_incomplete"
+            }
+        }
+    }
+
     /// Spawn the native event listener task (vendored WezTerm integration).
     #[cfg(feature = "native-wezterm")]
     fn spawn_native_event_task(
@@ -7227,9 +7311,27 @@ impl ObservationRuntime {
             let mut accept_task = AbortOnDropNativeAcceptTask::new(spawn_runtime_task(
                 &loop_cx,
                 move |accept_cx| async move {
-                    listener
-                        .run_with_cx(&accept_cx, event_tx, accept_shutdown_flag)
+                    let listener_result = listener
+                        .run_with_cx(
+                            &accept_cx,
+                            event_tx,
+                            Arc::clone(&accept_shutdown_flag),
+                        )
                         .await;
+                    // `run_with_cx` reports observed cancellation and requested
+                    // shutdown as `Ok(())`. Every error here is therefore an
+                    // actionable listener or terminal-settlement failure, even
+                    // if shutdown became visible concurrently with its return.
+                    match listener_result {
+                        Ok(()) => {}
+                        Err(error) => {
+                            warn!(
+                                event = "native_event_listener_failed",
+                                failure_class = Self::native_event_listener_error_class(&error),
+                                "Native event listener stopped after a typed failure"
+                            );
+                        }
+                    }
                 },
             ));
 
@@ -7247,6 +7349,9 @@ impl ObservationRuntime {
             let mut next_flush = start + flush_interval;
             let mut drain_pending_output_on_shutdown = false;
             let mut graceful_shutdown_requested = false;
+            let mut graceful_shutdown_deadline = None;
+            let mut forced_queue_drain_deadline = None;
+            let mut listener_sender_closed = false;
 
             'native_events: loop {
                 if loop_cx.checkpoint().is_err() {
@@ -7259,9 +7364,38 @@ impl ObservationRuntime {
                     // subset already present in the coalescer.
                     graceful_shutdown_requested = true;
                     drain_pending_output_on_shutdown = true;
-                    accept_task.abort();
+                    graceful_shutdown_deadline = Some(
+                        crate::runtime_async::timer_now_with_cx(&loop_cx)
+                            + NATIVE_ACCEPT_TASK_GRACEFUL_TIMEOUT,
+                    );
                 }
                 let now = crate::runtime_async::timer_now_with_cx(&loop_cx);
+                if graceful_shutdown_deadline.is_some_and(|deadline| now >= deadline) {
+                    warn!(
+                        grace_ms = NATIVE_ACCEPT_TASK_GRACEFUL_TIMEOUT.as_millis(),
+                        "Native event listener missed graceful shutdown deadline; escalating to abort"
+                    );
+                    // Stop the producer once, but retain the receiver and drain
+                    // every event it admitted before the abort takes effect.
+                    // A second finite deadline prevents a wedged listener from
+                    // holding runtime shutdown forever.
+                    accept_task.abort();
+                    graceful_shutdown_deadline = None;
+                    forced_queue_drain_deadline = Some(
+                        now + NATIVE_EVENT_QUEUE_DRAIN_TIMEOUT,
+                    );
+                }
+                if forced_queue_drain_deadline.is_some_and(|deadline| now >= deadline) {
+                    warn!(
+                        event = "native_event_queue_drain_timeout",
+                        queued_events_observed = event_rx.len(),
+                        drain_ms = NATIVE_EVENT_QUEUE_DRAIN_TIMEOUT.as_millis(),
+                        data_loss_indeterminate = true,
+                        loss_scope = "queued_or_inflight_native_events",
+                        "Native event queue remained open after producer abort; abandoning the bounded drain with explicit loss telemetry"
+                    );
+                    break;
+                }
                 if now >= next_flush {
                     next_flush = now + flush_interval;
                     let now_ms = now.duration_since(start) / 1_000_000;
@@ -7467,6 +7601,7 @@ impl ObservationRuntime {
                     Ok(RecvEvent::Closed) => {
                         // Producer completion is a clean terminal boundary;
                         // preserve already-coalesced bytes before exit.
+                        listener_sender_closed = true;
                         drain_pending_output_on_shutdown = true;
                         break;
                     }
@@ -7507,7 +7642,16 @@ impl ObservationRuntime {
                 }
             }
 
-            match accept_task.abort_and_settle().await {
+            let accept_settlement = if listener_sender_closed {
+                // Sender closure proves `run_with_cx` returned after its own
+                // nested connection drain. Let the small wrapper task finish
+                // logging that typed result instead of aborting it at the last
+                // instruction.
+                accept_task.settle().await
+            } else {
+                accept_task.abort_and_settle().await
+            };
+            match accept_settlement {
                 NativeAcceptTaskSettlement::Settled => {}
                 NativeAcceptTaskSettlement::SettledWithFailure { failure } => {
                     warn!(
@@ -9379,6 +9523,27 @@ fn record_capture_pipeline_depth(
 }
 
 impl RuntimeHandle {
+    fn take_task_join_set(&mut self) -> JoinSet<()> {
+        let mut tasks = JoinSet::new();
+        for handle in [
+            self.discovery.take(),
+            self.capture.take(),
+            self.relay.take(),
+            self.native_events.take(),
+            self.persistence.take(),
+            self.maintenance.take(),
+            self.connector_outbound.take(),
+            self.snapshot.take(),
+            self.snapshot_triggers.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            tasks.insert_handle(handle);
+        }
+        tasks
+    }
+
     /// Route an inbound connector signal into the runtime's live event bus.
     ///
     /// Connector host/SDK ingress paths should call this handle after
@@ -9443,32 +9608,25 @@ impl RuntimeHandle {
     }
 
     async fn join_impl(mut self) {
-        if let Some(h) = self.discovery.take() {
-            let _ = h.await;
-        }
-        if let Some(h) = self.capture.take() {
-            let _ = h.await;
-        }
-        if let Some(h) = self.relay.take() {
-            let _ = h.await;
-        }
-        if let Some(native) = self.native_events.take() {
-            let _ = native.await;
-        }
-        if let Some(h) = self.persistence.take() {
-            let _ = h.await;
-        }
-        if let Some(maintenance) = self.maintenance.take() {
-            let _ = maintenance.await;
-        }
-        if let Some(connector_outbound) = self.connector_outbound.take() {
-            let _ = connector_outbound.await;
-        }
-        if let Some(snapshot) = self.snapshot.take() {
-            let _ = snapshot.await;
-        }
-        if let Some(snapshot_triggers) = self.snapshot_triggers.take() {
-            let _ = snapshot_triggers.await;
+        let mut tasks = self.take_task_join_set();
+        while let Some(result) = tasks.drain_next_trusted().await {
+            match result {
+                Ok(()) => {}
+                Err(error) => match error.kind() {
+                    JoinErrorKind::WakerRegistrationFailed => {
+                        warn!(
+                            failure_class = ?error.kind(),
+                            "Top-level runtime task join observation failed; retaining trusted drain authority"
+                        );
+                    }
+                    _ => {
+                        warn!(
+                            failure_class = ?error.kind(),
+                            "Top-level runtime task failed while joining"
+                        );
+                    }
+                },
+            }
         }
     }
 
@@ -9542,130 +9700,113 @@ impl RuntimeHandle {
         }
         info!("Shutdown signal sent");
 
-        // Keep every handle in an owning Option outside the timed join future.
-        // Completed handles are awaited even when `is_finished()` was already
-        // true, so task panic/abort is observed rather than silently reported
-        // as a clean shutdown. A timeout leaves the current Option intact for
-        // real Abortable cancellation plus a second bounded settlement phase.
-        let mut task_handles = Vec::new();
-        for handle in [
-            self.discovery.take(),
-            self.capture.take(),
-            self.relay.take(),
-            self.native_events.take(),
-            self.persistence.take(),
-            self.maintenance.take(),
-            self.connector_outbound.take(),
-            self.snapshot.take(),
-            self.snapshot_triggers.take(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            task_handles.push(Some(handle));
-        }
+        // Transfer every top-level handle into one trusted-drain owner. A raw
+        // JoinHandle cannot recover terminal authority after persistent
+        // caller-waker registration failure: polling it again merely repeats
+        // the same observation error. JoinSet quarantines that handle, retains
+        // it, and re-polls only through its stable internal completion waker.
+        let mut task_handles = self.take_task_join_set();
         // Shutdown phases must never inherit an already-cancelled ambient Cx:
         // each phase gets a fresh context and its own bounded timeout.
         let mut graceful_join_failures = 0_usize;
         let mut graceful_join_unacknowledged = 0_usize;
         let join_cx = crate::cx::for_request();
         let join_result = runtime_timeout(&join_cx, shutdown_timeout, async {
-            for slot in &mut task_handles {
-                let retain_for_settlement = {
-                    let Some(handle) = slot.as_mut() else {
-                        continue;
-                    };
-                    match (&mut *handle).await {
-                        Ok(()) => false,
-                        Err(error)
-                            if error.kind()
-                                == crate::runtime_async::task::JoinErrorKind::WakerRegistrationFailed =>
-                        {
+            loop {
+                match task_handles.drain_next_with_cx(&join_cx).await {
+                    Ok(Some(Ok(()))) => {}
+                    Ok(Some(Err(error))) => match error.kind() {
+                        JoinErrorKind::WakerRegistrationFailed => {
                             graceful_join_failures = graceful_join_failures.saturating_add(1);
                             graceful_join_unacknowledged =
                                 graceful_join_unacknowledged.saturating_add(1);
-                            // The join boundary already signalled abort on this
-                            // class, but retain authority for a second poll that
-                            // can acknowledge terminal task destruction.
-                            handle.abort();
-                            true
                         }
-                        Err(_) => {
+                        _ => {
                             graceful_join_failures = graceful_join_failures.saturating_add(1);
-                            false
                         }
-                    }
-                };
-                if !retain_for_settlement {
-                    *slot = None;
+                    },
+                    Ok(None) => return Ok(()),
+                    Err(error) => return Err(error.kind()),
                 }
             }
         })
         .await;
 
+        let (graceful_timed_out, graceful_wait_failure, graceful_drain_failure) =
+            match join_result {
+                Ok(Ok(())) => (false, None, None),
+                Ok(Err(failure)) => (false, None, Some(failure)),
+                Err(RuntimeTimeoutFailure::Elapsed) => (true, None, None),
+                Err(RuntimeTimeoutFailure::Context(failure)) => {
+                    record_runtime_wait_failure("runtime_shutdown_graceful_join", failure);
+                    (false, Some(failure), None)
+                }
+            };
+
         if graceful_join_failures > 0 {
             clean = false;
             warnings.push(format!(
-                "{graceful_join_failures} top-level runtime task(s) failed during graceful shutdown"
+                "{graceful_join_failures} top-level runtime task join failure observation(s) occurred during graceful shutdown"
+            ));
+        }
+        if graceful_join_unacknowledged > 0 {
+            warnings.push(format!(
+                "{graceful_join_unacknowledged} caller-waker registration failure observation(s) entered trusted quarantine before terminal settlement"
+            ));
+        }
+        if let Some(failure) = graceful_drain_failure {
+            clean = false;
+            warnings.push(format!(
+                "Graceful top-level trusted drain failed with class {failure:?}"
             ));
         }
 
-        let (graceful_timed_out, graceful_wait_failure) = match join_result {
-            Ok(()) => (false, None),
-            Err(RuntimeTimeoutFailure::Elapsed) => (true, None),
-            Err(RuntimeTimeoutFailure::Context(failure)) => {
-                record_runtime_wait_failure("runtime_shutdown_graceful_join", failure);
-                (false, Some(failure))
-            }
-        };
-        let graceful_has_unsettled_handles = task_handles.iter().any(Option::is_some);
+        let graceful_has_unsettled_handles =
+            task_handles.settlement() != JoinSetSettlement::Settled;
         if graceful_timed_out
             || graceful_wait_failure.is_some()
+            || graceful_drain_failure.is_some()
             || graceful_has_unsettled_handles
         {
             clean = false;
-            for handle in task_handles.iter().filter_map(Option::as_ref) {
-                handle.abort();
-            }
+            task_handles.abort_all();
 
             let cancellation_cx = crate::cx::for_request();
             let mut cancellation_unacknowledged = 0_usize;
             let cancellation_result = runtime_timeout(&cancellation_cx, shutdown_timeout, async {
-                for slot in &mut task_handles {
-                    let retain_for_settlement = {
-                        let Some(handle) = slot.as_mut() else {
-                            continue;
-                        };
-                        match (&mut *handle).await {
-                            Err(error)
-                                if error.kind()
-                                    == crate::runtime_async::task::JoinErrorKind::WakerRegistrationFailed =>
-                            {
+                loop {
+                    match task_handles.drain_next_with_cx(&cancellation_cx).await {
+                        Ok(Some(Ok(()))) => {}
+                        Ok(Some(Err(error))) => {
+                            if error.kind() == JoinErrorKind::WakerRegistrationFailed {
                                 cancellation_unacknowledged =
                                     cancellation_unacknowledged.saturating_add(1);
-                                handle.abort();
-                                true
                             }
-                            Ok(()) | Err(_) => false,
                         }
-                    };
-                    if !retain_for_settlement {
-                        *slot = None;
+                        Ok(None) => return Ok(()),
+                        Err(error) => return Err(error.kind()),
                     }
                 }
             })
             .await;
-            let cancellation_wait_failure = match cancellation_result {
-                Ok(()) => None,
-                Err(RuntimeTimeoutFailure::Elapsed) => Some(RuntimeTimeoutFailure::Elapsed),
-                Err(RuntimeTimeoutFailure::Context(failure)) => {
-                    record_runtime_wait_failure("runtime_shutdown_cancellation_join", failure);
-                    Some(RuntimeTimeoutFailure::Context(failure))
-                }
-            };
+            let (cancellation_wait_failure, cancellation_drain_failure) =
+                match cancellation_result {
+                    Ok(Ok(())) => (None, None),
+                    Ok(Err(failure)) => (None, Some(failure)),
+                    Err(RuntimeTimeoutFailure::Elapsed) => {
+                        (Some(RuntimeTimeoutFailure::Elapsed), None)
+                    }
+                    Err(RuntimeTimeoutFailure::Context(failure)) => {
+                        record_runtime_wait_failure(
+                            "runtime_shutdown_cancellation_join",
+                            failure,
+                        );
+                        (Some(RuntimeTimeoutFailure::Context(failure)), None)
+                    }
+                };
             let cancellation_settled = cancellation_wait_failure.is_none()
-                && cancellation_unacknowledged == 0
-                && task_handles.iter().all(Option::is_none);
+                && cancellation_drain_failure.is_none()
+                && task_handles.settlement() == JoinSetSettlement::Settled;
 
             if cancellation_settled && graceful_timed_out {
                 warnings.push(
@@ -9679,11 +9820,23 @@ impl RuntimeHandle {
                     "Graceful task-join wait failed with class {}; every retained top-level task subsequently acknowledged cancellation, but independently delegated nested or blocking work is not proven stopped",
                     failure.as_str()
                 ));
+            } else if cancellation_settled
+                && let Some(failure) = graceful_drain_failure
+            {
+                warnings.push(format!(
+                    "Graceful trusted drain failed with class {failure:?}; every retained top-level task subsequently acknowledged cancellation, but independently delegated nested or blocking work is not proven stopped"
+                ));
             } else if cancellation_settled {
-                warnings.push(
-                    "A top-level join could not initially acknowledge completion; retained cancellation authority subsequently settled every top-level task, but independently delegated nested or blocking work is not proven stopped"
-                        .to_string(),
-                );
+                let registration_note = if cancellation_unacknowledged > 0 {
+                    format!(
+                        " after {cancellation_unacknowledged} caller-waker registration failure(s)"
+                    )
+                } else {
+                    String::new()
+                };
+                warnings.push(format!(
+                    "Retained cancellation authority subsequently settled every top-level task{registration_note}, but independently delegated nested or blocking work is not proven stopped"
+                ));
             } else if let Some(RuntimeTimeoutFailure::Context(failure)) =
                 cancellation_wait_failure
             {
@@ -9699,6 +9852,10 @@ impl RuntimeHandle {
                     "Cancellation settlement exceeded its timeout; terminal acknowledgement remained incomplete, so orphan risk remains"
                         .to_string(),
                 );
+            } else if let Some(failure) = cancellation_drain_failure {
+                warnings.push(format!(
+                    "Cancellation trusted drain failed with class {failure:?}; terminal acknowledgement remained incomplete, so orphan risk remains"
+                ));
             } else if graceful_join_unacknowledged > 0 {
                 warnings.push(format!(
                     "Cancellation was requested after {graceful_join_unacknowledged} top-level join acknowledgement failure(s), but bounded terminal settlement remained incomplete; orphan risk remains"
@@ -10616,8 +10773,10 @@ mod tests {
 
             assert_eq!(
                 tasks.abort_and_settle_all().await,
-                StreamingTaskDrainOutcome::Settled,
-                "waker-registration failure must retain and trusted-drain streaming task ownership",
+                StreamingTaskDrainOutcome::SettledWithFailure {
+                    failure: JoinErrorKind::WakerRegistrationFailed,
+                },
+                "waker-registration failure must remain observable after trusted settlement",
             );
             assert_eq!(tasks.settling.settlement(), JoinSetSettlement::Settled);
         });
@@ -10658,9 +10817,80 @@ mod tests {
 
             assert_eq!(
                 guard.abort_and_settle().await,
-                NativeAcceptTaskSettlement::Settled,
-                "waker-registration failure must retain and trusted-poll the aborted task to terminal acknowledgement",
+                NativeAcceptTaskSettlement::SettledWithFailure {
+                    failure: JoinErrorKind::WakerRegistrationFailed,
+                },
+                "waker-registration failure must remain observable after trusted settlement",
             );
+        });
+    }
+
+    #[cfg(feature = "native-wezterm")]
+    #[test]
+    fn native_accept_guard_graceful_settlement_does_not_abort_listener() {
+        run_async_test(async {
+            let completed = Arc::new(AtomicBool::new(false));
+            let completed_task = Arc::clone(&completed);
+            let handle = crate::runtime_async::task::spawn(async move {
+                crate::runtime_async::yield_now().await;
+                completed_task.store(true, Ordering::Release);
+            });
+            let mut guard = AbortOnDropNativeAcceptTask::new(handle);
+
+            assert_eq!(
+                guard.settle().await,
+                NativeAcceptTaskSettlement::Settled
+            );
+            assert!(
+                completed.load(Ordering::Acquire),
+                "graceful settlement must let the listener reach its own terminal path"
+            );
+        });
+    }
+
+    #[cfg(feature = "native-wezterm")]
+    #[test]
+    fn admitted_native_events_survive_producer_abort_for_receiver_drain() {
+        run_async_test(async {
+            let (event_tx, mut event_rx) = mpsc::channel(4);
+            event_tx
+                .try_send(NativeEvent::PaneDestroyed {
+                    pane_id: 41,
+                    timestamp_ms: 1,
+                })
+                .expect("first admitted native event");
+            event_tx
+                .try_send(NativeEvent::PaneDestroyed {
+                    pane_id: 42,
+                    timestamp_ms: 2,
+                })
+                .expect("second admitted native event");
+
+            let held_sender = event_tx.clone();
+            drop(event_tx);
+            let producer = crate::runtime_async::task::spawn(async move {
+                let _held_sender = held_sender;
+                std::future::pending::<()>().await;
+            });
+            let mut guard = AbortOnDropNativeAcceptTask::new(producer);
+            assert_eq!(
+                guard.abort_and_settle().await,
+                NativeAcceptTaskSettlement::Settled
+            );
+
+            let cx = crate::cx::for_testing();
+            assert!(matches!(
+                recv_event(&cx, &mut event_rx).await,
+                RecvEvent::Item(NativeEvent::PaneDestroyed { pane_id: 41, .. })
+            ));
+            assert!(matches!(
+                recv_event(&cx, &mut event_rx).await,
+                RecvEvent::Item(NativeEvent::PaneDestroyed { pane_id: 42, .. })
+            ));
+            assert!(matches!(
+                recv_event(&cx, &mut event_rx).await,
+                RecvEvent::Closed
+            ));
         });
     }
 
@@ -12106,6 +12336,66 @@ mod tests {
     }
 
     #[test]
+    fn runtime_wait_classifier_detects_unmaterialized_budget_exhaustion() {
+        let cases = [
+            (
+                crate::cx::Budget::new()
+                    .with_deadline(crate::runtime_async::RuntimeTime::ZERO),
+                RuntimeWaitFailureKind::DeadlineExceeded,
+            ),
+            (
+                crate::cx::Budget::new().with_poll_quota(0),
+                RuntimeWaitFailureKind::PollQuotaExhausted,
+            ),
+            (
+                crate::cx::Budget::new().with_cost_quota(0),
+                RuntimeWaitFailureKind::CostBudgetExhausted,
+            ),
+        ];
+
+        for (budget, expected) in cases {
+            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+            assert!(
+                cx.root_cancel_cause().is_none(),
+                "test precondition: budget failure must not yet be materialized as cancellation"
+            );
+            assert_eq!(runtime_context_failure_kind(&cx), expected);
+        }
+    }
+
+    #[test]
+    fn runtime_timeout_preserves_budget_failure_classes() {
+        run_async_test(async {
+            let cases = [
+                (
+                    crate::cx::Budget::new()
+                        .with_deadline(crate::runtime_async::RuntimeTime::ZERO),
+                    RuntimeWaitFailureKind::DeadlineExceeded,
+                ),
+                (
+                    crate::cx::Budget::new().with_poll_quota(0),
+                    RuntimeWaitFailureKind::PollQuotaExhausted,
+                ),
+                (
+                    crate::cx::Budget::new().with_cost_quota(0),
+                    RuntimeWaitFailureKind::CostBudgetExhausted,
+                ),
+            ];
+
+            for (budget, expected) in cases {
+                let cx = crate::cx::Cx::for_testing_with_budget(budget);
+                let result = runtime_timeout(
+                    &cx,
+                    Duration::from_secs(1),
+                    std::future::pending::<()>(),
+                )
+                .await;
+                assert_eq!(result, Err(RuntimeTimeoutFailure::Context(expected)));
+            }
+        });
+    }
+
+    #[test]
     fn runtime_backend_error_uses_structured_runtime_operation() {
         let err = runtime_backend_error("runtime.test_update", "watch channel closed");
 
@@ -13266,6 +13556,92 @@ mod tests {
                 "every pre-aborted task future must be terminally dropped"
             );
         });
+    }
+
+    #[test]
+    fn runtime_shutdown_trusted_drains_persistent_join_registration_failure() {
+        run_async_test_isolated(|| async {
+            let (_dir, handle, dropped) =
+                runtime_handle_with_stubborn_tasks(Duration::from_secs(30)).await;
+            handle
+                .discovery
+                .as_ref()
+                .expect("test runtime must own a discovery task")
+                .force_registration_failure_for_test();
+
+            let summary = handle.shutdown_with_timeout(Duration::from_secs(2)).await;
+
+            assert!(
+                !summary.clean,
+                "join observation failure must remain visible even after trusted settlement"
+            );
+            assert!(
+                summary
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("top-level runtime task join failure")),
+                "shutdown must report the finite observation failure: {:?}",
+                summary.warnings
+            );
+            assert!(
+                summary.warnings.iter().any(|warning| {
+                    warning.contains("caller-waker registration failure")
+                        && warning.contains("trusted quarantine")
+                }),
+                "the regression must exercise quarantine rather than only an immediately terminal abort: {:?}",
+                summary.warnings
+            );
+            assert!(
+                dropped.iter().all(|flag| flag.load(Ordering::SeqCst)),
+                "trusted drain must retain and terminally settle every top-level task"
+            );
+            assert!(
+                summary
+                    .warnings
+                    .iter()
+                    .all(|warning| !warning.contains("orphan risk remains")),
+                "terminally settled registration failure must not be mislabeled as orphan risk: {:?}",
+                summary.warnings
+            );
+        });
+    }
+
+    #[cfg(feature = "native-wezterm")]
+    #[test]
+    fn native_event_listener_error_class_is_finite_and_content_free() {
+        let cases = [
+            (
+                crate::native_events::NativeEventError::SocketAlreadyExists(
+                    "SECRET socket path that must not enter runtime telemetry".to_string(),
+                ),
+                "socket_already_exists",
+            ),
+            (
+                crate::native_events::NativeEventError::Io(std::io::Error::other(
+                    "SECRET transport detail that must not enter runtime telemetry",
+                )),
+                "io_failure",
+            ),
+            (
+                crate::native_events::NativeEventError::ConnectionTaskAdmissionFailed,
+                "connection_task_admission_failed",
+            ),
+            (
+                crate::native_events::NativeEventError::ConnectionTaskDrainTimedOut,
+                "connection_task_drain_timeout",
+            ),
+            (
+                crate::native_events::NativeEventError::ConnectionTaskDrainIncomplete,
+                "connection_task_drain_incomplete",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let class = ObservationRuntime::native_event_listener_error_class(&error);
+            assert_eq!(class, expected);
+            assert!(!class.contains("SECRET"));
+            assert!(class.len() <= 40, "telemetry class must remain finite");
+        }
     }
 
     #[test]
