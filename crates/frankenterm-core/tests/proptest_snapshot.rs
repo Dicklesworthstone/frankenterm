@@ -15,7 +15,7 @@ use proptest::prelude::*;
 
 use frankenterm_core::restore_layout::{LayoutRestorer, RestoreConfig};
 use frankenterm_core::restore_process::{LaunchAction, LaunchConfig, ProcessLauncher};
-use frankenterm_core::restore_scrollback::{InjectionConfig, ScrollbackData, ScrollbackInjector};
+use frankenterm_core::restore_scrollback::{ScrollbackData, ScrollbackInjector};
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::session_pane_state::{
     AgentMetadata, CapturedEnv, PaneStateSnapshot, ProcessInfo, TerminalState,
@@ -547,7 +547,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
     /// Arbitrary historical content never reaches the mock pane through PTY
-    /// input, regardless of chunking configuration.
+    /// input while the safe mux output channel is unavailable.
     #[test]
     fn scrollback_injection_never_writes_pty_input(
         lines in arb_scrollback_lines()
@@ -562,15 +562,7 @@ proptest! {
                 return Ok(());
             }
 
-            let injector = ScrollbackInjector::new(
-                mock.clone(),
-                InjectionConfig {
-                    max_lines: 50_000,
-                    chunk_size: 512, // small chunks to stress chunking logic
-                    inter_chunk_delay_ms: 0,
-                    concurrent_injections: 1,
-                },
-            );
+            let injector = ScrollbackInjector::new();
 
             let mut scrollback_map = HashMap::new();
             scrollback_map.insert(1u64, data);
@@ -1047,7 +1039,7 @@ proptest! {
 }
 
 // =============================================================================
-// Property: scrollback chunking
+// Property: logical scrollback accounting
 // =============================================================================
 
 proptest! {

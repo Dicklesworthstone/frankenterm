@@ -1132,22 +1132,31 @@ fn inject_no_auto_start<'a>(args: &'a [&'a str], enabled: bool) -> Vec<&'a str> 
 /// - `PaneNotFound`: specified pane ID doesn't exist
 /// - `Timeout`: command took too long
 struct ListPanesCliCache {
-    generation: u64,
+    epoch: Arc<()>,
+    next_request_ordinal: u64,
+    published_request_ordinal: Option<u64>,
     entry: Option<(Instant, Vec<PaneInfo>)>,
 }
 
 impl Default for ListPanesCliCache {
     fn default() -> Self {
         Self {
-            generation: 0,
+            epoch: Arc::new(()),
+            next_request_ordinal: 0,
+            published_request_ordinal: None,
             entry: None,
         }
     }
 }
 
+struct ListPanesCacheToken {
+    epoch: Arc<()>,
+    request_ordinal: u64,
+}
+
 enum ListPanesCacheProbe {
     Hit(Vec<PaneInfo>),
-    Miss { generation: u64 },
+    Miss(ListPanesCacheToken),
 }
 
 #[derive(Clone)]
@@ -1423,7 +1432,7 @@ impl WeztermClient {
     }
 
     fn probe_list_panes_cache(&self) -> ListPanesCacheProbe {
-        let cache = self
+        let mut cache = self
             .list_panes_cache
             .lock()
             .unwrap_or_else(record_poison_and_recover);
@@ -1432,38 +1441,55 @@ impl WeztermClient {
         {
             return ListPanesCacheProbe::Hit(panes.clone());
         }
-        ListPanesCacheProbe::Miss {
-            generation: cache.generation,
+
+        // Rotate the opaque epoch before the per-epoch request ordinal could
+        // wrap. This rejects every older in-flight publisher without relying
+        // on an integer generation that can saturate or exhibit ABA equality.
+        if cache.next_request_ordinal == u64::MAX {
+            cache.epoch = Arc::new(());
+            cache.next_request_ordinal = 0;
+            cache.published_request_ordinal = None;
+            cache.entry = None;
         }
+        let token = ListPanesCacheToken {
+            epoch: Arc::clone(&cache.epoch),
+            request_ordinal: cache.next_request_ordinal,
+        };
+        cache.next_request_ordinal += 1;
+        ListPanesCacheProbe::Miss(token)
     }
 
     /// Publish a CLI list result only if no topology mutation invalidated its
-    /// generation while the subprocess was in flight.
-    fn publish_list_panes_cache(&self, generation: u64, panes: Vec<PaneInfo>) -> bool {
+    /// epoch while the subprocess was in flight and no newer request in the
+    /// same epoch has already published.
+    fn publish_list_panes_cache(&self, token: ListPanesCacheToken, panes: Vec<PaneInfo>) -> bool {
         let mut cache = self
             .list_panes_cache
             .lock()
             .unwrap_or_else(record_poison_and_recover);
-        if cache.generation != generation {
+        if !Arc::ptr_eq(&cache.epoch, &token.epoch)
+            || cache
+                .published_request_ordinal
+                .is_some_and(|published| published > token.request_ordinal)
+        {
             return false;
         }
+        cache.published_request_ordinal = Some(token.request_ordinal);
         cache.entry = Some((Instant::now(), panes));
         true
     }
 
     /// Drop cached mux metadata before a topology/selection mutation. The
-    /// generation prevents an older in-flight CLI list from repopulating the
+    /// opaque epoch prevents an older in-flight CLI list from repopulating the
     /// cache after this invalidation.
     fn invalidate_list_panes_cache(&self) {
         let mut cache = self
             .list_panes_cache
             .lock()
             .unwrap_or_else(record_poison_and_recover);
-        // Saturation would permanently pin the token at `u64::MAX`, allowing
-        // every later invalidation-era result to publish under the same token.
-        // Wrapping preserves change detection. A false match would require a
-        // single list subprocess to remain in flight across 2^64 mutations.
-        cache.generation = cache.generation.wrapping_add(1);
+        cache.epoch = Arc::new(());
+        cache.next_request_ordinal = 0;
+        cache.published_request_ordinal = None;
         cache.entry = None;
     }
 
@@ -1528,12 +1554,12 @@ impl WeztermClient {
         // call list_panes() and each would spawn a separate `wezterm cli list`
         // process. The generation fence prevents an in-flight pre-mutation
         // response from repopulating the cache after topology changes.
-        let cache_generation = match self.probe_list_panes_cache() {
+        let cache_token = match self.probe_list_panes_cache() {
             ListPanesCacheProbe::Hit(panes) => {
                 tracing::trace!("list_panes: returning cached CLI result");
                 return Ok(panes);
             }
-            ListPanesCacheProbe::Miss { generation } => generation,
+            ListPanesCacheProbe::Miss(token) => token,
         };
 
         let output = self
@@ -1543,7 +1569,7 @@ impl WeztermClient {
         let panes: Vec<PaneInfo> =
             serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()))?;
 
-        self.publish_list_panes_cache(cache_generation, panes.clone());
+        self.publish_list_panes_cache(cache_token, panes.clone());
 
         Ok(panes)
     }
@@ -1554,12 +1580,12 @@ impl WeztermClient {
     /// identically.
     #[cfg(not(all(feature = "vendored", unix)))]
     pub async fn list_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
-        let cache_generation = match self.probe_list_panes_cache() {
+        let cache_token = match self.probe_list_panes_cache() {
             ListPanesCacheProbe::Hit(panes) => {
                 tracing::trace!("list_panes: returning cached CLI result");
                 return Ok(panes);
             }
-            ListPanesCacheProbe::Miss { generation } => generation,
+            ListPanesCacheProbe::Miss(token) => token,
         };
 
         let output = self
@@ -1569,7 +1595,7 @@ impl WeztermClient {
         let panes: Vec<PaneInfo> =
             serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()))?;
 
-        self.publish_list_panes_cache(cache_generation, panes.clone());
+        self.publish_list_panes_cache(cache_token, panes.clone());
 
         Ok(panes)
     }

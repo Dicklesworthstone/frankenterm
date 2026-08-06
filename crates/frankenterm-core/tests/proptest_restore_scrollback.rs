@@ -377,16 +377,17 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(30))]
 
-    /// skipped count matches skipped vec length.
+    /// Report Debug never exposes backend failure text.
     #[test]
-    fn prop_skipped_count(n in 0_usize..20) {
-        let skipped: Vec<u64> = (0..n as u64).collect();
+    fn prop_report_debug_redacts_failure_text(canary in "[A-Za-z0-9]{1,40}") {
         let report = InjectionReport {
             successes: vec![],
-            failures: vec![],
-            skipped: skipped.clone(),
+            failures: vec![(7, canary.clone())],
+            ..InjectionReport::default()
         };
-        prop_assert_eq!(report.skipped.len(), n);
+        let debug = format!("{report:?}");
+        prop_assert!(!debug.contains(&canary));
+        prop_assert!(debug.contains("failure_count: 1"));
     }
 
     /// total_lines sums lines_injected across successes.
@@ -396,18 +397,17 @@ proptest! {
         let report = InjectionReport {
             successes: stats,
             failures: vec![],
-            skipped: vec![],
+            ..InjectionReport::default()
         };
         let actual: usize = report.successes.iter().map(|s| s.lines_injected).sum();
         prop_assert_eq!(actual, expected);
     }
 
-    /// Mixed report with successes, failures, and skipped has correct counts.
+    /// Mixed report with successes and failures has correct counts.
     #[test]
     fn prop_mixed_report(
         n_success in 0_usize..5,
         n_failure in 0_usize..5,
-        n_skipped in 0_usize..10,
     ) {
         let successes: Vec<_> = (0..n_success).map(|i| PaneInjectionStats {
             old_pane_id: i as u64,
@@ -417,13 +417,16 @@ proptest! {
             chunks_sent: 1,
         }).collect();
         let failures: Vec<_> = (0..n_failure).map(|i| (i as u64, "err".to_string())).collect();
-        let skipped: Vec<u64> = (0..n_skipped as u64).collect();
 
-        let report = InjectionReport { successes, failures, skipped };
+        let report = InjectionReport {
+            successes,
+            failures,
+            ..InjectionReport::default()
+        };
         prop_assert_eq!(report.success_count(), n_success);
         prop_assert_eq!(report.failure_count(), n_failure);
         prop_assert_eq!(report.total_bytes(), n_success * 100);
-        prop_assert_eq!(report.skipped.len(), n_skipped);
+        prop_assert_eq!(report.skipped_count(), 0);
     }
 
     /// total_chunks sums chunks_sent across successes.
@@ -433,52 +436,10 @@ proptest! {
         let report = InjectionReport {
             successes: stats,
             failures: vec![],
-            skipped: vec![],
+            ..InjectionReport::default()
         };
         let actual: usize = report.successes.iter().map(|s| s.chunks_sent).sum();
         prop_assert_eq!(actual, expected);
-    }
-}
-
-// =========================================================================
-// InjectionConfig — additional boundary tests
-// =========================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(30))]
-
-    /// Config with extreme values still serializes/deserializes correctly.
-    #[test]
-    fn prop_config_extreme_values(
-        max_lines in prop_oneof![Just(1_usize), Just(usize::MAX / 2)],
-        chunk_size in prop_oneof![Just(1_usize), Just(1024 * 1024)],
-    ) {
-        let config = InjectionConfig {
-            max_lines,
-            chunk_size,
-            ..InjectionConfig::default()
-        };
-        let json = serde_json::to_string(&config).unwrap();
-        let back: InjectionConfig = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back.max_lines, max_lines);
-        prop_assert_eq!(back.chunk_size, chunk_size);
-    }
-
-    /// Config Debug impl doesn't panic for any valid config.
-    #[test]
-    fn prop_config_debug(config in arb_injection_config()) {
-        let debug = format!("{:?}", config);
-        prop_assert!(!debug.is_empty());
-    }
-
-    /// Config Clone produces equal fields.
-    #[test]
-    fn prop_config_clone(config in arb_injection_config()) {
-        let cloned = config.clone();
-        prop_assert_eq!(config.max_lines, cloned.max_lines);
-        prop_assert_eq!(config.chunk_size, cloned.chunk_size);
-        prop_assert_eq!(config.inter_chunk_delay_ms, cloned.inter_chunk_delay_ms);
-        prop_assert_eq!(config.concurrent_injections, cloned.concurrent_injections);
     }
 }
 
@@ -511,15 +472,6 @@ proptest! {
 // =========================================================================
 // Unit tests
 // =========================================================================
-
-#[test]
-fn config_default_values() {
-    let config = InjectionConfig::default();
-    assert_eq!(config.max_lines, 10_000);
-    assert_eq!(config.chunk_size, 4096);
-    assert_eq!(config.inter_chunk_delay_ms, 1);
-    assert_eq!(config.concurrent_injections, 5);
-}
 
 #[test]
 fn scrollback_from_terminal_lines_basic() {
@@ -565,7 +517,7 @@ fn report_aggregation() {
             },
         ],
         failures: vec![(3, "timeout".to_string())],
-        skipped: vec![4, 5],
+        ..InjectionReport::default()
     };
     assert_eq!(report.success_count(), 2);
     assert_eq!(report.failure_count(), 1);

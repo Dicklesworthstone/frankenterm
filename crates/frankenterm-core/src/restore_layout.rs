@@ -123,7 +123,7 @@ impl Default for RestoreConfig {
 // =============================================================================
 
 /// Result of a layout restoration operation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RestoreResult {
     /// Mapping from old pane IDs (snapshot) to new pane IDs (live session).
     pub pane_id_map: HashMap<u64, u64>,
@@ -137,6 +137,19 @@ pub struct RestoreResult {
     pub panes_created: usize,
 }
 
+impl std::fmt::Debug for RestoreResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RestoreResult")
+            .field("pane_mapping_count", &self.pane_id_map.len())
+            .field("failed_pane_count", &self.failed_panes.len())
+            .field("windows_created", &self.windows_created)
+            .field("tabs_created", &self.tabs_created)
+            .field("panes_created", &self.panes_created)
+            .finish()
+    }
+}
+
 impl RestoreResult {
     #[cfg(test)]
     fn new() -> Self {
@@ -146,7 +159,9 @@ impl RestoreResult {
     fn with_capacity(pane_capacity: usize) -> Self {
         Self {
             pane_id_map: HashMap::with_capacity(pane_capacity),
-            failed_panes: Vec::with_capacity(pane_capacity),
+            // Successful restores are the common path; do not reserve one
+            // failure allocation per pane up front.
+            failed_panes: Vec::new(),
             windows_created: 0,
             tabs_created: 0,
             panes_created: 0,
@@ -166,7 +181,7 @@ impl RestoreAccumulator {
     fn with_capacity(pane_capacity: usize) -> Self {
         Self {
             result: RestoreResult::with_capacity(pane_capacity),
-            failed_pane_ids: HashSet::with_capacity(pane_capacity),
+            failed_pane_ids: HashSet::new(),
             mapped_new_pane_ids: HashSet::with_capacity(pane_capacity),
             failure_logs_emitted: 0,
             failure_logs_suppressed: 0,
@@ -229,6 +244,14 @@ impl RestoreAccumulator {
 struct RestorePreflight {
     pane_count: usize,
     normalized_cwds: HashMap<u64, String>,
+    split_percents: HashMap<u64, u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ValidatedPaneTree {
+    pane_count: usize,
+    active_leaf_id: Option<u64>,
+    first_leaf_id: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -595,14 +618,29 @@ impl LayoutRestorer {
             // Peel right/bottom children from the outside in. `SplitSize` is
             // the size of the newly-created second child, so forward splitting
             // of the first pane reverses siblings. Reverse-prefix construction
-            // preserves both the requested ratios and the recorded order:
-            // for ratios [a,b,c], split c/(a+b+c), then b/(a+b), leaving a.
-            let mut prefix_ratio: f64 = children.iter().map(|(ratio, _)| *ratio).sum();
+            // preserves both the requested ratios and the recorded order. The
+            // ratio-restoring percentages were computed with scale-normalized
+            // prefix sums during full preflight, avoiding catastrophic suffix
+            // subtraction for ratios such as [1, 2, f64::MAX].
             let mut remaining_children = children.len();
-            for (ratio, child) in children[1..].iter().rev() {
+            for (_, child) in children[1..].iter().rev() {
                 restore_checkpoint(cx, "restore_layout.restore_split_children.before_split")?;
                 let percent = if self.config.restore_split_ratios {
-                    Some(split_percent(*ratio, prefix_ratio))
+                    let child_first_leaf_id = first_leaf_id(child).ok_or_else(|| {
+                        restore_layout_integrity_error(
+                            "restore_layout.split_plan.missing_child_leaf",
+                        )
+                    })?;
+                    Some(
+                        *preflight
+                            .split_percents
+                            .get(&child_first_leaf_id)
+                            .ok_or_else(|| {
+                                restore_layout_integrity_error(
+                                    "restore_layout.split_plan.missing_percent",
+                                )
+                            })?,
+                    )
                 } else {
                     Some(equal_split_percent(remaining_children))
                 };
@@ -645,7 +683,6 @@ impl LayoutRestorer {
                     }
                     Err(error) => return Err(error),
                 }
-                prefix_ratio -= *ratio;
                 remaining_children -= 1;
             }
 
