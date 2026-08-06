@@ -2508,6 +2508,52 @@ mod tests {
     }
 
     #[test]
+    fn parent_as_child_and_duplicate_split_receipts_fail_reconciliation() {
+        run_async_test(async {
+            for (receipt, tree, expected_operation) in [
+                (
+                    InjectedSplitReceipt::ParentPaneId,
+                    vsplit(vec![(0.5, leaf(1, None)), (0.5, leaf(2, None))]),
+                    "restore_layout.pane_mapping.new_id_conflict",
+                ),
+                (
+                    InjectedSplitReceipt::Fixed(999),
+                    vsplit(vec![
+                        (1.0, leaf(1, None)),
+                        (1.0, leaf(2, None)),
+                        (1.0, leaf(3, None)),
+                    ]),
+                    "restore_layout.pane_mapping.new_id_conflict",
+                ),
+            ] {
+                let inner = Arc::new(MockWezterm::new());
+                let wezterm: WeztermHandle = Arc::new(
+                    InstrumentedWezterm::with_split_receipt(inner.clone(), receipt),
+                );
+                let restorer = LayoutRestorer::new(wezterm, RestoreConfig::default());
+                let snapshot = single_tab_snapshot(tree);
+
+                let error = restorer
+                    .restore(&snapshot)
+                    .await
+                    .expect_err("duplicate backend pane receipts must fail closed");
+                assert!(matches!(
+                    error,
+                    crate::Error::RuntimeOperation {
+                        operation,
+                        source: RuntimeOperationSource::Backend(_),
+                    } if operation == expected_operation
+                ));
+                assert_eq!(
+                    inner.list_panes().await.unwrap().len(),
+                    1,
+                    "the malicious receipt must not create mock backend state"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn restore_partial_first_tab_reuses_created_window_for_later_tabs() {
         run_async_test(async {
             let inner = Arc::new(MockWezterm::new());
@@ -3132,10 +3178,17 @@ mod tests {
     // =================================================================
 
     #[test]
-    fn restore_result_debug() {
-        let r = RestoreResult::new();
+    fn restore_result_debug_is_aggregate_and_content_free() {
+        let mut r = RestoreResult::new();
+        r.pane_id_map.insert(777_777, 888_888);
+        r.failed_panes
+            .push((777_777, "SECRET backend pane failure".to_string()));
         let dbg = format!("{r:?}");
         assert!(dbg.contains("RestoreResult"));
-        assert!(dbg.contains("pane_id_map"));
+        assert!(dbg.contains("pane_mapping_count: 1"));
+        assert!(dbg.contains("failed_pane_count: 1"));
+        assert!(!dbg.contains("777777"));
+        assert!(!dbg.contains("888888"));
+        assert!(!dbg.contains("SECRET"));
     }
 }
