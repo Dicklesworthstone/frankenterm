@@ -72,10 +72,14 @@ The pattern-detection hot path (`PatternEngine::detect`,
 
 The two structural fixes (PooledReadConn + zstd::stream::encode_all)
 addressed the only foundational concerns flagged in round 1. The
-remaining hot paths were already classified well-engineered (Aho-
-Corasick + quick-reject in patterns; memchr SIMD + bounded overlap
-in delta extraction; time-windowed cache for `list_panes`; consistent
-RwLock ordering for registry/cursors).
+remaining hot paths were classified separately (Aho-Corasick + quick-
+reject in patterns; memchr SIMD + bounded overlap in delta extraction;
+consistent RwLock ordering for registry/cursors). The historical
+time-windowed `list_panes` cache was later removed: full `PaneInfo`
+contains volatile focus/cursor/cwd/title/viewport/zoom state, and a TTL
+cache could return older metadata across clients, transports, or concurrent
+mutations. A future optimization must coalesce one authoritative in-flight
+revision rather than reuse a completed result by elapsed time.
 
 No new microsecond-bench data gathered in this 15-min slot — round 1
 caveated the same. The fixes are structural and the test suites + CI

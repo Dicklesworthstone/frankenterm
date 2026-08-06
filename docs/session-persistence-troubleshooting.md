@@ -98,7 +98,7 @@ The `SessionRestorer` library can detect unclean sessions, but production
 
 - Another watcher instance is running and holding locks
 - A previous crash left the DB in a bad state (rare, but possible)
-- Another `ft snapshot restore` or `ft restart` is already holding the restart-operation lock
+- Another `ft snapshot restore` is already holding the restore-operation lock
 
 **What to do**
 
@@ -110,7 +110,7 @@ The `SessionRestorer` library can detect unclean sessions, but production
    ```bash
    ft stop
    ```
-3) If the error mentions another restore or restart already being in progress, wait for that operation to finish before retrying
+3) If the error mentions another restore already being in progress, wait for that operation to finish before retrying
 4) Re-run snapshot/session commands and see if the lock clears
 5) If migrations are involved:
    ```bash
@@ -151,9 +151,12 @@ pane. Process classification produces finite manual dispositions only.
   working directory match the snapshot
 - Inspect the saved session metadata to determine what previously occupied the
   pane, then resume it through that program's own supported recovery mechanism
-- Do not put command templates or credentials in
-  `[snapshots.process_relaunch]`; those historical keys are inert and are being
-  retired rather than executed through PTY input
+- Delete any historical `[snapshots.process_relaunch]` table. It is rejected
+  with a migration error, and there is no replacement launch setting because
+  process and agent restoration is unavailable
+- Delete any historical `session.restore_max_lines` setting. It is rejected
+  because scrollback replay is unavailable rather than silently pretending to
+  constrain a replay path
 - Do not interpret a completed layout restore as process, agent, scrollback,
   render-state, or full-session continuity
 

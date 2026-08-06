@@ -1036,15 +1036,18 @@ ft session doctor                # health check for session persistence
 ft watch                         # observe panes; startup restore prompting is not wired yet
 ```
 
-`ft snapshot restore` and `ft restart` are wired on Unix, but currently force
-layout-only behavior. Historical output is never written through PTY input,
-and shell/agent replacement remains a reported manual disposition until the
-mux exposes safe render-state and argv-isolated spawn channels. The
-`--layout-only` flag is therefore an explicit statement of the only supported
-mode, not a switch from a working scrollback-replay mode. The library can find
-unclean sessions, but the production `ft watch` startup path does not yet call
-that detector or offer a restore prompt; use the explicit snapshot/session
-commands to inspect and start a manual restore.
+`ft snapshot restore` is wired on Unix for a layout-only subset. Historical
+output is never written through PTY input, and shell/agent replacement remains
+a reported manual disposition until the mux exposes safe render-state and
+argv-isolated spawn channels. The `--layout-only` flag is therefore an explicit
+statement of the only supported mode, not a switch from a working scrollback
+replay mode. `ft restart` execution is deliberately unavailable: it fails
+closed before locks, capture, process discovery, signals, spawning, or mux
+mutation until one authenticated mux endpoint can be bound to an exact process
+incarnation and verified relaunch receipt. The library can find unclean
+sessions, but the production `ft watch` startup path does not yet call that
+detector or offer a restore prompt; use the explicit snapshot/session commands
+to inspect and start a manual layout restore.
 
 ### Configuration
 

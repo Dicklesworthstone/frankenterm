@@ -22,7 +22,7 @@ This document explains how ft captures and restores session state for crash reco
 
 - `frankenterm_core::snapshot_engine::SnapshotEngine`
   - Orchestrates capture
-  - Computes a BLAKE3 `state_hash` for dedup (“skip if unchanged”)
+  - Computes a versioned, framed SHA-256 `state_hash` for dedup and consistency
   - Writes snapshots to SQLite tables (`mux_sessions`, `session_checkpoints`, `mux_pane_state`)
 
 - `frankenterm_core::session_topology::TopologySnapshot`
@@ -58,7 +58,7 @@ This document explains how ft captures and restores session state for crash reco
 
 - `frankenterm_core::restore_process`
   - Classifies captured process state as skipped or requiring manual follow-up
-  - Rejects legacy executable plans without writing PTY input
+  - Makes executable process plans unrepresentable; no PTY-input launch path exists
 
 ## Data flow
 
@@ -68,7 +68,7 @@ This document explains how ft captures and restores session state for crash reco
 backend bridge cli list (current: `wezterm cli list`) → Vec<PaneInfo>
   → TopologySnapshot::from_panes()
   → PaneStateSnapshot::from_pane_info() (per pane)
-  → compute_state_hash(panes)
+  → snapshot_dedup_witness(panes)
   → SQLite transaction:
        mux_sessions (upsert session row)
        session_checkpoints (insert checkpoint)
@@ -98,7 +98,9 @@ The snapshot engine stores session data in three core tables:
 - `mux_sessions`
   - `session_id` (primary key)
   - `created_at`, `last_checkpoint_at`
-  - `shutdown_clean` (0 = crash/unclean, 1 = clean)
+  - `shutdown_clean` (0 = recovery authority unresolved, 1 = the latest exact
+    capture/restore receipt is resolved); after restore this is not proof that
+    the original process session shut down cleanly or retained continuity
   - `topology_json` (serialized `TopologySnapshot`)
   - `ft_version`, `host_id` (for diagnostics / cross-host detection)
 
@@ -107,7 +109,7 @@ The snapshot engine stores session data in three core tables:
   - `session_id` (FK)
   - `checkpoint_at` (epoch ms)
   - `checkpoint_type` (`periodic|event|shutdown|startup`)
-  - `state_hash` (BLAKE3)
+  - `state_hash` (versioned, framed SHA-256 witness)
   - `pane_count`, `total_bytes`
 
 - `mux_pane_state`
@@ -135,14 +137,18 @@ foreground processes:
 - Layout reconstruction creates each pane's default shell at the validated cwd.
 - Captured shells and agents always receive an explicit manual disposition so
   omitted process state cannot be mistaken for a successful restore.
-- Captured commands, cwd values, agent types, and manual hints are excluded from
-  reports and diagnostics.
-- Caller-supplied legacy executable plans fail closed and never write PTY input.
+- Captured commands, argv, cwd values, agent types, and free-form hints are
+  excluded from plans, reports, serialization, and diagnostics.
+- Reports retain exact saturating totals plus at most 32 deterministic-prefix,
+  content-free sample entries; consumers never infer totals from that sample.
 
-The historical `launch_shells`, `launch_agents`, `launch_delay_ms`, and
-`agent_commands` configuration keys are reserved and ignored. Actual process
-relaunch requires a future mux-native, argv-isolated spawn API. Configuration
-lives under `[snapshots.process_relaunch]` in `ft.toml`.
+The historical `[snapshots.process_relaunch]` table is removed and rejected
+with a finite migration error. Delete it from existing configuration. A future
+mux-native argv restoration design must introduce a new reviewed contract
+rather than silently activating credential-bearing historical templates.
+The historical `session.restore_max_lines` knob is also rejected: without a
+safe mux-owned terminal-output restoration channel, accepting a replay limit
+would describe behavior that does not exist.
 
 ## Bench budgets
 

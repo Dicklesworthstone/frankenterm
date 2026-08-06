@@ -15,7 +15,8 @@ At a high level, a snapshot stores:
 
 - **Layout topology**: windows / tabs / split tree (a `TopologySnapshot`)
 - **Per-pane state**: pane id, cwd, command, terminal size + alt-screen flag, agent metadata (a `PaneStateSnapshot`)
-- **Dedup hash**: a BLAKE3 `state_hash` so identical snapshots can be skipped
+- **Dedup/consistency witness**: a versioned, framed SHA-256 `state_hash` so
+  identical snapshots can be skipped and persisted projections can be checked
 
 The current topology schema v1 sorts numeric tab IDs for deterministic output.
 It does not yet preserve user tab order or an incarnation-scoped active-tab
@@ -164,24 +165,22 @@ ft snapshot restore 123 --layout-only
 
 ## `ft restart`
 
-`ft restart` performs the built-in safe restart flow:
+`ft restart` execution is currently unavailable and fails closed before lock
+acquisition, process discovery, snapshot capture, signaling, or any mux
+mutation. The existing implementation cannot authenticate one exact mux
+endpoint, process incarnation, and relaunch plan, so an acknowledgement flag is
+not sufficient to make execution safe.
 
-1) Capture a pre-restart snapshot
-2) Stop `frankenterm-mux-server`
-3) Start `frankenterm-mux-server`
-4) Restore from the captured snapshot unless `--skip-restore` is set
-
-Like `ft snapshot restore`, `ft restart` is currently supported only on Unix platforms.
+`--dry-run` reports this unavailable status and the intended continuity gaps.
+It performs no operation. A future restart design must bind an authenticated
+endpoint to an exact PID/incarnation receipt and a verified relaunch plan before
+any stop/start workflow can ship.
 
 Examples:
 
 ```bash
-ft restart
-ft restart --layout-only
-ft restart --skip-restore
+ft restart --dry-run
 ```
-
-If the mux restart succeeds but the restore phase fails, the snapshot is preserved and the CLI prints the checkpoint ID for manual recovery with `ft snapshot restore <id>`.
 
 ## Configuration
 
@@ -194,11 +193,6 @@ interval_seconds = 300
 max_concurrent_captures = 10
 retention_count = 10
 retention_days = 7
-
-[snapshots.process_relaunch]
-# Reserved historical keys; neither one permits execution.
-launch_shells = true
-launch_agents = false
 ```
 
 Notes:
@@ -207,9 +201,12 @@ Notes:
   types a captured shell or agent command into that PTY.
 - Captured shells and agents always receive an explicit manual disposition so
   state that was not restored cannot be mistaken for success.
-- All four historical keys (`launch_shells`, `launch_agents`, `launch_delay_ms`,
-  and `agent_commands`) are reserved and ignored until FrankenTerm has a
-  mux-native, argv-isolated spawn API.
+- The retired `[snapshots.process_relaunch]` table is rejected with a migration
+  error. Delete it from existing configuration; no replacement launch setting
+  exists because process and agent restoration is unavailable.
+- The retired `session.restore_max_lines` setting is likewise rejected instead
+  of being silently ignored. Historical scrollback replay has no supported
+  output channel, so there is no active replay-size limit to configure.
 - Retention is enforced by both `retention_count` and `retention_days`.
 
 ## Performance budgets and proof status

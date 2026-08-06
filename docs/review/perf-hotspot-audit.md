@@ -205,10 +205,13 @@ paths go through the same bounded-varbincode call.
 `crates/frankenterm-core/src/wezterm.rs:2140` — every CLI call
 (`run_cli` / `run_cli_with_cx`) spawns `wezterm` as a subprocess via
 `Command::new(wezterm_binary())`. Process spawn on macOS costs 5-20ms.
-For `list_panes`, the cost is amortized via the time-windowed cache at
-`wezterm.rs:885` (`list_panes_cache: Arc<Mutex<Option<(Instant, Vec<PaneInfo>)>>>`).
-For `get_text`, every call pays the full subprocess cost — by design,
-because pane content varies per-call.
+For `list_panes`, completed full-metadata results are deliberately not cached
+by TTL: `PaneInfo` carries volatile focus, cursor, cwd, title, viewport, and
+zoom state, and elapsed time is not an authority revision. Concurrent CLI-only
+callers can therefore still duplicate subprocess work. The required follow-up
+is cross-client, cross-transport singleflight tied to an authoritative mux
+revision/event stream. `get_text` likewise remains per-call because pane
+content varies per call.
 
 This is the documented WezTerm-fork mux boundary (per
 `docs/proposals/ft-zoxxq-mux-boundary-truth.md`). The architectural
