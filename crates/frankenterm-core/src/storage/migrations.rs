@@ -2251,7 +2251,9 @@ fn compact_schema_sql(sql: &str) -> String {
         .chars()
         .filter(|character| !character.is_ascii_whitespace())
         .collect::<String>();
-    compact.replace("createindexifnotexists", "createindex")
+    compact
+        .trim_end_matches(';')
+        .replace("createindexifnotexists", "createindex")
 }
 
 fn load_schema_object_sql(
@@ -2586,15 +2588,18 @@ fn ensure_checkpoint_snapshot_authority_schema(conn: &Connection) -> Result<()> 
         "migration v36",
     )?;
 
-    // Classify only the exact legacy receipt shape that the pre-v36 loader
-    // accepted. An empty startup snapshot alone is ambiguous: missing pane
-    // rows or metadata can also be corruption, and a migration must never mint
+    // Classify only the exact legacy receipt shape that the pre-v36 writer
+    // produced and loader accepted. An empty startup snapshot alone is
+    // ambiguous: missing pane rows or metadata can also be corruption, and a
+    // migration must never mint
     // clean authority from that negative evidence. JSON1 is already a schema
     // dependency elsewhere in this database.
     conn.execute_batch(
         "UPDATE session_checkpoints AS checkpoint
          SET checkpoint_role = 'restore_receipt'
          WHERE checkpoint.checkpoint_role = 'snapshot'
+           AND checkpoint.id > 0
+           AND checkpoint.checkpoint_at >= 0
            AND checkpoint.checkpoint_type = 'startup'
            AND checkpoint.topology_json IS NULL
            AND checkpoint.total_bytes = 0
@@ -2602,6 +2607,10 @@ fn ensure_checkpoint_snapshot_authority_schema(conn: &Connection) -> Result<()> 
            AND json_valid(checkpoint.metadata_json)
            AND json_type(checkpoint.metadata_json) = 'object'
            AND json_type(checkpoint.metadata_json, '$.old_to_new') = 'object'
+           AND (
+               SELECT COUNT(*)
+               FROM json_each(checkpoint.metadata_json)
+           ) = 1
            AND checkpoint.pane_count = (
                SELECT COUNT(*)
                FROM json_each(checkpoint.metadata_json, '$.old_to_new')
@@ -2630,7 +2639,7 @@ fn ensure_checkpoint_snapshot_authority_schema(conn: &Connection) -> Result<()> 
                checkpoint.state_hash = 'restore'
                OR (
                    length(checkpoint.state_hash) = 16
-                   AND lower(checkpoint.state_hash) NOT GLOB '*[^0-9a-f]*'
+                   AND checkpoint.state_hash NOT GLOB '*[^0-9a-f]*'
                )
            )
            AND NOT EXISTS (
@@ -5289,6 +5298,17 @@ pub fn migrate_database_to_version(db_path: &Path, target_version: i32) -> Resul
 mod tests {
     use super::*;
 
+    #[test]
+    fn schema_sql_comparison_ignores_statement_terminators() {
+        assert_eq!(
+            compact_schema_sql(
+                "CREATE INDEX IF NOT EXISTS idx_example ON example(value DESC);",
+            ),
+            compact_schema_sql("CREATE INDEX idx_example ON example(value DESC)"),
+            "sqlite_schema may omit the semicolon accepted by execute_batch"
+        );
+    }
+
     fn create_v35_checkpoint_fixture(conn: &Connection) {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
@@ -6535,6 +6555,8 @@ mod tests {
                  id, session_id, checkpoint_at, checkpoint_type, state_hash,
                  pane_count, total_bytes, metadata_json
              ) VALUES
+                 (-4, 'session-a',  50, 'startup',  'ffffffffffffffff', 0, 0,
+                      '{\"old_to_new\":{},\"unexpected\":true}'),
                  (-3, 'session-a',  60, 'startup',  'eeeeeeeeeeeeeeee', 2, 0,
                       '{\"old_to_new\":{\"7\":8,\"07\":9}}'),
                  (-2, 'session-a',  70, 'startup',  'dddddddddddddddd', 2, 0,
@@ -6550,7 +6572,9 @@ mod tests {
                  ( 3, 'session-a', 200, 'periodic', '3333333333333333', 1, 3,
                       NULL),
                  ( 4, 'session-a', 200, 'event',    '4444444444444444', 1, 4,
-                      NULL);
+                      NULL),
+                 ( 5, 'session-a',  80, 'startup',  'restore',          0, 0,
+                      '{\"old_to_new\":{}}');
              INSERT INTO mux_pane_state (checkpoint_id, pane_id)
              VALUES (2, 20), (3, 30), (4, 40);",
         )
@@ -6578,6 +6602,12 @@ mod tests {
             rows,
             vec![
                 (
+                    -4,
+                    "snapshot".to_string(),
+                    None,
+                    "ffffffffffffffff".to_string(),
+                ),
+                (
                     -3,
                     "snapshot".to_string(),
                     None,
@@ -6591,7 +6621,7 @@ mod tests {
                 ),
                 (
                     -1,
-                    "restore_receipt".to_string(),
+                    "snapshot".to_string(),
                     None,
                     "restore".to_string(),
                 ),
@@ -6625,6 +6655,12 @@ mod tests {
                     Some("{\"tab_order\":[2,1]}".to_string()),
                     "4444444444444444".to_string(),
                 ),
+                (
+                    5,
+                    "restore_receipt".to_string(),
+                    None,
+                    "restore".to_string(),
+                ),
             ],
             "only structurally proven legacy receipts are classified; the deterministic newest snapshot receives topology and witnesses stay byte-identical"
         );
@@ -6640,7 +6676,7 @@ mod tests {
                  id, session_id, checkpoint_at, checkpoint_type, state_hash,
                  pane_count, total_bytes, checkpoint_role, topology_json
              ) VALUES (
-                 5, 'session-a', 300, 'startup', '5555555555555555',
+                 6, 'session-a', 300, 'startup', '5555555555555555',
                  0, 0, 'snapshot', '{\"explicit_empty\":true}'
              )",
             [],
@@ -6666,7 +6702,7 @@ mod tests {
         assert_eq!(
             conn.query_row(
                 "SELECT checkpoint_role, topology_json
-                 FROM session_checkpoints WHERE id = 5",
+                 FROM session_checkpoints WHERE id = 6",
                 [],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )
