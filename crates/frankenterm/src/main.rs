@@ -713,12 +713,12 @@ SEE ALSO:
         timeout: u64,
     },
 
-    /// Safe-restart the WezTerm mux server (snapshot → stop → start → restore)
+    /// Safely restart the WezTerm mux server (snapshot → stop → start → layout restore)
     #[command(after_help = r#"EXAMPLES:
-    ft restart                        Full safe restart cycle
+    ft restart                        Safe restart with layout restoration
     ft restart --dry-run              Show what would happen
     ft restart --skip-restore         Restart without restoring layout
-    ft restart --layout-only          Only restore split layout (no scrollback)
+    ft restart --layout-only          Explicitly select the only safe restore mode
     ft restart --launch-agents        Re-launch agent commands after restore
     ft restart --stop-timeout 30      Custom stop timeout
 
@@ -739,7 +739,7 @@ SEE ALSO:
         #[arg(long)]
         skip_restore: bool,
 
-        /// Only restore layout (skip scrollback injection)
+        /// Explicit no-op: layout-only is currently the only safe restore mode
         #[arg(long)]
         layout_only: bool,
 
@@ -6537,12 +6537,12 @@ enum SnapshotCommands {
         format: String,
     },
 
-    /// Restore session layout from a snapshot
+    /// Restore session layout from a snapshot (historical output replay is disabled)
     Restore {
         /// Snapshot ID or "latest" for most recent
         snapshot_id: String,
 
-        /// Only restore layout (skip scrollback injection)
+        /// Explicit no-op: layout-only is currently the only safe restore mode
         #[arg(long)]
         layout_only: bool,
 
@@ -21489,6 +21489,40 @@ impl std::error::Error for CheckpointResolveError {
     }
 }
 
+/// Run a synchronous CLI database or short filesystem operation without
+/// occupying the async worker. The explicit caller context preserves
+/// cancellation and budget propagation. Write-like callers must arrange
+/// reconciliation for effects that may settle after mid-flight cancellation;
+/// operation-lock acquisition is paired with blocking-pool cleanup below.
+async fn run_cli_blocking_with_cx<T, F>(
+    cx: &frankenterm_core::cx::Cx,
+    operation: &'static str,
+    work: F,
+) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    frankenterm_core::runtime_async::spawn_blocking_with_cx(cx, work)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "{operation} cancelled or failed at the blocking-runtime boundary: {error}"
+            )
+        })?
+}
+
+async fn check_watcher_running_with_cx(
+    cx: &frankenterm_core::cx::Cx,
+    lock_path: PathBuf,
+    operation: &'static str,
+) -> anyhow::Result<Option<frankenterm_core::lock::LockMetadata>> {
+    run_cli_blocking_with_cx(cx, operation, move || {
+        Ok(frankenterm_core::lock::check_running(&lock_path))
+    })
+    .await
+}
+
 fn resolve_checkpoint_id(
     db_path: &str,
     snapshot_id: &str,
@@ -21501,7 +21535,7 @@ fn resolve_checkpoint_id(
                 "SELECT id
                  FROM session_checkpoints
                  WHERE checkpoint_role = 'snapshot'
-                 ORDER BY checkpoint_at DESC, id DESC
+                 ORDER BY id DESC
                  LIMIT 1",
                 [],
                 |row| row.get::<_, i64>(0),
@@ -21509,7 +21543,7 @@ fn resolve_checkpoint_id(
             CheckpointResolveScope::Any => conn.query_row(
                 "SELECT id
                  FROM session_checkpoints
-                 ORDER BY checkpoint_at DESC, id DESC
+                 ORDER BY id DESC
                  LIMIT 1",
                 [],
                 |row| row.get::<_, i64>(0),
@@ -21707,7 +21741,7 @@ fn robot_checkpoint_list_data(
         "SELECT id, session_id, checkpoint_at, checkpoint_type, checkpoint_role,
                 pane_count, total_bytes, state_hash, metadata_json
          FROM session_checkpoints
-         ORDER BY checkpoint_at DESC, id DESC
+         ORDER BY id DESC
          LIMIT ?1 OFFSET ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![limit_i64, offset_i64], |row| {
@@ -21822,9 +21856,14 @@ fn robot_checkpoint_show_data(
     for row in rows {
         let (pane_id, cwd, command, scrollback_checkpoint_seq) = row?;
         let pane_id = robot_checkpoint_nonnegative_u64("mux_pane_state.pane_id", pane_id)?;
+        let cwd = cwd.as_deref().map(redact_for_output);
+        let command = command.as_deref().map(redact_for_output);
+        let title = command
+            .clone()
+            .unwrap_or_else(|| format!("pane-{pane_id}"));
         panes.push(serde_json::json!({
             "pane_id": pane_id,
-            "title": command.clone().unwrap_or_else(|| format!("pane-{pane_id}")),
+            "title": title,
             "working_dir": cwd,
             "command": command,
             "has_scrollback": scrollback_checkpoint_seq.is_some(),
@@ -21893,9 +21932,10 @@ async fn robot_checkpoint_save_data(
     use std::sync::Arc;
 
     let db_path = layout.db_path.to_string_lossy().to_string();
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let wezterm =
         frankenterm_core::wezterm::wezterm_handle_with_timeout(config.cli.timeout_seconds);
-    let mut panes = wezterm.list_panes().await.map_err(|err| {
+    let mut panes = wezterm.list_panes_with_cx(&cx).await.map_err(|err| {
         robot_checkpoint_error_response(
             ROBOT_ERR_CONFIG,
             format!("Failed to list panes for checkpoint capture: {err}"),
@@ -21924,7 +21964,6 @@ async fn robot_checkpoint_save_data(
     }
 
     let engine = SnapshotEngine::new(Arc::new(db_path.clone()), config.snapshots.clone());
-    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let requested_pane_ids = pane_ids.unwrap_or_default();
     let result = engine
         .capture_with_options_with_cx(
@@ -21949,8 +21988,19 @@ async fn robot_checkpoint_save_data(
                 elapsed_ms,
             )
         })?;
-    let scrollback_verification =
-        robot_checkpoint_scrollback_included(&db_path, result.checkpoint_id);
+    let verification_db_path = db_path.clone();
+    let verification_checkpoint_id = result.checkpoint_id;
+    let scrollback_verification = run_cli_blocking_with_cx(
+        &cx,
+        "robot checkpoint scrollback verification",
+        move || {
+            robot_checkpoint_scrollback_included(
+                &verification_db_path,
+                verification_checkpoint_id,
+            )
+        },
+    )
+    .await;
 
     engine
         .close_after_checkpoint_with_cx(&cx, &result)
@@ -22006,6 +22056,7 @@ async fn handle_robot_checkpoint_command(
     elapsed_ms: u64,
 ) -> RobotResponse<serde_json::Value> {
     let db_path = layout.db_path.to_string_lossy().to_string();
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
 
     match command {
         RobotCheckpointCommands::Save {
@@ -22026,7 +22077,14 @@ async fn handle_robot_checkpoint_command(
             Err(response) => *response,
         },
         RobotCheckpointCommands::List { limit, offset } => {
-            match robot_checkpoint_list_data(&db_path, *limit, *offset) {
+            let list_db_path = db_path.clone();
+            let limit = *limit;
+            let offset = *offset;
+            match run_cli_blocking_with_cx(&cx, "robot checkpoint list", move || {
+                robot_checkpoint_list_data(&list_db_path, limit, offset)
+            })
+            .await
+            {
                 Ok(data) => RobotResponse::success(data, elapsed_ms),
                 Err(err) => robot_checkpoint_error_response(
                     ROBOT_ERR_STORAGE,
@@ -22037,17 +22095,39 @@ async fn handle_robot_checkpoint_command(
             }
         }
         RobotCheckpointCommands::Show { checkpoint_id } => {
-            let checkpoint_id_i64 =
-                match robot_checkpoint_resolve_id(
-                    &db_path,
-                    checkpoint_id,
-                    CheckpointResolveScope::Any,
-                    elapsed_ms,
-                ) {
-                    Ok(id) => id,
-                    Err(response) => return *response,
-                };
-            match robot_checkpoint_show_data(&db_path, checkpoint_id_i64) {
+            let resolve_db_path = db_path.clone();
+            let requested_checkpoint_id = checkpoint_id.clone();
+            let resolved = run_cli_blocking_with_cx(
+                &cx,
+                "robot checkpoint id resolution",
+                move || {
+                    Ok(robot_checkpoint_resolve_id(
+                        &resolve_db_path,
+                        &requested_checkpoint_id,
+                        CheckpointResolveScope::Any,
+                        elapsed_ms,
+                    ))
+                },
+            )
+            .await;
+            let checkpoint_id_i64 = match resolved {
+                Ok(Ok(id)) => id,
+                Ok(Err(response)) => return *response,
+                Err(err) => {
+                    return robot_checkpoint_error_response(
+                        ROBOT_ERR_STORAGE,
+                        format!("Checkpoint resolution failed: {err}"),
+                        None,
+                        elapsed_ms,
+                    );
+                }
+            };
+            let show_db_path = db_path.clone();
+            match run_cli_blocking_with_cx(&cx, "robot checkpoint show", move || {
+                robot_checkpoint_show_data(&show_db_path, checkpoint_id_i64)
+            })
+            .await
+            {
                 Ok(Some(data)) => RobotResponse::success(data, elapsed_ms),
                 Ok(None) => robot_checkpoint_not_found(checkpoint_id, elapsed_ms),
                 Err(err) => robot_checkpoint_error_response(
@@ -22092,20 +22172,40 @@ async fn handle_robot_checkpoint_command(
             checkpoint_id,
             dry_run,
         } => {
-            let checkpoint_id_i64 =
-                match robot_checkpoint_resolve_id(
-                    &db_path,
-                    checkpoint_id,
-                    CheckpointResolveScope::Snapshot,
-                    elapsed_ms,
-                ) {
-                    Ok(id) => id,
-                    Err(response) => return *response,
-                };
-            let checkpoint = match frankenterm_core::session_restore::load_checkpoint_by_id(
+            let resolve_db_path = db_path.clone();
+            let requested_checkpoint_id = checkpoint_id.clone();
+            let resolved = run_cli_blocking_with_cx(
+                &cx,
+                "robot rollback checkpoint resolution",
+                move || {
+                    Ok(robot_checkpoint_resolve_id(
+                        &resolve_db_path,
+                        &requested_checkpoint_id,
+                        CheckpointResolveScope::Snapshot,
+                        elapsed_ms,
+                    ))
+                },
+            )
+            .await;
+            let checkpoint_id_i64 = match resolved {
+                Ok(Ok(id)) => id,
+                Ok(Err(response)) => return *response,
+                Err(err) => {
+                    return robot_checkpoint_error_response(
+                        ROBOT_ERR_STORAGE,
+                        format!("Checkpoint rollback resolution failed: {err}"),
+                        None,
+                        elapsed_ms,
+                    );
+                }
+            };
+            let checkpoint = match frankenterm_core::session_restore::load_checkpoint_by_id_with_cx(
+                &cx,
                 &db_path,
                 checkpoint_id_i64,
-            ) {
+            )
+            .await
+            {
                 Ok(Some(checkpoint)) => checkpoint,
                 Ok(None) => return robot_checkpoint_not_found(checkpoint_id, elapsed_ms),
                 Err(err) => {
@@ -22119,7 +22219,7 @@ async fn handle_robot_checkpoint_command(
             };
 
             let restore_options = SnapshotRestoreWorkflowOptions {
-                layout_only: false,
+                layout_only: true,
                 launch_agents: false,
                 wezterm_timeout_secs: config.cli.timeout_seconds,
             };
@@ -22314,20 +22414,23 @@ fn build_session_show_json_payload(
 }
 
 async fn restore_snapshot_checkpoint(
+    restore_cx: &frankenterm_core::cx::Cx,
     db_path: &str,
     checkpoint_id: i64,
     wezterm_timeout_secs: u64,
-    layout_only: bool,
+    _layout_only: bool,
     process_relaunch: &frankenterm_core::config::ProcessRelaunchConfig,
     launch_agents: bool,
 ) -> anyhow::Result<frankenterm_core::session_restore::RestoreSummary> {
     use frankenterm_core::session_restore::{
-        SessionRestoreConfig, SessionRestorer, load_checkpoint_by_id, show_session,
+        SessionRestoreConfig, SessionRestorer, load_checkpoint_by_id_with_cx,
+        show_session_with_cx,
     };
 
-    let checkpoint = load_checkpoint_by_id(db_path, checkpoint_id)?
+    let checkpoint = load_checkpoint_by_id_with_cx(restore_cx, db_path, checkpoint_id)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("Snapshot {checkpoint_id} not found"))?;
-    let (session, _) = show_session(db_path, &checkpoint.session_id)?;
+    let (session, _) = show_session_with_cx(restore_cx, db_path, &checkpoint.session_id).await?;
     let wezterm = frankenterm_core::wezterm::wezterm_handle_with_timeout(wezterm_timeout_secs);
     let mut process_relaunch_cfg: frankenterm_core::restore_process::LaunchConfig =
         process_relaunch.clone().into();
@@ -22337,17 +22440,17 @@ async fn restore_snapshot_checkpoint(
     let restorer = SessionRestorer::new(
         Arc::new(db_path.to_string()),
         SessionRestoreConfig {
-            restore_scrollback: !layout_only,
+            // Historical terminal output cannot be restored through PTY input.
+            // Keep this fail-safe even if a stale caller passes layout_only=false.
+            restore_scrollback: false,
             process_relaunch: process_relaunch_cfg,
             ..SessionRestoreConfig::default()
         },
     );
 
     // ft-xbnl0.2.3 tick 268: cx-first session restore.
-    let restore_cx =
-        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     restorer
-        .restore_with_cx(&restore_cx, &session, &checkpoint, wezterm)
+        .restore_with_cx(restore_cx, &session, &checkpoint, wezterm)
         .await
         .map_err(|e| anyhow::anyhow!("Restore failed: {e}"))
 }
@@ -22369,48 +22472,132 @@ fn snapshot_trigger_from_cli_label(
     }
 }
 
+const SCROLLBACK_REPLAY_DISABLED_REASON: &str =
+    "disabled because the mux API has no safe terminal-output restoration channel";
+
+fn scrollback_replay_invariant_holds(
+    summary: &frankenterm_core::session_restore::RestoreSummary,
+) -> bool {
+    summary.scrollback_result.is_none() && summary.scrollback_error.is_none()
+}
+
 fn restore_scrollback_json(
     summary: &frankenterm_core::session_restore::RestoreSummary,
-    enabled: bool,
 ) -> serde_json::Value {
-    let mut payload = serde_json::json!({
-        "enabled": enabled,
-        "restored_panes": summary.scrollback_restored_count(),
-        "failed_panes": summary.scrollback_failed_count(),
-        "skipped_panes": summary.scrollback_skipped_count(),
-        "bytes_written": summary.scrollback_bytes_written(),
-    });
+    serde_json::json!({
+        "enabled": false,
+        "reason": SCROLLBACK_REPLAY_DISABLED_REASON,
+        "invariant_violation": !scrollback_replay_invariant_holds(summary),
+        "restored_panes": 0,
+        "failed_panes": 0,
+        "skipped_panes": 0,
+        "bytes_written": 0,
+    })
+}
 
-    if let Some(error) = &summary.scrollback_error
-        && let Some(object) = payload.as_object_mut()
-    {
-        object.insert("error".to_string(), serde_json::json!(error));
+fn process_relaunch_summary_json(
+    summary: &frankenterm_core::session_restore::RestoreSummary,
+) -> serde_json::Value {
+    summary.process_launch_report.as_ref().map_or_else(
+        || {
+            serde_json::json!({
+                "evaluated": false,
+                "settled_plans": 0,
+                "shells_launched": 0,
+                "agents_launched": 0,
+                "manual": 0,
+                "skipped": 0,
+                "failed": 0,
+                "interrupted": false,
+            })
+        },
+        |report| {
+            serde_json::json!({
+                "evaluated": true,
+                "settled_plans": report.results.len(),
+                "shells_launched": report.shells_launched,
+                "agents_launched": report.agents_launched,
+                "manual": report.manual,
+                "skipped": report.skipped,
+                "failed": report.failed,
+                "interrupted": report.interruption.is_some(),
+            })
+        },
+    )
+}
+
+fn restore_completed_successfully(
+    summary: &frankenterm_core::session_restore::RestoreSummary,
+) -> bool {
+    summary.source_marked_clean
+        && summary.intent_checkpoint_id > summary.checkpoint_id
+        && summary.outcome_checkpoint_id > summary.intent_checkpoint_id
+        && summary.failed_count() == 0
+        && summary.layout_result.failed_panes.is_empty()
+        && scrollback_replay_invariant_holds(summary)
+        && summary.process_launch_report.as_ref().is_none_or(|report| {
+            use frankenterm_core::restore_process::LaunchAction;
+
+            let mut expected_shells = 0usize;
+            let mut expected_agents = 0usize;
+            let mut expected_manual = 0usize;
+            let mut expected_skipped = 0usize;
+            let mut expected_failed = 0usize;
+            for result in &report.results {
+                if result.success {
+                    if result.error.is_some() {
+                        return false;
+                    }
+                    match &result.action {
+                        LaunchAction::LaunchShell { .. } => expected_shells += 1,
+                        LaunchAction::LaunchAgent { .. } => expected_agents += 1,
+                        LaunchAction::Manual { .. } => expected_manual += 1,
+                        LaunchAction::Skip { .. } => expected_skipped += 1,
+                    }
+                } else {
+                    if result.error.is_none() {
+                        return false;
+                    }
+                    expected_failed += 1;
+                }
+            }
+
+            report.interruption.is_none()
+                && expected_failed == 0
+                && report.shells_launched == expected_shells
+                && report.agents_launched == expected_agents
+                && report.manual == expected_manual
+                && report.skipped == expected_skipped
+                && report.failed == expected_failed
+        })
+}
+
+fn print_process_relaunch_summary(
+    summary: &frankenterm_core::session_restore::RestoreSummary,
+) {
+    if let Some(report) = summary.process_launch_report.as_ref() {
+        println!(
+            "Process relaunch: {} settled plans; {} shells, {} agents, {} manual, {} skipped, {} failed, interrupted={}",
+            report.results.len(),
+            report.shells_launched,
+            report.agents_launched,
+            report.manual,
+            report.skipped,
+            report.failed,
+            report.interruption.is_some(),
+        );
     }
-
-    payload
 }
 
 fn print_scrollback_restore_summary(
     summary: &frankenterm_core::session_restore::RestoreSummary,
-    enabled: bool,
 ) {
-    if !enabled {
-        println!("Scrollback replay skipped (--layout-only).");
-        return;
+    println!("Scrollback replay {SCROLLBACK_REPLAY_DISABLED_REASON}.");
+    if !scrollback_replay_invariant_holds(summary) {
+        eprintln!(
+            "Restore returned unexpected scrollback replay evidence; treating the result as incomplete."
+        );
     }
-
-    if let Some(error) = &summary.scrollback_error {
-        println!("Scrollback replay unavailable: {error}");
-        return;
-    }
-
-    println!(
-        "Scrollback replay: {} restored, {} failed, {} skipped, {} bytes",
-        summary.scrollback_restored_count(),
-        summary.scrollback_failed_count(),
-        summary.scrollback_skipped_count(),
-        summary.scrollback_bytes_written(),
-    );
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -22435,6 +22622,10 @@ fn snapshot_restore_dry_run_json(
             "pane_count": checkpoint.pane_count,
         },
         "layout_only": options.layout_only,
+        "scrollback_replay": {
+            "enabled": false,
+            "reason": SCROLLBACK_REPLAY_DISABLED_REASON,
+        },
         "launch_agents": options.launch_agents,
     })
 }
@@ -22452,6 +22643,7 @@ fn snapshot_restore_plan_lines(
         ),
         format!("  Pane count: {}", checkpoint.pane_count),
         format!("  layout_only={}", options.layout_only),
+        format!("  Scrollback replay: {SCROLLBACK_REPLAY_DISABLED_REASON}"),
         format!("  launch_agents={}", options.launch_agents),
         "Dry-run requested; no actions were executed.".to_string(),
     ]
@@ -22487,6 +22679,7 @@ impl SnapshotRestoreAbort {
 fn snapshot_restore_abort_json(abort: &SnapshotRestoreAbort) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "ok": false,
+        "complete": false,
         "phase": abort.phase,
         "checkpoint_id": abort.checkpoint_id,
         "error": abort.error,
@@ -22511,17 +22704,24 @@ struct SnapshotRestoreWorkflowResult {
 #[cfg(unix)]
 fn snapshot_restore_result_json(result: &SnapshotRestoreWorkflowResult) -> serde_json::Value {
     let summary = &result.summary;
+    let complete = restore_completed_successfully(summary);
 
     serde_json::json!({
-        "ok": true,
+        "ok": complete,
+        "phase": if complete { "complete" } else { "restore_partial" },
         "checkpoint_id": summary.checkpoint_id,
+        "intent_checkpoint_id": summary.intent_checkpoint_id,
+        "outcome_checkpoint_id": summary.outcome_checkpoint_id,
         "session_id": summary.session_id,
         "layout_only": result.layout_only,
         "restored_panes": summary.restored_count(),
         "failed_panes": summary.failed_count(),
         "total_panes": summary.total_count(),
+        "complete": complete,
+        "source_marked_clean": summary.source_marked_clean,
         "elapsed_ms": summary.elapsed_ms,
-        "scrollback": restore_scrollback_json(summary, !result.layout_only),
+        "scrollback": restore_scrollback_json(summary),
+        "process_relaunch": process_relaunch_summary_json(summary),
     })
 }
 
@@ -22540,14 +22740,30 @@ fn print_snapshot_restore_abort_plain(abort: &SnapshotRestoreAbort) {
 fn print_snapshot_restore_result_plain(result: &SnapshotRestoreWorkflowResult) {
     let summary = &result.summary;
 
+    let status = if restore_completed_successfully(summary) {
+        "complete"
+    } else {
+        "partial; reconciliation required"
+    };
     println!(
-        "Snapshot restore complete: {}/{} panes in {}ms (checkpoint #{})",
+        "Snapshot restore {status}: {}/{} panes in {}ms (checkpoint #{})",
         summary.restored_count(),
         summary.total_count(),
         summary.elapsed_ms,
         summary.checkpoint_id
     );
-    print_scrollback_restore_summary(summary, !result.layout_only);
+    print_scrollback_restore_summary(summary);
+    print_process_relaunch_summary(summary);
+    println!(
+        "Restore receipts: intent #{}; outcome #{}",
+        summary.intent_checkpoint_id, summary.outcome_checkpoint_id
+    );
+    if !restore_completed_successfully(summary) {
+        eprintln!(
+            "Restore did not settle cleanly. Inspect `ft session show {}` and `ft session doctor`; do not blindly replay while a durable restore intent may remain unresolved.",
+            summary.session_id,
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -22562,9 +22778,17 @@ where
             Output = anyhow::Result<frankenterm_core::session_restore::RestoreSummary>,
         >,
 {
+    let options = SnapshotRestoreWorkflowOptions {
+        layout_only: true,
+        ..options
+    };
     let summary = restore_snapshot(checkpoint_id, options.layout_only, options.launch_agents)
         .await
-        .map_err(|error| SnapshotRestoreAbort::new("restore", checkpoint_id, error))?;
+        .map_err(|error| {
+            SnapshotRestoreAbort::new("restore", checkpoint_id, error).with_hint(format!(
+                "Inspect `ft snapshot inspect {checkpoint_id}` and `ft session doctor`; do not blindly retry while a durable restore intent may be unresolved."
+            ))
+        })?;
 
     Ok(SnapshotRestoreWorkflowResult {
         summary,
@@ -22579,17 +22803,27 @@ async fn execute_snapshot_restore_workflow(
     process_relaunch: &frankenterm_core::config::ProcessRelaunchConfig,
     options: SnapshotRestoreWorkflowOptions,
 ) -> Result<SnapshotRestoreWorkflowResult, SnapshotRestoreAbort> {
-    let _restart_lock = acquire_restart_operation_lock(db_path).map_err(|error| {
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let lock_db_path = db_path.to_string();
+    let restart_lock = run_cli_blocking_with_cx(
+        &cx,
+        "snapshot restore operation-lock acquisition",
+        move || acquire_restart_operation_lock(&lock_db_path),
+    )
+    .await
+    .map_err(|error| {
         SnapshotRestoreAbort::new("preflight", checkpoint_id, error)
             .with_hint("Wait for the other snapshot restore or restart to finish, then retry.")
     })?;
 
     let wezterm_timeout_secs = options.wezterm_timeout_secs;
-    execute_snapshot_restore_post_preflight(
+    let restore_cx = cx.clone();
+    let workflow_result = execute_snapshot_restore_post_preflight(
         checkpoint_id,
         options,
         move |checkpoint_id, layout_only, launch_agents| async move {
             restore_snapshot_checkpoint(
+                &restore_cx,
                 db_path,
                 checkpoint_id,
                 wezterm_timeout_secs,
@@ -22600,7 +22834,23 @@ async fn execute_snapshot_restore_workflow(
             .await
         },
     )
-    .await
+    .await;
+    let release_result = release_restart_operation_lock(restart_lock).await;
+    match (workflow_result, release_result) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(error)) => Err(SnapshotRestoreAbort::new(
+            "finalize",
+            checkpoint_id,
+            format!("restore settled, but operation-lock cleanup failed: {error}"),
+        )
+        .with_hint("Inspect session state before retrying the restore.")),
+        (Err(mut abort), Err(error)) => {
+            abort.error.push_str(&format!(
+                "; operation-lock cleanup also failed: {error}"
+            ));
+            Err(abort)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -22625,24 +22875,19 @@ impl RestartWorkflowOptions {
 
 #[cfg(unix)]
 fn restart_snapshot_capture_options(
-    options: RestartWorkflowOptions,
+    _options: RestartWorkflowOptions,
 ) -> frankenterm_core::snapshot_engine::SnapshotCaptureOptions {
-    // A normal restart restores bounded scrollback from durable
-    // `output_segments`, so it needs a checkpoint-local max-sequence ref.
-    // `--layout-only` explicitly disables that restore phase; avoid the
-    // per-pane aggregate scans over long-running output histories there.
-    let include_scrollback = !options.layout_only;
+    // Historical terminal output cannot be reconstructed through PTY input.
+    // Avoid the per-pane output-history scans until the mux owns a dedicated,
+    // safe render-state restoration channel.
+    let include_scrollback = false;
     frankenterm_core::snapshot_engine::SnapshotCaptureOptions {
         include_scrollback,
         metadata: Some(serde_json::json!({
             "operation": "pre_restart",
             "recovery_state": "unclean_until_restart_outcome",
             "include_scrollback": include_scrollback,
-            "scrollback_ref_policy": if include_scrollback {
-                "linked_for_bounded_restore"
-            } else {
-                "omitted_for_layout_only"
-            },
+            "scrollback_ref_policy": "omitted_no_safe_output_channel",
         })),
     }
 }
@@ -22657,6 +22902,10 @@ fn restart_dry_run_json(options: RestartWorkflowOptions) -> serde_json::Value {
             "start_timeout_secs": options.start_timeout_secs,
             "skip_restore": options.skip_restore,
             "layout_only": options.layout_only,
+            "scrollback_replay": {
+                "enabled": false,
+                "reason": SCROLLBACK_REPLAY_DISABLED_REASON,
+            },
             "launch_agents": options.launch_agents,
         },
         "version": frankenterm_core::VERSION,
@@ -22682,6 +22931,9 @@ fn restart_plan_lines(options: RestartWorkflowOptions) -> Vec<String> {
         lines.push(format!(
             "  4. Restore from captured snapshot (layout_only={}, launch_agents={})",
             options.layout_only, options.launch_agents
+        ));
+        lines.push(format!(
+            "     Scrollback replay: {SCROLLBACK_REPLAY_DISABLED_REASON}"
         ));
     }
     lines.push("Dry-run requested; no actions were executed.".to_string());
@@ -22753,6 +23005,7 @@ impl RestartWorkflowAbort {
 fn restart_abort_json(abort: &RestartWorkflowAbort) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "ok": false,
+        "complete": false,
         "phase": abort.phase,
         "error": &abort.error,
     });
@@ -22789,8 +23042,13 @@ fn restart_restore_summary_json(
     serde_json::json!({
         "session_id": summary.session_id,
         "checkpoint_id": summary.checkpoint_id,
+        "intent_checkpoint_id": summary.intent_checkpoint_id,
+        "outcome_checkpoint_id": summary.outcome_checkpoint_id,
         "restored_panes": summary.restored_count(),
         "failed_panes": summary.failed_count(),
+        "complete": restore_completed_successfully(summary),
+        "source_marked_clean": summary.source_marked_clean,
+        "process_relaunch": process_relaunch_summary_json(summary),
         "elapsed_ms": summary.elapsed_ms,
     })
 }
@@ -22816,11 +23074,11 @@ enum RestartWorkflowResult {
 
 #[cfg(unix)]
 impl RestartWorkflowResult {
-    fn layout_only(&self) -> bool {
+    fn completed_successfully(&self) -> bool {
         match self {
-            Self::SkippedRestore { layout_only, .. }
-            | Self::Restored { layout_only, .. }
-            | Self::RestoreFailed { layout_only, .. } => *layout_only,
+            Self::SkippedRestore { .. } => true,
+            Self::Restored { summary, .. } => restore_completed_successfully(summary),
+            Self::RestoreFailed { .. } => false,
         }
     }
 }
@@ -22833,8 +23091,10 @@ fn restart_result_json(result: &RestartWorkflowResult) -> serde_json::Value {
             layout_only,
         } => serde_json::json!({
             "ok": true,
+            "complete": true,
             "phase": "complete",
             "restored": false,
+            "restore_attempted": false,
             "skip_restore": true,
             "layout_only": layout_only,
             "snapshot": restart_snapshot_json(snapshot, true),
@@ -22843,27 +23103,37 @@ fn restart_result_json(result: &RestartWorkflowResult) -> serde_json::Value {
             snapshot,
             summary,
             layout_only,
-        } => serde_json::json!({
-            "ok": true,
-            "phase": "complete",
-            "restored": true,
-            "layout_only": layout_only,
-            "snapshot": restart_snapshot_json(snapshot, true),
-            "restore": restart_restore_summary_json(summary),
-            "scrollback": restore_scrollback_json(summary, !layout_only),
-        }),
+        } => {
+            let complete = restore_completed_successfully(summary);
+            serde_json::json!({
+                "ok": complete,
+                "phase": if complete { "complete" } else { "restore_partial" },
+                "complete": complete,
+                "restored": complete,
+                "restore_attempted": true,
+                "layout_only": layout_only,
+                "snapshot": restart_snapshot_json(snapshot, true),
+                "restore": restart_restore_summary_json(summary),
+                "scrollback": restore_scrollback_json(summary),
+            })
+        }
         RestartWorkflowResult::RestoreFailed {
             snapshot,
             error,
             layout_only,
         } => serde_json::json!({
-            "ok": true,
+            "ok": false,
+            "complete": false,
             "phase": "restore_failed",
             "restored": false,
+            "restore_attempted": true,
             "layout_only": layout_only,
             "error": error,
             "snapshot": restart_snapshot_json(snapshot, false),
-            "hint": "Mux restarted. Run `ft snapshot restore <checkpoint_id>` to retry restore.",
+            "hint": format!(
+                "Mux restarted, but restore did not settle. Inspect `ft session show {}` and `ft session doctor`; do not blindly replay while a durable restore intent may remain unresolved.",
+                snapshot.session_id
+            ),
         }),
     }
 }
@@ -22908,20 +23178,42 @@ fn print_restart_result_plain(result: &RestartWorkflowResult) {
             );
         }
         RestartWorkflowResult::Restored { summary, .. } => {
+            let status = if restore_completed_successfully(summary) {
+                "complete"
+            } else {
+                "partial; reconciliation required"
+            };
             println!(
-                "Restart complete: restored {}/{} panes in {}ms (checkpoint #{})",
+                "Restart {status}: restored {}/{} panes in {}ms (checkpoint #{})",
                 summary.restored_count(),
                 summary.total_count(),
                 summary.elapsed_ms,
                 summary.checkpoint_id
             );
-            print_scrollback_restore_summary(summary, !result.layout_only());
+            print_scrollback_restore_summary(summary);
+            print_process_relaunch_summary(summary);
+            println!(
+                "Restore receipts: intent #{}; outcome #{}",
+                summary.intent_checkpoint_id, summary.outcome_checkpoint_id
+            );
+            if !restore_completed_successfully(summary) {
+                eprintln!(
+                    "Inspect `ft session show {}` and `ft session doctor`; do not blindly replay while a durable restore intent may remain unresolved.",
+                    summary.session_id,
+                );
+            }
         }
         RestartWorkflowResult::RestoreFailed {
             snapshot, error, ..
         } => {
             eprintln!("Mux restarted, but restore failed: {error}");
-            eprintln!("Retry with: ft snapshot restore {}", snapshot.checkpoint_id);
+            eprintln!(
+                "Inspect with: ft session show {}  (checkpoint {})",
+                snapshot.session_id, snapshot.checkpoint_id
+            );
+            eprintln!(
+                "Also run `ft session doctor`; do not blindly replay while a durable restore intent may remain unresolved."
+            );
         }
     }
 }
@@ -22957,6 +23249,10 @@ where
             Output = anyhow::Result<frankenterm_core::session_restore::RestoreSummary>,
         >,
 {
+    let options = RestartWorkflowOptions {
+        layout_only: true,
+        ..options
+    };
     let snapshot = capture_snapshot()
         .await
         .map_err(|error| RestartWorkflowAbort::new("snapshot", error))?;
@@ -23013,93 +23309,139 @@ async fn execute_restart_workflow(
 ) -> Result<RestartWorkflowResult, RestartWorkflowAbort> {
     use frankenterm_core::snapshot_engine::{SnapshotEngine, SnapshotTrigger};
 
-    let _restart_lock = acquire_restart_operation_lock(db_path).map_err(|error| {
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let lock_db_path = db_path.to_string();
+    let restart_lock = run_cli_blocking_with_cx(
+        &cx,
+        "restart operation-lock acquisition",
+        move || acquire_restart_operation_lock(&lock_db_path),
+    )
+    .await
+    .map_err(|error| {
         RestartWorkflowAbort::new("preflight", error)
             .with_hint("Wait for the other snapshot restore or restart to finish, then retry.")
     })?;
 
-    let snapshot_engine = Arc::new(SnapshotEngine::new(
-        Arc::new(db_path.to_string()),
-        snapshot_config.clone(),
-    ));
-    let wezterm =
-        frankenterm_core::wezterm::wezterm_handle_with_timeout(options.wezterm_timeout_secs);
+    let workflow_result: Result<RestartWorkflowResult, RestartWorkflowAbort> = async {
+        let snapshot_engine = Arc::new(SnapshotEngine::new(
+            Arc::new(db_path.to_string()),
+            snapshot_config.clone(),
+        ));
+        let wezterm = frankenterm_core::wezterm::wezterm_handle_with_timeout(
+            options.wezterm_timeout_secs,
+        );
 
-    // ft-xbnl0.2.3 tick 230: cx-first wezterm list_panes.
-    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-    let panes = wezterm.list_panes_with_cx(&cx).await.map_err(|error| {
-        RestartWorkflowAbort::new("preflight", format!("Failed to list panes: {error}"))
-    })?;
-    let existing_mux_pids =
-        mux_server_pids().map_err(|error| RestartWorkflowAbort::new("preflight", error))?;
-    validate_restart_preflight(&existing_mux_pids, panes.len())
-        .map_err(|error| RestartWorkflowAbort::new("preflight", error))?;
-
-    let process_relaunch = snapshot_config.process_relaunch.clone();
-    let wezterm_timeout_secs = options.wezterm_timeout_secs;
-    let capture_options = restart_snapshot_capture_options(options);
-    let capture_engine = Arc::clone(&snapshot_engine);
-    let result = execute_restart_post_preflight(
-        options,
-        move || async move {
-            // ft-xbnl0.2.3 tick 273: cx-first snapshot capture.
-            let snapshot_cx = frankenterm_core::cx::Cx::current()
-                .unwrap_or_else(frankenterm_core::cx::for_request);
-            capture_engine
-                .capture_with_options_with_cx(
-                    &snapshot_cx,
-                    &panes,
-                    SnapshotTrigger::Manual,
-                    capture_options,
-                )
-                .await
-                .map_err(anyhow::Error::from)
-        },
-        stop_mux_server_processes,
-        |start_timeout, wezterm_timeout_secs| async move {
-            start_mux_server_process(start_timeout, wezterm_timeout_secs)
-                .await
-                .map(|_| ())
-        },
-        move |checkpoint_id, layout_only, launch_agents| {
-            let process_relaunch = process_relaunch.clone();
-            async move {
-                restore_snapshot_checkpoint(
-                    db_path,
-                    checkpoint_id,
-                    wezterm_timeout_secs,
-                    layout_only,
-                    &process_relaunch,
-                    launch_agents,
-                )
-                .await
-            }
-        },
-    )
-    .await?;
-
-    if let RestartWorkflowResult::SkippedRestore { snapshot, .. } = &result {
-        let close_cx = frankenterm_core::cx::Cx::current()
-            .unwrap_or_else(frankenterm_core::cx::for_request);
-        snapshot_engine
-            .close_after_checkpoint_with_cx(&close_cx, snapshot)
+        let panes = wezterm.list_panes_with_cx(&cx).await.map_err(|error| {
+            RestartWorkflowAbort::new("preflight", format!("Failed to list panes: {error}"))
+        })?;
+        let existing_mux_pids = mux_server_pids_with_cx(&cx, CLI_PROCESS_HELPER_TIMEOUT)
             .await
-            .map_err(|error| {
-                RestartWorkflowAbort::new(
-                    "finalize",
-                    format!(
-                        "mux restarted and restore was explicitly skipped, but checkpoint {} could not be marked clean: {error}",
-                        snapshot.checkpoint_id
-                    ),
-                )
-                .with_snapshot(snapshot)
-                .with_hint(
-                    "The pre-restart checkpoint remains recovery-eligible; reconcile it before retrying.",
-                )
-            })?;
-    }
+            .map_err(|error| RestartWorkflowAbort::new("preflight", error))?;
+        validate_restart_preflight(&existing_mux_pids, panes.len())
+            .map_err(|error| RestartWorkflowAbort::new("preflight", error))?;
 
-    Ok(result)
+        let process_relaunch = snapshot_config.process_relaunch.clone();
+        let wezterm_timeout_secs = options.wezterm_timeout_secs;
+        let capture_options = restart_snapshot_capture_options(options);
+        let capture_engine = Arc::clone(&snapshot_engine);
+        let capture_cx = cx.clone();
+        let result = execute_restart_post_preflight(
+            options,
+            move || async move {
+                capture_engine
+                    .capture_with_options_with_cx(
+                        &capture_cx,
+                        &panes,
+                        SnapshotTrigger::Manual,
+                        capture_options,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)
+            },
+            {
+                let stop_cx = cx.clone();
+                move |stop_timeout| async move {
+                    stop_mux_server_processes_with_cx(&stop_cx, stop_timeout).await
+                }
+            },
+            {
+                let start_cx = cx.clone();
+                move |start_timeout, wezterm_timeout_secs| async move {
+                    start_mux_server_process_with_cx(
+                        &start_cx,
+                        start_timeout,
+                        wezterm_timeout_secs,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            },
+            {
+                let restore_cx = cx.clone();
+                move |checkpoint_id, layout_only, launch_agents| {
+                    let process_relaunch = process_relaunch.clone();
+                    async move {
+                        restore_snapshot_checkpoint(
+                            &restore_cx,
+                            db_path,
+                            checkpoint_id,
+                            wezterm_timeout_secs,
+                            layout_only,
+                            &process_relaunch,
+                            launch_agents,
+                        )
+                        .await
+                    }
+                }
+            },
+        )
+        .await?;
+
+        if let RestartWorkflowResult::SkippedRestore { snapshot, .. } = &result {
+            snapshot_engine
+                .close_after_checkpoint_with_cx(&cx, snapshot)
+                .await
+                .map_err(|error| {
+                    RestartWorkflowAbort::new(
+                        "finalize",
+                        format!(
+                            "mux restarted and restore was explicitly skipped, but checkpoint {} could not be marked clean: {error}",
+                            snapshot.checkpoint_id
+                        ),
+                    )
+                    .with_snapshot(snapshot)
+                    .with_hint(
+                        "The pre-restart checkpoint remains recovery-eligible; reconcile it before retrying.",
+                    )
+                })?;
+        }
+
+        Ok(result)
+    }
+    .await;
+    let release_result = release_restart_operation_lock(restart_lock).await;
+    match (workflow_result, release_result) {
+        (result, Ok(())) => result,
+        (Ok(result), Err(error)) => {
+            let snapshot = match &result {
+                RestartWorkflowResult::SkippedRestore { snapshot, .. }
+                | RestartWorkflowResult::Restored { snapshot, .. }
+                | RestartWorkflowResult::RestoreFailed { snapshot, .. } => snapshot,
+            };
+            Err(RestartWorkflowAbort::new(
+                "finalize",
+                format!("restart settled, but operation-lock cleanup failed: {error}"),
+            )
+            .with_snapshot(snapshot)
+            .with_hint("Inspect the saved snapshot and live mux state before retrying."))
+        }
+        (Err(mut abort), Err(error)) => {
+            abort.error.push_str(&format!(
+                "; operation-lock cleanup also failed: {error}"
+            ));
+            Err(abort)
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -23139,6 +23481,20 @@ fn acquire_restart_operation_lock(
 }
 
 #[cfg(unix)]
+async fn release_restart_operation_lock(
+    lock: frankenterm_core::lock::WatcherLock,
+) -> anyhow::Result<()> {
+    // Cleanup must get an independent chance to release the file lock even if
+    // the caller's operation context was cancelled after a durable mutation.
+    let cleanup_cx = frankenterm_core::cx::for_request();
+    run_cli_blocking_with_cx(&cleanup_cx, "restart operation-lock cleanup", move || {
+        drop(lock);
+        Ok(())
+    })
+    .await
+}
+
+#[cfg(unix)]
 fn validate_restart_preflight(mux_server_pids: &[i32], pane_count: usize) -> anyhow::Result<()> {
     if mux_server_pids.is_empty() {
         return Err(anyhow::anyhow!(
@@ -23154,11 +23510,90 @@ fn validate_restart_preflight(mux_server_pids: &[i32], pane_count: usize) -> any
 }
 
 #[cfg(unix)]
-fn mux_server_pids() -> anyhow::Result<Vec<i32>> {
-    let output = std::process::Command::new("pgrep")
-        .args(["-f", "frankenterm-mux-server"])
-        .output()?;
+const CLI_PROCESS_HELPER_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[cfg(unix)]
+// Match the executable basename at argv[0], not arbitrary command-line text
+// that merely mentions the server name.
+const MUX_SERVER_PGREP_PATTERN: &str =
+    r"^([^[:space:]]*/)?frankenterm-mux-server([[:space:]]|$)";
+
+#[cfg(unix)]
+const MAX_MUX_SERVER_TARGETS: usize = 64;
+
+#[cfg(unix)]
+const MAX_MUX_PROCESS_DISCOVERY_BYTES: usize = 4096;
+
+#[cfg(unix)]
+fn mux_process_remaining(deadline: Instant, phase: &str) -> anyhow::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(anyhow::anyhow!(
+            "Mux restart timeout elapsed before {phase}"
+        ))
+    } else {
+        Ok(remaining)
+    }
+}
+
+#[cfg(unix)]
+fn bounded_process_stderr(output: &std::process::Output) -> String {
+    let bounded_stderr = &output.stderr[..output.stderr.len().min(4096)];
+    redact_single_line_for_output(&String::from_utf8_lossy(bounded_stderr))
+        .chars()
+        .take(512)
+        .collect()
+}
+
+#[cfg(unix)]
+async fn run_bounded_cli_process_with_cx(
+    cx: &frankenterm_core::cx::Cx,
+    operation: &'static str,
+    timeout: Duration,
+    mut command: frankenterm_core::runtime_async::process::Command,
+) -> anyhow::Result<std::process::Output> {
+    cx.checkpoint()
+        .map_err(|error| anyhow::anyhow!("{operation} cancelled before launch: {error}"))?;
+    if timeout.is_zero() {
+        return Err(anyhow::anyhow!(
+            "{operation} has no remaining execution budget"
+        ));
+    }
+
+    command.kill_on_drop(true);
+    match frankenterm_core::runtime_async::timeout_with_cx(
+        cx,
+        timeout,
+        command.output_with_cx(cx),
+    )
+    .await
+    {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => {
+            if let Err(cancelled) = cx.checkpoint() {
+                Err(anyhow::anyhow!(
+                    "{operation} cancelled while running: {cancelled}"
+                ))
+            } else {
+                Err(anyhow::anyhow!("{operation} failed: {error}"))
+            }
+        }
+        Err(error) => {
+            if let Err(cancelled) = cx.checkpoint() {
+                Err(anyhow::anyhow!(
+                    "{operation} cancelled while running: {cancelled}"
+                ))
+            } else {
+                Err(anyhow::anyhow!(
+                    "{operation} exceeded its {timeout:?} execution budget: {error}"
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn parse_mux_server_pids(output: &std::process::Output) -> anyhow::Result<Vec<i32>> {
     // pgrep returns 1 when no processes matched.
     if output.status.code() == Some(1) {
         return Ok(Vec::new());
@@ -23167,22 +23602,110 @@ fn mux_server_pids() -> anyhow::Result<Vec<i32>> {
         return Err(anyhow::anyhow!(
             "pgrep failed with status {:?}: {}",
             output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
+            bounded_process_stderr(output)
+        ));
+    }
+    if output.stdout.len() > MAX_MUX_PROCESS_DISCOVERY_BYTES {
+        return Err(anyhow::anyhow!(
+            "pgrep output exceeded the {MAX_MUX_PROCESS_DISCOVERY_BYTES}-byte safety bound"
         ));
     }
 
-    let mut pids: Vec<i32> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse::<i32>().ok())
-        .collect();
-    pids.sort_unstable();
-    pids.dedup();
-    Ok(pids)
+    let mut pids = BTreeSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let pid = line
+            .parse::<i32>()
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| anyhow::anyhow!("pgrep returned a malformed process identifier"))?;
+        pids.insert(pid);
+        if pids.len() > MAX_MUX_SERVER_TARGETS {
+            return Err(anyhow::anyhow!(
+                "Refusing to operate on more than {MAX_MUX_SERVER_TARGETS} mux-server processes"
+            ));
+        }
+    }
+    Ok(pids.into_iter().collect())
 }
 
 #[cfg(unix)]
-async fn stop_mux_server_processes(stop_timeout: Duration) -> anyhow::Result<Vec<i32>> {
-    let initial_pids = mux_server_pids()?;
+async fn mux_server_pids_with_cx(
+    cx: &frankenterm_core::cx::Cx,
+    timeout: Duration,
+) -> anyhow::Result<Vec<i32>> {
+    let mut command = frankenterm_core::runtime_async::process::Command::new("pgrep");
+    command.args(["-f", MUX_SERVER_PGREP_PATTERN]);
+    let output = run_bounded_cli_process_with_cx(
+        cx,
+        "mux-server process discovery",
+        timeout.min(CLI_PROCESS_HELPER_TIMEOUT),
+        command,
+    )
+    .await?;
+    parse_mux_server_pids(&output)
+}
+
+#[cfg(unix)]
+async fn send_unix_signal_with_cx(
+    cx: &frankenterm_core::cx::Cx,
+    pid: i64,
+    signal: &'static str,
+    operation: &'static str,
+    timeout: Duration,
+) -> anyhow::Result<std::process::Output> {
+    if pid <= 0 {
+        return Err(anyhow::anyhow!(
+            "Refusing to signal invalid process identifier {pid}"
+        ));
+    }
+    if !matches!(signal, "TERM" | "KILL" | "HUP") {
+        return Err(anyhow::anyhow!(
+            "Refusing unsupported Unix signal `{signal}`"
+        ));
+    }
+
+    let pid = pid.to_string();
+    let mut command = frankenterm_core::runtime_async::process::Command::new("/bin/kill");
+    command.args(["-s", signal, pid.as_str()]);
+    run_bounded_cli_process_with_cx(
+        cx,
+        operation,
+        timeout.min(CLI_PROCESS_HELPER_TIMEOUT),
+        command,
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn signal_mux_server_with_cx(
+    cx: &frankenterm_core::cx::Cx,
+    pid: i32,
+    timeout: Duration,
+) -> anyhow::Result<std::process::Output> {
+    send_unix_signal_with_cx(
+        cx,
+        i64::from(pid),
+        "TERM",
+        "mux-server termination signal",
+        timeout,
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn stop_mux_server_processes_with_cx(
+    cx: &frankenterm_core::cx::Cx,
+    stop_timeout: Duration,
+) -> anyhow::Result<Vec<i32>> {
+    let deadline = Instant::now()
+        .checked_add(stop_timeout)
+        .ok_or_else(|| anyhow::anyhow!("mux stop timeout is too large: {stop_timeout:?}"))?;
+    let initial_pids =
+        mux_server_pids_with_cx(cx, mux_process_remaining(deadline, "process discovery")?).await?;
     if initial_pids.is_empty() {
         return Err(anyhow::anyhow!(
             "No running `frankenterm-mux-server` process found"
@@ -23190,97 +23713,133 @@ async fn stop_mux_server_processes(stop_timeout: Duration) -> anyhow::Result<Vec
     }
 
     for pid in &initial_pids {
-        let status = frankenterm_core::runtime_async::process::send_unix_signal_to_pid(
-            i64::from(*pid),
-            "TERM",
-        );
-        if let Ok(s) = status {
-            if !s.success() {
-                tracing::warn!(pid = *pid, "SIGTERM returned non-zero status");
-            }
-        } else if let Err(e) = status {
-            tracing::warn!(pid = *pid, error = %e, "failed to send SIGTERM");
+        let output = signal_mux_server_with_cx(
+            cx,
+            *pid,
+            mux_process_remaining(deadline, "termination signaling")?,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to signal mux-server pid {pid}: {error}"))?;
+        if !output.status.success() {
+            tracing::warn!(
+                pid = *pid,
+                exit_code = ?output.status.code(),
+                stderr = %bounded_process_stderr(&output),
+                "SIGTERM returned non-zero status"
+            );
         }
     }
 
-    let deadline = Instant::now()
-        .checked_add(stop_timeout)
-        .ok_or_else(|| anyhow::anyhow!("mux stop timeout is too large: {stop_timeout:?}"))?;
     loop {
-        let remaining = mux_server_pids()?;
+        let remaining_budget = mux_process_remaining(deadline, "shutdown settlement")?;
+        let remaining = mux_server_pids_with_cx(cx, remaining_budget).await?;
         if remaining.is_empty() {
             return Ok(initial_pids);
         }
-        if Instant::now() >= deadline {
-            return Err(anyhow::anyhow!(
-                "Timed out waiting for mux server shutdown; still running: {:?}",
-                remaining
-            ));
-        }
-        // ft-xbnl0.2.3 tick 283: cx-first mux-shutdown poll sleep.
-        let mux_stop_cx =
-            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-        if frankenterm_core::runtime_async::sleep_with_cx(&mux_stop_cx, Duration::from_millis(200))
+        let sleep_for = mux_process_remaining(deadline, "shutdown polling")?
+            .min(Duration::from_millis(200));
+        frankenterm_core::runtime_async::sleep_with_cx(cx, sleep_for)
             .await
-            .is_err()
-        {
-            return Err(anyhow::anyhow!(
-                "Cx cancelled while waiting for mux server shutdown"
-            ));
-        }
+            .map_err(|error| {
+                anyhow::anyhow!("Mux shutdown cancelled while awaiting settlement: {error}")
+            })?;
     }
 }
 
 #[cfg(unix)]
-async fn wait_for_mux_ready(timeout: Duration, wezterm_timeout_secs: u64) -> anyhow::Result<()> {
+async fn wait_for_mux_ready_with_cx(
+    cx: &frankenterm_core::cx::Cx,
+    timeout: Duration,
+    wezterm_timeout_secs: u64,
+) -> anyhow::Result<()> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| anyhow::anyhow!("mux ready timeout is too large: {timeout:?}"))?;
     let wezterm = frankenterm_core::wezterm::wezterm_handle_with_timeout(wezterm_timeout_secs);
-    // ft-xbnl0.2.3 tick 230: cx-first wezterm list_panes.
-    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
 
     loop {
-        match wezterm.list_panes_with_cx(&cx).await {
-            Ok(_) => return Ok(()),
-            Err(e) => {
+        cx.checkpoint()
+            .map_err(|error| anyhow::anyhow!("Mux readiness wait cancelled: {error}"))?;
+        let attempt_timeout = mux_process_remaining(deadline, "readiness probe")?;
+        match frankenterm_core::runtime_async::timeout_with_cx(
+            cx,
+            attempt_timeout,
+            wezterm.list_panes_with_cx(cx),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(error)) => {
                 if Instant::now() >= deadline {
                     return Err(anyhow::anyhow!(
-                        "Timed out waiting for WezTerm mux readiness; last error: {e}"
+                        "Timed out waiting for FrankenTerm mux readiness; last error: {error}"
                     ));
                 }
             }
+            Err(error) => {
+                cx.checkpoint().map_err(|cancelled| {
+                    anyhow::anyhow!("Mux readiness wait cancelled: {cancelled}")
+                })?;
+                return Err(anyhow::anyhow!(
+                    "Timed out waiting for FrankenTerm mux readiness: {error}"
+                ));
+            }
         }
 
-        // ft-xbnl0.2.3 tick 283: cx-first mux-ready poll sleep (reuse cx binding).
-        if frankenterm_core::runtime_async::sleep_with_cx(&cx, Duration::from_millis(250))
+        let sleep_for = mux_process_remaining(deadline, "readiness polling")?
+            .min(Duration::from_millis(250));
+        frankenterm_core::runtime_async::sleep_with_cx(cx, sleep_for)
             .await
-            .is_err()
-        {
-            return Err(anyhow::anyhow!(
-                "Cx cancelled while waiting for mux server readiness"
-            ));
-        }
+            .map_err(|error| {
+                anyhow::anyhow!("Mux readiness wait cancelled while polling: {error}")
+            })?;
     }
 }
 
 #[cfg(unix)]
-async fn start_mux_server_process(
+async fn start_mux_server_process_with_cx(
+    cx: &frankenterm_core::cx::Cx,
     start_timeout: Duration,
     wezterm_timeout_secs: u64,
 ) -> anyhow::Result<Vec<i32>> {
-    let status = std::process::Command::new("frankenterm-mux-server")
-        .arg("--daemonize")
-        .status()?;
-    if !status.success() {
+    let deadline = Instant::now()
+        .checked_add(start_timeout)
+        .ok_or_else(|| anyhow::anyhow!("mux start timeout is too large: {start_timeout:?}"))?;
+    let mut command =
+        frankenterm_core::runtime_async::process::Command::new("frankenterm-mux-server");
+    command.arg("--daemonize");
+    let output = run_bounded_cli_process_with_cx(
+        cx,
+        "mux-server daemon launch",
+        mux_process_remaining(deadline, "daemon launch")?,
+        command,
+    )
+    .await?;
+    if !output.status.success() {
         return Err(anyhow::anyhow!(
-            "Failed to start `frankenterm-mux-server --daemonize` (exit: {:?})",
-            status.code()
+            "Failed to start `frankenterm-mux-server --daemonize` (exit: {:?}): {}",
+            output.status.code(),
+            bounded_process_stderr(&output)
         ));
     }
 
-    wait_for_mux_ready(start_timeout, wezterm_timeout_secs).await?;
-    mux_server_pids()
+    wait_for_mux_ready_with_cx(
+        cx,
+        mux_process_remaining(deadline, "mux readiness")?,
+        wezterm_timeout_secs,
+    )
+    .await?;
+    let pids = mux_server_pids_with_cx(
+        cx,
+        mux_process_remaining(deadline, "post-start process discovery")?,
+    )
+    .await?;
+    if pids.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Mux reported ready, but no exact `frankenterm-mux-server` process could be identified"
+        ));
+    }
+    Ok(pids)
 }
 
 fn build_prepare_output(
@@ -51141,16 +51700,18 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             if health {
                 // Health check mode: JSON status including runtime health snapshot
                 let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
-                let session_report = layout
-                    .db_path
-                    .exists()
-                    .then(|| {
-                        frankenterm_core::session_restore::session_doctor(
-                            layout.db_path.to_string_lossy().as_ref(),
-                        )
-                        .ok()
-                    })
-                    .flatten();
+                let session_report = if layout.db_path.exists() {
+                    let cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    frankenterm_core::session_restore::session_doctor_with_cx(
+                        &cx,
+                        layout.db_path.to_string_lossy().as_ref(),
+                    )
+                    .await
+                    .ok()
+                } else {
+                    None
+                };
                 let mut payload = serde_json::json!({
                     "status": "ok",
                     "version": frankenterm_core::VERSION,
@@ -53108,11 +53669,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         }
 
         Some(Commands::Stop { force, timeout }) => {
-            use frankenterm_core::lock::check_running;
-
-            let lock_path = &layout.lock_path;
-
-            let Some(meta) = check_running(lock_path) else {
+            let lock_path = layout.lock_path.clone();
+            let Some(meta) = check_watcher_running_with_cx(
+                cx,
+                lock_path.clone(),
+                "watcher-stop preflight",
+            )
+            .await?
+            else {
                 eprintln!("No watcher running in workspace: {}", layout.root.display());
                 std::process::exit(1);
             };
@@ -53124,81 +53688,148 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             {
                 use std::time::{Duration, Instant};
 
-                // Send SIGTERM via the runtime_async process boundary (no unsafe needed).
-                let term_status = frankenterm_core::runtime_async::process::send_unix_signal_to_pid(
-                    i64::from(pid),
-                    "TERM",
-                );
-
-                match term_status {
-                    Ok(s) if s.success() => {}
-                    Ok(s) => {
-                        eprintln!(
-                            "Failed to send SIGTERM to pid {pid} (exit code: {}).",
-                            s.code().unwrap_or(-1)
-                        );
-                        eprintln!("The process may have already exited or belong to another user.");
-                        std::process::exit(1);
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to run kill command: {e}");
-                        std::process::exit(1);
-                    }
-                }
-
-                // Wait for the lock to be released.
                 let Some(deadline) = Instant::now().checked_add(Duration::from_secs(timeout))
                 else {
                     eprintln!("Timeout is too large: {timeout}s.");
                     std::process::exit(1);
                 };
-                // ft-xbnl0.2.3 tick 283: cx-first watcher-stop poll sleep.
-                let watcher_stop_cx = frankenterm_core::cx::Cx::current()
-                    .unwrap_or_else(frankenterm_core::cx::for_request);
+
+                // Signal through the cancellation-aware, bounded async-process boundary.
+                let term_status = send_unix_signal_with_cx(
+                    cx,
+                    i64::from(pid),
+                    "TERM",
+                    "watcher termination signal",
+                    CLI_PROCESS_HELPER_TIMEOUT,
+                )
+                .await;
+
                 let mut stopped = false;
-                while Instant::now() < deadline {
-                    if check_running(lock_path).is_none() {
+                match term_status {
+                    Ok(output) if output.status.success() => {}
+                    Ok(output) => {
+                        if check_watcher_running_with_cx(
+                            cx,
+                            lock_path.clone(),
+                            "watcher-stop signal reconciliation",
+                        )
+                        .await?
+                        .is_none()
+                        {
+                            // The process may have exited between lock discovery and
+                            // signal delivery. Treat only a released lock as success.
+                            stopped = true;
+                        } else {
+                            eprintln!(
+                                "Failed to send SIGTERM to pid {pid} (exit code: {}).",
+                                output.status.code().unwrap_or(-1)
+                            );
+                            eprintln!(
+                                "The process may have already exited or belong to another user."
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to send SIGTERM to pid {pid}: {e}");
+                        std::process::exit(1);
+                    }
+                }
+
+                // Wait for the lock to be released.
+                while !stopped {
+                    if check_watcher_running_with_cx(
+                        cx,
+                        lock_path.clone(),
+                        "watcher-stop settlement check",
+                    )
+                    .await?
+                    .is_none()
+                    {
                         stopped = true;
                         break;
                     }
-                    if frankenterm_core::runtime_async::sleep_with_cx(
-                        &watcher_stop_cx,
-                        Duration::from_millis(200),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        // Cx cancelled during graceful shutdown wait.
+
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
                         break;
                     }
+                    frankenterm_core::runtime_async::sleep_with_cx(
+                        cx,
+                        remaining.min(Duration::from_millis(200)),
+                    )
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "Watcher stop cancelled while waiting for pid {pid}: {error}"
+                        )
+                    })?;
                 }
 
                 if stopped {
                     println!("Watcher stopped gracefully (pid {pid}).");
                 } else if force {
-                    println!("Graceful shutdown timed out. Sending SIGKILL to pid {pid}.");
-                    let kill_status =
-                        frankenterm_core::runtime_async::process::send_unix_signal_to_pid(
-                            i64::from(pid),
-                            "KILL",
+                    let Some(current_meta) = check_watcher_running_with_cx(
+                        cx,
+                        lock_path.clone(),
+                        "watcher force-stop identity check",
+                    )
+                    .await?
+                    else {
+                        println!("Watcher stopped gracefully (pid {pid}).");
+                        return Ok(());
+                    };
+                    if current_meta.pid != meta.pid || current_meta.started_at != meta.started_at {
+                        eprintln!(
+                            "Refusing to send SIGKILL: the watcher lock changed ownership while waiting."
                         );
+                        std::process::exit(1);
+                    }
+
+                    println!("Graceful shutdown timed out. Sending SIGKILL to pid {pid}.");
+                    let kill_status = send_unix_signal_with_cx(
+                        cx,
+                        i64::from(pid),
+                        "KILL",
+                        "watcher force-stop signal",
+                        CLI_PROCESS_HELPER_TIMEOUT,
+                    )
+                    .await;
 
                     match kill_status {
-                        Ok(s) if s.success() => {}
-                        Ok(_) | Err(_) => {
-                            eprintln!("Failed to send SIGKILL to pid {pid}.");
+                        Ok(output) if output.status.success() => {}
+                        Ok(output) => {
+                            eprintln!(
+                                "Failed to send SIGKILL to pid {pid} (exit code: {}).",
+                                output.status.code().unwrap_or(-1)
+                            );
+                            std::process::exit(1);
+                        }
+                        Err(error) => {
+                            eprintln!("Failed to send SIGKILL to pid {pid}: {error}");
                             std::process::exit(1);
                         }
                     }
 
                     // Wait briefly for SIGKILL to take effect.
-                    // ft-xbnl0.2.3 tick 283: cx-first SIGKILL settle wait.
-                    let _ = frankenterm_core::runtime_async::sleep_with_cx(
-                        &watcher_stop_cx,
+                    frankenterm_core::runtime_async::sleep_with_cx(
+                        cx,
                         Duration::from_millis(500),
                     )
-                    .await;
-                    if check_running(lock_path).is_none() {
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "Watcher force-stop cancelled while waiting for pid {pid}: {error}"
+                        )
+                    })?;
+                    if check_watcher_running_with_cx(
+                        cx,
+                        lock_path.clone(),
+                        "watcher force-stop settlement check",
+                    )
+                    .await?
+                    .is_none()
+                    {
                         println!("Watcher killed (pid {pid}).");
                     } else {
                         eprintln!(
@@ -53237,7 +53868,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 stop_timeout_secs: stop_timeout,
                 start_timeout_secs: start_timeout,
                 skip_restore,
-                layout_only,
+                layout_only: {
+                    let _ = layout_only;
+                    true
+                },
                 launch_agents,
                 wezterm_timeout_secs: config.cli.timeout_seconds,
             };
@@ -53278,6 +53912,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     .await
                 {
                     Ok(result) => {
+                        let completed_successfully = result.completed_successfully();
                         if emit_json {
                             println!(
                                 "{}",
@@ -53285,6 +53920,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             );
                         } else {
                             print_restart_result_plain(&result);
+                        }
+                        if !completed_successfully {
+                            std::process::exit(1);
                         }
                     }
                     Err(abort) => {
@@ -56257,16 +56895,21 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             }
             let checks = run_diagnostics(&permission_warnings, &config, &layout);
             let mut all_checks: Vec<DiagnosticCheck> = checks;
-            let session_report = layout
-                .db_path
-                .exists()
-                .then(|| {
-                    frankenterm_core::session_restore::session_doctor(
-                        layout.db_path.to_string_lossy().as_ref(),
-                    )
-                    .ok()
-                })
-                .flatten();
+            let session_report = if layout.db_path.exists() {
+                let cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                frankenterm_core::session_restore::session_doctor_with_cx(
+                    &cx,
+                    layout.db_path.to_string_lossy().as_ref(),
+                )
+                .await
+                .ok()
+            } else {
+                None
+            };
+            if let Some(report) = session_report.as_ref() {
+                all_checks.push(session_recovery_diagnostic_check(report));
+            }
 
             let runtime_snapshot = load_runtime_health_snapshot(&layout).await;
             let swarm_capacity_summary = runtime_snapshot
@@ -68398,6 +69041,7 @@ async fn handle_snapshot_command(
     use std::sync::Arc;
 
     let db_path = Arc::new(layout.db_path.to_string_lossy().to_string());
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
 
     match command {
         SnapshotCommands::Save {
@@ -68413,7 +69057,7 @@ async fn handle_snapshot_command(
             // Get current pane list
             let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
             let panes = wezterm
-                .list_panes()
+                .list_panes_with_cx(&cx)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to list panes: {e}"))?;
 
@@ -68430,11 +69074,9 @@ async fn handle_snapshot_command(
             }
 
             // ft-xbnl0.2.3 tick 273: cx-first snapshot capture (ft snapshot save).
-            let snap_save_cx = frankenterm_core::cx::Cx::current()
-                .unwrap_or_else(frankenterm_core::cx::for_request);
             match engine
                 .capture_with_options_with_cx(
-                    &snap_save_cx,
+                    &cx,
                     &panes,
                     snap_trigger,
                     SnapshotCaptureOptions {
@@ -68451,7 +69093,7 @@ async fn handle_snapshot_command(
             {
                 Ok(result) => {
                     if let Err(error) = engine
-                        .close_after_checkpoint_with_cx(&snap_save_cx, &result)
+                        .close_after_checkpoint_with_cx(&cx, &result)
                         .await
                     {
                         let message = format!(
@@ -68505,47 +69147,52 @@ async fn handle_snapshot_command(
             format,
         } => {
             let output_format = resolve_snapshot_session_output_format(&format);
-            let conn = rusqlite::Connection::open(db_path.as_str())?;
-            let limit_i64 = i64::try_from(limit)
-                .map_err(|_| anyhow::anyhow!("snapshot list limit is too large"))?;
-            let map_row = |row: &rusqlite::Row<'_>| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, String>(7)?,
-                ))
-            };
-            let snapshots = if let Some(ref session_id) = session {
-                let mut stmt = conn.prepare(
-                    "SELECT sc.id, sc.session_id, sc.checkpoint_at,
-                            sc.checkpoint_type, sc.checkpoint_role,
-                            sc.pane_count, sc.total_bytes, sc.state_hash
-                     FROM session_checkpoints AS sc
-                     WHERE sc.session_id = ?1
-                       AND sc.checkpoint_role = 'snapshot'
-                     ORDER BY sc.checkpoint_at DESC, sc.id DESC
-                     LIMIT ?2",
-                )?;
-                stmt.query_map(rusqlite::params![session_id, limit_i64], map_row)?
-                    .collect::<std::result::Result<Vec<_>, _>>()?
-            } else {
-                let mut stmt = conn.prepare(
-                    "SELECT sc.id, sc.session_id, sc.checkpoint_at,
-                            sc.checkpoint_type, sc.checkpoint_role,
-                            sc.pane_count, sc.total_bytes, sc.state_hash
-                     FROM session_checkpoints AS sc
-                     WHERE sc.checkpoint_role = 'snapshot'
-                     ORDER BY sc.checkpoint_at DESC, sc.id DESC
-                     LIMIT ?1",
-                )?;
-                stmt.query_map([limit_i64], map_row)?
-                    .collect::<std::result::Result<Vec<_>, _>>()?
-            };
+            let list_db_path = Arc::clone(&db_path);
+            let snapshots = run_cli_blocking_with_cx(&cx, "snapshot list", move || {
+                let conn = rusqlite::Connection::open(list_db_path.as_str())?;
+                let limit_i64 = i64::try_from(limit)
+                    .map_err(|_| anyhow::anyhow!("snapshot list limit is too large"))?;
+                let map_row = |row: &rusqlite::Row<'_>| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                };
+                if let Some(ref session_id) = session {
+                    let mut stmt = conn.prepare(
+                        "SELECT sc.id, sc.session_id, sc.checkpoint_at,
+                                sc.checkpoint_type, sc.checkpoint_role,
+                                sc.pane_count, sc.total_bytes, sc.state_hash
+                         FROM session_checkpoints AS sc
+                         WHERE sc.session_id = ?1
+                           AND sc.checkpoint_role = 'snapshot'
+                         ORDER BY sc.id DESC
+                         LIMIT ?2",
+                    )?;
+                    let rows =
+                        stmt.query_map(rusqlite::params![session_id, limit_i64], map_row)?;
+                    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+                } else {
+                    let mut stmt = conn.prepare(
+                        "SELECT sc.id, sc.session_id, sc.checkpoint_at,
+                                sc.checkpoint_type, sc.checkpoint_role,
+                                sc.pane_count, sc.total_bytes, sc.state_hash
+                         FROM session_checkpoints AS sc
+                         WHERE sc.checkpoint_role = 'snapshot'
+                         ORDER BY sc.id DESC
+                         LIMIT ?1",
+                    )?;
+                    let rows = stmt.query_map([limit_i64], map_row)?;
+                    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+                }
+            })
+            .await?;
 
             if output_format.is_structured() {
                 let items: Vec<serde_json::Value> = snapshots
@@ -68595,104 +69242,117 @@ async fn handle_snapshot_command(
             format,
         } => {
             let output_format = resolve_snapshot_session_output_format(&format);
-            let conn = rusqlite::Connection::open(db_path.as_str())?;
             let cp_id: i64 = snapshot_id.parse().map_err(|_| {
                 anyhow::anyhow!("Invalid snapshot ID: {snapshot_id} (expected integer)")
             })?;
-
-            // Get checkpoint metadata
-            let checkpoint = conn.query_row(
-                "SELECT id, session_id, checkpoint_at, checkpoint_type,
-                        checkpoint_role, pane_count, total_bytes, state_hash
-                 FROM session_checkpoints
-                 WHERE id = ?1 AND checkpoint_role = 'snapshot'",
-                [cp_id],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, String>(7)?,
-                    ))
-                },
-            );
-
-            let (id, session_id, at, cp_type, cp_role, pane_count, total_bytes, hash) =
-                match checkpoint {
-                    Ok(cp) => cp,
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {
-                        let response = serde_json::json!({
-                            "ok": false,
-                            "error": format!("Snapshot {cp_id} not found"),
-                        });
-                        if !print_snapshot_session_structured_output(&response, output_format)? {
-                            eprintln!("Snapshot {cp_id} not found");
-                        }
-                        std::process::exit(1);
-                    }
+            let inspect_db_path = Arc::clone(&db_path);
+            let loaded = run_cli_blocking_with_cx(&cx, "snapshot inspect", move || {
+                let conn = rusqlite::Connection::open(inspect_db_path.as_str())?;
+                let checkpoint = match conn.query_row(
+                    "SELECT id, session_id, checkpoint_at, checkpoint_type,
+                            checkpoint_role, pane_count, total_bytes, state_hash
+                     FROM session_checkpoints
+                     WHERE id = ?1 AND checkpoint_role = 'snapshot'",
+                    [cp_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, String>(7)?,
+                        ))
+                    },
+                ) {
+                    Ok(checkpoint) => checkpoint,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
                     Err(error) => return Err(error.into()),
                 };
+                let id = checkpoint.0;
 
-            // Bind identifiers rather than interpolating them into SQL. Keep
-            // separate static statements so the pane-specific path retains a
-            // direct equality predicate for SQLite's indexes.
-            let pane_states = if let Some(pane_id) = pane {
-                let pane_id = i64::try_from(pane_id)
-                    .map_err(|_| anyhow::anyhow!("Pane ID is too large for SQLite"))?;
-                let mut stmt = conn.prepare(
-                    "SELECT pane_id, cwd, command, terminal_state_json, agent_metadata_json
-                     FROM mux_pane_state
-                     WHERE checkpoint_id = ?1 AND pane_id = ?2
-                     ORDER BY pane_id, id",
-                )?;
-                let rows = stmt.query_map(rusqlite::params![id, pane_id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                    ))
-                })?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()?
-            } else {
-                let mut stmt = conn.prepare(
-                    "SELECT pane_id, cwd, command, terminal_state_json, agent_metadata_json
-                     FROM mux_pane_state
-                     WHERE checkpoint_id = ?1
-                     ORDER BY pane_id, id",
-                )?;
-                let rows = stmt.query_map([id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                    ))
-                })?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()?
+                // Bind identifiers rather than interpolating them into SQL.
+                let pane_states = if let Some(pane_id) = pane {
+                    let pane_id = i64::try_from(pane_id)
+                        .map_err(|_| anyhow::anyhow!("Pane ID is too large for SQLite"))?;
+                    let mut stmt = conn.prepare(
+                        "SELECT pane_id, cwd, command, terminal_state_json, agent_metadata_json
+                         FROM mux_pane_state
+                         WHERE checkpoint_id = ?1 AND pane_id = ?2
+                         ORDER BY pane_id, id",
+                    )?;
+                    let rows = stmt.query_map(rusqlite::params![id, pane_id], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    })?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()?
+                } else {
+                    let mut stmt = conn.prepare(
+                        "SELECT pane_id, cwd, command, terminal_state_json, agent_metadata_json
+                         FROM mux_pane_state
+                         WHERE checkpoint_id = ?1
+                         ORDER BY pane_id, id",
+                    )?;
+                    let rows = stmt.query_map([id], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    })?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                Ok(Some((checkpoint, pane_states)))
+            })
+            .await?;
+            let Some((checkpoint, pane_states)) = loaded else {
+                let response = serde_json::json!({
+                    "ok": false,
+                    "error": format!("Snapshot {cp_id} not found"),
+                });
+                if !print_snapshot_session_structured_output(&response, output_format)? {
+                    eprintln!("Snapshot {cp_id} not found");
+                }
+                std::process::exit(1);
             };
+            let (id, session_id, at, cp_type, cp_role, pane_count, total_bytes, hash) = checkpoint;
 
             if output_format.is_structured() {
                 let panes_json: Vec<serde_json::Value> = pane_states
                     .iter()
                     .map(|(pid, cwd, cmd, term_json, agent_json)| {
+                        let cwd = cwd.as_deref().map(redact_for_output);
+                        let cmd = cmd.as_deref().map(redact_for_output);
                         let mut obj = serde_json::json!({
                             "pane_id": pid,
                             "cwd": cwd,
                             "command": cmd,
                         });
-                        if let Ok(term) = serde_json::from_str::<serde_json::Value>(term_json) {
-                            obj["terminal"] = term;
+                        if let Ok(mut term) = serde_json::from_str::<
+                            frankenterm_core::session_pane_state::TerminalState,
+                        >(term_json)
+                        {
+                            term.title = redact_for_output(&term.title);
+                            obj["terminal"] = serde_json::json!(term);
                         }
                         if let Some(aj) = agent_json {
-                            if let Ok(agent) = serde_json::from_str::<serde_json::Value>(aj) {
-                                obj["agent"] = agent;
+                            if let Ok(mut agent) = serde_json::from_str::<
+                                frankenterm_core::session_pane_state::AgentMetadata,
+                            >(aj)
+                            {
+                                if let Some(session_id) = agent.session_id.as_mut() {
+                                    *session_id = redact_for_output(session_id);
+                                }
+                                obj["agent"] = serde_json::json!(agent);
                             }
                         }
                         obj
@@ -68724,10 +69384,10 @@ async fn handle_snapshot_command(
                 for (pid, cwd, cmd, term_json, agent_json) in &pane_states {
                     println!("  Pane {pid}:");
                     if let Some(cwd) = cwd {
-                        println!("    CWD:     {cwd}");
+                        println!("    CWD:     {}", redact_for_output(cwd));
                     }
                     if let Some(cmd) = cmd {
-                        println!("    Command: {cmd}");
+                        println!("    Command: {}", redact_for_output(cmd));
                     }
                     if let Ok(term) = serde_json::from_str::<
                         frankenterm_core::session_pane_state::TerminalState,
@@ -68756,53 +69416,58 @@ async fn handle_snapshot_command(
 
         SnapshotCommands::Diff { id1, id2, format } => {
             let output_format = resolve_snapshot_session_output_format(&format);
-            let conn = rusqlite::Connection::open(db_path.as_str())?;
             let cp1: i64 = id1
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Invalid ID: {id1}"))?;
             let cp2: i64 = id2
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Invalid ID: {id2}"))?;
+            let diff_db_path = Arc::clone(&db_path);
+            let (missing_checkpoint, panes1, panes2) =
+                run_cli_blocking_with_cx(&cx, "snapshot diff", move || {
+                    let conn = rusqlite::Connection::open(diff_db_path.as_str())?;
 
-            // Verify both checkpoints exist before diffing. A checkpoint may
-            // legitimately have zero panes, so emptiness of the pane list is
-            // NOT a proxy for existence — without this guard, diffing against a
-            // missing checkpoint silently reports the other side's panes as
-            // wholly added/removed with no indication the snapshot is absent.
-            // Mirrors the existence check in the `Delete` arm below.
-            let checkpoint_exists = |cp_id: i64| -> anyhow::Result<bool> {
-                let count = conn.query_row(
-                    "SELECT COUNT(*)
-                     FROM session_checkpoints
-                     WHERE id = ?1 AND checkpoint_role = 'snapshot'",
-                    [cp_id],
-                    |row| row.get::<_, i64>(0),
-                )?;
-                Ok(count > 0)
-            };
-            for cp_id in [cp1, cp2] {
-                if !checkpoint_exists(cp_id)? {
-                    eprintln!("Snapshot #{cp_id} not found");
-                    std::process::exit(1);
-                }
+                    // A checkpoint may legitimately have zero panes, so pane
+                    // emptiness is not an existence check.
+                    let checkpoint_exists = |cp_id: i64| -> anyhow::Result<bool> {
+                        let count = conn.query_row(
+                            "SELECT COUNT(*)
+                             FROM session_checkpoints
+                             WHERE id = ?1 AND checkpoint_role = 'snapshot'",
+                            [cp_id],
+                            |row| row.get::<_, i64>(0),
+                        )?;
+                        Ok(count > 0)
+                    };
+                    let mut missing_checkpoint = None;
+                    for cp_id in [cp1, cp2] {
+                        if !checkpoint_exists(cp_id)? {
+                            missing_checkpoint = Some(cp_id);
+                            break;
+                        }
+                    }
+                    if missing_checkpoint.is_some() {
+                        return Ok((missing_checkpoint, Vec::new(), Vec::new()));
+                    }
+
+                    let get_pane_ids = |cp_id: i64| -> anyhow::Result<Vec<i64>> {
+                        let mut stmt = conn.prepare(
+                            "SELECT pane_id
+                             FROM mux_pane_state
+                             WHERE checkpoint_id = ?1
+                             ORDER BY pane_id, id",
+                        )?;
+                        let rows = stmt.query_map([cp_id], |row| row.get(0))?;
+                        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+                    };
+
+                    Ok((None, get_pane_ids(cp1)?, get_pane_ids(cp2)?))
+                })
+                .await?;
+            if let Some(cp_id) = missing_checkpoint {
+                eprintln!("Snapshot #{cp_id} not found");
+                std::process::exit(1);
             }
-
-            // Get pane IDs for each checkpoint
-            let get_pane_ids = |cp_id: i64| -> anyhow::Result<Vec<i64>> {
-                let mut stmt = conn.prepare(
-                    "SELECT pane_id
-                     FROM mux_pane_state
-                     WHERE checkpoint_id = ?1
-                     ORDER BY pane_id, id",
-                )?;
-                let ids: Vec<i64> = stmt
-                    .query_map([cp_id], |row| row.get(0))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Ok(ids)
-            };
-
-            let panes1 = get_pane_ids(cp1)?;
-            let panes2 = get_pane_ids(cp2)?;
 
             let set1: std::collections::HashSet<i64> = panes1.iter().copied().collect();
             let set2: std::collections::HashSet<i64> = panes2.iter().copied().collect();
@@ -68849,11 +69514,16 @@ async fn handle_snapshot_command(
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Invalid snapshot ID: {snapshot_id}"))?;
 
-            let Some(identity) = load_checkpoint_identity(
-                db_path.as_str(),
-                cp_id,
-                CheckpointResolveScope::Snapshot,
-            )? else {
+            let identity_db_path = Arc::clone(&db_path);
+            let identity = run_cli_blocking_with_cx(&cx, "snapshot delete preflight", move || {
+                load_checkpoint_identity(
+                    identity_db_path.as_str(),
+                    cp_id,
+                    CheckpointResolveScope::Snapshot,
+                )
+            })
+            .await?;
+            let Some(identity) = identity else {
                 eprintln!("Snapshot {cp_id} not found");
                 std::process::exit(1);
             };
@@ -68905,16 +69575,30 @@ async fn handle_snapshot_command(
         } => {
             let output_format = resolve_snapshot_session_output_format(&format);
             let restore_options = SnapshotRestoreWorkflowOptions {
-                layout_only,
+                layout_only: {
+                    let _ = layout_only;
+                    true
+                },
                 launch_agents,
                 wezterm_timeout_secs: config.cli.timeout_seconds,
             };
 
-            let checkpoint_id = match resolve_checkpoint_id(
-                db_path.as_str(),
-                &snapshot_id,
-                CheckpointResolveScope::Snapshot,
-            ) {
+            let resolve_db_path = Arc::clone(&db_path);
+            let requested_snapshot_id = snapshot_id.clone();
+            let checkpoint_id = match run_cli_blocking_with_cx(
+                &cx,
+                "snapshot restore checkpoint resolution",
+                move || {
+                    resolve_checkpoint_id(
+                        resolve_db_path.as_str(),
+                        &requested_snapshot_id,
+                        CheckpointResolveScope::Snapshot,
+                    )
+                    .map_err(anyhow::Error::from)
+                },
+            )
+            .await
+            {
                 Ok(id) => id,
                 Err(e) => {
                     if !print_snapshot_session_structured_output(
@@ -68930,10 +69614,13 @@ async fn handle_snapshot_command(
                 }
             };
 
-            let checkpoint = match frankenterm_core::session_restore::load_checkpoint_by_id(
+            let checkpoint = match frankenterm_core::session_restore::load_checkpoint_by_id_with_cx(
+                &cx,
                 db_path.as_str(),
                 checkpoint_id,
-            )? {
+            )
+            .await?
+            {
                 Some(cp) => cp,
                 None => {
                     if !print_snapshot_session_structured_output(
@@ -68979,6 +69666,8 @@ async fn handle_snapshot_command(
             .await
             {
                 Ok(result) => {
+                    let completed_successfully =
+                        restore_completed_successfully(&result.summary);
                     if output_format.is_structured() {
                         print_snapshot_session_structured_output(
                             &snapshot_restore_result_json(&result),
@@ -68986,6 +69675,9 @@ async fn handle_snapshot_command(
                         )?;
                     } else {
                         print_snapshot_restore_result_plain(&result);
+                    }
+                    if !completed_successfully {
+                        std::process::exit(1);
                     }
                 }
                 Err(abort) => {
@@ -69017,11 +69709,13 @@ async fn handle_session_command(
     use frankenterm_core::session_restore;
 
     let db_path = layout.db_path.to_string_lossy().to_string();
+    let cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
 
     match command {
         SessionCommands::List { format } => {
             let output_format = resolve_snapshot_session_output_format(&format);
-            let sessions = session_restore::list_sessions(&db_path)?;
+            let sessions = session_restore::list_sessions_with_cx(&cx, &db_path).await?;
 
             if output_format.is_structured() {
                 print_snapshot_session_structured_output(&sessions, output_format)?;
@@ -69075,11 +69769,29 @@ async fn handle_session_command(
             format,
         } => {
             let output_format = resolve_snapshot_session_output_format(&format);
-            let (session, checkpoints) = session_restore::show_session(&db_path, &session_id)?;
-            let pane_lookup = pane
-                .map(|pane_id| load_session_show_pane_lookup(&db_path, &session_id, pane_id))
-                .transpose()?
-                .map(redact_session_show_pane_lookup_for_output);
+            let (session, checkpoints) =
+                session_restore::show_session_with_cx(&cx, &db_path, &session_id).await?;
+            let pane_lookup = if let Some(pane_id) = pane {
+                let pane_db_path = db_path.clone();
+                let pane_session_id = session_id.clone();
+                let lookup = frankenterm_core::runtime_async::spawn_blocking_with_cx(
+                    &cx,
+                    move || {
+                        load_session_show_pane_lookup(
+                            &pane_db_path,
+                            &pane_session_id,
+                            pane_id,
+                        )
+                    },
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!(
+                    "session pane lookup cancelled or blocking runtime failed: {error}"
+                ))??;
+                Some(redact_session_show_pane_lookup_for_output(lookup))
+            } else {
+                None
+            };
 
             if output_format.is_structured() {
                 let data =
@@ -69177,7 +69889,8 @@ async fn handle_session_command(
                 std::process::exit(1);
             }
 
-            let deleted = session_restore::delete_session(&db_path, &session_id)?;
+            let deleted =
+                session_restore::delete_session_with_cx(&cx, &db_path, &session_id).await?;
             if deleted {
                 println!("Session {session_id} deleted.");
             } else {
@@ -69188,7 +69901,7 @@ async fn handle_session_command(
 
         SessionCommands::Doctor { format } => {
             let output_format = resolve_snapshot_session_output_format(&format);
-            let report = session_restore::session_doctor(&db_path)?;
+            let report = session_restore::session_doctor_with_cx(&cx, &db_path).await?;
             let guidance = build_session_recovery_guidance(&report);
 
             if output_format.is_structured() {
@@ -69206,9 +69919,30 @@ async fn handle_session_command(
             println!("Checkpoints:     {}", report.total_checkpoints);
             println!("Data size:       {}", format_bytes(report.total_data_bytes));
             println!("Orphaned states: {}", report.orphaned_pane_states);
+            println!(
+                "Restore attempts: {} unresolved",
+                report.unresolved_restore_attempts
+            );
+            println!(
+                "  Outcome complete:       {}",
+                report.outcome_complete_restore_attempts
+            );
+            println!(
+                "  Reconcile required:     {}",
+                report.reconciliation_required_restore_attempts
+            );
+            println!(
+                "  Orphaned intent rows:   {}",
+                report.orphaned_restore_intents
+            );
             println!();
 
             println!("{}", guidance.summary);
+            if session_restore_lifecycle_needs_reconciliation(&report) {
+                println!(
+                    "⚠ Durable restore state requires reconciliation — inspect the aggregate report and checkpoint roles before retrying any restore."
+                );
+            }
             if report.unclean_sessions > 0 {
                 println!(
                     "⚠ {} session(s) from unclean shutdown — run `ft watch` to restore.",
@@ -69221,7 +69955,10 @@ async fn handle_session_command(
                     report.orphaned_pane_states
                 );
             }
-            if report.unclean_sessions == 0 && report.orphaned_pane_states == 0 {
+            if report.unclean_sessions == 0
+                && report.orphaned_pane_states == 0
+                && !session_restore_lifecycle_needs_reconciliation(&report)
+            {
                 println!("✓ All healthy.");
             }
             println!();
@@ -72060,10 +72797,88 @@ fn recommended_steps_from_checks(checks: &[DiagnosticCheck]) -> Vec<OperatorNext
     steps
 }
 
+fn session_restore_lifecycle_needs_reconciliation(
+    report: &frankenterm_core::session_restore::SessionDoctorReport,
+) -> bool {
+    report.unresolved_restore_attempts > 0
+        || report.outcome_complete_restore_attempts > 0
+        || report.reconciliation_required_restore_attempts > 0
+        || report.orphaned_restore_intents > 0
+}
+
+fn session_recovery_diagnostic_check(
+    report: &frankenterm_core::session_restore::SessionDoctorReport,
+) -> DiagnosticCheck {
+    if session_restore_lifecycle_needs_reconciliation(report) {
+        return DiagnosticCheck::error(
+            "session restore lifecycle",
+            format!(
+                "{} unresolved; {} outcome-complete; {} reconciliation-required; {} orphaned intent rows",
+                report.unresolved_restore_attempts,
+                report.outcome_complete_restore_attempts,
+                report.reconciliation_required_restore_attempts,
+                report.orphaned_restore_intents,
+            ),
+            "Run 'ft session doctor -f json' and inspect checkpoint roles before retrying restore",
+        );
+    }
+    if report.unclean_sessions > 0 {
+        return DiagnosticCheck::warning(
+            "session persistence",
+            format!("{} unclean session(s)", report.unclean_sessions),
+            "Run 'ft session doctor' for the guided recovery path",
+        );
+    }
+    if report.orphaned_pane_states > 0 {
+        return DiagnosticCheck::warning(
+            "session persistence",
+            format!("{} orphaned pane state row(s)", report.orphaned_pane_states),
+            "Run 'ft session doctor -f json' before cleanup",
+        );
+    }
+
+    DiagnosticCheck::ok_with_detail(
+        "session persistence",
+        format!(
+            "{} session(s), {} checkpoint(s), restore lifecycle settled",
+            report.total_sessions, report.total_checkpoints
+        ),
+    )
+}
+
 fn build_session_recovery_guidance(
     report: &frankenterm_core::session_restore::SessionDoctorReport,
 ) -> OperatorGuidance {
     let mut next_steps = Vec::new();
+
+    if session_restore_lifecycle_needs_reconciliation(report) {
+        push_unique_operator_step(
+            &mut next_steps,
+            "Inspect aggregate restore health",
+            "ft session doctor -f json",
+        );
+        push_unique_operator_step(
+            &mut next_steps,
+            "Inspect checkpoint roles and causal IDs",
+            "ft robot checkpoint list --limit 100",
+        );
+        push_unique_operator_step(
+            &mut next_steps,
+            "Inspect persisted sessions",
+            "ft session list -f json",
+        );
+        return OperatorGuidance {
+            status: "reconciliation_required".to_string(),
+            summary: format!(
+                "Restore lifecycle requires inspection before retrying: {} unresolved attempt(s), including {} outcome-complete and {} explicitly reconciliation-required; {} orphaned intent row(s).",
+                report.unresolved_restore_attempts,
+                report.outcome_complete_restore_attempts,
+                report.reconciliation_required_restore_attempts,
+                report.orphaned_restore_intents,
+            ),
+            next_steps,
+        };
+    }
 
     if report.unclean_sessions > 0 {
         push_unique_operator_step(
@@ -72154,7 +72969,10 @@ fn build_doctor_operator_guidance(
     session_report: Option<&frankenterm_core::session_restore::SessionDoctorReport>,
 ) -> OperatorGuidance {
     if let Some(report) = session_report {
-        if report.unclean_sessions > 0 {
+        if session_restore_lifecycle_needs_reconciliation(report)
+            || report.unclean_sessions > 0
+            || report.orphaned_pane_states > 0
+        {
             return build_session_recovery_guidance(report);
         }
     }
@@ -72228,10 +73046,10 @@ fn build_status_health_operator_guidance(
     workspace_bootstrap_pending: bool,
 ) -> OperatorGuidance {
     if let Some(report) = session_report {
-        if report.unclean_sessions > 0 {
-            return build_session_recovery_guidance(report);
-        }
-        if report.orphaned_pane_states > 0 {
+        if session_restore_lifecycle_needs_reconciliation(report)
+            || report.unclean_sessions > 0
+            || report.orphaned_pane_states > 0
+        {
             return build_session_recovery_guidance(report);
         }
     }
@@ -72400,6 +73218,10 @@ mod operator_guidance_tests {
             unclean_sessions: 2,
             total_checkpoints: 4,
             orphaned_pane_states: 0,
+            unresolved_restore_attempts: 0,
+            outcome_complete_restore_attempts: 0,
+            reconciliation_required_restore_attempts: 0,
+            orphaned_restore_intents: 0,
             total_data_bytes: 8192,
         };
 
@@ -72415,12 +73237,69 @@ mod operator_guidance_tests {
     }
 
     #[test]
+    fn session_restore_lifecycle_counts_are_structured_and_block_blind_retry() {
+        let report = SessionDoctorReport {
+            total_sessions: 2,
+            unclean_sessions: 1,
+            total_checkpoints: 7,
+            orphaned_pane_states: 0,
+            unresolved_restore_attempts: 2,
+            outcome_complete_restore_attempts: 1,
+            reconciliation_required_restore_attempts: 1,
+            orphaned_restore_intents: 1,
+            total_data_bytes: 4096,
+        };
+
+        let structured = serde_json::to_value(&report).expect("serialize session doctor report");
+        assert_eq!(structured["unresolved_restore_attempts"].as_u64(), Some(2));
+        assert_eq!(
+            structured["outcome_complete_restore_attempts"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            structured["reconciliation_required_restore_attempts"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(structured["orphaned_restore_intents"].as_u64(), Some(1));
+        assert!(structured.get("restore_attempt_metadata").is_none());
+
+        let guidance = build_session_recovery_guidance(&report);
+        assert_eq!(guidance.status, "reconciliation_required");
+        assert!(guidance.summary.contains("2 unresolved attempt"));
+        assert!(guidance.summary.contains("1 orphaned intent"));
+        assert!(guidance.next_steps.iter().any(|step| {
+            step.command == "ft robot checkpoint list --limit 100"
+        }));
+        assert!(
+            guidance
+                .next_steps
+                .iter()
+                .all(|step| step.command != "ft watch --foreground")
+        );
+
+        let doctor_guidance = build_doctor_operator_guidance(&[], Some(&report));
+        assert_eq!(doctor_guidance.status, "reconciliation_required");
+        let status_guidance = build_status_health_operator_guidance(
+            false,
+            Some("ipc unavailable"),
+            Some(&report),
+            true,
+            false,
+        );
+        assert_eq!(status_guidance.status, "reconciliation_required");
+    }
+
+    #[test]
     fn session_recovery_guidance_marks_empty_workspace_as_first_run() {
         let report = SessionDoctorReport {
             total_sessions: 0,
             unclean_sessions: 0,
             total_checkpoints: 0,
             orphaned_pane_states: 0,
+            unresolved_restore_attempts: 0,
+            outcome_complete_restore_attempts: 0,
+            reconciliation_required_restore_attempts: 0,
+            orphaned_restore_intents: 0,
             total_data_bytes: 0,
         };
 
@@ -72436,6 +73315,10 @@ mod operator_guidance_tests {
             unclean_sessions: 1,
             total_checkpoints: 2,
             orphaned_pane_states: 0,
+            unresolved_restore_attempts: 0,
+            outcome_complete_restore_attempts: 0,
+            reconciliation_required_restore_attempts: 0,
+            orphaned_restore_intents: 0,
             total_data_bytes: 1024,
         };
 
@@ -73448,6 +74331,7 @@ mod tests {
         conn.execute_batch(
             "
             PRAGMA foreign_keys = ON;
+            PRAGMA user_version = 38;
 
             CREATE TABLE mux_sessions (
                 session_id TEXT PRIMARY KEY,
@@ -73462,7 +74346,7 @@ mod tests {
             );
 
             CREATE TABLE session_checkpoints (
-                id INTEGER PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
                 checkpoint_at INTEGER NOT NULL,
                 checkpoint_type TEXT NOT NULL
@@ -73472,9 +74356,70 @@ mod tests {
                 total_bytes INTEGER NOT NULL,
                 metadata_json TEXT,
                 checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
-                    CHECK(checkpoint_role IN ('snapshot','restore_receipt')),
-                topology_json TEXT
+                    CHECK(checkpoint_role IN ('snapshot','restore_intent','restore_receipt')),
+                topology_json TEXT,
+                restore_intent_checkpoint_id INTEGER
+                    REFERENCES session_checkpoints(id) ON DELETE CASCADE,
+                CHECK(checkpoint_role = 'restore_receipt'
+                      OR restore_intent_checkpoint_id IS NULL)
             );
+
+            CREATE INDEX idx_checkpoints_session
+                ON session_checkpoints(session_id, checkpoint_at);
+            CREATE INDEX idx_checkpoints_session_role_latest
+                ON session_checkpoints(session_id, checkpoint_role, checkpoint_at DESC, id DESC);
+            CREATE INDEX idx_checkpoints_session_role_causal
+                ON session_checkpoints(session_id, checkpoint_role, id DESC);
+            CREATE INDEX idx_checkpoints_global_latest
+                ON session_checkpoints(checkpoint_at DESC, id DESC);
+            CREATE INDEX idx_checkpoints_global_snapshot_latest
+                ON session_checkpoints(checkpoint_at DESC, id DESC)
+                WHERE checkpoint_role = 'snapshot';
+            CREATE UNIQUE INDEX idx_checkpoints_restore_intent_outcome
+                ON session_checkpoints(restore_intent_checkpoint_id)
+                WHERE restore_intent_checkpoint_id IS NOT NULL;
+            CREATE INDEX idx_mux_sessions_clean_checkpoint
+                ON mux_sessions(clean_checkpoint_id);
+
+            CREATE TABLE restore_attempt_lifecycle (
+                intent_checkpoint_id INTEGER PRIMARY KEY
+                    REFERENCES session_checkpoints(id)
+                    ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
+                session_id TEXT NOT NULL
+                    REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
+                source_checkpoint_id INTEGER NOT NULL,
+                outcome_checkpoint_id INTEGER
+                    REFERENCES session_checkpoints(id) ON DELETE SET NULL,
+                status TEXT NOT NULL
+                    CHECK(status IN ('intent','outcome_complete','resolved','reconciliation_required')),
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER,
+                CHECK(intent_checkpoint_id <> source_checkpoint_id),
+                CHECK(outcome_checkpoint_id IS NULL
+                      OR outcome_checkpoint_id <> intent_checkpoint_id),
+                CHECK(outcome_checkpoint_id IS NULL
+                      OR outcome_checkpoint_id <> source_checkpoint_id),
+                CHECK(created_at >= 0),
+                CHECK(resolved_at IS NULL OR resolved_at >= created_at),
+                CHECK(
+                    (status = 'intent'
+                        AND outcome_checkpoint_id IS NULL
+                        AND resolved_at IS NULL)
+                    OR (status = 'outcome_complete'
+                        AND outcome_checkpoint_id IS NOT NULL
+                        AND resolved_at IS NULL)
+                    OR (status = 'reconciliation_required'
+                        AND resolved_at IS NULL)
+                    OR (status = 'resolved'
+                        AND resolved_at IS NOT NULL)
+                )
+            );
+
+            CREATE INDEX idx_restore_attempt_lifecycle_session_status
+                ON restore_attempt_lifecycle(session_id, status, intent_checkpoint_id);
+            CREATE UNIQUE INDEX idx_restore_attempt_lifecycle_outcome
+                ON restore_attempt_lifecycle(outcome_checkpoint_id)
+                WHERE outcome_checkpoint_id IS NOT NULL;
 
             CREATE TABLE mux_pane_state (
                 id INTEGER PRIMARY KEY,
@@ -73492,6 +74437,14 @@ mod tests {
             ",
         )
         .expect("create session show test tables");
+        let fixture_schema_version = conn
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+            .expect("read session show fixture schema version");
+        assert_eq!(
+            fixture_schema_version,
+            frankenterm_core::storage::SCHEMA_VERSION,
+            "update setup_session_show_test_db when the current schema changes"
+        );
 
         (db_path.to_string_lossy().to_string(), conn, dir)
     }
@@ -74299,6 +75252,62 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn synthetic_process_output(
+        exit_code: i32,
+        stdout: impl Into<Vec<u8>>,
+        stderr: impl Into<Vec<u8>>,
+    ) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(exit_code << 8),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mux_server_pid_parser_is_strict_sorted_and_bounded() {
+        let parsed = parse_mux_server_pids(&synthetic_process_output(
+            0,
+            b"42\n7\n42\n".to_vec(),
+            Vec::new(),
+        ))
+        .expect("valid pgrep output");
+        assert_eq!(parsed, vec![7, 42]);
+
+        let duplicate_output = "7\n".repeat(MAX_MUX_SERVER_TARGETS + 1);
+        let duplicate_pids = parse_mux_server_pids(&synthetic_process_output(
+            0,
+            duplicate_output,
+            Vec::new(),
+        ))
+        .expect("the safety bound applies to unique targets, not duplicate pgrep lines");
+        assert_eq!(duplicate_pids, vec![7]);
+
+        let absent = parse_mux_server_pids(&synthetic_process_output(1, Vec::new(), Vec::new()))
+            .expect("pgrep exit one means no matches");
+        assert!(absent.is_empty());
+
+        let malformed = parse_mux_server_pids(&synthetic_process_output(
+            0,
+            b"7\nnot-a-pid\n".to_vec(),
+            Vec::new(),
+        ))
+        .expect_err("malformed pgrep output must fail closed");
+        assert!(malformed.to_string().contains("malformed process identifier"));
+
+        let excessive = (1..=MAX_MUX_SERVER_TARGETS + 1)
+            .map(|pid| pid.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let excessive = parse_mux_server_pids(&synthetic_process_output(0, excessive, Vec::new()))
+            .expect_err("an excessive target set must fail closed");
+        assert!(excessive.to_string().contains("Refusing to operate"));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn restart_operation_lock_is_exclusive() {
         let tempdir = tempfile::tempdir().expect("create tempdir");
@@ -74392,9 +75401,13 @@ mod tests {
     #[cfg(unix)]
     fn sample_restart_restore_summary() -> frankenterm_core::session_restore::RestoreSummary {
         use frankenterm_core::restore_layout::RestoreResult;
+        use frankenterm_core::restore_process::{
+            LaunchAction, LaunchInterruption, LaunchInterruptionPhase, LaunchReport, LaunchResult,
+        };
         use frankenterm_core::restore_scrollback::{InjectionReport, PaneInjectionStats};
-        use frankenterm_core::session_restore::RestoreSummary;
+        use frankenterm_core::session_restore::{RestoredPaneState, RestoreSummary};
         use std::collections::HashMap;
+        use std::path::PathBuf;
 
         let mut pane_id_map = HashMap::new();
         pane_id_map.insert(1, 101);
@@ -74403,6 +75416,8 @@ mod tests {
         RestoreSummary {
             session_id: "session-restart".to_string(),
             checkpoint_id: 42,
+            intent_checkpoint_id: 43,
+            outcome_checkpoint_id: 44,
             layout_result: RestoreResult {
                 pane_id_map,
                 failed_panes: vec![(3, "split failed".to_string())],
@@ -74410,7 +75425,17 @@ mod tests {
                 tabs_created: 1,
                 panes_created: 2,
             },
-            pane_states: Vec::new(),
+            pane_states: (1..=3)
+                .map(|pane_id| RestoredPaneState {
+                    pane_id,
+                    cwd: None,
+                    command: None,
+                    terminal_state: None,
+                    agent_metadata: None,
+                    scrollback_checkpoint_seq: None,
+                    last_output_at: None,
+                })
+                .collect(),
             scrollback_result: Some(InjectionReport {
                 successes: vec![PaneInjectionStats {
                     old_pane_id: 1,
@@ -74423,6 +75448,30 @@ mod tests {
                 skipped: vec![3],
             }),
             scrollback_error: None,
+            process_launch_report: Some(LaunchReport {
+                results: vec![LaunchResult {
+                    old_pane_id: 2,
+                    new_pane_id: 102,
+                    action: LaunchAction::LaunchAgent {
+                        command: "secret-agent-command --token raw-secret".to_string(),
+                        cwd: PathBuf::from("/private/raw-secret-worktree"),
+                        agent_type: "codex".to_string(),
+                    },
+                    success: false,
+                    error: Some("raw-secret-launch-error".to_string()),
+                }],
+                shells_launched: 1,
+                agents_launched: 0,
+                skipped: 0,
+                manual: 0,
+                failed: 1,
+                interruption: Some(LaunchInterruption {
+                    plan_index: 1,
+                    phase: LaunchInterruptionPhase::MuxOperation,
+                    detail: "raw-secret-interruption-detail".to_string(),
+                }),
+            }),
+            source_marked_clean: false,
             elapsed_ms: 2500,
         }
     }
@@ -74436,10 +75485,12 @@ mod tests {
             checkpoint_role: frankenterm_core::session_restore::CheckpointRole::Snapshot,
             verification:
                 frankenterm_core::session_restore::CheckpointVerification::VerifiedV2,
+            state_hash: "snp2:test-snapshot".to_string(),
             topology_json: Some(
                 r#"{"schema_version":1,"captured_at":1735689600,"windows":[]}"#
                     .to_string(),
             ),
+            restore_intent_checkpoint_id: None,
             pane_count: 3,
             total_bytes: 0,
             pane_states: Vec::new(),
@@ -74448,7 +75499,7 @@ mod tests {
 
     fn sample_snapshot_restore_options() -> SnapshotRestoreWorkflowOptions {
         SnapshotRestoreWorkflowOptions {
-            layout_only: false,
+            layout_only: true,
             launch_agents: true,
             wezterm_timeout_secs: 5,
         }
@@ -74459,7 +75510,7 @@ mod tests {
             stop_timeout_secs: 15,
             start_timeout_secs: 10,
             skip_restore: false,
-            layout_only: false,
+            layout_only: true,
             launch_agents: true,
             wezterm_timeout_secs: 5,
         }
@@ -74467,14 +75518,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn restart_capture_links_scrollback_only_when_restore_will_use_it() {
-        let normal = restart_snapshot_capture_options(sample_restart_options());
-        assert!(normal.include_scrollback);
+    fn restart_capture_omits_scrollback_without_safe_output_channel() {
+        let mut normal_options = sample_restart_options();
+        normal_options.layout_only = false;
+        let normal = restart_snapshot_capture_options(normal_options);
+        assert!(!normal.include_scrollback);
         let normal_metadata = normal.metadata.expect("normal restart metadata");
-        assert_eq!(normal_metadata["include_scrollback"].as_bool(), Some(true));
+        assert_eq!(normal_metadata["include_scrollback"].as_bool(), Some(false));
         assert_eq!(
             normal_metadata["scrollback_ref_policy"].as_str(),
-            Some("linked_for_bounded_restore")
+            Some("omitted_no_safe_output_channel")
         );
 
         let mut layout_only_options = sample_restart_options();
@@ -74488,24 +75541,21 @@ mod tests {
         );
         assert_eq!(
             layout_only_metadata["scrollback_ref_policy"].as_str(),
-            Some("omitted_for_layout_only")
+            Some("omitted_no_safe_output_channel")
         );
 
         let mut skip_restore_options = sample_restart_options();
         skip_restore_options.skip_restore = true;
         let skip_restore = restart_snapshot_capture_options(skip_restore_options);
-        assert!(
-            skip_restore.include_scrollback,
-            "a skipped immediate restore must retain full manual-recovery capability"
-        );
+        assert!(!skip_restore.include_scrollback);
     }
 
     #[cfg(unix)]
     #[test]
-    fn snapshot_restore_post_preflight_forwards_options_and_summary() {
+    fn snapshot_restore_post_preflight_forces_safe_layout_only_mode() {
         run_async_test(async {
             let mut options = sample_snapshot_restore_options();
-            options.layout_only = true;
+            options.layout_only = false;
             options.launch_agents = false;
             let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
 
@@ -74544,7 +75594,12 @@ mod tests {
             assert_eq!(abort.phase, "restore");
             assert_eq!(abort.checkpoint_id, 77);
             assert_eq!(abort.error, "restore planner mismatch");
-            assert!(abort.hint.is_none());
+            assert!(
+                abort
+                    .hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("do not blindly retry"))
+            );
         });
     }
 
@@ -74652,6 +75707,7 @@ mod tests {
         run_async_test(async {
             let mut options = sample_restart_options();
             options.skip_restore = true;
+            options.layout_only = false;
             let restore_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             let result = execute_restart_post_preflight(
@@ -74676,7 +75732,7 @@ mod tests {
                     layout_only,
                 } => {
                     assert_eq!(snapshot.checkpoint_id, 42);
-                    assert!(!layout_only);
+                    assert!(layout_only);
                 }
                 other => panic!("expected skipped restore result, got {other:?}"),
             }
@@ -74689,7 +75745,7 @@ mod tests {
     fn restart_post_preflight_restore_success_forwards_checkpoint_and_flags() {
         run_async_test(async {
             let mut options = sample_restart_options();
-            options.layout_only = true;
+            options.layout_only = false;
             options.launch_agents = false;
             let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
 
@@ -74731,17 +75787,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn restart_post_preflight_restore_failure_is_nonfatal() {
+    fn restart_post_preflight_restore_failure_is_returned_for_truthful_reporting() {
         run_async_test(async {
+            let mut options = sample_restart_options();
+            options.layout_only = false;
             let result = execute_restart_post_preflight(
-                sample_restart_options(),
+                options,
                 || async { Ok(sample_restart_snapshot_result()) },
                 |_| async { Ok(vec![111]) },
                 |_, _| async { Ok(()) },
                 |_, _, _| async { Err(anyhow::anyhow!("restore planner mismatch")) },
             )
             .await
-            .expect("restore failure should still return success envelope");
+            .expect("restore failure should return a reportable workflow result");
 
             match result {
                 RestartWorkflowResult::RestoreFailed {
@@ -74751,7 +75809,7 @@ mod tests {
                 } => {
                     assert_eq!(snapshot.checkpoint_id, 42);
                     assert_eq!(error, "restore planner mismatch");
-                    assert!(!layout_only);
+                    assert!(layout_only);
                 }
                 other => panic!("expected restore-failed result, got {other:?}"),
             }
@@ -74901,7 +75959,8 @@ mod tests {
                         "mask={mask:04b}: restore must not run after start failure"
                     );
                 } else if !restore_ok {
-                    // Restore failure is non-fatal: must produce Ok(RestoreFailed), never Err.
+                    // Preserve the snapshot in a reportable RestoreFailed value;
+                    // the outer CLI maps that value to ok=false and exit status 1.
                     let result = outcome.unwrap_or_else(|abort| {
                         panic!(
                             "mask={mask:04b}: restore failure must NOT abort (got {:?})",
@@ -74976,7 +76035,12 @@ mod tests {
             Some("session-restart")
         );
         assert_eq!(payload["snapshot"]["pane_count"].as_u64(), Some(3));
-        assert_eq!(payload["layout_only"].as_bool(), Some(false));
+        assert_eq!(payload["layout_only"].as_bool(), Some(true));
+        assert_eq!(payload["scrollback_replay"]["enabled"].as_bool(), Some(false));
+        assert_eq!(
+            payload["scrollback_replay"]["reason"].as_str(),
+            Some(SCROLLBACK_REPLAY_DISABLED_REASON)
+        );
         assert_eq!(payload["launch_agents"].as_bool(), Some(true));
     }
 
@@ -75001,6 +76065,11 @@ mod tests {
         assert!(
             lines
                 .iter()
+                .any(|line| line.contains(SCROLLBACK_REPLAY_DISABLED_REASON))
+        );
+        assert!(
+            lines
+                .iter()
                 .any(|line| line.contains("launch_agents=false"))
         );
         assert_eq!(
@@ -75022,7 +76091,15 @@ mod tests {
         assert_eq!(payload["planned"]["stop_timeout_secs"].as_u64(), Some(15));
         assert_eq!(payload["planned"]["start_timeout_secs"].as_u64(), Some(10));
         assert_eq!(payload["planned"]["skip_restore"].as_bool(), Some(false));
-        assert_eq!(payload["planned"]["layout_only"].as_bool(), Some(false));
+        assert_eq!(payload["planned"]["layout_only"].as_bool(), Some(true));
+        assert_eq!(
+            payload["planned"]["scrollback_replay"]["enabled"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["planned"]["scrollback_replay"]["reason"].as_str(),
+            Some(SCROLLBACK_REPLAY_DISABLED_REASON)
+        );
         assert_eq!(payload["planned"]["launch_agents"].as_bool(), Some(true));
         assert_eq!(payload["version"].as_str(), Some(frankenterm_core::VERSION),);
     }
@@ -75060,6 +76137,7 @@ mod tests {
         );
 
         assert_eq!(payload["ok"].as_bool(), Some(false));
+        assert_eq!(payload["complete"].as_bool(), Some(false));
         assert_eq!(payload["phase"].as_str(), Some("preflight"));
         assert_eq!(payload["checkpoint_id"].as_i64(), Some(42));
         assert_eq!(payload["error"].as_str(), Some("lock held"));
@@ -75071,22 +76149,123 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn snapshot_restore_result_json_includes_scrollback_metrics() {
+    fn restore_completion_requires_clean_and_internally_consistent_evidence() {
+        let mut summary = sample_restart_restore_summary();
+        summary.source_marked_clean = true;
+        assert!(!restore_completed_successfully(&summary));
+
+        summary.layout_result.pane_id_map.insert(3, 103);
+        summary.layout_result.failed_panes.clear();
+        assert!(!restore_completed_successfully(&summary));
+        summary.scrollback_result = None;
+
+        {
+            let report = summary
+                .process_launch_report
+                .as_mut()
+                .expect("sample process launch report");
+            report.results[0].success = true;
+            report.results[0].error = None;
+            report.shells_launched = 0;
+            report.agents_launched = 1;
+            report.failed = 0;
+            report.interruption = None;
+        }
+        assert!(restore_completed_successfully(&summary));
+
+        {
+            let report = summary
+                .process_launch_report
+                .as_mut()
+                .expect("sample process launch report");
+            report.shells_launched = 1;
+            report.agents_launched = 0;
+        }
+        assert!(!restore_completed_successfully(&summary));
+        {
+            let report = summary
+                .process_launch_report
+                .as_mut()
+                .expect("sample process launch report");
+            report.shells_launched = 0;
+            report.agents_launched = 1;
+        }
+        assert!(restore_completed_successfully(&summary));
+
+        summary.scrollback_error = Some("unexpected replay path".to_string());
+        assert!(!restore_completed_successfully(&summary));
+        summary.scrollback_error = None;
+        assert!(restore_completed_successfully(&summary));
+
+        summary
+            .layout_result
+            .failed_panes
+            .push((3, "inconsistent backend failure".to_string()));
+        assert!(!restore_completed_successfully(&summary));
+        summary.layout_result.failed_panes.clear();
+        assert!(restore_completed_successfully(&summary));
+
+        summary.outcome_checkpoint_id = summary.intent_checkpoint_id;
+        assert!(!restore_completed_successfully(&summary));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_restore_result_json_is_truthful_and_redacts_process_details() {
         let payload = snapshot_restore_result_json(&SnapshotRestoreWorkflowResult {
             summary: sample_restart_restore_summary(),
-            layout_only: false,
+            layout_only: true,
         });
 
-        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(payload["ok"].as_bool(), Some(false));
+        assert_eq!(payload["phase"].as_str(), Some("restore_partial"));
         assert_eq!(payload["checkpoint_id"].as_i64(), Some(42));
+        assert_eq!(payload["intent_checkpoint_id"].as_i64(), Some(43));
+        assert_eq!(payload["outcome_checkpoint_id"].as_i64(), Some(44));
         assert_eq!(payload["session_id"].as_str(), Some("session-restart"));
-        assert_eq!(payload["layout_only"].as_bool(), Some(false));
+        assert_eq!(payload["layout_only"].as_bool(), Some(true));
         assert_eq!(payload["restored_panes"].as_u64(), Some(2));
         assert_eq!(payload["failed_panes"].as_u64(), Some(1));
         assert_eq!(payload["total_panes"].as_u64(), Some(3));
+        assert_eq!(payload["complete"].as_bool(), Some(false));
+        assert_eq!(payload["source_marked_clean"].as_bool(), Some(false));
         assert_eq!(payload["elapsed_ms"].as_u64(), Some(2500));
-        assert_eq!(payload["scrollback"]["enabled"].as_bool(), Some(true));
-        assert_eq!(payload["scrollback"]["bytes_written"].as_u64(), Some(256));
+        assert_eq!(payload["scrollback"]["enabled"].as_bool(), Some(false));
+        assert_eq!(
+            payload["scrollback"]["invariant_violation"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(payload["scrollback"]["bytes_written"].as_u64(), Some(0));
+        assert_eq!(
+            payload["process_relaunch"]["settled_plans"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(payload["process_relaunch"]["failed"].as_u64(), Some(1));
+        assert_eq!(payload["process_relaunch"]["interrupted"].as_bool(), Some(true));
+        for forbidden_field in ["results", "action", "command", "cwd", "hint", "detail"] {
+            assert!(
+                payload["process_relaunch"].get(forbidden_field).is_none(),
+                "raw process field must not be emitted: {forbidden_field}"
+            );
+        }
+        let encoded = serde_json::to_string(&payload).expect("serialize redacted restore result");
+        assert!(!encoded.contains("raw-secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_skip_restore_json_is_truthful_about_completion() {
+        let payload = restart_result_json(&RestartWorkflowResult::SkippedRestore {
+            snapshot: sample_restart_snapshot_result(),
+            layout_only: true,
+        });
+
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(payload["complete"].as_bool(), Some(true));
+        assert_eq!(payload["phase"].as_str(), Some("complete"));
+        assert_eq!(payload["restored"].as_bool(), Some(false));
+        assert_eq!(payload["restore_attempted"].as_bool(), Some(false));
+        assert_eq!(payload["skip_restore"].as_bool(), Some(true));
     }
 
     #[cfg(unix)]
@@ -75102,6 +76281,7 @@ mod tests {
         );
 
         assert_eq!(payload["ok"].as_bool(), Some(false));
+        assert_eq!(payload["complete"].as_bool(), Some(false));
         assert_eq!(payload["phase"].as_str(), Some("stop"));
         assert_eq!(payload["error"].as_str(), Some("mux shutdown timed out"));
         assert_eq!(
@@ -75142,31 +76322,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn restart_complete_json_includes_restore_and_scrollback_metrics() {
+    fn restart_partial_json_is_unsuccessful_and_redacts_process_details() {
         let snapshot = sample_restart_snapshot_result();
         let summary = sample_restart_restore_summary();
         let payload = restart_result_json(&RestartWorkflowResult::Restored {
             snapshot,
             summary: Box::new(summary),
-            layout_only: false,
+            layout_only: true,
         });
 
-        assert_eq!(payload["ok"].as_bool(), Some(true));
-        assert_eq!(payload["phase"].as_str(), Some("complete"));
-        assert_eq!(payload["restored"].as_bool(), Some(true));
+        assert_eq!(payload["ok"].as_bool(), Some(false));
+        assert_eq!(payload["phase"].as_str(), Some("restore_partial"));
+        assert_eq!(payload["complete"].as_bool(), Some(false));
+        assert_eq!(payload["restored"].as_bool(), Some(false));
+        assert_eq!(payload["restore_attempted"].as_bool(), Some(true));
         assert_eq!(payload["snapshot"]["pane_count"].as_u64(), Some(3));
         assert_eq!(payload["restore"]["restored_panes"].as_u64(), Some(2));
         assert_eq!(payload["restore"]["failed_panes"].as_u64(), Some(1));
-        assert_eq!(payload["scrollback"]["enabled"].as_bool(), Some(true));
-        assert_eq!(payload["scrollback"]["restored_panes"].as_u64(), Some(1));
-        assert_eq!(payload["scrollback"]["failed_panes"].as_u64(), Some(1));
-        assert_eq!(payload["scrollback"]["skipped_panes"].as_u64(), Some(1));
-        assert_eq!(payload["scrollback"]["bytes_written"].as_u64(), Some(256));
+        assert_eq!(
+            payload["restore"]["source_marked_clean"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(payload["restore"]["intent_checkpoint_id"].as_i64(), Some(43));
+        assert_eq!(payload["restore"]["outcome_checkpoint_id"].as_i64(), Some(44));
+        assert_eq!(payload["scrollback"]["enabled"].as_bool(), Some(false));
+        assert_eq!(
+            payload["scrollback"]["invariant_violation"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(payload["scrollback"]["restored_panes"].as_u64(), Some(0));
+        assert_eq!(payload["scrollback"]["failed_panes"].as_u64(), Some(0));
+        assert_eq!(payload["scrollback"]["skipped_panes"].as_u64(), Some(0));
+        assert_eq!(payload["scrollback"]["bytes_written"].as_u64(), Some(0));
+        assert_eq!(
+            payload["restore"]["process_relaunch"]["interrupted"].as_bool(),
+            Some(true)
+        );
+        let encoded = serde_json::to_string(&payload).expect("serialize redacted restart result");
+        assert!(!encoded.contains("raw-secret"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn restart_restore_failed_json_preserves_retry_metadata() {
+    fn restart_restore_failed_json_requires_reconciliation_not_blind_retry() {
         let snapshot = sample_restart_snapshot_result();
         let payload = restart_result_json(&RestartWorkflowResult::RestoreFailed {
             snapshot,
@@ -75174,7 +76372,8 @@ mod tests {
             layout_only: true,
         });
 
-        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(payload["ok"].as_bool(), Some(false));
+        assert_eq!(payload["complete"].as_bool(), Some(false));
         assert_eq!(payload["phase"].as_str(), Some("restore_failed"));
         assert_eq!(payload["restored"].as_bool(), Some(false));
         assert_eq!(payload["layout_only"].as_bool(), Some(true));
@@ -75184,9 +76383,10 @@ mod tests {
             Some("session-restart")
         );
         assert_eq!(payload["snapshot"]["checkpoint_id"].as_i64(), Some(42));
-        assert_eq!(
-            payload["hint"].as_str(),
-            Some("Mux restarted. Run `ft snapshot restore <checkpoint_id>` to retry restore."),
+        assert!(
+            payload["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("do not blindly replay"))
         );
     }
 
