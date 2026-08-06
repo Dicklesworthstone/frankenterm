@@ -557,6 +557,9 @@ pub fn is_retryable(error: &Error) -> bool {
             WeztermError::CliNotFound => false,           // Need installation
             WeztermError::PaneNotFound(_) => false,       // Won't magically appear
             WeztermError::SocketNotFound(_) => true,      // Might be initializing
+            // The command may already have committed. Reconciliation, not
+            // replay, is the only safe next action.
+            WeztermError::IndeterminateMutation { .. } => false,
             WeztermError::ParseError(_) => false,         // Structural issue
             WeztermError::OutputTooLarge { .. } => false, // Output won't shrink on retry
         },
@@ -566,6 +569,10 @@ pub fn is_retryable(error: &Error) -> bool {
             StorageError::WriterBackendEpochPoisoned => false, // Must reopen the storage handle
             StorageError::BackendEpochPoisoned => false, // Must reopen/discard the backend loan
             StorageError::MigrationEpochPoisoned => false, // Must reopen the migration connection
+            // Both classes can follow a durable commit. Blind retry can
+            // duplicate the effect or overwrite newer state.
+            StorageError::IndeterminateMutation { .. }
+            | StorageError::WriterSettlementIndeterminate { .. } => false,
             StorageError::WriterClosed => false, // Must open a fresh storage handle
             StorageError::SubmitIdempotency(error) => error.is_retryable(),
             StorageError::InvalidEventDeliveryLeaseBatch(_) => false, // Caller must rebuild input
@@ -596,6 +603,19 @@ pub fn is_retryable(error: &Error) -> bool {
         // Cancelled variant: caller intent, not something to retry.
         Error::RuntimeOperation {
             source: crate::error::RuntimeOperationSource::Cancelled(_),
+            ..
+        } => false,
+        // Replaying under the same exhausted/failed capability cannot make
+        // progress, and lock poison/poll-after-completion require repair rather
+        // than another attempt. A lock-local timeout remains transient below.
+        Error::RuntimeOperation {
+            source:
+                crate::error::RuntimeOperationSource::DeadlineExceeded
+                | crate::error::RuntimeOperationSource::PollQuotaExhausted
+                | crate::error::RuntimeOperationSource::CostBudgetExhausted
+                | crate::error::RuntimeOperationSource::ContextFailure
+                | crate::error::RuntimeOperationSource::LockPoisoned
+                | crate::error::RuntimeOperationSource::PolledAfterCompletion,
             ..
         } => false,
         // [ft-h9g0q] Typed runtime/pane/watchdog variants added in
@@ -1691,6 +1711,28 @@ mod tests {
         ))));
     }
 
+    #[test]
+    fn indeterminate_mutations_and_writer_settlement_are_never_blindly_retried() {
+        use crate::error::{StorageError, WeztermError};
+
+        for error in [
+            Error::Wezterm(WeztermError::IndeterminateMutation {
+                operation: "spawn",
+            }),
+            Error::Storage(StorageError::IndeterminateMutation {
+                operation: "store_embedding",
+            }),
+            Error::Storage(StorageError::WriterSettlementIndeterminate {
+                phase: "command_response",
+            }),
+        ] {
+            assert!(
+                !is_retryable(&error),
+                "an unknown durable outcome must require reconciliation: {error:?}"
+            );
+        }
+    }
+
     // [review] Mirror the long-standing WeztermError::PaneNotFound ruling
     // onto the structured `Error::PaneOperation { PaneNotFound }` variant
     // added in 79702a50. Previously `is_retryable` blanket-approved all
@@ -1738,6 +1780,31 @@ mod tests {
             source: RuntimeOperationSource::WatchChannelClosed,
         };
         assert!(is_retryable(&err));
+    }
+
+    #[test]
+    fn exhausted_or_invalid_runtime_authority_is_not_retryable() {
+        use crate::error::RuntimeOperationSource;
+
+        for source in [
+            RuntimeOperationSource::DeadlineExceeded,
+            RuntimeOperationSource::PollQuotaExhausted,
+            RuntimeOperationSource::CostBudgetExhausted,
+            RuntimeOperationSource::ContextFailure,
+            RuntimeOperationSource::LockPoisoned,
+            RuntimeOperationSource::PolledAfterCompletion,
+        ] {
+            let error = Error::RuntimeOperation {
+                operation: "synthetic",
+                source,
+            };
+            assert!(!is_retryable(&error), "must repair authority: {error:?}");
+        }
+
+        assert!(is_retryable(&Error::RuntimeOperation {
+            operation: "synthetic",
+            source: RuntimeOperationSource::LockTimedOut,
+        }));
     }
 
     #[test]

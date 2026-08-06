@@ -326,22 +326,41 @@ pub static FT_1023: ErrorCodeDef = ErrorCodeDef {
     doc_link: None,
 };
 
-/// WA-1030: JSON parse error from WezTerm
+/// FT-1024: WezTerm mutation outcome is indeterminate
+pub static FT_1024: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-1024",
+    category: ErrorCategory::Wezterm,
+    title: "WezTerm mutation outcome is indeterminate",
+    description: "A non-idempotent mux command was admitted, but its authoritative completion response was lost. The requested action may already have taken effect.",
+    causes: &[
+        "Caller cancellation or deadline after command admission",
+        "Transport or subprocess response loss after dispatch",
+        "A successful pane-creation response contained an unusable receipt",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command("Reconcile live pane state", "ft list"),
+        RecoveryStep::with_command("Inspect machine state", "ft robot state"),
+        RecoveryStep::text("Do not blindly replay the mutation; verify its intended postcondition first"),
+    ],
+    doc_link: None,
+};
+
+/// FT-1030: WezTerm circuit breaker is open
 pub static FT_1030: ErrorCodeDef = ErrorCodeDef {
     code: "FT-1030",
     category: ErrorCategory::Wezterm,
-    title: "WezTerm output parse error",
-    description: "Failed to parse JSON output from the WezTerm bridge CLI. This may indicate \
-                  a version mismatch or unexpected output format.",
+    title: "WezTerm circuit breaker is open",
+    description: "The backend circuit breaker is temporarily rejecting commands after repeated \
+                  failures. The rejected command was not dispatched through this circuit.",
     causes: &[
-        "WezTerm version is too old or too new",
-        "WezTerm output format changed",
-        "Corrupted or incomplete output",
+        "Repeated backend command or transport failures",
+        "The backend bridge is unavailable or overloaded",
+        "The circuit breaker cooldown has not elapsed",
     ],
     recovery_steps: &[
-        RecoveryStep::with_command("Check backend bridge version", "wezterm --version"),
-        RecoveryStep::text("Update WezTerm bridge to a compatible version"),
-        RecoveryStep::text("Report issue if the problem persists"),
+        RecoveryStep::with_command("Check FrankenTerm status", "ft status"),
+        RecoveryStep::with_command("Run diagnostics", "ft doctor"),
+        RecoveryStep::text("Wait for the reported cooldown before retrying, and repair the backend if failures continue"),
     ],
     doc_link: None,
 };
@@ -503,6 +522,25 @@ pub static FT_2008: ErrorCodeDef = ErrorCodeDef {
     recovery_steps: &[
         RecoveryStep::text("Open a fresh storage handle before issuing more work"),
         RecoveryStep::with_command("Run diagnostics", "ft doctor"),
+    ],
+    doc_link: None,
+};
+
+/// FT-2009: Direct storage mutation outcome is indeterminate
+pub static FT_2009: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-2009",
+    category: ErrorCategory::Storage,
+    title: "Storage mutation outcome is indeterminate",
+    description: "A directly executed storage mutation may have committed after admission, but its authoritative completion result could not be observed.",
+    causes: &[
+        "Caller cancellation after blocking mutation admission",
+        "Blocking executor or completion-channel failure after a possible commit",
+        "Runtime observation failure after durable state changed",
+    ],
+    recovery_steps: &[
+        RecoveryStep::text("Reconcile the affected durable record before retrying"),
+        RecoveryStep::with_command("Run diagnostics", "ft doctor"),
+        RecoveryStep::text("Retry only after proving the original mutation did not commit or after deriving an idempotent continuation"),
     ],
     doc_link: None,
 };
@@ -681,6 +719,25 @@ pub static FT_2054: ErrorCodeDef = ErrorCodeDef {
         RecoveryStep::text("Correct deterministic request, schema, path, or capacity failures before retrying"),
         RecoveryStep::text("Retry only a typed busy or transient open failure"),
         RecoveryStep::with_command("Run diagnostics", "ft doctor"),
+    ],
+    doc_link: None,
+};
+
+/// FT-2055: Admitted writer command settlement is indeterminate
+pub static FT_2055: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-2055",
+    category: ErrorCategory::Storage,
+    title: "Storage writer settlement is indeterminate",
+    description: "A command was admitted to the dedicated storage writer, but its bounded response or shutdown settlement could not be authoritatively observed.",
+    causes: &[
+        "The writer withheld a command response beyond the settlement bound",
+        "A shutdown acknowledgment or native join receipt was not observed in time",
+        "The writer completion channel or blocking settlement runtime failed",
+    ],
+    recovery_steps: &[
+        RecoveryStep::text("Treat the command outcome as unknown and reconcile durable state"),
+        RecoveryStep::with_command("Run diagnostics", "ft doctor"),
+        RecoveryStep::text("A later shutdown call may observe the retained join receipt; do not assume the writer detached"),
     ],
     doc_link: None,
 };
@@ -1215,6 +1272,7 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         m.insert("FT-1021", &FT_1021);
         m.insert("FT-1022", &FT_1022);
         m.insert("FT-1023", &FT_1023);
+        m.insert("FT-1024", &FT_1024);
         m.insert("FT-1030", &FT_1030);
         // Storage errors
         m.insert("FT-2001", &FT_2001);
@@ -1225,6 +1283,7 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         m.insert("FT-2006", &FT_2006);
         m.insert("FT-2007", &FT_2007);
         m.insert("FT-2008", &FT_2008);
+        m.insert("FT-2009", &FT_2009);
         m.insert("FT-2010", &FT_2010);
         m.insert("FT-2020", &FT_2020);
         m.insert("FT-2030", &FT_2030);
@@ -1234,6 +1293,7 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         m.insert("FT-2052", &FT_2052);
         m.insert("FT-2053", &FT_2053);
         m.insert("FT-2054", &FT_2054);
+        m.insert("FT-2055", &FT_2055);
         // Pattern errors
         m.insert("FT-3001", &FT_3001);
         m.insert("FT-3002", &FT_3002);
@@ -1997,6 +2057,46 @@ mod tests {
         assert!(def.description.contains("PATH"));
         assert!(def.causes.len() >= 2);
         assert!(def.recovery_steps.len() >= 2);
+    }
+
+    #[test]
+    fn indeterminate_effect_codes_require_reconciliation_without_blind_retry() {
+        for code in ["FT-1024", "FT-2009", "FT-2055"] {
+            let def = get_error_code(code).expect("indeterminate-effect code");
+            assert!(
+                def.title.to_ascii_lowercase().contains("indeterminate"),
+                "{code} title must name the unknown outcome"
+            );
+            let guidance = def
+                .recovery_steps
+                .iter()
+                .map(|step| step.description.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            assert!(
+                guidance.contains("reconcile") || guidance.contains("verify"),
+                "{code} must require state reconciliation"
+            );
+            assert!(
+                guidance.contains("do not") || guidance.contains("only after"),
+                "{code} must prohibit an unconditional retry"
+            );
+        }
+    }
+
+    #[test]
+    fn ft_1030_describes_circuit_rejection_not_json_parsing() {
+        let def = get_error_code("FT-1030").expect("circuit-open code");
+        assert_eq!(def.category, ErrorCategory::Wezterm);
+        assert!(def.title.to_ascii_lowercase().contains("circuit"));
+        assert!(def.description.to_ascii_lowercase().contains("not dispatched"));
+        assert!(!def.title.to_ascii_lowercase().contains("parse"));
+        assert!(
+            def.recovery_steps
+                .iter()
+                .any(|step| step.description.to_ascii_lowercase().contains("cooldown"))
+        );
     }
 
     #[test]

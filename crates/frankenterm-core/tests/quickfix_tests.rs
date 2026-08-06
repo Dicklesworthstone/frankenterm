@@ -123,19 +123,55 @@ fn format_explanation_interpolates_context_in_detailed() {
 fn every_error_variant_has_remediation() {
     let json_err = serde_json::from_str::<serde_json::Value>("").unwrap_err();
     let errors: Vec<Error> = vec![
+        Error::CaptureAuthority(
+            frankenterm_core::capture_authority::CaptureAuthorityError::TransitionInProgress,
+        ),
         // Wezterm variants
         Error::Wezterm(WeztermError::CliNotFound),
         Error::Wezterm(WeztermError::NotRunning),
         Error::Wezterm(WeztermError::PaneNotFound(1)),
         Error::Wezterm(WeztermError::SocketNotFound("/tmp/wez.sock".to_string())),
         Error::Wezterm(WeztermError::CommandFailed("boom".to_string())),
+        Error::Wezterm(WeztermError::IndeterminateMutation {
+            operation: "spawn",
+        }),
         Error::Wezterm(WeztermError::ParseError("bad json".to_string())),
+        Error::Wezterm(WeztermError::OutputTooLarge {
+            command: "cli list".to_string(),
+            len: 1_024,
+            cap: 512,
+        }),
         Error::Wezterm(WeztermError::Timeout(5)),
         Error::Wezterm(WeztermError::CircuitOpen {
             retry_after_ms: 500,
         }),
         // Storage variants
         Error::Storage(StorageError::Database("db err".to_string())),
+        Error::Storage(StorageError::WriterBackendEpochPoisoned),
+        Error::Storage(StorageError::BackendEpochPoisoned),
+        Error::Storage(StorageError::MigrationEpochPoisoned),
+        Error::Storage(StorageError::IndeterminateMutation {
+            operation: "store_embedding",
+        }),
+        Error::Storage(StorageError::WriterSettlementIndeterminate {
+            phase: "command_response",
+        }),
+        Error::Storage(StorageError::WriterClosed),
+        Error::Storage(StorageError::SubmitIdempotency(
+            frankenterm_core::submit_idempotency_store::SubmitIdempotencyError::SchemaMismatch,
+        )),
+        Error::Storage(StorageError::ReservationConflict {
+            pane_id: 1,
+            existing_id: 2,
+        }),
+        Error::Storage(StorageError::InvalidEventDeliveryLeaseBatch(
+            EventDeliveryLeaseBatchError::EmptyToken,
+        )),
+        Error::Storage(StorageError::LeaseTokenConflict { event_id: 3 }),
+        Error::Storage(StorageError::LeaseOwnershipConflict {
+            updated: 1,
+            expected: 2,
+        }),
         Error::Storage(StorageError::SequenceDiscontinuity {
             expected: 1,
             actual: 2,
@@ -179,7 +215,22 @@ fn every_error_variant_has_remediation() {
         Error::Io(std::io::Error::other("io")),
         Error::Json(json_err),
         legacy_runtime_error("runtime"),
+        Error::RuntimeOperation {
+            operation: "quickfix_runtime",
+            source: RuntimeOperationSource::WatchChannelClosed,
+        },
+        Error::PaneOperation {
+            pane_id: 1,
+            operation: "quickfix_pane",
+            source: PaneOperationSource::PaneNotFound,
+        },
+        Error::WatchdogWarningRead {
+            backend: "quickfix_backend",
+            source: WatchdogWarningSource::Backend("unavailable".to_string()),
+        },
         Error::SetupError("setup failed".to_string()),
+        Error::Cancelled("cancelled".to_string()),
+        Error::Panicked("panicked".to_string()),
     ];
 
     for error in &errors {
@@ -269,6 +320,9 @@ fn contains_control_chars(s: &str) -> bool {
 fn remediation_commands_have_no_smart_quotes() {
     let json_err = serde_json::from_str::<serde_json::Value>("").unwrap_err();
     let errors: Vec<Error> = vec![
+        Error::CaptureAuthority(
+            frankenterm_core::capture_authority::CaptureAuthorityError::TransitionInProgress,
+        ),
         Error::Wezterm(WeztermError::CliNotFound),
         Error::Wezterm(WeztermError::NotRunning),
         Error::Wezterm(WeztermError::PaneNotFound(1)),
@@ -500,12 +554,45 @@ fn error_renderer_maps_all_error_variants_to_catalog() {
         Error::Wezterm(WeztermError::PaneNotFound(1)),
         Error::Wezterm(WeztermError::SocketNotFound("/tmp/s".to_string())),
         Error::Wezterm(WeztermError::CommandFailed("err".to_string())),
+        Error::Wezterm(WeztermError::IndeterminateMutation {
+            operation: "spawn",
+        }),
         Error::Wezterm(WeztermError::ParseError("bad".to_string())),
+        Error::Wezterm(WeztermError::OutputTooLarge {
+            command: "cli list".to_string(),
+            len: 1_024,
+            cap: 512,
+        }),
         Error::Wezterm(WeztermError::Timeout(5)),
         Error::Wezterm(WeztermError::CircuitOpen {
             retry_after_ms: 100,
         }),
         Error::Storage(StorageError::Database("db".to_string())),
+        Error::Storage(StorageError::WriterBackendEpochPoisoned),
+        Error::Storage(StorageError::BackendEpochPoisoned),
+        Error::Storage(StorageError::MigrationEpochPoisoned),
+        Error::Storage(StorageError::IndeterminateMutation {
+            operation: "store_embedding",
+        }),
+        Error::Storage(StorageError::WriterSettlementIndeterminate {
+            phase: "command_response",
+        }),
+        Error::Storage(StorageError::WriterClosed),
+        Error::Storage(StorageError::SubmitIdempotency(
+            frankenterm_core::submit_idempotency_store::SubmitIdempotencyError::SchemaMismatch,
+        )),
+        Error::Storage(StorageError::ReservationConflict {
+            pane_id: 1,
+            existing_id: 2,
+        }),
+        Error::Storage(StorageError::InvalidEventDeliveryLeaseBatch(
+            EventDeliveryLeaseBatchError::EmptyToken,
+        )),
+        Error::Storage(StorageError::LeaseTokenConflict { event_id: 3 }),
+        Error::Storage(StorageError::LeaseOwnershipConflict {
+            updated: 1,
+            expected: 2,
+        }),
         Error::Storage(StorageError::SequenceDiscontinuity {
             expected: 1,
             actual: 2,
@@ -535,13 +622,29 @@ fn error_renderer_maps_all_error_variants_to_catalog() {
         Error::Config(ConfigError::FileNotFound("f".to_string())),
         Error::Config(ConfigError::ReadFailed("f".to_string(), "e".to_string())),
         Error::Config(ConfigError::ParseError("p".to_string())),
+        Error::Config(ConfigError::ParseFailed("p".to_string())),
         Error::Config(ConfigError::SerializeFailed("s".to_string())),
         Error::Config(ConfigError::ValidationError("v".to_string())),
         Error::Policy("denied".to_string()),
         Error::Io(std::io::Error::other("io")),
         Error::Json(json_err),
         legacy_runtime_error("runtime"),
+        Error::RuntimeOperation {
+            operation: "quickfix_runtime",
+            source: RuntimeOperationSource::WatchChannelClosed,
+        },
+        Error::PaneOperation {
+            pane_id: 1,
+            operation: "quickfix_pane",
+            source: PaneOperationSource::PaneNotFound,
+        },
+        Error::WatchdogWarningRead {
+            backend: "quickfix_backend",
+            source: WatchdogWarningSource::Backend("unavailable".to_string()),
+        },
         Error::SetupError("setup".to_string()),
+        Error::Cancelled("cancelled".to_string()),
+        Error::Panicked("panicked".to_string()),
     ];
 
     for error in &errors {

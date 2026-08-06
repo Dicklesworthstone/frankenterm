@@ -43,6 +43,7 @@ impl ErrorRenderer {
                 WeztermError::PaneNotFound(_) => "FT-1010",
                 WeztermError::SocketNotFound(_) => "FT-1003",
                 WeztermError::CommandFailed(_) => "FT-1020",
+                WeztermError::IndeterminateMutation { .. } => "FT-1024",
                 WeztermError::ParseError(_) => "FT-1021",
                 WeztermError::OutputTooLarge { .. } => "FT-1023",
                 WeztermError::Timeout(_) => "FT-1022",
@@ -53,6 +54,8 @@ impl ErrorRenderer {
                 StorageError::WriterBackendEpochPoisoned => "FT-2005",
                 StorageError::MigrationEpochPoisoned => "FT-2006",
                 StorageError::BackendEpochPoisoned => "FT-2007",
+                StorageError::IndeterminateMutation { .. } => "FT-2009",
+                StorageError::WriterSettlementIndeterminate { .. } => "FT-2055",
                 StorageError::WriterClosed => "FT-2008",
                 StorageError::SubmitIdempotency(_) => "FT-2054",
                 StorageError::InvalidEventDeliveryLeaseBatch(_) => "FT-2051",
@@ -525,7 +528,16 @@ mod tests {
 
         let samples = vec![
             Error::Wezterm(WeztermError::CliNotFound),
+            Error::Wezterm(WeztermError::IndeterminateMutation {
+                operation: "spawn",
+            }),
             Error::Storage(StorageError::Database("db".to_string())),
+            Error::Storage(StorageError::IndeterminateMutation {
+                operation: "store_embedding",
+            }),
+            Error::Storage(StorageError::WriterSettlementIndeterminate {
+                phase: "command_response",
+            }),
             Error::Storage(StorageError::InvalidEventDeliveryLeaseBatch(
                 crate::error::EventDeliveryLeaseBatchError::EmptyToken,
             )),
@@ -583,6 +595,14 @@ mod tests {
             "FT-1020"
         );
         assert_eq!(
+            ErrorRenderer::error_code(&Error::Wezterm(
+                WeztermError::IndeterminateMutation {
+                    operation: "spawn",
+                },
+            )),
+            "FT-1024"
+        );
+        assert_eq!(
             ErrorRenderer::error_code(&Error::Wezterm(WeztermError::ParseError("bad".to_string()))),
             "FT-1021"
         );
@@ -625,6 +645,22 @@ mod tests {
         assert_eq!(
             ErrorRenderer::error_code(&Error::Storage(StorageError::WriterClosed)),
             "FT-2008"
+        );
+        assert_eq!(
+            ErrorRenderer::error_code(&Error::Storage(
+                StorageError::IndeterminateMutation {
+                    operation: "store_embedding",
+                },
+            )),
+            "FT-2009"
+        );
+        assert_eq!(
+            ErrorRenderer::error_code(&Error::Storage(
+                StorageError::WriterSettlementIndeterminate {
+                    phase: "command_response",
+                },
+            )),
+            "FT-2055"
         );
         assert_eq!(
             ErrorRenderer::error_code(&Error::Storage(

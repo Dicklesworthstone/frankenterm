@@ -3023,10 +3023,14 @@ impl StorageHandle {
         }
     }
 
-    fn invalidate_semantic_cache(&self) {
-        if let Ok(mut state) = self.semantic_budget_state.lock() {
+    fn finish_embedding_mutation(
+        semantic_budget_state: &Arc<Mutex<SemanticBudgetState>>,
+        result: Result<()>,
+    ) -> Result<()> {
+        if let Ok(mut state) = semantic_budget_state.lock() {
             state.invalidate_cache();
         }
+        result
     }
 
     /// Preserve cancellation as a first-class error at every storage Cx gate.
@@ -7799,7 +7803,8 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
         let vector = vector.to_vec();
 
-        Self::spawn_blocking_storage_mutation_with_cx(cx, "store_embedding", move || {
+        let mutation_result =
+            Self::spawn_blocking_storage_mutation_with_cx(cx, "store_embedding", move || {
             // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
             pooled_backend(db_path.as_str(), |backend| {
                 execute_typed(
@@ -7819,10 +7824,14 @@ impl StorageHandle {
                 Ok(())
             })
         })
-        .await?;
+        .await;
 
-        self.invalidate_semantic_cache();
-        Ok(())
+        // An indeterminate result can follow a durable INSERT/REPLACE. Clear
+        // cached semantic answers before returning either success or error so
+        // a lost completion cannot leave stale search results indefinitely.
+        // Pre-admission failures also pass here; invalidation is conservative
+        // and harmless in that case.
+        Self::finish_embedding_mutation(&self.semantic_budget_state, mutation_result)
     }
 
     /// Get segment IDs that have no embedding for the given embedder.
@@ -38170,6 +38179,55 @@ fn blocking_storage_mutation_failure_taxonomy_prevents_blind_retry() {
             })
         ));
     }
+}
+
+#[test]
+fn indeterminate_embedding_mutation_invalidates_semantic_cache_before_return() {
+    let state = Arc::new(Mutex::new(SemanticBudgetState::new(
+        SemanticBudgetConfig::default(),
+    )));
+    {
+        let mut guard = state.lock().expect("semantic state test lock");
+        let key = SemanticQueryCacheKey {
+            embedder_id: "embedder-test".to_owned(),
+            pane_id: None,
+            zone_type: None,
+            since: None,
+            until: None,
+            limit: 10,
+            query_vector_hash: 7,
+            query_vector_len: 4,
+        };
+        let _ = guard.cache.put(
+            key,
+            CachedSemanticHits {
+                hits: Vec::new(),
+                expires_at_ms: i64::MAX,
+                generation: 0,
+            },
+        );
+        assert_eq!(guard.cache.len(), 1);
+        assert_eq!(guard.metrics.semantic_cache_invalidations, 0);
+    }
+
+    let result = StorageHandle::finish_embedding_mutation(
+        &state,
+        Err(StorageError::IndeterminateMutation {
+            operation: "store_embedding",
+        }
+        .into()),
+    );
+    assert!(matches!(
+        result,
+        Err(crate::Error::Storage(StorageError::IndeterminateMutation {
+            operation: "store_embedding"
+        }))
+    ));
+
+    let guard = state.lock().expect("semantic state test lock");
+    assert_eq!(guard.cache.len(), 0);
+    assert_eq!(guard.generation, 1);
+    assert_eq!(guard.metrics.semantic_cache_invalidations, 1);
 }
 
 #[test]

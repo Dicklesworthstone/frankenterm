@@ -19,6 +19,7 @@ pub(crate) const MCP_ERR_CAUT: &str = "FT-MCP-0013";
 pub(crate) const MCP_ERR_CASS: &str = "FT-MCP-0014";
 pub(crate) const MCP_ERR_REMOTE_TEXT_UNAVAILABLE: &str = "FT-MCP-0015";
 pub(crate) const MCP_ERR_CURSOR_DISCONTINUITY: &str = "FT-MCP-0016";
+pub(crate) const MCP_ERR_INDETERMINATE_EFFECT: &str = "FT-MCP-0017";
 pub(crate) const MCP_ERR_INTERNAL: &str = "FT-MCP-9000";
 
 #[derive(Debug)]
@@ -87,6 +88,7 @@ fn redacted_mcp_error_message(error: &Error, code: &'static str) -> String {
         MCP_ERR_TIMEOUT => "Request timed out or was cancelled".to_string(),
         MCP_ERR_WEZTERM => "Backend bridge request failed".to_string(),
         MCP_ERR_STORAGE => "Storage unavailable".to_string(),
+        MCP_ERR_INDETERMINATE_EFFECT => "Operation outcome is indeterminate".to_string(),
         MCP_ERR_FTS_QUERY => "Search query rejected".to_string(),
         MCP_ERR_RESERVATION_CONFLICT => "Reservation conflict".to_string(),
         MCP_ERR_CONFIG => "Configuration unavailable".to_string(),
@@ -183,6 +185,13 @@ pub(crate) fn map_mcp_error(error: &Error) -> (&'static str, Option<String>) {
                     .to_string(),
             ),
         ),
+        Error::Wezterm(WeztermError::IndeterminateMutation { .. }) => (
+            MCP_ERR_INDETERMINATE_EFFECT,
+            Some(
+                "The mux mutation may already have taken effect. Reconcile live state and do not retry automatically."
+                    .to_string(),
+            ),
+        ),
         Error::Wezterm(_) => (MCP_ERR_WEZTERM, None),
         Error::Config(_) => (MCP_ERR_CONFIG, None),
         Error::Storage(StorageError::ReservationConflict { .. }) => (
@@ -198,6 +207,16 @@ pub(crate) fn map_mcp_error(error: &Error) -> (&'static str, Option<String>) {
             MCP_ERR_FTS_QUERY,
             Some(
                 "Quote the query as a phrase (\"like-this\") or remove FTS5 operator characters (- : * ( ) NEAR/AND/OR/NOT).".to_string(),
+            ),
+        ),
+        Error::Storage(
+            StorageError::IndeterminateMutation { .. }
+            | StorageError::WriterSettlementIndeterminate { .. },
+        ) => (
+            MCP_ERR_INDETERMINATE_EFFECT,
+            Some(
+                "The storage effect may already be durable. Reconcile stored state and do not retry automatically."
+                    .to_string(),
             ),
         ),
         Error::Storage(_) => (MCP_ERR_STORAGE, None),
@@ -225,14 +244,14 @@ pub(crate) fn map_mcp_error(error: &Error) -> (&'static str, Option<String>) {
 mod tests {
     use super::{
         MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_CURSOR_DISCONTINUITY,
-        MCP_ERR_FTS_QUERY, MCP_ERR_INTERNAL, MCP_ERR_INVALID_ARGS, MCP_ERR_NOT_IMPLEMENTED,
+        MCP_ERR_FTS_QUERY, MCP_ERR_INDETERMINATE_EFFECT, MCP_ERR_INTERNAL, MCP_ERR_INVALID_ARGS, MCP_ERR_NOT_IMPLEMENTED,
         MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
         MCP_ERR_RESERVATION_CONFLICT, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM,
         MCP_ERR_WORKFLOW, McpToolError, map_cass_error, map_caut_error, map_mcp_error,
     };
     use crate::cass::CassError;
     use crate::caut::CautError;
-    use crate::error::{Error, WeztermError};
+    use crate::error::{Error, StorageError, WeztermError};
     use proptest::prelude::*;
 
     // ========================================================================
@@ -257,6 +276,7 @@ mod tests {
             MCP_ERR_CASS,
             MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
             MCP_ERR_CURSOR_DISCONTINUITY,
+            MCP_ERR_INDETERMINATE_EFFECT,
             MCP_ERR_INTERNAL,
         ];
         let mut seen = std::collections::HashSet::new();
@@ -283,6 +303,7 @@ mod tests {
             MCP_ERR_CASS,
             MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
             MCP_ERR_CURSOR_DISCONTINUITY,
+            MCP_ERR_INDETERMINATE_EFFECT,
             MCP_ERR_INTERNAL,
         ];
         for code in codes {
@@ -311,6 +332,7 @@ mod tests {
             (MCP_ERR_CASS, "FT-MCP-0014"),
             (MCP_ERR_REMOTE_TEXT_UNAVAILABLE, "FT-MCP-0015"),
             (MCP_ERR_CURSOR_DISCONTINUITY, "FT-MCP-0016"),
+            (MCP_ERR_INDETERMINATE_EFFECT, "FT-MCP-0017"),
             (MCP_ERR_INTERNAL, "FT-MCP-9000"),
         ];
 
@@ -454,6 +476,36 @@ mod tests {
         let (code, hint) = map_mcp_error(&err);
         assert_eq!(code, MCP_ERR_WEZTERM);
         assert!(hint.unwrap().contains("PATH"));
+    }
+
+    #[test]
+    fn indeterminate_effects_have_a_dedicated_no_retry_mcp_contract() {
+        for error in [
+            Error::Wezterm(WeztermError::IndeterminateMutation {
+                operation: "spawn",
+            }),
+            Error::Storage(StorageError::IndeterminateMutation {
+                operation: "store_embedding",
+            }),
+            Error::Storage(StorageError::WriterSettlementIndeterminate {
+                phase: "command_response",
+            }),
+        ] {
+            let (code, hint) = map_mcp_error(&error);
+            assert_eq!(code, MCP_ERR_INDETERMINATE_EFFECT);
+            let hint = hint.expect("indeterminate MCP hint").to_ascii_lowercase();
+            assert!(hint.contains("reconcile"));
+            assert!(hint.contains("do not retry automatically"));
+
+            let envelope = McpToolError::from_error(error);
+            assert_eq!(envelope.code, MCP_ERR_INDETERMINATE_EFFECT);
+            assert_eq!(envelope.message, "Operation outcome is indeterminate");
+            assert!(
+                envelope
+                    .hint
+                    .is_some_and(|text| text.contains("do not retry automatically"))
+            );
+        }
     }
 
     #[test]

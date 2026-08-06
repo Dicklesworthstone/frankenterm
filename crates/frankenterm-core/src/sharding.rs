@@ -502,6 +502,8 @@ pub enum ShardBackendErrorClass {
     TimedOut,
     /// Circuit breaker rejected the operation.
     CircuitOpen,
+    /// A non-idempotent backend mutation may already have taken effect.
+    IndeterminateMutation,
     /// Backend operation reported cancellation.
     #[serde(rename = "backend_cancelled")]
     Cancelled,
@@ -524,6 +526,7 @@ impl ShardBackendErrorClass {
             Self::OutputTooLarge => "output_too_large",
             Self::TimedOut => "timed_out",
             Self::CircuitOpen => "circuit_open",
+            Self::IndeterminateMutation => "indeterminate_mutation",
             Self::Cancelled => "backend_cancelled",
             Self::Panicked => "backend_panicked",
             Self::Io => "io",
@@ -888,6 +891,9 @@ fn classify_backend_error(error: &crate::Error) -> ShardBackendErrorClass {
             WeztermError::OutputTooLarge { .. } => ShardBackendErrorClass::OutputTooLarge,
             WeztermError::Timeout(_) => ShardBackendErrorClass::TimedOut,
             WeztermError::CircuitOpen { .. } => ShardBackendErrorClass::CircuitOpen,
+            WeztermError::IndeterminateMutation { .. } => {
+                ShardBackendErrorClass::IndeterminateMutation
+            }
         },
         crate::Error::RuntimeOperation {
             source: crate::error::RuntimeOperationSource::Cancelled(_),
@@ -1254,9 +1260,81 @@ impl ShardedWeztermClient {
     ) -> crate::Error {
         let error_class = classify_backend_error(&err);
         let pane_hint = pane_id.map_or_else(String::new, |id| format!(", pane={id}"));
-        crate::Error::Wezterm(WeztermError::CommandFailed(format!(
-            "{op} failed on shard {shard_id}{pane_hint} (class={error_class})"
-        )))
+        let finite_detail = || {
+            format!("{op} failed on shard {shard_id}{pane_hint} (class={error_class})")
+        };
+
+        // Preserve every existing typed class that controls retry/cancellation
+        // semantics while replacing untrusted backend strings with a finite
+        // shard-local projection. In particular, laundering an indeterminate
+        // mutation into CommandFailed makes generic retry code duplicate
+        // pane creation, input, kill, activation, or zoom effects.
+        match err {
+            crate::Error::Wezterm(error) => crate::Error::Wezterm(match error {
+                WeztermError::CliNotFound => WeztermError::CliNotFound,
+                WeztermError::NotRunning => WeztermError::NotRunning,
+                WeztermError::PaneNotFound(local_pane_id) => {
+                    WeztermError::PaneNotFound(pane_id.unwrap_or(local_pane_id))
+                }
+                WeztermError::SocketNotFound(_) => WeztermError::SocketNotFound(format!(
+                    "shard-{shard_id}-backend-endpoint"
+                )),
+                WeztermError::CommandFailed(_) => WeztermError::CommandFailed(finite_detail()),
+                WeztermError::IndeterminateMutation { .. } => {
+                    WeztermError::IndeterminateMutation { operation: op }
+                }
+                WeztermError::ParseError(_) => WeztermError::ParseError(finite_detail()),
+                WeztermError::OutputTooLarge { len, cap, .. } => {
+                    WeztermError::OutputTooLarge {
+                        command: format!("{op} on shard {shard_id}"),
+                        len,
+                        cap,
+                    }
+                }
+                WeztermError::Timeout(seconds) => WeztermError::Timeout(seconds),
+                WeztermError::CircuitOpen { retry_after_ms } => {
+                    WeztermError::CircuitOpen { retry_after_ms }
+                }
+            }),
+            crate::Error::Cancelled(_) => crate::Error::Cancelled(format!(
+                "{op} cancelled on shard {shard_id}"
+            )),
+            crate::Error::RuntimeOperation { source, .. } => match source {
+                crate::error::RuntimeOperationSource::Backend(_) => {
+                    crate::Error::Wezterm(WeztermError::CommandFailed(finite_detail()))
+                }
+                crate::error::RuntimeOperationSource::Cancelled(_) => {
+                    crate::Error::RuntimeOperation {
+                        operation: op,
+                        source: crate::error::RuntimeOperationSource::Cancelled(
+                            "sharded backend cancellation".to_owned(),
+                        ),
+                    }
+                }
+                finite_source => crate::Error::RuntimeOperation {
+                    operation: op,
+                    source: finite_source,
+                },
+            },
+            crate::Error::PaneOperation {
+                pane_id: backend_pane_id,
+                source: crate::error::PaneOperationSource::PaneNotFound,
+                ..
+            } => crate::Error::PaneOperation {
+                pane_id: pane_id.unwrap_or(backend_pane_id),
+                operation: op,
+                source: crate::error::PaneOperationSource::PaneNotFound,
+            },
+            crate::Error::Io(error) => crate::Error::Io(std::io::Error::new(
+                error.kind(),
+                finite_detail(),
+            )),
+            crate::Error::Panicked(_) => crate::Error::Panicked(format!(
+                "{op} backend panicked on shard {shard_id}"
+            )),
+            crate::Error::CaptureAuthority(error) => crate::Error::CaptureAuthority(error),
+            _ => crate::Error::Wezterm(WeztermError::CommandFailed(finite_detail())),
+        }
     }
 
     fn codec_error_with_cleanup_failure(
@@ -4746,6 +4824,88 @@ mod tests {
         assert!(debug.contains("id: ShardId(3)"));
         // handle should be omitted via finish_non_exhaustive
         assert!(debug.contains(".."));
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn sharded_backend_projection_preserves_retry_authority_and_redacts_details() {
+        let handle = Arc::new(MockWezterm::new()) as WeztermHandle;
+        let client = ShardedWeztermClient::new(
+            vec![ShardBackend::new(ShardId(3), handle)],
+            AssignmentStrategy::RoundRobin,
+        )
+        .expect("single sharded backend");
+
+        let indeterminate = client.backend_error(
+            ShardId(3),
+            "split_pane",
+            Some(77),
+            crate::Error::Wezterm(WeztermError::IndeterminateMutation {
+                operation: "cli_split_pane",
+            }),
+        );
+        assert!(matches!(
+            &indeterminate,
+            crate::Error::Wezterm(WeztermError::IndeterminateMutation {
+                operation: "split_pane"
+            })
+        ));
+        assert!(!crate::retry::is_retryable(&indeterminate));
+        assert_eq!(
+            classify_backend_error(&indeterminate),
+            ShardBackendErrorClass::IndeterminateMutation
+        );
+
+        let missing = client.backend_error(
+            ShardId(3),
+            "get_text",
+            Some(77),
+            crate::Error::Wezterm(WeztermError::PaneNotFound(5)),
+        );
+        assert!(matches!(
+            &missing,
+            crate::Error::Wezterm(WeztermError::PaneNotFound(77))
+        ));
+        assert!(!crate::retry::is_retryable(&missing));
+
+        let circuit = client.backend_error(
+            ShardId(3),
+            "list_panes",
+            None,
+            crate::Error::Wezterm(WeztermError::CircuitOpen {
+                retry_after_ms: 250,
+            }),
+        );
+        assert!(matches!(
+            &circuit,
+            crate::Error::Wezterm(WeztermError::CircuitOpen {
+                retry_after_ms: 250
+            })
+        ));
+        assert!(!crate::retry::is_retryable(&circuit));
+
+        let cancelled = client.backend_error(
+            ShardId(3),
+            "send_text",
+            Some(77),
+            crate::Error::Cancelled("hostile-pane-secret".repeat(1_024)),
+        );
+        assert!(matches!(&cancelled, crate::Error::Cancelled(_)));
+        assert!(!crate::retry::is_retryable(&cancelled));
+        assert!(!cancelled.to_string().contains("hostile-pane-secret"));
+
+        let command = client.backend_error(
+            ShardId(3),
+            "send_text",
+            Some(77),
+            crate::Error::Wezterm(WeztermError::CommandFailed(
+                "hostile-command-secret".repeat(1_024),
+            )),
+        );
+        let rendered = command.to_string();
+        assert!(rendered.contains("class=command_failed"));
+        assert!(!rendered.contains("hostile-command-secret"));
+        assert!(rendered.len() < 256);
     }
 
     // -----------------------------------------------------------------------

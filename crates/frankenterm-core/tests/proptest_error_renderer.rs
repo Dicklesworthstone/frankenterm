@@ -43,10 +43,12 @@ use proptest::prelude::*;
 use frankenterm_core::Error as CoreError;
 use frankenterm_core::capture_authority::CaptureAuthorityError;
 use frankenterm_core::error::{
-    ConfigError, PatternError, StorageError, WeztermError, WorkflowError,
+    ConfigError, EventDeliveryLeaseBatchError, PaneOperationSource, PatternError,
+    RuntimeOperationSource, StorageError, WatchdogWarningSource, WeztermError, WorkflowError,
 };
 use frankenterm_core::error_codes::{ErrorCategory, get_error_code};
 use frankenterm_core::output::{ErrorRenderer, OutputFormat, get_code_for_error, render_error};
+use frankenterm_core::submit_idempotency_store::SubmitIdempotencyError;
 
 #[allow(deprecated)]
 fn legacy_runtime_error(message: String) -> CoreError {
@@ -78,7 +80,13 @@ fn arb_wezterm_error() -> impl Strategy<Value = WeztermError> {
         arb_u64().prop_map(WeztermError::PaneNotFound),
         arb_nonempty_string().prop_map(WeztermError::SocketNotFound),
         arb_nonempty_string().prop_map(WeztermError::CommandFailed),
+        (0..1u8).prop_map(|_| WeztermError::IndeterminateMutation {
+            operation: "property_mutation",
+        }),
         arb_nonempty_string().prop_map(WeztermError::ParseError),
+        (arb_nonempty_string(), 0usize..1_000_000, 1usize..1_000_001).prop_map(
+            |(command, len, cap)| WeztermError::OutputTooLarge { command, len, cap },
+        ),
         arb_u64().prop_map(WeztermError::Timeout),
         arb_u64().prop_map(|ms| WeztermError::CircuitOpen { retry_after_ms: ms }),
     ]
@@ -87,6 +95,34 @@ fn arb_wezterm_error() -> impl Strategy<Value = WeztermError> {
 fn arb_storage_error() -> impl Strategy<Value = StorageError> {
     prop_oneof![
         arb_nonempty_string().prop_map(StorageError::Database),
+        (0..1u8).prop_map(|_| StorageError::WriterBackendEpochPoisoned),
+        (0..1u8).prop_map(|_| StorageError::BackendEpochPoisoned),
+        (0..1u8).prop_map(|_| StorageError::MigrationEpochPoisoned),
+        (0..1u8).prop_map(|_| StorageError::IndeterminateMutation {
+            operation: "property_mutation",
+        }),
+        (0..1u8).prop_map(|_| StorageError::WriterSettlementIndeterminate {
+            phase: "property_settlement",
+        }),
+        (0..1u8).prop_map(|_| StorageError::WriterClosed),
+        (0..1u8).prop_map(|_| {
+            StorageError::SubmitIdempotency(SubmitIdempotencyError::SchemaMismatch)
+        }),
+        (arb_u64(), any::<i64>()).prop_map(|(pane_id, existing_id)| {
+            StorageError::ReservationConflict {
+                pane_id,
+                existing_id,
+            }
+        }),
+        (0..1u8).prop_map(|_| {
+            StorageError::InvalidEventDeliveryLeaseBatch(
+                EventDeliveryLeaseBatchError::EmptyToken,
+            )
+        }),
+        any::<i64>().prop_map(|event_id| StorageError::LeaseTokenConflict { event_id }),
+        (any::<usize>(), any::<usize>()).prop_map(|(updated, expected)| {
+            StorageError::LeaseOwnershipConflict { updated, expected }
+        }),
         (arb_u64(), arb_u64()).prop_map(|(expected, actual)| StorageError::SequenceDiscontinuity {
             expected,
             actual,
@@ -149,6 +185,19 @@ fn arb_core_error() -> impl Strategy<Value = CoreError> {
         arb_config_error().prop_map(CoreError::Config),
         arb_nonempty_string().prop_map(CoreError::Policy),
         arb_nonempty_string().prop_map(legacy_runtime_error),
+        (0..1u8).prop_map(|_| CoreError::RuntimeOperation {
+            operation: "property_runtime",
+            source: RuntimeOperationSource::WatchChannelClosed,
+        }),
+        arb_u64().prop_map(|pane_id| CoreError::PaneOperation {
+            pane_id,
+            operation: "property_pane",
+            source: PaneOperationSource::PaneNotFound,
+        }),
+        (0..1u8).prop_map(|_| CoreError::WatchdogWarningRead {
+            backend: "property_backend",
+            source: WatchdogWarningSource::Backend("property failure".to_owned()),
+        }),
         arb_nonempty_string().prop_map(CoreError::SetupError),
         arb_nonempty_string().prop_map(CoreError::Cancelled),
         arb_nonempty_string().prop_map(CoreError::Panicked),

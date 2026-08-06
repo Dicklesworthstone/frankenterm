@@ -451,9 +451,20 @@ impl Error {
             Self::Wezterm(e) => e.error_kind(),
             Self::Io(e) => crate::network_reliability::classify_io_error(e),
             Self::Cancelled(_) => NetworkErrorKind::Transient,
-            Self::Panicked(_) | Self::Runtime(_) | Self::RuntimeOperation { .. } => {
+            Self::Panicked(_) | Self::Runtime(_) => {
                 NetworkErrorKind::Transient
             }
+            Self::RuntimeOperation {
+                source:
+                    RuntimeOperationSource::DeadlineExceeded
+                    | RuntimeOperationSource::PollQuotaExhausted
+                    | RuntimeOperationSource::CostBudgetExhausted
+                    | RuntimeOperationSource::ContextFailure
+                    | RuntimeOperationSource::LockPoisoned
+                    | RuntimeOperationSource::PolledAfterCompletion,
+                ..
+            } => NetworkErrorKind::Permanent,
+            Self::RuntimeOperation { .. } => NetworkErrorKind::Transient,
             Self::PaneOperation {
                 source: PaneOperationSource::PaneNotFound,
                 ..
@@ -841,10 +852,12 @@ impl StorageError {
             Self::WriterClosed => Remediation::new(
                 "The storage writer has already completed an orderly shutdown.",
             )
+            .command("Inspect storage status", "ft status")
             .alternative("Open a fresh FrankenTerm storage handle before issuing more work."),
             Self::SubmitIdempotency(error) if error.is_retryable() => Remediation::new(
                 "The durable submit-idempotency store is temporarily unavailable.",
             )
+            .command("Diagnostics", "ft doctor")
             .alternative("Retry after the storage lock or open failure clears."),
             Self::SubmitIdempotency(_) => Remediation::new(
                 "The durable submit-idempotency request or store authority is invalid.",
@@ -866,14 +879,17 @@ impl StorageError {
             Self::InvalidEventDeliveryLeaseBatch(_) => Remediation::new(
                 "The event-delivery lease input is invalid and was not submitted to storage.",
             )
+            .command("Inspect event state", "ft status")
             .alternative("Rebuild the request using valid, bounded lease fields before retrying."),
             Self::LeaseTokenConflict { .. } => Remediation::new(
                 "One event appeared with more than one lease token in the same batch.",
             )
+            .command("Inspect event state", "ft status")
             .alternative("Rebuild the batch with at most one exact token for each event."),
             Self::LeaseOwnershipConflict { .. } => Remediation::new(
                 "Event delivery ownership changed before the requested mutation completed.",
             )
+            .command("Inspect event state", "ft status")
             .alternative(
                 "Retry each still-current lease independently or acquire a fresh lease before retrying.",
             ),
@@ -1089,6 +1105,9 @@ mod tests {
             Error::Wezterm(WeztermError::PaneNotFound(1)),
             Error::Wezterm(WeztermError::SocketNotFound("/tmp/wez.sock".to_string())),
             Error::Wezterm(WeztermError::CommandFailed("boom".to_string())),
+            Error::Wezterm(WeztermError::IndeterminateMutation {
+                operation: "spawn",
+            }),
             Error::Wezterm(WeztermError::ParseError("bad json".to_string())),
             Error::Wezterm(WeztermError::Timeout(5)),
             Error::Wezterm(WeztermError::CircuitOpen {
@@ -1098,6 +1117,12 @@ mod tests {
             Error::Storage(StorageError::WriterBackendEpochPoisoned),
             Error::Storage(StorageError::BackendEpochPoisoned),
             Error::Storage(StorageError::MigrationEpochPoisoned),
+            Error::Storage(StorageError::IndeterminateMutation {
+                operation: "store_embedding",
+            }),
+            Error::Storage(StorageError::WriterSettlementIndeterminate {
+                phase: "command_response",
+            }),
             Error::Storage(StorageError::WriterClosed),
             Error::Storage(StorageError::SubmitIdempotency(
                 crate::submit_idempotency_store::SubmitIdempotencyError::SchemaMismatch,
@@ -1387,6 +1412,37 @@ mod tests {
         let r = WeztermError::CliNotFound.remediation();
         assert!(r.commands.len() >= 3); // multiple platform installs
         assert!(r.learn_more.is_some());
+    }
+
+    #[test]
+    fn indeterminate_effect_errors_are_permanent_and_require_reconciliation() {
+        use crate::network_reliability::NetworkErrorKind;
+
+        for error in [
+            Error::Wezterm(WeztermError::IndeterminateMutation {
+                operation: "spawn",
+            }),
+            Error::Storage(StorageError::IndeterminateMutation {
+                operation: "store_embedding",
+            }),
+            Error::Storage(StorageError::WriterSettlementIndeterminate {
+                phase: "command_response",
+            }),
+        ] {
+            assert_eq!(error.error_kind(), NetworkErrorKind::Permanent);
+            let remediation = error.remediation().expect("indeterminate remediation");
+            let guidance = format!(
+                "{} {}",
+                remediation.summary,
+                remediation.alternatives.join(" ")
+            )
+            .to_ascii_lowercase();
+            assert!(guidance.contains("reconcile"));
+            assert!(guidance.contains("do not blindly") || guidance.contains("before retry"));
+            let rendered = error.to_string();
+            assert!(!rendered.contains('\n'));
+            assert!(rendered.len() < 256);
+        }
     }
 
     #[test]

@@ -270,6 +270,7 @@ All MCP errors use stable codes prefixed with `FT-MCP-`:
 | `FT-MCP-0014` | CASS integration error | `robot.cass_error` |
 | `FT-MCP-0015` | Remote pane text unavailable | `robot.remote_text_unavailable` |
 | `FT-MCP-0016` | Durable event cursor discontinuity (retention, epoch, scope, or authority mismatch) | `robot.cursor_discontinuity` |
+| `FT-MCP-0017` | Mutation outcome is indeterminate; reconcile state and do not retry automatically | `robot.wezterm_mutation_indeterminate` or the corresponding storage indeterminate class |
 | `FT-MCP-9000` | Internal MCP/server error with redacted details | Internal runtime, IO, JSON, setup, cancellation, or other unclassified failures |
 
 ## Safety & Policy

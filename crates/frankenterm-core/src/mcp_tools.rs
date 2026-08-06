@@ -7391,6 +7391,11 @@ fn mcp_await_event_error_invalidates_storage_epoch(error: &crate::Error) -> bool
         error,
         crate::Error::Storage(
             crate::error::StorageError::Database(_)
+                | crate::error::StorageError::WriterBackendEpochPoisoned
+                | crate::error::StorageError::BackendEpochPoisoned
+                | crate::error::StorageError::MigrationEpochPoisoned
+                | crate::error::StorageError::WriterSettlementIndeterminate { .. }
+                | crate::error::StorageError::WriterClosed
                 | crate::error::StorageError::MigrationFailed(_)
                 | crate::error::StorageError::SchemaTooNew { .. }
                 | crate::error::StorageError::WaTooOld { .. }
@@ -17562,7 +17567,24 @@ mod tests {
                 min_compatible: "0.12.0".to_string(),
             })
         ));
+        for epoch_failure in [
+            crate::Error::Storage(crate::StorageError::WriterBackendEpochPoisoned),
+            crate::Error::Storage(crate::StorageError::BackendEpochPoisoned),
+            crate::Error::Storage(crate::StorageError::MigrationEpochPoisoned),
+            crate::Error::Storage(crate::StorageError::WriterSettlementIndeterminate {
+                phase: "command_response",
+            }),
+            crate::Error::Storage(crate::StorageError::WriterClosed),
+        ] {
+            assert!(
+                super::mcp_await_event_error_invalidates_storage_epoch(&epoch_failure),
+                "writer/epoch failure must invalidate shared storage: {epoch_failure}"
+            );
+        }
         for request_local_error in [
+            crate::Error::Storage(crate::StorageError::IndeterminateMutation {
+                operation: "store_embedding",
+            }),
             crate::Error::Storage(crate::StorageError::NotFound("event".to_string())),
             crate::Error::Storage(crate::StorageError::ReservationConflict {
                 pane_id: 7,
