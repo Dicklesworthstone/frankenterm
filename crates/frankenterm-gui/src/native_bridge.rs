@@ -34,7 +34,10 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(250);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+const MAX_BRIDGE_TEXT_FIELD_BYTES: usize = 16 * 1024;
 static BRIDGE_QUEUE_FULL_DROPS: AtomicU64 = AtomicU64::new(0);
+static BRIDGE_OVERSIZED_FIELD_DROPS: AtomicU64 = AtomicU64::new(0);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -177,6 +180,38 @@ fn enqueue_bridge_event(
     }
 }
 
+fn bridge_text_field_allowed(
+    event_kind: &'static str,
+    pane_id: u64,
+    field: &'static str,
+    value: &str,
+) -> bool {
+    if value.len() <= MAX_BRIDGE_TEXT_FIELD_BYTES {
+        return true;
+    }
+
+    let previous = match BRIDGE_OVERSIZED_FIELD_DROPS.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |count| Some(count.saturating_add(1)),
+    ) {
+        Ok(previous) | Err(previous) => previous,
+    };
+    let drop_count = previous.saturating_add(1);
+    if drop_count.is_power_of_two() {
+        log::warn!(
+            "Native event bridge: oversized text field dropped; event_kind={} pane_id={} field={} field_bytes={} max_field_bytes={} delivery_gap=known cumulative_oversized_drops={}",
+            event_kind,
+            pane_id,
+            field,
+            value.len(),
+            MAX_BRIDGE_TEXT_FIELD_BYTES,
+            drop_count
+        );
+    }
+    false
+}
+
 /// The native event bridge. Owns the sender thread and mux subscription.
 pub struct NativeEventBridge {
     shutdown: Arc<AtomicBool>,
@@ -307,6 +342,10 @@ fn connect_authenticated_native_event_socket(
     validate_native_event_socket_endpoint(socket_path)?;
     let stream = UnixStream::connect(socket_path)?;
     validate_native_event_peer(&stream)?;
+    // The bridge's Drop implementation joins the sender thread. A peer that
+    // authenticates and then stops reading must not turn shutdown into an
+    // unbounded blocking write/join.
+    stream.set_write_timeout(Some(SOCKET_WRITE_TIMEOUT))?;
     Ok(stream)
 }
 
@@ -323,8 +362,8 @@ fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown
         if stream.is_none() {
             match connect_authenticated_native_event_socket(socket_path) {
                 Ok(s) => {
-                    log::debug!(
-                        "Native event bridge: connected to {}",
+                    log::info!(
+                        "Native event bridge: authenticated socket connected at {}",
                         socket_path.display()
                     );
                     stream = Some(s);
@@ -415,6 +454,7 @@ fn handle_mux_notification(
     notification: &MuxNotification,
     tx: &std_mpsc::SyncSender<BridgeEvent>,
 ) -> bool {
+    let timestamp_ms = now_ms();
     let event = match notification {
         MuxNotification::PaneOutput(pane_id) => {
             // This notification carries only a pane ID after the raw PTY bytes
@@ -423,7 +463,7 @@ fn handle_mux_notification(
             // delta boundaries and can both duplicate and omit bytes. Polling
             // remains the authoritative text-capture path until the mux reader
             // exposes a bounded raw-byte tap with sequence/gap semantics.
-            build_state_change_event(*pane_id)
+            build_state_change_event(*pane_id, timestamp_ms)
         }
 
         MuxNotification::PaneAdded(pane_id) => {
@@ -443,17 +483,26 @@ fn handle_mux_notification(
             } else {
                 ("unknown".to_string(), None)
             };
-            Some(BridgeEvent::PaneCreated {
-                pane_id: terminal_pane_id_to_u64(*pane_id),
-                domain,
-                cwd,
-                timestamp_ms: now_ms(),
-            })
+            let wire_pane_id = terminal_pane_id_to_u64(*pane_id);
+            if !bridge_text_field_allowed("pane_created", wire_pane_id, "domain", &domain)
+                || cwd.as_deref().is_some_and(|cwd| {
+                    !bridge_text_field_allowed("pane_created", wire_pane_id, "cwd", cwd)
+                })
+            {
+                None
+            } else {
+                Some(BridgeEvent::PaneCreated {
+                    pane_id: wire_pane_id,
+                    domain,
+                    cwd,
+                    timestamp_ms,
+                })
+            }
         }
 
         MuxNotification::PaneRemoved(pane_id) => Some(BridgeEvent::PaneDestroyed {
             pane_id: terminal_pane_id_to_u64(*pane_id),
-            timestamp_ms: now_ms(),
+            timestamp_ms,
         }),
 
         MuxNotification::TabTitleChanged { tab_id, .. } => {
@@ -463,7 +512,7 @@ fn handle_mux_notification(
             };
             if let Some(tab) = mux.get_tab(*tab_id) {
                 if let Some(pane) = tab.get_active_pane() {
-                    return emit_state_change(pane.pane_id(), tx);
+                    return emit_state_change(pane.pane_id(), timestamp_ms, tx);
                 }
             }
             None
@@ -472,17 +521,26 @@ fn handle_mux_notification(
         MuxNotification::Alert {
             pane_id,
             alert: wezterm_term::Alert::CurrentWorkingDirectoryChanged,
-        } => build_state_change_event(*pane_id),
+        } => build_state_change_event(*pane_id, timestamp_ms),
 
         MuxNotification::Alert {
             pane_id,
             alert: wezterm_term::Alert::SetUserVar { name, value },
-        } => Some(BridgeEvent::UserVar {
-            pane_id: terminal_pane_id_to_u64(*pane_id),
-            name: name.clone(),
-            value: value.clone(),
-            timestamp_ms: now_ms(),
-        }),
+        } => {
+            let wire_pane_id = terminal_pane_id_to_u64(*pane_id);
+            if !bridge_text_field_allowed("user_var", wire_pane_id, "name", name)
+                || !bridge_text_field_allowed("user_var", wire_pane_id, "value", value)
+            {
+                None
+            } else {
+                Some(BridgeEvent::UserVar {
+                    pane_id: wire_pane_id,
+                    name: name.clone(),
+                    value: value.clone(),
+                    timestamp_ms,
+                })
+            }
+        }
 
         // Ignore other notifications for now
         _ => None,
@@ -491,28 +549,37 @@ fn handle_mux_notification(
     event.is_none_or(|event| enqueue_bridge_event(tx, event).keeps_subscription())
 }
 
-fn build_state_change_event(pane_id: PaneId) -> Option<BridgeEvent> {
+fn build_state_change_event(pane_id: PaneId, timestamp_ms: u64) -> Option<BridgeEvent> {
     let mux = Mux::try_get()?;
     let pane = mux.get_pane(pane_id)?;
     let dims = pane.get_dimensions();
     let cursor = pane.get_cursor_position();
+    let title = pane.get_title();
+    let wire_pane_id = terminal_pane_id_to_u64(pane_id);
+    if !bridge_text_field_allowed("state_change", wire_pane_id, "title", &title) {
+        return None;
+    }
 
     Some(BridgeEvent::StateChange {
-        pane_id: terminal_pane_id_to_u64(pane_id),
+        pane_id: wire_pane_id,
         state: WirePaneState {
-            title: pane.get_title(),
+            title,
             rows: terminal_u16_from_usize(dims.viewport_rows),
             cols: terminal_u16_from_usize(dims.cols),
             is_alt_screen: pane.is_alt_screen_active(),
             cursor_row: terminal_u32_from_stable_delta(cursor.y),
             cursor_col: terminal_u32_from_usize(cursor.x),
         },
-        timestamp_ms: now_ms(),
+        timestamp_ms,
     })
 }
 
-fn emit_state_change(pane_id: PaneId, tx: &std_mpsc::SyncSender<BridgeEvent>) -> bool {
-    build_state_change_event(pane_id)
+fn emit_state_change(
+    pane_id: PaneId,
+    timestamp_ms: u64,
+    tx: &std_mpsc::SyncSender<BridgeEvent>,
+) -> bool {
+    build_state_change_event(pane_id, timestamp_ms)
         .is_none_or(|event| enqueue_bridge_event(tx, event).keeps_subscription())
 }
 
@@ -589,6 +656,21 @@ mod tests {
     }
 
     #[test]
+    fn text_field_bound_is_byte_exact_and_fail_closed() {
+        let exact = "x".repeat(MAX_BRIDGE_TEXT_FIELD_BYTES);
+        assert!(bridge_text_field_allowed("test", 1, "exact", &exact));
+
+        let oversized = format!("{exact}é");
+        assert_eq!(oversized.len(), MAX_BRIDGE_TEXT_FIELD_BYTES + 2);
+        assert!(!bridge_text_field_allowed(
+            "test",
+            1,
+            "oversized",
+            &oversized
+        ));
+    }
+
+    #[test]
     fn wire_event_preserves_notification_occurrence_timestamp() {
         match test_state_event(7).into_wire_event() {
             WireEvent::StateChange { pane_id, ts, .. } => {
@@ -644,6 +726,10 @@ mod tests {
 
         let stream = connect_authenticated_native_event_socket(&socket_path)
             .expect("same-user private endpoint should authenticate");
+        assert_eq!(
+            stream.write_timeout().expect("read write-timeout setting"),
+            Some(SOCKET_WRITE_TIMEOUT)
+        );
         drop(stream);
 
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))

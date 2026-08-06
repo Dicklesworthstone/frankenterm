@@ -35939,6 +35939,24 @@ async fn settle_watcher_background_task(
     }
 }
 
+struct SnapshotBackgroundTasks {
+    bridge: frankenterm_core::watchdog::WatchdogHandle,
+    scheduler: frankenterm_core::watchdog::WatchdogHandle,
+}
+
+async fn settle_snapshot_background_tasks(
+    tasks: SnapshotBackgroundTasks,
+    cleanup_cx: &frankenterm_core::cx::Cx,
+) {
+    // The bridge owns delivery of the durable watch-channel shutdown signal.
+    // Settle it first so the scheduler can observe that signal and exit through
+    // its own cleanup path. WatchdogHandle retains the two-second fallback abort
+    // for either task if cooperative acknowledgement stalls.
+    settle_watcher_background_task("snapshot_shutdown_bridge", tasks.bridge, cleanup_cx, false)
+        .await;
+    settle_watcher_background_task("snapshot_scheduler", tasks.scheduler, cleanup_cx, false).await;
+}
+
 /// Run the observation watcher daemon.
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn run_watcher(
@@ -36745,81 +36763,84 @@ async fn run_watcher(
     };
 
     // Start snapshot engine for session persistence
-    let mut snapshot_task_handles = Vec::new();
-    let snapshot_engine: Option<Arc<frankenterm_core::snapshot_engine::SnapshotEngine>> =
-        if config.snapshots.enabled {
-            let engine_db = Arc::new(db_path.to_string());
-            let engine = Arc::new(frankenterm_core::snapshot_engine::SnapshotEngine::new(
-                engine_db,
-                config.snapshots.clone(),
-            ));
-            let engine_for_loop = Arc::clone(&engine);
-            let shutdown_flag_for_snap = Arc::clone(&handle.shutdown_flag);
-            let bridge_shutdown_owner = Arc::clone(&shutdown_flag_for_snap);
-            let loop_timeout = config.cli.timeout_seconds;
-            // Bridge AtomicBool shutdown flag into a watch channel for run_periodic
-            let (snap_shutdown_tx, snap_shutdown_rx) = watch::channel(false);
-            let bridge_task = frankenterm_core::runtime_async::task::spawn(async move {
-                // ft-xbnl0.2.3 tick 285: cx-first shutdown-bridge poll sleep.
-                let bridge_cx = frankenterm_core::cx::Cx::current()
-                    .unwrap_or_else(frankenterm_core::cx::for_request);
-                loop {
-                    if shutdown_flag_for_snap.load(std::sync::atomic::Ordering::SeqCst) {
-                        let _ = snap_shutdown_tx.send(true);
-                        break;
-                    }
-                    if frankenterm_core::runtime_async::sleep_with_cx(
-                        &bridge_cx,
-                        Duration::from_millis(500),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        // Cx cancelled — send shutdown signal to the periodic loop.
-                        let _ = snap_shutdown_tx.send(true);
-                        break;
-                    }
+    let (snapshot_engine, snapshot_task_handles): (
+        Option<Arc<frankenterm_core::snapshot_engine::SnapshotEngine>>,
+        Option<SnapshotBackgroundTasks>,
+    ) = if config.snapshots.enabled {
+        let engine_db = Arc::new(db_path.to_string());
+        let engine = Arc::new(frankenterm_core::snapshot_engine::SnapshotEngine::new(
+            engine_db,
+            config.snapshots.clone(),
+        ));
+        let engine_for_loop = Arc::clone(&engine);
+        let shutdown_flag_for_snap = Arc::clone(&handle.shutdown_flag);
+        let bridge_shutdown_owner = Arc::clone(&shutdown_flag_for_snap);
+        let loop_timeout = config.cli.timeout_seconds;
+        // Bridge AtomicBool shutdown flag into a watch channel for run_periodic
+        let (snap_shutdown_tx, snap_shutdown_rx) = watch::channel(false);
+        let bridge_task = frankenterm_core::runtime_async::task::spawn(async move {
+            // ft-xbnl0.2.3 tick 285: cx-first shutdown-bridge poll sleep.
+            let bridge_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            loop {
+                if shutdown_flag_for_snap.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = snap_shutdown_tx.send(true);
+                    break;
                 }
-            });
-            snapshot_task_handles.push(
-                frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
-                    bridge_task,
-                    bridge_shutdown_owner,
-                ),
-            );
-            let scheduler_task = frankenterm_core::runtime_async::task::spawn(async move {
-                if let Err(error) = engine_for_loop
-                    .run_periodic(snap_shutdown_rx, move || async move {
-                        let wez =
-                            frankenterm_core::wezterm::wezterm_handle_with_timeout(loop_timeout);
-                        // ft-xbnl0.2.3 tick 284: cx-first periodic list_panes probe.
-                        let probe_cx = frankenterm_core::cx::Cx::current()
-                            .unwrap_or_else(frankenterm_core::cx::for_request);
-                        wez.list_panes_with_cx(&probe_cx).await.ok()
-                    })
-                    .await
+                if frankenterm_core::runtime_async::sleep_with_cx(
+                    &bridge_cx,
+                    Duration::from_millis(500),
+                )
+                .await
+                .is_err()
                 {
-                    match error {
-                        frankenterm_core::snapshot_engine::SnapshotError::Cancelled => {
-                            tracing::info!("snapshot scheduler cancelled");
-                        }
-                        other => {
-                            tracing::warn!(%other, "snapshot scheduler failed");
-                        }
+                    // Cx cancelled — send shutdown signal to the periodic loop.
+                    let _ = snap_shutdown_tx.send(true);
+                    break;
+                }
+            }
+        });
+        let bridge_handle = frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
+            bridge_task,
+            bridge_shutdown_owner,
+        );
+        let scheduler_task = frankenterm_core::runtime_async::task::spawn(async move {
+            if let Err(error) = engine_for_loop
+                .run_periodic(snap_shutdown_rx, move || async move {
+                    let wez =
+                        frankenterm_core::wezterm::wezterm_handle_with_timeout(loop_timeout);
+                    // ft-xbnl0.2.3 tick 284: cx-first periodic list_panes probe.
+                    let probe_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    wez.list_panes_with_cx(&probe_cx).await.ok()
+                })
+                .await
+            {
+                match error {
+                    frankenterm_core::snapshot_engine::SnapshotError::Cancelled => {
+                        tracing::info!("snapshot scheduler cancelled");
+                    }
+                    other => {
+                        tracing::warn!(%other, "snapshot scheduler failed");
                     }
                 }
-            });
-            snapshot_task_handles.push(
-                frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
-                    scheduler_task,
-                    Arc::clone(&handle.shutdown_flag),
-                ),
-            );
-            tracing::info!("Snapshot engine started");
-            Some(engine)
-        } else {
-            None
-        };
+            }
+        });
+        let scheduler_handle = frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
+            scheduler_task,
+            Arc::clone(&handle.shutdown_flag),
+        );
+        tracing::info!("Snapshot engine started");
+        (
+            Some(engine),
+            Some(SnapshotBackgroundTasks {
+                bridge: bridge_handle,
+                scheduler: scheduler_handle,
+            }),
+        )
+    } else {
+        (None, None)
+    };
 
     // Track current config for hot reload
     let mut current_config = config.clone();
@@ -37017,14 +37038,8 @@ async fn run_watcher(
         true,
     )
     .await;
-    for snapshot_task_handle in snapshot_task_handles {
-        settle_watcher_background_task(
-            "snapshot_scheduler",
-            snapshot_task_handle,
-            &background_shutdown_cx,
-            true,
-        )
-        .await;
+    if let Some(snapshot_task_handles) = snapshot_task_handles {
+        settle_snapshot_background_tasks(snapshot_task_handles, &background_shutdown_cx).await;
     }
     if let Some(distributed_listener_handle) = distributed_listener_handle {
         settle_watcher_background_task(
@@ -72894,6 +72909,69 @@ mod tests {
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    #[test]
+    fn snapshot_background_shutdown_settles_bridge_before_scheduler() {
+        run_async_test(async {
+            let shared_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let bridge_shutdown = Arc::clone(&shared_shutdown);
+            let scheduler_shutdown = Arc::clone(&shared_shutdown);
+            let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let bridge_phase = Arc::clone(&phase);
+            let scheduler_phase = Arc::clone(&phase);
+            let (shutdown_tx, mut shutdown_rx) =
+                frankenterm_core::runtime_async::watch::channel(false);
+
+            let bridge_task = frankenterm_core::runtime_async::task::spawn(async move {
+                while !bridge_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                    frankenterm_core::runtime_async::yield_now().await;
+                }
+                assert_eq!(
+                    bridge_phase.swap(1, std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "snapshot bridge must publish shutdown before the scheduler exits",
+                );
+                shutdown_tx
+                    .send(true)
+                    .expect("snapshot scheduler shutdown receiver must remain alive");
+            });
+            let scheduler_task = frankenterm_core::runtime_async::task::spawn(async move {
+                let scheduler_cx = frankenterm_core::cx::for_testing();
+                while !shutdown_rx.borrow_and_clone() {
+                    shutdown_rx
+                        .changed(&scheduler_cx)
+                        .await
+                        .expect("snapshot shutdown bridge must remain alive until delivery");
+                }
+                assert_eq!(
+                    scheduler_phase.swap(2, std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "snapshot scheduler must observe the bridge signal before settlement",
+                );
+            });
+
+            let tasks = SnapshotBackgroundTasks {
+                bridge: frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
+                    bridge_task,
+                    Arc::clone(&shared_shutdown),
+                ),
+                scheduler: frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
+                    scheduler_task,
+                    scheduler_shutdown,
+                ),
+            };
+            let cleanup_cx = frankenterm_core::cx::for_testing();
+            let timeout_cx = frankenterm_core::cx::for_testing();
+            frankenterm_core::runtime_async::timeout_with_cx(
+                &timeout_cx,
+                Duration::from_secs(1),
+                settle_snapshot_background_tasks(tasks, &cleanup_cx),
+            )
+            .await
+            .expect("cooperative bridge-first snapshot settlement must remain bounded");
+            assert_eq!(phase.load(std::sync::atomic::Ordering::SeqCst), 2);
+        });
     }
 
     fn test_health_snapshot_with_swarm_capacity(

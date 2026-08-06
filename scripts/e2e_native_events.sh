@@ -133,9 +133,7 @@ else
 fi
 
 # Step 3: Check that the authenticated native event bridge connected.
-if grep -q "Native event bridge: socket found" "$LOG_DIR/gui-stderr.log" 2>/dev/null; then
-    check "GUI connected to native event socket" "pass"
-elif grep -q "native_bridge" "$LOG_DIR/gui-stderr.log" 2>/dev/null; then
+if grep -q "Native event bridge: authenticated socket connected" "$LOG_DIR/gui-stderr.log" 2>/dev/null; then
     check "GUI connected to native event socket" "pass"
 else
     check "GUI connected to native event socket" "fail"
