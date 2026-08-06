@@ -1,7 +1,8 @@
 //! Undo execution engine for recorded actions.
 //!
 //! This module executes supported undo strategies from `action_undo` metadata
-//! and returns deterministic outcomes (`success`, `not_applicable`, `failed`).
+//! and returns deterministic outcomes (`success`, `applied_with_warning`,
+//! `not_applicable`, `indeterminate`, `failed`).
 
 use std::sync::Arc;
 
@@ -16,10 +17,12 @@ use crate::workflows::{
 };
 use crate::{Error, Result};
 
-fn undo_cancelled_error(operation: &'static str, detail: impl Into<String>) -> Error {
+fn undo_cancelled_error(operation: &'static str) -> Error {
     Error::RuntimeOperation {
         operation,
-        source: RuntimeOperationSource::Cancelled(detail.into()),
+        source: RuntimeOperationSource::Cancelled(
+            "undo operation cancelled by capability context".to_string(),
+        ),
     }
 }
 
@@ -40,8 +43,14 @@ fn is_undo_cancellation(error: &Error) -> bool {
 pub enum UndoOutcome {
     /// Undo action was applied successfully.
     Success,
+    /// The primary undo effect is known to have committed, but an audit or
+    /// secondary settlement step failed. The action must not be retried.
+    AppliedWithWarning,
     /// Undo could not be applied because target state no longer qualifies.
     NotApplicable,
+    /// The operation crossed its effect-dispatch boundary, but durable state
+    /// could not prove whether the effect committed. Verify before retrying.
+    Indeterminate,
     /// Undo was applicable but execution failed.
     Failed,
 }
@@ -100,7 +109,9 @@ pub struct UndoExecutionResult {
     pub target_workflow_id: Option<String>,
     /// Target pane when strategy is `pane_close`.
     pub target_pane_id: Option<u64>,
-    /// Populated for successful undo writes.
+    /// Populated when the durable undo-audit write committed. This can be
+    /// `None` for [`UndoOutcome::AppliedWithWarning`] when the primary effect
+    /// committed but the audit write failed.
     pub undone_at: Option<i64>,
 }
 
@@ -164,6 +175,47 @@ impl UndoExecutionResult {
             undone_at: None,
         }
     }
+
+    fn applied_with_warning(
+        action_id: i64,
+        strategy: String,
+        message: String,
+        guidance: Option<String>,
+        target_workflow_id: Option<String>,
+        target_pane_id: Option<u64>,
+        undone_at: Option<i64>,
+    ) -> Self {
+        Self {
+            action_id,
+            strategy,
+            outcome: UndoOutcome::AppliedWithWarning,
+            message,
+            guidance,
+            target_workflow_id,
+            target_pane_id,
+            undone_at,
+        }
+    }
+
+    fn indeterminate(
+        action_id: i64,
+        strategy: String,
+        message: String,
+        guidance: Option<String>,
+        target_workflow_id: Option<String>,
+        target_pane_id: Option<u64>,
+    ) -> Self {
+        Self {
+            action_id,
+            strategy,
+            outcome: UndoOutcome::Indeterminate,
+            message,
+            guidance,
+            target_workflow_id,
+            target_pane_id,
+            undone_at: None,
+        }
+    }
 }
 
 /// Executes undo strategies against durable storage and WezTerm state.
@@ -199,12 +251,8 @@ impl UndoExecutor {
         cx: &crate::cx::Cx,
         request: UndoRequest,
     ) -> Result<UndoExecutionResult> {
-        cx.checkpoint().map_err(|err| {
-            undo_cancelled_error(
-                "undo.execute.pre_start",
-                format!("pre-start checkpoint failed: {err}"),
-            )
-        })?;
+        cx.checkpoint()
+            .map_err(|_| undo_cancelled_error("undo.execute.pre_start"))?;
 
         // ft-xbnl0.2.3 tick 130: route through cx-first storage.
         let mut history = self
@@ -230,15 +278,8 @@ impl UndoExecutor {
             ));
         };
 
-        cx.checkpoint().map_err(|err| {
-            undo_cancelled_error(
-                "undo.execute.after_action_history",
-                format!(
-                    "between get_action_history and get_action_undo for action_id={}: {err}",
-                    request.action_id
-                ),
-            )
-        })?;
+        cx.checkpoint()
+            .map_err(|_| undo_cancelled_error("undo.execute.after_action_history"))?;
 
         let Some(undo) = self
             .storage
@@ -280,15 +321,8 @@ impl UndoExecutor {
             ));
         }
 
-        cx.checkpoint().map_err(|err| {
-            undo_cancelled_error(
-                "undo.execute.before_strategy_dispatch",
-                format!(
-                    "before strategy dispatch for action_id={} strategy={}: {err}",
-                    request.action_id, undo.undo_strategy
-                ),
-            )
-        })?;
+        cx.checkpoint()
+            .map_err(|_| undo_cancelled_error("undo.execute.before_strategy_dispatch"))?;
 
         match undo.undo_strategy.as_str() {
             "workflow_abort" => {
@@ -322,8 +356,10 @@ impl UndoExecutor {
     /// (tick 131) and the audit mark-undone through
     /// `mark_undone_after_effect`, so undo of a workflow-abort action honours
     /// caller cancellation until the abort commits. Once the workflow has
-    /// actually been aborted, the durable audit update is mandatory cleanup
-    /// and therefore runs under a fresh independent context.
+    /// actually been aborted, the durable audit update is mandatory cleanup.
+    /// The current compatibility implementation uses a separately minted
+    /// context; replacing that with runtime-owned bounded settlement authority
+    /// is tracked by `ft-interactive-systems-performance-4tenz.10.5`.
     async fn execute_workflow_abort_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -368,16 +404,20 @@ impl UndoExecutor {
                     .await
                 {
                     Ok(at) => at,
-                    Err(err) => {
-                        return Ok(UndoExecutionResult::failed(
+                    Err(_err) => {
+                        return Ok(UndoExecutionResult::applied_with_warning(
                             action.id,
                             undo.undo_strategy.clone(),
                             format!(
-                                "Workflow {execution_id} aborted but audit update failed: {err}"
+                                "Workflow {execution_id} aborted but the undo audit update failed (error_class=workflow_abort_audit_update_failed)"
                             ),
-                            undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                            Some(
+                                "Do not retry the abort automatically. Verify the durable workflow row and repair the undo-audit record."
+                                    .to_string(),
+                            ),
                             Some(execution_id),
                             action.pane_id,
+                            None,
                         ));
                     }
                 };
@@ -407,15 +447,121 @@ impl UndoExecutor {
                     Some(result.pane_id),
                 ))
             }
-            Err(err) if is_undo_cancellation(&err) => Err(err),
-            Err(err) => Ok(UndoExecutionResult::failed(
+            Err(err) if is_undo_cancellation(&err) => {
+                Err(undo_cancelled_error("undo.workflow_abort"))
+            }
+            Err(err) => {
+                Ok(self
+                    .reconcile_workflow_abort_error(
+                        cx,
+                        &request,
+                        action,
+                        undo,
+                        &execution_id,
+                        &err,
+                    )
+                    .await)
+            }
+        }
+    }
+
+    /// Reconcile an abort call that returned an error against durable state.
+    ///
+    /// `WorkflowRunner::abort_execution_with_cx` can durably persist the
+    /// `aborted` workflow row and then return an error when trigger settlement
+    /// fails. Treating every error as pre-effect would leave `action_undo`
+    /// apparently retryable even though the abort already committed. Re-read
+    /// with the existing caller Cx and mark the undo audit only when the durable
+    /// workflow row proves the external effect happened. If that Cx is no
+    /// longer usable, reconciliation fails closed and leaves the audit unmarked;
+    /// a runtime-owned independent cleanup authority is tracked by
+    /// ft-interactive-systems-performance-4tenz.10.5 and must not be emulated by
+    /// minting a new unrestricted request context here.
+    async fn reconcile_workflow_abort_error(
+        &self,
+        cx: &crate::cx::Cx,
+        request: &UndoRequest,
+        action: &crate::storage::ActionHistoryRecord,
+        undo: &ActionUndoRecord,
+        execution_id: &str,
+        _abort_error: &Error,
+    ) -> UndoExecutionResult {
+        match self
+            .storage
+            .get_workflow_with_cx(cx, execution_id)
+            .await
+        {
+            Ok(Some(workflow)) if workflow.status == "aborted" => {
+                match self
+                    .mark_undone_with_cx(cx, action.id, &request.actor)
+                    .await
+                {
+                    Ok(undone_at) => UndoExecutionResult::applied_with_warning(
+                        action.id,
+                        undo.undo_strategy.clone(),
+                        format!(
+                            "Workflow {execution_id} is durably aborted and the undo audit is marked complete, but post-abort settlement failed (error_class=workflow_abort_settlement_failed)"
+                        ),
+                        Some(
+                            "Do not retry the abort. The durable effect and undo audit are complete; inspect post-abort trigger settlement."
+                                .to_string(),
+                        ),
+                        Some(execution_id.to_string()),
+                        Some(workflow.pane_id),
+                        undone_at,
+                    ),
+                    Err(_audit_error) => UndoExecutionResult::applied_with_warning(
+                        action.id,
+                        undo.undo_strategy.clone(),
+                        format!(
+                            "Workflow {execution_id} is durably aborted, but post-abort settlement and the undo audit update failed (error_class=workflow_abort_audit_update_failed)"
+                        ),
+                        Some(
+                            "Do not retry the abort automatically. Verify the durable workflow row and repair the undo-audit record."
+                                .to_string(),
+                        ),
+                        Some(execution_id.to_string()),
+                        Some(workflow.pane_id),
+                        None,
+                    ),
+                }
+            }
+            Ok(Some(workflow)) => UndoExecutionResult::failed(
                 action.id,
                 undo.undo_strategy.clone(),
-                format!("Failed to abort workflow {execution_id}: {err}"),
+                format!(
+                    "Failed to abort workflow {execution_id}; durable state does not prove the abort committed, so the undo audit was not marked complete (error_class=workflow_abort_unverified)"
+                ),
                 undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
-                Some(execution_id),
+                Some(execution_id.to_string()),
+                Some(workflow.pane_id),
+            ),
+            Ok(None) => UndoExecutionResult::indeterminate(
+                action.id,
+                undo.undo_strategy.clone(),
+                format!(
+                    "Failed to abort workflow {execution_id}; the durable workflow row is missing, so effect state cannot be verified and the undo audit was not marked complete (error_class=workflow_abort_target_missing)"
+                ),
+                Some(
+                    "Verify the workflow execution and audit history before retrying; the target row is missing."
+                        .to_string(),
+                ),
+                Some(execution_id.to_string()),
                 action.pane_id,
-            )),
+            ),
+            Err(_verification_error) => UndoExecutionResult::indeterminate(
+                action.id,
+                undo.undo_strategy.clone(),
+                format!(
+                    "Abort returned an error for workflow {execution_id}, and durable state verification failed; the undo audit was not marked complete (error_class=workflow_abort_verification_failed)"
+                ),
+                Some(
+                    "Verify the durable workflow state before retrying; the abort result could not be reconciled."
+                        .to_string(),
+                ),
+                Some(execution_id.to_string()),
+                action.pane_id,
+            ),
         }
     }
 
@@ -428,11 +574,12 @@ impl UndoExecutor {
     /// Cancellation-safety contract: the checkpoint BEFORE
     /// `kill_pane_with_cx` is the critical seam — a mid-run
     /// cancel here aborts BEFORE destroying the pane. A
-    /// cancel after `kill_pane_with_cx` cannot suppress the audit update: once
-    /// the pane is gone, audit persistence is mandatory cleanup and runs with
-    /// a fresh independent context. A genuine storage failure is still
-    /// reported as "pane closed but audit update failed" so operators are not
-    /// told that the overall operation was atomic.
+    /// cancel after `kill_pane_with_cx` cannot safely justify an automatic
+    /// retry: once dispatch has occurred, an error is classified as
+    /// indeterminate until the pane is re-observed. When success is known,
+    /// audit persistence is mandatory cleanup. A storage failure is reported
+    /// as applied-with-warning so operators are not told that the operation was
+    /// atomic or encouraged to repeat the destructive effect.
     async fn execute_pane_close_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -470,11 +617,8 @@ impl UndoExecutor {
             ));
         };
 
-        cx.checkpoint().map_err(|err| {
-            undo_cancelled_error(
-                "undo.execute_pane_close.before_get_pane",
-                format!("before get_pane_with_cx for pane_id={pane_id}: {err}"),
-            )
+        cx.checkpoint().map_err(|_| {
+            undo_cancelled_error("undo.execute_pane_close.before_get_pane")
         })?;
 
         match self.wezterm.get_pane_with_cx(cx, pane_id).await {
@@ -489,12 +633,16 @@ impl UndoExecutor {
                     Some(pane_id),
                 ));
             }
-            Err(err) if is_undo_cancellation(&err) => return Err(err),
-            Err(err) => {
+            Err(err) if is_undo_cancellation(&err) => {
+                return Err(undo_cancelled_error("undo.pane_close.get_pane"));
+            }
+            Err(_err) => {
                 return Ok(UndoExecutionResult::failed(
                     action.id,
                     undo.undo_strategy.clone(),
-                    format!("Failed to validate pane {pane_id}: {err}"),
+                    format!(
+                        "Failed to validate pane {pane_id} (error_class=pane_validation_failed)"
+                    ),
                     undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
                     action.actor_id.clone(),
                     Some(pane_id),
@@ -502,11 +650,8 @@ impl UndoExecutor {
             }
         }
 
-        cx.checkpoint().map_err(|err| {
-            undo_cancelled_error(
-                "undo.execute_pane_close.before_kill_pane",
-                format!("before kill_pane_with_cx for pane_id={pane_id}: {err}"),
-            )
+        cx.checkpoint().map_err(|_| {
+            undo_cancelled_error("undo.execute_pane_close.before_kill_pane")
         })?;
 
         match self.wezterm.kill_pane_with_cx(cx, pane_id).await {
@@ -516,14 +661,20 @@ impl UndoExecutor {
                     .await
                 {
                     Ok(at) => at,
-                    Err(err) => {
-                        return Ok(UndoExecutionResult::failed(
+                    Err(_err) => {
+                        return Ok(UndoExecutionResult::applied_with_warning(
                             action.id,
                             undo.undo_strategy.clone(),
-                            format!("Pane {pane_id} closed but audit update failed: {err}"),
-                            undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                            format!(
+                                "Pane {pane_id} closed but the undo audit update failed (error_class=pane_close_audit_update_failed)"
+                            ),
+                            Some(
+                                "Do not retry the pane close automatically. Verify that the pane remains absent and repair the undo-audit record."
+                                    .to_string(),
+                            ),
                             action.actor_id.clone(),
                             Some(pane_id),
+                            None,
                         ));
                     }
                 };
@@ -546,11 +697,14 @@ impl UndoExecutor {
                     Some(pane_id),
                 ))
             }
-            Err(err) => Ok(UndoExecutionResult::failed(
+            Err(err) => Ok(UndoExecutionResult::indeterminate(
                 action.id,
                 undo.undo_strategy.clone(),
                 pane_close_failure_message(pane_id, &err),
-                undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                Some(
+                    "Verify whether the pane still exists before retrying; the close crossed its dispatch boundary."
+                        .to_string(),
+                ),
                 action.actor_id.clone(),
                 Some(pane_id),
             )),
@@ -740,10 +894,15 @@ fn pane_close_failure_message(pane_id: u64, error: &Error) -> String {
         format!(
             "Pane-close cancellation was observed after kill dispatch for pane {pane_id}; \
              pane state is indeterminate and the undo audit was not marked complete. \
-             Verify whether the pane still exists before retrying: {error}"
+             Verify whether the pane still exists before retrying \
+             (error_class=pane_close_cancelled_after_dispatch)"
         )
     } else {
-        format!("Failed to close pane {pane_id}: {error}")
+        format!(
+            "Pane close returned an error after kill dispatch for pane {pane_id}; \
+             pane state is indeterminate and the undo audit was not marked complete \
+             (error_class=pane_close_result_indeterminate)"
+        )
     }
 }
 
@@ -790,14 +949,16 @@ mod tests {
 
     #[test]
     fn undo_cancelled_error_uses_structured_runtime_operation() {
-        let err = undo_cancelled_error("undo.test_checkpoint", "caller cancelled");
+        let err = undo_cancelled_error("undo.test_checkpoint");
 
         match err {
             Error::RuntimeOperation { operation, source } => {
                 assert_eq!(operation, "undo.test_checkpoint");
                 assert_eq!(
                     source,
-                    RuntimeOperationSource::Cancelled("caller cancelled".to_string())
+                    RuntimeOperationSource::Cancelled(
+                        "undo operation cancelled by capability context".to_string()
+                    )
                 );
             }
             other => panic!("expected structured runtime operation, got {other:?}"),
@@ -810,8 +971,7 @@ mod tests {
             "caller cancelled".to_string()
         )));
         assert!(is_undo_cancellation(&undo_cancelled_error(
-            "undo.test_checkpoint",
-            "caller cancelled"
+            "undo.test_checkpoint"
         )));
         assert!(!is_undo_cancellation(&Error::runtime_backend(
             "undo.test_checkpoint",
@@ -821,13 +981,29 @@ mod tests {
 
     #[test]
     fn pane_close_cancellation_message_marks_post_dispatch_state_indeterminate() {
-        let error = undo_cancelled_error("mock kill pane", "caller cancelled");
+        let error = Error::Cancelled("SECRET caller-supplied cancellation reason".to_string());
         let message = pane_close_failure_message(41, &error);
 
         assert!(message.contains("after kill dispatch"));
         assert!(message.contains("state is indeterminate"));
         assert!(message.contains("audit was not marked complete"));
         assert!(message.contains("Verify whether the pane still exists"));
+        assert!(message.contains("pane_close_cancelled_after_dispatch"));
+        assert!(!message.contains("SECRET"));
+    }
+
+    #[test]
+    fn pane_close_backend_failure_message_is_indeterminate_and_content_free() {
+        let error = Error::runtime_backend(
+            "undo.test.kill_pane",
+            "SECRET credential-bearing backend diagnostic",
+        );
+        let message = pane_close_failure_message(42, &error);
+
+        assert!(message.contains("after kill dispatch"));
+        assert!(message.contains("state is indeterminate"));
+        assert!(message.contains("pane_close_result_indeterminate"));
+        assert!(!message.contains("SECRET"));
     }
 
     async fn seed_pane(storage: &StorageHandle, pane_id: u64) {
@@ -976,6 +1152,99 @@ mod tests {
                 .expect("undo exists");
             assert!(undo.undone_at.is_some());
             assert_eq!(undo.undone_by.as_deref(), Some("test-user"));
+
+            storage.shutdown().await.expect("shutdown");
+        });
+    }
+
+    #[test]
+    fn workflow_abort_error_reconciliation_marks_audit_when_abort_is_durable() {
+        run_async_test(async {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let db_path = temp.path().join("undo-workflow-post-effect-error.db");
+            let db_path = db_path.to_string_lossy().to_string();
+            let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
+            let pane_id = 43_u64;
+            let execution_id = "wf-undo-post-effect-error-1";
+
+            seed_pane(storage.as_ref(), pane_id).await;
+            let action_id = seed_action(
+                storage.as_ref(),
+                pane_id,
+                "workflow",
+                Some(execution_id),
+                "workflow_start",
+            )
+            .await;
+            seed_workflow(storage.as_ref(), execution_id, pane_id, "aborted").await;
+
+            storage
+                .upsert_action_undo(ActionUndoRecord {
+                    audit_action_id: action_id,
+                    undoable: true,
+                    undo_strategy: "workflow_abort".to_string(),
+                    undo_hint: Some(format!("ft robot workflow abort {execution_id}")),
+                    undo_payload: Some(
+                        serde_json::json!({ "execution_id": execution_id, "pane_id": pane_id })
+                            .to_string(),
+                    ),
+                    undone_at: None,
+                    undone_by: None,
+                })
+                .await
+                .expect("undo metadata");
+
+            let mut history = storage
+                .get_action_history(ActionHistoryQuery {
+                    audit_action_id: Some(action_id),
+                    limit: Some(1),
+                    ..Default::default()
+                })
+                .await
+                .expect("action history");
+            let action = history.pop().expect("seeded action");
+            let undo = storage
+                .get_action_undo(action_id)
+                .await
+                .expect("undo query")
+                .expect("undo exists");
+            let executor = UndoExecutor::new(Arc::clone(&storage), Arc::new(MockWezterm::new()));
+            let request = UndoRequest::new(action_id).with_actor("post-effect-operator");
+            let abort_error = Error::Workflow(crate::error::WorkflowError::Aborted(
+                "SECRET abort committed but trigger settlement failed".to_string(),
+            ));
+            let cx = crate::cx::for_request();
+
+            let result = executor
+                .reconcile_workflow_abort_error(
+                    &cx,
+                    &request,
+                    &action,
+                    &undo,
+                    execution_id,
+                    &abort_error,
+                )
+                .await;
+
+            assert_eq!(result.outcome, UndoOutcome::AppliedWithWarning);
+            assert_eq!(result.target_workflow_id.as_deref(), Some(execution_id));
+            assert_eq!(result.target_pane_id, Some(pane_id));
+            assert!(result.undone_at.is_some());
+            assert!(result.message.contains("durably aborted"));
+            assert!(result.message.contains("audit is marked complete"));
+            assert!(result.message.contains("workflow_abort_settlement_failed"));
+            assert!(!result.message.contains("SECRET"));
+
+            let durable_undo = storage
+                .get_action_undo(action_id)
+                .await
+                .expect("undo query")
+                .expect("undo exists");
+            assert_eq!(durable_undo.undone_at, result.undone_at);
+            assert_eq!(
+                durable_undo.undone_by.as_deref(),
+                Some("post-effect-operator")
+            );
 
             storage.shutdown().await.expect("shutdown");
         });
@@ -1134,7 +1403,9 @@ mod tests {
     fn undo_outcome_serde_roundtrip() {
         for variant in [
             UndoOutcome::Success,
+            UndoOutcome::AppliedWithWarning,
             UndoOutcome::NotApplicable,
+            UndoOutcome::Indeterminate,
             UndoOutcome::Failed,
         ] {
             let json = serde_json::to_string(&variant).unwrap();
@@ -1150,8 +1421,16 @@ mod tests {
             "\"success\""
         );
         assert_eq!(
+            serde_json::to_string(&UndoOutcome::AppliedWithWarning).unwrap(),
+            "\"applied_with_warning\""
+        );
+        assert_eq!(
             serde_json::to_string(&UndoOutcome::NotApplicable).unwrap(),
             "\"not_applicable\""
+        );
+        assert_eq!(
+            serde_json::to_string(&UndoOutcome::Indeterminate).unwrap(),
+            "\"indeterminate\""
         );
         assert_eq!(
             serde_json::to_string(&UndoOutcome::Failed).unwrap(),
@@ -1224,6 +1503,37 @@ mod tests {
         assert_eq!(r.outcome, UndoOutcome::Failed);
         assert_eq!(r.target_workflow_id.as_deref(), Some("wf-2"));
         assert_eq!(r.target_pane_id, Some(10));
+        assert!(r.undone_at.is_none());
+    }
+
+    #[test]
+    fn undo_execution_result_applied_with_warning_allows_missing_audit_timestamp() {
+        let r = UndoExecutionResult::applied_with_warning(
+            4,
+            "pane_close".to_string(),
+            "Primary effect committed; audit failed".to_string(),
+            Some("Do not retry automatically".to_string()),
+            None,
+            Some(11),
+            None,
+        );
+        assert_eq!(r.outcome, UndoOutcome::AppliedWithWarning);
+        assert_eq!(r.target_pane_id, Some(11));
+        assert!(r.undone_at.is_none());
+    }
+
+    #[test]
+    fn undo_execution_result_indeterminate_never_claims_an_audit_timestamp() {
+        let r = UndoExecutionResult::indeterminate(
+            5,
+            "pane_close".to_string(),
+            "Effect state unknown".to_string(),
+            Some("Verify before retrying".to_string()),
+            None,
+            Some(12),
+        );
+        assert_eq!(r.outcome, UndoOutcome::Indeterminate);
+        assert_eq!(r.target_pane_id, Some(12));
         assert!(r.undone_at.is_none());
     }
 
@@ -2330,8 +2640,12 @@ mod tests {
     fn undo_outcome_deserialize_from_string_values() {
         let s: UndoOutcome = serde_json::from_str(r#""success""#).unwrap();
         assert_eq!(s, UndoOutcome::Success);
+        let w: UndoOutcome = serde_json::from_str(r#""applied_with_warning""#).unwrap();
+        assert_eq!(w, UndoOutcome::AppliedWithWarning);
         let n: UndoOutcome = serde_json::from_str(r#""not_applicable""#).unwrap();
         assert_eq!(n, UndoOutcome::NotApplicable);
+        let i: UndoOutcome = serde_json::from_str(r#""indeterminate""#).unwrap();
+        assert_eq!(i, UndoOutcome::Indeterminate);
         let f: UndoOutcome = serde_json::from_str(r#""failed""#).unwrap();
         assert_eq!(f, UndoOutcome::Failed);
     }

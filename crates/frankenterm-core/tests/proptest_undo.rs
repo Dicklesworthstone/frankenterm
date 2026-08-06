@@ -14,7 +14,9 @@ use proptest::prelude::*;
 fn arb_undo_outcome() -> impl Strategy<Value = UndoOutcome> {
     prop_oneof![
         Just(UndoOutcome::Success),
+        Just(UndoOutcome::AppliedWithWarning),
         Just(UndoOutcome::NotApplicable),
+        Just(UndoOutcome::Indeterminate),
         Just(UndoOutcome::Failed),
     ]
 }
@@ -76,7 +78,9 @@ proptest! {
         let json = serde_json::to_string(&outcome).unwrap();
         let expected = match outcome {
             UndoOutcome::Success => "\"success\"",
+            UndoOutcome::AppliedWithWarning => "\"applied_with_warning\"",
             UndoOutcome::NotApplicable => "\"not_applicable\"",
+            UndoOutcome::Indeterminate => "\"indeterminate\"",
             UndoOutcome::Failed => "\"failed\"",
         };
         prop_assert_eq!(json.as_str(), expected);
@@ -298,15 +302,24 @@ proptest! {
         let _ = format!("{:?}", copied);
     }
 
-    /// All three UndoOutcome variants produce distinct serde representations.
+    /// All five UndoOutcome variants produce distinct serde representations.
     #[test]
     fn prop_outcome_all_variants_distinct(_seed in 0_u32..1) {
         let s = serde_json::to_string(&UndoOutcome::Success).unwrap();
+        let w = serde_json::to_string(&UndoOutcome::AppliedWithWarning).unwrap();
         let na = serde_json::to_string(&UndoOutcome::NotApplicable).unwrap();
+        let i = serde_json::to_string(&UndoOutcome::Indeterminate).unwrap();
         let f = serde_json::to_string(&UndoOutcome::Failed).unwrap();
+        prop_assert_ne!(&s, &w);
         prop_assert_ne!(&s, &na);
+        prop_assert_ne!(&s, &i);
         prop_assert_ne!(&s, &f);
+        prop_assert_ne!(&w, &na);
+        prop_assert_ne!(&w, &i);
+        prop_assert_ne!(&w, &f);
+        prop_assert_ne!(&na, &i);
         prop_assert_ne!(&na, &f);
+        prop_assert_ne!(&i, &f);
     }
 
     /// PartialEq is reflexive for UndoOutcome.
@@ -476,9 +489,16 @@ proptest! {
 
 #[test]
 fn outcome_all_variants_distinct() {
+    assert_ne!(UndoOutcome::Success, UndoOutcome::AppliedWithWarning);
     assert_ne!(UndoOutcome::Success, UndoOutcome::NotApplicable);
+    assert_ne!(UndoOutcome::Success, UndoOutcome::Indeterminate);
     assert_ne!(UndoOutcome::Success, UndoOutcome::Failed);
+    assert_ne!(UndoOutcome::AppliedWithWarning, UndoOutcome::NotApplicable);
+    assert_ne!(UndoOutcome::AppliedWithWarning, UndoOutcome::Indeterminate);
+    assert_ne!(UndoOutcome::AppliedWithWarning, UndoOutcome::Failed);
+    assert_ne!(UndoOutcome::NotApplicable, UndoOutcome::Indeterminate);
     assert_ne!(UndoOutcome::NotApplicable, UndoOutcome::Failed);
+    assert_ne!(UndoOutcome::Indeterminate, UndoOutcome::Failed);
 }
 
 #[test]

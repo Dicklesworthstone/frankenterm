@@ -10,8 +10,8 @@
 //! code that uses `WebhookDispatcher` injects its own transport. This
 //! suite ships a small `RealHttpTransport` IN the test crate so we can
 //! exercise the trait against actual HTTP framing, header propagation,
-//! and connection-failure paths. The transport is std-net-only, no new
-//! workspace dependencies.
+//! caller-Cx propagation, and connection-failure paths. It uses the same
+//! asupersync HTTP client surface as the production adapter.
 //!
 //! Coverage:
 //! - real_http_dispatch_succeeds_against_local_server: 200 OK on real
@@ -21,7 +21,7 @@
 //! - real_http_dispatch_records_failure_on_connection_drop: server
 //!   resets the connection mid-response
 //! - real_http_dispatch_records_failure_on_unreachable_port: no
-//!   listener at all → connect() fails, surfaces as DeliveryResult::err
+//!   listener at all → connect() fails, surfaces as a finite transport failure
 //!
 //! Gated on `FT_REAL_HTTP_TESTS=1` so default cargo test runs (and CI
 //! lanes that block outbound TCP) skip cleanly. Each test binds to
@@ -42,9 +42,7 @@ use frankenterm_core::webhook::{
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::io::{Read, Write};
 use std::pin::Pin;
-use std::time::Duration;
 
 fn should_run() -> bool {
     std::env::var("FT_REAL_HTTP_TESTS")
@@ -69,100 +67,139 @@ fn log(test: &str, phase: &str, body: serde_json::Value) {
 
 // ── Real HTTP transport (test-only) ──────────────────────────────────────────
 //
-// Uses std::net::TcpStream synchronously inside the async `send` future.
-// The dispatcher polls this future on whichever runtime drives the test;
-// blocking on a 127.0.0.1 socket inside a single-threaded test runtime
-// is acceptable here because the local server replies in <50ms.
-struct RealHttpTransport;
+// Uses the canonical runtime HTTP client surface so the exact caller Cx reaches
+// DNS/connect/I/O rather than being reduced to a preflight-only check.
+struct RealHttpTransport {
+    client: frankenterm_core::runtime_async::http::HttpClient,
+}
+
+impl RealHttpTransport {
+    fn new() -> Self {
+        Self {
+            client: frankenterm_core::runtime_async::http::HttpClient::new(),
+        }
+    }
+
+    fn checkpoint_failure(
+        cx: &frankenterm_core::cx::Cx,
+        error: &frankenterm_core::runtime_async::ContextError,
+    ) -> DeliveryResult {
+        use frankenterm_core::runtime_async::ContextErrorKind;
+
+        match error.kind() {
+            ContextErrorKind::DeadlineExceeded => DeliveryResult::deadline_exceeded(),
+            ContextErrorKind::CancelTimeout => DeliveryResult::cancellation_cleanup_timeout(),
+            ContextErrorKind::PollQuotaExhausted => DeliveryResult::poll_budget_exhausted(),
+            ContextErrorKind::CostQuotaExhausted => DeliveryResult::cost_budget_exhausted(),
+            ContextErrorKind::Cancelled => {
+                finite_capability_failure(cx).unwrap_or_else(DeliveryResult::cancelled)
+            }
+            _ => DeliveryResult::context_failure(),
+        }
+    }
+
+    fn client_failure(
+        cx: &frankenterm_core::cx::Cx,
+        error: &frankenterm_core::runtime_async::http::ClientError,
+    ) -> DeliveryResult {
+        use frankenterm_core::runtime_async::http::ClientError;
+
+        match error {
+            ClientError::DeadlineExceeded => DeliveryResult::deadline_exceeded(),
+            ClientError::Cancelled => match cx.checkpoint() {
+                Ok(()) => finite_capability_failure(cx).unwrap_or_else(DeliveryResult::cancelled),
+                Err(error) => Self::checkpoint_failure(cx, &error),
+            },
+            ClientError::InvalidUrl(_)
+            | ClientError::DnsError(_)
+            | ClientError::ConnectError(_)
+            | ClientError::TlsError(_)
+            | ClientError::HttpError(_)
+            | ClientError::TooManyRedirects { .. }
+            | ClientError::Io(_)
+            | ClientError::ConnectTunnelRefused { .. }
+            | ClientError::InvalidConnectInput(_)
+            | ClientError::ProxyError(_)
+            | ClientError::PoolExhausted { .. } => DeliveryResult::transport_failure(),
+        }
+    }
+}
 
 impl WebhookTransport for RealHttpTransport {
-    fn send<'a>(
+    fn send_with_cx<'a>(
         &'a self,
+        cx: &'a frankenterm_core::cx::Cx,
         url: &'a str,
         headers: &'a HashMap<String, String>,
         body: &'a serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = DeliveryResult> + Send + 'a>> {
-        let url = url.to_string();
-        let headers = headers.clone();
-        let body = body.clone();
         Box::pin(async move {
-            match send_blocking(&url, &headers, &body) {
-                // Mirror the convention used by `MockTransport::failure(500, ..)`
-                // in webhook_labruntime.rs: 4xx/5xx are NOT accepted. A real
-                // HTTP client without this mapping would silently swallow
-                // server errors, which is the very class of bug the no-mocks
-                // suite exists to catch.
-                Ok(status) if (200..=299).contains(&status) => DeliveryResult::ok(status),
-                Ok(status) => DeliveryResult::err(status, format!("HTTP {status}")),
-                Err(err) => DeliveryResult::err(0, err),
+            if let Err(error) = cx.checkpoint() {
+                return Self::checkpoint_failure(cx, &error);
+            }
+
+            let body = match serde_json::to_vec(body) {
+                Ok(body) => body,
+                Err(_) => return DeliveryResult::context_failure(),
+            };
+            let mut request_headers = Vec::with_capacity(headers.len() + 1);
+            request_headers.push(("Content-Type".to_string(), "application/json".to_string()));
+            request_headers.extend(headers.iter().map(|(key, value)| {
+                (key.clone(), value.clone())
+            }));
+
+            if let Err(error) = cx.checkpoint() {
+                return Self::checkpoint_failure(cx, &error);
+            }
+
+            match self
+                .client
+                .request(
+                    cx,
+                    frankenterm_core::runtime_async::http::Method::Post,
+                    url,
+                    request_headers,
+                    body,
+                )
+                .await
+            {
+                Ok(response) => DeliveryResult::from_http_status(response.status),
+                // Client errors may contain credential-bearing URLs or remote
+                // text. Classify by discriminant and discard every payload.
+                Err(error) => Self::client_failure(cx, &error),
             }
         })
     }
 }
 
-fn send_blocking(
-    url: &str,
-    headers: &HashMap<String, String>,
-    body: &serde_json::Value,
-) -> Result<u16, String> {
-    let (host_port, path) = parse_url(url)?;
-    let body_bytes = serde_json::to_vec(body).map_err(|e| format!("serialize body: {e}"))?;
+fn finite_capability_failure(cx: &frankenterm_core::cx::Cx) -> Option<DeliveryResult> {
+    use frankenterm_core::outcome::CancelKind;
 
-    let mut stream = std::net::TcpStream::connect_timeout(
-        &host_port
-            .parse()
-            .map_err(|e| format!("parse host_port {host_port}: {e}"))?,
-        Duration::from_secs(2),
-    )
-    .map_err(|e| format!("connect {host_port}: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
-
-    let mut request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n",
-        len = body_bytes.len()
-    );
-    for (k, v) in headers {
-        request.push_str(&format!("{k}: {v}\r\n"));
+    if let Some(reason) = cx.root_cancel_cause() {
+        return Some(match reason.kind {
+            CancelKind::Timeout | CancelKind::Deadline => DeliveryResult::deadline_exceeded(),
+            CancelKind::PollQuota => DeliveryResult::poll_budget_exhausted(),
+            CancelKind::CostBudget => DeliveryResult::cost_budget_exhausted(),
+            CancelKind::User
+            | CancelKind::FailFast
+            | CancelKind::RaceLost
+            | CancelKind::ParentCancelled
+            | CancelKind::ResourceUnavailable
+            | CancelKind::Shutdown
+            | CancelKind::LinkedExit => DeliveryResult::cancelled(),
+        });
     }
-    request.push_str("\r\n");
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| format!("write headers: {e}"))?;
-    stream
-        .write_all(&body_bytes)
-        .map_err(|e| format!("write body: {e}"))?;
-    stream.flush().ok();
 
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|e| format!("read response: {e}"))?;
-    parse_status(&response)
-}
-
-fn parse_url(url: &str) -> Result<(String, String), String> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| format!("only http:// supported, got {url}"))?;
-    if let Some(slash) = rest.find('/') {
-        let (host_port, path) = rest.split_at(slash);
-        Ok((host_port.to_string(), path.to_string()))
+    let budget = cx.budget_stats();
+    if budget.deadline.at.is_some() && budget.deadline.remaining.is_none() {
+        Some(DeliveryResult::deadline_exceeded())
+    } else if budget.polls.remaining == Some(0) {
+        Some(DeliveryResult::poll_budget_exhausted())
+    } else if budget.cost.remaining == Some(0) {
+        Some(DeliveryResult::cost_budget_exhausted())
     } else {
-        Ok((rest.to_string(), "/".to_string()))
+        None
     }
-}
-
-fn parse_status(response: &[u8]) -> Result<u16, String> {
-    let head = std::str::from_utf8(response).map_err(|e| format!("non-utf8 response: {e}"))?;
-    let first_line = head.lines().next().ok_or("empty response")?;
-    let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
-    if parts.len() < 2 {
-        return Err(format!("malformed status line: {first_line}"));
-    }
-    parts[1]
-        .parse::<u16>()
-        .map_err(|e| format!("parse status code {}: {e}", parts[1]))
 }
 
 // ── Test fixtures (mirrored from webhook_labruntime.rs) ──────────────────────
@@ -221,7 +258,7 @@ fn real_http_dispatch_succeeds_against_local_server() {
         &url,
         WebhookTemplate::Generic,
     )];
-    let dispatcher = WebhookDispatcher::new(endpoints, Box::new(RealHttpTransport));
+    let dispatcher = WebhookDispatcher::new(endpoints, Box::new(RealHttpTransport::new()));
 
     let records = RuntimeFixture::current_thread().block_on(async {
         dispatcher
@@ -274,7 +311,7 @@ fn real_http_dispatch_records_failure_on_500() {
 
     let url = server.url_path("/hooks/error");
     let endpoints = vec![test_endpoint("err", &url, WebhookTemplate::Generic)];
-    let dispatcher = WebhookDispatcher::new(endpoints, Box::new(RealHttpTransport));
+    let dispatcher = WebhookDispatcher::new(endpoints, Box::new(RealHttpTransport::new()));
 
     let records = RuntimeFixture::current_thread().block_on(async {
         dispatcher
@@ -310,7 +347,7 @@ fn real_http_dispatch_records_failure_on_connection_drop() {
 
     let url = server.url_path("/hooks/drop");
     let endpoints = vec![test_endpoint("drop", &url, WebhookTemplate::Generic)];
-    let dispatcher = WebhookDispatcher::new(endpoints, Box::new(RealHttpTransport));
+    let dispatcher = WebhookDispatcher::new(endpoints, Box::new(RealHttpTransport::new()));
 
     let records = RuntimeFixture::current_thread().block_on(async {
         dispatcher
@@ -327,7 +364,7 @@ fn real_http_dispatch_records_failure_on_connection_drop() {
         }),
     );
     // A reset connection causes parse_status to fail (empty / truncated
-    // response). The transport returns DeliveryResult::err with
+    // response). The transport returns a finite transport failure with
     // status_code=0; the dispatcher must record accepted=false.
     assert_eq!(records.len(), 1);
     assert!(
@@ -345,14 +382,14 @@ fn real_http_dispatch_records_failure_on_unreachable_port() {
     // Bind a listener, capture its port, then drop the listener so the
     // port is unbound. The dispatcher attempts to connect to a known-
     // dead port — connect() returns ECONNREFUSED and the transport
-    // surfaces it as DeliveryResult::err.
+    // surfaces it as a finite transport failure.
     let dead_port = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("temporary bind");
         listener.local_addr().expect("local_addr").port()
     };
     let url = format!("http://127.0.0.1:{dead_port}/hooks/dead");
     let endpoints = vec![test_endpoint("dead", &url, WebhookTemplate::Generic)];
-    let dispatcher = WebhookDispatcher::new(endpoints, Box::new(RealHttpTransport));
+    let dispatcher = WebhookDispatcher::new(endpoints, Box::new(RealHttpTransport::new()));
 
     let records = RuntimeFixture::current_thread().block_on(async {
         dispatcher

@@ -302,50 +302,175 @@ fn render_discord(p: &WebhookPayload) -> serde_json::Value {
 // Transport trait
 // ============================================================================
 
-/// Result of a webhook delivery attempt.
-#[derive(Clone)]
-pub struct DeliveryResult {
-    /// HTTP status code (or 0 if connection failed).
-    pub status_code: u16,
-    /// Whether the delivery was accepted (2xx).
-    pub accepted: bool,
-    /// Transport-private error detail (if delivery failed).
+/// Finite failure classes returned by a webhook transport.
+///
+/// The transport boundary deliberately carries no free-text error detail:
+/// HTTP client errors frequently embed the credential-bearing webhook URL,
+/// response bodies may contain secrets, and cancellation reasons are caller
+/// controlled. Operators get a stable class; raw detail is discarded at this
+/// boundary rather than retained in the result or dispatcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryFailureClass {
+    /// Explicit caller or parent cancellation.
+    Cancelled,
+    /// The bounded cleanup period after cancellation was exhausted.
+    CancellationCleanupTimeout,
+    /// Wall/virtual-time deadline or timeout exhaustion.
+    DeadlineExceeded,
+    /// Cooperative poll quota exhaustion.
+    PollBudgetExhausted,
+    /// Cost quota exhaustion.
+    CostBudgetExhausted,
+    /// A pre-I/O capability-checkpoint or local JSON-serialization failure.
     ///
-    /// This value is untrusted and may contain the credential-bearing request
-    /// URL. [`WebhookDispatcher`] converts it to a finite error class before
-    /// logging or copying it into a delivery record, and this type's `Debug`
-    /// implementation exposes only whether detail is present.
-    pub error: Option<String>,
+    /// This is a fanout-stopping control failure. URL parsing, request-client
+    /// construction, connection, and protocol failures belong to `Transport`.
+    Context,
+    /// Connection, protocol, or other transport failure before an HTTP result.
+    Transport,
+    /// A syntactically valid non-2xx HTTP response.
+    RemoteRejected,
+    /// A transport supplied an impossible or invalid HTTP result.
+    InvalidResult,
+}
+
+impl DeliveryFailureClass {
+    /// Stable finite diagnostic code persisted in notification records.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Cancelled => WEBHOOK_CANCELLATION_ERROR,
+            Self::CancellationCleanupTimeout => WEBHOOK_CANCELLATION_CLEANUP_TIMEOUT_ERROR,
+            Self::DeadlineExceeded => WEBHOOK_DEADLINE_ERROR,
+            Self::PollBudgetExhausted => WEBHOOK_POLL_BUDGET_ERROR,
+            Self::CostBudgetExhausted => WEBHOOK_COST_BUDGET_ERROR,
+            Self::Context => WEBHOOK_CONTEXT_ERROR,
+            Self::Transport => WEBHOOK_TRANSPORT_ERROR,
+            Self::RemoteRejected => WEBHOOK_REMOTE_REJECTION,
+            Self::InvalidResult => WEBHOOK_INVALID_TRANSPORT_RESULT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryOutcome {
+    Accepted,
+    Failed(DeliveryFailureClass),
+}
+
+/// Result of a webhook delivery attempt.
+///
+/// Fields are private so an accepted non-2xx response, a failure carrying
+/// secret free text, or a control failure paired with an HTTP status cannot be
+/// constructed accidentally. Use the finite smart constructors below.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DeliveryResult {
+    status_code: u16,
+    outcome: DeliveryOutcome,
 }
 
 impl fmt::Debug for DeliveryResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeliveryResult")
             .field("status_code", &self.status_code)
-            .field("accepted", &self.accepted)
-            .field("error_present", &self.error.is_some())
+            .field("accepted", &self.accepted())
+            .field("failure_class", &self.failure_class())
             .finish()
     }
 }
 
 impl DeliveryResult {
-    /// Create a successful result.
+    /// Classify a completed HTTP response.
+    ///
+    /// Only status codes in the HTTP range 100..=599 are accepted as valid
+    /// responses. A 2xx code is accepted, another valid HTTP code is a remote
+    /// rejection, zero is the conventional no-response transport failure, and
+    /// every other value is an invalid transport result.
     #[must_use]
-    pub fn ok(status_code: u16) -> Self {
+    pub const fn from_http_status(status_code: u16) -> Self {
+        let outcome = if status_code >= 200 && status_code < 300 {
+            DeliveryOutcome::Accepted
+        } else if status_code == 0 {
+            DeliveryOutcome::Failed(DeliveryFailureClass::Transport)
+        } else if status_code >= 100 && status_code < 600 {
+            DeliveryOutcome::Failed(DeliveryFailureClass::RemoteRejected)
+        } else {
+            DeliveryOutcome::Failed(DeliveryFailureClass::InvalidResult)
+        };
         Self {
             status_code,
-            accepted: true,
-            error: None,
+            outcome,
         }
     }
 
-    /// Create a failure result.
-    #[must_use]
-    pub fn err(status_code: u16, error: impl Into<String>) -> Self {
+    const fn without_http_response(class: DeliveryFailureClass) -> Self {
         Self {
-            status_code,
-            accepted: false,
-            error: Some(error.into()),
+            status_code: 0,
+            outcome: DeliveryOutcome::Failed(class),
+        }
+    }
+
+    /// Create an explicit-cancellation result.
+    #[must_use]
+    pub const fn cancelled() -> Self {
+        Self::without_http_response(DeliveryFailureClass::Cancelled)
+    }
+
+    /// Create a cancellation-cleanup-timeout result.
+    #[must_use]
+    pub const fn cancellation_cleanup_timeout() -> Self {
+        Self::without_http_response(DeliveryFailureClass::CancellationCleanupTimeout)
+    }
+
+    /// Create a deadline/timeout-exhaustion result.
+    #[must_use]
+    pub const fn deadline_exceeded() -> Self {
+        Self::without_http_response(DeliveryFailureClass::DeadlineExceeded)
+    }
+
+    /// Create a poll-quota exhaustion result.
+    #[must_use]
+    pub const fn poll_budget_exhausted() -> Self {
+        Self::without_http_response(DeliveryFailureClass::PollBudgetExhausted)
+    }
+
+    /// Create a cost-quota exhaustion result.
+    #[must_use]
+    pub const fn cost_budget_exhausted() -> Self {
+        Self::without_http_response(DeliveryFailureClass::CostBudgetExhausted)
+    }
+
+    /// Create a fanout-stopping capability or payload-serialization failure.
+    #[must_use]
+    pub const fn context_failure() -> Self {
+        Self::without_http_response(DeliveryFailureClass::Context)
+    }
+
+    /// Create a transport failure with no HTTP response.
+    #[must_use]
+    pub const fn transport_failure() -> Self {
+        Self::without_http_response(DeliveryFailureClass::Transport)
+    }
+
+    /// HTTP status code, or zero when no valid HTTP response exists.
+    #[must_use]
+    pub const fn status_code(&self) -> u16 {
+        self.status_code
+    }
+
+    /// Whether a valid 2xx response accepted the webhook.
+    #[must_use]
+    pub const fn accepted(&self) -> bool {
+        matches!(self.outcome, DeliveryOutcome::Accepted)
+    }
+
+    /// Finite failure class, or `None` for an accepted response.
+    #[must_use]
+    pub const fn failure_class(&self) -> Option<DeliveryFailureClass> {
+        match self.outcome {
+            DeliveryOutcome::Accepted => None,
+            DeliveryOutcome::Failed(class) => Some(class),
         }
     }
 }
@@ -355,35 +480,18 @@ impl DeliveryResult {
 /// Implementations provide the actual HTTP POST. This decouples frankenterm-core
 /// from any specific HTTP client library.
 pub trait WebhookTransport: Send + Sync {
-    /// Send a JSON payload to the given URL with optional headers.
-    fn send<'a>(
+    /// Send a JSON payload under the caller's capability context.
+    ///
+    /// This is the required transport primitive. Implementations must thread
+    /// this exact Cx into request construction and I/O; they must not replace it
+    /// with ambient lookup or a newly minted context.
+    fn send_with_cx<'a>(
         &'a self,
+        cx: &'a crate::cx::Cx,
         url: &'a str,
         headers: &'a HashMap<String, String>,
         body: &'a serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = DeliveryResult> + Send + 'a>>;
-
-    /// Send a JSON payload bound to the caller's asupersync capability
-    /// context (ft-xbnl0.2.3 Cx-first trait extension).
-    ///
-    /// The default implementation delegates to [`send`](Self::send). The
-    /// dispatcher checkpoints immediately before and after this fallback, so
-    /// cancellation prevents a new request and stops later fanout. A request
-    /// already in flight can only be interrupted when a concrete transport
-    /// overrides this method and propagates the Cx into its HTTP client.
-    ///
-    /// The `cx` parameter lifetime matches the returned future so
-    /// overrides can thread cx into async operations held by the
-    /// future.
-    fn send_with_cx<'a>(
-        &'a self,
-        _cx: &'a crate::cx::Cx,
-        url: &'a str,
-        headers: &'a HashMap<String, String>,
-        body: &'a serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = DeliveryResult> + Send + 'a>> {
-        self.send(url, headers, body)
-    }
 }
 
 // ============================================================================
@@ -405,56 +513,48 @@ pub type DeliveryRecord = NotificationDeliveryRecord;
 
 const WEBHOOK_DISPATCH_TARGET: &str = "webhook_dispatch";
 const WEBHOOK_CANCELLATION_ERROR: &str = "webhook_dispatch_cancelled";
+const WEBHOOK_CANCELLATION_CLEANUP_TIMEOUT_ERROR: &str =
+    "webhook_dispatch_cancellation_cleanup_timeout";
 const WEBHOOK_DEADLINE_ERROR: &str = "webhook_dispatch_deadline_exceeded";
-const WEBHOOK_BUDGET_ERROR: &str = "webhook_dispatch_budget_exhausted";
+const WEBHOOK_POLL_BUDGET_ERROR: &str = "webhook_dispatch_poll_budget_exhausted";
+const WEBHOOK_COST_BUDGET_ERROR: &str = "webhook_dispatch_cost_budget_exhausted";
 const WEBHOOK_CONTEXT_ERROR: &str = "webhook_dispatch_context_error";
 const WEBHOOK_TRANSPORT_ERROR: &str = "webhook_transport_error";
 const WEBHOOK_REMOTE_REJECTION: &str = "webhook_remote_rejected";
 const WEBHOOK_INVALID_TRANSPORT_RESULT: &str = "webhook_invalid_transport_result";
 
 fn delivery_was_accepted(result: &DeliveryResult) -> bool {
-    result.accepted
-        && (200..300).contains(&result.status_code)
-        && result.error.is_none()
+    result.accepted()
 }
 
 fn safe_delivery_error(result: &DeliveryResult) -> Option<&'static str> {
-    if delivery_was_accepted(result) {
-        None
-    } else if result.status_code == 0 {
-        Some(WEBHOOK_TRANSPORT_ERROR)
-    } else if !(200..300).contains(&result.status_code) {
-        Some(WEBHOOK_REMOTE_REJECTION)
-    } else {
-        // A 2xx response paired with `accepted = false` or any error detail is
-        // internally inconsistent. Fail closed rather than allowing a buggy or
-        // adversarial transport to turn that malformed result into success.
-        Some(WEBHOOK_INVALID_TRANSPORT_RESULT)
-    }
+    result.failure_class().map(DeliveryFailureClass::code)
 }
 
 fn checkpoint_error_class(
     cx: &crate::cx::Cx,
-    error: &asupersync::error::Error,
-) -> &'static str {
-    use asupersync::error::ErrorKind;
+    error: &crate::runtime_async::ContextError,
+) -> DeliveryFailureClass {
+    use crate::runtime_async::ContextErrorKind;
 
     match error.kind() {
-        ErrorKind::DeadlineExceeded => WEBHOOK_DEADLINE_ERROR,
-        ErrorKind::PollQuotaExhausted
-        | ErrorKind::CostQuotaExhausted
-        | ErrorKind::CancelTimeout => WEBHOOK_BUDGET_ERROR,
-        ErrorKind::Cancelled => match cx.cancel_reason().map(|reason| reason.root_cause().kind) {
+        ContextErrorKind::DeadlineExceeded => DeliveryFailureClass::DeadlineExceeded,
+        ContextErrorKind::CancelTimeout => DeliveryFailureClass::CancellationCleanupTimeout,
+        ContextErrorKind::PollQuotaExhausted => DeliveryFailureClass::PollBudgetExhausted,
+        ContextErrorKind::CostQuotaExhausted => DeliveryFailureClass::CostBudgetExhausted,
+        ContextErrorKind::Cancelled => match cx.cancel_reason().map(|reason| reason.root_cause().kind) {
             Some(crate::outcome::CancelKind::Timeout | crate::outcome::CancelKind::Deadline) => {
-                WEBHOOK_DEADLINE_ERROR
+                DeliveryFailureClass::DeadlineExceeded
             }
-            Some(
-                crate::outcome::CancelKind::PollQuota
-                | crate::outcome::CancelKind::CostBudget,
-            ) => WEBHOOK_BUDGET_ERROR,
-            _ => WEBHOOK_CANCELLATION_ERROR,
+            Some(crate::outcome::CancelKind::PollQuota) => {
+                DeliveryFailureClass::PollBudgetExhausted
+            }
+            Some(crate::outcome::CancelKind::CostBudget) => {
+                DeliveryFailureClass::CostBudgetExhausted
+            }
+            _ => DeliveryFailureClass::Cancelled,
         },
-        _ => WEBHOOK_CONTEXT_ERROR,
+        _ => DeliveryFailureClass::Context,
     }
 }
 
@@ -462,8 +562,10 @@ fn is_dispatch_control_error(error: &str) -> bool {
     matches!(
         error,
         WEBHOOK_CANCELLATION_ERROR
+            | WEBHOOK_CANCELLATION_CLEANUP_TIMEOUT_ERROR
             | WEBHOOK_DEADLINE_ERROR
-            | WEBHOOK_BUDGET_ERROR
+            | WEBHOOK_POLL_BUDGET_ERROR
+            | WEBHOOK_COST_BUDGET_ERROR
             | WEBHOOK_CONTEXT_ERROR
     )
 }
@@ -478,8 +580,22 @@ fn checkpoint_dispatch(
         status_code: 0,
         // Checkpoint diagnostics can include caller-controlled cancellation
         // reasons. Persist only the typed root-cause class, never raw detail.
-        error: Some(checkpoint_error_class(cx, &error).to_string()),
+        error: Some(checkpoint_error_class(cx, &error).code().to_string()),
     })
+}
+
+fn is_transport_control_failure(result: &DeliveryResult) -> bool {
+    matches!(
+        result.failure_class(),
+        Some(
+            DeliveryFailureClass::Cancelled
+                | DeliveryFailureClass::CancellationCleanupTimeout
+                | DeliveryFailureClass::DeadlineExceeded
+                | DeliveryFailureClass::PollBudgetExhausted
+                | DeliveryFailureClass::CostBudgetExhausted
+                | DeliveryFailureClass::Context
+        )
+    )
 }
 
 fn notification_delivery_error(success: bool, records: &[DeliveryRecord]) -> Option<String> {
@@ -487,10 +603,12 @@ fn notification_delivery_error(success: bool, records: &[DeliveryRecord]) -> Opt
         return None;
     }
 
-    let error = records
+    let control_error = records
         .iter()
         .filter_map(|record| record.error.as_deref())
-        .find(|error| is_dispatch_control_error(error))
+        .find(|error| is_dispatch_control_error(error));
+    let error = control_error
+        .or_else(|| records.iter().find_map(|record| record.error.as_deref()))
         .unwrap_or("one_or_more_deliveries_failed");
     Some(error.to_owned())
 }
@@ -536,8 +654,8 @@ impl WebhookDispatcher {
     ///
     /// Checkpoints before payload construction, then routes through
     /// [`dispatch_payload_with_cx`] so caller Cx propagates through each
-    /// endpoint's `transport.send_with_cx` call. Caller cancellation cuts
-    /// fanout even when a transport uses the default Cx-unaware fallback.
+    /// endpoint's required `transport.send_with_cx` call. Caller cancellation
+    /// cuts fanout before another endpoint is attempted.
     pub async fn dispatch_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -563,9 +681,8 @@ impl WebhookDispatcher {
 
     /// Cx-first `dispatch_payload` (ft-xbnl0.2.3). Checkpoints before any
     /// rendering, logging, or transport side effect and between matching
-    /// endpoint attempts. Cx-aware transports may also interrupt the current
-    /// request; the default transport fallback is allowed to finish only the
-    /// request already in flight, after which cancellation stops all remaining
+    /// endpoint attempts. The required Cx-first transport primitive can
+    /// interrupt the current request, and cancellation stops all remaining
     /// delivery. Cancellation observed after the final matching request has
     /// completed does not retroactively turn completed delivery into failure.
     pub async fn dispatch_payload_with_cx(
@@ -637,13 +754,13 @@ impl WebhookDispatcher {
             if accepted {
                 tracing::info!(
                     endpoint = %endpoint.name,
-                    status = result.status_code,
+                    status = result.status_code(),
                     "webhook delivered"
                 );
             } else {
                 tracing::warn!(
                     endpoint = %endpoint.name,
-                    status = result.status_code,
+                    status = result.status_code(),
                     error_class = ?safe_error,
                     "webhook delivery failed"
                 );
@@ -652,15 +769,22 @@ impl WebhookDispatcher {
             records.push(DeliveryRecord {
                 target: endpoint.name.clone(),
                 accepted,
-                status_code: result.status_code,
+                status_code: result.status_code(),
                 error: safe_error.map(str::to_owned),
             });
 
-            // The transport fallback may not observe Cx cancellation while a
-            // request is in flight. Check again only when another matching
-            // endpoint remains. Once the final intended side effect has
-            // completed, a concurrent late cancellation must not create a
-            // false failure that could invite duplicate delivery.
+            // A required Cx-aware transport can report the exact control
+            // failure that ended its own request. That finite endpoint record
+            // is authoritative: stop immediately instead of checkpointing and
+            // appending a second, generic control record for the same event.
+            if is_transport_control_failure(&result) {
+                return records;
+            }
+
+            // Check again only when another matching endpoint remains. Once
+            // the final intended side effect has completed, a concurrent late
+            // cancellation must not create a false failure that could invite
+            // duplicate delivery.
             if following_endpoint_index.is_some() {
                 if let Err(record) = checkpoint_dispatch(cx, WEBHOOK_DISPATCH_TARGET) {
                     records.push(record);
@@ -769,11 +893,7 @@ mod tests {
 
     #[derive(Clone)]
     struct MockTransport {
-        /// Captured requests for assertions.
-        requests: Arc<Mutex<Vec<MockRequest>>>,
-        /// Captured cx-path requests (separate bucket to prove the
-        /// Cx-first transport surface was exercised vs. the ambient
-        /// `send` fallback).
+        /// Captured requests through the required Cx-first primitive.
         cx_requests: Arc<Mutex<Vec<MockRequest>>>,
         /// Response to return.
         response: DeliveryResult,
@@ -789,23 +909,18 @@ mod tests {
 
     impl MockTransport {
         fn success() -> Self {
-            Self::responding(DeliveryResult::ok(200))
+            Self::responding(DeliveryResult::from_http_status(200))
         }
 
         fn responding(response: DeliveryResult) -> Self {
             Self {
-                requests: Arc::new(Mutex::new(Vec::new())),
                 cx_requests: Arc::new(Mutex::new(Vec::new())),
                 response,
             }
         }
 
-        fn failure(status: u16, error: &str) -> Self {
-            Self::responding(DeliveryResult::err(status, error))
-        }
-
-        fn requests(&self) -> Vec<MockRequest> {
-            self.requests.lock().unwrap().clone()
+        fn failure(status: u16) -> Self {
+            Self::responding(DeliveryResult::from_http_status(status))
         }
 
         fn cx_requests(&self) -> Vec<MockRequest> {
@@ -814,26 +929,6 @@ mod tests {
     }
 
     impl WebhookTransport for MockTransport {
-        fn send<'a>(
-            &'a self,
-            url: &'a str,
-            headers: &'a HashMap<String, String>,
-            body: &'a serde_json::Value,
-        ) -> Pin<Box<dyn Future<Output = DeliveryResult> + Send + 'a>> {
-            let req = MockRequest {
-                url: url.to_string(),
-                headers: headers.clone(),
-                body: body.clone(),
-            };
-            self.requests.lock().unwrap().push(req);
-            let resp = self.response.clone();
-            Box::pin(async move { resp })
-        }
-
-        /// Override the Cx-first transport entry point so the test
-        /// suite can observe which path was used. Concrete transports
-        /// (e.g. asupersync::http) override this to propagate caller
-        /// cx; the default trait impl would delegate to `send`.
         fn send_with_cx<'a>(
             &'a self,
             _cx: &'a crate::cx::Cx,
@@ -852,27 +947,25 @@ mod tests {
         }
     }
 
-    /// Transport that intentionally relies on the trait's default
-    /// `send_with_cx` implementation. This pins the dispatcher's cancellation
-    /// gates for transports that cannot interrupt an in-flight request.
+    /// Cx-aware transport that can request cancellation during one delivery.
     #[derive(Clone)]
-    struct AmbientOnlyTransport {
+    struct CxTestTransport {
         requests: Arc<Mutex<Vec<MockRequest>>>,
-        cancel_on_send: Option<crate::cx::Cx>,
+        cancel_on_send: bool,
     }
 
-    impl AmbientOnlyTransport {
+    impl CxTestTransport {
         fn success() -> Self {
             Self {
                 requests: Arc::new(Mutex::new(Vec::new())),
-                cancel_on_send: None,
+                cancel_on_send: false,
             }
         }
 
-        fn cancelling(cx: &crate::cx::Cx) -> Self {
+        fn cancelling() -> Self {
             Self {
                 requests: Arc::new(Mutex::new(Vec::new())),
-                cancel_on_send: Some(cx.clone()),
+                cancel_on_send: true,
             }
         }
 
@@ -881,9 +974,10 @@ mod tests {
         }
     }
 
-    impl WebhookTransport for AmbientOnlyTransport {
-        fn send<'a>(
+    impl WebhookTransport for CxTestTransport {
+        fn send_with_cx<'a>(
             &'a self,
+            cx: &'a crate::cx::Cx,
             url: &'a str,
             headers: &'a HashMap<String, String>,
             body: &'a serde_json::Value,
@@ -893,13 +987,13 @@ mod tests {
                 headers: headers.clone(),
                 body: body.clone(),
             });
-            if let Some(cx) = &self.cancel_on_send {
+            if self.cancel_on_send {
                 cx.cancel_with(
                     crate::outcome::CancelKind::User,
-                    Some("default webhook transport mid-fanout test"),
+                    Some("Cx-first webhook transport mid-fanout test"),
                 );
             }
-            Box::pin(async { DeliveryResult::ok(200) })
+            Box::pin(async { DeliveryResult::from_http_status(200) })
         }
     }
 
@@ -1092,13 +1186,9 @@ mod tests {
     }
 
     /// ft-xbnl0.2.3 Cx-first: `WebhookDispatcher::dispatch_payload_with_cx`
-    /// must invoke `transport.send_with_cx` rather than falling back to
-    /// the ambient `send` path. This pins the Cx-forward contract at the
-    /// dispatcher → transport boundary so a Cx-aware transport has the
-    /// opportunity to thread caller cancellation into its underlying
-    /// HTTP call. Regression guard: if the dispatcher regressed to
-    /// calling `send` directly, `cx_requests` would stay empty while
-    /// `requests` would populate — this test would fail loudly.
+    /// must invoke the required `transport.send_with_cx` primitive. This pins
+    /// the Cx-forward contract at the dispatcher → transport boundary so the
+    /// exact caller context reaches the underlying HTTP call.
     #[test]
     fn dispatch_payload_with_cx_invokes_transport_cx_path() {
         run_async_test(async {
@@ -1128,15 +1218,10 @@ mod tests {
                 "mock transport reports success for both endpoints"
             );
 
-            // Cx-first path populated, ambient path untouched.
             assert_eq!(
                 transport.cx_requests().len(),
                 2,
                 "dispatch_payload_with_cx must invoke transport.send_with_cx for each endpoint"
-            );
-            assert!(
-                transport.requests().is_empty(),
-                "dispatch_payload_with_cx must NOT fall back to transport.send"
             );
         });
     }
@@ -1171,18 +1256,14 @@ mod tests {
                 1,
                 "dispatch_with_cx must route through the cx-aware transport path"
             );
-            assert!(
-                transport.requests().is_empty(),
-                "dispatch_with_cx must NOT fall back to transport.send"
-            );
         });
     }
 
     #[test]
-    fn precancelled_cx_blocks_default_transport_and_surfaces_cancellation() {
+    fn precancelled_cx_blocks_transport_and_surfaces_cancellation() {
         run_async_test(async {
             const SECRET: &str = "sentinel-private-webhook-cancellation-reason";
-            let transport = AmbientOnlyTransport::success();
+            let transport = CxTestTransport::success();
             let endpoints = vec![test_endpoint(
                 "blocked",
                 "https://example.invalid/blocked",
@@ -1215,7 +1296,7 @@ mod tests {
             assert!(!format!("{delivery:?}").contains(SECRET));
             assert!(
                 transport.requests().is_empty(),
-                "pre-cancelled dispatch must not enter the default transport"
+                "pre-cancelled dispatch must not enter the transport"
             );
         });
     }
@@ -1223,7 +1304,7 @@ mod tests {
     #[test]
     fn exhausted_poll_budget_is_not_misreported_as_user_cancellation() {
         run_async_test(async {
-            let transport = AmbientOnlyTransport::success();
+            let transport = CxTestTransport::success();
             let endpoint = test_endpoint(
                 "budget-blocked",
                 "https://example.invalid/blocked",
@@ -1243,9 +1324,12 @@ mod tests {
             assert_eq!(delivery.records[0].target, WEBHOOK_DISPATCH_TARGET);
             assert_eq!(
                 delivery.records[0].error.as_deref(),
-                Some(WEBHOOK_BUDGET_ERROR)
+                Some(WEBHOOK_POLL_BUDGET_ERROR)
             );
-            assert_eq!(delivery.error.as_deref(), Some(WEBHOOK_BUDGET_ERROR));
+            assert_eq!(
+                delivery.error.as_deref(),
+                Some(WEBHOOK_POLL_BUDGET_ERROR)
+            );
             assert!(
                 transport.requests().is_empty(),
                 "an exhausted poll budget must stop before transport dispatch"
@@ -1256,17 +1340,82 @@ mod tests {
     #[test]
     fn unknown_checkpoint_error_uses_finite_context_class() {
         let cx = crate::cx::for_request();
-        let error = asupersync::error::Error::new(asupersync::error::ErrorKind::Internal)
+        let error = crate::runtime_async::ContextError::new(
+            crate::runtime_async::ContextErrorKind::Internal,
+        )
             .with_message("sentinel-private-context-detail");
 
-        assert_eq!(checkpoint_error_class(&cx, &error), WEBHOOK_CONTEXT_ERROR);
+        assert_eq!(
+            checkpoint_error_class(&cx, &error),
+            DeliveryFailureClass::Context
+        );
     }
 
     #[test]
-    fn cancellation_during_default_transport_stops_later_endpoints() {
+    fn cancellation_cleanup_timeout_is_not_misreported_as_request_deadline() {
+        let cx = crate::cx::for_request();
+        let error = crate::runtime_async::ContextError::new(
+            crate::runtime_async::ContextErrorKind::CancelTimeout,
+        )
+        .with_message("sentinel-private-cancellation-cleanup-detail");
+
+        assert_eq!(
+            checkpoint_error_class(&cx, &error),
+            DeliveryFailureClass::CancellationCleanupTimeout
+        );
+        assert_eq!(
+            checkpoint_error_class(&cx, &error).code(),
+            WEBHOOK_CANCELLATION_CLEANUP_TIMEOUT_ERROR
+        );
+    }
+
+    #[test]
+    fn cancelled_checkpoint_preserves_every_root_cancel_class_without_detail_leak() {
+        use crate::outcome::CancelKind;
+
+        const SECRET: &str = "sentinel-private-webhook-root-cancel-detail";
+        let cases = [
+            (CancelKind::Timeout, DeliveryFailureClass::DeadlineExceeded),
+            (CancelKind::Deadline, DeliveryFailureClass::DeadlineExceeded),
+            (
+                CancelKind::PollQuota,
+                DeliveryFailureClass::PollBudgetExhausted,
+            ),
+            (
+                CancelKind::CostBudget,
+                DeliveryFailureClass::CostBudgetExhausted,
+            ),
+            (CancelKind::User, DeliveryFailureClass::Cancelled),
+            (CancelKind::FailFast, DeliveryFailureClass::Cancelled),
+            (CancelKind::RaceLost, DeliveryFailureClass::Cancelled),
+            (CancelKind::ParentCancelled, DeliveryFailureClass::Cancelled),
+            (
+                CancelKind::ResourceUnavailable,
+                DeliveryFailureClass::Cancelled,
+            ),
+            (CancelKind::Shutdown, DeliveryFailureClass::Cancelled),
+            (CancelKind::LinkedExit, DeliveryFailureClass::Cancelled),
+        ];
+
+        for (kind, expected) in cases {
+            let cx = crate::cx::for_request();
+            cx.cancel_with(kind, Some(SECRET));
+            let error = crate::runtime_async::ContextError::new(
+                crate::runtime_async::ContextErrorKind::Cancelled,
+            )
+            .with_message(SECRET);
+
+            let actual = checkpoint_error_class(&cx, &error);
+            assert_eq!(actual, expected);
+            assert!(!actual.code().contains(SECRET));
+        }
+    }
+
+    #[test]
+    fn cancellation_during_transport_stops_later_endpoints() {
         run_async_test(async {
             let cx = crate::cx::for_request();
-            let transport = AmbientOnlyTransport::cancelling(&cx);
+            let transport = CxTestTransport::cancelling();
             let endpoints = vec![
                 test_endpoint(
                     "first",
@@ -1288,7 +1437,7 @@ mod tests {
             assert_eq!(
                 transport.requests().len(),
                 1,
-                "cancellation from the first default-transport request must stop later fanout"
+                "cancellation from the first Cx-aware request must stop later fanout"
             );
             assert_eq!(records.len(), 2);
             assert_eq!(records[0].target, "first");
@@ -1304,14 +1453,129 @@ mod tests {
     }
 
     #[test]
-    fn inconsistent_transport_success_fails_closed_with_finite_error() {
+    fn typed_transport_control_failure_stops_fanout_without_duplicate_record() {
         run_async_test(async {
-            const SECRET: &str = "sentinel-inconsistent-transport-secret";
-            let transport = MockTransport::responding(DeliveryResult {
-                status_code: 0,
-                accepted: true,
-                error: Some(format!("https://hooks.invalid/{SECRET}")),
-            });
+            let cases = [
+                (
+                    DeliveryResult::cancelled(),
+                    DeliveryFailureClass::Cancelled,
+                ),
+                (
+                    DeliveryResult::cancellation_cleanup_timeout(),
+                    DeliveryFailureClass::CancellationCleanupTimeout,
+                ),
+                (
+                    DeliveryResult::deadline_exceeded(),
+                    DeliveryFailureClass::DeadlineExceeded,
+                ),
+                (
+                    DeliveryResult::poll_budget_exhausted(),
+                    DeliveryFailureClass::PollBudgetExhausted,
+                ),
+                (
+                    DeliveryResult::cost_budget_exhausted(),
+                    DeliveryFailureClass::CostBudgetExhausted,
+                ),
+                (
+                    DeliveryResult::context_failure(),
+                    DeliveryFailureClass::Context,
+                ),
+            ];
+
+            for (result, expected_class) in cases {
+                let transport = MockTransport::responding(result);
+                let endpoints = vec![
+                    test_endpoint(
+                        "control-failed",
+                        "https://example.invalid/first",
+                        WebhookTemplate::Generic,
+                    ),
+                    test_endpoint(
+                        "must-not-run",
+                        "https://example.invalid/second",
+                        WebhookTemplate::Generic,
+                    ),
+                ];
+                let dispatcher =
+                    WebhookDispatcher::new(endpoints, Box::new(transport.clone()));
+                let payload = NotificationPayload::from_detection(
+                    &test_detection(),
+                    3,
+                    &test_rendered(),
+                    0,
+                );
+                let cx = crate::cx::for_request();
+
+                let records = dispatcher.dispatch_payload_with_cx(&cx, &payload).await;
+
+                assert_eq!(
+                    transport.cx_requests().len(),
+                    1,
+                    "typed {expected_class:?} must stop later endpoint fanout"
+                );
+                assert_eq!(
+                    records.len(),
+                    1,
+                    "typed {expected_class:?} must not be followed by a duplicate checkpoint record"
+                );
+                assert_eq!(records[0].target, "control-failed");
+                assert_eq!(records[0].error.as_deref(), Some(expected_class.code()));
+            }
+        });
+    }
+
+    #[test]
+    fn typed_transport_control_failure_from_final_endpoint_is_retained_exactly() {
+        run_async_test(async {
+            let cases = [
+                (
+                    DeliveryResult::cancelled(),
+                    DeliveryFailureClass::Cancelled,
+                ),
+                (
+                    DeliveryResult::poll_budget_exhausted(),
+                    DeliveryFailureClass::PollBudgetExhausted,
+                ),
+                (
+                    DeliveryResult::cost_budget_exhausted(),
+                    DeliveryFailureClass::CostBudgetExhausted,
+                ),
+            ];
+
+            for (result, expected_class) in cases {
+                let transport = MockTransport::responding(result);
+                let endpoint = test_endpoint(
+                    "only",
+                    "https://example.invalid/only",
+                    WebhookTemplate::Generic,
+                );
+                let dispatcher = WebhookDispatcher::new(vec![endpoint], Box::new(transport));
+                let payload = NotificationPayload::from_detection(
+                    &test_detection(),
+                    3,
+                    &test_rendered(),
+                    0,
+                );
+                let cx = crate::cx::for_request();
+
+                let delivery = dispatcher.send_with_cx(&cx, &payload).await;
+
+                assert!(!delivery.success);
+                assert_eq!(delivery.records.len(), 1);
+                assert_eq!(delivery.records[0].target, "only");
+                assert_eq!(
+                    delivery.records[0].error.as_deref(),
+                    Some(expected_class.code())
+                );
+                assert_eq!(delivery.error.as_deref(), Some(expected_class.code()));
+            }
+        });
+    }
+
+    #[test]
+    fn transport_failure_stays_finite_through_notification_delivery() {
+        run_async_test(async {
+            let transport = MockTransport::responding(DeliveryResult::transport_failure());
             let endpoint = test_endpoint(
                 "inconsistent",
                 "https://example.invalid/hook",
@@ -1332,19 +1596,15 @@ mod tests {
                 delivery.records[0].error.as_deref(),
                 Some(WEBHOOK_TRANSPORT_ERROR)
             );
-            assert!(!format!("{delivery:?}").contains(SECRET));
+            assert_eq!(delivery.error.as_deref(), Some(WEBHOOK_TRANSPORT_ERROR));
         });
     }
 
     #[test]
-    fn inconsistent_two_xx_transport_result_uses_invalid_result_class() {
+    fn invalid_http_status_uses_invalid_result_class() {
         run_async_test(async {
-            const SECRET: &str = "sentinel-inconsistent-two-xx-secret";
-            let transport = MockTransport::responding(DeliveryResult {
-                status_code: 204,
-                accepted: true,
-                error: Some(SECRET.to_string()),
-            });
+            let transport =
+                MockTransport::responding(DeliveryResult::from_http_status(u16::MAX));
             let endpoint = test_endpoint(
                 "inconsistent-two-xx",
                 "https://example.invalid/hook",
@@ -1359,11 +1619,11 @@ mod tests {
 
             assert!(!delivery.success);
             assert!(!delivery.records[0].accepted);
+            assert_eq!(delivery.records[0].status_code, u16::MAX);
             assert_eq!(
                 delivery.records[0].error.as_deref(),
                 Some(WEBHOOK_INVALID_TRANSPORT_RESULT)
             );
-            assert!(!format!("{delivery:?}").contains(SECRET));
         });
     }
 
@@ -1371,7 +1631,7 @@ mod tests {
     fn late_cancellation_does_not_falsify_completed_final_delivery() {
         run_async_test(async {
             let cx = crate::cx::for_request();
-            let transport = AmbientOnlyTransport::cancelling(&cx);
+            let transport = CxTestTransport::cancelling();
             let endpoints = vec![test_endpoint(
                 "only",
                 "https://example.invalid/only",
@@ -1432,11 +1692,7 @@ mod tests {
     #[test]
     fn dispatcher_records_failures() {
         run_async_test(async {
-            const SECRET: &str = "sentinel-transport-error-webhook-credential";
-            let transport = MockTransport::failure(
-                500,
-                &format!("request to https://hooks.invalid/{SECRET} was rejected"),
-            );
+            let transport = MockTransport::failure(500);
             let endpoints = vec![test_endpoint(
                 "broken",
                 "http://localhost",
@@ -1452,7 +1708,6 @@ mod tests {
             assert!(!records[0].accepted);
             assert_eq!(records[0].status_code, 500);
             assert_eq!(records[0].error.as_deref(), Some(WEBHOOK_REMOTE_REJECTION));
-            assert!(!format!("{:?}", records[0]).contains(SECRET));
         });
     }
 
@@ -1556,15 +1811,18 @@ url = "http://localhost:8080/hook"
 
     #[test]
     fn delivery_result_constructors() {
-        let ok = DeliveryResult::ok(200);
-        assert!(ok.accepted);
-        assert_eq!(ok.status_code, 200);
-        assert!(ok.error.is_none());
+        let ok = DeliveryResult::from_http_status(200);
+        assert!(ok.accepted());
+        assert_eq!(ok.status_code(), 200);
+        assert_eq!(ok.failure_class(), None);
 
-        let err = DeliveryResult::err(503, "Service Unavailable");
-        assert!(!err.accepted);
-        assert_eq!(err.status_code, 503);
-        assert!(err.error.unwrap().contains("Service Unavailable"));
+        let rejected = DeliveryResult::from_http_status(503);
+        assert!(!rejected.accepted());
+        assert_eq!(rejected.status_code(), 503);
+        assert_eq!(
+            rejected.failure_class(),
+            Some(DeliveryFailureClass::RemoteRejected)
+        );
     }
 
     #[test]
@@ -1619,7 +1877,6 @@ url = "http://localhost:8080/hook"
                 dispatcher.dispatch(&d, 3, &test_rendered(), 0).await;
             }
             // Verify no requests were made
-            assert!(transport.requests().is_empty());
             assert!(transport.cx_requests().is_empty());
         });
     }
@@ -1781,7 +2038,7 @@ url = "http://localhost:8080/hook"
         run_async_test(async {
             // Two transports with different responses — simulate via
             // a single dispatcher with the same transport returning failure
-            let transport = MockTransport::failure(500, "Internal Server Error");
+            let transport = MockTransport::failure(500);
             let endpoints = vec![
                 test_endpoint("failing1", "http://fail1.test", WebhookTemplate::Generic),
                 test_endpoint("failing2", "http://fail2.test", WebhookTemplate::Slack),
@@ -1899,39 +2156,96 @@ url = "http://localhost:8080/hook"
     // ====================================================================
 
     #[test]
-    fn delivery_result_ok_201() {
-        let r = DeliveryResult::ok(201);
-        assert!(r.accepted);
-        assert_eq!(r.status_code, 201);
-        assert!(r.error.is_none());
+    fn delivery_result_accepts_201() {
+        let result = DeliveryResult::from_http_status(201);
+        assert!(result.accepted());
+        assert_eq!(result.status_code(), 201);
+        assert_eq!(result.failure_class(), None);
     }
 
     #[test]
-    fn delivery_result_err_zero_status_connection_failure() {
-        let r = DeliveryResult::err(0, "connection refused");
-        assert!(!r.accepted);
-        assert_eq!(r.status_code, 0);
-        assert_eq!(r.error.as_deref(), Some("connection refused"));
+    fn delivery_result_zero_status_is_transport_failure() {
+        let result = DeliveryResult::from_http_status(0);
+        assert!(!result.accepted());
+        assert_eq!(result.status_code(), 0);
+        assert_eq!(
+            result.failure_class(),
+            Some(DeliveryFailureClass::Transport)
+        );
     }
 
     #[test]
-    fn delivery_result_debug() {
-        const SECRET: &str = "sentinel-delivery-result-secret";
-        let r = DeliveryResult::err(0, format!("https://hooks.invalid/{SECRET}"));
-        let dbg = format!("{r:?}");
+    fn delivery_result_debug_is_finite() {
+        let result = DeliveryResult::deadline_exceeded();
+        let dbg = format!("{result:?}");
         assert!(dbg.contains("DeliveryResult"));
-        assert!(dbg.contains("error_present: true"));
-        assert!(!dbg.contains(SECRET));
-        assert!(!dbg.contains("hooks.invalid"));
+        assert!(dbg.contains("DeadlineExceeded"));
+        assert!(dbg.len() < 128, "finite debug output grew unexpectedly: {dbg}");
     }
 
     #[test]
     fn delivery_result_clone() {
-        let r = DeliveryResult::err(429, "rate limited");
-        let r2 = r.clone();
-        assert_eq!(r2.status_code, 429);
-        assert!(!r2.accepted);
-        assert_eq!(r2.error.as_deref(), Some("rate limited"));
+        let result = DeliveryResult::from_http_status(429);
+        let cloned = result.clone();
+        assert_eq!(cloned, result);
+        assert_eq!(cloned.status_code(), 429);
+        assert_eq!(
+            cloned.failure_class(),
+            Some(DeliveryFailureClass::RemoteRejected)
+        );
+    }
+
+    #[test]
+    fn delivery_result_control_failure_constructors_are_distinct() {
+        let cases = [
+            (
+                DeliveryResult::cancelled(),
+                DeliveryFailureClass::Cancelled,
+            ),
+            (
+                DeliveryResult::cancellation_cleanup_timeout(),
+                DeliveryFailureClass::CancellationCleanupTimeout,
+            ),
+            (
+                DeliveryResult::deadline_exceeded(),
+                DeliveryFailureClass::DeadlineExceeded,
+            ),
+            (
+                DeliveryResult::poll_budget_exhausted(),
+                DeliveryFailureClass::PollBudgetExhausted,
+            ),
+            (
+                DeliveryResult::cost_budget_exhausted(),
+                DeliveryFailureClass::CostBudgetExhausted,
+            ),
+            (
+                DeliveryResult::context_failure(),
+                DeliveryFailureClass::Context,
+            ),
+            (
+                DeliveryResult::transport_failure(),
+                DeliveryFailureClass::Transport,
+            ),
+        ];
+
+        for (result, expected) in cases {
+            assert!(!result.accepted());
+            assert_eq!(result.status_code(), 0);
+            assert_eq!(result.failure_class(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn delivery_result_rejects_non_http_status_values() {
+        for status in [1_u16, 99, 600, u16::MAX] {
+            let result = DeliveryResult::from_http_status(status);
+            assert!(!result.accepted());
+            assert_eq!(result.status_code(), status);
+            assert_eq!(
+                result.failure_class(),
+                Some(DeliveryFailureClass::InvalidResult)
+            );
+        }
     }
 
     // ====================================================================

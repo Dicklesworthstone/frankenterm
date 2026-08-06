@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use frankenterm_core::notifications::NotificationPayload;
 use frankenterm_core::webhook::{
-    DeliveryResult, WebhookEndpointConfig, WebhookTemplate, render_template,
+    DeliveryFailureClass, DeliveryResult, WebhookEndpointConfig, WebhookTemplate, render_template,
 };
 use proptest::prelude::*;
 
@@ -326,43 +326,51 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(80))]
 
-    /// DeliveryResult::ok() sets accepted=true and error=None.
+    /// Every valid 2xx HTTP status is accepted without a failure class.
     #[test]
-    fn prop_delivery_ok_constructor(status in 200_u16..300) {
-        let result = DeliveryResult::ok(status);
-        prop_assert!(result.accepted, "ok() should set accepted=true");
-        prop_assert!(result.error.is_none(), "ok() should set error=None");
-        prop_assert_eq!(result.status_code, status);
+    fn prop_delivery_http_success(status in 200_u16..300) {
+        let result = DeliveryResult::from_http_status(status);
+        prop_assert!(result.accepted());
+        prop_assert_eq!(result.failure_class(), None);
+        prop_assert_eq!(result.status_code(), status);
     }
 
-    /// DeliveryResult::err() sets accepted=false and error=Some(...).
+    /// Every valid non-2xx HTTP status is a finite remote rejection.
     #[test]
-    fn prop_delivery_err_constructor(
-        status in 400_u16..600,
-        msg in "[a-z ]{5,30}",
+    fn prop_delivery_http_rejection(status in prop_oneof![100_u16..200, 300_u16..600]) {
+        let result = DeliveryResult::from_http_status(status);
+        prop_assert!(!result.accepted());
+        prop_assert_eq!(
+            result.failure_class(),
+            Some(DeliveryFailureClass::RemoteRejected)
+        );
+        prop_assert_eq!(result.status_code(), status);
+    }
+
+    /// Values outside the HTTP status range fail closed as invalid results.
+    #[test]
+    fn prop_delivery_invalid_http_status(
+        status in prop_oneof![1_u16..100, 600_u16..=u16::MAX],
     ) {
-        let result = DeliveryResult::err(status, msg.clone());
-        prop_assert!(!result.accepted, "err() should set accepted=false");
-        prop_assert_eq!(result.error, Some(msg));
-        prop_assert_eq!(result.status_code, status);
+        let result = DeliveryResult::from_http_status(status);
+        prop_assert!(!result.accepted());
+        prop_assert_eq!(
+            result.failure_class(),
+            Some(DeliveryFailureClass::InvalidResult)
+        );
+        prop_assert_eq!(result.status_code(), status);
     }
 
-    /// DeliveryResult::ok() and err() produce opposite accepted flags.
+    /// Status zero is the conventional no-response transport failure.
     #[test]
-    fn prop_delivery_ok_err_opposite(status in 100_u16..600) {
-        let ok = DeliveryResult::ok(status);
-        let err = DeliveryResult::err(status, "fail");
-        prop_assert!(ok.accepted != err.accepted,
-            "ok and err should have opposite accepted flags");
-    }
-
-    /// DeliveryResult::err() with status 0 (connection failure).
-    #[test]
-    fn prop_delivery_err_zero_status(msg in "[a-z ]{5,30}") {
-        let result = DeliveryResult::err(0, msg.clone());
-        prop_assert_eq!(result.status_code, 0);
-        prop_assert!(!result.accepted);
-        prop_assert_eq!(result.error, Some(msg));
+    fn prop_delivery_zero_status_is_transport_failure(_seed in any::<u8>()) {
+        let result = DeliveryResult::from_http_status(0);
+        prop_assert_eq!(result.status_code(), 0);
+        prop_assert!(!result.accepted());
+        prop_assert_eq!(
+            result.failure_class(),
+            Some(DeliveryFailureClass::Transport)
+        );
     }
 }
 
@@ -516,19 +524,22 @@ fn endpoint_with_headers_roundtrip() {
 }
 
 #[test]
-fn delivery_result_ok_basic() {
-    let result = DeliveryResult::ok(200);
-    assert!(result.accepted);
-    assert!(result.error.is_none());
-    assert_eq!(result.status_code, 200);
+fn delivery_result_success_basic() {
+    let result = DeliveryResult::from_http_status(200);
+    assert!(result.accepted());
+    assert_eq!(result.failure_class(), None);
+    assert_eq!(result.status_code(), 200);
 }
 
 #[test]
-fn delivery_result_err_basic() {
-    let result = DeliveryResult::err(500, "server error");
-    assert!(!result.accepted);
-    assert_eq!(result.error, Some("server error".to_string()));
-    assert_eq!(result.status_code, 500);
+fn delivery_result_remote_rejection_basic() {
+    let result = DeliveryResult::from_http_status(500);
+    assert!(!result.accepted());
+    assert_eq!(
+        result.failure_class(),
+        Some(DeliveryFailureClass::RemoteRejected)
+    );
+    assert_eq!(result.status_code(), 500);
 }
 
 // =========================================================================
@@ -588,22 +599,25 @@ proptest! {
         prop_assert!(!json.is_empty());
     }
 
-    /// DeliveryResult ok has accepted=true and no error.
+    /// Valid 2xx results are accepted and carry no failure class.
     #[test]
-    fn delivery_ok_invariants(status in 200_u16..300) {
-        let result = DeliveryResult::ok(status);
-        prop_assert!(result.accepted);
-        prop_assert!(result.error.is_none());
-        prop_assert_eq!(result.status_code, status);
+    fn delivery_success_invariants(status in 200_u16..300) {
+        let result = DeliveryResult::from_http_status(status);
+        prop_assert!(result.accepted());
+        prop_assert_eq!(result.failure_class(), None);
+        prop_assert_eq!(result.status_code(), status);
     }
 
-    /// DeliveryResult err has accepted=false and some error.
+    /// Valid non-2xx results are finite remote rejections.
     #[test]
-    fn delivery_err_invariants(status in 400_u16..600, msg in "[a-z ]{3,20}") {
-        let result = DeliveryResult::err(status, &msg);
-        prop_assert!(!result.accepted);
-        prop_assert!(result.error.is_some());
-        prop_assert_eq!(result.status_code, status);
+    fn delivery_rejection_invariants(status in prop_oneof![100_u16..200, 300_u16..600]) {
+        let result = DeliveryResult::from_http_status(status);
+        prop_assert!(!result.accepted());
+        prop_assert_eq!(
+            result.failure_class(),
+            Some(DeliveryFailureClass::RemoteRejected)
+        );
+        prop_assert_eq!(result.status_code(), status);
     }
 
     /// WebhookTemplate Debug is non-empty for all variants.
@@ -615,11 +629,9 @@ proptest! {
 
     /// DeliveryResult Clone preserves all fields.
     #[test]
-    fn delivery_result_clone_preserves(status in 100_u16..600) {
-        let result = DeliveryResult::ok(status);
+    fn delivery_result_clone_preserves(status in any::<u16>()) {
+        let result = DeliveryResult::from_http_status(status);
         let cloned = result.clone();
-        prop_assert_eq!(cloned.accepted, result.accepted);
-        prop_assert_eq!(cloned.status_code, result.status_code);
-        prop_assert_eq!(cloned.error, result.error);
+        prop_assert_eq!(cloned, result);
     }
 }

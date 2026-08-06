@@ -46,14 +46,14 @@ impl MockTransport {
     fn success() -> Self {
         Self {
             requests: Arc::new(Mutex::new(Vec::new())),
-            response: DeliveryResult::ok(200),
+            response: DeliveryResult::from_http_status(200),
         }
     }
 
-    fn failure(status: u16, error: &str) -> Self {
+    fn failure(status: u16) -> Self {
         Self {
             requests: Arc::new(Mutex::new(Vec::new())),
-            response: DeliveryResult::err(status, error),
+            response: DeliveryResult::from_http_status(status),
         }
     }
 
@@ -63,8 +63,9 @@ impl MockTransport {
 }
 
 impl WebhookTransport for MockTransport {
-    fn send<'a>(
+    fn send_with_cx<'a>(
         &'a self,
+        _cx: &'a frankenterm_core::cx::Cx,
         url: &'a str,
         headers: &'a HashMap<String, String>,
         body: &'a serde_json::Value,
@@ -185,7 +186,7 @@ fn dispatcher_skips_non_matching_endpoints() {
 #[test]
 fn dispatcher_records_failures() {
     RuntimeFixture::current_thread().block_on(async {
-        let transport = MockTransport::failure(500, "Internal Server Error");
+        let transport = MockTransport::failure(500);
         let endpoints = vec![test_endpoint(
             "broken",
             "http://localhost",
@@ -442,7 +443,7 @@ fn pipeline_mixed_success_and_failure() {
     RuntimeFixture::current_thread().block_on(async {
         // Two transports with different responses -- simulate via
         // a single dispatcher with the same transport returning failure
-        let transport = MockTransport::failure(500, "Internal Server Error");
+        let transport = MockTransport::failure(500);
         let endpoints = vec![
             test_endpoint("failing1", "http://fail1.test", WebhookTemplate::Generic),
             test_endpoint("failing2", "http://fail2.test", WebhookTemplate::Slack),
