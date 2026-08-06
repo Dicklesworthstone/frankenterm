@@ -12,7 +12,7 @@
 //! Database → SessionCandidate → RestoreDecision → LayoutRestorer → RestoreSummary
 //! ```
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use rusqlite::{
@@ -71,10 +71,7 @@ pub enum RestoreError {
     /// Stored consistency witness does not match the exact persisted
     /// checkpoint projection. This detects corruption and partial mutation;
     /// it is not authentication against a writer that can recompute SHA-256.
-    #[error(
-        "state_hash mismatch on checkpoint {checkpoint_id} \
-         (session {session_id}): stored={stored}, recomputed={recomputed}"
-    )]
+    #[error("state_hash mismatch on checkpoint {checkpoint_id}")]
     StateHashMismatch {
         checkpoint_id: i64,
         session_id: String,
@@ -82,7 +79,7 @@ pub enum RestoreError {
         recomputed: String,
     },
 
-    #[error("invalid checkpoint role on checkpoint {checkpoint_id}: {role}")]
+    #[error("invalid checkpoint role on checkpoint {checkpoint_id}")]
     InvalidCheckpointRole { checkpoint_id: i64, role: String },
 
     #[error(
@@ -126,8 +123,8 @@ pub enum RestoreError {
 }
 
 impl From<rusqlite::Error> for RestoreError {
-    fn from(e: rusqlite::Error) -> Self {
-        RestoreError::Database(e.to_string())
+    fn from(_error: rusqlite::Error) -> Self {
+        RestoreError::Database("database operation failed".to_string())
     }
 }
 
@@ -227,7 +224,8 @@ pub struct SessionRestoreConfig {
     /// It is not applied to raw `output_segments`, whose rows are arbitrary
     /// stream fragments rather than lines.
     pub restore_max_lines: usize,
-    /// Process re-launch behavior after a fully successful restore.
+    /// Reserved process-plan policy payload. Restore records captured plans as
+    /// manual dispositions and never launches those processes.
     pub process_relaunch: LaunchConfig,
 }
 
@@ -359,11 +357,13 @@ pub struct RestoreSummary {
     pub layout_result: RestoreResult,
     /// Pane states that were loaded.
     pub pane_states: Vec<RestoredPaneState>,
-    /// Scrollback injection report when replay was enabled.
+    /// Reserved report for a future mux-owned output restoration channel.
+    /// Currently always `None`; replay requests fail during preflight.
     pub scrollback_result: Option<InjectionReport>,
-    /// Global scrollback replay error when capture data could not be loaded.
+    /// Reserved global error for future safe replay. Currently always `None`
+    /// because replay requests fail before capture lookup.
     pub scrollback_error: Option<String>,
-    /// Process relaunch report when at least one relaunch plan was evaluated.
+    /// Process disposition report when at least one captured plan was evaluated.
     pub process_launch_report: Option<LaunchReport>,
     /// Whether the exact restore receipt was durably bound as clean authority.
     pub source_marked_clean: bool,
@@ -372,12 +372,7 @@ pub struct RestoreSummary {
 }
 
 impl RestoreSummary {
-    fn failed_expected_pane_ids(&self) -> HashSet<u64> {
-        let expected = self
-            .pane_states
-            .iter()
-            .map(|pane| pane.pane_id)
-            .collect::<HashSet<_>>();
+    fn failed_expected_pane_ids_for(&self, expected: &HashSet<u64>) -> HashSet<u64> {
         let mut failed = expected
             .iter()
             .copied()
@@ -391,6 +386,15 @@ impl RestoreSummary {
                 .filter(|pane_id| expected.contains(pane_id)),
         );
         failed
+    }
+
+    fn failed_expected_pane_ids(&self) -> HashSet<u64> {
+        let expected = self
+            .pane_states
+            .iter()
+            .map(|pane| pane.pane_id)
+            .collect::<HashSet<_>>();
+        self.failed_expected_pane_ids_for(&expected)
     }
 
     /// Number of panes successfully restored.
@@ -411,32 +415,34 @@ impl RestoreSummary {
         self.pane_states.len()
     }
 
-    /// Number of panes whose scrollback was replayed.
+    /// Reserved successful replay count; currently zero.
     pub fn scrollback_restored_count(&self) -> usize {
         self.scrollback_result
             .as_ref()
             .map_or(0, InjectionReport::success_count)
     }
 
-    /// Number of panes whose scrollback replay failed.
+    /// Reserved failed replay count; currently zero.
     pub fn scrollback_failed_count(&self) -> usize {
         self.scrollback_result
             .as_ref()
             .map_or(0, InjectionReport::failure_count)
     }
 
-    /// Number of panes skipped during scrollback replay.
+    /// Reserved skipped replay count; currently zero.
     pub fn scrollback_skipped_count(&self) -> usize {
         self.scrollback_result
             .as_ref()
             .map_or(0, |report| report.skipped.len())
     }
 
-    /// Total bytes written during scrollback replay.
+    /// Reserved replay byte count; currently zero.
     pub fn scrollback_bytes_written(&self) -> usize {
-        self.scrollback_result
-            .as_ref()
-            .map_or(0, InjectionReport::total_bytes)
+        self.scrollback_result.as_ref().map_or(0, |report| {
+            report.successes.iter().fold(0usize, |total, pane| {
+                total.saturating_add(pane.bytes_written)
+            })
+        })
     }
 }
 
@@ -509,11 +515,14 @@ fn restore_ambiguity_from_conn(
                    intent.checkpoint_role = 'restore_intent'
                    OR (
                        intent.checkpoint_role = 'restore_receipt'
-                       AND json_valid(intent.metadata_json)
-                       AND json_extract(
+                       AND CASE
+                           WHEN json_valid(intent.metadata_json)
+                           THEN json_extract(
                                intent.metadata_json,
                                '$.restore_attempt.phase'
-                           ) = 'intent'
+                           )
+                           ELSE NULL
+                       END = 'intent'
                    )
                )
                AND NOT EXISTS (
@@ -762,7 +771,9 @@ pub fn load_latest_checkpoint(
     match checkpoint_id {
         Ok(id) => load_checkpoint_by_id_from_conn(&conn, id),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(RestoreError::Database(e.to_string())),
+        Err(_error) => Err(RestoreError::Database(
+            "checkpoint lookup failed".to_string(),
+        )),
     }
 }
 
@@ -843,7 +854,11 @@ fn load_checkpoint_by_id_from_conn(
     ) = match checkpoint {
         Ok(c) => c,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-        Err(e) => return Err(RestoreError::Database(e.to_string())),
+        Err(_error) => {
+            return Err(RestoreError::Database(
+                "checkpoint row lookup failed".to_string(),
+            ));
+        }
     };
     let checkpoint_at = decode_u64(checkpoint_at_raw, "session_checkpoints.checkpoint_at")?;
     let pane_count = decode_usize(pane_count_raw, "session_checkpoints.pane_count")?;
@@ -905,16 +920,16 @@ fn load_checkpoint_by_id_from_conn(
     for persisted in persisted_panes {
         let pane_id = decode_u64(persisted.pane_id, "mux_pane_state.pane_id")?;
         let terminal_state = serde_json::from_str::<TerminalState>(&persisted.terminal_state_json)
-            .map_err(|error| {
+            .map_err(|_error| {
                 RestoreError::CorruptCheckpoint(format!(
-                    "pane {pane_id} has invalid terminal_state_json: {error}"
+                    "pane {pane_id} has invalid terminal_state_json"
                 ))
             })?;
         let agent_metadata = match persisted.agent_metadata_json.as_deref() {
             Some(agent_json) => Some(serde_json::from_str::<AgentMetadata>(agent_json).map_err(
-                |error| {
+                |_error| {
                     RestoreError::CorruptCheckpoint(format!(
-                        "pane {pane_id} has invalid agent_metadata_json: {error}"
+                        "pane {pane_id} has invalid agent_metadata_json"
                     ))
                 },
             )?),
@@ -1287,6 +1302,8 @@ fn validate_restore_outcome_metadata(
                 "restore outcome {checkpoint_id} overflows its process disposition count"
             ))
         })?;
+    // The disposition-only engine has no launched-success category: every
+    // settled plan must appear exactly once as failed, manual, or skipped.
     let invalid = *intent_checkpoint_id <= 0
         || *intent_checkpoint_at < 0
         || intent_state_hash.is_empty()
@@ -1308,9 +1325,8 @@ fn validate_restore_outcome_metadata(
                 || *scrollback_skipped != 0
                 || *scrollback_global_error))
         || *process_plans_settled > *process_plans_total
-        || disposition_count > *process_plans_settled
-        || (!*process_plan_evaluated
-            && (*process_plans_total != 0 || *process_plans_settled != 0))
+        || disposition_count != *process_plans_settled
+        || *process_plan_evaluated != (*process_plans_total > 0)
         || (*process_interrupted && !*attempt_interrupted)
         || interruption_phase.is_some() != *attempt_interrupted;
     if invalid {
@@ -1361,9 +1377,9 @@ fn verify_checkpoint_witness(
             topology_json,
             panes,
         )
-        .map_err(|error| {
+        .map_err(|_error| {
             RestoreError::CorruptCheckpoint(format!(
-                "checkpoint {checkpoint_id} witness projection is invalid: {error}"
+                "checkpoint {checkpoint_id} witness projection is invalid"
             ))
         })?;
         if recomputed != stored_state_hash {
@@ -1404,7 +1420,7 @@ fn verify_checkpoint_witness(
 
 /// Test-only exact-receipt clean transition for legacy fixture coverage.
 /// Production restore bookkeeping persists an unclean receipt first and binds
-/// that exact receipt only after process relaunch settles.
+/// that exact receipt only after process disposition evaluation settles.
 #[cfg(test)]
 fn mark_session_restored(db_path: &str, session_id: &str) -> Result<(), RestoreError> {
     let conn = open_conn(db_path)?;
@@ -1418,9 +1434,9 @@ fn mark_session_restored(db_path: &str, session_id: &str) -> Result<(), RestoreE
             [session_id],
             |row| row.get::<_, i64>(0),
         )
-        .map_err(|error| {
+        .map_err(|_error| {
             RestoreError::Bookkeeping(format!(
-                "cannot mark session {session_id} restored without an exact checkpoint receipt: {error}"
+                "cannot mark session {session_id} restored without an exact checkpoint receipt"
             ))
         })?;
     let updated = conn.execute(
@@ -1454,10 +1470,10 @@ fn prepare_restore_receipt_metadata(
         ordered_mapping.insert(old_id.to_string(), new_id);
     }
     let metadata = serde_json::json!({ "old_to_new": ordered_mapping });
-    let metadata_json = canonical_json_string(&metadata).map_err(|error| {
-        RestoreError::Bookkeeping(format!(
-            "failed to canonicalize restore receipt metadata: {error}"
-        ))
+    let metadata_json = canonical_json_string(&metadata).map_err(|_error| {
+        RestoreError::Bookkeeping(
+            "failed to canonicalize restore receipt metadata".to_string(),
+        )
     })?;
     Ok((metadata_json, pane_count))
 }
@@ -1483,10 +1499,10 @@ fn prepare_restore_intent_metadata(source: &RestoreIntentSource) -> Result<Strin
             "source_pane_count": source.pane_count,
         }
     });
-    canonical_json_string(&metadata).map_err(|error| {
-        RestoreError::Bookkeeping(format!(
-            "failed to canonicalize restore intent metadata: {error}"
-        ))
+    canonical_json_string(&metadata).map_err(|_error| {
+        RestoreError::Bookkeeping(
+            "failed to canonicalize restore intent metadata".to_string(),
+        )
     })
 }
 
@@ -1689,6 +1705,8 @@ fn validate_restore_authority_chain(
         ))
     })?;
     if !persisted_restore_intent_is_valid(&intent_metadata)
+        || *intent_source_id >= linked_intent_id
+        || linked_intent_id >= outcome.checkpoint_id
         || *outcome_source_id != *intent_source_id
         || *outcome_source_at != *intent_source_at
         || outcome_source_role != intent_source_role
@@ -1701,17 +1719,31 @@ fn validate_restore_authority_chain(
         )));
     }
 
-    let lifecycle: Option<(i64, Option<i64>, String, Option<i64>)> = conn
+    let lifecycle: Option<(i64, Option<i64>, String, i64, Option<i64>)> = conn
         .query_row(
-            "SELECT source_checkpoint_id, outcome_checkpoint_id, status, resolved_at
+            "SELECT source_checkpoint_id, outcome_checkpoint_id, status,
+                    created_at, resolved_at
              FROM restore_attempt_lifecycle
              WHERE intent_checkpoint_id = ?1 AND session_id = ?2",
             rusqlite::params![linked_intent_id, session_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((lifecycle_source_id, lifecycle_outcome_id, lifecycle_status, resolved_at)) =
-        lifecycle
+    let Some((
+        lifecycle_source_id,
+        lifecycle_outcome_id,
+        lifecycle_status,
+        lifecycle_created_at,
+        resolved_at,
+    )) = lifecycle
     else {
         return Err(RestoreError::CorruptCheckpoint(format!(
             "restore outcome {} has no same-session lifecycle authority",
@@ -1722,7 +1754,9 @@ fn validate_restore_authority_chain(
     if lifecycle_source_id != *intent_source_id
         || lifecycle_outcome_id != Some(outcome.checkpoint_id)
         || lifecycle_status != expected_lifecycle_status
+        || lifecycle_created_at != *intent_checkpoint_at
         || resolved_at.is_some() != expected_resolved_at
+        || resolved_at.is_some_and(|resolved_at| resolved_at < lifecycle_created_at)
     {
         return Err(RestoreError::CorruptCheckpoint(format!(
             "restore outcome {} has inconsistent lifecycle authority",
@@ -1785,10 +1819,10 @@ fn prepare_restore_outcome_metadata(
     evidence: &RestoreOutcomeEvidence,
 ) -> Result<(String, i64), RestoreError> {
     let (mapping_json, pane_count) = prepare_restore_receipt_metadata(pane_id_map)?;
-    let mapping: serde_json::Value = serde_json::from_str(&mapping_json).map_err(|error| {
-        RestoreError::Bookkeeping(format!(
-            "failed to decode canonical restore mapping metadata: {error}"
-        ))
+    let mapping: serde_json::Value = serde_json::from_str(&mapping_json).map_err(|_error| {
+        RestoreError::Bookkeeping(
+            "failed to decode canonical restore mapping metadata".to_string(),
+        )
     })?;
     let old_to_new = mapping
         .get("old_to_new")
@@ -1825,10 +1859,10 @@ fn prepare_restore_outcome_metadata(
             "process_skipped": evidence.process_skipped,
         }
     });
-    let metadata_json = canonical_json_string(&metadata).map_err(|error| {
-        RestoreError::Bookkeeping(format!(
-            "failed to canonicalize restore outcome metadata: {error}"
-        ))
+    let metadata_json = canonical_json_string(&metadata).map_err(|_error| {
+        RestoreError::Bookkeeping(
+            "failed to canonicalize restore outcome metadata".to_string(),
+        )
     })?;
     Ok((metadata_json, pane_count))
 }
@@ -1918,10 +1952,8 @@ fn insert_restore_authority_checkpoint(
         None,
         &[],
     )
-    .map_err(|error| {
-        RestoreError::Bookkeeping(format!(
-            "failed to compute {role} witness: {error}"
-        ))
+    .map_err(|_error| {
+        RestoreError::Bookkeeping(format!("failed to compute {role} witness"))
     })?;
     let updated = tx.execute(
         "UPDATE session_checkpoints SET state_hash = ?1 WHERE id = ?2",
@@ -2044,8 +2076,8 @@ where
 }
 
 /// Persist a restore receipt while deliberately leaving the source session
-/// unclean. Process relaunch must settle before the exact receipt can authorize
-/// the separate clean transition.
+/// unclean. Process disposition evaluation must settle before the exact receipt
+/// can authorize the separate clean transition.
 fn persist_restore_receipt_unclean(
     db_path: &str,
     session_id: &str,
@@ -2312,7 +2344,7 @@ fn persist_restore_intent_unclean(
 }
 
 /// Bind one immutable, deterministic-latest restore receipt as the exact clean
-/// authority only after layout and process relaunch have both settled.
+/// authority only after layout and process disposition evaluation have settled.
 fn mark_restore_receipt_clean(
     db_path: &str,
     session_id: &str,
@@ -2643,16 +2675,22 @@ fn finalize_restore_for_test(
         pane_count: source_checkpoint.pane_count,
     };
     let intent = persist_restore_intent_unclean(db_path, session_id, &source)
-        .map_err(|error| RestoreError::Bookkeeping(error.to_string()))?;
+        .map_err(|_error| {
+            RestoreError::Bookkeeping("test restore intent did not settle".to_string())
+        })?;
     let mut evidence = complete_test_restore_outcome_evidence(pane_id_map.len());
     evidence.intent = intent;
     evidence.source = source;
     let receipt =
         persist_restore_receipt_unclean(db_path, session_id, pane_id_map, &evidence, true)
-        .map_err(|error| RestoreError::Bookkeeping(error.to_string()))?;
+        .map_err(|_error| {
+            RestoreError::Bookkeeping("test restore outcome did not settle".to_string())
+        })?;
     if mark_clean {
         mark_restore_receipt_clean(db_path, session_id, &receipt)
-            .map_err(|error| RestoreError::Bookkeeping(error.to_string()))?;
+            .map_err(|_error| {
+                RestoreError::Bookkeeping("test restore clean mark did not settle".to_string())
+            })?;
     }
     Ok(receipt.checkpoint_id)
 }
@@ -2928,7 +2966,7 @@ pub fn show_session(
         )
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => RestoreError::NoSessions,
-            other => RestoreError::Database(other.to_string()),
+            _other => RestoreError::Database("session lookup failed".to_string()),
         })?;
     let session = SessionCandidate {
         session_id: session.0,
@@ -3464,11 +3502,11 @@ impl SessionRestorer {
     /// - `LayoutRestorer::restore_with_cx` (tick 93)
     /// - fail-closed scrollback capability preflight before any mux effect
     /// - no PTY-input banner or historical-output injection
-    /// - `ProcessLauncher::execute_cx` for process relaunch
+    /// - `ProcessLauncher::execute_cx` for audited manual dispositions
     ///
     /// Per-step `cx.checkpoint()` seams also gate each stage so a
     /// cancelled caller can bail between topology parse, layout,
-    /// scrollback preflight, bookkeeping, and relaunch.
+    /// scrollback preflight, bookkeeping, and process disposition.
     pub async fn restore_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -3653,6 +3691,16 @@ impl SessionRestorer {
         let layout_complete = layout_result.failed_panes.is_empty()
             && mapped_pane_ids == expected_pane_ids
             && unique_target_count == layout_result.pane_id_map.len();
+        let failed_expected_pane_count = expected_pane_ids
+            .iter()
+            .filter(|pane_id| {
+                !mapped_pane_ids.contains(pane_id)
+                    || reported_failed_expected_pane_ids.contains(pane_id)
+            })
+            .count();
+        let restored_expected_pane_count = expected_pane_ids
+            .len()
+            .saturating_sub(failed_expected_pane_count);
         if !layout_complete && layout_result.failed_panes.is_empty() {
             warn!(
                 expected_panes = expected_pane_ids.len(),
@@ -3689,7 +3737,7 @@ impl SessionRestorer {
                 .map(|_error| {
                     (
                         "post-scrollback checkpoint",
-                        "caller capability stopped before relaunch".to_string(),
+                        "caller capability stopped before process disposition".to_string(),
                     )
                 });
         }
@@ -3708,8 +3756,8 @@ impl SessionRestorer {
                 .err()
                 .map(|_error| {
                     (
-                        "pre-relaunch checkpoint",
-                        "caller capability stopped before relaunch".to_string(),
+                        "pre-process-disposition checkpoint",
+                        "caller capability stopped before process disposition".to_string(),
                     )
                 });
         }
@@ -3727,15 +3775,15 @@ impl SessionRestorer {
         } else if !layout_complete {
             warn!(
                 session_id = %session.session_id,
-                restored_panes = layout_result.pane_id_map.len(),
-                failed_panes = layout_result.failed_panes.len(),
+                restored_panes = restored_expected_pane_count,
+                failed_panes = failed_expected_pane_count,
                 "Session restore incomplete; leaving source session unclean for reconciliation"
             );
         } else if !scrollback_replay_complete {
             warn!(
                 session_id = %session.session_id,
                 intent_checkpoint_id = intent.checkpoint_id,
-                "Skipping process relaunch because scrollback replay is incomplete"
+                "Skipping process disposition evaluation because scrollback replay is incomplete"
             );
         } else {
             let launch_snapshots: Vec<_> = checkpoint
@@ -3743,7 +3791,7 @@ impl SessionRestorer {
                 .iter()
                 .map(|state| launch_snapshot_from_restored_state(state, checkpoint.checkpoint_at))
                 .collect();
-            let launcher = ProcessLauncher::new(self.config.process_relaunch.clone());
+            let launcher = ProcessLauncher::new();
             let plans = launcher.plan(&layout_result.pane_id_map, &launch_snapshots);
             process_plans_total = plans.len();
             if !plans.is_empty() {
@@ -3760,7 +3808,7 @@ impl SessionRestorer {
                         skipped = report.skipped,
                         failed = report.failed,
                         interrupted = report.interruption.is_some(),
-                        "Process relaunch completed with follow-up required"
+                        "Captured process dispositions require manual follow-up"
                     );
                 } else {
                     info!(
@@ -3768,7 +3816,7 @@ impl SessionRestorer {
                         shells_launched = report.shells_launched,
                         agents_launched = report.agents_launched,
                         skipped = report.skipped,
-                        "Process relaunch complete"
+                        "Captured process disposition evaluation complete"
                     );
                 }
                 process_launch_report = Some(report);
@@ -3780,8 +3828,8 @@ impl SessionRestorer {
             .and_then(|report| report.interruption.as_ref())
             .map(|_interruption| {
                 (
-                    "process relaunch",
-                    "process relaunch stopped before every plan settled".to_string(),
+                    "process disposition evaluation",
+                    "process disposition evaluation stopped before every plan settled".to_string(),
                 )
             });
         if attempt_interruption.is_none() {
@@ -3793,8 +3841,8 @@ impl SessionRestorer {
                 .err()
                 .map(|_error| {
                     (
-                        "post-relaunch checkpoint",
-                        "caller capability stopped after relaunch".to_string(),
+                        "post-process-disposition checkpoint",
+                        "caller capability stopped after process disposition".to_string(),
                     )
                 });
         }
@@ -3934,12 +3982,11 @@ impl SessionRestorer {
             warn!(
                 session_id = %session.session_id,
                 checkpoint_id = receipt.checkpoint_id,
-                "Process relaunch requires follow-up; leaving source session unclean"
+                "Process disposition evaluation requires follow-up; leaving source session unclean"
             );
         }
 
         let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let failed_panes = layout_result.failed_panes.len();
         let restore_status = if restore_complete {
             "complete"
         } else {
@@ -3948,8 +3995,8 @@ impl SessionRestorer {
 
         info!(
             session_id = %session.session_id,
-            restored = layout_result.pane_id_map.len(),
-            failed = failed_panes,
+            restored = restored_expected_pane_count,
+            failed = failed_expected_pane_count,
             total = total_panes,
             status = restore_status,
             elapsed_ms = elapsed,
@@ -4084,7 +4131,17 @@ impl SessionRestorer {
 
 /// Format a restore summary for human display.
 pub fn format_restore_summary(summary: &RestoreSummary) -> String {
+    const MAX_FAILURE_DETAILS: usize = 20;
+
     let mut out = String::new();
+    let expected_pane_ids = summary
+        .pane_states
+        .iter()
+        .map(|pane| pane.pane_id)
+        .collect::<HashSet<_>>();
+    let failed_expected_pane_ids = summary.failed_expected_pane_ids_for(&expected_pane_ids);
+    let failed_count = failed_expected_pane_ids.len();
+    let restored_count = summary.total_count().saturating_sub(failed_count);
     let status = if summary.source_marked_clean {
         "restored"
     } else {
@@ -4094,26 +4151,35 @@ pub fn format_restore_summary(summary: &RestoreSummary) -> String {
         "Session {} {}: {}/{} panes in {}ms\n",
         summary.session_id,
         status,
-        summary.restored_count(),
+        restored_count,
         summary.total_count(),
         summary.elapsed_ms,
     ));
 
-    if summary.failed_count() > 0 {
+    if failed_count > 0 {
         out.push_str("Failed panes:\n");
-        const MAX_FAILURE_DETAILS: usize = 20;
+        let mut smallest_failed_pane_ids = BinaryHeap::with_capacity(MAX_FAILURE_DETAILS + 1);
+        for &pane_id in &failed_expected_pane_ids {
+            if smallest_failed_pane_ids.len() < MAX_FAILURE_DETAILS {
+                smallest_failed_pane_ids.push(pane_id);
+            } else if smallest_failed_pane_ids
+                .peek()
+                .is_some_and(|largest| pane_id < *largest)
+            {
+                smallest_failed_pane_ids.pop();
+                smallest_failed_pane_ids.push(pane_id);
+            }
+        }
+        let mut failed_pane_ids = smallest_failed_pane_ids.into_vec();
+        failed_pane_ids.sort_unstable();
         let explicitly_failed = summary
             .layout_result
             .failed_panes
             .iter()
             .map(|(pane_id, _error)| *pane_id)
+            .filter(|pane_id| failed_pane_ids.binary_search(pane_id).is_ok())
             .collect::<HashSet<_>>();
-        let mut failed_pane_ids = summary
-            .failed_expected_pane_ids()
-            .into_iter()
-            .collect::<Vec<_>>();
-        failed_pane_ids.sort_unstable();
-        for pane_id in failed_pane_ids.iter().take(MAX_FAILURE_DETAILS) {
+        for pane_id in &failed_pane_ids {
             if explicitly_failed.contains(pane_id) {
                 out.push_str(&format!(
                     "  pane {pane_id}: layout restoration reported failure\n"
@@ -4124,17 +4190,12 @@ pub fn format_restore_summary(summary: &RestoreSummary) -> String {
                 ));
             }
         }
-        let omitted = failed_pane_ids.len().saturating_sub(MAX_FAILURE_DETAILS);
+        let omitted = failed_count.saturating_sub(failed_pane_ids.len());
         if omitted > 0 {
             out.push_str(&format!("  ... {omitted} additional failed panes omitted\n"));
         }
     }
 
-    let expected_pane_ids = summary
-        .pane_states
-        .iter()
-        .map(|pane| pane.pane_id)
-        .collect::<HashSet<_>>();
     let unexpected_mapping_count = summary
         .layout_result
         .pane_id_map
@@ -4145,8 +4206,10 @@ pub fn format_restore_summary(summary: &RestoreSummary) -> String {
         .layout_result
         .failed_panes
         .iter()
-        .filter(|(pane_id, _)| !expected_pane_ids.contains(pane_id))
-        .count();
+        .map(|(pane_id, _error)| *pane_id)
+        .filter(|pane_id| !expected_pane_ids.contains(pane_id))
+        .collect::<HashSet<_>>()
+        .len();
     let unique_target_count = summary
         .layout_result
         .pane_id_map
@@ -4174,11 +4237,17 @@ pub fn format_restore_summary(summary: &RestoreSummary) -> String {
             report.success_count(),
             report.failure_count(),
             report.skipped.len(),
-            report.total_bytes(),
+            summary.scrollback_bytes_written(),
         ));
-        for (pane_id, _error) in &report.failures {
+        for (pane_id, _error) in report.failures.iter().take(MAX_FAILURE_DETAILS) {
             out.push_str(&format!(
                 "  scrollback pane {pane_id}: replay reported failure\n"
+            ));
+        }
+        let omitted = report.failures.len().saturating_sub(MAX_FAILURE_DETAILS);
+        if omitted > 0 {
+            out.push_str(&format!(
+                "  ... {omitted} additional scrollback failures omitted\n"
             ));
         }
     }
@@ -4189,7 +4258,7 @@ pub fn format_restore_summary(summary: &RestoreSummary) -> String {
 
     if let Some(report) = &summary.process_launch_report {
         out.push_str(&format!(
-            "Process relaunch: {} shells, {} agents, {} manual, {} failed, {} skipped\n",
+            "Process disposition: {} shells, {} agents, {} manual, {} failed, {} skipped\n",
             report.shells_launched,
             report.agents_launched,
             report.manual,
@@ -4197,7 +4266,9 @@ pub fn format_restore_summary(summary: &RestoreSummary) -> String {
             report.skipped,
         ));
         if report.interruption.is_some() {
-            out.push_str("Process relaunch was interrupted before every plan settled.\n");
+            out.push_str(
+                "Process disposition evaluation was interrupted before every plan settled.\n",
+            );
         }
     }
     if !summary.source_marked_clean {
@@ -4244,6 +4315,86 @@ mod tests {
             scrollback_checkpoint_seq: None,
             last_output_at: None,
         }
+    }
+
+    fn persisted_outcome_with_process_counts(
+        process_plans_total: usize,
+        process_plans_settled: usize,
+        process_failed: usize,
+        process_manual: usize,
+        process_skipped: usize,
+    ) -> PersistedRestoreCheckpointMetadata {
+        PersistedRestoreCheckpointMetadata {
+            old_to_new: BTreeMap::new(),
+            restore_attempt: Some(PersistedRestoreAttempt::Outcome {
+                intent_checkpoint_id: 2,
+                intent_checkpoint_at: 2,
+                intent_state_hash: "rsi2:test-intent".to_string(),
+                source_checkpoint_id: 1,
+                source_checkpoint_at: 1,
+                source_checkpoint_role: CHECKPOINT_ROLE_SNAPSHOT.to_string(),
+                source_state_hash: "test-source".to_string(),
+                expected_panes: 0,
+                mapped_panes: 0,
+                reported_layout_failures: 0,
+                layout_complete: true,
+                scrollback_requested: false,
+                scrollback_complete: true,
+                scrollback_failures: 0,
+                scrollback_skipped: 0,
+                scrollback_global_error: false,
+                process_plan_evaluated: process_plans_total > 0,
+                process_plans_total,
+                process_plans_settled,
+                process_interrupted: false,
+                attempt_interrupted: false,
+                interruption_phase: None,
+                process_failed,
+                process_manual,
+                process_skipped,
+            }),
+        }
+    }
+
+    #[test]
+    fn outcome_process_dispositions_exactly_cover_settled_plans() {
+        let exact = persisted_outcome_with_process_counts(2, 2, 0, 2, 0);
+        validate_restore_outcome_metadata(3, &exact).expect("exact dispositions are valid");
+
+        let missing = persisted_outcome_with_process_counts(2, 2, 0, 1, 0);
+        assert!(matches!(
+            validate_restore_outcome_metadata(3, &missing),
+            Err(RestoreError::CorruptCheckpoint(_))
+        ));
+
+        let mut empty_but_claimed_evaluated =
+            persisted_outcome_with_process_counts(0, 0, 0, 0, 0);
+        let Some(PersistedRestoreAttempt::Outcome {
+            process_plan_evaluated,
+            ..
+        }) = empty_but_claimed_evaluated.restore_attempt.as_mut()
+        else {
+            unreachable!("test helper always constructs outcome metadata");
+        };
+        *process_plan_evaluated = true;
+        assert!(matches!(
+            validate_restore_outcome_metadata(3, &empty_but_claimed_evaluated),
+            Err(RestoreError::CorruptCheckpoint(_))
+        ));
+    }
+
+    #[test]
+    fn outcome_process_disposition_overflow_is_rejected() {
+        let overflow = persisted_outcome_with_process_counts(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            1,
+            0,
+        );
+        let error = validate_restore_outcome_metadata(3, &overflow)
+            .expect_err("overflowed disposition sum must fail closed");
+        assert!(matches!(error, RestoreError::CorruptCheckpoint(_)));
     }
 
     // ── Schema-v36 role and witness regressions ──────────────────────
@@ -6710,6 +6861,41 @@ mod tests {
     }
 
     #[test]
+    fn restore_reloads_checkpoint_authority_instead_of_using_mutated_caller_data() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-reload-authority", false);
+        set_single_pane_topology(&conn, "sess-reload-authority", 31, "/restore");
+        let checkpoint_id = insert_checkpoint(&conn, "sess-reload-authority", 5000, 1);
+        insert_pane_state(&conn, checkpoint_id, 31, Some("/restore"), Some("bash"));
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = 5000
+             WHERE session_id = 'sess-reload-authority'",
+            [],
+        )
+        .unwrap();
+
+        let restorer = SessionRestorer::new(
+            Arc::new(db_path),
+            SessionRestoreConfig::default(),
+        );
+        let session = restorer.detect().unwrap().expect("restorable session");
+        let mut caller_checkpoint = restorer.load_checkpoint(&session).unwrap();
+        caller_checkpoint.topology_json = Some("{caller-mutated".to_string());
+        caller_checkpoint.pane_count = usize::MAX;
+        caller_checkpoint.state_hash = "caller-mutated".to_string();
+
+        let summary = run_async_test(restorer.restore(
+            &session,
+            &caller_checkpoint,
+            Arc::new(MockWezterm::new()),
+        ))
+        .expect("restore must rebind to the exact persisted checkpoint row");
+        assert_eq!(summary.checkpoint_id, checkpoint_id);
+        assert_eq!(summary.restored_count(), 1);
+        assert!(summary.source_marked_clean);
+    }
+
+    #[test]
     fn session_restorer_rejects_scrollback_before_intent_or_mux_effects() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-scrollback", false);
@@ -6935,6 +7121,7 @@ mod tests {
                     (7, "sensitive backend detail".to_string()),
                     (7, "duplicate sensitive detail".to_string()),
                     (999, "unexpected sensitive detail".to_string()),
+                    (999, "duplicate unexpected detail".to_string()),
                 ],
                 windows_created: 1,
                 tabs_created: 1,
@@ -6954,6 +7141,57 @@ mod tests {
         assert!(formatted.contains("pane 7: layout restoration reported failure"));
         assert!(formatted.contains("1 unexpected failures"));
         assert!(!formatted.contains("sensitive backend detail"));
+    }
+
+    #[test]
+    fn restore_summary_bounds_scrollback_failure_details_without_backend_text() {
+        let summary = RestoreSummary {
+            session_id: "sess-scrollback-failures".to_string(),
+            checkpoint_id: 1,
+            intent_checkpoint_id: 2,
+            outcome_checkpoint_id: 3,
+            layout_result: RestoreResult {
+                pane_id_map: HashMap::new(),
+                failed_panes: Vec::new(),
+                windows_created: 0,
+                tabs_created: 0,
+                panes_created: 0,
+            },
+            pane_states: Vec::new(),
+            scrollback_result: Some(InjectionReport {
+                successes: vec![
+                    crate::restore_scrollback::PaneInjectionStats {
+                        old_pane_id: 100,
+                        new_pane_id: 200,
+                        lines_injected: 1,
+                        bytes_written: usize::MAX,
+                        chunks_sent: 1,
+                    },
+                    crate::restore_scrollback::PaneInjectionStats {
+                        old_pane_id: 101,
+                        new_pane_id: 201,
+                        lines_injected: 1,
+                        bytes_written: 1,
+                        chunks_sent: 1,
+                    },
+                ],
+                failures: (0_u64..25)
+                    .map(|pane_id| (pane_id, "sensitive replay detail".to_string()))
+                    .collect(),
+                skipped: Vec::new(),
+            }),
+            scrollback_error: None,
+            process_launch_report: None,
+            source_marked_clean: false,
+            elapsed_ms: 1,
+        };
+
+        assert_eq!(summary.scrollback_bytes_written(), usize::MAX);
+        let formatted = format_restore_summary(&summary);
+        assert!(formatted.contains("scrollback pane 19: replay reported failure"));
+        assert!(!formatted.contains("scrollback pane 20:"));
+        assert!(formatted.contains("5 additional scrollback failures omitted"));
+        assert!(!formatted.contains("sensitive replay detail"));
     }
 
     #[test]

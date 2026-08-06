@@ -987,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_agent_pane_is_manual_with_reserved_default_config() {
+    fn plan_agent_metadata_is_redacted() {
         let launcher = test_launcher();
         let id_map = test_pane_id_map();
 
@@ -1005,7 +1005,7 @@ mod tests {
         match &plans[0].action {
             LaunchAction::Manual { hint, .. } => {
                 assert!(hint.contains("mux-native argv"));
-                assert!(!hint.contains("claude_code"));
+                assert!(!hint.contains("raw-"));
             }
             other => panic!("expected Manual, got {other:?}"),
         }
@@ -1017,10 +1017,11 @@ mod tests {
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
+        state.cwd = Some("/raw/cwd-canary".into());
         state.agent = Some(AgentMetadata {
-            agent_type: "claude_code".into(),
-            session_id: None,
-            state: None,
+            agent_type: "raw-agent-canary".into(),
+            session_id: Some("raw-session-canary".into()),
+            state: Some("raw-state-canary".into()),
         });
 
         let plans = launcher.plan(&id_map, &[state]);
@@ -1040,22 +1041,24 @@ mod tests {
     }
 
     #[test]
-    fn plan_agent_manual_hint_contains_no_command_or_cwd() {
+    fn plan_detected_agent_hint_contains_no_argv_or_cwd() {
         let launcher = ProcessLauncher::new();
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
-        state.agent = Some(AgentMetadata {
-            agent_type: "claude_code".into(),
-            session_id: None,
-            state: None,
+        state.cwd = Some("/raw/cwd-canary".into());
+        state.shell = None;
+        state.foreground_process = Some(ProcessInfo {
+            name: "claude".into(),
+            pid: Some(42),
+            argv: Some(vec!["claude".into(), "raw-argv-canary".into()]),
         });
 
         let plans = launcher.plan(&id_map, &[state]);
         match &plans[0].action {
             LaunchAction::Manual { hint, .. } => {
                 assert!(hint.contains("mux-native argv"));
-                assert!(!hint.contains("/home/user/project"));
+                assert!(!hint.contains("/raw/cwd-canary"));
                 assert!(!hint.contains("raw-"));
             }
             other => panic!("expected safe Manual disposition, got {other:?}"),
