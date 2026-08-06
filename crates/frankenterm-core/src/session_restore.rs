@@ -5619,7 +5619,7 @@ mod tests {
     }
 
     #[test]
-    fn session_restorer_restore_partial_failure_leaves_session_unclean_for_retry() {
+    fn session_restorer_restore_partial_failure_requires_explicit_reconciliation() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-partial", false);
 
@@ -5704,15 +5704,28 @@ mod tests {
             .unwrap();
         assert!(
             !shutdown_clean,
-            "partial restore should leave the session unclean so it can be retried"
+            "partial restore must remain unclean until its durable attempt is reconciled"
         );
 
-        let retry_candidate = restorer.detect().unwrap().expect("retryable session");
-        assert_eq!(retry_candidate.session_id, "sess-partial");
+        let error = restorer
+            .detect()
+            .expect_err("an incomplete durable restore must not be retried implicitly");
+        assert!(matches!(
+            error,
+            RestoreError::RestoreAttemptRequiresReconciliation {
+                ref session_id,
+                intent_checkpoint_id,
+                outcome_checkpoint_id: Some(outcome_checkpoint_id),
+                ref status,
+            } if session_id == "sess-partial"
+                && intent_checkpoint_id == summary.intent_checkpoint_id
+                && outcome_checkpoint_id == summary.outcome_checkpoint_id
+                && status == "reconciliation_required"
+        ));
     }
 
     #[test]
-    fn session_restorer_root_tab_failure_leaves_session_unclean_for_retry() {
+    fn session_restorer_root_tab_failure_requires_explicit_reconciliation() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-tab-fail", false);
 
@@ -5811,11 +5824,24 @@ mod tests {
             .unwrap();
         assert!(
             !shutdown_clean,
-            "failed tab restore should leave the session unclean so it can be retried"
+            "failed tab restore must remain unclean until its durable attempt is reconciled"
         );
 
-        let retry_candidate = restorer.detect().unwrap().expect("retryable session");
-        assert_eq!(retry_candidate.session_id, "sess-tab-fail");
+        let error = restorer
+            .detect()
+            .expect_err("an incomplete durable restore must not be retried implicitly");
+        assert!(matches!(
+            error,
+            RestoreError::RestoreAttemptRequiresReconciliation {
+                ref session_id,
+                intent_checkpoint_id,
+                outcome_checkpoint_id: Some(outcome_checkpoint_id),
+                ref status,
+            } if session_id == "sess-tab-fail"
+                && intent_checkpoint_id == summary.intent_checkpoint_id
+                && outcome_checkpoint_id == summary.outcome_checkpoint_id
+                && status == "reconciliation_required"
+        ));
     }
 
     #[test]
@@ -6065,10 +6091,18 @@ mod tests {
         let wezterm = Arc::new(MockWezterm::new());
         let err = run_async_test(restorer.restore(&session, &checkpoint, wezterm))
             .expect_err("restore should fail when bookkeeping cannot be committed");
-        assert!(
-            matches!(err, RestoreError::Bookkeeping(_)),
-            "unexpected restore error: {err}"
-        );
+        let (intent_checkpoint_id, outcome_checkpoint_id) = match &err {
+            RestoreError::RestoreAttemptInterrupted {
+                session_id,
+                intent_checkpoint_id,
+                outcome_checkpoint_id: Some(outcome_checkpoint_id),
+                phase: "clean receipt binding",
+                ..
+            } if session_id == "sess-bookkeeping-fail" => {
+                (*intent_checkpoint_id, *outcome_checkpoint_id)
+            }
+            other => panic!("unexpected restore error: {other}"),
+        };
         assert!(
             err.to_string()
                 .contains("simulated restore bookkeeping failure"),
@@ -6084,8 +6118,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            startup_count, 0,
-            "failed restore bookkeeping should not leave a startup checkpoint behind"
+            startup_count, 2,
+            "intent and outcome must remain durable when only the final clean binding fails"
+        );
+
+        let lifecycle: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT status, outcome_checkpoint_id
+                 FROM restore_attempt_lifecycle
+                 WHERE intent_checkpoint_id = ?1 AND session_id = 'sess-bookkeeping-fail'",
+                [intent_checkpoint_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            ("outcome_complete".to_string(), Some(outcome_checkpoint_id))
         );
 
         let shutdown_clean: bool = conn
@@ -6097,8 +6145,23 @@ mod tests {
             .unwrap();
         assert!(
             !shutdown_clean,
-            "failed restore bookkeeping should leave the session unclean for retry"
+            "failed clean binding must leave the session unclean for reconciliation"
         );
+        let error = restorer
+            .detect()
+            .expect_err("an outcome-complete attempt needs explicit clean reconciliation");
+        assert!(matches!(
+            error,
+            RestoreError::RestoreAttemptRequiresReconciliation {
+                ref session_id,
+                intent_checkpoint_id: detected_intent,
+                outcome_checkpoint_id: Some(detected_outcome),
+                ref status,
+            } if session_id == "sess-bookkeeping-fail"
+                && detected_intent == intent_checkpoint_id
+                && detected_outcome == outcome_checkpoint_id
+                && status == "outcome_complete"
+        ));
     }
 
     #[test]

@@ -2615,6 +2615,7 @@ fn ensure_checkpoint_snapshot_authority_schema(conn: &Connection) -> Result<()> 
                FROM json_each(checkpoint.metadata_json, '$.old_to_new') AS mapping
                WHERE mapping.key = ''
                   OR mapping.key GLOB '*[^0-9]*'
+                  OR (length(mapping.key) > 1 AND substr(mapping.key, 1, 1) = '0')
                   OR length(mapping.key) > 19
                   OR (length(mapping.key) = 19
                       AND mapping.key > '9223372036854775807')
@@ -6534,6 +6535,8 @@ mod tests {
                  id, session_id, checkpoint_at, checkpoint_type, state_hash,
                  pane_count, total_bytes, metadata_json
              ) VALUES
+                 (-3, 'session-a',  60, 'startup',  'eeeeeeeeeeeeeeee', 2, 0,
+                      '{\"old_to_new\":{\"7\":8,\"07\":9}}'),
                  (-2, 'session-a',  70, 'startup',  'dddddddddddddddd', 2, 0,
                       '{\"old_to_new\":{\"7\":8,\"7\":9}}'),
                  (-1, 'session-a',  80, 'startup',  'restore',          0, 0,
@@ -6574,6 +6577,12 @@ mod tests {
         assert_eq!(
             rows,
             vec![
+                (
+                    -3,
+                    "snapshot".to_string(),
+                    None,
+                    "eeeeeeeeeeeeeeee".to_string(),
+                ),
                 (
                     -2,
                     "snapshot".to_string(),
