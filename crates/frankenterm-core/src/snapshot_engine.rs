@@ -927,6 +927,75 @@ fn retain_latched_snapshot_authority(state: &Arc<SnapshotAuthorityState>) {
     }
 }
 
+/// Publish filesystem object identity after a formerly-missing database has
+/// been created. Without this refresh, an engine registered by path before the
+/// first commit and a later hard-link spelling could acquire independent
+/// same-process authority states for one SQLite inode.
+fn refresh_snapshot_authority_file_identities(
+    db_path: &str,
+    state: &Arc<SnapshotAuthorityState>,
+) {
+    let identities = snapshot_authority_file_identities(db_path);
+    if identities.is_empty() {
+        return;
+    }
+
+    let mut conflicts: Vec<Arc<SnapshotAuthorityState>> = Vec::new();
+    {
+        // Lock order is registry then per-state identities, matching
+        // shared_snapshot_authority_state and the type-level invariant.
+        let mut entries = snapshot_authority_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for identity in &identities {
+            let existing = match entries.get(identity) {
+                Some(SnapshotAuthorityRegistryEntry::Live(existing)) => existing.upgrade(),
+                Some(SnapshotAuthorityRegistryEntry::Latched(existing)) => {
+                    Some(Arc::clone(existing))
+                }
+                None => None,
+            };
+            if let Some(existing) = existing
+                && !Arc::ptr_eq(&existing, state)
+                && !conflicts.iter().any(|known| Arc::ptr_eq(known, &existing))
+            {
+                conflicts.push(existing);
+            }
+        }
+
+        if conflicts.is_empty() {
+            let mut registered = state
+                .registry_identities
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for identity in identities {
+                if !registered.contains(&identity) {
+                    registered.push(identity.clone());
+                }
+                let entry = if state.reconciliation_is_required() {
+                    SnapshotAuthorityRegistryEntry::Latched(Arc::clone(state))
+                } else {
+                    SnapshotAuthorityRegistryEntry::Live(Arc::downgrade(state))
+                };
+                entries.insert(identity, entry);
+            }
+            return;
+        }
+    }
+
+    // A split was already live before refresh could publish the inode. Do not
+    // guess which state owned earlier work: latch every participant after
+    // releasing registry locks so all future mutations fail closed.
+    tracing::error!(
+        conflict_count = conflicts.len(),
+        "detected split snapshot authority for one SQLite filesystem object"
+    );
+    state.latch_reconciliation(SnapshotAuthorityOperation::CheckpointCommit);
+    for conflict in conflicts {
+        conflict.latch_reconciliation(SnapshotAuthorityOperation::CheckpointCommit);
+    }
+}
+
 fn freeze_filesystem_path_from_base(path: &Path, base: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -2226,6 +2295,15 @@ impl SnapshotEngine {
                 },
             )
             .await?;
+
+        // The first successful commit may have created a path that did not
+        // exist when this engine registered. Publish its stable filesystem
+        // object identity before another hard-link spelling can split the
+        // same-process authority lane.
+        refresh_snapshot_authority_file_identities(
+            self.db_path.as_str(),
+            &self.snapshot_authority,
+        );
 
         // 8. Publish both in-memory authorities only after the typed durable
         // receipt. An indeterminate handoff leaves the sticky latch set and a
