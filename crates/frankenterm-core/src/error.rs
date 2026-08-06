@@ -128,6 +128,27 @@ pub enum RuntimeOperationSource {
     /// Operation was cancelled with backend-specific context.
     #[error("cancelled: {0}")]
     Cancelled(String),
+    /// The caller's capability deadline elapsed.
+    #[error("capability deadline exceeded")]
+    DeadlineExceeded,
+    /// The caller exhausted its cooperative poll quota.
+    #[error("capability poll quota exhausted")]
+    PollQuotaExhausted,
+    /// The caller exhausted its cost budget.
+    #[error("capability cost budget exhausted")]
+    CostBudgetExhausted,
+    /// The capability context failed without a stronger finite cause.
+    #[error("capability context failed")]
+    ContextFailure,
+    /// A synchronization primitive's own lock wait timed out.
+    #[error("lock acquisition timed out")]
+    LockTimedOut,
+    /// A synchronization primitive was poisoned by an earlier panic.
+    #[error("lock is poisoned")]
+    LockPoisoned,
+    /// A completed lock-acquisition future was polled again.
+    #[error("lock acquisition future polled after completion")]
+    PolledAfterCompletion,
 }
 
 /// Structured source for pane-targeted operations.
@@ -331,6 +352,42 @@ impl Error {
                 .command("Status", "ft status")
                 .command("Diagnostics", "ft doctor")
                 .alternative("Retry if the cancellation was unexpected or increase the caller's budget/deadline."),
+                RuntimeOperationSource::DeadlineExceeded => Remediation::new(format!(
+                    "Runtime operation '{operation}' exceeded its capability deadline."
+                ))
+                .command("Status", "ft status")
+                .alternative("Increase the caller deadline only after checking for backend latency or contention."),
+                RuntimeOperationSource::PollQuotaExhausted => Remediation::new(format!(
+                    "Runtime operation '{operation}' exhausted its cooperative poll quota."
+                ))
+                .command("Diagnostics", "ft doctor")
+                .alternative("Increase the poll budget or reduce work performed by this operation."),
+                RuntimeOperationSource::CostBudgetExhausted => Remediation::new(format!(
+                    "Runtime operation '{operation}' exhausted its cost budget."
+                ))
+                .command("Diagnostics", "ft doctor")
+                .alternative("Increase the cost budget or reduce the requested workload."),
+                RuntimeOperationSource::ContextFailure => Remediation::new(format!(
+                    "Runtime operation '{operation}' encountered an unattributed capability-context failure."
+                ))
+                .command("Diagnostics", "ft doctor")
+                .alternative("Treat the operation as failed closed and inspect runtime context telemetry."),
+                RuntimeOperationSource::LockTimedOut => Remediation::new(format!(
+                    "Runtime operation '{operation}' timed out waiting for an internal lock."
+                ))
+                .command("Status", "ft status")
+                .command("Diagnostics", "ft doctor")
+                .alternative("Inspect lock contention before increasing the wait bound."),
+                RuntimeOperationSource::LockPoisoned => Remediation::new(format!(
+                    "Runtime operation '{operation}' encountered an internal lock poisoned by a prior panic."
+                ))
+                .command("Diagnostics", "ft doctor")
+                .alternative("Restart the affected runtime after preserving diagnostics."),
+                RuntimeOperationSource::PolledAfterCompletion => Remediation::new(format!(
+                    "Runtime operation '{operation}' reused a completed lock-acquisition future."
+                ))
+                .command("Diagnostics", "ft doctor")
+                .alternative("Report this internal lifecycle defect; blind retry may repeat it."),
             }),
             Self::PaneOperation {
                 pane_id,
