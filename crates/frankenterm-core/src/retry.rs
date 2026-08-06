@@ -614,6 +614,7 @@ pub fn is_retryable(error: &Error) -> bool {
                 | crate::error::RuntimeOperationSource::PollQuotaExhausted
                 | crate::error::RuntimeOperationSource::CostBudgetExhausted
                 | crate::error::RuntimeOperationSource::ContextFailure
+                | crate::error::RuntimeOperationSource::CancellationCleanupTimedOut
                 | crate::error::RuntimeOperationSource::LockPoisoned
                 | crate::error::RuntimeOperationSource::PolledAfterCompletion,
             ..

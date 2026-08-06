@@ -1,8 +1,9 @@
 //! Session restore engine — detect and recover from unclean shutdowns.
 //!
-//! On `ft watch` startup, this module checks the database for sessions
-//! that did not shut down cleanly (`shutdown_clean = 0`). If found, it
-//! loads the latest checkpoint, reconstructs the mux topology via
+//! This library module can detect sessions that did not shut down cleanly
+//! (`shutdown_clean = 0`) and load their latest checkpoint. The production
+//! `ft watch` startup path does not currently call that detector. An explicit
+//! restore reconstructs the mux topology via
 //! [`LayoutRestorer`] without writing banners or historical output through PTY
 //! input APIs.
 //!
@@ -26,14 +27,17 @@ use crate::checkpoint_witness::{
     RESTORE_INTENT_WITNESS_PREFIX, RESTORE_RECEIPT_WITNESS_PREFIX, SNAPSHOT_WITNESS_PREFIX,
     PersistedPaneState, canonical_json_string, checkpoint_witness,
 };
-use crate::restore_layout::{LayoutRestorer, RestoreConfig, RestoreResult};
-use crate::restore_process::{LaunchConfig, LaunchReport, ProcessLauncher};
-use crate::restore_scrollback::InjectionReport;
+use crate::restore_layout::{
+    LayoutRestoreInterruptionReason, LayoutRestorer, RestoreConfig, RestoreResult,
+};
+use crate::restore_process::{
+    LaunchInterruptionReason, LaunchReport, ProcessDispositionInput, ProcessLauncher,
+};
 use crate::snapshot_engine::{
     SnapshotAuthorityOperation, SnapshotAuthorityWorkFailure, SnapshotError,
     run_checkpoint_authority_sync, run_checkpoint_authority_with_cx,
 };
-use crate::session_pane_state::{AgentMetadata, PaneStateSnapshot, ProcessInfo, TerminalState};
+use crate::session_pane_state::{AgentMetadata, TerminalState};
 use crate::session_topology::{PaneNode, TopologySnapshot};
 use crate::wezterm::WeztermHandle;
 
@@ -42,9 +46,9 @@ use crate::wezterm::WeztermHandle;
 // =============================================================================
 
 /// Errors during session restore.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum RestoreError {
-    #[error("database error: {0}")]
+    #[error("database operation failed")]
     Database(String),
 
     #[error("invalid persisted value for {field}: {value}")]
@@ -53,19 +57,28 @@ pub enum RestoreError {
     #[error("no restorable sessions found")]
     NoSessions,
 
-    #[error("checkpoint data corrupt: {0}")]
+    #[error("checkpoint data is corrupt")]
     CorruptCheckpoint(String),
 
-    #[error("topology deserialization failed: {0}")]
+    #[error("topology deserialization failed")]
     TopologyParse(String),
 
-    #[error("layout restoration failed: {0}")]
-    LayoutRestore(String),
-
-    #[error("wezterm command failed: {0}")]
+    #[error("mux operation failed")]
     Wezterm(String),
 
-    #[error("restore bookkeeping failed: {0}")]
+    #[error("restore interrupted during {phase}: {reason}")]
+    Interrupted {
+        phase: &'static str,
+        reason: RestoreInterruptionReason,
+    },
+
+    #[error("restore infrastructure failed during {phase}: {failure}")]
+    InfrastructureFailure {
+        phase: &'static str,
+        failure: RestoreInfrastructureFailure,
+    },
+
+    #[error("restore bookkeeping failed")]
     Bookkeeping(String),
 
     /// Stored consistency witness does not match the exact persisted
@@ -82,9 +95,7 @@ pub enum RestoreError {
     #[error("invalid checkpoint role on checkpoint {checkpoint_id}")]
     InvalidCheckpointRole { checkpoint_id: i64, role: String },
 
-    #[error(
-        "checkpoint {checkpoint_id} has role {role} and is not a restorable session snapshot"
-    )]
+    #[error("checkpoint {checkpoint_id} is not a restorable session snapshot")]
     CheckpointNotRestorable { checkpoint_id: i64, role: String },
 
     #[error("checkpoint {checkpoint_id} has no checkpoint-local topology")]
@@ -96,7 +107,7 @@ pub enum RestoreError {
     LegacyCheckpointRequiresManualRestore { checkpoint_id: i64 },
 
     #[error(
-        "session {session_id} has unresolved restore attempt {intent_checkpoint_id} ({status}, outcome={outcome_checkpoint_id:?}); reconcile that attempt before starting another restore"
+        "restore attempt {intent_checkpoint_id} is unresolved (outcome={outcome_checkpoint_id:?}); reconcile it before starting another restore"
     )]
     RestoreAttemptRequiresReconciliation {
         session_id: String,
@@ -106,20 +117,356 @@ pub enum RestoreError {
     },
 
     #[error(
-        "restore attempt {intent_checkpoint_id} for session {session_id} stopped during {phase}; reconcile the durable attempt before retrying: {detail}"
+        "restore attempt {intent_checkpoint_id} stopped during {phase}: {reason} (outcome={outcome_checkpoint_id:?}); reconcile it before retrying"
     )]
     RestoreAttemptInterrupted {
         session_id: String,
         intent_checkpoint_id: i64,
         outcome_checkpoint_id: Option<i64>,
         phase: &'static str,
-        detail: String,
+        reason: RestoreInterruptionReason,
     },
 
     #[error(
         "scrollback replay is unavailable because the mux API has no safe terminal-output injection channel; retry with layout-only restore"
     )]
     SafeScrollbackReplayUnavailable,
+}
+
+/// Finite, content-free reason that a restore capability stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreInterruptionReason {
+    Cancelled,
+    CancellationCleanupTimedOut,
+    DeadlineExceeded,
+    PollQuotaExhausted,
+    CostQuotaExhausted,
+    ContextFailure,
+    ValidationFailure,
+    BackendFailure,
+    MuxOutcomeIndeterminate,
+    IntegrityFailure,
+}
+
+/// Finite failure of the blocking infrastructure rather than the caller's
+/// capability. These errors must not be mislabeled as cancellation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreInfrastructureFailure {
+    BlockingRuntimeFailure,
+    CancellationWatcherTimerFailure,
+}
+
+impl std::fmt::Display for RestoreInfrastructureFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::BlockingRuntimeFailure => "blocking runtime failed",
+            Self::CancellationWatcherTimerFailure => {
+                "blocking cancellation watcher timer failed"
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for RestoreInterruptionReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::Cancelled => "cancelled",
+            Self::CancellationCleanupTimedOut => "cancellation cleanup timed out",
+            Self::DeadlineExceeded => "deadline exceeded",
+            Self::PollQuotaExhausted => "poll quota exhausted",
+            Self::CostQuotaExhausted => "cost quota exhausted",
+            Self::ContextFailure => "capability context failed",
+            Self::ValidationFailure => "restore validation failed",
+            Self::BackendFailure => "restore backend failed",
+            Self::MuxOutcomeIndeterminate => "mux mutation outcome is indeterminate",
+            Self::IntegrityFailure => "restore integrity check failed",
+        };
+        formatter.write_str(label)
+    }
+}
+
+impl std::fmt::Debug for RestoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(_) => formatter.write_str("RestoreError::Database"),
+            Self::InvalidPersistedValue { field, value } => formatter
+                .debug_struct("RestoreError::InvalidPersistedValue")
+                .field("field", field)
+                .field("value", value)
+                .finish(),
+            Self::NoSessions => formatter.write_str("RestoreError::NoSessions"),
+            Self::CorruptCheckpoint(_) => {
+                formatter.write_str("RestoreError::CorruptCheckpoint")
+            }
+            Self::TopologyParse(_) => formatter.write_str("RestoreError::TopologyParse"),
+            Self::Wezterm(_) => formatter.write_str("RestoreError::MuxOperation"),
+            Self::Interrupted { phase, reason } => formatter
+                .debug_struct("RestoreError::Interrupted")
+                .field("phase", phase)
+                .field("reason", reason)
+                .finish(),
+            Self::InfrastructureFailure { phase, failure } => formatter
+                .debug_struct("RestoreError::InfrastructureFailure")
+                .field("phase", phase)
+                .field("failure", failure)
+                .finish(),
+            Self::Bookkeeping(_) => formatter.write_str("RestoreError::Bookkeeping"),
+            Self::StateHashMismatch { checkpoint_id, .. } => formatter
+                .debug_struct("RestoreError::StateHashMismatch")
+                .field("checkpoint_id", checkpoint_id)
+                .finish(),
+            Self::InvalidCheckpointRole { checkpoint_id, .. } => formatter
+                .debug_struct("RestoreError::InvalidCheckpointRole")
+                .field("checkpoint_id", checkpoint_id)
+                .finish(),
+            Self::CheckpointNotRestorable { checkpoint_id, .. } => formatter
+                .debug_struct("RestoreError::CheckpointNotRestorable")
+                .field("checkpoint_id", checkpoint_id)
+                .finish(),
+            Self::CheckpointTopologyUnavailable { checkpoint_id } => formatter
+                .debug_struct("RestoreError::CheckpointTopologyUnavailable")
+                .field("checkpoint_id", checkpoint_id)
+                .finish(),
+            Self::LegacyCheckpointRequiresManualRestore { checkpoint_id } => formatter
+                .debug_struct("RestoreError::LegacyCheckpointRequiresManualRestore")
+                .field("checkpoint_id", checkpoint_id)
+                .finish(),
+            Self::RestoreAttemptRequiresReconciliation {
+                intent_checkpoint_id,
+                outcome_checkpoint_id,
+                ..
+            } => formatter
+                .debug_struct("RestoreError::RestoreAttemptRequiresReconciliation")
+                .field("intent_checkpoint_id", intent_checkpoint_id)
+                .field("outcome_checkpoint_id", outcome_checkpoint_id)
+                .finish(),
+            Self::RestoreAttemptInterrupted {
+                intent_checkpoint_id,
+                outcome_checkpoint_id,
+                phase,
+                reason,
+                ..
+            } => formatter
+                .debug_struct("RestoreError::RestoreAttemptInterrupted")
+                .field("intent_checkpoint_id", intent_checkpoint_id)
+                .field("outcome_checkpoint_id", outcome_checkpoint_id)
+                .field("phase", phase)
+                .field("reason", reason)
+                .finish(),
+            Self::SafeScrollbackReplayUnavailable => {
+                formatter.write_str("RestoreError::SafeScrollbackReplayUnavailable")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestoreAttemptInterruption {
+    phase: &'static str,
+    receipt_phase: RestoreInterruptionPhase,
+    reason: RestoreInterruptionReason,
+}
+
+const RESTORE_OUTCOME_EVIDENCE_VERSION: u8 = 3;
+const RESTORE_OUTCOME_REASON_EVIDENCE_VERSION: u8 = 2;
+
+const fn legacy_restore_outcome_evidence_version() -> u8 {
+    1
+}
+
+/// Finite persisted phase for an interrupted restore attempt. Aliases retain
+/// readability of version-1 receipts that used human-oriented labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum RestoreInterruptionPhase {
+    #[serde(rename = "layout_restoration", alias = "layout restoration")]
+    LayoutRestoration,
+    #[serde(rename = "post_layout_checkpoint", alias = "post-layout checkpoint")]
+    PostLayoutCheckpoint,
+    #[serde(
+        rename = "pre_process_disposition_checkpoint",
+        alias = "pre-process-disposition checkpoint"
+    )]
+    PreProcessDispositionCheckpoint,
+    #[serde(
+        rename = "process_disposition_evaluation",
+        alias = "process disposition evaluation"
+    )]
+    ProcessDispositionEvaluation,
+    #[serde(
+        rename = "post_process_disposition_checkpoint",
+        alias = "post-process-disposition checkpoint"
+    )]
+    PostProcessDispositionCheckpoint,
+}
+
+fn restore_layout_interruption_reason(
+    reason: LayoutRestoreInterruptionReason,
+) -> RestoreInterruptionReason {
+    match reason {
+        LayoutRestoreInterruptionReason::Cancelled => RestoreInterruptionReason::Cancelled,
+        LayoutRestoreInterruptionReason::CancellationCleanupTimedOut => {
+            RestoreInterruptionReason::CancellationCleanupTimedOut
+        }
+        LayoutRestoreInterruptionReason::DeadlineExceeded => {
+            RestoreInterruptionReason::DeadlineExceeded
+        }
+        LayoutRestoreInterruptionReason::PollQuotaExhausted => {
+            RestoreInterruptionReason::PollQuotaExhausted
+        }
+        LayoutRestoreInterruptionReason::CostQuotaExhausted => {
+            RestoreInterruptionReason::CostQuotaExhausted
+        }
+        LayoutRestoreInterruptionReason::ContextFailure => {
+            RestoreInterruptionReason::ContextFailure
+        }
+        LayoutRestoreInterruptionReason::ValidationFailure => {
+            RestoreInterruptionReason::ValidationFailure
+        }
+        LayoutRestoreInterruptionReason::BackendFailure => {
+            RestoreInterruptionReason::BackendFailure
+        }
+        LayoutRestoreInterruptionReason::MuxOutcomeIndeterminate => {
+            RestoreInterruptionReason::MuxOutcomeIndeterminate
+        }
+        LayoutRestoreInterruptionReason::IntegrityFailure => {
+            RestoreInterruptionReason::IntegrityFailure
+        }
+    }
+}
+
+fn restore_process_interruption_reason(
+    reason: LaunchInterruptionReason,
+) -> RestoreInterruptionReason {
+    match reason {
+        LaunchInterruptionReason::Cancelled => RestoreInterruptionReason::Cancelled,
+        LaunchInterruptionReason::CancellationCleanupTimedOut => {
+            RestoreInterruptionReason::CancellationCleanupTimedOut
+        }
+        LaunchInterruptionReason::DeadlineExceeded => {
+            RestoreInterruptionReason::DeadlineExceeded
+        }
+        LaunchInterruptionReason::PollQuotaExhausted => {
+            RestoreInterruptionReason::PollQuotaExhausted
+        }
+        LaunchInterruptionReason::CostQuotaExhausted => {
+            RestoreInterruptionReason::CostQuotaExhausted
+        }
+        LaunchInterruptionReason::ContextFailure => RestoreInterruptionReason::ContextFailure,
+    }
+}
+
+fn restore_snapshot_interruption_reason(error: &SnapshotError) -> RestoreInterruptionReason {
+    match error {
+        SnapshotError::Cancelled => RestoreInterruptionReason::Cancelled,
+        SnapshotError::DeadlineExceeded => RestoreInterruptionReason::DeadlineExceeded,
+        SnapshotError::PollQuotaExhausted => RestoreInterruptionReason::PollQuotaExhausted,
+        SnapshotError::CostBudgetExhausted => RestoreInterruptionReason::CostQuotaExhausted,
+        SnapshotError::ContextFailure => RestoreInterruptionReason::ContextFailure,
+        SnapshotError::IndeterminateAuthorityMutation { .. }
+        | SnapshotError::AuthorityReconciliationRequired { .. }
+        | SnapshotError::LockPoisoned
+        | SnapshotError::LockPolledAfterCompletion => RestoreInterruptionReason::IntegrityFailure,
+        SnapshotError::Topology(_) | SnapshotError::Serialization(_) => {
+            RestoreInterruptionReason::ValidationFailure
+        }
+        SnapshotError::InProgress
+        | SnapshotError::ShuttingDown
+        | SnapshotError::SchedulerInProgress
+        | SnapshotError::TriggerReceiverUnavailable
+        | SnapshotError::NoPanes
+        | SnapshotError::NoChanges
+        | SnapshotError::PaneList(_)
+        | SnapshotError::Database(_)
+        | SnapshotError::AuthorityMutationInProgress { .. }
+        | SnapshotError::BlockingRuntimeFailure
+        | SnapshotError::ShutdownTimedOut { .. }
+        | SnapshotError::ShutdownMarkFailed { .. }
+        | SnapshotError::LockTimedOut { .. } => RestoreInterruptionReason::BackendFailure,
+    }
+}
+
+fn restore_interruption_reason(
+    cx: &crate::cx::Cx,
+    error: &crate::runtime_async::ContextError,
+) -> RestoreInterruptionReason {
+    use crate::runtime_async::ContextErrorKind;
+
+    match error.kind() {
+        ContextErrorKind::DeadlineExceeded => RestoreInterruptionReason::DeadlineExceeded,
+        ContextErrorKind::PollQuotaExhausted => RestoreInterruptionReason::PollQuotaExhausted,
+        ContextErrorKind::CostQuotaExhausted => RestoreInterruptionReason::CostQuotaExhausted,
+        ContextErrorKind::CancelTimeout => {
+            RestoreInterruptionReason::CancellationCleanupTimedOut
+        }
+        ContextErrorKind::Cancelled => restore_cancel_kind_reason(
+            cx.root_cancel_cause().map(|reason| reason.kind),
+        ),
+        _ => RestoreInterruptionReason::ContextFailure,
+    }
+}
+
+fn restore_cancel_kind_reason(
+    kind: Option<crate::outcome::CancelKind>,
+) -> RestoreInterruptionReason {
+    use crate::outcome::CancelKind;
+
+    match kind {
+        Some(CancelKind::Deadline | CancelKind::Timeout) => {
+            RestoreInterruptionReason::DeadlineExceeded
+        }
+        Some(CancelKind::PollQuota) => RestoreInterruptionReason::PollQuotaExhausted,
+        Some(CancelKind::CostBudget) => RestoreInterruptionReason::CostQuotaExhausted,
+        Some(
+            CancelKind::User
+            | CancelKind::FailFast
+            | CancelKind::RaceLost
+            | CancelKind::ParentCancelled
+            | CancelKind::ResourceUnavailable
+            | CancelKind::Shutdown
+            | CancelKind::LinkedExit,
+        )
+        | None => RestoreInterruptionReason::Cancelled,
+    }
+}
+
+fn restore_context_error(
+    phase: &'static str,
+    cx: &crate::cx::Cx,
+    error: &crate::runtime_async::ContextError,
+) -> RestoreError {
+    RestoreError::Interrupted {
+        phase,
+        reason: restore_interruption_reason(cx, error),
+    }
+}
+
+fn restore_blocking_error(
+    phase: &'static str,
+    error: crate::runtime_async::SpawnBlockingWithCxError,
+) -> RestoreError {
+    use crate::runtime_async::SpawnBlockingWithCxError;
+
+    match error {
+        SpawnBlockingWithCxError::CancelledBeforeSpawn { kind }
+        | SpawnBlockingWithCxError::CancelledMidFlight { kind } => {
+            RestoreError::Interrupted {
+                phase,
+                reason: restore_cancel_kind_reason(kind),
+            }
+        }
+        SpawnBlockingWithCxError::RuntimeFailure => RestoreError::InfrastructureFailure {
+            phase,
+            failure: RestoreInfrastructureFailure::BlockingRuntimeFailure,
+        },
+        SpawnBlockingWithCxError::CancellationWatcherTimerFailure => {
+            RestoreError::InfrastructureFailure {
+                phase,
+                failure: RestoreInfrastructureFailure::CancellationWatcherTimerFailure,
+            }
+        }
+    }
 }
 
 impl From<rusqlite::Error> for RestoreError {
@@ -160,13 +507,26 @@ impl SnapshotAuthorityWorkFailure for RestoreAuthorityDbError {
 
 fn restore_authority_error(stage: &'static str, error: SnapshotError) -> RestoreError {
     match error {
-        SnapshotError::Cancelled
-        | SnapshotError::DeadlineExceeded
-        | SnapshotError::PollQuotaExhausted
-        | SnapshotError::CostBudgetExhausted
-        | SnapshotError::ContextFailure => {
-            RestoreError::Wezterm(format!("restore capability stopped during {stage}"))
-        }
+        SnapshotError::Cancelled => RestoreError::Interrupted {
+            phase: stage,
+            reason: RestoreInterruptionReason::Cancelled,
+        },
+        SnapshotError::DeadlineExceeded => RestoreError::Interrupted {
+            phase: stage,
+            reason: RestoreInterruptionReason::DeadlineExceeded,
+        },
+        SnapshotError::PollQuotaExhausted => RestoreError::Interrupted {
+            phase: stage,
+            reason: RestoreInterruptionReason::PollQuotaExhausted,
+        },
+        SnapshotError::CostBudgetExhausted => RestoreError::Interrupted {
+            phase: stage,
+            reason: RestoreInterruptionReason::CostQuotaExhausted,
+        },
+        SnapshotError::ContextFailure => RestoreError::Interrupted {
+            phase: stage,
+            reason: RestoreInterruptionReason::ContextFailure,
+        },
         _other => RestoreError::Bookkeeping(format!(
             "{stage}: durable restore authority operation did not settle"
         )),
@@ -206,27 +566,16 @@ fn decode_bool(value: i64, field: &'static str) -> Result<bool, RestoreError> {
 
 /// Session restore behavior configuration.
 ///
-/// ```toml
-/// [session]
-/// auto_restore = false
-/// restore_scrollback = false
-/// restore_max_lines = 5000
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+/// This library value is constructed programmatically by explicit restore
+/// callers. It is not a top-level `ft.toml` section: `[session]` is rejected
+/// until the production startup path and a safe replay channel are wired.
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionRestoreConfig {
     /// Skip the restore prompt and always restore automatically.
     pub auto_restore: bool,
     /// Request historical scrollback replay. Enabling this currently fails
     /// closed because the mux exposes no terminal-output restoration channel.
     pub restore_scrollback: bool,
-    /// Future logical terminal-line bound for a safe output restoration API.
-    /// It is not applied to raw `output_segments`, whose rows are arbitrary
-    /// stream fragments rather than lines.
-    pub restore_max_lines: usize,
-    /// Reserved process-plan policy payload. Restore records captured plans as
-    /// manual dispositions and never launches those processes.
-    pub process_relaunch: LaunchConfig,
 }
 
 impl Default for SessionRestoreConfig {
@@ -234,9 +583,76 @@ impl Default for SessionRestoreConfig {
         Self {
             auto_restore: false,
             restore_scrollback: false,
-            restore_max_lines: 5000,
-            process_relaunch: LaunchConfig::default(),
         }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct SessionRestoreConfigWire {
+    auto_restore: bool,
+    restore_scrollback: bool,
+    /// Presence sentinel for the retired replay-size knob. Historical
+    /// scrollback replay is unavailable, so silently accepting this setting
+    /// would falsely imply that it constrains a live restoration path.
+    #[serde(default, deserialize_with = "reject_retired_restore_max_lines")]
+    restore_max_lines: (),
+    /// Presence sentinel for the retired process-relaunch surface. Process
+    /// identity is not captured with enough authority to resume or recreate
+    /// it, so every explicit representation must fail closed.
+    #[serde(default, deserialize_with = "reject_retired_session_process_relaunch")]
+    process_relaunch: (),
+}
+
+impl Default for SessionRestoreConfigWire {
+    fn default() -> Self {
+        let defaults = SessionRestoreConfig::default();
+        Self {
+            auto_restore: defaults.auto_restore,
+            restore_scrollback: defaults.restore_scrollback,
+            restore_max_lines: (),
+            process_relaunch: (),
+        }
+    }
+}
+
+fn reject_retired_restore_max_lines<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ignored = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Err(serde::de::Error::custom(
+        "session.restore_max_lines was removed because historical scrollback replay is unavailable; delete this setting",
+    ))
+}
+
+fn reject_retired_session_process_relaunch<'de, D>(
+    deserializer: D,
+) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ignored = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Err(serde::de::Error::custom(
+        "session.process_relaunch was removed because process and agent restoration is unavailable; delete this setting",
+    ))
+}
+
+impl<'de> Deserialize<'de> for SessionRestoreConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let SessionRestoreConfigWire {
+            auto_restore,
+            restore_scrollback,
+            restore_max_lines: (),
+            process_relaunch: (),
+        } = SessionRestoreConfigWire::deserialize(deserializer)?;
+        Ok(Self {
+            auto_restore,
+            restore_scrollback,
+        })
     }
 }
 
@@ -245,7 +661,7 @@ impl Default for SessionRestoreConfig {
 // =============================================================================
 
 /// A session candidate for restore.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionCandidate {
     pub session_id: String,
     pub created_at: u64,
@@ -255,6 +671,19 @@ pub struct SessionCandidate {
     pub topology_json: String,
     pub ft_version: String,
     pub host_id: Option<String>,
+}
+
+impl std::fmt::Debug for SessionCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionCandidate")
+            .field("has_session_id", &!self.session_id.is_empty())
+            .field("has_last_checkpoint", &self.last_checkpoint_at.is_some())
+            .field("topology_bytes", &self.topology_json.len())
+            .field("has_ft_version", &!self.ft_version.is_empty())
+            .field("has_host_id", &self.host_id.is_some())
+            .finish()
+    }
 }
 
 /// Durable purpose of a checkpoint row.
@@ -310,7 +739,7 @@ pub enum CheckpointVerification {
 }
 
 /// Loaded checkpoint with per-pane state.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CheckpointData {
     pub checkpoint_id: i64,
     pub session_id: String,
@@ -330,8 +759,30 @@ pub struct CheckpointData {
     pub pane_states: Vec<RestoredPaneState>,
 }
 
+impl std::fmt::Debug for CheckpointData {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CheckpointData")
+            .field("checkpoint_id", &self.checkpoint_id)
+            .field("checkpoint_role", &self.checkpoint_role)
+            .field("verification", &self.verification)
+            .field("has_session_id", &!self.session_id.is_empty())
+            .field("has_checkpoint_type", &!self.checkpoint_type.is_empty())
+            .field("has_state_hash", &!self.state_hash.is_empty())
+            .field("has_topology", &self.topology_json.is_some())
+            .field(
+                "restore_intent_checkpoint_id",
+                &self.restore_intent_checkpoint_id,
+            )
+            .field("declared_pane_count", &self.pane_count)
+            .field("loaded_pane_count", &self.pane_states.len())
+            .field("total_bytes", &self.total_bytes)
+            .finish()
+    }
+}
+
 /// Per-pane state loaded from the database.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RestoredPaneState {
     pub pane_id: u64,
     pub cwd: Option<String>,
@@ -342,8 +793,25 @@ pub struct RestoredPaneState {
     pub last_output_at: Option<u64>,
 }
 
-/// Complete result of a session restore.
-#[derive(Debug)]
+impl std::fmt::Debug for RestoredPaneState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RestoredPaneState")
+            .field("pane_id", &self.pane_id)
+            .field("has_cwd", &self.cwd.is_some())
+            .field("has_command", &self.command.is_some())
+            .field("has_terminal_state", &self.terminal_state.is_some())
+            .field("has_agent_metadata", &self.agent_metadata.is_some())
+            .field(
+                "has_scrollback_checkpoint",
+                &self.scrollback_checkpoint_seq.is_some(),
+            )
+            .field("has_last_output_at", &self.last_output_at.is_some())
+            .finish()
+    }
+}
+
+/// Result of a layout reconstruction and durable restore-authority settlement.
 pub struct RestoreSummary {
     /// The session that was restored.
     pub session_id: String,
@@ -357,18 +825,56 @@ pub struct RestoreSummary {
     pub layout_result: RestoreResult,
     /// Pane states that were loaded.
     pub pane_states: Vec<RestoredPaneState>,
-    /// Reserved report for a future mux-owned output restoration channel.
-    /// Currently always `None`; replay requests fail during preflight.
-    pub scrollback_result: Option<InjectionReport>,
-    /// Reserved global error for future safe replay. Currently always `None`
-    /// because replay requests fail before capture lookup.
-    pub scrollback_error: Option<String>,
     /// Process disposition report when at least one captured plan was evaluated.
     pub process_launch_report: Option<LaunchReport>,
     /// Whether the exact restore receipt was durably bound as clean authority.
-    pub source_marked_clean: bool,
+    pub restore_authority_resolved: bool,
     /// Total time for the restore in milliseconds.
     pub elapsed_ms: u64,
+}
+
+impl std::fmt::Debug for RestoreSummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RestoreSummary")
+            .field("has_session_id", &!self.session_id.is_empty())
+            .field("checkpoint_id", &self.checkpoint_id)
+            .field("intent_checkpoint_id", &self.intent_checkpoint_id)
+            .field("outcome_checkpoint_id", &self.outcome_checkpoint_id)
+            .field("mapped_panes", &self.layout_result.pane_id_map.len())
+            .field("failed_panes", &self.layout_result.failed_panes.len())
+            .field("windows_created", &self.layout_result.windows_created)
+            .field("tabs_created", &self.layout_result.tabs_created)
+            .field("panes_created", &self.layout_result.panes_created)
+            .field("loaded_pane_count", &self.pane_states.len())
+            .field(
+                "has_process_disposition_report",
+                &self.process_launch_report.is_some(),
+            )
+            .field(
+                "restore_authority_resolved",
+                &self.restore_authority_resolved,
+            )
+            .field("elapsed_ms", &self.elapsed_ms)
+            .finish()
+    }
+}
+
+fn duplicate_target_source_pane_ids(pane_id_map: &HashMap<u64, u64>) -> HashSet<u64> {
+    let mut target_counts = HashMap::with_capacity(pane_id_map.len());
+    for &target_pane_id in pane_id_map.values() {
+        let count = target_counts.entry(target_pane_id).or_insert(0_usize);
+        *count = count.saturating_add(1);
+    }
+    pane_id_map
+        .iter()
+        .filter(|(_, target_pane_id)| {
+            target_counts
+                .get(target_pane_id)
+                .is_some_and(|count| *count > 1)
+        })
+        .map(|(&source_pane_id, _)| source_pane_id)
+        .collect()
 }
 
 impl RestoreSummary {
@@ -385,6 +891,17 @@ impl RestoreSummary {
                 .map(|(pane_id, _)| *pane_id)
                 .filter(|pane_id| expected.contains(pane_id)),
         );
+
+        // A duplicate target means none of the colliding source mappings is an
+        // authoritative success. Counting both sources as settled would report
+        // impossible progress such as 2/2 even though only one target pane
+        // exists. Include unexpected source keys when detecting collisions so
+        // an expected source cannot appear settled by sharing their target.
+        failed.extend(
+            duplicate_target_source_pane_ids(&self.layout_result.pane_id_map)
+                .into_iter()
+                .filter(|source_pane_id| expected.contains(source_pane_id)),
+        );
         failed
     }
 
@@ -397,53 +914,26 @@ impl RestoreSummary {
         self.failed_expected_pane_ids_for(&expected)
     }
 
-    /// Number of panes successfully restored.
-    pub fn restored_count(&self) -> usize {
-        self.total_count().saturating_sub(self.failed_count())
+    /// Number of expected panes whose layout mutation settled successfully.
+    pub fn layout_settled_pane_count(&self) -> usize {
+        self.expected_pane_count()
+            .saturating_sub(self.layout_failed_pane_count())
     }
 
     /// Number of unique expected panes that were either not mapped or were
-    /// explicitly reported failed after mapping (for example, activation).
+    /// explicitly reported failed after mapping (for example, activation), or
+    /// participates in a duplicate-target mapping collision.
     /// Unexpected backend pane IDs are reported separately as integrity
     /// anomalies and never inflate this source-pane count.
-    pub fn failed_count(&self) -> usize {
+    pub fn layout_failed_pane_count(&self) -> usize {
         self.failed_expected_pane_ids().len()
     }
 
-    /// Total panes attempted.
-    pub fn total_count(&self) -> usize {
+    /// Number of source panes expected by the selected checkpoint.
+    pub fn expected_pane_count(&self) -> usize {
         self.pane_states.len()
     }
 
-    /// Reserved successful replay count; currently zero.
-    pub fn scrollback_restored_count(&self) -> usize {
-        self.scrollback_result
-            .as_ref()
-            .map_or(0, InjectionReport::success_count)
-    }
-
-    /// Reserved failed replay count; currently zero.
-    pub fn scrollback_failed_count(&self) -> usize {
-        self.scrollback_result
-            .as_ref()
-            .map_or(0, InjectionReport::failure_count)
-    }
-
-    /// Reserved skipped replay count; currently zero.
-    pub fn scrollback_skipped_count(&self) -> usize {
-        self.scrollback_result
-            .as_ref()
-            .map_or(0, |report| report.skipped.len())
-    }
-
-    /// Reserved replay byte count; currently zero.
-    pub fn scrollback_bytes_written(&self) -> usize {
-        self.scrollback_result.as_ref().map_or(0, |report| {
-            report.successes.iter().fold(0usize, |total, pane| {
-                total.saturating_add(pane.bytes_written)
-            })
-        })
-    }
 }
 
 // =============================================================================
@@ -806,11 +1296,7 @@ pub async fn load_checkpoint_by_id_with_cx(
         load_checkpoint_by_id(&db_path, checkpoint_id)
     })
     .await
-    .map_err(|_error| {
-        RestoreError::Database(
-            "checkpoint lookup stopped before blocking work completed".to_string(),
-        )
-    })?
+    .map_err(|error| restore_blocking_error("checkpoint lookup", error))?
 }
 
 fn load_checkpoint_by_id_from_conn(
@@ -1157,7 +1643,7 @@ fn validate_restore_authority_row_shape(
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedRestoreCheckpointMetadata {
     old_to_new: BTreeMap<String, u64>,
@@ -1165,7 +1651,7 @@ struct PersistedRestoreCheckpointMetadata {
     restore_attempt: Option<PersistedRestoreAttempt>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 enum PersistedRestoreAttempt {
     Intent {
@@ -1177,6 +1663,8 @@ enum PersistedRestoreAttempt {
         source_pane_count: Option<usize>,
     },
     Outcome {
+        #[serde(default = "legacy_restore_outcome_evidence_version")]
+        evidence_version: u8,
         intent_checkpoint_id: i64,
         intent_checkpoint_at: i64,
         intent_state_hash: String,
@@ -1187,6 +1675,14 @@ enum PersistedRestoreAttempt {
         expected_panes: usize,
         mapped_panes: usize,
         reported_layout_failures: usize,
+        #[serde(default)]
+        failed_source_pane_ids: Option<Vec<u64>>,
+        #[serde(default)]
+        unexpected_mapping_count: Option<usize>,
+        #[serde(default)]
+        unexpected_failure_count: Option<usize>,
+        #[serde(default)]
+        duplicate_target_source_pane_ids: Option<Vec<u64>>,
         layout_complete: bool,
         scrollback_requested: bool,
         scrollback_complete: bool,
@@ -1198,7 +1694,9 @@ enum PersistedRestoreAttempt {
         process_plans_settled: usize,
         process_interrupted: bool,
         attempt_interrupted: bool,
-        interruption_phase: Option<String>,
+        interruption_phase: Option<RestoreInterruptionPhase>,
+        #[serde(default)]
+        interruption_reason: Option<RestoreInterruptionReason>,
         process_failed: usize,
         process_manual: usize,
         process_skipped: usize,
@@ -1263,6 +1761,7 @@ fn validate_restore_outcome_metadata(
     metadata: &PersistedRestoreCheckpointMetadata,
 ) -> Result<(), RestoreError> {
     let Some(PersistedRestoreAttempt::Outcome {
+        evidence_version,
         intent_checkpoint_id,
         intent_checkpoint_at,
         intent_state_hash,
@@ -1273,6 +1772,10 @@ fn validate_restore_outcome_metadata(
         expected_panes,
         mapped_panes,
         reported_layout_failures,
+        failed_source_pane_ids,
+        unexpected_mapping_count,
+        unexpected_failure_count,
+        duplicate_target_source_pane_ids,
         layout_complete,
         scrollback_requested,
         scrollback_complete,
@@ -1285,6 +1788,7 @@ fn validate_restore_outcome_metadata(
         process_interrupted,
         attempt_interrupted,
         interruption_phase,
+        interruption_reason,
         process_failed,
         process_manual,
         process_skipped,
@@ -1302,6 +1806,111 @@ fn validate_restore_outcome_metadata(
                 "restore outcome {checkpoint_id} overflows its process disposition count"
             ))
         })?;
+    let process_state_consistent = if !*layout_complete {
+        !*process_plan_evaluated
+            && *process_plans_total == 0
+            && *process_plans_settled == 0
+            && disposition_count == 0
+            && !*process_interrupted
+    } else if *expected_panes == 0 {
+        !*process_plan_evaluated
+            && *process_plans_total == 0
+            && *process_plans_settled == 0
+            && disposition_count == 0
+            && !*process_interrupted
+    } else if *process_plan_evaluated {
+        *process_plans_total == *expected_panes
+    } else {
+        // Cancellation may land after layout has settled but before process
+        // disposition begins. That truthful partial receipt has no process
+        // inventory, and is admissible only as an interrupted attempt.
+        *attempt_interrupted
+            && *process_plans_total == 0
+            && *process_plans_settled == 0
+            && disposition_count == 0
+            && !*process_interrupted
+    };
+    let interruption_shape_consistent = match *evidence_version {
+        1 => {
+            interruption_phase.is_some() == *attempt_interrupted
+                && interruption_reason.is_none()
+                && failed_source_pane_ids.is_none()
+                && unexpected_mapping_count.is_none()
+                && unexpected_failure_count.is_none()
+                && duplicate_target_source_pane_ids.is_none()
+        }
+        RESTORE_OUTCOME_REASON_EVIDENCE_VERSION => {
+            interruption_phase.is_some() == *attempt_interrupted
+                && interruption_reason.is_some() == *attempt_interrupted
+                && failed_source_pane_ids.is_none()
+                && unexpected_mapping_count.is_none()
+                && unexpected_failure_count.is_none()
+                && duplicate_target_source_pane_ids.is_none()
+        }
+        RESTORE_OUTCOME_EVIDENCE_VERSION => {
+            let failed_ids_are_canonical = failed_source_pane_ids
+                .as_ref()
+                .is_some_and(|pane_ids| {
+                    pane_ids.len() >= *reported_layout_failures
+                        && pane_ids.len() <= *expected_panes
+                        && pane_ids.windows(2).all(|pair| pair[0] < pair[1])
+                });
+            let duplicate_ids_are_canonical = duplicate_target_source_pane_ids
+                .as_ref()
+                .is_some_and(|pane_ids| {
+                    pane_ids.windows(2).all(|pair| pair[0] < pair[1])
+                        && failed_source_pane_ids.as_ref().is_some_and(|failed_ids| {
+                            pane_ids
+                                .iter()
+                                .all(|pane_id| failed_ids.binary_search(pane_id).is_ok())
+                        })
+                });
+            interruption_phase.is_some() == *attempt_interrupted
+                && interruption_reason.is_some() == *attempt_interrupted
+                && failed_ids_are_canonical
+                && unexpected_mapping_count.is_some()
+                && unexpected_failure_count.is_some()
+                && duplicate_ids_are_canonical
+        }
+        _ => false,
+    };
+    let interruption_phase_consistent = match interruption_phase {
+        None => !*attempt_interrupted,
+        Some(RestoreInterruptionPhase::LayoutRestoration) => {
+            *attempt_interrupted
+                && !*layout_complete
+                && !*process_plan_evaluated
+                && *process_plans_total == 0
+                && *process_plans_settled == 0
+                && !*process_interrupted
+        }
+        Some(
+            RestoreInterruptionPhase::PostLayoutCheckpoint
+            | RestoreInterruptionPhase::PreProcessDispositionCheckpoint,
+        ) => {
+            *attempt_interrupted
+                && !*process_plan_evaluated
+                && *process_plans_total == 0
+                && *process_plans_settled == 0
+                && !*process_interrupted
+        }
+        Some(RestoreInterruptionPhase::ProcessDispositionEvaluation) => {
+            *attempt_interrupted
+                && *layout_complete
+                && *process_plan_evaluated
+                && *process_interrupted
+                && *process_plans_total == *expected_panes
+                && *process_plans_settled < *process_plans_total
+        }
+        Some(RestoreInterruptionPhase::PostProcessDispositionCheckpoint) => {
+            *attempt_interrupted
+                && *layout_complete
+                && *process_plan_evaluated
+                && !*process_interrupted
+                && *process_plans_total == *expected_panes
+                && *process_plans_settled == *process_plans_total
+        }
+    };
     // The disposition-only engine has no launched-success category: every
     // settled plan must appear exactly once as failed, manual, or skipped.
     let invalid = *intent_checkpoint_id <= 0
@@ -1314,6 +1923,14 @@ fn validate_restore_outcome_metadata(
         || *mapped_panes != metadata.old_to_new.len()
         || *mapped_panes > *expected_panes
         || *reported_layout_failures > *expected_panes
+        || (*evidence_version == RESTORE_OUTCOME_EVIDENCE_VERSION && *process_failed != 0)
+        || (*layout_complete
+            && (failed_source_pane_ids.as_ref().is_some_and(|ids| !ids.is_empty())
+                || unexpected_mapping_count.is_some_and(|count| count != 0)
+                || unexpected_failure_count.is_some_and(|count| count != 0)
+                || duplicate_target_source_pane_ids
+                    .as_ref()
+                    .is_some_and(|ids| !ids.is_empty())))
         || (*layout_complete
             && (*mapped_panes != *expected_panes || *reported_layout_failures != 0))
         || (*scrollback_complete
@@ -1327,8 +1944,10 @@ fn validate_restore_outcome_metadata(
         || *process_plans_settled > *process_plans_total
         || disposition_count != *process_plans_settled
         || *process_plan_evaluated != (*process_plans_total > 0)
+        || !process_state_consistent
         || (*process_interrupted && !*attempt_interrupted)
-        || interruption_phase.is_some() != *attempt_interrupted;
+        || !interruption_shape_consistent
+        || !interruption_phase_consistent;
     if invalid {
         return Err(RestoreError::CorruptCheckpoint(format!(
             "restore outcome {checkpoint_id} has internally inconsistent evidence"
@@ -1453,9 +2072,9 @@ fn mark_session_restored(db_path: &str, session_id: &str) -> Result<(), RestoreE
     Ok(())
 }
 
-fn prepare_restore_receipt_metadata(
+fn prepare_restore_mapping(
     pane_id_map: &HashMap<u64, u64>,
-) -> Result<(String, i64), RestoreError> {
+) -> Result<(BTreeMap<String, u64>, i64), RestoreError> {
     let pane_count = i64::try_from(pane_id_map.len()).map_err(|_| {
         RestoreError::Bookkeeping("restore pane mapping count exceeds SQLite INTEGER".to_string())
     })?;
@@ -1469,6 +2088,13 @@ fn prepare_restore_receipt_metadata(
         }
         ordered_mapping.insert(old_id.to_string(), new_id);
     }
+    Ok((ordered_mapping, pane_count))
+}
+
+fn prepare_restore_receipt_metadata(
+    pane_id_map: &HashMap<u64, u64>,
+) -> Result<(String, i64), RestoreError> {
+    let (ordered_mapping, pane_count) = prepare_restore_mapping(pane_id_map)?;
     let metadata = serde_json::json!({ "old_to_new": ordered_mapping });
     let metadata_json = canonical_json_string(&metadata).map_err(|_error| {
         RestoreError::Bookkeeping(
@@ -1517,11 +2143,16 @@ struct RestoreReceipt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RestoreOutcomeEvidence {
+    evidence_version: u8,
     intent: RestoreReceipt,
     source: RestoreIntentSource,
     expected_panes: usize,
     mapped_panes: usize,
     reported_layout_failures: usize,
+    failed_source_pane_ids: Vec<u64>,
+    unexpected_mapping_count: usize,
+    unexpected_failure_count: usize,
+    duplicate_target_source_pane_ids: Vec<u64>,
     layout_complete: bool,
     scrollback_requested: bool,
     scrollback_complete: bool,
@@ -1533,7 +2164,8 @@ struct RestoreOutcomeEvidence {
     process_plans_settled: usize,
     process_interrupted: bool,
     attempt_interrupted: bool,
-    interruption_phase: Option<&'static str>,
+    interruption_phase: Option<RestoreInterruptionPhase>,
+    interruption_reason: Option<RestoreInterruptionReason>,
     process_failed: usize,
     process_manual: usize,
     process_skipped: usize,
@@ -1543,14 +2175,21 @@ fn restore_outcome_evidence_is_complete(evidence: &RestoreOutcomeEvidence) -> bo
     evidence.layout_complete
         && evidence.mapped_panes == evidence.expected_panes
         && evidence.reported_layout_failures == 0
+        && evidence.failed_source_pane_ids.is_empty()
+        && evidence.unexpected_mapping_count == 0
+        && evidence.unexpected_failure_count == 0
+        && evidence.duplicate_target_source_pane_ids.is_empty()
         && evidence.scrollback_complete
         && evidence.scrollback_failures == 0
         && evidence.scrollback_skipped == 0
         && !evidence.scrollback_global_error
+        && evidence.process_plan_evaluated == (evidence.expected_panes > 0)
+        && evidence.process_plans_total == evidence.expected_panes
         && evidence.process_plans_settled == evidence.process_plans_total
         && !evidence.process_interrupted
         && !evidence.attempt_interrupted
         && evidence.interruption_phase.is_none()
+        && evidence.interruption_reason.is_none()
         && evidence.process_failed == 0
 }
 
@@ -1560,22 +2199,49 @@ fn persisted_restore_outcome_is_complete(
     matches!(
         metadata.restore_attempt.as_ref(),
         Some(PersistedRestoreAttempt::Outcome {
+            evidence_version,
             expected_panes,
             mapped_panes,
             reported_layout_failures: 0,
+            failed_source_pane_ids,
+            unexpected_mapping_count,
+            unexpected_failure_count,
+            duplicate_target_source_pane_ids,
             layout_complete: true,
             scrollback_complete: true,
             scrollback_failures: 0,
             scrollback_skipped: 0,
             scrollback_global_error: false,
+            process_plan_evaluated,
             process_plans_total,
             process_plans_settled,
             process_interrupted: false,
             attempt_interrupted: false,
             interruption_phase: None,
+            interruption_reason: None,
             process_failed: 0,
             ..
-        }) if mapped_panes == expected_panes && process_plans_settled == process_plans_total
+        }) if mapped_panes == expected_panes
+            && match *evidence_version {
+                1 | RESTORE_OUTCOME_REASON_EVIDENCE_VERSION => {
+                    failed_source_pane_ids.is_none()
+                        && unexpected_mapping_count.is_none()
+                        && unexpected_failure_count.is_none()
+                        && duplicate_target_source_pane_ids.is_none()
+                }
+                RESTORE_OUTCOME_EVIDENCE_VERSION => {
+                    failed_source_pane_ids.as_ref().is_some_and(Vec::is_empty)
+                        && *unexpected_mapping_count == Some(0)
+                        && *unexpected_failure_count == Some(0)
+                        && duplicate_target_source_pane_ids
+                            .as_ref()
+                            .is_some_and(Vec::is_empty)
+                }
+                _ => false,
+            }
+            && *process_plan_evaluated == (*expected_panes > 0)
+            && process_plans_total == expected_panes
+            && process_plans_settled == process_plans_total
     )
 }
 
@@ -1817,21 +2483,13 @@ fn validate_restore_authority_chain(
 fn prepare_restore_outcome_metadata(
     pane_id_map: &HashMap<u64, u64>,
     evidence: &RestoreOutcomeEvidence,
-) -> Result<(String, i64), RestoreError> {
-    let (mapping_json, pane_count) = prepare_restore_receipt_metadata(pane_id_map)?;
-    let mapping: serde_json::Value = serde_json::from_str(&mapping_json).map_err(|_error| {
-        RestoreError::Bookkeeping(
-            "failed to decode canonical restore mapping metadata".to_string(),
-        )
-    })?;
-    let old_to_new = mapping
-        .get("old_to_new")
-        .cloned()
-        .ok_or_else(|| RestoreError::Bookkeeping("restore mapping metadata missing old_to_new".into()))?;
+) -> Result<(String, i64, PersistedRestoreCheckpointMetadata), RestoreError> {
+    let (old_to_new, pane_count) = prepare_restore_mapping(pane_id_map)?;
     let metadata = serde_json::json!({
         "old_to_new": old_to_new,
         "restore_attempt": {
             "phase": "outcome",
+            "evidence_version": evidence.evidence_version,
             "intent_checkpoint_id": evidence.intent.checkpoint_id,
             "intent_checkpoint_at": evidence.intent.checkpoint_at,
             "intent_state_hash": evidence.intent.state_hash.as_str(),
@@ -1842,6 +2500,10 @@ fn prepare_restore_outcome_metadata(
             "expected_panes": evidence.expected_panes,
             "mapped_panes": evidence.mapped_panes,
             "reported_layout_failures": evidence.reported_layout_failures,
+            "failed_source_pane_ids": evidence.failed_source_pane_ids,
+            "unexpected_mapping_count": evidence.unexpected_mapping_count,
+            "unexpected_failure_count": evidence.unexpected_failure_count,
+            "duplicate_target_source_pane_ids": evidence.duplicate_target_source_pane_ids,
             "layout_complete": evidence.layout_complete,
             "scrollback_requested": evidence.scrollback_requested,
             "scrollback_complete": evidence.scrollback_complete,
@@ -1854,6 +2516,7 @@ fn prepare_restore_outcome_metadata(
             "process_interrupted": evidence.process_interrupted,
             "attempt_interrupted": evidence.attempt_interrupted,
             "interruption_phase": evidence.interruption_phase,
+            "interruption_reason": evidence.interruption_reason,
             "process_failed": evidence.process_failed,
             "process_manual": evidence.process_manual,
             "process_skipped": evidence.process_skipped,
@@ -1864,7 +2527,12 @@ fn prepare_restore_outcome_metadata(
             "failed to canonicalize restore outcome metadata".to_string(),
         )
     })?;
-    Ok((metadata_json, pane_count))
+    let parsed = parse_restore_checkpoint_metadata(
+        evidence.intent.checkpoint_id,
+        Some(&metadata_json),
+    )?;
+    validate_restore_outcome_metadata(evidence.intent.checkpoint_id, &parsed)?;
+    Ok((metadata_json, pane_count, parsed))
 }
 
 fn insert_restore_receipt(
@@ -2093,8 +2761,9 @@ fn persist_restore_receipt_unclean(
     // for every persisted record (collision on the persisted column).
     let now_ms = crate::clock_anomaly::epoch_ms_i64("ft.session_restore.clock");
 
-    let (metadata_json, pane_count) = prepare_restore_outcome_metadata(pane_id_map, evidence)
-        .map_err(|source| RestoreAuthorityDbError::RetrySafe { source })?;
+    let (metadata_json, pane_count, prepared_metadata) =
+        prepare_restore_outcome_metadata(pane_id_map, evidence)
+            .map_err(|source| RestoreAuthorityDbError::RetrySafe { source })?;
 
     run_restore_authority_transaction(&conn, |tx| {
         crate::session_retention::ensure_session_authority_tables_have_no_unaudited_triggers(tx)?;
@@ -2108,6 +2777,20 @@ fn persist_restore_receipt_unclean(
                         ))
                     },
                 )?;
+            let persisted_source =
+                load_checkpoint_by_id_from_conn(tx, evidence.source.checkpoint_id)?.ok_or_else(
+                    || {
+                        RestoreError::Bookkeeping(format!(
+                            "restore source {} disappeared before outcome commit",
+                            evidence.source.checkpoint_id
+                        ))
+                    },
+                )?;
+            let source_pane_ids = persisted_source
+                .pane_states
+                .iter()
+                .map(|pane| pane.pane_id)
+                .collect::<HashSet<_>>();
             let session_authority: Option<(i64, Option<i64>)> = tx
                 .query_row(
                     "SELECT shutdown_clean, clean_checkpoint_id
@@ -2134,6 +2817,23 @@ fn persist_restore_receipt_unclean(
                 )?
                 || persisted_intent.state_hash != evidence.intent.state_hash
                 || persisted_intent.verification != CheckpointVerification::VerifiedV2
+                || persisted_source.session_id != session_id
+                || persisted_source.checkpoint_role != CheckpointRole::Snapshot
+                || persisted_source.checkpoint_at != evidence.source.checkpoint_at
+                || persisted_source.state_hash != evidence.source.state_hash
+                || persisted_source.pane_count != evidence.source.pane_count
+                || evidence.expected_panes != source_pane_ids.len()
+                || pane_id_map
+                    .keys()
+                    .any(|pane_id| !source_pane_ids.contains(pane_id))
+                || evidence
+                    .failed_source_pane_ids
+                    .iter()
+                    .any(|pane_id| !source_pane_ids.contains(pane_id))
+                || evidence
+                    .duplicate_target_source_pane_ids
+                    .iter()
+                    .any(|pane_id| !source_pane_ids.contains(pane_id))
                 || session_authority != Some((0, None))
                 || lifecycle
                     != Some((
@@ -2157,6 +2857,39 @@ fn persist_restore_receipt_unclean(
             pane_count,
             intent_link,
         )?;
+        let persisted_receipt =
+            load_checkpoint_by_id_from_conn(tx, receipt.checkpoint_id)?.ok_or_else(|| {
+                RestoreError::Bookkeeping(format!(
+                    "restore outcome {} disappeared inside its insertion transaction",
+                    receipt.checkpoint_id
+                ))
+            })?;
+        let persisted_metadata =
+            restore_checkpoint_metadata_from_conn(tx, receipt.checkpoint_id, session_id)?;
+        validate_restore_outcome_metadata(receipt.checkpoint_id, &persisted_metadata)?;
+        if persisted_receipt.session_id != session_id
+            || persisted_receipt.checkpoint_role != CheckpointRole::RestoreReceipt
+            || persisted_receipt.checkpoint_type != "startup"
+            || persisted_receipt.verification != CheckpointVerification::VerifiedV2
+            || persisted_receipt.checkpoint_at
+                != decode_u64(
+                    receipt.checkpoint_at,
+                    "restore_receipt.checkpoint_at",
+                )?
+            || persisted_receipt.state_hash != receipt.state_hash
+            || persisted_receipt.restore_intent_checkpoint_id != intent_link
+            || persisted_receipt.pane_count
+                != decode_usize(pane_count, "restore_receipt.pane_count")?
+            || persisted_receipt.total_bytes != 0
+            || persisted_receipt.topology_json.is_some()
+            || !persisted_receipt.pane_states.is_empty()
+            || persisted_metadata != prepared_metadata
+        {
+            return Err(RestoreError::Bookkeeping(format!(
+                "restore outcome {} failed its transaction-local reload verification",
+                receipt.checkpoint_id
+            )));
+        }
         if require_intent_cas {
             let next_status = if restore_outcome_evidence_is_complete(evidence) {
                 "outcome_complete"
@@ -2450,6 +3183,7 @@ fn mark_restore_receipt_clean(
 #[cfg(test)]
 fn complete_test_restore_outcome_evidence(pane_count: usize) -> RestoreOutcomeEvidence {
     RestoreOutcomeEvidence {
+        evidence_version: RESTORE_OUTCOME_EVIDENCE_VERSION,
         intent: RestoreReceipt {
             checkpoint_id: 0,
             checkpoint_at: 0,
@@ -2465,20 +3199,25 @@ fn complete_test_restore_outcome_evidence(pane_count: usize) -> RestoreOutcomeEv
         expected_panes: pane_count,
         mapped_panes: pane_count,
         reported_layout_failures: 0,
+        failed_source_pane_ids: Vec::new(),
+        unexpected_mapping_count: 0,
+        unexpected_failure_count: 0,
+        duplicate_target_source_pane_ids: Vec::new(),
         layout_complete: true,
         scrollback_requested: false,
         scrollback_complete: true,
         scrollback_failures: 0,
         scrollback_skipped: 0,
         scrollback_global_error: false,
-        process_plan_evaluated: false,
-        process_plans_total: 0,
-        process_plans_settled: 0,
+        process_plan_evaluated: pane_count > 0,
+        process_plans_total: pane_count,
+        process_plans_settled: pane_count,
         process_interrupted: false,
         attempt_interrupted: false,
         interruption_phase: None,
+        interruption_reason: None,
         process_failed: 0,
-        process_manual: 0,
+        process_manual: pane_count,
         process_skipped: 0,
     }
 }
@@ -2693,41 +3432,6 @@ fn finalize_restore_for_test(
             })?;
     }
     Ok(receipt.checkpoint_id)
-}
-
-fn launch_snapshot_from_restored_state(
-    state: &RestoredPaneState,
-    checkpoint_at: u64,
-) -> PaneStateSnapshot {
-    let terminal = state
-        .terminal_state
-        .clone()
-        .unwrap_or_else(|| TerminalState {
-            rows: 24,
-            cols: 80,
-            cursor_row: 0,
-            cursor_col: 0,
-            is_alt_screen: false,
-            title: String::new(),
-        });
-
-    let mut snapshot = PaneStateSnapshot::new(state.pane_id, checkpoint_at, terminal);
-    if let Some(cwd) = &state.cwd {
-        snapshot = snapshot.with_cwd(cwd.clone());
-    }
-    if let Some(command) = &state.command
-        && !command.is_empty()
-    {
-        snapshot = snapshot.with_process(ProcessInfo {
-            name: command.clone(),
-            pid: None,
-            argv: None,
-        });
-    }
-    if let Some(agent) = &state.agent_metadata {
-        snapshot = snapshot.with_agent(agent.clone());
-    }
-    snapshot
 }
 
 fn validate_restore_topology(
@@ -3148,11 +3852,7 @@ pub async fn list_sessions_with_cx(
     let db_path = db_path.to_string();
     crate::runtime_async::spawn_blocking_with_cx(cx, move || list_sessions(&db_path))
         .await
-        .map_err(|_error| {
-            RestoreError::Database(
-                "session list stopped before blocking work completed".to_string(),
-            )
-        })?
+        .map_err(|error| restore_blocking_error("session list", error))?
 }
 
 /// Cx-first detailed session query.
@@ -3167,11 +3867,7 @@ pub async fn show_session_with_cx(
         show_session(&db_path, &session_id)
     })
     .await
-    .map_err(|_error| {
-        RestoreError::Database(
-            "session show stopped before blocking work completed".to_string(),
-        )
-    })?
+    .map_err(|error| restore_blocking_error("session show", error))?
 }
 
 /// Cx-first health query with bounded blocking-pool execution.
@@ -3182,11 +3878,7 @@ pub async fn session_doctor_with_cx(
     let db_path = db_path.to_string();
     crate::runtime_async::spawn_blocking_with_cx(cx, move || session_doctor(&db_path))
         .await
-        .map_err(|_error| {
-            RestoreError::Database(
-                "session doctor stopped before blocking work completed".to_string(),
-            )
-        })?
+        .map_err(|error| restore_blocking_error("session doctor", error))?
 }
 
 /// Delete a session and all its checkpoints (cascading via SQL).
@@ -3319,6 +4011,7 @@ fn restore_banner(
 }
 
 /// Format epoch ms to human-readable string.
+#[cfg(test)]
 fn format_epoch_ms(epoch_ms: u64) -> String {
     let secs = epoch_ms / 1000;
     let hours = (secs / 3600) % 24;
@@ -3514,16 +4207,15 @@ impl SessionRestorer {
         checkpoint: &CheckpointData,
         wezterm: WeztermHandle,
     ) -> Result<RestoreSummary, RestoreError> {
-        cx.checkpoint().map_err(|_error| {
-            RestoreError::Wezterm("restore capability stopped during preflight".to_string())
-        })?;
+        cx.checkpoint()
+            .map_err(|error| restore_context_error("restore preflight", cx, &error))?;
 
         // Treat the caller's checkpoint as an identifier, not as authority.
         // The row and its complete witnessed pane projection may have changed
         // between detection and admission, so reload it before parsing caller-
         // supplied topology or making any external mux call.
         let requested_checkpoint_id = checkpoint.checkpoint_id;
-        let checkpoint = load_checkpoint_by_id_with_cx(
+        let mut checkpoint = load_checkpoint_by_id_with_cx(
             cx,
             self.db_path.as_str(),
             requested_checkpoint_id,
@@ -3565,7 +4257,7 @@ impl SessionRestorer {
 
         let start = std::time::Instant::now();
 
-        let topology_json = checkpoint.topology_json.clone().ok_or(
+        let topology_json = checkpoint.topology_json.take().ok_or(
             RestoreError::CheckpointTopologyUnavailable {
                 checkpoint_id: checkpoint.checkpoint_id,
             },
@@ -3592,11 +4284,7 @@ impl SessionRestorer {
             Ok::<_, RestoreError>(topology)
         })
         .await
-        .map_err(|_error| {
-            RestoreError::Wezterm(
-                "restore stopped during topology preparation".to_string(),
-            )
-        })??;
+        .map_err(|error| restore_blocking_error("topology preparation", error))??;
 
         let total_panes = topology.pane_count();
 
@@ -3607,9 +4295,8 @@ impl SessionRestorer {
             "Restoring session topology (cx-first)"
         );
 
-        cx.checkpoint().map_err(|_error| {
-            RestoreError::Wezterm("restore capability stopped before layout".to_string())
-        })?;
+        cx.checkpoint()
+            .map_err(|error| restore_context_error("before layout", cx, &error))?;
 
         let intent_source = RestoreIntentSource {
             checkpoint_id: checkpoint.checkpoint_id,
@@ -3647,16 +4334,15 @@ impl SessionRestorer {
             continue_on_error: true,
         };
         let restorer = LayoutRestorer::new(wezterm.clone(), restore_config);
-        let layout_result = restorer
-            .restore_with_cx(cx, &topology)
-            .await
-            .map_err(|_error| RestoreError::RestoreAttemptInterrupted {
-                session_id: session.session_id.clone(),
-                intent_checkpoint_id: intent.checkpoint_id,
-                outcome_checkpoint_id: None,
-                phase: "layout restoration",
-                detail: "layout restoration did not settle".to_string(),
-            })?;
+        let layout_attempt = restorer.restore_attempt_with_cx(cx, &topology).await;
+        let mut attempt_interruption = layout_attempt.interruption.map(|interruption| {
+            RestoreAttemptInterruption {
+                phase: interruption.phase,
+                receipt_phase: RestoreInterruptionPhase::LayoutRestoration,
+                reason: restore_layout_interruption_reason(interruption.reason),
+            }
+        });
+        let layout_result = layout_attempt.result;
 
         info!(
             panes_created = layout_result.panes_created,
@@ -3688,16 +4374,41 @@ impl SessionRestorer {
             .copied()
             .collect::<HashSet<_>>()
             .len();
-        let layout_complete = layout_result.failed_panes.is_empty()
+        let duplicate_target_source_pane_id_set =
+            duplicate_target_source_pane_ids(&layout_result.pane_id_map);
+        let unexpected_mapping_count = layout_result
+            .pane_id_map
+            .keys()
+            .filter(|pane_id| !expected_pane_ids.contains(pane_id))
+            .count();
+        let unexpected_failure_count = layout_result
+            .failed_panes
+            .iter()
+            .map(|(pane_id, _error)| *pane_id)
+            .filter(|pane_id| !expected_pane_ids.contains(pane_id))
+            .collect::<HashSet<_>>()
+            .len();
+        let layout_complete = attempt_interruption.is_none()
+            && layout_result.failed_panes.is_empty()
             && mapped_pane_ids == expected_pane_ids
             && unique_target_count == layout_result.pane_id_map.len();
-        let failed_expected_pane_count = expected_pane_ids
+        let mut failed_source_pane_ids = expected_pane_ids
             .iter()
             .filter(|pane_id| {
                 !mapped_pane_ids.contains(pane_id)
                     || reported_failed_expected_pane_ids.contains(pane_id)
+                    || duplicate_target_source_pane_id_set.contains(pane_id)
             })
-            .count();
+            .copied()
+            .collect::<Vec<_>>();
+        failed_source_pane_ids.sort_unstable();
+        let failed_expected_pane_count = failed_source_pane_ids.len();
+        let mut duplicate_target_source_pane_ids = duplicate_target_source_pane_id_set
+            .iter()
+            .copied()
+            .filter(|pane_id| expected_pane_ids.contains(pane_id))
+            .collect::<Vec<_>>();
+        duplicate_target_source_pane_ids.sort_unstable();
         let restored_expected_pane_count = expected_pane_ids
             .len()
             .saturating_sub(failed_expected_pane_count);
@@ -3710,36 +4421,14 @@ impl SessionRestorer {
             );
         }
 
-        let mut attempt_interruption = cx
-            .checkpoint()
-            .err()
-            .map(|_error| {
-                (
-                    "post-layout checkpoint",
-                    "caller capability stopped after layout".to_string(),
-                )
+        if attempt_interruption.is_none()
+            && let Err(error) = cx.checkpoint()
+        {
+            attempt_interruption = Some(RestoreAttemptInterruption {
+                phase: "post-layout checkpoint",
+                receipt_phase: RestoreInterruptionPhase::PostLayoutCheckpoint,
+                reason: restore_interruption_reason(cx, &error),
             });
-
-        // The restore preflight rejects `restore_scrollback = true` before an
-        // intent or mux mutation. Raw `output_segments` are arbitrary stream
-        // fragments, not terminal lines or render state, and must never be
-        // loaded and replayed through PTY input. A future implementation must
-        // use a mux-owned terminal-state/output channel with explicit byte and
-        // terminal-row bounds.
-        let scrollback_result = None;
-        let scrollback_error = None;
-        let scrollback_replay_complete = true;
-
-        if attempt_interruption.is_none() {
-            attempt_interruption = cx
-                .checkpoint()
-                .err()
-                .map(|_error| {
-                    (
-                        "post-scrollback checkpoint",
-                        "caller capability stopped before process disposition".to_string(),
-                    )
-                });
         }
 
         // Do not inject a restore banner through the PTY input API. Persisted
@@ -3751,26 +4440,24 @@ impl SessionRestorer {
         );
 
         if attempt_interruption.is_none() {
-            attempt_interruption = cx
-                .checkpoint()
-                .err()
-                .map(|_error| {
-                    (
-                        "pre-process-disposition checkpoint",
-                        "caller capability stopped before process disposition".to_string(),
-                    )
+            if let Err(error) = cx.checkpoint() {
+                attempt_interruption = Some(RestoreAttemptInterruption {
+                    phase: "pre-process-disposition checkpoint",
+                    receipt_phase: RestoreInterruptionPhase::PreProcessDispositionCheckpoint,
+                    reason: restore_interruption_reason(cx, &error),
                 });
+            }
         }
 
-        let mut process_relaunch_complete = layout_complete && scrollback_replay_complete;
+        let mut process_disposition_complete = layout_complete;
         let mut process_launch_report = None;
         let mut process_plans_total = 0usize;
         if attempt_interruption.is_some() {
-            process_relaunch_complete = false;
+            process_disposition_complete = false;
             warn!(
                 session_id = %session.session_id,
                 intent_checkpoint_id = intent.checkpoint_id,
-                "Caller capability stopped after layout; skipping all further external effects and settling an unclean outcome"
+                "Layout attempt stopped; skipping all further external effects and settling an unclean outcome"
             );
         } else if !layout_complete {
             warn!(
@@ -3779,43 +4466,46 @@ impl SessionRestorer {
                 failed_panes = failed_expected_pane_count,
                 "Session restore incomplete; leaving source session unclean for reconciliation"
             );
-        } else if !scrollback_replay_complete {
-            warn!(
-                session_id = %session.session_id,
-                intent_checkpoint_id = intent.checkpoint_id,
-                "Skipping process disposition evaluation because scrollback replay is incomplete"
-            );
         } else {
-            let launch_snapshots: Vec<_> = checkpoint
-                .pane_states
-                .iter()
-                .map(|state| launch_snapshot_from_restored_state(state, checkpoint.checkpoint_at))
-                .collect();
-            let launcher = ProcessLauncher::new();
-            let plans = launcher.plan(&layout_result.pane_id_map, &launch_snapshots);
+            let plans = ProcessLauncher::plan_inputs(
+                &layout_result.pane_id_map,
+                checkpoint.pane_states.iter().map(|state| ProcessDispositionInput {
+                    pane_id: state.pane_id,
+                    foreground_process_name: state
+                        .command
+                        .as_deref()
+                        .filter(|command| !command.is_empty()),
+                    shell_present: false,
+                    agent_present: state.agent_metadata.is_some(),
+                }),
+            );
             process_plans_total = plans.len();
             if !plans.is_empty() {
-                let report = launcher.execute_cx(cx, &plans);
+                let report = ProcessLauncher::execute_cx(cx, &plans);
                 // Captured process plans are audit-only manual dispositions.
                 // They do not make an otherwise complete layout restore fail.
-                process_relaunch_complete = report.failed == 0 && report.interruption.is_none();
-                if report.failed > 0 || report.manual > 0 || report.interruption.is_some() {
+                process_disposition_complete = report.interruption().is_none()
+                    && report.plans_settled() == report.plans_total();
+                if report.manual_count() > 0
+                    || report.interruption().is_some()
+                {
                     warn!(
                         session_id = %session.session_id,
-                        shells_launched = report.shells_launched,
-                        agents_launched = report.agents_launched,
-                        manual = report.manual,
-                        skipped = report.skipped,
-                        failed = report.failed,
-                        interrupted = report.interruption.is_some(),
+                        plans_total = report.plans_total(),
+                        plans_settled = report.plans_settled(),
+                        sampled_results = report.result_sample().len(),
+                        manual = report.manual_count(),
+                        skipped = report.skipped_count(),
+                        interrupted = report.interruption().is_some(),
                         "Captured process dispositions require manual follow-up"
                     );
                 } else {
                     info!(
                         session_id = %session.session_id,
-                        shells_launched = report.shells_launched,
-                        agents_launched = report.agents_launched,
-                        skipped = report.skipped,
+                        plans_total = report.plans_total(),
+                        plans_settled = report.plans_settled(),
+                        sampled_results = report.result_sample().len(),
+                        skipped = report.skipped_count(),
                         "Captured process disposition evaluation complete"
                     );
                 }
@@ -3825,53 +4515,56 @@ impl SessionRestorer {
 
         let process_report = process_launch_report.as_ref();
         let process_interruption = process_report
-            .and_then(|report| report.interruption.as_ref())
-            .map(|_interruption| {
-                (
-                    "process disposition evaluation",
-                    "process disposition evaluation stopped before every plan settled".to_string(),
-                )
+            .and_then(LaunchReport::interruption)
+            .map(|interruption| RestoreAttemptInterruption {
+                phase: "process disposition evaluation",
+                receipt_phase: RestoreInterruptionPhase::ProcessDispositionEvaluation,
+                reason: restore_process_interruption_reason(interruption.reason),
             });
         if attempt_interruption.is_none() {
             attempt_interruption = process_interruption;
         }
         if attempt_interruption.is_none() {
-            attempt_interruption = cx
-                .checkpoint()
-                .err()
-                .map(|_error| {
-                    (
-                        "post-process-disposition checkpoint",
-                        "caller capability stopped after process disposition".to_string(),
-                    )
+            if let Err(error) = cx.checkpoint() {
+                attempt_interruption = Some(RestoreAttemptInterruption {
+                    phase: "post-process-disposition checkpoint",
+                    receipt_phase: RestoreInterruptionPhase::PostProcessDispositionCheckpoint,
+                    reason: restore_interruption_reason(cx, &error),
                 });
+            }
         }
         let outcome_evidence = RestoreOutcomeEvidence {
+            evidence_version: RESTORE_OUTCOME_EVIDENCE_VERSION,
             intent: intent.clone(),
             source: intent_source,
             expected_panes: expected_pane_ids.len(),
             mapped_panes: 0,
             reported_layout_failures: reported_failed_expected_pane_ids.len(),
+            failed_source_pane_ids,
+            unexpected_mapping_count,
+            unexpected_failure_count,
+            duplicate_target_source_pane_ids,
             layout_complete,
-            scrollback_requested: self.config.restore_scrollback,
-            scrollback_complete: scrollback_replay_complete,
-            scrollback_failures: scrollback_result
-                .as_ref()
-                .map_or(0, InjectionReport::failure_count),
-            scrollback_skipped: scrollback_result
-                .as_ref()
-                .map_or(0, |report| report.skipped.len()),
-            scrollback_global_error: scrollback_error.is_some(),
+            scrollback_requested: false,
+            scrollback_complete: true,
+            scrollback_failures: 0,
+            scrollback_skipped: 0,
+            scrollback_global_error: false,
             process_plan_evaluated: process_report.is_some(),
             process_plans_total,
-            process_plans_settled: process_report.map_or(0, |report| report.results.len()),
+            process_plans_settled: process_report.map_or(0, LaunchReport::plans_settled),
             process_interrupted: process_report
-                .is_some_and(|report| report.interruption.is_some()),
+                .is_some_and(|report| report.interruption().is_some()),
             attempt_interrupted: attempt_interruption.is_some(),
-            interruption_phase: attempt_interruption.as_ref().map(|(phase, _)| *phase),
-            process_failed: process_report.map_or(0, |report| report.failed),
-            process_manual: process_report.map_or(0, |report| report.manual),
-            process_skipped: process_report.map_or(0, |report| report.skipped),
+            interruption_phase: attempt_interruption
+                .map(|interruption| interruption.receipt_phase),
+            interruption_reason: attempt_interruption.map(|interruption| interruption.reason),
+            // The current evaluator has only settled Manual/Skip categories;
+            // retain the persisted v1/v2 compatibility field as an enforced
+            // zero until a schema migration removes it atomically.
+            process_failed: 0,
+            process_manual: process_report.map_or(0, LaunchReport::manual_count),
+            process_skipped: process_report.map_or(0, LaunchReport::skipped_count),
         };
         // Persist only deterministic, source-owned, one-to-one mappings. A
         // malformed backend result (unexpected source IDs or duplicate target
@@ -3897,12 +4590,9 @@ impl SessionRestorer {
         // skipped merely because the caller canceled. Use a fresh, bounded
         // capability only for the durable outcome receipt; never use it to
         // continue layout or type additional process commands.
-        let settlement_cx = attempt_interruption
-            .as_ref()
-            .map(|_| crate::cx::for_request());
-        let receipt_cx = settlement_cx.as_ref().unwrap_or(cx);
+        let receipt_cx = crate::cx::Cx::for_request_with_budget(crate::cx::Budget::MINIMAL);
         let receipt = run_checkpoint_authority_with_cx(
-            receipt_cx,
+            &receipt_cx,
             db_path,
             SnapshotAuthorityOperation::RestoreReceiptCommit,
             move |db_path| {
@@ -3916,12 +4606,12 @@ impl SessionRestorer {
             },
         )
         .await
-        .map_err(|_error| RestoreError::RestoreAttemptInterrupted {
+        .map_err(|error| RestoreError::RestoreAttemptInterrupted {
             session_id: session.session_id.clone(),
             intent_checkpoint_id: intent.checkpoint_id,
             outcome_checkpoint_id: None,
             phase: "outcome receipt commit",
-            detail: "restore outcome receipt commit did not settle".to_string(),
+            reason: restore_snapshot_interruption_reason(&error),
         })?;
         debug!(
             checkpoint_id = receipt.checkpoint_id,
@@ -3929,18 +4619,18 @@ impl SessionRestorer {
             "Persisted unclean restore outcome receipt"
         );
 
-        if let Some((phase, detail)) = attempt_interruption {
+        if let Some(interruption) = attempt_interruption {
             return Err(RestoreError::RestoreAttemptInterrupted {
                 session_id: session.session_id.clone(),
                 intent_checkpoint_id: intent.checkpoint_id,
                 outcome_checkpoint_id: Some(receipt.checkpoint_id),
-                phase,
-                detail,
+                phase: interruption.phase,
+                reason: interruption.reason,
             });
         }
 
         let restore_complete = restore_outcome_evidence_is_complete(&outcome_evidence)
-            && process_relaunch_complete;
+            && process_disposition_complete;
         if restore_complete {
             let db_path = Arc::clone(&self.db_path);
             let session_id = session.session_id.clone();
@@ -3954,29 +4644,16 @@ impl SessionRestorer {
                 },
             )
             .await
-            .map_err(|_error| RestoreError::RestoreAttemptInterrupted {
+            .map_err(|error| RestoreError::RestoreAttemptInterrupted {
                 session_id: session.session_id.clone(),
                 intent_checkpoint_id: intent.checkpoint_id,
                 outcome_checkpoint_id: Some(receipt.checkpoint_id),
                 phase: "clean receipt binding",
-                detail: "restore clean-receipt binding did not settle".to_string(),
+                reason: restore_snapshot_interruption_reason(&error),
             })?;
             debug!(
                 checkpoint_id = receipt.checkpoint_id,
                 "Bound exact restore receipt as clean authority"
-            );
-        } else if layout_complete && !scrollback_replay_complete {
-            warn!(
-                session_id = %session.session_id,
-                checkpoint_id = receipt.checkpoint_id,
-                failed_scrollback_panes = scrollback_result
-                    .as_ref()
-                    .map_or(0, InjectionReport::failure_count),
-                skipped_scrollback_panes = scrollback_result
-                    .as_ref()
-                    .map_or(0, |report| report.skipped.len()),
-                has_global_scrollback_error = scrollback_error.is_some(),
-                "Scrollback replay requires follow-up; leaving source session unclean"
             );
         } else if layout_complete {
             warn!(
@@ -4009,11 +4686,9 @@ impl SessionRestorer {
             intent_checkpoint_id: intent.checkpoint_id,
             outcome_checkpoint_id: receipt.checkpoint_id,
             layout_result,
-            pane_states: checkpoint.pane_states.clone(),
-            scrollback_result,
-            scrollback_error,
+            pane_states: checkpoint.pane_states,
             process_launch_report,
-            source_marked_clean: restore_complete,
+            restore_authority_resolved: restore_complete,
             elapsed_ms: elapsed,
         })
     }
@@ -4042,10 +4717,8 @@ impl SessionRestorer {
         cx: &crate::cx::Cx,
         wezterm: WeztermHandle,
     ) -> Result<Option<RestoreSummary>, RestoreError> {
-        cx.checkpoint().map_err(|_error| {
-            RestoreError::Wezterm(
-                "detect-and-restore capability stopped during preflight".to_string(),
-            )
+        cx.checkpoint().map_err(|error| {
+            restore_context_error("detect-and-restore preflight", cx, &error)
         })?;
 
         let detect_db_path = Arc::clone(&self.db_path);
@@ -4054,20 +4727,14 @@ impl SessionRestorer {
             SessionRestorer::new(detect_db_path, detect_config).detect()
         })
         .await
-        .map_err(|_error| {
-            RestoreError::Wezterm(
-                "detect-and-restore stopped during detection".to_string(),
-            )
-        })?;
+        .map_err(|error| restore_blocking_error("restore detection", error))?;
         let session = match detected? {
             Some(s) => s,
             None => return Ok(None),
         };
 
-        cx.checkpoint().map_err(|_error| {
-            RestoreError::Wezterm(
-                "detect-and-restore capability stopped before checkpoint load".to_string(),
-            )
+        cx.checkpoint().map_err(|error| {
+            restore_context_error("before detected checkpoint load", cx, &error)
         })?;
 
         let load_db_path = Arc::clone(&self.db_path);
@@ -4078,11 +4745,7 @@ impl SessionRestorer {
                 .load_checkpoint(&session_for_load)
         })
         .await
-        .map_err(|_error| {
-            RestoreError::Wezterm(
-                "detect-and-restore stopped during checkpoint load".to_string(),
-            )
-        })??;
+        .map_err(|error| restore_blocking_error("detected checkpoint load", error))??;
 
         if checkpoint.pane_states.is_empty() {
             warn!(
@@ -4093,10 +4756,8 @@ impl SessionRestorer {
             return Ok(None);
         }
 
-        cx.checkpoint().map_err(|_error| {
-            RestoreError::Wezterm(
-                "detect-and-restore capability stopped before mux check".to_string(),
-            )
+        cx.checkpoint().map_err(|error| {
+            restore_context_error("before mux reachability check", cx, &error)
         })?;
 
         // ft-xbnl0.2.3 tick 129: route list_panes through cx-first.
@@ -4141,20 +4802,25 @@ pub fn format_restore_summary(summary: &RestoreSummary) -> String {
         .collect::<HashSet<_>>();
     let failed_expected_pane_ids = summary.failed_expected_pane_ids_for(&expected_pane_ids);
     let failed_count = failed_expected_pane_ids.len();
-    let restored_count = summary.total_count().saturating_sub(failed_count);
-    let status = if summary.source_marked_clean {
-        "restored"
+    let restored_count = summary
+        .expected_pane_count()
+        .saturating_sub(failed_count);
+    let status = if summary.restore_authority_resolved {
+        "layout/authority settled"
     } else {
-        "partially restored"
+        "layout/authority partial"
     };
     out.push_str(&format!(
-        "Session {} {}: {}/{} panes in {}ms\n",
+        "Session {}: {} for {}/{} panes in {}ms\n",
         summary.session_id,
         status,
         restored_count,
-        summary.total_count(),
+        summary.expected_pane_count(),
         summary.elapsed_ms,
     ));
+    out.push_str(
+        "Process continuity, historical scrollback, and full-session continuity were not restored.\n",
+    );
 
     if failed_count > 0 {
         out.push_str("Failed panes:\n");
@@ -4179,10 +4845,16 @@ pub fn format_restore_summary(summary: &RestoreSummary) -> String {
             .map(|(pane_id, _error)| *pane_id)
             .filter(|pane_id| failed_pane_ids.binary_search(pane_id).is_ok())
             .collect::<HashSet<_>>();
+        let duplicate_target_sources =
+            duplicate_target_source_pane_ids(&summary.layout_result.pane_id_map);
         for pane_id in &failed_pane_ids {
             if explicitly_failed.contains(pane_id) {
                 out.push_str(&format!(
                     "  pane {pane_id}: layout restoration reported failure\n"
+                ));
+            } else if duplicate_target_sources.contains(pane_id) {
+                out.push_str(&format!(
+                    "  pane {pane_id}: layout mapping collided on a duplicate target pane\n"
                 ));
             } else {
                 out.push_str(&format!(
@@ -4231,47 +4903,23 @@ pub fn format_restore_summary(summary: &RestoreSummary) -> String {
         ));
     }
 
-    if let Some(report) = &summary.scrollback_result {
-        out.push_str(&format!(
-            "Scrollback replay: {} restored, {} failed, {} skipped, {} bytes\n",
-            report.success_count(),
-            report.failure_count(),
-            report.skipped.len(),
-            summary.scrollback_bytes_written(),
-        ));
-        for (pane_id, _error) in report.failures.iter().take(MAX_FAILURE_DETAILS) {
-            out.push_str(&format!(
-                "  scrollback pane {pane_id}: replay reported failure\n"
-            ));
-        }
-        let omitted = report.failures.len().saturating_sub(MAX_FAILURE_DETAILS);
-        if omitted > 0 {
-            out.push_str(&format!(
-                "  ... {omitted} additional scrollback failures omitted\n"
-            ));
-        }
-    }
-
-    if summary.scrollback_error.is_some() {
-        out.push_str("Scrollback replay unavailable: capture lookup did not settle\n");
-    }
-
     if let Some(report) = &summary.process_launch_report {
         out.push_str(&format!(
-            "Process disposition: {} shells, {} agents, {} manual, {} failed, {} skipped\n",
-            report.shells_launched,
-            report.agents_launched,
-            report.manual,
-            report.failed,
-            report.skipped,
+            "Process disposition: {} of {} plans settled, {} manual, {} skipped; {} content-free sample entries retained (cap {})\n",
+            report.plans_settled(),
+            report.plans_total(),
+            report.manual_count(),
+            report.skipped_count(),
+            report.result_sample().len(),
+            crate::restore_process::LAUNCH_RESULT_SAMPLE_CAP,
         ));
-        if report.interruption.is_some() {
+        if report.interruption().is_some() {
             out.push_str(
                 "Process disposition evaluation was interrupted before every plan settled.\n",
             );
         }
     }
-    if !summary.source_marked_clean {
+    if !summary.restore_authority_resolved {
         out.push_str(&format!(
             "Source session remains unclean. Reconcile restore intent {} and outcome {} before retrying.\n",
             summary.intent_checkpoint_id, summary.outcome_checkpoint_id
@@ -4324,9 +4972,25 @@ mod tests {
         process_manual: usize,
         process_skipped: usize,
     ) -> PersistedRestoreCheckpointMetadata {
+        let ordinary_size = process_plans_total <= 64;
+        let old_to_new = if ordinary_size {
+            (0..process_plans_total)
+                .map(|pane_id| {
+                    (
+                        pane_id.to_string(),
+                        u64::try_from(pane_id)
+                            .expect("small test pane id fits u64")
+                            .saturating_add(100),
+                    )
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
         PersistedRestoreCheckpointMetadata {
-            old_to_new: BTreeMap::new(),
+            old_to_new,
             restore_attempt: Some(PersistedRestoreAttempt::Outcome {
+                evidence_version: RESTORE_OUTCOME_EVIDENCE_VERSION,
                 intent_checkpoint_id: 2,
                 intent_checkpoint_at: 2,
                 intent_state_hash: "rsi2:test-intent".to_string(),
@@ -4334,10 +4998,14 @@ mod tests {
                 source_checkpoint_at: 1,
                 source_checkpoint_role: CHECKPOINT_ROLE_SNAPSHOT.to_string(),
                 source_state_hash: "test-source".to_string(),
-                expected_panes: 0,
-                mapped_panes: 0,
+                expected_panes: if ordinary_size { process_plans_total } else { 0 },
+                mapped_panes: if ordinary_size { process_plans_total } else { 0 },
                 reported_layout_failures: 0,
-                layout_complete: true,
+                failed_source_pane_ids: Some(Vec::new()),
+                unexpected_mapping_count: Some(0),
+                unexpected_failure_count: Some(0),
+                duplicate_target_source_pane_ids: Some(Vec::new()),
+                layout_complete: ordinary_size,
                 scrollback_requested: false,
                 scrollback_complete: true,
                 scrollback_failures: 0,
@@ -4349,6 +5017,7 @@ mod tests {
                 process_interrupted: false,
                 attempt_interrupted: false,
                 interruption_phase: None,
+                interruption_reason: None,
                 process_failed,
                 process_manual,
                 process_skipped,
@@ -4381,6 +5050,153 @@ mod tests {
             validate_restore_outcome_metadata(3, &empty_but_claimed_evaluated),
             Err(RestoreError::CorruptCheckpoint(_))
         ));
+    }
+
+    #[test]
+    fn outcome_evidence_versions_preserve_v2_and_fail_closed_for_malformed_v3() {
+        let mut legacy_v2 = persisted_outcome_with_process_counts(1, 1, 0, 1, 0);
+        let Some(PersistedRestoreAttempt::Outcome {
+            evidence_version,
+            failed_source_pane_ids,
+            unexpected_mapping_count,
+            unexpected_failure_count,
+            duplicate_target_source_pane_ids,
+            ..
+        }) = legacy_v2.restore_attempt.as_mut()
+        else {
+            unreachable!("test helper always constructs outcome metadata");
+        };
+        *evidence_version = RESTORE_OUTCOME_REASON_EVIDENCE_VERSION;
+        *failed_source_pane_ids = None;
+        *unexpected_mapping_count = None;
+        *unexpected_failure_count = None;
+        *duplicate_target_source_pane_ids = None;
+        validate_restore_outcome_metadata(3, &legacy_v2)
+            .expect("pre-v3 reason-bearing evidence remains readable");
+
+        let mut missing_v3_field = persisted_outcome_with_process_counts(1, 1, 0, 1, 0);
+        let Some(PersistedRestoreAttempt::Outcome {
+            failed_source_pane_ids,
+            ..
+        }) = missing_v3_field.restore_attempt.as_mut()
+        else {
+            unreachable!("test helper always constructs outcome metadata");
+        };
+        *failed_source_pane_ids = None;
+        assert!(matches!(
+            validate_restore_outcome_metadata(3, &missing_v3_field),
+            Err(RestoreError::CorruptCheckpoint(_))
+        ));
+
+        let mut unsorted_v3 = persisted_outcome_with_process_counts(2, 0, 0, 0, 0);
+        let Some(PersistedRestoreAttempt::Outcome {
+            mapped_panes,
+            reported_layout_failures,
+            failed_source_pane_ids,
+            layout_complete,
+            process_plan_evaluated,
+            ..
+        }) = unsorted_v3.restore_attempt.as_mut()
+        else {
+            unreachable!("test helper always constructs outcome metadata");
+        };
+        *mapped_panes = 0;
+        *reported_layout_failures = 2;
+        *failed_source_pane_ids = Some(vec![1, 1]);
+        *layout_complete = false;
+        *process_plan_evaluated = false;
+        unsorted_v3.old_to_new.clear();
+        assert!(matches!(
+            validate_restore_outcome_metadata(3, &unsorted_v3),
+            Err(RestoreError::CorruptCheckpoint(_))
+        ));
+
+        let mut unknown_version = persisted_outcome_with_process_counts(1, 1, 0, 1, 0);
+        let Some(PersistedRestoreAttempt::Outcome {
+            evidence_version, ..
+        }) = unknown_version.restore_attempt.as_mut()
+        else {
+            unreachable!("test helper always constructs outcome metadata");
+        };
+        *evidence_version = RESTORE_OUTCOME_EVIDENCE_VERSION.saturating_add(1);
+        assert!(matches!(
+            validate_restore_outcome_metadata(3, &unknown_version),
+            Err(RestoreError::CorruptCheckpoint(_))
+        ));
+    }
+
+    #[test]
+    fn complete_outcome_binds_process_plan_count_to_expected_panes() {
+        let mut metadata = persisted_outcome_with_process_counts(1, 1, 0, 1, 0);
+        metadata.old_to_new = BTreeMap::from([
+            ("1".to_string(), 101),
+            ("2".to_string(), 102),
+            ("3".to_string(), 103),
+        ]);
+        let Some(PersistedRestoreAttempt::Outcome {
+            expected_panes,
+            mapped_panes,
+            layout_complete,
+            ..
+        }) = metadata.restore_attempt.as_mut()
+        else {
+            unreachable!("test helper always constructs outcome metadata");
+        };
+        *expected_panes = 3;
+        *mapped_panes = 3;
+        *layout_complete = true;
+
+        assert!(matches!(
+            validate_restore_outcome_metadata(3, &metadata),
+            Err(RestoreError::CorruptCheckpoint(_))
+        ));
+        assert!(!persisted_restore_outcome_is_complete(&metadata));
+
+        let Some(PersistedRestoreAttempt::Outcome {
+            process_plans_total,
+            process_plans_settled,
+            process_manual,
+            ..
+        }) = metadata.restore_attempt.as_mut()
+        else {
+            unreachable!("test helper always constructs outcome metadata");
+        };
+        *process_plans_total = 3;
+        *process_plans_settled = 3;
+        *process_manual = 3;
+        validate_restore_outcome_metadata(3, &metadata)
+            .expect("one settled disposition per expected pane is consistent");
+        assert!(persisted_restore_outcome_is_complete(&metadata));
+    }
+
+    #[test]
+    fn post_layout_interruption_allows_zero_process_inventory_but_not_completion() {
+        let mut metadata = persisted_outcome_with_process_counts(0, 0, 0, 0, 0);
+        metadata.old_to_new = BTreeMap::from([
+            ("1".to_string(), 101),
+            ("2".to_string(), 102),
+            ("3".to_string(), 103),
+        ]);
+        let Some(PersistedRestoreAttempt::Outcome {
+            expected_panes,
+            mapped_panes,
+            attempt_interrupted,
+            interruption_phase,
+            interruption_reason,
+            ..
+        }) = metadata.restore_attempt.as_mut()
+        else {
+            unreachable!("test helper always constructs outcome metadata");
+        };
+        *expected_panes = 3;
+        *mapped_panes = 3;
+        *attempt_interrupted = true;
+        *interruption_phase = Some(RestoreInterruptionPhase::PreProcessDispositionCheckpoint);
+        *interruption_reason = Some(RestoreInterruptionReason::Cancelled);
+
+        validate_restore_outcome_metadata(3, &metadata)
+            .expect("an interrupted post-layout receipt must remain reloadable");
+        assert!(!persisted_restore_outcome_is_complete(&metadata));
     }
 
     #[test]
@@ -6311,10 +7127,40 @@ mod tests {
         let checkpoint = restorer.load_checkpoint(&session).unwrap();
 
         let wezterm = Arc::new(SplitFailOnceWezterm::new());
-        let summary = run_async_test(restorer.restore(&session, &checkpoint, wezterm)).unwrap();
+        let error = run_async_test(restorer.restore(&session, &checkpoint, wezterm))
+            .expect_err("an uncertain split must return its durable interrupted receipt");
+        let (intent_checkpoint_id, outcome_checkpoint_id) = match error {
+            RestoreError::RestoreAttemptInterrupted {
+                intent_checkpoint_id,
+                outcome_checkpoint_id: Some(outcome_checkpoint_id),
+                reason: RestoreInterruptionReason::BackendFailure,
+                ..
+            } => (intent_checkpoint_id, outcome_checkpoint_id),
+            other => panic!("expected receipted partial restore, got {other:?}"),
+        };
 
-        assert_eq!(summary.restored_count(), 1);
-        assert_eq!(summary.failed_count(), 1);
+        let outcome = load_checkpoint_by_id(&db_path, outcome_checkpoint_id)
+            .expect("partial receipt must load")
+            .expect("partial receipt row must exist");
+        assert_eq!(outcome.checkpoint_role, CheckpointRole::RestoreReceipt);
+        let metadata = restore_checkpoint_metadata_from_conn(
+            &conn,
+            outcome_checkpoint_id,
+            "sess-partial",
+        )
+        .expect("partial receipt metadata must validate");
+        assert_eq!(metadata.old_to_new.len(), 1);
+        assert!(matches!(
+            metadata.restore_attempt,
+            Some(PersistedRestoreAttempt::Outcome {
+                evidence_version: RESTORE_OUTCOME_EVIDENCE_VERSION,
+                layout_complete: false,
+                attempt_interrupted: true,
+                interruption_phase: Some(RestoreInterruptionPhase::LayoutRestoration),
+                interruption_reason: Some(RestoreInterruptionReason::BackendFailure),
+                ..
+            })
+        ));
 
         let shutdown_clean: bool = conn
             .query_row(
@@ -6335,12 +7181,12 @@ mod tests {
             error,
             RestoreError::RestoreAttemptRequiresReconciliation {
                 ref session_id,
-                intent_checkpoint_id,
-                outcome_checkpoint_id: Some(outcome_checkpoint_id),
+                intent_checkpoint_id: observed_intent_checkpoint_id,
+                outcome_checkpoint_id: Some(observed_outcome_checkpoint_id),
                 ref status,
             } if session_id == "sess-partial"
-                && intent_checkpoint_id == summary.intent_checkpoint_id
-                && outcome_checkpoint_id == summary.outcome_checkpoint_id
+                && observed_intent_checkpoint_id == intent_checkpoint_id
+                && observed_outcome_checkpoint_id == outcome_checkpoint_id
                 && status == "reconciliation_required"
         ));
     }
@@ -6416,25 +7262,35 @@ mod tests {
         let checkpoint = restorer.load_checkpoint(&session).unwrap();
 
         let wezterm = Arc::new(SpawnFailSecondTabWezterm::new());
-        let summary = run_async_test(restorer.restore(&session, &checkpoint, wezterm)).unwrap();
-
-        assert_eq!(summary.restored_count(), 1);
-        assert_eq!(summary.failed_count(), 1);
-        // [ft-nam3s] Derive the expected text from the same error the mock
-        // returns (the ft-kccj8 propagation of the restore_layout.rs fix) —
-        // a hardcoded "Runtime error: …" literal staled the moment
-        // Error::RuntimeOperation gained its operation field.
-        assert_eq!(
-            summary.layout_result.failed_panes,
-            vec![(
-                2,
-                test_runtime_error(
-                    "session_restore.test.spawn_targeted",
-                    "simulated second-tab spawn failure"
-                )
-                .to_string()
-            )]
-        );
+        let error = run_async_test(restorer.restore(&session, &checkpoint, wezterm))
+            .expect_err("an uncertain second-tab spawn must return a durable partial receipt");
+        let (intent_checkpoint_id, outcome_checkpoint_id) = match error {
+            RestoreError::RestoreAttemptInterrupted {
+                intent_checkpoint_id,
+                outcome_checkpoint_id: Some(outcome_checkpoint_id),
+                reason: RestoreInterruptionReason::BackendFailure,
+                ..
+            } => (intent_checkpoint_id, outcome_checkpoint_id),
+            other => panic!("expected receipted partial restore, got {other:?}"),
+        };
+        let metadata = restore_checkpoint_metadata_from_conn(
+            &conn,
+            outcome_checkpoint_id,
+            "sess-tab-fail",
+        )
+        .expect("partial tab receipt metadata must validate");
+        assert_eq!(metadata.old_to_new.len(), 1);
+        assert!(matches!(
+            metadata.restore_attempt,
+            Some(PersistedRestoreAttempt::Outcome {
+                evidence_version: RESTORE_OUTCOME_EVIDENCE_VERSION,
+                layout_complete: false,
+                attempt_interrupted: true,
+                interruption_phase: Some(RestoreInterruptionPhase::LayoutRestoration),
+                interruption_reason: Some(RestoreInterruptionReason::BackendFailure),
+                ..
+            })
+        ));
 
         let shutdown_clean: bool = conn
             .query_row(
@@ -6455,12 +7311,12 @@ mod tests {
             error,
             RestoreError::RestoreAttemptRequiresReconciliation {
                 ref session_id,
-                intent_checkpoint_id,
-                outcome_checkpoint_id: Some(outcome_checkpoint_id),
+                intent_checkpoint_id: observed_intent_checkpoint_id,
+                outcome_checkpoint_id: Some(observed_outcome_checkpoint_id),
                 ref status,
             } if session_id == "sess-tab-fail"
-                && intent_checkpoint_id == summary.intent_checkpoint_id
-                && outcome_checkpoint_id == summary.outcome_checkpoint_id
+                && observed_intent_checkpoint_id == intent_checkpoint_id
+                && observed_outcome_checkpoint_id == outcome_checkpoint_id
                 && status == "reconciliation_required"
         ));
     }
@@ -6489,11 +7345,9 @@ mod tests {
         let summary =
             run_async_test(restorer.restore(&session, &checkpoint, wezterm.clone())).unwrap();
 
-        assert_eq!(summary.restored_count(), 1);
-        assert_eq!(summary.failed_count(), 0);
+        assert_eq!(summary.layout_settled_pane_count(), 1);
+        assert_eq!(summary.layout_failed_pane_count(), 0);
         assert_eq!(summary.checkpoint_id, checkpoint_id);
-        assert!(summary.scrollback_result.is_none());
-        assert!(summary.scrollback_error.is_none());
         assert_eq!(summary.layout_result.pane_id_map.len(), 1);
 
         let verify_conn = Connection::open(&db_path).expect("open verification db");
@@ -6557,7 +7411,7 @@ mod tests {
     }
 
     #[test]
-    fn session_restorer_opted_in_agent_remains_manual_without_mux_native_spawn() {
+    fn session_restorer_agent_is_manual_without_any_launch_configuration() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-agent-launch", false);
         set_single_pane_topology(&conn, "sess-agent-launch", 7, "/agents");
@@ -6588,17 +7442,7 @@ mod tests {
 
         let restorer = SessionRestorer::new(
             Arc::new(db_path.clone()),
-            SessionRestoreConfig {
-                process_relaunch: LaunchConfig {
-                    launch_agents: true,
-                    agent_commands: HashMap::from([(
-                        "codex".to_string(),
-                        "codex --resume".to_string(),
-                    )]),
-                    ..LaunchConfig::default()
-                },
-                ..SessionRestoreConfig::default()
-            },
+            SessionRestoreConfig::default(),
         );
         let session = restorer.detect().unwrap().expect("restorable session");
         let checkpoint = restorer.load_checkpoint(&session).unwrap();
@@ -6607,7 +7451,7 @@ mod tests {
         let summary =
             run_async_test(restorer.restore(&session, &checkpoint, wezterm.clone())).unwrap();
 
-        assert_eq!(summary.restored_count(), 1);
+        assert_eq!(summary.layout_settled_pane_count(), 1);
         let new_pane_id = *summary
             .layout_result
             .pane_id_map
@@ -6619,9 +7463,9 @@ mod tests {
             .process_launch_report
             .as_ref()
             .expect("agent disposition must be reported");
-        assert_eq!(report.manual, 1);
-        assert_eq!(report.agents_launched, 0);
-        assert_eq!(report.failed, 0);
+        assert_eq!(report.manual_count(), 1);
+        assert_eq!(report.plans_total(), 1);
+        assert_eq!(report.plans_settled(), 1);
     }
 
     #[test]
@@ -6667,14 +7511,13 @@ mod tests {
             Arc::new(MockWezterm::new()),
         ))
         .expect("layout restore with manual follow-up");
-        assert_eq!(summary.failed_count(), 0);
-        assert!(summary.source_marked_clean);
+        assert_eq!(summary.layout_failed_pane_count(), 0);
+        assert!(summary.restore_authority_resolved);
         let launch_report = summary
             .process_launch_report
             .as_ref()
             .expect("manual process disposition must remain visible");
-        assert_eq!(launch_report.manual, 1);
-        assert_eq!(launch_report.failed, 0);
+        assert_eq!(launch_report.manual_count(), 1);
 
         let (shutdown_clean, receipt_count): (bool, i64) = conn
             .query_row(
@@ -6891,8 +7734,8 @@ mod tests {
         ))
         .expect("restore must rebind to the exact persisted checkpoint row");
         assert_eq!(summary.checkpoint_id, checkpoint_id);
-        assert_eq!(summary.restored_count(), 1);
-        assert!(summary.source_marked_clean);
+        assert_eq!(summary.layout_settled_pane_count(), 1);
+        assert!(summary.restore_authority_resolved);
     }
 
     #[test]
@@ -6987,9 +7830,6 @@ mod tests {
         let wezterm = Arc::new(MockWezterm::new());
         let summary =
             run_async_test(restorer.restore(&session, &checkpoint, wezterm.clone())).unwrap();
-
-        assert!(summary.scrollback_result.is_none());
-        assert!(summary.scrollback_error.is_none());
 
         let new_pane_id = *summary
             .layout_result
@@ -7096,16 +7936,80 @@ mod tests {
                 summary_pane_state(1),
                 summary_pane_state(2),
             ],
-            scrollback_result: None,
-            scrollback_error: None,
             process_launch_report: None,
-            source_marked_clean: false,
+            restore_authority_resolved: false,
             elapsed_ms: 100,
         };
 
-        assert_eq!(summary.restored_count(), 2);
-        assert_eq!(summary.failed_count(), 1);
-        assert_eq!(summary.total_count(), 3);
+        assert_eq!(summary.layout_settled_pane_count(), 2);
+        assert_eq!(summary.layout_failed_pane_count(), 1);
+        assert_eq!(summary.expected_pane_count(), 3);
+    }
+
+    #[test]
+    fn restore_summary_treats_every_duplicate_target_source_as_failed() {
+        let summary = RestoreSummary {
+            session_id: "sess-duplicate-target".to_string(),
+            checkpoint_id: 1,
+            intent_checkpoint_id: 2,
+            outcome_checkpoint_id: 3,
+            layout_result: RestoreResult {
+                pane_id_map: HashMap::from([(7, 70), (8, 70)]),
+                failed_panes: Vec::new(),
+                windows_created: 1,
+                tabs_created: 1,
+                panes_created: 2,
+            },
+            pane_states: vec![summary_pane_state(7), summary_pane_state(8)],
+            process_launch_report: None,
+            restore_authority_resolved: false,
+            elapsed_ms: 1,
+        };
+
+        assert_eq!(summary.layout_failed_pane_count(), 2);
+        assert_eq!(summary.layout_settled_pane_count(), 0);
+        let formatted = format_restore_summary(&summary);
+        assert!(formatted.contains("0/2 panes"));
+        assert!(formatted.contains(
+            "pane 7: layout mapping collided on a duplicate target pane"
+        ));
+        assert!(formatted.contains(
+            "pane 8: layout mapping collided on a duplicate target pane"
+        ));
+    }
+
+    #[test]
+    fn restore_summary_debug_is_bounded_and_content_free() {
+        let summary = RestoreSummary {
+            session_id: "raw-session-canary".to_string(),
+            checkpoint_id: 1,
+            intent_checkpoint_id: 2,
+            outcome_checkpoint_id: 3,
+            layout_result: RestoreResult {
+                pane_id_map: HashMap::from([(7, 70)]),
+                failed_panes: vec![(8, "raw-layout-error-canary".to_string())],
+                windows_created: 1,
+                tabs_created: 1,
+                panes_created: 1,
+            },
+            pane_states: vec![RestoredPaneState {
+                pane_id: 7,
+                cwd: Some("raw-cwd-canary".to_string()),
+                command: Some("raw-command-canary".to_string()),
+                terminal_state: None,
+                agent_metadata: None,
+                scrollback_checkpoint_seq: None,
+                last_output_at: None,
+            }],
+            process_launch_report: None,
+            restore_authority_resolved: false,
+            elapsed_ms: 1,
+        };
+        let debug = format!("{summary:?}");
+        for canary in ["raw-session", "raw-layout", "raw-cwd", "raw-command"] {
+            assert!(!debug.contains(canary));
+        }
+        assert!(debug.len() < 512);
     }
 
     #[test]
@@ -7128,70 +8032,17 @@ mod tests {
                 panes_created: 1,
             },
             pane_states: vec![summary_pane_state(7)],
-            scrollback_result: None,
-            scrollback_error: None,
             process_launch_report: None,
-            source_marked_clean: false,
+            restore_authority_resolved: false,
             elapsed_ms: 1,
         };
 
-        assert_eq!(summary.failed_count(), 1);
-        assert_eq!(summary.restored_count(), 0);
+        assert_eq!(summary.layout_failed_pane_count(), 1);
+        assert_eq!(summary.layout_settled_pane_count(), 0);
         let formatted = format_restore_summary(&summary);
         assert!(formatted.contains("pane 7: layout restoration reported failure"));
         assert!(formatted.contains("1 unexpected failures"));
         assert!(!formatted.contains("sensitive backend detail"));
-    }
-
-    #[test]
-    fn restore_summary_bounds_scrollback_failure_details_without_backend_text() {
-        let summary = RestoreSummary {
-            session_id: "sess-scrollback-failures".to_string(),
-            checkpoint_id: 1,
-            intent_checkpoint_id: 2,
-            outcome_checkpoint_id: 3,
-            layout_result: RestoreResult {
-                pane_id_map: HashMap::new(),
-                failed_panes: Vec::new(),
-                windows_created: 0,
-                tabs_created: 0,
-                panes_created: 0,
-            },
-            pane_states: Vec::new(),
-            scrollback_result: Some(InjectionReport {
-                successes: vec![
-                    crate::restore_scrollback::PaneInjectionStats {
-                        old_pane_id: 100,
-                        new_pane_id: 200,
-                        lines_injected: 1,
-                        bytes_written: usize::MAX,
-                        chunks_sent: 1,
-                    },
-                    crate::restore_scrollback::PaneInjectionStats {
-                        old_pane_id: 101,
-                        new_pane_id: 201,
-                        lines_injected: 1,
-                        bytes_written: 1,
-                        chunks_sent: 1,
-                    },
-                ],
-                failures: (0_u64..25)
-                    .map(|pane_id| (pane_id, "sensitive replay detail".to_string()))
-                    .collect(),
-                skipped: Vec::new(),
-            }),
-            scrollback_error: None,
-            process_launch_report: None,
-            source_marked_clean: false,
-            elapsed_ms: 1,
-        };
-
-        assert_eq!(summary.scrollback_bytes_written(), usize::MAX);
-        let formatted = format_restore_summary(&summary);
-        assert!(formatted.contains("scrollback pane 19: replay reported failure"));
-        assert!(!formatted.contains("scrollback pane 20:"));
-        assert!(formatted.contains("5 additional scrollback failures omitted"));
-        assert!(!formatted.contains("sensitive replay detail"));
     }
 
     #[test]
@@ -7213,16 +8064,14 @@ mod tests {
             outcome_checkpoint_id: 3,
             layout_result,
             pane_states: vec![summary_pane_state(0), summary_pane_state(1)],
-            scrollback_result: None,
-            scrollback_error: None,
             process_launch_report: None,
-            source_marked_clean: true,
+            restore_authority_resolved: true,
             elapsed_ms: 42,
         };
 
         let text = format_restore_summary(&summary);
         assert!(text.contains("sess-fmt"));
-        assert!(text.contains("restored"));
+        assert!(text.contains("layout/authority settled"));
         assert!(text.contains("2/2"));
         assert!(text.contains("42ms"));
     }
@@ -7248,16 +8097,14 @@ mod tests {
             outcome_checkpoint_id: 3,
             layout_result,
             pane_states: vec![summary_pane_state(0), summary_pane_state(1)],
-            scrollback_result: None,
-            scrollback_error: None,
             process_launch_report: None,
-            source_marked_clean: false,
+            restore_authority_resolved: false,
             elapsed_ms: 42,
         };
 
         let text = format_restore_summary(&summary);
         assert!(text.contains("sess-partial-fmt"));
-        assert!(text.contains("partially restored"));
+        assert!(text.contains("layout/authority partial"));
         assert!(text.contains("1/2"));
         assert!(text.contains("Failed panes:"));
     }
@@ -7647,9 +8494,6 @@ mod tests {
         let cfg = SessionRestoreConfig::default();
         assert!(!cfg.auto_restore);
         assert!(!cfg.restore_scrollback);
-        assert_eq!(cfg.restore_max_lines, 5000);
-        assert!(cfg.process_relaunch.launch_shells);
-        assert!(!cfg.process_relaunch.launch_agents);
     }
 
     #[test]
@@ -7657,29 +8501,11 @@ mod tests {
         let cfg = SessionRestoreConfig {
             auto_restore: true,
             restore_scrollback: true,
-            restore_max_lines: 10_000,
-            process_relaunch: LaunchConfig {
-                launch_shells: false,
-                launch_agents: true,
-                launch_delay_ms: 250,
-                agent_commands: HashMap::from([(
-                    "codex".to_string(),
-                    "codex --resume".to_string(),
-                )]),
-            },
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let parsed: SessionRestoreConfig = serde_json::from_str(&json).unwrap();
         assert!(parsed.auto_restore);
         assert!(parsed.restore_scrollback);
-        assert_eq!(parsed.restore_max_lines, 10_000);
-        assert!(!parsed.process_relaunch.launch_shells);
-        assert!(parsed.process_relaunch.launch_agents);
-        assert_eq!(parsed.process_relaunch.launch_delay_ms, 250);
-        assert_eq!(
-            parsed.process_relaunch.agent_commands.get("codex"),
-            Some(&"codex --resume".to_string())
-        );
     }
 
     #[test]
@@ -7688,9 +8514,34 @@ mod tests {
         let parsed: SessionRestoreConfig = serde_json::from_str(json).unwrap();
         assert!(!parsed.auto_restore);
         assert!(!parsed.restore_scrollback);
-        assert_eq!(parsed.restore_max_lines, 5000);
-        assert!(parsed.process_relaunch.launch_shells);
-        assert!(!parsed.process_relaunch.launch_agents);
+    }
+
+    #[test]
+    fn retired_session_restore_fields_fail_closed_for_every_json_shape() {
+        for (field, message) in [
+            (
+                "restore_max_lines",
+                "session.restore_max_lines was removed",
+            ),
+            (
+                "process_relaunch",
+                "session.process_relaunch was removed",
+            ),
+        ] {
+            for value in [
+                serde_json::Value::Null,
+                serde_json::json!(17),
+                serde_json::json!("raw-secret-canary"),
+                serde_json::json!({"argv": ["raw-secret-canary"]}),
+            ] {
+                let encoded = serde_json::json!({field: value}).to_string();
+                let error = serde_json::from_str::<SessionRestoreConfig>(&encoded)
+                    .expect_err("every explicit retired field representation must fail closed")
+                    .to_string();
+                assert!(error.contains(message));
+                assert!(!error.contains("raw-secret-canary"));
+            }
+        }
     }
 
     #[test]
@@ -7698,16 +8549,10 @@ mod tests {
         let cfg = SessionRestoreConfig {
             auto_restore: true,
             restore_scrollback: false,
-            restore_max_lines: 100,
-            ..SessionRestoreConfig::default()
         };
         let c = cfg.clone();
         assert!(c.auto_restore);
-        assert_eq!(c.restore_max_lines, 100);
-        assert_eq!(
-            c.process_relaunch.launch_agents,
-            cfg.process_relaunch.launch_agents
-        );
+        assert!(!c.restore_scrollback);
     }
 
     #[test]
@@ -7721,7 +8566,8 @@ mod tests {
     #[test]
     fn restore_error_display_database() {
         let err = RestoreError::Database("connection refused".to_string());
-        assert_eq!(err.to_string(), "database error: connection refused");
+        assert_eq!(err.to_string(), "database operation failed");
+        assert!(!format!("{err:?}").contains("connection refused"));
     }
 
     #[test]
@@ -7733,7 +8579,8 @@ mod tests {
     #[test]
     fn restore_error_display_corrupt_checkpoint() {
         let err = RestoreError::CorruptCheckpoint("invalid JSON".to_string());
-        assert_eq!(err.to_string(), "checkpoint data corrupt: invalid JSON");
+        assert_eq!(err.to_string(), "checkpoint data is corrupt");
+        assert!(!format!("{err:?}").contains("invalid JSON"));
     }
 
     #[test]
@@ -7741,20 +8588,126 @@ mod tests {
         let err = RestoreError::TopologyParse("missing windows".to_string());
         assert_eq!(
             err.to_string(),
-            "topology deserialization failed: missing windows"
+            "topology deserialization failed"
         );
-    }
-
-    #[test]
-    fn restore_error_display_layout_restore() {
-        let err = RestoreError::LayoutRestore("split failed".to_string());
-        assert_eq!(err.to_string(), "layout restoration failed: split failed");
     }
 
     #[test]
     fn restore_error_display_wezterm() {
         let err = RestoreError::Wezterm("not running".to_string());
-        assert_eq!(err.to_string(), "wezterm command failed: not running");
+        assert_eq!(err.to_string(), "mux operation failed");
+    }
+
+    #[test]
+    fn restore_context_errors_preserve_finite_capability_classes() {
+        use crate::runtime_async::{ContextError, ContextErrorKind};
+
+        let cx = crate::cx::for_testing();
+        for (kind, expected) in [
+            (
+                ContextErrorKind::DeadlineExceeded,
+                RestoreInterruptionReason::DeadlineExceeded,
+            ),
+            (
+                ContextErrorKind::PollQuotaExhausted,
+                RestoreInterruptionReason::PollQuotaExhausted,
+            ),
+            (
+                ContextErrorKind::CostQuotaExhausted,
+                RestoreInterruptionReason::CostQuotaExhausted,
+            ),
+            (
+                ContextErrorKind::CancelTimeout,
+                RestoreInterruptionReason::CancellationCleanupTimedOut,
+            ),
+            (
+                ContextErrorKind::Internal,
+                RestoreInterruptionReason::ContextFailure,
+            ),
+        ] {
+            let error = ContextError::new(kind).with_message("raw-context-detail-canary");
+            let classified = restore_context_error("unit-test-phase", &cx, &error);
+            assert!(matches!(
+                classified,
+                RestoreError::Interrupted {
+                    phase: "unit-test-phase",
+                    reason,
+                } if reason == expected
+            ));
+            assert!(!format!("{classified:?}").contains("raw-context-detail-canary"));
+        }
+
+        let cancelled_cx = crate::cx::for_testing();
+        cancelled_cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("raw-cancel-detail-canary"),
+        );
+        let cancelled = ContextError::new(ContextErrorKind::Cancelled)
+            .with_message("raw-context-detail-canary");
+        let classified = restore_context_error("unit-test-phase", &cancelled_cx, &cancelled);
+        assert!(matches!(
+            classified,
+            RestoreError::Interrupted {
+                reason: RestoreInterruptionReason::Cancelled,
+                ..
+            }
+        ));
+        assert!(!format!("{classified:?}").contains("raw-"));
+    }
+
+    #[test]
+    fn restore_blocking_errors_distinguish_cancellation_from_infrastructure() {
+        use crate::outcome::CancelKind;
+        use crate::runtime_async::SpawnBlockingWithCxError;
+
+        for (kind, expected) in [
+            (Some(CancelKind::User), RestoreInterruptionReason::Cancelled),
+            (
+                Some(CancelKind::Deadline),
+                RestoreInterruptionReason::DeadlineExceeded,
+            ),
+            (
+                Some(CancelKind::PollQuota),
+                RestoreInterruptionReason::PollQuotaExhausted,
+            ),
+            (
+                Some(CancelKind::CostBudget),
+                RestoreInterruptionReason::CostQuotaExhausted,
+            ),
+        ] {
+            let error = restore_blocking_error(
+                "blocking test",
+                SpawnBlockingWithCxError::CancelledMidFlight { kind },
+            );
+            assert!(matches!(
+                error,
+                RestoreError::Interrupted {
+                    phase: "blocking test",
+                    reason,
+                } if reason == expected
+            ));
+        }
+
+        assert!(matches!(
+            restore_blocking_error(
+                "blocking test",
+                SpawnBlockingWithCxError::RuntimeFailure,
+            ),
+            RestoreError::InfrastructureFailure {
+                failure: RestoreInfrastructureFailure::BlockingRuntimeFailure,
+                ..
+            }
+        ));
+        assert!(matches!(
+            restore_blocking_error(
+                "blocking test",
+                SpawnBlockingWithCxError::CancellationWatcherTimerFailure,
+            ),
+            RestoreError::InfrastructureFailure {
+                failure: RestoreInfrastructureFailure::CancellationWatcherTimerFailure,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -7783,15 +8736,18 @@ mod tests {
     #[test]
     fn session_candidate_debug() {
         let c = SessionCandidate {
-            session_id: "s".to_string(),
+            session_id: "raw-session-canary".to_string(),
             created_at: 0,
             last_checkpoint_at: None,
-            topology_json: "{}".to_string(),
-            ft_version: "0.1".to_string(),
-            host_id: None,
+            topology_json: "raw-topology-canary".to_string(),
+            ft_version: "raw-version-canary".to_string(),
+            host_id: Some("raw-host-canary".to_string()),
         };
         let dbg = format!("{:?}", c);
         assert!(dbg.contains("SessionCandidate"));
+        for canary in ["raw-session", "raw-topology", "raw-version", "raw-host"] {
+            assert!(!dbg.contains(canary));
+        }
     }
 
     #[test]
@@ -7817,6 +8773,37 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_data_debug_is_content_free() {
+        let checkpoint = CheckpointData {
+            checkpoint_id: 42,
+            session_id: "raw-session-canary".to_string(),
+            checkpoint_at: 5000,
+            checkpoint_type: "raw-type-canary".to_string(),
+            checkpoint_role: CheckpointRole::Snapshot,
+            verification: CheckpointVerification::VerifiedV2,
+            state_hash: "raw-hash-canary".to_string(),
+            topology_json: Some("raw-topology-canary".to_string()),
+            restore_intent_checkpoint_id: None,
+            pane_count: 1,
+            total_bytes: 99,
+            pane_states: vec![RestoredPaneState {
+                pane_id: 7,
+                cwd: Some("raw-cwd-canary".to_string()),
+                command: Some("raw-command-canary".to_string()),
+                terminal_state: None,
+                agent_metadata: None,
+                scrollback_checkpoint_seq: None,
+                last_output_at: None,
+            }],
+        };
+        let debug = format!("{checkpoint:?}");
+        for canary in ["raw-session", "raw-type", "raw-hash", "raw-topology", "raw-cwd", "raw-command"] {
+            assert!(!debug.contains(canary));
+        }
+        assert!(debug.contains("loaded_pane_count: 1"));
+    }
+
+    #[test]
     fn restored_pane_state_clone() {
         let s = RestoredPaneState {
             pane_id: 7,
@@ -7831,6 +8818,23 @@ mod tests {
         assert_eq!(s2.pane_id, 7);
         assert_eq!(s2.cwd.as_deref(), Some("/home"));
         assert_eq!(s2.command.as_deref(), Some("zsh"));
+    }
+
+    #[test]
+    fn restored_pane_state_debug_is_content_free() {
+        let state = RestoredPaneState {
+            pane_id: 7,
+            cwd: Some("raw-cwd-canary".to_string()),
+            command: Some("raw-command-canary".to_string()),
+            terminal_state: None,
+            agent_metadata: None,
+            scrollback_checkpoint_seq: None,
+            last_output_at: None,
+        };
+        let debug = format!("{state:?}");
+        assert!(debug.contains("pane_id: 7"));
+        assert!(!debug.contains("raw-cwd"));
+        assert!(!debug.contains("raw-command"));
     }
 
     #[test]
@@ -8181,9 +9185,8 @@ mod tests {
 
     /// ft-xbnl0.2.3 Cx-first: `restore_with_cx` must produce a
     /// RestoreSummary equivalent to `restore` on a single-pane
-    /// clean-restore case. Uses the same MockWezterm harness
-    /// the legacy success test uses; asserts restored_count,
-    /// failed_count, and pane_id_map size match expectations.
+    /// clean-restore case. Uses the same MockWezterm harness and asserts the
+    /// layout-settled count, layout-failed count, and pane map size.
     #[test]
     fn session_restorer_restore_with_cx_matches_legacy() {
         let (db_path, conn, _dir) = setup_test_db();
@@ -8209,8 +9212,8 @@ mod tests {
             run_async_test(restorer.restore_with_cx(&cx, &session, &checkpoint, wezterm.clone()))
                 .unwrap();
 
-        assert_eq!(summary.restored_count(), 1);
-        assert_eq!(summary.failed_count(), 0);
+        assert_eq!(summary.layout_settled_pane_count(), 1);
+        assert_eq!(summary.layout_failed_pane_count(), 0);
         assert_eq!(summary.checkpoint_id, checkpoint_id);
         assert_eq!(summary.layout_result.pane_id_map.len(), 1);
     }

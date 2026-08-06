@@ -348,10 +348,10 @@ impl PaneStateSnapshot {
         is_alt_screen: bool,
     ) -> Self {
         let terminal = TerminalState {
-            rows: pane.effective_rows() as u16,
-            cols: pane.effective_cols() as u16,
-            cursor_row: pane.cursor_y.unwrap_or(0) as u16,
-            cursor_col: pane.cursor_x.unwrap_or(0) as u16,
+            rows: terminal_dimension(pane.effective_rows()),
+            cols: terminal_dimension(pane.effective_cols()),
+            cursor_row: terminal_dimension(pane.cursor_y.unwrap_or(0)),
+            cursor_col: terminal_dimension(pane.cursor_x.unwrap_or(0)),
             is_alt_screen,
             title: pane.title.clone().unwrap_or_default(),
         };
@@ -364,13 +364,17 @@ impl PaneStateSnapshot {
 
         debug!(
             pane_id = pane.pane_id,
-            cwd = ?snapshot.cwd,
+            has_cwd = snapshot.cwd.is_some(),
             alt_screen = is_alt_screen,
             "Captured state for pane"
         );
 
         snapshot
     }
+}
+
+fn terminal_dimension(value: u32) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 // =============================================================================
@@ -582,6 +586,13 @@ mod tests {
         assert!(!snapshot.terminal.is_alt_screen);
         assert_eq!(snapshot.terminal.title, "claude-code");
         assert_eq!(snapshot.cwd, Some("/home/user/project".to_string()));
+    }
+
+    #[test]
+    fn terminal_dimensions_saturate_instead_of_wrapping() {
+        assert_eq!(terminal_dimension(u32::from(u16::MAX)), u16::MAX);
+        assert_eq!(terminal_dimension(u32::from(u16::MAX) + 1), u16::MAX);
+        assert_eq!(terminal_dimension(u32::MAX), u16::MAX);
     }
 
     // ---- Sensitive var detection ----

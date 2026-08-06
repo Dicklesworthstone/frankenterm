@@ -140,6 +140,9 @@ pub enum RuntimeOperationSource {
     /// The capability context failed without a stronger finite cause.
     #[error("capability context failed")]
     ContextFailure,
+    /// Cancellation cleanup did not settle within its bounded grace period.
+    #[error("capability cancellation cleanup timed out")]
+    CancellationCleanupTimedOut,
     /// A synchronization primitive's own lock wait timed out.
     #[error("lock acquisition timed out")]
     LockTimedOut,
@@ -372,6 +375,11 @@ impl Error {
                 ))
                 .command("Diagnostics", "ft doctor")
                 .alternative("Treat the operation as failed closed and inspect runtime context telemetry."),
+                RuntimeOperationSource::CancellationCleanupTimedOut => Remediation::new(format!(
+                    "Runtime operation '{operation}' did not settle cancellation cleanup within its bounded grace period."
+                ))
+                .command("Diagnostics", "ft doctor")
+                .alternative("Reconcile any admitted external or durable effects before retrying."),
                 RuntimeOperationSource::LockTimedOut => Remediation::new(format!(
                     "Runtime operation '{operation}' timed out waiting for an internal lock."
                 ))
@@ -460,6 +468,7 @@ impl Error {
                     | RuntimeOperationSource::PollQuotaExhausted
                     | RuntimeOperationSource::CostBudgetExhausted
                     | RuntimeOperationSource::ContextFailure
+                    | RuntimeOperationSource::CancellationCleanupTimedOut
                     | RuntimeOperationSource::LockPoisoned
                     | RuntimeOperationSource::PolledAfterCompletion,
                 ..

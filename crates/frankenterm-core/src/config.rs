@@ -20,8 +20,10 @@
 //!
 //! # Forward Compatibility
 //!
-//! All sections use `#[serde(default)]` to allow missing fields.
-//! Unknown fields are ignored to support forward compatibility.
+//! All sections use `#[serde(default)]` to allow missing fields. Unknown
+//! fields are generally ignored for forward compatibility, while explicitly
+//! retired or unsupported settings use presence tombstones and fail closed so
+//! configuration cannot claim behavior that the runtime does not provide.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -100,6 +102,19 @@ pub struct Config {
 
     /// Session snapshot settings (periodic capture, retention)
     pub snapshots: SnapshotConfig,
+
+    /// Presence sentinel for the unsupported top-level `[session]` table.
+    /// Automatic startup restore and historical scrollback replay are not
+    /// wired configuration surfaces, so accepting that table would silently
+    /// describe behavior that does not exist.
+    #[doc(hidden)]
+    #[serde(
+        rename = "session",
+        default,
+        skip_serializing,
+        deserialize_with = "reject_unsupported_session_table"
+    )]
+    unsupported_session_table: (),
 
     /// Semantic search settings (embedding models, fusion, daemon)
     pub search: SearchConfig,
@@ -4169,8 +4184,7 @@ impl Default for SnapshotSchedulingConfig {
 /// hazard_trigger_value = 10.0
 /// periodic_fallback_minutes = 30
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SnapshotConfig {
     /// Enable periodic session snapshots.
     pub enabled: bool,
@@ -4191,10 +4205,6 @@ pub struct SnapshotConfig {
     #[serde(default)]
     pub session_retention: SessionRetentionConfig,
 
-    /// Reserved process-restoration configuration.
-    #[serde(default)]
-    pub process_relaunch: ProcessRelaunchConfig,
-
     /// Snapshot scheduling mode and value weighting.
     #[serde(default)]
     pub scheduling: SnapshotSchedulingConfig,
@@ -4209,68 +4219,87 @@ impl Default for SnapshotConfig {
             retention_count: 10,
             retention_days: 7,
             session_retention: SessionRetentionConfig::default(),
-            process_relaunch: ProcessRelaunchConfig::default(),
             scheduling: SnapshotSchedulingConfig::default(),
         }
     }
 }
 
-/// Reserved process-restoration configuration.
-///
-/// Layout restoration creates a default shell in each pane. The current
-/// process-restoration layer only classifies captured shell/agent state for
-/// operator follow-up; it never types commands into PTYs and cannot launch a
-/// process until the mux exposes an argv-isolated spawn capability.
-///
-/// # Example (ft.toml)
-///
-/// ```toml
-/// [snapshots.process_relaunch]
-/// # Reserved historical keys; neither one permits execution.
-/// launch_shells = true
-/// launch_agents = false
-/// ```
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(default)]
-pub struct ProcessRelaunchConfig {
-    /// Reserved historical setting. Ignored by the current planner and executor;
-    /// captured shells always require an explicit manual disposition.
-    pub launch_shells: bool,
-
-    /// Reserved historical setting. Ignored by the current planner and executor;
-    /// captured agents always require an explicit manual disposition.
-    pub launch_agents: bool,
-
-    /// Reserved for a future argv-isolated mux spawn implementation. Ignored by
-    /// the current planner and executor.
-    pub launch_delay_ms: u64,
-
-    /// Reserved templates for a future argv-isolated mux spawn implementation.
-    /// Ignored by the current planner and executor. Values are excluded from
-    /// `Debug` output because they may contain paths or credentials.
-    pub agent_commands: std::collections::HashMap<String, String>,
+struct SnapshotConfigWire {
+    enabled: bool,
+    interval_seconds: u64,
+    max_concurrent_captures: usize,
+    retention_count: usize,
+    retention_days: u64,
+    session_retention: SessionRetentionConfig,
+    scheduling: SnapshotSchedulingConfig,
+    /// Presence sentinel for the removed table. The custom hook is invoked for
+    /// every explicit value, including null/scalar input in non-TOML formats.
+    #[serde(default, deserialize_with = "reject_retired_process_relaunch")]
+    process_relaunch: (),
 }
 
-impl std::fmt::Debug for ProcessRelaunchConfig {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ProcessRelaunchConfig")
-            .field("reserved_launch_shells", &self.launch_shells)
-            .field("reserved_launch_agents", &self.launch_agents)
-            .field("reserved_launch_delay_ms", &self.launch_delay_ms)
-            .field("reserved_agent_command_count", &self.agent_commands.len())
-            .finish()
+impl Default for SnapshotConfigWire {
+    fn default() -> Self {
+        let defaults = SnapshotConfig::default();
+        Self {
+            enabled: defaults.enabled,
+            interval_seconds: defaults.interval_seconds,
+            max_concurrent_captures: defaults.max_concurrent_captures,
+            retention_count: defaults.retention_count,
+            retention_days: defaults.retention_days,
+            session_retention: defaults.session_retention,
+            scheduling: defaults.scheduling,
+            process_relaunch: (),
+        }
     }
 }
 
-impl Default for ProcessRelaunchConfig {
-    fn default() -> Self {
-        Self {
-            launch_shells: true,
-            launch_agents: false,
-            launch_delay_ms: 500,
-            agent_commands: std::collections::HashMap::new(),
-        }
+fn reject_retired_process_relaunch<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ignored = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Err(serde::de::Error::custom(
+        "snapshots.process_relaunch was removed; delete the table because process and agent restoration is unavailable",
+    ))
+}
+
+fn reject_unsupported_session_table<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ignored = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Err(serde::de::Error::custom(
+        "the top-level [session] table is unsupported because automatic startup restore and historical scrollback replay are not wired; delete this table",
+    ))
+}
+
+impl<'de> Deserialize<'de> for SnapshotConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let SnapshotConfigWire {
+            enabled,
+            interval_seconds,
+            max_concurrent_captures,
+            retention_count,
+            retention_days,
+            session_retention,
+            scheduling,
+            process_relaunch: (),
+        } = SnapshotConfigWire::deserialize(deserializer)?;
+        Ok(Self {
+            enabled,
+            interval_seconds,
+            max_concurrent_captures,
+            retention_count,
+            retention_days,
+            session_retention,
+            scheduling,
+        })
     }
 }
 
@@ -6297,15 +6326,75 @@ mod tests {
     }
 
     #[test]
-    fn process_relaunch_debug_redacts_reserved_templates() {
-        let mut config = ProcessRelaunchConfig::default();
-        config.agent_commands.insert(
-            "secret-agent-type".to_string(),
-            "secret command with /secret/cwd".to_string(),
-        );
-        let diagnostic = format!("{config:?}");
-        assert!(diagnostic.contains("reserved_agent_command_count: 1"));
-        assert!(!diagnostic.contains("secret"));
+    fn retired_process_relaunch_table_fails_closed_without_echoing_values() {
+        let error = Config::from_toml_unvalidated(
+            r#"
+[snapshots.process_relaunch]
+launch_agents = true
+agent_commands = { codex = "credential-canary" }
+"#,
+        )
+        .expect_err("retired process configuration must require migration")
+        .to_string();
+        assert!(error.contains("snapshots.process_relaunch was removed"));
+        assert!(!error.contains("credential-canary"));
+    }
+
+    #[test]
+    fn retired_process_relaunch_presence_rejects_null_scalar_and_map() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!({"agent_commands": {"codex": "credential-canary"}}),
+        ] {
+            let error = serde_json::from_value::<SnapshotConfig>(serde_json::json!({
+                "process_relaunch": value,
+            }))
+            .expect_err("every explicit retired field value must fail closed")
+            .to_string();
+            assert!(error.contains("snapshots.process_relaunch was removed"));
+            assert!(!error.contains("credential-canary"));
+        }
+    }
+
+    #[test]
+    fn serialized_snapshot_config_omits_retired_process_relaunch_table() {
+        let serialized = Config::default().to_toml().expect("serialize defaults");
+        assert!(!serialized.contains("process_relaunch"));
+        assert!(!serialized.contains("agent_commands"));
+    }
+
+    #[test]
+    fn unsupported_top_level_session_table_fails_closed_without_echoing_values() {
+        let error = Config::from_toml_unvalidated(
+            r#"
+[session]
+auto_restore = true
+restore_max_lines = 5000
+credential_canary = "must-not-echo"
+"#,
+        )
+        .expect_err("unsupported session configuration must require removal")
+        .to_string();
+        assert!(error.contains("top-level [session] table is unsupported"));
+        assert!(!error.contains("must-not-echo"));
+    }
+
+    #[test]
+    fn unsupported_top_level_session_presence_rejects_null_scalar_and_map() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!({"auto_restore": true, "credential_canary": "must-not-echo"}),
+        ] {
+            let error = serde_json::from_value::<Config>(serde_json::json!({
+                "session": value,
+            }))
+            .expect_err("every explicit top-level session value must fail closed")
+            .to_string();
+            assert!(error.contains("top-level [session] table is unsupported"));
+            assert!(!error.contains("must-not-echo"));
+        }
     }
 
     #[test]
