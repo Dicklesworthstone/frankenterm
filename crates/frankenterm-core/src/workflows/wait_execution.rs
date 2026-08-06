@@ -168,6 +168,15 @@ fn wait_timed_out(deadline: RuntimeTime, now: RuntimeTime) -> bool {
     now >= deadline
 }
 
+fn wait_poll_forbidden(
+    deadline: RuntimeTime,
+    now: RuntimeTime,
+    polls: usize,
+    max_polls: usize,
+) -> bool {
+    wait_timed_out(deadline, now) || polls >= max_polls
+}
+
 fn wait_remaining(deadline: RuntimeTime, now: RuntimeTime) -> Duration {
     Duration::from_nanos(deadline.duration_since(now))
 }
@@ -336,6 +345,12 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
     ///
     /// This method blocks until the condition is satisfied or the timeout elapses.
     /// It reuses the PaneWaiter infrastructure for consistent polling behavior.
+    /// The deadline is a half-open interval: observations are eligible only
+    /// while `now < deadline`. Consequently a zero timeout performs no poll and
+    /// returns `TimedOut` even when the condition was already true; a sleep whose
+    /// duration equals its timeout also returns `TimedOut`. `max_polls` is an
+    /// observation budget, so the final allowed poll may still satisfy a
+    /// condition if it completes strictly before the deadline.
     /// ft-tr5a0 Cx-first sibling of [`Self::execute`].
     pub async fn execute_with_cx(
         &self,
@@ -396,24 +411,38 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             }
             WaitCondition::Sleep { duration_ms } => {
                 let dur = Duration::from_millis(*duration_ms);
-                if dur > timeout {
-                    let timeout_ms = duration_millis_u64(timeout);
-                    wait_sleep_with_cx(cx, timeout, "sleep wait condition").await?;
+                let start = wait_clock_now(cx);
+                let deadline = wait_deadline_after(start, timeout, "sleep")?;
+                if wait_timed_out(deadline, start) {
                     return Ok(WaitConditionResult::TimedOut {
-                        elapsed_ms: timeout_ms,
+                        elapsed_ms: 0,
                         polls: 0,
                         last_observed: Some(format!(
-                            "sleep duration {duration_ms}ms exceeded timeout {timeout_ms}ms"
+                            "sleep duration {duration_ms}ms reached zero timeout"
                         )),
                     });
                 }
 
-                wait_sleep_with_cx(cx, dur, "sleep wait condition").await?;
-                Ok(WaitConditionResult::Satisfied {
-                    elapsed_ms: *duration_ms,
-                    polls: 0,
-                    context: Some("sleep completed".to_string()),
-                })
+                let sleep_duration = dur.min(wait_remaining(deadline, start));
+                wait_sleep_with_cx(cx, sleep_duration, "sleep wait condition").await?;
+                wait_checkpoint(cx, "sleep wait condition after timer")?;
+                let now = wait_clock_now(cx);
+                if dur >= timeout || wait_timed_out(deadline, now) {
+                    Ok(WaitConditionResult::TimedOut {
+                        elapsed_ms: duration_millis_u64(timeout),
+                        polls: 0,
+                        last_observed: Some(format!(
+                            "sleep duration {duration_ms}ms reached timeout {}ms",
+                            duration_millis_u64(timeout)
+                        )),
+                    })
+                } else {
+                    Ok(WaitConditionResult::Satisfied {
+                        elapsed_ms: wait_elapsed_ms(start, now),
+                        polls: 0,
+                        context: Some("sleep completed".to_string()),
+                    })
+                }
             }
             WaitCondition::External { key } => {
                 if key.trim().is_empty() {
@@ -437,20 +466,15 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 let mut interval = self.options.poll_initial;
                 loop {
                     wait_checkpoint(cx, "external signal wait")?;
-                    if registry.is_signaled(key) {
-                        let now = wait_clock_now(cx);
-                        return Ok(WaitConditionResult::Satisfied {
-                            elapsed_ms: wait_elapsed_ms(start, now),
-                            polls,
-                            context: Some(format!("external signal '{key}' fired")),
-                        });
-                    }
-
-                    polls += 1;
-                    let now = wait_clock_now(cx);
-                    if wait_timed_out(deadline, now) || polls >= self.options.max_polls {
+                    let before_poll = wait_clock_now(cx);
+                    if wait_poll_forbidden(
+                        deadline,
+                        before_poll,
+                        polls,
+                        self.options.max_polls,
+                    ) {
                         return Ok(WaitConditionResult::TimedOut {
-                            elapsed_ms: wait_elapsed_ms(start, now),
+                            elapsed_ms: wait_elapsed_ms(start, before_poll),
                             polls,
                             last_observed: Some(format!(
                                 "external signal '{key}' not fired within {}ms",
@@ -459,7 +483,40 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                         });
                     }
 
-                    let remaining = wait_remaining(deadline, now);
+                    polls = polls.saturating_add(1);
+                    let signaled = registry.is_signaled(key);
+                    wait_checkpoint(cx, "external signal wait after registry read")?;
+                    let observed_at = wait_clock_now(cx);
+                    if wait_timed_out(deadline, observed_at) {
+                        return Ok(WaitConditionResult::TimedOut {
+                            elapsed_ms: wait_elapsed_ms(start, observed_at),
+                            polls,
+                            last_observed: Some(format!(
+                                "external signal '{key}' not fired within {}ms",
+                                timeout.as_millis()
+                            )),
+                        });
+                    }
+                    if signaled {
+                        return Ok(WaitConditionResult::Satisfied {
+                            elapsed_ms: wait_elapsed_ms(start, observed_at),
+                            polls,
+                            context: Some(format!("external signal '{key}' fired")),
+                        });
+                    }
+
+                    if polls >= self.options.max_polls {
+                        return Ok(WaitConditionResult::TimedOut {
+                            elapsed_ms: wait_elapsed_ms(start, observed_at),
+                            polls,
+                            last_observed: Some(format!(
+                                "external signal '{key}' not fired within {}ms",
+                                timeout.as_millis()
+                            )),
+                        });
+                    }
+
+                    let remaining = wait_remaining(deadline, observed_at);
                     let sleep_duration = interval.min(remaining);
                     if !sleep_duration.is_zero() {
                         wait_sleep_with_cx(cx, sleep_duration, "external signal wait").await?;
@@ -492,19 +549,50 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
 
         loop {
             wait_checkpoint(cx, "pattern wait")?;
-            polls += 1;
+            let before_poll = wait_clock_now(cx);
+            if wait_poll_forbidden(
+                deadline,
+                before_poll,
+                polls,
+                self.options.max_polls,
+            ) {
+                return Ok(WaitConditionResult::TimedOut {
+                    elapsed_ms: wait_elapsed_ms(start, before_poll),
+                    polls,
+                    last_observed: last_detection_summary,
+                });
+            }
+            polls = polls.saturating_add(1);
 
             // Get pane text
-            let text = self.source.get_text_with_cx(cx, pane_id, false).await?;
+            let text_result = self.source.get_text_with_cx(cx, pane_id, false).await;
             wait_checkpoint(cx, "pattern wait after pane read")?;
+            let text = text_result?;
+            let after_read = wait_clock_now(cx);
+            if wait_timed_out(deadline, after_read) {
+                return Ok(WaitConditionResult::TimedOut {
+                    elapsed_ms: wait_elapsed_ms(start, after_read),
+                    polls,
+                    last_observed: last_detection_summary,
+                });
+            }
             let tail = tail_text(&text, self.options.tail_lines);
 
             // Run pattern detection
             let detections = self.pattern_engine.detect(&tail);
+            wait_checkpoint(cx, "pattern wait after detection")?;
+            let observed_at = wait_clock_now(cx);
+            if wait_timed_out(deadline, observed_at) {
+                return Ok(WaitConditionResult::TimedOut {
+                    elapsed_ms: wait_elapsed_ms(start, observed_at),
+                    polls,
+                    last_observed: last_detection_summary,
+                });
+            }
 
             // Check for matching rule
             if detections.iter().any(|detection| detection.rule_id == rule_id) {
-                let elapsed_ms = wait_elapsed_ms(start, wait_clock_now(cx));
+                let elapsed_ms = wait_elapsed_ms(start, observed_at);
                 tracing::info!(
                     pane_id,
                     rule_id,
@@ -526,9 +614,8 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             }
 
             // Check timeout
-            let now = wait_clock_now(cx);
-            if wait_timed_out(deadline, now) || polls >= self.options.max_polls {
-                let elapsed_ms = wait_elapsed_ms(start, now);
+            if polls >= self.options.max_polls {
+                let elapsed_ms = wait_elapsed_ms(start, observed_at);
                 tracing::info!(pane_id, rule_id, elapsed_ms, polls, "pattern_wait timeout");
                 return Ok(WaitConditionResult::TimedOut {
                     elapsed_ms,
@@ -538,7 +625,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             }
 
             // Sleep with backoff
-            let remaining = wait_remaining(deadline, now);
+            let remaining = wait_remaining(deadline, observed_at);
             let sleep_duration = interval.min(remaining);
             if !sleep_duration.is_zero() {
                 wait_sleep_with_cx(cx, sleep_duration, "pattern wait").await?;
@@ -584,21 +671,42 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
 
         loop {
             wait_checkpoint(cx, "pane idle wait")?;
-            polls += 1;
+            let before_poll = wait_clock_now(cx);
+            if wait_poll_forbidden(
+                deadline,
+                before_poll,
+                polls,
+                self.options.max_polls,
+            ) {
+                return Ok(WaitConditionResult::TimedOut {
+                    elapsed_ms: wait_elapsed_ms(start, before_poll),
+                    polls,
+                    last_observed: last_state_desc,
+                });
+            }
+            polls = polls.saturating_add(1);
 
             // Check idle state
-            let (is_idle, state_desc) = self.check_idle_state(cx, pane_id).await?;
+            let state_result = self.check_idle_state(cx, pane_id).await;
             wait_checkpoint(cx, "pane idle wait after state read")?;
+            let (is_idle, state_desc) = state_result?;
+            let observed_at = wait_clock_now(cx);
+            if wait_timed_out(deadline, observed_at) {
+                return Ok(WaitConditionResult::TimedOut {
+                    elapsed_ms: wait_elapsed_ms(start, observed_at),
+                    polls,
+                    last_observed: last_state_desc,
+                });
+            }
             last_state_desc = Some(state_desc.clone());
 
             if is_idle {
                 // Track idle duration
-                let now = wait_clock_now(cx);
-                let idle_start = idle_since.get_or_insert(now);
-                let idle_duration = wait_elapsed(*idle_start, now);
+                let idle_start = idle_since.get_or_insert(observed_at);
+                let idle_duration = wait_elapsed(*idle_start, observed_at);
 
                 if idle_duration >= idle_threshold {
-                    let elapsed_ms = wait_elapsed_ms(start, now);
+                    let elapsed_ms = wait_elapsed_ms(start, observed_at);
                     tracing::info!(
                         pane_id,
                         elapsed_ms,
@@ -623,9 +731,8 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             }
 
             // Check timeout
-            let now = wait_clock_now(cx);
-            if wait_timed_out(deadline, now) || polls >= self.options.max_polls {
-                let elapsed_ms = wait_elapsed_ms(start, now);
+            if polls >= self.options.max_polls {
+                let elapsed_ms = wait_elapsed_ms(start, observed_at);
                 tracing::info!(pane_id, elapsed_ms, polls, "pane_idle_wait timeout");
                 return Ok(WaitConditionResult::TimedOut {
                     elapsed_ms,
@@ -635,7 +742,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             }
 
             // Sleep with backoff
-            let remaining = wait_remaining(deadline, now);
+            let remaining = wait_remaining(deadline, observed_at);
             let sleep_duration = interval.min(remaining);
             if !sleep_duration.is_zero() {
                 wait_sleep_with_cx(cx, sleep_duration, "pane idle wait").await?;
@@ -667,8 +774,9 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         // Fallback: Use heuristic prompt detection
         if self.options.allow_idle_heuristics {
             // ft-xbnl0.2.3 tick 264: cx-first heuristic idle check.
-            let text = self.source.get_text_with_cx(cx, pane_id, false).await?;
+            let text_result = self.source.get_text_with_cx(cx, pane_id, false).await;
             wait_checkpoint(cx, "pane idle heuristic after pane read")?;
+            let text = text_result?;
             let (is_idle, desc) = heuristic_idle_check(&text, self.options.tail_lines);
             return Ok((is_idle, format!("heuristic:{desc}")));
         }
@@ -702,20 +810,68 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
 
         loop {
             wait_checkpoint(cx, "stable tail wait")?;
-            polls += 1;
+            let before_poll = wait_clock_now(cx);
+            if wait_poll_forbidden(
+                deadline,
+                before_poll,
+                polls,
+                self.options.max_polls,
+            ) {
+                let last_observed = last_hash.map(|hash| {
+                    format!(
+                        "last_hash={:016x} tail_len={} stable_for_ms={}",
+                        hash, last_tail_len, stable_for_ms
+                    )
+                });
+                return Ok(WaitConditionResult::TimedOut {
+                    elapsed_ms: wait_elapsed_ms(start, before_poll),
+                    polls,
+                    last_observed,
+                });
+            }
+            polls = polls.saturating_add(1);
 
-            let text = self.source.get_text_with_cx(cx, pane_id, false).await?;
+            let text_result = self.source.get_text_with_cx(cx, pane_id, false).await;
             wait_checkpoint(cx, "stable tail wait after pane read")?;
+            let text = text_result?;
+            let observed_at = wait_clock_now(cx);
+            if wait_timed_out(deadline, observed_at) {
+                let last_observed = last_hash.map(|hash| {
+                    format!(
+                        "last_hash={:016x} tail_len={} stable_for_ms={}",
+                        hash, last_tail_len, stable_for_ms
+                    )
+                });
+                return Ok(WaitConditionResult::TimedOut {
+                    elapsed_ms: wait_elapsed_ms(start, observed_at),
+                    polls,
+                    last_observed,
+                });
+            }
             let tail = tail_text(&text, self.options.tail_lines);
             let tail_hash = stable_hash(tail.as_bytes());
             let tail_len = tail.len();
+            wait_checkpoint(cx, "stable tail wait after hashing")?;
+            let decision_at = wait_clock_now(cx);
+            if wait_timed_out(deadline, decision_at) {
+                let last_observed = last_hash.map(|hash| {
+                    format!(
+                        "last_hash={:016x} tail_len={} stable_for_ms={}",
+                        hash, last_tail_len, stable_for_ms
+                    )
+                });
+                return Ok(WaitConditionResult::TimedOut {
+                    elapsed_ms: wait_elapsed_ms(start, decision_at),
+                    polls,
+                    last_observed,
+                });
+            }
 
             if let Some(prev_hash) = last_hash {
                 if prev_hash == tail_hash {
-                    let now = wait_clock_now(cx);
-                    let stable_duration = wait_elapsed(last_change_at, now);
+                    let stable_duration = wait_elapsed(last_change_at, decision_at);
                     if stable_duration >= stable_for {
-                        let elapsed_ms = wait_elapsed_ms(start, now);
+                        let elapsed_ms = wait_elapsed_ms(start, decision_at);
                         tracing::info!(
                             pane_id,
                             elapsed_ms,
@@ -736,10 +892,10 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                         });
                     }
                 } else {
-                    last_change_at = wait_clock_now(cx);
+                    last_change_at = decision_at;
                 }
             } else {
-                last_change_at = wait_clock_now(cx);
+                last_change_at = decision_at;
             }
 
             last_hash = Some(tail_hash);
@@ -747,9 +903,8 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 last_tail_len = tail_len;
             }
 
-            let now = wait_clock_now(cx);
-            if wait_timed_out(deadline, now) || polls >= self.options.max_polls {
-                let elapsed_ms = wait_elapsed_ms(start, now);
+            if polls >= self.options.max_polls {
+                let elapsed_ms = wait_elapsed_ms(start, decision_at);
                 tracing::info!(pane_id, elapsed_ms, polls, "stable_tail_wait timeout");
                 let last_observed = last_hash.map(|hash| {
                     let tail_len = last_tail_len;
@@ -765,7 +920,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 });
             }
 
-            let remaining = wait_remaining(deadline, now);
+            let remaining = wait_remaining(deadline, decision_at);
             let sleep_duration = interval.min(remaining);
             if !sleep_duration.is_zero() {
                 wait_sleep_with_cx(cx, sleep_duration, "stable tail wait").await?;
@@ -785,7 +940,26 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         matcher: &TextMatch,
         timeout: Duration,
     ) -> crate::Result<WaitConditionResult> {
-        let wait_matcher = matcher.to_wait_matcher()?;
+        let start = wait_clock_now(cx);
+        let deadline = wait_deadline_after(start, timeout, "text_match")?;
+        if wait_poll_forbidden(deadline, start, 0, self.options.max_polls) {
+            return Ok(WaitConditionResult::TimedOut {
+                elapsed_ms: 0,
+                polls: 0,
+                last_observed: Some(format!("timeout {}", matcher.description())),
+            });
+        }
+        let matcher_result = matcher.to_wait_matcher();
+        wait_checkpoint(cx, "text match wait after matcher preparation")?;
+        let prepared_at = wait_clock_now(cx);
+        if wait_timed_out(deadline, prepared_at) {
+            return Ok(WaitConditionResult::TimedOut {
+                elapsed_ms: wait_elapsed_ms(start, prepared_at),
+                polls: 0,
+                last_observed: Some(format!("timeout {}", matcher.description())),
+            });
+        }
+        let wait_matcher = matcher_result?;
         let waiter = PaneWaiter::new(self.source).with_options(WaitOptions {
             tail_lines: self.options.tail_lines,
             escapes: false,
@@ -794,10 +968,29 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             max_polls: self.options.max_polls,
         });
 
-        let result = waiter
-            .wait_for_with_cx(cx, pane_id, &wait_matcher, timeout)
-            .await?;
+        let wait_result = waiter
+            .wait_for_with_cx(
+                cx,
+                pane_id,
+                &wait_matcher,
+                wait_remaining(deadline, prepared_at),
+            )
+            .await;
         wait_checkpoint(cx, "text match wait after pane wait")?;
+        let result = wait_result?;
+        let observed_at = wait_clock_now(cx);
+        if wait_timed_out(deadline, observed_at) {
+            let polls = match &result {
+                WaitResult::Matched { polls, .. }
+                | WaitResult::TimedOut { polls, .. }
+                | WaitResult::Cancelled { polls, .. } => *polls,
+            };
+            return Ok(WaitConditionResult::TimedOut {
+                elapsed_ms: wait_elapsed_ms(start, observed_at),
+                polls,
+                last_observed: Some(format!("timeout {}", matcher.description())),
+            });
+        }
         match result {
             WaitResult::Matched { elapsed_ms, polls } => Ok(WaitConditionResult::Satisfied {
                 elapsed_ms,
@@ -995,6 +1188,70 @@ mod tests {
                     crate::outcome::CancelKind::User,
                     Some("SECRET post-read cancellation detail"),
                 );
+                Ok(text)
+            })
+        }
+    }
+
+    struct CancelAndFailPaneSource {
+        cancel_cx: crate::cx::Cx,
+    }
+
+    impl crate::wezterm::PaneTextSource for CancelAndFailPaneSource {
+        type Fut<'a> =
+            std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            let cancel_cx = self.cancel_cx.clone();
+            Box::pin(async move {
+                cancel_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("SECRET cancellation concurrent with backend failure"),
+                );
+                Err(crate::Error::Workflow(
+                    crate::error::WorkflowError::Aborted(
+                        "SECRET pane backend failure must not win".to_string(),
+                    ),
+                ))
+            })
+        }
+    }
+
+    struct DelayedPaneSource {
+        delay: Duration,
+        text: String,
+    }
+
+    impl DelayedPaneSource {
+        fn new(delay: Duration, text: impl Into<String>) -> Self {
+            Self {
+                delay,
+                text: text.into(),
+            }
+        }
+    }
+
+    impl crate::wezterm::PaneTextSource for DelayedPaneSource {
+        type Fut<'a> =
+            std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            let text = self.text.clone();
+            Box::pin(async move { Ok(text) })
+        }
+
+        fn get_text_with_cx<'a>(
+            &'a self,
+            cx: &'a crate::cx::Cx,
+            _pane_id: u64,
+            _escapes: bool,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>,
+        > {
+            let delay = self.delay;
+            let text = self.text.clone();
+            Box::pin(async move {
+                wait_sleep_with_cx(cx, delay, "delayed pane source").await?;
                 Ok(text)
             })
         }
@@ -1404,7 +1661,7 @@ mod tests {
             assert!(
                 last_observed
                     .as_deref()
-                    .is_some_and(|s| s.contains("exceeded timeout")),
+                    .is_some_and(|s| s.contains("reached timeout")),
                 "unexpected last_observed: {last_observed:?}"
             );
         } else {
@@ -1412,6 +1669,101 @@ mod tests {
         }
         // Should complete near 50ms, not 10 seconds
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn execute_sleep_treats_duration_equal_to_timeout_as_timed_out() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec![]);
+        let engine = PatternEngine::new();
+        let executor = WaitConditionExecutor::new(&source, &engine);
+        let condition = WaitCondition::Sleep { duration_ms: 10 };
+
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_millis(10)))
+            .expect("equal sleep deadline should produce an outcome");
+
+        assert!(result.is_timed_out(), "unexpected result: {result:?}");
+        assert_eq!(result.elapsed_ms(), Some(10));
+        assert_eq!(source.calls(), 0);
+    }
+
+    #[test]
+    fn zero_timeout_forbids_every_supported_wait_observation() {
+        let rt = test_runtime();
+        let rule = RuleDef {
+            id: "wezterm.error_detect".to_string(),
+            agent_type: AgentType::Wezterm,
+            event_type: "error".to_string(),
+            severity: Severity::Warning,
+            anchors: vec!["ERROR".to_string()],
+            regex: None,
+            description: "zero-timeout regression rule".to_string(),
+            remediation: None,
+            workflow: None,
+            manual_fix: None,
+            preview_command: None,
+            learn_more_url: None,
+        };
+        let engine = PatternEngine::with_packs(vec![PatternPack::new(
+            "test:zero-timeout",
+            "1.0.0",
+            vec![rule],
+        )])
+        .expect("zero-timeout pattern pack");
+        let source = MockPaneSource::new(vec!["ERROR\n$ ".to_string()]);
+        let signals = ExternalSignalRegistry::new();
+        signals.signal("already-fired");
+        let executor = WaitConditionExecutor::new(&source, &engine)
+            .with_external_signals(&signals);
+        let conditions = [
+            WaitCondition::Pattern {
+                pane_id: None,
+                rule_id: "wezterm.error_detect".to_string(),
+            },
+            WaitCondition::PaneIdle {
+                pane_id: None,
+                idle_threshold_ms: 0,
+            },
+            WaitCondition::StableTail {
+                pane_id: None,
+                stable_for_ms: 0,
+            },
+            WaitCondition::TextMatch {
+                pane_id: None,
+                matcher: TextMatch::substring("ERROR"),
+            },
+            WaitCondition::Sleep { duration_ms: 0 },
+            WaitCondition::External {
+                key: "already-fired".to_string(),
+            },
+        ];
+
+        rt.block_on(async {
+            for condition in &conditions {
+                let cx = crate::cx::for_testing();
+                let result = executor
+                    .execute_with_cx(&cx, condition, 1, Duration::ZERO)
+                    .await
+                    .expect("zero-timeout wait should produce an outcome");
+                assert!(
+                    matches!(
+                        &result,
+                        WaitConditionResult::TimedOut {
+                            elapsed_ms: 0,
+                            polls: 0,
+                            ..
+                        }
+                    ),
+                    "zero timeout must win before observing {condition:?}: {result:?}"
+                );
+            }
+        });
+        assert_eq!(
+            source.calls(),
+            0,
+            "zero-timeout waits must not read pane content"
+        );
     }
 
     #[test]
@@ -2356,6 +2708,112 @@ mod tests {
     }
 
     #[test]
+    fn pane_observations_arriving_after_deadline_are_discarded_under_virtual_time() {
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed_task = std::sync::Arc::clone(&observed);
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(7303)
+                .with_auto_advance()
+                .worker_count(2)
+                .max_steps(50_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::Cx::current().expect("LabRuntime task should expose Cx");
+                let rule = RuleDef {
+                    id: "wezterm.error_detect".to_string(),
+                    agent_type: AgentType::Wezterm,
+                    event_type: "error".to_string(),
+                    severity: Severity::Warning,
+                    anchors: vec!["ERROR".to_string()],
+                    regex: None,
+                    description: "late-match regression rule".to_string(),
+                    remediation: None,
+                    workflow: None,
+                    manual_fix: None,
+                    preview_command: None,
+                    learn_more_url: None,
+                };
+                let engine = PatternEngine::with_packs(vec![PatternPack::new(
+                    "test:late-match",
+                    "1.0.0",
+                    vec![rule],
+                )])
+                .expect("late-match pattern pack");
+                let source = DelayedPaneSource::new(
+                    Duration::from_millis(10),
+                    "ERROR arrived too late\n$ ",
+                );
+                let executor = WaitConditionExecutor::new(&source, &engine);
+                let conditions = [
+                    WaitCondition::Pattern {
+                        pane_id: None,
+                        rule_id: "wezterm.error_detect".to_string(),
+                    },
+                    WaitCondition::PaneIdle {
+                        pane_id: None,
+                        idle_threshold_ms: 0,
+                    },
+                    WaitCondition::StableTail {
+                        pane_id: None,
+                        stable_for_ms: 0,
+                    },
+                    WaitCondition::TextMatch {
+                        pane_id: None,
+                        matcher: TextMatch::substring("ERROR"),
+                    },
+                ];
+                let mut results = Vec::with_capacity(conditions.len());
+                for condition in &conditions {
+                    let result = executor
+                        .execute_with_cx(
+                            &cx,
+                            condition,
+                            1,
+                            Duration::from_millis(5),
+                        )
+                        .await
+                        .expect("late pane read should produce a timeout outcome");
+                    results.push(result);
+                }
+                *observed_task.lock().expect("result lock") = Some(results);
+            })
+            .expect("spawn virtual-time late-match task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+
+        let report = runtime.run_with_auto_advance();
+        let results = observed
+            .lock()
+            .expect("result lock")
+            .take()
+            .expect("late-match task should store its result");
+
+        assert_eq!(results.len(), 4);
+        for result in &results {
+            assert!(
+                result.is_timed_out(),
+                "late pane observation must lose: {result:?}"
+            );
+            assert!(
+                result.elapsed_ms().is_some_and(|elapsed| elapsed >= 5),
+                "timeout should be measured on the Cx clock: {result:?}"
+            );
+        }
+        assert!(
+            !matches!(
+                report.termination,
+                asupersync::lab::AutoAdvanceTermination::StuckBailout
+            ),
+            "late-match virtual-time task should not get stuck: {:?}",
+            report.termination
+        );
+    }
+
+    #[test]
     fn external_wait_timeout_uses_same_cx_virtual_clock() {
         let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
         let observed_task = std::sync::Arc::clone(&observed);
@@ -2462,6 +2920,50 @@ mod tests {
             stable_for_ms: 0,
         });
         assert_finite_post_read_cancellation(&error);
+    }
+
+    #[test]
+    fn post_read_context_failure_wins_over_concurrent_backend_error() {
+        let conditions = [
+            WaitCondition::Pattern {
+                pane_id: None,
+                rule_id: "wezterm.error_detect".to_string(),
+            },
+            WaitCondition::PaneIdle {
+                pane_id: None,
+                idle_threshold_ms: 0,
+            },
+            WaitCondition::StableTail {
+                pane_id: None,
+                stable_for_ms: 0,
+            },
+            WaitCondition::TextMatch {
+                pane_id: None,
+                matcher: TextMatch::substring("ERROR"),
+            },
+        ];
+
+        for condition in conditions {
+            let rt = test_runtime();
+            let cx = crate::cx::for_testing();
+            let source = CancelAndFailPaneSource {
+                cancel_cx: cx.clone(),
+            };
+            let engine = PatternEngine::new();
+            let executor = WaitConditionExecutor::new(&source, &engine);
+            let error = rt
+                .block_on(executor.execute_with_cx(
+                    &cx,
+                    &condition,
+                    1,
+                    Duration::from_secs(5),
+                ))
+                .expect_err("post-read context failure must win over backend error");
+
+            assert_finite_post_read_cancellation(&error);
+            let rendered = error.to_string();
+            assert!(!rendered.contains("backend failure"), "{rendered}");
+        }
     }
 
     #[test]
