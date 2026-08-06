@@ -237,16 +237,36 @@ fn classify_native_spawn_failure(
 }
 
 #[cfg(any(unix, windows))]
-fn native_accept_error_is_permanent(kind: std::io::ErrorKind) -> bool {
-    matches!(
-        kind,
+fn native_accept_error_is_permanent(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
         std::io::ErrorKind::InvalidInput
             | std::io::ErrorKind::InvalidData
             | std::io::ErrorKind::Unsupported
             | std::io::ErrorKind::PermissionDenied
             | std::io::ErrorKind::NotConnected
             | std::io::ErrorKind::BrokenPipe
-    )
+    ) {
+        return true;
+    }
+
+    // `ErrorKind` deliberately folds several terminal descriptor/socket
+    // failures into `Other`. Retrying these cannot repair the listener and
+    // would otherwise leave the native path in a permanent one-second retry
+    // loop. Resource exhaustion errors remain transient and use the bounded
+    // backoff below.
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(9) {
+        // POSIX EBADF on every supported Unix target.
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(6 | 10_038)) {
+        // ERROR_INVALID_HANDLE / WSAENOTSOCK.
+        return true;
+    }
+
+    false
 }
 
 /// Finite security failure classes for the local native-event transport.
@@ -507,6 +527,7 @@ mod socket_transport {
 enum EventDispatchOutcome {
     Sent,
     Backpressure,
+    ContextEnded,
     Closed,
 }
 
@@ -1262,10 +1283,11 @@ impl NativeEventListener {
                     }
                 }
                 Ok(Err(err)) => {
-                    if native_accept_error_is_permanent(err.kind()) {
+                    if native_accept_error_is_permanent(&err) {
                         warn!(
                             error = %err,
                             error_kind = ?err.kind(),
+                            raw_os_error = ?err.raw_os_error(),
                             path = %self.socket_path.display(),
                             "native event listener stopped after permanent accept failure"
                         );
@@ -1277,6 +1299,7 @@ impl NativeEventListener {
                         warn!(
                             error = %err,
                             error_kind = ?err.kind(),
+                            raw_os_error = ?err.raw_os_error(),
                             consecutive_accept_errors,
                             retry_backoff_ms = accept_error_backoff.as_millis(),
                             path = %self.socket_path.display(),
@@ -1606,6 +1629,14 @@ async fn handle_connection_with_cx(
                                 "native event backpressure drops reached sampled threshold"
                             );
                         }
+                    }
+                    EventDispatchOutcome::ContextEnded => {
+                        debug!(
+                            event_kind,
+                            pane_id,
+                            "native event dispatch stopped because its capability context ended"
+                        );
+                        break;
                     }
                     EventDispatchOutcome::Closed => {
                         debug!(event_kind, pane_id, "native event channel closed (cx path)");
