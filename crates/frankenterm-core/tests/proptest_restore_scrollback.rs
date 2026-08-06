@@ -1,11 +1,10 @@
 //! Property-based tests for the `restore_scrollback` module.
 //!
-//! Covers `InjectionConfig` serde roundtrips and defaults, `ScrollbackData`
-//! construction and truncation invariants, and `InjectionReport` aggregation
-//! methods.
+//! Covers `ScrollbackData` construction and truncation invariants,
+//! `InjectionReport` aggregation, and suppression-guard semantics.
 
 use frankenterm_core::restore_scrollback::{
-    InjectionConfig, InjectionGuard, InjectionReport, PaneInjectionStats, ScrollbackData,
+    InjectionGuard, InjectionReport, PaneInjectionStats, ScrollbackData,
 };
 use proptest::prelude::*;
 use std::collections::HashMap;
@@ -14,17 +13,6 @@ use std::sync::{Arc, Mutex};
 // =========================================================================
 // Strategies
 // =========================================================================
-
-fn arb_injection_config() -> impl Strategy<Value = InjectionConfig> {
-    (1_usize..100_000, 256_usize..65536, 0_u64..100, 1_usize..20).prop_map(
-        |(max_lines, chunk_size, inter_chunk_delay_ms, concurrent_injections)| InjectionConfig {
-            max_lines,
-            chunk_size,
-            inter_chunk_delay_ms,
-            concurrent_injections,
-        },
-    )
-}
 
 fn arb_segments() -> impl Strategy<Value = Vec<String>> {
     proptest::collection::vec("[A-Za-z0-9 ]{0,50}", 0..20)
@@ -49,63 +37,6 @@ fn arb_pane_stats() -> impl Strategy<Value = PaneInjectionStats> {
                 }
             },
         )
-}
-
-// =========================================================================
-// InjectionConfig — serde roundtrip
-// =========================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(30))]
-
-    /// InjectionConfig serde roundtrip preserves all fields.
-    #[test]
-    fn prop_config_serde(config in arb_injection_config()) {
-        let json = serde_json::to_string(&config).unwrap();
-        let back: InjectionConfig = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back.max_lines, config.max_lines);
-        prop_assert_eq!(back.chunk_size, config.chunk_size);
-        prop_assert_eq!(back.inter_chunk_delay_ms, config.inter_chunk_delay_ms);
-        prop_assert_eq!(back.concurrent_injections, config.concurrent_injections);
-    }
-
-    /// Default InjectionConfig has expected values.
-    #[test]
-    fn prop_config_defaults(_dummy in 0..1_u8) {
-        let config = InjectionConfig::default();
-        prop_assert_eq!(config.max_lines, 10_000);
-        prop_assert_eq!(config.chunk_size, 4096);
-        prop_assert_eq!(config.inter_chunk_delay_ms, 1);
-        prop_assert_eq!(config.concurrent_injections, 5);
-    }
-
-    /// InjectionConfig deserializes from empty JSON with defaults.
-    #[test]
-    fn prop_config_from_empty_json(_dummy in 0..1_u8) {
-        let back: InjectionConfig = serde_json::from_str("{}").unwrap();
-        prop_assert_eq!(back.max_lines, 10_000);
-        prop_assert_eq!(back.chunk_size, 4096);
-    }
-
-    /// InjectionConfig partial JSON fills missing with defaults.
-    #[test]
-    fn prop_config_partial_json(max_lines in 1_usize..50_000) {
-        let json = format!("{{\"max_lines\":{}}}", max_lines);
-        let back: InjectionConfig = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back.max_lines, max_lines);
-        // Missing fields get defaults
-        prop_assert_eq!(back.chunk_size, 4096);
-        prop_assert_eq!(back.inter_chunk_delay_ms, 1);
-        prop_assert_eq!(back.concurrent_injections, 5);
-    }
-
-    /// InjectionConfig serde is deterministic.
-    #[test]
-    fn prop_config_deterministic(config in arb_injection_config()) {
-        let j1 = serde_json::to_string(&config).unwrap();
-        let j2 = serde_json::to_string(&config).unwrap();
-        prop_assert_eq!(&j1, &j2);
-    }
 }
 
 // =========================================================================
@@ -196,7 +127,7 @@ proptest! {
         let report = InjectionReport {
             successes: stats.clone(),
             failures: vec![],
-            skipped: vec![],
+            ..InjectionReport::default()
         };
         prop_assert_eq!(report.success_count(), stats.len());
     }
@@ -208,7 +139,7 @@ proptest! {
         let report = InjectionReport {
             successes: vec![],
             failures,
-            skipped: vec![],
+            ..InjectionReport::default()
         };
         prop_assert_eq!(report.failure_count(), n);
     }
@@ -220,7 +151,7 @@ proptest! {
         let report = InjectionReport {
             successes: stats,
             failures: vec![],
-            skipped: vec![],
+            ..InjectionReport::default()
         };
         prop_assert_eq!(report.total_bytes(), expected);
     }
@@ -232,7 +163,8 @@ proptest! {
         prop_assert_eq!(report.success_count(), 0);
         prop_assert_eq!(report.failure_count(), 0);
         prop_assert_eq!(report.total_bytes(), 0);
-        prop_assert!(report.skipped.is_empty());
+        prop_assert_eq!(report.skipped_count(), 0);
+        prop_assert!(report.skipped_sample().is_empty());
     }
 
     /// total_bytes is zero when no successes.
@@ -242,7 +174,7 @@ proptest! {
         let report = InjectionReport {
             successes: vec![],
             failures,
-            skipped: vec![],
+            ..InjectionReport::default()
         };
         prop_assert_eq!(report.total_bytes(), 0);
     }
@@ -261,7 +193,7 @@ proptest! {
         pane_ids in proptest::collection::vec(0_u64..1000, 1..10),
     ) {
         let suppressed = Arc::new(Mutex::new(HashMap::new()));
-        let _guard = InjectionGuard::new(suppressed.clone(), pane_ids.clone());
+        let _guard = InjectionGuard::new(suppressed.clone(), pane_ids.clone()).unwrap();
 
         for &id in &pane_ids {
             prop_assert!(InjectionGuard::is_suppressed(&suppressed, id),
@@ -276,7 +208,7 @@ proptest! {
         other in 501_u64..1000,
     ) {
         let suppressed = Arc::new(Mutex::new(HashMap::new()));
-        let _guard = InjectionGuard::new(suppressed.clone(), guarded);
+        let _guard = InjectionGuard::new(suppressed.clone(), guarded).unwrap();
 
         prop_assert!(!InjectionGuard::is_suppressed(&suppressed, other),
             "pane {} should NOT be suppressed", other);
@@ -290,7 +222,7 @@ proptest! {
         let suppressed = Arc::new(Mutex::new(HashMap::new()));
 
         {
-            let _guard = InjectionGuard::new(suppressed.clone(), pane_ids.clone());
+            let _guard = InjectionGuard::new(suppressed.clone(), pane_ids.clone()).unwrap();
             // suppression is active
             for &id in &pane_ids {
                 prop_assert!(InjectionGuard::is_suppressed(&suppressed, id));
@@ -310,8 +242,8 @@ proptest! {
         panes_b in proptest::collection::vec(500_u64..1000, 1..5),
     ) {
         let suppressed = Arc::new(Mutex::new(HashMap::new()));
-        let _guard_a = InjectionGuard::new(suppressed.clone(), panes_a.clone());
-        let _guard_b = InjectionGuard::new(suppressed.clone(), panes_b.clone());
+        let _guard_a = InjectionGuard::new(suppressed.clone(), panes_a.clone()).unwrap();
+        let _guard_b = InjectionGuard::new(suppressed.clone(), panes_b.clone()).unwrap();
 
         for &id in &panes_a {
             prop_assert!(InjectionGuard::is_suppressed(&suppressed, id));
@@ -328,10 +260,10 @@ proptest! {
         panes_b in proptest::collection::vec(500_u64..1000, 1..5),
     ) {
         let suppressed = Arc::new(Mutex::new(HashMap::new()));
-        let _guard_b = InjectionGuard::new(suppressed.clone(), panes_b.clone());
+        let _guard_b = InjectionGuard::new(suppressed.clone(), panes_b.clone()).unwrap();
 
         {
-            let _guard_a = InjectionGuard::new(suppressed.clone(), panes_a.clone());
+            let _guard_a = InjectionGuard::new(suppressed.clone(), panes_a.clone()).unwrap();
         }
         // guard_a dropped, guard_b still active
         for &id in &panes_b {
@@ -344,7 +276,7 @@ proptest! {
     #[test]
     fn prop_guard_empty(_dummy in 0..1_u8) {
         let suppressed = Arc::new(Mutex::new(HashMap::new()));
-        let _guard = InjectionGuard::new(suppressed.clone(), vec![]);
+        let _guard = InjectionGuard::new(suppressed.clone(), vec![]).unwrap();
         prop_assert!(suppressed.lock().unwrap().is_empty());
     }
 }
