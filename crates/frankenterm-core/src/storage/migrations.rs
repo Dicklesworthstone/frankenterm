@@ -2606,6 +2606,10 @@ fn ensure_checkpoint_snapshot_authority_schema(conn: &Connection) -> Result<()> 
                SELECT COUNT(*)
                FROM json_each(checkpoint.metadata_json, '$.old_to_new')
            )
+           AND (
+               SELECT COUNT(DISTINCT mapping.key)
+               FROM json_each(checkpoint.metadata_json, '$.old_to_new') AS mapping
+           ) = checkpoint.pane_count
            AND NOT EXISTS (
                SELECT 1
                FROM json_each(checkpoint.metadata_json, '$.old_to_new') AS mapping
@@ -6530,6 +6534,8 @@ mod tests {
                  id, session_id, checkpoint_at, checkpoint_type, state_hash,
                  pane_count, total_bytes, metadata_json
              ) VALUES
+                 (-2, 'session-a',  70, 'startup',  'dddddddddddddddd', 2, 0,
+                      '{"old_to_new":{"7":8,"7":9}}'),
                  (-1, 'session-a',  80, 'startup',  'restore',          0, 0,
                       '{"old_to_new":{}}'),
                  ( 0, 'session-a',  90, 'startup',  '0000000000000000', 0, 0,
@@ -6568,6 +6574,12 @@ mod tests {
         assert_eq!(
             rows,
             vec![
+                (
+                    -2,
+                    "snapshot".to_string(),
+                    None,
+                    "dddddddddddddddd".to_string(),
+                ),
                 (
                     -1,
                     "restore_receipt".to_string(),
