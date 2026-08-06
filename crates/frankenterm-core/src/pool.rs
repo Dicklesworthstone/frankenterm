@@ -17,10 +17,12 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::cx::{self, Cx};
-use crate::runtime_async::{LockAcquireError, Mutex, Semaphore, TryAcquireError};
+use crate::runtime_async::{
+    LockAcquireError, Mutex, RuntimeTime, Semaphore, TryAcquireError,
+};
 use serde::{Deserialize, Serialize};
 
 /// Add to a telemetry counter without allowing an ancient/high-volume process
@@ -67,7 +69,16 @@ impl Default for PoolConfig {
 #[derive(Debug)]
 struct PooledEntry<C> {
     conn: C,
-    returned_at: Instant,
+    returned_at: RuntimeTime,
+}
+
+fn idle_age_exceeds_timeout(
+    returned_at: RuntimeTime,
+    now: RuntimeTime,
+    idle_timeout: Duration,
+) -> bool {
+    let timeout_nanos = u64::try_from(idle_timeout.as_nanos()).unwrap_or(u64::MAX);
+    now.duration_since(returned_at) > timeout_nanos
 }
 
 /// Statistics about the pool's current state and historical usage.
@@ -295,7 +306,10 @@ impl<C: Send + 'static> Pool<C> {
                     #[cfg(test)]
                     self.fire_after_idle_lock_acquired();
                     Self::checkpoint_explicit_cx(cx)?;
-                    self.evict_expired(&mut idle);
+                    self.evict_expired(
+                        &mut idle,
+                        crate::runtime_async::timer_now_with_cx(cx),
+                    );
                     idle.pop_front().map(|e| e.conn)
                 };
                 saturating_atomic_add(&self.stats_acquired, 1);
@@ -364,7 +378,10 @@ impl<C: Send + 'static> Pool<C> {
             #[cfg(test)]
             self.fire_after_idle_lock_acquired();
             Self::checkpoint_explicit_cx(cx)?;
-            self.evict_expired(&mut idle);
+            self.evict_expired(
+                &mut idle,
+                crate::runtime_async::timer_now_with_cx(cx),
+            );
             idle.pop_front().map(|e| e.conn)
         };
         saturating_atomic_add(&self.stats_acquired, 1);
@@ -402,11 +419,12 @@ impl<C: Send + 'static> Pool<C> {
         #[cfg(test)]
         self.fire_after_idle_lock_acquired();
         Self::checkpoint_explicit_cx(cx)?;
-        self.evict_expired(&mut idle);
+        let now = crate::runtime_async::timer_now_with_cx(cx);
+        self.evict_expired(&mut idle, now);
         if idle.len() < self.config.max_size {
             idle.push_back(PooledEntry {
                 conn,
-                returned_at: Instant::now(),
+                returned_at: now,
             });
             saturating_atomic_add(&self.stats_returned, 1);
         }
@@ -431,7 +449,10 @@ impl<C: Send + 'static> Pool<C> {
         #[cfg(test)]
         self.fire_after_idle_lock_acquired();
         Self::checkpoint_explicit_cx(cx)?;
-        Ok(self.evict_expired(&mut idle))
+        Ok(self.evict_expired(
+            &mut idle,
+            crate::runtime_async::timer_now_with_cx(cx),
+        ))
     }
 
     /// Get current pool statistics under an explicit `&Cx`.
@@ -489,12 +510,14 @@ impl<C: Send + 'static> Pool<C> {
     }
 
     /// Internal: remove expired entries from the idle queue.
-    fn evict_expired(&self, idle: &mut VecDeque<PooledEntry<C>>) -> usize {
-        let cutoff = self.config.idle_timeout;
-        let now = Instant::now();
+    fn evict_expired(
+        &self,
+        idle: &mut VecDeque<PooledEntry<C>>,
+        now: RuntimeTime,
+    ) -> usize {
         let mut evicted = 0;
         while let Some(front) = idle.front() {
-            if now.duration_since(front.returned_at) > cutoff {
+            if idle_age_exceeds_timeout(front.returned_at, now, self.config.idle_timeout) {
                 idle.pop_front();
                 evicted += 1;
             } else {
@@ -660,6 +683,96 @@ mod tests {
         assert_eq!(saturating_atomic_add(&counter, 1), u64::MAX);
         assert_eq!(saturating_atomic_add(&counter, u64::MAX), u64::MAX);
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn idle_expiration_boundary_uses_saturating_runtime_time() {
+        let returned_at = RuntimeTime::from_nanos(1_000);
+        let timeout = Duration::from_nanos(50);
+
+        assert!(!idle_age_exceeds_timeout(
+            returned_at,
+            RuntimeTime::from_nanos(999),
+            timeout,
+        ));
+        assert!(!idle_age_exceeds_timeout(
+            returned_at,
+            RuntimeTime::from_nanos(1_050),
+            timeout,
+        ));
+        assert!(idle_age_exceeds_timeout(
+            returned_at,
+            RuntimeTime::from_nanos(1_051),
+            timeout,
+        ));
+    }
+
+    #[test]
+    fn idle_eviction_advances_only_with_labruntime_virtual_time() {
+        const SEED: u64 = 0xF001_C10C_C410_0001;
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_task = Arc::clone(&completed);
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(SEED)
+                .with_auto_advance()
+                .worker_count(1)
+                .max_steps(50_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = Cx::current().expect("LabRuntime task must expose its timer-aware Cx");
+                let pool: Pool<String> = Pool::new(PoolConfig {
+                    max_size: 1,
+                    idle_timeout: Duration::from_millis(10),
+                    acquire_timeout: Duration::from_millis(100),
+                });
+                pool.put_with_cx(&cx, "virtual-idle".to_string())
+                    .await
+                    .expect("LabRuntime pool return");
+
+                crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(10))
+                    .await
+                    .expect("virtual sleep to exact idle boundary");
+                assert_eq!(
+                    pool.evict_idle_with_cx(&cx)
+                        .await
+                        .expect("boundary eviction"),
+                    0,
+                    "the historical strict-greater-than timeout boundary must be preserved",
+                );
+
+                crate::runtime_async::sleep_with_cx(&cx, Duration::from_nanos(1))
+                    .await
+                    .expect("virtual sleep past idle boundary");
+                assert_eq!(
+                    pool.evict_idle_with_cx(&cx)
+                        .await
+                        .expect("post-boundary eviction"),
+                    1,
+                );
+                completed_task.store(true, Ordering::SeqCst);
+            })
+            .expect("spawn LabRuntime idle-eviction task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+
+        let virtual_time = runtime.run_with_auto_advance();
+        let report = runtime.run_until_quiescent_with_report();
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "idle eviction task must complete under virtual time",
+        );
+        assert!(
+            virtual_time.auto_advances >= 2,
+            "both idle-boundary sleeps must advance virtual time: {virtual_time:?}",
+        );
+        assert!(
+            report.oracle_report.all_passed(),
+            "LabRuntime oracles must all pass: {report:?}",
+        );
     }
 
     async fn wait_for_all_permits_to_be_consumed<C: Send + 'static>(pool: &Pool<C>) {

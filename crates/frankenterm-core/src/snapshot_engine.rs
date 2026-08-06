@@ -898,6 +898,10 @@ impl SnapshotEngine {
         // `cleanup_interval_hours` cadence is honored across both scheduling
         // modes (None = never run yet → triggers the startup pass).
         let mut last_session_cleanup: Option<Instant> = None;
+        // An indeterminate cleanup may already have committed. Suppress every
+        // automatic retry for the lifetime of this scheduler so a lost receipt
+        // cannot trigger another deletion pass without operator reconciliation.
+        let mut session_cleanup_reconciliation_required = false;
         match self.config.scheduling.mode {
             SnapshotSchedulingMode::Periodic => {
                 let interval_secs = self.config.interval_seconds.max(30);
@@ -926,8 +930,12 @@ impl SnapshotEngine {
                         return Err(SnapshotError::Cancelled);
                     }
 
-                    self.maybe_run_session_cleanup(cx, &mut last_session_cleanup)
-                        .await;
+                    self.maybe_run_session_cleanup(
+                        cx,
+                        &mut last_session_cleanup,
+                        &mut session_cleanup_reconciliation_required,
+                    )
+                    .await;
                     cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
 
                     let trigger = if is_first {
@@ -999,8 +1007,12 @@ impl SnapshotEngine {
                         return Err(SnapshotError::Cancelled);
                     }
 
-                    self.maybe_run_session_cleanup(cx, &mut last_session_cleanup)
-                        .await;
+                    self.maybe_run_session_cleanup(
+                        cx,
+                        &mut last_session_cleanup,
+                        &mut session_cleanup_reconciliation_required,
+                    )
+                    .await;
                     cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
 
                     // ft-83kc7: read the shutdown FLAG, do not wait for a change
@@ -1123,12 +1135,18 @@ impl SnapshotEngine {
     /// (when `last_cleanup` is `None`) always runs, and subsequent calls are
     /// skipped. A positive value reruns every N hours. The DB connection is
     /// opened fresh inside the cleanup engine (a blocking SQLite pipeline run on
-    /// the blocking pool), so this is safe to drive from the async scheduler.
+    /// the blocking pool). If its authoritative completion is lost, the
+    /// scheduler latches `reconciliation_required` and suppresses all further
+    /// automatic cleanup attempts for this process lifetime.
     async fn maybe_run_session_cleanup(
         &self,
         cx: &crate::cx::Cx,
         last_cleanup: &mut Option<Instant>,
+        reconciliation_required: &mut bool,
     ) {
+        if *reconciliation_required {
+            return;
+        }
         let interval_hours = self.config.session_retention.cleanup_interval_hours;
         if !session_cleanup_due(*last_cleanup, interval_hours, Instant::now()) {
             return;
@@ -1157,7 +1175,16 @@ impl SnapshotEngine {
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Session retention cleanup failed");
+                if e.requires_reconciliation() {
+                    *reconciliation_required = true;
+                    tracing::warn!(
+                        error = %e,
+                        automatic_retry_suppressed = true,
+                        "Session retention cleanup outcome is indeterminate; reconcile durable state before restarting cleanup"
+                    );
+                } else {
+                    tracing::warn!(error = %e, "Session retention cleanup failed");
+                }
             }
         }
     }

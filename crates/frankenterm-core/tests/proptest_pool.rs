@@ -11,7 +11,7 @@
 //! - Excess put() beyond max_size drops connections
 //! - try_acquire on empty pool with no slots returns error
 
-use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, LockAcquireError, RuntimeBuilder};
 use proptest::prelude::*;
 use std::time::Duration;
 
@@ -113,7 +113,12 @@ fn arb_pool_error() -> impl Strategy<Value = PoolError> {
         Just(PoolError::PollQuotaExhausted),
         Just(PoolError::CostBudgetExhausted),
         Just(PoolError::ContextFailure),
+        any::<u64>().prop_map(|deadline_nanos| PoolError::LockTimedOut { deadline_nanos }),
         Just(PoolError::PolledAfterCompletion),
+        Just(PoolError::LockAcquire(LockAcquireError::Poisoned)),
+        Just(PoolError::LockAcquire(
+            LockAcquireError::PolledAfterCompletion,
+        )),
     ]
 }
 
