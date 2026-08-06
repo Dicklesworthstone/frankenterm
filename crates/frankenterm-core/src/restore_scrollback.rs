@@ -22,21 +22,59 @@
 //! nesting-safe contract, but the current fail-closed injector never marks a
 //! pane suppressed because it never mutates terminal state.
 
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
+use std::fmt;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-
 use crate::error::RuntimeOperationSource;
-use crate::wezterm::WeztermHandle;
 
-fn restore_scrollback_cancelled_error(operation: &'static str) -> crate::Error {
-    crate::Error::RuntimeOperation {
-        operation,
-        // Cancellation causes may contain caller-controlled or capability
-        // internals. Keep this boundary finite and content-free.
-        source: RuntimeOperationSource::Cancelled("caller capability stopped".to_string()),
-    }
+/// Maximum number of skipped pane IDs retained for diagnostics.
+///
+/// The sample always contains the numerically smallest IDs in ascending order,
+/// making it deterministic across `HashMap` iteration orders while bounding
+/// memory to this fixed number of entries.
+pub const INJECTION_SKIPPED_SAMPLE_CAP: usize = 16;
+
+/// Number of scrollback rows scanned between cooperative capability checks.
+const INJECTION_SCAN_CHECKPOINT_INTERVAL: usize = 256;
+
+fn restore_scrollback_context_error(
+    operation: &'static str,
+    cx: &crate::cx::Cx,
+    error: &crate::runtime_async::ContextError,
+) -> crate::Error {
+    use crate::outcome::CancelKind;
+    use crate::runtime_async::ContextErrorKind;
+
+    let source = match error.kind() {
+        ContextErrorKind::DeadlineExceeded => RuntimeOperationSource::DeadlineExceeded,
+        ContextErrorKind::PollQuotaExhausted => RuntimeOperationSource::PollQuotaExhausted,
+        ContextErrorKind::CostQuotaExhausted => RuntimeOperationSource::CostBudgetExhausted,
+        ContextErrorKind::Cancelled | ContextErrorKind::CancelTimeout => {
+            match cx.root_cancel_cause().map(|reason| reason.kind) {
+                Some(CancelKind::Deadline | CancelKind::Timeout) => {
+                    RuntimeOperationSource::DeadlineExceeded
+                }
+                Some(CancelKind::PollQuota) => RuntimeOperationSource::PollQuotaExhausted,
+                Some(CancelKind::CostBudget) => RuntimeOperationSource::CostBudgetExhausted,
+                Some(
+                    CancelKind::User
+                    | CancelKind::FailFast
+                    | CancelKind::RaceLost
+                    | CancelKind::ParentCancelled
+                    | CancelKind::ResourceUnavailable
+                    | CancelKind::Shutdown
+                    | CancelKind::LinkedExit,
+                )
+                | None => RuntimeOperationSource::Cancelled(
+                    "caller capability stopped during scrollback preflight".to_string(),
+                ),
+            }
+        }
+        _ => RuntimeOperationSource::ContextFailure,
+    };
+
+    crate::Error::RuntimeOperation { operation, source }
 }
 
 fn restore_scrollback_unsupported_error() -> crate::Error {
@@ -49,35 +87,6 @@ fn restore_scrollback_unsupported_error() -> crate::Error {
 }
 
 // =============================================================================
-// Configuration
-// =============================================================================
-
-/// Configuration for scrollback injection behavior.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct InjectionConfig {
-    /// Maximum number of lines to inject per pane.
-    pub max_lines: usize,
-    /// Chunk size in bytes for each write operation.
-    pub chunk_size: usize,
-    /// Delay between chunks in milliseconds (prevents parser overload).
-    pub inter_chunk_delay_ms: u64,
-    /// Maximum number of panes to inject into concurrently.
-    pub concurrent_injections: usize,
-}
-
-impl Default for InjectionConfig {
-    fn default() -> Self {
-        Self {
-            max_lines: 10_000,
-            chunk_size: 4096,
-            inter_chunk_delay_ms: 1,
-            concurrent_injections: 5,
-        }
-    }
-}
-
-// =============================================================================
 // Scrollback data
 // =============================================================================
 
@@ -86,7 +95,7 @@ impl Default for InjectionConfig {
 /// Raw `output_segments` must not be converted with this type: each database
 /// row is an arbitrary stream fragment and may contain zero, one, or many
 /// lines, or end in the middle of a line.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ScrollbackData {
     /// Ordered lines of terminal output (may include ANSI escapes).
     pub lines: Vec<String>,
@@ -100,15 +109,27 @@ impl ScrollbackData {
 
     /// Total UTF-8 byte size of the current logical lines.
     pub fn total_bytes(&self) -> usize {
-        self.lines.iter().map(String::len).sum()
+        self.lines
+            .iter()
+            .fold(0usize, |total, line| total.saturating_add(line.len()))
     }
 
     /// Truncate to max_lines, keeping the most recent content.
     pub fn truncate(&mut self, max_lines: usize) {
         if self.lines.len() > max_lines {
-            let skip = self.lines.len() - max_lines;
-            self.lines.drain(..skip);
+            let retain_from = self.lines.len() - max_lines;
+            self.lines = self.lines.split_off(retain_from);
         }
+    }
+}
+
+impl fmt::Debug for ScrollbackData {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScrollbackData")
+            .field("line_count", &self.lines.len())
+            .field("total_bytes", &self.total_bytes())
+            .finish()
     }
 }
 
@@ -132,14 +153,18 @@ pub struct PaneInjectionStats {
 }
 
 /// Report from a scrollback injection operation.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct InjectionReport {
     /// Per-pane results for successful injections.
     pub successes: Vec<PaneInjectionStats>,
     /// Per-pane failures (old pane ID, error message).
     pub failures: Vec<(u64, String)>,
-    /// Panes skipped because they weren't in the pane ID map.
-    pub skipped: Vec<u64>,
+    /// Exact count of panes skipped because they were absent from the pane map.
+    ///
+    /// Saturates only if the platform's `usize` counter is exhausted.
+    skipped_count: usize,
+    /// Deterministic bounded sample of the smallest skipped pane IDs.
+    skipped_sample: Vec<u64>,
 }
 
 impl InjectionReport {
@@ -153,9 +178,34 @@ impl InjectionReport {
         self.failures.len()
     }
 
+    /// Exact number of skipped panes, saturating only at `usize::MAX`.
+    pub fn skipped_count(&self) -> usize {
+        self.skipped_count
+    }
+
+    /// Deterministic ascending sample of the smallest skipped pane IDs.
+    pub fn skipped_sample(&self) -> &[u64] {
+        &self.skipped_sample
+    }
+
     /// Total bytes written across all panes.
     pub fn total_bytes(&self) -> usize {
-        self.successes.iter().map(|s| s.bytes_written).sum()
+        self.successes.iter().fold(0usize, |total, pane| {
+            total.saturating_add(pane.bytes_written)
+        })
+    }
+}
+
+impl fmt::Debug for InjectionReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InjectionReport")
+            .field("success_count", &self.success_count())
+            .field("failure_count", &self.failure_count())
+            .field("total_bytes", &self.total_bytes())
+            .field("skipped_count", &self.skipped_count())
+            .field("skipped_sample", &self.skipped_sample())
+            .finish()
     }
 }
 
@@ -169,7 +219,6 @@ impl InjectionReport {
 /// detection hot path to skip detection for panes receiving injected content.
 ///
 /// The guard automatically clears suppression when dropped.
-#[derive(Debug)]
 pub struct InjectionGuard {
     suppressed: Arc<std::sync::Mutex<HashMap<u64, usize>>>,
     pane_ids: Vec<u64>,
@@ -177,22 +226,41 @@ pub struct InjectionGuard {
 
 impl InjectionGuard {
     /// Create a new injection guard that suppresses the given pane IDs.
+    ///
+    /// Duplicate IDs are counted once per guard. Lock poison and reference
+    /// counter exhaustion fail closed without partially changing the map.
     pub fn new(
         suppressed: Arc<std::sync::Mutex<HashMap<u64, usize>>>,
-        pane_ids: Vec<u64>,
-    ) -> Self {
+        mut pane_ids: Vec<u64>,
+    ) -> crate::Result<Self> {
+        pane_ids.sort_unstable();
+        pane_ids.dedup();
+
         {
             let mut set = suppressed
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .map_err(|_error| crate::Error::RuntimeOperation {
+                    operation: "restore_scrollback.suppression_guard.acquire",
+                    source: RuntimeOperationSource::LockPoisoned,
+                })?;
+            if pane_ids
+                .iter()
+                .any(|id| set.get(id).is_some_and(|count| *count == usize::MAX))
+            {
+                return Err(crate::Error::RuntimeOperation {
+                    operation: "restore_scrollback.suppression_guard.acquire",
+                    source: RuntimeOperationSource::ContextFailure,
+                });
+            }
             for &id in &pane_ids {
-                *set.entry(id).or_insert(0) += 1;
+                let count = set.entry(id).or_insert(0);
+                *count += 1;
             }
         }
-        Self {
+        Ok(Self {
             suppressed,
             pane_ids,
-        }
+        })
     }
 
     /// Check if a pane ID is currently suppressed.
@@ -200,24 +268,40 @@ impl InjectionGuard {
         suppressed: &Arc<std::sync::Mutex<HashMap<u64, usize>>>,
         pane_id: u64,
     ) -> bool {
-        suppressed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&pane_id)
-            .is_some_and(|count| *count > 0)
+        match suppressed.lock() {
+            Ok(set) => set.get(&pane_id).is_some_and(|count| *count > 0),
+            // A poisoned suppression map has unknown state. Suppressing is the
+            // fail-closed answer: it cannot create detections from historical
+            // content while the guard authority is uncertain.
+            Err(_) => true,
+        }
+    }
+}
+
+impl fmt::Debug for InjectionGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InjectionGuard")
+            .field("pane_count", &self.pane_ids.len())
+            .finish_non_exhaustive()
     }
 }
 
 impl Drop for InjectionGuard {
     fn drop(&mut self) {
-        let mut set = self
-            .suppressed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Ok(mut set) = self.suppressed.lock() else {
+            // Retaining suppression is safer than mutating uncertain poisoned
+            // state and accidentally re-enabling historical-content detection.
+            return;
+        };
         for &id in &self.pane_ids {
             let remove = if let Some(count) = set.get_mut(&id) {
-                *count = count.saturating_sub(1);
-                *count == 0
+                if *count == 0 {
+                    false
+                } else {
+                    *count -= 1;
+                    *count == 0
+                }
             } else {
                 false
             };
@@ -233,22 +317,20 @@ impl Drop for InjectionGuard {
 // =============================================================================
 
 /// Capability gate for future mux-owned scrollback restoration.
+#[derive(Default)]
 pub struct ScrollbackInjector {
     /// Shared suppression set for pattern detection gating.
     suppressed_panes: Arc<std::sync::Mutex<HashMap<u64, usize>>>,
 }
 
 impl ScrollbackInjector {
-    /// Create a capability gate.
+    /// Create the fail-closed capability gate.
     ///
-    /// The mux handle and tuning parameters are accepted as the future
-    /// restoration-channel boundary but are deliberately not retained while
-    /// that channel is unavailable. This avoids extending mux resource
-    /// lifetimes for an operation that must fail before touching the mux.
-    pub fn new(_wezterm: WeztermHandle, _config: InjectionConfig) -> Self {
-        Self {
-            suppressed_panes: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        }
+    /// No mux handle or replay tuning is accepted: neither can affect behavior
+    /// until a safe mux-owned terminal-state restoration channel exists.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Get a reference to the suppressed panes set for pattern engine integration.
@@ -262,8 +344,9 @@ impl ScrollbackInjector {
     /// `scrollbacks` maps old pane IDs to their captured scrollback data.
     ///
     /// Unsupported mapped panes and cancellation are returned as typed errors.
-    /// [`InjectionReport::skipped`] is reserved for old pane IDs absent from
-    /// `pane_id_map`.
+    /// [`InjectionReport::skipped_count`] and
+    /// [`InjectionReport::skipped_sample`] describe old pane IDs absent from
+    /// `pane_id_map` without retaining an unbounded ID list.
     pub async fn inject(
         &self,
         pane_id_map: &HashMap<u64, u64>,
@@ -293,24 +376,43 @@ impl ScrollbackInjector {
         pane_id_map: &HashMap<u64, u64>,
         scrollbacks: &HashMap<u64, ScrollbackData>,
     ) -> crate::Result<InjectionReport> {
-        cx.checkpoint().map_err(|_err| {
-            restore_scrollback_cancelled_error("restore_scrollback.inject.pre_flight")
-        })?;
-        // Mapped data cannot be restored safely today. Detect it before
-        // allocating or sorting the potentially huge unmapped-ID report.
-        if scrollbacks
-            .keys()
-            .any(|old_pane_id| pane_id_map.contains_key(old_pane_id))
-        {
-            return Err(restore_scrollback_unsupported_error());
+        const OPERATION: &str = "restore_scrollback.inject.preflight";
+
+        cx.checkpoint()
+            .map_err(|error| restore_scrollback_context_error(OPERATION, cx, &error))?;
+
+        let mut skipped_count = 0usize;
+        let mut smallest_skipped = BinaryHeap::with_capacity(INJECTION_SKIPPED_SAMPLE_CAP);
+        for (index, old_pane_id) in scrollbacks.keys().copied().enumerate() {
+            if index != 0 && index % INJECTION_SCAN_CHECKPOINT_INTERVAL == 0 {
+                cx.checkpoint()
+                    .map_err(|error| restore_scrollback_context_error(OPERATION, cx, &error))?;
+            }
+
+            // Any mapped data requires a terminal-state output channel. Return
+            // before allocating, formatting, suppressing, or touching the mux.
+            if pane_id_map.contains_key(&old_pane_id) {
+                return Err(restore_scrollback_unsupported_error());
+            }
+
+            skipped_count = skipped_count.saturating_add(1);
+            if smallest_skipped.len() < INJECTION_SKIPPED_SAMPLE_CAP {
+                smallest_skipped.push(old_pane_id);
+            } else if smallest_skipped
+                .peek()
+                .is_some_and(|largest_sampled| old_pane_id < *largest_sampled)
+            {
+                let _ = smallest_skipped.pop();
+                smallest_skipped.push(old_pane_id);
+            }
         }
-        let mut skipped = scrollbacks
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        skipped.sort_unstable();
+
+        cx.checkpoint()
+            .map_err(|error| restore_scrollback_context_error(OPERATION, cx, &error))?;
+
         Ok(InjectionReport {
-            skipped,
+            skipped_count,
+            skipped_sample: smallest_skipped.into_sorted_vec(),
             ..InjectionReport::default()
         })
     }
@@ -321,7 +423,10 @@ impl ScrollbackInjector {
 // production build so no caller can turn reconstructed content into PTY input.
 #[cfg(test)]
 fn build_injection_content(lines: &[String]) -> String {
-    let mut content = String::with_capacity(lines.iter().map(|line| line.len() + 1).sum());
+    let capacity = lines.iter().fold(0usize, |total, line| {
+        total.saturating_add(line.len().saturating_add(1))
+    });
+    let mut content = String::with_capacity(capacity);
     content.push_str("\x1b[0m\x1b[H\x1b[2J");
     for (index, line) in lines.iter().enumerate() {
         content.push_str(line);
@@ -341,7 +446,7 @@ fn chunk_content(content: &str, chunk_size: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut start = 0;
     while start < content.len() {
-        let target = (start + chunk_size).min(content.len());
+        let target = start.saturating_add(chunk_size).min(content.len());
         let end = if target < content.len() {
             find_safe_split(content, start, target)
         } else {
@@ -421,8 +526,8 @@ mod tests {
         }
     }
 
-    fn make_injector(mock: Arc<MockWezterm>) -> ScrollbackInjector {
-        ScrollbackInjector::new(mock, InjectionConfig::default())
+    fn make_injector() -> ScrollbackInjector {
+        ScrollbackInjector::new()
     }
 
     fn mock_scrollback(lines: Vec<&str>) -> ScrollbackData {
@@ -430,21 +535,50 @@ mod tests {
     }
 
     #[test]
-    fn restore_scrollback_cancelled_error_uses_structured_runtime_operation() {
-        let err = restore_scrollback_cancelled_error(
-            "restore_scrollback.test_checkpoint",
-            "caller cancelled",
-        );
+    fn restore_scrollback_context_error_preserves_finite_error_kind() {
+        use crate::runtime_async::{ContextError, ContextErrorKind};
 
-        match err {
-            crate::Error::RuntimeOperation { operation, source } => {
-                assert_eq!(operation, "restore_scrollback.test_checkpoint");
-                assert_eq!(
-                    source,
-                    RuntimeOperationSource::Cancelled("caller capability stopped".to_string())
-                );
+        let cx = crate::cx::for_request();
+        let cases = [
+            (
+                ContextErrorKind::DeadlineExceeded,
+                RuntimeOperationSource::DeadlineExceeded,
+            ),
+            (
+                ContextErrorKind::PollQuotaExhausted,
+                RuntimeOperationSource::PollQuotaExhausted,
+            ),
+            (
+                ContextErrorKind::CostQuotaExhausted,
+                RuntimeOperationSource::CostBudgetExhausted,
+            ),
+            (
+                ContextErrorKind::Cancelled,
+                RuntimeOperationSource::Cancelled(
+                    "caller capability stopped during scrollback preflight".to_string(),
+                ),
+            ),
+            (
+                ContextErrorKind::Internal,
+                RuntimeOperationSource::ContextFailure,
+            ),
+        ];
+
+        for (kind, expected) in cases {
+            let source_error = ContextError::new(kind).with_message("raw-context-canary");
+            let error = restore_scrollback_context_error(
+                "restore_scrollback.test_checkpoint",
+                &cx,
+                &source_error,
+            );
+            match error {
+                crate::Error::RuntimeOperation { operation, source } => {
+                    assert_eq!(operation, "restore_scrollback.test_checkpoint");
+                    assert_eq!(source, expected);
+                    assert!(!format!("{source:?}").contains("raw-context-canary"));
+                }
+                other => panic!("expected structured runtime operation, got {other:?}"),
             }
-            other => panic!("expected structured runtime operation, got {other:?}"),
         }
     }
 
@@ -473,15 +607,14 @@ mod tests {
         assert_eq!(data.lines.len(), 2);
     }
 
-    // --- InjectionConfig defaults ---
-
     #[test]
-    fn injection_config_defaults() {
-        let c = InjectionConfig::default();
-        assert_eq!(c.max_lines, 10_000);
-        assert_eq!(c.chunk_size, 4096);
-        assert_eq!(c.inter_chunk_delay_ms, 1);
-        assert_eq!(c.concurrent_injections, 5);
+    fn scrollback_data_debug_is_content_free() {
+        let data = ScrollbackData::from_terminal_lines(vec!["raw-terminal-canary".into()]);
+        let debug = format!("{data:?}");
+
+        assert!(debug.contains("line_count: 1"));
+        assert!(debug.contains("total_bytes: 19"));
+        assert!(!debug.contains("raw-terminal-canary"));
     }
 
     // --- InjectionReport ---
@@ -492,6 +625,8 @@ mod tests {
         assert_eq!(r.success_count(), 0);
         assert_eq!(r.failure_count(), 0);
         assert_eq!(r.total_bytes(), 0);
+        assert_eq!(r.skipped_count(), 0);
+        assert!(r.skipped_sample().is_empty());
     }
 
     #[test]
@@ -517,6 +652,46 @@ mod tests {
         assert_eq!(r.total_bytes(), 8000);
     }
 
+    #[test]
+    fn injection_report_total_bytes_saturates() {
+        let report = InjectionReport {
+            successes: vec![
+                PaneInjectionStats {
+                    old_pane_id: 1,
+                    new_pane_id: 10,
+                    lines_injected: 0,
+                    bytes_written: usize::MAX,
+                    chunks_sent: 0,
+                },
+                PaneInjectionStats {
+                    old_pane_id: 2,
+                    new_pane_id: 11,
+                    lines_injected: 0,
+                    bytes_written: 1,
+                    chunks_sent: 0,
+                },
+            ],
+            ..InjectionReport::default()
+        };
+
+        assert_eq!(report.total_bytes(), usize::MAX);
+    }
+
+    #[test]
+    fn injection_report_debug_is_bounded_and_content_free() {
+        let report = InjectionReport {
+            failures: vec![(7, "raw-backend-canary".into())],
+            skipped_count: 1,
+            skipped_sample: vec![7],
+            ..InjectionReport::default()
+        };
+        let debug = format!("{report:?}");
+
+        assert!(debug.contains("failure_count: 1"));
+        assert!(debug.contains("skipped_count: 1"));
+        assert!(!debug.contains("raw-backend-canary"));
+    }
+
     // --- InjectionGuard ---
 
     #[test]
@@ -525,7 +700,7 @@ mod tests {
         assert!(!InjectionGuard::is_suppressed(&set, 42));
 
         {
-            let _guard = InjectionGuard::new(set.clone(), vec![42, 43]);
+            let _guard = InjectionGuard::new(set.clone(), vec![42, 43]).unwrap();
             assert!(InjectionGuard::is_suppressed(&set, 42));
             assert!(InjectionGuard::is_suppressed(&set, 43));
             assert!(!InjectionGuard::is_suppressed(&set, 99));
@@ -617,7 +792,7 @@ mod tests {
         run_async_test(async {
             let mock = Arc::new(MockWezterm::new());
             mock.add_default_pane(10).await;
-            let injector = make_injector(mock.clone());
+            let injector = make_injector();
 
             let mut pane_id_map = HashMap::new();
             pane_id_map.insert(1_u64, 10_u64);
@@ -641,7 +816,7 @@ mod tests {
             let mock = Arc::new(MockWezterm::new());
             mock.add_default_pane(10).await;
             mock.add_default_pane(11).await;
-            let injector = make_injector(mock.clone());
+            let injector = make_injector();
 
             let mut pane_id_map = HashMap::new();
             pane_id_map.insert(1_u64, 10_u64);
@@ -666,7 +841,7 @@ mod tests {
             let mock = Arc::new(MockWezterm::new());
             mock.add_default_pane(10).await;
             mock.add_default_pane(11).await;
-            let injector = make_injector(mock.clone());
+            let injector = make_injector();
 
             let mut pane_id_map = HashMap::new();
             pane_id_map.insert(1_u64, 10_u64);
@@ -698,7 +873,7 @@ mod tests {
     fn inject_skips_unmapped_panes() {
         run_async_test(async {
             let mock = Arc::new(MockWezterm::new());
-            let injector = make_injector(mock.clone());
+            let injector = make_injector();
 
             let pane_id_map = HashMap::new(); // Empty — no mappings.
 
@@ -708,8 +883,8 @@ mod tests {
             let report = injector.inject(&pane_id_map, &scrollbacks).await.unwrap();
 
             assert_eq!(report.success_count(), 0);
-            assert_eq!(report.skipped.len(), 1);
-            assert_eq!(report.skipped[0], 1);
+            assert_eq!(report.skipped_count(), 1);
+            assert_eq!(report.skipped_sample(), &[1]);
         });
     }
 
@@ -718,7 +893,7 @@ mod tests {
         run_async_test(async {
             let mock = Arc::new(MockWezterm::new());
             mock.add_default_pane(10).await;
-            let injector = make_injector(mock.clone());
+            let injector = make_injector();
 
             let mut pane_id_map = HashMap::new();
             pane_id_map.insert(1_u64, 10_u64);
@@ -738,11 +913,7 @@ mod tests {
         run_async_test(async {
             let mock = Arc::new(MockWezterm::new());
             mock.add_default_pane(10).await;
-            let config = InjectionConfig {
-                max_lines: 3,
-                ..Default::default()
-            };
-            let injector = ScrollbackInjector::new(mock.clone(), config);
+            let injector = ScrollbackInjector::new();
 
             let mut pane_id_map = HashMap::new();
             pane_id_map.insert(1_u64, 10_u64);
@@ -764,8 +935,7 @@ mod tests {
     #[test]
     fn inject_no_scrollbacks() {
         run_async_test(async {
-            let mock = Arc::new(MockWezterm::new());
-            let injector = make_injector(mock.clone());
+            let injector = make_injector();
 
             let pane_id_map = HashMap::new();
             let scrollbacks = HashMap::new();
@@ -774,7 +944,36 @@ mod tests {
 
             assert_eq!(report.success_count(), 0);
             assert_eq!(report.failure_count(), 0);
-            assert_eq!(report.skipped.len(), 0);
+            assert_eq!(report.skipped_count(), 0);
+            assert!(report.skipped_sample().is_empty());
+        });
+    }
+
+    #[test]
+    fn skipped_diagnostics_retain_only_deterministic_smallest_ids() {
+        run_async_test(async {
+            let injector = make_injector();
+            let pane_id_map = HashMap::new();
+            let scrollbacks = (0..(INJECTION_SKIPPED_SAMPLE_CAP as u64 + 37))
+                .rev()
+                .map(|pane_id| {
+                    (
+                        pane_id,
+                        ScrollbackData::from_terminal_lines(Vec::new()),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+
+            let report = injector.inject(&pane_id_map, &scrollbacks).await.unwrap();
+
+            assert_eq!(report.skipped_count(), scrollbacks.len());
+            assert_eq!(report.skipped_sample().len(), INJECTION_SKIPPED_SAMPLE_CAP);
+            assert_eq!(
+                report.skipped_sample(),
+                (0..INJECTION_SKIPPED_SAMPLE_CAP as u64)
+                    .collect::<Vec<_>>()
+                    .as_slice()
+            );
         });
     }
 
@@ -783,7 +982,7 @@ mod tests {
         run_async_test(async {
             let mock = Arc::new(MockWezterm::new());
             mock.add_default_pane(10).await;
-            let injector = make_injector(mock.clone());
+            let injector = make_injector();
             let suppressed = injector.suppressed_panes().clone();
 
             // Before injection: not suppressed.
@@ -858,7 +1057,7 @@ mod tests {
     #[test]
     fn injection_guard_empty_pane_list() {
         let set = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let _guard = InjectionGuard::new(set.clone(), vec![]);
+        let _guard = InjectionGuard::new(set.clone(), vec![]).unwrap();
         // No panes suppressed
         assert!(!InjectionGuard::is_suppressed(&set, 1));
         assert!(!InjectionGuard::is_suppressed(&set, 0));
@@ -867,8 +1066,8 @@ mod tests {
     #[test]
     fn injection_guard_overlapping_guards() {
         let set = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let guard1 = InjectionGuard::new(set.clone(), vec![1, 2]);
-        let guard2 = InjectionGuard::new(set.clone(), vec![2, 3]);
+        let guard1 = InjectionGuard::new(set.clone(), vec![1, 2]).unwrap();
+        let guard2 = InjectionGuard::new(set.clone(), vec![2, 3]).unwrap();
 
         assert!(InjectionGuard::is_suppressed(&set, 1));
         assert!(InjectionGuard::is_suppressed(&set, 2));
@@ -889,11 +1088,55 @@ mod tests {
     fn injection_guard_duplicate_pane_ids() {
         let set = Arc::new(std::sync::Mutex::new(HashMap::new()));
         {
-            let _guard = InjectionGuard::new(set.clone(), vec![42, 42, 42]);
+            let _guard = InjectionGuard::new(set.clone(), vec![42, 42, 42]).unwrap();
             assert!(InjectionGuard::is_suppressed(&set, 42));
+            assert_eq!(set.lock().unwrap().get(&42), Some(&1));
         }
         // After drop, suppression cleared even with duplicates
         assert!(!InjectionGuard::is_suppressed(&set, 42));
+    }
+
+    #[test]
+    fn injection_guard_reference_overflow_fails_without_partial_mutation() {
+        let set = Arc::new(std::sync::Mutex::new(HashMap::from([
+            (41, 7),
+            (42, usize::MAX),
+        ])));
+
+        let error = InjectionGuard::new(set.clone(), vec![41, 42])
+            .expect_err("reference-count exhaustion must fail closed");
+
+        assert!(matches!(
+            error,
+            crate::Error::RuntimeOperation {
+                operation: "restore_scrollback.suppression_guard.acquire",
+                source: RuntimeOperationSource::ContextFailure,
+            }
+        ));
+        let counts = set.lock().unwrap();
+        assert_eq!(counts.get(&41), Some(&7));
+        assert_eq!(counts.get(&42), Some(&usize::MAX));
+    }
+
+    #[test]
+    fn injection_guard_lock_poison_fails_closed() {
+        let set = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let poison_target = set.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _locked = poison_target.lock().unwrap();
+            panic!("poison suppression map for test");
+        });
+
+        assert!(InjectionGuard::is_suppressed(&set, 42));
+        let error = InjectionGuard::new(set, vec![42])
+            .expect_err("poisoned suppression authority must reject a new guard");
+        assert!(matches!(
+            error,
+            crate::Error::RuntimeOperation {
+                operation: "restore_scrollback.suppression_guard.acquire",
+                source: RuntimeOperationSource::LockPoisoned,
+            }
+        ));
     }
 
     // --- InjectionReport edge cases ---
@@ -1041,64 +1284,4 @@ mod tests {
         assert!(content.is_char_boundary(pos));
     }
 
-    // --- InjectionConfig serde ---
-
-    #[test]
-    fn injection_config_serde_roundtrip() {
-        let config = InjectionConfig {
-            max_lines: 5000,
-            chunk_size: 2048,
-            inter_chunk_delay_ms: 5,
-            concurrent_injections: 10,
-        };
-        let json = serde_json::to_string(&config).unwrap();
-        let parsed: InjectionConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.max_lines, 5000);
-        assert_eq!(parsed.chunk_size, 2048);
-        assert_eq!(parsed.inter_chunk_delay_ms, 5);
-        assert_eq!(parsed.concurrent_injections, 10);
-    }
-
-    #[test]
-    fn injection_config_serde_defaults_on_missing() {
-        let json = "{}";
-        let parsed: InjectionConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.max_lines, 10_000);
-        assert_eq!(parsed.chunk_size, 4096);
-    }
-
-    // --- Chunked injection ---
-
-    #[test]
-    fn chunk_configuration_cannot_reenable_pty_replay() {
-        run_async_test(async {
-            let mock = Arc::new(MockWezterm::new());
-            mock.add_default_pane(10).await;
-            let config = InjectionConfig {
-                chunk_size: 16, // Very small chunks.
-                inter_chunk_delay_ms: 0,
-                ..Default::default()
-            };
-            let injector = ScrollbackInjector::new(mock.clone(), config);
-
-            let mut pane_id_map = HashMap::new();
-            pane_id_map.insert(1_u64, 10_u64);
-
-            let mut scrollbacks = HashMap::new();
-            scrollbacks.insert(
-                1,
-                mock_scrollback(vec![
-                    "this is a longer line that will require multiple chunks",
-                ]),
-            );
-
-            injector
-                .inject(&pane_id_map, &scrollbacks)
-                .await
-                .expect_err("chunk configuration must not re-enable PTY replay");
-
-            let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
-            assert!(text.is_empty());
-        });
-    }
 }
