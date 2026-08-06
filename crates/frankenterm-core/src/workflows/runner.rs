@@ -1680,14 +1680,50 @@ impl WorkflowRunner {
                 StepResult::JumpTo { step } => {
                     jump_count += 1;
                     if jump_count > max_total_jumps {
+                        let reason = format!("exceeded maximum jump count ({max_total_jumps})");
                         tracing::error!(
                             execution_id,
                             jump_count,
                             "Workflow exceeded maximum jump count ({max_total_jumps}); aborting to prevent infinite loop"
                         );
+                        workflow.cleanup(&mut ctx).await;
+                        if let Err(error) = self
+                            .persist_aborted_execution_with_cx(
+                                cx,
+                                execution_id,
+                                &reason,
+                                "aborted",
+                            )
+                            .await
+                        {
+                            return workflow_execution_error(
+                                execution_id,
+                                format!("{reason}; abort settlement failed: {error}"),
+                            );
+                        }
+                        if let Err(error) = record_workflow_terminal_action_with_cx(
+                            cx,
+                            &self.storage,
+                            &workflow_name,
+                            execution_id,
+                            pane_id,
+                            "workflow_aborted",
+                            "aborted",
+                            Some(&reason),
+                            Some(current_step),
+                            Some(current_step.saturating_add(1)),
+                            start_action_id,
+                        )
+                        .await
+                        {
+                            return workflow_execution_error(
+                                execution_id,
+                                format!("{reason}; terminal audit failed: {error}"),
+                            );
+                        }
                         return WorkflowExecutionResult::Aborted {
                             execution_id: execution_id.to_string(),
-                            reason: format!("exceeded maximum jump count ({max_total_jumps})"),
+                            reason,
                             step_index: current_step,
                             elapsed_ms: elapsed_ms(start_time),
                         };
@@ -3408,10 +3444,27 @@ impl WorkflowRunner {
         execution_id: &str,
         result: Option<serde_json::Value>,
     ) -> crate::Result<()> {
-        self.complete_execution_with_cx(cx, execution_id, result)
-            .await?;
-        self.mark_trigger_event_handled_with_cx(cx, execution_id, "completed")
-            .await
+        // Completion persistence can fail after the workflow row itself is
+        // durable (for example, while writing the usage metric). Trigger
+        // settlement must still be attempted or the source event remains
+        // replayable and can duplicate already-completed side effects.
+        let completion_result = self
+            .complete_execution_with_cx(cx, execution_id, result)
+            .await;
+        let trigger_result = self
+            .mark_trigger_event_handled_with_cx(cx, execution_id, "completed")
+            .await;
+        match (completion_result, trigger_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(completion_error), Err(trigger_error)) => Err(crate::Error::Workflow(
+                crate::error::WorkflowError::Aborted(format!(
+                    "workflow completion persistence failed: {completion_error}; trigger \
+                     settlement failed: {trigger_error}"
+                )),
+            )),
+        }
     }
 
     async fn persist_aborted_execution_with_cx(
