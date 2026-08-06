@@ -3,7 +3,9 @@
 //! Provides fast, reliable detection of agent state transitions.
 #![allow(unexpected_cfgs)]
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(not(feature = "patterns-fingerprint-dedup"))]
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -465,14 +467,6 @@ fn dedup_fingerprint_separator(hash: u128, separator: u8) -> u128 {
 }
 
 #[cfg(feature = "patterns-fingerprint-dedup")]
-fn dedup_fingerprint_from_key(key: &str) -> u128 {
-    dedup_fingerprint_update(
-        dedup_fingerprint_separator(DEDUP_FINGERPRINT_OFFSET, 0x01),
-        key.as_bytes(),
-    )
-}
-
-#[cfg(feature = "patterns-fingerprint-dedup")]
 fn dedup_fingerprint_from_parts(rule_id: &str, mut parts: Vec<DedupFingerprintPart<'_>>) -> u128 {
     parts.sort_by(|left, right| {
         left.name
@@ -608,12 +602,15 @@ pub struct DetectionContext {
     pub agent_type: Option<AgentType>,
     /// Previously seen dedup keys with last-seen timestamp and recency
     /// generation, used to avoid re-emitting (ft-zo4hw).
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
     seen_keys: HashMap<String, SeenEntry>,
     /// Order of seen keys as `(key, generation)` tokens for LRU eviction.
     /// Refresh is O(1): a new token is pushed and the superseded one is skipped
     /// lazily, replacing the prior O(n) string position-scan + remove.
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
     seen_order: VecDeque<(String, u64)>,
     /// Monotonic recency counter stamping `seen_order` tokens.
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
     seen_generation: u64,
     #[cfg(feature = "patterns-fingerprint-dedup")]
     /// Fingerprint-indexed dedup table for the default-off Q6 path.
@@ -636,6 +633,7 @@ pub struct DetectionContext {
 
 /// Dedup entry: last-seen timestamp plus the recency generation that stamps
 /// this key's live `seen_order` token (ft-zo4hw).
+#[cfg(not(feature = "patterns-fingerprint-dedup"))]
 #[derive(Debug, Clone, Copy)]
 struct SeenEntry {
     last_seen: Instant,
@@ -672,8 +670,11 @@ impl DetectionContext {
         Self {
             pane_id: None,
             agent_type: None,
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
             seen_keys: HashMap::new(),
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
             seen_order: VecDeque::new(),
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
             seen_generation: 0,
             #[cfg(feature = "patterns-fingerprint-dedup")]
             seen_fingerprints: HashMap::new(),
@@ -696,8 +697,11 @@ impl DetectionContext {
         Self {
             pane_id: None,
             agent_type: Some(agent_type),
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
             seen_keys: HashMap::new(),
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
             seen_order: VecDeque::new(),
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
             seen_generation: 0,
             #[cfg(feature = "patterns-fingerprint-dedup")]
             seen_fingerprints: HashMap::new(),
@@ -720,8 +724,11 @@ impl DetectionContext {
         Self {
             pane_id: Some(pane_id),
             agent_type,
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
             seen_keys: HashMap::new(),
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
             seen_order: VecDeque::new(),
+            #[cfg(not(feature = "patterns-fingerprint-dedup"))]
             seen_generation: 0,
             #[cfg(feature = "patterns-fingerprint-dedup")]
             seen_fingerprints: HashMap::new(),
@@ -753,51 +760,46 @@ impl DetectionContext {
         self.mark_seen_key(detection.dedup_key())
     }
 
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
     fn mark_seen_key(&mut self, key: String) -> bool {
-        #[cfg(feature = "patterns-fingerprint-dedup")]
-        {
-            return self.mark_seen_fingerprint(dedup_fingerprint_from_key(&key));
-        }
-        #[cfg(not(feature = "patterns-fingerprint-dedup"))]
-        {
-            let now = Instant::now();
+        let now = Instant::now();
 
-            // Check if seen and valid (not expired)
-            if let Some(entry) = self.seen_keys.get(&key) {
-                if now.duration_since(entry.last_seen) < self.ttl {
-                    return false;
-                }
+        // Check if seen and valid (not expired)
+        if let Some(entry) = self.seen_keys.get(&key) {
+            if now.duration_since(entry.last_seen) < self.ttl {
+                return false;
             }
-
-            // New or expired key: (re)insert with a fresh recency generation. The
-            // key's prior `seen_order` token (if any) becomes stale and is dropped
-            // lazily on eviction/compaction — no O(n) string position-scan per mark
-            // (ft-zo4hw). The HASH map still holds at most one entry per key, so
-            // re-marking an expired key never inflates `seen_count`.
-            let is_new_key = !self.seen_keys.contains_key(&key);
-
-            // Enforce capacity only when adding a genuinely new key.
-            if is_new_key && self.seen_keys.len() >= Self::MAX_SEEN_KEYS {
-                self.evict_oldest_seen();
-            }
-
-            let generation = self.next_seen_generation();
-            self.seen_keys.insert(
-                key.clone(),
-                SeenEntry {
-                    last_seen: now,
-                    generation,
-                },
-            );
-            // Push to back of order for LRU-style eviction.
-            self.seen_order.push_back((key, generation));
-            self.compact_seen_order_if_needed();
-            true
         }
+
+        // New or expired key: (re)insert with a fresh recency generation. The
+        // key's prior `seen_order` token (if any) becomes stale and is dropped
+        // lazily on eviction/compaction — no O(n) string position-scan per mark
+        // (ft-zo4hw). The HASH map still holds at most one entry per key, so
+        // re-marking an expired key never inflates `seen_count`.
+        let is_new_key = !self.seen_keys.contains_key(&key);
+
+        // Enforce capacity only when adding a genuinely new key.
+        if is_new_key && self.seen_keys.len() >= Self::MAX_SEEN_KEYS {
+            self.evict_oldest_seen();
+        }
+
+        let generation = self.next_seen_generation();
+        self.seen_keys.insert(
+            key.clone(),
+            SeenEntry {
+                last_seen: now,
+                generation,
+            },
+        );
+        // Push to back of order for LRU-style eviction.
+        self.seen_order.push_back((key, generation));
+        self.compact_seen_order_if_needed();
+        true
     }
 
     /// Next monotonic recency generation (wraps defensively; unreachable in
     /// practice).
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
     fn next_seen_generation(&mut self) -> u64 {
         self.seen_generation = self.seen_generation.wrapping_add(1);
         self.seen_generation
@@ -806,6 +808,7 @@ impl DetectionContext {
     /// Evict the least-recently-seen live key, skipping superseded tokens in
     /// O(1) each (ft-zo4hw). The frontmost live token is the true LRU key
     /// because a key's current-generation token is its most recently pushed.
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
     fn evict_oldest_seen(&mut self) {
         while let Some((key, generation)) = self.seen_order.pop_front() {
             // Count each examined token (ft-wo323 amortized-O(1) guard).
@@ -825,6 +828,7 @@ impl DetectionContext {
     /// Amortized O(1) per mark: at most one stale token is added per refresh, so
     /// this O(n) retain runs at most once per `MAX_SEEN_KEYS` refreshes,
     /// bounding `seen_order` to <= 2x capacity even under repeated re-marks.
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
     fn compact_seen_order_if_needed(&mut self) {
         if self.seen_order.len() <= Self::MAX_SEEN_KEYS.saturating_mul(2) {
             return;
@@ -852,18 +856,12 @@ impl DetectionContext {
     }
 
     #[must_use]
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
     fn is_seen_key(&self, key: &str) -> bool {
-        #[cfg(feature = "patterns-fingerprint-dedup")]
-        {
-            return self.is_seen_fingerprint(dedup_fingerprint_from_key(key));
-        }
-        #[cfg(not(feature = "patterns-fingerprint-dedup"))]
-        {
-            if let Some(entry) = self.seen_keys.get(key) {
-                Instant::now().duration_since(entry.last_seen) < self.ttl
-            } else {
-                false
-            }
+        if let Some(entry) = self.seen_keys.get(key) {
+            Instant::now().duration_since(entry.last_seen) < self.ttl
+        } else {
+            false
         }
     }
 
@@ -997,8 +995,11 @@ impl DetectionContext {
     /// starting from a new context. Both the dedup state and the cross-segment
     /// matching buffer are reset.
     pub fn clear_seen(&mut self) {
-        self.seen_keys.clear();
-        self.seen_order.clear();
+        #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+        {
+            self.seen_keys.clear();
+            self.seen_order.clear();
+        }
         #[cfg(feature = "patterns-fingerprint-dedup")]
         {
             self.seen_fingerprints.clear();
@@ -5181,7 +5182,10 @@ impl PatternEngine {
         extracted
     }
 
-    #[cfg(feature = "patterns-lazy-captures")]
+    #[cfg(all(
+        feature = "patterns-lazy-captures",
+        not(feature = "patterns-fingerprint-dedup")
+    ))]
     fn dedup_key_from_captures(
         rule_id: &str,
         compiled: &CompiledRule,
@@ -8198,6 +8202,7 @@ rules:
         assert!(!after_clear.is_empty(), "Should detect after clearing seen");
     }
 
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
     #[test]
     fn clear_seen_resets_seen_order_and_tail_buffer() {
         let mut ctx = DetectionContext::new();
@@ -8218,6 +8223,7 @@ rules:
         assert_eq!(ctx.seen_order.len(), 1);
     }
 
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
     #[test]
     fn mark_seen_key_refreshes_expired_key_without_unbounded_order_growth() {
         // ft-zo4hw: refresh is now O(1) (lazy token invalidation) rather than
@@ -8245,6 +8251,7 @@ rules:
 
     // ft-wo323: perf-regression guards for the ft-zo4hw amortized-O(1) dedup.
 
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
     #[test]
     fn mark_seen_key_does_no_scan_below_compaction_threshold() {
         // Marking distinct new keys below the eviction/compaction thresholds
@@ -8264,6 +8271,7 @@ rules:
         );
     }
 
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
     #[test]
     fn mark_seen_key_is_amortized_o1_under_repeated_expired_marks() {
         // Re-marking one expired key N times: total maintenance work must be
@@ -8285,6 +8293,7 @@ rules:
         assert_eq!(ctx.seen_count(), 1);
     }
 
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
     #[test]
     fn mark_seen_key_eviction_churn_is_amortized_o1() {
         // Marking N distinct new keys into a full dedup set forces N evictions;
@@ -8307,6 +8316,7 @@ rules:
         assert_eq!(ctx.seen_count(), DetectionContext::MAX_SEEN_KEYS);
     }
 
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
     #[test]
     fn mark_seen_key_matches_reference_model_under_random_marks() {
         // Property test: with a TTL long enough that nothing expires, dedup is
@@ -11050,7 +11060,11 @@ rules:
             "fingerprint dedup must emit the same first-seen detections as the string-key oracle"
         );
         assert_eq!(context.seen_count(), string_key_oracle.len());
-        assert_eq!(context.seen_keys.len(), 0);
+        assert_eq!(
+            context.seen_fingerprints.len(),
+            string_key_oracle.len(),
+            "fingerprint mode must store exactly one fingerprint per oracle key"
+        );
 
         let repeat = engine.detect_with_context(text, &mut context);
         assert!(

@@ -1012,29 +1012,7 @@ fn build_workflow_audit_decision_context(
     Ok(serde_json::to_string(&context)?)
 }
 
-pub(super) async fn record_workflow_start_action(
-    storage: &crate::storage::StorageHandle,
-    workflow_name: &str,
-    execution_id: &str,
-    pane_id: u64,
-    step_count: usize,
-    start_step: usize,
-) -> crate::Result<i64> {
-    // ft-dit9w: ergonomic wrapper around `record_workflow_start_action_with_cx`.
-    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-    record_workflow_start_action_with_cx(
-        &cx,
-        storage,
-        workflow_name,
-        execution_id,
-        pane_id,
-        step_count,
-        start_step,
-    )
-    .await
-}
-
-/// ft-xbnl0.2.3 Cx-first sibling of [`record_workflow_start_action`].
+/// Record a workflow-start audit action under the caller's capability context.
 ///
 /// Routes both the audit-action write and undo-metadata upsert through their
 /// Cx-first storage siblings without collapsing either failure.
@@ -1089,16 +1067,7 @@ pub(super) async fn record_workflow_start_action_with_cx(
     Ok(action_id)
 }
 
-pub(super) async fn fetch_workflow_start_action_id(
-    storage: &crate::storage::StorageHandle,
-    execution_id: &str,
-) -> crate::Result<Option<i64>> {
-    // ft-dit9w: ergonomic wrapper around `fetch_workflow_start_action_id_with_cx`.
-    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-    fetch_workflow_start_action_id_with_cx(&cx, storage, execution_id).await
-}
-
-/// ft-xbnl0.2.3 Cx-first sibling of [`fetch_workflow_start_action_id`].
+/// Fetch the workflow-start action under the caller's capability context.
 ///
 /// Routes the audit query through `get_audit_actions_with_cx`; `None` means no
 /// matching row, while cancellation/backend failure remains an error.
@@ -1117,16 +1086,7 @@ pub(super) async fn fetch_workflow_start_action_id_with_cx(
     Ok(rows.pop().map(|row| row.id))
 }
 
-pub(super) async fn record_workflow_step_action(
-    storage: &crate::storage::StorageHandle,
-    input: WorkflowStepActionInput<'_>,
-) -> crate::Result<i64> {
-    // ft-dit9w: ergonomic wrapper around `record_workflow_step_action_with_cx`.
-    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-    record_workflow_step_action_with_cx(&cx, storage, input).await
-}
-
-/// ft-dit9w Cx-first sibling of [`record_workflow_step_action`].
+/// Record a workflow-step audit action under the caller's capability context.
 ///
 /// Routes through `record_workflow_action_with_cx` so the audit-action
 /// write threads cx into its inner storage call rather than running
@@ -1163,38 +1123,7 @@ pub(super) async fn record_workflow_step_action_with_cx(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn record_workflow_terminal_action(
-    storage: &crate::storage::StorageHandle,
-    workflow_name: &str,
-    execution_id: &str,
-    pane_id: u64,
-    action_kind: &str,
-    result: &str,
-    reason: Option<&str>,
-    step_index: Option<usize>,
-    steps_executed: Option<usize>,
-    start_action_id: Option<i64>,
-) -> crate::Result<()> {
-    // ft-dit9w: ergonomic wrapper around `record_workflow_terminal_action_with_cx`.
-    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-    record_workflow_terminal_action_with_cx(
-        &cx,
-        storage,
-        workflow_name,
-        execution_id,
-        pane_id,
-        action_kind,
-        result,
-        reason,
-        step_index,
-        steps_executed,
-        start_action_id,
-    )
-    .await
-}
-
-/// ft-xbnl0.2.3 Cx-first sibling of [`record_workflow_terminal_action`].
+/// Record a terminal workflow action under the caller's capability context.
 ///
 /// Routes both inner writes through Cx-aware paths:
 /// `record_workflow_action_with_cx` for the audit row and
@@ -1516,29 +1445,34 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
+            let cx = crate::cx::for_testing();
             let storage = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
                 .await
                 .expect("storage should initialize");
             // Insert a pane record so the audit_actions FK constraint is satisfied
             storage
-                .upsert_pane(crate::storage::PaneRecord {
-                    pane_id: 9,
-                    pane_uuid: None,
-                    domain: "local".to_string(),
-                    window_id: None,
-                    tab_id: None,
-                    title: None,
-                    cwd: None,
-                    tty_name: None,
-                    first_seen_at: 1_700_000_000_000,
-                    last_seen_at: 1_700_000_000_000,
-                    observed: true,
-                    ignore_reason: None,
-                    last_decision_at: None,
-                })
+                .upsert_pane_with_cx(
+                    &cx,
+                    crate::storage::PaneRecord {
+                        pane_id: 9,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: None,
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 1_700_000_000_000,
+                        last_seen_at: 1_700_000_000_000,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    },
+                )
                 .await
                 .expect("pane upsert should succeed");
-            record_workflow_step_action(
+            record_workflow_step_action_with_cx(
+                &cx,
                 &storage,
                 WorkflowStepActionInput {
                     workflow_name: "handle_compaction",
