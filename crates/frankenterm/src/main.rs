@@ -22475,6 +22475,10 @@ fn snapshot_trigger_from_cli_label(
 const SCROLLBACK_REPLAY_DISABLED_REASON: &str =
     "disabled because the mux API has no safe terminal-output restoration channel";
 
+fn bounded_restore_diagnostic(error: impl std::fmt::Display) -> String {
+    bounded_terminal_diagnostic(&error.to_string(), 1_000, 4_096)
+}
+
 fn scrollback_replay_invariant_holds(
     summary: &frankenterm_core::session_restore::RestoreSummary,
 ) -> bool {
@@ -22664,7 +22668,7 @@ impl SnapshotRestoreAbort {
         Self {
             phase,
             checkpoint_id,
-            error: error.to_string(),
+            error: bounded_restore_diagnostic(error),
             hint: None,
         }
     }
@@ -22845,8 +22849,9 @@ async fn execute_snapshot_restore_workflow(
         )
         .with_hint("Inspect session state before retrying the restore.")),
         (Err(mut abort), Err(error)) => {
-            abort.error.push_str(&format!(
-                "; operation-lock cleanup also failed: {error}"
+            abort.error = bounded_restore_diagnostic(format!(
+                "{}; operation-lock cleanup also failed: {error}",
+                abort.error
             ));
             Err(abort)
         }
@@ -22975,7 +22980,7 @@ impl RestartWorkflowAbort {
     fn new(phase: &'static str, error: impl std::fmt::Display) -> Self {
         Self {
             phase,
-            error: error.to_string(),
+            error: bounded_restore_diagnostic(error),
             snapshot: None,
             stopped_mux_pids: Vec::new(),
             hint: None,
@@ -23121,20 +23126,23 @@ fn restart_result_json(result: &RestartWorkflowResult) -> serde_json::Value {
             snapshot,
             error,
             layout_only,
-        } => serde_json::json!({
-            "ok": false,
-            "complete": false,
-            "phase": "restore_failed",
-            "restored": false,
-            "restore_attempted": true,
-            "layout_only": layout_only,
-            "error": error,
-            "snapshot": restart_snapshot_json(snapshot, false),
-            "hint": format!(
-                "Mux restarted, but restore did not settle. Inspect `ft session show {}` and `ft session doctor`; do not blindly replay while a durable restore intent may remain unresolved.",
-                snapshot.session_id
-            ),
-        }),
+        } => {
+            let error = bounded_restore_diagnostic(error);
+            serde_json::json!({
+                "ok": false,
+                "complete": false,
+                "phase": "restore_failed",
+                "restored": false,
+                "restore_attempted": true,
+                "layout_only": layout_only,
+                "error": error,
+                "snapshot": restart_snapshot_json(snapshot, false),
+                "hint": format!(
+                    "Mux restarted, but restore did not settle. Inspect `ft session show {}` and `ft session doctor`; do not blindly replay while a durable restore intent may remain unresolved.",
+                    snapshot.session_id
+                ),
+            })
+        }
     }
 }
 
@@ -23206,7 +23214,10 @@ fn print_restart_result_plain(result: &RestartWorkflowResult) {
         RestartWorkflowResult::RestoreFailed {
             snapshot, error, ..
         } => {
-            eprintln!("Mux restarted, but restore failed: {error}");
+            eprintln!(
+                "Mux restarted, but restore failed: {}",
+                bounded_restore_diagnostic(error)
+            );
             eprintln!(
                 "Inspect with: ft session show {}  (checkpoint {})",
                 snapshot.session_id, snapshot.checkpoint_id
@@ -23295,7 +23306,7 @@ where
         }),
         Err(error) => Ok(RestartWorkflowResult::RestoreFailed {
             snapshot,
-            error: error.to_string(),
+            error: bounded_restore_diagnostic(error),
             layout_only: options.layout_only,
         }),
     }
@@ -23436,8 +23447,9 @@ async fn execute_restart_workflow(
             .with_hint("Inspect the saved snapshot and live mux state before retrying."))
         }
         (Err(mut abort), Err(error)) => {
-            abort.error.push_str(&format!(
-                "; operation-lock cleanup also failed: {error}"
+            abort.error = bounded_restore_diagnostic(format!(
+                "{}; operation-lock cleanup also failed: {error}",
+                abort.error
             ));
             Err(abort)
         }
@@ -69938,26 +69950,35 @@ async fn handle_session_command(
             println!();
 
             println!("{}", guidance.summary);
-            if session_restore_lifecycle_needs_reconciliation(&report) {
+            let restore_lifecycle_needs_reconciliation =
+                session_restore_lifecycle_needs_reconciliation(&report);
+            if restore_lifecycle_needs_reconciliation {
                 println!(
                     "⚠ Durable restore state requires reconciliation — inspect the aggregate report and checkpoint roles before retrying any restore."
                 );
             }
             if report.unclean_sessions > 0 {
-                println!(
-                    "⚠ {} session(s) from unclean shutdown — run `ft watch` to restore.",
-                    report.unclean_sessions
-                );
+                if restore_lifecycle_needs_reconciliation {
+                    println!(
+                        "⚠ {} session(s) remain unclean — reconcile the durable restore lifecycle before starting another restore.",
+                        report.unclean_sessions
+                    );
+                } else {
+                    println!(
+                        "⚠ {} session(s) from unclean shutdown — run `ft watch` to restore.",
+                        report.unclean_sessions
+                    );
+                }
             }
             if report.orphaned_pane_states > 0 {
                 println!(
-                    "⚠ {} orphaned pane state(s) — consider running cleanup.",
+                    "⚠ {} orphaned pane state(s) — inspect `ft session doctor -f json` before any cleanup.",
                     report.orphaned_pane_states
                 );
             }
             if report.unclean_sessions == 0
                 && report.orphaned_pane_states == 0
-                && !session_restore_lifecycle_needs_reconciliation(&report)
+                && !restore_lifecycle_needs_reconciliation
             {
                 println!("✓ All healthy.");
             }
