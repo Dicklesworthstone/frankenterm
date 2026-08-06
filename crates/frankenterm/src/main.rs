@@ -73126,7 +73126,7 @@ mod operator_guidance_tests {
     use super::{
         DiagnosticCheck, DiagnosticStatus, build_doctor_operator_guidance,
         build_session_recovery_guidance, build_status_health_operator_guidance,
-        workspace_bootstrap_pending_from_checks,
+        session_recovery_diagnostic_check, workspace_bootstrap_pending_from_checks,
     };
     use frankenterm_core::session_restore::SessionDoctorReport;
 
@@ -73262,6 +73262,16 @@ mod operator_guidance_tests {
         );
         assert_eq!(structured["orphaned_restore_intents"].as_u64(), Some(1));
         assert!(structured.get("restore_attempt_metadata").is_none());
+
+        let diagnostic = session_recovery_diagnostic_check(&report);
+        assert_eq!(diagnostic.status, DiagnosticStatus::Error);
+        assert_eq!(diagnostic.name, "session restore lifecycle");
+        assert!(
+            diagnostic
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("2 unresolved"))
+        );
 
         let guidance = build_session_recovery_guidance(&report);
         assert_eq!(guidance.status, "reconciliation_required");
