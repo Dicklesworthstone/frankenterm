@@ -1,52 +1,67 @@
-//! Process re-launch engine — restart shells and agent processes in restored panes.
+//! Process disposition engine for restored panes.
 //!
-//! After layout restoration creates panes and scrollback injection restores visual
-//! content, this module re-launches the original foreground processes so users can
-//! resume work.
+//! Layout restoration already creates a default shell at the restored working
+//! directory. This module classifies the captured foreground process and reports
+//! whether operator follow-up is required.
 //!
 //! # Safety
 //!
-//! Shell processes auto-launch. Agent processes (Claude Code, Codex, Gemini) require
-//! explicit opt-in because re-launching starts a **new session** — the agent's
-//! in-memory state (conversation history, context window, in-flight operations) is
-//! permanently lost.
+//! Shell switching and agent execution require an argv-isolated mux spawn API.
+//! Until that API exists, the planner reports those cases as manual and execution
+//! of caller-supplied legacy launch plans fails closed without PTY input.
 //!
 //! # Data flow
 //!
 //! ```text
-//! PaneStateSnapshot (DB) → ProcessPlan → ProcessLauncher → send_text → pane
+//! PaneStateSnapshot (DB) → ProcessPlan → finite LaunchReport
 //! ```
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::info;
 
 use crate::patterns::AgentType;
-use crate::session_pane_state::{AgentMetadata, PaneStateSnapshot, ProcessInfo};
-use crate::wezterm::WeztermHandle;
+use crate::session_pane_state::{PaneStateSnapshot, ProcessInfo};
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
-/// Configuration for process re-launch behavior.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Reserved process-restoration configuration.
+///
+/// The field names are retained temporarily because persisted configuration
+/// still exposes them. None of these settings permit PTY command injection or
+/// cause this module to start a process.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LaunchConfig {
-    /// Automatically re-launch shell processes.
+    /// Reserved historical setting. Ignored by the current planner and executor;
+    /// captured shells always require an explicit manual disposition.
     pub launch_shells: bool,
-    /// Automatically re-launch agent processes (requires explicit opt-in).
+    /// Reserved historical setting. Ignored by the current planner and executor;
+    /// captured agents always require an explicit manual disposition.
     pub launch_agents: bool,
-    /// Delay between successive launches in milliseconds.
+    /// Reserved for a future argv-isolated mux spawn implementation. Ignored by
+    /// the current planner and executor.
     pub launch_delay_ms: u64,
-    /// Custom agent launch commands keyed by agent type.
-    ///
-    /// Supports `{cwd}` placeholder in command templates.
-    /// Example: `claude_code = "cd {cwd} && claude"`
+    /// Reserved command templates for a future argv-isolated mux spawn
+    /// implementation. Ignored by the current planner and executor.
     pub agent_commands: HashMap<String, String>,
+}
+
+impl fmt::Debug for LaunchConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LaunchConfig")
+            .field("reserved_launch_shells", &self.launch_shells)
+            .field("reserved_launch_agents", &self.launch_agents)
+            .field("reserved_launch_delay_ms", &self.launch_delay_ms)
+            .field("reserved_agent_command_count", &self.agent_commands.len())
+            .finish()
+    }
 }
 
 impl Default for LaunchConfig {
@@ -75,19 +90,23 @@ impl From<crate::config::ProcessRelaunchConfig> for LaunchConfig {
 // Plan types
 // =============================================================================
 
-/// What action to take for a pane during process re-launch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+/// Internal action retained between classification and disposition settlement.
+///
+/// This type deliberately has no serde implementation: it can contain raw
+/// persisted commands, paths, or operator hints and is not a wire/report type.
+#[derive(Clone, PartialEq, Eq)]
 pub enum LaunchAction {
-    /// Re-launch a shell process (cd to cwd, exec shell).
+    /// Legacy shell launch request. Execution rejects it until the mux exposes
+    /// an argv-isolated spawn channel.
     LaunchShell { shell: String, cwd: PathBuf },
-    /// Re-launch an agent process with a configured command.
+    /// Legacy agent launch request. Execution rejects PTY command injection
+    /// until the mux exposes an argv-isolated spawn channel.
     LaunchAgent {
         command: String,
         cwd: PathBuf,
         agent_type: String,
     },
-    /// Skip this pane (process cannot or should not be re-launched).
+    /// Skip process follow-up for this pane.
     Skip { reason: String },
     /// Manual hint for the user (process needs manual restart).
     Manual {
@@ -96,8 +115,43 @@ pub enum LaunchAction {
     },
 }
 
-/// Re-launch plan for a single pane.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl fmt::Debug for LaunchAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::LaunchShell { .. } => "LaunchShell { redacted: true }",
+            Self::LaunchAgent { .. } => "LaunchAgent { redacted: true }",
+            Self::Skip { .. } => "Skip { redacted: true }",
+            Self::Manual { .. } => "Manual { redacted: true }",
+        })
+    }
+}
+
+/// Finite, content-free disposition retained in execution reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchDisposition {
+    Shell,
+    Agent,
+    Skip,
+    Manual,
+}
+
+impl LaunchAction {
+    const fn disposition(&self) -> LaunchDisposition {
+        match self {
+            Self::LaunchShell { .. } => LaunchDisposition::Shell,
+            Self::LaunchAgent { .. } => LaunchDisposition::Agent,
+            Self::Skip { .. } => LaunchDisposition::Skip,
+            Self::Manual { .. } => LaunchDisposition::Manual,
+        }
+    }
+}
+
+/// Process-restoration disposition plan for a single pane.
+///
+/// This type deliberately has no serde implementation and its `Debug` output
+/// omits the raw action payload and state warning.
+#[derive(Clone)]
 pub struct ProcessPlan {
     /// Original pane ID from the snapshot.
     pub old_pane_id: u64,
@@ -109,45 +163,80 @@ pub struct ProcessPlan {
     pub state_warning: Option<String>,
 }
 
-/// Result of executing a process plan on a single pane.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl fmt::Debug for ProcessPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessPlan")
+            .field("old_pane_id", &self.old_pane_id)
+            .field("new_pane_id", &self.new_pane_id)
+            .field("action", &self.action.disposition())
+            .field("has_state_warning", &self.state_warning.is_some())
+            .finish()
+    }
+}
+
+/// Result of settling a process plan on a single pane.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LaunchResult {
     pub old_pane_id: u64,
     pub new_pane_id: u64,
-    pub action: LaunchAction,
+    /// Content-free action category. Commands, paths, hints, and persisted
+    /// process strings are deliberately not duplicated into reports.
+    pub action: LaunchDisposition,
     pub success: bool,
     pub error: Option<String>,
+}
+
+impl fmt::Debug for LaunchResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LaunchResult")
+            .field("old_pane_id", &self.old_pane_id)
+            .field("new_pane_id", &self.new_pane_id)
+            .field("action", &self.action)
+            .field("success", &self.success)
+            .field("has_error", &self.error.is_some())
+            .finish()
+    }
 }
 
 /// Report after executing all process plans.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LaunchReport {
     pub results: Vec<LaunchResult>,
+    /// Successful argv-isolated shell launches. Always zero until that mux
+    /// capability exists; retained in the report schema for that future path.
     pub shells_launched: usize,
+    /// Successful argv-isolated agent launches. Always zero until that mux
+    /// capability exists; retained in the report schema for that future path.
     pub agents_launched: usize,
     pub skipped: usize,
     pub manual: usize,
     pub failed: usize,
     /// Structured reason that execution stopped before every plan settled.
-    /// A canceled delay or mux operation must stop the sequence immediately;
-    /// callers use this field to leave the restore attempt unclean and require
-    /// reconciliation rather than treating a partial relaunch as success.
+    /// Cancellation stops the sequence immediately; callers use this field to
+    /// leave the restore attempt unclean and require reconciliation rather than
+    /// treating partial settlement as success.
     pub interruption: Option<LaunchInterruption>,
 }
 
-/// Phase at which a process relaunch sequence stopped cooperatively.
+/// Phase at which a process-disposition sequence stopped cooperatively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LaunchInterruptionPhase {
     BeforePlan,
+    /// Reserved for a future argv-isolated spawn path.
     InterLaunchDelay,
+    /// Reserved for a future argv-isolated spawn path.
     ShellSettleDelay,
+    /// Reserved for a future argv-isolated spawn path.
     AgentSettleDelay,
+    /// Reserved for a future argv-isolated spawn path.
     MuxOperation,
 }
 
-/// Typed partial-result marker for a canceled process relaunch sequence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Typed partial-result marker for a canceled process-disposition sequence.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchInterruption {
     /// Zero-based plan index that did not settle.
     pub plan_index: usize,
@@ -156,35 +245,36 @@ pub struct LaunchInterruption {
     pub detail: String,
 }
 
-#[derive(Debug)]
-enum LaunchStepError {
-    Failed(String),
-    Interrupted {
-        phase: LaunchInterruptionPhase,
-        detail: String,
-    },
+impl fmt::Debug for LaunchInterruption {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LaunchInterruption")
+            .field("plan_index", &self.plan_index)
+            .field("phase", &self.phase)
+            .field("has_detail", &!self.detail.is_empty())
+            .finish()
+    }
 }
 
 // =============================================================================
 // ProcessLauncher
 // =============================================================================
 
-/// Orchestrates re-launching processes in restored panes.
-pub struct ProcessLauncher {
-    wezterm: WeztermHandle,
-    config: LaunchConfig,
-}
+/// Classifies and settles process-restoration dispositions for restored panes.
+pub struct ProcessLauncher;
 
 impl ProcessLauncher {
-    /// Create a new process launcher.
-    pub fn new(wezterm: WeztermHandle, config: LaunchConfig) -> Self {
-        Self { wezterm, config }
+    /// Create a process-disposition engine. It intentionally takes no mux
+    /// handle because the current implementation cannot launch or inject input.
+    pub fn new(_reserved_config: LaunchConfig) -> Self {
+        Self
     }
 
-    /// Generate a re-launch plan without executing anything.
+    /// Generate a process-disposition plan without executing anything.
     ///
     /// The plan maps each pane from the snapshot to an action based on its
-    /// captured process info, agent metadata, and the launch configuration.
+    /// captured process info and agent metadata. Reserved launch configuration
+    /// does not affect the result.
     pub fn plan(
         &self,
         pane_id_map: &HashMap<u64, u64>,
@@ -195,13 +285,7 @@ impl ProcessLauncher {
         for state in pane_states {
             let new_pane_id = match pane_id_map.get(&state.pane_id) {
                 Some(&id) => id,
-                None => {
-                    debug!(
-                        old_pane_id = state.pane_id,
-                        "pane not in id map, skipping plan"
-                    );
-                    continue;
-                }
+                None => continue,
             };
 
             let (action, state_warning) = self.resolve_action(state);
@@ -217,24 +301,26 @@ impl ProcessLauncher {
         plans
     }
 
-    /// Execute a set of process plans, sending commands to panes.
+    /// Settle a set of process plans without writing commands to panes.
     ///
-    /// Plans are executed sequentially with `launch_delay_ms` between each
-    /// to prevent resource spikes.
-    pub async fn execute(&self, plans: &[ProcessPlan]) -> LaunchReport {
+    /// Plans are evaluated sequentially. Structural `Skip`/`Manual` actions
+    /// succeed; executable legacy actions are rejected with finite errors.
+    pub fn execute(&self, plans: &[ProcessPlan]) -> LaunchReport {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.execute_cx(&cx, plans).await
+        self.execute_cx(&cx, plans)
     }
 
     /// Execute process plans under an explicit `&Cx` (ft-xbnl0.2.2 Cx-first
     /// API).
     ///
-    /// Inter-launch sleeps and per-pane command delays bind to the provided
-    /// capability context so cancellation, budget, and virtual time propagate
-    /// cleanly through the launch sequence.
-    pub async fn execute_cx(&self, cx: &crate::cx::Cx, plans: &[ProcessPlan]) -> LaunchReport {
-        let mut report = LaunchReport::default();
-        let delay = Duration::from_millis(self.config.launch_delay_ms);
+    /// Caller cancellation is checked before every disposition. Automatic
+    /// shell and agent execution currently fails closed because the mux
+    /// boundary has no argv-isolated command spawn API.
+    pub fn execute_cx(&self, cx: &crate::cx::Cx, plans: &[ProcessPlan]) -> LaunchReport {
+        let mut report = LaunchReport {
+            results: Vec::with_capacity(plans.len()),
+            ..LaunchReport::default()
+        };
 
         for (i, plan) in plans.iter().enumerate() {
             if cx.checkpoint().is_err() {
@@ -245,21 +331,7 @@ impl ProcessLauncher {
                 });
                 break;
             }
-            if i > 0 && !delay.is_zero() {
-                if crate::runtime_async::sleep_with_cx(cx, delay)
-                    .await
-                    .is_err()
-                {
-                    report.interruption = Some(LaunchInterruption {
-                        plan_index: i,
-                        phase: LaunchInterruptionPhase::InterLaunchDelay,
-                        detail: "capability-aware inter-launch delay stopped".to_string(),
-                    });
-                    break;
-                }
-            }
-
-            let result = match &plan.action {
+            let error = match &plan.action {
                 LaunchAction::LaunchShell { shell, cwd } => {
                     self.reject_legacy_shell_launch(shell, cwd)
                 }
@@ -267,29 +339,24 @@ impl ProcessLauncher {
                     command,
                     cwd,
                     agent_type,
-                } => {
-                    self.launch_agent_cx(cx, plan.new_pane_id, command, cwd, agent_type)
-                        .await
-                }
-                LaunchAction::Skip { reason } => {
-                    debug!(pane = plan.new_pane_id, reason = %reason, "skipping pane");
+                } => self.reject_legacy_agent_launch(command, cwd, agent_type),
+                LaunchAction::Skip { .. } => {
                     report.skipped += 1;
                     report.results.push(LaunchResult {
                         old_pane_id: plan.old_pane_id,
                         new_pane_id: plan.new_pane_id,
-                        action: plan.action.clone(),
+                        action: plan.action.disposition(),
                         success: true,
                         error: None,
                     });
                     continue;
                 }
-                LaunchAction::Manual { hint, .. } => {
-                    info!(pane = plan.new_pane_id, hint = %hint, "manual restart required");
+                LaunchAction::Manual { .. } => {
                     report.manual += 1;
                     report.results.push(LaunchResult {
                         old_pane_id: plan.old_pane_id,
                         new_pane_id: plan.new_pane_id,
-                        action: plan.action.clone(),
+                        action: plan.action.disposition(),
                         success: true,
                         error: None,
                     });
@@ -297,20 +364,7 @@ impl ProcessLauncher {
                 }
             };
 
-            match result {
-                Ok(()) => self.record_result(&mut report, plan, Ok(())),
-                Err(LaunchStepError::Failed(error)) => {
-                    self.record_result(&mut report, plan, Err(error));
-                }
-                Err(LaunchStepError::Interrupted { phase, detail }) => {
-                    report.interruption = Some(LaunchInterruption {
-                        plan_index: i,
-                        phase,
-                        detail,
-                    });
-                    break;
-                }
-            }
+            Self::record_failure(&mut report, plan, error);
         }
 
         info!(
@@ -320,52 +374,21 @@ impl ProcessLauncher {
             manual = report.manual,
             failed = report.failed,
             interrupted = report.interruption.is_some(),
-            "process re-launch complete"
+            "process restore dispositions settled"
         );
 
         report
     }
 
-    /// Explicit quarantine for legacy non-asupersync process relaunch.
-    ///
-    /// Owner: `ft-xbnl0.2.5`.
-    /// Removal path: drop this helper once the workspace no longer supports
-    /// non-`asupersync-runtime` restore execution.
-    /// Shared result recording logic used by both execute_cx and execute_legacy.
-    #[allow(clippy::unused_self)]
-    fn record_result(
-        &self,
-        report: &mut LaunchReport,
-        plan: &ProcessPlan,
-        result: Result<(), String>,
-    ) {
-        match result {
-            Ok(()) => {
-                match &plan.action {
-                    LaunchAction::LaunchShell { .. } => report.shells_launched += 1,
-                    LaunchAction::LaunchAgent { .. } => report.agents_launched += 1,
-                    _ => {}
-                }
-                report.results.push(LaunchResult {
-                    old_pane_id: plan.old_pane_id,
-                    new_pane_id: plan.new_pane_id,
-                    action: plan.action.clone(),
-                    success: true,
-                    error: None,
-                });
-            }
-            Err(e) => {
-                warn!(pane = plan.new_pane_id, error = %e, "process launch failed");
-                report.failed += 1;
-                report.results.push(LaunchResult {
-                    old_pane_id: plan.old_pane_id,
-                    new_pane_id: plan.new_pane_id,
-                    action: plan.action.clone(),
-                    success: false,
-                    error: Some(e),
-                });
-            }
-        }
+    fn record_failure(report: &mut LaunchReport, plan: &ProcessPlan, error: String) {
+        report.failed += 1;
+        report.results.push(LaunchResult {
+            old_pane_id: plan.old_pane_id,
+            new_pane_id: plan.new_pane_id,
+            action: plan.action.disposition(),
+            success: false,
+            error: Some(error),
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -374,26 +397,20 @@ impl ProcessLauncher {
 
     /// Determine what action to take for a pane based on its snapshot.
     fn resolve_action(&self, state: &PaneStateSnapshot) -> (LaunchAction, Option<String>) {
-        let cwd = state
-            .cwd
-            .as_deref()
-            .map(normalize_cwd)
-            .filter(|cwd| !cwd.as_os_str().is_empty())
-            .unwrap_or_else(|| PathBuf::from("/"));
-
         // Check for agent metadata first
-        if let Some(ref agent) = state.agent {
-            return self.resolve_agent_action(agent, &cwd);
+        if state.agent.is_some() {
+            let cwd = state.cwd.as_deref().and_then(normalize_restored_cwd);
+            return self.resolve_agent_action(cwd.as_deref());
         }
 
         // Check foreground process
         if let Some(ref process) = state.foreground_process {
-            return self.resolve_process_action(process, &cwd);
+            return self.resolve_process_action(process, state.cwd.as_deref());
         }
 
         // Check shell field
-        if let Some(ref shell) = state.shell {
-            return self.resolve_shell_action(shell, &cwd);
+        if state.shell.is_some() {
+            return self.resolve_shell_action();
         }
 
         (
@@ -406,52 +423,18 @@ impl ProcessLauncher {
     }
 
     /// Resolve action for a pane with known agent metadata.
-    fn resolve_agent_action(
-        &self,
-        agent: &AgentMetadata,
-        cwd: &Path,
-    ) -> (LaunchAction, Option<String>) {
-        let agent_type = parse_agent_type(&agent.agent_type);
-        let warning = Some(format!(
-            "Agent {} will start a NEW session. \
-             Conversation history, context, and in-flight work are lost.",
-            agent.agent_type
-        ));
+    fn resolve_agent_action(&self, cwd: Option<&Path>) -> (LaunchAction, Option<String>) {
+        let warning = Some(
+            "Agent process state cannot be resumed automatically; conversation context and in-flight work may be unavailable."
+                .to_string(),
+        );
 
-        if !self.config.launch_agents {
+        if cwd.is_none() {
             return (
                 LaunchAction::Manual {
-                    hint: format!(
-                        "Was running {} in {}. Use --launch-agents to auto-restart.",
-                        agent.agent_type,
-                        cwd.display()
-                    ),
-                    original_process: agent.agent_type.clone(),
-                },
-                warning,
-            );
-        }
-
-        // Check for custom command template
-        if let Some(template) = self.config.agent_commands.get(&agent.agent_type) {
-            let command = template.replace("{cwd}", &shell_escape(cwd));
-            return (
-                LaunchAction::LaunchAgent {
-                    command,
-                    cwd: cwd.to_path_buf(),
-                    agent_type: agent.agent_type.clone(),
-                },
-                warning,
-            );
-        }
-
-        // Use default command for known agent types
-        if let Some(cmd) = default_agent_command(agent_type, cwd) {
-            return (
-                LaunchAction::LaunchAgent {
-                    command: cmd,
-                    cwd: cwd.to_path_buf(),
-                    agent_type: agent.agent_type.clone(),
+                    hint: "Agent restart requires a verified absolute working directory."
+                        .to_string(),
+                    original_process: "agent".to_string(),
                 },
                 warning,
             );
@@ -459,14 +442,14 @@ impl ProcessLauncher {
 
         (
             LaunchAction::Manual {
-                hint: format!(
-                    "Unknown agent type '{}' in {}. Configure in [snapshots.agent_commands].",
-                    agent.agent_type,
-                    cwd.display()
-                ),
-                original_process: agent.agent_type.clone(),
+                hint: "Automatic agent restart requires a mux-native argv spawn channel; restart manually."
+                    .to_string(),
+                original_process: "agent".to_string(),
             },
-            warning,
+            Some(
+                "Automatic agent switching is unavailable without a mux-native argv channel."
+                    .to_string(),
+            ),
         )
     }
 
@@ -474,86 +457,48 @@ impl ProcessLauncher {
     fn resolve_process_action(
         &self,
         process: &ProcessInfo,
-        cwd: &Path,
+        cwd: Option<&str>,
     ) -> (LaunchAction, Option<String>) {
         let name = &process.name;
 
         // Detect agent processes by name
         let agent_type = agent_type_from_process_name(name);
         if agent_type != AgentType::Unknown {
-            let agent_str = format!("{agent_type}");
-            let meta = AgentMetadata {
-                agent_type: agent_str.clone(),
-                session_id: None,
-                state: None,
-            };
-            return self.resolve_agent_action(&meta, cwd);
+            let cwd = cwd.and_then(normalize_restored_cwd);
+            return self.resolve_agent_action(cwd.as_deref());
         }
 
         // Common shells
         if is_shell(name) {
-            return self.resolve_shell_action(name, cwd);
+            return self.resolve_shell_action();
         }
 
         // Interactive programs that need manual restart
         if is_interactive_program(name) {
             return (
                 LaunchAction::Manual {
-                    hint: format!("Was running {name} in {}. Restart manually.", cwd.display()),
-                    original_process: name.clone(),
+                    hint: "Interactive process requires manual restart.".to_string(),
+                    original_process: "interactive".to_string(),
                 },
                 None,
             );
         }
 
-        // Unknown process — provide a hint
-        let argv_hint = process
-            .argv
-            .as_ref()
-            .map(|args| args.join(" "))
-            .unwrap_or_else(|| name.clone());
-
         (
             LaunchAction::Manual {
-                hint: format!("Was running: {argv_hint} in {}", cwd.display()),
-                original_process: name.clone(),
+                hint: "Unrecognized foreground process requires manual restart.".to_string(),
+                original_process: "unrecognized".to_string(),
             },
             None,
         )
     }
 
-    fn resolve_shell_action(
-        &self,
-        shell: &str,
-        cwd: &Path,
-    ) -> (LaunchAction, Option<String>) {
-        if !self.config.launch_shells {
-            return (
-                LaunchAction::Skip {
-                    reason: "shell launch disabled".into(),
-                },
-                None,
-            );
-        }
-        let restored_shell = shell.rsplit('/').next().unwrap_or(shell);
-        let current_shell = default_shell();
-        let current_shell = current_shell.rsplit('/').next().unwrap_or(&current_shell);
-        if is_shell(restored_shell) && restored_shell == current_shell {
-            return (
-                LaunchAction::Skip {
-                    reason: "layout restore already created the default shell at the restored working directory"
-                        .into(),
-                },
-                None,
-            );
-        }
+    fn resolve_shell_action(&self) -> (LaunchAction, Option<String>) {
         (
             LaunchAction::Manual {
-                hint: format!(
-                    "Layout restored {} with the default shell; previous shell {shell:?} requires a mux-native argv spawn and was not typed through PTY input.",
-                    cwd.display()
-                ),
-                original_process: shell.to_string(),
+                hint: "Layout restored the default shell; switching shells requires a mux-native argv spawn and was not typed through PTY input."
+                    .to_string(),
+                original_process: "shell".to_string(),
             },
             Some("Automatic shell switching is unavailable without a mux-native argv channel.".to_string()),
         )
@@ -573,63 +518,35 @@ impl ProcessLauncher {
         &self,
         shell: &str,
         cwd: &Path,
-    ) -> Result<(), LaunchStepError> {
-        sanitize_restored_command(shell).map_err(LaunchStepError::Failed)?;
-        validate_restored_cwd(cwd).map_err(LaunchStepError::Failed)?;
-        Err(LaunchStepError::Failed(
-            "automatic shell switching requires a mux-native argv spawn channel; PTY command injection is refused"
-                .to_string(),
-        ))
+    ) -> String {
+        if let Err(error) = sanitize_restored_command(shell) {
+            return error;
+        }
+        if let Err(error) = validate_restored_cwd(cwd) {
+            return error;
+        }
+        "automatic shell switching requires a mux-native argv spawn channel; PTY command injection is refused"
+            .to_string()
     }
 
-    /// Send agent launch command to a pane.
-    async fn launch_agent_cx(
+    /// Reject a legacy agent-launch plan without writing to the pane.
+    fn reject_legacy_agent_launch(
         &self,
-        cx: &crate::cx::Cx,
-        pane_id: u64,
         command: &str,
         cwd: &Path,
         agent_type: &str,
-    ) -> Result<(), LaunchStepError> {
-        // [ft-kegvt] mirror launch_agent_legacy: sanitize before any
-        // send_text hits the interactive shell. Both code paths must
-        // share the same defense-in-depth contract.
-        let safe_command =
-            sanitize_restored_command(command).map_err(LaunchStepError::Failed)?;
-        validate_restored_cwd(cwd).map_err(LaunchStepError::Failed)?;
-        let cd_cmd = format!("cd {}\r", shell_escape(cwd));
-        // ft-xbnl0.2.3 tick 294: cx-first send_text in launch_agent_cx.
-        self.wezterm
-            .send_text_with_options_with_cx(cx, pane_id, &cd_cmd, true, true)
-            .await
-            .map_err(|error| launch_mux_step_error(cx, "send cd", error))?;
-        crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50))
-            .await
-            .map_err(|_error| LaunchStepError::Interrupted {
-                phase: LaunchInterruptionPhase::AgentSettleDelay,
-                detail: "capability-aware agent settle delay stopped".to_string(),
-            })?;
-        let full_cmd = format!("{safe_command}\r");
-        self.wezterm
-            .send_text_with_options_with_cx(cx, pane_id, &full_cmd, true, true)
-            .await
-            .map_err(|error| launch_mux_step_error(cx, "send agent command", error))?;
-        info!(pane = pane_id, agent = %agent_type, cwd = %cwd.display(), "agent launched");
-        Ok(())
-    }
-}
-
-fn launch_mux_step_error(
-    cx: &crate::cx::Cx,
-    operation: &'static str,
-    error: impl std::fmt::Display,
-) -> LaunchStepError {
-    match cx.checkpoint() {
-        Ok(()) => LaunchStepError::Failed(format!("{operation}: {error}")),
-        Err(_cancelled) => LaunchStepError::Interrupted {
-            phase: LaunchInterruptionPhase::MuxOperation,
-            detail: "caller capability stopped during mux operation".to_string(),
-        },
+    ) -> String {
+        if let Err(error) = sanitize_restored_command(command) {
+            return error;
+        }
+        if let Err(error) = validate_restored_cwd(cwd) {
+            return error;
+        }
+        if agent_type.is_empty() {
+            return "automatic agent relaunch requires a non-empty agent type".to_string();
+        }
+        "automatic agent relaunch requires a mux-native argv spawn channel; PTY command injection is refused"
+            .to_string()
     }
 }
 
@@ -654,6 +571,25 @@ fn normalize_cwd(cwd: &str) -> PathBuf {
     };
 
     PathBuf::from(percent_decode(path))
+}
+
+/// Normalize only a local, absolute working directory suitable for a future
+/// argv-isolated spawn. A non-local `file://` authority belongs to another mux
+/// domain and must never be silently interpreted on this host.
+fn normalize_restored_cwd(cwd: &str) -> Option<PathBuf> {
+    if let Some(authority_and_path) = cwd.strip_prefix("file://") {
+        let is_local = authority_and_path.starts_with('/')
+            || authority_and_path == "localhost"
+            || authority_and_path.starts_with("localhost/");
+        if !is_local {
+            return None;
+        }
+    }
+    let path = normalize_cwd(cwd);
+    if path.as_os_str().is_empty() || validate_restored_cwd(&path).is_err() {
+        return None;
+    }
+    Some(path)
 }
 
 /// Simple percent-decoding for common path characters.
@@ -692,6 +628,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// Escape a path for use in a shell command.
+#[cfg(test)]
 fn shell_escape(path: &Path) -> String {
     let s = path.to_string_lossy();
     if s.is_empty() {
@@ -706,10 +643,7 @@ fn shell_escape(path: &Path) -> String {
 
 fn validate_restored_cwd(path: &Path) -> Result<(), String> {
     if !path.is_absolute() {
-        return Err(format!(
-            "refusing restored working directory that is not absolute: {}",
-            path.display()
-        ));
+        return Err("refusing restored working directory that is not absolute".to_string());
     }
     let value = path.to_string_lossy();
     for (index, ch) in value.char_indices() {
@@ -723,17 +657,13 @@ fn validate_restored_cwd(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Sanitize a restored agent command before it's typed into the pane's
-/// interactive shell.
+/// Validate a command carried by a legacy launch plan before rejecting it.
 ///
-/// [ft-kegvt] `launch_agent_legacy` and `launch_agent_cx` both send the
-/// restored `command` string into an active pane via
-/// `wezterm.send_text(pane_id, format!("{command}\r"))`. That helper
-/// types characters into the interactive shell rather than invoking
-/// argv-isolated exec, so any CR/LF in the command injects additional
-/// shell lines. `mux_pane_state.command` is loaded from the session DB
-/// and may be attacker-reachable through snapshot/diag-bundle import
-/// or tampered state.
+/// FrankenTerm no longer types restored commands into a PTY. The legacy raw
+/// plan variants remain quarantined until their callers are removed, and every
+/// such plan fails closed. Validation remains defense in depth so a future
+/// argv-isolated implementation cannot accidentally inherit terminal-control
+/// payloads from persisted state.
 ///
 /// This helper rejects any command that contains a control character
 /// that would break the "one command, one CR" assumption:
@@ -743,9 +673,8 @@ fn validate_restored_cwd(path: &Path) -> Result<(), String> {
 /// - other C0 controls (`\x00..=\x1f` except `\t`) — reserved/rarely
 ///   legitimate in a restored agent command; reject to stay conservative.
 ///
-/// Returns `Ok(command)` unchanged on success. Errors are stringly
-/// typed to match the surrounding `Result<(), String>` convention of
-/// the restore path.
+/// Returns `Ok(command)` unchanged on success. Every error is finite and omits
+/// the command itself.
 fn sanitize_restored_command(command: &str) -> Result<&str, String> {
     for (idx, ch) in command.char_indices() {
         match ch {
@@ -796,6 +725,7 @@ fn sanitize_restored_command(command: &str) -> Result<&str, String> {
 }
 
 /// Get the default shell for the platform.
+#[cfg(test)]
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
 }
@@ -853,6 +783,7 @@ fn agent_type_from_process_name(name: &str) -> AgentType {
 }
 
 /// Parse an agent type string back to the enum.
+#[cfg(test)]
 fn parse_agent_type(s: &str) -> AgentType {
     match s {
         "claude_code" | "ClaudeCode" => AgentType::ClaudeCode,
@@ -863,6 +794,7 @@ fn parse_agent_type(s: &str) -> AgentType {
 }
 
 /// Get the default launch command for a known agent type.
+#[cfg(test)]
 fn default_agent_command(agent_type: AgentType, cwd: &Path) -> Option<String> {
     let cwd_escaped = shell_escape(cwd);
     match agent_type {
@@ -880,7 +812,7 @@ fn default_agent_command(agent_type: AgentType, cwd: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_pane_state::TerminalState;
+    use crate::session_pane_state::{AgentMetadata, TerminalState};
 
     /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove the Cx-first
     /// `execute_cx` path runs under seed-locked virtual-time scheduling.
@@ -910,9 +842,8 @@ mod tests {
             .state
             .create_task(region, asupersync::Budget::INFINITE, async move {
                 let cx = crate::cx::for_request();
-                let wezterm = crate::wezterm::mock_wezterm_handle();
-                let launcher = ProcessLauncher::new(wezterm, LaunchConfig::default());
-                let report = launcher.execute_cx(&cx, &[]).await;
+                let launcher = ProcessLauncher::new(LaunchConfig::default());
+                let report = launcher.execute_cx(&cx, &[]);
                 assert_eq!(report.shells_launched, 0);
                 assert_eq!(report.agents_launched, 0);
                 assert_eq!(report.failed, 0);
@@ -947,10 +878,7 @@ mod tests {
                 crate::outcome::CancelKind::User,
                 Some("restore process pre-cancel regression"),
             );
-            let launcher = ProcessLauncher::new(
-                crate::wezterm::mock_wezterm_handle(),
-                LaunchConfig::default(),
-            );
+            let launcher = ProcessLauncher::new(LaunchConfig::default());
             let plans = vec![ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 10,
@@ -961,7 +889,7 @@ mod tests {
                 state_warning: None,
             }];
 
-            let report = launcher.execute_cx(&cx, &plans).await;
+            let report = launcher.execute_cx(&cx, &plans);
             let interruption = report
                 .interruption
                 .expect("pre-cancel must produce a typed interruption");
@@ -997,8 +925,7 @@ mod tests {
     }
 
     fn test_launcher() -> ProcessLauncher {
-        let wez = crate::wezterm::mock_wezterm_handle();
-        ProcessLauncher::new(wez, LaunchConfig::default())
+        ProcessLauncher::new(LaunchConfig::default())
     }
 
     fn test_pane_id_map() -> HashMap<u64, u64> {
@@ -1047,18 +974,18 @@ mod tests {
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].old_pane_id, 1);
         assert_eq!(plans[0].new_pane_id, 100);
-        assert!(plans[0].state_warning.is_none());
+        assert!(plans[0].state_warning.is_some());
 
         match &plans[0].action {
-            LaunchAction::Skip { reason } => {
-                assert!(reason.contains("already created"));
+            LaunchAction::Manual { hint, .. } => {
+                assert!(hint.contains("mux-native argv"));
             }
-            other => panic!("expected structural shell Skip, got {other:?}"),
+            other => panic!("expected shell Manual disposition, got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_agent_pane_no_opt_in() {
+    fn plan_agent_pane_is_manual_with_reserved_default_config() {
         let launcher = test_launcher();
         let id_map = test_pane_id_map();
 
@@ -1075,21 +1002,20 @@ mod tests {
 
         match &plans[0].action {
             LaunchAction::Manual { hint, .. } => {
-                assert!(hint.contains("claude_code"));
-                assert!(hint.contains("--launch-agents"));
+                assert!(hint.contains("mux-native argv"));
+                assert!(!hint.contains("claude_code"));
             }
             other => panic!("expected Manual, got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_agent_pane_with_opt_in() {
+    fn plan_agent_pane_is_manual_with_reserved_setting_enabled() {
         let config = LaunchConfig {
             launch_agents: true,
             ..Default::default()
         };
-        let wez = crate::wezterm::mock_wezterm_handle();
-        let launcher = ProcessLauncher::new(wez, config);
+        let launcher = ProcessLauncher::new(config);
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
@@ -1104,20 +1030,19 @@ mod tests {
         assert!(plans[0].state_warning.is_some());
 
         match &plans[0].action {
-            LaunchAction::LaunchAgent {
-                command,
-                agent_type,
-                ..
+            LaunchAction::Manual {
+                hint,
+                original_process,
             } => {
-                assert!(command.contains("claude"));
-                assert_eq!(agent_type, "claude_code");
+                assert!(hint.contains("mux-native argv"));
+                assert_eq!(original_process, "agent");
             }
-            other => panic!("expected LaunchAgent, got {other:?}"),
+            other => panic!("expected safe Manual disposition, got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_agent_with_custom_command() {
+    fn plan_agent_ignores_reserved_command_template() {
         let mut agent_commands = HashMap::new();
         agent_commands.insert("claude_code".into(), "cd {cwd} && claude --resume".into());
         let config = LaunchConfig {
@@ -1125,8 +1050,7 @@ mod tests {
             agent_commands,
             ..Default::default()
         };
-        let wez = crate::wezterm::mock_wezterm_handle();
-        let launcher = ProcessLauncher::new(wez, config);
+        let launcher = ProcessLauncher::new(config);
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
@@ -1138,11 +1062,12 @@ mod tests {
 
         let plans = launcher.plan(&id_map, &[state]);
         match &plans[0].action {
-            LaunchAction::LaunchAgent { command, .. } => {
-                assert!(command.contains("--resume"));
-                assert!(command.contains("/home/user/project"));
+            LaunchAction::Manual { hint, .. } => {
+                assert!(hint.contains("mux-native argv"));
+                assert!(!hint.contains("--resume"));
+                assert!(!hint.contains("/home/user/project"));
             }
-            other => panic!("expected LaunchAgent, got {other:?}"),
+            other => panic!("expected safe Manual disposition, got {other:?}"),
         }
     }
 
@@ -1165,8 +1090,8 @@ mod tests {
                 hint,
                 original_process,
             } => {
-                assert!(hint.contains("vim"));
-                assert_eq!(original_process, "vim");
+                assert_eq!(hint, "Interactive process requires manual restart.");
+                assert_eq!(original_process, "interactive");
             }
             other => panic!("expected Manual, got {other:?}"),
         }
@@ -1186,9 +1111,8 @@ mod tests {
         });
 
         let plans = launcher.plan(&id_map, &[state]);
-        // Agents default to Manual without opt-in
         assert!(plans[0].state_warning.is_some());
-        matches!(&plans[0].action, LaunchAction::Manual { .. });
+        assert!(matches!(&plans[0].action, LaunchAction::Manual { .. }));
     }
 
     #[test]
@@ -1218,22 +1142,21 @@ mod tests {
     }
 
     #[test]
-    fn plan_shells_disabled() {
+    fn plan_shell_setting_is_reserved_and_still_manual() {
         let config = LaunchConfig {
             launch_shells: false,
             ..Default::default()
         };
-        let wez = crate::wezterm::mock_wezterm_handle();
-        let launcher = ProcessLauncher::new(wez, config);
+        let launcher = ProcessLauncher::new(config);
         let id_map = test_pane_id_map();
         let states = vec![test_pane_state(1)];
 
         let plans = launcher.plan(&id_map, &states);
         match &plans[0].action {
-            LaunchAction::Skip { reason } => {
-                assert!(reason.contains("disabled"));
+            LaunchAction::Manual { hint, .. } => {
+                assert!(hint.contains("mux-native argv"));
             }
-            other => panic!("expected Skip, got {other:?}"),
+            other => panic!("expected Manual, got {other:?}"),
         }
     }
 
@@ -1348,7 +1271,7 @@ mod tests {
     fn sanitize_restored_command_rejects_newline_injection() {
         // The concrete attack payload from the bead: attacker stashes
         // a multi-line command in mux_pane_state.command. Pre-fix,
-        // send_text would type both lines into the shell.
+        // the removed send_text path would have typed both lines into the shell.
         let payload = "claude-code\ninnocent_payload\r";
         let err = sanitize_restored_command(payload).expect_err("CR/LF injection must be rejected");
         assert!(
@@ -1540,22 +1463,12 @@ mod tests {
         }
     }
 
-    /// Create a mock with panes pre-registered at the given IDs.
-    async fn mock_with_panes(pane_ids: &[u64]) -> WeztermHandle {
-        let mock = crate::wezterm::MockWezterm::new();
-        for &id in pane_ids {
-            mock.add_default_pane(id).await;
-        }
-        std::sync::Arc::new(mock) as WeztermHandle
-    }
-
     #[test]
     fn execute_shell_launch_is_refused_without_pty_input() {
         run_async_test(async {
             let mock = std::sync::Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(100).await;
-            let wez: crate::wezterm::WeztermHandle = mock.clone();
-            let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+            let launcher = ProcessLauncher::new(LaunchConfig::default());
             let plans = vec![ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 100,
@@ -1566,7 +1479,7 @@ mod tests {
                 state_warning: None,
             }];
 
-            let report = launcher.execute(&plans).await;
+            let report = launcher.execute(&plans);
             assert_eq!(report.shells_launched, 0);
             assert_eq!(report.failed, 1);
             assert_eq!(report.results.len(), 1);
@@ -1584,8 +1497,7 @@ mod tests {
     #[test]
     fn execute_mixed_plan() {
         run_async_test(async {
-            let wez = mock_with_panes(&[100, 200, 300]).await;
-            let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+            let launcher = ProcessLauncher::new(LaunchConfig::default());
             let plans = vec![
                 ProcessPlan {
                     old_pane_id: 1,
@@ -1615,7 +1527,7 @@ mod tests {
                 },
             ];
 
-            let report = launcher.execute(&plans).await;
+            let report = launcher.execute(&plans);
             assert_eq!(report.shells_launched, 0);
             assert_eq!(report.skipped, 1);
             assert_eq!(report.manual, 1);
@@ -1673,55 +1585,35 @@ mod tests {
     }
 
     // =========================================================================
-    // LaunchAction — serde tagged enum
+    // LaunchAction / ProcessPlan — redacted diagnostic surfaces
     // =========================================================================
 
     #[test]
-    fn launch_action_serde_launch_shell() {
-        let action = LaunchAction::LaunchShell {
-            shell: "zsh".into(),
-            cwd: PathBuf::from("/tmp"),
-        };
-        let json = serde_json::to_string(&action).unwrap();
-        assert!(json.contains("\"action\":\"launch_shell\""));
-        let roundtrip: LaunchAction = serde_json::from_str(&json).unwrap();
-        assert_eq!(roundtrip, action);
-    }
+    fn launch_action_debug_redacts_all_raw_payloads() {
+        let actions = [
+            LaunchAction::LaunchShell {
+                shell: "secret-shell".into(),
+                cwd: PathBuf::from("/secret/shell/path"),
+            },
+            LaunchAction::LaunchAgent {
+                command: "secret-agent-command".into(),
+                cwd: PathBuf::from("/secret/agent/path"),
+                agent_type: "secret-agent-type".into(),
+            },
+            LaunchAction::Skip {
+                reason: "secret-skip-reason".into(),
+            },
+            LaunchAction::Manual {
+                hint: "secret-manual-hint".into(),
+                original_process: "secret-process".into(),
+            },
+        ];
 
-    #[test]
-    fn launch_action_serde_launch_agent() {
-        let action = LaunchAction::LaunchAgent {
-            command: "cd /proj && claude".into(),
-            cwd: PathBuf::from("/proj"),
-            agent_type: "claude_code".into(),
-        };
-        let json = serde_json::to_string(&action).unwrap();
-        assert!(json.contains("\"action\":\"launch_agent\""));
-        let roundtrip: LaunchAction = serde_json::from_str(&json).unwrap();
-        assert_eq!(roundtrip, action);
-    }
-
-    #[test]
-    fn launch_action_serde_skip() {
-        let action = LaunchAction::Skip {
-            reason: "no info".into(),
-        };
-        let json = serde_json::to_string(&action).unwrap();
-        assert!(json.contains("\"action\":\"skip\""));
-        let roundtrip: LaunchAction = serde_json::from_str(&json).unwrap();
-        assert_eq!(roundtrip, action);
-    }
-
-    #[test]
-    fn launch_action_serde_manual() {
-        let action = LaunchAction::Manual {
-            hint: "Was running vim".into(),
-            original_process: "vim".into(),
-        };
-        let json = serde_json::to_string(&action).unwrap();
-        assert!(json.contains("\"action\":\"manual\""));
-        let roundtrip: LaunchAction = serde_json::from_str(&json).unwrap();
-        assert_eq!(roundtrip, action);
+        for action in actions {
+            let diagnostic = format!("{action:?}");
+            assert!(diagnostic.contains("redacted: true"));
+            assert!(!diagnostic.contains("secret"));
+        }
     }
 
     #[test]
@@ -1747,26 +1639,26 @@ mod tests {
     }
 
     // =========================================================================
-    // ProcessPlan / LaunchResult / LaunchReport — serde
+    // ProcessPlan redaction / LaunchResult / LaunchReport serde
     // =========================================================================
 
     #[test]
-    fn process_plan_serde_roundtrip() {
+    fn process_plan_debug_redacts_action_and_warning() {
         let plan = ProcessPlan {
             old_pane_id: 42,
             new_pane_id: 100,
             action: LaunchAction::LaunchShell {
-                shell: "fish".into(),
-                cwd: PathBuf::from("/data"),
+                shell: "secret-shell".into(),
+                cwd: PathBuf::from("/secret/data"),
             },
-            state_warning: Some("careful!".into()),
+            state_warning: Some("secret-warning".into()),
         };
-        let json = serde_json::to_string(&plan).unwrap();
-        let plan2: ProcessPlan = serde_json::from_str(&json).unwrap();
-        assert_eq!(plan2.old_pane_id, 42);
-        assert_eq!(plan2.new_pane_id, 100);
-        assert_eq!(plan2.state_warning.as_deref(), Some("careful!"));
-        assert_eq!(plan2.action, plan.action);
+        let diagnostic = format!("{plan:?}");
+        assert!(diagnostic.contains("ProcessPlan"));
+        assert!(diagnostic.contains("old_pane_id: 42"));
+        assert!(diagnostic.contains("action: Shell"));
+        assert!(diagnostic.contains("has_state_warning: true"));
+        assert!(!diagnostic.contains("secret"));
     }
 
     #[test]
@@ -1774,9 +1666,7 @@ mod tests {
         let result = LaunchResult {
             old_pane_id: 1,
             new_pane_id: 10,
-            action: LaunchAction::Skip {
-                reason: "test".into(),
-            },
+            action: LaunchDisposition::Skip,
             success: true,
             error: None,
         };
@@ -1793,11 +1683,7 @@ mod tests {
         let result = LaunchResult {
             old_pane_id: 5,
             new_pane_id: 50,
-            action: LaunchAction::LaunchAgent {
-                command: "claude".into(),
-                cwd: PathBuf::from("/x"),
-                agent_type: "claude_code".into(),
-            },
+            action: LaunchDisposition::Agent,
             success: false,
             error: Some("connection refused".into()),
         };
@@ -1824,7 +1710,7 @@ mod tests {
             results: vec![LaunchResult {
                 old_pane_id: 1,
                 new_pane_id: 10,
-                action: LaunchAction::Skip { reason: "r".into() },
+                action: LaunchDisposition::Skip,
                 success: true,
                 error: None,
             }],
@@ -2190,13 +2076,8 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn plan_no_info_shells_disabled() {
-        let config = LaunchConfig {
-            launch_shells: false,
-            ..Default::default()
-        };
-        let wez = crate::wezterm::mock_wezterm_handle();
-        let launcher = ProcessLauncher::new(wez, config);
+    fn plan_no_process_metadata_is_structural_skip() {
+        let launcher = ProcessLauncher::new(LaunchConfig::default());
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
@@ -2232,15 +2113,15 @@ mod tests {
 
         let plans = launcher.plan(&id_map, &[state]);
         match &plans[0].action {
-            LaunchAction::Skip { reason } => {
-                assert!(reason.contains("already created"));
+            LaunchAction::Manual { hint, .. } => {
+                assert!(hint.contains("mux-native argv"));
             }
-            other => panic!("expected structural shell Skip, got {other:?}"),
+            other => panic!("expected shell Manual disposition, got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_unknown_process_with_argv_hint() {
+    fn plan_unknown_process_redacts_argv() {
         let launcher = test_launcher();
         let id_map = test_pane_id_map();
 
@@ -2258,8 +2139,12 @@ mod tests {
                 hint,
                 original_process,
             } => {
-                assert!(hint.contains("cargo test --release"));
-                assert_eq!(original_process, "cargo");
+                assert_eq!(
+                    hint,
+                    "Unrecognized foreground process requires manual restart."
+                );
+                assert_eq!(original_process, "unrecognized");
+                assert!(!hint.contains("cargo test --release"));
             }
             other => panic!("expected Manual, got {other:?}"),
         }
@@ -2284,16 +2169,19 @@ mod tests {
                 hint,
                 original_process,
             } => {
-                // Without argv, hint uses the name
-                assert!(hint.contains("mysterious"));
-                assert_eq!(original_process, "mysterious");
+                assert_eq!(
+                    hint,
+                    "Unrecognized foreground process requires manual restart."
+                );
+                assert_eq!(original_process, "unrecognized");
+                assert!(!hint.contains("mysterious"));
             }
             other => panic!("expected Manual, got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_no_cwd_defaults_to_root() {
+    fn plan_no_cwd_does_not_synthesize_process_launch_root() {
         let launcher = test_launcher();
         let id_map = test_pane_id_map();
 
@@ -2303,8 +2191,6 @@ mod tests {
         state.foreground_process = None;
 
         let plans = launcher.plan(&id_map, &[state]);
-        // With no cwd (defaults to "/") and shells enabled but cwd == "/",
-        // should skip
         match &plans[0].action {
             LaunchAction::Skip { reason } => {
                 assert!(reason.contains("layout restore"));
@@ -2314,7 +2200,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_empty_cwd_matches_missing_cwd_root_fallback_for_shells() {
+    fn plan_empty_cwd_shell_requires_manual_verified_spawn() {
         let launcher = test_launcher();
         let id_map = test_pane_id_map();
 
@@ -2324,15 +2210,15 @@ mod tests {
 
         let plans = launcher.plan(&id_map, &[state]);
         match &plans[0].action {
-            LaunchAction::Skip { reason } => {
-                assert!(reason.contains("already created"));
+            LaunchAction::Manual { hint, .. } => {
+                assert!(hint.contains("mux-native argv"));
             }
-            other => panic!("expected structural shell Skip, got {other:?}"),
+            other => panic!("expected shell Manual disposition, got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_empty_cwd_matches_missing_cwd_root_fallback_for_agents() {
+    fn plan_empty_cwd_refuses_agent_restart_instead_of_using_root() {
         let mut agent_commands = HashMap::new();
         agent_commands.insert("claude_code".into(), "cd {cwd} && claude --resume".into());
         let config = LaunchConfig {
@@ -2340,8 +2226,7 @@ mod tests {
             agent_commands,
             ..Default::default()
         };
-        let wez = crate::wezterm::mock_wezterm_handle();
-        let launcher = ProcessLauncher::new(wez, config);
+        let launcher = ProcessLauncher::new(config);
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
@@ -2354,14 +2239,11 @@ mod tests {
 
         let plans = launcher.plan(&id_map, &[state]);
         match &plans[0].action {
-            LaunchAction::LaunchAgent { command, cwd, .. } => {
-                assert_eq!(cwd, &PathBuf::from("/"));
-                assert!(
-                    command.contains("cd / && claude --resume"),
-                    "empty cwd must not render as bare `cd`: {command}"
-                );
+            LaunchAction::Manual { hint, .. } => {
+                assert!(hint.contains("verified absolute working directory"));
+                assert!(!hint.contains('/'));
             }
-            other => panic!("expected LaunchAgent, got {other:?}"),
+            other => panic!("expected Manual, got {other:?}"),
         }
     }
 
@@ -2379,24 +2261,23 @@ mod tests {
         });
 
         let plans = launcher.plan(&id_map, &[state]);
-        // Agents default to Manual without opt-in
         assert!(plans[0].state_warning.is_some());
         match &plans[0].action {
             LaunchAction::Manual { hint, .. } => {
-                assert!(hint.contains("codex"));
+                assert!(hint.contains("mux-native argv"));
+                assert!(!hint.contains("codex"));
             }
             other => panic!("expected Manual, got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_gemini_agent_with_opt_in() {
+    fn plan_gemini_agent_is_manual_with_reserved_setting_enabled() {
         let config = LaunchConfig {
             launch_agents: true,
             ..Default::default()
         };
-        let wez = crate::wezterm::mock_wezterm_handle();
-        let launcher = ProcessLauncher::new(wez, config);
+        let launcher = ProcessLauncher::new(config);
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
@@ -2409,15 +2290,11 @@ mod tests {
         let plans = launcher.plan(&id_map, &[state]);
         assert!(plans[0].state_warning.is_some());
         match &plans[0].action {
-            LaunchAction::LaunchAgent {
-                command,
-                agent_type,
-                ..
-            } => {
-                assert!(command.contains("gemini-cli"));
-                assert_eq!(agent_type, "Gemini");
+            LaunchAction::Manual { hint, .. } => {
+                assert!(hint.contains("mux-native argv"));
+                assert!(!hint.contains("Gemini"));
             }
-            other => panic!("expected LaunchAgent, got {other:?}"),
+            other => panic!("expected safe Manual disposition, got {other:?}"),
         }
     }
 
@@ -2427,8 +2304,7 @@ mod tests {
             launch_agents: true,
             ..Default::default()
         };
-        let wez = crate::wezterm::mock_wezterm_handle();
-        let launcher = ProcessLauncher::new(wez, config);
+        let launcher = ProcessLauncher::new(config);
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
@@ -2441,21 +2317,20 @@ mod tests {
         let plans = launcher.plan(&id_map, &[state]);
         match &plans[0].action {
             LaunchAction::Manual { hint, .. } => {
-                assert!(hint.contains("Unknown agent type"));
-                assert!(hint.contains("custom_bot"));
+                assert!(hint.contains("mux-native argv"));
+                assert!(!hint.contains("custom_bot"));
             }
             other => panic!("expected Manual, got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_state_warning_contains_agent_name() {
+    fn plan_state_warning_is_finite_and_content_free() {
         let config = LaunchConfig {
             launch_agents: true,
             ..Default::default()
         };
-        let wez = crate::wezterm::mock_wezterm_handle();
-        let launcher = ProcessLauncher::new(wez, config);
+        let launcher = ProcessLauncher::new(config);
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
@@ -2467,9 +2342,9 @@ mod tests {
 
         let plans = launcher.plan(&id_map, &[state]);
         let warning = plans[0].state_warning.as_ref().unwrap();
-        assert!(warning.contains("claude_code"));
-        assert!(warning.contains("NEW session"));
-        assert!(warning.contains("lost"));
+        assert!(warning.contains("cannot be resumed automatically"));
+        assert!(warning.contains("in-flight work"));
+        assert!(!warning.contains("claude_code"));
     }
 
     // =========================================================================
@@ -2479,9 +2354,8 @@ mod tests {
     #[test]
     fn execute_empty_plans() {
         run_async_test(async {
-            let wez = mock_with_panes(&[]).await;
-            let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
-            let report = launcher.execute(&[]).await;
+            let launcher = ProcessLauncher::new(LaunchConfig::default());
+            let report = launcher.execute(&[]);
             assert_eq!(report.results.len(), 0);
             assert_eq!(report.shells_launched, 0);
             assert_eq!(report.failed, 0);
@@ -2491,8 +2365,7 @@ mod tests {
     #[test]
     fn execute_skip_only() {
         run_async_test(async {
-            let wez = mock_with_panes(&[]).await;
-            let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+            let launcher = ProcessLauncher::new(LaunchConfig::default());
             let plans = vec![
                 ProcessPlan {
                     old_pane_id: 1,
@@ -2511,7 +2384,7 @@ mod tests {
                     state_warning: None,
                 },
             ];
-            let report = launcher.execute(&plans).await;
+            let report = launcher.execute(&plans);
             assert_eq!(report.skipped, 2);
             assert_eq!(report.shells_launched, 0);
             assert_eq!(report.agents_launched, 0);
@@ -2523,8 +2396,7 @@ mod tests {
     #[test]
     fn execute_manual_only() {
         run_async_test(async {
-            let wez = mock_with_panes(&[]).await;
-            let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+            let launcher = ProcessLauncher::new(LaunchConfig::default());
             let plans = vec![ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 100,
@@ -2534,7 +2406,7 @@ mod tests {
                 },
                 state_warning: None,
             }];
-            let report = launcher.execute(&plans).await;
+            let report = launcher.execute(&plans);
             assert_eq!(report.manual, 1);
             assert_eq!(report.shells_launched, 0);
             assert!(report.results[0].success);
@@ -2542,10 +2414,11 @@ mod tests {
     }
 
     #[test]
-    fn execute_agent_launch() {
+    fn execute_legacy_agent_plan_is_refused() {
         run_async_test(async {
-            let wez = mock_with_panes(&[100]).await;
-            let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+            let mock = std::sync::Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(100).await;
+            let launcher = ProcessLauncher::new(LaunchConfig::default());
             let plans = vec![ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 100,
@@ -2556,23 +2429,22 @@ mod tests {
                 },
                 state_warning: Some("new session warning".into()),
             }];
-            let report = launcher.execute(&plans).await;
-            assert_eq!(report.agents_launched, 1);
-            assert_eq!(report.failed, 0);
-            assert!(report.results[0].success);
+            let report = launcher.execute(&plans);
+            assert_eq!(report.agents_launched, 0);
+            assert_eq!(report.failed, 1);
+            assert!(!report.results[0].success);
+            assert_eq!(mock.pane_state(100).await.unwrap().content, "");
         });
     }
 
     #[test]
-    fn execute_agent_launch_anchors_cwd_before_custom_command() {
+    fn execute_reserved_agent_setting_does_not_enable_launch() {
         run_async_test(async {
             let mock = std::sync::Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(100).await;
-            let wez: crate::wezterm::WeztermHandle = mock.clone();
             let launcher = ProcessLauncher::new(
-                wez,
                 LaunchConfig {
-                    launch_delay_ms: 0,
+                    launch_agents: true,
                     ..Default::default()
                 },
             );
@@ -2587,26 +2459,25 @@ mod tests {
                 state_warning: Some("new session warning".into()),
             }];
 
-            let report = launcher.execute(&plans).await;
-            assert_eq!(report.agents_launched, 1);
-            assert_eq!(report.failed, 0);
+            let report = launcher.execute(&plans);
+            assert_eq!(report.agents_launched, 0);
+            assert_eq!(report.failed, 1);
+            assert!(
+                report.results[0]
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("mux-native argv"))
+            );
 
             let content = mock.pane_state(100).await.unwrap().content;
-            assert_eq!(content, "cd '/tmp/project with spaces'\rclaude --resume\r");
+            assert_eq!(content, "");
         });
     }
 
     #[test]
     fn execute_report_result_order_preserved() {
         run_async_test(async {
-            let wez = mock_with_panes(&[100, 200]).await;
-            let launcher = ProcessLauncher::new(
-                wez,
-                LaunchConfig {
-                    launch_delay_ms: 0,
-                    ..Default::default()
-                },
-            );
+            let launcher = ProcessLauncher::new(LaunchConfig::default());
             let plans = vec![
                 ProcessPlan {
                     old_pane_id: 1,
@@ -2626,7 +2497,7 @@ mod tests {
                     state_warning: None,
                 },
             ];
-            let report = launcher.execute(&plans).await;
+            let report = launcher.execute(&plans);
             assert_eq!(report.results[0].old_pane_id, 1);
             assert_eq!(report.results[1].old_pane_id, 2);
         });
