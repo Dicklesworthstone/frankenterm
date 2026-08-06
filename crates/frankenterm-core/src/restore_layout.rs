@@ -79,7 +79,9 @@ fn restore_layout_error(operation: &'static str, detail: &'static str) -> crate:
 fn restore_layout_integrity_error(operation: &'static str) -> crate::Error {
     crate::Error::RuntimeOperation {
         operation,
-        source: RuntimeOperationSource::ContextFailure,
+        source: RuntimeOperationSource::Backend(
+            "restore layout state integrity check failed".to_string(),
+        ),
     }
 }
 
@@ -720,6 +722,7 @@ fn validate_restore_snapshot(
     let mut seen_tab_ids = HashSet::new();
     let mut seen_pane_ids = HashSet::new();
     let mut normalized_cwds = HashMap::new();
+    let mut split_percents = HashMap::new();
     let mut pane_count = 0usize;
 
     for window in &snapshot.windows {
@@ -752,25 +755,14 @@ fn validate_restore_snapshot(
                     "topology contains a duplicate tab id",
                 ));
             }
-            let (tab_panes, active_leaf_count) = validate_pane_tree(
+            let validated = validate_pane_tree(
                 &tab.pane_tree,
                 1,
                 restore_working_dirs,
                 &mut seen_pane_ids,
                 &mut normalized_cwds,
+                &mut split_percents,
             )?;
-            if tab_panes == 0 {
-                return Err(restore_layout_error(
-                    OPERATION,
-                    "topology contains a zero-leaf pane tree",
-                ));
-            }
-            if active_leaf_count > 1 {
-                return Err(restore_layout_error(
-                    OPERATION,
-                    "tab contains multiple active leaf markers",
-                ));
-            }
             if tab
                 .active_pane_id
                 .is_some_and(|pane_id| !pane_tree_contains(&tab.pane_tree, pane_id))
@@ -780,7 +772,16 @@ fn validate_restore_snapshot(
                     "tab active pane is outside its pane tree",
                 ));
             }
-            pane_count = pane_count.checked_add(tab_panes).ok_or_else(|| {
+            if matches!(
+                (tab.active_pane_id, validated.active_leaf_id),
+                (Some(explicit), Some(marked)) if explicit != marked
+            ) {
+                return Err(restore_layout_error(
+                    OPERATION,
+                    "tab active pane contradicts its active leaf marker",
+                ));
+            }
+            pane_count = pane_count.checked_add(validated.pane_count).ok_or_else(|| {
                 restore_layout_error(OPERATION, "topology pane count overflowed")
             })?;
         }
@@ -796,6 +797,7 @@ fn validate_restore_snapshot(
     Ok(RestorePreflight {
         pane_count,
         normalized_cwds,
+        split_percents,
     })
 }
 
@@ -805,7 +807,8 @@ fn validate_pane_tree(
     restore_working_dirs: bool,
     seen_pane_ids: &mut HashSet<u64>,
     normalized_cwds: &mut HashMap<u64, String>,
-) -> crate::Result<(usize, usize)> {
+    split_percents: &mut HashMap<u64, u8>,
+) -> crate::Result<ValidatedPaneTree> {
     const OPERATION: &str = "restore_layout.preflight";
 
     if depth > MAX_PANE_TREE_DEPTH {
@@ -841,7 +844,11 @@ fn validate_pane_tree(
                     .map_err(|detail| restore_layout_error(OPERATION, detail))?;
                 normalized_cwds.insert(*pane_id, normalized);
             }
-            Ok((1, usize::from(*is_active)))
+            Ok(ValidatedPaneTree {
+                pane_count: 1,
+                active_leaf_id: is_active.then_some(*pane_id),
+                first_leaf_id: *pane_id,
+            })
         }
         PaneNode::HSplit { children } | PaneNode::VSplit { children } => {
             if children.len() < 2 {
@@ -851,37 +858,83 @@ fn validate_pane_tree(
                 ));
             }
             let mut pane_count = 0usize;
-            let mut active_leaf_count = 0usize;
-            let mut ratio_sum = 0.0f64;
-            for (ratio, child) in children {
+            let mut active_leaf_id = None;
+            let mut first_child_leaf_id = None;
+            let mut prefix_scale = 0.0f64;
+            let mut scaled_prefix_sum = 0.0f64;
+            for (child_index, (ratio, child)) in children.iter().enumerate() {
                 if !ratio.is_finite() || *ratio <= 0.0 {
                     return Err(restore_layout_error(
                         OPERATION,
                         "split node has a non-positive or non-finite ratio",
                     ));
                 }
-                ratio_sum += *ratio;
-                if !ratio_sum.is_finite() {
+                if *ratio > prefix_scale {
+                    scaled_prefix_sum = if prefix_scale == 0.0 {
+                        1.0
+                    } else {
+                        scaled_prefix_sum * (prefix_scale / *ratio) + 1.0
+                    };
+                    prefix_scale = *ratio;
+                } else {
+                    scaled_prefix_sum += *ratio / prefix_scale;
+                }
+                if !prefix_scale.is_finite()
+                    || prefix_scale <= 0.0
+                    || !scaled_prefix_sum.is_finite()
+                    || scaled_prefix_sum <= 0.0
+                {
                     return Err(restore_layout_error(
                         OPERATION,
-                        "split ratio sum overflowed",
+                        "split ratio normalization failed",
                     ));
                 }
-                let (child_panes, child_active) = validate_pane_tree(
+                let validated_child = validate_pane_tree(
                     child,
                     depth + 1,
                     restore_working_dirs,
                     seen_pane_ids,
                     normalized_cwds,
+                    split_percents,
                 )?;
-                pane_count = pane_count.checked_add(child_panes).ok_or_else(|| {
-                    restore_layout_error(OPERATION, "topology pane count overflowed")
-                })?;
-                active_leaf_count = active_leaf_count.checked_add(child_active).ok_or_else(|| {
-                    restore_layout_error(OPERATION, "topology active pane count overflowed")
-                })?;
+                if child_index == 0 {
+                    first_child_leaf_id = Some(validated_child.first_leaf_id);
+                } else {
+                    let child_scaled_ratio = *ratio / prefix_scale;
+                    let percent = split_percent(child_scaled_ratio, scaled_prefix_sum)
+                        .map_err(|detail| restore_layout_error(OPERATION, detail))?;
+                    if split_percents
+                        .insert(validated_child.first_leaf_id, percent)
+                        .is_some()
+                    {
+                        return Err(restore_layout_integrity_error(
+                            "restore_layout.split_plan.duplicate_child_key",
+                        ));
+                    }
+                }
+                pane_count = pane_count
+                    .checked_add(validated_child.pane_count)
+                    .ok_or_else(|| {
+                        restore_layout_error(OPERATION, "topology pane count overflowed")
+                    })?;
+                if let Some(child_active_leaf_id) = validated_child.active_leaf_id {
+                    if active_leaf_id.replace(child_active_leaf_id).is_some() {
+                        return Err(restore_layout_error(
+                            OPERATION,
+                            "tab contains multiple active leaf markers",
+                        ));
+                    }
+                }
             }
-            Ok((pane_count, active_leaf_count))
+            Ok(ValidatedPaneTree {
+                pane_count,
+                active_leaf_id,
+                first_leaf_id: first_child_leaf_id.ok_or_else(|| {
+                    restore_layout_integrity_error(
+                        "restore_layout.preflight.missing_split_first_leaf",
+                    )
+                })?,
+            })
         }
     }
 }
@@ -1051,15 +1104,26 @@ fn pane_tree_contains(node: &PaneNode, pane_id: u64) -> bool {
     }
 }
 
-fn split_percent(child_ratio: f64, prefix_ratio: f64) -> u8 {
-    if !child_ratio.is_finite()
-        || !prefix_ratio.is_finite()
-        || child_ratio <= 0.0
-        || prefix_ratio <= 0.0
+fn split_percent(child_scaled_ratio: f64, scaled_prefix_sum: f64) -> Result<u8, &'static str> {
+    if !child_scaled_ratio.is_finite()
+        || !scaled_prefix_sum.is_finite()
+        || child_scaled_ratio < 0.0
+        || scaled_prefix_sum <= 0.0
+        || child_scaled_ratio > scaled_prefix_sum
     {
-        return 50;
+        return Err("split ratio percentage invariant failed");
     }
-    ((child_ratio / prefix_ratio * 100.0).round() as u8).clamp(1, 99)
+    if child_scaled_ratio == 0.0 {
+        // A validated positive ratio can underflow only after normalization by
+        // an astronomically larger sibling. The backend's minimum 1% is the
+        // closest representable request and is not an invariant failure.
+        return Ok(1);
+    }
+    let percent = (child_scaled_ratio / scaled_prefix_sum * 100.0).round();
+    if !percent.is_finite() {
+        return Err("split ratio percentage calculation failed");
+    }
+    Ok((percent as u8).clamp(1, 99))
 }
 
 fn equal_split_percent(remaining_children: usize) -> u8 {
@@ -1196,6 +1260,12 @@ mod tests {
         LockPoisoned,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum InjectedSplitReceipt {
+        ParentPaneId,
+        Fixed(u64),
+    }
+
     impl InjectedMutationFailure {
         fn error(self, operation: &'static str, pane_id: u64) -> crate::Error {
             match self {
@@ -1221,6 +1291,7 @@ mod tests {
     struct InstrumentedWezterm {
         inner: Arc<MockWezterm>,
         split_failure: Option<InjectedMutationFailure>,
+        split_receipt: Option<InjectedSplitReceipt>,
         activation_failure: Option<InjectedMutationFailure>,
         split_attempts: Mutex<Vec<(u64, SplitDirection, Option<u8>)>>,
         activation_attempts: Mutex<Vec<u64>>,
@@ -1233,6 +1304,7 @@ mod tests {
                 inner,
                 split_failure: fail_splits
                     .then_some(InjectedMutationFailure::AuthoritativePaneRejection),
+                split_receipt: None,
                 activation_failure: fail_activations
                     .then_some(InjectedMutationFailure::AuthoritativePaneRejection),
                 split_attempts: Mutex::new(Vec::new()),
@@ -1248,6 +1320,22 @@ mod tests {
             Self {
                 inner,
                 split_failure: Some(split_failure),
+                split_receipt: None,
+                activation_failure: None,
+                split_attempts: Mutex::new(Vec::new()),
+                activation_attempts: Mutex::new(Vec::new()),
+                get_pane_attempts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_split_receipt(
+            inner: Arc<MockWezterm>,
+            split_receipt: InjectedSplitReceipt,
+        ) -> Self {
+            Self {
+                inner,
+                split_failure: None,
+                split_receipt: Some(split_receipt),
                 activation_failure: None,
                 split_attempts: Mutex::new(Vec::new()),
                 activation_attempts: Mutex::new(Vec::new()),
@@ -1469,7 +1557,13 @@ mod tests {
                 .lock()
                 .expect("split-attempt lock poisoned")
                 .push((pane_id, direction, percent));
-            if let Some(failure) = self.split_failure {
+            if let Some(receipt) = self.split_receipt {
+                let returned_pane_id = match receipt {
+                    InjectedSplitReceipt::ParentPaneId => pane_id,
+                    InjectedSplitReceipt::Fixed(returned_pane_id) => returned_pane_id,
+                };
+                Box::pin(async move { Ok(returned_pane_id) })
+            } else if let Some(failure) = self.split_failure {
                 let error = failure.error("restore_layout.test.split_pane", pane_id);
                 Box::pin(async move { Err(error) })
             } else {
@@ -1489,7 +1583,13 @@ mod tests {
                 .lock()
                 .expect("split-attempt lock poisoned")
                 .push((pane_id, direction, percent));
-            if let Some(failure) = self.split_failure {
+            if let Some(receipt) = self.split_receipt {
+                let returned_pane_id = match receipt {
+                    InjectedSplitReceipt::ParentPaneId => pane_id,
+                    InjectedSplitReceipt::Fixed(returned_pane_id) => returned_pane_id,
+                };
+                Box::pin(async move { Ok(returned_pane_id) })
+            } else if let Some(failure) = self.split_failure {
                 if matches!(
                     failure,
                     InjectedMutationFailure::AuthoritativePaneRejectionThenCancel
@@ -2068,12 +2168,15 @@ mod tests {
     }
 
     #[test]
-    fn split_percent_preserves_full_valid_range() {
-        assert_eq!(split_percent(1.0, 2.0), 50);
-        assert_eq!(split_percent(7.0, 10.0), 70);
-        assert_eq!(split_percent(2.0, 3.0), 67);
-        assert_eq!(split_percent(f64::MIN_POSITIVE, 1.0), 1);
-        assert_eq!(split_percent(1.0, 1.0), 99);
+    fn split_percent_preserves_full_valid_range_and_rejects_broken_invariants() {
+        assert_eq!(split_percent(1.0, 2.0).unwrap(), 50);
+        assert_eq!(split_percent(7.0, 10.0).unwrap(), 70);
+        assert_eq!(split_percent(2.0, 3.0).unwrap(), 67);
+        assert_eq!(split_percent(f64::MIN_POSITIVE, 1.0).unwrap(), 1);
+        assert_eq!(split_percent(1.0, 1.0).unwrap(), 99);
+        assert!(split_percent(f64::NAN, 1.0).is_err());
+        assert!(split_percent(1.0, 0.0).is_err());
+        assert!(split_percent(2.0, 1.0).is_err());
     }
 
     #[test]
@@ -2168,6 +2271,25 @@ mod tests {
                 .restore(&snapshot)
                 .await
                 .expect_err("relative working directories must fail closed");
+            assert!(mock.list_panes().await.unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn contradictory_active_authority_fails_before_mux_effects() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = make_restorer(mock.clone());
+            let mut snapshot = single_tab_snapshot(vsplit(vec![
+                (0.5, leaf(1, None)),
+                (0.5, active_leaf(2)),
+            ]));
+            snapshot.windows[0].tabs[0].active_pane_id = Some(1);
+
+            restorer
+                .restore(&snapshot)
+                .await
+                .expect_err("contradictory active-pane authorities must fail preflight");
             assert!(mock.list_panes().await.unwrap().is_empty());
         });
     }
@@ -2510,6 +2632,41 @@ mod tests {
                 split_attempts,
                 vec![
                     (result.pane_id_map[&1], SplitDirection::Right, Some(70)),
+                    (result.pane_id_map[&1], SplitDirection::Right, Some(67)),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn restore_extreme_ratio_prefixes_without_suffix_cancellation() {
+        run_async_test(async {
+            let inner = Arc::new(MockWezterm::new());
+            let instrumented = Arc::new(InstrumentedWezterm::new(
+                inner,
+                false,
+                false,
+            ));
+            let restorer = LayoutRestorer::new(
+                instrumented.clone(),
+                RestoreConfig::default(),
+            );
+            let snapshot = single_tab_snapshot(vsplit(vec![
+                (1.0, leaf(1, None)),
+                (2.0, leaf(2, None)),
+                (f64::MAX, leaf(3, None)),
+            ]));
+
+            let result = restorer.restore(&snapshot).await.unwrap();
+
+            assert_eq!(result.panes_created, 3);
+            assert_eq!(
+                *instrumented
+                    .split_attempts
+                    .lock()
+                    .expect("split-attempt lock poisoned"),
+                vec![
+                    (result.pane_id_map[&1], SplitDirection::Right, Some(99)),
                     (result.pane_id_map[&1], SplitDirection::Right, Some(67)),
                 ]
             );
