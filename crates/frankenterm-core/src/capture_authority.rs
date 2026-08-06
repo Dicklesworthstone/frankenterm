@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::runtime_async::{notify::Notify, sleep_with_cx, timeout_with_cx};
+use crate::runtime_async::{
+    ContextError, ContextErrorKind, notify::Notify, sleep_with_cx, timeout_with_cx,
+};
 
 const LEASE_ADMITTING: u8 = 0;
 const LEASE_DRAINING: u8 = 1;
@@ -228,9 +230,21 @@ pub enum CaptureAuthorityError {
     /// The caller cancelled while a revoked lease was draining.
     #[error("capture authority drain was cancelled")]
     DrainCancelled,
-    /// The bounded drain deadline expired.  The predecessor remains revoked.
+    /// The bounded drain timeout or caller deadline expired. The predecessor remains revoked.
     #[error("capture authority drain timed out")]
     DrainTimedOut,
+    /// Cancellation cleanup exceeded its dedicated bound while draining.
+    #[error("capture authority drain cancellation cleanup timed out")]
+    DrainCancellationCleanupTimedOut,
+    /// The caller's cooperative poll budget was exhausted while draining.
+    #[error("capture authority drain poll budget exhausted")]
+    DrainPollBudgetExhausted,
+    /// The caller's cost budget was exhausted while draining.
+    #[error("capture authority drain cost budget exhausted")]
+    DrainCostBudgetExhausted,
+    /// A non-time, non-cancellation context failure interrupted the drain.
+    #[error("capture authority drain context failed")]
+    DrainContextFailure,
     /// Authority state changed unexpectedly while completing a drain.
     #[error("capture authority changed during drain completion")]
     AuthorityChanged,
@@ -619,6 +633,70 @@ impl Drop for CaptureDrainWaiter {
     }
 }
 
+fn capture_drain_capability_failure(
+    cx: &crate::cx::Cx,
+) -> Option<CaptureAuthorityError> {
+    use crate::outcome::CancelKind;
+
+    if let Some(reason) = cx.root_cancel_cause() {
+        return Some(match reason.kind {
+            CancelKind::Timeout | CancelKind::Deadline => CaptureAuthorityError::DrainTimedOut,
+            CancelKind::PollQuota => CaptureAuthorityError::DrainPollBudgetExhausted,
+            CancelKind::CostBudget => CaptureAuthorityError::DrainCostBudgetExhausted,
+            CancelKind::User
+            | CancelKind::FailFast
+            | CancelKind::RaceLost
+            | CancelKind::ParentCancelled
+            | CancelKind::ResourceUnavailable
+            | CancelKind::Shutdown
+            | CancelKind::LinkedExit => CaptureAuthorityError::DrainCancelled,
+        });
+    }
+
+    // A budget-aware timer can observe exhaustion before `checkpoint()` has
+    // materialized a root cancellation cause. Preserve the finite budget class
+    // from the content-free snapshot rather than calling every interruption a
+    // timeout.
+    let budget = cx.budget_stats();
+    if budget.deadline.at.is_some() && budget.deadline.remaining.is_none() {
+        Some(CaptureAuthorityError::DrainTimedOut)
+    } else if budget.polls.remaining == Some(0) {
+        Some(CaptureAuthorityError::DrainPollBudgetExhausted)
+    } else if budget.cost.remaining == Some(0) {
+        Some(CaptureAuthorityError::DrainCostBudgetExhausted)
+    } else {
+        None
+    }
+}
+
+fn capture_drain_context_failure(
+    cx: &crate::cx::Cx,
+    error: &ContextError,
+) -> CaptureAuthorityError {
+    match error.kind() {
+        ContextErrorKind::DeadlineExceeded => CaptureAuthorityError::DrainTimedOut,
+        ContextErrorKind::CancelTimeout => {
+            CaptureAuthorityError::DrainCancellationCleanupTimedOut
+        }
+        ContextErrorKind::PollQuotaExhausted => {
+            CaptureAuthorityError::DrainPollBudgetExhausted
+        }
+        ContextErrorKind::CostQuotaExhausted => {
+            CaptureAuthorityError::DrainCostBudgetExhausted
+        }
+        ContextErrorKind::Cancelled => capture_drain_capability_failure(cx)
+            .unwrap_or(CaptureAuthorityError::DrainCancelled),
+        _ => CaptureAuthorityError::DrainContextFailure,
+    }
+}
+
+fn checkpoint_capture_drain(cx: &crate::cx::Cx) -> Result<(), CaptureAuthorityError> {
+    match cx.checkpoint() {
+        Ok(()) => capture_drain_capability_failure(cx).map_or(Ok(()), Err),
+        Err(error) => Err(capture_drain_context_failure(cx, &error)),
+    }
+}
+
 async fn await_capture_drain_with_cx<T, F>(
     cx: &crate::cx::Cx,
     timeout: Duration,
@@ -627,55 +705,43 @@ async fn await_capture_drain_with_cx<T, F>(
 where
     F: std::future::Future<Output = Result<T, CaptureAuthorityError>>,
 {
-    if cx.is_cancel_requested() {
-        return Err(CaptureAuthorityError::DrainCancelled);
-    }
+    checkpoint_capture_drain(cx)?;
 
     use futures::future::{Either, select};
-
-    #[derive(Clone, Copy)]
-    enum DrainInterrupt {
-        Cancelled,
-        TimedOut,
-    }
 
     let bounded_drain = std::pin::pin!(timeout_with_cx(cx, timeout, drain));
     let cancel_watcher = std::pin::pin!(async {
         loop {
-            if cx.is_cancel_requested() {
-                return DrainInterrupt::Cancelled;
+            if let Err(error) = checkpoint_capture_drain(cx) {
+                return error;
             }
-            if sleep_with_cx(cx, CX_CANCEL_POLL_INTERVAL).await.is_err() {
-                return if cx.is_cancel_requested() {
-                    DrainInterrupt::Cancelled
-                } else {
-                    DrainInterrupt::TimedOut
-                };
+            let sleep_result = sleep_with_cx(cx, CX_CANCEL_POLL_INTERVAL).await;
+            if let Err(error) = checkpoint_capture_drain(cx) {
+                return error;
+            }
+            if sleep_result.is_err() {
+                return CaptureAuthorityError::DrainContextFailure;
             }
         }
     });
 
     match select(bounded_drain, cancel_watcher).await {
-        Either::Left((Ok(result), _)) => result,
-        Either::Left((Err(_), _)) if cx.is_cancel_requested() => {
-            Err(CaptureAuthorityError::DrainCancelled)
+        Either::Left((Ok(result), _)) => {
+            checkpoint_capture_drain(cx)?;
+            result
         }
-        Either::Left((Err(_), _)) => Err(CaptureAuthorityError::DrainTimedOut),
-        Either::Right((DrainInterrupt::Cancelled, _)) => {
-            Err(CaptureAuthorityError::DrainCancelled)
+        Either::Left((Err(_), _)) => match checkpoint_capture_drain(cx) {
+            Ok(()) => Err(CaptureAuthorityError::DrainTimedOut),
+            Err(error) => Err(error),
         }
-        Either::Right((DrainInterrupt::TimedOut, _)) => Err(CaptureAuthorityError::DrainTimedOut),
+        Either::Right((error, _)) => Err(error),
     }
 }
 
 fn checkpoint_after_capture_drain(
     cx: &crate::cx::Cx,
 ) -> Result<(), CaptureAuthorityError> {
-    match cx.checkpoint() {
-        Ok(()) => Ok(()),
-        Err(_) if cx.is_cancel_requested() => Err(CaptureAuthorityError::DrainCancelled),
-        Err(_) => Err(CaptureAuthorityError::DrainTimedOut),
-    }
+    checkpoint_capture_drain(cx)
 }
 
 struct PaneAuthorityState {
@@ -2047,6 +2113,92 @@ mod tests {
                 )
                 .await
                 .expect("resume after cancellation");
+        });
+    }
+
+    #[test]
+    fn drain_context_failures_preserve_finite_non_timeout_classes() {
+        let cx = crate::cx::for_testing();
+        let cases = [
+            (
+                ContextErrorKind::DeadlineExceeded,
+                CaptureAuthorityError::DrainTimedOut,
+            ),
+            (
+                ContextErrorKind::CancelTimeout,
+                CaptureAuthorityError::DrainCancellationCleanupTimedOut,
+            ),
+            (
+                ContextErrorKind::PollQuotaExhausted,
+                CaptureAuthorityError::DrainPollBudgetExhausted,
+            ),
+            (
+                ContextErrorKind::CostQuotaExhausted,
+                CaptureAuthorityError::DrainCostBudgetExhausted,
+            ),
+            (
+                ContextErrorKind::Internal,
+                CaptureAuthorityError::DrainContextFailure,
+            ),
+        ];
+
+        for (kind, expected) in cases {
+            let error = ContextError::new(kind).with_message("SECRET capture context detail");
+            let actual = capture_drain_context_failure(&cx, &error);
+            assert_eq!(actual, expected, "kind: {kind:?}");
+            assert!(!actual.to_string().contains("SECRET"), "kind: {kind:?}");
+        }
+    }
+
+    #[test]
+    fn exhausted_poll_and_cost_budgets_are_not_reported_as_drain_timeouts() {
+        run_async_test(async {
+            let authority = CaptureAuthority::new();
+            let pane = authority.activate_pane(24).expect("pane");
+            let lease = authority
+                .issue_source(pane, CaptureSourceKind::Polling)
+                .expect("source");
+            let stamp = lease.stamp();
+            let held = lease
+                .try_acquire_producer(stamp, stamp.global_pane_id())
+                .expect("held producer");
+            let revocation = authority
+                .begin_source_revocation(pane, stamp)
+                .expect("revocation");
+
+            let cases = [
+                (
+                    crate::cx::Cx::for_testing_with_budget(
+                        crate::cx::Budget::new().with_poll_quota(0),
+                    ),
+                    CaptureAuthorityError::DrainPollBudgetExhausted,
+                ),
+                (
+                    crate::cx::Cx::for_testing_with_budget(
+                        crate::cx::Budget::new().with_cost_quota(0),
+                    ),
+                    CaptureAuthorityError::DrainCostBudgetExhausted,
+                ),
+            ];
+
+            for (cx, expected) in cases {
+                assert_eq!(
+                    revocation
+                        .wait_with_cx(&cx, Duration::from_secs(1))
+                        .await
+                        .unwrap_err(),
+                    expected
+                );
+            }
+
+            drop(held);
+            revocation
+                .wait_with_cx(
+                    &crate::cx::for_testing(),
+                    Duration::from_millis(50),
+                )
+                .await
+                .expect("resume after budget exhaustion");
         });
     }
 
