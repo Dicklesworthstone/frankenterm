@@ -467,6 +467,17 @@ pub enum WeztermError {
     #[error("Command failed: {0}")]
     CommandFailed(String),
 
+    /// A non-idempotent CLI command was admitted but its authoritative
+    /// completion could not be observed. The action may already have taken
+    /// effect, so automatic retry is unsafe until the mux state is reconciled.
+    #[error(
+        "WezTerm mutation '{operation}' has an indeterminate outcome; reconcile mux state before retrying"
+    )]
+    IndeterminateMutation {
+        /// Finite operation identity; never argv, pane text, or stderr.
+        operation: &'static str,
+    },
+
     /// JSON parsing failed
     #[error("Failed to parse WezTerm output: {0}")]
     ParseError(String),
@@ -538,6 +549,12 @@ impl WeztermError {
                         "Ensure the active backend bridge (current: WezTerm) is running and responsive.",
                     )
             }
+            Self::IndeterminateMutation { .. } => Remediation::new(
+                "The backend command may already have taken effect. Reconcile the live mux state before deciding whether to retry.",
+            )
+            .command("List panes", "ft list")
+            .command("Inspect state", "ft robot state")
+            .alternative("Do not blindly replay the mutation; verify its intended postcondition first."),
             Self::ParseError(_) => {
                 Remediation::new("WezTerm returned unexpected output; verify the version.")
                     .command("Check version", "wezterm --version")
@@ -591,7 +608,8 @@ impl WeztermError {
             | Self::SocketNotFound(_)
             | Self::ParseError(_)
             | Self::OutputTooLarge { .. }
-            | Self::PaneNotFound(_) => NetworkErrorKind::Permanent,
+            | Self::PaneNotFound(_)
+            | Self::IndeterminateMutation { .. } => NetworkErrorKind::Permanent,
             Self::CircuitOpen { .. } => NetworkErrorKind::Degraded,
         }
     }

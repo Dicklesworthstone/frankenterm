@@ -1011,6 +1011,12 @@ const LIST_PANES_CLI_CACHE_MS: u64 = 500;
 /// is legitimate (see ft-9nmmh).
 const MAX_CLI_METADATA_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliEffect {
+    ReadOnly,
+    Mutation { operation: &'static str },
+}
+
 /// Environment variable to override the wezterm binary path.
 const WEZTERM_CLI_ENV: &str = "FT_WEZTERM_CLI";
 
