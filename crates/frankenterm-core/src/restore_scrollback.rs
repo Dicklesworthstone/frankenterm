@@ -26,13 +26,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+
 use crate::error::RuntimeOperationSource;
 use crate::wezterm::WeztermHandle;
 
-fn restore_scrollback_cancelled_error(
-    operation: &'static str,
-    _detail: impl Into<String>,
-) -> crate::Error {
+fn restore_scrollback_cancelled_error(operation: &'static str) -> crate::Error {
     crate::Error::RuntimeOperation {
         operation,
         // Cancellation causes may contain caller-controlled or capability
@@ -234,20 +232,21 @@ impl Drop for InjectionGuard {
 // Scrollback injector
 // =============================================================================
 
-/// Engine that injects captured scrollback content into restored panes.
+/// Capability gate for future mux-owned scrollback restoration.
 pub struct ScrollbackInjector {
-    _wezterm: WeztermHandle,
-    _config: InjectionConfig,
     /// Shared suppression set for pattern detection gating.
     suppressed_panes: Arc<std::sync::Mutex<HashMap<u64, usize>>>,
 }
 
 impl ScrollbackInjector {
-    /// Create a new scrollback injector.
-    pub fn new(wezterm: WeztermHandle, config: InjectionConfig) -> Self {
+    /// Create a capability gate.
+    ///
+    /// The mux handle and tuning parameters are accepted as the future
+    /// restoration-channel boundary but are deliberately not retained while
+    /// that channel is unavailable. This avoids extending mux resource
+    /// lifetimes for an operation that must fail before touching the mux.
+    pub fn new(_wezterm: WeztermHandle, _config: InjectionConfig) -> Self {
         Self {
-            _wezterm: wezterm,
-            _config: config,
             suppressed_panes: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -295,10 +294,7 @@ impl ScrollbackInjector {
         scrollbacks: &HashMap<u64, ScrollbackData>,
     ) -> crate::Result<InjectionReport> {
         cx.checkpoint().map_err(|_err| {
-            restore_scrollback_cancelled_error(
-                "restore_scrollback.inject.pre_flight",
-                "caller capability stopped",
-            )
+            restore_scrollback_cancelled_error("restore_scrollback.inject.pre_flight")
         })?;
         // Mapped data cannot be restored safely today. Detect it before
         // allocating or sorting the potentially huge unmapped-ID report.

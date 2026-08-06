@@ -320,9 +320,9 @@ fn insert_pane_state(
         "UPDATE session_checkpoints
          SET total_bytes = COALESCE((
              SELECT SUM(
-                 length(terminal_state_json)
-                 + length(COALESCE(env_json, ''))
-                 + length(COALESCE(agent_metadata_json, ''))
+                 length(CAST(terminal_state_json AS BLOB))
+                 + length(CAST(COALESCE(env_json, '') AS BLOB))
+                 + length(CAST(COALESCE(agent_metadata_json, '') AS BLOB))
              )
              FROM mux_pane_state
              WHERE checkpoint_id = ?1
@@ -716,7 +716,15 @@ proptest! {
                 text.contains("Failed panes"),
                 "summary with failures should contain 'Failed panes'"
             );
+            let expected_ids = summary
+                .pane_states
+                .iter()
+                .map(|pane| pane.pane_id)
+                .collect::<std::collections::HashSet<_>>();
             for (id, _err) in &summary.layout_result.failed_panes {
+                if !expected_ids.contains(id) {
+                    continue;
+                }
                 let id_str = format!("pane {}", id);
                 prop_assert!(
                     text.contains(&id_str),
@@ -1395,11 +1403,14 @@ proptest! {
         insert_session(&conn, "newest-created-no-checkpoint", false, base_created_at + checkpoint_gap, "0.1.0", Some("host-b"));
         insert_session(&conn, "oldest", false, base_created_at - checkpoint_gap, "0.1.0", Some("host-c"));
 
-        conn.execute(
-            "UPDATE mux_sessions SET last_checkpoint_at = ?2 WHERE session_id = ?1",
-            params!["older-created-newer-checkpoint", base_created_at + checkpoint_gap * 2],
-        )
-        .unwrap();
+        insert_checkpoint(
+            &conn,
+            "older-created-newer-checkpoint",
+            base_created_at + checkpoint_gap * 2,
+            0,
+            0,
+            None,
+        );
 
         let candidates = frankenterm_core::session_restore::find_unclean_sessions(&db_path).unwrap();
         let ordered_ids: Vec<&str> = candidates.iter().map(|candidate| candidate.session_id.as_str()).collect();

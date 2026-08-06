@@ -261,12 +261,14 @@ impl fmt::Debug for LaunchInterruption {
 // =============================================================================
 
 /// Classifies and settles process-restoration dispositions for restored panes.
+#[derive(Debug, Default, Clone, Copy)]
 pub struct ProcessLauncher;
 
 impl ProcessLauncher {
     /// Create a process-disposition engine. It intentionally takes no mux
-    /// handle because the current implementation cannot launch or inject input.
-    pub fn new(_reserved_config: LaunchConfig) -> Self {
+    /// handle or launch configuration because the current implementation cannot
+    /// launch or inject input and every historical launch setting is inert.
+    pub const fn new() -> Self {
         Self
     }
 
@@ -842,7 +844,7 @@ mod tests {
             .state
             .create_task(region, asupersync::Budget::INFINITE, async move {
                 let cx = crate::cx::for_request();
-                let launcher = ProcessLauncher::new(LaunchConfig::default());
+                let launcher = ProcessLauncher::new();
                 let report = launcher.execute_cx(&cx, &[]);
                 assert_eq!(report.shells_launched, 0);
                 assert_eq!(report.agents_launched, 0);
@@ -878,7 +880,7 @@ mod tests {
                 crate::outcome::CancelKind::User,
                 Some("restore process pre-cancel regression"),
             );
-            let launcher = ProcessLauncher::new(LaunchConfig::default());
+            let launcher = ProcessLauncher::new();
             let plans = vec![ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 10,
@@ -925,7 +927,7 @@ mod tests {
     }
 
     fn test_launcher() -> ProcessLauncher {
-        ProcessLauncher::new(LaunchConfig::default())
+        ProcessLauncher::new()
     }
 
     fn test_pane_id_map() -> HashMap<u64, u64> {
@@ -1011,11 +1013,7 @@ mod tests {
 
     #[test]
     fn plan_agent_pane_is_manual_with_reserved_setting_enabled() {
-        let config = LaunchConfig {
-            launch_agents: true,
-            ..Default::default()
-        };
-        let launcher = ProcessLauncher::new(config);
+        let launcher = ProcessLauncher::new();
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
@@ -1043,14 +1041,7 @@ mod tests {
 
     #[test]
     fn plan_agent_ignores_reserved_command_template() {
-        let mut agent_commands = HashMap::new();
-        agent_commands.insert("claude_code".into(), "cd {cwd} && claude --resume".into());
-        let config = LaunchConfig {
-            launch_agents: true,
-            agent_commands,
-            ..Default::default()
-        };
-        let launcher = ProcessLauncher::new(config);
+        let launcher = ProcessLauncher::new();
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
@@ -1143,11 +1134,7 @@ mod tests {
 
     #[test]
     fn plan_shell_setting_is_reserved_and_still_manual() {
-        let config = LaunchConfig {
-            launch_shells: false,
-            ..Default::default()
-        };
-        let launcher = ProcessLauncher::new(config);
+        let launcher = ProcessLauncher::new();
         let id_map = test_pane_id_map();
         let states = vec![test_pane_state(1)];
 
@@ -1468,7 +1455,7 @@ mod tests {
         run_async_test(async {
             let mock = std::sync::Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(100).await;
-            let launcher = ProcessLauncher::new(LaunchConfig::default());
+            let launcher = ProcessLauncher::new();
             let plans = vec![ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 100,
@@ -1497,7 +1484,7 @@ mod tests {
     #[test]
     fn execute_mixed_plan() {
         run_async_test(async {
-            let launcher = ProcessLauncher::new(LaunchConfig::default());
+            let launcher = ProcessLauncher::new();
             let plans = vec![
                 ProcessPlan {
                     old_pane_id: 1,
@@ -2077,7 +2064,7 @@ mod tests {
 
     #[test]
     fn plan_no_process_metadata_is_structural_skip() {
-        let launcher = ProcessLauncher::new(LaunchConfig::default());
+        let launcher = ProcessLauncher::new();
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
@@ -2219,14 +2206,7 @@ mod tests {
 
     #[test]
     fn plan_empty_cwd_refuses_agent_restart_instead_of_using_root() {
-        let mut agent_commands = HashMap::new();
-        agent_commands.insert("claude_code".into(), "cd {cwd} && claude --resume".into());
-        let config = LaunchConfig {
-            launch_agents: true,
-            agent_commands,
-            ..Default::default()
-        };
-        let launcher = ProcessLauncher::new(config);
+        let launcher = ProcessLauncher::new();
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
@@ -2273,11 +2253,7 @@ mod tests {
 
     #[test]
     fn plan_gemini_agent_is_manual_with_reserved_setting_enabled() {
-        let config = LaunchConfig {
-            launch_agents: true,
-            ..Default::default()
-        };
-        let launcher = ProcessLauncher::new(config);
+        let launcher = ProcessLauncher::new();
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
@@ -2300,11 +2276,7 @@ mod tests {
 
     #[test]
     fn plan_unknown_agent_type_manual() {
-        let config = LaunchConfig {
-            launch_agents: true,
-            ..Default::default()
-        };
-        let launcher = ProcessLauncher::new(config);
+        let launcher = ProcessLauncher::new();
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
@@ -2326,11 +2298,7 @@ mod tests {
 
     #[test]
     fn plan_state_warning_is_finite_and_content_free() {
-        let config = LaunchConfig {
-            launch_agents: true,
-            ..Default::default()
-        };
-        let launcher = ProcessLauncher::new(config);
+        let launcher = ProcessLauncher::new();
         let id_map = test_pane_id_map();
 
         let mut state = test_pane_state(1);
@@ -2354,7 +2322,7 @@ mod tests {
     #[test]
     fn execute_empty_plans() {
         run_async_test(async {
-            let launcher = ProcessLauncher::new(LaunchConfig::default());
+            let launcher = ProcessLauncher::new();
             let report = launcher.execute(&[]);
             assert_eq!(report.results.len(), 0);
             assert_eq!(report.shells_launched, 0);
@@ -2365,7 +2333,7 @@ mod tests {
     #[test]
     fn execute_skip_only() {
         run_async_test(async {
-            let launcher = ProcessLauncher::new(LaunchConfig::default());
+            let launcher = ProcessLauncher::new();
             let plans = vec![
                 ProcessPlan {
                     old_pane_id: 1,
@@ -2396,7 +2364,7 @@ mod tests {
     #[test]
     fn execute_manual_only() {
         run_async_test(async {
-            let launcher = ProcessLauncher::new(LaunchConfig::default());
+            let launcher = ProcessLauncher::new();
             let plans = vec![ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 100,
@@ -2418,7 +2386,7 @@ mod tests {
         run_async_test(async {
             let mock = std::sync::Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(100).await;
-            let launcher = ProcessLauncher::new(LaunchConfig::default());
+            let launcher = ProcessLauncher::new();
             let plans = vec![ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 100,
@@ -2438,16 +2406,11 @@ mod tests {
     }
 
     #[test]
-    fn execute_reserved_agent_setting_does_not_enable_launch() {
+    fn execute_agent_plan_with_spaced_cwd_requires_mux_native_argv() {
         run_async_test(async {
             let mock = std::sync::Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(100).await;
-            let launcher = ProcessLauncher::new(
-                LaunchConfig {
-                    launch_agents: true,
-                    ..Default::default()
-                },
-            );
+            let launcher = ProcessLauncher::new();
             let plans = vec![ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 100,
@@ -2477,7 +2440,7 @@ mod tests {
     #[test]
     fn execute_report_result_order_preserved() {
         run_async_test(async {
-            let launcher = ProcessLauncher::new(LaunchConfig::default());
+            let launcher = ProcessLauncher::new();
             let plans = vec![
                 ProcessPlan {
                     old_pane_id: 1,
