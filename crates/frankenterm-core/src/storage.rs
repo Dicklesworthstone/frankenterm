@@ -38227,6 +38227,93 @@ fn writer_join_authority_timeout_after_transfer_retains_terminal_receipt() {
 }
 
 #[test]
+fn writer_join_authority_drop_before_blocking_start_retains_pending_handle() {
+    use std::future::Future as _;
+    use std::task::Poll;
+
+    let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+        .max_blocking_threads(1)
+        .build()
+        .expect("one-worker test runtime");
+    runtime.block_on(async {
+        let pool = crate::runtime_async::current_runtime_handle()
+            .and_then(|handle| handle.blocking_handle())
+            .expect("test runtime must expose its blocking pool");
+        let (blocker_entered_tx, blocker_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::sync_channel(1);
+        let blocker = pool.spawn(move || {
+            blocker_entered_tx
+                .send(())
+                .expect("announce occupied blocking worker");
+            release_blocker_rx
+                .recv()
+                .expect("release occupied blocking worker");
+        });
+        blocker_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("blocking worker did not enter its gate");
+
+        let (release_writer_tx, release_writer_rx) = std::sync::mpsc::channel::<()>();
+        let native_writer = thread::spawn(move || {
+            release_writer_rx
+                .recv()
+                .expect("test controls native writer release");
+        });
+        let authority = Arc::new(WriterJoinAuthority::new(native_writer));
+        let queued_authority = Arc::clone(&authority);
+        let cx = crate::cx::for_testing();
+        let mut queued = Box::pin(crate::runtime_async::spawn_blocking_with_cx(
+            &cx,
+            move || queued_authority.drive(std::time::Duration::from_secs(5)),
+        ));
+        let first_poll = std::future::poll_fn(|poll_cx| {
+            Poll::Ready(queued.as_mut().poll(poll_cx))
+        })
+        .await;
+        assert!(
+            matches!(first_poll, Poll::Pending),
+            "join settlement must queue behind the occupied worker"
+        );
+        for _ in 0..1_000 {
+            if pool.pending_count() == 1 {
+                break;
+            }
+            crate::runtime_async::task::yield_now().await;
+        }
+        assert_eq!(pool.pending_count(), 1, "join settlement must be queued");
+
+        drop(queued);
+        release_blocker_tx
+            .send(())
+            .expect("release occupied blocking worker");
+        assert!(
+            blocker.wait_timeout(std::time::Duration::from_secs(5)),
+            "occupied blocking worker did not finish"
+        );
+        for _ in 0..1_000 {
+            if pool.pending_count() == 0 {
+                break;
+            }
+            crate::runtime_async::task::yield_now().await;
+        }
+        assert_eq!(pool.pending_count(), 0, "cancelled queued join must retire");
+        assert!(
+            matches!(
+                &*authority.state.lock().expect("writer join authority lock"),
+                WriterJoinState::Pending(_)
+            ),
+            "dropping queued-but-unstarted settlement must retain the native handle"
+        );
+
+        release_writer_tx.send(()).expect("release native writer");
+        assert_eq!(
+            authority.drive(std::time::Duration::from_secs(5)),
+            WriterJoinDriveOutcome::Completed(WriterJoinOutcome::Joined)
+        );
+    });
+}
+
+#[test]
 fn writer_join_authority_panic_receipt_is_persistent() {
     let native_writer = thread::spawn(|| panic!("synthetic writer panic"));
     let authority = WriterJoinAuthority::new(native_writer);
@@ -38267,6 +38354,31 @@ fn storage_shutdown_with_cx_is_idempotent_after_clean_join() {
             storage.write_tx.terminal_state.load(AtomicOrdering::Acquire),
             WRITER_TERMINAL_CLOSED_CLEANLY,
             "a repeated shutdown must report the retained clean terminal state"
+        );
+    });
+}
+
+#[test]
+fn storage_concurrent_shutdown_callers_share_one_join_receipt() {
+    run_storage_async_test(async {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let db_path = directory.path().join("shutdown-concurrent.sqlite3");
+        let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+        let first = storage.clone();
+        let second = storage.clone();
+        let first_cx = crate::cx::for_testing();
+        let second_cx = crate::cx::for_testing();
+
+        let (first_result, second_result) = futures::join!(
+            first.shutdown_with_cx(&first_cx),
+            second.shutdown_with_cx(&second_cx)
+        );
+        first_result.expect("first shutdown caller");
+        second_result.expect("second shutdown caller");
+        assert_eq!(
+            storage.completed_writer_join_outcome().unwrap(),
+            Some(WriterJoinOutcome::Joined),
+            "both callers must converge on one persistent native join receipt"
         );
     });
 }
