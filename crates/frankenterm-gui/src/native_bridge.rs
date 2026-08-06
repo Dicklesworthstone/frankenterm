@@ -4,8 +4,10 @@
 //! mux events as newline-delimited JSON [`WireEvent`] messages.
 //! This replaces the polling-based capture loop with real-time push.
 
-use base64::Engine as _;
-use frankenterm_core::native_events::{WireEvent, WirePaneState};
+use frankenterm_core::native_events::{
+    NativeEventError, WireEvent, WirePaneState, validate_native_event_peer,
+    validate_native_event_socket_endpoint,
+};
 use frankenterm_gui::{
     terminal_pane_id_to_u64, terminal_u16_from_usize, terminal_u32_from_stable_delta,
     terminal_u32_from_usize,
@@ -16,7 +18,7 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +33,7 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(250);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+static BRIDGE_QUEUE_FULL_DROPS: AtomicU64 = AtomicU64::new(0);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -42,12 +45,7 @@ fn now_ms() -> u64 {
 }
 
 /// A mux-to-wire event that's ready to serialize.
-#[allow(dead_code)]
 enum BridgeEvent {
-    PaneOutput {
-        pane_id: u64,
-        data: Vec<u8>,
-    },
     StateChange {
         pane_id: u64,
         state: WirePaneState,
@@ -68,14 +66,18 @@ enum BridgeEvent {
 }
 
 impl BridgeEvent {
+    fn metadata(&self) -> (&'static str, u64) {
+        match self {
+            Self::StateChange { pane_id, .. } => ("state_change", *pane_id),
+            Self::UserVar { pane_id, .. } => ("user_var", *pane_id),
+            Self::PaneCreated { pane_id, .. } => ("pane_created", *pane_id),
+            Self::PaneDestroyed { pane_id } => ("pane_destroyed", *pane_id),
+        }
+    }
+
     fn into_wire_event(self) -> WireEvent {
         let ts = now_ms();
         match self {
-            BridgeEvent::PaneOutput { pane_id, data } => WireEvent::PaneOutput {
-                pane_id,
-                data_b64: base64::engine::general_purpose::STANDARD.encode(&data),
-                ts,
-            },
             BridgeEvent::StateChange { pane_id, state } => {
                 WireEvent::StateChange { pane_id, state, ts }
             }
@@ -104,6 +106,54 @@ impl BridgeEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BridgeQueueOutcome {
+    Queued,
+    DroppedFull,
+    Closed,
+}
+
+impl BridgeQueueOutcome {
+    fn keeps_subscription(self) -> bool {
+        !matches!(self, Self::Closed)
+    }
+}
+
+fn enqueue_bridge_event(
+    tx: &std_mpsc::SyncSender<BridgeEvent>,
+    event: BridgeEvent,
+) -> BridgeQueueOutcome {
+    let (event_kind, pane_id) = event.metadata();
+    match tx.try_send(event) {
+        Ok(()) => BridgeQueueOutcome::Queued,
+        Err(std_mpsc::TrySendError::Full(_)) => {
+            let drop_count = BRIDGE_QUEUE_FULL_DROPS
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            // Pane-output storms must not turn a bounded data queue into an
+            // unbounded warning stream. Powers-of-two sampling stays visible
+            // while adding only logarithmic log volume.
+            if drop_count.is_power_of_two() {
+                log::warn!(
+                    "Native event bridge: bounded queue full; dropped event_kind={} pane_id={} delivery_gap=known cumulative_queue_drops={}",
+                    event_kind,
+                    pane_id,
+                    drop_count
+                );
+            }
+            BridgeQueueOutcome::DroppedFull
+        }
+        Err(std_mpsc::TrySendError::Disconnected(_)) => {
+            log::warn!(
+                "Native event bridge: sender channel closed; dropped event_kind={} pane_id={} delivery_gap=known",
+                event_kind,
+                pane_id
+            );
+            BridgeQueueOutcome::Closed
+        }
+    }
+}
+
 /// The native event bridge. Owns the sender thread and mux subscription.
 pub struct NativeEventBridge {
     shutdown: Arc<AtomicBool>,
@@ -124,7 +174,7 @@ impl NativeEventBridge {
         let socket_path = socket_path.to_path_buf();
 
         // Try initial connection to verify the socket exists
-        match UnixStream::connect(&socket_path) {
+        match connect_authenticated_native_event_socket(&socket_path) {
             Ok(stream) => {
                 drop(stream);
                 log::info!(
@@ -184,8 +234,7 @@ impl NativeEventBridge {
                 if shutdown_for_subscription.load(Ordering::Acquire) {
                     return false;
                 }
-                handle_mux_notification(&notification, &tx_clone);
-                true // keep listening
+                handle_mux_notification(&notification, &tx_clone)
             }) {
                 Ok(subscription_id) => subscription_id,
                 Err(err) => {
@@ -250,6 +299,15 @@ fn wait_for_retry_or_shutdown(delay: Duration, shutdown: &AtomicBool) -> bool {
     }
 }
 
+fn connect_authenticated_native_event_socket(
+    socket_path: &Path,
+) -> Result<UnixStream, NativeEventError> {
+    validate_native_event_socket_endpoint(socket_path)?;
+    let stream = UnixStream::connect(socket_path)?;
+    validate_native_event_peer(&stream)?;
+    Ok(stream)
+}
+
 /// Background thread that reads events from the channel and writes to the socket.
 fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown: &AtomicBool) {
     let mut backoff = INITIAL_BACKOFF;
@@ -261,7 +319,7 @@ fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown
     while !shutdown.load(Ordering::Acquire) {
         // Ensure we have a connection
         if stream.is_none() {
-            match UnixStream::connect(socket_path) {
+            match connect_authenticated_native_event_socket(socket_path) {
                 Ok(s) => {
                     log::debug!(
                         "Native event bridge: connected to {}",
@@ -308,10 +366,22 @@ fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown
         // Wait for an event from the channel
         match rx.recv_timeout(RECV_TIMEOUT) {
             Ok(event) => {
+                let (event_kind, pane_id) = event.metadata();
                 let wire = event.into_wire_event();
                 if let Some(ref mut s) = stream {
-                    if write_event(s, &wire).is_err() {
-                        log::warn!("Native event bridge: write failed, reconnecting");
+                    if let Err(error) = write_event(s, &wire) {
+                        // A stream write may fail after some or all bytes reached
+                        // the receiver. Retrying here could duplicate a mutation,
+                        // while dropping it leaves a possible gap. Until the wire
+                        // protocol has sequence/ack reconciliation, surface the
+                        // outcome as indeterminate and reconnect without a blind
+                        // replay.
+                        log::warn!(
+                            "Native event bridge: write outcome indeterminate; event_kind={} pane_id={} error={} reconnecting without blind retry",
+                            event_kind,
+                            pane_id,
+                            error
+                        );
                         stream = None;
                     }
                 }
@@ -339,18 +409,24 @@ fn write_event(stream: &mut UnixStream, event: &WireEvent) -> Result<(), std::io
 }
 
 /// Convert a MuxNotification into a BridgeEvent and send it.
-fn handle_mux_notification(notification: &MuxNotification, tx: &std_mpsc::SyncSender<BridgeEvent>) {
+fn handle_mux_notification(
+    notification: &MuxNotification,
+    tx: &std_mpsc::SyncSender<BridgeEvent>,
+) -> bool {
     let event = match notification {
         MuxNotification::PaneOutput(pane_id) => {
-            // PaneOutput only gives us the pane ID — we need to read the output.
-            // For now, emit a state change notification since reading output
-            // from here is complex (requires async pane access).
+            // This notification carries only a pane ID after the raw PTY bytes
+            // have already been parsed. Emit a state hint, but never manufacture
+            // a PaneOutput payload from visible screen state: that would invent
+            // delta boundaries and can both duplicate and omit bytes. Polling
+            // remains the authoritative text-capture path until the mux reader
+            // exposes a bounded raw-byte tap with sequence/gap semantics.
             build_state_change_event(*pane_id)
         }
 
         MuxNotification::PaneAdded(pane_id) => {
             let Some(mux) = Mux::try_get() else {
-                return;
+                return true;
             };
             let (domain, cwd) = if let Some(pane) = mux.get_pane(*pane_id) {
                 let domain_id = pane.domain_id();
@@ -379,7 +455,7 @@ fn handle_mux_notification(notification: &MuxNotification, tx: &std_mpsc::SyncSe
         MuxNotification::TabTitleChanged { tab_id, .. } => {
             // Title change → emit state change for all panes in the tab
             let Some(mux) = Mux::try_get() else {
-                return;
+                return true;
             };
             if let Some(tab) = mux.get_tab(*tab_id) {
                 if let Some(pane) = tab.get_active_pane() {
@@ -407,10 +483,7 @@ fn handle_mux_notification(notification: &MuxNotification, tx: &std_mpsc::SyncSe
         _ => None,
     };
 
-    if let Some(event) = event {
-        // Try to send; drop if channel is full (backpressure)
-        let _ = tx.try_send(event);
-    }
+    event.is_none_or(|event| enqueue_bridge_event(tx, event).keeps_subscription())
 }
 
 fn build_state_change_event(pane_id: PaneId) -> Option<BridgeEvent> {
@@ -432,15 +505,15 @@ fn build_state_change_event(pane_id: PaneId) -> Option<BridgeEvent> {
     })
 }
 
-fn emit_state_change(pane_id: PaneId, tx: &std_mpsc::SyncSender<BridgeEvent>) {
-    if let Some(event) = build_state_change_event(pane_id) {
-        let _ = tx.try_send(event);
-    }
+fn emit_state_change(pane_id: PaneId, tx: &std_mpsc::SyncSender<BridgeEvent>) -> bool {
+    build_state_change_event(pane_id)
+        .is_none_or(|event| enqueue_bridge_event(tx, event).keeps_subscription())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
@@ -476,6 +549,38 @@ mod tests {
         }
     }
 
+    fn test_state_event(pane_id: u64) -> BridgeEvent {
+        BridgeEvent::StateChange {
+            pane_id,
+            state: WirePaneState {
+                title: "test".to_string(),
+                rows: 24,
+                cols: 80,
+                is_alt_screen: false,
+                cursor_row: 0,
+                cursor_col: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn bounded_queue_reports_every_delivery_loss_class() {
+        let (tx, rx) = std_mpsc::sync_channel(1);
+        assert_eq!(
+            enqueue_bridge_event(&tx, test_state_event(1)),
+            BridgeQueueOutcome::Queued
+        );
+        assert_eq!(
+            enqueue_bridge_event(&tx, test_state_event(2)),
+            BridgeQueueOutcome::DroppedFull
+        );
+        drop(rx);
+        assert_eq!(
+            enqueue_bridge_event(&tx, test_state_event(3)),
+            BridgeQueueOutcome::Closed
+        );
+    }
+
     #[test]
     fn retry_wait_returns_false_after_shutdown() {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -495,6 +600,32 @@ mod tests {
             elapsed < Duration::from_millis(250),
             "shutdown-aware wait should stop quickly, elapsed={elapsed:?}"
         );
+    }
+
+    #[test]
+    fn authenticated_connect_enforces_private_endpoint_metadata_and_peer_uid() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket_path = root.path().join("native-bridge.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+            .expect("bind native bridge test listener");
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+            .expect("secure native bridge test socket");
+
+        let stream = connect_authenticated_native_event_socket(&socket_path)
+            .expect("same-user private endpoint should authenticate");
+        drop(stream);
+
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))
+            .expect("make native bridge test socket deliberately open");
+        assert!(matches!(
+            connect_authenticated_native_event_socket(&socket_path),
+            Err(NativeEventError::Security(
+                frankenterm_core::native_events::NativeEventSecurityError::EndpointModeMismatch {
+                    actual_mode: 0o666
+                }
+            ))
+        ));
+        drop(listener);
     }
 
     #[test]

@@ -148,7 +148,6 @@ rustls-pemfile = { workspace = true, optional = true }
 x509-parser = { workspace = true, optional = true }
 # Lexical search (optional, behind feature)
 tantivy = { workspace = true, optional = true }
-nix = { workspace = true, optional = true, features = ["fs"] }
 # FrankenSearch integration (optional, behind feature)
 frankensearch = { workspace = true, optional = true }
 # Agent detection integration (optional, behind feature)
@@ -176,6 +175,9 @@ roaring = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 frankenterm-uds = { workspace = true, features = ["async-asupersync"] }
 sysinfo = { version = "0.39.3", default-features = false, features = ["system", "disk"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, optional = true, features = ["fs", "socket", "user"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -909,7 +911,7 @@ tui-widgets = ["dep:ftui-render", "dep:ftui-layout", "dep:ftui-style", "dep:ftui
 tui-dashboard = ["tui-widgets", "dep:ftui-runtime", "dep:ftui-core", "dep:ftui-backend"]
 rollout = ["tui-oracle", "ftui"]
 metrics = []
-native-wezterm = []
+native-wezterm = ["dep:nix"]
 # Per-frame self-time instrumentation for the hottest loops (extract_delta,
 # scan_pipeline, redactor). NON-default: the default build compiles the timer to a
 # zero-sized no-op (no overhead). Enable for MT8 keep-gate attribution + capturing

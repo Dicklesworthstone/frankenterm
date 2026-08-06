@@ -5,6 +5,14 @@
 >
 > **Scope:** Interface and IPC protocol only. No implementation in this bead.
 
+> **Current implementation status:** the GUI bridge carries best-effort
+> state, user-variable, and pane-lifecycle hints. `MuxNotification::PaneOutput`
+> exposes only a pane ID after parsing, so it is not an authoritative raw-byte
+> source and the bridge deliberately does not fabricate a `pane_output` frame
+> from visible screen state. The raw-reader hook and sequence/gap/ack protocol
+> sketched below remain design work; polling is the current authoritative text
+> capture path.
+
 ## Why
 
 Lua hooks in WezTerm can become a performance bottleneck (e.g., `update-status`)
@@ -132,7 +140,8 @@ config.ft_event_filter = {
 ### Environment override
 
 ```bash
-export WEZTERM_FT_SOCKET="/tmp/ft/events.sock"
+FT_RUNTIME_ROOT="${TMPDIR:-/tmp}"
+export WEZTERM_FT_SOCKET="${FT_RUNTIME_ROOT%/}/frankenterm-$(id -u)/events.sock"
 ```
 
 ## Feature Flag + Minimal Integration Points

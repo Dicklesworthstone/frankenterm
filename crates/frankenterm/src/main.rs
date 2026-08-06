@@ -6902,6 +6902,8 @@ const ROBOT_ERR_APPROVAL: &str = "robot.approval_error";
 const ROBOT_ERR_PANE_NOT_FOUND: &str = "robot.pane_not_found";
 const ROBOT_ERR_RESERVATION_CONFLICT: &str = "robot.reservation_conflict";
 const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
+const ROBOT_ERR_STORAGE_EFFECT_INDETERMINATE: &str =
+    "robot.storage_effect_indeterminate";
 const ROBOT_ERR_CURSOR_DISCONTINUITY: &str = "robot.cursor_discontinuity";
 const ROBOT_ERR_FEATURE_NOT_AVAILABLE: &str = "robot.feature_not_available";
 const ROBOT_ERR_POLICY_DENIED: &str = "robot.policy_denied";
@@ -6988,6 +6990,24 @@ fn robot_reservation_error_details(
             ROBOT_ERR_RESERVATION_CONFLICT,
             Some(
                 "Pane is already reserved. Use 'ft robot reservations list' to inspect or release the conflicting reservation."
+                    .to_string(),
+            ),
+        ),
+        _ => robot_storage_error_details(err),
+    }
+}
+
+fn robot_storage_error_details(
+    err: &frankenterm_core::Error,
+) -> (&'static str, Option<String>) {
+    match err {
+        frankenterm_core::Error::Storage(
+            frankenterm_core::StorageError::IndeterminateMutation { .. }
+            | frankenterm_core::StorageError::WriterSettlementIndeterminate { .. },
+        ) => (
+            ROBOT_ERR_STORAGE_EFFECT_INDETERMINATE,
+            Some(
+                "The storage effect may already be durable. Reconcile the affected state and writer health; do not automatically retry."
                     .to_string(),
             ),
         ),
@@ -31097,6 +31117,13 @@ fn map_wezterm_error_to_robot(error: &frankenterm_core::Error) -> (&'static str,
                         .to_string(),
                 ),
             ),
+            WeztermError::IndeterminateMutation { .. } => (
+                "robot.wezterm_mutation_indeterminate",
+                Some(
+                    "The mutation may already have taken effect. Reconcile live mux state and verify the intended postcondition; do not blindly retry."
+                        .to_string(),
+                ),
+            ),
             WeztermError::ParseError(_) => (
                 "robot.wezterm_parse_error",
                 Some(
@@ -33975,7 +34002,17 @@ async fn spawn_distributed_listener(
         // ft-xbnl0.2.3 tick 287: cx-first distributed listener accept timeout.
         let accept_cx =
             frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+        let mut connection_tasks = frankenterm_core::runtime_async::task::JoinSet::new();
         loop {
+            while let Some(join_result) = connection_tasks.try_join_next() {
+                if let Err(error) = join_result {
+                    tracing::warn!(
+                        failure_class = ?error.kind(),
+                        "Distributed connection task failed"
+                    );
+                }
+            }
+
             if shutdown_flag.load(Ordering::SeqCst) {
                 break;
             }
@@ -34016,7 +34053,7 @@ async fn spawn_distributed_listener(
             let shutdown_flag = Arc::clone(&shutdown_flag);
             let tls_acceptor = tls_acceptor.clone();
 
-            frankenterm_core::runtime_async::task::spawn(async move {
+            connection_tasks.spawn(async move {
                 let _permit = permit;
                 if let Some(acceptor) = tls_acceptor {
                     match acceptor.accept(stream).await {
@@ -34055,6 +34092,69 @@ async fn spawn_distributed_listener(
                     .await;
                 }
             });
+        }
+
+        // Connection handlers can be blocked on quiet clients or TLS
+        // handshakes. Retain every task handle, request cancellation, and
+        // bound the terminal-acknowledgement drain so listener shutdown can
+        // neither detach work nor wait forever.
+        connection_tasks.abort_all();
+        let drain_cx = frankenterm_core::cx::for_request();
+        let drain_result = frankenterm_core::runtime_async::timeout_with_cx(
+            &drain_cx,
+            Duration::from_secs(1),
+            async {
+                loop {
+                    match connection_tasks.drain_next_with_cx(&drain_cx).await {
+                        Ok(Some(join_result)) => {
+                            if let Err(error) = join_result {
+                                tracing::debug!(
+                                    failure_class = ?error.kind(),
+                                    "Distributed connection task stopped during listener shutdown"
+                                );
+                            }
+                        }
+                        Ok(None) => return Ok(()),
+                        Err(drain_error) => return Err(drain_error),
+                    }
+                }
+            },
+        )
+        .await;
+        if let Ok(Err(drain_error)) = &drain_result {
+            tracing::warn!(
+                failure_class = ?drain_error.kind(),
+                "Distributed connection task drain context failed before terminal settlement"
+            );
+        }
+        match connection_tasks.settlement() {
+            frankenterm_core::runtime_async::task::JoinSetSettlement::Settled => {}
+            frankenterm_core::runtime_async::task::JoinSetSettlement::Incomplete {
+                active_tasks,
+                unacknowledged_tasks,
+            } if drain_result.is_err() => {
+                tracing::warn!(
+                    event = "distributed_connection_task_drain_timeout",
+                    active_tasks,
+                    unacknowledged_tasks,
+                    remaining_tasks = connection_tasks.len(),
+                    orphan_risk = true,
+                    "Distributed connection tasks missed bounded terminal settlement"
+                );
+            }
+            frankenterm_core::runtime_async::task::JoinSetSettlement::Incomplete {
+                active_tasks,
+                unacknowledged_tasks,
+            } => {
+                tracing::warn!(
+                    event = "distributed_connection_task_settlement_incomplete",
+                    active_tasks,
+                    unacknowledged_tasks,
+                    remaining_tasks = connection_tasks.len(),
+                    orphan_risk = true,
+                    "Distributed connection task drain ended without terminal settlement"
+                );
+            }
         }
 
         tracing::info!("Distributed listener stopped");
@@ -35564,14 +35664,13 @@ async fn run_distributed_agent(
     let event_bus = Arc::new(EventBus::new(1000));
     let wezterm_handle = frankenterm_core::wezterm::wezterm_handle_from_config(config);
 
-    // Auto-detect native event socket: always provide the socket path so the
-    // runtime can bind and listen for push events from frankenterm-gui.
-    // Priority: WEZTERM_FT_SOCKET env var > config socket_path > default.
-    let native_event_socket = {
-        let env_socket = std::env::var("WEZTERM_FT_SOCKET").ok();
-        let socket = env_socket.unwrap_or_else(|| config.native.socket_path.clone());
-        Some(PathBuf::from(socket))
-    };
+    // Native push events are opt-in. When enabled, an explicit environment
+    // override wins over the already-canonicalized configured path.
+    let native_event_socket = frankenterm_core::config::resolve_native_events_socket_path(
+        config.native.enabled,
+        std::env::var("WEZTERM_FT_SOCKET").ok().as_deref(),
+        &config.native.socket_path,
+    );
     let vendored_mux_socket_paths =
         if config.vendored.sharding.enabled && config.vendored.sharding.socket_paths.len() >= 2 {
             config
@@ -35820,6 +35919,26 @@ async fn run_watcher_with_backoff(
     }
 }
 
+async fn settle_watcher_background_task(
+    label: &'static str,
+    handle: frankenterm_core::watchdog::WatchdogHandle,
+    cleanup_cx: &frankenterm_core::cx::Cx,
+    abort_first: bool,
+) {
+    let result = if abort_first {
+        handle.abort_and_join_with_cx(cleanup_cx).await
+    } else {
+        handle.join_with_cx(cleanup_cx).await
+    };
+    if let Err(error) = result {
+        tracing::warn!(
+            task = label,
+            error = %error,
+            "Watcher background task did not reach terminal acknowledgement"
+        );
+    }
+}
+
 /// Run the observation watcher daemon.
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn run_watcher(
@@ -36028,7 +36147,7 @@ async fn run_watcher(
     // Create event bus for publishing detections to workflow runners
     let event_bus = Arc::new(EventBus::new(1000));
 
-    let _notification_handle = if config.notifications.enabled {
+    let notification_handle = if config.notifications.enabled {
         let mut senders: Vec<Box<dyn frankenterm_core::notifications::NotificationSender>> =
             Vec::new();
 
@@ -36216,7 +36335,12 @@ async fn run_watcher(
                 tracing::info!("Notification pipeline stopped");
             });
 
-            Some(handle)
+            Some(
+                frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
+                    handle,
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                ),
+            )
         }
     } else {
         tracing::info!("Notification pipeline disabled by config");
@@ -36230,7 +36354,7 @@ async fn run_watcher(
     let wezterm_handle = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
 
     // Set up workflow runner if auto_handle is enabled
-    let _workflow_runner_handle = if auto_handle {
+    let workflow_runner_handle = if auto_handle {
         // Create shared storage for workflow runner (recreate config since it doesn't impl Clone)
         let workflow_storage_config =
             frankenterm_core::storage::StorageConfig::from(&config.storage);
@@ -36284,29 +36408,48 @@ async fn run_watcher(
         // `Cx::current().unwrap_or_else(for_request)` to pick up any
         // ambient cx installed by the runtime driver, falling back
         // to a fresh request-scoped cx. Threads that cx through the
-        // entire event-loop + child-spawn chain via
-        // `run_with_cx` (tick 223). A cx-cancel bubbles through the
-        // runner loop AND all child workflow executions in flight.
+        // entire event-loop + owned child-task chain via
+        // `run_with_shutdown_with_cx`. Shutdown now wakes the idle event wait
+        // and bounded-drains every in-flight workflow execution.
         let event_bus_clone = Arc::clone(&event_bus);
+        let workflow_shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_shutdown_flag = Arc::clone(&workflow_shutdown_flag);
+        let workflow_shutdown_notify =
+            Arc::new(frankenterm_core::runtime_async::notify::Notify::new());
+        let task_shutdown_notify = Arc::clone(&workflow_shutdown_notify);
         let runner_handle = frankenterm_core::runtime_async::task::spawn(async move {
             tracing::info!("Workflow runner started, listening for detection events");
             let cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
-            workflow_runner.run_with_cx(&cx, &event_bus_clone).await;
+            workflow_runner
+                .run_with_shutdown_with_cx(
+                    &cx,
+                    &event_bus_clone,
+                    &task_shutdown_flag,
+                    &task_shutdown_notify,
+                )
+                .await;
             tracing::info!("Workflow runner stopped");
         });
 
-        Some(runner_handle)
+        Some(
+            frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task_with_notify(
+                runner_handle,
+                workflow_shutdown_flag,
+                workflow_shutdown_notify,
+            ),
+        )
     } else {
         None
     };
 
-    // Configure the runtime — always provide native event socket for auto-detection.
-    let native_event_socket = {
-        let env_socket = std::env::var("WEZTERM_FT_SOCKET").ok();
-        let socket = env_socket.unwrap_or_else(|| config.native.socket_path.clone());
-        Some(PathBuf::from(socket))
-    };
+    // Native push events are opt-in. When enabled, an explicit environment
+    // override wins over the already-canonicalized configured path.
+    let native_event_socket = frankenterm_core::config::resolve_native_events_socket_path(
+        config.native.enabled,
+        std::env::var("WEZTERM_FT_SOCKET").ok().as_deref(),
+        &config.native.socket_path,
+    );
     let vendored_mux_socket_paths =
         if config.vendored.sharding.enabled && config.vendored.sharding.socket_paths.len() >= 2 {
             config
@@ -36380,43 +36523,48 @@ async fn run_watcher(
     let distributed_listener_handle = if config.distributed.enabled {
         let wire_limits =
             frankenterm_core::wire_protocol::resolve_limits(Some(&config.tuning.wire_protocol));
+        let task = spawn_distributed_listener(
+            config.distributed.clone(),
+            wire_limits,
+            Arc::clone(&shared_storage),
+            Arc::clone(&event_bus),
+            Arc::clone(&handle.shutdown_flag),
+        )
+        .await?;
         Some(
-            spawn_distributed_listener(
-                config.distributed.clone(),
-                wire_limits,
-                Arc::clone(&shared_storage),
-                Arc::clone(&event_bus),
+            frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
+                task,
                 Arc::clone(&handle.shutdown_flag),
-            )
-            .await?,
+            ),
         )
     } else {
         None
     };
 
     #[cfg(not(feature = "distributed"))]
-    let distributed_listener_handle: Option<
-        frankenterm_core::runtime_async::task::JoinHandle<()>,
-    > = if config.distributed.enabled {
-        tracing::warn!(
-            "Distributed mode enabled in config, but ft was built without the distributed feature"
-        );
-        None
-    } else {
-        None
-    };
+    let distributed_listener_handle: Option<frankenterm_core::watchdog::WatchdogHandle> =
+        if config.distributed.enabled {
+            tracing::warn!(
+                "Distributed mode enabled in config, but ft was built without the distributed feature"
+            );
+            None
+        } else {
+            None
+        };
 
     // Background scheduler for saved searches (scheduled alerts).
     //
     // Runs inside the watcher process and publishes synthetic PatternDetected
     // events onto the EventBus so the existing notification pipeline can fire.
-    let _saved_search_scheduler_handle = {
+    let saved_search_scheduler_handle = {
         let storage = scheduler_storage.clone();
         let event_bus = Arc::clone(&event_bus);
         let shutdown_flag = Arc::clone(&handle.shutdown_flag);
-        frankenterm_core::runtime_async::task::spawn(async move {
-            run_saved_search_scheduler(storage, event_bus, shutdown_flag).await;
-        })
+        let task_shutdown_flag = Arc::clone(&shutdown_flag);
+        let task = frankenterm_core::runtime_async::task::spawn(async move {
+            run_saved_search_scheduler(storage, event_bus, task_shutdown_flag).await;
+        });
+        frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(task, shutdown_flag)
     };
 
     #[cfg(feature = "metrics")]
@@ -36466,7 +36614,7 @@ async fn run_watcher(
     let config_path_buf = config_path.map(Path::to_path_buf);
     let ipc_handle: Option<(
         frankenterm_core::runtime_async::mpsc::Sender<()>,
-        frankenterm_core::runtime_async::task::JoinHandle<()>,
+        frankenterm_core::watchdog::WatchdogHandle,
     )> = if config.ipc.enabled {
         #[cfg(unix)]
         {
@@ -36512,7 +36660,13 @@ async fn run_watcher(
                             )
                             .await;
                     });
-                    Some((shutdown_tx, ipc_task))
+                    Some((
+                        shutdown_tx,
+                        frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
+                            ipc_task,
+                            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        ),
+                    ))
                 }
                 Err(err) => {
                     tracing::error!(
@@ -36541,33 +36695,43 @@ async fn run_watcher(
         let db_path = layout.db_path.clone();
         let storage = Arc::clone(&shared_storage);
         let shutdown_flag = Arc::clone(&handle.shutdown_flag);
+        let task_shutdown_flag = Arc::clone(&shutdown_flag);
         let notify_config = config.notifications.desktop.clone();
-        Some(frankenterm_core::runtime_async::task::spawn(async move {
+        let task = frankenterm_core::runtime_async::task::spawn(async move {
             run_scheduled_backups(
                 backup_config,
                 workspace_root,
                 db_path,
                 storage,
-                shutdown_flag,
+                task_shutdown_flag,
                 notify_config,
             )
             .await;
-        }))
+        });
+        Some(
+            frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(task, shutdown_flag),
+        )
     } else {
         None
     };
 
     // Start orphan reaper for stuck wezterm cli processes
-    let _orphan_reaper_handle = {
+    let orphan_reaper_handle = {
         let cli_config = config.cli.clone();
         let shutdown_flag = Arc::clone(&handle.shutdown_flag);
-        frankenterm_core::runtime_async::task::spawn(async move {
-            frankenterm_core::orphan_reaper::run_orphan_reaper(cli_config, shutdown_flag).await;
-        })
+        let task_shutdown_flag = Arc::clone(&shutdown_flag);
+        let task = frankenterm_core::runtime_async::task::spawn(async move {
+            frankenterm_core::orphan_reaper::run_orphan_reaper(
+                cli_config,
+                task_shutdown_flag,
+            )
+            .await;
+        });
+        frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(task, shutdown_flag)
     };
 
     // Start mux server watchdog (health monitoring + memory tracking)
-    let _mux_watchdog_handle = {
+    let mux_watchdog_handle = {
         let watchdog_config = frankenterm_core::watchdog::MuxWatchdogConfig::default();
         let wezterm =
             frankenterm_core::wezterm::wezterm_handle_with_timeout(config.cli.timeout_seconds);
@@ -36581,6 +36745,7 @@ async fn run_watcher(
     };
 
     // Start snapshot engine for session persistence
+    let mut snapshot_task_handles = Vec::new();
     let snapshot_engine: Option<Arc<frankenterm_core::snapshot_engine::SnapshotEngine>> =
         if config.snapshots.enabled {
             let engine_db = Arc::new(db_path.to_string());
@@ -36590,10 +36755,11 @@ async fn run_watcher(
             ));
             let engine_for_loop = Arc::clone(&engine);
             let shutdown_flag_for_snap = Arc::clone(&handle.shutdown_flag);
+            let bridge_shutdown_owner = Arc::clone(&shutdown_flag_for_snap);
             let loop_timeout = config.cli.timeout_seconds;
             // Bridge AtomicBool shutdown flag into a watch channel for run_periodic
             let (snap_shutdown_tx, snap_shutdown_rx) = watch::channel(false);
-            frankenterm_core::runtime_async::task::spawn(async move {
+            let bridge_task = frankenterm_core::runtime_async::task::spawn(async move {
                 // ft-xbnl0.2.3 tick 285: cx-first shutdown-bridge poll sleep.
                 let bridge_cx = frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -36615,7 +36781,13 @@ async fn run_watcher(
                     }
                 }
             });
-            frankenterm_core::runtime_async::task::spawn(async move {
+            snapshot_task_handles.push(
+                frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
+                    bridge_task,
+                    bridge_shutdown_owner,
+                ),
+            );
+            let scheduler_task = frankenterm_core::runtime_async::task::spawn(async move {
                 if let Err(error) = engine_for_loop
                     .run_periodic(snap_shutdown_rx, move || async move {
                         let wez =
@@ -36637,6 +36809,12 @@ async fn run_watcher(
                     }
                 }
             });
+            snapshot_task_handles.push(
+                frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
+                    scheduler_task,
+                    Arc::clone(&handle.shutdown_flag),
+                ),
+            );
             tracing::info!("Snapshot engine started");
             Some(engine)
         } else {
@@ -36763,9 +36941,16 @@ async fn run_watcher(
     }
 
     // Graceful shutdown
+    let background_shutdown_cx = frankenterm_core::cx::for_request();
     if let Some((shutdown_tx, ipc_task)) = ipc_handle {
         let _ = shutdown_tx.try_send(());
-        let _ = ipc_task.await;
+        settle_watcher_background_task(
+            "ipc_server",
+            ipc_task,
+            &background_shutdown_cx,
+            false,
+        )
+        .await;
     }
 
     // Snapshot engine: capture final state before tearing down runtime
@@ -36807,9 +36992,75 @@ async fn run_watcher(
 
     tracing::info!("Shutting down observation runtime...");
     handle.signal_shutdown();
+    if let Some(notification_handle) = notification_handle {
+        settle_watcher_background_task(
+            "notification_pipeline",
+            notification_handle,
+            &background_shutdown_cx,
+            true,
+        )
+        .await;
+    }
+    if let Some(workflow_runner_handle) = workflow_runner_handle {
+        settle_watcher_background_task(
+            "workflow_runner",
+            workflow_runner_handle,
+            &background_shutdown_cx,
+            false,
+        )
+        .await;
+    }
+    settle_watcher_background_task(
+        "saved_search_scheduler",
+        saved_search_scheduler_handle,
+        &background_shutdown_cx,
+        true,
+    )
+    .await;
+    for snapshot_task_handle in snapshot_task_handles {
+        settle_watcher_background_task(
+            "snapshot_scheduler",
+            snapshot_task_handle,
+            &background_shutdown_cx,
+            true,
+        )
+        .await;
+    }
+    if let Some(distributed_listener_handle) = distributed_listener_handle {
+        settle_watcher_background_task(
+            "distributed_listener",
+            distributed_listener_handle,
+            &background_shutdown_cx,
+            false,
+        )
+        .await;
+    }
+    settle_watcher_background_task(
+        "mux_watchdog",
+        mux_watchdog_handle,
+        &background_shutdown_cx,
+        false,
+    )
+    .await;
+    settle_watcher_background_task(
+        "orphan_reaper",
+        orphan_reaper_handle,
+        &background_shutdown_cx,
+        true,
+    )
+    .await;
+    if let Some(backup_handle) = scheduled_backup_handle {
+        settle_watcher_background_task(
+            "scheduled_backup",
+            backup_handle,
+            &background_shutdown_cx,
+            true,
+        )
+        .await;
+    }
     #[cfg(feature = "metrics")]
     if let Some(metrics_handle) = metrics_handle {
-        metrics_handle.wait().await;
+        metrics_handle.wait_with_cx(&background_shutdown_cx).await;
     }
     match Arc::try_unwrap(handle) {
         Ok(handle) => handle.shutdown().await,
@@ -36821,15 +37072,7 @@ async fn run_watcher(
         }
     }
 
-    if let Some(distributed_listener_handle) = distributed_listener_handle {
-        let _ = distributed_listener_handle.await;
-    }
-
     tracing::info!("Watcher shutdown complete");
-
-    if let Some(backup_handle) = scheduled_backup_handle {
-        let _ = backup_handle.await;
-    }
 
     Ok(())
 }
@@ -41168,10 +41411,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 )
                                                 .await
                                         } {
+                                            let (code, hint) =
+                                                robot_storage_error_details(&e);
                                             let response = RobotResponse::<RobotEventMutationData>::error_with_code(
-                                                ROBOT_ERR_STORAGE,
+                                                code,
                                                 format!("Failed to update note: {e}"),
-                                                None,
+                                                hint,
                                                 elapsed_ms(start),
                                             );
                                             print_robot_response(&response, format, stats)?;
@@ -41288,12 +41533,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         {
                                             Ok(v) => v,
                                             Err(e) => {
+                                                let (code, hint) =
+                                                    robot_storage_error_details(&e);
                                                 let response = RobotResponse::<
                                                     RobotEventMutationData,
                                                 >::error_with_code(
-                                                    ROBOT_ERR_STORAGE,
+                                                    code,
                                                     format!("Failed to update triage state: {e}"),
-                                                    None,
+                                                    hint,
                                                     elapsed_ms(start),
                                                 );
                                                 print_robot_response(&response, format, stats)?;
@@ -41426,12 +41673,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             {
                                                 Ok(v) => v,
                                                 Err(e) => {
+                                                    let (code, hint) =
+                                                        robot_storage_error_details(&e);
                                                     let response = RobotResponse::<
                                                         RobotEventMutationData,
                                                     >::error_with_code(
-                                                        ROBOT_ERR_STORAGE,
+                                                        code,
                                                         format!("Failed to add label: {e}"),
-                                                        None,
+                                                        hint,
                                                         elapsed_ms(start),
                                                     );
                                                     print_robot_response(&response, format, stats)?;
@@ -41527,12 +41776,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             {
                                                 Ok(v) => v,
                                                 Err(e) => {
+                                                    let (code, hint) =
+                                                        robot_storage_error_details(&e);
                                                     let response = RobotResponse::<
                                                         RobotEventMutationData,
                                                     >::error_with_code(
-                                                        ROBOT_ERR_STORAGE,
+                                                        code,
                                                         format!("Failed to remove label: {e}"),
-                                                        None,
+                                                        hint,
                                                         elapsed_ms(start),
                                                     );
                                                     print_robot_response(&response, format, stats)?;
@@ -68668,7 +68919,6 @@ async fn handle_session_command(
             for chunk in &replay_plan.chunks {
                 session_recovery_send_text_on_runtime_task(
                     wezterm.clone(),
-                    mux_timeout_seconds,
                     pane_id,
                     chunk.text.clone(),
                 )
@@ -69054,7 +69304,7 @@ async fn session_recovery_create_pane(
         timeout_seconds,
         "splitting live mux pane for recovery replay"
     );
-    session_recovery_split_pane_on_runtime_task(wezterm.clone(), timeout_seconds, source_pane_id)
+    session_recovery_split_pane_on_runtime_task(wezterm.clone(), source_pane_id)
         .await
         .map_err(|err| anyhow::anyhow!("Failed to create recovery pane: {err}"))
 }
@@ -69096,7 +69346,6 @@ async fn session_recovery_list_panes_on_runtime_task(
 
 async fn session_recovery_split_pane_on_runtime_task(
     wezterm: frankenterm_core::wezterm::WeztermHandle,
-    timeout_seconds: u64,
     source_pane_id: u64,
 ) -> frankenterm_core::Result<u64> {
     let parent_cx =
@@ -69109,36 +69358,30 @@ async fn session_recovery_split_pane_on_runtime_task(
                 &cx,
                 CapabilityContextSite::SessionRecoveryOperation,
             )?;
-            match frankenterm_core::runtime_async::timeout_with_cx(
-                &cx,
-                Duration::from_secs(timeout_seconds.max(1)),
-                wezterm.split_pane_with_cx(
+            // The mutation primitive owns its timeout and converts every
+            // response-loss class after backend admission into
+            // `IndeterminateMutation`. An outer timeout would drop that
+            // future before it can classify the outcome and make blind replay
+            // look safe.
+            wezterm
+                .split_pane_with_cx(
                     &cx,
                     source_pane_id,
                     frankenterm_core::wezterm::SplitDirection::Right,
                     None,
                     Some(50),
-                ),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(session_recovery_timeout_failure(
-                    "session.recovery.split_pane.timeout",
-                    &cx,
-                )),
-            }
+                )
+                .await
         },
     );
     task.await
         .map_err(|error| {
-            runtime_task_join_failure("session.recovery.split_pane.await_task", error)
+            session_recovery_mutation_join_failure("session_recovery_split_pane", error)
         })?
 }
 
 async fn session_recovery_send_text_on_runtime_task(
     wezterm: frankenterm_core::wezterm::WeztermHandle,
-    timeout_seconds: u64,
     pane_id: u64,
     text: String,
 ) -> frankenterm_core::Result<()> {
@@ -69152,25 +69395,30 @@ async fn session_recovery_send_text_on_runtime_task(
                 &cx,
                 CapabilityContextSite::SessionRecoveryOperation,
             )?;
-            match frankenterm_core::runtime_async::timeout_with_cx(
-                &cx,
-                Duration::from_secs(timeout_seconds.max(1)),
-                wezterm.send_text_with_options_with_cx(&cx, pane_id, &text, true, true),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(session_recovery_timeout_failure(
-                    "session.recovery.send_text.timeout",
-                    &cx,
-                )),
-            }
+            // Once delivery is admitted, loss of the response is
+            // indeterminate. Preserve the inner mutation boundary so it can
+            // classify that outcome instead of fabricating retry safety.
+            wezterm
+                .send_text_with_options_with_cx(&cx, pane_id, &text, true, true)
+                .await
         },
     );
     task.await
         .map_err(|error| {
-            runtime_task_join_failure("session.recovery.send_text.await_task", error)
+            session_recovery_mutation_join_failure("session_recovery_send_text", error)
         })?
+}
+
+fn session_recovery_mutation_join_failure(
+    operation: &'static str,
+    error: frankenterm_core::runtime_async::task::JoinError,
+) -> frankenterm_core::Error {
+    tracing::warn!(
+        operation,
+        failure_class = ?error.kind(),
+        "lost authoritative completion at session-recovery mutation task boundary"
+    );
+    frankenterm_core::error::WeztermError::IndeterminateMutation { operation }.into()
 }
 
 fn session_mmap_replay_skip_reason_json(
@@ -87299,6 +87547,10 @@ log_level = "debug"
         assert_eq!(ROBOT_ERR_PANE_NOT_FOUND, "robot.pane_not_found");
         assert_eq!(ROBOT_ERR_RESERVATION_CONFLICT, "robot.reservation_conflict");
         assert_eq!(ROBOT_ERR_STORAGE, "robot.storage_error");
+        assert_eq!(
+            ROBOT_ERR_STORAGE_EFFECT_INDETERMINATE,
+            "robot.storage_effect_indeterminate"
+        );
         assert_eq!(ROBOT_ERR_TIMEOUT, "robot.timeout");
         assert_eq!(ROBOT_ERR_NOT_IMPLEMENTED, "robot.not_implemented");
         assert_eq!(ROBOT_ERR_CHECKPOINT_NOT_FOUND, "robot.checkpoint_not_found");
@@ -87520,6 +87772,36 @@ log_level = "debug"
     }
 
     #[test]
+    fn indeterminate_mux_mutation_maps_to_reconciliation_without_retry() {
+        let error = frankenterm_core::Error::Wezterm(
+            frankenterm_core::error::WeztermError::IndeterminateMutation {
+                operation: "split_pane",
+            },
+        );
+        let (code, hint) = map_wezterm_error_to_robot(&error);
+        assert_eq!(code, "robot.wezterm_mutation_indeterminate");
+        let hint = hint.expect("indeterminate mutation must carry reconciliation guidance");
+        assert!(hint.contains("Reconcile live mux state"));
+        assert!(hint.contains("do not blindly retry"));
+    }
+
+    #[test]
+    fn lost_session_recovery_mutation_join_is_indeterminate() {
+        let error = session_recovery_mutation_join_failure(
+            "session_recovery_send_text",
+            frankenterm_core::runtime_async::task::JoinError::task_failed(),
+        );
+        assert!(matches!(
+            error,
+            frankenterm_core::Error::Wezterm(
+                frankenterm_core::error::WeztermError::IndeterminateMutation {
+                    operation: "session_recovery_send_text"
+                }
+            )
+        ));
+    }
+
+    #[test]
     fn robot_reservation_error_details_maps_conflict() {
         let err =
             frankenterm_core::Error::Storage(frankenterm_core::StorageError::ReservationConflict {
@@ -87529,6 +87811,29 @@ log_level = "debug"
         let (code, hint) = robot_reservation_error_details(&err);
         assert_eq!(code, ROBOT_ERR_RESERVATION_CONFLICT);
         assert!(hint.unwrap().contains("reservations list"));
+    }
+
+    #[test]
+    fn robot_storage_error_details_requires_reconciliation_for_uncertain_effects() {
+        let cases = [
+            frankenterm_core::Error::Storage(
+                frankenterm_core::StorageError::IndeterminateMutation {
+                    operation: "set_event_note",
+                },
+            ),
+            frankenterm_core::Error::Storage(
+                frankenterm_core::StorageError::WriterSettlementIndeterminate {
+                    phase: "submit_result_wait",
+                },
+            ),
+        ];
+        for error in &cases {
+            let (code, hint) = robot_storage_error_details(error);
+            assert_eq!(code, ROBOT_ERR_STORAGE_EFFECT_INDETERMINATE);
+            let hint = hint.as_deref().expect("uncertain storage effect needs guidance");
+            assert!(hint.contains("Reconcile the affected state"));
+            assert!(hint.contains("do not automatically retry"));
+        }
     }
 
     #[test]

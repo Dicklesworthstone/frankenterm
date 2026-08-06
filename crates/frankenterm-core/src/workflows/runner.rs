@@ -11,13 +11,153 @@ use super::*;
 
 const MAX_WORKFLOW_TOTAL_DEADLINE_MS: u64 = 24 * 60 * 60 * 1000;
 const WORKFLOW_INDEPENDENT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKFLOW_RUNNER_CHILD_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
-fn spawn_runner_child_with_cx<F, Fut>(cx: &crate::cx::Cx, task: F)
-where
-    F: FnOnce(crate::cx::Cx) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-{
-    std::mem::drop(crate::runtime_async::task::spawn_with_cx(cx, task));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowRunnerChildDrainOutcome {
+    Settled,
+    TimedOut {
+        active_tasks: usize,
+        unacknowledged_tasks: usize,
+    },
+    Incomplete {
+        active_tasks: usize,
+        unacknowledged_tasks: usize,
+    },
+}
+
+fn classify_workflow_runner_child_drain(
+    timed_out: bool,
+    settlement: crate::runtime_async::task::JoinSetSettlement,
+) -> WorkflowRunnerChildDrainOutcome {
+    match settlement {
+        crate::runtime_async::task::JoinSetSettlement::Settled => {
+            WorkflowRunnerChildDrainOutcome::Settled
+        }
+        crate::runtime_async::task::JoinSetSettlement::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        } if timed_out => WorkflowRunnerChildDrainOutcome::TimedOut {
+            active_tasks,
+            unacknowledged_tasks,
+        },
+        crate::runtime_async::task::JoinSetSettlement::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        } => WorkflowRunnerChildDrainOutcome::Incomplete {
+            active_tasks,
+            unacknowledged_tasks,
+        },
+    }
+}
+
+async fn settle_workflow_runner_children(
+    child_tasks: &mut crate::runtime_async::task::JoinSet<()>,
+) -> WorkflowRunnerChildDrainOutcome {
+    child_tasks.abort_all();
+    let drain_cx = crate::cx::for_request();
+    let drain_result = crate::runtime_async::timeout_with_cx(
+        &drain_cx,
+        WORKFLOW_RUNNER_CHILD_DRAIN_TIMEOUT,
+        async {
+            loop {
+                match child_tasks.drain_next_with_cx(&drain_cx).await {
+                    Ok(Some(Ok(()))) => {}
+                    Ok(Some(Err(error))) => {
+                        if matches!(
+                            error.kind(),
+                            crate::runtime_async::task::JoinErrorKind::Aborted
+                                | crate::runtime_async::task::JoinErrorKind::ContextCancelled
+                                | crate::runtime_async::task::JoinErrorKind::WakerRegistrationFailed
+                        ) {
+                            tracing::debug!(
+                                failure_class = ?error.kind(),
+                                "Workflow child task stopped during runner shutdown"
+                            );
+                        } else {
+                            tracing::warn!(
+                                failure_class = ?error.kind(),
+                                "Workflow child task failed during runner shutdown"
+                            );
+                        }
+                    }
+                    Ok(None) => return Ok(()),
+                    Err(drain_error) => return Err(drain_error),
+                }
+            }
+        },
+    )
+    .await;
+    if let Ok(Err(drain_error)) = &drain_result {
+        tracing::warn!(
+            failure_class = ?drain_error.kind(),
+            "Workflow child task drain context failed before terminal settlement"
+        );
+    }
+    classify_workflow_runner_child_drain(drain_result.is_err(), child_tasks.settlement())
+}
+
+type WorkflowChildJoinResult = Result<(), crate::runtime_async::task::JoinError>;
+type WorkflowChildDrainResult = Result<
+    Option<WorkflowChildJoinResult>,
+    crate::runtime_async::task::JoinError,
+>;
+
+enum WorkflowRunnerWake {
+    Shutdown,
+    Event(Result<crate::events::Event, crate::events::RecvError>),
+    Child(WorkflowChildDrainResult),
+}
+
+async fn wait_for_workflow_runner_activity(
+    cx: &crate::cx::Cx,
+    subscriber: &mut crate::events::EventSubscriber,
+    child_tasks: &mut crate::runtime_async::task::JoinSet<()>,
+    shutdown: Option<(
+        &std::sync::atomic::AtomicBool,
+        &crate::runtime_async::notify::Notify,
+    )>,
+) -> WorkflowRunnerWake {
+    use futures::future::{Either, select};
+
+    if child_tasks.is_empty() {
+        if let Some((shutdown_flag, shutdown_notify)) = shutdown {
+            let shutdown_wait = std::pin::pin!(shutdown_notify.wait_until(|| {
+                shutdown_flag.load(Ordering::SeqCst)
+            }));
+            let event_wait = std::pin::pin!(subscriber.recv_cx(cx));
+            return match select(shutdown_wait, event_wait).await {
+                Either::Left(((), _)) => WorkflowRunnerWake::Shutdown,
+                Either::Right((event, _)) => WorkflowRunnerWake::Event(event),
+            };
+        }
+        return WorkflowRunnerWake::Event(subscriber.recv_cx(cx).await);
+    }
+
+    if let Some((shutdown_flag, shutdown_notify)) = shutdown {
+        let shutdown_wait = std::pin::pin!(shutdown_notify.wait_until(|| {
+            shutdown_flag.load(Ordering::SeqCst)
+        }));
+        let activity_wait = std::pin::pin!(async {
+            let event_wait = std::pin::pin!(subscriber.recv_cx(cx));
+            let child_wait = std::pin::pin!(child_tasks.drain_next_with_cx(cx));
+            match select(event_wait, child_wait).await {
+                Either::Left((event, _)) => WorkflowRunnerWake::Event(event),
+                Either::Right((child, _)) => WorkflowRunnerWake::Child(child),
+            }
+        });
+        return match select(shutdown_wait, activity_wait).await {
+            Either::Left(((), _)) => WorkflowRunnerWake::Shutdown,
+            Either::Right((wake, _)) => wake,
+        };
+    }
+
+    let event_wait = std::pin::pin!(subscriber.recv_cx(cx));
+    let child_wait = std::pin::pin!(child_tasks.drain_next_with_cx(cx));
+    match select(event_wait, child_wait).await {
+        Either::Left((event, _)) => WorkflowRunnerWake::Event(event),
+        Either::Right((child, _)) => WorkflowRunnerWake::Child(child),
+    }
 }
 
 fn workflow_wait_aborted(label: &str, err: impl std::fmt::Display) -> crate::Error {
@@ -2787,6 +2927,47 @@ impl WorkflowRunner {
     ///
     /// Legacy [`run`](Self::run) preserved unchanged.
     pub async fn run_with_cx(&self, cx: &crate::cx::Cx, event_bus: &crate::events::EventBus) {
+        self.run_loop_with_cx(cx, event_bus, None).await;
+    }
+
+    /// Run the event loop with an explicit cooperative shutdown channel.
+    ///
+    /// The atomic flag is the durable predicate and `shutdown_notify` is its
+    /// wake accelerator. They must be the same pair owned by the surrounding
+    /// [`crate::watchdog::WatchdogHandle`]. On shutdown, the runner stops
+    /// admitting detections, aborts every owned per-workflow task, and performs
+    /// a bounded trusted terminal drain before returning.
+    pub async fn run_with_shutdown_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event_bus: &crate::events::EventBus,
+        shutdown_flag: &std::sync::atomic::AtomicBool,
+        shutdown_notify: &crate::runtime_async::notify::Notify,
+    ) {
+        self.run_loop_with_cx(
+            cx,
+            event_bus,
+            Some((shutdown_flag, shutdown_notify)),
+        )
+        .await;
+    }
+
+    async fn run_loop_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event_bus: &crate::events::EventBus,
+        shutdown: Option<(
+            &std::sync::atomic::AtomicBool,
+            &crate::runtime_async::notify::Notify,
+        )>,
+    ) {
+        if shutdown.is_some_and(|(flag, _)| flag.load(Ordering::SeqCst)) {
+            tracing::info!(
+                explicit_cx = true,
+                "Workflow runner shutdown was already requested before resume"
+            );
+            return;
+        }
         let resumed = self.resume_incomplete_with_cx(cx).await;
         if !resumed.is_empty() {
             tracing::info!(
@@ -2820,8 +3001,18 @@ impl WorkflowRunner {
         }
 
         let mut subscriber = event_bus.subscribe_detections();
+        let mut child_tasks = crate::runtime_async::task::JoinSet::new();
 
         loop {
+            while let Some(join_result) = child_tasks.try_join_next() {
+                if let Err(error) = join_result {
+                    tracing::warn!(
+                        failure_class = ?error.kind(),
+                        "Workflow child task failed"
+                    );
+                }
+            }
+
             if cx.checkpoint().is_err() {
                 tracing::info!(
                     explicit_cx = true,
@@ -2829,7 +3020,49 @@ impl WorkflowRunner {
                 );
                 break;
             }
-            match subscriber.recv_cx(cx).await {
+            if shutdown.is_some_and(|(flag, _)| flag.load(Ordering::SeqCst)) {
+                tracing::info!(
+                    explicit_cx = true,
+                    "Workflow runner received shutdown signal"
+                );
+                break;
+            }
+
+            let next_event = match wait_for_workflow_runner_activity(
+                cx,
+                &mut subscriber,
+                &mut child_tasks,
+                shutdown,
+            )
+            .await
+            {
+                WorkflowRunnerWake::Shutdown => {
+                    tracing::info!(
+                        explicit_cx = true,
+                        "Workflow runner received shutdown notification"
+                    );
+                    break;
+                }
+                WorkflowRunnerWake::Event(event) => event,
+                WorkflowRunnerWake::Child(Ok(Some(Ok(())))) => continue,
+                WorkflowRunnerWake::Child(Ok(Some(Err(error)))) => {
+                    tracing::warn!(
+                        failure_class = ?error.kind(),
+                        "Workflow child task failed"
+                    );
+                    continue;
+                }
+                WorkflowRunnerWake::Child(Ok(None)) => continue,
+                WorkflowRunnerWake::Child(Err(error)) => {
+                    tracing::warn!(
+                        failure_class = ?error.kind(),
+                        "Workflow child task drain wait failed"
+                    );
+                    continue;
+                }
+            };
+
+            match next_event {
                 Ok(event) => {
                     if let crate::events::Event::PatternDetected {
                         pane_id,
@@ -2868,7 +3101,7 @@ impl WorkflowRunner {
                                         external_signals: self.external_signals.clone(),
                                     };
 
-                                    spawn_runner_child_with_cx(cx, move |child_cx| async move {
+                                    child_tasks.spawn_with_cx(cx, move |child_cx| async move {
                                         let result = runner
                                             .run_workflow_with_cx(
                                                 &child_cx,
@@ -3044,6 +3277,36 @@ impl WorkflowRunner {
                     );
                     break;
                 }
+            }
+        }
+
+        match settle_workflow_runner_children(&mut child_tasks).await {
+            WorkflowRunnerChildDrainOutcome::Settled => {}
+            WorkflowRunnerChildDrainOutcome::TimedOut {
+                active_tasks,
+                unacknowledged_tasks,
+            } => {
+                tracing::warn!(
+                    event = "workflow_runner_child_task_drain_timeout",
+                    active_tasks,
+                    unacknowledged_tasks,
+                    remaining_tasks = child_tasks.len(),
+                    orphan_risk = true,
+                    "Workflow child tasks missed bounded terminal settlement"
+                );
+            }
+            WorkflowRunnerChildDrainOutcome::Incomplete {
+                active_tasks,
+                unacknowledged_tasks,
+            } => {
+                tracing::warn!(
+                    event = "workflow_runner_child_task_settlement_incomplete",
+                    active_tasks,
+                    unacknowledged_tasks,
+                    remaining_tasks = child_tasks.len(),
+                    orphan_risk = true,
+                    "Workflow child task drain ended without terminal settlement"
+                );
             }
         }
     }
@@ -3859,6 +4122,78 @@ mod tests {
         }
     }
 
+    #[test]
+    fn workflow_runner_child_drain_truth_gives_settlement_precedence() {
+        assert_eq!(
+            classify_workflow_runner_child_drain(
+                true,
+                crate::runtime_async::task::JoinSetSettlement::Settled,
+            ),
+            WorkflowRunnerChildDrainOutcome::Settled,
+        );
+        assert_eq!(
+            classify_workflow_runner_child_drain(
+                true,
+                crate::runtime_async::task::JoinSetSettlement::Incomplete {
+                    active_tasks: 2,
+                    unacknowledged_tasks: 1,
+                },
+            ),
+            WorkflowRunnerChildDrainOutcome::TimedOut {
+                active_tasks: 2,
+                unacknowledged_tasks: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn workflow_runner_child_drain_trusted_polls_registration_failure_to_settlement() {
+        run_async_test(async {
+            let mut child_tasks = crate::runtime_async::task::JoinSet::new();
+            child_tasks.spawn(std::future::pending::<()>());
+            child_tasks.force_join_registration_failure_for_test();
+
+            assert_eq!(
+                settle_workflow_runner_children(&mut child_tasks).await,
+                WorkflowRunnerChildDrainOutcome::Settled,
+                "forced caller-waker registration failure must retain and trusted-drain the aborted workflow task",
+            );
+            assert_eq!(
+                child_tasks.settlement(),
+                crate::runtime_async::task::JoinSetSettlement::Settled,
+            );
+        });
+    }
+
+    #[test]
+    fn workflow_runner_reaps_completed_child_while_event_stream_is_idle() {
+        run_async_test(async {
+            let event_bus = crate::events::EventBus::new(8);
+            let mut subscriber = event_bus.subscribe_detections();
+            let mut child_tasks = crate::runtime_async::task::JoinSet::new();
+            child_tasks.spawn(async {});
+            let cx = crate::cx::for_testing();
+
+            let wake = crate::runtime_async::timeout_with_cx(
+                &cx,
+                Duration::from_secs(1),
+                wait_for_workflow_runner_activity(
+                    &cx,
+                    &mut subscriber,
+                    &mut child_tasks,
+                    None,
+                ),
+            )
+            .await
+            .expect("child completion must wake an otherwise-idle runner");
+            assert!(matches!(wake, WorkflowRunnerWake::Child(Ok(Some(Ok(()))))));
+            assert_eq!(
+                child_tasks.settlement(),
+                crate::runtime_async::task::JoinSetSettlement::Settled,
+            );
+        });
+    }
+
     // ========================================================================
     // WorkflowStartResult predicates
     // ========================================================================
@@ -4395,6 +4730,62 @@ mod tests {
             WorkflowRunnerConfig::default(),
         );
         (storage, runner, lock_manager)
+    }
+
+    #[test]
+    fn workflow_runner_shutdown_notify_wakes_idle_loop_and_settles() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().expect("tempdir");
+            let db_path = temp_dir
+                .path()
+                .join("runner_cooperative_shutdown.db")
+                .to_string_lossy()
+                .to_string();
+            let (storage, runner, _lock_manager) = unlimited_gate_runner(&db_path).await;
+            let event_bus = Arc::new(crate::events::EventBus::new(8));
+            let task_event_bus = Arc::clone(&event_bus);
+            let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let task_shutdown_flag = Arc::clone(&shutdown_flag);
+            let shutdown_notify = Arc::new(crate::runtime_async::notify::Notify::new());
+            let task_shutdown_notify = Arc::clone(&shutdown_notify);
+            let runner_cx = crate::cx::for_testing();
+
+            let runner_task = crate::runtime_async::task::spawn(async move {
+                runner
+                    .run_with_shutdown_with_cx(
+                        &runner_cx,
+                        &task_event_bus,
+                        &task_shutdown_flag,
+                        &task_shutdown_notify,
+                    )
+                    .await;
+            });
+
+            for _ in 0..4_096 {
+                if event_bus.stats().detection_subscribers > 0 {
+                    break;
+                }
+                crate::runtime_async::yield_now().await;
+            }
+            assert!(
+                event_bus.stats().detection_subscribers > 0,
+                "runner must reach its idle detection wait before shutdown"
+            );
+
+            shutdown_flag.store(true, Ordering::SeqCst);
+            shutdown_notify.notify_waiters();
+            let join_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(
+                &join_cx,
+                Duration::from_secs(1),
+                runner_task,
+            )
+            .await
+            .expect("cooperative shutdown must remain bounded")
+            .expect("workflow runner task must settle cleanly");
+
+            storage.shutdown().await.expect("shutdown workflow storage");
+        });
     }
 
     async fn seed_limited_pane(

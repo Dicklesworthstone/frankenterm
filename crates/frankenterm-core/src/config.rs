@@ -3885,23 +3885,74 @@ pub struct NativeEventsConfig {
     pub socket_path: String,
 }
 
-/// Default native-events socket path. Unix keeps the historical
-/// `/tmp/ft/events.sock` literal (behavior unchanged); Windows derives a
-/// portable path under the OS temp dir (`%TEMP%\ft\events.sock`) since `/tmp`
-/// is not a valid Windows location. ft-plp3c path-portability.
-fn default_native_events_socket_path() -> String {
+/// Canonical native-events socket path.
+///
+/// Authenticated Unix targets isolate the endpoint in a per-effective-user
+/// runtime directory; the listener enforces owner-only directory and socket
+/// permissions before bind. Unsupported Unix targets retain deterministic
+/// serialization but fail before creating an endpoint. Windows retains a
+/// portable temp-directory path, but its listener likewise fails closed until
+/// an equivalent peer-identity contract is available.
+#[must_use]
+pub fn default_native_events_socket_path() -> String {
     #[cfg(windows)]
     {
         std::env::temp_dir()
-            .join("ft")
+            .join("frankenterm")
             .join("events.sock")
             .to_string_lossy()
             .into_owned()
     }
-    #[cfg(not(windows))]
+    #[cfg(all(unix, feature = "native-wezterm"))]
     {
-        "/tmp/ft/events.sock".to_string()
+        let effective_uid = nix::unistd::Uid::effective().as_raw();
+        std::env::temp_dir()
+            .join(format!("frankenterm-{effective_uid}"))
+            .join("events.sock")
+            .to_string_lossy()
+            .into_owned()
     }
+    #[cfg(all(unix, not(feature = "native-wezterm")))]
+    {
+        // This build cannot authenticate native-event peers and therefore
+        // cannot bind the endpoint. Keep path resolution deterministic for
+        // config serialization without pretending the transport is usable.
+        std::env::temp_dir()
+            .join("frankenterm-native-events-disabled")
+            .join("events.sock")
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::env::temp_dir()
+            .join("frankenterm-native-events-unsupported")
+            .join("events.sock")
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// Resolve the native-event endpoint without allowing an environment override
+/// to bypass explicit disablement.
+///
+/// The caller supplies the environment value so this function remains pure and
+/// deterministic. Empty environment values are treated as absent; when the
+/// transport is enabled, the configured path is the fallback and is expected
+/// to have already received the canonical default during deserialization.
+#[must_use]
+pub fn resolve_native_events_socket_path(
+    enabled: bool,
+    environment_override: Option<&str>,
+    configured_path: &str,
+) -> Option<PathBuf> {
+    enabled.then(|| {
+        PathBuf::from(
+            environment_override
+                .filter(|value| !value.is_empty())
+                .unwrap_or(configured_path),
+        )
+    })
 }
 
 impl Default for NativeEventsConfig {
@@ -10021,8 +10072,52 @@ mode = "periodic"
         assert_eq!(config.general.data_dir, "~/Library/Application Support/ft");
         #[cfg(not(target_os = "macos"))]
         assert_eq!(config.general.data_dir, "~/.local/share/ft");
-        assert_eq!(config.native.socket_path, "/tmp/ft/events.sock");
+        assert_eq!(
+            config.native.socket_path,
+            default_native_events_socket_path()
+        );
         assert_eq!(config.metrics.prefix, "ft");
+    }
+
+    #[cfg(all(unix, feature = "native-wezterm"))]
+    #[test]
+    fn native_event_default_is_canonical_and_effective_user_private() {
+        let effective_uid = nix::unistd::Uid::effective().as_raw();
+        let expected = std::env::temp_dir()
+            .join(format!("frankenterm-{effective_uid}"))
+            .join("events.sock");
+        let actual = PathBuf::from(default_native_events_socket_path());
+        assert_eq!(actual, expected);
+        assert!(actual.is_absolute());
+        assert!(!actual.to_string_lossy().contains("/tmp/ft/events.sock"));
+        assert!(!actual.to_string_lossy().contains("/tmp/wa/events.sock"));
+    }
+
+    #[test]
+    fn native_event_socket_resolution_honors_enablement_and_override_precedence() {
+        let configured = "/private/runtime/frankenterm/events.sock";
+        assert_eq!(
+            resolve_native_events_socket_path(false, None, configured),
+            None
+        );
+        assert_eq!(
+            resolve_native_events_socket_path(false, Some("/ignored.sock"), configured),
+            None,
+            "an environment variable must not bypass native.enabled=false"
+        );
+        assert_eq!(
+            resolve_native_events_socket_path(true, None, configured),
+            Some(PathBuf::from(configured))
+        );
+        assert_eq!(
+            resolve_native_events_socket_path(true, Some(""), configured),
+            Some(PathBuf::from(configured)),
+            "an empty environment variable must not erase the configured path"
+        );
+        assert_eq!(
+            resolve_native_events_socket_path(true, Some("/override.sock"), configured),
+            Some(PathBuf::from("/override.sock"))
+        );
     }
 
     #[test]

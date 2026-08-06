@@ -343,7 +343,8 @@ impl ErrorCode {
             | "robot.fts_query_error"
             | "robot.reservation_conflict"
             | "robot.event_not_found"
-            | "robot.cursor_discontinuity" => ErrorCategory::Storage,
+            | "robot.cursor_discontinuity"
+            | "robot.storage_effect_indeterminate" => ErrorCategory::Storage,
             "robot.rule_not_found" => ErrorCategory::Pattern,
             "robot.config_error"
             | "robot.feature_not_available"
@@ -373,6 +374,7 @@ impl ErrorCode {
             | "robot.wezterm_not_running"
             | "robot.wezterm_socket_not_found"
             | "robot.wezterm_command_failed"
+            | "robot.wezterm_mutation_indeterminate"
             | "robot.wezterm_parse_error"
             | "robot.wezterm_output_too_large"
             | "robot.pane_not_found"
@@ -457,8 +459,14 @@ pub fn hint_for(code: &ErrorCode) -> Option<&'static str> {
         "robot.wezterm_command_failed" | "robot.wezterm_error" => {
             "Inspect WezTerm logs; transient failures will resolve after retry."
         }
+        "robot.wezterm_mutation_indeterminate" => {
+            "The mux mutation may already have taken effect. Reconcile live mux state and verify the intended postcondition; do not blindly retry."
+        }
         "robot.wezterm_parse_error" => {
             "WezTerm output didn't match the expected schema — likely a version skew."
+        }
+        "robot.wezterm_output_too_large" => {
+            "Inspect backend health and reduce the metadata scope or pane count; retrying the same oversized response cannot succeed."
         }
         "robot.circuit_open" => {
             "Upstream circuit breaker is open; wait for the cooldown window before retrying."
@@ -488,6 +496,9 @@ pub fn hint_for(code: &ErrorCode) -> Option<&'static str> {
         }
         "robot.cursor_discontinuity" => {
             "Inspect the structured discontinuity data; resume with the exact original scope or explicitly establish a fresh tail token."
+        }
+        "robot.storage_effect_indeterminate" => {
+            "The storage effect may already be durable. Reconcile the affected state and writer health; do not automatically retry."
         }
         // Tx contention
         "robot.tx_lock_failed" => {
@@ -3663,6 +3674,9 @@ mod tests {
     fn error_code_roundtrip() {
         for code in [
             "robot.wezterm_not_found",
+            "robot.wezterm_mutation_indeterminate",
+            "robot.wezterm_output_too_large",
+            "robot.storage_effect_indeterminate",
             "robot.reservation_conflict",
             "robot.require_approval",
             "robot.workflow_aborted",
@@ -3990,6 +4004,10 @@ mod tests {
             ("robot.reservation_conflict", ErrorCategory::Storage),
             ("robot.rule_not_found", ErrorCategory::Pattern),
             ("robot.storage_error", ErrorCategory::Storage),
+            (
+                "robot.storage_effect_indeterminate",
+                ErrorCategory::Storage,
+            ),
             ("robot.timeout", ErrorCategory::Network),
             ("robot.tx_error", ErrorCategory::Workflow),
             ("robot.tx_execution_failed", ErrorCategory::Workflow),
@@ -4010,6 +4028,14 @@ mod tests {
             ("robot.wezterm_error", ErrorCategory::Wezterm),
             ("robot.wezterm_not_found", ErrorCategory::Wezterm),
             ("robot.wezterm_not_running", ErrorCategory::Wezterm),
+            (
+                "robot.wezterm_mutation_indeterminate",
+                ErrorCategory::Wezterm,
+            ),
+            (
+                "robot.wezterm_output_too_large",
+                ErrorCategory::Wezterm,
+            ),
             ("robot.wezterm_parse_error", ErrorCategory::Wezterm),
             ("robot.wezterm_socket_not_found", ErrorCategory::Wezterm),
             ("robot.workflow_aborted", ErrorCategory::Workflow),
@@ -4998,7 +5024,9 @@ mod tests {
             "robot.wezterm_socket_not_found",
             "robot.wezterm_command_failed",
             "robot.wezterm_error",
+            "robot.wezterm_mutation_indeterminate",
             "robot.wezterm_parse_error",
+            "robot.wezterm_output_too_large",
             "robot.circuit_open",
             "robot.timeout",
             "robot.cass_timeout",
@@ -5007,6 +5035,7 @@ mod tests {
             "robot.require_approval",
             "robot.approval_error",
             "robot.storage_error",
+            "robot.storage_effect_indeterminate",
             "robot.fts_query_error",
             "robot.reservation_conflict",
             "robot.event_not_found",
@@ -5073,6 +5102,25 @@ mod tests {
             hint_for(&killswitch).unwrap().contains("ft mission unkill"),
             "killswitch hint must direct operator at ft mission unkill"
         );
+
+        let mux_indeterminate =
+            ErrorCode::parse("robot.wezterm_mutation_indeterminate").unwrap();
+        let mux_hint = hint_for(&mux_indeterminate).unwrap();
+        assert!(mux_hint.contains("Reconcile live mux state"));
+        assert!(mux_hint.contains("do not blindly retry"));
+
+        let storage_indeterminate =
+            ErrorCode::parse("robot.storage_effect_indeterminate").unwrap();
+        let storage_hint = hint_for(&storage_indeterminate).unwrap();
+        assert!(storage_hint.contains("Reconcile the affected state"));
+        assert!(storage_hint.contains("do not automatically retry"));
+
+        let oversized = ErrorCode::parse("robot.wezterm_output_too_large").unwrap();
+        assert!(
+            hint_for(&oversized)
+                .unwrap()
+                .contains("retrying the same oversized response cannot succeed")
+        );
     }
 
     #[test]
@@ -5094,9 +5142,12 @@ mod tests {
 
         let non_retryable = [
             "robot.wezterm_not_found",
+            "robot.wezterm_mutation_indeterminate",
             "robot.wezterm_parse_error",
+            "robot.wezterm_output_too_large",
             "robot.pane_not_found",
             "robot.storage_error",
+            "robot.storage_effect_indeterminate",
             "robot.cursor_discontinuity",
             "robot.reservation_conflict",
             "robot.policy_denied",
@@ -5579,10 +5630,13 @@ mod tests {
             "robot.wezterm_socket_not_found",
             "robot.pane_not_found",
             "robot.wezterm_command_failed",
+            "robot.wezterm_mutation_indeterminate",
             "robot.wezterm_parse_error",
+            "robot.wezterm_output_too_large",
             "robot.circuit_open",
             "robot.rule_not_found",
             "robot.storage_error",
+            "robot.storage_effect_indeterminate",
             "robot.event_not_found",
             "robot.fts_query_error",
             "robot.reservation_conflict",

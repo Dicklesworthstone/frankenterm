@@ -72,12 +72,14 @@ Watcher startup currently wires these components in-process:
 `ObservationRuntime::start()` spawns cooperative tasks for:
 
 - pane discovery (`spawn_discovery_task`)
-- capture collection (`spawn_capture_task`; plus native push event task when enabled)
+- polling-based capture collection (`spawn_capture_task`), plus an explicitly
+  enabled native state/lifecycle hint task on authenticated Unix targets
 - capture relay and queueing
 - persistence + detection (`spawn_persistence_task`)
 - maintenance/retention and snapshot triggers.
-- burst protection on native output via `NativeOutputCoalescer` before segments
-  hit storage/pattern scanning.
+- burst protection via `NativeOutputCoalescer` if a producer supplies raw
+  `PaneOutput` wire frames. The current GUI mux-notification bridge does not
+  expose raw PTY bytes, so GUI pane text remains polling-authoritative.
 
 Core passive loop contract: observe/store/detect only. Side effects are delegated to workflow/policy layers.
 

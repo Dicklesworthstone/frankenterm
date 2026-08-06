@@ -55,6 +55,16 @@ mod download;
 mod frontend;
 mod glyphcache;
 mod inputmap;
+#[cfg(all(
+    unix,
+    any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
 mod native_bridge;
 mod overlay;
 mod quad;
@@ -995,26 +1005,48 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         opts.workspace.as_deref(),
     )?;
 
-    // Start the native event bridge if configured.
-    // This subscribes to mux events and pushes them to the ft watch daemon
-    // over a Unix domain socket for real-time event processing.
+    // Start the authenticated native-event bridge on targets whose Unix socket
+    // API exposes peer credentials. Other targets compile the GUI without a
+    // bridge rather than pretending an unauthenticated transport is usable.
+    #[cfg(all(
+        unix,
+        any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "dragonfly"
+        )
+    ))]
     let _native_bridge = {
-        let ft_config = frankenterm_core::config::Config::load().unwrap_or_default();
-        if ft_config.native.enabled {
-            let socket_path = PathBuf::from(&ft_config.native.socket_path);
-            native_bridge::NativeEventBridge::start(&socket_path)
-        } else {
-            // Even if not explicitly enabled, try the default socket path
-            // so it "just works" when ft watch is running.
-            let default_path = PathBuf::from("/tmp/wa/events.sock");
-            if default_path.exists() {
-                log::info!("Native event socket found at default path, enabling bridge");
-                native_bridge::NativeEventBridge::start(&default_path)
-            } else {
-                None
+        let ft_config = match frankenterm_core::config::Config::load() {
+            Ok(config) => config,
+            Err(error) => {
+                log::warn!(
+                    "Native event bridge disabled because ft configuration failed to load: {error}"
+                );
+                frankenterm_core::config::Config::default()
             }
-        }
+        };
+        let environment_override = std::env::var("WEZTERM_FT_SOCKET").ok();
+        frankenterm_core::config::resolve_native_events_socket_path(
+            ft_config.native.enabled,
+            environment_override.as_deref(),
+            &ft_config.native.socket_path,
+        )
+        .and_then(|socket_path| native_bridge::NativeEventBridge::start(&socket_path))
     };
+    #[cfg(not(all(
+        unix,
+        any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "dragonfly"
+        )
+    )))]
+    let _native_bridge = ();
 
     // First, let's see if we can ask an already running instance to do this.
     // We must do this before we start the gui frontend as the scheduler

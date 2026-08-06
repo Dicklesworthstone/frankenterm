@@ -235,7 +235,9 @@ New GUI actions surfaced in FrankenTerm include:
 Operationally important points:
 
 1. `ft` CLI workflows remain valid.
-2. `ft watch` can consume GUI native events when native event socket is available.
+2. `ft watch` can consume best-effort GUI state/lifecycle hints when the
+   authenticated native event socket is explicitly enabled. Raw pane-output
+   bytes still use the polling capture path.
 3. Existing workspace state (`ft.toml`, `ft.db`) remains usable.
 4. `FrankenTerm.app` can replace prior wrapper app bundles.
 5. WezTerm can remain installed side-by-side during migration.
@@ -271,7 +273,10 @@ ft runtime-side (`~/.config/ft/ft.toml`):
 ```toml
 [native]
 enabled = true
-socket_path = "/tmp/wa/events.sock"
+# `socket_path` is optional. When omitted, FrankenTerm resolves a private
+# per-user runtime path under `$TMPDIR` (or `/tmp`).
+# The authenticated bridge is currently available on Apple, Linux, Android,
+# FreeBSD, and DragonFly targets. Other targets fail closed.
 
 [ingest]
 poll_interval_ms = 200
@@ -301,7 +306,9 @@ ft mcp serve
 
 - If memory pressure rises, lower `scrollback_lines`.
 - If capture load is high, increase `ingest.poll_interval_ms` and/or lower `max_concurrent_captures`.
-- Native event bridge uses bounded buffering; keep `ft watch` running so events drain continuously.
+- Native state/lifecycle hints use bounded buffering and can be dropped under
+  pressure or an indeterminate socket write. Polling remains the authoritative
+  pane-text path; keep `ft watch` running so the hint queue drains continuously.
 - For release posture, hardware-tier defaults, and fallback expectations, use `docs/resize-user-facing-release-tuning-guidance-wa-1u90p.8.5.md`.
 - For exact runtime knob ranges, use `docs/tuning-reference.md`.
 
@@ -344,5 +351,9 @@ frankenterm-gui show-keys
 If GUI-native events are missing:
 
 1. Ensure `ft watch` is running.
-2. Ensure `[native].enabled = true` (or default socket exists).
-3. Check logs for native bridge reconnect warnings.
+2. Ensure `[native].enabled = true`; merely creating the default socket or
+   setting `WEZTERM_FT_SOCKET` does not bypass explicit disablement.
+3. Ensure the GUI and watcher resolve the same socket path and that its parent
+   directory is owned by the effective user with mode `0700`.
+4. Check logs for authentication, known queue-drop, indeterminate-write, or
+   reconnect warnings.

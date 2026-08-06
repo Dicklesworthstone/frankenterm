@@ -607,6 +607,14 @@ mod tests {
             "FT-1021"
         );
         assert_eq!(
+            ErrorRenderer::error_code(&Error::Wezterm(WeztermError::OutputTooLarge {
+                command: "cli list".to_string(),
+                len: 1_024,
+                cap: 512,
+            })),
+            "FT-1023"
+        );
+        assert_eq!(
             ErrorRenderer::error_code(&Error::Wezterm(WeztermError::Timeout(30))),
             "FT-1022"
         );
