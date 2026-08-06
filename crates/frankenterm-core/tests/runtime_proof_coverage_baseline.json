@@ -1,89 +1,698 @@
 {
-  "schema_version": 2,
-  "comment": "ft-3kv6e schema-v2 census ratchet baseline. Update only after reviewing the complete live census from scripts/check_runtime_proof_coverage.py.",
-  "uncovered_sites": 0,
-  "covered_sites": 499,
-  "exempt_files_sites": 44,
-  "wrapper_exempt_sites": 437,
-  "independent_context_adapter_sites": 0,
-  "total_sites": 980,
-  "by_file_uncovered": {},
   "by_file_counts": {
-    "alerts.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "approval.rs": { "total": 15, "covered": 8, "exempt": 0, "wrapper_exempt": 7, "independent_adapter": 0, "uncovered": 0 },
-    "cancellation_safe_channel.rs": { "total": 4, "covered": 2, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "capture_authority.rs": { "total": 2, "covered": 2, "exempt": 0, "wrapper_exempt": 0, "independent_adapter": 0, "uncovered": 0 },
-    "cass.rs": { "total": 18, "covered": 9, "exempt": 0, "wrapper_exempt": 9, "independent_adapter": 0, "uncovered": 0 },
-    "caut.rs": { "total": 4, "covered": 2, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "cleanup.rs": { "total": 5, "covered": 3, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "cpu_pressure.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "cx.rs": { "total": 3, "covered": 0, "exempt": 3, "wrapper_exempt": 0, "independent_adapter": 0, "uncovered": 0 },
-    "cx_stub.rs": { "total": 1, "covered": 0, "exempt": 1, "wrapper_exempt": 0, "independent_adapter": 0, "uncovered": 0 },
-    "diagnostic.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "distributed.rs": { "total": 2, "covered": 2, "exempt": 0, "wrapper_exempt": 0, "independent_adapter": 0, "uncovered": 0 },
-    "environment.rs": { "total": 4, "covered": 2, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "event_stream.rs": { "total": 5, "covered": 3, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "events.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "export.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "ingest.rs": { "total": 5, "covered": 3, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "ipc.rs": { "total": 66, "covered": 36, "exempt": 0, "wrapper_exempt": 30, "independent_adapter": 0, "uncovered": 0 },
-    "mcp_helpers.rs": { "total": 10, "covered": 5, "exempt": 0, "wrapper_exempt": 5, "independent_adapter": 0, "uncovered": 0 },
-    "memory_budget.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "memory_pressure.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "metrics.rs": { "total": 4, "covered": 2, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "native_events.rs": { "total": 17, "covered": 10, "exempt": 0, "wrapper_exempt": 7, "independent_adapter": 0, "uncovered": 0 },
-    "notifications.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "orphan_reaper.rs": { "total": 4, "covered": 2, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "policy.rs": { "total": 10, "covered": 5, "exempt": 0, "wrapper_exempt": 5, "independent_adapter": 0, "uncovered": 0 },
-    "pool.rs": { "total": 8, "covered": 6, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "protocol_recovery.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "recorder_migration.rs": { "total": 10, "covered": 5, "exempt": 0, "wrapper_exempt": 5, "independent_adapter": 0, "uncovered": 0 },
-    "recording.rs": { "total": 8, "covered": 4, "exempt": 0, "wrapper_exempt": 4, "independent_adapter": 0, "uncovered": 0 },
-    "replay.rs": { "total": 4, "covered": 2, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "reports.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "restore_layout.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "restore_process.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "restore_scrollback.rs": { "total": 3, "covered": 2, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "retry.rs": { "total": 8, "covered": 4, "exempt": 0, "wrapper_exempt": 4, "independent_adapter": 0, "uncovered": 0 },
-    "robot_sdk_contracts.rs": { "total": 4, "covered": 2, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "runtime.rs": { "total": 14, "covered": 7, "exempt": 0, "wrapper_exempt": 7, "independent_adapter": 0, "uncovered": 0 },
-    "runtime_async.rs": { "total": 40, "covered": 0, "exempt": 40, "wrapper_exempt": 0, "independent_adapter": 0, "uncovered": 0 },
-    "search_bridge.rs": { "total": 5, "covered": 3, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "search_explain.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "secrets.rs": { "total": 4, "covered": 2, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "session_correlation.rs": { "total": 6, "covered": 3, "exempt": 0, "wrapper_exempt": 3, "independent_adapter": 0, "uncovered": 0 },
-    "session_restore.rs": { "total": 4, "covered": 2, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "session_retention.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "sharding.rs": { "total": 8, "covered": 4, "exempt": 0, "wrapper_exempt": 4, "independent_adapter": 0, "uncovered": 0 },
-    "simulation.rs": { "total": 20, "covered": 10, "exempt": 0, "wrapper_exempt": 10, "independent_adapter": 0, "uncovered": 0 },
-    "snapshot_engine.rs": { "total": 12, "covered": 6, "exempt": 0, "wrapper_exempt": 6, "independent_adapter": 0, "uncovered": 0 },
-    "spsc_ring_buffer.rs": { "total": 8, "covered": 4, "exempt": 0, "wrapper_exempt": 4, "independent_adapter": 0, "uncovered": 0 },
-    "storage.rs": { "total": 358, "covered": 187, "exempt": 0, "wrapper_exempt": 171, "independent_adapter": 0, "uncovered": 0 },
-    "storage/handle/event_mutes.rs": { "total": 8, "covered": 4, "exempt": 0, "wrapper_exempt": 4, "independent_adapter": 0, "uncovered": 0 },
-    "storage_telemetry.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "survival.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "tailer.rs": { "total": 4, "covered": 2, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "telemetry.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "ui_query.rs": { "total": 4, "covered": 2, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "undo.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "vendored.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "vendored/mux_client.rs": { "total": 51, "covered": 26, "exempt": 0, "wrapper_exempt": 25, "independent_adapter": 0, "uncovered": 0 },
-    "vendored/mux_pool.rs": { "total": 23, "covered": 13, "exempt": 0, "wrapper_exempt": 10, "independent_adapter": 0, "uncovered": 0 },
-    "wait.rs": { "total": 12, "covered": 6, "exempt": 0, "wrapper_exempt": 6, "independent_adapter": 0, "uncovered": 0 },
-    "watchdog.rs": { "total": 3, "covered": 3, "exempt": 0, "wrapper_exempt": 0, "independent_adapter": 0, "uncovered": 0 },
-    "web.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "web/server.rs": { "total": 4, "covered": 2, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "web_framework.rs": { "total": 4, "covered": 2, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "webhook.rs": { "total": 4, "covered": 2, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "wezterm.rs": { "total": 61, "covered": 33, "exempt": 0, "wrapper_exempt": 28, "independent_adapter": 0, "uncovered": 0 },
-    "workflows/account_steps.rs": { "total": 6, "covered": 3, "exempt": 0, "wrapper_exempt": 3, "independent_adapter": 0, "uncovered": 0 },
-    "workflows/builtin_workflows.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "workflows/codex_exit.rs": { "total": 4, "covered": 2, "exempt": 0, "wrapper_exempt": 2, "independent_adapter": 0, "uncovered": 0 },
-    "workflows/context.rs": { "total": 10, "covered": 5, "exempt": 0, "wrapper_exempt": 5, "independent_adapter": 0, "uncovered": 0 },
-    "workflows/engine.rs": { "total": 16, "covered": 10, "exempt": 0, "wrapper_exempt": 6, "independent_adapter": 0, "uncovered": 0 },
-    "workflows/mod.rs": { "total": 5, "covered": 5, "exempt": 0, "wrapper_exempt": 0, "independent_adapter": 0, "uncovered": 0 },
-    "workflows/plan_helpers.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 },
-    "workflows/runner.rs": { "total": 12, "covered": 7, "exempt": 0, "wrapper_exempt": 5, "independent_adapter": 0, "uncovered": 0 },
-    "workflows/wait_execution.rs": { "total": 2, "covered": 1, "exempt": 0, "wrapper_exempt": 1, "independent_adapter": 0, "uncovered": 0 }
-  }
+    "alerts.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "approval.rs": {
+      "covered": 8,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 15,
+      "uncovered": 0,
+      "wrapper_exempt": 7
+    },
+    "cancellation_safe_channel.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 4,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "capture_authority.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 0
+    },
+    "cass.rs": {
+      "covered": 9,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 18,
+      "uncovered": 0,
+      "wrapper_exempt": 9
+    },
+    "caut.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 4,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "cleanup.rs": {
+      "covered": 3,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 5,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "cpu_pressure.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "cx.rs": {
+      "covered": 0,
+      "exempt": 3,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 3,
+      "uncovered": 0,
+      "wrapper_exempt": 0
+    },
+    "cx_stub.rs": {
+      "covered": 0,
+      "exempt": 1,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 1,
+      "uncovered": 0,
+      "wrapper_exempt": 0
+    },
+    "diagnostic.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "distributed.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 0
+    },
+    "environment.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 4,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "event_stream.rs": {
+      "covered": 3,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 5,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "events.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "export.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "ingest.rs": {
+      "covered": 3,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 5,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "ipc.rs": {
+      "covered": 36,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 66,
+      "uncovered": 0,
+      "wrapper_exempt": 30
+    },
+    "mcp_helpers.rs": {
+      "covered": 5,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 10,
+      "uncovered": 0,
+      "wrapper_exempt": 5
+    },
+    "memory_budget.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "memory_pressure.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "metrics.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 4,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "native_events.rs": {
+      "covered": 10,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 7,
+      "total": 17,
+      "uncovered": 0,
+      "wrapper_exempt": 7
+    },
+    "notifications.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "orphan_reaper.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 4,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "policy.rs": {
+      "covered": 5,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 10,
+      "uncovered": 0,
+      "wrapper_exempt": 5
+    },
+    "pool.rs": {
+      "covered": 6,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 8,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "protocol_recovery.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "recorder_migration.rs": {
+      "covered": 5,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 10,
+      "uncovered": 0,
+      "wrapper_exempt": 5
+    },
+    "recording.rs": {
+      "covered": 4,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 8,
+      "uncovered": 0,
+      "wrapper_exempt": 4
+    },
+    "replay.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 4,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "reports.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "restore_layout.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "restore_process.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "restore_scrollback.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 3,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "retry.rs": {
+      "covered": 4,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 8,
+      "uncovered": 0,
+      "wrapper_exempt": 4
+    },
+    "robot_sdk_contracts.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 4,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "runtime.rs": {
+      "covered": 7,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 14,
+      "uncovered": 0,
+      "wrapper_exempt": 7
+    },
+    "runtime_async.rs": {
+      "covered": 0,
+      "exempt": 42,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 42,
+      "uncovered": 0,
+      "wrapper_exempt": 0
+    },
+    "search_bridge.rs": {
+      "covered": 3,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 5,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "search_explain.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "secrets.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 4,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "session_correlation.rs": {
+      "covered": 3,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 6,
+      "uncovered": 0,
+      "wrapper_exempt": 3
+    },
+    "session_restore.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 4,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "session_retention.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "sharding.rs": {
+      "covered": 4,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 8,
+      "uncovered": 0,
+      "wrapper_exempt": 4
+    },
+    "simulation.rs": {
+      "covered": 10,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 20,
+      "uncovered": 0,
+      "wrapper_exempt": 10
+    },
+    "snapshot_engine.rs": {
+      "covered": 6,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 12,
+      "uncovered": 0,
+      "wrapper_exempt": 6
+    },
+    "spsc_ring_buffer.rs": {
+      "covered": 4,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 8,
+      "uncovered": 0,
+      "wrapper_exempt": 4
+    },
+    "storage.rs": {
+      "covered": 187,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 358,
+      "uncovered": 0,
+      "wrapper_exempt": 171
+    },
+    "storage/handle/event_mutes.rs": {
+      "covered": 4,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 8,
+      "uncovered": 0,
+      "wrapper_exempt": 4
+    },
+    "storage_telemetry.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "survival.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "tailer.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 4,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "telemetry.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "ui_query.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 4,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "undo.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "vendored.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "vendored/mux_client.rs": {
+      "covered": 26,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 51,
+      "uncovered": 0,
+      "wrapper_exempt": 25
+    },
+    "vendored/mux_pool.rs": {
+      "covered": 13,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 23,
+      "uncovered": 0,
+      "wrapper_exempt": 10
+    },
+    "wait.rs": {
+      "covered": 6,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 12,
+      "uncovered": 0,
+      "wrapper_exempt": 6
+    },
+    "watchdog.rs": {
+      "covered": 3,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 3,
+      "uncovered": 0,
+      "wrapper_exempt": 0
+    },
+    "web.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "web/server.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 4,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "web_framework.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 4,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "webhook.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 4,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "wezterm.rs": {
+      "covered": 33,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 61,
+      "uncovered": 0,
+      "wrapper_exempt": 28
+    },
+    "workflows/account_steps.rs": {
+      "covered": 3,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 6,
+      "uncovered": 0,
+      "wrapper_exempt": 3
+    },
+    "workflows/builtin_workflows.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "workflows/codex_exit.rs": {
+      "covered": 2,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 4,
+      "uncovered": 0,
+      "wrapper_exempt": 2
+    },
+    "workflows/context.rs": {
+      "covered": 5,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 10,
+      "uncovered": 0,
+      "wrapper_exempt": 5
+    },
+    "workflows/engine.rs": {
+      "covered": 10,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 16,
+      "uncovered": 0,
+      "wrapper_exempt": 6
+    },
+    "workflows/mod.rs": {
+      "covered": 5,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 5,
+      "uncovered": 0,
+      "wrapper_exempt": 0
+    },
+    "workflows/plan_helpers.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    },
+    "workflows/runner.rs": {
+      "covered": 7,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 12,
+      "uncovered": 0,
+      "wrapper_exempt": 5
+    },
+    "workflows/wait_execution.rs": {
+      "covered": 1,
+      "exempt": 0,
+      "independent_adapter": 0,
+      "required_ambient_wrapper": 0,
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 1
+    }
+  },
+  "by_file_uncovered": {},
+  "comment": "ft-3kv6e fail-closed census ratchet. Update only with an audited source change. Generated by scripts/check_runtime_proof_coverage.py.",
+  "covered_sites": 499,
+  "exempt_files_sites": 46,
+  "independent_context_adapter_sites": 0,
+  "required_ambient_wrapper_sites": 7,
+  "schema_version": 3,
+  "total_sites": 982,
+  "uncovered_sites": 0,
+  "wrapper_exempt_sites": 437
 }

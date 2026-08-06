@@ -8,6 +8,7 @@
 # Prerequisites:
 #   - Explicit absolute candidate paths in FRANKENTERM_CLI/FRANKENTERM_GUI
 #   - Their common candidate root in FRANKENTERM_CANDIDATE_ROOT
+#   - Its detached atomic manifest in FRANKENTERM_COMPONENT_MANIFEST
 #   - Full source SHA/profile metadata for the retained artifact manifest
 #   - A graphical session in which launching the GUI is acceptable
 #
@@ -22,6 +23,7 @@
 #   2 = disruptive GUI launch was not explicitly authorized
 
 set -euo pipefail
+umask 077
 
 if [ "${FRANKENTERM_ALLOW_GUI_E2E:-}" != "1" ]; then
     echo "refusing to launch FrankenTerm GUI without FRANKENTERM_ALLOW_GUI_E2E=1" >&2
@@ -33,8 +35,9 @@ if [ "${FRANKENTERM_GUI_E2E_FOCUS_ACK:-}" != "I_ACCEPT_FOCUS_DISRUPTION" ]; then
 fi
 
 if [ -z "${FRANKENTERM_GUI:-}" ] || [ -z "${FRANKENTERM_CLI:-}" ] || \
-   [ -z "${FRANKENTERM_CANDIDATE_ROOT:-}" ]; then
-    echo "FRANKENTERM_GUI, FRANKENTERM_CLI, and FRANKENTERM_CANDIDATE_ROOT must be explicit absolute candidate paths" >&2
+   [ -z "${FRANKENTERM_CANDIDATE_ROOT:-}" ] || \
+   [ -z "${FRANKENTERM_COMPONENT_MANIFEST:-}" ]; then
+    echo "FRANKENTERM_GUI, FRANKENTERM_CLI, FRANKENTERM_CANDIDATE_ROOT, and FRANKENTERM_COMPONENT_MANIFEST must be explicit absolute candidate paths" >&2
     exit 2
 fi
 if [ -z "${FRANKENTERM_CANDIDATE_SHA:-}" ] || \
@@ -51,11 +54,23 @@ fi
 FT_GUI="$FRANKENTERM_GUI"
 FT_CLI="$FRANKENTERM_CLI"
 CANDIDATE_ROOT="$FRANKENTERM_CANDIDATE_ROOT"
+CANDIDATE_MANIFEST="$FRANKENTERM_COMPONENT_MANIFEST"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ATOMIC_MANIFEST_TOOL="$SCRIPT_DIR/atomic-component-manifest.sh"
 LOG_DIR=$(mktemp -d /tmp/e2e-native-events.XXXXXX)
 WORKSPACE_DIR="$LOG_DIR/workspace"
 NATIVE_RUNTIME_DIR="$WORKSPACE_DIR/native-runtime"
 SOCKET_PATH="$NATIVE_RUNTIME_DIR/events.sock"
 CONFIG_PATH="$WORKSPACE_DIR/ft.toml"
+HERMETIC_HOME="$WORKSPACE_DIR/home"
+HERMETIC_XDG_CONFIG_HOME="$WORKSPACE_DIR/xdg-config"
+HERMETIC_XDG_CACHE_HOME="$WORKSPACE_DIR/xdg-cache"
+HERMETIC_XDG_DATA_HOME="$WORKSPACE_DIR/xdg-data"
+HERMETIC_XDG_STATE_HOME="$WORKSPACE_DIR/xdg-state"
+HERMETIC_XDG_RUNTIME_DIR="$WORKSPACE_DIR/xdg-runtime"
+HERMETIC_TMPDIR="$WORKSPACE_DIR/tmp"
+PRIVATE_MUX_DIR="$WORKSPACE_DIR/private-mux"
+PRIVATE_MUX_SOCKET_PATH="$PRIVATE_MUX_DIR/not-created.sock"
 PASS=0
 FAIL=0
 
@@ -67,7 +82,7 @@ case "$(uname -s)" in
         ;;
 esac
 
-for candidate_path in "$FT_GUI" "$FT_CLI" "$CANDIDATE_ROOT"; do
+for candidate_path in "$FT_GUI" "$FT_CLI" "$CANDIDATE_ROOT" "$CANDIDATE_MANIFEST"; do
     case "$candidate_path" in
         /*) ;;
         *) echo "candidate paths must be absolute: $candidate_path" >&2; exit 2 ;;
@@ -89,6 +104,17 @@ for candidate_binary in "$FT_GUI" "$FT_CLI"; do
         *) echo "candidate binary escapes candidate root: $candidate_binary" >&2; exit 2 ;;
     esac
 done
+FT_GUI=$(cd "$(dirname "$FT_GUI")" && pwd -P)/$(basename "$FT_GUI")
+FT_CLI=$(cd "$(dirname "$FT_CLI")" && pwd -P)/$(basename "$FT_CLI")
+if [ ! -f "$CANDIDATE_MANIFEST" ] || [ -L "$CANDIDATE_MANIFEST" ]; then
+    echo "candidate component manifest must be a regular non-symlink file: $CANDIDATE_MANIFEST" >&2
+    exit 2
+fi
+CANDIDATE_MANIFEST=$(cd "$(dirname "$CANDIDATE_MANIFEST")" && pwd -P)/$(basename "$CANDIDATE_MANIFEST")
+if [ ! -f "$ATOMIC_MANIFEST_TOOL" ] || [ -L "$ATOMIC_MANIFEST_TOOL" ]; then
+    echo "atomic component verifier must be a regular non-symlink file: $ATOMIC_MANIFEST_TOOL" >&2
+    exit 2
+fi
 
 hash_file() {
     if command -v shasum >/dev/null 2>&1; then
@@ -101,15 +127,190 @@ hash_file() {
     fi
 }
 
+verify_candidate_manifest_contract() {
+    python3 - \
+        "$CANDIDATE_MANIFEST" \
+        "$FRANKENTERM_CANDIDATE_SHA" \
+        "$FRANKENTERM_BUILD_PROFILE" \
+        "$CANDIDATE_ROOT" \
+        "$FT_CLI" \
+        "$FT_GUI" \
+        "$CLI_SHA256" \
+        "$GUI_SHA256" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+def reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
+
+
+def fail(message):
+    raise SystemExit(f"candidate manifest contract mismatch: {message}")
+
+
+manifest_path = Path(sys.argv[1])
+expected_source_revision = sys.argv[2]
+expected_profile = sys.argv[3]
+package_root = Path(sys.argv[4]).resolve(strict=True)
+expected_components = {
+    "ft": (Path(sys.argv[5]).resolve(strict=True), sys.argv[7]),
+    "frankenterm-gui": (Path(sys.argv[6]).resolve(strict=True), sys.argv[8]),
+}
+
+try:
+    manifest = json.loads(
+        manifest_path.read_bytes().decode("utf-8"),
+        object_pairs_hook=reject_duplicate_keys,
+    )
+except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+    fail(f"cannot read strict JSON from {manifest_path}: {error}")
+
+if not isinstance(manifest, dict):
+    fail("top-level value is not an object")
+identity = manifest.get("identity")
+if not isinstance(identity, dict):
+    fail("identity is not an object")
+if identity.get("source_revision") != expected_source_revision:
+    fail(
+        "source revision differs "
+        f"(expected {expected_source_revision!r}, observed {identity.get('source_revision')!r})"
+    )
+if identity.get("profile") != expected_profile:
+    fail(
+        "build profile differs "
+        f"(expected {expected_profile!r}, observed {identity.get('profile')!r})"
+    )
+
+files = manifest.get("files")
+if not isinstance(files, list):
+    fail("files is not an array")
+
+verified_paths = {}
+for component, (binary_path, binary_sha256) in expected_components.items():
+    try:
+        expected_relative = binary_path.relative_to(package_root).as_posix()
+    except ValueError:
+        fail(f"{component} path escapes the package root: {binary_path}")
+    matches = [
+        record
+        for record in files
+        if isinstance(record, dict) and record.get("component") == component
+    ]
+    if len(matches) != 1:
+        fail(f"component {component!r} has {len(matches)} manifest records, expected exactly one")
+    record = matches[0]
+    if record.get("path") != expected_relative:
+        fail(
+            f"component {component!r} path differs "
+            f"(expected {expected_relative!r}, observed {record.get('path')!r})"
+        )
+    if record.get("kind") != "executable" or record.get("executable") is not True:
+        fail(f"component {component!r} is not catalogued as an executable file")
+    if record.get("sha256") != binary_sha256:
+        fail(
+            f"component {component!r} digest differs "
+            f"(expected {binary_sha256!r}, observed {record.get('sha256')!r})"
+        )
+    verified_paths[component] = expected_relative
+
+print(
+    json.dumps(
+        {
+            "ok": True,
+            "profile": expected_profile,
+            "source_revision": expected_source_revision,
+            "verified_component_paths": verified_paths,
+        },
+        sort_keys=True,
+    )
+)
+PY
+}
+
 GUI_SHA256=$(hash_file "$FT_GUI")
 CLI_SHA256=$(hash_file "$FT_CLI")
+MANIFEST_SHA256_BEFORE=$(hash_file "$CANDIDATE_MANIFEST")
 
-mkdir -m 700 "$WORKSPACE_DIR" "$NATIVE_RUNTIME_DIR"
+# Fail closed before either candidate binary is started. The offline verifier
+# binds the exact package inventory, executable bytes, and embedded component
+# identities to this detached manifest. The additional contract check binds
+# the operator-supplied source SHA/profile and exact ft/GUI paths to it.
+if ! bash "$ATOMIC_MANIFEST_TOOL" verify \
+    --root "$CANDIDATE_ROOT" \
+    --manifest "$CANDIDATE_MANIFEST" \
+    >"$LOG_DIR/atomic-manifest-verify.json" \
+    2>"$LOG_DIR/atomic-manifest-verify.stderr"; then
+    echo "candidate atomic component manifest verification failed; refusing process launch" >&2
+    sed -n '1,120p' "$LOG_DIR/atomic-manifest-verify.stderr" >&2
+    exit 2
+fi
+if ! verify_candidate_manifest_contract \
+    >"$LOG_DIR/candidate-manifest-contract.json" \
+    2>"$LOG_DIR/candidate-manifest-contract.stderr"; then
+    echo "candidate manifest identity/path contract failed; refusing process launch" >&2
+    sed -n '1,120p' "$LOG_DIR/candidate-manifest-contract.stderr" >&2
+    exit 2
+fi
+
+MANIFEST_SHA256_AFTER=$(hash_file "$CANDIDATE_MANIFEST")
+GUI_SHA256_AFTER=$(hash_file "$FT_GUI")
+CLI_SHA256_AFTER=$(hash_file "$FT_CLI")
+if [ "$MANIFEST_SHA256_AFTER" != "$MANIFEST_SHA256_BEFORE" ] || \
+   [ "$GUI_SHA256_AFTER" != "$GUI_SHA256" ] || \
+   [ "$CLI_SHA256_AFTER" != "$CLI_SHA256" ]; then
+    echo "candidate manifest or executable changed during verification; refusing process launch" >&2
+    exit 2
+fi
+
+mkdir -m 700 \
+    "$WORKSPACE_DIR" \
+    "$NATIVE_RUNTIME_DIR" \
+    "$HERMETIC_HOME" \
+    "$HERMETIC_XDG_CONFIG_HOME" \
+    "$HERMETIC_XDG_CACHE_HOME" \
+    "$HERMETIC_XDG_DATA_HOME" \
+    "$HERMETIC_XDG_STATE_HOME" \
+    "$HERMETIC_XDG_RUNTIME_DIR" \
+    "$HERMETIC_TMPDIR" \
+    "$PRIVATE_MUX_DIR"
 {
     echo '[native]'
     echo 'enabled = true'
     printf 'socket_path = "%s"\n' "$SOCKET_PATH"
+    echo ''
+    echo '[vendored]'
+    printf 'mux_socket_path = "%s"\n' "$PRIVATE_MUX_SOCKET_PATH"
 } >"$CONFIG_PATH"
+
+HERMETIC_ENV=(
+    "HOME=$HERMETIC_HOME"
+    "XDG_CONFIG_HOME=$HERMETIC_XDG_CONFIG_HOME"
+    "XDG_CACHE_HOME=$HERMETIC_XDG_CACHE_HOME"
+    "XDG_DATA_HOME=$HERMETIC_XDG_DATA_HOME"
+    "XDG_STATE_HOME=$HERMETIC_XDG_STATE_HOME"
+    "XDG_RUNTIME_DIR=$HERMETIC_XDG_RUNTIME_DIR"
+    "TMPDIR=$HERMETIC_TMPDIR"
+    "FRANKENTERM_CONFIG_FILE=$CONFIG_PATH"
+    "WEZTERM_CONFIG_FILE=$CONFIG_PATH"
+    "FRANKENTERM_CONFIG_DIR=$WORKSPACE_DIR"
+    "WEZTERM_CONFIG_DIR=$WORKSPACE_DIR"
+    "FRANKENTERM_UNIX_SOCKET=$PRIVATE_MUX_SOCKET_PATH"
+    "WEZTERM_UNIX_SOCKET=$PRIVATE_MUX_SOCKET_PATH"
+)
+
+assert_private_mux_socket_absent() {
+    if [ -e "$PRIVATE_MUX_SOCKET_PATH" ] || [ -L "$PRIVATE_MUX_SOCKET_PATH" ]; then
+        echo "private watcher mux socket unexpectedly exists; refusing process launch: $PRIVATE_MUX_SOCKET_PATH" >&2
+        return 1
+    fi
+}
 
 # Invoked through the EXIT trap below.
 # shellcheck disable=SC2329
@@ -171,6 +372,7 @@ echo "=== Native Event Bridge E2E Test ==="
 echo "Socket: $SOCKET_PATH"
 echo "Config: $CONFIG_PATH"
 echo "Log dir: $LOG_DIR"
+echo "Atomic manifest: $CANDIDATE_MANIFEST"
 echo "Candidate source SHA: $FRANKENTERM_CANDIDATE_SHA"
 echo "Candidate profile: $FRANKENTERM_BUILD_PROFILE"
 echo ""
@@ -178,6 +380,8 @@ echo ""
 {
     printf 'declared_source_sha=%s\n' "$FRANKENTERM_CANDIDATE_SHA"
     printf 'build_profile=%s\n' "$FRANKENTERM_BUILD_PROFILE"
+    printf 'component_manifest_path=%s\ncomponent_manifest_sha256=%s\n' \
+        "$CANDIDATE_MANIFEST" "$MANIFEST_SHA256_AFTER"
     printf 'cli_path=%s\ncli_sha256=%s\n' "$FT_CLI" "$CLI_SHA256"
     printf 'gui_path=%s\ngui_sha256=%s\n' "$FT_GUI" "$GUI_SHA256"
 } >"$LOG_DIR/artifact-manifest.txt"
@@ -187,9 +391,12 @@ echo ""
 # authenticated, identity-pinned stale-socket cleanup; this harness must never
 # unlink a caller-selected path.
 echo "[step 1] Starting ft watch..."
+assert_private_mux_socket_absent
 (
     cd "$WORKSPACE_DIR"
-    exec env RUST_LOG=info,frankenterm_core::native_events=debug WEZTERM_FT_SOCKET="$SOCKET_PATH" \
+    exec env "${HERMETIC_ENV[@]}" \
+        RUST_LOG=info,frankenterm_core::native_events=debug \
+        WEZTERM_FT_SOCKET="$SOCKET_PATH" \
         "$FT_CLI" --config "$CONFIG_PATH" --workspace "$WORKSPACE_DIR" watch --foreground
 ) >"$LOG_DIR/watch-stdout.log" 2>"$LOG_DIR/watch-stderr.log" &
 WATCH_PID=$!
@@ -208,9 +415,13 @@ fi
 # same path and cannot bypass disablement because the config enables native
 # events first.
 echo "[step 2] Starting frankenterm-gui..."
+assert_private_mux_socket_absent
 (
     cd "$WORKSPACE_DIR"
-    exec env RUST_LOG=info WEZTERM_FT_SOCKET="$SOCKET_PATH" "$FT_GUI"
+    exec env "${HERMETIC_ENV[@]}" \
+        RUST_LOG=info \
+        WEZTERM_FT_SOCKET="$SOCKET_PATH" \
+        "$FT_GUI" start --always-new-process --no-auto-connect
 ) >"$LOG_DIR/gui-stdout.log" 2>"$LOG_DIR/gui-stderr.log" &
 GUI_PID=$!
 sleep 3
@@ -252,10 +463,12 @@ fi
 echo "[step 5] Stopping harness-owned GUI, checking server-observed disconnect..."
 if stop_child "$GUI_PID" "GUI"; then
     check "harness-owned GUI stopped within bounded cleanup" "pass"
+    unset GUI_PID
 else
     check "harness-owned GUI stopped within bounded cleanup" "fail"
+    echo "GUI did not stop cleanly; retaining GUI_PID for EXIT cleanup" >&2
+    exit 1
 fi
-unset GUI_PID
 
 disconnect_seen=false
 for _ in $(seq 1 40); do
