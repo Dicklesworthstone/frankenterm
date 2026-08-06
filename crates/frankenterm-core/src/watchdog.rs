@@ -20,9 +20,35 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::runtime_async::task::{self, JoinHandle};
+use crate::runtime_async::{
+    RuntimeTime,
+    notify::Notify,
+    task::{self, JoinErrorKind, JoinHandle},
+};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
+
+/// Increment cumulative telemetry without allowing wraparound to masquerade as
+/// a counter reset. Returns the value published by this update.
+fn saturating_atomic_increment(counter: &AtomicU64) -> u64 {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(1);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn runtime_elapsed_ms(start: RuntimeTime, end: RuntimeTime) -> u64 {
+    end.duration_since(start) / 1_000_000
+}
 
 // =============================================================================
 // Telemetry types
@@ -98,33 +124,25 @@ impl HeartbeatRegistry {
 
     /// Record a heartbeat for the discovery subsystem.
     pub fn record_discovery(&self) {
-        self.telemetry
-            .discovery_heartbeats
-            .fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_increment(&self.telemetry.discovery_heartbeats);
         self.discovery.store(epoch_ms(), Ordering::SeqCst);
     }
 
     /// Record a heartbeat for the capture subsystem.
     pub fn record_capture(&self) {
-        self.telemetry
-            .capture_heartbeats
-            .fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_increment(&self.telemetry.capture_heartbeats);
         self.capture.store(epoch_ms(), Ordering::SeqCst);
     }
 
     /// Record a heartbeat for the persistence subsystem.
     pub fn record_persistence(&self) {
-        self.telemetry
-            .persistence_heartbeats
-            .fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_increment(&self.telemetry.persistence_heartbeats);
         self.persistence.store(epoch_ms(), Ordering::SeqCst);
     }
 
     /// Record a heartbeat for the maintenance subsystem.
     pub fn record_maintenance(&self) {
-        self.telemetry
-            .maintenance_heartbeats
-            .fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_increment(&self.telemetry.maintenance_heartbeats);
         self.maintenance.store(epoch_ms(), Ordering::SeqCst);
     }
 
@@ -152,7 +170,7 @@ impl HeartbeatRegistry {
     /// Check all components against their thresholds and return overall health.
     #[must_use]
     pub fn check_health(&self, config: &WatchdogConfig) -> HealthReport {
-        self.telemetry.health_checks.fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_increment(&self.telemetry.health_checks);
         let now = epoch_ms();
         let uptime_ms = now.saturating_sub(self.created_at);
         let components = [
@@ -330,23 +348,88 @@ impl HealthReport {
 pub struct WatchdogHandle {
     task: JoinHandle<()>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_notify: Arc<Notify>,
+    #[cfg(test)]
+    wait_entered: Arc<std::sync::atomic::AtomicBool>,
+}
+
+const WATCHDOG_JOIN_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Finite failure classes for watchdog task settlement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WatchdogJoinError {
+    /// The task reached a terminal failure rather than a normal exit.
+    #[error("watchdog task failed with class {kind:?}")]
+    TaskFailed { kind: JoinErrorKind },
+    /// The join waker could not be contained, so terminal acknowledgement was
+    /// not established even after abort was requested.
+    #[error("watchdog task settlement remained unacknowledged")]
+    SettlementUnacknowledged,
+    /// Abort was requested, but terminal acknowledgement missed its bound.
+    #[error("watchdog task settlement timed out")]
+    SettlementTimedOut,
 }
 
 impl WatchdogHandle {
     /// Signal the watchdog to stop.
     pub fn signal_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
     }
 
-    /// Signals shutdown unconditionally, then awaits the task handle only if
-    /// the cx is not already cancelled. A cancelled caller can therefore stop
-    /// waiting without detaching a watchdog that was never asked to exit.
-    pub async fn join_with_cx(self, cx: &crate::cx::Cx) {
+    /// Signal shutdown and retain ownership until the task acknowledges either
+    /// graceful completion or bounded abort settlement.
+    ///
+    /// A cancelled caller cannot suppress cleanup. It skips the graceful wait,
+    /// requests task abort, and uses an independently bounded settlement
+    /// context so dropping this handle never silently detaches a live watchdog.
+    pub async fn join_with_cx(
+        mut self,
+        cx: &crate::cx::Cx,
+    ) -> Result<(), WatchdogJoinError> {
         self.signal_shutdown();
-        if cx.checkpoint().is_err() {
-            return;
+
+        if cx.checkpoint().is_ok() {
+            match crate::runtime_async::timeout_with_cx(
+                cx,
+                WATCHDOG_JOIN_SETTLEMENT_TIMEOUT,
+                &mut self.task,
+            )
+            .await
+            {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) if error.kind() != JoinErrorKind::WakerRegistrationFailed => {
+                    return Err(WatchdogJoinError::TaskFailed { kind: error.kind() });
+                }
+                Ok(Err(_)) | Err(_) => {}
+            }
         }
-        let _ = self.task.await;
+
+        self.task.abort();
+        let settlement_cx = crate::cx::for_request();
+        match crate::runtime_async::timeout_with_cx(
+            &settlement_cx,
+            WATCHDOG_JOIN_SETTLEMENT_TIMEOUT,
+            &mut self.task,
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if error.kind() == JoinErrorKind::Aborted => Ok(()),
+            Ok(Err(error)) if error.kind() == JoinErrorKind::WakerRegistrationFailed => {
+                Err(WatchdogJoinError::SettlementUnacknowledged)
+            }
+            Ok(Err(error)) => Err(WatchdogJoinError::TaskFailed { kind: error.kind() }),
+            Err(_) => Err(WatchdogJoinError::SettlementTimedOut),
+        }
+    }
+}
+
+impl Drop for WatchdogHandle {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
+        self.task.abort();
     }
 }
 
@@ -370,6 +453,12 @@ pub fn spawn_watchdog(
 ) -> WatchdogHandle {
     let internal_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let internal_flag = Arc::clone(&internal_shutdown);
+    let internal_shutdown_notify = Arc::new(Notify::new());
+    let internal_notify = Arc::clone(&internal_shutdown_notify);
+    #[cfg(test)]
+    let wait_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(test)]
+    let task_wait_entered = Arc::clone(&wait_entered);
     let check_interval = config.check_interval;
 
     let task = {
@@ -420,12 +509,27 @@ pub fn spawn_watchdog(
                     }
                 }
 
-                if crate::runtime_async::sleep_with_cx(&watchdog_cx, check_interval)
-                    .await
-                    .is_err()
-                {
-                    info!("Watchdog: cancelled via cx");
-                    break;
+                use futures::future::{Either, select};
+
+                #[cfg(test)]
+                task_wait_entered.store(true, Ordering::SeqCst);
+                let shutdown_wait = std::pin::pin!(internal_notify.wait_until(|| {
+                    internal_flag.load(Ordering::SeqCst)
+                }));
+                let interval_wait = std::pin::pin!(crate::runtime_async::sleep_with_cx(
+                    &watchdog_cx,
+                    check_interval,
+                ));
+                match select(shutdown_wait, interval_wait).await {
+                    Either::Left(((), _)) => {
+                        info!("Watchdog: shutdown signal received");
+                        break;
+                    }
+                    Either::Right((Ok(()), _)) => {}
+                    Either::Right((Err(_), _)) => {
+                        info!("Watchdog: cancelled via cx");
+                        break;
+                    }
                 }
             }
         })
@@ -434,6 +538,9 @@ pub fn spawn_watchdog(
     WatchdogHandle {
         task,
         shutdown: internal_shutdown,
+        shutdown_notify: internal_shutdown_notify,
+        #[cfg(test)]
+        wait_entered,
     }
 }
 
@@ -610,6 +717,15 @@ impl MuxWatchdog {
         }
     }
 
+    fn record_completed_check(&mut self) {
+        self.total_checks = self.total_checks.saturating_add(1);
+    }
+
+    fn record_ping_failure(&mut self) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.total_failures = self.total_failures.saturating_add(1);
+    }
+
     /// Create a new mux watchdog.
     #[must_use]
     pub fn new(mut config: MuxWatchdogConfig, wezterm: crate::wezterm::WeztermHandle) -> Self {
@@ -639,7 +755,7 @@ impl MuxWatchdog {
     ) -> Result<MuxHealthSample, MuxWatchdogCheckError> {
         cx.checkpoint().map_err(|_| Self::classify_cx_failure(cx))?;
         let now = epoch_ms();
-        let start = std::time::Instant::now();
+        let start = crate::runtime_async::timer_now_with_cx(cx);
 
         // Tick 206 (ft-xbnl0.2.3): route the ping through
         // list_panes_with_cx(cx) so the inner WeztermInterface call
@@ -660,7 +776,10 @@ impl MuxWatchdog {
         let ping_ok = matches!(ping_result, Ok(Ok(_)));
 
         let ping_latency_ms = if ping_ok {
-            Some(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
+            Some(runtime_elapsed_ms(
+                start,
+                crate::runtime_async::timer_now_with_cx(cx),
+            ))
         } else {
             None
         };
@@ -688,7 +807,7 @@ impl MuxWatchdog {
             Err(_) => WarningProbeOutcome::Timeout,
         };
 
-        self.total_checks += 1;
+        self.record_completed_check();
         Ok(self.finalize_sample(now, ping_ok, ping_latency_ms, rss_bytes, warning_probe))
     }
 
@@ -713,8 +832,7 @@ impl MuxWatchdog {
 
         // Determine baseline status from ping/memory checks.
         let mut status = if !ping_ok {
-            self.consecutive_failures += 1;
-            self.total_failures += 1;
+            self.record_ping_failure();
             if self.consecutive_failures >= self.config.failure_threshold {
                 HealthStatus::Critical
             } else {
@@ -1001,8 +1119,75 @@ mod tests {
     impl TestWatchdogJoin for WatchdogHandle {
         async fn join(self) {
             let cx = crate::cx::Cx::for_testing();
-            self.join_with_cx(&cx).await;
+            self.join_with_cx(&cx)
+                .await
+                .expect("test watchdog task must settle");
         }
+    }
+
+    #[test]
+    fn watchdog_atomic_telemetry_saturates_instead_of_wrapping() {
+        let registry = HeartbeatRegistry::new();
+        registry
+            .telemetry
+            .discovery_heartbeats
+            .store(u64::MAX, Ordering::Relaxed);
+        registry
+            .telemetry
+            .capture_heartbeats
+            .store(u64::MAX, Ordering::Relaxed);
+        registry
+            .telemetry
+            .persistence_heartbeats
+            .store(u64::MAX, Ordering::Relaxed);
+        registry
+            .telemetry
+            .maintenance_heartbeats
+            .store(u64::MAX, Ordering::Relaxed);
+        registry
+            .telemetry
+            .health_checks
+            .store(u64::MAX, Ordering::Relaxed);
+
+        registry.record_discovery();
+        registry.record_capture();
+        registry.record_persistence();
+        registry.record_maintenance();
+        let _ = registry.check_health(&WatchdogConfig::default());
+
+        let telemetry = registry.telemetry().snapshot();
+        assert_eq!(telemetry.discovery_heartbeats, u64::MAX);
+        assert_eq!(telemetry.capture_heartbeats, u64::MAX);
+        assert_eq!(telemetry.persistence_heartbeats, u64::MAX);
+        assert_eq!(telemetry.maintenance_heartbeats, u64::MAX);
+        assert_eq!(telemetry.health_checks, u64::MAX);
+    }
+
+    #[test]
+    fn mux_watchdog_cumulative_counters_saturate_instead_of_wrapping() {
+        let mut watchdog = MuxWatchdog::new(
+            MuxWatchdogConfig::default(),
+            crate::wezterm::mock_wezterm_handle(),
+        );
+        watchdog.total_checks = u64::MAX;
+        watchdog.total_failures = u64::MAX;
+        watchdog.consecutive_failures = u32::MAX;
+
+        watchdog.record_completed_check();
+        watchdog.record_ping_failure();
+
+        assert_eq!(watchdog.total_checks, u64::MAX);
+        assert_eq!(watchdog.total_failures, u64::MAX);
+        assert_eq!(watchdog.consecutive_failures, u32::MAX);
+    }
+
+    #[test]
+    fn mux_watchdog_latency_uses_runtime_clock_nanoseconds() {
+        let start = RuntimeTime::from_nanos(10_000_000);
+        let end = RuntimeTime::from_nanos(13_999_999);
+
+        assert_eq!(runtime_elapsed_ms(start, end), 3);
+        assert_eq!(runtime_elapsed_ms(end, start), 0);
     }
 
     /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove the Cx-first
@@ -1306,17 +1491,33 @@ mod tests {
 
             let shutdown = Arc::new(AtomicBool::new(false));
             let config = WatchdogConfig {
-                check_interval: Duration::from_millis(10),
+                check_interval: Duration::from_secs(60),
                 ..WatchdogConfig::default()
             };
 
             let cx = crate::cx::Cx::for_testing();
             let handle =
                 spawn_watchdog(&cx, Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
-            crate::runtime_async::sleep(Duration::from_millis(30)).await;
-
+            for _ in 0..4_096 {
+                if handle.wait_entered.load(Ordering::SeqCst) {
+                    break;
+                }
+                crate::runtime_async::yield_now().await;
+            }
+            assert!(
+                handle.wait_entered.load(Ordering::SeqCst),
+                "watchdog task must enter its 60-second interval wait"
+            );
             let cx = crate::cx::for_testing();
-            handle.join_with_cx(&cx).await;
+            let started = std::time::Instant::now();
+            handle
+                .join_with_cx(&cx)
+                .await
+                .expect("watchdog task must settle after shutdown signal");
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "shutdown notification must wake a 60-second watchdog sleep"
+            );
             // `join_with_cx` calls `signal_shutdown` unconditionally,
             // so the internal flag drives the task to exit even though
             // `shutdown` was never flipped to true.
@@ -1324,9 +1525,9 @@ mod tests {
     }
 
     /// ft-xbnl0.2.3 Cx-first: `join_with_cx` with a pre-cancelled
-    /// cx must return quickly without blocking on the task join.
-    /// The internal shutdown signal is still issued so the
-    /// background task can exit cleanly on its own.
+    /// cx must retain ownership, abort, and terminally settle the task rather
+    /// than returning by detaching it. The 60-second interval proves shutdown
+    /// does not depend on the ordinary sleep deadline.
     #[test]
     fn watchdog_join_with_precancelled_cx_returns_quickly() {
         run_async_test(async {
@@ -1353,15 +1554,16 @@ mod tests {
             );
 
             let start = std::time::Instant::now();
-            handle.join_with_cx(&cx).await;
+            handle
+                .join_with_cx(&cx)
+                .await
+                .expect("pre-cancelled join must still settle watchdog ownership");
             let elapsed = start.elapsed();
 
             assert!(
                 elapsed < Duration::from_millis(500),
-                "join_with_cx on cancelled cx should return quickly, took {elapsed:?}"
+                "join_with_cx on cancelled cx should settle quickly, took {elapsed:?}"
             );
-            // Drive the task to exit so the test harness doesn't leak it.
-            shutdown.store(true, Ordering::SeqCst);
         });
     }
 

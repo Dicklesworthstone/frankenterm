@@ -225,6 +225,24 @@ fn duration_to_timeout_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Increment cumulative mux-pool telemetry without allowing a long-running
+/// process to wrap to zero. Returns the value published by this update.
+fn saturating_atomic_increment(counter: &AtomicU64) -> u64 {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(1);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 fn require_render_batch_remaining(
     remaining: Option<Duration>,
     configured_timeout: Duration,
@@ -347,7 +365,7 @@ impl MuxPool {
 
     fn record_permanent_failure(&self, decision: MuxRecoveryDecision) {
         if decision.kind == ProtocolErrorKind::Permanent {
-            self.permanent_failures.fetch_add(1, Ordering::Relaxed);
+            saturating_atomic_increment(&self.permanent_failures);
         }
     }
 
@@ -403,7 +421,7 @@ impl MuxPool {
             .begin()
             .expect("render attempt must be checked before beginning");
         if attempt > 1 {
-            self.recovery_attempts.fetch_add(1, Ordering::Relaxed);
+            saturating_atomic_increment(&self.recovery_attempts);
         }
         Ok(attempt)
     }
@@ -501,7 +519,7 @@ impl MuxPool {
             }
             None => match DirectMuxClient::connect_with_cx(cx, self.mux_config.clone()).await {
                 Ok(client) => {
-                    let count = self.connections_created.fetch_add(1, Ordering::Relaxed) + 1;
+                    let count = saturating_atomic_increment(&self.connections_created);
                     tracing::debug!(
                         subsystem = "mux_pool",
                         event = "acquire",
@@ -512,7 +530,7 @@ impl MuxPool {
                     client
                 }
                 Err(e) => {
-                    let count = self.connections_failed.fetch_add(1, Ordering::Relaxed) + 1;
+                    let count = saturating_atomic_increment(&self.connections_failed);
                     tracing::warn!(subsystem = "mux_pool", event = "connect_failed", total_failed = count, error = %e, "mux connection creation failed");
                     return Err(MuxPoolError::Mux(e));
                 }
@@ -582,7 +600,7 @@ impl MuxPool {
             Self::checkpoint_cx(cx)?;
             attempt = attempt.saturating_add(1);
             if attempt > 1 {
-                self.recovery_attempts.fetch_add(1, Ordering::Relaxed);
+                saturating_atomic_increment(&self.recovery_attempts);
             }
 
             match self.acquire_client_with_cx(cx).await {
@@ -629,7 +647,7 @@ impl MuxPool {
             Ok(value) => {
                 self.return_client_with_cx(cx, client).await;
                 if attempt > 1 {
-                    self.recovery_successes.fetch_add(1, Ordering::Relaxed);
+                    saturating_atomic_increment(&self.recovery_successes);
                 }
                 Ok(value)
             }
@@ -673,7 +691,7 @@ impl MuxPool {
             if attempt > 1 {
                 // Count a retry only after cancellation gates have passed and
                 // the next acquisition attempt is actually about to begin.
-                self.recovery_attempts.fetch_add(1, Ordering::Relaxed);
+                saturating_atomic_increment(&self.recovery_attempts);
             }
 
             let (mut client, guard) = if let Some(retained) = retained_client.take() {
@@ -717,9 +735,18 @@ impl MuxPool {
             let result = op(&mut client).await;
             match result {
                 Ok(value) => {
+                    // This helper is used only by repeatable reads. A
+                    // cancellation that became visible while the read was in
+                    // flight must not publish a stale result to its caller.
+                    // Drop the connection rather than attempting a return
+                    // through the already-interrupted context.
+                    if let Err(error) = Self::checkpoint_cx(cx) {
+                        drop(client);
+                        return Err(error);
+                    }
                     self.return_client_with_cx(cx, client).await;
                     if attempt > 1 {
-                        self.recovery_successes.fetch_add(1, Ordering::Relaxed);
+                        saturating_atomic_increment(&self.recovery_successes);
                     }
                     return Ok(value);
                 }
@@ -1097,7 +1124,7 @@ impl MuxPool {
         };
 
         if result.is_ok() && attempts.recovery_started() {
-            self.recovery_successes.fetch_add(1, Ordering::Relaxed);
+            saturating_atomic_increment(&self.recovery_successes);
         }
         result
     }
@@ -1211,7 +1238,7 @@ impl MuxPool {
         Self::checkpoint_cx(cx)?;
         match self.list_panes_with_cx(cx).await {
             Ok(_) => {
-                let check_num = self.health_checks.fetch_add(1, Ordering::Relaxed) + 1;
+                let check_num = saturating_atomic_increment(&self.health_checks);
                 tracing::debug!(
                     subsystem = "mux_pool",
                     event = "health_check",
@@ -1232,8 +1259,8 @@ impl MuxPool {
                 Err(error)
             }
             Err(e) => {
-                let check_num = self.health_checks.fetch_add(1, Ordering::Relaxed) + 1;
-                let fail_count = self.health_check_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                let check_num = saturating_atomic_increment(&self.health_checks);
+                let fail_count = saturating_atomic_increment(&self.health_check_failures);
                 tracing::warn!(subsystem = "mux_pool", event = "health_check", outcome = "fail", check_num, total_failures = fail_count, error = %e, "mux pool health check failed");
                 Err(e)
             }
@@ -1352,6 +1379,15 @@ mod tests {
                 .await
                 .expect("test mux pool stats snapshot must succeed")
         }
+    }
+
+    #[test]
+    fn mux_pool_telemetry_counter_saturates_instead_of_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+
+        assert_eq!(saturating_atomic_increment(&counter), u64::MAX);
+        assert_eq!(saturating_atomic_increment(&counter), u64::MAX);
+        assert_eq!(counter.load(AtomicOrdering::Relaxed), u64::MAX);
     }
 
     async fn unix_stream_read(
@@ -4243,7 +4279,63 @@ mod tests {
     }
 
     #[test]
-    fn pool_health_check_with_precancelled_cx_tracks_failure_without_connecting() {
+    fn repeatable_read_success_is_not_published_after_in_flight_cancellation() {
+        run_async_test(async {
+            const SECRET: &str = "SECRET cancellation during successful mux read";
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 1,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig {
+                    enabled: false,
+                    ..MuxRecoveryConfig::default()
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+            let cx = Cx::for_testing();
+            let cancel_during_read = cx.clone();
+
+            let error = pool
+                .execute_with_recovery_with_cx(
+                    &cx,
+                    "synthetic_success_then_cancel",
+                    move |_client| {
+                        let cancel_during_read = cancel_during_read.clone();
+                        Box::pin(async move {
+                            cancel_during_read.cancel_with(CancelKind::User, Some(SECRET));
+                            Ok::<u64, DirectMuxError>(42)
+                        })
+                    },
+                )
+                .await
+                .expect_err("a read completed under cancellation must not publish its value");
+
+            assert!(matches!(
+                &error,
+                MuxPoolError::Pool(PoolError::Cancelled)
+            ));
+            assert!(!error.to_string().contains(SECRET));
+
+            let stats_cx = Cx::for_testing();
+            let stats = pool
+                .stats_with_cx(&stats_cx)
+                .await
+                .expect("fresh context must read pool stats");
+            assert_eq!(stats.pool.total_acquired, 1);
+            assert_eq!(stats.pool.idle_count, 0);
+            assert_eq!(stats.recovery_successes, 0);
+        });
+    }
+
+    #[test]
+    fn pool_health_check_with_precancelled_cx_does_not_publish_mux_failure() {
         run_async_test(async {
             let config = MuxPoolConfig {
                 pool: PoolConfig {
@@ -4276,8 +4368,8 @@ mod tests {
             assert!(matches!(err, MuxPoolError::Pool(PoolError::Cancelled)));
 
             let stats = pool.stats().await;
-            assert_eq!(stats.health_checks, 1);
-            assert_eq!(stats.health_check_failures, 1);
+            assert_eq!(stats.health_checks, 0);
+            assert_eq!(stats.health_check_failures, 0);
             assert_eq!(stats.pool.total_acquired, 0);
             assert_eq!(stats.pool.total_timeouts, 0);
             assert_eq!(stats.connections_created, 0);

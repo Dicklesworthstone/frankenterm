@@ -18,7 +18,7 @@ use crate::runtime_async::mpsc_reserve_send;
 #[cfg(test)]
 use crate::runtime_async::task;
 use crate::runtime_async::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
-use crate::runtime_async::{io, mpsc, mpsc_try_reserve_send, timeout, watch};
+use crate::runtime_async::{io, mpsc, mpsc_try_reserve_send, watch};
 use codec::{
     AdjustPaneSize, CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompatDecision, CompressionMode,
     CreateFloatingPane, CycleStack, DecodedPdu, GetCodecVersion, GetCodecVersionResponse,
