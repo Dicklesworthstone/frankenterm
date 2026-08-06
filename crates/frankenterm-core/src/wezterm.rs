@@ -1017,6 +1017,41 @@ enum CliEffect {
     Mutation { operation: &'static str },
 }
 
+/// Private provenance used to settle the CLI circuit breaker exactly once.
+///
+/// The public error taxonomy intentionally does not expose transport timing,
+/// but the breaker must distinguish a caller-cancelled response wait from an
+/// authoritative subprocess response that reports a backend/contract failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliMutationCircuitEvidence {
+    /// The CLI transport completed authoritatively. This includes a successful
+    /// response and a finite domain rejection such as `PaneNotFound`.
+    SuccessfulResponse,
+    /// The backend, transport, or completed response contract failed.
+    BackendFailure,
+    /// No backend-health conclusion is justified (for example, caller
+    /// cancellation before admission or while awaiting a response).
+    Ignore,
+}
+
+#[derive(Debug)]
+struct CliMutationOutcome<T> {
+    result: Result<T>,
+    circuit_evidence: CliMutationCircuitEvidence,
+}
+
+/// Mux transport-health evidence is distinct from operation retry authority.
+/// A framed remote rejection proves the connection is healthy even though the
+/// operation failed, while a caller cancellation or local pre-write rejection
+/// says nothing about connection health.
+#[cfg(all(feature = "vendored", unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MuxCircuitEvidence {
+    SuccessfulResponse,
+    BackendFailure,
+    Ignore,
+}
+
 /// Environment variable to override the wezterm binary path.
 const WEZTERM_CLI_ENV: &str = "FT_WEZTERM_CLI";
 
@@ -1383,7 +1418,7 @@ impl WeztermClient {
                         return Ok(pane_info_from_mux_response(&response));
                     }
                     Err(e) => {
-                        self.mux_circuit_record_failure(&e);
+                        self.mux_circuit_record_error(&e);
                         if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                             return Err(Self::mux_cancelled_error("list_panes_with_cx", e));
                         }
@@ -1537,10 +1572,10 @@ impl WeztermClient {
                     let changes = match changes_result {
                         Ok(changes) => changes,
                         Err(e) => {
+                            self.mux_circuit_record_error(&e);
                             if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                                 return Err(Self::mux_cancelled_error("get_text_with_cx", e));
                             }
-                            self.mux_circuit_record_failure(&e);
                             tracing::debug!(
                                 error = %e,
                                 "mux pool get_text_with_cx: render_changes failed; falling back to CLI"
@@ -1554,6 +1589,7 @@ impl WeztermClient {
                     {
                         Ok(v) => v,
                         Err(_) => {
+                            self.mux_circuit_record_contract_failure();
                             tracing::debug!(
                                 rows = changes.dimensions.scrollback_rows,
                                 "mux pool get_text_with_cx: scrollback_rows overflow; falling back to CLI"
@@ -1564,6 +1600,7 @@ impl WeztermClient {
                     let scrollback_end = match scrollback_top.checked_add(scrollback_rows) {
                         Some(v) => v,
                         None => {
+                            self.mux_circuit_record_contract_failure();
                             tracing::debug!(
                                 top = scrollback_top,
                                 rows = scrollback_rows,
@@ -1611,7 +1648,7 @@ impl WeztermClient {
                                 }
                             }
                             Err(e) => {
-                                self.mux_circuit_record_failure(&e);
+                                self.mux_circuit_record_error(&e);
                                 if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                                     return Err(Self::mux_cancelled_error("get_text_with_cx", e));
                                 }
@@ -1684,8 +1721,8 @@ impl WeztermClient {
 
             match pool.get_semantic_zones_with_cx(cx, pane_id).await {
                 Ok(response) => {
-                    self.mux_circuit_record_success();
                     if response.zones.len() != response.zone_texts.len() {
+                        self.mux_circuit_record_contract_failure();
                         return Err(WeztermError::CommandFailed(format!(
                             "semantic data unavailable for pane {pane_id}: mux returned {} zones but {} texts",
                             response.zones.len(),
@@ -1699,13 +1736,14 @@ impl WeztermClient {
                         .zip(response.zone_texts)
                         .map(Into::into)
                         .collect();
+                    self.mux_circuit_record_success();
                     return Ok(MuxSemanticSnapshot {
                         zones,
                         last_exit_code: response.last_exit_code,
                     });
                 }
                 Err(err) => {
-                    self.mux_circuit_record_failure(&err);
+                    self.mux_circuit_record_error(&err);
                     if !self.mux_error_should_fallback_to_cli_for_client(&err) {
                         return Err(Self::mux_cancelled_error("get_semantic_zones_with_cx", err));
                     }
@@ -1780,7 +1818,7 @@ impl WeztermClient {
                         );
                     }
                     Err(err) => {
-                        self.mux_circuit_record_failure(&err);
+                        self.mux_circuit_record_error(&err);
                         if !self.mux_error_should_fallback_to_cli_for_client(&err) {
                             return Err(Self::mux_cancelled_error(
                                 "pane_tiered_scrollback_summary_with_cx",
@@ -2004,7 +2042,7 @@ impl WeztermClient {
     }
 
     /// Cx-first [`spawn_targeted`] (ft-xbnl0.2.3). Threads caller
-    /// `&Cx` through [`Self::run_cli_mutation_with_cx`] so `wezterm cli spawn`
+    /// `&Cx` through [`Self::run_cli_mutation_unsettled_with_cx`] so `wezterm cli spawn`
     /// honors caller cancellation, budget, and virtual time. The argv
     /// construction (window targeting, domain, cwd) is identical to
     /// the legacy path so both variants produce the exact same
@@ -2026,7 +2064,7 @@ impl WeztermClient {
                         return Ok(response.pane_id as u64);
                     }
                     Err(e) => {
-                        self.mux_circuit_record_failure(&e);
+                        self.mux_circuit_record_error(&e);
                         if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                             return Err(Self::mux_cancelled_error("spawn_targeted_with_cx", e));
                         }
@@ -2062,10 +2100,10 @@ impl WeztermClient {
             args.push(&cwd_arg);
         }
 
-        let output = self
-            .run_cli_mutation_with_cx(cx, &args, "spawn_targeted")
-            .await?;
-        Self::parse_mutation_pane_id("spawn_targeted", &output)
+        let outcome = self
+            .run_cli_mutation_unsettled_with_cx(cx, &args, "spawn_targeted")
+            .await;
+        self.settle_cli_pane_id_mutation("spawn_targeted", outcome)
     }
 
     /// Split an existing pane
@@ -2091,12 +2129,12 @@ impl WeztermClient {
     }
 
     /// Cx-first [`split_pane`] (ft-xbnl0.2.3). Threads caller `&Cx`
-    /// through [`Self::run_cli_mutation_with_pane_check_with_cx`] so
-    /// `wezterm cli split-pane` honors caller cancellation, budget,
-    /// and virtual time. The argv construction (direction flag, cwd,
-    /// percent clamp to 10-90) is identical to the legacy path so
-    /// both variants produce the exact same command line for the
-    /// same inputs.
+    /// through the unsettled mutation runner, pane-error mapping, and final
+    /// receipt settlement so `wezterm cli split-pane` honors cancellation,
+    /// budget, virtual time, and exactly-once circuit-breaker accounting. The
+    /// argv construction (direction flag, cwd, percent clamp to 10-90) is
+    /// identical to the legacy path so both variants produce the exact same
+    /// command line for the same inputs.
     pub async fn split_pane_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2118,7 +2156,7 @@ impl WeztermClient {
                         return Ok(response.pane_id as u64);
                     }
                     Err(e) => {
-                        self.mux_circuit_record_failure(&e);
+                        self.mux_circuit_record_error(&e);
                         if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                             return Err(Self::mux_cancelled_error("split_pane_with_cx", e));
                         }
@@ -2155,10 +2193,11 @@ impl WeztermClient {
             args.push(&percent_arg);
         }
 
-        let output = self
-            .run_cli_mutation_with_pane_check_with_cx(cx, &args, pane_id, "split_pane")
-            .await?;
-        Self::parse_mutation_pane_id("split_pane", &output)
+        let outcome = self
+            .run_cli_mutation_unsettled_with_cx(cx, &args, "split_pane")
+            .await;
+        let outcome = Self::map_cli_mutation_pane_error(outcome, pane_id);
+        self.settle_cli_pane_id_mutation("split_pane", outcome)
     }
 
     /// Activate (focus) a specific pane
@@ -2329,7 +2368,7 @@ impl WeztermClient {
                         return Ok(());
                     }
                     Err(e) => {
-                        self.mux_circuit_record_failure(&e);
+                        self.mux_circuit_record_error(&e);
                         if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                             return Err(Self::mux_cancelled_error("send_text_with_cx", e));
                         }
@@ -2417,15 +2456,12 @@ impl WeztermClient {
         pane_id: u64,
         operation: &'static str,
     ) -> Result<String> {
-        match self.run_cli_mutation_with_cx(cx, args, operation).await {
-            Ok(output) => Ok(output),
-            Err(crate::Error::Wezterm(WeztermError::CommandFailed(ref stderr)))
-                if Self::stderr_is_pane_not_found(stderr) =>
-            {
-                Err(WeztermError::PaneNotFound(pane_id).into())
-            }
-            Err(error) => Err(error),
-        }
+        let outcome = self
+            .run_cli_mutation_unsettled_with_cx(cx, args, operation)
+            .await;
+        let outcome = Self::map_cli_mutation_pane_error(outcome, pane_id);
+        self.circuit_record_mutation_evidence(outcome.circuit_evidence);
+        outcome.result
     }
 
     /// Run a WezTerm CLI command with an explicit capability context. Binds
@@ -2442,6 +2478,7 @@ impl WeztermClient {
     async fn run_cli_with_cx(&self, cx: &crate::cx::Cx, args: &[&str]) -> Result<String> {
         self.run_cli_effect_with_cx(cx, args, CliEffect::ReadOnly)
             .await
+            .0
     }
 
     /// Execute a non-idempotent CLI command without fabricating retry safety.
@@ -2452,14 +2489,42 @@ impl WeztermClient {
     /// failure become [`WeztermError::IndeterminateMutation`]. A successful
     /// subprocess response is authoritative and is not overwritten by a Cx
     /// cancellation that races after completion.
-    async fn run_cli_mutation_with_cx(
+    async fn run_cli_mutation_unsettled_with_cx(
         &self,
         cx: &crate::cx::Cx,
         args: &[&str],
         operation: &'static str,
-    ) -> Result<String> {
-        self.run_cli_effect_with_cx(cx, args, CliEffect::Mutation { operation })
-            .await
+    ) -> CliMutationOutcome<String> {
+        // Mutation calls are guarded exactly once but never retried. Preserve
+        // admission/response provenance so late caller cancellation cannot
+        // overwrite an already-authoritative backend failure.
+        if cx.checkpoint().is_err() {
+            return CliMutationOutcome {
+                result: Err(wezterm_cx_error(
+                    cx,
+                    "wezterm cli mutation",
+                    "capability checkpoint failed before circuit admission",
+                )),
+                circuit_evidence: CliMutationCircuitEvidence::Ignore,
+            };
+        }
+        if let Err(error) = self.circuit_guard() {
+            return CliMutationOutcome {
+                result: Err(error),
+                circuit_evidence: CliMutationCircuitEvidence::Ignore,
+            };
+        }
+        let (result, circuit_evidence) = self
+            .run_cli_effect_with_cx(cx, args, CliEffect::Mutation { operation })
+            .await;
+        CliMutationOutcome {
+            result,
+            // A mutation effect always returns provenance. If a future edit
+            // violates that private invariant, fail closed for backend health
+            // instead of leaving a half-open probe unsettled.
+            circuit_evidence: circuit_evidence
+                .unwrap_or(CliMutationCircuitEvidence::BackendFailure),
+        }
     }
 
     async fn run_cli_effect_with_cx(
@@ -2467,20 +2532,28 @@ impl WeztermClient {
         cx: &crate::cx::Cx,
         args: &[&str],
         effect: CliEffect,
-    ) -> Result<String> {
+    ) -> (Result<String>, Option<CliMutationCircuitEvidence>) {
         use crate::runtime_async::process::Command;
 
-        cx.checkpoint().map_err(|_| {
-            wezterm_cx_error(
-                cx,
-                "wezterm cli",
-                "capability checkpoint failed before subprocess spawn",
-            )
-        })?;
+        if cx.checkpoint().is_err() {
+            return Self::cli_effect_result(
+                effect,
+                Err(wezterm_cx_error(
+                    cx,
+                    "wezterm cli",
+                    "capability checkpoint failed before subprocess spawn",
+                )),
+                CliMutationCircuitEvidence::Ignore,
+            );
+        }
 
         if let Some(ref socket) = self.socket_path {
             if !std::path::Path::new(socket).exists() {
-                return Err(WeztermError::SocketNotFound(socket.clone()).into());
+                return Self::cli_effect_result(
+                    effect,
+                    Err(WeztermError::SocketNotFound(socket.clone()).into()),
+                    CliMutationCircuitEvidence::BackendFailure,
+                );
             }
         }
 
@@ -2515,35 +2588,101 @@ impl WeztermClient {
                                 | std::io::ErrorKind::PermissionDenied
                         )
                     {
-                        return Err(Self::categorize_io_error(&error).into());
+                        return Self::cli_effect_result(
+                            effect,
+                            Err(Self::categorize_io_error(&error).into()),
+                            CliMutationCircuitEvidence::BackendFailure,
+                        );
                     }
-                    return Err(WeztermError::IndeterminateMutation { operation }.into());
+                    let circuit_evidence = if cx.checkpoint().is_ok() {
+                        CliMutationCircuitEvidence::BackendFailure
+                    } else {
+                        CliMutationCircuitEvidence::Ignore
+                    };
+                    return Self::cli_effect_result(
+                        effect,
+                        Err(WeztermError::IndeterminateMutation { operation }.into()),
+                        circuit_evidence,
+                    );
                 }
                 if cx.checkpoint().is_err() {
-                    return Err(wezterm_cx_error(
-                        cx,
-                        "wezterm cli",
-                        "capability checkpoint failed while awaiting subprocess",
-                    ));
+                    return Self::cli_effect_result(
+                        effect,
+                        Err(wezterm_cx_error(
+                            cx,
+                            "wezterm cli",
+                            "capability checkpoint failed while awaiting subprocess",
+                        )),
+                        CliMutationCircuitEvidence::Ignore,
+                    );
                 }
-                return Err(Self::categorize_io_error(&error).into());
+                return Self::cli_effect_result(
+                    effect,
+                    Err(Self::categorize_io_error(&error).into()),
+                    CliMutationCircuitEvidence::Ignore,
+                );
             }
             Err(_) => {
                 if let CliEffect::Mutation { operation } = effect {
-                    return Err(WeztermError::IndeterminateMutation { operation }.into());
+                    let circuit_evidence = if cx.checkpoint().is_ok() {
+                        CliMutationCircuitEvidence::BackendFailure
+                    } else {
+                        CliMutationCircuitEvidence::Ignore
+                    };
+                    return Self::cli_effect_result(
+                        effect,
+                        Err(WeztermError::IndeterminateMutation { operation }.into()),
+                        circuit_evidence,
+                    );
                 }
                 if cx.checkpoint().is_err() {
-                    return Err(wezterm_cx_error(
-                        cx,
-                        "wezterm cli",
-                        "capability timeout failed while awaiting subprocess",
-                    ));
+                    return Self::cli_effect_result(
+                        effect,
+                        Err(wezterm_cx_error(
+                            cx,
+                            "wezterm cli",
+                            "capability timeout failed while awaiting subprocess",
+                        )),
+                        CliMutationCircuitEvidence::Ignore,
+                    );
                 }
-                return Err(WeztermError::Timeout(self.timeout_secs).into());
+                return Self::cli_effect_result(
+                    effect,
+                    Err(WeztermError::Timeout(self.timeout_secs).into()),
+                    CliMutationCircuitEvidence::Ignore,
+                );
             }
         };
 
-        Self::finalize_cli_effect_after_wait(cx, effect, output)
+        let result = Self::finalize_cli_effect_after_wait(cx, effect, output);
+        let circuit_evidence = Self::completed_cli_mutation_circuit_evidence(&result);
+        Self::cli_effect_result(effect, result, circuit_evidence)
+    }
+
+    fn cli_effect_result(
+        effect: CliEffect,
+        result: Result<String>,
+        mutation_circuit_evidence: CliMutationCircuitEvidence,
+    ) -> (Result<String>, Option<CliMutationCircuitEvidence>) {
+        let circuit_evidence = match effect {
+            CliEffect::ReadOnly => None,
+            CliEffect::Mutation { .. } => Some(mutation_circuit_evidence),
+        };
+        (result, circuit_evidence)
+    }
+
+    fn completed_cli_mutation_circuit_evidence(
+        result: &Result<String>,
+    ) -> CliMutationCircuitEvidence {
+        match result {
+            Ok(_) => CliMutationCircuitEvidence::SuccessfulResponse,
+            Err(crate::Error::Wezterm(WeztermError::CommandFailed(stderr)))
+                if Self::stderr_is_pane_not_found(stderr) =>
+            {
+                CliMutationCircuitEvidence::SuccessfulResponse
+            }
+            Err(_) => CliMutationCircuitEvidence::BackendFailure,
+        }
     }
 
     fn finalize_cli_effect_after_wait(
@@ -2608,6 +2747,22 @@ impl WeztermClient {
                 || stderr.contains("no such"))
     }
 
+    fn map_cli_mutation_pane_error(
+        mut outcome: CliMutationOutcome<String>,
+        pane_id: u64,
+    ) -> CliMutationOutcome<String> {
+        outcome.result = match outcome.result {
+            Err(crate::Error::Wezterm(WeztermError::CommandFailed(ref stderr)))
+                if Self::stderr_is_pane_not_found(stderr) =>
+            {
+                outcome.circuit_evidence = CliMutationCircuitEvidence::SuccessfulResponse;
+                Err(WeztermError::PaneNotFound(pane_id).into())
+            }
+            result => result,
+        };
+        outcome
+    }
+
     fn finalize_cli_mutation_output(
         output: std::process::Output,
         operation: &'static str,
@@ -2628,6 +2783,25 @@ impl WeztermClient {
     fn parse_mutation_pane_id(operation: &'static str, output: &str) -> Result<u64> {
         Self::parse_pane_id(output)
             .map_err(|_| WeztermError::IndeterminateMutation { operation }.into())
+    }
+
+    fn settle_cli_pane_id_mutation(
+        &self,
+        operation: &'static str,
+        mut outcome: CliMutationOutcome<String>,
+    ) -> Result<u64> {
+        outcome.result = match outcome.result {
+            Ok(output) => {
+                let result = Self::parse_mutation_pane_id(operation, &output);
+                if result.is_err() {
+                    outcome.circuit_evidence = CliMutationCircuitEvidence::BackendFailure;
+                }
+                result
+            }
+            Err(error) => Err(error),
+        };
+        self.circuit_record_mutation_evidence(outcome.circuit_evidence);
+        outcome.result
     }
 
     /// Guards a parsed-JSON *metadata* command's stdout against
@@ -2701,6 +2875,22 @@ impl WeztermClient {
         }
     }
 
+    fn circuit_record_mutation_evidence(&self, evidence: CliMutationCircuitEvidence) {
+        if matches!(evidence, CliMutationCircuitEvidence::Ignore) {
+            return;
+        }
+        let mut guard = match self.circuit_breaker.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        match evidence {
+            CliMutationCircuitEvidence::SuccessfulResponse => guard.record_success(),
+            CliMutationCircuitEvidence::BackendFailure => guard.record_failure(),
+            CliMutationCircuitEvidence::Ignore => unreachable!("handled before locking"),
+        }
+    }
+
     #[cfg(all(feature = "vendored", unix))]
     fn mux_recovery_decision_requires_transport_failover(
         decision: crate::protocol_recovery::MuxRecoveryDecision,
@@ -2734,8 +2924,47 @@ impl WeztermClient {
     }
 
     #[cfg(all(feature = "vendored", unix))]
+    fn direct_mux_error_is_authoritative_response(
+        error: &crate::vendored::DirectMuxError,
+    ) -> bool {
+        matches!(
+            error,
+            crate::vendored::DirectMuxError::RemoteError(_)
+                | crate::vendored::DirectMuxError::AlignedUnexpectedResponse { .. }
+        )
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_error_circuit_evidence(
+        err: &crate::vendored::MuxPoolError,
+    ) -> MuxCircuitEvidence {
+        match err {
+            crate::vendored::MuxPoolError::Pool(_) => MuxCircuitEvidence::Ignore,
+            crate::vendored::MuxPoolError::Mux(mux)
+            | crate::vendored::MuxPoolError::IndeterminateMutation(mux) => {
+                let decision = crate::protocol_recovery::mux_recovery_decision(mux);
+                if decision.cancelled {
+                    MuxCircuitEvidence::Ignore
+                } else if matches!(
+                    decision.connection,
+                    crate::protocol_recovery::MuxConnectionDisposition::Discard
+                ) {
+                    MuxCircuitEvidence::BackendFailure
+                } else if Self::direct_mux_error_is_authoritative_response(mux) {
+                    MuxCircuitEvidence::SuccessfulResponse
+                } else {
+                    MuxCircuitEvidence::Ignore
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
     fn mux_error_is_circuit_breaker_trigger(err: &crate::vendored::MuxPoolError) -> bool {
-        Self::mux_error_requires_transport_failover(err)
+        matches!(
+            Self::mux_error_circuit_evidence(err),
+            MuxCircuitEvidence::BackendFailure
+        )
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -2856,16 +3085,17 @@ impl WeztermClient {
 
     #[cfg(all(feature = "vendored", unix))]
     fn mux_circuit_record_success(&self) {
-        let mut guard = match self.mux_circuit_breaker.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.record_success();
+        self.mux_circuit_record_evidence(MuxCircuitEvidence::SuccessfulResponse);
     }
 
     #[cfg(all(feature = "vendored", unix))]
-    fn mux_circuit_record_failure(&self, err: &crate::vendored::MuxPoolError) {
-        if !Self::mux_error_is_circuit_breaker_trigger(err) {
+    fn mux_circuit_record_error(&self, err: &crate::vendored::MuxPoolError) {
+        self.mux_circuit_record_evidence(Self::mux_error_circuit_evidence(err));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_circuit_record_evidence(&self, evidence: MuxCircuitEvidence) {
+        if matches!(evidence, MuxCircuitEvidence::Ignore) {
             return;
         }
 
@@ -2873,16 +3103,16 @@ impl WeztermClient {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.record_failure();
+        match evidence {
+            MuxCircuitEvidence::SuccessfulResponse => guard.record_success(),
+            MuxCircuitEvidence::BackendFailure => guard.record_failure(),
+            MuxCircuitEvidence::Ignore => unreachable!("handled before locking"),
+        }
     }
 
     #[cfg(all(feature = "vendored", unix))]
     fn mux_circuit_record_contract_failure(&self) {
-        let mut guard = match self.mux_circuit_breaker.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.record_failure();
+        self.mux_circuit_record_evidence(MuxCircuitEvidence::BackendFailure);
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -6005,20 +6235,29 @@ mod tests {
     }
 
     #[cfg(all(feature = "vendored", unix))]
-    fn assert_mux_transport_failover(err: &crate::vendored::MuxPoolError, expected: bool) {
+    fn assert_mux_recovery_axes(
+        err: &crate::vendored::MuxPoolError,
+        expected_circuit_evidence: MuxCircuitEvidence,
+        expected_failover: bool,
+    ) {
         assert_eq!(
             WeztermClient::mux_error_requires_transport_failover(err),
-            expected,
+            expected_failover,
             "canonical transport-failover predicate disagreed for {err:?}"
         );
         assert_eq!(
             WeztermClient::mux_error_is_circuit_breaker_trigger(err),
-            expected,
+            matches!(expected_circuit_evidence, MuxCircuitEvidence::BackendFailure),
             "circuit-breaker consumer disagreed for {err:?}"
         );
         assert_eq!(
+            WeztermClient::mux_error_circuit_evidence(err),
+            expected_circuit_evidence,
+            "circuit-breaker settlement evidence disagreed for {err:?}"
+        );
+        assert_eq!(
             WeztermClient::mux_error_should_fallback_to_cli(err),
-            expected,
+            expected_failover,
             "CLI-fallback consumer disagreed for {err:?}"
         );
     }
@@ -6027,7 +6266,7 @@ mod tests {
     #[test]
     fn mux_pool_cancelled_does_not_trigger_circuit_breaker() {
         let err = crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::Cancelled);
-        assert_mux_transport_failover(&err, false);
+        assert_mux_recovery_axes(&err, MuxCircuitEvidence::Ignore, false);
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -6039,7 +6278,7 @@ mod tests {
                 "mux response_read_wait cancelled: test cancellation",
             ),
         ));
-        assert_mux_transport_failover(&err, false);
+        assert_mux_recovery_axes(&err, MuxCircuitEvidence::Ignore, false);
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -6048,14 +6287,14 @@ mod tests {
         let err = crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteError(
             "invalid spawn domain".to_string(),
         ));
-        assert_mux_transport_failover(&err, false);
+        assert_mux_recovery_axes(&err, MuxCircuitEvidence::SuccessfulResponse, false);
     }
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
     fn mux_pool_cancelled_does_not_fallback_to_cli() {
         let err = crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::Cancelled);
-        assert_mux_transport_failover(&err, false);
+        assert_mux_recovery_axes(&err, MuxCircuitEvidence::Ignore, false);
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -6067,7 +6306,7 @@ mod tests {
                 "mux response_read_wait cancelled: test cancellation",
             ),
         ));
-        assert_mux_transport_failover(&err, false);
+        assert_mux_recovery_axes(&err, MuxCircuitEvidence::Ignore, false);
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -6076,7 +6315,7 @@ mod tests {
         let err = crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteError(
             "invalid spawn domain".to_string(),
         ));
-        assert_mux_transport_failover(&err, false);
+        assert_mux_recovery_axes(&err, MuxCircuitEvidence::SuccessfulResponse, false);
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -6148,6 +6387,7 @@ mod tests {
                 false,
                 false,
                 false,
+                MuxCircuitEvidence::SuccessfulResponse,
             ),
             (
                 DirectMuxError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
@@ -6156,6 +6396,7 @@ mod tests {
                 true,
                 false,
                 false,
+                MuxCircuitEvidence::BackendFailure,
             ),
             (
                 DirectMuxError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
@@ -6164,6 +6405,7 @@ mod tests {
                 true,
                 false,
                 true,
+                MuxCircuitEvidence::BackendFailure,
             ),
             (
                 DirectMuxError::Disconnected,
@@ -6172,6 +6414,7 @@ mod tests {
                 true,
                 false,
                 true,
+                MuxCircuitEvidence::BackendFailure,
             ),
             (
                 DirectMuxError::Cancelled {
@@ -6183,10 +6426,20 @@ mod tests {
                 true,
                 true,
                 false,
+                MuxCircuitEvidence::Ignore,
             ),
         ];
 
-        for (error, kind, retry, discard, cancelled, should_fail_over) in cases {
+        for (
+            error,
+            kind,
+            retry,
+            discard,
+            cancelled,
+            should_fail_over,
+            expected_circuit_evidence,
+        ) in cases
+        {
             let decision = crate::protocol_recovery::mux_recovery_decision(&error);
             assert_eq!(decision.kind, kind, "kind disagreed for {error:?}");
             assert_eq!(decision.retry, retry, "retry disagreed for {error:?}");
@@ -6200,8 +6453,9 @@ mod tests {
                 "cancellation disagreed for {error:?}"
             );
 
-            assert_mux_transport_failover(
+            assert_mux_recovery_axes(
                 &crate::vendored::MuxPoolError::Mux(error),
+                expected_circuit_evidence,
                 should_fail_over,
             );
         }
@@ -6215,26 +6469,40 @@ mod tests {
             crate::pool::PoolError::Closed,
             crate::pool::PoolError::Cancelled,
         ] {
-            assert_mux_transport_failover(&crate::vendored::MuxPoolError::Pool(pool_error), false);
+            assert_mux_recovery_axes(
+                &crate::vendored::MuxPoolError::Pool(pool_error),
+                MuxCircuitEvidence::Ignore,
+                false,
+            );
         }
     }
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
     fn indeterminate_mutation_never_replays_through_another_transport() {
-        for mux_error in [
-            crate::vendored::DirectMuxError::Disconnected,
-            crate::vendored::DirectMuxError::UnexpectedResponse {
-                expected: "UnitResponse".to_string(),
-                got: "unexpected".to_string(),
-            },
-            crate::vendored::DirectMuxError::Cancelled {
-                phase: "mutation_response_wait",
-                detail: "test cancellation".to_string(),
-            },
+        for (mux_error, expected_circuit_evidence) in [
+            (
+                crate::vendored::DirectMuxError::Disconnected,
+                MuxCircuitEvidence::BackendFailure,
+            ),
+            (
+                crate::vendored::DirectMuxError::UnexpectedResponse {
+                    expected: "UnitResponse".to_string(),
+                    got: "unexpected".to_string(),
+                },
+                MuxCircuitEvidence::BackendFailure,
+            ),
+            (
+                crate::vendored::DirectMuxError::Cancelled {
+                    phase: "mutation_response_wait",
+                    detail: "test cancellation".to_string(),
+                },
+                MuxCircuitEvidence::Ignore,
+            ),
         ] {
-            assert_mux_transport_failover(
+            assert_mux_recovery_axes(
                 &crate::vendored::MuxPoolError::IndeterminateMutation(mux_error),
+                expected_circuit_evidence,
                 false,
             );
         }
@@ -6477,7 +6745,15 @@ mod tests {
 
     #[test]
     fn malformed_successful_spawn_receipt_is_indeterminate() {
-        let error = WeztermClient::parse_mutation_pane_id("spawn_targeted", "not-a-pane-id")
+        let client = WeztermClient::new();
+        let error = client
+            .settle_cli_pane_id_mutation(
+                "spawn_targeted",
+                CliMutationOutcome {
+                    result: Ok("not-a-pane-id".to_string()),
+                    circuit_evidence: CliMutationCircuitEvidence::SuccessfulResponse,
+                },
+            )
             .expect_err("the pane may exist even when its receipt is malformed");
         assert!(matches!(
             error,
@@ -6485,6 +6761,112 @@ mod tests {
                 operation: "spawn_targeted"
             })
         ));
+        assert_eq!(client.circuit_status().consecutive_failures, 1);
+    }
+
+    #[test]
+    fn malformed_successful_spawn_receipt_reopens_half_open_breaker() {
+        let client = WeztermClient::new().with_circuit_breaker_config(CircuitBreakerConfig::new(
+            1,
+            1,
+            Duration::ZERO,
+        ));
+        client.circuit_record_mutation_evidence(CliMutationCircuitEvidence::BackendFailure);
+        assert_eq!(client.circuit_status().state, CircuitStateKind::Open);
+        client
+            .circuit_guard()
+            .expect("zero cooldown must admit one half-open probe");
+        assert_eq!(client.circuit_status().state, CircuitStateKind::HalfOpen);
+
+        let error = client
+            .settle_cli_pane_id_mutation(
+                "spawn_targeted",
+                CliMutationOutcome {
+                    result: Ok("malformed-receipt".to_string()),
+                    circuit_evidence: CliMutationCircuitEvidence::SuccessfulResponse,
+                },
+            )
+            .expect_err("malformed successful receipt must fail the full operation contract");
+        assert!(matches!(
+            error,
+            crate::Error::Wezterm(WeztermError::IndeterminateMutation {
+                operation: "spawn_targeted"
+            })
+        ));
+        assert_eq!(client.circuit_status().state, CircuitStateKind::Open);
+    }
+
+    #[test]
+    fn explicit_pane_rejection_settles_half_open_transport_probe_as_success() {
+        let client = WeztermClient::new().with_circuit_breaker_config(CircuitBreakerConfig::new(
+            1,
+            1,
+            Duration::ZERO,
+        ));
+        client.circuit_record_mutation_evidence(CliMutationCircuitEvidence::BackendFailure);
+        client
+            .circuit_guard()
+            .expect("zero cooldown must admit one half-open probe");
+
+        let pane_rejection = WeztermClient::map_cli_mutation_pane_error(
+            CliMutationOutcome {
+                result: Err(
+                    WeztermError::CommandFailed("pane 41 not found".to_string()).into(),
+                ),
+                circuit_evidence: CliMutationCircuitEvidence::SuccessfulResponse,
+            },
+            41,
+        );
+        client.circuit_record_mutation_evidence(pane_rejection.circuit_evidence);
+
+        assert!(matches!(
+            pane_rejection.result,
+            Err(crate::Error::Wezterm(WeztermError::PaneNotFound(41)))
+        ));
+        assert_eq!(client.circuit_status().state, CircuitStateKind::Closed);
+        assert_eq!(client.circuit_status().consecutive_failures, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_mutation_breaker_uses_completion_provenance_not_late_cx_state() {
+        let cx = crate::cx::for_testing();
+        cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("late caller cancellation after authoritative failure"),
+        );
+        let authoritative_failure = WeztermClient::finalize_cli_effect_after_wait(
+            &cx,
+            CliEffect::Mutation {
+                operation: "send_text",
+            },
+            synthetic_cli_output(false, "", "remote response failed after dispatch"),
+        );
+        assert!(matches!(
+            &authoritative_failure,
+            Err(crate::Error::Wezterm(
+                WeztermError::IndeterminateMutation {
+                    operation: "send_text"
+                }
+            ))
+        ));
+        let evidence =
+            WeztermClient::completed_cli_mutation_circuit_evidence(&authoritative_failure);
+        assert_eq!(evidence, CliMutationCircuitEvidence::BackendFailure);
+
+        let backend_client = WeztermClient::new();
+        backend_client.circuit_record_mutation_evidence(evidence);
+        assert_eq!(backend_client.circuit_status().consecutive_failures, 1);
+
+        let caller_cancelled_client = WeztermClient::new();
+        caller_cancelled_client
+            .circuit_record_mutation_evidence(CliMutationCircuitEvidence::Ignore);
+        assert_eq!(
+            caller_cancelled_client
+                .circuit_status()
+                .consecutive_failures,
+            0
+        );
     }
 
     #[test]

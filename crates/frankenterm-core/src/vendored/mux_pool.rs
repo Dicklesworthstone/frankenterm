@@ -198,6 +198,8 @@ pub struct MuxPool {
     permanent_failures: AtomicU64,
     pipeline_depth: usize,
     pipeline_timeout: Duration,
+    #[cfg(test)]
+    after_render_batch_success: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 fn classify_render_batch_fallback(decision: Option<MuxRecoveryDecision>) -> bool {
@@ -330,6 +332,20 @@ impl MuxPool {
             permanent_failures: AtomicU64::new(0),
             pipeline_depth,
             pipeline_timeout,
+            #[cfg(test)]
+            after_render_batch_success: std::sync::Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn fire_after_render_batch_success(&self) {
+        let hook = self
+            .after_render_batch_success
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -745,6 +761,11 @@ impl MuxPool {
                         return Err(error);
                     }
                     self.return_client_with_cx(cx, client).await;
+                    // Returning the reusable connection can itself wait for
+                    // the idle-queue lock. Re-check after that await so a
+                    // cancellation observed during cleanup cannot publish a
+                    // now-stale repeatable-read result.
+                    Self::checkpoint_cx(cx)?;
                     if attempt > 1 {
                         saturating_atomic_increment(&self.recovery_successes);
                     }
@@ -1005,7 +1026,23 @@ impl MuxPool {
                 .await;
             match result {
                 Ok(value) => {
+                    #[cfg(test)]
+                    self.fire_after_render_batch_success();
+                    // The batch read is repeatable, but a result produced after
+                    // its caller lost authority must not escape as fresh render
+                    // state. Re-check both capability cancellation and the one
+                    // logical batch deadline before returning or pooling the
+                    // connection.
+                    if let Err(error) = self.remaining_render_batch_time(cx, deadline) {
+                        drop(client);
+                        return Err(RenderExecutionError::Operation(error));
+                    }
                     self.return_client_with_cx(cx, client).await;
+                    // Pool return can suspend on the idle-queue lock. Preserve
+                    // the same cancellation/deadline publication boundary on
+                    // the far side of that await as well.
+                    self.remaining_render_batch_time(cx, deadline)
+                        .map_err(RenderExecutionError::Operation)?;
                     return Ok(value);
                 }
                 Err(error) => {
@@ -3749,6 +3786,7 @@ mod tests {
         for error in [
             PoolError::AcquireTimeout,
             PoolError::Closed,
+            PoolError::LockTimedOut { deadline_nanos: 7 },
             PoolError::PolledAfterCompletion,
         ] {
             assert!(
@@ -4330,6 +4368,46 @@ mod tests {
                 .expect("fresh context must read pool stats");
             assert_eq!(stats.pool.total_acquired, 1);
             assert_eq!(stats.pool.idle_count, 0);
+            assert_eq!(stats.recovery_successes, 0);
+        });
+    }
+
+    #[test]
+    fn render_batch_success_is_not_published_after_in_flight_cancellation() {
+        run_async_test(async {
+            const SECRET: &str = "SECRET cancellation after successful render batch";
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let mut config = pool_config(socket_path, 1);
+            config.pipeline_depth = 2;
+            let pool = MuxPool::new(config);
+            let cx = Cx::for_testing();
+            let cancel_after_success = cx.clone();
+            *pool
+                .after_render_batch_success
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+                cancel_after_success.cancel_with(CancelKind::User, Some(SECRET));
+            }));
+
+            let error = pool
+                .get_pane_render_changes_batch_with_cx(&cx, vec![1, 2])
+                .await
+                .expect_err("cancelled caller must not receive a completed render batch");
+            assert!(matches!(
+                &error,
+                MuxPoolError::Pool(PoolError::Cancelled)
+            ));
+            assert!(!error.to_string().contains(SECRET));
+
+            let stats = pool
+                .stats_with_cx(&Cx::for_testing())
+                .await
+                .expect("fresh context must read mux pool stats");
+            assert_eq!(stats.pool.total_acquired, 1);
+            assert_eq!(stats.pool.total_returned, 0);
+            assert_eq!(stats.pool.idle_count, 0);
+            assert_eq!(stats.recovery_attempts, 0);
             assert_eq!(stats.recovery_successes, 0);
         });
     }
@@ -5349,12 +5427,11 @@ mod tests {
             });
         }
 
-        /// 4. `health_check_with_cx` counts the attempt even when Cx is
-        ///    cancelled, then increments health_check_failures — but still
-        ///    does not connect. This pins the bead acceptance criterion
-        ///    "health checks work through Cx".
+        /// 4. `health_check_with_cx` rejects a pre-cancelled Cx before it can
+        ///    publish a backend health attempt or failure. Caller interruption
+        ///    is not evidence that the mux server itself is unhealthy.
         #[test]
-        fn mux_pool_health_check_with_precancelled_cx_counts_failure_under_labruntime() {
+        fn mux_pool_health_check_with_precancelled_cx_publishes_no_health_sample_under_labruntime() {
             run_lab(904, || async move {
                 let pool = unreachable_pool(2);
                 let cx = pre_cancelled_cx("wa-2h5wv health_check cancel");
@@ -5365,12 +5442,12 @@ mod tests {
                 assert!(matches!(err, MuxPoolError::Pool(PoolError::Cancelled)));
                 let stats = pool.stats().await;
                 assert_eq!(
-                    stats.health_checks, 1,
-                    "health check attempt must be counted even on cancel"
+                    stats.health_checks, 0,
+                    "preflight cancellation must not publish a mux health attempt"
                 );
                 assert_eq!(
-                    stats.health_check_failures, 1,
-                    "cancelled health check must count as a failure"
+                    stats.health_check_failures, 0,
+                    "caller cancellation must not count as a mux backend failure"
                 );
                 assert_eq!(
                     stats.connections_created, 0,
