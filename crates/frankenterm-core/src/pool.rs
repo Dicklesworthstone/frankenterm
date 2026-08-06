@@ -23,6 +23,25 @@ use crate::cx::{self, Cx};
 use crate::runtime_async::{LockAcquireError, Mutex, Semaphore, TryAcquireError};
 use serde::{Deserialize, Serialize};
 
+/// Add to a telemetry counter without allowing an ancient/high-volume process
+/// to make the cumulative value appear to move backwards after `u64::MAX`.
+/// Returns the value published by this update.
+fn saturating_atomic_add(counter: &AtomicU64, delta: u64) -> u64 {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(delta);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// Configuration for the connection pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolConfig {
@@ -156,6 +175,8 @@ pub struct Pool<C> {
     stats_returned: AtomicU64,
     stats_evicted: AtomicU64,
     stats_timeouts: AtomicU64,
+    #[cfg(test)]
+    after_idle_lock_acquired: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl<C: Send + 'static> Pool<C> {
@@ -204,6 +225,18 @@ impl<C: Send + 'static> Pool<C> {
         cx.checkpoint().map_err(|_| Self::classify_cx_failure(cx))
     }
 
+    #[cfg(test)]
+    fn fire_after_idle_lock_acquired(&self) {
+        let hook = self
+            .after_idle_lock_acquired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     /// Create a new pool with the given configuration.
     #[must_use]
     pub fn new(config: PoolConfig) -> Self {
@@ -216,6 +249,8 @@ impl<C: Send + 'static> Pool<C> {
             stats_returned: AtomicU64::new(0),
             stats_evicted: AtomicU64::new(0),
             stats_timeouts: AtomicU64::new(0),
+            #[cfg(test)]
+            after_idle_lock_acquired: std::sync::Mutex::new(None),
         }
     }
 
@@ -246,10 +281,13 @@ impl<C: Send + 'static> Pool<C> {
                         .lock_with_cx(cx)
                         .await
                         .map_err(|error| Self::classify_lock_failure(cx, error))?;
+                    #[cfg(test)]
+                    self.fire_after_idle_lock_acquired();
+                    Self::checkpoint_explicit_cx(cx)?;
                     self.evict_expired(&mut idle);
                     idle.pop_front().map(|e| e.conn)
                 };
-                self.stats_acquired.fetch_add(1, Ordering::Relaxed);
+                saturating_atomic_add(&self.stats_acquired, 1);
                 Ok(PoolAcquireResult {
                     conn,
                     permit: Some(permit),
@@ -299,7 +337,7 @@ impl<C: Send + 'static> Pool<C> {
                 if cx.checkpoint().is_err() {
                     return Err(Self::classify_cx_failure(cx));
                 }
-                self.stats_timeouts.fetch_add(1, Ordering::Relaxed);
+                saturating_atomic_add(&self.stats_timeouts, 1);
                 return Err(PoolError::AcquireTimeout);
             }
         };
@@ -312,10 +350,13 @@ impl<C: Send + 'static> Pool<C> {
                 .lock_with_cx(cx)
                 .await
                 .map_err(|error| Self::classify_lock_failure(cx, error))?;
+            #[cfg(test)]
+            self.fire_after_idle_lock_acquired();
+            Self::checkpoint_explicit_cx(cx)?;
             self.evict_expired(&mut idle);
             idle.pop_front().map(|e| e.conn)
         };
-        self.stats_acquired.fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_add(&self.stats_acquired, 1);
         Ok(PoolAcquireResult {
             conn,
             permit: Some(permit),
@@ -346,13 +387,16 @@ impl<C: Send + 'static> Pool<C> {
             .lock_with_cx(cx)
             .await
             .map_err(|error| Self::classify_lock_failure(cx, error))?;
+        #[cfg(test)]
+        self.fire_after_idle_lock_acquired();
+        Self::checkpoint_explicit_cx(cx)?;
         self.evict_expired(&mut idle);
         if idle.len() < self.config.max_size {
             idle.push_back(PooledEntry {
                 conn,
                 returned_at: Instant::now(),
             });
-            self.stats_returned.fetch_add(1, Ordering::Relaxed);
+            saturating_atomic_add(&self.stats_returned, 1);
         }
         // If queue is at max_size, connection is dropped (not returned).
         Ok(())
@@ -372,6 +416,9 @@ impl<C: Send + 'static> Pool<C> {
             .lock_with_cx(cx)
             .await
             .map_err(|error| Self::classify_lock_failure(cx, error))?;
+        #[cfg(test)]
+        self.fire_after_idle_lock_acquired();
+        Self::checkpoint_explicit_cx(cx)?;
         Ok(self.evict_expired(&mut idle))
     }
 
@@ -384,12 +431,15 @@ impl<C: Send + 'static> Pool<C> {
     ///
     /// Returns a typed pool error if the idle queue cannot be locked.
     pub async fn stats_with_cx(&self, cx: &Cx) -> Result<PoolStats, PoolError> {
-        let idle_count = self
+        let idle = self
             .idle
             .lock_with_cx(cx)
             .await
-            .map_err(|error| Self::classify_lock_failure(cx, error))?
-            .len();
+            .map_err(|error| Self::classify_lock_failure(cx, error))?;
+        #[cfg(test)]
+        self.fire_after_idle_lock_acquired();
+        Self::checkpoint_explicit_cx(cx)?;
+        let idle_count = idle.len();
         let acquired = self.stats_acquired.load(Ordering::Relaxed);
         let returned = self.stats_returned.load(Ordering::Relaxed);
         Ok(PoolStats {
@@ -417,9 +467,12 @@ impl<C: Send + 'static> Pool<C> {
             .lock_with_cx(cx)
             .await
             .map_err(|error| Self::classify_lock_failure(cx, error))?;
+        #[cfg(test)]
+        self.fire_after_idle_lock_acquired();
+        Self::checkpoint_explicit_cx(cx)?;
         let count = idle.len() as u64;
         idle.clear();
-        self.stats_evicted.fetch_add(count, Ordering::Relaxed);
+        saturating_atomic_add(&self.stats_evicted, count);
         Ok(())
     }
 
@@ -437,8 +490,7 @@ impl<C: Send + 'static> Pool<C> {
             }
         }
         if evicted > 0 {
-            self.stats_evicted
-                .fetch_add(evicted as u64, Ordering::Relaxed);
+            saturating_atomic_add(&self.stats_evicted, evicted as u64);
         }
         evicted
     }
@@ -573,6 +625,29 @@ mod tests {
             idle_timeout: Duration::from_secs(60),
             acquire_timeout: Duration::from_millis(100),
         }
+    }
+
+    fn cancel_after_next_idle_lock<C: Send + 'static>(pool: &Pool<C>, cx: &Cx) {
+        let cancel = cx.clone();
+        *pool
+            .after_idle_lock_acquired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            cancel.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("deterministic cancellation after idle lock grant"),
+            );
+        }));
+    }
+
+    #[test]
+    fn pool_telemetry_counter_saturates_instead_of_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+
+        assert_eq!(saturating_atomic_add(&counter, 1), u64::MAX);
+        assert_eq!(saturating_atomic_add(&counter, 1), u64::MAX);
+        assert_eq!(saturating_atomic_add(&counter, u64::MAX), u64::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 
     async fn wait_for_all_permits_to_be_consumed<C: Send + 'static>(pool: &Pool<C>) {
@@ -1834,6 +1909,113 @@ mod tests {
             drop(held);
             let result = pool.acquire().await;
             assert!(result.is_ok());
+        });
+    }
+
+    #[test]
+    fn pool_lock_grant_then_cancel_never_reads_or_mutates_idle_state() {
+        run_async_test(async {
+            for blocking_acquire in [false, true] {
+                let pool: Pool<String> = Pool::new(test_config(1));
+                pool.put("idle".to_string()).await;
+                let cx = Cx::for_testing();
+                cancel_after_next_idle_lock(&pool, &cx);
+
+                let error = if blocking_acquire {
+                    pool.acquire_with_cx(&cx)
+                        .await
+                        .expect_err("post-grant cancellation must reject acquire")
+                } else {
+                    pool.try_acquire_with_cx(&cx)
+                        .await
+                        .expect_err("post-grant cancellation must reject try_acquire")
+                };
+                assert_eq!(error, PoolError::Cancelled);
+
+                let stats_cx = Cx::for_testing();
+                let stats = pool
+                    .stats_with_cx(&stats_cx)
+                    .await
+                    .expect("fresh context must read pool stats");
+                assert_eq!(stats.idle_count, 1, "cancelled acquire must not pop");
+                assert_eq!(stats.active_count, 0, "permit must be released");
+                assert_eq!(stats.total_acquired, 0);
+            }
+
+            struct DropProbe(Arc<AtomicU64>);
+            impl Drop for DropProbe {
+                fn drop(&mut self) {
+                    saturating_atomic_add(&self.0, 1);
+                }
+            }
+
+            let put_pool: Pool<DropProbe> = Pool::new(test_config(1));
+            let dropped = Arc::new(AtomicU64::new(0));
+            let put_cx = Cx::for_testing();
+            cancel_after_next_idle_lock(&put_pool, &put_cx);
+            assert_eq!(
+                put_pool
+                    .put_with_cx(&put_cx, DropProbe(Arc::clone(&dropped)))
+                    .await
+                    .expect_err("post-grant cancellation must reject put"),
+                PoolError::Cancelled
+            );
+            assert_eq!(dropped.load(Ordering::Relaxed), 1);
+            let put_stats = put_pool
+                .stats_with_cx(&Cx::for_testing())
+                .await
+                .expect("fresh context must read put stats");
+            assert_eq!(put_stats.idle_count, 0);
+            assert_eq!(put_stats.total_returned, 0);
+
+            let mut evict_config = test_config(1);
+            evict_config.idle_timeout = Duration::ZERO;
+            let evict_pool: Pool<String> = Pool::new(evict_config);
+            evict_pool.put("idle".to_string()).await;
+            let evict_cx = Cx::for_testing();
+            cancel_after_next_idle_lock(&evict_pool, &evict_cx);
+            assert_eq!(
+                evict_pool
+                    .evict_idle_with_cx(&evict_cx)
+                    .await
+                    .expect_err("post-grant cancellation must reject eviction"),
+                PoolError::Cancelled
+            );
+            let evict_stats = evict_pool
+                .stats_with_cx(&Cx::for_testing())
+                .await
+                .expect("fresh context must read eviction stats");
+            assert_eq!(evict_stats.idle_count, 1);
+            assert_eq!(evict_stats.total_evicted, 0);
+
+            let clear_pool: Pool<String> = Pool::new(test_config(1));
+            clear_pool.put("idle".to_string()).await;
+            let clear_cx = Cx::for_testing();
+            cancel_after_next_idle_lock(&clear_pool, &clear_cx);
+            assert_eq!(
+                clear_pool
+                    .clear_with_cx(&clear_cx)
+                    .await
+                    .expect_err("post-grant cancellation must reject clear"),
+                PoolError::Cancelled
+            );
+            let clear_stats = clear_pool
+                .stats_with_cx(&Cx::for_testing())
+                .await
+                .expect("fresh context must read clear stats");
+            assert_eq!(clear_stats.idle_count, 1);
+            assert_eq!(clear_stats.total_evicted, 0);
+
+            let stats_pool: Pool<String> = Pool::new(test_config(1));
+            let stats_cx = Cx::for_testing();
+            cancel_after_next_idle_lock(&stats_pool, &stats_cx);
+            assert_eq!(
+                stats_pool
+                    .stats_with_cx(&stats_cx)
+                    .await
+                    .expect_err("post-grant cancellation must reject stats snapshot"),
+                PoolError::Cancelled
+            );
         });
     }
 
