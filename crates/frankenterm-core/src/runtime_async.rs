@@ -2134,6 +2134,7 @@ pub mod task {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::{Context, Poll};
+    use std::time::Duration;
 
     pub use crate::cx::SpawnError;
 
@@ -2160,6 +2161,7 @@ pub mod task {
     // prevent runtime cascade when possible (the recovery).
     static JOIN_HANDLE_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
     static JOIN_HANDLE_WAKER_CALLBACK_PANIC_COUNT: AtomicU64 = AtomicU64::new(0);
+    const JOIN_SET_QUARANTINE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
     /// Read the current count of recovered JoinHandle downstream-waker
     /// Mutex-poison events. Non-zero values mean a prior thread
@@ -2653,6 +2655,71 @@ pub mod task {
                 self.poll_active(cx)
             })
             .await
+        }
+
+        /// Drain one terminal task result without treating quarantined handles
+        /// as an empty set.
+        ///
+        /// Unlike [`Self::join_next`] and [`Self::join_next_with_cx`], `Ok(None)`
+        /// is returned only when this set owns no active or unacknowledged
+        /// handles. If caller-waker registration failed and the affected task
+        /// has not yet acknowledged the requested abort, this method retains
+        /// the handle and periodically polls it through the trusted internal
+        /// completion waker until it becomes terminal.
+        ///
+        /// The retry interval prevents a quarantined task from turning a
+        /// shutdown lane into a hot spin. Callers must still put their desired
+        /// overall shutdown deadline around this future (for example with
+        /// [`super::timeout_with_cx`]); dropping the future leaves terminal
+        /// authority in this `JoinSet`, visible through [`Self::settlement`].
+        /// A top-level `Err` is a finite drain-context failure and does not
+        /// consume any owned task handle. The nested result is the completed
+        /// task's ordinary join result.
+        pub async fn drain_next_with_cx(
+            &mut self,
+            caller_cx: &crate::cx::Cx,
+        ) -> Result<Option<Result<T, JoinError>>, JoinError> {
+            loop {
+                if self.is_empty() {
+                    return Ok(None);
+                }
+                if caller_cx.checkpoint().is_err() {
+                    return Err(JoinError::from_context_failure(caller_cx));
+                }
+                if let Some(result) = self.try_join_next() {
+                    return Ok(Some(result));
+                }
+
+                if !self.unacknowledged.is_empty() {
+                    // A quarantined handle's stable completion waker no longer
+                    // forwards to this caller. Always arm the retry timer when
+                    // any such authority remains, even if another active task
+                    // is also pending; otherwise that unrelated active task
+                    // could suppress the only trusted re-poll until the outer
+                    // shutdown deadline expires.
+                    super::sleep_with_cx(caller_cx, JOIN_SET_QUARANTINE_POLL_INTERVAL)
+                        .await
+                        .map_err(|_| JoinError::from_context_failure(caller_cx))?;
+                    continue;
+                }
+
+                if !self.handles.is_empty() {
+                    let result = std::future::poll_fn(|task_cx| {
+                        if caller_cx.checkpoint().is_err() {
+                            return Poll::Ready(Err(JoinError::from_context_failure(caller_cx)));
+                        }
+                        match self.poll_active(task_cx) {
+                            Poll::Ready(result) => Poll::Ready(Ok(result)),
+                            Poll::Pending => Poll::Pending,
+                        }
+                    })
+                    .await?;
+                    if result.is_some() {
+                        return Ok(result);
+                    }
+                    continue;
+                }
+            }
         }
 
         /// Non-blocking poll for the next completed task.
@@ -9406,18 +9473,24 @@ mod tests {
             );
             assert_eq!(set.unacknowledged_len(), 1);
 
-            let mut terminal = None;
-            for _ in 0..4_096 {
-                task::yield_now().await;
-                if let Some(result) = set.try_join_next() {
-                    terminal = Some(result);
-                    break;
-                }
-            }
+            let drain_cx = crate::cx::Cx::for_testing();
+            let terminal = timeout_with_cx(
+                &drain_cx,
+                Duration::from_secs(1),
+                set.drain_next_with_cx(&drain_cx),
+            )
+            .await
+            .expect("trusted drain must remain bounded")
+            .expect("trusted drain context must remain live");
             let error = terminal
                 .expect("aborted quarantined task must become terminally drainable")
                 .expect_err("pending task was aborted after registration failure");
             assert_eq!(error.kind(), task::JoinErrorKind::Aborted);
+            assert_eq!(
+                set.drain_next_with_cx(&drain_cx).await,
+                Ok(None),
+                "drain None is reserved for genuine terminal settlement"
+            );
             assert_eq!(set.settlement(), task::JoinSetSettlement::Settled);
         });
     }
@@ -9443,14 +9516,14 @@ mod tests {
             assert!(set.join_next_with_cx(&cx).await.is_none());
             assert_eq!(set.unacknowledged_len(), 1);
 
-            let mut terminal = None;
-            for _ in 0..4_096 {
-                task::yield_now().await;
-                if let Some(result) = set.try_join_next() {
-                    terminal = Some(result);
-                    break;
-                }
-            }
+            let terminal = timeout_with_cx(
+                &cx,
+                Duration::from_secs(1),
+                set.drain_next_with_cx(&cx),
+            )
+            .await
+            .expect("trusted drain must remain bounded")
+            .expect("trusted drain context must remain live");
             let error = terminal
                 .expect("trusted polling must recover terminal authority")
                 .expect_err("pending task was aborted after registration failure");
@@ -9460,24 +9533,89 @@ mod tests {
     }
 
     #[test]
+    fn join_set_trusted_drain_repolls_quarantine_while_an_active_task_is_pending() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut set = task::JoinSet::new();
+            set.spawn(std::future::pending::<()>());
+            set.spawn(std::future::pending::<()>());
+            set.force_join_registration_failure_for_test();
+
+            let observation_error = set
+                .join_next()
+                .await
+                .expect("set contains two tasks")
+                .expect_err("forced registration failure must be observable");
+            assert_eq!(
+                observation_error.kind(),
+                task::JoinErrorKind::WakerRegistrationFailed
+            );
+            assert_eq!(
+                set.settlement(),
+                task::JoinSetSettlement::Incomplete {
+                    active_tasks: 1,
+                    unacknowledged_tasks: 1,
+                }
+            );
+
+            let drain_cx = crate::cx::Cx::for_testing();
+            let quarantined_result = timeout_with_cx(
+                &drain_cx,
+                Duration::from_secs(1),
+                set.drain_next_with_cx(&drain_cx),
+            )
+            .await
+            .expect("mixed active/quarantined trusted drain must remain live")
+            .expect("trusted drain context must remain live")
+            .expect("quarantined task must reach a terminal result");
+            assert!(matches!(
+                quarantined_result,
+                Err(ref error) if error.kind() == task::JoinErrorKind::Aborted
+            ));
+            assert_eq!(
+                set.settlement(),
+                task::JoinSetSettlement::Incomplete {
+                    active_tasks: 1,
+                    unacknowledged_tasks: 0,
+                },
+                "the unrelated active task must remain owned"
+            );
+
+            set.abort_all();
+            let active_result = timeout_with_cx(
+                &drain_cx,
+                Duration::from_secs(1),
+                set.drain_next_with_cx(&drain_cx),
+            )
+            .await
+            .expect("active task abort must remain bounded")
+            .expect("trusted drain context must remain live")
+            .expect("active task must reach a terminal result");
+            assert!(matches!(
+                active_result,
+                Err(ref error) if error.kind() == task::JoinErrorKind::Aborted
+            ));
+            assert_eq!(set.settlement(), task::JoinSetSettlement::Settled);
+        });
+    }
+
+    #[test]
     fn join_set_try_join_next_uses_trusted_terminal_poll_after_registration_failure() {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let mut set = task::JoinSet::new();
-            set.spawn(async { 7_u32 });
+            let (completed_tx, completed_rx) = oneshot::channel();
+            set.spawn(async move {
+                let _ = completed_tx.send(());
+                7_u32
+            });
+            await_test_signal(completed_rx, "completed JoinSet child").await;
+            task::yield_now().await;
             set.force_join_registration_failure_for_test();
 
-            let mut terminal = None;
-            for _ in 0..4_096 {
-                if let Some(result) = set.try_join_next() {
-                    terminal = Some(result);
-                    break;
-                }
-                task::yield_now().await;
-            }
-
             assert_eq!(
-                terminal.expect("completed task must become synchronously pollable"),
+                set.try_join_next()
+                    .expect("completed task must become synchronously pollable"),
                 Ok(7)
             );
             assert_eq!(set.settlement(), task::JoinSetSettlement::Settled);
