@@ -261,7 +261,7 @@ impl ProcessLauncher {
 
             let result = match &plan.action {
                 LaunchAction::LaunchShell { shell, cwd } => {
-                    self.launch_shell_cx(cx, plan.new_pane_id, shell, cwd).await
+                    self.reject_legacy_shell_launch(shell, cwd)
                 }
                 LaunchAction::LaunchAgent {
                     command,
@@ -563,11 +563,14 @@ impl ProcessLauncher {
     // Internal: execution
     // -------------------------------------------------------------------------
 
-    /// Send shell launch commands to a pane.
-    async fn launch_shell_cx(
+    /// Reject a legacy shell-launch plan without writing to the pane.
+    ///
+    /// Layout restoration already creates a shell at the restored working
+    /// directory. Switching to a different shell requires an argv-isolated
+    /// mux spawn API; typing a command into the restored PTY would execute
+    /// attacker-controlled persisted state in an interactive shell.
+    fn reject_legacy_shell_launch(
         &self,
-        _cx: &crate::cx::Cx,
-        _pane_id: u64,
         shell: &str,
         cwd: &Path,
     ) -> Result<(), LaunchStepError> {
@@ -1547,9 +1550,11 @@ mod tests {
     }
 
     #[test]
-    fn execute_shell_launch() {
+    fn execute_shell_launch_is_refused_without_pty_input() {
         run_async_test(async {
-            let wez = mock_with_panes(&[100]).await;
+            let mock = std::sync::Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(100).await;
+            let wez: crate::wezterm::WeztermHandle = mock.clone();
             let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
             let plans = vec![ProcessPlan {
                 old_pane_id: 1,
@@ -1562,8 +1567,17 @@ mod tests {
             }];
 
             let report = launcher.execute(&plans).await;
-            assert_eq!(report.shells_launched, 1);
-            assert_eq!(report.failed, 0);
+            assert_eq!(report.shells_launched, 0);
+            assert_eq!(report.failed, 1);
+            assert_eq!(report.results.len(), 1);
+            assert!(!report.results[0].success);
+            assert!(
+                report.results[0]
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("PTY command injection is refused"))
+            );
+            assert_eq!(mock.pane_state(100).await.unwrap().content, "");
         });
     }
 
@@ -1602,10 +1616,10 @@ mod tests {
             ];
 
             let report = launcher.execute(&plans).await;
-            assert_eq!(report.shells_launched, 1);
+            assert_eq!(report.shells_launched, 0);
             assert_eq!(report.skipped, 1);
             assert_eq!(report.manual, 1);
-            assert_eq!(report.failed, 0);
+            assert_eq!(report.failed, 1);
             assert_eq!(report.results.len(), 3);
         });
     }

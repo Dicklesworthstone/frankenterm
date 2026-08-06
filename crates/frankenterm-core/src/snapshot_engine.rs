@@ -2743,7 +2743,7 @@ impl SnapshotEngine {
                 );
                 Err(error)
             }
-            Err(error) => {
+            Err(error) if error.is_retry_safe_scheduler_failure() => {
                 tracing::warn!(
                     error = %error,
                     retry_delay_seconds = CHECKPOINT_CLEANUP_RETRY_DELAY.as_secs(),
@@ -2751,6 +2751,7 @@ impl SnapshotEngine {
                 );
                 Ok(())
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -2785,11 +2786,11 @@ impl SnapshotEngine {
         let db_path = Arc::clone(&self.db_path);
         let deleted = self
             .spawn_blocking_authority_with_cx(
-            cx,
-            SnapshotAuthorityOperation::CheckpointDelete,
-            move || delete_checkpoint_authoritatively_sync(&db_path, &target),
-        )
-        .await?;
+                cx,
+                SnapshotAuthorityOperation::CheckpointDelete,
+                move || delete_checkpoint_authoritatively_sync(&db_path, &target),
+            )
+            .await?;
         if deleted.is_some() {
             *last_dedup_hash = None;
         }

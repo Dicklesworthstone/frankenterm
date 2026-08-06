@@ -6535,7 +6535,7 @@ mod tests {
                  pane_count, total_bytes, metadata_json
              ) VALUES
                  (-2, 'session-a',  70, 'startup',  'dddddddddddddddd', 2, 0,
-                      '{"old_to_new":{"7":8,"7":9}}'),
+                      '{\"old_to_new\":{\"7\":8,\"7\":9}}'),
                  (-1, 'session-a',  80, 'startup',  'restore',          0, 0,
                       '{"old_to_new":{}}'),
                  ( 0, 'session-a',  90, 'startup',  '0000000000000000', 0, 0,

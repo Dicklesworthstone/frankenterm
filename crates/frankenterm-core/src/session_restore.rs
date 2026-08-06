@@ -491,7 +491,8 @@ pub(crate) fn assess_clean_authority(
                AND NOT EXISTS (
                    SELECT 1
                    FROM restore_attempt_lifecycle AS lifecycle
-                   WHERE lifecycle.intent_checkpoint_id = intent.id
+                   WHERE lifecycle.session_id = intent.session_id
+                     AND lifecycle.intent_checkpoint_id = intent.id
                )
          )",
         [session_id],
