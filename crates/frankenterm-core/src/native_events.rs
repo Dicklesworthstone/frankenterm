@@ -1721,6 +1721,23 @@ async fn dispatch_event_with_timeout(
     dispatch_event_with_timeout_with_cx(&cx, event_tx, event, send_timeout).await
 }
 
+/// Return whether the caller capability has ended through cancellation or a
+/// finite budget. A timeout can be driven either by the explicit send limit or
+/// by an earlier capability deadline; `timeout_with_cx_typed` intentionally
+/// reports both as `Elapsed`, so the caller must inspect the Cx to preserve the
+/// distinction. The budget snapshot catches exhaustion before a timer has
+/// materialized it as a root cancellation cause.
+fn native_dispatch_context_ended(cx: &crate::cx::Cx) -> bool {
+    if cx.checkpoint().is_err() || cx.root_cancel_cause().is_some() {
+        return true;
+    }
+
+    let budget = cx.budget_stats();
+    (budget.deadline.at.is_some() && budget.deadline.remaining.is_none())
+        || budget.polls.remaining == Some(0)
+        || budget.cost.remaining == Some(0)
+}
+
 /// ft-xbnl0.2.3 Cx-first sibling of [`dispatch_event_with_timeout`].
 ///
 /// Threads the caller's cx into the `event_tx.reserve(cx)` wait,
@@ -1735,23 +1752,27 @@ async fn dispatch_event_with_timeout_with_cx(
     event: NativeEvent,
     send_timeout: Duration,
 ) -> EventDispatchOutcome {
-    match crate::runtime_async::timeout_with_cx(cx, send_timeout, event_tx.reserve(cx)).await {
+    match crate::runtime_async::timeout_with_cx_typed(cx, send_timeout, event_tx.reserve(cx)).await {
         Ok(Ok(permit)) => {
             // Reserving capacity is an await boundary. Do not commit an event
             // if cancellation/budget exhaustion won concurrently with the
             // permit becoming ready.
-            if cx.checkpoint().is_err() {
-                return EventDispatchOutcome::Backpressure;
+            if native_dispatch_context_ended(cx) {
+                return EventDispatchOutcome::ContextEnded;
             }
             permit.send(event);
             EventDispatchOutcome::Sent
         }
-        Ok(Err(_)) => EventDispatchOutcome::Closed,
-        // `timeout_with_cx` Err surfaces as Backpressure to match
-        // the legacy semantics — at this layer we can't
-        // distinguish "queue full too long" from "parent cx
-        // cancelled", and both warrant dropping the event.
-        Err(_) => EventDispatchOutcome::Backpressure,
+        Ok(Err(mpsc::SendError::Disconnected(()))) => EventDispatchOutcome::Closed,
+        Ok(Err(mpsc::SendError::Cancelled(()))) => EventDispatchOutcome::ContextEnded,
+        Ok(Err(mpsc::SendError::Full(()))) => EventDispatchOutcome::Backpressure,
+        Err(crate::runtime_async::TimeoutError::Elapsed) => {
+            if native_dispatch_context_ended(cx) {
+                EventDispatchOutcome::ContextEnded
+            } else {
+                EventDispatchOutcome::Backpressure
+            }
+        }
     }
 }
 
@@ -1892,7 +1913,11 @@ mod native_accept_error_classifier_tests {
             std::io::ErrorKind::NotConnected,
             std::io::ErrorKind::BrokenPipe,
         ] {
-            assert!(native_accept_error_is_permanent(kind), "kind={kind:?}");
+            let error = std::io::Error::from(kind);
+            assert!(
+                native_accept_error_is_permanent(&error),
+                "kind={kind:?}"
+            );
         }
 
         for kind in [
@@ -1901,7 +1926,30 @@ mod native_accept_error_classifier_tests {
             std::io::ErrorKind::ConnectionAborted,
             std::io::ErrorKind::Other,
         ] {
-            assert!(!native_accept_error_is_permanent(kind), "kind={kind:?}");
+            let error = std::io::Error::from(kind);
+            assert!(
+                !native_accept_error_is_permanent(&error),
+                "kind={kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn invalid_unix_listener_descriptor_is_classified_from_raw_code() {
+        let error = std::io::Error::from_raw_os_error(9);
+        assert!(native_accept_error_is_permanent(&error));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn invalid_windows_listener_handles_are_classified_from_raw_codes() {
+        for raw_os_error in [6, 10_038] {
+            let error = std::io::Error::from_raw_os_error(raw_os_error);
+            assert!(
+                native_accept_error_is_permanent(&error),
+                "raw_os_error={raw_os_error}"
+            );
         }
     }
 
@@ -3042,7 +3090,7 @@ mod tests {
                     Duration::from_millis(50),
                 )
                 .await,
-                EventDispatchOutcome::Backpressure
+                EventDispatchOutcome::ContextEnded
             );
             assert!(
                 event_rx.try_recv().is_err(),
@@ -3576,15 +3624,35 @@ mod tests {
             )
             .await;
 
-            // Pre-cancelled cx causes channel reserve to fail (Closed) or
-            // timeout to fire (Backpressure) — either way the event is dropped.
-            assert!(
-                matches!(
-                    outcome,
-                    EventDispatchOutcome::Backpressure | EventDispatchOutcome::Closed
-                ),
-                "pre-cancelled cx should drop the event, got {outcome:?}"
+            assert_eq!(
+                outcome,
+                EventDispatchOutcome::ContextEnded,
+                "pre-cancelled cx must not be reported as closure or queue pressure"
             );
+        });
+    }
+
+    #[test]
+    fn dispatch_event_reports_expired_capability_budget_separately_from_backpressure() {
+        run_async_test(async {
+            let (tx, _rx) = mpsc::channel(1);
+            send_value(&tx, pane_destroyed_event(1))
+                .await
+                .expect("first send should fill the queue");
+            let cx = crate::cx::Cx::for_testing_with_budget(
+                crate::cx::Budget::new()
+                    .with_deadline(crate::runtime_async::RuntimeTime::ZERO),
+            );
+
+            let outcome = dispatch_event_with_timeout_with_cx(
+                &cx,
+                &tx,
+                pane_destroyed_event(2),
+                Duration::from_secs(1),
+            )
+            .await;
+
+            assert_eq!(outcome, EventDispatchOutcome::ContextEnded);
         });
     }
 
@@ -3868,6 +3936,14 @@ mod tests {
         );
         assert_ne!(
             EventDispatchOutcome::Backpressure,
+            EventDispatchOutcome::Closed
+        );
+        assert_ne!(
+            EventDispatchOutcome::ContextEnded,
+            EventDispatchOutcome::Backpressure
+        );
+        assert_ne!(
+            EventDispatchOutcome::ContextEnded,
             EventDispatchOutcome::Closed
         );
     }

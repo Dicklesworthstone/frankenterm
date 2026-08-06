@@ -1134,8 +1134,18 @@ impl SnapshotEngine {
                         checkpoint_id = result.checkpoint_id,
                         "snapshot captured (cx path)"
                     );
-                    if let Err(e) = self.cleanup_with_cx(cx).await {
-                        tracing::warn!(error = %e, "snapshot retention cleanup failed (cx path)");
+                    if let Err(error) = self.cleanup_with_cx(cx).await {
+                        if error.requires_reconciliation() {
+                            tracing::warn!(
+                                error = %error,
+                                "snapshot retention cleanup requires durable-state reconciliation"
+                            );
+                            return Err(error);
+                        }
+                        tracing::warn!(
+                            error = %error,
+                            "snapshot retention cleanup failed (cx path)"
+                        );
                     }
                     Ok(true)
                 }
