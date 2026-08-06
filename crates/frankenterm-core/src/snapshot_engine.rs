@@ -1175,8 +1175,7 @@ impl SnapshotEngine {
                 }
             }
             Err(e) => {
-                if e.requires_reconciliation() {
-                    *reconciliation_required = true;
+                if latch_session_cleanup_reconciliation(reconciliation_required, e) {
                     tracing::warn!(
                         error = %e,
                         automatic_retry_suppressed = true,
@@ -1566,6 +1565,17 @@ fn session_cleanup_due(last_cleanup: Option<Instant>, interval_hours: u64, now: 
     }
 }
 
+/// Monotonically latch cleanup reconciliation after any outcome whose durable
+/// effects are indeterminate. Retry-safe failures must never clear a latch set
+/// by an earlier observation loss.
+fn latch_session_cleanup_reconciliation(
+    reconciliation_required: &mut bool,
+    error: crate::session_retention::SessionCleanupError,
+) -> bool {
+    *reconciliation_required |= error.requires_reconciliation();
+    *reconciliation_required
+}
+
 /// Generate a time-ordered session ID (UUID v7-like: timestamp prefix + random).
 fn generate_session_id() -> String {
     let ts = epoch_ms();
@@ -1936,6 +1946,36 @@ mod tests {
             !session_cleanup_due(Some(now), 24, now),
             "0 elapsed < 24h interval must not be due"
         );
+    }
+
+    #[test]
+    fn session_cleanup_reconciliation_latch_is_monotonic() {
+        use crate::session_retention::{
+            SessionCleanupError, SessionCleanupIndeterminatePhase,
+        };
+
+        let mut required = false;
+        for retry_safe in [
+            SessionCleanupError::CancelledBeforeHandoff,
+            SessionCleanupError::DatabaseOpen,
+            SessionCleanupError::DatabasePreparation,
+        ] {
+            assert!(!latch_session_cleanup_reconciliation(
+                &mut required,
+                retry_safe
+            ));
+        }
+
+        assert!(latch_session_cleanup_reconciliation(
+            &mut required,
+            SessionCleanupError::IndeterminateCleanup {
+                phase: SessionCleanupIndeterminatePhase::BlockingTaskSettlement,
+            }
+        ));
+        assert!(latch_session_cleanup_reconciliation(
+            &mut required,
+            SessionCleanupError::DatabaseOpen
+        ));
     }
 
     fn run_async_test<F>(future: F)

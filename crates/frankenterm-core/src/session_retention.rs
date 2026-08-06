@@ -168,12 +168,13 @@ pub fn cleanup_sessions(
 /// Active sessions (shutdown_clean = 0 with recent checkpoints) are preserved.
 fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize, rusqlite::Error> {
     let cutoff_ms = epoch_ms().saturating_sub(max_age_days.saturating_mul(86_400_000));
+    let cutoff_ms = i64::try_from(cutoff_ms).unwrap_or(i64::MAX);
 
     let deleted = conn.execute(
         "DELETE FROM mux_sessions
          WHERE created_at < ?1
          AND shutdown_clean = 1",
-        [cutoff_ms as i64],
+        [cutoff_ms],
     )?;
 
     Ok(deleted)
@@ -184,6 +185,7 @@ fn delete_excess_closed_sessions(
     conn: &Connection,
     max_count: usize,
 ) -> Result<usize, rusqlite::Error> {
+    let max_count = i64::try_from(max_count).unwrap_or(i64::MAX);
     let deleted = conn.execute(
         "DELETE FROM mux_sessions
          WHERE shutdown_clean = 1
@@ -193,7 +195,7 @@ fn delete_excess_closed_sessions(
              ORDER BY COALESCE(last_checkpoint_at, created_at) DESC
              LIMIT ?1
          )",
-        [max_count as i64],
+        [max_count],
     )?;
 
     Ok(deleted)
@@ -204,22 +206,29 @@ fn delete_sessions_by_size(conn: &Connection, max_total_mb: u64) -> Result<usize
     let max_bytes = max_total_mb.saturating_mul(1_024).saturating_mul(1_024);
 
     // Get total size of session data
-    let total_bytes: i64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(total_bytes), 0) FROM session_checkpoints",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    let (total_bytes, minimum_bytes): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(total_bytes), 0), COALESCE(MIN(total_bytes), 0)
+         FROM session_checkpoints",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if minimum_bytes < 0 {
+        return Err(rusqlite::Error::IntegralValueOutOfRange(
+            1,
+            minimum_bytes,
+        ));
+    }
+    let total_bytes = u64::try_from(total_bytes)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, total_bytes))?;
 
-    if (total_bytes as u64) <= max_bytes {
+    if total_bytes <= max_bytes {
         return Ok(0);
     }
 
     // Need to free: total_bytes - max_bytes
-    let to_free = (total_bytes as u64).saturating_sub(max_bytes);
+    let to_free = total_bytes.saturating_sub(max_bytes);
     let mut freed: u64 = 0;
-    let mut deleted = 0;
+    let mut deleted = 0_usize;
 
     // Get closed sessions ordered oldest first, with their checkpoint sizes
     let mut stmt = conn.prepare(
@@ -231,10 +240,16 @@ fn delete_sessions_by_size(conn: &Connection, max_total_mb: u64) -> Result<usize
          ORDER BY COALESCE(s.last_checkpoint_at, s.created_at) ASC",
     )?;
 
-    let sessions: Vec<(String, i64)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let sessions: Vec<(String, u64)> = stmt
+        .query_map([], |row| {
+            let session_id = row.get(0)?;
+            let session_bytes: i64 = row.get(1)?;
+            let session_bytes = u64::try_from(session_bytes).map_err(|_| {
+                rusqlite::Error::IntegralValueOutOfRange(1, session_bytes)
+            })?;
+            Ok((session_id, session_bytes))
+        })?
+        .collect::<Result<_, _>>()?;
 
     for (session_id, session_bytes) in sessions {
         if freed >= to_free {
@@ -246,8 +261,8 @@ fn delete_sessions_by_size(conn: &Connection, max_total_mb: u64) -> Result<usize
             [&session_id],
         )?;
 
-        freed += u64::try_from(session_bytes).unwrap_or(0);
-        deleted += 1;
+        freed = freed.saturating_add(session_bytes);
+        deleted = deleted.saturating_add(1);
 
         debug!(
             session_id = %session_id,
@@ -661,6 +676,22 @@ mod tests {
 
         let deleted = delete_sessions_by_size(&conn, 1).unwrap();
         assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn size_cleanup_rejects_negative_checkpoint_accounting_without_deleting() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        insert_session(&conn, "corrupt-size", now, true);
+        insert_checkpoint(&conn, "corrupt-size", now, -1);
+
+        let error = delete_sessions_by_size(&conn, 1)
+            .expect_err("negative byte accounting must fail closed");
+        assert!(matches!(
+            error,
+            rusqlite::Error::IntegralValueOutOfRange(1, -1)
+        ));
+        assert_eq!(count_sessions(&conn), 1);
     }
 
     // ---- Cascade delete ----
