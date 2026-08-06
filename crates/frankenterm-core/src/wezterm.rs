@@ -2004,7 +2004,7 @@ impl WeztermClient {
     }
 
     /// Cx-first [`spawn_targeted`] (ft-xbnl0.2.3). Threads caller
-    /// `&Cx` through [`Self::run_cli_with_cx`] so `wezterm cli spawn`
+    /// `&Cx` through [`Self::run_cli_mutation_with_cx`] so `wezterm cli spawn`
     /// honors caller cancellation, budget, and virtual time. The argv
     /// construction (window targeting, domain, cwd) is identical to
     /// the legacy path so both variants produce the exact same
@@ -2062,8 +2062,10 @@ impl WeztermClient {
             args.push(&cwd_arg);
         }
 
-        let output = self.run_cli_with_cx(cx, &args).await?;
-        Self::parse_pane_id(&output)
+        let output = self
+            .run_cli_mutation_with_cx(cx, &args, "spawn_targeted")
+            .await?;
+        Self::parse_mutation_pane_id("spawn_targeted", &output)
     }
 
     /// Split an existing pane
@@ -2089,7 +2091,7 @@ impl WeztermClient {
     }
 
     /// Cx-first [`split_pane`] (ft-xbnl0.2.3). Threads caller `&Cx`
-    /// through [`Self::run_cli_with_pane_check_with_cx`] so
+    /// through [`Self::run_cli_mutation_with_pane_check_with_cx`] so
     /// `wezterm cli split-pane` honors caller cancellation, budget,
     /// and virtual time. The argv construction (direction flag, cwd,
     /// percent clamp to 10-90) is identical to the legacy path so
@@ -2154,9 +2156,9 @@ impl WeztermClient {
         }
 
         let output = self
-            .run_cli_with_pane_check_with_cx(cx, &args, pane_id)
+            .run_cli_mutation_with_pane_check_with_cx(cx, &args, pane_id, "split_pane")
             .await?;
-        Self::parse_pane_id(&output)
+        Self::parse_mutation_pane_id("split_pane", &output)
     }
 
     /// Activate (focus) a specific pane
@@ -2169,7 +2171,7 @@ impl WeztermClient {
     }
 
     /// Cx-first [`activate_pane`] (ft-xbnl0.2.3). Threads caller `&Cx`
-    /// through [`Self::run_cli_with_pane_check_with_cx`] so the
+    /// through [`Self::run_cli_mutation_with_pane_check_with_cx`] so the
     /// underlying `wezterm cli activate-pane` invocation honors
     /// cancellation, budget, and virtual time from the caller's
     /// context rather than the ambient thread-local one.
@@ -2179,7 +2181,7 @@ impl WeztermClient {
         );
         let pane_id_str = pane_id.to_string();
         let args = ["cli", "activate-pane", "--pane-id", &pane_id_str];
-        self.run_cli_with_pane_check_with_cx(cx, &args, pane_id)
+        self.run_cli_mutation_with_pane_check_with_cx(cx, &args, pane_id, "activate_pane")
             .await?;
         Ok(())
     }
@@ -2232,7 +2234,7 @@ impl WeztermClient {
     }
 
     /// Cx-first [`kill_pane`] (ft-xbnl0.2.3). Threads caller `&Cx`
-    /// through [`Self::run_cli_with_pane_check_with_cx`] so the
+    /// through [`Self::run_cli_mutation_with_pane_check_with_cx`] so the
     /// `wezterm cli kill-pane` subprocess honors caller cancellation,
     /// budget, and virtual time.
     pub async fn kill_pane_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> Result<()> {
@@ -2241,7 +2243,7 @@ impl WeztermClient {
         );
         let pane_id_str = pane_id.to_string();
         let args = ["cli", "kill-pane", "--pane-id", &pane_id_str];
-        self.run_cli_with_pane_check_with_cx(cx, &args, pane_id)
+        self.run_cli_mutation_with_pane_check_with_cx(cx, &args, pane_id, "kill_pane")
             .await?;
         Ok(())
     }
@@ -2257,7 +2259,7 @@ impl WeztermClient {
     }
 
     /// Cx-first [`zoom_pane`] (ft-xbnl0.2.3). Threads caller `&Cx`
-    /// through [`Self::run_cli_with_pane_check_with_cx`] so the
+    /// through [`Self::run_cli_mutation_with_pane_check_with_cx`] so the
     /// `wezterm cli zoom-pane` subprocess honors caller cancellation,
     /// budget, and virtual time. The `--unzoom` arg selection logic is
     /// identical to the legacy path.
@@ -2272,7 +2274,7 @@ impl WeztermClient {
         if !zoom {
             args.push("--unzoom");
         }
-        self.run_cli_with_pane_check_with_cx(cx, &args, pane_id)
+        self.run_cli_mutation_with_pane_check_with_cx(cx, &args, pane_id, "zoom_pane")
             .await?;
         Ok(())
     }
@@ -2289,9 +2291,11 @@ impl WeztermClient {
     /// Cx-first `send_text_impl` (ft-xbnl0.2.3). The mux-pool fast
     /// path uses `pool.write_to_pane_with_cx(cx)` /
     /// `pool.send_paste_with_cx(cx)`. For an eligible pre-mutation transport
-    /// failure, CLI failover uses `run_cli_with_pane_check_with_cx`, preserving
-    /// the same cancellation context across both transports. Pool admission,
-    /// cancellation, and indeterminate mutation errors surface without replay.
+    /// failure, CLI failover uses
+    /// `run_cli_mutation_with_pane_check_with_cx`, preserving the same
+    /// cancellation context without overwriting a committed response at a
+    /// late checkpoint. Pool admission, cancellation, and indeterminate
+    /// mutation errors surface without replay.
     #[cfg(all(feature = "vendored", unix))]
     async fn send_text_impl_with_cx(
         &self,
@@ -2347,7 +2351,7 @@ impl WeztermClient {
         }
         args.push("--");
         args.push(text);
-        self.run_cli_with_pane_check_with_cx(cx, &args, pane_id)
+        self.run_cli_mutation_with_pane_check_with_cx(cx, &args, pane_id, "send_text")
             .await?;
         Ok(())
     }
@@ -2376,7 +2380,7 @@ impl WeztermClient {
         }
         args.push("--");
         args.push(text);
-        self.run_cli_with_pane_check_with_cx(cx, &args, pane_id)
+        self.run_cli_mutation_with_pane_check_with_cx(cx, &args, pane_id, "send_text")
             .await?;
         Ok(())
     }
@@ -2394,14 +2398,33 @@ impl WeztermClient {
         match self.run_cli_with_cx(cx, args).await {
             Ok(output) => Ok(output),
             Err(crate::Error::Wezterm(WeztermError::CommandFailed(ref stderr)))
-                if stderr.contains("pane")
-                    && (stderr.contains("not found")
-                        || stderr.contains("does not exist")
-                        || stderr.contains("no such")) =>
+                if Self::stderr_is_pane_not_found(stderr) =>
             {
                 Err(WeztermError::PaneNotFound(pane_id).into())
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Mutation counterpart to [`Self::run_cli_with_pane_check_with_cx`].
+    /// Explicit pane rejection remains `PaneNotFound`; every response-loss
+    /// class after subprocess admission stays indeterminate and is never
+    /// rewritten as retry-safe cancellation.
+    async fn run_cli_mutation_with_pane_check_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        args: &[&str],
+        pane_id: u64,
+        operation: &'static str,
+    ) -> Result<String> {
+        match self.run_cli_mutation_with_cx(cx, args, operation).await {
+            Ok(output) => Ok(output),
+            Err(crate::Error::Wezterm(WeztermError::CommandFailed(ref stderr)))
+                if Self::stderr_is_pane_not_found(stderr) =>
+            {
+                Err(WeztermError::PaneNotFound(pane_id).into())
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -2417,6 +2440,34 @@ impl WeztermClient {
     /// check and post-execution error categorization are centralized in
     /// [`Self::finalize_cli_output`].
     async fn run_cli_with_cx(&self, cx: &crate::cx::Cx, args: &[&str]) -> Result<String> {
+        self.run_cli_effect_with_cx(cx, args, CliEffect::ReadOnly)
+            .await
+    }
+
+    /// Execute a non-idempotent CLI command without fabricating retry safety.
+    ///
+    /// A pre-spawn checkpoint, missing socket, missing executable, or denied
+    /// executable proves the mutation was not admitted. Once process execution
+    /// is admitted, timeout/cancellation/I/O loss and non-authoritative command
+    /// failure become [`WeztermError::IndeterminateMutation`]. A successful
+    /// subprocess response is authoritative and is not overwritten by a Cx
+    /// cancellation that races after completion.
+    async fn run_cli_mutation_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        args: &[&str],
+        operation: &'static str,
+    ) -> Result<String> {
+        self.run_cli_effect_with_cx(cx, args, CliEffect::Mutation { operation })
+            .await
+    }
+
+    async fn run_cli_effect_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        args: &[&str],
+        effect: CliEffect,
+    ) -> Result<String> {
         use crate::runtime_async::process::Command;
 
         cx.checkpoint().map_err(|_| {
@@ -2453,6 +2504,21 @@ impl WeztermClient {
         {
             Ok(Ok(output)) => output,
             Ok(Err(error)) => {
+                if let CliEffect::Mutation { operation } = effect {
+                    // NotFound/PermissionDenied are spawn-time failures for
+                    // this command surface and prove no backend mutation ran.
+                    // Every other I/O failure may follow child admission.
+                    if cx.checkpoint().is_ok()
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound
+                                | std::io::ErrorKind::PermissionDenied
+                        )
+                    {
+                        return Err(Self::categorize_io_error(&error).into());
+                    }
+                    return Err(WeztermError::IndeterminateMutation { operation }.into());
+                }
                 if cx.checkpoint().is_err() {
                     return Err(wezterm_cx_error(
                         cx,
@@ -2463,6 +2529,9 @@ impl WeztermClient {
                 return Err(Self::categorize_io_error(&error).into());
             }
             Err(_) => {
+                if let CliEffect::Mutation { operation } = effect {
+                    return Err(WeztermError::IndeterminateMutation { operation }.into());
+                }
                 if cx.checkpoint().is_err() {
                     return Err(wezterm_cx_error(
                         cx,
@@ -2474,15 +2543,30 @@ impl WeztermClient {
             }
         };
 
-        cx.checkpoint().map_err(|_| {
-            wezterm_cx_error(
-                cx,
-                "wezterm cli",
-                "capability checkpoint failed after subprocess completion",
-            )
-        })?;
+        Self::finalize_cli_effect_after_wait(cx, effect, output)
+    }
 
-        Self::finalize_cli_output(output)
+    fn finalize_cli_effect_after_wait(
+        cx: &crate::cx::Cx,
+        effect: CliEffect,
+        output: std::process::Output,
+    ) -> Result<String> {
+        if matches!(effect, CliEffect::ReadOnly) {
+            cx.checkpoint().map_err(|_| {
+                wezterm_cx_error(
+                    cx,
+                    "wezterm cli",
+                    "capability checkpoint failed after subprocess completion",
+                )
+            })?;
+        }
+
+        match effect {
+            CliEffect::ReadOnly => Self::finalize_cli_output(output),
+            CliEffect::Mutation { operation } => {
+                Self::finalize_cli_mutation_output(output, operation)
+            }
+        }
     }
 
     /// Shared post-timeout validation: checks exit status, stderr
@@ -2515,6 +2599,35 @@ impl WeztermClient {
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    fn stderr_is_pane_not_found(stderr: &str) -> bool {
+        stderr.contains("pane")
+            && (stderr.contains("not found")
+                || stderr.contains("does not exist")
+                || stderr.contains("no such"))
+    }
+
+    fn finalize_cli_mutation_output(
+        output: std::process::Output,
+        operation: &'static str,
+    ) -> Result<String> {
+        match Self::finalize_cli_output(output) {
+            Ok(output) => Ok(output),
+            // These finite classes prove rejection before a mux-side effect.
+            Err(error @ crate::Error::Wezterm(WeztermError::NotRunning)) => Err(error),
+            Err(crate::Error::Wezterm(WeztermError::CommandFailed(stderr)))
+                if Self::stderr_is_pane_not_found(&stderr) =>
+            {
+                Err(WeztermError::CommandFailed(stderr).into())
+            }
+            Err(_) => Err(WeztermError::IndeterminateMutation { operation }.into()),
+        }
+    }
+
+    fn parse_mutation_pane_id(operation: &'static str, output: &str) -> Result<u64> {
+        Self::parse_pane_id(output)
+            .map_err(|_| WeztermError::IndeterminateMutation { operation }.into())
     }
 
     /// Guards a parsed-JSON *metadata* command's stdout against
@@ -2642,22 +2755,71 @@ impl WeztermClient {
     }
 
     #[cfg(all(feature = "vendored", unix))]
-    fn mux_cancelled_error(op: &str, err: crate::vendored::MuxPoolError) -> crate::Error {
+    fn mux_cancelled_error(
+        op: &'static str,
+        err: crate::vendored::MuxPoolError,
+    ) -> crate::Error {
+        use crate::error::RuntimeOperationSource;
+        use crate::runtime_async::LockAcquireError;
+
+        let runtime_failure = |source| crate::Error::RuntimeOperation {
+            operation: op,
+            source,
+        };
         match &err {
             crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::Cancelled) => {
-                crate::Error::runtime_cancelled(
-                    "wezterm mux operation",
-                    format!("{op} cancelled by pool context"),
-                )
+                runtime_failure(RuntimeOperationSource::Cancelled(
+                    "mux_pool_context_cancelled".to_string(),
+                ))
             }
-            crate::vendored::MuxPoolError::Mux(mux)
-            | crate::vendored::MuxPoolError::IndeterminateMutation(mux)
-                if mux.is_cancelled() =>
-            {
-                crate::Error::runtime_cancelled(
-                    "wezterm mux operation",
-                    format!("{op} cancelled by transport context"),
-                )
+            crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::DeadlineExceeded) => {
+                runtime_failure(RuntimeOperationSource::DeadlineExceeded)
+            }
+            crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::PollQuotaExhausted) => {
+                runtime_failure(RuntimeOperationSource::PollQuotaExhausted)
+            }
+            crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::CostBudgetExhausted) => {
+                runtime_failure(RuntimeOperationSource::CostBudgetExhausted)
+            }
+            crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::ContextFailure) => {
+                runtime_failure(RuntimeOperationSource::ContextFailure)
+            }
+            crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::LockTimedOut { .. }) => {
+                runtime_failure(RuntimeOperationSource::LockTimedOut)
+            }
+            crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::PolledAfterCompletion) => {
+                runtime_failure(RuntimeOperationSource::PolledAfterCompletion)
+            }
+            crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::LockAcquire(lock)) => {
+                let source = match lock {
+                    LockAcquireError::Poisoned => RuntimeOperationSource::LockPoisoned,
+                    LockAcquireError::Cancelled => RuntimeOperationSource::Cancelled(
+                        "mux_pool_lock_cancelled".to_string(),
+                    ),
+                    LockAcquireError::DeadlineExceeded => {
+                        RuntimeOperationSource::DeadlineExceeded
+                    }
+                    LockAcquireError::PollQuotaExhausted => {
+                        RuntimeOperationSource::PollQuotaExhausted
+                    }
+                    LockAcquireError::CostBudgetExhausted => {
+                        RuntimeOperationSource::CostBudgetExhausted
+                    }
+                    LockAcquireError::ContextFailure => RuntimeOperationSource::ContextFailure,
+                    LockAcquireError::TimedOut { .. } => RuntimeOperationSource::LockTimedOut,
+                    LockAcquireError::PolledAfterCompletion => {
+                        RuntimeOperationSource::PolledAfterCompletion
+                    }
+                };
+                runtime_failure(source)
+            }
+            crate::vendored::MuxPoolError::IndeterminateMutation(_) => {
+                WeztermError::IndeterminateMutation { operation: op }.into()
+            }
+            crate::vendored::MuxPoolError::Mux(mux) if mux.is_cancelled() => {
+                runtime_failure(RuntimeOperationSource::Cancelled(
+                    "mux_transport_context_cancelled".to_string(),
+                ))
             }
             _ => WeztermError::CommandFailed(format!(
                 "wezterm mux {op} failed without CLI fallback: {err}"
@@ -6123,14 +6285,18 @@ mod tests {
     fn mux_cancelled_error_maps_to_cancelled_core_error() {
         let err = crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::Cancelled);
         let mapped = WeztermClient::mux_cancelled_error("list_panes", err);
-        assert!(
-            matches!(mapped, crate::Error::Cancelled(message) if message.contains("list_panes"))
-        );
+        assert!(matches!(
+            mapped,
+            crate::Error::RuntimeOperation {
+                operation: "list_panes",
+                source: crate::error::RuntimeOperationSource::Cancelled(detail),
+            } if detail == "mux_pool_context_cancelled"
+        ));
     }
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
-    fn indeterminate_mutation_preserves_typed_cancellation() {
+    fn indeterminate_mutation_never_becomes_retry_safe_cancellation() {
         let err = crate::vendored::MuxPoolError::IndeterminateMutation(
             crate::vendored::DirectMuxError::Cancelled {
                 phase: "mutation_response_wait",
@@ -6140,8 +6306,65 @@ mod tests {
         let mapped = WeztermClient::mux_cancelled_error("send_text_with_cx", err);
         assert!(matches!(
             mapped,
-            crate::Error::Cancelled(message) if message.contains("send_text_with_cx")
+            crate::Error::Wezterm(WeztermError::IndeterminateMutation {
+                operation: "send_text_with_cx"
+            })
         ));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_pool_context_failures_preserve_finite_root_cause() {
+        let cases = [
+            (
+                crate::pool::PoolError::DeadlineExceeded,
+                crate::error::RuntimeOperationSource::DeadlineExceeded,
+            ),
+            (
+                crate::pool::PoolError::PollQuotaExhausted,
+                crate::error::RuntimeOperationSource::PollQuotaExhausted,
+            ),
+            (
+                crate::pool::PoolError::CostBudgetExhausted,
+                crate::error::RuntimeOperationSource::CostBudgetExhausted,
+            ),
+            (
+                crate::pool::PoolError::ContextFailure,
+                crate::error::RuntimeOperationSource::ContextFailure,
+            ),
+            (
+                crate::pool::PoolError::LockTimedOut { deadline_nanos: 9 },
+                crate::error::RuntimeOperationSource::LockTimedOut,
+            ),
+            (
+                crate::pool::PoolError::PolledAfterCompletion,
+                crate::error::RuntimeOperationSource::PolledAfterCompletion,
+            ),
+            (
+                crate::pool::PoolError::LockAcquire(
+                    crate::runtime_async::LockAcquireError::Poisoned,
+                ),
+                crate::error::RuntimeOperationSource::LockPoisoned,
+            ),
+            (
+                crate::pool::PoolError::LockAcquire(
+                    crate::runtime_async::LockAcquireError::TimedOut { deadline_nanos: 9 },
+                ),
+                crate::error::RuntimeOperationSource::LockTimedOut,
+            ),
+        ];
+
+        for (pool_error, expected_source) in cases {
+            let mapped = WeztermClient::mux_cancelled_error(
+                "list_panes",
+                crate::vendored::MuxPoolError::Pool(pool_error),
+            );
+            let crate::Error::RuntimeOperation { operation, source } = mapped else {
+                panic!("pool context failure must remain a runtime operation");
+            };
+            assert_eq!(operation, "list_panes");
+            assert_eq!(source, expected_source);
+        }
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -6173,6 +6396,95 @@ mod tests {
     #[test]
     fn parse_pane_id_with_whitespace() {
         assert_eq!(WeztermClient::parse_pane_id("  123  \n").unwrap(), 123);
+    }
+
+    #[cfg(unix)]
+    fn synthetic_cli_output(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_mutation_success_is_authoritative_after_late_cancellation() {
+        let cx = crate::cx::for_testing();
+        cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("SECRET late cancellation after mutation response"),
+        );
+
+        let mutation = WeztermClient::finalize_cli_effect_after_wait(
+            &cx,
+            CliEffect::Mutation {
+                operation: "send_text",
+            },
+            synthetic_cli_output(true, "", ""),
+        );
+        assert_eq!(mutation.unwrap(), "");
+
+        let read = WeztermClient::finalize_cli_effect_after_wait(
+            &cx,
+            CliEffect::ReadOnly,
+            synthetic_cli_output(true, "pane text", ""),
+        )
+        .expect_err("a read completed after cancellation must not escape");
+        assert!(wezterm_error_is_cancelled(&read));
+        assert!(!read.to_string().contains("SECRET"));
+        assert!(!format!("{read:?}").contains("SECRET"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_mutation_failure_taxonomy_prevents_blind_replay() {
+        let pane_rejection = WeztermClient::finalize_cli_mutation_output(
+            synthetic_cli_output(false, "", "pane 41 not found"),
+            "kill_pane",
+        );
+        assert!(matches!(
+            pane_rejection,
+            Err(crate::Error::Wezterm(WeztermError::CommandFailed(detail)))
+                if detail.contains("pane 41 not found")
+        ));
+
+        let not_running = WeztermClient::finalize_cli_mutation_output(
+            synthetic_cli_output(false, "", "Connection refused"),
+            "send_text",
+        );
+        assert!(matches!(
+            not_running,
+            Err(crate::Error::Wezterm(WeztermError::NotRunning))
+        ));
+
+        let unknown = WeztermClient::finalize_cli_mutation_output(
+            synthetic_cli_output(false, "", "remote response was lost after dispatch"),
+            "send_text",
+        )
+        .expect_err("unproven mutation rejection must be indeterminate");
+        assert!(matches!(
+            unknown,
+            crate::Error::Wezterm(WeztermError::IndeterminateMutation {
+                operation: "send_text"
+            })
+        ));
+        assert!(!unknown.to_string().contains("remote response"));
+        assert!(!format!("{unknown:?}").contains("remote response"));
+    }
+
+    #[test]
+    fn malformed_successful_spawn_receipt_is_indeterminate() {
+        let error = WeztermClient::parse_mutation_pane_id("spawn_targeted", "not-a-pane-id")
+            .expect_err("the pane may exist even when its receipt is malformed");
+        assert!(matches!(
+            error,
+            crate::Error::Wezterm(WeztermError::IndeterminateMutation {
+                operation: "spawn_targeted"
+            })
+        ));
     }
 
     #[test]
@@ -7890,23 +8202,28 @@ fn allocate_mock_id(counter: &AtomicU64, label: &str) -> crate::Result<u64> {
 }
 
 fn mock_lock_error(
-    cx: &crate::cx::Cx,
+    _cx: &crate::cx::Cx,
     operation: &'static str,
     error: crate::runtime_async::LockAcquireError,
 ) -> crate::Error {
-    match error {
-        crate::runtime_async::LockAcquireError::Cancelled =>
-            wezterm_cx_error(cx, operation, "lock acquisition cancelled"),
-        crate::runtime_async::LockAcquireError::TimedOut { .. } => {
-            crate::Error::runtime_backend(operation, "lock acquisition timed out")
+    use crate::error::RuntimeOperationSource;
+    use crate::runtime_async::LockAcquireError;
+
+    let source = match error {
+        LockAcquireError::Cancelled => {
+            RuntimeOperationSource::Cancelled("mock_lock_cancelled".to_string())
         }
-        crate::runtime_async::LockAcquireError::Poisoned => {
-            crate::Error::runtime_backend(operation, "lock poisoned")
+        LockAcquireError::DeadlineExceeded => RuntimeOperationSource::DeadlineExceeded,
+        LockAcquireError::PollQuotaExhausted => RuntimeOperationSource::PollQuotaExhausted,
+        LockAcquireError::CostBudgetExhausted => RuntimeOperationSource::CostBudgetExhausted,
+        LockAcquireError::ContextFailure => RuntimeOperationSource::ContextFailure,
+        LockAcquireError::TimedOut { .. } => RuntimeOperationSource::LockTimedOut,
+        LockAcquireError::Poisoned => RuntimeOperationSource::LockPoisoned,
+        LockAcquireError::PolledAfterCompletion => {
+            RuntimeOperationSource::PolledAfterCompletion
         }
-        crate::runtime_async::LockAcquireError::PolledAfterCompletion => {
-            crate::Error::runtime_backend(operation, "lock future polled after completion")
-        }
-    }
+    };
+    crate::Error::RuntimeOperation { operation, source }
 }
 
 fn mock_checkpoint(cx: &crate::cx::Cx, operation: &'static str) -> crate::Result<()> {
@@ -8996,35 +9313,52 @@ mod mock_tests {
         let deadline = mock_lock_error(
             &deadline_cx,
             "mock classification",
-            crate::runtime_async::LockAcquireError::Cancelled,
+            crate::runtime_async::LockAcquireError::DeadlineExceeded,
         );
         assert!(matches!(
             deadline,
             crate::Error::RuntimeOperation {
                 operation: "mock classification",
-                source: crate::error::RuntimeOperationSource::Backend(_),
+                source: crate::error::RuntimeOperationSource::DeadlineExceeded,
             }
         ));
         assert!(!deadline.to_string().contains("SECRET"));
         assert!(!format!("{deadline:?}").contains("SECRET"));
 
         let active_cx = crate::cx::for_testing();
-        for lock_error in [
-            crate::runtime_async::LockAcquireError::TimedOut { deadline_nanos: 7 },
-            crate::runtime_async::LockAcquireError::Poisoned,
-            crate::runtime_async::LockAcquireError::PolledAfterCompletion,
-        ] {
+        let cases = [
+            (
+                crate::runtime_async::LockAcquireError::PollQuotaExhausted,
+                crate::error::RuntimeOperationSource::PollQuotaExhausted,
+            ),
+            (
+                crate::runtime_async::LockAcquireError::CostBudgetExhausted,
+                crate::error::RuntimeOperationSource::CostBudgetExhausted,
+            ),
+            (
+                crate::runtime_async::LockAcquireError::ContextFailure,
+                crate::error::RuntimeOperationSource::ContextFailure,
+            ),
+            (
+                crate::runtime_async::LockAcquireError::TimedOut { deadline_nanos: 7 },
+                crate::error::RuntimeOperationSource::LockTimedOut,
+            ),
+            (
+                crate::runtime_async::LockAcquireError::Poisoned,
+                crate::error::RuntimeOperationSource::LockPoisoned,
+            ),
+            (
+                crate::runtime_async::LockAcquireError::PolledAfterCompletion,
+                crate::error::RuntimeOperationSource::PolledAfterCompletion,
+            ),
+        ];
+        for (lock_error, expected_source) in cases {
             let mapped = mock_lock_error(&active_cx, "mock classification", lock_error);
-            assert!(
-                matches!(
-                    mapped,
-                    crate::Error::RuntimeOperation {
-                        operation: "mock classification",
-                        source: crate::error::RuntimeOperationSource::Backend(_),
-                    }
-                ),
-                "non-cancellation lock failure must remain a backend error: {lock_error:?}"
-            );
+            let crate::Error::RuntimeOperation { operation, source } = mapped else {
+                panic!("lock failure must remain a runtime operation: {lock_error:?}");
+            };
+            assert_eq!(operation, "mock classification");
+            assert_eq!(source, expected_source, "lock error: {lock_error:?}");
         }
     }
 
