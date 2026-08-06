@@ -478,7 +478,7 @@ impl<T> Mutex<T> {
     }
 
     pub async fn lock(&self) -> MutexGuard<'_, T> {
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.lock_with_cx(&cx)
             .await
             .expect("runtime_async mutex lock failed")
@@ -548,7 +548,7 @@ impl<T> RwLock<T> {
 
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
     pub async fn read(&self) -> RwLockReadGuard<'_, T> {
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.read_with_cx(&cx)
             .await
             .expect("runtime_async rwlock read failed")
@@ -582,7 +582,7 @@ impl<T> RwLock<T> {
 
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
     pub async fn write(&self) -> RwLockWriteGuard<'_, T> {
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.write_with_cx(&cx)
             .await
             .expect("runtime_async rwlock write failed")
@@ -3694,9 +3694,13 @@ where
         .map_err(|err| err.to_string())
 }
 
-fn cx_timer_now(cx: &crate::cx::Cx) -> asupersync::Time {
+pub(crate) fn timer_now_with_cx(cx: &crate::cx::Cx) -> asupersync::Time {
     cx.timer_driver()
         .map_or_else(asupersync::time::wall_now, |driver| driver.now())
+}
+
+fn cx_timer_now(cx: &crate::cx::Cx) -> asupersync::Time {
+    timer_now_with_cx(cx)
 }
 
 /// Runs blocking work on the active runtime's blocking executor.
@@ -9965,13 +9969,15 @@ mod tests {
             });
         }
 
-        /// Ambient lock helpers intentionally create an independent request Cx
-        /// instead of inheriting an installed caller context. Cancelling the
-        /// installed context therefore cannot turn their infallible contract
-        /// into a panic.
+        /// Ambient lock helpers must inherit an installed caller context rather
+        /// than minting a new full-capability request context. Their historical
+        /// infallible signature still panics when that inherited context cannot
+        /// acquire, but cancelled work is never allowed to escape its scope.
         #[test]
-        fn ambient_locks_ignore_cancelled_installed_cx() {
+        fn ambient_locks_do_not_escape_cancelled_installed_cx() {
             run_lab(0x10C5_10C5_C410_4014, || async move {
+                use futures::FutureExt as _;
+
                 let installed = crate::cx::Cx::current().expect("lab task installs a Cx");
                 installed.cancel_with(
                     crate::outcome::CancelKind::User,
@@ -9979,12 +9985,29 @@ mod tests {
                 );
 
                 let mutex = Mutex::new(11u32);
-                assert_eq!(*mutex.lock().await, 11);
+                assert!(
+                    std::panic::AssertUnwindSafe(mutex.lock())
+                        .catch_unwind()
+                        .await
+                        .is_err(),
+                    "ambient mutex must inherit the cancelled task context"
+                );
 
                 let rwlock = RwLock::new(12u32);
-                assert_eq!(*rwlock.read().await, 12);
-                *rwlock.write().await = 13;
-                assert_eq!(*rwlock.read().await, 13);
+                assert!(
+                    std::panic::AssertUnwindSafe(rwlock.read())
+                        .catch_unwind()
+                        .await
+                        .is_err(),
+                    "ambient rwlock read must inherit the cancelled task context"
+                );
+                assert!(
+                    std::panic::AssertUnwindSafe(rwlock.write())
+                        .catch_unwind()
+                        .await
+                        .is_err(),
+                    "ambient rwlock write must inherit the cancelled task context"
+                );
             });
         }
 

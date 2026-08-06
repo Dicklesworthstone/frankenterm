@@ -590,10 +590,10 @@ impl MuxWatchdog {
 
     /// Run a single health check and return the sample.
     pub async fn check(&mut self) -> MuxHealthSample {
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.check_cx(&cx)
             .await
-            .expect("fresh mux watchdog check context cannot be cancelled")
+            .expect("infallible ambient mux watchdog check failed")
     }
 
     /// Run a single health check under an explicit `&Cx` (ft-xbnl0.2.2

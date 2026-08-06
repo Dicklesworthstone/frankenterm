@@ -1252,10 +1252,10 @@ impl MuxPool {
 
     /// Evict idle connections that have exceeded the idle timeout.
     pub async fn evict_idle(&self) -> usize {
-        let cleanup_cx = cx::for_request();
-        self.evict_idle_with_cx(&cleanup_cx)
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.evict_idle_with_cx(&cx)
             .await
-            .expect("infallible mux pool eviction failed under independent cleanup context")
+            .expect("infallible ambient mux pool eviction failed")
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`Self::evict_idle`].
@@ -1282,10 +1282,10 @@ impl MuxPool {
 
     /// Clear all idle connections from the pool.
     pub async fn clear(&self) {
-        let cleanup_cx = cx::for_request();
-        self.clear_with_cx(&cleanup_cx)
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.clear_with_cx(&cx)
             .await
-            .expect("infallible mux pool clear failed under independent cleanup context");
+            .expect("infallible ambient mux pool clear failed");
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`Self::clear`].
@@ -1309,10 +1309,10 @@ impl MuxPool {
 
     /// Get pool statistics.
     pub async fn stats(&self) -> MuxPoolStats {
-        let snapshot_cx = cx::for_request();
-        self.stats_with_cx(&snapshot_cx)
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.stats_with_cx(&cx)
             .await
-            .expect("infallible mux pool stats failed under independent snapshot context")
+            .expect("infallible ambient mux pool stats failed")
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`Self::stats`].

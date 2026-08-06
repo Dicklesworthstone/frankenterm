@@ -2445,7 +2445,7 @@ impl WeztermClient {
                         "wezterm cli cancelled while awaiting subprocess: {cancel}"
                     )));
                 }
-                return Err(Self::categorize_io_error(&error));
+                return Err(Self::categorize_io_error(&error).into());
             }
             Err(_) => {
                 if let Err(cancel) = cx.checkpoint() {

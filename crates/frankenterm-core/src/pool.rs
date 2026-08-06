@@ -270,10 +270,10 @@ impl<C: Send + 'static> Pool<C> {
     /// If the pool's idle queue is already at capacity, the connection is
     /// dropped instead.
     pub async fn put(&self, conn: C) {
-        let cleanup_cx = cx::for_request();
-        self.put_with_cx(&cleanup_cx, conn)
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.put_with_cx(&cx, conn)
             .await
-            .expect("infallible pool return failed under independent cleanup context");
+            .expect("infallible ambient pool return failed");
     }
 
     /// Return a connection to the pool under an explicit `&Cx`
@@ -306,10 +306,10 @@ impl<C: Send + 'static> Pool<C> {
 
     /// Evict idle connections that have exceeded the idle timeout.
     pub async fn evict_idle(&self) -> usize {
-        let cleanup_cx = cx::for_request();
-        self.evict_idle_with_cx(&cleanup_cx)
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.evict_idle_with_cx(&cx)
             .await
-            .expect("infallible pool eviction failed under independent cleanup context")
+            .expect("infallible ambient pool eviction failed")
     }
 
     /// Evict expired idle connections under an explicit `&Cx`
@@ -329,10 +329,10 @@ impl<C: Send + 'static> Pool<C> {
 
     /// Get current pool statistics.
     pub async fn stats(&self) -> PoolStats {
-        let snapshot_cx = cx::for_request();
-        self.stats_with_cx(&snapshot_cx)
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.stats_with_cx(&cx)
             .await
-            .expect("infallible pool stats failed under independent snapshot context")
+            .expect("infallible ambient pool stats failed")
     }
 
     /// Get current pool statistics under an explicit `&Cx`
@@ -363,10 +363,10 @@ impl<C: Send + 'static> Pool<C> {
 
     /// Drain all idle connections from the pool.
     pub async fn clear(&self) {
-        let cleanup_cx = cx::for_request();
-        self.clear_with_cx(&cleanup_cx)
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.clear_with_cx(&cx)
             .await
-            .expect("infallible pool clear failed under independent cleanup context");
+            .expect("infallible ambient pool clear failed");
     }
 
     /// Drain all idle connections under an explicit `&Cx`
