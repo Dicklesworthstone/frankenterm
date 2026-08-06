@@ -993,9 +993,9 @@ mod tests {
 
         let mut state = test_pane_state(1);
         state.agent = Some(AgentMetadata {
-            agent_type: "claude_code".into(),
-            session_id: None,
-            state: None,
+            agent_type: "raw-agent-canary".into(),
+            session_id: Some("raw-session-canary".into()),
+            state: Some("raw-state-canary".into()),
         });
 
         let plans = launcher.plan(&id_map, &[state]);
@@ -1055,8 +1055,8 @@ mod tests {
         match &plans[0].action {
             LaunchAction::Manual { hint, .. } => {
                 assert!(hint.contains("mux-native argv"));
-                assert!(!hint.contains("--resume"));
                 assert!(!hint.contains("/home/user/project"));
+                assert!(!hint.contains("raw-"));
             }
             other => panic!("expected safe Manual disposition, got {other:?}"),
         }
