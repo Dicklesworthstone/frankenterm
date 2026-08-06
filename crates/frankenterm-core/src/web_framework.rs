@@ -7,7 +7,7 @@ use crate::runtime_async::net::TcpListener;
 use crate::runtime_async::task::{self, JoinError, JoinErrorKind, JoinHandle};
 use crate::{Error, Result};
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
@@ -129,8 +129,35 @@ fn validate_unauthenticated_bind_candidates(
 }
 
 fn resolve_unauthenticated_bind_addr(bind_addr: &str) -> Result<SocketAddr> {
-    let candidates = bind_addr.to_socket_addrs().map_err(Error::Io)?;
-    validate_unauthenticated_bind_candidates(candidates)
+    if let Ok(address) = bind_addr.parse::<SocketAddr>() {
+        return validate_unauthenticated_bind_candidates([address]);
+    }
+
+    // The unauthenticated server admits only numeric loopback addresses or the
+    // exact `localhost` label. Resolve that label deterministically to IPv4
+    // loopback instead of invoking the platform DNS/NSS resolver synchronously
+    // on an async executor thread. Arbitrary hostnames are already outside the
+    // security policy and must not gain a blocking, cancellation-insensitive
+    // pre-bind resolution path.
+    let Some((host, port)) = bind_addr.rsplit_once(':') else {
+        return Err(Error::runtime_backend(
+            "web bind validation",
+            "web_bind_address_invalid",
+        ));
+    };
+    if !host.eq_ignore_ascii_case("localhost") {
+        return Err(Error::runtime_backend(
+            "web bind validation",
+            "web_bind_host_not_numeric_loopback_or_localhost",
+        ));
+    }
+    let port = port.parse::<u16>().map_err(|_| {
+        Error::runtime_backend("web bind validation", "web_bind_port_invalid")
+    })?;
+    validate_unauthenticated_bind_candidates([SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        port,
+    )])
 }
 
 fn wake_listener(addr: SocketAddr) {
@@ -644,7 +671,8 @@ mod tests {
     use super::{
         ConnectionDrainOutcome, ConnectionDrainTimerFailure, ResponseBody, StatusCode,
         WebCxFailureClass, classify_web_cx_failure, json_response_with_status,
-        listener_wake_addr, validate_unauthenticated_bind_candidates,
+        listener_wake_addr, resolve_unauthenticated_bind_addr,
+        validate_unauthenticated_bind_candidates,
         validate_unauthenticated_bound_addr, wait_for_connections_to_drain_with, web_cx_error,
     };
     use crate::error::RuntimeOperationSource;
@@ -743,6 +771,34 @@ mod tests {
                 .expect("an all-loopback resolution set is admissible"),
             first
         );
+    }
+
+    #[test]
+    fn unauthenticated_bind_resolution_is_dns_free_and_loopback_only() {
+        assert_eq!(
+            resolve_unauthenticated_bind_addr("localhost:8080").unwrap(),
+            "127.0.0.1:8080".parse().unwrap()
+        );
+        assert_eq!(
+            resolve_unauthenticated_bind_addr("LOCALHOST:0").unwrap(),
+            "127.0.0.1:0".parse().unwrap()
+        );
+        assert_eq!(
+            resolve_unauthenticated_bind_addr("[::1]:8080").unwrap(),
+            "[::1]:8080".parse().unwrap()
+        );
+
+        for rejected in [
+            "example.com:8080",
+            "localhost:not-a-port",
+            "localhost",
+            "192.0.2.1:8080",
+        ] {
+            assert!(
+                resolve_unauthenticated_bind_addr(rejected).is_err(),
+                "unauthenticated bind must reject {rejected:?} without DNS resolution"
+            );
+        }
     }
 
     #[test]
