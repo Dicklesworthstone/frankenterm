@@ -45,7 +45,7 @@ fn make_pane_state(pane_id: u64, tick: u64) -> PaneStateSnapshot {
         .with_cwd(format!("/tmp/pane-{pane_id}"))
         .with_scrollback(ScrollbackRef {
             output_segments_seq: i64::try_from(tick).unwrap_or_default(),
-            total_lines_captured: 100 + tick,
+            total_segments_captured: 100 + tick,
             last_capture_at: tick,
         })
 }
@@ -149,7 +149,7 @@ fn apply_action(
             if let Some(state) = live.get_mut(&pane_id) {
                 state.scrollback_ref = Some(ScrollbackRef {
                     output_segments_seq: i64::try_from(tick).unwrap_or_default(),
-                    total_lines_captured: 1_000 + tick,
+                    total_segments_captured: 1_000 + tick,
                     last_capture_at: tick,
                 });
                 engine.tracker_mut().mark_output(pane_id);

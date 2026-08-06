@@ -268,6 +268,7 @@ proptest! {
             skipped,
             manual,
             failed,
+            interruption: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         let back: LaunchReport = serde_json::from_str(&json).unwrap();

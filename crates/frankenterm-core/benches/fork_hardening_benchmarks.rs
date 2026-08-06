@@ -58,12 +58,12 @@ fn make_terminal(rows: u16, cols: u16) -> TerminalState {
 }
 
 fn make_pane_state(pane_id: u64, seq: i64) -> PaneStateSnapshot {
-    let line_count = u64::try_from(seq.max(0)).unwrap_or_default();
+    let segment_count = u64::try_from(seq.max(0)).unwrap_or_default();
     PaneStateSnapshot::new(pane_id, 1_000, make_terminal(24, 80))
         .with_cwd(format!("/tmp/pane-{pane_id}"))
         .with_scrollback(ScrollbackRef {
             output_segments_seq: seq,
-            total_lines_captured: 1_000 + line_count,
+            total_segments_captured: 1_000 + segment_count,
             last_capture_at: 1_000,
         })
 }
@@ -143,7 +143,7 @@ fn run_full_snapshot_capture(total_panes: usize, dirty_ratio_pct: usize, cycle: 
         let cycle_u64 = u64::try_from(cycle).unwrap_or_default();
         pane.scrollback_ref = Some(ScrollbackRef {
             output_segments_seq: i64::try_from(cycle).unwrap_or_default(),
-            total_lines_captured: 2_000 + cycle_u64,
+            total_segments_captured: 2_000 + cycle_u64,
             last_capture_at: 1_500 + cycle_u64,
         });
     }
@@ -168,7 +168,7 @@ fn run_differential_capture(total_panes: usize, dirty_ratio_pct: usize, cycle: u
             let cycle_u64 = u64::try_from(cycle).unwrap_or_default();
             state.scrollback_ref = Some(ScrollbackRef {
                 output_segments_seq: i64::try_from(cycle).unwrap_or_default(),
-                total_lines_captured: 2_000 + cycle_u64,
+                total_segments_captured: 2_000 + cycle_u64,
                 last_capture_at: 1_500 + cycle_u64,
             });
         }
@@ -196,7 +196,7 @@ fn run_snapshot_save_cycle(total_panes: usize, dirty_ratio_pct: usize, cycle: us
             let cycle_u64 = u64::try_from(cycle).unwrap_or_default();
             state.scrollback_ref = Some(ScrollbackRef {
                 output_segments_seq: i64::try_from(cycle).unwrap_or_default(),
-                total_lines_captured: 3_000 + cycle_u64,
+                total_segments_captured: 3_000 + cycle_u64,
                 last_capture_at: 2_000 + cycle_u64,
             });
         }
@@ -231,7 +231,7 @@ fn run_memory_growth_proxy(total_panes: usize, dirty_per_cycle: usize, cycles: u
                 let cycle_u64 = u64::try_from(cycle).unwrap_or_default();
                 state.scrollback_ref = Some(ScrollbackRef {
                     output_segments_seq: i64::try_from(cycle).unwrap_or_default(),
-                    total_lines_captured: 4_000 + cycle_u64,
+                    total_segments_captured: 4_000 + cycle_u64,
                     last_capture_at: 2_500 + cycle_u64,
                 });
             }

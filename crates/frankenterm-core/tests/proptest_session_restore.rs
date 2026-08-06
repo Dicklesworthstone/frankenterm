@@ -66,7 +66,7 @@ fn setup_test_db() -> (tempfile::TempDir, String, Connection) {
         );
 
         CREATE TABLE session_checkpoints (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
             checkpoint_at INTEGER NOT NULL,
             checkpoint_type TEXT NOT NULL
@@ -76,8 +76,38 @@ fn setup_test_db() -> (tempfile::TempDir, String, Connection) {
             total_bytes INTEGER NOT NULL,
             metadata_json TEXT,
             checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
-                CHECK(checkpoint_role IN ('snapshot','restore_receipt')),
-            topology_json TEXT
+                CHECK(checkpoint_role IN ('snapshot','restore_intent','restore_receipt')),
+            topology_json TEXT,
+            restore_intent_checkpoint_id INTEGER
+                REFERENCES session_checkpoints(id) ON DELETE CASCADE,
+            CHECK(checkpoint_role = 'restore_receipt'
+                  OR restore_intent_checkpoint_id IS NULL)
+        );
+
+        CREATE TABLE restore_attempt_lifecycle (
+            intent_checkpoint_id INTEGER PRIMARY KEY
+                REFERENCES session_checkpoints(id)
+                ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
+            session_id TEXT NOT NULL
+                REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
+            source_checkpoint_id INTEGER NOT NULL,
+            outcome_checkpoint_id INTEGER
+                REFERENCES session_checkpoints(id) ON DELETE SET NULL,
+            status TEXT NOT NULL
+                CHECK(status IN ('intent','outcome_complete','resolved','reconciliation_required')),
+            created_at INTEGER NOT NULL,
+            resolved_at INTEGER,
+            CHECK(intent_checkpoint_id <> source_checkpoint_id),
+            CHECK(outcome_checkpoint_id IS NULL OR outcome_checkpoint_id <> intent_checkpoint_id),
+            CHECK(outcome_checkpoint_id IS NULL OR outcome_checkpoint_id <> source_checkpoint_id),
+            CHECK(created_at >= 0),
+            CHECK(resolved_at IS NULL OR resolved_at >= created_at),
+            CHECK(
+                (status = 'intent' AND outcome_checkpoint_id IS NULL AND resolved_at IS NULL)
+                OR (status = 'outcome_complete' AND outcome_checkpoint_id IS NOT NULL AND resolved_at IS NULL)
+                OR (status = 'reconciliation_required' AND resolved_at IS NULL)
+                OR (status = 'resolved' AND resolved_at IS NOT NULL)
+            )
         );
 
         CREATE TABLE mux_pane_state (
@@ -97,6 +127,16 @@ fn setup_test_db() -> (tempfile::TempDir, String, Connection) {
         CREATE INDEX idx_checkpoints_session ON session_checkpoints(session_id, checkpoint_at);
         CREATE INDEX idx_checkpoints_session_role_latest
             ON session_checkpoints(session_id, checkpoint_role, checkpoint_at DESC, id DESC);
+        CREATE INDEX idx_checkpoints_session_role_causal
+            ON session_checkpoints(session_id, checkpoint_role, id DESC);
+        CREATE UNIQUE INDEX idx_checkpoints_restore_intent_outcome
+            ON session_checkpoints(restore_intent_checkpoint_id)
+            WHERE restore_intent_checkpoint_id IS NOT NULL;
+        CREATE INDEX idx_restore_attempt_lifecycle_session_status
+            ON restore_attempt_lifecycle(session_id, status, intent_checkpoint_id);
+        CREATE UNIQUE INDEX idx_restore_attempt_lifecycle_outcome
+            ON restore_attempt_lifecycle(outcome_checkpoint_id)
+            WHERE outcome_checkpoint_id IS NOT NULL;
         CREATE INDEX idx_pane_state_checkpoint ON mux_pane_state(checkpoint_id);",
     )
     .unwrap();
@@ -132,16 +172,34 @@ fn insert_session(
 }
 
 fn insert_clean_receipt(conn: &Connection, session_id: &str, checkpoint_at: i64) {
+    let topology_json: String = conn
+        .query_row(
+            "SELECT topology_json FROM mux_sessions WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
     conn.execute(
         "INSERT INTO session_checkpoints
          (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
           total_bytes, metadata_json, checkpoint_role, topology_json)
-         VALUES (?1, ?2, 'startup', 'restore', 0, 0,
-                 '{\"old_to_new\":{}}', 'restore_receipt', NULL)",
-        params![session_id, checkpoint_at],
+         VALUES (?1, ?2, 'shutdown', 'pending:snp2', 0, 0,
+                 NULL, 'snapshot', ?3)",
+        params![session_id, checkpoint_at, topology_json],
     )
     .unwrap();
     let receipt_id = conn.last_insert_rowid();
+    let state_hash = independent_empty_snapshot_witness(
+        session_id,
+        receipt_id,
+        checkpoint_at,
+        &topology_json,
+    );
+    conn.execute(
+        "UPDATE session_checkpoints SET state_hash = ?1 WHERE id = ?2",
+        params![state_hash, receipt_id],
+    )
+    .unwrap();
     conn.execute(
         "UPDATE mux_sessions
          SET shutdown_clean = 1,
@@ -151,6 +209,62 @@ fn insert_clean_receipt(conn: &Connection, session_id: &str, checkpoint_at: i64)
         params![session_id, checkpoint_at, receipt_id],
     )
     .unwrap();
+}
+
+fn independent_empty_snapshot_witness(
+    session_id: &str,
+    checkpoint_id: i64,
+    checkpoint_at: i64,
+    topology_json: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    fn label(hasher: &mut Sha256, label: &str) {
+        hasher.update(u32::try_from(label.len()).unwrap().to_be_bytes());
+        hasher.update(label.as_bytes());
+    }
+    fn required(hasher: &mut Sha256, label_name: &str, value: &[u8]) {
+        label(hasher, label_name);
+        hasher.update([1]);
+        hasher.update(u64::try_from(value.len()).unwrap().to_be_bytes());
+        hasher.update(value);
+    }
+    fn optional(hasher: &mut Sha256, label_name: &str, value: Option<&[u8]>) {
+        label(hasher, label_name);
+        if let Some(value) = value {
+            hasher.update([1]);
+            hasher.update(u64::try_from(value.len()).unwrap().to_be_bytes());
+            hasher.update(value);
+        } else {
+            hasher.update([0]);
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    required(
+        &mut hasher,
+        "domain",
+        b"frankenterm:snapshot-checkpoint:v2",
+    );
+    required(&mut hasher, "checkpoint_role", b"snapshot");
+    required(&mut hasher, "session_id", session_id.as_bytes());
+    required(&mut hasher, "checkpoint_id", &checkpoint_id.to_be_bytes());
+    required(&mut hasher, "checkpoint_at", &checkpoint_at.to_be_bytes());
+    required(&mut hasher, "checkpoint_type", b"shutdown");
+    required(&mut hasher, "pane_count", &0_i64.to_be_bytes());
+    required(&mut hasher, "total_bytes", &0_i64.to_be_bytes());
+    optional(&mut hasher, "metadata_json", None);
+    optional(
+        &mut hasher,
+        "topology_json",
+        Some(topology_json.as_bytes()),
+    );
+    required(
+        &mut hasher,
+        "persisted_pane_row_count",
+        &0_u64.to_be_bytes(),
+    );
+    format!("snp2:{}", hex::encode(hasher.finalize()))
 }
 
 fn insert_checkpoint(
@@ -200,6 +314,21 @@ fn insert_pane_state(
             terminal_json,
             agent_json,
         ],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_checkpoints
+         SET total_bytes = COALESCE((
+             SELECT SUM(
+                 length(terminal_state_json)
+                 + length(COALESCE(env_json, ''))
+                 + length(COALESCE(agent_metadata_json, ''))
+             )
+             FROM mux_pane_state
+             WHERE checkpoint_id = ?1
+         ), 0)
+         WHERE id = ?1",
+        [checkpoint_id],
     )
     .unwrap();
 }
@@ -325,14 +454,21 @@ fn arb_restore_summary() -> impl Strategy<Value = RestoreSummary> {
         0u64..60000,
     )
         .prop_map(
-            |(session_id, checkpoint_id, layout_result, pane_states, elapsed_ms)| RestoreSummary {
-                session_id,
-                checkpoint_id,
-                layout_result,
-                pane_states,
-                scrollback_result: None,
-                scrollback_error: None,
-                elapsed_ms,
+            |(session_id, checkpoint_id, layout_result, pane_states, elapsed_ms)| {
+                let source_marked_clean = layout_result.failed_panes.is_empty();
+                RestoreSummary {
+                    session_id,
+                    checkpoint_id,
+                    intent_checkpoint_id: checkpoint_id + 1,
+                    outcome_checkpoint_id: checkpoint_id + 2,
+                    layout_result,
+                    pane_states,
+                    scrollback_result: None,
+                    scrollback_error: None,
+                    process_launch_report: None,
+                    source_marked_clean,
+                    elapsed_ms,
+                }
             },
         )
 }
@@ -385,6 +521,7 @@ fn arb_checkpoint_info() -> impl Strategy<Value = CheckpointInfo> {
         ],
         prop_oneof![
             Just(CheckpointRole::Snapshot),
+            Just(CheckpointRole::RestoreIntent),
             Just(CheckpointRole::RestoreReceipt),
         ],
         0usize..50,
@@ -412,6 +549,10 @@ fn arb_session_doctor_report() -> impl Strategy<Value = SessionDoctorReport> {
                 unclean_sessions,
                 total_checkpoints,
                 orphaned_pane_states,
+                unresolved_restore_attempts: 0,
+                outcome_complete_restore_attempts: 0,
+                reconciliation_required_restore_attempts: 0,
+                orphaned_restore_intents: 0,
                 total_data_bytes,
             })
         },
@@ -915,7 +1056,14 @@ proptest! {
     ) {
         let (_dir, db_path, conn) = setup_test_db();
         insert_session(&conn, "sess-byid", false, 1000, "0.1.0", None);
-        let cp_id = insert_checkpoint(&conn, "sess-byid", 5000, pane_count, 2048, Some("periodic"));
+        let cp_id = insert_checkpoint(
+            &conn,
+            "sess-byid",
+            5000,
+            pane_count,
+            if pane_count == 0 { 0 } else { 2048 },
+            Some("periodic"),
+        );
 
         for p in 0..pane_count {
             insert_pane_state(&conn, cp_id, p as u64, Some("/tmp"), Some("bash"), None);
@@ -1179,6 +1327,10 @@ proptest! {
             unclean_sessions: unclean.min(total),
             total_checkpoints: 10,
             orphaned_pane_states: 0,
+            unresolved_restore_attempts: 0,
+            outcome_complete_restore_attempts: 0,
+            reconciliation_required_restore_attempts: 0,
+            orphaned_restore_intents: 0,
             total_data_bytes: 1024,
         };
         let json = serde_json::to_string(&report).unwrap();
@@ -1215,10 +1367,14 @@ proptest! {
         let summary = RestoreSummary {
             session_id,
             checkpoint_id: 1,
+            intent_checkpoint_id: 2,
+            outcome_checkpoint_id: 3,
             layout_result: layout,
             pane_states: vec![],
             scrollback_result: None,
             scrollback_error: None,
+            process_launch_report: None,
+            source_marked_clean: true,
             elapsed_ms: 50,
         };
         let formatted = format_restore_summary(&summary);

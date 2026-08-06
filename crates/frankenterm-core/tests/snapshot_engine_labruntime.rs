@@ -1,8 +1,9 @@
 //! LabRuntime-ported snapshot_engine tests for deterministic async testing.
 //!
 //! Ports snapshot_engine.rs tests from `run_async_test()`/`#[tokio::test]` to
-//! asupersync-based `RuntimeFixture`. The SnapshotEngine uses direct rusqlite
-//! I/O (not StorageHandle), so it works under RuntimeFixture's block_on.
+//! asupersync-based `RuntimeFixture`. SnapshotEngine routes its CPU-heavy
+//! preparation and SQLite work through the project blocking boundary, which
+//! remains usable from `RuntimeFixture::block_on`.
 //!
 //! Tests requiring private internals (compute_state_hash, generate_session_id,
 //! trigger_value, is_immediate_trigger, open_conn) or `runtime_async::task::spawn`
@@ -457,11 +458,17 @@ fn snapshot_shutdown_with_empty_panes_commits_terminal_receipt() {
         assert_eq!(result.pane_count, 0);
 
         let connection = Connection::open(db_path.as_str()).expect("open snapshot database");
-        let persisted: (i64, Option<i64>, Option<i64>, Option<i64>, Option<String>) = connection
+        let persisted: (i64, Option<i64>, Option<i64>, i64, String) = connection
             .query_row(
-                "SELECT shutdown_clean, clean_checkpoint_id, last_checkpoint_id, \
-                        last_checkpoint_at, state_hash \
-                 FROM mux_sessions WHERE session_id = ?1",
+                "SELECT session.shutdown_clean,
+                        session.clean_checkpoint_id,
+                        session.last_checkpoint_at,
+                        checkpoint.checkpoint_at,
+                        checkpoint.state_hash
+                 FROM mux_sessions AS session
+                 JOIN session_checkpoints AS checkpoint
+                   ON checkpoint.id = session.clean_checkpoint_id
+                 WHERE session.session_id = ?1",
                 params![result.session_id],
                 |row| {
                     Ok((
@@ -476,9 +483,9 @@ fn snapshot_shutdown_with_empty_panes_commits_terminal_receipt() {
             .expect("load terminal session receipt");
         assert_eq!(persisted.0, 1);
         assert_eq!(persisted.1, Some(result.checkpoint_id));
-        assert_eq!(persisted.2, Some(result.checkpoint_id));
-        assert_eq!(persisted.3, i64::try_from(result.checkpoint_at).ok());
-        assert_eq!(persisted.4.as_deref(), Some(result.state_hash.as_str()));
+        assert_eq!(persisted.2, i64::try_from(result.checkpoint_at).ok());
+        assert_eq!(persisted.3, i64::try_from(result.checkpoint_at).unwrap());
+        assert_eq!(persisted.4, result.state_hash);
     });
 }
 
@@ -513,7 +520,7 @@ fn snapshot_delete_with_precancelled_cx_does_not_mutate() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let (_tmp, db_path, _storage) = setup_test_db().await;
-        let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
         let checkpoint = engine
             .capture(
                 &[make_test_pane(41, 24, 80)],
@@ -550,7 +557,48 @@ fn snapshot_delete_with_precancelled_cx_does_not_mutate() {
             )
             .await
             .expect("deleting the durable row must invalidate periodic dedup state");
-        assert_ne!(replacement.checkpoint_id, checkpoint.checkpoint_id);
+        let persisted_replacement: i64 = Connection::open(db_path.as_str())
+            .expect("open snapshot database")
+            .query_row(
+                "SELECT COUNT(*) FROM session_checkpoints
+                 WHERE id = ?1 AND session_id = ?2 AND state_hash = ?3",
+                params![
+                    replacement.checkpoint_id,
+                    replacement.session_id,
+                    replacement.state_hash,
+                ],
+                |row| row.get(0),
+            )
+            .expect("load replacement checkpoint");
+        assert_eq!(persisted_replacement, 1);
+    });
+}
+
+#[test]
+fn snapshot_cross_engine_delete_cannot_leave_periodic_dedup_stale() {
+    let rt = RuntimeFixture::current_thread();
+    rt.block_on(async {
+        let (_tmp, db_path, _storage) = setup_test_db().await;
+        let capture_engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let delete_engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+        let panes = [make_test_pane(51, 24, 80)];
+
+        let checkpoint = capture_engine
+            .capture(&panes, SnapshotTrigger::Periodic)
+            .await
+            .expect("initial periodic checkpoint");
+        delete_engine
+            .delete_checkpoint(SnapshotDeleteTarget::Id(checkpoint.checkpoint_id))
+            .await
+            .expect("cross-engine delete")
+            .expect("checkpoint must exist");
+
+        let replacement = capture_engine
+            .capture(&panes, SnapshotTrigger::Periodic)
+            .await
+            .expect("dedup must revalidate the exact durable receipt");
+        assert_eq!(replacement.pane_count, panes.len());
+        assert_eq!(replacement.trigger, SnapshotTrigger::Periodic);
     });
 }
 
@@ -803,11 +851,10 @@ fn snapshot_dedup_skip_updates_telemetry() {
 
 // ===========================================================================
 // Note: Intelligent scheduling tests (16+ tests) and emit_trigger channel
-// tests omitted — they use `runtime_async::task::spawn` (delegated to
-// tokio::spawn) for `run_periodic` and access private fields (trigger_rx).
+// tests omitted — they use the project runtime task-spawn surface for
+// `run_periodic` and access private fields (trigger_rx).
 // These are fully exercised as unit tests in snapshot_engine.rs.
 //
-// LabRuntime sections (2-5) also omitted: SnapshotEngine uses direct
-// rusqlite I/O (not spawn_blocking), which is synchronous and doesn't
-// interact with the LabRuntime's deterministic task scheduler.
+// Private blocking-handoff state-machine coverage remains in the module unit
+// tests, while this integration suite proves the public Cx-first behavior.
 // ===========================================================================

@@ -88,7 +88,8 @@ fn setup_db() -> (String, Connection) {
     let db_path = dir.path().join("bench.db").to_string_lossy().to_string();
     let conn = Connection::open(&db_path).unwrap();
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
+        "PRAGMA foreign_keys=ON;
+         PRAGMA journal_mode=WAL;
          PRAGMA busy_timeout=5000;
 
          CREATE TABLE mux_sessions (
@@ -99,25 +100,66 @@ fn setup_db() -> (String, Connection) {
              topology_json TEXT NOT NULL,
              window_metadata_json TEXT,
              ft_version TEXT NOT NULL,
-             host_id TEXT
+             host_id TEXT,
+             clean_checkpoint_id INTEGER
+                 REFERENCES session_checkpoints(id) ON DELETE SET NULL
          );
 
          CREATE TABLE session_checkpoints (
-             id INTEGER PRIMARY KEY,
-             session_id TEXT NOT NULL,
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id TEXT NOT NULL
+                 REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
              checkpoint_at INTEGER NOT NULL,
-             checkpoint_type TEXT,
+             checkpoint_type TEXT NOT NULL
+                 CHECK(checkpoint_type IN ('periodic','event','shutdown','startup')),
              state_hash TEXT NOT NULL,
              pane_count INTEGER NOT NULL,
              total_bytes INTEGER NOT NULL,
              metadata_json TEXT,
-             checkpoint_role TEXT NOT NULL DEFAULT 'snapshot',
-             topology_json TEXT
+             checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
+                 CHECK(checkpoint_role IN ('snapshot','restore_intent','restore_receipt')),
+             topology_json TEXT,
+             restore_intent_checkpoint_id INTEGER
+                 REFERENCES session_checkpoints(id) ON DELETE CASCADE,
+             CHECK(checkpoint_role = 'restore_receipt' OR restore_intent_checkpoint_id IS NULL)
+         );
+
+         CREATE TABLE restore_attempt_lifecycle (
+             intent_checkpoint_id INTEGER PRIMARY KEY
+                 REFERENCES session_checkpoints(id)
+                 ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
+             session_id TEXT NOT NULL
+                 REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
+             source_checkpoint_id INTEGER NOT NULL,
+             outcome_checkpoint_id INTEGER
+                 REFERENCES session_checkpoints(id) ON DELETE SET NULL,
+             status TEXT NOT NULL
+                 CHECK(status IN ('intent','outcome_complete','resolved','reconciliation_required')),
+             created_at INTEGER NOT NULL,
+             resolved_at INTEGER,
+             CHECK(intent_checkpoint_id <> source_checkpoint_id),
+             CHECK(outcome_checkpoint_id IS NULL OR outcome_checkpoint_id <> intent_checkpoint_id),
+             CHECK(outcome_checkpoint_id IS NULL OR outcome_checkpoint_id <> source_checkpoint_id),
+             CHECK(created_at >= 0),
+             CHECK(resolved_at IS NULL OR resolved_at >= created_at),
+             CHECK(
+                 (status = 'intent'
+                     AND outcome_checkpoint_id IS NULL
+                     AND resolved_at IS NULL)
+                 OR (status = 'outcome_complete'
+                     AND outcome_checkpoint_id IS NOT NULL
+                     AND resolved_at IS NULL)
+                 OR (status = 'reconciliation_required'
+                     AND resolved_at IS NULL)
+                 OR (status = 'resolved'
+                     AND resolved_at IS NOT NULL)
+             )
          );
 
          CREATE TABLE mux_pane_state (
              id INTEGER PRIMARY KEY,
-             checkpoint_id INTEGER NOT NULL,
+             checkpoint_id INTEGER NOT NULL
+                 REFERENCES session_checkpoints(id) ON DELETE CASCADE,
              pane_id INTEGER NOT NULL,
              cwd TEXT,
              command TEXT,
@@ -129,7 +171,27 @@ fn setup_db() -> (String, Connection) {
          );
 
          CREATE INDEX idx_checkpoints_session ON session_checkpoints(session_id, checkpoint_at);
-         CREATE INDEX idx_pane_state_checkpoint ON mux_pane_state(checkpoint_id);",
+         CREATE INDEX idx_checkpoints_session_role_latest
+             ON session_checkpoints(session_id, checkpoint_role, checkpoint_at DESC, id DESC);
+         CREATE INDEX idx_checkpoints_session_role_causal
+             ON session_checkpoints(session_id, checkpoint_role, id DESC);
+         CREATE INDEX idx_checkpoints_global_latest
+             ON session_checkpoints(checkpoint_at DESC, id DESC);
+         CREATE INDEX idx_checkpoints_global_snapshot_latest
+             ON session_checkpoints(checkpoint_at DESC, id DESC)
+             WHERE checkpoint_role = 'snapshot';
+         CREATE UNIQUE INDEX idx_checkpoints_restore_intent_outcome
+             ON session_checkpoints(restore_intent_checkpoint_id)
+             WHERE restore_intent_checkpoint_id IS NOT NULL;
+         CREATE INDEX idx_mux_sessions_clean_checkpoint
+             ON mux_sessions(clean_checkpoint_id);
+         CREATE INDEX idx_restore_attempt_lifecycle_session_status
+             ON restore_attempt_lifecycle(session_id, status, intent_checkpoint_id);
+         CREATE UNIQUE INDEX idx_restore_attempt_lifecycle_outcome
+             ON restore_attempt_lifecycle(outcome_checkpoint_id)
+             WHERE outcome_checkpoint_id IS NOT NULL;
+         CREATE INDEX idx_pane_state_checkpoint ON mux_pane_state(checkpoint_id);
+         CREATE INDEX idx_pane_state_pane ON mux_pane_state(pane_id);",
     )
     .unwrap();
 

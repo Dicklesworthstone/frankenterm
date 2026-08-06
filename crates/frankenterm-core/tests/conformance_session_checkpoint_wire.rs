@@ -108,9 +108,9 @@ fn arb_process_info() -> impl Strategy<Value = ProcessInfo> {
 
 fn arb_scrollback_ref() -> impl Strategy<Value = ScrollbackRef> {
     (0i64..10_000, 0u64..10_000, 0u64..10_000_000).prop_map(
-        |(output_segments_seq, total_lines_captured, last_capture_at)| ScrollbackRef {
+        |(output_segments_seq, total_segments_captured, last_capture_at)| ScrollbackRef {
             output_segments_seq,
-            total_lines_captured,
+            total_segments_captured,
             last_capture_at,
         },
     )

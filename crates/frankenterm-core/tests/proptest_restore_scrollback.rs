@@ -8,7 +8,7 @@ use frankenterm_core::restore_scrollback::{
     InjectionConfig, InjectionGuard, InjectionReport, PaneInjectionStats, ScrollbackData,
 };
 use proptest::prelude::*;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 // =========================================================================
@@ -115,19 +115,19 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
-    /// from_segments correctly counts total_bytes.
+    /// from_terminal_lines correctly counts total_bytes.
     #[test]
-    fn prop_from_segments_byte_count(segments in arb_segments()) {
+    fn prop_from_terminal_lines_byte_count(segments in arb_segments()) {
         let expected_bytes: usize = segments.iter().map(|s| s.len()).sum();
-        let data = ScrollbackData::from_segments(segments.clone());
+        let data = ScrollbackData::from_terminal_lines(segments.clone());
         prop_assert_eq!(data.total_bytes, expected_bytes);
         prop_assert_eq!(data.lines.len(), segments.len());
     }
 
-    /// from_segments with empty input gives zero bytes.
+    /// from_terminal_lines with empty input gives zero bytes.
     #[test]
-    fn prop_from_segments_empty(_dummy in 0..1_u8) {
-        let data = ScrollbackData::from_segments(vec![]);
+    fn prop_from_terminal_lines_empty(_dummy in 0..1_u8) {
+        let data = ScrollbackData::from_terminal_lines(vec![]);
         prop_assert_eq!(data.total_bytes, 0);
         prop_assert!(data.lines.is_empty());
     }
@@ -135,7 +135,7 @@ proptest! {
     /// truncate reduces line count to max when needed.
     #[test]
     fn prop_truncate_reduces(segments in proptest::collection::vec("[a-z]{5,10}", 5..20), max in 1_usize..4) {
-        let mut data = ScrollbackData::from_segments(segments.clone());
+        let mut data = ScrollbackData::from_terminal_lines(segments.clone());
         data.truncate(max);
         prop_assert!(data.lines.len() <= max);
     }
@@ -143,7 +143,7 @@ proptest! {
     /// truncate keeps most recent lines.
     #[test]
     fn prop_truncate_keeps_recent(segments in proptest::collection::vec("[a-z]{5,10}", 5..20), max in 1_usize..4) {
-        let mut data = ScrollbackData::from_segments(segments.clone());
+        let mut data = ScrollbackData::from_terminal_lines(segments.clone());
         data.truncate(max);
         // The retained lines should be the last `max` lines from original
         let expected: Vec<_> = segments.iter().rev().take(max).rev().cloned().collect();
@@ -153,8 +153,8 @@ proptest! {
     /// truncate is idempotent.
     #[test]
     fn prop_truncate_idempotent(segments in arb_segments(), max in 1_usize..50) {
-        let mut data1 = ScrollbackData::from_segments(segments.clone());
-        let mut data2 = ScrollbackData::from_segments(segments);
+        let mut data1 = ScrollbackData::from_terminal_lines(segments.clone());
+        let mut data2 = ScrollbackData::from_terminal_lines(segments);
         data1.truncate(max);
         data2.truncate(max);
         data2.truncate(max); // second truncation
@@ -166,7 +166,7 @@ proptest! {
     #[test]
     fn prop_truncate_noop_when_within_limit(segments in arb_segments()) {
         let max = segments.len() + 10;
-        let mut data = ScrollbackData::from_segments(segments.clone());
+        let mut data = ScrollbackData::from_terminal_lines(segments.clone());
         let original_bytes = data.total_bytes;
         data.truncate(max);
         prop_assert_eq!(data.lines.len(), segments.len());
@@ -176,7 +176,7 @@ proptest! {
     /// truncate updates total_bytes correctly.
     #[test]
     fn prop_truncate_updates_bytes(segments in proptest::collection::vec("[a-z]{5,10}", 5..20), max in 1_usize..4) {
-        let mut data = ScrollbackData::from_segments(segments);
+        let mut data = ScrollbackData::from_terminal_lines(segments);
         data.truncate(max);
         let recalculated: usize = data.lines.iter().map(|s| s.len()).sum();
         prop_assert_eq!(data.total_bytes, recalculated);
@@ -260,7 +260,7 @@ proptest! {
     fn prop_guard_suppresses_given_panes(
         pane_ids in proptest::collection::vec(0_u64..1000, 1..10),
     ) {
-        let suppressed = Arc::new(Mutex::new(HashSet::new()));
+        let suppressed = Arc::new(Mutex::new(HashMap::new()));
         let _guard = InjectionGuard::new(suppressed.clone(), pane_ids.clone());
 
         for &id in &pane_ids {
@@ -275,7 +275,7 @@ proptest! {
         guarded in proptest::collection::vec(0_u64..500, 1..5),
         other in 501_u64..1000,
     ) {
-        let suppressed = Arc::new(Mutex::new(HashSet::new()));
+        let suppressed = Arc::new(Mutex::new(HashMap::new()));
         let _guard = InjectionGuard::new(suppressed.clone(), guarded);
 
         prop_assert!(!InjectionGuard::is_suppressed(&suppressed, other),
@@ -287,7 +287,7 @@ proptest! {
     fn prop_guard_drop_clears(
         pane_ids in proptest::collection::vec(0_u64..1000, 1..10),
     ) {
-        let suppressed = Arc::new(Mutex::new(HashSet::new()));
+        let suppressed = Arc::new(Mutex::new(HashMap::new()));
 
         {
             let _guard = InjectionGuard::new(suppressed.clone(), pane_ids.clone());
@@ -309,7 +309,7 @@ proptest! {
         panes_a in proptest::collection::vec(0_u64..500, 1..5),
         panes_b in proptest::collection::vec(500_u64..1000, 1..5),
     ) {
-        let suppressed = Arc::new(Mutex::new(HashSet::new()));
+        let suppressed = Arc::new(Mutex::new(HashMap::new()));
         let _guard_a = InjectionGuard::new(suppressed.clone(), panes_a.clone());
         let _guard_b = InjectionGuard::new(suppressed.clone(), panes_b.clone());
 
@@ -327,7 +327,7 @@ proptest! {
         panes_a in proptest::collection::vec(0_u64..500, 1..5),
         panes_b in proptest::collection::vec(500_u64..1000, 1..5),
     ) {
-        let suppressed = Arc::new(Mutex::new(HashSet::new()));
+        let suppressed = Arc::new(Mutex::new(HashMap::new()));
         let _guard_b = InjectionGuard::new(suppressed.clone(), panes_b.clone());
 
         {
@@ -343,7 +343,7 @@ proptest! {
     /// Empty guard suppresses nothing and cleans up nothing.
     #[test]
     fn prop_guard_empty(_dummy in 0..1_u8) {
-        let suppressed = Arc::new(Mutex::new(HashSet::new()));
+        let suppressed = Arc::new(Mutex::new(HashMap::new()));
         let _guard = InjectionGuard::new(suppressed.clone(), vec![]);
         prop_assert!(suppressed.lock().unwrap().is_empty());
     }
@@ -359,7 +359,7 @@ proptest! {
     /// Single-line scrollback preserves the content and byte count.
     #[test]
     fn prop_single_line(content in "[A-Za-z0-9]{1,200}") {
-        let data = ScrollbackData::from_segments(vec![content.clone()]);
+        let data = ScrollbackData::from_terminal_lines(vec![content.clone()]);
         prop_assert_eq!(data.lines.len(), 1);
         prop_assert_eq!(data.total_bytes, content.len());
         prop_assert_eq!(&data.lines[0], &content);
@@ -368,7 +368,7 @@ proptest! {
     /// Truncating to zero leaves empty data.
     #[test]
     fn prop_truncate_to_zero(segments in proptest::collection::vec("[a-z]{1,10}", 1..20)) {
-        let mut data = ScrollbackData::from_segments(segments);
+        let mut data = ScrollbackData::from_terminal_lines(segments);
         data.truncate(0);
         prop_assert!(data.lines.is_empty());
         prop_assert_eq!(data.total_bytes, 0);
@@ -378,7 +378,7 @@ proptest! {
     #[test]
     fn prop_truncate_to_one(segments in proptest::collection::vec("[a-z]{1,10}", 2..20)) {
         let last = segments.last().unwrap().clone();
-        let mut data = ScrollbackData::from_segments(segments);
+        let mut data = ScrollbackData::from_terminal_lines(segments);
         data.truncate(1);
         prop_assert_eq!(data.lines.len(), 1);
         prop_assert_eq!(&data.lines[0], &last);
@@ -388,7 +388,7 @@ proptest! {
     /// total_bytes is always the sum of line lengths.
     #[test]
     fn prop_total_bytes_invariant(segments in arb_segments()) {
-        let data = ScrollbackData::from_segments(segments.clone());
+        let data = ScrollbackData::from_terminal_lines(segments.clone());
         let sum: usize = segments.iter().map(|s| s.len()).sum();
         prop_assert_eq!(data.total_bytes, sum);
     }
@@ -399,10 +399,10 @@ proptest! {
         segments in proptest::collection::vec("[a-z]{1,10}", 1..20),
         max in 0_usize..30,
     ) {
-        let original = ScrollbackData::from_segments(segments.clone());
+        let original = ScrollbackData::from_terminal_lines(segments.clone());
         let original_bytes = original.total_bytes;
 
-        let mut data = ScrollbackData::from_segments(segments);
+        let mut data = ScrollbackData::from_terminal_lines(segments);
         data.truncate(max);
         prop_assert!(data.total_bytes <= original_bytes,
             "truncated bytes {} should not exceed original {}", data.total_bytes, original_bytes);
@@ -415,23 +415,23 @@ proptest! {
         max in 0_usize..30,
     ) {
         let original_len = segments.len();
-        let mut data = ScrollbackData::from_segments(segments);
+        let mut data = ScrollbackData::from_terminal_lines(segments);
         data.truncate(max);
         prop_assert!(data.lines.len() <= original_len);
         prop_assert!(data.lines.len() <= max);
     }
 
-    /// from_segments preserves order of lines.
+    /// from_terminal_lines preserves order of lines.
     #[test]
-    fn prop_from_segments_preserves_order(segments in arb_segments()) {
-        let data = ScrollbackData::from_segments(segments.clone());
+    fn prop_from_terminal_lines_preserves_order(segments in arb_segments()) {
+        let data = ScrollbackData::from_terminal_lines(segments.clone());
         prop_assert_eq!(&data.lines, &segments);
     }
 
     /// Clone produces identical data.
     #[test]
     fn prop_clone_identical(segments in arb_segments()) {
-        let data = ScrollbackData::from_segments(segments);
+        let data = ScrollbackData::from_terminal_lines(segments);
         let cloned = data.clone();
         prop_assert_eq!(&data.lines, &cloned.lines);
         prop_assert_eq!(data.total_bytes, cloned.total_bytes);
@@ -590,8 +590,8 @@ fn config_default_values() {
 }
 
 #[test]
-fn scrollback_from_segments_basic() {
-    let data = ScrollbackData::from_segments(vec![
+fn scrollback_from_terminal_lines_basic() {
+    let data = ScrollbackData::from_terminal_lines(vec![
         "line1".to_string(),
         "line2".to_string(),
         "line3".to_string(),
@@ -602,7 +602,7 @@ fn scrollback_from_segments_basic() {
 
 #[test]
 fn scrollback_truncate_basic() {
-    let mut data = ScrollbackData::from_segments(vec![
+    let mut data = ScrollbackData::from_terminal_lines(vec![
         "aa".to_string(),
         "bb".to_string(),
         "cc".to_string(),

@@ -18,6 +18,7 @@
 
 use proptest::prelude::*;
 use rusqlite::{Connection, params};
+use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankenterm_core::config::SessionRetentionConfig;
@@ -42,6 +43,106 @@ fn make_test_db() -> Connection {
     conn
 }
 
+fn frame_required(hasher: &mut Sha256, label: &str, value: &[u8]) {
+    hasher.update(u32::try_from(label.len()).unwrap().to_be_bytes());
+    hasher.update(label.as_bytes());
+    hasher.update([1]);
+    hasher.update(u64::try_from(value.len()).unwrap().to_be_bytes());
+    hasher.update(value);
+}
+
+fn frame_optional(hasher: &mut Sha256, label: &str, value: Option<&[u8]>) {
+    hasher.update(u32::try_from(label.len()).unwrap().to_be_bytes());
+    hasher.update(label.as_bytes());
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(u64::try_from(value.len()).unwrap().to_be_bytes());
+            hasher.update(value);
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn empty_restore_receipt_witness(
+    session_id: &str,
+    checkpoint_id: i64,
+    checkpoint_at: i64,
+    metadata_json: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    frame_required(
+        &mut hasher,
+        "domain",
+        b"frankenterm:restore-receipt:v2",
+    );
+    frame_required(&mut hasher, "checkpoint_role", b"restore_receipt");
+    frame_required(&mut hasher, "session_id", session_id.as_bytes());
+    frame_required(
+        &mut hasher,
+        "checkpoint_id",
+        &checkpoint_id.to_be_bytes(),
+    );
+    frame_required(
+        &mut hasher,
+        "checkpoint_at",
+        &checkpoint_at.to_be_bytes(),
+    );
+    frame_required(&mut hasher, "checkpoint_type", b"startup");
+    frame_required(&mut hasher, "pane_count", &0_i64.to_be_bytes());
+    frame_required(&mut hasher, "total_bytes", &0_i64.to_be_bytes());
+    frame_optional(
+        &mut hasher,
+        "metadata_json",
+        Some(metadata_json.as_bytes()),
+    );
+    frame_optional(&mut hasher, "topology_json", None);
+    frame_required(
+        &mut hasher,
+        "persisted_pane_row_count",
+        &0_u64.to_be_bytes(),
+    );
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(5 + digest.len() * 2);
+    encoded.push_str("rst2:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").unwrap();
+    }
+    encoded
+}
+
+fn insert_v2_clean_receipt(conn: &Connection, session_id: &str, checkpoint_at: i64) -> i64 {
+    let metadata_json = r#"{"old_to_new":{}}"#;
+    conn.execute(
+        "INSERT INTO session_checkpoints
+         (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+          total_bytes, metadata_json, checkpoint_role, topology_json)
+         VALUES (?1, ?2, 'startup', 'pending:rst2', 0, 0, ?3,
+                 'restore_receipt', NULL)",
+        params![session_id, checkpoint_at, metadata_json],
+    )
+    .unwrap();
+    let checkpoint_id = conn.last_insert_rowid();
+    let state_hash =
+        empty_restore_receipt_witness(session_id, checkpoint_id, checkpoint_at, metadata_json);
+    conn.execute(
+        "UPDATE session_checkpoints SET state_hash = ?1 WHERE id = ?2",
+        params![state_hash, checkpoint_id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE mux_sessions
+         SET shutdown_clean = 1,
+             last_checkpoint_at = ?2,
+             clean_checkpoint_id = ?3
+         WHERE session_id = ?1",
+        params![session_id, checkpoint_at, checkpoint_id],
+    )
+    .unwrap();
+    checkpoint_id
+}
+
 fn insert_session(conn: &Connection, id: &str, created_at: i64, shutdown_clean: bool) {
     conn.execute(
         "INSERT INTO mux_sessions (session_id, created_at, shutdown_clean, topology_json, ft_version)
@@ -50,24 +151,7 @@ fn insert_session(conn: &Connection, id: &str, created_at: i64, shutdown_clean: 
     )
     .unwrap();
     if shutdown_clean {
-        conn.execute(
-            "INSERT INTO session_checkpoints
-             (session_id, checkpoint_at, checkpoint_type, state_hash,
-              pane_count, total_bytes, metadata_json, checkpoint_role,
-              topology_json)
-             VALUES (?1, ?2, 'startup', 'restore', 0, 0,
-                     '{\"old_to_new\":{}}', 'restore_receipt', NULL)",
-            params![id, created_at],
-        )
-        .unwrap();
-        let receipt_id = conn.last_insert_rowid();
-        conn.execute(
-            "UPDATE mux_sessions
-             SET last_checkpoint_at = ?2, clean_checkpoint_id = ?3
-             WHERE session_id = ?1",
-            params![id, created_at, receipt_id],
-        )
-        .unwrap();
+        insert_v2_clean_receipt(conn, id, created_at);
     }
 }
 
@@ -92,22 +176,29 @@ fn insert_checkpoint(
     conn.execute(
         "INSERT INTO session_checkpoints
          (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
-         VALUES (?1, ?2, 'periodic', 'hash', 1, ?3)",
+         VALUES (?1, ?2, 'periodic', '0123456789abcdef', 1, ?3)",
         params![session_id, checkpoint_at, total_bytes],
     )
     .unwrap();
     let checkpoint_id = conn.last_insert_rowid();
+    let shutdown_clean: bool = conn
+        .query_row(
+            "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
     conn.execute(
         "UPDATE mux_sessions
          SET last_checkpoint_at = ?2,
-             clean_checkpoint_id = CASE
-                 WHEN shutdown_clean = 1 THEN ?3
-                 ELSE NULL
-             END
+             clean_checkpoint_id = NULL
          WHERE session_id = ?1",
-        params![session_id, checkpoint_at, checkpoint_id],
+        params![session_id, checkpoint_at],
     )
     .unwrap();
+    if shutdown_clean {
+        insert_v2_clean_receipt(conn, session_id, checkpoint_at);
+    }
     checkpoint_id
 }
 
@@ -127,7 +218,7 @@ fn insert_orphaned_checkpoint(conn: &Connection, fake_session_id: &str, checkpoi
     conn.execute(
         "INSERT INTO session_checkpoints
          (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
-         VALUES (?1, ?2, 'periodic', 'hash', 0, 0)",
+         VALUES (?1, ?2, 'periodic', '0123456789abcdef', 0, 0)",
         params![fake_session_id, checkpoint_at],
     )
     .unwrap();
@@ -173,9 +264,12 @@ fn count_active_sessions(conn: &Connection) -> i64 {
 }
 
 fn count_checkpoints(conn: &Connection) -> i64 {
-    conn.query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
-        row.get(0)
-    })
+    conn.query_row(
+        "SELECT COUNT(*) FROM session_checkpoints
+         WHERE checkpoint_role = 'snapshot'",
+        [],
+        |row| row.get(0),
+    )
     .unwrap()
 }
 

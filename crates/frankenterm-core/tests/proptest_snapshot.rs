@@ -540,16 +540,16 @@ proptest! {
 }
 
 // =============================================================================
-// Property: scrollback injection correctness
+// Property: scrollback replay fails closed without a safe mux output channel
 // =============================================================================
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
-    /// Scrollback content injected into a mock pane can be fully retrieved.
-    /// Verifies that no data is lost during chunked injection.
+    /// Arbitrary historical content never reaches the mock pane through PTY
+    /// input, regardless of chunking configuration.
     #[test]
-    fn scrollback_injection_preserves_content(
+    fn scrollback_injection_never_writes_pty_input(
         lines in arb_scrollback_lines()
     ) {
         let rt = RuntimeBuilder::multi_thread().build().unwrap();
@@ -557,7 +557,7 @@ proptest! {
             let mock = Arc::new(MockWezterm::new());
             mock.add_default_pane(1).await;
 
-            let data = ScrollbackData::from_segments(lines.clone());
+            let data = ScrollbackData::from_terminal_lines(lines.clone());
             if data.lines.is_empty() {
                 return Ok(());
             }
@@ -578,28 +578,16 @@ proptest! {
             let id_map: HashMap<u64, u64> = std::iter::once((1, 1)).collect();
             let report = injector.inject(&id_map, &scrollback_map).await;
 
-            prop_assert!(
-                report.failures.is_empty(),
-                "injection should succeed: {:?}",
-                report.failures
-            );
+            prop_assert!(report.successes.is_empty());
+            prop_assert!(report.failures.is_empty());
+            prop_assert_eq!(report.skipped, vec![1]);
 
             // Verify injected content matches original
             let pane_content: String = WeztermInterface::get_text(&*mock, 1, false)
                 .await
                 .unwrap();
 
-            // The mock echoes send_text content, so the injected data should
-            // be a substring of the pane content (modulo ANSI reset prefix).
-            for line in &lines {
-                if !line.is_empty() {
-                    prop_assert!(
-                        pane_content.contains(line.as_str()),
-                        "pane content should contain line: {:?}",
-                        line
-                    );
-                }
-            }
+            prop_assert!(pane_content.is_empty());
 
             Ok(())
         })?;
@@ -611,7 +599,7 @@ proptest! {
         lines in prop::collection::vec("[a-z]{1,50}", 10..500),
         max_lines in 1usize..50,
     ) {
-        let mut data = ScrollbackData::from_segments(lines.clone());
+        let mut data = ScrollbackData::from_terminal_lines(lines.clone());
         let original_len = data.lines.len();
         data.truncate(max_lines);
 
@@ -1078,12 +1066,12 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
-    /// ScrollbackData::from_segments never loses lines.
+    /// ScrollbackData::from_terminal_lines never loses logical lines.
     #[test]
     fn scrollback_from_lines_preserves_count(
         lines in prop::collection::vec("[a-zA-Z0-9 ]{0,100}", 0..500),
     ) {
-        let data = ScrollbackData::from_segments(lines.clone());
+        let data = ScrollbackData::from_terminal_lines(lines.clone());
         prop_assert_eq!(data.lines.len(), lines.len());
     }
 
@@ -1092,7 +1080,7 @@ proptest! {
     fn scrollback_byte_count_is_accurate(
         lines in prop::collection::vec("[a-zA-Z0-9 ]{0,100}", 0..200),
     ) {
-        let data = ScrollbackData::from_segments(lines.clone());
+        let data = ScrollbackData::from_terminal_lines(lines.clone());
         let expected_bytes: usize = lines.iter().map(|l| l.len()).sum::<usize>();
         prop_assert_eq!(data.total_bytes, expected_bytes);
     }
@@ -1208,7 +1196,7 @@ proptest! {
     /// Empty input gives empty scrollback.
     #[test]
     fn scrollback_empty_input(_dummy in 0..1u8) {
-        let data = ScrollbackData::from_segments(vec![]);
+        let data = ScrollbackData::from_terminal_lines(vec![]);
         prop_assert_eq!(data.lines.len(), 0);
         prop_assert_eq!(data.total_bytes, 0);
     }
@@ -1216,7 +1204,7 @@ proptest! {
     /// Single line preserves content exactly.
     #[test]
     fn scrollback_single_line(line in "[a-zA-Z0-9 ]{1,100}") {
-        let data = ScrollbackData::from_segments(vec![line.clone()]);
+        let data = ScrollbackData::from_terminal_lines(vec![line.clone()]);
         prop_assert_eq!(data.lines.len(), 1);
         prop_assert_eq!(data.lines[0].as_str(), line.as_str());
         prop_assert_eq!(data.total_bytes, line.len());
@@ -1227,7 +1215,7 @@ proptest! {
     fn scrollback_truncation_noop(
         lines in prop::collection::vec("[a-z]{1,20}", 1..50),
     ) {
-        let mut data = ScrollbackData::from_segments(lines.clone());
+        let mut data = ScrollbackData::from_terminal_lines(lines.clone());
         let original_len = data.lines.len();
         data.truncate(original_len + 100);
         prop_assert_eq!(data.lines.len(), original_len);
@@ -1238,7 +1226,7 @@ proptest! {
     fn scrollback_truncation_to_zero(
         lines in prop::collection::vec("[a-z]{1,20}", 1..50),
     ) {
-        let mut data = ScrollbackData::from_segments(lines);
+        let mut data = ScrollbackData::from_terminal_lines(lines);
         data.truncate(0);
         prop_assert_eq!(data.lines.len(), 0);
     }

@@ -44,14 +44,14 @@ fn make_terminal() -> TerminalState {
 }
 
 fn make_pane_state(pane_id: u64, seq: i64) -> PaneStateSnapshot {
-    let total_lines = u64::try_from(seq.max(0))
+    let total_segments = u64::try_from(seq.max(0))
         .unwrap_or_default()
         .saturating_add(100);
     PaneStateSnapshot::new(pane_id, 1_700_000_000_000, make_terminal())
         .with_cwd(format!("/tmp/replay-diff/{pane_id}"))
         .with_scrollback(ScrollbackRef {
             output_segments_seq: seq,
-            total_lines_captured: total_lines,
+            total_segments_captured: total_segments,
             last_capture_at: 1_700_000_000_000,
         })
 }
@@ -120,7 +120,7 @@ fn build_current_snapshot(
             state.cwd = Some(format!("/tmp/replay-diff/mutated/{pane_id}"));
             state.scrollback_ref = Some(ScrollbackRef {
                 output_segments_seq: i64::try_from(10_000 + i).unwrap_or_default(),
-                total_lines_captured: 50_000,
+                total_segments_captured: 50_000,
                 last_capture_at: 1_700_000_010_000,
             });
         }

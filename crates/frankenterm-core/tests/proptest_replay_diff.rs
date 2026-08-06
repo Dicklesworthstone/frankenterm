@@ -122,7 +122,7 @@ fn snapshot_from_specs(
             .with_cwd(format!("/tmp/pane-{pane_id}-{cwd_salt}-{topology_salt}"))
             .with_scrollback(ScrollbackRef {
                 output_segments_seq: tick as i64,
-                total_lines_captured: 100 + tick,
+                total_segments_captured: 100 + tick,
                 last_capture_at: tick,
             });
         dedup.insert(pane_id, pane);

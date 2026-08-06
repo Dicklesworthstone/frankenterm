@@ -253,7 +253,7 @@ fn bench_diff_with_scrollback(c: &mut Criterion) {
                 for i in 0..5u64 {
                     current.get_mut(&i).unwrap().scrollback_ref = Some(ScrollbackRef {
                         output_segments_seq: 100 + i as i64,
-                        total_lines_captured: 5000 + i,
+                        total_segments_captured: 5000 + i,
                         last_capture_at: 2000,
                     });
                 }

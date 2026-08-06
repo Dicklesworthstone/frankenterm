@@ -21,7 +21,7 @@ fn make_injector(mock: Arc<MockWezterm>) -> ScrollbackInjector {
 }
 
 fn mock_scrollback(lines: Vec<&str>) -> ScrollbackData {
-    ScrollbackData::from_segments(lines.into_iter().map(String::from).collect())
+    ScrollbackData::from_terminal_lines(lines.into_iter().map(String::from).collect())
 }
 
 // ===========================================================================
@@ -29,7 +29,7 @@ fn mock_scrollback(lines: Vec<&str>) -> ScrollbackData {
 // ===========================================================================
 
 #[test]
-fn inject_single_pane() {
+fn inject_single_pane_fails_closed() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let mock = Arc::new(MockWezterm::new());
@@ -44,14 +44,12 @@ fn inject_single_pane() {
 
         let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-        assert_eq!(report.success_count(), 1);
+        assert_eq!(report.success_count(), 0);
         assert_eq!(report.failure_count(), 0);
-        assert_eq!(report.successes[0].lines_injected, 3);
-        assert!(report.successes[0].bytes_written > 0);
+        assert_eq!(report.skipped, vec![1]);
 
         let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
-        assert!(text.contains("line1"));
-        assert!(text.contains("line3"));
+        assert!(text.is_empty());
     });
 }
 
@@ -78,8 +76,9 @@ fn inject_multiple_panes() {
 
         let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-        assert_eq!(report.success_count(), 2);
+        assert_eq!(report.success_count(), 0);
         assert_eq!(report.failure_count(), 0);
+        assert_eq!(report.skipped, vec![1, 2]);
     });
 }
 
@@ -123,13 +122,12 @@ fn inject_empty_scrollback() {
         pane_id_map.insert(1_u64, 10_u64);
 
         let mut scrollbacks = HashMap::new();
-        scrollbacks.insert(1, ScrollbackData::from_segments(vec![]));
+        scrollbacks.insert(1, ScrollbackData::from_terminal_lines(vec![]));
 
         let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-        assert_eq!(report.success_count(), 1);
-        assert_eq!(report.successes[0].lines_injected, 0);
-        assert_eq!(report.successes[0].bytes_written, 0);
+        assert_eq!(report.success_count(), 0);
+        assert_eq!(report.skipped, vec![1]);
     });
 }
 
@@ -138,7 +136,7 @@ fn inject_empty_scrollback() {
 // ===========================================================================
 
 #[test]
-fn inject_truncates_large_scrollback() {
+fn inject_large_scrollback_does_not_write() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let mock = Arc::new(MockWezterm::new());
@@ -154,16 +152,15 @@ fn inject_truncates_large_scrollback() {
 
         let lines: Vec<String> = (0..100).map(|i| format!("line-{i}")).collect();
         let mut scrollbacks = HashMap::new();
-        scrollbacks.insert(1, ScrollbackData::from_segments(lines));
+        scrollbacks.insert(1, ScrollbackData::from_terminal_lines(lines));
 
         let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-        assert_eq!(report.success_count(), 1);
-        assert_eq!(report.successes[0].lines_injected, 3);
+        assert_eq!(report.success_count(), 0);
+        assert_eq!(report.skipped, vec![1]);
 
         let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
-        assert!(text.contains("line-99"));
-        assert!(text.contains("line-97"));
+        assert!(text.is_empty());
     });
 }
 
@@ -212,7 +209,8 @@ fn injection_guard_active_during_inject() {
 
         let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-        assert_eq!(report.success_count(), 1);
+        assert_eq!(report.success_count(), 0);
+        assert_eq!(report.skipped, vec![1]);
         assert!(!InjectionGuard::is_suppressed(&suppressed, 10));
     });
 }
@@ -222,7 +220,7 @@ fn injection_guard_active_during_inject() {
 // ===========================================================================
 
 #[test]
-fn inject_with_small_chunks() {
+fn chunk_settings_cannot_reenable_pty_replay() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let mock = Arc::new(MockWezterm::new());
@@ -247,10 +245,10 @@ fn inject_with_small_chunks() {
 
         let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-        assert_eq!(report.success_count(), 1);
-        assert!(report.successes[0].chunks_sent > 1);
+        assert_eq!(report.success_count(), 0);
+        assert_eq!(report.skipped, vec![1]);
 
         let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
-        assert!(text.contains("multiple chunks"));
+        assert!(text.is_empty());
     });
 }
