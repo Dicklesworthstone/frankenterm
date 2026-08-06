@@ -427,6 +427,27 @@ const METRICS_MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const METRICS_ACCEPT_ERROR_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
 const METRICS_ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_secs(1);
 
+// `std::io::ErrorKind` has no portable NotSocket variant. These symbolic raw
+// codes cover FrankenTerm's Apple/BSD and x86_64/aarch64 Linux target classes
+// without adding a libc dependency to the no-default-features build.
+#[cfg(all(
+    unix,
+    any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )
+))]
+const UNIX_ENOTSOCK_RAW: i32 = 38;
+#[cfg(all(
+    unix,
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const UNIX_ENOTSOCK_RAW: i32 = 88;
+
 #[cfg(all(test, feature = "metrics"))]
 struct MetricsConnectionTestProbe {
     active_tasks: std::sync::atomic::AtomicUsize,
@@ -525,6 +546,23 @@ fn metrics_accept_error_is_permanent(error: &std::io::Error) -> bool {
         // POSIX EBADF on every supported Unix target.
         return true;
     }
+    #[cfg(all(
+        unix,
+        any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            all(
+                any(target_os = "linux", target_os = "android"),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    if error.raw_os_error() == Some(UNIX_ENOTSOCK_RAW) {
+        return true;
+    }
     #[cfg(windows)]
     if matches!(error.raw_os_error(), Some(6 | 10_038)) {
         // ERROR_INVALID_HANDLE / WSAENOTSOCK.
@@ -569,28 +607,42 @@ impl MetricsRetryBackoff {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetricsConnectionTaskDrainOutcome {
     Settled,
+    SettledWithFailure {
+        first_non_benign_failure: JoinErrorKind,
+    },
     TimedOut {
         active_tasks: usize,
         unacknowledged_tasks: usize,
+        first_non_benign_failure: Option<JoinErrorKind>,
     },
     Incomplete {
         active_tasks: usize,
         unacknowledged_tasks: usize,
+        first_non_benign_failure: Option<JoinErrorKind>,
     },
 }
 
 fn classify_metrics_connection_task_drain(
     timed_out: bool,
+    first_non_benign_failure: Option<JoinErrorKind>,
     settlement: JoinSetSettlement,
 ) -> MetricsConnectionTaskDrainOutcome {
     match settlement {
-        JoinSetSettlement::Settled => MetricsConnectionTaskDrainOutcome::Settled,
+        JoinSetSettlement::Settled => first_non_benign_failure.map_or(
+            MetricsConnectionTaskDrainOutcome::Settled,
+            |first_non_benign_failure| {
+                MetricsConnectionTaskDrainOutcome::SettledWithFailure {
+                    first_non_benign_failure,
+                }
+            },
+        ),
         JoinSetSettlement::Incomplete {
             active_tasks,
             unacknowledged_tasks,
         } if timed_out => MetricsConnectionTaskDrainOutcome::TimedOut {
             active_tasks,
             unacknowledged_tasks,
+            first_non_benign_failure,
         },
         JoinSetSettlement::Incomplete {
             active_tasks,
@@ -598,8 +650,16 @@ fn classify_metrics_connection_task_drain(
         } => MetricsConnectionTaskDrainOutcome::Incomplete {
             active_tasks,
             unacknowledged_tasks,
+            first_non_benign_failure,
         },
     }
+}
+
+const fn metrics_connection_join_failure_is_benign(failure: JoinErrorKind) -> bool {
+    matches!(
+        failure,
+        JoinErrorKind::Aborted | JoinErrorKind::ContextCancelled
+    )
 }
 
 async fn settle_metrics_connection_tasks(
@@ -607,6 +667,7 @@ async fn settle_metrics_connection_tasks(
 ) -> MetricsConnectionTaskDrainOutcome {
     connection_tasks.abort_all();
     let drain_cx = crate::cx::for_request();
+    let mut first_non_benign_failure = None;
     let drain_result = crate::runtime_async::timeout_with_cx(
         &drain_cx,
         METRICS_CONNECTION_TASK_DRAIN_TIMEOUT,
@@ -615,38 +676,52 @@ async fn settle_metrics_connection_tasks(
                 match connection_tasks.drain_next_with_cx(&drain_cx).await {
                     Ok(Some(Ok(()))) => {}
                     Ok(Some(Err(error))) => {
-                        if matches!(
-                            error.kind(),
-                            JoinErrorKind::Aborted
-                                | JoinErrorKind::ContextCancelled
-                                | JoinErrorKind::WakerRegistrationFailed
-                        ) {
+                        let failure = error.kind();
+                        if metrics_connection_join_failure_is_benign(failure) {
                             debug!(
-                                failure_class = ?error.kind(),
+                                failure_class = ?failure,
                                 "Metrics connection task stopped during server shutdown"
                             );
                         } else {
-                            warn!(
-                                failure_class = ?error.kind(),
-                                "Metrics connection task failed during server shutdown"
-                            );
+                            first_non_benign_failure.get_or_insert(failure);
+                            if failure == JoinErrorKind::WakerRegistrationFailed {
+                                warn!(
+                                    event = "metrics_connection_task_join_observation_quarantined",
+                                    failure_class = ?failure,
+                                    terminal_authority_retained = true,
+                                    "Metrics connection task join observation failed; trusted drain retained terminal authority"
+                                );
+                            } else {
+                                warn!(
+                                    event = "metrics_connection_task_join_failure_observed",
+                                    failure_class = ?failure,
+                                    "Metrics connection task failed during trusted shutdown drain"
+                                );
+                            }
                         }
                     }
                     Ok(None) => return Ok(()),
-                    Err(drain_error) => return Err(drain_error),
+                    Err(drain_error) => {
+                        let failure = drain_error.kind();
+                        if !metrics_connection_join_failure_is_benign(failure) {
+                            first_non_benign_failure.get_or_insert(failure);
+                        }
+                        return Err(failure);
+                    }
                 }
             }
         },
     )
     .await;
-    if let Ok(Err(drain_error)) = &drain_result {
+    if let Ok(Err(drain_failure)) = &drain_result {
         warn!(
-            failure_class = ?drain_error.kind(),
+            failure_class = ?drain_failure,
             "Metrics connection task drain context failed before terminal settlement"
         );
     }
     classify_metrics_connection_task_drain(
         drain_result.is_err(),
+        first_non_benign_failure,
         connection_tasks.settlement(),
     )
 }
@@ -981,14 +1056,26 @@ impl MetricsServer {
 
             match settle_metrics_connection_tasks(&mut connection_tasks).await {
                 MetricsConnectionTaskDrainOutcome::Settled => {}
+                MetricsConnectionTaskDrainOutcome::SettledWithFailure {
+                    first_non_benign_failure,
+                } => {
+                    warn!(
+                        event = "metrics_connection_task_settled_with_failure",
+                        failure_class = ?first_non_benign_failure,
+                        terminally_settled = true,
+                        "Metrics connection tasks settled after a non-benign join failure"
+                    );
+                }
                 MetricsConnectionTaskDrainOutcome::TimedOut {
                     active_tasks,
                     unacknowledged_tasks,
+                    first_non_benign_failure,
                 } => {
                     warn!(
                         event = "metrics_connection_task_drain_timeout",
                         active_tasks,
                         unacknowledged_tasks,
+                        first_non_benign_failure = ?first_non_benign_failure,
                         remaining_tasks = connection_tasks.len(),
                         orphan_risk = true,
                         "Metrics connection tasks missed bounded terminal settlement"
@@ -997,11 +1084,13 @@ impl MetricsServer {
                 MetricsConnectionTaskDrainOutcome::Incomplete {
                     active_tasks,
                     unacknowledged_tasks,
+                    first_non_benign_failure,
                 } => {
                     warn!(
                         event = "metrics_connection_task_settlement_incomplete",
                         active_tasks,
                         unacknowledged_tasks,
+                        first_non_benign_failure = ?first_non_benign_failure,
                         remaining_tasks = connection_tasks.len(),
                         orphan_risk = true,
                         "Metrics connection task drain ended without terminal settlement"
@@ -1479,6 +1568,22 @@ mod pure_tests {
         let descriptor_exhaustion = std::io::Error::from_raw_os_error(24);
         assert!(metrics_accept_error_is_permanent(&invalid_descriptor));
         assert!(!metrics_accept_error_is_permanent(&descriptor_exhaustion));
+
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            all(
+                any(target_os = "linux", target_os = "android"),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        ))]
+        {
+            let not_a_socket = std::io::Error::from_raw_os_error(UNIX_ENOTSOCK_RAW);
+            assert!(metrics_accept_error_is_permanent(&not_a_socket));
+        }
     }
 
     #[cfg(windows)]
@@ -1702,12 +1807,13 @@ mod pure_tests {
     #[test]
     fn metrics_connection_drain_truth_gives_settlement_precedence() {
         assert_eq!(
-            classify_metrics_connection_task_drain(true, JoinSetSettlement::Settled),
+            classify_metrics_connection_task_drain(true, None, JoinSetSettlement::Settled),
             MetricsConnectionTaskDrainOutcome::Settled,
         );
         assert_eq!(
             classify_metrics_connection_task_drain(
                 true,
+                None,
                 JoinSetSettlement::Incomplete {
                     active_tasks: 2,
                     unacknowledged_tasks: 1,
@@ -1716,8 +1822,61 @@ mod pure_tests {
             MetricsConnectionTaskDrainOutcome::TimedOut {
                 active_tasks: 2,
                 unacknowledged_tasks: 1,
+                first_non_benign_failure: None,
             },
         );
+    }
+
+    #[test]
+    fn metrics_connection_drain_truth_preserves_non_benign_failure() {
+        assert_eq!(
+            classify_metrics_connection_task_drain(
+                false,
+                Some(JoinErrorKind::TaskFailed),
+                JoinSetSettlement::Settled,
+            ),
+            MetricsConnectionTaskDrainOutcome::SettledWithFailure {
+                first_non_benign_failure: JoinErrorKind::TaskFailed,
+            },
+        );
+        assert_eq!(
+            classify_metrics_connection_task_drain(
+                true,
+                Some(JoinErrorKind::WakerRegistrationFailed),
+                JoinSetSettlement::Incomplete {
+                    active_tasks: 2,
+                    unacknowledged_tasks: 1,
+                },
+            ),
+            MetricsConnectionTaskDrainOutcome::TimedOut {
+                active_tasks: 2,
+                unacknowledged_tasks: 1,
+                first_non_benign_failure: Some(JoinErrorKind::WakerRegistrationFailed),
+            },
+        );
+    }
+
+    #[test]
+    fn metrics_connection_join_failure_classifier_keeps_expected_shutdown_benign() {
+        assert!(metrics_connection_join_failure_is_benign(
+            JoinErrorKind::Aborted
+        ));
+        assert!(metrics_connection_join_failure_is_benign(
+            JoinErrorKind::ContextCancelled
+        ));
+        for failure in [
+            JoinErrorKind::DeadlineExceeded,
+            JoinErrorKind::PollQuotaExhausted,
+            JoinErrorKind::CostBudgetExhausted,
+            JoinErrorKind::ContextFailure,
+            JoinErrorKind::TaskFailed,
+            JoinErrorKind::WakerRegistrationFailed,
+        ] {
+            assert!(
+                !metrics_connection_join_failure_is_benign(failure),
+                "failure={failure:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2278,8 +2437,25 @@ mod tests {
 
             assert_eq!(
                 settle_metrics_connection_tasks(&mut connection_tasks).await,
+                MetricsConnectionTaskDrainOutcome::SettledWithFailure {
+                    first_non_benign_failure: JoinErrorKind::WakerRegistrationFailed,
+                },
+                "forced caller-waker registration failure must remain visible after trusted settlement",
+            );
+            assert_eq!(connection_tasks.settlement(), JoinSetSettlement::Settled);
+        });
+    }
+
+    #[test]
+    fn metrics_connection_drain_treats_expected_abort_as_clean_settlement() {
+        run_async_test(async {
+            let mut connection_tasks = JoinSet::new();
+            connection_tasks.spawn(std::future::pending::<()>());
+
+            assert_eq!(
+                settle_metrics_connection_tasks(&mut connection_tasks).await,
                 MetricsConnectionTaskDrainOutcome::Settled,
-                "forced caller-waker registration failure must retain and trusted-drain the aborted connection task",
+                "an acknowledged shutdown abort is not a connection-task failure",
             );
             assert_eq!(connection_tasks.settlement(), JoinSetSettlement::Settled);
         });

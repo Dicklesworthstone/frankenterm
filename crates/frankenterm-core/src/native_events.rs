@@ -56,6 +56,27 @@ const NATIVE_SOCKET_DIRECTORY_MODE: u32 = 0o700;
 #[cfg(unix)]
 const NATIVE_SOCKET_MODE: u32 = 0o600;
 
+// `std::io::ErrorKind` does not expose a portable NotSocket variant. Keep the
+// symbolic raw code local to the target classes FrankenTerm actively supports
+// for the native bridge and performance campaign.
+#[cfg(all(
+    unix,
+    any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )
+))]
+const UNIX_ENOTSOCK_RAW: i32 = 38;
+#[cfg(all(
+    unix,
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const UNIX_ENOTSOCK_RAW: i32 = 88;
+
 #[cfg(any(unix, windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeConnectionTaskDrainOutcome {
@@ -153,10 +174,88 @@ fn record_native_listener_anomaly(counter: &AtomicU64) -> u64 {
 struct NativeListenerAnomalyCounters {
     oversized_line_drops: AtomicU64,
     backpressure_drops: AtomicU64,
+    context_ended_drops: AtomicU64,
+    channel_closed_drops: AtomicU64,
     malformed_event_drops: AtomicU64,
     connections_with_drops: AtomicU64,
     post_accept_io_failures: AtomicU64,
     rejected_peers: AtomicU64,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct NativeConnectionDropCounts {
+    oversized_line_drops: u64,
+    backpressure_drops: u64,
+    context_ended_drops: u64,
+    channel_closed_drops: u64,
+    malformed_event_drops: u64,
+}
+
+#[cfg(any(unix, windows))]
+fn record_native_context_ended_drop(
+    connection_counter: &mut u64,
+    listener_counters: &NativeListenerAnomalyCounters,
+) -> (u64, u64) {
+    (
+        record_native_connection_anomaly(connection_counter),
+        record_native_listener_anomaly(&listener_counters.context_ended_drops),
+    )
+}
+
+#[cfg(any(unix, windows))]
+fn record_native_channel_closed_drop(
+    connection_counter: &mut u64,
+    listener_counters: &NativeListenerAnomalyCounters,
+) -> (u64, u64) {
+    (
+        record_native_connection_anomaly(connection_counter),
+        record_native_listener_anomaly(&listener_counters.channel_closed_drops),
+    )
+}
+
+#[cfg(any(unix, windows))]
+fn record_native_connection_drop_summary(
+    listener_counters: &NativeListenerAnomalyCounters,
+    drops: &NativeConnectionDropCounts,
+) -> Option<u64> {
+    (drops.oversized_line_drops > 0
+        || drops.backpressure_drops > 0
+        || drops.context_ended_drops > 0
+        || drops.channel_closed_drops > 0
+        || drops.malformed_event_drops > 0)
+        .then(|| {
+            record_native_listener_anomaly(&listener_counters.connections_with_drops)
+        })
+}
+
+#[cfg(any(unix, windows))]
+fn finalize_native_connection(
+    listener_counters: &NativeListenerAnomalyCounters,
+    drops: &NativeConnectionDropCounts,
+    result: Result<(), std::io::Error>,
+) -> Result<(), std::io::Error> {
+    if let Some(anomalous_connections) =
+        record_native_connection_drop_summary(listener_counters, drops)
+    {
+        if anomalous_connections.is_power_of_two() {
+            warn!(
+                anomalous_connections,
+                oversized_line_drops = drops.oversized_line_drops,
+                backpressure_drops = drops.backpressure_drops,
+                context_ended_drops = drops.context_ended_drops,
+                channel_closed_drops = drops.channel_closed_drops,
+                malformed_event_drops = drops.malformed_event_drops,
+                "native event connections with bounded event drops reached sampled threshold"
+            );
+        }
+    }
+
+    debug!(
+        io_error = result.is_err(),
+        "native event connection closed (cx path)"
+    );
+    result
 }
 
 #[cfg(any(unix, windows))]
@@ -258,6 +357,23 @@ fn native_accept_error_is_permanent(error: &std::io::Error) -> bool {
     #[cfg(unix)]
     if error.raw_os_error() == Some(9) {
         // POSIX EBADF on every supported Unix target.
+        return true;
+    }
+    #[cfg(all(
+        unix,
+        any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            all(
+                any(target_os = "linux", target_os = "android"),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    if error.raw_os_error() == Some(UNIX_ENOTSOCK_RAW) {
         return true;
     }
     #[cfg(windows)]
@@ -1567,129 +1683,154 @@ async fn handle_connection_with_cx(
     listener_anomalies: &NativeListenerAnomalyCounters,
 ) -> Result<(), std::io::Error> {
     debug!("native event connection accepted (cx path)");
-    cx.checkpoint()
-        .map_err(|_| native_context_io_error("connection_pre_read"))?;
-    // ft-kccj8: the default lines() cap is 64 KiB — far below
-    // MAX_EVENT_LINE_BYTES (512 KiB) — so the warn-and-skip branch below
-    // was unreachable and any 64 KiB..512 KiB event killed the whole
-    // connection with InvalidData. Cap at 2× so the skip branch has a
-    // real window; lines beyond that still hard-close the connection
-    // (memory stays bounded at ~1 MiB).
-    let mut lines = socket_transport::lines_with_max_length(
-        socket_transport::buffered(stream),
-        MAX_EVENT_LINE_BYTES.saturating_mul(2),
-    );
-    let mut oversized_line_drops = 0_u64;
-    let mut backpressure_drops = 0_u64;
-    let mut malformed_event_drops = 0_u64;
+    let mut drops = NativeConnectionDropCounts::default();
+    // Keep every fallible read-loop exit inside this result. The single
+    // finalizer below must observe accumulated drops before returning the
+    // original success or I/O error to the listener task.
+    let connection_result: Result<(), std::io::Error> = async {
+        cx.checkpoint()
+            .map_err(|_| native_context_io_error("connection_pre_read"))?;
+        // ft-kccj8: the default lines() cap is 64 KiB — far below
+        // MAX_EVENT_LINE_BYTES (512 KiB) — so the warn-and-skip branch below
+        // was unreachable and any 64 KiB..512 KiB event killed the whole
+        // connection with InvalidData. Cap at 2× so the skip branch has a
+        // real window; lines beyond that still hard-close the connection
+        // (memory stays bounded at ~1 MiB).
+        let mut lines = socket_transport::lines_with_max_length(
+            socket_transport::buffered(stream),
+            MAX_EVENT_LINE_BYTES.saturating_mul(2),
+        );
 
-    while let Some(line) = socket_transport::next_line_with_cx(&cx, &mut lines).await? {
-        if line.len() > MAX_EVENT_LINE_BYTES {
-            let connection_drop_count =
-                record_native_connection_anomaly(&mut oversized_line_drops);
-            let listener_drop_count = record_native_listener_anomaly(
-                &listener_anomalies.oversized_line_drops,
-            );
-            if listener_drop_count.is_power_of_two() {
-                warn!(
-                    connection_drop_count,
-                    listener_drop_count,
-                    line_bytes = line.len(),
-                    "native event oversized-line drops reached sampled threshold"
+        'connection: loop {
+            let line = match socket_transport::next_line_with_cx(&cx, &mut lines).await? {
+                Some(line) => line,
+                None => break 'connection Ok(()),
+            };
+            if line.len() > MAX_EVENT_LINE_BYTES {
+                let connection_drop_count = record_native_connection_anomaly(
+                    &mut drops.oversized_line_drops,
                 );
-            }
-            continue;
-        }
-
-        match decode_wire_event(&line) {
-            Ok(Some(event)) => {
-                let (event_kind, pane_id) = event_metadata(&event);
-                match dispatch_event_with_cx(&cx, &event_tx, event).await {
-                    EventDispatchOutcome::Sent => {
-                        debug!(event_kind, pane_id, "native event dispatched (cx path)");
-                    }
-                    EventDispatchOutcome::Backpressure => {
-                        // ft-wtd5g: a dropped event here is silent data loss
-                        // (the read loop holds no capture-pipeline handle, so it
-                        // cannot inject a per-pane gap from this layer). Promote
-                        // to warn so the loss is at least operator-visible rather
-                        // than sinking into a filtered debug line; full per-pane
-                        // gap injection for this path is tracked as a follow-up.
-                        let connection_drop_count =
-                            record_native_connection_anomaly(&mut backpressure_drops);
-                        let listener_drop_count = record_native_listener_anomaly(
-                            &listener_anomalies.backpressure_drops,
-                        );
-                        if listener_drop_count.is_power_of_two() {
-                            warn!(
-                                connection_drop_count,
-                                listener_drop_count,
-                                event_kind,
-                                pane_id,
-                                "native event backpressure drops reached sampled threshold"
-                            );
-                        }
-                    }
-                    EventDispatchOutcome::ContextEnded => {
-                        debug!(
-                            event_kind,
-                            pane_id,
-                            "native event dispatch stopped because its capability context ended"
-                        );
-                        break;
-                    }
-                    EventDispatchOutcome::Closed => {
-                        debug!(event_kind, pane_id, "native event channel closed (cx path)");
-                        break;
-                    }
-                }
-            }
-            Ok(None) => {
-                debug!(
-                    event = "native_event_hello_received",
-                    "native event protocol hello received"
-                );
-            }
-            Err(_) => {
-                // Promoted from debug! — a malformed wire event is a
-                // protocol-level anomaly (version skew, corruption, or
-                // a hostile client writing to the native-events socket)
-                // and must not sink silently into a debug-level log
-                // that operators routinely filter out.
-                let connection_drop_count =
-                    record_native_connection_anomaly(&mut malformed_event_drops);
                 let listener_drop_count = record_native_listener_anomaly(
-                    &listener_anomalies.malformed_event_drops,
+                    &listener_anomalies.oversized_line_drops,
                 );
                 if listener_drop_count.is_power_of_two() {
                     warn!(
                         connection_drop_count,
                         listener_drop_count,
-                        failure_class = "wire_decode_failure",
-                        "native event malformed-frame drops reached sampled threshold"
+                        line_bytes = line.len(),
+                        "native event oversized-line drops reached sampled threshold"
                     );
+                }
+                continue;
+            }
+
+            match decode_wire_event(&line) {
+                Ok(Some(event)) => {
+                    let (event_kind, pane_id) = event_metadata(&event);
+                    match dispatch_event_with_cx(&cx, &event_tx, event).await {
+                        EventDispatchOutcome::Sent => {
+                            debug!(event_kind, pane_id, "native event dispatched (cx path)");
+                        }
+                        EventDispatchOutcome::Backpressure => {
+                            // ft-wtd5g: a dropped event here is silent data loss
+                            // (the read loop holds no capture-pipeline handle, so it
+                            // cannot inject a per-pane gap from this layer). Promote
+                            // to warn so the loss is at least operator-visible rather
+                            // than sinking into a filtered debug line; full per-pane
+                            // gap injection for this path is tracked as a follow-up.
+                            let connection_drop_count = record_native_connection_anomaly(
+                                &mut drops.backpressure_drops,
+                            );
+                            let listener_drop_count = record_native_listener_anomaly(
+                                &listener_anomalies.backpressure_drops,
+                            );
+                            if listener_drop_count.is_power_of_two() {
+                                warn!(
+                                    connection_drop_count,
+                                    listener_drop_count,
+                                    event_kind,
+                                    pane_id,
+                                    "native event backpressure drops reached sampled threshold"
+                                );
+                            }
+                        }
+                        EventDispatchOutcome::ContextEnded => {
+                            // The frame was already decoded, so this is a real
+                            // dropped event even though it is not queue pressure.
+                            // Retain a separate bounded counter and sampled warning
+                            // rather than silently hiding it in shutdown control
+                            // flow or polluting backpressure telemetry.
+                            let (connection_drop_count, listener_drop_count) =
+                                record_native_context_ended_drop(
+                                    &mut drops.context_ended_drops,
+                                    listener_anomalies,
+                                );
+                            if listener_drop_count.is_power_of_two() {
+                                warn!(
+                                    connection_drop_count,
+                                    listener_drop_count,
+                                    event_kind,
+                                    pane_id,
+                                    "native event context-ended drops reached sampled threshold"
+                                );
+                            }
+                            break 'connection Ok(());
+                        }
+                        EventDispatchOutcome::Closed => {
+                            // The receiver disappeared after this frame was
+                            // decoded. Record the resulting loss separately
+                            // from both queue pressure and capability expiry.
+                            let (connection_drop_count, listener_drop_count) =
+                                record_native_channel_closed_drop(
+                                    &mut drops.channel_closed_drops,
+                                    listener_anomalies,
+                                );
+                            if listener_drop_count.is_power_of_two() {
+                                warn!(
+                                    connection_drop_count,
+                                    listener_drop_count,
+                                    event_kind,
+                                    pane_id,
+                                    "native event channel-closed drops reached sampled threshold"
+                                );
+                            }
+                            break 'connection Ok(());
+                        }
+                    }
+                }
+                Ok(None) => {
+                    debug!(
+                        event = "native_event_hello_received",
+                        "native event protocol hello received"
+                    );
+                }
+                Err(_) => {
+                    // Promoted from debug! — a malformed wire event is a
+                    // protocol-level anomaly (version skew, corruption, or
+                    // a hostile client writing to the native-events socket)
+                    // and must not sink silently into a debug-level log
+                    // that operators routinely filter out.
+                    let connection_drop_count = record_native_connection_anomaly(
+                        &mut drops.malformed_event_drops,
+                    );
+                    let listener_drop_count = record_native_listener_anomaly(
+                        &listener_anomalies.malformed_event_drops,
+                    );
+                    if listener_drop_count.is_power_of_two() {
+                        warn!(
+                            connection_drop_count,
+                            listener_drop_count,
+                            failure_class = "wire_decode_failure",
+                            "native event malformed-frame drops reached sampled threshold"
+                        );
+                    }
                 }
             }
         }
     }
+    .await;
 
-    if oversized_line_drops > 0 || backpressure_drops > 0 || malformed_event_drops > 0 {
-        let anomalous_connections = record_native_listener_anomaly(
-            &listener_anomalies.connections_with_drops,
-        );
-        if anomalous_connections.is_power_of_two() {
-            warn!(
-                anomalous_connections,
-                oversized_line_drops,
-                backpressure_drops,
-                malformed_event_drops,
-                "native event connections with bounded input drops reached sampled threshold"
-            );
-        }
-    }
-
-    debug!("native event connection closed (cx path)");
-    Ok(())
+    finalize_native_connection(listener_anomalies, &drops, connection_result)
 }
 
 fn event_metadata(event: &NativeEvent) -> (&'static str, u64) {
@@ -1941,6 +2082,25 @@ mod native_accept_error_classifier_tests {
         let error = std::io::Error::from_raw_os_error(9);
         assert!(native_accept_error_is_permanent(&error));
 
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            all(
+                any(target_os = "linux", target_os = "android"),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        ))]
+        {
+            let not_a_socket = std::io::Error::from_raw_os_error(UNIX_ENOTSOCK_RAW);
+            assert!(
+                native_accept_error_is_permanent(&not_a_socket),
+                "ENOTSOCK cannot recover through accept retry"
+            );
+        }
+
         let descriptor_exhaustion = std::io::Error::from_raw_os_error(24);
         assert!(!native_accept_error_is_permanent(&descriptor_exhaustion));
     }
@@ -2028,6 +2188,110 @@ mod native_accept_error_classifier_tests {
         let mut counter = u64::MAX - 1;
         assert_eq!(record_native_connection_anomaly(&mut counter), u64::MAX);
         assert_eq!(record_native_connection_anomaly(&mut counter), u64::MAX);
+    }
+
+    #[test]
+    fn listener_anomaly_counter_saturates_for_long_lived_listeners() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(record_native_listener_anomaly(&counter), u64::MAX);
+        assert_eq!(record_native_listener_anomaly(&counter), u64::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn context_ended_drop_telemetry_stays_distinct_from_backpressure() {
+        let counters = NativeListenerAnomalyCounters::default();
+        let mut drops = NativeConnectionDropCounts::default();
+
+        assert_eq!(
+            record_native_context_ended_drop(&mut drops.context_ended_drops, &counters),
+            (1, 1)
+        );
+        assert_eq!(drops.context_ended_drops, 1);
+        assert_eq!(
+            counters.context_ended_drops.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters.backpressure_drops.load(Ordering::Relaxed),
+            0,
+            "capability termination must not be counted as queue pressure"
+        );
+        assert_eq!(
+            record_native_connection_drop_summary(
+                &counters,
+                &NativeConnectionDropCounts::default(),
+            ),
+            None,
+            "a drop-free connection must not affect anomaly summaries"
+        );
+        assert_eq!(
+            record_native_connection_drop_summary(&counters, &drops),
+            Some(1),
+            "a context-ended event loss must appear in the connection summary"
+        );
+        assert_eq!(
+            counters.connections_with_drops.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn channel_closed_drop_telemetry_is_terminal_but_not_pressure_or_context() {
+        let counters = NativeListenerAnomalyCounters::default();
+        let mut drops = NativeConnectionDropCounts::default();
+
+        assert_eq!(
+            record_native_channel_closed_drop(&mut drops.channel_closed_drops, &counters),
+            (1, 1)
+        );
+        assert_eq!(drops.channel_closed_drops, 1);
+        assert_eq!(
+            counters.channel_closed_drops.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(counters.backpressure_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.context_ended_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            record_native_connection_drop_summary(&counters, &drops),
+            Some(1)
+        );
+        assert_eq!(
+            counters.connections_with_drops.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn connection_error_finalization_preserves_error_and_summarizes_prior_drops_once() {
+        let counters = NativeListenerAnomalyCounters::default();
+        let mut drops = NativeConnectionDropCounts::default();
+        assert_eq!(
+            record_native_connection_anomaly(&mut drops.malformed_event_drops),
+            1
+        );
+        assert_eq!(
+            record_native_listener_anomaly(&counters.malformed_event_drops),
+            1
+        );
+
+        let propagated = finalize_native_connection(
+            &counters,
+            &drops,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "synthetic line-read failure",
+            )),
+        )
+        .expect_err("line-read failure must remain an error after drop summarization");
+
+        assert_eq!(propagated.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(propagated.to_string(), "synthetic line-read failure");
+        assert_eq!(
+            counters.connections_with_drops.load(Ordering::Relaxed),
+            1,
+            "the single finalization point must emit one connection summary"
+        );
     }
 
     #[test]

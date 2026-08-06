@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
@@ -763,6 +763,15 @@ where
     T: Send + 'static,
 {
     crate::runtime_async::task::spawn_with_cx(runtime_cx, task_fn)
+}
+
+const SNAPSHOT_SCHEDULER_RUNNING: u8 = 0;
+const SNAPSHOT_SCHEDULER_SHUTDOWN_ACKNOWLEDGED: u8 = 1;
+const SNAPSHOT_SCHEDULER_UNEXPECTED_RETURN: u8 = 2;
+const SNAPSHOT_SCHEDULER_FAILED: u8 = 3;
+
+const fn snapshot_scheduler_shutdown_acknowledged(status: u8) -> bool {
+    status == SNAPSHOT_SCHEDULER_SHUTDOWN_ACKNOWLEDGED
 }
 
 /// RAII-guarded holder for the capture task's per-pane vendored streaming
@@ -4003,7 +4012,15 @@ impl ObservationRuntime {
         let connector_outbound = self.spawn_connector_outbound_task();
 
         // Spawn snapshot engine task (session persistence) if configured
-        let (snapshot_handle, snapshot_shutdown_tx, snapshot_triggers) =
+        let (
+            snapshot_handle,
+            snapshot_shutdown_tx,
+            snapshot_triggers,
+            snapshot_shutdown_clean,
+            snapshot_engine,
+            snapshot_scheduler_status,
+            snapshot_shutdown_requested,
+        ) =
             if let Some(ref snap_config) = self.snapshot_config {
                 if snap_config.enabled {
                     let db_path = Arc::new(self.storage.db_path().to_string());
@@ -4024,46 +4041,73 @@ impl ObservationRuntime {
                     } else {
                         None
                     };
+                    let snapshot_shutdown_clean = Arc::new(AtomicBool::new(false));
+                    let snapshot_scheduler_status =
+                        Arc::new(AtomicU8::new(SNAPSHOT_SCHEDULER_RUNNING));
+                    let task_snapshot_scheduler_status = Arc::clone(&snapshot_scheduler_status);
+                    let snapshot_shutdown_requested = Arc::new(AtomicBool::new(false));
+                    let task_snapshot_shutdown_requested =
+                        Arc::clone(&snapshot_shutdown_requested);
+                    let scheduler_engine = Arc::clone(&engine);
 
                     let loop_cx = runtime_loop_cx();
                     let handle = spawn_runtime_task(&loop_cx, move |task_cx| async move {
                         let pane_provider_cx = task_cx.clone();
-                        if let Err(error) = engine
+                        let scheduler_wezterm = wezterm.clone();
+                        let scheduler_result = scheduler_engine
                             .run_periodic_with_cx(&task_cx, shutdown_rx, move || {
-                                let wez = wezterm.clone();
+                                let wez = scheduler_wezterm.clone();
                                 let pane_provider_cx = pane_provider_cx.clone();
                                 async move {
-                                    match wez.list_panes_with_cx(&pane_provider_cx).await {
-                                        Ok(panes) => Some(panes),
-                                        Err(e) => {
-                                            warn!(
-                                                error = %e,
-                                                "snapshot pane listing failed"
-                                            );
-                                            None
-                                        }
-                                    }
+                                    wez.list_panes_with_cx(&pane_provider_cx)
+                                        .await
+                                        .map_err(|error| {
+                                            crate::snapshot_engine::SnapshotError::PaneList(
+                                                error.to_string(),
+                                            )
+                                        })
                                 }
                             })
-                            .await
-                        {
-                            match error {
-                                crate::snapshot_engine::SnapshotError::Cancelled => {
-                                    info!("snapshot scheduler cancelled");
-                                }
-                                other => {
-                                    warn!(error = %other, "snapshot scheduler failed");
-                                }
+                            .await;
+                        let shutdown_was_requested =
+                            task_snapshot_shutdown_requested.load(Ordering::Acquire);
+                        let scheduler_status = match scheduler_result {
+                            Ok(()) if shutdown_was_requested => {
+                                info!("snapshot scheduler acknowledged runtime shutdown");
+                                SNAPSHOT_SCHEDULER_SHUTDOWN_ACKNOWLEDGED
                             }
-                        }
+                            Ok(()) => {
+                                error!(
+                                    "snapshot scheduler returned before runtime shutdown was requested"
+                                );
+                                SNAPSHOT_SCHEDULER_UNEXPECTED_RETURN
+                            }
+                            Err(error) => {
+                                error!(
+                                    error = %error,
+                                    shutdown_was_requested,
+                                    "snapshot scheduler failed before publishing a clean shutdown acknowledgement"
+                                );
+                                SNAPSHOT_SCHEDULER_FAILED
+                            }
+                        };
+                        task_snapshot_scheduler_status.store(scheduler_status, Ordering::Release);
                     });
                     info!("Snapshot engine started");
-                    (Some(handle), Some(shutdown_tx), snapshot_triggers)
+                    (
+                        Some(handle),
+                        Some(shutdown_tx),
+                        snapshot_triggers,
+                        Some(snapshot_shutdown_clean),
+                        Some(engine),
+                        Some(snapshot_scheduler_status),
+                        Some(snapshot_shutdown_requested),
+                    )
                 } else {
-                    (None, None, None)
+                    (None, None, None, None, None, None, None)
                 }
             } else {
-                (None, None, None)
+                (None, None, None, None, None, None, None)
             };
 
         info!("Observation runtime started");
@@ -4078,6 +4122,10 @@ impl ObservationRuntime {
             snapshot: snapshot_handle,
             snapshot_triggers,
             snapshot_shutdown: snapshot_shutdown_tx,
+            snapshot_shutdown_clean,
+            snapshot_engine,
+            snapshot_scheduler_status,
+            snapshot_shutdown_requested,
             shutdown_flag: Arc::clone(&self.shutdown_flag),
             storage: self.storage.clone(),
             metrics: Arc::clone(&self.metrics),
@@ -8707,19 +8755,27 @@ pub struct RuntimeHandle {
     pub snapshot_triggers: Option<JoinHandle<()>>,
     /// Snapshot engine shutdown sender (bridges AtomicBool → watch channel).
     ///
-    /// br-ft-x2oyy: callers signal shutdown via
-    /// `if let Some(ref tx) = self.snapshot_shutdown { let _ = tx.send(true); }`
-    /// at three sites (`shutdown_with_summary`, `shutdown`,
-    /// `signal_shutdown`). The `let _ =` swallow is intentional best-
-    /// effort fan-out: `watch::Sender::send` returns `Err(SendError)`
-    /// only when ALL receivers have been dropped, which means the
-    /// snapshot task has already exited (its on_event loop awaits the
-    /// matching `watch::Receiver`). The downstream `shutdown_flag`
-    /// AtomicBool is the authoritative signal; this watch channel is a
-    /// secondary wake-up to break the snapshot task out of any pending
-    /// async wait. Receiver-dropped IS the success case here — no
-    /// observability gap.
+    /// The `let _ = tx.send(true)` calls are intentional best-effort wake-ups:
+    /// a send error means every receiver has already gone away, so retrying
+    /// cannot help. Receiver loss is not itself a clean-shutdown receipt;
+    /// `snapshot_scheduler_status` distinguishes an acknowledged shutdown from
+    /// an unexpected return or failure after the task join settles.
     snapshot_shutdown: Option<watch::Sender<bool>>,
+    /// Set only by the unique RuntimeHandle shutdown owner after every runtime
+    /// task has settled, storage has flushed, and the terminal snapshot helper
+    /// returns both its final-checkpoint and clean-mark receipt.
+    /// `None` means this runtime did not enable the duplicate snapshot surface.
+    snapshot_shutdown_clean: Option<Arc<AtomicBool>>,
+    /// Snapshot engine retained by the unique shutdown owner. The scheduler
+    /// task never finalizes this engine merely because its loop returns.
+    snapshot_engine: Option<Arc<crate::snapshot_engine::SnapshotEngine>>,
+    /// Finite terminal status published by the scheduler task. A successful
+    /// task join is insufficient because an unexpected `Ok(())` return is still
+    /// a lifecycle failure.
+    snapshot_scheduler_status: Option<Arc<AtomicU8>>,
+    /// Explicit shutdown intent shared with the scheduler task. This separates
+    /// an expected watch-channel acknowledgement from a spontaneous return.
+    snapshot_shutdown_requested: Option<Arc<AtomicBool>>,
     /// Shutdown flag for signaling tasks
     pub shutdown_flag: Arc<AtomicBool>,
     /// Storage handle for external access
@@ -9714,7 +9770,8 @@ impl RuntimeHandle {
     /// 1. Sets the shutdown flag to signal all tasks
     /// 2. Waits for tasks to complete (with timeout)
     /// 3. Flushes storage
-    /// 4. Collects and returns a shutdown summary
+    /// 4. Persists the terminal mux snapshot and clean mark, when configured
+    /// 5. Collects and returns a shutdown summary
     pub async fn shutdown_with_summary(self) -> ShutdownSummary {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.shutdown_with_summary_with_cx(&cx).await
@@ -9742,10 +9799,12 @@ impl RuntimeHandle {
     ///
     /// `shutdown_timeout` independently bounds the graceful task-join phase,
     /// the forced-cancellation settlement phase (when needed), the final
-    /// cursor snapshot, and the subsequent storage flush. A stubborn writer
-    /// task that misses both join windows — and is therefore still running
-    /// concurrently with the flush — cannot wedge the flush either. Total
-    /// shutdown latency may therefore span multiple timeout budgets.
+    /// cursor snapshot, the subsequent storage flush, and terminal pane
+    /// discovery. The terminal snapshot mutation uses the smaller of this
+    /// timeout and five seconds. A stubborn writer task that misses both join
+    /// windows — and is therefore still running concurrently with the flush —
+    /// cannot wedge the flush either. Total shutdown latency may therefore
+    /// span multiple timeout budgets.
     pub async fn shutdown_with_timeout(self, shutdown_timeout: Duration) -> ShutdownSummary {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.shutdown_with_timeout_with_cx(&cx, shutdown_timeout)
@@ -9762,9 +9821,12 @@ impl RuntimeHandle {
 
         // Signal shutdown
         self.shutdown_flag.store(true, Ordering::SeqCst);
+        if let Some(requested) = self.snapshot_shutdown_requested.as_ref() {
+            requested.store(true, Ordering::Release);
+        }
         if let Some(ref tx) = self.snapshot_shutdown {
-            // br-ft-x2oyy: intentional best-effort shutdown signal; send
-            // only fails when the snapshot trigger task has already exited.
+            // Intentional best-effort wake-up. The joined scheduler status,
+            // not channel receiver presence, is the shutdown receipt.
             let _ = tx.send(true);
         }
         info!("Shutdown signal sent");
@@ -9937,6 +9999,50 @@ impl RuntimeHandle {
             }
         }
 
+        if let Some(status) = self.snapshot_scheduler_status.as_ref() {
+            let status = status.load(Ordering::Acquire);
+            if snapshot_scheduler_shutdown_acknowledged(status) {
+                // The explicit shutdown watch was observed and the scheduler
+                // returned without a typed failure.
+            } else {
+                match status {
+                    SNAPSHOT_SCHEDULER_RUNNING => {
+                        clean = false;
+                        warnings.push(
+                            "RuntimeBuilder snapshot scheduler did not publish a terminal acknowledgement"
+                                .to_string(),
+                        );
+                    }
+                    SNAPSHOT_SCHEDULER_UNEXPECTED_RETURN => {
+                        clean = false;
+                        warnings.push(
+                            "RuntimeBuilder snapshot scheduler returned before shutdown was requested"
+                                .to_string(),
+                        );
+                    }
+                    SNAPSHOT_SCHEDULER_FAILED => {
+                        clean = false;
+                        warnings.push(
+                            "RuntimeBuilder snapshot scheduler failed before clean shutdown acknowledgement"
+                                .to_string(),
+                        );
+                    }
+                    unknown => {
+                        clean = false;
+                        warnings.push(format!(
+                            "RuntimeBuilder snapshot scheduler published unknown terminal status {unknown}"
+                        ));
+                    }
+                }
+            }
+        } else if self.snapshot_engine.is_some() {
+            clean = false;
+            warnings.push(
+                "RuntimeBuilder snapshot engine has no scheduler acknowledgement authority"
+                    .to_string(),
+            );
+        }
+
         // Get final metrics
         let segments_persisted = self.metrics.segments_persisted.get();
         let events_recorded = self.metrics.events_recorded.get();
@@ -10034,7 +10140,142 @@ impl RuntimeHandle {
             clean = false;
         }
 
-        ShutdownSummary {
+        // The consuming RuntimeHandle is the sole terminal-snapshot owner. A
+        // clean path here proves that the scheduler and every top-level
+        // producer/persistence task settled, storage flushed, and the live
+        // queue observations above were zero. Never convert a degraded earlier
+        // phase into `shutdown_clean = 1`.
+        if let Some(snapshot_engine) = self.snapshot_engine.as_ref() {
+            if clean {
+                let snapshot_cx = crate::cx::for_request();
+                let pane_list_result = runtime_timeout(
+                    &snapshot_cx,
+                    shutdown_timeout,
+                    self.wezterm_handle.list_panes_with_cx(&snapshot_cx),
+                )
+                .await;
+                match pane_list_result {
+                    Ok(Ok(panes)) => {
+                        let checkpoint_timeout = shutdown_timeout.min(Duration::from_secs(5));
+                        match snapshot_engine
+                            .shutdown_checkpoint_with_cx(
+                                &snapshot_cx,
+                                &panes,
+                                checkpoint_timeout,
+                            )
+                            .await
+                        {
+                            Ok(checkpoint) => {
+                                info!(
+                                    checkpoint_id = checkpoint.checkpoint_id,
+                                    pane_count = checkpoint.pane_count,
+                                    total_bytes = checkpoint.total_bytes,
+                                    "runtime snapshot terminal checkpoint and clean mark committed after storage settlement"
+                                );
+                                if let Some(receipt) = self.snapshot_shutdown_clean.as_ref() {
+                                    receipt.store(true, Ordering::Release);
+                                }
+                            }
+                            Err(error) => {
+                                clean = false;
+                                if let Some(checkpoint) =
+                                    error.committed_shutdown_checkpoint()
+                                {
+                                    let session_id = checkpoint
+                                        .session_id
+                                        .chars()
+                                        .take(64)
+                                        .collect::<String>();
+                                    warn!(
+                                        error = %error,
+                                        %session_id,
+                                        checkpoint_id = checkpoint.checkpoint_id,
+                                        pane_count = checkpoint.pane_count,
+                                        total_bytes = checkpoint.total_bytes,
+                                        "runtime terminal checkpoint committed but clean mark failed"
+                                    );
+                                    warnings.push(format!(
+                                        "RuntimeBuilder terminal checkpoint {} committed, but its clean mark failed",
+                                        checkpoint.checkpoint_id
+                                    ));
+                                } else {
+                                    warn!(
+                                        error = %error,
+                                        "runtime terminal snapshot failed before a clean receipt"
+                                    );
+                                    warnings.push(
+                                        "RuntimeBuilder terminal snapshot failed before publishing a clean receipt"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        clean = false;
+                        warn!(
+                            error = %error,
+                            "runtime terminal snapshot pane listing failed after storage settlement"
+                        );
+                        warnings.push(
+                            "RuntimeBuilder terminal snapshot pane listing failed".to_string(),
+                        );
+                    }
+                    Err(RuntimeTimeoutFailure::Elapsed) => {
+                        clean = false;
+                        warnings.push(
+                            "RuntimeBuilder terminal snapshot pane listing exceeded its timeout"
+                                .to_string(),
+                        );
+                    }
+                    Err(RuntimeTimeoutFailure::Context(failure)) => {
+                        clean = false;
+                        record_runtime_wait_failure(
+                            "runtime_shutdown_snapshot_pane_list",
+                            failure,
+                        );
+                        warnings.push(format!(
+                            "RuntimeBuilder terminal snapshot pane-list wait failed with class {}",
+                            failure.as_str()
+                        ));
+                    }
+                }
+            } else {
+                warnings.push(
+                    "RuntimeBuilder terminal snapshot clean mark was suppressed because an earlier shutdown phase was unclean"
+                        .to_string(),
+                );
+            }
+        }
+
+        if self
+            .snapshot_shutdown_clean
+            .as_ref()
+            .is_some_and(|receipt| !receipt.load(Ordering::Acquire))
+        {
+            clean = false;
+            warnings.push(
+                "RuntimeBuilder snapshot session did not publish both final-checkpoint and clean-mark receipts"
+                    .to_string(),
+            );
+        }
+
+        // Derive proof-related diagnostics only after both queue observations
+        // have updated the final clean state. Zero observations remain
+        // non-authoritative after any earlier unclean phase.
+        let managed_queue_quiescence_proven =
+            clean && final_capture_queue == 0 && final_write_queue == 0;
+        if !managed_queue_quiescence_proven
+            && final_capture_queue == 0
+            && final_write_queue == 0
+        {
+            warnings.push(
+                "Managed queue quiescence was not proven because an earlier shutdown phase was unclean"
+                    .to_string(),
+            );
+        }
+
+        ShutdownSummary::from_runtime_observation(
             elapsed_secs,
             final_capture_queue,
             final_write_queue,
@@ -10043,7 +10284,7 @@ impl RuntimeHandle {
             last_seq_by_pane,
             clean,
             warnings,
-        }
+        )
     }
 
     /// Request graceful shutdown.
@@ -10063,9 +10304,9 @@ impl RuntimeHandle {
     /// leak).
     pub async fn shutdown_with_cx(self, cx: &crate::cx::Cx) {
         let summary = self.shutdown_with_summary_with_cx(cx).await;
-        if !summary.clean || !summary.warnings.is_empty() {
+        if !summary.is_clean() || !summary.warnings.is_empty() {
             warn!(
-                clean = summary.clean,
+                clean = summary.is_clean(),
                 warnings = ?summary.warnings,
                 "runtime shutdown completed with warnings"
             );
@@ -10075,9 +10316,12 @@ impl RuntimeHandle {
     /// Signal shutdown without waiting.
     pub fn signal_shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
+        if let Some(requested) = self.snapshot_shutdown_requested.as_ref() {
+            requested.store(true, Ordering::Release);
+        }
         if let Some(ref tx) = self.snapshot_shutdown {
-            // br-ft-x2oyy: intentional best-effort shutdown signal; send
-            // only fails when the snapshot trigger task has already exited.
+            // Intentional best-effort wake-up. The joined scheduler status,
+            // not channel receiver presence, is the shutdown receipt.
             let _ = tx.send(true);
         }
     }
@@ -10343,9 +10587,9 @@ impl Drop for RuntimeHandle {
             );
         }
         if let Some(ref tx) = self.snapshot_shutdown {
-            // Same intentional best-effort send as the explicit shutdown
-            // paths: failure here just means the snapshot task already
-            // exited.
+            // Same best-effort wake-up as the explicit path. Deliberately do
+            // not set `snapshot_shutdown_requested`: Drop is an abnormal exit,
+            // never a clean scheduler acknowledgement.
             let _ = tx.send(true);
         }
         for handle in [
@@ -13138,6 +13382,10 @@ mod tests {
             snapshot: None,
             snapshot_triggers: None,
             snapshot_shutdown: None,
+            snapshot_shutdown_clean: None,
+            snapshot_engine: None,
+            snapshot_scheduler_status: None,
+            snapshot_shutdown_requested: None,
             shutdown_flag: Arc::clone(&runtime.shutdown_flag),
             storage: runtime.storage.clone(),
             metrics: Arc::clone(&runtime.metrics),
@@ -13592,7 +13840,7 @@ mod tests {
 
             let summary = handle.shutdown_with_summary().await;
             assert!(
-                summary.clean,
+                summary.is_clean(),
                 "shutdown should complete cleanly: {:?}",
                 summary.warnings
             );
@@ -13600,6 +13848,152 @@ mod tests {
                 summary.warnings.is_empty(),
                 "shutdown should not emit warnings for mock lifecycle: {:?}",
                 summary.warnings
+            );
+            assert!(
+                summary.managed_queue_quiescence_proven(),
+                "a fully clean zero-depth shutdown should prove managed-queue quiescence"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_builder_snapshot_session_is_closed_after_scheduler_settles() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let patterns = PatternEngine::new();
+            let config = RuntimeConfig {
+                discovery_interval: Duration::from_millis(10),
+                capture_interval: Duration::from_millis(10),
+                min_capture_interval: Duration::from_millis(5),
+                channel_buffer: 64,
+                ..Default::default()
+            };
+            let snapshot_config = SnapshotConfig {
+                enabled: true,
+                interval_seconds: 3600,
+                scheduling: crate::config::SnapshotSchedulingConfig {
+                    mode: SnapshotSchedulingMode::Periodic,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mock = crate::wezterm::MockWezterm::new();
+            mock.add_default_pane(0).await;
+            let wezterm_handle: WeztermHandle = Arc::new(mock);
+            let mut runtime = ObservationRuntime::new(
+                config,
+                storage,
+                Arc::new(RwLock::new(patterns)),
+            )
+            .with_wezterm_handle(wezterm_handle)
+            .with_snapshot_config(snapshot_config);
+
+            let handle = runtime.start().await.expect("runtime should start");
+            let startup_deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let checkpoint_exists = rusqlite::Connection::open(&db_path)
+                    .and_then(|connection| {
+                        connection.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM session_checkpoints)",
+                            [],
+                            |row| row.get::<_, bool>(0),
+                        )
+                    })
+                    .unwrap_or(false);
+                if checkpoint_exists {
+                    break;
+                }
+                assert!(
+                    Instant::now() < startup_deadline,
+                    "snapshot scheduler did not publish its startup checkpoint"
+                );
+                sleep(Duration::from_millis(20)).await;
+            }
+
+            let summary = handle.shutdown_with_summary().await;
+            assert!(
+                summary.is_clean(),
+                "runtime shutdown should settle cleanly: {:?}",
+                summary.warnings
+            );
+            let connection = rusqlite::Connection::open(&db_path).unwrap();
+            let (sessions, clean_sessions): (i64, i64) = connection
+                .query_row(
+                    "SELECT COUNT(*), COALESCE(SUM(shutdown_clean), 0) FROM mux_sessions",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert!(sessions > 0, "startup must create a snapshot session");
+            assert_eq!(
+                clean_sessions, sessions,
+                "every RuntimeBuilder-owned snapshot session must close cleanly"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_builder_empty_domain_persists_terminal_snapshot_receipt() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let patterns = PatternEngine::new();
+            let config = RuntimeConfig {
+                discovery_interval: Duration::from_millis(10),
+                capture_interval: Duration::from_millis(10),
+                min_capture_interval: Duration::from_millis(5),
+                channel_buffer: 64,
+                ..Default::default()
+            };
+            let snapshot_config = SnapshotConfig {
+                enabled: true,
+                interval_seconds: 3600,
+                scheduling: crate::config::SnapshotSchedulingConfig {
+                    mode: SnapshotSchedulingMode::Periodic,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut runtime = ObservationRuntime::new(
+                config,
+                storage,
+                Arc::new(RwLock::new(patterns)),
+            )
+            .with_wezterm_handle(Arc::new(crate::wezterm::MockWezterm::new()))
+            .with_snapshot_config(snapshot_config);
+
+            let handle = runtime.start().await.expect("runtime should start");
+            let summary = handle.shutdown_with_summary().await;
+            assert!(
+                summary.is_clean(),
+                "empty-domain shutdown should settle cleanly: {:?}",
+                summary.warnings
+            );
+
+            let connection = rusqlite::Connection::open(&db_path).unwrap();
+            let (sessions, clean_sessions): (i64, i64) = connection
+                .query_row(
+                    "SELECT COUNT(*), COALESCE(SUM(shutdown_clean), 0) FROM mux_sessions",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(sessions, 1, "terminal checkpoint must create one session");
+            assert_eq!(
+                clean_sessions, sessions,
+                "the empty-domain terminal session must carry a clean-mark receipt"
+            );
+            let empty_shutdown_checkpoints: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_checkpoints WHERE checkpoint_type = 'shutdown' AND pane_count = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                empty_shutdown_checkpoints, 1,
+                "empty-domain shutdown must persist an explicit zero-pane checkpoint"
             );
         });
     }
@@ -13635,7 +14029,7 @@ mod tests {
                 .await;
 
             assert!(
-                summary.clean,
+                summary.is_clean(),
                 "fresh bounded cleanup contexts must complete despite caller cancellation: {:?}",
                 summary.warnings
             );
@@ -13664,12 +14058,16 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                !summary.clean,
+                !summary.is_clean(),
                 "stubborn tasks should make shutdown summary unclean"
             );
             assert_eq!(
-                summary.final_capture_queue, 7,
+                summary.final_capture_queue(), 7,
                 "shutdown summary must report the observed capture queue depth"
+            );
+            assert!(
+                !summary.managed_queue_quiescence_proven(),
+                "non-zero or unclean queue state must not claim proven quiescence"
             );
             assert!(
                 summary.warnings.iter().any(|warning| {
@@ -13717,8 +14115,28 @@ mod tests {
             let summary = handle.shutdown_with_timeout(Duration::from_secs(2)).await;
 
             assert!(
-                !summary.clean,
+                !summary.is_clean(),
                 "pre-aborted top-level task results must make shutdown unclean"
+            );
+            assert_eq!(
+                (
+                    summary.final_capture_queue(),
+                    summary.final_write_queue(),
+                ),
+                (0, 0),
+                "regression precondition: this path must exercise observed-zero but unclean shutdown"
+            );
+            assert!(
+                !summary.managed_queue_quiescence_proven(),
+                "observed zeroes must not become a proof after an unclean task-settlement phase"
+            );
+            assert!(
+                summary
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("Managed queue quiescence was not proven")),
+                "unknown zero-depth state must remain operator-visible: {:?}",
+                summary.warnings
             );
             assert!(
                 summary
@@ -13749,7 +14167,7 @@ mod tests {
             let summary = handle.shutdown_with_timeout(Duration::from_secs(2)).await;
 
             assert!(
-                !summary.clean,
+                !summary.is_clean(),
                 "join observation failure must remain visible even after trusted settlement"
             );
             assert!(
@@ -13781,6 +14199,44 @@ mod tests {
                 summary.warnings
             );
         });
+    }
+
+    #[test]
+    fn runtime_shutdown_summary_rejects_missing_snapshot_close_receipt() {
+        run_async_test_isolated(|| async {
+            let (_dir, mut handle, _dropped) =
+                runtime_handle_with_stubborn_tasks(Duration::ZERO).await;
+            handle.snapshot_shutdown_clean = Some(Arc::new(AtomicBool::new(false)));
+
+            let summary = handle.shutdown_with_timeout(Duration::from_secs(2)).await;
+            assert!(
+                !summary.is_clean(),
+                "missing snapshot close authority must make the runtime summary unclean"
+            );
+            assert!(
+                summary.warnings.iter().any(|warning| warning.contains(
+                    "snapshot session did not publish both final-checkpoint and clean-mark receipts"
+                )),
+                "missing typed receipt must remain operator-visible: {:?}",
+                summary.warnings
+            );
+        });
+    }
+
+    #[test]
+    fn snapshot_scheduler_clean_exit_requires_explicit_shutdown_acknowledgement() {
+        assert!(snapshot_scheduler_shutdown_acknowledged(
+            SNAPSHOT_SCHEDULER_SHUTDOWN_ACKNOWLEDGED
+        ));
+        assert!(!snapshot_scheduler_shutdown_acknowledged(
+            SNAPSHOT_SCHEDULER_RUNNING
+        ));
+        assert!(!snapshot_scheduler_shutdown_acknowledged(
+            SNAPSHOT_SCHEDULER_UNEXPECTED_RETURN
+        ));
+        assert!(!snapshot_scheduler_shutdown_acknowledged(
+            SNAPSHOT_SCHEDULER_FAILED
+        ));
     }
 
     #[cfg(feature = "native-wezterm")]
@@ -13869,7 +14325,7 @@ mod tests {
 
             let summary = handle.shutdown_with_summary().await;
             assert!(
-                summary.clean,
+                summary.is_clean(),
                 "shutdown should complete cleanly: {:?}",
                 summary.warnings
             );
