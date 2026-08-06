@@ -353,7 +353,7 @@ Honest status of every shipped surface, without migration-era hand-waving.
 | Operating envelope | **Supported** | `ft.operating_envelope.v1` planner contract + golden fixtures; fails closed on missing or critical-pressure telemetry |
 | Mission objective planner | **Supported** | Capacity-aware planner for safe swarm orchestration (ft-auy2g) |
 | Incident bundles | **Supported** | Wired to live collectors; publish-side snapshot path; beads coordination snapshot included |
-| Session persistence | **Supported with backend prerequisite** | Snapshots, session inspection, and `ft session doctor` are cross-platform; live restore (`ft restart`, `ft snapshot restore`) is currently Unix-only |
+| Session persistence | **Partially supported with backend prerequisite** | Snapshots, session inspection, and `ft session doctor` are cross-platform. Unix-only live restore currently rebuilds the supported layout subset; historical scrollback, process/agent state, stable mux-domain identity, exact tab order/focus, and full window appearance are not restored. |
 | Reality-check + attestation | **Supported** | `ft attestation verify` / `show` ship as a thin Rust wrapper over `scripts/attestation-verify.sh`. Signed bundles live in `docs/attestations/` |
 | Deferred proof queue | **Supported with fail-closed proof prerequisite** | `ft proof queue/status/replay/attach` and `ft robot proof status` expose source-landed proof intents. Replay executes only through remote-required RCH when admission is explicitly `admitted`; local Cargo is never substituted. Release-slot evidence stays under `docs/attestations/proofs/deferred-proof-replay.json`; current W8.2 remote proof remains blocked on RCH admission. |
 | Web API / SSE | **Supported behind `--features web`** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
@@ -1036,7 +1036,13 @@ ft session doctor                # health check for session persistence
 ft watch                         # startup detection + restore prompt for unclean shutdowns
 ```
 
-`ft snapshot restore` and `ft restart` are wired (Unix-only currently). Use `--layout-only` to skip scrollback replay; use `ft watch` to get restore-on-startup behavior after an unclean shutdown.
+`ft snapshot restore` and `ft restart` are wired on Unix, but currently force
+layout-only behavior. Historical output is never written through PTY input,
+and shell/agent replacement remains a reported manual disposition until the
+mux exposes safe render-state and argv-isolated spawn channels. The
+`--layout-only` flag is therefore an explicit statement of the only supported
+mode, not a switch from a working scrollback-replay mode. Use `ft watch` for
+unclean-session detection and restore prompting.
 
 ### Configuration
 

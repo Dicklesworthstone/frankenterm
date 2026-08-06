@@ -14,7 +14,7 @@ This document explains how ft captures and restores session state for crash reco
 
 - Process checkpoint/restore (CRIU-style)
 - Perfect fidelity for alt-screen / TUIs in scrollback
-- “Continue the same agent session” semantics (agents relaunch fresh)
+- “Continue the same agent session” semantics (agents require manual follow-up)
 
 ## Modules and responsibilities
 
@@ -41,17 +41,20 @@ This document explains how ft captures and restores session state for crash reco
 - `frankenterm_core::session_restore`
   - Detects unclean sessions (`shutdown_clean = 0`)
   - Loads the latest checkpoint
-  - Coordinates restoration steps (layout first; optional scrollback/process steps)
+  - Coordinates layout restoration, the fail-closed scrollback capability
+    check, and process-disposition classification
 
 - `frankenterm_core::restore_layout::LayoutRestorer`
   - Recreates windows/tabs/splits via backend bridge CLI operations (current: WezTerm)
   - Produces an old-pane-id → new-pane-id mapping
 
 - `frankenterm_core::restore_scrollback`
-  - Replays captured scrollback into newly created panes (best-effort)
+  - Fails closed without writing PTY input because no safe render-state restore
+    channel currently exists
 
 - `frankenterm_core::restore_process`
-  - Plans optional process re-launch (shells by default; agents opt-in)
+  - Classifies captured process state as skipped or requiring manual follow-up
+  - Rejects legacy executable plans without writing PTY input
 
 ## Data flow
 
@@ -76,8 +79,8 @@ ft watch startup
   → find sessions where shutdown_clean = 0
   → load_latest_checkpoint(session_id)
   → LayoutRestorer recreates topology
-  → (optional) restore_scrollback
-  → (optional) restore_process relaunch
+  → restore_scrollback capability check (mapped replay fails closed)
+  → restore_process disposition classification
   → mark session shutdown_clean = 1
 ```
 
@@ -117,14 +120,22 @@ If the hash is unchanged from the last capture, the engine can skip writing a ne
 
 This prevents periodic snapshots from bloating the database when nothing has materially changed.
 
-## Process re-launch (opt-in)
+## Process restoration disposition
 
-Process relaunch is intentionally conservative:
+Process restoration currently classifies captured state; it does not re-launch
+foreground processes:
 
-- Shell relaunch is allowed by default (best-effort, cwd-based)
-- Agent relaunch is **disabled by default** because the new process cannot recover hidden model state
+- Layout reconstruction creates each pane's default shell at the validated cwd.
+- Captured shells and agents always receive an explicit manual disposition so
+  omitted process state cannot be mistaken for a successful restore.
+- Captured commands, cwd values, agent types, and manual hints are excluded from
+  reports and diagnostics.
+- Caller-supplied legacy executable plans fail closed and never write PTY input.
 
-Configuration lives under `[snapshots.process_relaunch]` in `ft.toml`.
+The historical `launch_shells`, `launch_agents`, `launch_delay_ms`, and
+`agent_commands` configuration keys are reserved and ignored. Actual process
+relaunch requires a future mux-native, argv-isolated spawn API. Configuration
+lives under `[snapshots.process_relaunch]` in `ft.toml`.
 
 ## Bench budgets
 

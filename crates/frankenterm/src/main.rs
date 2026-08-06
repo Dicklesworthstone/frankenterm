@@ -719,7 +719,6 @@ SEE ALSO:
     ft restart --dry-run              Show what would happen
     ft restart --skip-restore         Restart without restoring layout
     ft restart --layout-only          Explicitly select the only safe restore mode
-    ft restart --launch-agents        Re-launch agent commands after restore
     ft restart --stop-timeout 30      Custom stop timeout
 
 SEE ALSO:
@@ -742,10 +741,6 @@ SEE ALSO:
         /// Explicit no-op: layout-only is currently the only safe restore mode
         #[arg(long)]
         layout_only: bool,
-
-        /// Re-launch agent commands in restored panes (starts new agent sessions)
-        #[arg(long)]
-        launch_agents: bool,
 
         /// Show what would happen without executing
         #[arg(long)]
@@ -6545,10 +6540,6 @@ enum SnapshotCommands {
         /// Explicit no-op: layout-only is currently the only safe restore mode
         #[arg(long)]
         layout_only: bool,
-
-        /// Re-launch agent commands in restored panes (starts new agent sessions)
-        #[arg(long)]
-        launch_agents: bool,
 
         /// Show what would be restored without executing
         #[arg(long)]
@@ -22220,7 +22211,6 @@ async fn handle_robot_checkpoint_command(
 
             let restore_options = SnapshotRestoreWorkflowOptions {
                 layout_only: true,
-                launch_agents: false,
                 wezterm_timeout_secs: config.cli.timeout_seconds,
             };
 
@@ -22420,7 +22410,6 @@ async fn restore_snapshot_checkpoint(
     wezterm_timeout_secs: u64,
     _layout_only: bool,
     process_relaunch: &frankenterm_core::config::ProcessRelaunchConfig,
-    launch_agents: bool,
 ) -> anyhow::Result<frankenterm_core::session_restore::RestoreSummary> {
     use frankenterm_core::session_restore::{
         SessionRestoreConfig, SessionRestorer, load_checkpoint_by_id_with_cx,
@@ -22432,11 +22421,8 @@ async fn restore_snapshot_checkpoint(
         .ok_or_else(|| anyhow::anyhow!("Snapshot {checkpoint_id} not found"))?;
     let (session, _) = show_session_with_cx(restore_cx, db_path, &checkpoint.session_id).await?;
     let wezterm = frankenterm_core::wezterm::wezterm_handle_with_timeout(wezterm_timeout_secs);
-    let mut process_relaunch_cfg: frankenterm_core::restore_process::LaunchConfig =
+    let process_relaunch_cfg: frankenterm_core::restore_process::LaunchConfig =
         process_relaunch.clone().into();
-    if launch_agents {
-        process_relaunch_cfg.launch_agents = true;
-    }
     let restorer = SessionRestorer::new(
         Arc::new(db_path.to_string()),
         SessionRestoreConfig {
@@ -22540,7 +22526,7 @@ fn restore_completed_successfully(
         && summary.layout_result.failed_panes.is_empty()
         && scrollback_replay_invariant_holds(summary)
         && summary.process_launch_report.as_ref().is_none_or(|report| {
-            use frankenterm_core::restore_process::LaunchAction;
+            use frankenterm_core::restore_process::LaunchDisposition;
 
             let mut expected_shells = 0usize;
             let mut expected_agents = 0usize;
@@ -22553,10 +22539,10 @@ fn restore_completed_successfully(
                         return false;
                     }
                     match &result.action {
-                        LaunchAction::LaunchShell { .. } => expected_shells += 1,
-                        LaunchAction::LaunchAgent { .. } => expected_agents += 1,
-                        LaunchAction::Manual { .. } => expected_manual += 1,
-                        LaunchAction::Skip { .. } => expected_skipped += 1,
+                        LaunchDisposition::Shell => expected_shells += 1,
+                        LaunchDisposition::Agent => expected_agents += 1,
+                        LaunchDisposition::Manual => expected_manual += 1,
+                        LaunchDisposition::Skip => expected_skipped += 1,
                     }
                 } else {
                     if result.error.is_none() {
@@ -22607,7 +22593,6 @@ fn print_scrollback_restore_summary(
 #[derive(Debug, Clone, Copy)]
 struct SnapshotRestoreWorkflowOptions {
     layout_only: bool,
-    launch_agents: bool,
     wezterm_timeout_secs: u64,
 }
 
@@ -22630,7 +22615,10 @@ fn snapshot_restore_dry_run_json(
             "enabled": false,
             "reason": SCROLLBACK_REPLAY_DISABLED_REASON,
         },
-        "launch_agents": options.launch_agents,
+        "process_replacement": {
+            "available": false,
+            "reason": "mux_native_argv_spawn_unavailable",
+        },
     })
 }
 
@@ -22648,7 +22636,7 @@ fn snapshot_restore_plan_lines(
         format!("  Pane count: {}", checkpoint.pane_count),
         format!("  layout_only={}", options.layout_only),
         format!("  Scrollback replay: {SCROLLBACK_REPLAY_DISABLED_REASON}"),
-        format!("  launch_agents={}", options.launch_agents),
+        "  Process replacement: unavailable without mux-native argv spawn".to_string(),
         "Dry-run requested; no actions were executed.".to_string(),
     ]
 }
@@ -22777,7 +22765,7 @@ async fn execute_snapshot_restore_post_preflight<Restore, RestoreFut>(
     restore_snapshot: Restore,
 ) -> Result<SnapshotRestoreWorkflowResult, SnapshotRestoreAbort>
 where
-    Restore: FnOnce(i64, bool, bool) -> RestoreFut,
+    Restore: FnOnce(i64, bool) -> RestoreFut,
     RestoreFut: std::future::Future<
             Output = anyhow::Result<frankenterm_core::session_restore::RestoreSummary>,
         >,
@@ -22786,7 +22774,7 @@ where
         layout_only: true,
         ..options
     };
-    let summary = restore_snapshot(checkpoint_id, options.layout_only, options.launch_agents)
+    let summary = restore_snapshot(checkpoint_id, options.layout_only)
         .await
         .map_err(|error| {
             SnapshotRestoreAbort::new("restore", checkpoint_id, error).with_hint(format!(
@@ -22825,7 +22813,7 @@ async fn execute_snapshot_restore_workflow(
     let workflow_result = execute_snapshot_restore_post_preflight(
         checkpoint_id,
         options,
-        move |checkpoint_id, layout_only, launch_agents| async move {
+        move |checkpoint_id, layout_only| async move {
             restore_snapshot_checkpoint(
                 &restore_cx,
                 db_path,
@@ -22833,7 +22821,6 @@ async fn execute_snapshot_restore_workflow(
                 wezterm_timeout_secs,
                 layout_only,
                 process_relaunch,
-                launch_agents,
             )
             .await
         },
@@ -22864,7 +22851,6 @@ struct RestartWorkflowOptions {
     start_timeout_secs: u64,
     skip_restore: bool,
     layout_only: bool,
-    launch_agents: bool,
     wezterm_timeout_secs: u64,
 }
 
@@ -22911,7 +22897,10 @@ fn restart_dry_run_json(options: RestartWorkflowOptions) -> serde_json::Value {
                 "enabled": false,
                 "reason": SCROLLBACK_REPLAY_DISABLED_REASON,
             },
-            "launch_agents": options.launch_agents,
+            "process_replacement": {
+                "available": false,
+                "reason": "mux_native_argv_spawn_unavailable",
+            },
         },
         "version": frankenterm_core::VERSION,
     })
@@ -22934,12 +22923,15 @@ fn restart_plan_lines(options: RestartWorkflowOptions) -> Vec<String> {
         lines.push("  4. Skip restore phase (--skip-restore)".to_string());
     } else {
         lines.push(format!(
-            "  4. Restore from captured snapshot (layout_only={}, launch_agents={})",
-            options.layout_only, options.launch_agents
+            "  4. Restore from captured snapshot (layout_only={})",
+            options.layout_only
         ));
         lines.push(format!(
             "     Scrollback replay: {SCROLLBACK_REPLAY_DISABLED_REASON}"
         ));
+        lines.push(
+            "     Process replacement: unavailable without mux-native argv spawn".to_string(),
+        );
     }
     lines.push("Dry-run requested; no actions were executed.".to_string());
     lines
@@ -23255,7 +23247,7 @@ where
     StopFut: std::future::Future<Output = anyhow::Result<Vec<i32>>>,
     Start: FnOnce(Duration, u64) -> StartFut,
     StartFut: std::future::Future<Output = anyhow::Result<()>>,
-    Restore: FnOnce(i64, bool, bool) -> RestoreFut,
+    Restore: FnOnce(i64, bool) -> RestoreFut,
     RestoreFut: std::future::Future<
             Output = anyhow::Result<frankenterm_core::session_restore::RestoreSummary>,
         >,
@@ -23292,11 +23284,7 @@ where
         });
     }
 
-    match restore_snapshot(
-        snapshot.checkpoint_id,
-        options.layout_only,
-        options.launch_agents,
-    )
+    match restore_snapshot(snapshot.checkpoint_id, options.layout_only)
     .await
     {
         Ok(summary) => Ok(RestartWorkflowResult::Restored {
@@ -23389,7 +23377,7 @@ async fn execute_restart_workflow(
             },
             {
                 let restore_cx = cx.clone();
-                move |checkpoint_id, layout_only, launch_agents| {
+                move |checkpoint_id, layout_only| {
                     let process_relaunch = process_relaunch.clone();
                     async move {
                         restore_snapshot_checkpoint(
@@ -23399,7 +23387,6 @@ async fn execute_restart_workflow(
                             wezterm_timeout_secs,
                             layout_only,
                             &process_relaunch,
-                            launch_agents,
                         )
                         .await
                     }
@@ -53870,7 +53857,6 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             start_timeout,
             skip_restore,
             layout_only,
-            launch_agents,
             dry_run,
             format,
         }) => {
@@ -53884,7 +53870,6 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     let _ = layout_only;
                     true
                 },
-                launch_agents,
                 wezterm_timeout_secs: config.cli.timeout_seconds,
             };
 
@@ -53909,7 +53894,6 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     start_timeout,
                     skip_restore,
                     layout_only,
-                    launch_agents,
                     emit_json,
                     restart_options,
                 );
@@ -69581,7 +69565,6 @@ async fn handle_snapshot_command(
         SnapshotCommands::Restore {
             snapshot_id,
             layout_only,
-            launch_agents,
             dry_run,
             format,
         } => {
@@ -69591,7 +69574,6 @@ async fn handle_snapshot_command(
                     let _ = layout_only;
                     true
                 },
-                launch_agents,
                 wezterm_timeout_secs: config.cli.timeout_seconds,
             };
 
@@ -75433,12 +75415,12 @@ mod tests {
     fn sample_restart_restore_summary() -> frankenterm_core::session_restore::RestoreSummary {
         use frankenterm_core::restore_layout::RestoreResult;
         use frankenterm_core::restore_process::{
-            LaunchAction, LaunchInterruption, LaunchInterruptionPhase, LaunchReport, LaunchResult,
+            LaunchDisposition, LaunchInterruption, LaunchInterruptionPhase, LaunchReport,
+            LaunchResult,
         };
         use frankenterm_core::restore_scrollback::{InjectionReport, PaneInjectionStats};
         use frankenterm_core::session_restore::{RestoredPaneState, RestoreSummary};
         use std::collections::HashMap;
-        use std::path::PathBuf;
 
         let mut pane_id_map = HashMap::new();
         pane_id_map.insert(1, 101);
@@ -75483,11 +75465,7 @@ mod tests {
                 results: vec![LaunchResult {
                     old_pane_id: 2,
                     new_pane_id: 102,
-                    action: LaunchAction::LaunchAgent {
-                        command: "secret-agent-command --token raw-secret".to_string(),
-                        cwd: PathBuf::from("/private/raw-secret-worktree"),
-                        agent_type: "codex".to_string(),
-                    },
+                    action: LaunchDisposition::Agent,
                     success: false,
                     error: Some("raw-secret-launch-error".to_string()),
                 }],
@@ -75531,7 +75509,6 @@ mod tests {
     fn sample_snapshot_restore_options() -> SnapshotRestoreWorkflowOptions {
         SnapshotRestoreWorkflowOptions {
             layout_only: true,
-            launch_agents: true,
             wezterm_timeout_secs: 5,
         }
     }
@@ -75542,7 +75519,6 @@ mod tests {
             start_timeout_secs: 10,
             skip_restore: false,
             layout_only: true,
-            launch_agents: true,
             wezterm_timeout_secs: 5,
         }
     }
@@ -75587,14 +75563,13 @@ mod tests {
         run_async_test(async {
             let mut options = sample_snapshot_restore_options();
             options.layout_only = false;
-            options.launch_agents = false;
             let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
 
             let result = execute_snapshot_restore_post_preflight(42, options, {
                 let observed = std::sync::Arc::clone(&observed);
-                move |checkpoint_id, layout_only, launch_agents| async move {
+                move |checkpoint_id, layout_only| async move {
                     *observed.lock().expect("lock observed restore args") =
-                        Some((checkpoint_id, layout_only, launch_agents));
+                        Some((checkpoint_id, layout_only));
                     Ok(sample_restart_restore_summary())
                 }
             })
@@ -75605,7 +75580,7 @@ mod tests {
             assert!(result.layout_only);
             assert_eq!(
                 *observed.lock().expect("lock observed restore args"),
-                Some((42, true, false)),
+                Some((42, true)),
             );
         });
     }
@@ -75617,7 +75592,7 @@ mod tests {
             let abort = execute_snapshot_restore_post_preflight(
                 77,
                 sample_snapshot_restore_options(),
-                |_, _, _| async { Err(anyhow::anyhow!("restore planner mismatch")) },
+                |_, _| async { Err(anyhow::anyhow!("restore planner mismatch")) },
             )
             .await
             .expect_err("restore failure should abort snapshot restore");
@@ -75651,7 +75626,7 @@ mod tests {
                     }
                 },
                 |_, _| async { Ok(()) },
-                |_, _, _| async { Ok(sample_restart_restore_summary()) },
+                |_, _| async { Ok(sample_restart_restore_summary()) },
             )
             .await
             .expect_err("snapshot failure should abort workflow");
@@ -75680,7 +75655,7 @@ mod tests {
                         Ok(())
                     }
                 },
-                |_, _, _| async { Ok(sample_restart_restore_summary()) },
+                |_, _| async { Ok(sample_restart_restore_summary()) },
             )
             .await
             .expect_err("stop failure should abort workflow");
@@ -75709,7 +75684,7 @@ mod tests {
                 |_, _| async { Err(anyhow::anyhow!("mux failed to daemonize")) },
                 {
                     let restore_called = std::sync::Arc::clone(&restore_called);
-                    move |_, _, _| async move {
+                    move |_, _| async move {
                         restore_called.store(true, std::sync::atomic::Ordering::SeqCst);
                         Ok(sample_restart_restore_summary())
                     }
@@ -75748,7 +75723,7 @@ mod tests {
                 |_, _| async { Ok(()) },
                 {
                     let restore_called = std::sync::Arc::clone(&restore_called);
-                    move |_, _, _| async move {
+                    move |_, _| async move {
                         restore_called.store(true, std::sync::atomic::Ordering::SeqCst);
                         Ok(sample_restart_restore_summary())
                     }
@@ -75777,7 +75752,6 @@ mod tests {
         run_async_test(async {
             let mut options = sample_restart_options();
             options.layout_only = false;
-            options.launch_agents = false;
             let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
 
             let result = execute_restart_post_preflight(
@@ -75787,9 +75761,9 @@ mod tests {
                 |_, _| async { Ok(()) },
                 {
                     let observed = std::sync::Arc::clone(&observed);
-                    move |checkpoint_id, layout_only, launch_agents| async move {
+                    move |checkpoint_id, layout_only| async move {
                         *observed.lock().expect("lock observed restore args") =
-                            Some((checkpoint_id, layout_only, launch_agents));
+                            Some((checkpoint_id, layout_only));
                         Ok(sample_restart_restore_summary())
                     }
                 },
@@ -75811,7 +75785,7 @@ mod tests {
             }
             assert_eq!(
                 *observed.lock().expect("lock observed restore args"),
-                Some((42, true, false)),
+                Some((42, true)),
             );
         });
     }
@@ -75827,7 +75801,7 @@ mod tests {
                 || async { Ok(sample_restart_snapshot_result()) },
                 |_| async { Ok(vec![111]) },
                 |_, _| async { Ok(()) },
-                |_, _, _| async { Err(anyhow::anyhow!("restore planner mismatch")) },
+                |_, _| async { Err(anyhow::anyhow!("restore planner mismatch")) },
             )
             .await
             .expect("restore failure should return a reportable workflow result");
@@ -75910,7 +75884,7 @@ mod tests {
                     },
                     {
                         let restore_called = std::sync::Arc::clone(&restore_called);
-                        move |_, _, _| async move {
+                        move |_, _| async move {
                             restore_called.store(true, std::sync::atomic::Ordering::SeqCst);
                             if restore_ok {
                                 Ok(sample_restart_restore_summary())
@@ -76072,14 +76046,20 @@ mod tests {
             payload["scrollback_replay"]["reason"].as_str(),
             Some(SCROLLBACK_REPLAY_DISABLED_REASON)
         );
-        assert_eq!(payload["launch_agents"].as_bool(), Some(true));
+        assert_eq!(
+            payload["process_replacement"]["available"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["process_replacement"]["reason"].as_str(),
+            Some("mux_native_argv_spawn_unavailable")
+        );
     }
 
     #[test]
-    fn snapshot_restore_plan_lines_reflect_launch_options() {
+    fn snapshot_restore_plan_lines_report_unavailable_process_replacement() {
         let mut options = sample_snapshot_restore_options();
         options.layout_only = true;
-        options.launch_agents = false;
 
         let lines = snapshot_restore_plan_lines(&sample_snapshot_restore_checkpoint(), options);
 
@@ -76101,7 +76081,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("launch_agents=false"))
+                .any(|line| line.contains("Process replacement: unavailable"))
         );
         assert_eq!(
             lines.last().map(String::as_str),
@@ -76131,7 +76111,14 @@ mod tests {
             payload["planned"]["scrollback_replay"]["reason"].as_str(),
             Some(SCROLLBACK_REPLAY_DISABLED_REASON)
         );
-        assert_eq!(payload["planned"]["launch_agents"].as_bool(), Some(true));
+        assert_eq!(
+            payload["planned"]["process_replacement"]["available"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["planned"]["process_replacement"]["reason"].as_str(),
+            Some("mux_native_argv_spawn_unavailable")
+        );
         assert_eq!(payload["version"].as_str(), Some(frankenterm_core::VERSION),);
     }
 
@@ -76422,31 +76409,16 @@ mod tests {
     }
 
     #[test]
-    fn restart_and_snapshot_restore_cli_parse_launch_agents() {
-        let restart_cli =
-            Cli::try_parse_from(["ft", "restart", "--launch-agents"]).expect("restart parses");
-        match restart_cli.command.map(|cmd| *cmd) {
-            Some(Commands::Restart { launch_agents, .. }) => assert!(launch_agents),
-            _ => panic!("unexpected restart parse result"),
-        }
-
-        let restore_cli =
+    fn restart_and_snapshot_restore_reject_removed_launch_agents_flag() {
+        assert!(
+            Cli::try_parse_from(["ft", "restart", "--launch-agents"]).is_err(),
+            "restart must not advertise an unavailable process-launch action"
+        );
+        assert!(
             Cli::try_parse_from(["ft", "snapshot", "restore", "latest", "--launch-agents"])
-                .expect("snapshot restore parses");
-        match restore_cli.command.map(|cmd| *cmd) {
-            Some(Commands::Snapshot {
-                command:
-                    SnapshotCommands::Restore {
-                        snapshot_id,
-                        launch_agents,
-                        ..
-                    },
-            }) => {
-                assert_eq!(snapshot_id, "latest");
-                assert!(launch_agents);
-            }
-            _ => panic!("unexpected snapshot restore parse result"),
-        }
+                .is_err(),
+            "snapshot restore must not advertise an unavailable process-launch action"
+        );
     }
 
     fn sample_cli_mission() -> frankenterm_core::plan::Mission {

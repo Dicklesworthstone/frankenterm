@@ -184,14 +184,20 @@ retention_count = 10
 retention_days = 7
 
 [snapshots.process_relaunch]
+# Reserved historical keys; neither one permits execution.
 launch_shells = true
 launch_agents = false
-launch_delay_ms = 500
 ```
 
 Notes:
 
-- `launch_agents = false` by default because agent sessions don’t restore “where they left off”.
+- Layout restoration creates the pane's default shell. The process layer never
+  types a captured shell or agent command into that PTY.
+- Captured shells and agents always receive an explicit manual disposition so
+  state that was not restored cannot be mistaken for success.
+- All four historical keys (`launch_shells`, `launch_agents`, `launch_delay_ms`,
+  and `agent_commands`) are reserved and ignored until FrankenTerm has a
+  mux-native, argv-isolated spawn API.
 - Retention is enforced by both `retention_count` and `retention_days`.
 
 ## Performance expectations

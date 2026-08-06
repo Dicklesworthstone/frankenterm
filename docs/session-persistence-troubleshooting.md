@@ -53,7 +53,7 @@ Session persistence is a shipped `ft` feature, but live snapshot/restore still d
    ft snapshot list --limit 10
    ft snapshot restore <checkpoint_id>
    ```
-4) If you only want the split/tab/window layout and do not want scrollback replay:
+4) State the currently supported layout-only mode explicitly:
    ```bash
    ft snapshot restore <checkpoint_id> --layout-only
    ```
@@ -117,18 +117,24 @@ Session persistence is a shipped `ft` feature, but live snapshot/restore still d
    ft db migrate
    ```
 
-## 5) Scrollback fidelity surprises (TUIs, alt-screen, partial replay)
+## 5) Historical scrollback is not replayed
 
 **What to expect**
 
-- Scrollback restore is best-effort and may not perfectly reproduce interactive TUIs.
-- Alt-screen content is inherently less stable for capture and replay.
+- Restore fails closed rather than sending captured historical output to a
+  pane through PTY input.
+- `output_segments` are arbitrary stream fragments, not authoritative logical
+  terminal lines or a versioned render-state snapshot.
+- Alt-screen state, interactive TUI buffers, images, cursor state, and reflow
+  therefore are not reconstructed by the current layout-only path.
 
 **What to do**
 
-- Prefer relying on layout restoration first (splits/tabs/windows)
+- Use layout restoration for its documented supported subset
 - Use `ft snapshot inspect <id>` to confirm the pane’s captured terminal state (size, alt-screen)
-- If you need a reproducible artifact, consider `ft record` / `ft reproduce` instead of scrollback replay
+- Use `ft record` / `ft reproduce` when you need a reproducible historical artifact
+- Do not treat `--layout-only` as an optional performance mode: the CLI forces
+  it until a mux-owned output or render-state restoration channel exists
 
 ## Minimal “what do I run?” checklist
 
