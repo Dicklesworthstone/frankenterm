@@ -2186,8 +2186,8 @@ impl WriterJoinAuthority {
 
     fn outcome(&self) -> std::result::Result<Option<WriterJoinOutcome>, ()> {
         let state = self.state.lock().map_err(|_| ())?;
-        Ok(match *state {
-            WriterJoinState::Completed(outcome) => Some(outcome),
+        Ok(match &*state {
+            WriterJoinState::Completed(outcome) => Some(*outcome),
             WriterJoinState::Pending(_) | WriterJoinState::Joining => None,
         })
     }
@@ -2270,11 +2270,11 @@ impl WriterJoinAuthority {
             }
         };
         loop {
-            if let WriterJoinState::Completed(outcome) = *state {
+            if let WriterJoinState::Completed(outcome) = &*state {
                 return if lock_was_poisoned {
                     WriterJoinDriveOutcome::StatePoisoned
                 } else {
-                    WriterJoinDriveOutcome::Completed(outcome)
+                    WriterJoinDriveOutcome::Completed(*outcome)
                 };
             }
 
@@ -2288,7 +2288,7 @@ impl WriterJoinAuthority {
                 Ok((next, timed_out)) => {
                     state = next;
                     if timed_out.timed_out()
-                        && !matches!(*state, WriterJoinState::Completed(_))
+                        && !matches!(&*state, WriterJoinState::Completed(_))
                     {
                         return WriterJoinDriveOutcome::InProgress;
                     }
@@ -38170,6 +38170,80 @@ fn blocking_storage_mutation_failure_taxonomy_prevents_blind_retry() {
             })
         ));
     }
+}
+
+#[test]
+fn writer_join_authority_timeout_after_transfer_retains_terminal_receipt() {
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let native_writer = thread::spawn(move || {
+        release_rx
+            .recv()
+            .expect("test controls native writer release");
+    });
+    let authority = Arc::new(WriterJoinAuthority::new(native_writer));
+    let join_owner_authority = Arc::clone(&authority);
+    let join_owner = thread::spawn(move || {
+        join_owner_authority.drive(std::time::Duration::from_secs(5))
+    });
+
+    let transfer_deadline = Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let transferred = matches!(
+            &*authority.state.lock().expect("writer join authority lock"),
+            WriterJoinState::Joining
+        );
+        if transferred {
+            break;
+        }
+        assert!(
+            Instant::now() < transfer_deadline,
+            "join owner must transfer Pending to Joining"
+        );
+        thread::yield_now();
+    }
+
+    assert_eq!(
+        authority.drive(std::time::Duration::ZERO),
+        WriterJoinDriveOutcome::InProgress,
+        "a bounded waiter may time out without consuming the in-flight authority"
+    );
+    assert_eq!(authority.outcome().unwrap(), None);
+
+    release_tx.send(()).expect("release native writer");
+    assert_eq!(
+        join_owner.join().expect("join authority driver"),
+        WriterJoinDriveOutcome::Completed(WriterJoinOutcome::Joined)
+    );
+    assert_eq!(
+        authority.outcome().unwrap(),
+        Some(WriterJoinOutcome::Joined),
+        "the join result must persist independently of the timed-out waiter"
+    );
+    assert_eq!(
+        authority.drive(std::time::Duration::ZERO),
+        WriterJoinDriveOutcome::Completed(WriterJoinOutcome::Joined),
+        "later callers must observe the retained receipt"
+    );
+}
+
+#[test]
+fn writer_join_authority_panic_receipt_is_persistent() {
+    let native_writer = thread::spawn(|| panic!("synthetic writer panic"));
+    let authority = WriterJoinAuthority::new(native_writer);
+
+    assert_eq!(
+        authority.drive(std::time::Duration::from_secs(5)),
+        WriterJoinDriveOutcome::Completed(WriterJoinOutcome::Panicked)
+    );
+    assert_eq!(
+        authority.outcome().unwrap(),
+        Some(WriterJoinOutcome::Panicked)
+    );
+    assert_eq!(
+        authority.drive(std::time::Duration::ZERO),
+        WriterJoinDriveOutcome::Completed(WriterJoinOutcome::Panicked),
+        "a retry must never reinterpret a panicked join as clean"
+    );
 }
 
 #[test]

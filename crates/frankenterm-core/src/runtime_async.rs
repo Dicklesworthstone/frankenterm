@@ -2284,6 +2284,8 @@ pub mod task {
         abort_handle: futures::future::AbortHandle,
         forwarding: std::sync::Arc<super::ContainedForwardingWaker>,
         completion_waker: std::task::Waker,
+        #[cfg(test)]
+        fail_next_registration: std::sync::atomic::AtomicBool,
     }
 
     impl<T> Future for JoinHandle<T> {
@@ -2293,6 +2295,15 @@ pub mod task {
             // Publish the caller waker before polling the inner join. The
             // asupersync handle sees only `completion_waker`, whose identity
             // remains stable across every poll and whose callback is contained.
+            #[cfg(test)]
+            if self
+                .fail_next_registration
+                .swap(false, Ordering::AcqRel)
+            {
+                self.abort_handle.abort();
+                self.forwarding.clear();
+                return Poll::Ready(Err(JoinError::waker_registration_failed()));
+            }
             let registration = self.forwarding.register(cx.waker());
             if registration.is_err() {
                 // If completion can no longer be forwarded, do not silently
@@ -2351,6 +2362,11 @@ pub mod task {
             self.abort_handle.abort();
             self.forwarding.forward_one();
         }
+
+        #[cfg(test)]
+        fn fail_next_registration_for_test(&self) {
+            self.fail_next_registration.store(true, Ordering::Release);
+        }
     }
 
     impl<T> Drop for JoinHandle<T> {
@@ -2406,6 +2422,9 @@ pub mod task {
         }
 
         /// Await the next completed task. Returns `None` if the set is empty.
+        /// A [`JoinErrorKind::WakerRegistrationFailed`] observation requests
+        /// task abort but is not terminal acknowledgement, so the handle stays
+        /// in the set for a later drain attempt.
         pub async fn join_next(&mut self) -> Option<Result<T, JoinError>> {
             if self.handles.is_empty() {
                 return None;
@@ -2415,6 +2434,13 @@ pub mod task {
                 for i in 0..self.handles.len() {
                     let mut pinned = std::pin::Pin::new(&mut self.handles[i]);
                     if let std::task::Poll::Ready(result) = pinned.as_mut().poll(cx) {
+                        if matches!(
+                            &result,
+                            Err(error)
+                                if error.kind() == JoinErrorKind::WakerRegistrationFailed
+                        ) {
+                            return std::task::Poll::Ready(Some(result));
+                        }
                         self.handles.swap_remove(i);
                         return std::task::Poll::Ready(Some(result));
                     }
@@ -2434,6 +2460,9 @@ pub mod task {
         /// Returns `Some(Err(JoinError))` on context failure. The finite
         /// `JoinErrorKind` preserves cancellation-vs-budget distinctions
         /// without copying caller-provided cancellation text.
+        /// `WakerRegistrationFailed` is an observation failure rather than a
+        /// terminal task result, so that class is returned without removing
+        /// the handle from this set.
         ///
         /// Note the local shadowing of `cx`: the poll_fn closure
         /// receives a `std::task::Context` also conventionally
@@ -2479,6 +2508,13 @@ pub mod task {
                 for i in 0..self.handles.len() {
                     let mut pinned = std::pin::Pin::new(&mut self.handles[i]);
                     if let std::task::Poll::Ready(result) = pinned.as_mut().poll(cx) {
+                        if matches!(
+                            &result,
+                            Err(error)
+                                if error.kind() == JoinErrorKind::WakerRegistrationFailed
+                        ) {
+                            return std::task::Poll::Ready(Some(result));
+                        }
                         self.handles.swap_remove(i);
                         return std::task::Poll::Ready(Some(result));
                     }
@@ -2492,23 +2528,33 @@ pub mod task {
         ///
         /// Checks if any handle is finished and returns its result.
         /// Returns `None` if the set is empty or no task has completed.
+        /// A [`JoinErrorKind::WakerRegistrationFailed`] observation leaves the
+        /// handle in the set because abort has only been requested, not yet
+        /// terminally acknowledged.
         pub fn try_join_next(&mut self) -> Option<Result<T, JoinError>> {
             // Find the first finished handle
             let pos = self.handles.iter().position(|h| h.is_finished());
             if let Some(idx) = pos {
-                let mut handle = self.handles.swap_remove(idx);
                 // Task is finished, so we can poll it synchronously via a noop waker
                 let waker = futures::task::noop_waker();
                 let mut cx = std::task::Context::from_waker(&waker);
-                match std::pin::Pin::new(&mut handle).poll(&mut cx) {
-                    std::task::Poll::Ready(result) => Some(result),
+                let result = std::pin::Pin::new(&mut self.handles[idx]).poll(&mut cx);
+                match result {
+                    std::task::Poll::Ready(Err(error))
+                        if error.kind() == JoinErrorKind::WakerRegistrationFailed =>
+                    {
+                        Some(Err(error))
+                    }
+                    std::task::Poll::Ready(result) => {
+                        self.handles.swap_remove(idx);
+                        Some(result)
+                    }
                     std::task::Poll::Pending => {
                         // `is_finished` and result publication are expected to
                         // be atomic from the wrapper's perspective, but retain
                         // ownership if an underlying runtime ever exposes a
                         // transient gap. Dropping here would silently detach a
                         // handle whose result was not actually observable.
-                        self.handles.push(handle);
                         None
                     }
                 }
@@ -2526,6 +2572,14 @@ pub mod task {
             for handle in &self.handles {
                 handle.abort();
             }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn fail_next_join_registration_for_test(&self) {
+            self.handles
+                .first()
+                .expect("JoinSet registration-failure test requires one handle")
+                .fail_next_registration_for_test();
         }
     }
 
@@ -2623,6 +2677,8 @@ pub mod task {
             abort_handle,
             forwarding,
             completion_waker,
+            #[cfg(test)]
+            fail_next_registration: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2662,6 +2718,8 @@ pub mod task {
             abort_handle,
             forwarding,
             completion_waker,
+            #[cfg(test)]
+            fail_next_registration: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2706,6 +2764,8 @@ pub mod task {
             abort_handle,
             forwarding,
             completion_waker,
+            #[cfg(test)]
+            fail_next_registration: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
