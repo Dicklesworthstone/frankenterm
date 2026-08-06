@@ -18,6 +18,7 @@ use crate::events::EventBus;
 use crate::runtime::RuntimeHandle;
 use crate::runtime_async::io::AsyncWriteExt;
 use crate::runtime_async::net::{TcpListener, TcpStream};
+use crate::runtime_async::notify::Notify;
 use crate::runtime_async::task::{JoinErrorKind, JoinSet, JoinSetSettlement};
 use tracing::{debug, warn};
 
@@ -420,6 +421,69 @@ impl MetricsServerHandle {
 }
 
 const METRICS_CONNECTION_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const METRICS_ACCEPT_ERROR_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
+const METRICS_ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+fn metrics_accept_error_is_permanent(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::InvalidData
+            | std::io::ErrorKind::Unsupported
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::BrokenPipe
+    ) {
+        return true;
+    }
+
+    // `ErrorKind` deliberately collapses some platform errors into `Other`.
+    // A listener whose descriptor/socket is invalid cannot recover by retrying
+    // accept, so recognize the stable platform error numbers as well. Resource
+    // exhaustion such as EMFILE/WSAEMFILE remains retryable, but is throttled
+    // by the bounded exponential backoff below.
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(9) {
+        // POSIX EBADF on every supported Unix target.
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(6 | 10_038)) {
+        // ERROR_INVALID_HANDLE / WSAENOTSOCK.
+        return true;
+    }
+
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetricsAcceptErrorBackoff {
+    retry_delay: Duration,
+    consecutive_errors: u64,
+}
+
+impl MetricsAcceptErrorBackoff {
+    const fn new() -> Self {
+        Self {
+            retry_delay: METRICS_ACCEPT_ERROR_INITIAL_BACKOFF,
+            consecutive_errors: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn record_failure(&mut self) -> (u64, Duration) {
+        self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+        let retry_delay = self.retry_delay;
+        self.retry_delay = self
+            .retry_delay
+            .saturating_mul(2)
+            .min(METRICS_ACCEPT_ERROR_MAX_BACKOFF);
+        (self.consecutive_errors, retry_delay)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetricsConnectionTaskDrainOutcome {
@@ -594,9 +658,14 @@ impl MetricsServer {
         let collector = Arc::clone(&self.collector);
         let handle_shutdown_flag = Arc::clone(&self.shutdown_flag);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
+        let shutdown_notify = Arc::new(Notify::new());
+        let task_shutdown_notify = Arc::clone(&shutdown_notify);
         let join = crate::runtime_async::task::spawn_with_cx(cx, move |accept_cx| async move {
+            use futures::future::{Either, select};
+
             let accept_poll_interval = Duration::from_millis(250);
             let mut connection_tasks = JoinSet::new();
+            let mut accept_error_backoff = MetricsAcceptErrorBackoff::new();
             loop {
                 while let Some(join_result) = connection_tasks.try_join_next() {
                     if let Err(error) = join_result {
@@ -607,18 +676,26 @@ impl MetricsServer {
                     }
                 }
 
-                if shutdown_flag.load(Ordering::SeqCst) || accept_cx.is_cancel_requested() {
+                if shutdown_flag.load(Ordering::SeqCst) || accept_cx.checkpoint().is_err() {
                     break;
                 }
 
-                match crate::runtime_async::timeout_with_cx(
+                let shutdown_wait = std::pin::pin!(task_shutdown_notify.wait_until(|| {
+                    shutdown_flag.load(Ordering::SeqCst)
+                }));
+                let accept_wait = std::pin::pin!(crate::runtime_async::timeout_with_cx(
                     &accept_cx,
                     accept_poll_interval,
                     listener.accept(),
-                )
-                .await
-                {
+                ));
+                let accept_result = match select(shutdown_wait, accept_wait).await {
+                    Either::Left(((), _)) => break,
+                    Either::Right((result, _)) => result,
+                };
+
+                match accept_result {
                     Ok(Ok((socket, peer))) => {
+                        accept_error_backoff.reset();
                         if shutdown_flag.load(Ordering::SeqCst)
                             || accept_cx.checkpoint().is_err()
                         {
@@ -627,7 +704,7 @@ impl MetricsServer {
                         }
                         let collector = Arc::clone(&collector);
                         let prefix = prefix.clone();
-                        connection_tasks.spawn_with_cx(
+                        match crate::runtime_async::task::try_spawn_with_cx(
                             &accept_cx,
                             move |conn_cx| async move {
                                 if let Err(err) =
@@ -637,10 +714,51 @@ impl MetricsServer {
                                     debug!(error = %err, peer = %peer, "Metrics connection failed");
                                 }
                             },
-                        );
+                        ) {
+                            Ok(handle) => connection_tasks.insert_handle(handle),
+                            Err(error) => {
+                                warn!(
+                                    error_code = error.code(),
+                                    "Metrics connection task admission failed; stopping listener"
+                                );
+                                break;
+                            }
+                        }
                     }
                     Ok(Err(err)) => {
-                        warn!(error = %err, "Metrics listener accept failed");
+                        if metrics_accept_error_is_permanent(&err) {
+                            warn!(
+                                error = %err,
+                                error_kind = ?err.kind(),
+                                raw_os_error = ?err.raw_os_error(),
+                                "Metrics listener stopped after permanent accept failure"
+                            );
+                            break;
+                        }
+
+                        let (consecutive_accept_errors, retry_delay) =
+                            accept_error_backoff.record_failure();
+                        if consecutive_accept_errors.is_power_of_two() {
+                            warn!(
+                                error = %err,
+                                error_kind = ?err.kind(),
+                                raw_os_error = ?err.raw_os_error(),
+                                consecutive_accept_errors,
+                                retry_backoff_ms = retry_delay.as_millis(),
+                                "Metrics listener accept failed; applying bounded retry backoff"
+                            );
+                        }
+                        let shutdown_wait = std::pin::pin!(task_shutdown_notify.wait_until(|| {
+                            shutdown_flag.load(Ordering::SeqCst)
+                        }));
+                        let retry_wait = std::pin::pin!(crate::runtime_async::sleep_with_cx(
+                            &accept_cx,
+                            retry_delay,
+                        ));
+                        match select(shutdown_wait, retry_wait).await {
+                            Either::Left(((), _)) | Either::Right((Err(_), _)) => break,
+                            Either::Right((Ok(()), _)) => {}
+                        }
                     }
                     // `timeout_with_cx` returns Err on either the poll
                     // interval elapsing OR the Cx being cancelled. Loop
@@ -682,9 +800,10 @@ impl MetricsServer {
         });
 
         Ok(MetricsServerHandle {
-            task: crate::watchdog::WatchdogHandle::adopt_shutdown_task(
+            task: crate::watchdog::WatchdogHandle::adopt_shutdown_task_with_notify(
                 join,
                 handle_shutdown_flag,
+                shutdown_notify,
             ),
             local_addr,
         })
@@ -989,6 +1108,73 @@ fn escape_prometheus_label_value(value: &str) -> String {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
+
+    #[test]
+    fn metrics_accept_error_classifier_stops_permanent_failures() {
+        for kind in [
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::Unsupported,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotConnected,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let error = std::io::Error::new(kind, "permanent accept failure");
+            assert!(metrics_accept_error_is_permanent(&error), "kind={kind:?}");
+        }
+
+        for kind in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::OutOfMemory,
+            std::io::ErrorKind::Other,
+        ] {
+            let error = std::io::Error::new(kind, "retryable accept failure");
+            assert!(
+                !metrics_accept_error_is_permanent(&error),
+                "kind={kind:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metrics_accept_error_classifier_distinguishes_ebadf_from_emfile() {
+        let invalid_descriptor = std::io::Error::from_raw_os_error(9);
+        let descriptor_exhaustion = std::io::Error::from_raw_os_error(24);
+        assert!(metrics_accept_error_is_permanent(&invalid_descriptor));
+        assert!(!metrics_accept_error_is_permanent(&descriptor_exhaustion));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn metrics_accept_error_classifier_distinguishes_wsaenotsock_from_wsaemfile() {
+        let invalid_socket = std::io::Error::from_raw_os_error(10_038);
+        let descriptor_exhaustion = std::io::Error::from_raw_os_error(10_024);
+        assert!(metrics_accept_error_is_permanent(&invalid_socket));
+        assert!(!metrics_accept_error_is_permanent(&descriptor_exhaustion));
+    }
+
+    #[test]
+    fn metrics_accept_backoff_is_bounded_and_resets_after_success() {
+        let mut backoff = MetricsAcceptErrorBackoff::new();
+        let mut previous_delay = Duration::ZERO;
+        for expected_count in 1..=128 {
+            let (count, delay) = backoff.record_failure();
+            assert_eq!(count, expected_count);
+            assert!(delay >= previous_delay);
+            assert!(delay <= METRICS_ACCEPT_ERROR_MAX_BACKOFF);
+            previous_delay = delay;
+        }
+        assert_eq!(previous_delay, METRICS_ACCEPT_ERROR_MAX_BACKOFF);
+
+        backoff.reset();
+        assert_eq!(
+            backoff.record_failure(),
+            (1, METRICS_ACCEPT_ERROR_INITIAL_BACKOFF),
+        );
+    }
 
     #[test]
     fn metrics_connection_drain_truth_gives_settlement_precedence() {
