@@ -2408,7 +2408,7 @@ pub mod task {
         }
 
         #[cfg(test)]
-        fn force_registration_failure_for_test(&self) {
+        pub(crate) fn force_registration_failure_for_test(&self) {
             self.force_registration_failure
                 .store(true, Ordering::Release);
         }
@@ -2718,6 +2718,38 @@ pub mod task {
                         return Ok(result);
                     }
                     continue;
+                }
+            }
+        }
+
+        /// Drain one terminal task result while retaining unconditional
+        /// settlement authority.
+        ///
+        /// This is the unbounded counterpart to [`Self::drain_next_with_cx`]
+        /// for ownership boundaries whose public contract is to join every
+        /// task rather than return on caller-context failure. Quarantined
+        /// handles are polled through their stable completion waker after a
+        /// small unbudgeted timer pause, so a persistent caller-waker
+        /// registration failure cannot detach work or turn into a hot spin.
+        pub(crate) async fn drain_next_trusted(&mut self) -> Option<Result<T, JoinError>> {
+            loop {
+                if self.is_empty() {
+                    return None;
+                }
+                if let Some(result) = self.try_join_next() {
+                    return Some(result);
+                }
+
+                if !self.unacknowledged.is_empty() {
+                    super::sleep_unbudgeted(JOIN_SET_QUARANTINE_POLL_INTERVAL).await;
+                    continue;
+                }
+
+                if !self.handles.is_empty() {
+                    let result = std::future::poll_fn(|task_cx| self.poll_active(task_cx)).await;
+                    if result.is_some() {
+                        return result;
+                    }
                 }
             }
         }
@@ -4168,6 +4200,43 @@ pub async fn sleep_with_cx(cx: &crate::cx::Cx, duration: Duration) -> Result<(),
         .map_err(|err| err.to_string())
 }
 
+/// Pause without inheriting the ambient capability budget.
+///
+/// Reserved for trusted terminal-settlement loops that must retain ownership
+/// after their caller context has failed. The starting timestamp still comes
+/// from the ambient timer driver when one exists, preserving deterministic
+/// runtime clock domains without making cancellation turn the pause into a
+/// zero-duration spin.
+async fn sleep_unbudgeted(duration: Duration) {
+    let now = crate::cx::Cx::current().map_or_else(asupersync::time::wall_now, |cx| {
+        cx.timer_driver()
+            .map_or_else(asupersync::time::wall_now, |driver| driver.now())
+    });
+    asupersync::time::sleep(now, duration).await;
+}
+
+/// Finite failure class for the typed timeout boundary.
+///
+/// `asupersync` 0.3.5 exposes only an elapsed result from `budget_timeout`.
+/// Keeping that fact typed here prevents callers from interpreting an opaque
+/// string as some different timer or backend failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimeoutError {
+    /// The explicit timeout or the caller's earlier capability deadline
+    /// elapsed. Callers can inspect the `Cx` to distinguish those cases.
+    Elapsed,
+}
+
+impl std::fmt::Display for TimeoutError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Elapsed => formatter.write_str("timeout elapsed"),
+        }
+    }
+}
+
+impl std::error::Error for TimeoutError {}
+
 /// Runs `future` with a timeout using asupersync.
 pub async fn timeout<F>(duration: Duration, future: F) -> Result<F::Output, String>
 where
@@ -4212,9 +4281,31 @@ pub async fn timeout_with_cx<F>(
 where
     F: Future,
 {
+    timeout_with_cx_typed(cx, duration, future)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Typed sibling of [`timeout_with_cx`].
+///
+/// Prefer this at correctness-sensitive boundaries that must not infer a
+/// failure class by parsing or discarding the legacy string error.
+///
+/// # Errors
+///
+/// Returns [`TimeoutError::Elapsed`] when either the explicit duration or an
+/// earlier deadline in the supplied capability budget expires.
+pub(crate) async fn timeout_with_cx_typed<F>(
+    cx: &crate::cx::Cx,
+    duration: Duration,
+    future: F,
+) -> Result<F::Output, TimeoutError>
+where
+    F: Future,
+{
     asupersync::time::budget_timeout(cx, duration, Box::pin(future), cx_timer_now(cx))
         .await
-        .map_err(|err| err.to_string())
+        .map_err(|_elapsed| TimeoutError::Elapsed)
 }
 
 pub(crate) fn timer_now_with_cx(cx: &crate::cx::Cx) -> asupersync::Time {
@@ -9496,6 +9587,43 @@ mod tests {
     }
 
     #[test]
+    fn join_set_unbounded_trusted_drain_settles_quarantined_handle() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut set = task::JoinSet::new();
+            set.spawn(std::future::pending::<()>());
+            set.force_join_registration_failure_for_test();
+
+            let observation_error = set
+                .drain_next_trusted()
+                .await
+                .expect("set contains one task")
+                .expect_err("forced caller-waker failure must be observed once");
+            assert_eq!(
+                observation_error.kind(),
+                task::JoinErrorKind::WakerRegistrationFailed
+            );
+            assert_eq!(
+                set.settlement(),
+                task::JoinSetSettlement::Incomplete {
+                    active_tasks: 0,
+                    unacknowledged_tasks: 1,
+                },
+                "observation failure must enter quarantine before settlement"
+            );
+
+            let terminal_error = set
+                .drain_next_trusted()
+                .await
+                .expect("quarantined handle must reach terminal acknowledgement")
+                .expect_err("registration failure requested task abort");
+            assert_eq!(terminal_error.kind(), task::JoinErrorKind::Aborted);
+            assert!(set.drain_next_trusted().await.is_none());
+            assert_eq!(set.settlement(), task::JoinSetSettlement::Settled);
+        });
+    }
+
+    #[test]
     fn join_set_cx_join_quarantines_nonterminal_registration_failure_without_spin() {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
@@ -9817,6 +9945,29 @@ mod tests {
                 "expired-budget cx must cause timeout_with_cx to return promptly; \
                  took {elapsed:?}"
             );
+        });
+    }
+
+    #[test]
+    fn typed_timeout_preserves_elapsed_failure_class() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let budget =
+                asupersync::types::Budget::new().with_deadline(asupersync::types::Time::ZERO);
+            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+
+            let error = timeout_with_cx_typed(
+                &cx,
+                Duration::from_secs(30),
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect_err("expired budget must terminate the typed timeout");
+
+            assert_eq!(error, TimeoutError::Elapsed);
         });
     }
 
