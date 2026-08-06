@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use frankenterm_core::wait::{
     ActivityTracker, Backoff, QueueDepthGauge, QuiescenceSignals, QuiescenceState, WaitError,
-    WaitFor,
+    WaitFor, WaitTermination,
 };
 use proptest::prelude::*;
 
@@ -220,6 +220,7 @@ proptest! {
             last_observed: None,
             retries,
             elapsed: Duration::from_millis(elapsed_ms),
+            termination: WaitTermination::ConfiguredTimeout,
         };
         let display = err.to_string();
         prop_assert!(
@@ -238,6 +239,7 @@ proptest! {
             last_observed: None,
             retries,
             elapsed: Duration::from_millis(100),
+            termination: WaitTermination::RetryLimit,
         };
         let display = err.to_string();
         prop_assert!(
@@ -256,6 +258,7 @@ proptest! {
             last_observed: Some(observed.clone()),
             retries: 1,
             elapsed: Duration::from_millis(100),
+            termination: WaitTermination::ConfiguredTimeout,
         };
         let display = err.to_string();
         prop_assert!(
@@ -272,6 +275,7 @@ proptest! {
             last_observed: None,
             retries: 1,
             elapsed: Duration::from_millis(100),
+            termination: WaitTermination::ConfiguredTimeout,
         };
         let display = err.to_string();
         prop_assert!(
@@ -423,6 +427,7 @@ fn wait_error_is_std_error() {
         last_observed: None,
         retries: 0,
         elapsed: Duration::ZERO,
+        termination: WaitTermination::ConfiguredTimeout,
     };
     let _: &dyn std::error::Error = &err;
 }
@@ -482,12 +487,14 @@ proptest! {
             last_observed: Some("observed".to_string()),
             retries,
             elapsed: Duration::from_millis(elapsed_ms),
+            termination: WaitTermination::RetryLimit,
         };
         let cloned = err.clone();
         prop_assert_eq!(cloned.expected.as_str(), err.expected.as_str());
         prop_assert_eq!(cloned.last_observed, err.last_observed);
         prop_assert_eq!(cloned.retries, err.retries);
         prop_assert_eq!(cloned.elapsed, err.elapsed);
+        prop_assert_eq!(cloned.termination, err.termination);
     }
 
     /// WaitError Debug output is non-empty.
@@ -500,6 +507,7 @@ proptest! {
             last_observed: None,
             retries: 0,
             elapsed: Duration::ZERO,
+            termination: WaitTermination::ConfiguredTimeout,
         };
         let dbg = format!("{:?}", err);
         prop_assert!(!dbg.is_empty());
@@ -640,6 +648,7 @@ proptest! {
             last_observed: None,
             retries: 0,
             elapsed: Duration::ZERO,
+            termination: WaitTermination::ConfiguredTimeout,
         };
         let display = format!("{}", err);
         prop_assert!(display.contains(&expected),

@@ -348,7 +348,7 @@ impl WorkflowEngine {
         }
 
         let step_logs = storage.get_step_logs_with_cx(cx, execution_id).await?;
-        let next_step = resolve_resume_step(&record, &step_logs);
+        let next_step = resolve_resume_step(&record, &step_logs)?;
 
         let execution = WorkflowExecution {
             id: record.id,
@@ -578,51 +578,78 @@ impl WorkflowEngine {
 /// Compute the next step index from step logs
 ///
 /// Finds the highest completed step index and returns the next one.
-/// If no steps are completed, returns 0.
-pub(super) fn compute_next_step(step_logs: &[crate::storage::WorkflowStepLogRecord]) -> usize {
+/// If no steps are completed, returns 0. A persisted `jump_to` log must contain
+/// a valid target; corrupt or incomplete durable state fails closed instead of
+/// silently re-executing a step whose side effects may already have happened.
+pub(super) fn compute_next_step(
+    step_logs: &[crate::storage::WorkflowStepLogRecord],
+) -> crate::Result<usize> {
     if step_logs.is_empty() {
-        return 0;
+        return Ok(0);
     }
 
     // Find the log with the highest ID (most recent chronologically)
     let last_log = step_logs.iter().max_by_key(|log| log.id);
 
-    match last_log {
+    let next_step = match last_log {
         Some(log) => match log.result_type.as_str() {
             "continue" | "done" => log.step_index.saturating_add(1),
             "jump_to" => {
-                if let Some(data) = &log.result_data {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(step) =
-                            json.get("step").and_then(|v| v.as_u64()).or_else(|| {
-                                json.get("step_result")
-                                    .and_then(|value| value.get("step"))
-                                    .and_then(|v| v.as_u64())
-                            })
-                        {
-                            return step as usize;
-                        }
-                    }
-                }
-                log.step_index // Fallback if data is missing or malformed
+                let data = log.result_data.as_deref().ok_or_else(|| {
+                    crate::Error::runtime_backend(
+                        "workflow.resume.decode_jump_target",
+                        format!(
+                            "jump_to step log {} at step {} has no result_data",
+                            log.id, log.step_index
+                        ),
+                    )
+                })?;
+                let json = serde_json::from_str::<serde_json::Value>(data)?;
+                let step = json
+                    .get("step")
+                    .and_then(serde_json::Value::as_u64)
+                    .or_else(|| {
+                        json.get("step_result")
+                            .and_then(|value| value.get("step"))
+                            .and_then(serde_json::Value::as_u64)
+                    })
+                    .ok_or_else(|| {
+                        crate::Error::runtime_backend(
+                            "workflow.resume.decode_jump_target",
+                            format!(
+                                "jump_to step log {} at step {} has no unsigned integer target",
+                                log.id, log.step_index
+                            ),
+                        )
+                    })?;
+                usize::try_from(step).map_err(|_| {
+                    crate::Error::runtime_backend(
+                        "workflow.resume.decode_jump_target",
+                        format!(
+                            "jump_to step log {} target {step} exceeds this platform's index range",
+                            log.id
+                        ),
+                    )
+                })?
             }
             // For retry, wait_for, send_text, abort, we re-execute or stay on the same step
             _ => log.step_index,
         },
         None => 0,
-    }
+    };
+    Ok(next_step)
 }
 
 pub(super) fn resolve_resume_step(
     record: &crate::storage::WorkflowRecord,
     step_logs: &[crate::storage::WorkflowStepLogRecord],
-) -> usize {
-    let next_from_logs = compute_next_step(step_logs);
+) -> crate::Result<usize> {
+    let next_from_logs = compute_next_step(step_logs)?;
     let Some(last_log) = step_logs.iter().max_by_key(|log| log.id) else {
-        return record.current_step;
+        return Ok(record.current_step);
     };
 
-    match last_log.result_type.as_str() {
+    Ok(match last_log.result_type.as_str() {
         "send_text" | "wait_for"
             if record.status == "running"
                 && record.wait_condition.is_none()
@@ -631,7 +658,7 @@ pub(super) fn resolve_resume_step(
             record.current_step
         }
         _ => next_from_logs,
-    }
+    })
 }
 
 /// Generate a unique workflow execution ID
