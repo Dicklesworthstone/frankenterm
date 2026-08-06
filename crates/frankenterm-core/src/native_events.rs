@@ -160,11 +160,6 @@ struct NativeListenerAnomalyCounters {
 }
 
 #[cfg(any(unix, windows))]
-fn native_spawn_admission_is_transient(error: &crate::runtime_async::task::SpawnError) -> bool {
-    native_spawn_error_code_is_transient(error.code())
-}
-
-#[cfg(any(unix, windows))]
 fn native_spawn_error_code_is_transient(code: &str) -> bool {
     // Asupersync publishes ASUP-E006 as the stable machine-readable identity
     // of RegionAtCapacity. All other spawn failures require runtime repair or
@@ -175,6 +170,70 @@ fn native_spawn_error_code_is_transient(code: &str) -> bool {
 #[cfg(any(unix, windows))]
 fn native_spawn_error_may_be_shutdown_race(code: &str) -> bool {
     matches!(code, "ASUP-E001" | "ASUP-E002" | "ASUP-E003")
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeSpawnRetryState {
+    consecutive_capacity_errors: u64,
+    backoff: Duration,
+}
+
+#[cfg(any(unix, windows))]
+impl NativeSpawnRetryState {
+    const fn new() -> Self {
+        Self {
+            consecutive_capacity_errors: 0,
+            backoff: ACCEPT_ERROR_INITIAL_BACKOFF,
+        }
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_capacity_errors = 0;
+        self.backoff = ACCEPT_ERROR_INITIAL_BACKOFF;
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeSpawnAdmissionDecision {
+    RetryCapacity {
+        consecutive_capacity_errors: u64,
+        retry_backoff: Duration,
+    },
+    CleanShutdown,
+    Fatal,
+}
+
+#[cfg(any(unix, windows))]
+fn classify_native_spawn_failure(
+    error_code: &str,
+    shutdown_observed: bool,
+    retry_state: &mut NativeSpawnRetryState,
+) -> NativeSpawnAdmissionDecision {
+    let capacity_error = native_spawn_error_code_is_transient(error_code);
+    if shutdown_observed
+        && (capacity_error || native_spawn_error_may_be_shutdown_race(error_code))
+    {
+        return NativeSpawnAdmissionDecision::CleanShutdown;
+    }
+
+    if !capacity_error {
+        return NativeSpawnAdmissionDecision::Fatal;
+    }
+
+    retry_state.consecutive_capacity_errors = retry_state
+        .consecutive_capacity_errors
+        .saturating_add(1);
+    let retry_backoff = retry_state.backoff;
+    retry_state.backoff = retry_state
+        .backoff
+        .saturating_mul(2)
+        .min(ACCEPT_ERROR_MAX_BACKOFF);
+    NativeSpawnAdmissionDecision::RetryCapacity {
+        consecutive_capacity_errors: retry_state.consecutive_capacity_errors,
+        retry_backoff,
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -998,8 +1057,7 @@ impl NativeEventListener {
         let mut connection_capacity_waits = 0_u64;
         let mut accept_error_backoff = ACCEPT_ERROR_INITIAL_BACKOFF;
         let mut consecutive_accept_errors = 0_u64;
-        let mut consecutive_spawn_capacity_errors = 0_u64;
-        let mut spawn_capacity_backoff = ACCEPT_ERROR_INITIAL_BACKOFF;
+        let mut spawn_retry_state = NativeSpawnRetryState::new();
         let mut listener_error = None;
         let anomaly_counters = Arc::new(NativeListenerAnomalyCounters::default());
 
@@ -1144,56 +1202,61 @@ impl NativeEventListener {
                         },
                     ) {
                         Ok(handle) => {
-                            consecutive_spawn_capacity_errors = 0;
-                            spawn_capacity_backoff = ACCEPT_ERROR_INITIAL_BACKOFF;
+                            spawn_retry_state.record_success();
                             connection_tasks.insert_handle(handle);
                         }
-                        Err(error) if native_spawn_admission_is_transient(&error) => {
-                            consecutive_spawn_capacity_errors =
-                                consecutive_spawn_capacity_errors.saturating_add(1);
-                            if consecutive_spawn_capacity_errors.is_power_of_two() {
-                                warn!(
-                                    error_code = error.code(),
-                                    consecutive_spawn_capacity_errors,
-                                    retry_backoff_ms = spawn_capacity_backoff.as_millis(),
-                                    path = %self.socket_path.display(),
-                                    "native event connection task region is at capacity; applying bounded retry backoff"
-                                );
-                            }
-                            if crate::runtime_async::sleep_with_cx(cx, spawn_capacity_backoff)
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                            spawn_capacity_backoff = spawn_capacity_backoff
-                                .saturating_mul(2)
-                                .min(ACCEPT_ERROR_MAX_BACKOFF);
-                        }
-                        Err(error)
-                            if native_spawn_error_may_be_shutdown_race(error.code())
-                                && (shutdown_flag.load(Ordering::SeqCst)
-                                    || cx.checkpoint().is_err()) =>
-                        {
-                            debug!(
-                                error_code = error.code(),
-                                "native event connection spawn lost the normal runtime-shutdown race"
-                            );
-                            break;
-                        }
                         Err(error) => {
-                            warn!(
-                                error_code = error.code(),
-                                path = %self.socket_path.display(),
-                                "native event connection task admission failed"
-                            );
-                            // Continuing would accept and drop an unbounded
-                            // stream of clients while task admission remains
-                            // unavailable. Fail the listener loop closed;
-                            // polling remains active and a runtime restart is
-                            // required to attempt a fresh listener.
-                            listener_error = Some(NativeEventError::ConnectionTaskAdmissionFailed);
-                            break;
+                            let shutdown_observed = shutdown_flag.load(Ordering::SeqCst)
+                                || cx.checkpoint().is_err();
+                            match classify_native_spawn_failure(
+                                error.code(),
+                                shutdown_observed,
+                                &mut spawn_retry_state,
+                            ) {
+                                NativeSpawnAdmissionDecision::RetryCapacity {
+                                    consecutive_capacity_errors,
+                                    retry_backoff,
+                                } => {
+                                    if consecutive_capacity_errors.is_power_of_two() {
+                                        warn!(
+                                            error_code = error.code(),
+                                            consecutive_spawn_capacity_errors = consecutive_capacity_errors,
+                                            retry_backoff_ms = retry_backoff.as_millis(),
+                                            path = %self.socket_path.display(),
+                                            "native event connection task region is at capacity; applying bounded retry backoff"
+                                        );
+                                    }
+                                    if crate::runtime_async::sleep_with_cx(cx, retry_backoff)
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                NativeSpawnAdmissionDecision::CleanShutdown => {
+                                    debug!(
+                                        error_code = error.code(),
+                                        "native event connection spawn lost the normal runtime-shutdown race"
+                                    );
+                                    break;
+                                }
+                                NativeSpawnAdmissionDecision::Fatal => {
+                                    warn!(
+                                        error_code = error.code(),
+                                        path = %self.socket_path.display(),
+                                        "native event connection task admission failed"
+                                    );
+                                    // Continuing would accept and drop an unbounded
+                                    // stream of clients while task admission remains
+                                    // unavailable. Fail the listener loop closed;
+                                    // polling remains active and a runtime restart is
+                                    // required to attempt a fresh listener.
+                                    listener_error = Some(
+                                        NativeEventError::ConnectionTaskAdmissionFailed,
+                                    );
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -1882,17 +1945,40 @@ mod native_accept_error_classifier_tests {
 
     #[test]
     fn listener_anomaly_sampling_persists_across_connection_boundaries() {
-        let counter = AtomicU64::new(0);
-        let first_connection = record_native_listener_anomaly(&counter);
-        let second_connection = record_native_listener_anomaly(&counter);
-        let third_connection = record_native_listener_anomaly(&counter);
-        let fourth_connection = record_native_listener_anomaly(&counter);
+        let counters = NativeListenerAnomalyCounters::default();
+        let mut listener_counts = Vec::new();
 
-        assert!(first_connection.is_power_of_two());
-        assert!(second_connection.is_power_of_two());
-        assert!(!third_connection.is_power_of_two());
-        assert!(fourth_connection.is_power_of_two());
-        assert_eq!(counter.load(Ordering::Relaxed), 4);
+        for _connection in 0..4 {
+            // Each handler owns a fresh local counter. The listener counter is
+            // deliberately shared across reconnects, so a reconnect storm
+            // cannot turn every first malformed frame into a warning.
+            let mut connection_count = 0;
+            assert_eq!(
+                record_native_connection_anomaly(&mut connection_count),
+                1
+            );
+            listener_counts.push(record_native_listener_anomaly(
+                &counters.malformed_event_drops,
+            ));
+            assert_eq!(
+                record_native_listener_anomaly(&counters.connections_with_drops),
+                listener_counts.len() as u64,
+            );
+        }
+
+        assert_eq!(listener_counts, [1, 2, 3, 4]);
+        assert!(listener_counts[0].is_power_of_two());
+        assert!(listener_counts[1].is_power_of_two());
+        assert!(!listener_counts[2].is_power_of_two());
+        assert!(listener_counts[3].is_power_of_two());
+        assert_eq!(
+            counters.malformed_event_drops.load(Ordering::Relaxed),
+            4
+        );
+        assert_eq!(
+            counters.connections_with_drops.load(Ordering::Relaxed),
+            4
+        );
     }
 
     #[test]
@@ -1927,6 +2013,73 @@ mod native_accept_error_classifier_tests {
             "unknown",
         ] {
             assert!(!native_spawn_error_may_be_shutdown_race(non_lifecycle_code));
+        }
+    }
+
+    #[test]
+    fn spawn_admission_decision_owns_retry_growth_reset_and_terminal_classes() {
+        let mut retry_state = NativeSpawnRetryState::new();
+
+        assert_eq!(
+            classify_native_spawn_failure("ASUP-E006", false, &mut retry_state),
+            NativeSpawnAdmissionDecision::RetryCapacity {
+                consecutive_capacity_errors: 1,
+                retry_backoff: ACCEPT_ERROR_INITIAL_BACKOFF,
+            }
+        );
+        assert_eq!(
+            classify_native_spawn_failure("ASUP-E006", false, &mut retry_state),
+            NativeSpawnAdmissionDecision::RetryCapacity {
+                consecutive_capacity_errors: 2,
+                retry_backoff: ACCEPT_ERROR_INITIAL_BACKOFF * 2,
+            }
+        );
+
+        for _ in 0..16 {
+            let NativeSpawnAdmissionDecision::RetryCapacity { retry_backoff, .. } =
+                classify_native_spawn_failure("ASUP-E006", false, &mut retry_state)
+            else {
+                panic!("RegionAtCapacity must remain retryable before shutdown");
+            };
+            assert!(retry_backoff <= ACCEPT_ERROR_MAX_BACKOFF);
+        }
+        assert_eq!(retry_state.backoff, ACCEPT_ERROR_MAX_BACKOFF);
+
+        retry_state.record_success();
+        assert_eq!(retry_state, NativeSpawnRetryState::new());
+        assert_eq!(
+            classify_native_spawn_failure("ASUP-E006", false, &mut retry_state),
+            NativeSpawnAdmissionDecision::RetryCapacity {
+                consecutive_capacity_errors: 1,
+                retry_backoff: ACCEPT_ERROR_INITIAL_BACKOFF,
+            },
+            "one successful admission must reset count and backoff"
+        );
+
+        for lifecycle_code in ["ASUP-E001", "ASUP-E002", "ASUP-E003"] {
+            assert_eq!(
+                classify_native_spawn_failure(lifecycle_code, true, &mut retry_state),
+                NativeSpawnAdmissionDecision::CleanShutdown,
+                "lifecycle failure after shutdown observation must be clean: {lifecycle_code}",
+            );
+            assert_eq!(
+                classify_native_spawn_failure(lifecycle_code, false, &mut retry_state),
+                NativeSpawnAdmissionDecision::Fatal,
+                "lifecycle failure while still running must fail closed: {lifecycle_code}",
+            );
+        }
+        assert_eq!(
+            classify_native_spawn_failure("ASUP-E006", true, &mut retry_state),
+            NativeSpawnAdmissionDecision::CleanShutdown,
+            "shutdown must not sleep through a concurrent capacity rejection"
+        );
+
+        for fatal_code in ["ASUP-E004", "ASUP-E005", "ASUP-E007", "unknown"] {
+            assert_eq!(
+                classify_native_spawn_failure(fatal_code, false, &mut retry_state),
+                NativeSpawnAdmissionDecision::Fatal,
+                "non-retryable admission error must stop the listener: {fatal_code}",
+            );
         }
     }
 
