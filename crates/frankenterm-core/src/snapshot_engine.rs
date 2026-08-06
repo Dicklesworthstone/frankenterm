@@ -2278,32 +2278,32 @@ impl SnapshotEngine {
         let pane_count = prepared.pane_count;
 
         let db_path = Arc::clone(&self.db_path);
+        let authority_for_identity_refresh = Arc::clone(&self.snapshot_authority);
 
         let result = self
             .spawn_blocking_authority_with_cx(
                 cx,
                 SnapshotAuthorityOperation::CheckpointCommit,
                 move || {
-                    save_checkpoint_authoritatively_sync(
-                        &db_path,
+                    let receipt = save_checkpoint_authoritatively_sync(
+                        db_path.as_str(),
                         &session_id,
                         now_ms,
                         &checkpoint_type,
                         &prepared,
                         new_session.as_ref(),
-                    )
+                    )?;
+                    // Keep mutation admission held while publishing an inode
+                    // discovered by the first commit, closing the construction
+                    // race with a later hard-link-spelled engine.
+                    refresh_snapshot_authority_file_identities(
+                        db_path.as_str(),
+                        &authority_for_identity_refresh,
+                    );
+                    Ok(receipt)
                 },
             )
             .await?;
-
-        // The first successful commit may have created a path that did not
-        // exist when this engine registered. Publish its stable filesystem
-        // object identity before another hard-link spelling can split the
-        // same-process authority lane.
-        refresh_snapshot_authority_file_identities(
-            self.db_path.as_str(),
-            &self.snapshot_authority,
-        );
 
         // 8. Publish both in-memory authorities only after the typed durable
         // receipt. An indeterminate handoff leaves the sticky latch set and a
