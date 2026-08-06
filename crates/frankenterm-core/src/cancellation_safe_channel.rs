@@ -107,15 +107,45 @@ impl Drop for Reservation {
 // ── Channel Errors ─────────────────────────────────────────────────────────
 
 /// Errors from channel operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxCancellationKind {
+    /// Explicit user cancellation.
+    User,
+    /// An operation-scoped timeout requested cancellation.
+    Timeout,
+    /// A sibling failure triggered fail-fast cancellation.
+    FailFast,
+    /// Another branch won a structured race.
+    RaceLost,
+    /// A parent region was cancelled.
+    ParentCancelled,
+    /// A required resource became unavailable.
+    ResourceUnavailable,
+    /// The runtime is shutting down.
+    Shutdown,
+    /// A linked task exited abnormally.
+    LinkedExit,
+    /// Cancellation lacked a typed root cause.
+    Unknown,
+}
+
+/// Errors from channel operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxChannelError {
     /// Channel has been closed.
     Closed,
     /// The caller's capability context was explicitly cancelled.
-    Cancelled,
-    /// The capability context or its timer failed for a reason other than
-    /// explicit cancellation (for example, an exhausted budget).
-    Context(String),
+    Cancelled { kind: TxCancellationKind },
+    /// The capability-context deadline elapsed.
+    DeadlineExceeded,
+    /// The capability-context poll quota was exhausted.
+    PollQuotaExhausted,
+    /// The capability-context cost budget was exhausted.
+    CostBudgetExhausted,
+    /// A capability checkpoint failed without a stable typed cause.
+    ContextFailure,
+    /// The Cx timer failed independently of cancellation or budget expiry.
+    TimerFailure,
     /// Channel is at capacity (for try_reserve).
     Full,
     /// Reservation belongs to a different channel.
@@ -128,8 +158,12 @@ impl fmt::Display for TxChannelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Closed => write!(f, "channel closed"),
-            Self::Cancelled => write!(f, "channel operation cancelled"),
-            Self::Context(detail) => write!(f, "channel capability context failed: {detail}"),
+            Self::Cancelled { kind } => write!(f, "channel operation cancelled ({kind:?})"),
+            Self::DeadlineExceeded => write!(f, "channel capability deadline exceeded"),
+            Self::PollQuotaExhausted => write!(f, "channel capability poll quota exhausted"),
+            Self::CostBudgetExhausted => write!(f, "channel capability cost budget exhausted"),
+            Self::ContextFailure => write!(f, "channel capability context failed"),
+            Self::TimerFailure => write!(f, "channel capability timer failed"),
             Self::Full => write!(f, "channel full"),
             Self::WrongChannel { expected, actual } => {
                 write!(f, "reservation for channel {actual}, expected {expected}")
@@ -171,11 +205,49 @@ struct TxEnvelope<T> {
     value: T,
 }
 
-fn cx_channel_error(cx: &crate::cx::Cx, detail: impl Into<String>) -> TxChannelError {
-    if cx.is_cancel_requested() {
-        TxChannelError::Cancelled
-    } else {
-        TxChannelError::Context(detail.into())
+fn cx_cancel_error(cx: &crate::cx::Cx) -> TxChannelError {
+    use crate::outcome::CancelKind;
+
+    match cx.root_cancel_cause().map(|reason| reason.kind) {
+        Some(CancelKind::Deadline) => TxChannelError::DeadlineExceeded,
+        Some(CancelKind::PollQuota) => TxChannelError::PollQuotaExhausted,
+        Some(CancelKind::CostBudget) => TxChannelError::CostBudgetExhausted,
+        Some(kind) => TxChannelError::Cancelled {
+            kind: match kind {
+                CancelKind::User => TxCancellationKind::User,
+                CancelKind::Timeout => TxCancellationKind::Timeout,
+                CancelKind::FailFast => TxCancellationKind::FailFast,
+                CancelKind::RaceLost => TxCancellationKind::RaceLost,
+                CancelKind::ParentCancelled => TxCancellationKind::ParentCancelled,
+                CancelKind::ResourceUnavailable => TxCancellationKind::ResourceUnavailable,
+                CancelKind::Shutdown => TxCancellationKind::Shutdown,
+                CancelKind::LinkedExit => TxCancellationKind::LinkedExit,
+                CancelKind::Deadline | CancelKind::PollQuota | CancelKind::CostBudget => {
+                    unreachable!("budget causes are classified before cancellation kinds")
+                }
+            },
+        },
+        None => TxChannelError::Cancelled {
+            kind: TxCancellationKind::Unknown,
+        },
+    }
+}
+
+fn cx_checkpoint_error(
+    cx: &crate::cx::Cx,
+    error: &asupersync::error::Error,
+) -> TxChannelError {
+    use asupersync::error::ErrorKind;
+
+    if cx.root_cancel_cause().is_some() {
+        return cx_cancel_error(cx);
+    }
+    match error.kind() {
+        ErrorKind::DeadlineExceeded => TxChannelError::DeadlineExceeded,
+        ErrorKind::PollQuotaExhausted => TxChannelError::PollQuotaExhausted,
+        ErrorKind::CostQuotaExhausted => TxChannelError::CostBudgetExhausted,
+        ErrorKind::Cancelled | ErrorKind::CancelTimeout => cx_cancel_error(cx),
+        _ => TxChannelError::ContextFailure,
     }
 }
 
@@ -320,8 +392,8 @@ impl<T> TxProducer<T> {
 
     /// Cx-first [`Self::reserve`] (ft-xbnl0.2.3). Explicit cancellation is
     /// reported as [`TxChannelError::Cancelled`], independently from a closed
-    /// channel. Other context failures retain their diagnostic detail in
-    /// [`TxChannelError::Context`].
+    /// channel. Deadline and quota exhaustion have their own finite variants;
+    /// raw cancellation-reason text is never copied into the channel error.
     ///
     /// The capacity notification uses [`Notify::wait_until`] so close or
     /// capacity release between the failed fast-path check and waiter
@@ -331,8 +403,11 @@ impl<T> TxProducer<T> {
         use std::time::Duration;
 
         loop {
+            if self.is_closed() {
+                return Err(TxChannelError::Closed);
+            }
             cx.checkpoint()
-                .map_err(|error| cx_channel_error(cx, error.to_string()))?;
+                .map_err(|error| cx_checkpoint_error(cx, &error))?;
             match self.try_reserve() {
                 Ok(r) => return Ok(r),
                 Err(TxChannelError::Full) => {
@@ -351,10 +426,19 @@ impl<T> TxProducer<T> {
                                 return Ok(());
                             }
                             cx.checkpoint()
-                                .map_err(|error| cx_channel_error(cx, error.to_string()))?;
-                            crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50))
-                                .await
-                                .map_err(|error| cx_channel_error(cx, error))?;
+                                .map_err(|error| cx_checkpoint_error(cx, &error))?;
+                            if crate::runtime_async::sleep_with_cx(
+                                cx,
+                                Duration::from_millis(50),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return match cx.checkpoint() {
+                                    Err(error) => Err(cx_checkpoint_error(cx, &error)),
+                                    Ok(()) => Err(TxChannelError::TimerFailure),
+                                };
+                            }
                         }
                     });
 
@@ -566,11 +650,6 @@ impl<T> TxConsumer<T> {
         use std::time::Duration;
 
         loop {
-            cx.checkpoint()
-                .map_err(|error| cx_channel_error(cx, error.to_string()))?;
-            if let Some(rv) = self.try_recv() {
-                return Ok(Some(rv));
-            }
             let drained = self.shared.closed.load(Ordering::Acquire)
                 && self.shared.queue.is_empty()
                 && self
@@ -581,6 +660,11 @@ impl<T> TxConsumer<T> {
                     == 0;
             if drained {
                 return Ok(None);
+            }
+            cx.checkpoint()
+                .map_err(|error| cx_checkpoint_error(cx, &error))?;
+            if let Some(rv) = self.try_recv() {
+                return Ok(Some(rv));
             }
 
             #[cfg(test)]
@@ -615,10 +699,16 @@ impl<T> TxConsumer<T> {
                         return Ok(());
                     }
                     cx.checkpoint()
-                        .map_err(|error| cx_channel_error(cx, error.to_string()))?;
-                    crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50))
+                        .map_err(|error| cx_checkpoint_error(cx, &error))?;
+                    if crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50))
                         .await
-                        .map_err(|error| cx_channel_error(cx, error))?;
+                        .is_err()
+                    {
+                        return match cx.checkpoint() {
+                            Err(error) => Err(cx_checkpoint_error(cx, &error)),
+                            Ok(()) => Err(TxChannelError::TimerFailure),
+                        };
+                    }
                 }
             });
 
@@ -945,7 +1035,9 @@ mod tests {
                 let inner = result.expect("outer timeout must not fire");
                 assert_eq!(
                     inner.expect_err("cancelled recv_with_cx must not report closed/drained"),
-                    TxChannelError::Cancelled
+                    TxChannelError::Cancelled {
+                        kind: TxCancellationKind::User
+                    }
                 );
             });
         }));
@@ -956,6 +1048,103 @@ mod tests {
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    #[test]
+    fn channel_cx_failures_preserve_finite_cancel_and_budget_classes() {
+        use crate::runtime_async::CompatRuntime;
+
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        runtime.block_on(async {
+            const SECRET_SENTINEL: &str = "secret-channel-cancel-reason-must-not-escape";
+            let cases = [
+                (
+                    crate::cx::Cx::for_testing_with_budget(
+                        crate::cx::Budget::new()
+                            .with_deadline(asupersync::types::Time::ZERO),
+                    ),
+                    TxChannelError::DeadlineExceeded,
+                ),
+                (
+                    crate::cx::Cx::for_testing_with_budget(
+                        crate::cx::Budget::new().with_poll_quota(0),
+                    ),
+                    TxChannelError::PollQuotaExhausted,
+                ),
+                (
+                    crate::cx::Cx::for_testing_with_budget(
+                        crate::cx::Budget::new().with_cost_quota(0),
+                    ),
+                    TxChannelError::CostBudgetExhausted,
+                ),
+            ];
+
+            for (cx, expected) in cases {
+                let (tx, _rx) = tx_channel::<u32>(1);
+                let error = tx
+                    .reserve_with_cx(&cx)
+                    .await
+                    .expect_err("exhausted Cx must reject reserve");
+                assert_eq!(error, expected);
+            }
+
+            let user_cx = crate::cx::Cx::for_testing();
+            user_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some(SECRET_SENTINEL),
+            );
+            let (tx, _rx) = tx_channel::<u32>(1);
+            let error = tx
+                .reserve_with_cx(&user_cx)
+                .await
+                .expect_err("user cancellation must reject reserve");
+            assert_eq!(
+                error,
+                TxChannelError::Cancelled {
+                    kind: TxCancellationKind::User
+                }
+            );
+            assert!(
+                !error.to_string().contains(SECRET_SENTINEL),
+                "finite channel errors must not expose cancellation reason text"
+            );
+        });
+    }
+
+    #[test]
+    fn closed_and_drained_precedes_simultaneous_cancellation() {
+        use crate::runtime_async::CompatRuntime;
+
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        runtime.block_on(async {
+            let (tx, rx) = tx_channel::<u32>(1);
+            tx.close();
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("simultaneous closed and cancelled precedence"),
+            );
+
+            assert!(
+                rx.recv_with_cx(&cx)
+                    .await
+                    .expect("terminal closed state is not a Cx failure")
+                    .is_none(),
+                "an already closed-and-drained outcome must not be falsified by late cancellation"
+            );
+            assert_eq!(
+                tx.reserve_with_cx(&cx)
+                    .await
+                    .expect_err("closed channel cannot reserve"),
+                TxChannelError::Closed
+            );
+        });
     }
 
     #[test]
@@ -1327,12 +1516,19 @@ mod tests {
     fn error_display() {
         assert_eq!(TxChannelError::Closed.to_string(), "channel closed");
         assert_eq!(
-            TxChannelError::Cancelled.to_string(),
-            "channel operation cancelled"
+            TxChannelError::Cancelled {
+                kind: TxCancellationKind::User
+            }
+            .to_string(),
+            "channel operation cancelled (User)"
         );
         assert_eq!(
-            TxChannelError::Context("deadline exhausted".to_string()).to_string(),
-            "channel capability context failed: deadline exhausted"
+            TxChannelError::DeadlineExceeded.to_string(),
+            "channel capability deadline exceeded"
+        );
+        assert_eq!(
+            TxChannelError::TimerFailure.to_string(),
+            "channel capability timer failed"
         );
         assert_eq!(TxChannelError::Full.to_string(), "channel full");
         assert_eq!(
