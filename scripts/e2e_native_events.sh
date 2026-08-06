@@ -31,6 +31,26 @@ fi
 set -euo pipefail
 umask 077
 SANITIZED_PATH=/usr/bin:/bin:/usr/sbin:/sbin
+PYTHON3_BIN=''
+for python_candidate in \
+    /usr/bin/python3 \
+    /usr/local/bin/python3 \
+    /opt/homebrew/bin/python3; do
+    if [ -f "$python_candidate" ] && [ -x "$python_candidate" ]; then
+        PYTHON3_BIN=$python_candidate
+        break
+    fi
+done
+if [ -z "$PYTHON3_BIN" ]; then
+    printf '%s\n' \
+        'no Python 3 interpreter found at an approved absolute system path' >&2
+    exit 2
+fi
+PYTHON3_DIR=${PYTHON3_BIN%/*}
+case ":$SANITIZED_PATH:" in
+    *":$PYTHON3_DIR:"*) PREFLIGHT_PATH=$SANITIZED_PATH ;;
+    *) PREFLIGHT_PATH="$SANITIZED_PATH:$PYTHON3_DIR" ;;
+esac
 PATH=$SANITIZED_PATH
 export PATH
 
@@ -107,6 +127,10 @@ if [ ! -d "$CANDIDATE_ROOT" ]; then
     exit 2
 fi
 CANDIDATE_ROOT=$(cd "$CANDIDATE_ROOT" && pwd -P)
+if [ "$CANDIDATE_ROOT" = "/" ]; then
+    echo "candidate root may not be the filesystem root" >&2
+    exit 2
+fi
 for candidate_binary in "$FT_GUI" "$FT_CLI"; do
     if [ ! -f "$candidate_binary" ] || [ ! -x "$candidate_binary" ] || [ -L "$candidate_binary" ]; then
         echo "candidate binary must be an executable non-symlink file: $candidate_binary" >&2
@@ -139,23 +163,36 @@ fi
 DECLARED_CANDIDATE_ROOT="$CANDIDATE_ROOT"
 DECLARED_FT_GUI="$FT_GUI"
 DECLARED_FT_CLI="$FT_CLI"
+DECLARED_CANDIDATE_MANIFEST="$CANDIDATE_MANIFEST"
+DECLARED_ATOMIC_MANIFEST_TOOL="$ATOMIC_MANIFEST_TOOL"
 FT_GUI_RELATIVE=${FT_GUI#"$CANDIDATE_ROOT"/}
 FT_CLI_RELATIVE=${FT_CLI#"$CANDIDATE_ROOT"/}
 
 hash_file() {
-    if command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$1" | awk '{print $1}'
-    elif command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" | awk '{print $1}'
-    else
-        echo "no SHA-256 utility available" >&2
-        return 1
-    fi
+    env -i \
+        "PATH=$PREFLIGHT_PATH" \
+        "LANG=${LANG:-C}" \
+        "HOME=$LOG_DIR" \
+        "TMPDIR=$LOG_DIR" \
+        PYTHONNOUSERSITE=1 \
+        "$PYTHON3_BIN" - "$1" <<'PY'
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as source:
+    while True:
+        chunk = source.read(1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
 }
 
 verify_atomic_candidate_root() {
     env -i \
-        "PATH=$SANITIZED_PATH" \
+        "PATH=$PREFLIGHT_PATH" \
         "LANG=${LANG:-C}" \
         "HOME=$LOG_DIR" \
         "TMPDIR=$LOG_DIR" \
@@ -167,12 +204,12 @@ verify_atomic_candidate_root() {
 
 verify_candidate_manifest_contract() {
     env -i \
-        "PATH=$SANITIZED_PATH" \
+        "PATH=$PREFLIGHT_PATH" \
         "LANG=${LANG:-C}" \
         "HOME=$LOG_DIR" \
         "TMPDIR=$LOG_DIR" \
         PYTHONNOUSERSITE=1 \
-        python3 - \
+        "$PYTHON3_BIN" - \
         "$CANDIDATE_MANIFEST" \
         "$FRANKENTERM_CANDIDATE_SHA" \
         "$FRANKENTERM_BUILD_PROFILE" \
@@ -281,6 +318,7 @@ PY
 GUI_SHA256=$(hash_file "$FT_GUI")
 CLI_SHA256=$(hash_file "$FT_CLI")
 MANIFEST_SHA256_BEFORE=$(hash_file "$CANDIDATE_MANIFEST")
+ATOMIC_MANIFEST_TOOL_SHA256=$(hash_file "$ATOMIC_MANIFEST_TOOL")
 
 # Fail closed before either candidate binary is started. The offline verifier
 # binds the exact package inventory, executable bytes, and embedded component
@@ -304,26 +342,44 @@ fi
 MANIFEST_SHA256_AFTER=$(hash_file "$CANDIDATE_MANIFEST")
 GUI_SHA256_AFTER=$(hash_file "$FT_GUI")
 CLI_SHA256_AFTER=$(hash_file "$FT_CLI")
+ATOMIC_MANIFEST_TOOL_SHA256_AFTER=$(hash_file "$ATOMIC_MANIFEST_TOOL")
 if [ "$MANIFEST_SHA256_AFTER" != "$MANIFEST_SHA256_BEFORE" ] || \
    [ "$GUI_SHA256_AFTER" != "$GUI_SHA256" ] || \
-   [ "$CLI_SHA256_AFTER" != "$CLI_SHA256" ]; then
-    echo "candidate manifest or executable changed during verification; refusing process launch" >&2
+   [ "$CLI_SHA256_AFTER" != "$CLI_SHA256" ] || \
+   [ "$ATOMIC_MANIFEST_TOOL_SHA256_AFTER" != "$ATOMIC_MANIFEST_TOOL_SHA256" ]; then
+    echo "candidate manifest, verifier, or executable changed during verification; refusing process launch" >&2
     exit 2
 fi
-
 
 # Execute only a harness-owned snapshot, never paths in the caller-owned
 # candidate tree. The copied tree is verified again as a complete package
 # before either process starts, closing the verify-then-exec race against the
 # original staging directory and keeping all runtime package access inside the
 # private 0700 harness directory.
-EXECUTION_CANDIDATE_ROOT="$LOG_DIR/candidate-snapshot"
-mkdir -m 700 "$EXECUTION_CANDIDATE_ROOT"
-if ! cp -Rp "$DECLARED_CANDIDATE_ROOT/." "$EXECUTION_CANDIDATE_ROOT/"; then
+EXECUTION_MANIFEST="$LOG_DIR/execution-component-manifest.json"
+EXECUTION_ATOMIC_MANIFEST_TOOL="$LOG_DIR/execution-atomic-component-manifest.sh"
+if ! cp -p "$DECLARED_CANDIDATE_MANIFEST" "$EXECUTION_MANIFEST" || \
+   ! cp -p "$DECLARED_ATOMIC_MANIFEST_TOOL" "$EXECUTION_ATOMIC_MANIFEST_TOOL"; then
+    echo "failed to snapshot detached manifest and verifier; refusing process launch" >&2
+    exit 2
+fi
+if [ -L "$EXECUTION_MANIFEST" ] || [ -L "$EXECUTION_ATOMIC_MANIFEST_TOOL" ] || \
+   [ "$(hash_file "$EXECUTION_MANIFEST")" != "$MANIFEST_SHA256_AFTER" ] || \
+   [ "$(hash_file "$EXECUTION_ATOMIC_MANIFEST_TOOL")" != "$ATOMIC_MANIFEST_TOOL_SHA256" ]; then
+    echo "private manifest or verifier snapshot differs from verified bytes; refusing process launch" >&2
+    exit 2
+fi
+CANDIDATE_MANIFEST="$EXECUTION_MANIFEST"
+ATOMIC_MANIFEST_TOOL="$EXECUTION_ATOMIC_MANIFEST_TOOL"
+
+EXECUTION_CANDIDATE_PARENT="$LOG_DIR/candidate-snapshot"
+CANDIDATE_ROOT_BASENAME=${DECLARED_CANDIDATE_ROOT##*/}
+mkdir -m 700 "$EXECUTION_CANDIDATE_PARENT"
+if ! cp -Rp "$DECLARED_CANDIDATE_ROOT" "$EXECUTION_CANDIDATE_PARENT/"; then
     echo "failed to create private candidate snapshot; refusing process launch" >&2
     exit 2
 fi
-CANDIDATE_ROOT=$(cd "$EXECUTION_CANDIDATE_ROOT" && pwd -P)
+CANDIDATE_ROOT=$(cd "$EXECUTION_CANDIDATE_PARENT/$CANDIDATE_ROOT_BASENAME" && pwd -P)
 FT_GUI="$CANDIDATE_ROOT/$FT_GUI_RELATIVE"
 FT_CLI="$CANDIDATE_ROOT/$FT_CLI_RELATIVE"
 for snapshot_binary in "$FT_GUI" "$FT_CLI"; do
@@ -356,6 +412,7 @@ fi
 verify_execution_snapshot_integrity() {
     local phase="$1"
     if [ "$(hash_file "$CANDIDATE_MANIFEST")" != "$MANIFEST_SHA256_AFTER" ] || \
+       [ "$(hash_file "$ATOMIC_MANIFEST_TOOL")" != "$ATOMIC_MANIFEST_TOOL_SHA256" ] || \
        [ "$(hash_file "$FT_GUI")" != "$GUI_SHA256" ] || \
        [ "$(hash_file "$FT_CLI")" != "$CLI_SHA256" ]; then
         echo "candidate snapshot identity changed during $phase" >&2
@@ -546,11 +603,16 @@ wait_for_watch_bind() {
         if grep -Fq \
             "Native event listener bound — waiting for GUI connections" \
             "$LOG_DIR/watch-stderr.log" 2>/dev/null; then
-            builtin kill -0 "$WATCH_PID" 2>/dev/null
-            return
+            if builtin kill -0 "$WATCH_PID" 2>/dev/null; then
+                return 0
+            fi
+            builtin wait "$WATCH_PID" 2>/dev/null || true
+            WATCH_PID=''
+            return 1
         fi
         if ! builtin kill -0 "$WATCH_PID" 2>/dev/null; then
             builtin wait "$WATCH_PID" 2>/dev/null || true
+            WATCH_PID=''
             return 1
         fi
         attempts=$((attempts - 1))
@@ -565,10 +627,12 @@ wait_for_bridge_handshake() {
     while [ "$attempts" -gt 0 ]; do
         if ! builtin kill -0 "$WATCH_PID" 2>/dev/null; then
             builtin wait "$WATCH_PID" 2>/dev/null || true
+            WATCH_PID=''
             return 1
         fi
         if ! builtin kill -0 "$GUI_PID" 2>/dev/null; then
             builtin wait "$GUI_PID" 2>/dev/null || true
+            GUI_PID=''
             return 2
         fi
         if grep -Fq "$gui_connected_marker" "$LOG_DIR/gui-stderr.log" 2>/dev/null && \
@@ -605,18 +669,89 @@ echo "Candidate source SHA: $FRANKENTERM_CANDIDATE_SHA"
 echo "Candidate profile: $FRANKENTERM_BUILD_PROFILE"
 echo ""
 
-{
-    printf 'declared_source_sha=%s\n' "$FRANKENTERM_CANDIDATE_SHA"
-    printf 'build_profile=%s\n' "$FRANKENTERM_BUILD_PROFILE"
-    printf 'component_manifest_path=%s\ncomponent_manifest_sha256=%s\n' \
-        "$CANDIDATE_MANIFEST" "$MANIFEST_SHA256_AFTER"
-    printf 'declared_candidate_root=%s\nexecution_candidate_root=%s\n' \
-        "$DECLARED_CANDIDATE_ROOT" "$CANDIDATE_ROOT"
-    printf 'declared_cli_path=%s\nexecution_cli_path=%s\ncli_sha256=%s\n' \
-        "$DECLARED_FT_CLI" "$FT_CLI" "$CLI_SHA256"
-    printf 'declared_gui_path=%s\nexecution_gui_path=%s\ngui_sha256=%s\n' \
-        "$DECLARED_FT_GUI" "$FT_GUI" "$GUI_SHA256"
-} >"$LOG_DIR/artifact-manifest.txt"
+env -i \
+    "PATH=$PREFLIGHT_PATH" \
+    "LANG=${LANG:-C}" \
+    "HOME=$LOG_DIR" \
+    "TMPDIR=$LOG_DIR" \
+    PYTHONNOUSERSITE=1 \
+    "$PYTHON3_BIN" - \
+    "$LOG_DIR/artifact-manifest.json" \
+    "$FRANKENTERM_CANDIDATE_SHA" \
+    "$FRANKENTERM_BUILD_PROFILE" \
+    "$DECLARED_CANDIDATE_MANIFEST" \
+    "$CANDIDATE_MANIFEST" \
+    "$MANIFEST_SHA256_AFTER" \
+    "$DECLARED_ATOMIC_MANIFEST_TOOL" \
+    "$ATOMIC_MANIFEST_TOOL" \
+    "$ATOMIC_MANIFEST_TOOL_SHA256" \
+    "$DECLARED_CANDIDATE_ROOT" \
+    "$CANDIDATE_ROOT" \
+    "$DECLARED_FT_CLI" \
+    "$FT_CLI" \
+    "$CLI_SHA256" \
+    "$DECLARED_FT_GUI" \
+    "$FT_GUI" \
+    "$GUI_SHA256" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+(
+    output_path,
+    source_revision,
+    profile,
+    declared_manifest,
+    execution_manifest,
+    manifest_sha256,
+    declared_verifier,
+    execution_verifier,
+    verifier_sha256,
+    declared_root,
+    execution_root,
+    declared_cli,
+    execution_cli,
+    cli_sha256,
+    declared_gui,
+    execution_gui,
+    gui_sha256,
+) = sys.argv[1:]
+receipt = {
+    "schema_version": "ft.native_event_e2e_artifact_receipt.v1",
+    "source_revision": source_revision,
+    "profile": profile,
+    "component_manifest": {
+        "declared_path": declared_manifest,
+        "execution_path": execution_manifest,
+        "sha256": manifest_sha256,
+    },
+    "verifier": {
+        "declared_path": declared_verifier,
+        "execution_path": execution_verifier,
+        "sha256": verifier_sha256,
+    },
+    "candidate_root": {
+        "declared_path": declared_root,
+        "execution_path": execution_root,
+    },
+    "components": {
+        "ft": {
+            "declared_path": declared_cli,
+            "execution_path": execution_cli,
+            "sha256": cli_sha256,
+        },
+        "frankenterm-gui": {
+            "declared_path": declared_gui,
+            "execution_path": execution_gui,
+            "sha256": gui_sha256,
+        },
+    },
+}
+Path(output_path).write_text(
+    json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
 
 # Step 1: Start ft watch in foreground mode with an isolated, explicitly
 # enabled native-event configuration. The listener exclusively owns
@@ -714,11 +849,13 @@ else
 fi
 
 disconnect_seen=false
-for _ in $(seq 1 40); do
+disconnect_attempts=40
+while [ "$disconnect_attempts" -gt 0 ]; do
     if grep -Fq "native event connection closed (cx path)" "$LOG_DIR/watch-stderr.log" 2>/dev/null; then
         disconnect_seen=true
         break
     fi
+    disconnect_attempts=$((disconnect_attempts - 1))
     sleep 0.1
 done
 if [ "$disconnect_seen" = true ]; then

@@ -1752,7 +1752,8 @@ async fn dispatch_event_with_timeout_with_cx(
     event: NativeEvent,
     send_timeout: Duration,
 ) -> EventDispatchOutcome {
-    match crate::runtime_async::timeout_with_cx_typed(cx, send_timeout, event_tx.reserve(cx)).await {
+    match crate::runtime_async::timeout_with_cx_typed(cx, send_timeout, event_tx.reserve(cx)).await
+    {
         Ok(Ok(permit)) => {
             // Reserving capacity is an await boundary. Do not commit an event
             // if cancellation/budget exhaustion won concurrently with the
@@ -1939,6 +1940,9 @@ mod native_accept_error_classifier_tests {
     fn invalid_unix_listener_descriptor_is_classified_from_raw_code() {
         let error = std::io::Error::from_raw_os_error(9);
         assert!(native_accept_error_is_permanent(&error));
+
+        let descriptor_exhaustion = std::io::Error::from_raw_os_error(24);
+        assert!(!native_accept_error_is_permanent(&descriptor_exhaustion));
     }
 
     #[test]
@@ -1951,6 +1955,9 @@ mod native_accept_error_classifier_tests {
                 "raw_os_error={raw_os_error}"
             );
         }
+
+        let descriptor_exhaustion = std::io::Error::from_raw_os_error(10_024);
+        assert!(!native_accept_error_is_permanent(&descriptor_exhaustion));
     }
 
     #[test]

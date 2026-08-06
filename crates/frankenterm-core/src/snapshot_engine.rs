@@ -266,7 +266,7 @@ impl SnapshotTrigger {
 /// Result of a successful snapshot capture.
 #[derive(Debug, Clone)]
 pub struct SnapshotResult {
-    /// Session ID (UUID v7).
+    /// Time-ordered `sess-<timestamp>-<random>` session ID (UUID-v7-like).
     pub session_id: String,
     /// Checkpoint row ID in SQLite.
     pub checkpoint_id: i64,
@@ -317,7 +317,7 @@ impl std::fmt::Display for SnapshotAuthorityOperation {
     }
 }
 
-/// Error returned when a snapshot cannot be captured.
+/// Error returned when a snapshot-engine operation cannot complete safely.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
     #[error("snapshot already in progress")]
@@ -908,11 +908,10 @@ impl SnapshotEngine {
             host_id: current_host_id(),
         });
 
-        // 7. Acquire the final in-memory commit guard before the durable write.
-        // Once the SQLite transaction commits, cancellation is too late to
-        // report failure: doing so would lie about a checkpoint that now
-        // exists. Holding this guard across the write makes the durable and
-        // in-memory commit points one ordered operation.
+        // 7. Acquire the final in-memory publication guard before the durable
+        // write. Post-handoff cancellation is indeterminate, never an ordinary
+        // failure; a typed success can therefore publish the dedup witness
+        // immediately while both in-memory authority guards remain held.
         let mut last_state_hash = self
             .last_state_hash
             .write_with_cx(cx)
@@ -2344,6 +2343,7 @@ fn mark_shutdown_sync(db_path: &str, session_id: &str) -> std::result::Result<()
 /// Save a checkpoint with all pane states in a single transaction. When
 /// `new_session` is present, session creation is part of that same transaction.
 /// Returns (session_id, checkpoint_id, total_bytes).
+#[allow(clippy::too_many_arguments)] // One flattened argument set defines the SQLite transaction.
 fn save_checkpoint_sync(
     db_path: &str,
     session_id: &str,
@@ -5467,16 +5467,20 @@ mod tests {
                 operation: SnapshotAuthorityOperation::CheckpointCommit,
             }
             .to_string(),
-            "snapshot authority outcome is indeterminate after checkpoint_commit handoff; \
-             reconcile durable state before retrying"
+            concat!(
+                "snapshot authority outcome is indeterminate after checkpoint_commit handoff; ",
+                "reconcile durable state before retrying"
+            )
         );
         assert_eq!(
             SnapshotError::AuthorityReconciliationRequired {
                 operation: SnapshotAuthorityOperation::ShutdownMark,
             }
             .to_string(),
-            "snapshot authority reconciliation is required before shutdown_mark; durable \
-             mutation suppressed"
+            concat!(
+                "snapshot authority reconciliation is required before shutdown_mark; durable ",
+                "mutation suppressed"
+            )
         );
     }
 
