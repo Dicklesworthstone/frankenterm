@@ -246,12 +246,20 @@ impl WebServerConfig {
         format!("{host}:{}", self.port)
     }
 
-    /// Returns `true` when the configured host is a loopback address.
+    /// Returns `true` when the configured host names or parses as loopback.
+    ///
+    /// This is only the pre-bind admission check. The server separately checks
+    /// the address returned by the listener after hostname resolution, so a
+    /// surprising `localhost` resolver entry cannot cross the unauthenticated
+    /// control-plane boundary.
     fn is_localhost(&self) -> bool {
-        matches!(
-            self.host.as_str(),
-            "127.0.0.1" | "::1" | "localhost" | "[::1]"
-        )
+        let host = self
+            .host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(&self.host);
+        host.eq_ignore_ascii_case("localhost")
+            || matches!(host.parse::<IpAddr>(), Ok(ip) if ip.is_loopback())
     }
 }
 
@@ -489,6 +497,18 @@ mod tests {
     #[test]
     fn config_is_localhost_name() {
         let cfg = WebServerConfig::new(8000).with_host("localhost");
+        assert!(cfg.is_localhost());
+    }
+
+    #[test]
+    fn config_is_localhost_name_case_insensitively() {
+        let cfg = WebServerConfig::new(8000).with_host("LOCALHOST");
+        assert!(cfg.is_localhost());
+    }
+
+    #[test]
+    fn config_accepts_entire_ipv4_loopback_range() {
+        let cfg = WebServerConfig::new(8000).with_host("127.255.255.254");
         assert!(cfg.is_localhost());
     }
 

@@ -6,7 +6,9 @@ use super::{WebServerConfig, WebServerHandle, build_app};
 use crate::runtime_async::signal;
 use crate::web_framework::FrameworkWebRuntime;
 use crate::{Error, Result};
-use tracing::info;
+use std::io::Write;
+use std::net::SocketAddr;
+use tracing::{info, warn};
 
 /// Start the web server and return a handle for shutdown.
 ///
@@ -77,6 +79,13 @@ fn validate_bind_config(config: &WebServerConfig) -> Result<()> {
     ))
 }
 
+fn write_listening_announcement(
+    mut writer: impl Write,
+    bound_addr: SocketAddr,
+) -> std::io::Result<()> {
+    writeln!(writer, "ft web listening on http://{bound_addr}")
+}
+
 /// ft-xbnl0.2.3 Cx-first sibling of [`run_web_server`].
 ///
 /// Routes the initial bind through [`start_web_server_with_cx`] so startup
@@ -95,7 +104,13 @@ pub async fn run_web_server_with_cx(cx: &crate::cx::Cx, config: WebServerConfig)
         mut runtime,
     } = start_web_server_with_cx(cx, config).await?;
 
-    println!("ft web listening on http://{bound_addr}");
+    if let Err(error) = write_listening_announcement(std::io::stdout().lock(), bound_addr) {
+        warn!(
+            target: "wa.web",
+            error = %error,
+            "unable to write web-listener announcement to stdout; server remains active"
+        );
+    }
 
     let (join_result, shutdown_result) = crate::runtime_async::select! {
         result = runtime.join_handle_mut() => {
@@ -206,13 +221,45 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_bind_config;
+    use super::{validate_bind_config, write_listening_announcement};
     use crate::web::WebServerConfig;
+    use std::io::{self, Write};
+    use std::net::SocketAddr;
+
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stdout-closed-sentinel",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn validate_bind_config_allows_localhost() {
         let config = WebServerConfig::default();
         assert!(validate_bind_config(&config).is_ok());
+    }
+
+    #[test]
+    fn validate_bind_config_allows_noncanonical_ipv4_loopback() {
+        let config = WebServerConfig::new(8080).with_host("127.0.0.2");
+        assert!(validate_bind_config(&config).is_ok());
+    }
+
+    #[test]
+    fn listener_announcement_write_failure_is_returned_without_panicking() {
+        let bound_addr: SocketAddr = "127.0.0.1:8000".parse().expect("valid loopback address");
+        let error = write_listening_announcement(BrokenPipeWriter, bound_addr)
+            .expect_err("closed stdout must be reported as an ordinary I/O error");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[test]

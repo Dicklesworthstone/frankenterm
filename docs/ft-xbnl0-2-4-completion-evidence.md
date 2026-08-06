@@ -138,8 +138,11 @@ Covers all three cx signal timings (pre-start, mid-flight, happy) on the
 two bead-scoped service boundaries. HTTP client side (§2.1) already has
 matching three-timing coverage. The web-server mid-flight test also pins the
 important distinction between completing cleanup and reporting success: caller
-cancellation is returned only after the listener and runtime resources have
-been drained.
+cancellation is returned only after owned listener/runtime cleanup completes in
+the tested no-active-connection scenario. It does not prove preemption or
+bounded settlement of arbitrary request handlers or application lifecycle
+hooks; those remaining ownership gaps are tracked by
+`ft-interactive-systems-performance-4tenz.33.1`, `.33.2`, and `.33.3`.
 
 ### 2.4 Regression guards (`crates/frankenterm-core/tests/ft_xbnl0_2_4_no_direct_tokio_net_or_rustls.rs`)
 

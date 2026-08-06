@@ -672,6 +672,7 @@ fn parse_undo_payload_checked(
     }
 }
 
+#[cfg(test)]
 fn parse_undo_payload(undo: &ActionUndoRecord) -> Option<serde_json::Value> {
     parse_undo_payload_checked(undo).ok().flatten()
 }

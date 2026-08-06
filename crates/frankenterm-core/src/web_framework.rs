@@ -98,6 +98,19 @@ fn listener_wake_addr(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(ip, addr.port())
 }
 
+fn validate_unauthenticated_bound_addr(bound_addr: SocketAddr) -> Result<()> {
+    if bound_addr.ip().is_loopback() {
+        return Ok(());
+    }
+
+    Err(Error::runtime_backend(
+        "web bind validation",
+        format!(
+            "refusing resolved non-loopback web listener {bound_addr}: the current web API has no authentication boundary"
+        ),
+    ))
+}
+
 fn wake_listener(addr: SocketAddr) {
     let wake_addr = listener_wake_addr(addr);
     if let Ok(stream) = TcpStream::connect_timeout(&wake_addr, Duration::from_millis(200)) {
@@ -256,6 +269,15 @@ impl FrameworkWebRuntime {
                 return rollback_started_app(app.as_ref(), Error::Io(err)).await;
             }
         };
+
+        // The configured `localhost` name is only a pre-bind candidate. Check
+        // the listener's resolved address before spawning the accept task so a
+        // surprising resolver entry never creates even a transient public
+        // unauthenticated listener.
+        if let Err(primary_error) = validate_unauthenticated_bound_addr(local_addr) {
+            drop(listener);
+            return rollback_started_app(app.as_ref(), primary_error).await;
+        }
 
         if let Err(err) = cx.checkpoint() {
             drop(listener);
@@ -444,7 +466,19 @@ impl FrameworkWebRuntime {
 
 /// Build a JSON response with the given status code.
 pub fn json_response_with_status<T: serde::Serialize>(status: StatusCode, payload: &T) -> Response {
-    let body = serde_json::to_vec(payload).unwrap_or_default();
+    let (status, body) = match serde_json::to_vec(payload) {
+        Ok(body) => (status, body),
+        Err(_) => {
+            warn!(
+                target: "wa.web",
+                "JSON response serialization failed; returning finite internal error"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                br#"{"error":"response_serialization_failed"}"#.to_vec(),
+            )
+        }
+    };
     Response::with_status(status)
         .header("content-type", b"application/json".to_vec())
         .body(ResponseBody::Bytes(body))
@@ -466,12 +500,46 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionDrainOutcome, listener_wake_addr, wait_for_connections_to_drain_with,
+        ConnectionDrainOutcome, ResponseBody, StatusCode, json_response_with_status,
+        listener_wake_addr, validate_unauthenticated_bound_addr,
+        wait_for_connections_to_drain_with,
     };
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
     use std::cell::Cell;
     use std::net::SocketAddr;
     use std::time::Duration;
+
+    struct SerializationFailure;
+
+    impl serde::Serialize for SerializationFailure {
+        fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(<S::Error as serde::ser::Error>::custom(
+                "credential-bearing serializer failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn json_serialization_failure_returns_finite_valid_error_response() {
+        let response = json_response_with_status(StatusCode::OK, &SerializationFailure);
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        match response.body_ref() {
+            ResponseBody::Bytes(body) => {
+                assert_eq!(
+                    body.as_slice(),
+                    br#"{"error":"response_serialization_failed"}"#
+                );
+                assert!(!body
+                    .windows(b"credential-bearing".len())
+                    .any(|window| window == b"credential-bearing"));
+            }
+            other => panic!("expected finite JSON error body, got {other:?}"),
+        }
+    }
 
     #[test]
     fn wildcard_listener_wake_addresses_use_matching_loopback_family() {
@@ -488,6 +556,19 @@ mod tests {
             "[::1]:8765".parse().expect("valid loopback address")
         );
         assert_eq!(listener_wake_addr(concrete_v4), concrete_v4);
+    }
+
+    #[test]
+    fn unauthenticated_listener_rejects_resolved_non_loopback_before_serve() {
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().expect("valid loopback address");
+        let public: SocketAddr = "192.0.2.1:8080".parse().expect("valid public address");
+
+        assert!(validate_unauthenticated_bound_addr(loopback).is_ok());
+        let error = validate_unauthenticated_bound_addr(public)
+            .expect_err("resolved non-loopback listener must fail closed")
+            .to_string();
+        assert!(error.contains("192.0.2.1:8080"));
+        assert!(error.contains("no authentication boundary"));
     }
 
     #[test]
