@@ -633,13 +633,25 @@ where
 
     use futures::future::{Either, select};
 
+    #[derive(Clone, Copy)]
+    enum DrainInterrupt {
+        Cancelled,
+        TimedOut,
+    }
+
     let bounded_drain = std::pin::pin!(timeout_with_cx(cx, timeout, drain));
     let cancel_watcher = std::pin::pin!(async {
         loop {
             if cx.is_cancel_requested() {
-                return;
+                return DrainInterrupt::Cancelled;
             }
-            let _ = sleep_with_cx(cx, CX_CANCEL_POLL_INTERVAL).await;
+            if sleep_with_cx(cx, CX_CANCEL_POLL_INTERVAL).await.is_err() {
+                return if cx.is_cancel_requested() {
+                    DrainInterrupt::Cancelled
+                } else {
+                    DrainInterrupt::TimedOut
+                };
+            }
         }
     });
 
@@ -649,7 +661,20 @@ where
             Err(CaptureAuthorityError::DrainCancelled)
         }
         Either::Left((Err(_), _)) => Err(CaptureAuthorityError::DrainTimedOut),
-        Either::Right(((), _)) => Err(CaptureAuthorityError::DrainCancelled),
+        Either::Right((DrainInterrupt::Cancelled, _)) => {
+            Err(CaptureAuthorityError::DrainCancelled)
+        }
+        Either::Right((DrainInterrupt::TimedOut, _)) => Err(CaptureAuthorityError::DrainTimedOut),
+    }
+}
+
+fn checkpoint_after_capture_drain(
+    cx: &crate::cx::Cx,
+) -> Result<(), CaptureAuthorityError> {
+    match cx.checkpoint() {
+        Ok(()) => Ok(()),
+        Err(_) if cx.is_cancel_requested() => Err(CaptureAuthorityError::DrainCancelled),
+        Err(_) => Err(CaptureAuthorityError::DrainTimedOut),
     }
 }
 
@@ -1080,6 +1105,11 @@ impl SourceRevocation {
         timeout: Duration,
     ) -> Result<CaptureStamp, CaptureAuthorityError> {
         await_capture_drain_with_cx(cx, timeout, self.revocation.wait_until_drained()).await?;
+        // The drain future can become ready in the same scheduler turn that
+        // cancellation or budget exhaustion is observed. Recheck immediately
+        // before the authority-map mutation so a losing caller cannot retire a
+        // source merely because the drain branch won the preceding await.
+        checkpoint_after_capture_drain(cx)?;
         let mut state = self.authority.lock_state()?;
         let pane = CaptureAuthority::authoritative_pane_mut(&mut state, self.identity)?;
         if pane
@@ -1118,6 +1148,9 @@ impl PaneRevocation {
             Ok(())
         };
         await_capture_drain_with_cx(cx, timeout, drain_all).await?;
+        // See SourceRevocation: the successful drain await is not itself an
+        // authorization to mutate after concurrent cancellation.
+        checkpoint_after_capture_drain(cx)?;
 
         let mut state = self.authority.lock_state()?;
         let pane = CaptureAuthority::authoritative_pane(&state, self.identity)?;

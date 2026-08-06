@@ -35,6 +35,8 @@ pub const IPC_SOCKET_NAME: &str = "ipc.sock";
 pub const MAX_MESSAGE_SIZE: usize = crate::tuning_config::IpcTuning::DEFAULT_MAX_MESSAGE_SIZE;
 #[cfg(any(unix, windows))]
 const IPC_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+#[cfg(any(unix, windows))]
+const IPC_CONNECTION_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(any(unix, windows))]
 mod socket_transport {
@@ -1186,22 +1188,33 @@ impl IpcServer {
             .await
             {
                 Ok(Ok((stream, _addr))) => {
+                    if cx.checkpoint().is_err() {
+                        // The accept can become ready in the same scheduler
+                        // turn as cancellation. Do not admit a fresh client
+                        // task after the server's cancellation boundary.
+                        drop(stream);
+                        break;
+                    }
                     let ctx = ctx.clone();
                     connection_tasks.spawn_with_cx(cx, move |child_cx| async move {
-                        if let Err(e) = handle_client_with_context_with_cx(
+                        if handle_client_with_context_with_cx(
                             child_cx,
                             stream,
                             ctx,
                             limits.max_message_size,
                         )
                         .await
+                        .is_err()
                         {
-                            tracing::warn!(error = %e, "IPC client error");
+                            tracing::warn!(
+                                error_class = "ipc_client_handler_failed",
+                                "IPC client error"
+                            );
                         }
                     });
                 }
                 Ok(Err(e)) => {
-                    tracing::error!(error = %e, "Failed to accept IPC connection");
+                    tracing::error!(error_kind = ?e.kind(), "Failed to accept IPC connection");
                 }
                 Err(_elapsed) => {}
             }
@@ -1214,10 +1227,34 @@ impl IpcServer {
         }
 
         connection_tasks.abort_all();
-        while let Some(join_result) = connection_tasks.join_next().await {
-            if let Err(join_err) = join_result {
-                tracing::debug!(error = %join_err, "IPC client task failed during shutdown");
-            }
+        let drain_cx = crate::cx::for_request();
+        let drain_result = crate::runtime_async::timeout_with_cx(
+            &drain_cx,
+            IPC_CONNECTION_TASK_DRAIN_TIMEOUT,
+            async {
+                while let Some(join_result) = connection_tasks.join_next().await {
+                    if let Err(join_err) = join_result {
+                        tracing::debug!(
+                            error = %join_err,
+                            "IPC client task failed during shutdown"
+                        );
+                    }
+                }
+            },
+        )
+        .await;
+        if drain_result.is_err() {
+            tracing::error!(
+                event = "ipc_connection_task_drain_timeout",
+                remaining_tasks = connection_tasks.len(),
+                orphan_risk = true,
+                "IPC connection cancellation did not reach terminal acknowledgement before the bounded drain timeout"
+            );
+        } else {
+            tracing::debug!(
+                event = "ipc_connection_tasks_settled",
+                "IPC connection task cancellation reached terminal acknowledgement"
+            );
         }
 
         #[cfg(any(unix, windows))]

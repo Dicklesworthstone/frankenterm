@@ -2516,6 +2516,80 @@ static POLICY_CLOCK_ANOMALY_COUNT: AtomicU64 = AtomicU64::new(0);
 // 18-module poison-recovery counter sweep.
 static POLICY_INVALID_REGEX_COMPILE_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Count of synthetic Trauma Guard feedback writes that could not be
+/// delivered. The primary policy denial remains authoritative; this counter
+/// makes the secondary operator-feedback loss observable without logging a
+/// backend error or cancellation reason that may contain pane content.
+static POLICY_TRAUMA_FEEDBACK_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
+static POLICY_WORKFLOW_PARENT_LOOKUP_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
+static POLICY_AUDIT_WRITE_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn increment_policy_failure_counter(counter: &AtomicU64) -> u64 {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(1))
+        })
+        .unwrap_or_else(|current| current)
+        .saturating_add(1)
+}
+
+/// Return the cumulative number of failed Trauma Guard feedback writes.
+#[must_use]
+pub fn policy_trauma_feedback_failure_count() -> u64 {
+    POLICY_TRAUMA_FEEDBACK_FAILURE_COUNT.load(Ordering::Relaxed)
+}
+
+fn record_trauma_feedback_failure(pane_id: u64) {
+    let failures = increment_policy_failure_counter(&POLICY_TRAUMA_FEEDBACK_FAILURE_COUNT);
+    tracing::warn!(
+        pane_id,
+        trauma_feedback_failures_total = failures,
+        "Synthetic trauma guard feedback could not be delivered"
+    );
+}
+
+/// Return the cumulative number of workflow-parent audit lookups that failed.
+#[must_use]
+pub fn policy_workflow_parent_lookup_failure_count() -> u64 {
+    POLICY_WORKFLOW_PARENT_LOOKUP_FAILURE_COUNT.load(Ordering::Relaxed)
+}
+
+/// Return the cumulative number of policy audit rows that could not be
+/// persisted after a decision or injection outcome was already determined.
+#[must_use]
+pub fn policy_audit_write_failure_count() -> u64 {
+    POLICY_AUDIT_WRITE_FAILURE_COUNT.load(Ordering::Relaxed)
+}
+
+fn record_policy_audit_write_failure(pane_id: u64, action: ActionKind) {
+    let failures = increment_policy_failure_counter(&POLICY_AUDIT_WRITE_FAILURE_COUNT);
+    tracing::warn!(
+        pane_id,
+        action = action.as_str(),
+        policy_audit_write_failures_total = failures,
+        "Policy audit record could not be persisted"
+    );
+}
+
+fn settle_workflow_parent_lookup(
+    result: crate::Result<Option<i64>>,
+    pane_id: u64,
+) -> Option<i64> {
+    match result {
+        Ok(parent_action_id) => parent_action_id,
+        Err(_) => {
+            let failures =
+                increment_policy_failure_counter(&POLICY_WORKFLOW_PARENT_LOOKUP_FAILURE_COUNT);
+            tracing::warn!(
+                pane_id,
+                workflow_parent_lookup_failures_total = failures,
+                "Workflow parent audit lookup failed; recording send without parent link"
+            );
+            None
+        }
+    }
+}
+
 // br-ft-yygus: audit-row decision_context fidelity observability.
 // 4 sites in this file (Allowed/Denied/RequiresApproval/Error
 // AuditActionRecord constructors) and 1 in mcp_tools.rs use the
@@ -8060,17 +8134,13 @@ where
             return;
         };
 
-        if let Err(error) = self
+        if self
             .client
             .send_text_with_options_with_cx(cx, pane_id, &feedback, true, false)
             .await
+            .is_err()
         {
-            tracing::warn!(
-                pane_id,
-                rule_id = ?decision.rule_id(),
-                error = %error,
-                "Failed to inject synthetic trauma guard feedback (cx path)"
-            );
+            record_trauma_feedback_failure(pane_id);
         }
     }
 
@@ -8262,7 +8332,10 @@ where
             if let Some(storage) = storage_for_summary.as_ref() {
                 let parent_action_id = if actor == ActorKind::Workflow {
                     if let Some(id) = workflow_id {
-                        find_workflow_start_action_id_with_cx(cx, storage, id).await
+                        settle_workflow_parent_lookup(
+                            find_workflow_start_action_id_with_cx(cx, storage, id).await,
+                            pane_id,
+                        )
                     } else {
                         None
                     }
@@ -8290,12 +8363,8 @@ where
                 Ok(audit_id) => {
                     result.set_audit_action_id(audit_id);
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        pane_id,
-                        action = action.as_str(),
-                        "Failed to emit audit record: {e}"
-                    );
+                Err(_) => {
+                    record_policy_audit_write_failure(pane_id, action);
                 }
             }
         }
@@ -8570,9 +8639,13 @@ where
                 }
                 PolicyDecision::Deny { .. } => {
                     if let Some(feedback) = trauma_feedback_comment(&decision) {
-                        let _ = client
+                        if client
                             .send_text_with_options_with_cx(cx, pane_id, &feedback, true, false)
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            record_trauma_feedback_failure(pane_id);
+                        }
                     }
                     InjectionResult::Denied {
                         decision: decision.clone(),
@@ -8624,7 +8697,10 @@ where
                 if action == ActionKind::SendText {
                     let parent_action_id = if actor == ActorKind::Workflow {
                         if let Some(id) = workflow_id.as_deref() {
-                            find_workflow_start_action_id_with_cx(cx, storage, id).await
+                            settle_workflow_parent_lookup(
+                                find_workflow_start_action_id_with_cx(cx, storage, id).await,
+                                pane_id,
+                            )
                         } else {
                             None
                         }
@@ -8642,12 +8718,8 @@ where
                     .await
                 {
                     Ok(audit_id) => result.set_audit_action_id(audit_id),
-                    Err(e) => {
-                        tracing::warn!(
-                            pane_id,
-                            action = action.as_str(),
-                            "Failed to emit audit record: {e}"
-                        );
+                    Err(_) => {
+                        record_policy_audit_write_failure(pane_id, action);
                     }
                 }
             }
@@ -8743,14 +8815,15 @@ fn decision_definition_text(decision: &PolicyDecision) -> String {
 }
 
 /// Routes through `get_audit_actions_with_cx` so the lookup
-/// honours cancellation. Returns `None` on cancellation (matching
-/// the legacy "swallow errors → None" contract), so callers in the
-/// decision-context capture path degrade gracefully.
+/// honours cancellation and preserves storage failures for the caller to
+/// settle explicitly. The send effect may already have committed, so callers
+/// record a content-free lookup-loss signal rather than rewriting the primary
+/// injection result into a false send failure.
 async fn find_workflow_start_action_id_with_cx(
     cx: &crate::cx::Cx,
     storage: &crate::storage::StorageHandle,
     execution_id: &str,
-) -> Option<i64> {
+) -> crate::Result<Option<i64>> {
     let query = crate::storage::AuditQuery {
         limit: Some(1),
         actor_id: Some(execution_id.to_string()),
@@ -8760,8 +8833,7 @@ async fn find_workflow_start_action_id_with_cx(
     storage
         .get_audit_actions_with_cx(cx, query)
         .await
-        .ok()
-        .and_then(|mut rows| rows.pop().map(|row| row.id))
+        .map(|mut rows| rows.pop().map(|row| row.id))
 }
 
 #[cfg(test)]
@@ -8792,6 +8864,14 @@ mod tests {
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    #[test]
+    fn policy_failure_counter_saturates_instead_of_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(increment_policy_failure_counter(&counter), u64::MAX);
+        assert_eq!(increment_policy_failure_counter(&counter), u64::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 
     // ========================================================================

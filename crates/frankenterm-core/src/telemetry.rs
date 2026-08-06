@@ -1177,7 +1177,8 @@ impl TelemetryCollector {
                     .increment_counter("telemetry.collector.cancelled");
                 true
             }
-            SpawnBlockingWithCxError::RuntimeFailure { .. } => {
+            SpawnBlockingWithCxError::RuntimeFailure
+            | SpawnBlockingWithCxError::CancellationWatcherTimerFailure => {
                 warn!(
                     pid,
                     error_class = "telemetry_blocking_probe_runtime_failure",
@@ -2839,9 +2840,7 @@ mod tests {
         );
 
         let runtime_collector = TelemetryCollector::new(TelemetryConfig::default());
-        let runtime_error = SpawnBlockingWithCxError::RuntimeFailure {
-            detail: "blocking executor unavailable".to_string(),
-        };
+        let runtime_error = SpawnBlockingWithCxError::RuntimeFailure;
         assert!(
             !runtime_collector.handle_blocking_probe_error(7, &runtime_error),
             "runtime failure must retain the collector for a later retry"
@@ -2858,6 +2857,12 @@ mod tests {
         assert_eq!(
             runtime_metrics.counter_value("telemetry.resource_probe.runtime_failure"),
             1
+        );
+
+        let watcher_error = SpawnBlockingWithCxError::CancellationWatcherTimerFailure;
+        assert!(
+            !runtime_collector.handle_blocking_probe_error(7, &watcher_error),
+            "watcher timer failure is a finite runtime failure, not cancellation"
         );
     }
 

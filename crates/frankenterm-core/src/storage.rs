@@ -2221,11 +2221,6 @@ impl WriteCommandSender {
         }
     }
 
-    async fn send(&self, command: WriteCommand) -> std::result::Result<(), WriteCommandSendError> {
-        let cx = crate::cx::for_request();
-        self.send_with_cx(&cx, command).await
-    }
-
     fn mark_command_dequeued(counter: &AtomicUsize) -> bool {
         let mut depth = counter.load(AtomicOrdering::Acquire);
         loop {
@@ -2262,21 +2257,16 @@ impl WriteCommandSender {
         }
     }
 
-    /// ft-xbnl0.2.3 Cx-first sibling of [`WriteCommandSender::send`].
+    /// Enqueue a writer command under the caller's explicit capability
+    /// context.
     ///
-    /// Plugs the orphan-cx hole at the root of the storage write
-    /// path: the legacy `send` uses `crate::cx::for_request()` for
-    /// its inner mpsc reserve wait, severing the cancellation
-    /// chain from every storage `_with_cx` caller. This sibling
-    /// threads the caller's cx all the way into the inner mpsc
-    /// reserve path so a full writer queue under a cancelled parent
-    /// cx releases immediately rather than waiting for backpressure
-    /// to drain.
+    /// Threads the caller's Cx all the way into the inner mpsc reserve path so
+    /// a full writer queue under a cancelled parent releases immediately
+    /// rather than waiting for backpressure to drain.
     ///
     /// Every storage `_with_cx` writer call site routes through this method.
     /// Callers classify `Cancelled` separately from a disconnected writer or
-    /// violated post-reservation capacity invariant. Legacy `send` stays
-    /// available for ambient-cx callers.
+    /// violated post-reservation capacity invariant.
     async fn send_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2923,9 +2913,9 @@ impl StorageHandle {
     /// Pre-cancel: returns immediately if `cx` is already cancelled.
     /// Mid-flight cancel: the await unblocks within ~50–100 ms with
     /// a typed cancellation error if `cx` cancels while the blocking
-    /// closure is still executing. The orphaned blocking task
-    /// continues to run on the blocking thread pool until the
-    /// closure returns naturally; its result is discarded.
+    /// closure is queued or executing. Queued work may be skipped; a closure
+    /// that already started continues on the blocking thread pool until it
+    /// returns naturally, and its result is discarded.
     ///
     /// See [`crate::runtime_async::spawn_blocking_with_cx`] for the
     /// full contract documentation.
@@ -2959,14 +2949,25 @@ impl StorageHandle {
                     "{join_error_prefix}: {error}"
                 )))
             }
-            Err(error @ SpawnBlockingWithCxError::RuntimeFailure { .. }) => {
+            Err(
+                error
+                @ (SpawnBlockingWithCxError::RuntimeFailure
+                | SpawnBlockingWithCxError::CancellationWatcherTimerFailure),
+            ) => {
                 Err(StorageError::Database(format!("{join_error_prefix}: {error}")).into())
             }
         }
     }
 
     async fn recv_writer_response<T>(rx: oneshot::Receiver<Result<T>>) -> Result<T> {
-        crate::runtime_async::oneshot_recv(rx)
+        // Once a command is admitted, the writer may already have committed
+        // durable effects. Await its authoritative response on a live cleanup
+        // context instead of an unrelated ambient Cx; surfacing ambient
+        // cancellation here could falsely report that an admitted write did
+        // not happen.
+        let response_cx =
+            crate::cx::Cx::for_request_with_budget(crate::cx::Budget::INFINITE);
+        crate::runtime_async::oneshot_recv_with_cx(&response_cx, rx)
             .await
             .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
     }
@@ -2979,7 +2980,12 @@ impl StorageHandle {
             return Ok(false);
         }
         use futures::future::{Either, select};
-        let ack = std::pin::pin!(crate::runtime_async::oneshot_recv(rx));
+        // The caller Cx is raced explicitly below. Keep the acknowledgment
+        // receive itself on a live infrastructure context so an unrelated
+        // ambient Cx cannot turn receiver cancellation/channel closure into a
+        // false positive acknowledgment.
+        let ack_cx = crate::cx::Cx::for_request_with_budget(crate::cx::Budget::INFINITE);
+        let ack = std::pin::pin!(crate::runtime_async::oneshot_recv_with_cx(&ack_cx, rx));
         let cancel_watcher = std::pin::pin!(async {
             loop {
                 let sleep_result = crate::runtime_async::sleep_with_cx(
@@ -3000,7 +3006,11 @@ impl StorageHandle {
             }
         });
         match select(ack, cancel_watcher).await {
-            Either::Left(_) => Ok(true),
+            Either::Left((Ok(()), _)) => Ok(true),
+            Either::Left((Err(_), _)) => Err(StorageError::Database(
+                "storage shutdown acknowledgment channel closed".to_string(),
+            )
+            .into()),
             Either::Right((Ok(()), _)) => Ok(false),
             Either::Right((Err(error), _)) => Err(StorageError::Database(format!(
                 "storage shutdown acknowledgment watcher failed: {error}"
@@ -9481,10 +9491,11 @@ impl StorageHandle {
     /// is also select-raced against the caller's Cx cancellation
     /// watcher (50 ms poll period, matching
     /// `distributed::race_with_cx_cancel`'s pattern) so a mid-
-    /// flight cancel returns a typed cancellation promptly. An already-spawned join
-    /// runs to completion in the background; the writer thread itself
-    /// continues independently even if cancellation wins before spawn, and the
-    /// handle is consumed once.
+    /// flight cancel returns a typed cancellation promptly. A join closure that
+    /// already started runs to completion in the background. If cancellation
+    /// wins before that closure starts, the queued closure may be skipped and
+    /// dropping its standard-library JoinHandle detaches (but does not stop)
+    /// the writer thread. In either case the handle is consumed once.
     pub async fn shutdown_with_cx(&self, cx: &crate::cx::Cx) -> Result<()> {
         let rx = self.enqueue_writer_shutdown_cleanup().await;
         #[cfg(test)]
@@ -9500,6 +9511,17 @@ impl StorageHandle {
         if !Self::recv_writer_shutdown_ack_with_cx(cx, rx).await? {
             return Err(crate::Error::Cancelled(
                 "storage shutdown cancelled before writer acknowledgment".to_string(),
+            ));
+        }
+
+        // The acknowledgment and cancellation watcher can become ready in
+        // the same scheduler turn. Re-check before consuming the sole native
+        // JoinHandle so a cancellation observed at that boundary leaves it
+        // available for a later shutdown attempt instead of detaching the
+        // writer before any blocking join was admitted.
+        if cx.checkpoint().is_err() {
+            return Err(crate::Error::Cancelled(
+                "storage shutdown cancelled before joining writer".to_string(),
             ));
         }
 
@@ -9529,7 +9551,11 @@ impl StorageHandle {
                         "storage shutdown cancelled while joining writer".to_string(),
                     ));
                 }
-                Err(e @ SpawnBlockingWithCxError::RuntimeFailure { .. }) => {
+                Err(
+                    e
+                    @ (SpawnBlockingWithCxError::RuntimeFailure
+                    | SpawnBlockingWithCxError::CancellationWatcherTimerFailure),
+                ) => {
                     return Err(StorageError::Database(format!(
                         "Shutdown spawn_blocking error: {e}"
                     ))

@@ -30529,16 +30529,132 @@ fn runtime_task_join_failure(
     operation: &'static str,
     error: frankenterm_core::runtime_async::task::JoinError,
 ) -> frankenterm_core::Error {
-    let source = if error.is_cancelled() {
-        frankenterm_core::error::RuntimeOperationSource::Cancelled(
-            "runtime task aborted".to_string(),
-        )
-    } else {
-        frankenterm_core::error::RuntimeOperationSource::Backend(
-            "runtime task failed at join boundary".to_string(),
-        )
+    let source = runtime_task_join_failure_source(error.kind());
+    frankenterm_core::Error::RuntimeOperation { operation, source }
+}
+
+fn runtime_task_join_failure_source(
+    kind: frankenterm_core::runtime_async::task::JoinErrorKind,
+) -> frankenterm_core::error::RuntimeOperationSource {
+    use frankenterm_core::error::RuntimeOperationSource;
+    use frankenterm_core::runtime_async::task::JoinErrorKind;
+
+    match kind {
+        JoinErrorKind::Aborted => {
+            RuntimeOperationSource::Cancelled("runtime task aborted".to_string())
+        }
+        JoinErrorKind::ContextCancelled => RuntimeOperationSource::Cancelled(
+            "runtime task cancelled by capability context".to_string(),
+        ),
+        JoinErrorKind::DeadlineExceeded => RuntimeOperationSource::Backend(
+            "capability deadline exceeded at runtime task join".to_string(),
+        ),
+        JoinErrorKind::PollQuotaExhausted => RuntimeOperationSource::Backend(
+            "capability poll quota exhausted at runtime task join".to_string(),
+        ),
+        JoinErrorKind::CostBudgetExhausted => RuntimeOperationSource::Backend(
+            "capability cost budget exhausted at runtime task join".to_string(),
+        ),
+        JoinErrorKind::ContextFailure => RuntimeOperationSource::Backend(
+            "capability context failed at runtime task join".to_string(),
+        ),
+        JoinErrorKind::TaskFailed => {
+            RuntimeOperationSource::Backend("runtime task failed at join boundary".to_string())
+        }
+        JoinErrorKind::WakerRegistrationFailed => RuntimeOperationSource::Backend(
+            "runtime task join waker registration failed".to_string(),
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityContextSite {
+    RobotOperation,
+    SessionRecoveryOperation,
+    SemaphoreAcquire,
+}
+
+impl CapabilityContextSite {
+    const fn cancelled_detail(self) -> &'static str {
+        match self {
+            Self::RobotOperation => "robot operation cancelled",
+            Self::SessionRecoveryOperation => "session recovery operation cancelled",
+            Self::SemaphoreAcquire => "semaphore acquire cancelled",
+        }
+    }
+}
+
+fn capability_context_failure(
+    operation: &'static str,
+    cx: &frankenterm_core::cx::Cx,
+    site: CapabilityContextSite,
+) -> frankenterm_core::Error {
+    use frankenterm_core::error::RuntimeOperationSource;
+    use frankenterm_core::outcome::CancelKind;
+
+    let source = match cx.root_cancel_cause().map(|reason| reason.kind) {
+        Some(CancelKind::Deadline | CancelKind::Timeout) => {
+            RuntimeOperationSource::Backend("capability deadline exceeded".to_string())
+        }
+        Some(CancelKind::PollQuota) => {
+            RuntimeOperationSource::Backend("capability poll quota exhausted".to_string())
+        }
+        Some(CancelKind::CostBudget) => {
+            RuntimeOperationSource::Backend("capability cost budget exhausted".to_string())
+        }
+        Some(
+            CancelKind::User
+            | CancelKind::FailFast
+            | CancelKind::RaceLost
+            | CancelKind::ParentCancelled
+            | CancelKind::ResourceUnavailable
+            | CancelKind::Shutdown
+            | CancelKind::LinkedExit,
+        ) => RuntimeOperationSource::Cancelled(site.cancelled_detail().to_string()),
+        None => RuntimeOperationSource::Backend("capability context failed".to_string()),
     };
     frankenterm_core::Error::RuntimeOperation { operation, source }
+}
+
+fn runtime_context_preflight(
+    operation: &'static str,
+    cx: &frankenterm_core::cx::Cx,
+    site: CapabilityContextSite,
+) -> frankenterm_core::Result<()> {
+    cx.checkpoint()
+        .map_err(|_| capability_context_failure(operation, cx, site))
+}
+
+fn session_recovery_timeout_failure(
+    operation: &'static str,
+    cx: &frankenterm_core::cx::Cx,
+) -> frankenterm_core::Error {
+    if cx.root_cancel_cause().is_some() {
+        return capability_context_failure(
+            operation,
+            cx,
+            CapabilityContextSite::SessionRecoveryOperation,
+        );
+    }
+
+    // `timeout_with_cx` caps the requested timeout by the Cx deadline but
+    // returns an opaque string for either source. Inspect the content-free
+    // budget snapshot so a Cx deadline/quota remains distinct from the
+    // operation's own timeout without forwarding that string.
+    let budget = cx.budget_stats();
+    let detail = if budget.deadline.at.is_some() && budget.deadline.remaining.is_none() {
+        "capability deadline exceeded"
+    } else if budget.polls.remaining == Some(0) {
+        "capability poll quota exhausted"
+    } else if budget.cost.remaining == Some(0) {
+        "capability cost budget exhausted"
+    } else {
+        "session recovery operation timed out"
+    };
+    frankenterm_core::Error::RuntimeOperation {
+        operation,
+        source: frankenterm_core::error::RuntimeOperationSource::Backend(detail.to_string()),
+    }
 }
 
 fn semaphore_acquire_failure(
@@ -30546,8 +30662,6 @@ fn semaphore_acquire_failure(
     cx: &frankenterm_core::cx::Cx,
     error: frankenterm_core::runtime_async::AcquireError,
 ) -> frankenterm_core::Error {
-    use frankenterm_core::outcome::CancelKind;
-
     let source = match error {
         frankenterm_core::runtime_async::AcquireError::Closed => {
             frankenterm_core::error::RuntimeOperationSource::Backend(
@@ -30560,38 +30674,11 @@ fn semaphore_acquire_failure(
             )
         }
         frankenterm_core::runtime_async::AcquireError::Cancelled => {
-            match cx.root_cancel_cause().map(|reason| reason.kind) {
-                Some(CancelKind::Deadline) => {
-                    frankenterm_core::error::RuntimeOperationSource::Backend(
-                        "capability deadline exceeded".to_string(),
-                    )
-                }
-                Some(CancelKind::PollQuota) => {
-                    frankenterm_core::error::RuntimeOperationSource::Backend(
-                        "capability poll quota exhausted".to_string(),
-                    )
-                }
-                Some(CancelKind::CostBudget) => {
-                    frankenterm_core::error::RuntimeOperationSource::Backend(
-                        "capability cost budget exhausted".to_string(),
-                    )
-                }
-                Some(
-                    CancelKind::User
-                    | CancelKind::Timeout
-                    | CancelKind::FailFast
-                    | CancelKind::RaceLost
-                    | CancelKind::ParentCancelled
-                    | CancelKind::ResourceUnavailable
-                    | CancelKind::Shutdown
-                    | CancelKind::LinkedExit,
-                ) => frankenterm_core::error::RuntimeOperationSource::Cancelled(
-                    "semaphore acquire cancelled".to_string(),
-                ),
-                None => frankenterm_core::error::RuntimeOperationSource::Backend(
-                    "capability context failed".to_string(),
-                ),
-            }
+            return capability_context_failure(
+                operation,
+                cx,
+                CapabilityContextSite::SemaphoreAcquire,
+            );
         }
     };
     frankenterm_core::Error::RuntimeOperation { operation, source }
@@ -30599,49 +30686,219 @@ fn semaphore_acquire_failure(
 
 #[cfg(test)]
 #[test]
-fn runtime_task_join_failure_preserves_cancellation_vs_failure_class() {
-    let cancelled = runtime_task_join_failure(
-        "test.cancelled",
-        frankenterm_core::runtime_async::task::JoinError::new("task aborted"),
-    );
-    match cancelled {
-        frankenterm_core::Error::RuntimeOperation {
-            operation,
-            source: frankenterm_core::error::RuntimeOperationSource::Cancelled(detail),
-        } => {
-            assert_eq!(operation, "test.cancelled");
-            assert_eq!(detail, "runtime task aborted");
-        }
-        other => panic!("aborted join must remain cancellation, got {other:?}"),
+fn runtime_task_join_failure_maps_every_finite_class_without_free_text() {
+    use frankenterm_core::error::RuntimeOperationSource;
+    use frankenterm_core::runtime_async::task::JoinErrorKind;
+
+    let cases = [
+        (JoinErrorKind::Aborted, true, "runtime task aborted"),
+        (
+            JoinErrorKind::ContextCancelled,
+            true,
+            "runtime task cancelled by capability context",
+        ),
+        (
+            JoinErrorKind::DeadlineExceeded,
+            false,
+            "capability deadline exceeded at runtime task join",
+        ),
+        (
+            JoinErrorKind::PollQuotaExhausted,
+            false,
+            "capability poll quota exhausted at runtime task join",
+        ),
+        (
+            JoinErrorKind::CostBudgetExhausted,
+            false,
+            "capability cost budget exhausted at runtime task join",
+        ),
+        (
+            JoinErrorKind::ContextFailure,
+            false,
+            "capability context failed at runtime task join",
+        ),
+        (
+            JoinErrorKind::TaskFailed,
+            false,
+            "runtime task failed at join boundary",
+        ),
+        (
+            JoinErrorKind::WakerRegistrationFailed,
+            false,
+            "runtime task join waker registration failed",
+        ),
+    ];
+
+    for (kind, expected_cancelled, expected_detail) in cases {
+        let source = runtime_task_join_failure_source(kind);
+        let (actual_cancelled, detail) = match source {
+            RuntimeOperationSource::Cancelled(detail) => (true, detail),
+            RuntimeOperationSource::Backend(detail) => (false, detail),
+            other => panic!("join failure must use a finite cancellation/backend class: {other:?}"),
+        };
+        assert_eq!(actual_cancelled, expected_cancelled, "kind: {kind:?}");
+        assert_eq!(detail, expected_detail, "kind: {kind:?}");
+        assert!(!detail.contains("SECRET"), "kind: {kind:?}");
     }
 
-    let failed = runtime_task_join_failure(
-        "test.failed",
-        frankenterm_core::runtime_async::task::JoinError::new(
-            "SECRET task failed at join boundary",
-        ),
+    let error = runtime_task_join_failure(
+        "test.cancelled",
+        frankenterm_core::runtime_async::task::JoinError::aborted(),
     );
-    match failed {
+    assert!(matches!(
+        error,
         frankenterm_core::Error::RuntimeOperation {
-            operation,
-            source: frankenterm_core::error::RuntimeOperationSource::Backend(detail),
-        } => {
-            assert_eq!(operation, "test.failed");
-            assert_eq!(detail, "runtime task failed at join boundary");
-            assert!(!detail.contains("SECRET"));
-        }
-        other => panic!("non-abort join must remain backend failure, got {other:?}"),
+            operation: "test.cancelled",
+            source: RuntimeOperationSource::Cancelled(detail),
+        } if detail == "runtime task aborted"
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn capability_context_failure_maps_every_cancel_kind_without_reason_text() {
+    use frankenterm_core::error::RuntimeOperationSource;
+    use frankenterm_core::outcome::CancelKind;
+
+    let cases = [
+        (CancelKind::Deadline, false, "capability deadline exceeded"),
+        (
+            CancelKind::PollQuota,
+            false,
+            "capability poll quota exhausted",
+        ),
+        (
+            CancelKind::CostBudget,
+            false,
+            "capability cost budget exhausted",
+        ),
+        (CancelKind::Timeout, false, "capability deadline exceeded"),
+        (CancelKind::User, true, "robot operation cancelled"),
+        (CancelKind::FailFast, true, "robot operation cancelled"),
+        (CancelKind::RaceLost, true, "robot operation cancelled"),
+        (CancelKind::ParentCancelled, true, "robot operation cancelled"),
+        (
+            CancelKind::ResourceUnavailable,
+            true,
+            "robot operation cancelled",
+        ),
+        (CancelKind::Shutdown, true, "robot operation cancelled"),
+        (CancelKind::LinkedExit, true, "robot operation cancelled"),
+    ];
+
+    for (kind, expected_cancelled, expected_detail) in cases {
+        let cx = frankenterm_core::cx::for_testing();
+        cx.cancel_with(kind, Some("SECRET cancellation reason"));
+        let error = capability_context_failure(
+            "test.context",
+            &cx,
+            CapabilityContextSite::RobotOperation,
+        );
+        let frankenterm_core::Error::RuntimeOperation { operation, source } = error else {
+            panic!("context failure must remain a runtime operation");
+        };
+        assert_eq!(operation, "test.context");
+        let (actual_cancelled, detail) = match source {
+            RuntimeOperationSource::Cancelled(detail) => (true, detail),
+            RuntimeOperationSource::Backend(detail) => (false, detail),
+            other => panic!("context failure must use cancellation/backend: {other:?}"),
+        };
+        assert_eq!(actual_cancelled, expected_cancelled, "kind: {kind:?}");
+        assert_eq!(detail, expected_detail, "kind: {kind:?}");
+        assert!(!detail.contains("SECRET"), "kind: {kind:?}");
     }
+
+    let live_cx = frankenterm_core::cx::for_testing();
+    let fallback = capability_context_failure(
+        "test.fallback",
+        &live_cx,
+        CapabilityContextSite::RobotOperation,
+    );
+    assert!(matches!(
+        fallback,
+        frankenterm_core::Error::RuntimeOperation {
+            operation: "test.fallback",
+            source: RuntimeOperationSource::Backend(detail),
+        } if detail == "capability context failed"
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn session_recovery_timeout_failure_preserves_budget_vs_operation_timeout() {
+    use frankenterm_core::error::RuntimeOperationSource;
+
+    fn assert_timeout_failure(
+        cx: &frankenterm_core::cx::Cx,
+        expected_cancelled: bool,
+        expected_detail: &str,
+    ) {
+        let error = session_recovery_timeout_failure("test.session.timeout", cx);
+        let frankenterm_core::Error::RuntimeOperation { operation, source } = error else {
+            panic!("timeout failure must remain a runtime operation");
+        };
+        assert_eq!(operation, "test.session.timeout");
+        let (actual_cancelled, detail) = match source {
+            RuntimeOperationSource::Cancelled(detail) => (true, detail),
+            RuntimeOperationSource::Backend(detail) => (false, detail),
+            other => panic!("timeout failure must use cancellation/backend: {other:?}"),
+        };
+        assert_eq!(actual_cancelled, expected_cancelled);
+        assert_eq!(detail, expected_detail);
+        assert!(!detail.contains("SECRET"));
+    }
+
+    let operation_timeout = frankenterm_core::cx::for_testing();
+    assert_timeout_failure(
+        &operation_timeout,
+        false,
+        "session recovery operation timed out",
+    );
+
+    let deadline = frankenterm_core::cx::Cx::for_testing_with_budget(
+        frankenterm_core::cx::Budget::new()
+            .with_deadline(frankenterm_core::runtime_async::RuntimeTime::ZERO),
+    );
+    assert_timeout_failure(&deadline, false, "capability deadline exceeded");
+
+    let poll_quota = frankenterm_core::cx::Cx::for_testing_with_budget(
+        frankenterm_core::cx::Budget::new().with_poll_quota(0),
+    );
+    assert_timeout_failure(&poll_quota, false, "capability poll quota exhausted");
+
+    let cost_budget = frankenterm_core::cx::Cx::for_testing_with_budget(
+        frankenterm_core::cx::Budget::new().with_cost_quota(0),
+    );
+    assert_timeout_failure(&cost_budget, false, "capability cost budget exhausted");
+
+    let cancelled = frankenterm_core::cx::for_testing();
+    cancelled.cancel_with(
+        frankenterm_core::outcome::CancelKind::User,
+        Some("SECRET session recovery cancellation reason"),
+    );
+    assert_timeout_failure(
+        &cancelled,
+        true,
+        "session recovery operation cancelled",
+    );
 }
 
 async fn robot_list_panes_on_runtime_task(
     wezterm: frankenterm_core::wezterm::WeztermHandle,
 ) -> frankenterm_core::Result<Vec<frankenterm_core::wezterm::PaneInfo>> {
-    let task = frankenterm_core::runtime_async::task::spawn(async move {
-        let cx =
-            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-        wezterm.list_panes_with_cx(&cx).await
-    });
+    let parent_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let task = frankenterm_core::runtime_async::task::spawn_with_cx(
+        &parent_cx,
+        move |cx| async move {
+            runtime_context_preflight(
+                "robot.list_panes.context",
+                &cx,
+                CapabilityContextSite::RobotOperation,
+            )?;
+            wezterm.list_panes_with_cx(&cx).await
+        },
+    );
     task.await
         .map_err(|error| runtime_task_join_failure("robot.list_panes.await_task", error))?
 }
@@ -30651,11 +30908,19 @@ async fn robot_get_text_on_runtime_task(
     pane_id: u64,
     escapes: bool,
 ) -> frankenterm_core::Result<String> {
-    let task = frankenterm_core::runtime_async::task::spawn(async move {
-        let cx =
-            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-        wezterm.get_text_with_cx(&cx, pane_id, escapes).await
-    });
+    let parent_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let task = frankenterm_core::runtime_async::task::spawn_with_cx(
+        &parent_cx,
+        move |cx| async move {
+            runtime_context_preflight(
+                "robot.get_text.context",
+                &cx,
+                CapabilityContextSite::RobotOperation,
+            )?;
+            wezterm.get_text_with_cx(&cx, pane_id, escapes).await
+        },
+    );
     task.await
         .map_err(|error| runtime_task_join_failure("robot.get_text.await_task", error))?
 }
@@ -30664,11 +30929,19 @@ async fn robot_get_semantic_snapshot_on_runtime_task(
     wezterm: frankenterm_core::wezterm::WeztermHandle,
     pane_id: u64,
 ) -> frankenterm_core::Result<frankenterm_core::wezterm::MuxSemanticSnapshot> {
-    let task = frankenterm_core::runtime_async::task::spawn(async move {
-        let cx =
-            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-        wezterm.get_semantic_zones_with_cx(&cx, pane_id).await
-    });
+    let parent_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let task = frankenterm_core::runtime_async::task::spawn_with_cx(
+        &parent_cx,
+        move |cx| async move {
+            runtime_context_preflight(
+                "robot.dom.context",
+                &cx,
+                CapabilityContextSite::RobotOperation,
+            )?;
+            wezterm.get_semantic_zones_with_cx(&cx, pane_id).await
+        },
+    );
     task.await
         .map_err(|error| runtime_task_join_failure("robot.dom.await_task", error))?
 }
@@ -30715,7 +30988,8 @@ async fn batch_get_pane_text(
     escapes: bool,
     tail_lines: usize,
 ) -> BTreeMap<u64, RobotPaneTextResult> {
-    let parent_cx = frankenterm_core::cx::for_request();
+    let parent_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let semaphore = Arc::new(frankenterm_core::runtime_async::Semaphore::new(
         ROBOT_BATCH_GET_TEXT_MAX_CONCURRENT,
     ));
@@ -31582,20 +31856,117 @@ fn build_ipc_rpc_handler(
 }
 
 struct AsupersyncWebhookTransport {
-    client: asupersync::http::h1::HttpClient,
+    client: frankenterm_core::runtime_async::http::HttpClient,
 }
 
 impl AsupersyncWebhookTransport {
     fn new() -> Self {
         Self {
-            client: asupersync::http::h1::HttpClient::new(),
+            client: frankenterm_core::runtime_async::http::HttpClient::new(),
+        }
+    }
+
+    fn capability_failure(
+        cx: &frankenterm_core::cx::Cx,
+    ) -> Option<frankenterm_core::webhook::DeliveryResult> {
+        use frankenterm_core::outcome::CancelKind;
+        use frankenterm_core::webhook::DeliveryResult;
+
+        if let Some(reason) = cx.root_cancel_cause() {
+            return Some(match reason.kind {
+                CancelKind::Timeout | CancelKind::Deadline => {
+                    DeliveryResult::deadline_exceeded()
+                }
+                CancelKind::PollQuota => DeliveryResult::poll_budget_exhausted(),
+                CancelKind::CostBudget => DeliveryResult::cost_budget_exhausted(),
+                CancelKind::User
+                | CancelKind::FailFast
+                | CancelKind::RaceLost
+                | CancelKind::ParentCancelled
+                | CancelKind::ResourceUnavailable
+                | CancelKind::Shutdown
+                | CancelKind::LinkedExit => DeliveryResult::cancelled(),
+            });
+        }
+
+        // A Cx-aware HTTP timeout may observe an exhausted budget before a
+        // checkpoint has materialized its root cancellation reason. Preserve
+        // that finite identity from the content-free budget snapshot.
+        let budget = cx.budget_stats();
+        if budget.deadline.at.is_some() && budget.deadline.remaining.is_none() {
+            Some(DeliveryResult::deadline_exceeded())
+        } else if budget.polls.remaining == Some(0) {
+            Some(DeliveryResult::poll_budget_exhausted())
+        } else if budget.cost.remaining == Some(0) {
+            Some(DeliveryResult::cost_budget_exhausted())
+        } else {
+            None
+        }
+    }
+
+    fn checkpoint_failure(
+        cx: &frankenterm_core::cx::Cx,
+        error: &frankenterm_core::runtime_async::ContextError,
+    ) -> frankenterm_core::webhook::DeliveryResult {
+        use frankenterm_core::runtime_async::ContextErrorKind;
+        use frankenterm_core::webhook::DeliveryResult;
+
+        match error.kind() {
+            ContextErrorKind::DeadlineExceeded => DeliveryResult::deadline_exceeded(),
+            ContextErrorKind::CancelTimeout => DeliveryResult::cancellation_cleanup_timeout(),
+            ContextErrorKind::PollQuotaExhausted => DeliveryResult::poll_budget_exhausted(),
+            ContextErrorKind::CostQuotaExhausted => DeliveryResult::cost_budget_exhausted(),
+            ContextErrorKind::Cancelled => {
+                Self::capability_failure(cx).unwrap_or_else(DeliveryResult::cancelled)
+            }
+            _ => DeliveryResult::context_failure(),
+        }
+    }
+
+    fn client_failure(
+        cx: &frankenterm_core::cx::Cx,
+        error: &frankenterm_core::runtime_async::http::ClientError,
+    ) -> frankenterm_core::webhook::DeliveryResult {
+        use frankenterm_core::runtime_async::http::ClientError;
+        use frankenterm_core::webhook::DeliveryResult;
+
+        match error {
+            // The client's configured request timeout can expire while the
+            // caller's capability budget remains live, so this discriminant
+            // is authoritative on its own.
+            ClientError::DeadlineExceeded => DeliveryResult::deadline_exceeded(),
+            // Cancellation initiated through the Cx may have a more precise
+            // finite budget class. Never retain or format its free-text cause.
+            ClientError::Cancelled => {
+                match cx.checkpoint() {
+                    Ok(()) => {
+                        Self::capability_failure(cx).unwrap_or_else(DeliveryResult::cancelled)
+                    }
+                    Err(error) => Self::checkpoint_failure(cx, &error),
+                }
+            }
+            // URL, DNS, TLS, protocol, proxy, pool, and I/O details may carry
+            // caller-controlled or secret text. Collapse them to the finite
+            // transport class without formatting or retaining their payloads.
+            ClientError::InvalidUrl(_)
+            | ClientError::DnsError(_)
+            | ClientError::ConnectError(_)
+            | ClientError::TlsError(_)
+            | ClientError::HttpError(_)
+            | ClientError::TooManyRedirects { .. }
+            | ClientError::Io(_)
+            | ClientError::ConnectTunnelRefused { .. }
+            | ClientError::InvalidConnectInput(_)
+            | ClientError::ProxyError(_)
+            | ClientError::PoolExhausted { .. } => DeliveryResult::transport_failure(),
         }
     }
 }
 
 impl frankenterm_core::webhook::WebhookTransport for AsupersyncWebhookTransport {
-    fn send<'a>(
+    fn send_with_cx<'a>(
         &'a self,
+        cx: &'a frankenterm_core::cx::Cx,
         url: &'a str,
         headers: &'a std::collections::HashMap<String, String>,
         body: &'a serde_json::Value,
@@ -31605,13 +31976,14 @@ impl frankenterm_core::webhook::WebhookTransport for AsupersyncWebhookTransport 
         >,
     > {
         Box::pin(async move {
+            if let Err(error) = cx.checkpoint() {
+                return Self::checkpoint_failure(cx, &error);
+            }
+
             let body_bytes = match serde_json::to_vec(body) {
                 Ok(bytes) => bytes,
-                Err(err) => {
-                    return frankenterm_core::webhook::DeliveryResult::err(
-                        0,
-                        format!("request_failed: serialize_body: {err}"),
-                    );
+                Err(_) => {
+                    return frankenterm_core::webhook::DeliveryResult::context_failure();
                 }
             };
 
@@ -31621,38 +31993,233 @@ impl frankenterm_core::webhook::WebhookTransport for AsupersyncWebhookTransport 
                 request_headers.push((key.clone(), value.clone()));
             }
 
-            let cx = frankenterm_core::cx::Cx::current()
-                .unwrap_or_else(frankenterm_core::cx::for_request);
+            // Request construction may clone nontrivial caller-owned headers
+            // and payload data. Re-check immediately before the HTTP side
+            // effect so cancellation during that work cannot start a request.
+            if let Err(error) = cx.checkpoint() {
+                return Self::checkpoint_failure(cx, &error);
+            }
+
             match self
                 .client
                 .request(
-                    &cx,
-                    asupersync::http::h1::Method::Post,
+                    cx,
+                    frankenterm_core::runtime_async::http::Method::Post,
                     url,
                     request_headers,
                     body_bytes,
                 )
                 .await
             {
-                Ok(resp) => {
-                    if (200..300).contains(&resp.status) {
-                        frankenterm_core::webhook::DeliveryResult::ok(resp.status)
-                    } else {
-                        let body_text = String::from_utf8_lossy(&resp.body);
-                        let message = if body_text.trim().is_empty() {
-                            format!("http {}", resp.status)
-                        } else {
-                            format!("http {}: {}", resp.status, body_text.trim())
-                        };
-                        frankenterm_core::webhook::DeliveryResult::err(resp.status, message)
-                    }
+                // Delivery classification needs only the status. The response
+                // body is dropped here without decoding or retaining it.
+                Ok(response) => {
+                    frankenterm_core::webhook::DeliveryResult::from_http_status(response.status)
                 }
-                Err(err) => frankenterm_core::webhook::DeliveryResult::err(
-                    0,
-                    format!("request_failed: {err}"),
-                ),
+                Err(error) => Self::client_failure(cx, &error),
             }
         })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn asupersync_webhook_capability_failure_maps_every_cancel_kind_without_reason_text() {
+    use frankenterm_core::outcome::CancelKind;
+    use frankenterm_core::webhook::DeliveryFailureClass;
+
+    let cases = [
+        (CancelKind::Timeout, DeliveryFailureClass::DeadlineExceeded),
+        (CancelKind::Deadline, DeliveryFailureClass::DeadlineExceeded),
+        (
+            CancelKind::PollQuota,
+            DeliveryFailureClass::PollBudgetExhausted,
+        ),
+        (
+            CancelKind::CostBudget,
+            DeliveryFailureClass::CostBudgetExhausted,
+        ),
+        (CancelKind::User, DeliveryFailureClass::Cancelled),
+        (CancelKind::FailFast, DeliveryFailureClass::Cancelled),
+        (CancelKind::RaceLost, DeliveryFailureClass::Cancelled),
+        (
+            CancelKind::ParentCancelled,
+            DeliveryFailureClass::Cancelled,
+        ),
+        (
+            CancelKind::ResourceUnavailable,
+            DeliveryFailureClass::Cancelled,
+        ),
+        (CancelKind::Shutdown, DeliveryFailureClass::Cancelled),
+        (CancelKind::LinkedExit, DeliveryFailureClass::Cancelled),
+    ];
+
+    for (kind, expected) in cases {
+        let cx = frankenterm_core::cx::for_testing();
+        cx.cancel_with(kind, Some("SECRET webhook cancellation reason"));
+        let result = AsupersyncWebhookTransport::capability_failure(&cx)
+            .expect("cancelled Cx must have a finite webhook failure");
+        assert_eq!(result.status_code(), 0, "kind: {kind:?}");
+        assert!(!result.accepted(), "kind: {kind:?}");
+        assert_eq!(
+            result.failure_class(),
+            Some(expected),
+            "kind: {kind:?}"
+        );
+        assert!(
+            !format!("{result:?}").contains("SECRET"),
+            "kind: {kind:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn asupersync_webhook_capability_failure_reads_content_free_budget_state() {
+    use frankenterm_core::webhook::DeliveryFailureClass;
+
+    let live = frankenterm_core::cx::for_testing();
+    assert!(AsupersyncWebhookTransport::capability_failure(&live).is_none());
+
+    let deadline = frankenterm_core::cx::Cx::for_testing_with_budget(
+        frankenterm_core::cx::Budget::new()
+            .with_deadline(frankenterm_core::runtime_async::RuntimeTime::ZERO),
+    );
+    let deadline_result = AsupersyncWebhookTransport::capability_failure(&deadline)
+        .expect("expired deadline must be classified");
+    assert_eq!(
+        deadline_result.failure_class(),
+        Some(DeliveryFailureClass::DeadlineExceeded)
+    );
+
+    let poll_quota = frankenterm_core::cx::Cx::for_testing_with_budget(
+        frankenterm_core::cx::Budget::new().with_poll_quota(0),
+    );
+    let poll_result = AsupersyncWebhookTransport::capability_failure(&poll_quota)
+        .expect("exhausted poll quota must be classified");
+    assert_eq!(
+        poll_result.failure_class(),
+        Some(DeliveryFailureClass::PollBudgetExhausted)
+    );
+
+    let cost_budget = frankenterm_core::cx::Cx::for_testing_with_budget(
+        frankenterm_core::cx::Budget::new().with_cost_quota(0),
+    );
+    let cost_result = AsupersyncWebhookTransport::capability_failure(&cost_budget)
+        .expect("exhausted cost budget must be classified");
+    assert_eq!(
+        cost_result.failure_class(),
+        Some(DeliveryFailureClass::CostBudgetExhausted)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn asupersync_webhook_checkpoint_failure_preserves_cleanup_timeout_without_details() {
+    use frankenterm_core::runtime_async::{ContextError, ContextErrorKind};
+    use frankenterm_core::webhook::DeliveryFailureClass;
+
+    let cx = frankenterm_core::cx::for_testing();
+    let cleanup_timeout = ContextError::new(ContextErrorKind::CancelTimeout)
+        .with_message("SECRET cancellation cleanup diagnostic");
+    let result = AsupersyncWebhookTransport::checkpoint_failure(&cx, &cleanup_timeout);
+    assert_eq!(
+        result.failure_class(),
+        Some(DeliveryFailureClass::CancellationCleanupTimeout)
+    );
+    assert!(!format!("{result:?}").contains("SECRET"));
+
+    let unknown = ContextError::new(ContextErrorKind::Internal)
+        .with_message("SECRET context diagnostic");
+    let result = AsupersyncWebhookTransport::checkpoint_failure(&cx, &unknown);
+    assert_eq!(
+        result.failure_class(),
+        Some(DeliveryFailureClass::Context)
+    );
+    assert!(!format!("{result:?}").contains("SECRET"));
+}
+
+#[cfg(test)]
+#[test]
+fn asupersync_webhook_client_failure_preserves_finite_discriminants_without_details() {
+    use frankenterm_core::runtime_async::http::ClientError;
+    use frankenterm_core::webhook::DeliveryFailureClass;
+
+    let live = frankenterm_core::cx::for_testing();
+    let request_timeout =
+        AsupersyncWebhookTransport::client_failure(&live, &ClientError::DeadlineExceeded);
+    assert_eq!(
+        request_timeout.failure_class(),
+        Some(DeliveryFailureClass::DeadlineExceeded)
+    );
+
+    let cancelled = AsupersyncWebhookTransport::client_failure(&live, &ClientError::Cancelled);
+    assert_eq!(
+        cancelled.failure_class(),
+        Some(DeliveryFailureClass::Cancelled)
+    );
+
+    let deadline = frankenterm_core::cx::Cx::for_testing_with_budget(
+        frankenterm_core::cx::Budget::new()
+            .with_deadline(frankenterm_core::runtime_async::RuntimeTime::ZERO),
+    );
+    let cancelled_at_deadline =
+        AsupersyncWebhookTransport::client_failure(&deadline, &ClientError::Cancelled);
+    assert_eq!(
+        cancelled_at_deadline.failure_class(),
+        Some(DeliveryFailureClass::DeadlineExceeded)
+    );
+
+    let transport = AsupersyncWebhookTransport::client_failure(
+        &live,
+        &ClientError::InvalidUrl("SECRET webhook URL".to_string()),
+    );
+    assert_eq!(
+        transport.failure_class(),
+        Some(DeliveryFailureClass::Transport)
+    );
+    assert!(!format!("{transport:?}").contains("SECRET"));
+}
+
+#[cfg(test)]
+#[test]
+fn asupersync_webhook_send_with_cx_short_circuits_exact_cancelled_caller() {
+    use frankenterm_core::webhook::{DeliveryFailureClass, WebhookTransport};
+
+    let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("webhook test runtime");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(async {
+        let transport = AsupersyncWebhookTransport::new();
+        let cx = frankenterm_core::cx::for_testing();
+        cx.cancel_with(
+            frankenterm_core::outcome::CancelKind::User,
+            Some("SECRET exact caller cancellation"),
+        );
+        let headers = std::collections::HashMap::new();
+        let body = serde_json::json!({"private": "SECRET body"});
+
+        let result = transport
+            .send_with_cx(&cx, "not a valid URL", &headers, &body)
+            .await;
+        assert_eq!(result.status_code(), 0);
+        assert!(!result.accepted());
+        assert_eq!(
+            result.failure_class(),
+            Some(DeliveryFailureClass::Cancelled)
+        );
+        assert!(!format!("{result:?}").contains("SECRET"));
+    })));
+    // Runtime::block_on intentionally retains its ambient handle. Test
+    // teardown must drop the runtime first and then clear that TLS slot under
+    // containment; otherwise a destructor panic can leak into a later test.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        frankenterm_core::runtime_async::clear_runtime_handle();
+    }));
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
     }
 }
 
@@ -35022,6 +35589,7 @@ async fn run_distributed_agent(
 /// Run the observation watcher daemon with crash-loop backoff.
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn run_watcher_with_backoff(
+    cx: &frankenterm_core::cx::Cx,
     layout: &frankenterm_core::config::WorkspaceLayout,
     config: &frankenterm_core::config::Config,
     config_path: Option<&Path>,
@@ -35040,6 +35608,7 @@ async fn run_watcher_with_backoff(
     loop {
         let started_at = Instant::now();
         let result = run_watcher(
+            cx,
             layout,
             config,
             config_path,
@@ -35100,6 +35669,7 @@ async fn run_watcher_with_backoff(
 /// Run the observation watcher daemon.
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn run_watcher(
+    cx: &frankenterm_core::cx::Cx,
     layout: &frankenterm_core::config::WorkspaceLayout,
     config: &frankenterm_core::config::Config,
     config_path: Option<&Path>,
@@ -35848,7 +36418,12 @@ async fn run_watcher(
         let wezterm =
             frankenterm_core::wezterm::wezterm_handle_with_timeout(config.cli.timeout_seconds);
         let shutdown_flag = Arc::clone(&handle.shutdown_flag);
-        frankenterm_core::watchdog::spawn_mux_watchdog(watchdog_config, wezterm, shutdown_flag)
+        frankenterm_core::watchdog::spawn_mux_watchdog(
+            cx,
+            watchdog_config,
+            wezterm,
+            shutdown_flag,
+        )
     };
 
     // Start snapshot engine for session persistence
@@ -36853,7 +37428,20 @@ fn main() {
     emit_runtime_bootstrap_lifecycle(runtime_spec, "startup", "runtime_initialized", None);
     let robot_mode = runtime_role == RuntimeProcessRole::Robot;
     rt.block_on(async {
-        match Box::pin(run(robot_mode)).await {
+        let Some(process_cx) = frankenterm_core::cx::Cx::current() else {
+            emit_runtime_bootstrap_lifecycle(
+                runtime_spec,
+                "shutdown",
+                "run_failed",
+                Some("runtime.root_context_unavailable"),
+            );
+            handle_fatal_error(
+                &anyhow::anyhow!("runtime root capability context unavailable"),
+                robot_mode,
+            );
+            std::process::exit(1);
+        };
+        match Box::pin(run(&process_cx, robot_mode)).await {
             Ok(()) => {
                 emit_runtime_bootstrap_lifecycle(runtime_spec, "shutdown", "run_completed", None);
             }
@@ -36871,7 +37459,7 @@ fn main() {
     });
 }
 
-async fn run(robot_mode: bool) -> anyhow::Result<()> {
+async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
 
     let cli = match Cli::try_parse() {
@@ -37342,6 +37930,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             });
 
             run_watcher_with_backoff(
+                cx,
                 &layout,
                 &config,
                 resolved_config_path.as_deref(),
@@ -54538,11 +55127,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     .with_reason(reason.clone());
                 match executor.execute_with_cx(&undo_cx, request).await {
                     Ok(result) => results.push(result),
-                    Err(err) => results.push(UndoExecutionResult {
+                    Err(_err) => results.push(UndoExecutionResult {
                         action_id,
                         strategy: "unknown".to_string(),
                         outcome: UndoOutcome::Failed,
-                        message: format!("Undo execution failed: {err}"),
+                        message:
+                            "Undo execution failed (error_class=undo_execution_error)".to_string(),
                         guidance: Some(
                             "Inspect action history and workflow status for remediation."
                                 .to_string(),
@@ -54571,7 +55161,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 for result in &results {
                     let outcome = match result.outcome {
                         UndoOutcome::Success => "success",
+                        UndoOutcome::AppliedWithWarning => "applied_with_warning",
                         UndoOutcome::NotApplicable => "not_applicable",
+                        UndoOutcome::Indeterminate => "indeterminate",
                         UndoOutcome::Failed => "failed",
                     };
                     println!("#{} [{outcome}] {}", result.action_id, result.message);
@@ -68286,10 +68878,6 @@ fn session_mmap_replay_json(
     })
 }
 
-fn session_recovery_operation_cx() -> frankenterm_core::cx::Cx {
-    frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request)
-}
-
 async fn session_recovery_create_pane(
     wezterm: &frankenterm_core::wezterm::WeztermHandle,
     timeout_seconds: u64,
@@ -68321,22 +68909,31 @@ async fn session_recovery_list_panes_on_runtime_task(
     wezterm: frankenterm_core::wezterm::WeztermHandle,
     timeout_seconds: u64,
 ) -> frankenterm_core::Result<Vec<frankenterm_core::wezterm::PaneInfo>> {
-    let task = frankenterm_core::runtime_async::task::spawn(async move {
-        let cx = session_recovery_operation_cx();
-        match frankenterm_core::runtime_async::timeout_with_cx(
-            &cx,
-            Duration::from_secs(timeout_seconds.max(1)),
-            wezterm.list_panes_with_cx(&cx),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => Err(frankenterm_core::Error::RuntimeOperation {
-                operation: "session.recovery.list_panes.timeout",
-                source: frankenterm_core::error::RuntimeOperationSource::Backend(error),
-            }),
-        }
-    });
+    let parent_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let task = frankenterm_core::runtime_async::task::spawn_with_cx(
+        &parent_cx,
+        move |cx| async move {
+            runtime_context_preflight(
+                "session.recovery.list_panes.context",
+                &cx,
+                CapabilityContextSite::SessionRecoveryOperation,
+            )?;
+            match frankenterm_core::runtime_async::timeout_with_cx(
+                &cx,
+                Duration::from_secs(timeout_seconds.max(1)),
+                wezterm.list_panes_with_cx(&cx),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(session_recovery_timeout_failure(
+                    "session.recovery.list_panes.timeout",
+                    &cx,
+                )),
+            }
+        },
+    );
     task.await
         .map_err(|error| {
             runtime_task_join_failure("session.recovery.list_panes.await_task", error)
@@ -68348,28 +68945,37 @@ async fn session_recovery_split_pane_on_runtime_task(
     timeout_seconds: u64,
     source_pane_id: u64,
 ) -> frankenterm_core::Result<u64> {
-    let task = frankenterm_core::runtime_async::task::spawn(async move {
-        let cx = session_recovery_operation_cx();
-        match frankenterm_core::runtime_async::timeout_with_cx(
-            &cx,
-            Duration::from_secs(timeout_seconds.max(1)),
-            wezterm.split_pane_with_cx(
+    let parent_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let task = frankenterm_core::runtime_async::task::spawn_with_cx(
+        &parent_cx,
+        move |cx| async move {
+            runtime_context_preflight(
+                "session.recovery.split_pane.context",
                 &cx,
-                source_pane_id,
-                frankenterm_core::wezterm::SplitDirection::Right,
-                None,
-                Some(50),
-            ),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => Err(frankenterm_core::Error::RuntimeOperation {
-                operation: "session.recovery.split_pane.timeout",
-                source: frankenterm_core::error::RuntimeOperationSource::Backend(error),
-            }),
-        }
-    });
+                CapabilityContextSite::SessionRecoveryOperation,
+            )?;
+            match frankenterm_core::runtime_async::timeout_with_cx(
+                &cx,
+                Duration::from_secs(timeout_seconds.max(1)),
+                wezterm.split_pane_with_cx(
+                    &cx,
+                    source_pane_id,
+                    frankenterm_core::wezterm::SplitDirection::Right,
+                    None,
+                    Some(50),
+                ),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(session_recovery_timeout_failure(
+                    "session.recovery.split_pane.timeout",
+                    &cx,
+                )),
+            }
+        },
+    );
     task.await
         .map_err(|error| {
             runtime_task_join_failure("session.recovery.split_pane.await_task", error)
@@ -68382,22 +68988,31 @@ async fn session_recovery_send_text_on_runtime_task(
     pane_id: u64,
     text: String,
 ) -> frankenterm_core::Result<()> {
-    let task = frankenterm_core::runtime_async::task::spawn(async move {
-        let cx = session_recovery_operation_cx();
-        match frankenterm_core::runtime_async::timeout_with_cx(
-            &cx,
-            Duration::from_secs(timeout_seconds.max(1)),
-            wezterm.send_text_with_options_with_cx(&cx, pane_id, &text, true, true),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => Err(frankenterm_core::Error::RuntimeOperation {
-                operation: "session.recovery.send_text.timeout",
-                source: frankenterm_core::error::RuntimeOperationSource::Backend(error),
-            }),
-        }
-    });
+    let parent_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let task = frankenterm_core::runtime_async::task::spawn_with_cx(
+        &parent_cx,
+        move |cx| async move {
+            runtime_context_preflight(
+                "session.recovery.send_text.context",
+                &cx,
+                CapabilityContextSite::SessionRecoveryOperation,
+            )?;
+            match frankenterm_core::runtime_async::timeout_with_cx(
+                &cx,
+                Duration::from_secs(timeout_seconds.max(1)),
+                wezterm.send_text_with_options_with_cx(&cx, pane_id, &text, true, true),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(session_recovery_timeout_failure(
+                    "session.recovery.send_text.timeout",
+                    &cx,
+                )),
+            }
+        },
+    );
     task.await
         .map_err(|error| {
             runtime_task_join_failure("session.recovery.send_text.await_task", error)

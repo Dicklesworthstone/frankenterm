@@ -259,10 +259,9 @@ pub async fn cleanup_sessions_async(
 /// Run cleanup asynchronously under an explicit `&Cx` (ft-xbnl0.2.2).
 ///
 /// Cx-first entry point: caller-supplied cancellation is honored at the
-/// boundaries around the blocking SQLite work. A checkpoint before the
-/// spawn lets a canceled caller skip the blocking handoff entirely; a
-/// checkpoint after the join lets the caller abort before returning the
-/// result into the wider call graph.
+/// boundary before the blocking SQLite work. Once the closure starts, its
+/// transaction may commit; there is deliberately no post-join checkpoint that
+/// could report cancellation after durable cleanup already occurred.
 pub async fn cleanup_sessions_async_cx(
     cx: &crate::cx::Cx,
     db_path: Arc<String>,
@@ -270,7 +269,7 @@ pub async fn cleanup_sessions_async_cx(
 ) -> Result<CleanupResult, String> {
     // Honor caller cancellation before we hand work off to the blocking pool.
     cx.checkpoint()
-        .map_err(|err| format!("cx checkpoint failed before spawn_blocking: {err}"))?;
+        .map_err(|_| "session cleanup cancelled before blocking handoff".to_string())?;
 
     let outcome = crate::runtime_async::spawn_blocking(move || {
         let conn = Connection::open(db_path.as_str())
@@ -283,11 +282,6 @@ pub async fn cleanup_sessions_async_cx(
     })
     .await
     .map_err(|e| format!("Task join error: {e}"))?;
-
-    // Honor caller cancellation after the blocking work returns so a
-    // late-canceled caller does not propagate a stale result.
-    cx.checkpoint()
-        .map_err(|err| format!("cx checkpoint failed after spawn_blocking: {err}"))?;
 
     outcome
 }
