@@ -4191,7 +4191,7 @@ pub struct SnapshotConfig {
     #[serde(default)]
     pub session_retention: SessionRetentionConfig,
 
-    /// Process re-launch configuration for session restoration.
+    /// Reserved process-restoration configuration.
     #[serde(default)]
     pub process_relaunch: ProcessRelaunchConfig,
 
@@ -4215,39 +4215,52 @@ impl Default for SnapshotConfig {
     }
 }
 
-/// Process re-launch configuration for session restoration.
+/// Reserved process-restoration configuration.
 ///
-/// Controls how processes are restarted in restored panes after a
-/// mux server restart.
+/// Layout restoration creates a default shell in each pane. The current
+/// process-restoration layer only classifies captured shell/agent state for
+/// operator follow-up; it never types commands into PTYs and cannot launch a
+/// process until the mux exposes an argv-isolated spawn capability.
 ///
 /// # Example (ft.toml)
 ///
 /// ```toml
 /// [snapshots.process_relaunch]
+/// # Reserved historical keys; neither one permits execution.
 /// launch_shells = true
 /// launch_agents = false
-/// launch_delay_ms = 500
-///
-/// [snapshots.process_relaunch.agent_commands]
-/// claude_code = "cd {cwd} && claude"
-/// codex = "cd {cwd} && codex"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProcessRelaunchConfig {
-    /// Automatically re-launch shell processes in their original working directories.
+    /// Reserved historical setting. Ignored by the current planner and executor;
+    /// captured shells always require an explicit manual disposition.
     pub launch_shells: bool,
 
-    /// Automatically re-launch agent processes (Claude Code, Codex, Gemini).
-    /// Disabled by default because agent sessions start fresh (state is lost).
+    /// Reserved historical setting. Ignored by the current planner and executor;
+    /// captured agents always require an explicit manual disposition.
     pub launch_agents: bool,
 
-    /// Delay between successive process launches in milliseconds.
+    /// Reserved for a future argv-isolated mux spawn implementation. Ignored by
+    /// the current planner and executor.
     pub launch_delay_ms: u64,
 
-    /// Custom agent launch commands keyed by agent type.
-    /// Supports `{cwd}` placeholder for the original working directory.
+    /// Reserved templates for a future argv-isolated mux spawn implementation.
+    /// Ignored by the current planner and executor. Values are excluded from
+    /// `Debug` output because they may contain paths or credentials.
     pub agent_commands: std::collections::HashMap<String, String>,
+}
+
+impl std::fmt::Debug for ProcessRelaunchConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProcessRelaunchConfig")
+            .field("reserved_launch_shells", &self.launch_shells)
+            .field("reserved_launch_agents", &self.launch_agents)
+            .field("reserved_launch_delay_ms", &self.launch_delay_ms)
+            .field("reserved_agent_command_count", &self.agent_commands.len())
+            .finish()
+    }
 }
 
 impl Default for ProcessRelaunchConfig {
@@ -6281,6 +6294,18 @@ mod tests {
         assert!(config.safety.require_prompt_active);
         assert_eq!(config.workflows.max_concurrent, 3);
         assert!(!config.metrics.enabled);
+    }
+
+    #[test]
+    fn process_relaunch_debug_redacts_reserved_templates() {
+        let mut config = ProcessRelaunchConfig::default();
+        config.agent_commands.insert(
+            "secret-agent-type".to_string(),
+            "secret command with /secret/cwd".to_string(),
+        );
+        let diagnostic = format!("{config:?}");
+        assert!(diagnostic.contains("reserved_agent_command_count: 1"));
+        assert!(!diagnostic.contains("secret"));
     }
 
     #[test]
