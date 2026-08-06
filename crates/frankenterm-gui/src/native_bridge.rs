@@ -127,9 +127,14 @@ fn enqueue_bridge_event(
     match tx.try_send(event) {
         Ok(()) => BridgeQueueOutcome::Queued,
         Err(std_mpsc::TrySendError::Full(_)) => {
-            let drop_count = BRIDGE_QUEUE_FULL_DROPS
-                .fetch_add(1, Ordering::Relaxed)
-                .saturating_add(1);
+            let previous = match BRIDGE_QUEUE_FULL_DROPS.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |count| Some(count.saturating_add(1)),
+            ) {
+                Ok(previous) | Err(previous) => previous,
+            };
+            let drop_count = previous.saturating_add(1);
             // Pane-output storms must not turn a bounded data queue into an
             // unbounded warning stream. Powers-of-two sampling stays visible
             // while adding only logarithmic log volume.
