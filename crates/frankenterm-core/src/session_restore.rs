@@ -4635,8 +4635,14 @@ impl SessionRestorer {
             let db_path = Arc::clone(&self.db_path);
             let session_id = session.session_id.clone();
             let receipt_for_mark = receipt.clone();
+            // The outcome is already durable and complete. Caller
+            // cancellation at this point must not strand an otherwise exact
+            // receipt in outcome_complete merely because final clean binding
+            // reused the canceled capability.
+            let clean_binding_cx =
+                crate::cx::Cx::for_request_with_budget(crate::cx::Budget::MINIMAL);
             run_checkpoint_authority_with_cx(
-                cx,
+                &clean_binding_cx,
                 db_path,
                 SnapshotAuthorityOperation::RestoreCleanMark,
                 move |db_path| {
@@ -7154,12 +7160,17 @@ mod tests {
             metadata.restore_attempt,
             Some(PersistedRestoreAttempt::Outcome {
                 evidence_version: RESTORE_OUTCOME_EVIDENCE_VERSION,
+                failed_source_pane_ids: Some(ref failed_source_pane_ids),
+                unexpected_mapping_count: Some(0),
+                unexpected_failure_count: Some(0),
+                duplicate_target_source_pane_ids: Some(ref duplicate_target_source_pane_ids),
                 layout_complete: false,
                 attempt_interrupted: true,
                 interruption_phase: Some(RestoreInterruptionPhase::LayoutRestoration),
                 interruption_reason: Some(RestoreInterruptionReason::BackendFailure),
                 ..
-            })
+            }) if failed_source_pane_ids == &[2]
+                && duplicate_target_source_pane_ids.is_empty()
         ));
 
         let shutdown_clean: bool = conn
@@ -7284,12 +7295,17 @@ mod tests {
             metadata.restore_attempt,
             Some(PersistedRestoreAttempt::Outcome {
                 evidence_version: RESTORE_OUTCOME_EVIDENCE_VERSION,
+                failed_source_pane_ids: Some(ref failed_source_pane_ids),
+                unexpected_mapping_count: Some(0),
+                unexpected_failure_count: Some(0),
+                duplicate_target_source_pane_ids: Some(ref duplicate_target_source_pane_ids),
                 layout_complete: false,
                 attempt_interrupted: true,
                 interruption_phase: Some(RestoreInterruptionPhase::LayoutRestoration),
                 interruption_reason: Some(RestoreInterruptionReason::BackendFailure),
                 ..
-            })
+            }) if failed_source_pane_ids == &[2]
+                && duplicate_target_source_pane_ids.is_empty()
         ));
 
         let shutdown_clean: bool = conn
