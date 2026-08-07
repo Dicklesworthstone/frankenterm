@@ -797,8 +797,8 @@ impl FrameState {
             LazyLock::new(|| Arc::new(vec![0, 0, 0, 0x00]));
 
         let current_frame = DecodedFrame {
-            pixels: Arc::clone(&TRANSPARENT),
-            hash: ImageDataType::hash_bytes(&TRANSPARENT),
+            pixels: Arc::clone(&*TRANSPARENT),
+            hash: ImageDataType::hash_bytes(TRANSPARENT.as_slice()),
             width: TRANSPARENT_SIZE,
             height: TRANSPARENT_SIZE,
             duration: Duration::from_millis(0),
@@ -3829,6 +3829,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn decoded_worker_frame_is_memory_resident_and_hash_authoritative_without_blob_io() {
+        let frame = decoder_test_frame(0x5a, Duration::from_millis(17));
+        let clone = frame.clone();
+        let handle = DecodedFrameHandle(&frame);
+
+        assert!(Arc::ptr_eq(&frame.pixels, &clone.pixels));
+        assert_eq!(
+            frame.hash,
+            ImageDataType::hash_bytes(frame.pixels.as_slice())
+        );
+        assert_eq!(handle.image_dimensions(), (1, 1));
+        assert!(!handle.is_mutable());
+        assert_eq!(frame.duration, Duration::from_millis(17));
+        assert_eq!(frame.checked_decoded_bytes(), Some(frame.pixels.len()));
+    }
+
     fn disconnected_frame_state(frames: Vec<DecodedFrame>) -> FrameState {
         let (tx, receiver) = channel();
         drop(tx);
@@ -3981,7 +3998,7 @@ mod tests {
         let (mut cache, _) = test_glyph_cache();
 
         // Holding the encoded source lock here is intentional. Rendering uses
-        // only the independent decoded BlobLease snapshot and must therefore
+        // only the independent immutable in-memory snapshot and must therefore
         // complete without recursively waiting on this payload mutex.
         let source_guard = source.data();
         let (_, _, state) = GlyphCache::cached_image_impl(

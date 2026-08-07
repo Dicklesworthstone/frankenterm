@@ -725,14 +725,14 @@ impl<S> InstrumentedStorage<S> {
     /// Cancellation belongs at the operation boundary; once an outcome exists,
     /// dropping its telemetry would make the accounting observably false.
     #[allow(clippy::future_not_send)]
-    pub async fn append_batch_instrumented_with_cx(
+    pub fn append_batch_instrumented_with_cx(
         &self,
         _cx: &crate::cx::Cx,
         _req: AppendRequest,
         result: Result<AppendResponse, RecorderStorageError>,
         start: Instant,
         backend: RecorderBackendKind,
-    ) -> Result<AppendResponse, RecorderStorageError> {
+    ) -> impl std::future::Future<Output = Result<AppendResponse, RecorderStorageError>> {
         let elapsed_us = start.elapsed().as_nanos() as f64 / 1000.0;
         match &result {
             Ok(resp) => {
@@ -750,7 +750,7 @@ impl<S> InstrumentedStorage<S> {
                     .record_error_for_backend(e.class(), Some(backend));
             }
         }
-        result
+        std::future::ready(result)
     }
 
     /// Time a flush call and record telemetry.

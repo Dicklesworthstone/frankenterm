@@ -1256,7 +1256,6 @@ impl ShardedWeztermClient {
     }
 
     fn backend_error(
-        &self,
         shard_id: ShardId,
         op: &'static str,
         pane_id: Option<u64>,
@@ -1663,7 +1662,7 @@ impl ShardedWeztermClient {
             .handle
             .spawn_with_cx(cx, cwd, domain_name)
             .await
-            .map_err(|err| self.backend_error(shard, "spawn", None, err))?;
+            .map_err(|err| Self::backend_error(shard, "spawn", None, err))?;
         let global_id = Self::encode_created_pane_or_rollback_after_cx_creation(
             backend,
             shard,
@@ -1709,7 +1708,7 @@ impl ShardedWeztermClient {
                 .handle
                 .list_panes_with_cx(cx)
                 .await
-                .map_err(|err| self.backend_error(backend.id, "list_panes", None, err))?;
+                .map_err(|err| Self::backend_error(backend.id, "list_panes", None, err))?;
 
             for mut pane in panes {
                 let local_pane_id = pane.pane_id;
@@ -1959,7 +1958,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .get_pane(route.local_pane_id)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "get_pane", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "get_pane", Some(pane_id), err)
                 })?;
             pane.pane_id =
                 try_encode_sharded_pane_id(route.shard_id, route.local_pane_id)?;
@@ -1981,7 +1980,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .handle
                 .get_text(route.local_pane_id, escapes)
                 .await
-                .map_err(|err| self.backend_error(route.shard_id, "get_text", Some(pane_id), err))
+                .map_err(|err| Self::backend_error(route.shard_id, "get_text", Some(pane_id), err))
         })
     }
 
@@ -1994,7 +1993,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .get_semantic_zones(route.local_pane_id)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "get_semantic_zones", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "get_semantic_zones", Some(pane_id), err)
                 })
         })
     }
@@ -2008,7 +2007,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .handle
                 .send_text(route.local_pane_id, &text)
                 .await
-                .map_err(|err| self.backend_error(route.shard_id, "send_text", Some(pane_id), err))
+                .map_err(|err| Self::backend_error(route.shard_id, "send_text", Some(pane_id), err))
         })
     }
 
@@ -2022,7 +2021,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .send_text_no_paste(route.local_pane_id, &text)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "send_text_no_paste", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "send_text_no_paste", Some(pane_id), err)
                 })
         })
     }
@@ -2043,7 +2042,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .send_text_with_options(route.local_pane_id, &text, no_paste, no_newline)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "send_text_with_options", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "send_text_with_options", Some(pane_id), err)
                 })
         })
     }
@@ -2058,7 +2057,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .send_control(route.local_pane_id, &control_char)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "send_control", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "send_control", Some(pane_id), err)
                 })
         })
     }
@@ -2103,7 +2102,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .handle
                 .spawn_targeted(cwd.as_deref(), domain_name.as_deref(), target)
                 .await
-                .map_err(|err| self.backend_error(shard, "spawn_targeted", None, err))?;
+                .map_err(|err| Self::backend_error(shard, "spawn_targeted", None, err))?;
             let global_id = Self::encode_created_pane_or_rollback(
                 backend,
                 shard,
@@ -2138,7 +2137,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .split_pane(route.local_pane_id, direction, cwd.as_deref(), percent)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "split_pane", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "split_pane", Some(pane_id), err)
                 })?;
 
             let global_new = Self::encode_created_pane_or_rollback(
@@ -2168,7 +2167,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .activate_pane(route.local_pane_id)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "activate_pane", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "activate_pane", Some(pane_id), err)
                 })
         })
     }
@@ -2186,7 +2185,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .get_pane_direction(route.local_pane_id, direction)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "get_pane_direction", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "get_pane_direction", Some(pane_id), err)
                 })?;
 
             if let Some(local_id) = next_local {
@@ -2214,7 +2213,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .kill_pane(route.local_pane_id)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "kill_pane", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "kill_pane", Some(pane_id), err)
                 })?;
             self.remove_pane_route(pane_id);
             Ok(())
@@ -2229,7 +2228,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .handle
                 .zoom_pane(route.local_pane_id, zoom)
                 .await
-                .map_err(|err| self.backend_error(route.shard_id, "zoom_pane", Some(pane_id), err))
+                .map_err(|err| Self::backend_error(route.shard_id, "zoom_pane", Some(pane_id), err))
         })
     }
 
@@ -2270,7 +2269,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .pane_tiered_scrollback_summary(route.local_pane_id)
                 .await
                 .map_err(|err| {
-                    self.backend_error(
+                    Self::backend_error(
                         route.shard_id,
                         "pane_tiered_scrollback_summary",
                         Some(pane_id),
@@ -2309,7 +2308,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .get_pane_with_cx(cx, route.local_pane_id)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "get_pane", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "get_pane", Some(pane_id), err)
                 })?;
             pane.pane_id =
                 try_encode_sharded_pane_id(route.shard_id, route.local_pane_id)?;
@@ -2336,7 +2335,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .handle
                 .get_text_with_cx(cx, route.local_pane_id, escapes)
                 .await
-                .map_err(|err| self.backend_error(route.shard_id, "get_text", Some(pane_id), err))
+                .map_err(|err| Self::backend_error(route.shard_id, "get_text", Some(pane_id), err))
         })
     }
 
@@ -2353,7 +2352,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .get_semantic_zones_with_cx(cx, route.local_pane_id)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "get_semantic_zones", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "get_semantic_zones", Some(pane_id), err)
                 })
         })
     }
@@ -2372,7 +2371,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .handle
                 .send_text_with_cx(cx, route.local_pane_id, &text)
                 .await
-                .map_err(|err| self.backend_error(route.shard_id, "send_text", Some(pane_id), err))
+                .map_err(|err| Self::backend_error(route.shard_id, "send_text", Some(pane_id), err))
         })
     }
 
@@ -2391,7 +2390,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .send_text_no_paste_with_cx(cx, route.local_pane_id, &text)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "send_text_no_paste", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "send_text_no_paste", Some(pane_id), err)
                 })
         })
     }
@@ -2419,7 +2418,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 )
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "send_text_with_options", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "send_text_with_options", Some(pane_id), err)
                 })
         })
     }
@@ -2439,7 +2438,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .send_control_with_cx(cx, route.local_pane_id, &control_char)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "send_control", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "send_control", Some(pane_id), err)
                 })
         })
     }
@@ -2457,7 +2456,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .pane_tiered_scrollback_summary_with_cx(cx, route.local_pane_id)
                 .await
                 .map_err(|err| {
-                    self.backend_error(
+                    Self::backend_error(
                         route.shard_id,
                         "pane_tiered_scrollback_summary",
                         Some(pane_id),
@@ -2480,7 +2479,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .activate_pane_with_cx(cx, route.local_pane_id)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "activate_pane", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "activate_pane", Some(pane_id), err)
                 })
         })
     }
@@ -2498,7 +2497,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .kill_pane_with_cx(cx, route.local_pane_id)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "kill_pane", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "kill_pane", Some(pane_id), err)
                 })?;
             self.remove_pane_route(pane_id);
             Ok(())
@@ -2518,7 +2517,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .handle
                 .zoom_pane_with_cx(cx, route.local_pane_id, zoom)
                 .await
-                .map_err(|err| self.backend_error(route.shard_id, "zoom_pane", Some(pane_id), err))
+                .map_err(|err| Self::backend_error(route.shard_id, "zoom_pane", Some(pane_id), err))
         })
     }
 
@@ -2556,7 +2555,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .handle
                 .spawn_targeted_with_cx(cx, cwd, domain_name, target)
                 .await
-                .map_err(|err| self.backend_error(shard, "spawn_targeted", None, err))?;
+                .map_err(|err| Self::backend_error(shard, "spawn_targeted", None, err))?;
             let global_id = Self::encode_created_pane_or_rollback_after_cx_creation(
                 backend,
                 shard,
@@ -2591,7 +2590,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 .split_pane_with_cx(cx, route.local_pane_id, direction, cwd, percent)
                 .await
                 .map_err(|err| {
-                    self.backend_error(route.shard_id, "split_pane", Some(pane_id), err)
+                    Self::backend_error(route.shard_id, "split_pane", Some(pane_id), err)
                 })?;
 
             let global_new = Self::encode_created_pane_or_rollback_after_cx_creation(
@@ -4896,7 +4895,7 @@ mod tests {
         )
         .expect("single sharded backend");
 
-        let indeterminate = client.backend_error(
+        let indeterminate = ShardedWeztermClient::backend_error(
             ShardId(3),
             "split_pane",
             Some(77),
@@ -4934,7 +4933,7 @@ mod tests {
                 },
             ),
         ] {
-            let projected = client.backend_error(
+            let projected = ShardedWeztermClient::backend_error(
                 ShardId(3),
                 "custom_backend",
                 None,
@@ -4949,7 +4948,7 @@ mod tests {
             );
         }
 
-        let storage_backend_detail = client.backend_error(
+        let storage_backend_detail = ShardedWeztermClient::backend_error(
             ShardId(3),
             "custom_backend",
             None,
@@ -4966,7 +4965,7 @@ mod tests {
             .contains("hostile-storage-secret"));
         assert!(storage_backend_detail.to_string().len() < 256);
 
-        let missing = client.backend_error(
+        let missing = ShardedWeztermClient::backend_error(
             ShardId(3),
             "get_text",
             Some(77),
@@ -4978,7 +4977,7 @@ mod tests {
         ));
         assert!(!crate::retry::is_retryable(&missing));
 
-        let circuit = client.backend_error(
+        let circuit = ShardedWeztermClient::backend_error(
             ShardId(3),
             "list_panes",
             None,
@@ -4994,7 +4993,7 @@ mod tests {
         ));
         assert!(!crate::retry::is_retryable(&circuit));
 
-        let cancelled = client.backend_error(
+        let cancelled = ShardedWeztermClient::backend_error(
             ShardId(3),
             "send_text",
             Some(77),
@@ -5004,7 +5003,7 @@ mod tests {
         assert!(!crate::retry::is_retryable(&cancelled));
         assert!(!cancelled.to_string().contains("hostile-pane-secret"));
 
-        let command = client.backend_error(
+        let command = ShardedWeztermClient::backend_error(
             ShardId(3),
             "send_text",
             Some(77),

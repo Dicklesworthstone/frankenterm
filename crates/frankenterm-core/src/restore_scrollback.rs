@@ -388,7 +388,21 @@ impl ScrollbackInjector {
     /// The caller's capability is checked first. An uncancelled request then
     /// receives a structured resource-limit or unsupported-channel error; no
     /// pane API is called.
-    pub async fn inject_with_cx(
+    pub fn inject_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id_map: &HashMap<u64, u64>,
+        scrollbacks: &HashMap<u64, ScrollbackData>,
+    ) -> impl std::future::Future<Output = crate::Result<InjectionReport>> {
+        std::future::ready(self.inject_preflight_with_cx(cx, pane_id_map, scrollbacks))
+    }
+
+    /// Execute the bounded, zero-I/O injection preflight synchronously.
+    ///
+    /// Keeping the scan in a synchronous helper makes it explicit that the
+    /// returned future is already settled while retaining every entry and
+    /// cadence checkpoint from the former async-without-await body.
+    fn inject_preflight_with_cx(
         &self,
         cx: &crate::cx::Cx,
         pane_id_map: &HashMap<u64, u64>,
