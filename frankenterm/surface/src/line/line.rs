@@ -529,6 +529,22 @@ impl Line {
             .and_then(|data| data.upgrade())
     }
 
+    /// Copy the application-data reference from an independently cloned line.
+    ///
+    /// [`Line::clone`] intentionally gives each clone its own mutex so later
+    /// content mutations cannot race through shared cache metadata. Copy-backed
+    /// pane implementations can nevertheless project a line to a renderer and,
+    /// after proving that the authoritative content is still identical, use
+    /// this method to retain cache metadata produced on that projection.
+    #[cfg(feature = "appdata")]
+    pub fn copy_appdata_from(&self, source: &Self) {
+        if std::ptr::eq(self, source) {
+            return;
+        }
+        let source_appdata = lock_or_recover(&source.appdata).clone();
+        *lock_or_recover(&self.appdata) = source_appdata;
+    }
+
     /// Returns true if the line's last changed seqno is more recent
     /// than the provided seqno parameter
     pub fn changed_since(&self, seqno: SequenceNo) -> bool {
@@ -745,11 +761,31 @@ impl Line {
         }
 
         self.bits &= !LineBits::SCANNED_IMPLICIT_HYPERLINKS;
+        // Implicit-link state participates in `compute_shape_hash`, while
+        // renderer appdata may cache that hash independently of the line
+        // sequence.  Rule-epoch invalidation deliberately retains the current
+        // sequence number, so leaving appdata attached here would let a stale
+        // same-seqno shape hash survive removal (or later replacement) of an
+        // implicit link.
+        #[cfg(feature = "appdata")]
+        self.clear_appdata();
         if (self.bits & LineBits::HAS_IMPLICIT_HYPERLINKS) == LineBits::NONE {
             return;
         }
 
         self.invalidate_implicit_hyperlinks_impl(seqno);
+    }
+
+    /// Whether this physical row has already participated in an implicit-link
+    /// scan since its last content mutation or explicit invalidation.
+    ///
+    /// Callers that own complete logical-line assembly can use this as a cheap
+    /// fast-path predicate before walking wrapped neighbors. A `true` value is
+    /// meaningful only for the rule epoch selected by that caller; [`Line`]
+    /// deliberately does not retain rule identity itself.
+    #[inline]
+    pub fn implicit_hyperlinks_are_scanned(&self) -> bool {
+        self.bits.contains(LineBits::SCANNED_IMPLICIT_HYPERLINKS)
     }
 
     fn invalidate_implicit_hyperlinks_impl(&mut self, seqno: SequenceNo) {
@@ -2329,6 +2365,25 @@ mod tests {
 
         line.clear_appdata();
         assert!(line.get_appdata().is_none());
+    }
+
+    #[cfg(feature = "appdata")]
+    #[test]
+    fn implicit_hyperlink_epoch_invalidation_clears_same_seqno_appdata() {
+        let mut line: Line = "https://example.com".into();
+        line.bits.insert(LineBits::SCANNED_IMPLICIT_HYPERLINKS);
+        let original_seqno = line.current_seqno();
+        let cached_shape = alloc::sync::Arc::new(line.compute_shape_hash());
+        line.set_appdata(alloc::sync::Arc::clone(&cached_shape));
+        assert!(line.get_appdata().is_some());
+
+        line.invalidate_implicit_hyperlinks(original_seqno);
+
+        assert_eq!(line.current_seqno(), original_seqno);
+        assert!(
+            line.get_appdata().is_none(),
+            "same-seqno rule invalidation must not retain a pre-invalidation shape cache"
+        );
     }
 
     #[cfg(feature = "appdata")]

@@ -236,40 +236,52 @@ Terminal mutation
   -> TerminalState sequence + per-Line sequence
   -> PaneOutput/window invalidation
   -> paint_pane
-  -> publish_terminal_state_for_pane (metadata mirror only)
-  -> get_changed_since(renderer sequence fence)
+  -> get_changed_since_with_source_fence(renderer-only sequence fence)
   -> DirtyLineBitmap marks
-  -> apply_hyperlinks(visible stable range)
-  -> LocalPane::with_lines_mut(visible stable range)
+  -> LocalPane::with_lines_mut_and_apply_hyperlinks(visible stable range)
   -> shape hash + LFU line-quad lookup
   -> on miss: shaping + glyph/atlas + quad construction
   -> draw/submit/present
-  -> exact DamageGeneration settlement
+  -> exact DamageGeneration settlement after synchronous present success
 ```
 
-`LocalPane::get_changed_since`, `apply_hyperlinks`, and `with_lines_mut` each
-take the terminal mutex separately. The important long critical section is
-`LocalPane::with_lines_mut`: `terminal_with_lines_mut` invokes the GUI's
-`LineRender` callback while the terminal guard is still alive, and that
-callback performs line hashing, cache-key construction, shaping, glyph and
-atlas work, and quad construction. The parser needs the same terminal mutex.
-The hyperlink pass is an additional terminal-locked visible-range traversal
-before that render pass.
+Dirty discovery captures the source sequence and changed rows under one pane
+operation. Hyperlink normalization and line rendering now share one terminal
+guard rather than reacquiring it for a second visible-range traversal. The
+important remaining critical section is still long:
+`terminal_with_lines_mut_and_apply_hyperlinks` invokes the GUI's `LineRender`
+callback while the terminal guard is alive, and that callback performs line
+hashing, cache-key construction, shaping, glyph/atlas work, and quad
+construction. The PTY parser needs the same terminal mutex. This tranche
+removes redundant locking/traversal; it does not implement the short-lock
+immutable snapshot required by `.6.3`.
 
 The current remote path is:
 
 ```text
 server PerPane::prepare_surface_changes
-  -> get_changed_since(full viewport range, legacy baseline)
+  -> checked full-viewport stable-row range
+  -> get_changed_since_with_source_fence(legacy baseline)
   -> get_lines(full viewport range)
   -> filter cloned lines to dirty rows
   -> fetch/compress/deduplicate cursor row best-effort
   -> codec/connection delivery
-  -> client RenderablePane cache/prediction apply
-  -> ClientPane::with_lines_mut
-  -> impl_with_lines_via_get_lines (clone range + allocate ref vector)
+  -> client validates bounded SerializedLines resources
+  -> coordinate image RPCs (bounded concurrency/locators/deadline)
+  -> decoded-image verification on a dedicated two-thread pool
+  -> RenderablePane cache/prediction apply; unresolved image rows stay stale
+  -> ClientPane::with_lines_mut_and_apply_hyperlinks
+  -> clone requested rows + allocate mutable-reference vector
   -> same GUI line loop, caches, draw, submit, and present
 ```
+
+Remote shape appdata is written back only when the rendered clone remains
+content-equal to the authoritative cached row, and each `TermWindow` now owns a
+distinct cache token so appdata from another window cannot alias its LFU entry.
+Image admission authenticates canonical decoded identity and accounts decoded
+bytes/frames, but the transport still performs coordinate-based N+1 lookups.
+There is no snapshot-owned batch identity, cross-request singleflight, or
+decoded/GPU/in-flight unified budget yet; `.6.7.1` owns that architectural gap.
 
 The transactional `PaneRenderBeginSnapshot` and delivery-coordinator state
 machines in `sessionhandler.rs` are compiled and tested but explicitly
@@ -281,15 +293,16 @@ transactional path as the live server authority.
 | Substrate or claim | Live classification | Production effect | Exact gap |
 |---|---|---|---|
 | terminal `SequenceNo` plus `Pane::get_changed_since` | wired, authoritative but single-baseline | discovers changed stable rows for local GUI and server | no bounded multi-consumer journal, overflow epoch, acknowledgement, or resync identity |
-| GUI `DirtyLineBitmap` and source counters | wired, partial | marks row damage and gates clean-row LFU cache reuse/accounting | paint still visits every visible line and hashes/builds its cache key; it is not a sparse line iterator |
-| `DamageGeneration` and presented-frame settlement | wired, authoritative for GUI damage clearing | retains damage on failed/stale presentation and clears only an exact successful generation | not a coherent terminal-content generation and not shared with server/client deltas |
+| GUI `DirtyLineBitmap` and source counters | wired, partial | marks row damage and attributes clean cache-hit accounting | paint and cache lookup remain independent of the bitmap; every visible line still builds a cache key, so this is not a sparse iterator |
+| `DamageGeneration` and presented-frame settlement | wired, authoritative for GUI damage clearing | retains damage on failed/stale synchronous presentation and clears only an exact successful generation, including the initial whole-screen damage | synchronous present return is not GPU completion, scanout, or key-to-photon evidence; the generation is not shared with terminal/server/client content |
 | LFU `line_quad_cache` | wired | valid cache hits reapply retained layers and avoid shaping/glyph/quad reconstruction | global generations still invalidate broadly; cache is not the proposed row-indexed ownership model |
 | `render::per_row_quad_cache` | test-only foundation | pure invalidation-plan tests | no live paint consumer and no owned per-row quad vectors |
-| GUI `TerminalStateTripleBufferRegistry` | mirror-only, health-wired | publishes rows, columns, cursor, alternate-screen bit, and title; status tick polls watchdog health | payload contains no lines, attributes, images, hyperlinks, selection, IME, or render geometry; live renderer never acquires it |
+| GUI `TerminalStateTripleBufferRegistry` | dormant/test foundation | explicit APIs and tests can publish metadata and derive watchdog health | no production producer, frame/status consumer, or renderer acquisition path; payload also lacks lines, attributes, images, hyperlinks, selection, IME, and render geometry |
 | `DifferentialCellStream` GPU delta | compiled test-only/dormant | unit tests exercise CPU diff and ring policy | types and implementation are `allow(dead_code)` and WebGPU paint has no consumer |
 | server transactional render attempt/coordinator | partial/dormant | model and unit tests cover preparation/settlement identities | legacy `compute_changes` remains live; no application-ACK-owned commit path |
-| server legacy render delta | wired, coarse | produces correct dirty-line payloads under its current baseline contract | clones the complete viewport before filtering and separately materializes cursor work |
-| client `RenderablePane` and `ClientPane` adapter | wired, partial | caches received rows, reconciles prediction, and serves GUI lines | GUI adapter clones the requested line range and allocates a mutable-reference vector on every render pass |
+| server legacy render delta | wired, coarse | uses checked ranges, a source fence, saturation requery, and rollback/redirty on failed preparation or enqueue | clones the complete viewport before filtering; has no client application ACK and no autonomous retry of a successfully enqueued but unapplied delta |
+| client `RenderablePane` and `ClientPane` adapter | wired, partial | bounds line/image resources, caches received rows, reconciles prediction, retains safe shape appdata, and serves GUI lines | GUI adapter clones the requested range and allocates a mutable-reference vector; coordinate image hydration lacks global singleflight/batch ownership |
+| GUI renderer behavior tests | partial topology | pure helpers and library-owned surfaces execute under ordinary tests | the binary-owned `TermWindow`/renderer modules are declared with `test = false`; `.6.8.1` owns making their production behavior executable under normal gates |
 
 The audit also found that GUI renderer damage discovery had reused
 `Selection::seqno` as its render watermark. With no active selection that
@@ -300,7 +313,12 @@ per-pane fence, captures the source sequence before the dirty query so races
 can repeat but never skip changes, retains the selection fence only while a
 selection exists, checks stable-row range arithmetic, gives viewport movement
 its own full-pane invalidation source, and drops GUI pane state on pane removal.
-Those corrections remain unshipped until their required remote proof passes.
+The same pass now rejects zero/MAX shape-cache sentinels, namespaces cached
+line state by `TermWindow`, clears appdata when implicit-link epochs change,
+and makes overlay search results conditional on exact run/source/geometry/range
+identity. These are source-candidate corrections, not native performance or
+visual proof; they remain unqualified until the required remote and target
+gates pass.
 
 The non-duplicative implementation map is:
 
@@ -315,11 +333,14 @@ The non-duplicative implementation map is:
 | `.6.8` | prove the combined state pipeline with model, property, fuzz, failure, and native visual/IME/a11y evidence | unit tests or a static call graph alone |
 | `.6.9` | adjudicate every lever independently and then the retained combination on real workloads | bundling losing or unmeasured levers behind an aggregate improvement |
 
-Sequence-number saturation remains fail-closed work for `.6.4`: terminal
-sequence numbers currently saturate at `usize::MAX`, after which ordinary
-`changed_since` ordering cannot identify later mutations. No campaign result
-may call sparse damage complete until exhaustion has an explicit bounded
-resync/reconstruction transition.
+Sequence-number saturation still needs a bounded system protocol in `.6.4`.
+Terminal sequence numbers saturate at `usize::MAX`, after which ordinary
+`changed_since(MAX)` ordering cannot identify later mutations. The local GUI
+and legacy server now preserve correctness by querying from `SEQ_ZERO` while
+the source is saturated, at the cost of treating the requested range as dirty
+on every subsequent query. The dormant transactional server path instead
+closes before ambiguous identity. None of these is the bounded epoch/resync
+transition required to call sparse multi-consumer damage complete.
 
 ### 2.3 Long-session risk model
 
@@ -1482,7 +1503,7 @@ The umbrella epic closes only when all of the following are true:
 The campaign is successful when these user-level properties are durable and
 explainable—not when a proxy benchmark alone reports an attractive number.
 
-## 19. Current reality checkpoint (2026-08-04)
+## 19. Current reality checkpoint (2026-08-07)
 
 This campaign is **PARTIAL and not release-qualified**. The repository now has
 substantial bounded protocol, persistence, rendering, telemetry, and test
@@ -1502,9 +1523,21 @@ substrate, but the user-level result promised above has not yet been proved:
   but the negotiated production path is still dormant. Its presence is not a
   latency or allocation win until capability activation and real workload
   evidence prove that the legacy path is no longer serving supported sessions.
-- A fresh-eyes review removed duplicate whole-window resize invalidation and
-  tightened ordered-snapshot per-tab producer admission. These are bounded code
+- The current source candidate adds atomic dirty source fences, exact damage
+  settlement, one-lock local hyperlink/render traversal, generation-safe
+  overlay search publication, authenticated decoded-image admission, bounded
+  off-main image validation, safe remote shape-appdata retention, and checked
+  server rollback/range behavior. These are bounded correctness/performance
   improvements, not proof of improved native key-to-photon or resize latency.
+- Remote images still use coordinate lookup rather than a snapshot-owned batch,
+  and there is no global cross-request singleflight or unified decoded/GPU/
+  in-flight budget. `.6.7.1` remains open for that replacement architecture.
+- Binary-owned `TermWindow` renderer behavior remains excluded by the GUI
+  target's normal `test = false` topology. Library/pure tests do not substitute
+  for `.6.8.1` making the production modules executable under ordinary gates.
+- Same-numeric-pane-ID reconnect/ABA protection and delivery application ACK
+  remain separate open P0/P1 work; generation-aware cleanup and cache tokens do
+  not by themselves establish end-to-end successor safety.
 - The latest retained target-class resource-cockpit artifact remains
   `skipped_not_proven`; there is no admissible native M4/M5/Threadripper
   key-to-photon, continuous-resize, visual-quality, or long-session result for
@@ -1516,10 +1549,12 @@ substrate, but the user-level result promised above has not yet been proved:
   extrapolated to the whole tracker.
 
 The next promotion boundary is therefore implementation and evidence, not a
-broader claim: activate ordered snapshots fail-closed, complete stable GUI
-layout restoration, replace the legacy production pane projection, and then
-run correlated native quiet/loaded interaction plus resize/zoom qualification
-on the named targets without touching a user's live session.
+broader claim: finish the open image/snapshot/application-ACK and executable
+renderer-test topology, activate ordered snapshots fail-closed, complete stable
+GUI layout restoration, replace the legacy production pane projection, and
+then run explicitly isolated correlated native quiet/loaded interaction plus
+resize/zoom qualification on the named targets without touching an operator's
+live session.
 
 ## 20. Primary external references
 

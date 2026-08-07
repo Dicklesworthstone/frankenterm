@@ -883,3 +883,99 @@ pub struct Image {
     /// the image data
     pub image: Arc<ImageData>,
 }
+
+#[cfg(feature = "use_image")]
+impl Image {
+    /// Return the bounded portion of this image change that can affect a
+    /// surface with the supplied cell extents.
+    ///
+    /// Horizontal clipping retains the leftmost source columns because image
+    /// placement does not horizontally scroll. Vertical clipping retains the
+    /// bottommost source rows because an image taller than the viewport scrolls
+    /// its leading rows away. Keeping this transformation next to `Image`
+    /// allows both the surface change journal and direct terminal renderers to
+    /// apply the same bounded geometry before doing work proportional to the
+    /// cell dimensions.
+    pub fn clipped_to_cell_bounds(
+        &self,
+        max_width: usize,
+        max_height: usize,
+    ) -> Option<Self> {
+        if self.width == 0 || self.height == 0 || max_width == 0 || max_height == 0 {
+            return None;
+        }
+
+        let top_left_x = self.top_left.x.into_inner();
+        let top_left_y = self.top_left.y.into_inner();
+        let bottom_right_x = self.bottom_right.x.into_inner();
+        let bottom_right_y = self.bottom_right.y.into_inner();
+        if !top_left_x.is_finite()
+            || !top_left_y.is_finite()
+            || !bottom_right_x.is_finite()
+            || !bottom_right_y.is_finite()
+            || !(0.0..=1.0).contains(&top_left_x)
+            || !(0.0..=1.0).contains(&top_left_y)
+            || !(0.0..=1.0).contains(&bottom_right_x)
+            || !(0.0..=1.0).contains(&bottom_right_y)
+            || top_left_x >= bottom_right_x
+            || top_left_y >= bottom_right_y
+        {
+            return None;
+        }
+
+        let width = self.width.min(max_width);
+        let height = self.height.min(max_height);
+        let skipped_rows = self.height.saturating_sub(height);
+
+        let clipped_right = interpolate_texture_axis(
+            top_left_x,
+            bottom_right_x,
+            width,
+            self.width,
+        )?;
+        let clipped_top = interpolate_texture_axis(
+            top_left_y,
+            bottom_right_y,
+            skipped_rows,
+            self.height,
+        )?;
+
+        // Extremely disproportionate, attacker-controlled cell spans can map
+        // a retained slice below f32 texture-coordinate resolution. Treat that
+        // unrenderable slice as rejected rather than forwarding a huge loop to
+        // another renderer or fabricating a visibly different interval.
+        if top_left_x >= clipped_right || clipped_top >= bottom_right_y {
+            return None;
+        }
+
+        Some(Self {
+            width,
+            height,
+            top_left: TextureCoordinate::new_f32(top_left_x, clipped_top),
+            bottom_right: TextureCoordinate::new_f32(clipped_right, bottom_right_y),
+            image: Arc::clone(&self.image),
+        })
+    }
+}
+
+#[cfg(feature = "use_image")]
+fn interpolate_texture_axis(
+    start: f32,
+    end: f32,
+    numerator: usize,
+    denominator: usize,
+) -> Option<f32> {
+    if denominator == 0 || numerator > denominator {
+        return None;
+    }
+    if numerator == 0 {
+        return Some(start);
+    }
+    if numerator == denominator {
+        return Some(end);
+    }
+
+    let ratio = numerator as f64 / denominator as f64;
+    let value = (f64::from(start) + (f64::from(end) - f64::from(start)) * ratio) as f32;
+    value.is_finite().then_some(value)
+}

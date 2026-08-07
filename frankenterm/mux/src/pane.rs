@@ -19,7 +19,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use termwiz::hyperlink::Rule;
 use termwiz::input::KeyboardEncoding;
-use termwiz::surface::{Line, SequenceNo};
+use termwiz::surface::{Line, SequenceNo, SEQ_ZERO};
 use url::Url;
 
 static PANE_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
@@ -166,6 +166,20 @@ pub struct LogicalLine {
     pub first_row: StableRowIndex,
 }
 
+/// Choose the baseline for an incremental changed-row query. Sequence-domain
+/// regression and sequence exhaustion both require a full query from zero.
+#[must_use]
+pub const fn changed_since_query_baseline(
+    last_observed_source_end: SequenceNo,
+    source_end: SequenceNo,
+) -> SequenceNo {
+    if source_end == SequenceNo::MAX || source_end < last_observed_source_end {
+        SEQ_ZERO
+    } else {
+        last_observed_source_end
+    }
+}
+
 fn stable_row_offset(row: StableRowIndex, offset: usize) -> Option<StableRowIndex> {
     let offset = StableRowIndex::try_from(offset).ok()?;
     row.checked_add(offset)
@@ -175,6 +189,13 @@ fn stable_row_span(row: StableRowIndex, len: usize) -> Option<Range<StableRowInd
     let end = stable_row_offset(row, len)?;
     Some(row..end)
 }
+
+/// Bound used when reconstructing physical rows into a logical line.
+///
+/// Copy-backed panes and remote render caches must use the same limit as the
+/// generic logical-line reconstruction path so that hyperlink normalization
+/// cannot turn a pathological wrapped line into unbounded main-thread work.
+pub const MAX_LOGICAL_LINE_LEN: usize = 1024;
 
 fn logical_len_exceeds_limit(current: usize, additional: usize, limit: usize) -> bool {
     match current.checked_add(additional) {
@@ -363,6 +384,23 @@ pub trait Pane: Downcast + Send + Sync {
         seqno: SequenceNo,
     ) -> RangeSet<StableRowIndex>;
 
+    /// Capture the source sequence, derive a fail-closed query baseline, and
+    /// scan changed rows as one backend observation. The split default is only
+    /// repetition-safe for backends whose sequence domain remains monotonic and
+    /// stable between the two calls. Shared or mutable backends must override
+    /// this method atomically: a sequence-domain regression between the default
+    /// calls can otherwise make the second query miss changed rows.
+    fn get_changed_since_with_source_fence(
+        &self,
+        lines: Range<StableRowIndex>,
+        last_observed_source_end: SequenceNo,
+    ) -> (SequenceNo, RangeSet<StableRowIndex>) {
+        let source_end = self.get_current_seqno();
+        let baseline = changed_since_query_baseline(last_observed_source_end, source_end);
+        let changed = self.get_changed_since(lines, baseline);
+        (source_end, changed)
+    }
+
     /// Returns a set of lines from the scrollback or visible portion of
     /// the display.  The lines are indexed using StableRowIndex, which
     /// can be invalidated if the scrollback is busy, or when switching
@@ -377,6 +415,25 @@ pub trait Pane: Downcast + Send + Sync {
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>);
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines);
+
+    /// Provide one mutable line view after applying the configured implicit
+    /// hyperlink rules.
+    ///
+    /// The default is correct for panes whose logical-line mutation persists:
+    /// apply the rules over complete logical lines, then expose the requested
+    /// physical range. Copy-backed panes should override this method so the
+    /// hyperlink-bearing data and the callback view come from one authoritative
+    /// snapshot rather than mutating and discarding one copy before fetching a
+    /// second.
+    fn with_lines_mut_and_apply_hyperlinks(
+        &self,
+        lines: Range<StableRowIndex>,
+        rules: &[Rule],
+        with_lines: &mut dyn WithPaneLines,
+    ) {
+        self.apply_hyperlinks(lines.clone(), rules);
+        self.with_lines_mut(lines, with_lines);
+    }
 
     fn for_each_logical_line_in_stable_range_mut(
         &self,
@@ -661,7 +718,6 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
     // (such as 1.5MB of json) that we previously wrapped.  We don't want to
     // un-wrap, scan, and re-wrap that thing.
     // This is an imperfect length constraint to partially manage the cost.
-    const MAX_LOGICAL_LINE_LEN: usize = 1024;
     let mut back_len = 0;
 
     // Look backwards to find the start of the first logical line

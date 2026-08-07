@@ -764,6 +764,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn retry_with_backoff<T, E, F>(
     policy: ResizeRetryPolicy,
     mut op: F,
@@ -875,6 +876,21 @@ impl Pane for LocalPane {
         terminal_get_dirty_lines(&mut self.locked_terminal(), lines, seqno)
     }
 
+    fn get_changed_since_with_source_fence(
+        &self,
+        lines: Range<StableRowIndex>,
+        last_observed_source_end: SequenceNo,
+    ) -> (SequenceNo, RangeSet<StableRowIndex>) {
+        let mut terminal = self.locked_terminal();
+        let source_end = terminal.current_seqno();
+        let baseline = crate::pane::changed_since_query_baseline(
+            last_observed_source_end,
+            source_end,
+        );
+        let changed = terminal_get_dirty_lines(&mut terminal, lines, baseline);
+        (source_end, changed)
+    }
+
     fn for_each_logical_line_in_stable_range_mut(
         &self,
         lines: Range<StableRowIndex>,
@@ -889,6 +905,20 @@ impl Pane for LocalPane {
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines) {
         terminal_with_lines_mut(&mut self.locked_terminal(), lines, with_lines)
+    }
+
+    fn with_lines_mut_and_apply_hyperlinks(
+        &self,
+        lines: Range<StableRowIndex>,
+        rules: &[termwiz::hyperlink::Rule],
+        with_lines: &mut dyn WithPaneLines,
+    ) {
+        terminal_with_lines_mut_and_apply_hyperlinks(
+            &mut self.locked_terminal(),
+            lines,
+            rules,
+            with_lines,
+        )
     }
 
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
@@ -1977,10 +2007,11 @@ impl LocalPane {
         };
         let enqueued_at = Instant::now();
 
-        let outcome = match {
+        let enqueue_result = {
             let mut queue = self.resize_queue.lock();
             queue.try_enqueue(size, pty_size, enqueued_at)
-        } {
+        };
+        let outcome = match enqueue_result {
             Ok(outcome) => outcome,
             Err(ResizeEnqueueError::SequenceExhausted) => {
                 metrics::counter!(

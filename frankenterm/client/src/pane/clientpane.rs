@@ -1,4 +1,4 @@
-use crate::client::{RpcConsumerKind, RpcGenerationScope};
+use crate::client::{admit_interactive_rpc_now, RpcConsumerKind, RpcGenerationScope};
 use crate::domain::{lock_or_recover, ClientInner};
 use crate::pane::mousestate::MouseState;
 use crate::pane::renderable::{
@@ -24,6 +24,7 @@ use ratelim::RateLimiter;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
+use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,6 +39,31 @@ use wezterm_term::{
 };
 
 const MAX_RENDER_APPLICATION_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Admit latency-critical input into the exact mux transport generation during
+/// the input callback itself.  Awaiting the reply remains asynchronous, so a
+/// slow or disconnected peer can never park the GUI thread.
+fn dispatch_interactive_rpc<F, T>(request: F, operation: &'static str) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<T>> + 'static,
+    T: 'static,
+{
+    let Some(request) = admit_interactive_rpc_now(request)? else {
+        return Ok(());
+    };
+    promise::spawn::spawn(async move {
+        if let Err(error) = request.await {
+            metrics::counter!(
+                "mux.client.interactive_rpc.detached_error.total",
+                "operation" => operation,
+            )
+            .increment(1);
+            log::debug!("detached interactive mux RPC {operation} failed: {error:#}");
+        }
+    })
+    .detach();
+    Ok(())
+}
 
 fn should_process_unilateral_render_delta(
     current_seqno: SequenceNo,
@@ -616,7 +642,8 @@ fn validate_render_application_resources(
                     RenderApplicationComponent::Hyperlinks
                 }
                 SerializedLinesStructureError::ImageLineMissing
-                | SerializedLinesStructureError::ImageCellOutOfRange => {
+                | SerializedLinesStructureError::ImageCellOutOfRange
+                | SerializedLinesStructureError::ImageTextureCoordinatesInvalid => {
                     RenderApplicationComponent::Images
                 }
                 SerializedLinesStructureError::DuplicateStableRow
@@ -772,6 +799,7 @@ impl ClientPane {
                         reverse_video: false,
                     },
                     title,
+                    alt_screen_active,
                     fetch_limiter,
                     weak_renderable.clone(),
                 )),
@@ -1066,6 +1094,13 @@ impl ClientPane {
 
         match pdu {
             Pdu::GetPaneRenderChangesResponse(mut delta) => {
+                if delta.pane_id != self.remote_pane_id {
+                    bail!(
+                        "unilateral render response pane mismatch: expected {}, got {}",
+                        self.remote_pane_id,
+                        delta.pane_id
+                    );
+                }
                 let mouse_grabbed = delta.mouse_grabbed;
                 let alt_screen_active = delta.alt_screen_active;
                 let current_seqno = registration.try_with_current(|_| {
@@ -1085,26 +1120,34 @@ impl ClientPane {
                 let stale_dispatch_ack = current_seqno > delta.seqno;
 
                 let serialized_bonus_lines = std::mem::take(&mut delta.bonus_lines);
-                let bonus_lines = if stale_dispatch_ack {
+                let (bonus_lines, incomplete_image_rows) = if stale_dispatch_ack {
                     // The surface content is stale and will be rejected below. Do
                     // not spend decompression or image-hydration work on it; the
                     // dispatch serial and sequence fence are the only admissible
                     // information in this reordered response.
-                    Vec::new()
+                    (Vec::new(), Default::default())
                 } else {
-                    hydrate_lines(rpc, delta.pane_id, serialized_bonus_lines).await
+                    hydrate_lines(rpc, delta.pane_id, serialized_bonus_lines)
+                        .await?
+                        .into_parts()
                 };
 
                 let applied = rpc
                     .commit_sync(RpcConsumerKind::PaneUnilateral, || {
                         registration
                             .try_with_current_output(|_| {
-                                let applied = self
-                                    .renderable
-                                    .lock()
-                                    .inner
-                                    .borrow_mut()
-                                    .apply_changes_to_surface(delta, bonus_lines);
+                                let applied = {
+                                    let renderable = self.renderable.lock();
+                                    let mut inner = renderable.inner.borrow_mut();
+                                    let applied =
+                                        inner.apply_changes_to_surface(delta, bonus_lines);
+                                    if applied {
+                                        inner.mark_image_hydration_incomplete_rows(
+                                            &incomplete_image_rows,
+                                        );
+                                    }
+                                    applied
+                                };
                                 if applied {
                                     *self.mouse_grabbed.lock() = mouse_grabbed;
                                     *self.alt_screen_active.lock() = alt_screen_active;
@@ -1346,6 +1389,29 @@ impl Pane for ClientPane {
         mux::pane::impl_with_lines_via_get_lines(self, lines, with_lines);
     }
 
+    fn with_lines_mut_and_apply_hyperlinks(
+        &self,
+        lines: Range<StableRowIndex>,
+        rules: &[termwiz::hyperlink::Rule],
+        with_lines: &mut dyn WithPaneLines,
+    ) {
+        // Rule selection and extraction share one authoritative cache snapshot.
+        // The callback cannot run under the renderable lock because pane
+        // consumers may re-enter pane APIs. Afterward, write back only appdata
+        // from projections whose content still exactly matches the cache; this
+        // preserves remote shape hashes without admitting prediction/overlay
+        // metadata or a stale completion.
+        let renderable = self.renderable.lock();
+        let (first, mut owned_lines) = renderable.get_lines_with_hyperlinks(lines, rules);
+        drop(renderable);
+        let mut line_refs = owned_lines.iter_mut().collect::<Vec<_>>();
+        with_lines.with_lines_mut(first, &mut line_refs);
+        drop(line_refs);
+        self.renderable
+            .lock()
+            .write_back_unchanged_line_appdata(first, &owned_lines);
+    }
+
     fn for_each_logical_line_in_stable_range_mut(
         &self,
         lines: Range<StableRowIndex>,
@@ -1374,6 +1440,16 @@ impl Pane for ClientPane {
         self.renderable.lock().get_changed_since(lines, seqno)
     }
 
+    fn get_changed_since_with_source_fence(
+        &self,
+        lines: Range<StableRowIndex>,
+        last_observed_source_end: SequenceNo,
+    ) -> (SequenceNo, RangeSet<StableRowIndex>) {
+        self.renderable
+            .lock()
+            .get_changed_since_with_source_fence(lines, last_observed_source_end)
+    }
+
     fn set_clipboard(&self, clipboard: &Arc<dyn Clipboard>) {
         self.clipboard.lock().replace(Arc::clone(clipboard));
     }
@@ -1391,19 +1467,16 @@ impl Pane for ClientPane {
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        self.renderable
-            .lock()
-            .inner
-            .borrow_mut()
-            .predict_from_paste(text);
-
         let data = text.to_owned();
         let request = client.client.send_paste(SendPaste {
             pane_id: remote_pane_id,
             data,
         });
-        promise::spawn::spawn(request).detach();
-        self.renderable.lock().inner.borrow_mut().update_last_send();
+        dispatch_interactive_rpc(request, "send_paste")?;
+        let renderable = self.renderable.lock();
+        let mut inner = renderable.inner.borrow_mut();
+        inner.predict_from_paste(text);
+        inner.update_last_send();
         Ok(())
     }
 
@@ -1493,14 +1566,7 @@ impl Pane for ClientPane {
     }
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
-        let input_serial;
-        {
-            let renderable = self.renderable.lock();
-            let mut inner = renderable.inner.borrow_mut();
-            inner.input_serial = InputSerial::now();
-            input_serial = inner.input_serial;
-            inner.predict_from_key_event(key, mods);
-        }
+        let input_serial = InputSerial::now();
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
         let request = client.client.key_down(SendKeyDown {
@@ -1511,8 +1577,12 @@ impl Pane for ClientPane {
             },
             input_serial,
         });
-        promise::spawn::spawn(request).detach();
-        self.renderable.lock().inner.borrow_mut().update_last_send();
+        dispatch_interactive_rpc(request, "key_down")?;
+        let renderable = self.renderable.lock();
+        let mut inner = renderable.inner.borrow_mut();
+        inner.input_serial = input_serial;
+        inner.predict_from_key_event(key, mods);
+        inner.update_last_send();
         Ok(())
     }
 
@@ -1526,7 +1596,7 @@ impl Pane for ClientPane {
                 modifiers: mods,
             },
         });
-        promise::spawn::spawn(request).detach();
+        dispatch_interactive_rpc(request, "key_up")?;
         Ok(())
     }
 
@@ -1670,6 +1740,11 @@ impl Pane for ClientPane {
         });
         promise::spawn::spawn(request).detach();
         self.config.lock().replace(config);
+        // Implicit hyperlink rules are selected by each GUI window when it
+        // borrows lines for rendering. Do not walk the complete remote line
+        // cache here: one pane can be projected through windows with different
+        // rule sets, and the next projection performs the exact lazy epoch
+        // transition under the renderable lock.
     }
 
     fn get_config(&self) -> Option<Arc<dyn TerminalConfiguration>> {
@@ -1692,17 +1767,17 @@ impl std::io::Write for PaneWriter {
         // the ENTIRE GUI — every pane stopped rendering and no other domain was
         // serviced (a head-of-line block; visible in profiles as the main thread in
         // `__psynch_cvwait`/`semaphore_wait`). Mirror the non-blocking sibling input
-        // methods (`key_down`, `send_paste`, `resize`): fire-and-forget on the
-        // runtime and report the bytes as accepted. Ordering is preserved — spawned
-        // tasks run FIFO on the main-thread spawn queue and each enqueues its PDU
-        // into the ordered channel before its first await, exactly as `key_down`
-        // already relies on.
+        // methods (`key_down` and `send_paste`): synchronously perform only the
+        // bounded, non-blocking exact-generation admission, then await the reply
+        // asynchronously.  That preserves input ordering without making admission
+        // wait behind unrelated executor work, and reports an already-retired or
+        // unavailable transport to the caller instead of silently losing input.
         let client = Arc::clone(&self.client);
         let pane_id = self.remote_pane_id;
         let data = data.to_vec();
         let len = data.len();
         let request = client.client.write_to_pane(WriteToPane { pane_id, data });
-        promise::spawn::spawn(request).detach();
+        dispatch_interactive_rpc(request, "write_to_pane").map_err(std::io::Error::other)?;
         Ok(len)
     }
 
@@ -1791,6 +1866,19 @@ mod tests {
         pane.prepare_render_application_bootstrap(&inner.client.rpc_scope())
             .expect("test pane should prepare its committed render connection");
         pane
+    }
+
+    #[test]
+    fn rejected_interactive_input_does_not_publish_local_prediction_authority() {
+        let inner = test_client_inner(17);
+        let pane = test_client_pane(&inner, 40, 29);
+        let before = pane.renderable.lock().inner.borrow().input_serial;
+
+        pane.key_down(KeyCode::Char('x'), KeyModifiers::NONE)
+            .expect_err("closed test transport must reject input during exact admission");
+
+        let after = pane.renderable.lock().inner.borrow().input_serial;
+        assert_eq!(after, before, "rejected input must not advance prediction authority");
     }
 
     fn test_render_application_update(

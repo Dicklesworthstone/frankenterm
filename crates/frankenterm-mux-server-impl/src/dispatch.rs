@@ -12642,9 +12642,6 @@ mod tests {
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum GeneratedMuxNotification {
         Empty,
-        PaneRemoved {
-            pane_id: usize,
-        },
         AlertPaletteChanged {
             pane_id: usize,
         },
@@ -12680,7 +12677,6 @@ mod tests {
         fn into_notification(self) -> MuxNotification {
             match self {
                 Self::Empty => MuxNotification::Empty,
-                Self::PaneRemoved { pane_id } => MuxNotification::PaneRemoved(pane_id),
                 Self::AlertPaletteChanged { pane_id } => MuxNotification::Alert {
                     pane_id,
                     alert: Alert::PaletteChanged,
@@ -13143,7 +13139,6 @@ mod tests {
         let label = "[a-zA-Z0-9 _./-]{0,48}";
         prop_oneof![
             Just(GeneratedMuxNotification::Empty),
-            (0usize..4096).prop_map(|pane_id| GeneratedMuxNotification::PaneRemoved { pane_id }),
             (0usize..4096)
                 .prop_map(|pane_id| GeneratedMuxNotification::AlertPaletteChanged { pane_id }),
             (0usize..4096).prop_map(|pane_id| GeneratedMuxNotification::AlertBell { pane_id }),

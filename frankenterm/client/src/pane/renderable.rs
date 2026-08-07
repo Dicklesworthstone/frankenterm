@@ -4,6 +4,7 @@ use codec::*;
 use config::{configuration, ConfigHandle};
 use futures::future::{select, Either};
 use futures::pin_mut;
+use futures::stream::{self, StreamExt};
 use lru::LruCache;
 use mux::pane::PaneId;
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
@@ -14,14 +15,18 @@ use ratelim::RateLimiter;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 use termwiz::cell::{Cell, CellAttributes, Underline};
 use termwiz::color::AnsiColor;
-use termwiz::image::{ImageCell, ImageData};
+use termwiz::hyperlink::Rule;
+use termwiz::image::{
+    ImageCell, ImageData, ImageDataValidationError, ImageDataValidationLimits,
+};
 use termwiz::surface::{SequenceNo, SEQ_ZERO};
 use url::Url;
 use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
@@ -163,14 +168,41 @@ impl LineEntry {
     }
 }
 
+fn fresh_cached_line(entry: Option<&LineEntry>) -> Option<&Line> {
+    match entry {
+        Some(LineEntry::Line(line)) => Some(line),
+        Some(
+            LineEntry::Fetching(_)
+            | LineEntry::LineAndFetching(_, _)
+            | LineEntry::Stale(_),
+        )
+        | None => None,
+    }
+}
+
+fn hyperlink_rules_equal(left: &[Rule], right: &[Rule]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.highlight == right.highlight
+                && left.format == right.format
+                && left.regex.as_str() == right.regex.as_str()
+        })
+}
+
 fn rebuild_cache_as_stale(lines: &mut LruCache<StableRowIndex, LineEntry>, capacity: NonZeroUsize) {
     let mut stale_lines = LruCache::new(capacity);
     while let Some((stable_row, entry)) = lines.pop_lru() {
         let entry = match entry {
-            LineEntry::Stale(old) | LineEntry::Line(old) => LineEntry::Stale(old),
-            entry => entry,
+            LineEntry::Stale(old)
+            | LineEntry::Line(old)
+            | LineEntry::LineAndFetching(old, _) => Some(LineEntry::Stale(old)),
+            // A geometry epoch change invalidates the request identity. A late
+            // old-width completion must find no matching token and be dropped.
+            LineEntry::Fetching(_) => None,
         };
-        stale_lines.put(stable_row, entry);
+        if let Some(entry) = entry {
+            stale_lines.put(stable_row, entry);
+        }
     }
     *lines = stale_lines;
 }
@@ -373,6 +405,12 @@ pub struct RenderableInner {
     pub working_dir: Option<Url>,
     pub seqno: SequenceNo,
 
+    /// Exact rules used for the persisted implicit links in `lines`. GUI
+    /// windows can supply different rule sets for the same remote pane, so this
+    /// cannot be inferred from process-global configuration. Comparing these
+    /// borrowed fields avoids allocating a signature on every paint.
+    implicit_hyperlink_rules: Vec<Rule>,
+
     fetch_limiter: RateLimiter,
 
     last_send_time: Instant,
@@ -431,6 +469,7 @@ impl RenderableInner {
         binding: RenderablePaneBinding,
         dimensions: RenderableDimensions,
         title: &str,
+        alt_screen_active: bool,
         fetch_limiter: RateLimiter,
         renderable: Weak<parking_lot::Mutex<RenderableState>>,
     ) -> Self {
@@ -467,8 +506,9 @@ impl RenderableInner {
             last_input_rtt: 0,
             input_serial: InputSerial::empty(),
             seqno: SEQ_ZERO,
+            implicit_hyperlink_rules: config.hyperlink_rules.clone(),
             predictions: Vec::new(),
-            alt_screen_active: false,
+            alt_screen_active,
             prediction_score: 0,
             last_prediction_miss: now,
         }
@@ -936,7 +976,13 @@ impl RenderableInner {
             );
             return false;
         }
-        if authoritative_snapshot {
+        let alt_screen_changed = self.alt_screen_active != delta.alt_screen_active;
+        if authoritative_snapshot || alt_screen_changed {
+            // Stable row coordinates belong to the active screen epoch. Never
+            // combine cached main-screen rows with an alternate-screen delta
+            // (or vice versa), and never carry a speculative main-screen glyph
+            // into a full-screen application that deliberately suppresses local
+            // prediction.
             self.lines.clear();
             reset_prediction_state(&mut self.predictions, &mut self.prediction_score);
             self.last_prediction_miss = now;
@@ -1000,12 +1046,15 @@ impl RenderableInner {
         );
         self.seqno = delta.seqno;
 
-        let config = configuration();
+        let mut hyperlink_rows = Vec::with_capacity(bonus_lines.len());
         for (stable_row, line) in bonus_lines {
             log::trace!("bonus line {} seqno={}", stable_row, line.current_seqno());
-            self.put_line(stable_row, line, &config, None);
+            if self.put_line(stable_row, line, None) {
+                hyperlink_rows.push(stable_row);
+            }
             dirty.remove(stable_row);
         }
+        self.normalize_current_implicit_hyperlinks_for_rows(hyperlink_rows);
 
         let mut to_fetch = RangeSet::new();
         let mut fetch_token = None;
@@ -1085,14 +1134,243 @@ impl RenderableInner {
         }
     }
 
+    /// Release only the reservations created by one exact line-fetch request.
+    /// A response may omit rows and an RPC may fail after an old line was kept
+    /// visible; those rows must remain stale rather than being promoted back to
+    /// fresh merely because the in-flight marker is gone.
+    fn release_exact_fetch_reservations(
+        &mut self,
+        requested: &RangeSet<StableRowIndex>,
+        fetch_token: &FetchToken,
+    ) {
+        for range in requested.iter() {
+            for stable_row in range.clone() {
+                let replacement = match self.lines.pop(&stable_row) {
+                    Some(LineEntry::Fetching(current))
+                        if fetch_token.same_request(&current) =>
+                    {
+                        None
+                    }
+                    Some(LineEntry::LineAndFetching(line, current))
+                        if fetch_token.same_request(&current) =>
+                    {
+                        Some(LineEntry::Stale(line))
+                    }
+                    other => other,
+                };
+                if let Some(entry) = replacement {
+                    self.lines.put(stable_row, entry);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn mark_image_hydration_incomplete_rows(
+        &mut self,
+        incomplete_rows: &HashSet<StableRowIndex>,
+    ) {
+        for stable_row in incomplete_rows {
+            self.make_stale(*stable_row);
+        }
+    }
+
+    /// Resolve the complete fresh logical line containing `stable_row`.
+    ///
+    /// Hyperlink matching must fail closed when a boundary row is absent or
+    /// stale. Scanning a partial wrapped line can manufacture a truncated URI
+    /// and, once marked scanned, prevent the completed line from being
+    /// reconsidered. Both the cell and physical-row limits bound adversarial
+    /// chains of empty or extremely long wrapped rows.
+    fn complete_cached_logical_group(
+        &self,
+        stable_row: StableRowIndex,
+    ) -> Option<Range<StableRowIndex>> {
+        if stable_row < self.dimensions.scrollback_top {
+            return None;
+        }
+        fresh_cached_line(self.lines.peek(&stable_row))?;
+
+        let mut start = stable_row;
+        let mut backward_rows = 0usize;
+        while start > self.dimensions.scrollback_top {
+            let prior_row = start.checked_sub(1)?;
+            let prior = fresh_cached_line(self.lines.peek(&prior_row))?;
+            if !prior.last_cell_was_wrapped() {
+                break;
+            }
+            backward_rows = backward_rows.checked_add(1)?;
+            if backward_rows > mux::pane::MAX_LOGICAL_LINE_LEN {
+                return None;
+            }
+            start = prior_row;
+        }
+
+        let mut row = start;
+        let mut physical_rows = 0usize;
+        let mut cells = 0usize;
+        loop {
+            let line = fresh_cached_line(self.lines.peek(&row))?;
+            physical_rows = physical_rows.checked_add(1)?;
+            cells = cells.checked_add(line.len())?;
+            if physical_rows > mux::pane::MAX_LOGICAL_LINE_LEN
+                || (physical_rows > 1 && cells > mux::pane::MAX_LOGICAL_LINE_LEN)
+            {
+                return None;
+            }
+
+            let end = row.checked_add(1)?;
+            if !line.last_cell_was_wrapped() {
+                return Some(start..end);
+            }
+            row = end;
+        }
+    }
+
+    fn normalize_cached_logical_group(
+        &mut self,
+        group: Range<StableRowIndex>,
+        rules: &[Rule],
+    ) -> bool {
+        let mut extracted = Vec::new();
+        for stable_row in group.clone() {
+            match self.lines.pop(&stable_row) {
+                Some(LineEntry::Line(line)) => extracted.push((stable_row, line)),
+                Some(entry) => {
+                    self.lines.put(stable_row, entry);
+                    for (row, line) in extracted {
+                        self.lines.put(row, LineEntry::Line(line));
+                    }
+                    return false;
+                }
+                None => {
+                    for (row, line) in extracted {
+                        self.lines.put(row, LineEntry::Line(line));
+                    }
+                    return false;
+                }
+            }
+        }
+
+        let mut line_refs: Vec<&mut Line> =
+            extracted.iter_mut().map(|(_, line)| line).collect();
+        Line::apply_hyperlink_rules(rules, &mut line_refs);
+        drop(line_refs);
+
+        for (stable_row, line) in extracted {
+            self.lines.put(stable_row, LineEntry::Line(line));
+        }
+        true
+    }
+
+    /// Select the exact rule set for this cache epoch. Switching rule sets is
+    /// rare but must invalidate every cached representation before any group is
+    /// rescanned; otherwise rows outside the immediate paint range can retain
+    /// links produced by a different window's configuration.
+    fn select_implicit_hyperlink_rules(&mut self, rules: &[Rule]) -> bool {
+        if hyperlink_rules_equal(&self.implicit_hyperlink_rules, rules) {
+            return false;
+        }
+
+        let stable_rows = self
+            .lines
+            .iter()
+            .map(|(stable_row, _)| *stable_row)
+            .collect::<Vec<_>>();
+        for stable_row in stable_rows {
+            let Some(entry) = self.lines.get_mut(&stable_row) else {
+                continue;
+            };
+            let line = match entry {
+                LineEntry::Line(line)
+                | LineEntry::LineAndFetching(line, _)
+                | LineEntry::Stale(line) => line,
+                LineEntry::Fetching(_) => continue,
+            };
+            let seqno = line.current_seqno();
+            line.invalidate_implicit_hyperlinks(seqno);
+        }
+        self.implicit_hyperlink_rules = rules.to_vec();
+        true
+    }
+
+    fn normalize_implicit_hyperlinks_for_rows(
+        &mut self,
+        touched_rows: impl IntoIterator<Item = StableRowIndex>,
+        rules: &[Rule],
+    ) {
+        if rules.is_empty() {
+            return;
+        }
+        let mut seen = HashSet::new();
+        let mut groups = Vec::new();
+        for stable_row in touched_rows {
+            // Complete logical groups are normalized as a unit. Once a fresh
+            // touched row is marked scanned for the selected rule epoch,
+            // rediscovering both wrapped boundaries on every unchanged paint
+            // is pure allocation and LRU churn.
+            let Some(line) = fresh_cached_line(self.lines.peek(&stable_row)) else {
+                continue;
+            };
+            if line.implicit_hyperlinks_are_scanned() {
+                continue;
+            }
+            let Some(group) = self.complete_cached_logical_group(stable_row) else {
+                continue;
+            };
+            if seen.insert((group.start, group.end)) {
+                groups.push(group);
+            }
+        }
+        groups.sort_unstable_by_key(|group| group.start);
+        for group in groups {
+            let _ = self.normalize_cached_logical_group(group, rules);
+        }
+    }
+
+    fn normalize_all_implicit_hyperlinks(&mut self, rules: &[Rule]) {
+        let stable_rows = self
+            .lines
+            .iter()
+            .filter_map(|(stable_row, entry)| {
+                matches!(entry, LineEntry::Line(_)).then_some(*stable_row)
+            })
+            .collect::<Vec<_>>();
+        self.normalize_implicit_hyperlinks_for_rows(stable_rows, rules);
+    }
+
+    fn normalize_implicit_hyperlinks_for_request(
+        &mut self,
+        touched_rows: impl IntoIterator<Item = StableRowIndex>,
+        rules: &[Rule],
+    ) {
+        if self.select_implicit_hyperlink_rules(rules) {
+            self.normalize_all_implicit_hyperlinks(rules);
+        } else {
+            self.normalize_implicit_hyperlinks_for_rows(touched_rows, rules);
+        }
+    }
+
+    fn normalize_current_implicit_hyperlinks_for_rows(
+        &mut self,
+        touched_rows: impl IntoIterator<Item = StableRowIndex>,
+    ) {
+        let rules = self.implicit_hyperlink_rules.clone();
+        self.normalize_implicit_hyperlinks_for_rows(touched_rows, &rules);
+    }
+
     fn put_line(
         &mut self,
         stable_row: StableRowIndex,
         mut line: Line,
-        config: &ConfigHandle,
         fetch_token: Option<&FetchToken>,
-    ) {
-        line.scan_and_create_hyperlinks(&config.hyperlink_rules);
+    ) -> bool {
+        // The remote endpoint may have scanned this physical row under a
+        // different rule set. Preserve explicit OSC-8 links, but clear all
+        // implicit state until the complete logical group is present locally.
+        // Scanning one physical fragment eagerly can create a clickable but
+        // truncated URL and gives the fragment a false "already scanned" bit.
+        let seqno = line.current_seqno();
+        line.invalidate_implicit_hyperlinks(seqno);
 
         let entry = if let Some(fetch_token) = fetch_token {
             // If we're completing a fetch, only replace entries that were
@@ -1123,14 +1401,15 @@ impl RenderableInner {
                         fetch_token.started_at()
                     );
                     self.lines.put(stable_row, e);
-                    return;
+                    return false;
                 }
-                None => return,
+                None => return false,
             }
         } else {
             LineEntry::Line(line)
         };
         self.lines.put(stable_row, entry);
+        true
     }
 
     fn schedule_fetch_lines(
@@ -1138,7 +1417,11 @@ impl RenderableInner {
         to_fetch: RangeSet<StableRowIndex>,
         fetch_token: FetchToken,
     ) {
-        if to_fetch.is_empty() || self.dead {
+        if to_fetch.is_empty() {
+            return;
+        }
+        if self.dead {
+            self.release_exact_fetch_reservations(&to_fetch, &fetch_token);
             return;
         }
 
@@ -1178,10 +1461,13 @@ impl RenderableInner {
             let result = request.await;
 
             let result = match result {
-                Ok(result) => {
-                    let lines = hydrate_lines(&rpc, remote_pane_id, result.lines).await;
-                    Ok(lines)
+                Ok(result) if result.pane_id == remote_pane_id => {
+                    hydrate_lines(&rpc, remote_pane_id, result.lines).await
                 }
+                Ok(result) => Err(anyhow::anyhow!(
+                    "GetLines response pane mismatch: expected {remote_pane_id}, got {}",
+                    result.pane_id
+                )),
                 Err(err) => Err(err),
             };
             Self::apply_lines(
@@ -1202,7 +1488,7 @@ impl RenderableInner {
         renderable: Arc<parking_lot::Mutex<RenderableState>>,
         local_pane_id: PaneId,
         rpc: RpcGenerationScope,
-        result: anyhow::Result<Vec<(StableRowIndex, Line)>>,
+        result: anyhow::Result<HydratedLines>,
         to_fetch: RangeSet<StableRowIndex>,
         fetch_token: FetchToken,
     ) -> anyhow::Result<()> {
@@ -1211,58 +1497,56 @@ impl RenderableInner {
         // request. Pointer identity, rather than timestamp equality, prevents a
         // stale G1 completion from clearing a successor request that happened
         // to start at the same clock instant.
-        let clear_exact_fetch_markers = || {
+        let release_exact_fetch_reservations = || {
             registration.try_with_current_output(|_| {
                 let renderable = renderable.lock();
                 let mut inner = renderable.inner.borrow_mut();
-                for range in to_fetch.iter() {
-                    for stable_row in range.clone() {
-                        let entry = match inner.lines.pop(&stable_row) {
-                            Some(LineEntry::Fetching(current))
-                                if fetch_token.same_request(&current) =>
-                            {
-                                continue;
-                            }
-                            Some(LineEntry::LineAndFetching(line, current))
-                                if fetch_token.same_request(&current) =>
-                            {
-                                LineEntry::Line(line)
-                            }
-                            Some(entry) => entry,
-                            None => continue,
-                        };
-                        inner.lines.put(stable_row, entry);
-                    }
-                }
+                inner.release_exact_fetch_reservations(&to_fetch, &fetch_token);
             })
         };
 
         let applied = match result {
-            Ok(lines) => match rpc.commit_sync(RpcConsumerKind::FetchedLines, || {
+            Ok(hydrated) => match rpc.commit_sync(RpcConsumerKind::FetchedLines, || {
                 registration.try_with_current_output(|_| {
                     let renderable = renderable.lock();
                     let mut inner = renderable.inner.borrow_mut();
-                    let config = configuration();
-
+                    let (lines, incomplete_rows) = hydrated.into_parts();
                     log::trace!(
                         "fetch complete for {:?} at {:?}",
                         to_fetch,
                         fetch_token.started_at()
                     );
+                    let mut hyperlink_rows = Vec::with_capacity(lines.len());
                     for (stable_row, line) in lines.into_iter() {
-                        inner.put_line(stable_row, line, &config, Some(&fetch_token));
+                        if incomplete_rows.contains(&stable_row) {
+                            // Image-bearing lines are a row-level transaction.
+                            // Keep a previously complete row visible while the
+                            // replacement is incomplete; publishing a text-only
+                            // or partial z-stack causes flicker and can expose a
+                            // composition that never existed on the server.
+                            inner.make_stale(stable_row);
+                            continue;
+                        }
+                        if inner.put_line(stable_row, line, Some(&fetch_token)) {
+                            hyperlink_rows.push(stable_row);
+                        }
                     }
+                    // A successful response is still allowed to be partial.
+                    // Sweep exact markers after applying returned rows so an
+                    // omitted row cannot remain Fetching forever.
+                    inner.release_exact_fetch_reservations(&to_fetch, &fetch_token);
+                    inner.normalize_current_implicit_hyperlinks_for_rows(hyperlink_rows);
                 })
             }) {
                 Ok(applied) => applied,
                 Err(error) => {
-                    let _ = clear_exact_fetch_markers();
+                    let _ = release_exact_fetch_reservations();
                     return Err(anyhow::Error::new(error));
                 }
             },
             Err(err) => {
                 log::error!("get_lines failed: {}", err);
-                clear_exact_fetch_markers()
+                release_exact_fetch_reservations()
             }
         };
         if applied.is_none() {
@@ -1327,7 +1611,13 @@ impl RenderableInner {
                 );
             }
             let alive = match response {
-                Ok(response) => response.is_alive,
+                Ok(response) if response.pane_id == remote_pane_id => response.is_alive,
+                Ok(response) => {
+                    return Err(anyhow::anyhow!(
+                        "liveness response pane mismatch: expected {remote_pane_id}, got {}",
+                        response.pane_id
+                    ));
+                }
                 // Preserve the established liveness policy: a transient
                 // transport failure cannot declare a reconnectable pane dead,
                 // while a non-reconnectable pane has no successor that could
@@ -1360,16 +1650,61 @@ impl RenderableInner {
 
 const IMAGE_LRU_MAX_ENTRIES: usize = 128;
 const IMAGE_LRU_MAX_BYTES: usize = 256 * 1024 * 1024;
+const MAX_ORDINARY_IMAGE_BATCH_BYTES: usize = MAX_IMAGE_HYDRATION_DECODED_BYTES;
+const MAX_ENCODED_IMAGE_BYTES: usize = MAX_IMAGE_HYDRATION_DECODED_BYTES;
+const MAX_CONCURRENT_IMAGE_HYDRATIONS: usize = 8;
+const MAX_IMAGE_LOCATOR_ATTEMPTS_PER_REVISION: usize = 8;
+const MAX_IMAGE_VALIDATION_WORKERS: usize = 2;
+const MAX_PENDING_IMAGE_VALIDATIONS: usize = 8;
+const MAX_DECODED_IMAGE_FRAMES: usize = 4_096;
+const MAX_RENDERABLE_IMAGE_AXIS: u32 = 16_384;
+const ORDINARY_IMAGE_HYDRATION_TIMEOUT: Duration = Duration::from_secs(2);
+// One admitted hydration can temporarily retain the compressed frame, its
+// decompressed typed response, and a canonical decoded pixel replacement.
+// Reserve that full worst-case lifetime before issuing the RPC. Keeping a
+// single global slot prevents multiple panes from multiplying 65 MiB replies
+// on the connection reader and bounds damage until image transfer moves to a
+// cancellable out-of-band channel.
+const IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES: usize =
+    MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES * 2
+        + MAX_IMAGE_HYDRATION_DECODED_BYTES;
+const MAX_GLOBAL_IMAGE_HYDRATION_WORKING_SET_BYTES: usize =
+    IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES;
+
+type ImageCacheKey = (RenderConnectionIdentity, PaneId, [u8; 32]);
+
+#[derive(Clone, Debug)]
+struct ValidatedImageData {
+    data: Arc<ImageData>,
+    decoded_bytes: usize,
+    source_revision: [u8; 32],
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ImageValidationFailure {
+    #[error(transparent)]
+    Invalid(ImageDataValidationError),
+    #[error("image validation unavailable: {0}")]
+    Unavailable(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CachedImageFailure {
+    Permanent,
+    Transient { retry_after: Instant },
+}
 
 #[derive(Debug)]
-struct CachedImageData {
-    data: Arc<ImageData>,
-    bytes: usize,
+enum ImageHydrationAttempt {
+    Validated(ValidatedImageData),
+    PermanentFailure,
+    TransientFailure,
 }
 
 #[derive(Debug)]
 struct ImageLru {
-    cache: LruCache<[u8; 32], CachedImageData>,
+    cache: LruCache<ImageCacheKey, ValidatedImageData>,
+    failures: LruCache<ImageCacheKey, CachedImageFailure>,
     retained_bytes: usize,
     max_bytes: usize,
 }
@@ -1378,31 +1713,136 @@ impl ImageLru {
     fn new(max_entries: NonZeroUsize, max_bytes: usize) -> Self {
         Self {
             cache: LruCache::new(max_entries),
+            failures: LruCache::new(max_entries),
             retained_bytes: 0,
             max_bytes,
         }
     }
 
-    fn get(&mut self, hash: &[u8; 32]) -> Option<Arc<ImageData>> {
-        self.cache.get(hash).map(|cached| Arc::clone(&cached.data))
+    #[cfg(test)]
+    fn get(
+        &mut self,
+        connection: RenderConnectionIdentity,
+        pane_id: PaneId,
+        hash: &[u8; 32],
+    ) -> Option<ValidatedImageData> {
+        let key = (connection, pane_id, *hash);
+        let is_current = self
+            .cache
+            .peek(&key)
+            .is_some_and(|validated| validated.data.current_content_hash() == *hash);
+        if !is_current {
+            if let Some(stale) = self.cache.pop(&key) {
+                self.retained_bytes = self
+                    .retained_bytes
+                    .saturating_sub(stale.decoded_bytes);
+            }
+            return None;
+        }
+        self.cache.get(&key).cloned()
     }
 
-    fn put(&mut self, data: Arc<ImageData>) {
-        let hash = data.hash();
-        if let Some(old) = self.cache.pop(&hash) {
-            self.retained_bytes = self.retained_bytes.saturating_sub(old.bytes);
-        }
+    fn get_candidate(
+        &mut self,
+        connection: RenderConnectionIdentity,
+        pane_id: PaneId,
+        hash: &[u8; 32],
+    ) -> Option<ValidatedImageData> {
+        self.cache.get(&(connection, pane_id, *hash)).cloned()
+    }
 
-        let bytes = data.len();
-        if bytes > self.max_bytes {
+    fn remove_candidate_if_same(
+        &mut self,
+        connection: RenderConnectionIdentity,
+        pane_id: PaneId,
+        hash: [u8; 32],
+        candidate: &ValidatedImageData,
+    ) {
+        let key = (connection, pane_id, hash);
+        let is_same = self.cache.peek(&key).is_some_and(|current| {
+            current.source_revision == candidate.source_revision
+                && Arc::ptr_eq(&current.data, &candidate.data)
+        });
+        if is_same {
+            if let Some(stale) = self.cache.pop(&key) {
+                self.retained_bytes = self
+                    .retained_bytes
+                    .saturating_sub(stale.decoded_bytes);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn put(
+        &mut self,
+        connection: RenderConnectionIdentity,
+        pane_id: PaneId,
+        validated: ValidatedImageData,
+    ) {
+        if validated.decoded_bytes > self.max_bytes
+            || validated.data.current_content_hash() != validated.source_revision
+        {
             return;
         }
+        self.put_trusted(connection, pane_id, validated);
+    }
 
-        if let Some((_, old)) = self.cache.push(hash, CachedImageData { data, bytes }) {
-            self.retained_bytes = self.retained_bytes.saturating_sub(old.bytes);
+    fn put_trusted(
+        &mut self,
+        connection: RenderConnectionIdentity,
+        pane_id: PaneId,
+        validated: ValidatedImageData,
+    ) {
+        if validated.decoded_bytes > self.max_bytes {
+            return;
         }
-        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        let key = (connection, pane_id, validated.source_revision);
+        self.failures.pop(&key);
+        if let Some(old) = self.cache.pop(&key) {
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_sub(old.decoded_bytes);
+        }
+
+        let decoded_bytes = validated.decoded_bytes;
+        if let Some((_, old)) = self.cache.push(key, validated) {
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_sub(old.decoded_bytes);
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(decoded_bytes);
         self.enforce_byte_budget();
+    }
+
+    fn get_failure(
+        &mut self,
+        connection: RenderConnectionIdentity,
+        pane_id: PaneId,
+        revision: &[u8; 32],
+        now: Instant,
+    ) -> Option<CachedImageFailure> {
+        let key = (connection, pane_id, *revision);
+        let failure = self.failures.get(&key).copied()?;
+        if matches!(failure, CachedImageFailure::Transient { retry_after } if retry_after <= now) {
+            self.failures.pop(&key);
+            None
+        } else {
+            Some(failure)
+        }
+    }
+
+    fn record_failure(
+        &mut self,
+        connection: RenderConnectionIdentity,
+        pane_id: PaneId,
+        revision: [u8; 32],
+        failure: CachedImageFailure,
+    ) {
+        let key = (connection, pane_id, revision);
+        if self.cache.contains(&key) {
+            return;
+        }
+        self.failures.push(key, failure);
     }
 
     fn enforce_byte_budget(&mut self) {
@@ -1411,7 +1851,9 @@ impl ImageLru {
                 self.retained_bytes = 0;
                 break;
             };
-            self.retained_bytes = self.retained_bytes.saturating_sub(old.bytes);
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_sub(old.decoded_bytes);
         }
     }
 
@@ -1431,89 +1873,623 @@ lazy_static::lazy_static! {
         NonZeroUsize::new(IMAGE_LRU_MAX_ENTRIES).unwrap(),
         IMAGE_LRU_MAX_BYTES,
     ));
+    static ref IMAGE_VALIDATION_POOL: Result<rayon::ThreadPool, String> =
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(MAX_IMAGE_VALIDATION_WORKERS)
+            .thread_name(|index| format!("ft-image-validation-{index}"))
+            .build()
+            .map_err(|error| error.to_string());
+}
+
+static IMAGE_VALIDATION_JOBS: AtomicUsize = AtomicUsize::new(0);
+static IMAGE_HYDRATION_RESERVED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+struct ImageHydrationBytePermit {
+    bytes: usize,
+}
+
+impl ImageHydrationBytePermit {
+    fn try_acquire(bytes: usize) -> Option<Self> {
+        IMAGE_HYDRATION_RESERVED_BYTES
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                let next = reserved.checked_add(bytes)?;
+                (next <= MAX_GLOBAL_IMAGE_HYDRATION_WORKING_SET_BYTES).then_some(next)
+            })
+            .ok()
+            .map(|_| Self { bytes })
+    }
+}
+
+impl Drop for ImageHydrationBytePermit {
+    fn drop(&mut self) {
+        let prior = IMAGE_HYDRATION_RESERVED_BYTES.fetch_sub(self.bytes, Ordering::AcqRel);
+        debug_assert!(prior >= self.bytes);
+    }
+}
+
+struct ImageValidationJobPermit;
+
+impl ImageValidationJobPermit {
+    fn try_acquire() -> Option<Self> {
+        IMAGE_VALIDATION_JOBS
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_PENDING_IMAGE_VALIDATIONS).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for ImageValidationJobPermit {
+    fn drop(&mut self) {
+        let prior = IMAGE_VALIDATION_JOBS.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prior > 0);
+    }
+}
+
+struct CancelImageValidationOnDrop {
+    cancelled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl CancelImageValidationOnDrop {
+    fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelImageValidationOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
 }
 
 fn lock_image_lru() -> MutexGuard<'static, ImageLru> {
     IMAGE_LRU.lock().unwrap_or_else(|poisoned| {
         log::warn!("recovering poisoned client image cache lock");
+        IMAGE_LRU.clear_poison();
         poisoned.into_inner()
     })
+}
+
+fn get_cached_validated_image(
+    connection: RenderConnectionIdentity,
+    pane_id: PaneId,
+    hash: &[u8; 32],
+) -> Option<ValidatedImageData> {
+    let candidate = {
+        let mut cache = lock_image_lru();
+        cache.get_candidate(connection, pane_id, hash)?
+    };
+    if candidate.data.current_content_hash() == *hash {
+        return Some(candidate);
+    }
+
+    // Hashing a mutable payload can scan tens of MiB. It deliberately occurs
+    // outside the global LRU mutex; remove only the exact candidate observed
+    // before hashing so a concurrent replacement cannot be evicted.
+    lock_image_lru().remove_candidate_if_same(connection, pane_id, *hash, &candidate);
+    None
+}
+
+fn put_cached_validated_image(
+    connection: RenderConnectionIdentity,
+    pane_id: PaneId,
+    validated: ValidatedImageData,
+) -> bool {
+    if validated.data.current_content_hash() != validated.source_revision {
+        return false;
+    }
+    lock_image_lru().put_trusted(connection, pane_id, validated);
+    true
+}
+
+fn record_image_hydration_rejection(reason: &'static str) {
+    metrics::counter!(
+        "mux.client.image_hydration.rejected.total",
+        "reason" => reason
+    )
+    .increment(1);
+}
+
+fn push_image_locator(
+    requests: &mut Vec<([u8; 32], Vec<GetImageCell>)>,
+    request_indices: &mut HashMap<[u8; 32], usize>,
+    hash: [u8; 32],
+    request: GetImageCell,
+) {
+    if let Some(index) = request_indices.get(&hash).copied() {
+        let locators = &mut requests[index].1;
+        if locators.len() < MAX_IMAGE_LOCATOR_ATTEMPTS_PER_REVISION {
+            locators.push(request);
+        } else {
+            record_image_hydration_rejection("locator_attempt_limit");
+        }
+        return;
+    }
+
+    request_indices.insert(hash, requests.len());
+    requests.push((hash, vec![request]));
+}
+
+fn rows_requiring_image_retry(
+    unavailable_rows: &HashSet<StableRowIndex>,
+    rows_with_permanent_failure: &HashSet<StableRowIndex>,
+) -> HashSet<StableRowIndex> {
+    // Row publication is atomic. If any layer is permanently malformed, the
+    // server composition can never be reconstructed exactly, so settle that
+    // entire row to its text-only fallback even when another layer on the same
+    // row failed transiently. Rows with only transient failures retain their
+    // prior complete cache entry and retry later.
+    unavailable_rows
+        .difference(rows_with_permanent_failure)
+        .copied()
+        .collect()
+}
+
+async fn await_image_work_until<F>(future: F, deadline: Instant) -> Option<F::Output>
+where
+    F: Future,
+{
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    if remaining.is_zero() {
+        return None;
+    }
+    let timeout = async move {
+        promise::spawn::sleep(remaining).await;
+    };
+    pin_mut!(future);
+    pin_mut!(timeout);
+    match select(future, timeout).await {
+        Either::Left((output, _)) => Some(output),
+        Either::Right(((), _)) => None,
+    }
+}
+
+async fn acquire_image_hydration_bytes_until(
+    deadline: Instant,
+) -> Option<ImageHydrationBytePermit> {
+    loop {
+        if let Some(permit) = ImageHydrationBytePermit::try_acquire(
+            IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES,
+        ) {
+            return Some(permit);
+        }
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        if remaining.is_zero() {
+            return None;
+        }
+        promise::spawn::sleep(remaining.min(Duration::from_millis(2))).await;
+    }
+}
+
+async fn validate_image_off_main_thread(
+    data: Arc<ImageData>,
+    expected_revision: [u8; 32],
+    limits: ImageDataValidationLimits,
+) -> Result<ValidatedImageData, ImageValidationFailure> {
+    let pool = IMAGE_VALIDATION_POOL
+        .as_ref()
+        .map_err(|error| {
+            ImageValidationFailure::Unavailable(format!(
+                "image validation pool is unavailable: {error}"
+            ))
+        })?;
+    let permit = ImageValidationJobPermit::try_acquire().ok_or_else(|| {
+        ImageValidationFailure::Unavailable(format!(
+            "image validation queue is full ({MAX_PENDING_IMAGE_VALIDATIONS} running or pending jobs)"
+        ))
+    })?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut cancel_on_drop = CancelImageValidationOnDrop::new(Arc::clone(&cancelled));
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    pool.spawn(move || {
+        let _permit = permit;
+        let result = (|| {
+            let normalized = data.normalize_for_content_revision_with_limits(
+                expected_revision,
+                MAX_ENCODED_IMAGE_BYTES,
+                limits,
+                &|| cancelled.load(Ordering::Acquire),
+            )?;
+            let immutable_data = match normalized.replacement {
+                Some(replacement) => Arc::new(replacement),
+                None => {
+                    // A response payload is expected to be uniquely owned at
+                    // this trust boundary. Rewrap the payload after validation
+                    // so no external Arc can mutate it between validation,
+                    // cache publication, and row attachment.
+                    let owned = Arc::try_unwrap(data).map_err(|_| {
+                        ImageDataValidationError::SharedMutablePayload
+                    })?;
+                    Arc::new(ImageData::with_data(owned.into_data()))
+                }
+            };
+            Ok(ValidatedImageData {
+                data: immutable_data,
+                decoded_bytes: normalized.summary.decoded_bytes,
+                source_revision: expected_revision,
+            })
+        })()
+            .map_err(|error| match error {
+                ImageDataValidationError::DecodeCancelled => {
+                    ImageValidationFailure::Unavailable("image validation was cancelled".into())
+                }
+                ImageDataValidationError::SharedMutablePayload => {
+                    ImageValidationFailure::Unavailable(
+                        "validated image payload remained externally shared and mutable".into(),
+                    )
+                }
+                error @ (ImageDataValidationError::EncodedResourceIo { .. }
+                | ImageDataValidationError::EncodedLeaseUnavailable { .. }) => {
+                    // A blob lease or its backing store can become available
+                    // again without the requested image revision changing.
+                    // Never permanently poison that revision in the negative
+                    // cache merely because one resource read failed.
+                    ImageValidationFailure::Unavailable(error.to_string())
+                }
+                error => ImageValidationFailure::Invalid(error),
+            });
+        let _ = sender.send(result);
+    });
+    let result = receiver
+        .await
+        .map_err(|_| {
+            ImageValidationFailure::Unavailable(
+                "image validation worker exited without a result".to_string(),
+            )
+        })?;
+    cancel_on_drop.disarm();
+    result
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct HydratedLines {
+    lines: Vec<(StableRowIndex, Line)>,
+    incomplete_rows: HashSet<StableRowIndex>,
+}
+
+impl HydratedLines {
+    fn complete(lines: Vec<(StableRowIndex, Line)>) -> Self {
+        Self {
+            lines,
+            incomplete_rows: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<(StableRowIndex, Line)>,
+        HashSet<StableRowIndex>,
+    ) {
+        (self.lines, self.incomplete_rows)
+    }
 }
 
 pub(crate) async fn hydrate_lines(
     rpc: &RpcGenerationScope,
     pane_id: PaneId,
     serialized_lines: SerializedLines,
-) -> Vec<(StableRowIndex, Line)> {
-    let (lines, image_cells) = serialized_lines.extract_data();
+) -> anyhow::Result<HydratedLines> {
+    let started_at = Instant::now();
+    let deadline = started_at
+        .checked_add(ORDINARY_IMAGE_HYDRATION_TIMEOUT)
+        .unwrap_or(started_at);
+    let counts = serialized_lines
+        .validate_structure()
+        .map_err(anyhow::Error::new)?;
+    if counts.lines > MAX_RENDER_APPLICATION_LINES
+        || counts.cells > MAX_RENDER_APPLICATION_CELLS
+        || counts.hyperlink_spans > MAX_RENDER_APPLICATION_HYPERLINK_SPANS
+        || counts.images > MAX_RENDER_APPLICATION_IMAGE_REFERENCES
+    {
+        record_image_hydration_rejection("serialized_resource_limit");
+        anyhow::bail!(
+            "GetLines payload exceeds bounded render resources: {counts:?}"
+        );
+    }
+    // The payload cannot change between validation and extraction because it
+    // is consumed here. Avoid a second O(lines + cells + references) pass on
+    // this latency-sensitive path.
+    let (mut lines, image_cells) = serialized_lines.extract_data();
 
     if image_cells.is_empty() {
-        return lines;
+        return Ok(HydratedLines::complete(lines));
     }
 
-    let mut requests = HashMap::new();
-    let mut data_by_hash = HashMap::new();
-    for im in &image_cells {
-        if let Some(data) = lock_image_lru().get(&im.data_hash) {
-            data_by_hash.insert(im.data_hash, data);
-        } else {
-            requests
-                .entry(&im.data_hash)
-                .or_insert_with(|| GetImageCell {
+    let connection_identity = rpc.render_connection_identity();
+    let mut requests = Vec::<([u8; 32], Vec<GetImageCell>)>::new();
+    let mut request_indices = HashMap::<[u8; 32], usize>::new();
+    let mut data_by_hash = HashMap::<[u8; 32], ValidatedImageData>::new();
+    let mut permanently_failed_hashes = HashSet::<[u8; 32]>::new();
+    let mut accepted_decoded_bytes = 0usize;
+    for image in &image_cells {
+        if data_by_hash.contains_key(&image.data_hash) {
+            continue;
+        }
+        if request_indices.contains_key(&image.data_hash) {
+            push_image_locator(
+                &mut requests,
+                &mut request_indices,
+                image.data_hash,
+                GetImageCell {
                     pane_id,
-                    line_idx: im.line_idx,
-                    cell_idx: im.cell_idx,
-                    data_hash: im.data_hash,
-                });
+                    line_idx: image.line_idx,
+                    cell_idx: image.cell_idx,
+                    data_hash: image.data_hash,
+                },
+            );
+            continue;
         }
-    }
-
-    for (_, request) in requests {
-        match rpc.get_image_cell(request).await {
-            Ok(GetImageCellResponse {
-                data: Some(data), ..
-            }) => {
-                lock_image_lru().put(Arc::clone(&data));
-                data_by_hash.insert(data.hash(), data);
+        let cached = connection_identity
+            .and_then(|identity| get_cached_validated_image(identity, pane_id, &image.data_hash));
+        if let Some(validated) = cached {
+            accepted_decoded_bytes = accepted_decoded_bytes
+                .checked_add(validated.decoded_bytes)
+                .ok_or_else(|| anyhow::anyhow!("decoded image byte accounting overflowed"))?;
+            if accepted_decoded_bytes > MAX_ORDINARY_IMAGE_BATCH_BYTES {
+                record_image_hydration_rejection("batch_decoded_byte_limit");
+                break;
             }
-            Ok(GetImageCellResponse { data: None, .. }) => {
-                log::error!("no image data!");
-            }
-
-            Err(err) => {
-                log::error!("failed to retrieve image {err:#}");
-            }
-        }
-    }
-
-    let mut line_by_idx = HashMap::new();
-    for (line_idx, line) in lines {
-        line_by_idx.insert(line_idx, line);
-    }
-
-    for im in image_cells {
-        if let Some(data) = data_by_hash.get(&im.data_hash) {
-            if let Some(line) = line_by_idx.get_mut(&im.line_idx) {
-                if let Some(cell) = line.cells_mut_for_attr_changes_only().get_mut(im.cell_idx) {
-                    cell.attrs_mut()
-                        .attach_image(Box::new(ImageCell::with_z_index(
-                            im.top_left,
-                            im.bottom_right,
-                            Arc::clone(data),
-                            im.z_index,
-                            im.padding_left,
-                            im.padding_top,
-                            im.padding_right,
-                            im.padding_bottom,
-                            im.image_id,
-                            im.placement_id,
-                        )));
+            data_by_hash.insert(image.data_hash, validated);
+        } else if let Some(failure) = connection_identity.and_then(|identity| {
+            lock_image_lru().get_failure(identity, pane_id, &image.data_hash, Instant::now())
+        }) {
+            match failure {
+                CachedImageFailure::Permanent => {
+                    permanently_failed_hashes.insert(image.data_hash);
                 }
+                CachedImageFailure::Transient { .. } => {}
             }
+        } else {
+            // Keep every already-admitted alternate locator for this hash. A row
+            // can change or scroll out between the line snapshot and this
+            // legacy coordinate lookup; a stale first locator must not make
+            // a later still-valid occurrence unavailable. The enclosing
+            // SerializedLines trust boundary caps all image references at
+            // MAX_RENDER_APPLICATION_IMAGE_REFERENCES, while the hydration
+            // deadline caps attempted RPC work.
+            push_image_locator(
+                &mut requests,
+                &mut request_indices,
+                image.data_hash,
+                GetImageCell {
+                    pane_id,
+                    line_idx: image.line_idx,
+                    cell_idx: image.cell_idx,
+                    data_hash: image.data_hash,
+                },
+            );
         }
     }
 
-    line_by_idx.into_iter().collect()
+    let validation_limits = ImageDataValidationLimits {
+        max_decoded_bytes: MAX_ORDINARY_IMAGE_BATCH_BYTES,
+        max_frame_count: MAX_DECODED_IMAGE_FRAMES,
+        max_width: MAX_RENDERABLE_IMAGE_AXIS,
+        max_height: MAX_RENDERABLE_IMAGE_AXIS,
+    };
+    let mut unresolved_hashes = requests
+        .iter()
+        .map(|(hash, _)| *hash)
+        .collect::<HashSet<_>>();
+    let hydration = stream::iter(requests.into_iter())
+        .map(|(expected_hash, locators)| async move {
+            for request in locators {
+                let Some(_byte_permit) = acquire_image_hydration_bytes_until(deadline).await else {
+                    record_image_hydration_rejection("global_working_set_limit");
+                    return (expected_hash, ImageHydrationAttempt::TransientFailure);
+                };
+                let response = match rpc.get_image_cell(request).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        log::warn!(
+                            "image hydration RPC failed for pane {pane_id}; row remains stale: {error:#}"
+                        );
+                        // A transport failure is connection-scoped, not a stale
+                        // coordinate. Retrying every alternate locator would
+                        // multiply the same failure and monopolize the global
+                        // byte reservation until the deadline.
+                        return (expected_hash, ImageHydrationAttempt::TransientFailure);
+                    }
+                };
+                if response.pane_id != pane_id {
+                    record_image_hydration_rejection("response_pane_mismatch");
+                    log::warn!(
+                        "discarding image hydration response for pane {}; expected {pane_id}",
+                        response.pane_id
+                    );
+                    continue;
+                }
+                let Some(data) = response.data else {
+                    continue;
+                };
+                return match validate_image_off_main_thread(
+                    data,
+                    expected_hash,
+                    validation_limits,
+                )
+                .await
+                {
+                    Ok(validated) => {
+                        (expected_hash, ImageHydrationAttempt::Validated(validated))
+                    }
+                    Err(ImageValidationFailure::Invalid(
+                        ImageDataValidationError::ContentRevisionMismatch,
+                    )) => {
+                        // The coordinate changed after the line snapshot. Try
+                        // another occurrence of the same requested revision.
+                        continue;
+                    }
+                    Err(ImageValidationFailure::Invalid(error)) => {
+                        record_image_hydration_rejection("decoded_validation");
+                        log::warn!(
+                            "permanently rejecting invalid decoded image for pane {pane_id}: {error}"
+                        );
+                        (expected_hash, ImageHydrationAttempt::PermanentFailure)
+                    }
+                    Err(ImageValidationFailure::Unavailable(error)) => {
+                        log::warn!(
+                            "image validation unavailable for pane {pane_id}; retrying after backoff: {error}"
+                        );
+                        (expected_hash, ImageHydrationAttempt::TransientFailure)
+                    }
+                };
+            }
+            (expected_hash, ImageHydrationAttempt::TransientFailure)
+        })
+        .buffer_unordered(MAX_CONCURRENT_IMAGE_HYDRATIONS);
+    let mut hydration = Box::pin(hydration);
+    loop {
+        let Some(next) = await_image_work_until(hydration.next(), deadline).await else {
+            record_image_hydration_rejection("deadline");
+            log::warn!(
+                "image hydration exceeded {:?} for pane {pane_id}; unresolved rows remain stale",
+                ORDINARY_IMAGE_HYDRATION_TIMEOUT
+            );
+            break;
+        };
+        let Some((expected_hash, attempt)) = next else {
+            break;
+        };
+        unresolved_hashes.remove(&expected_hash);
+        let validated = match attempt {
+            ImageHydrationAttempt::Validated(validated) => validated,
+            ImageHydrationAttempt::PermanentFailure => {
+                permanently_failed_hashes.insert(expected_hash);
+                if let Some(identity) = connection_identity {
+                    lock_image_lru().record_failure(
+                        identity,
+                        pane_id,
+                        expected_hash,
+                        CachedImageFailure::Permanent,
+                    );
+                }
+                continue;
+            }
+            ImageHydrationAttempt::TransientFailure => {
+                if let Some(identity) = connection_identity {
+                    lock_image_lru().record_failure(
+                        identity,
+                        pane_id,
+                        expected_hash,
+                        CachedImageFailure::Transient {
+                            retry_after: Instant::now() + Duration::from_millis(500),
+                        },
+                    );
+                }
+                continue;
+            }
+        };
+        let Some(next_bytes) = accepted_decoded_bytes.checked_add(validated.decoded_bytes) else {
+            record_image_hydration_rejection("decoded_byte_overflow");
+            break;
+        };
+        if next_bytes > MAX_ORDINARY_IMAGE_BATCH_BYTES {
+            record_image_hydration_rejection("batch_decoded_byte_limit");
+            break;
+        }
+        accepted_decoded_bytes = next_bytes;
+        if let Some(identity) = connection_identity {
+            if !put_cached_validated_image(identity, pane_id, validated.clone()) {
+                record_image_hydration_rejection("revision_changed_before_cache_publish");
+                continue;
+            }
+        }
+        if validated.data.current_content_hash() != expected_hash {
+            record_image_hydration_rejection("revision_changed_before_row_publish");
+            continue;
+        }
+        data_by_hash.insert(expected_hash, validated);
+    }
+
+    drop(hydration);
+    for unresolved in unresolved_hashes {
+        if let Some(identity) = connection_identity {
+            lock_image_lru().record_failure(
+                identity,
+                pane_id,
+                unresolved,
+                CachedImageFailure::Transient {
+                    retry_after: Instant::now() + Duration::from_millis(500),
+                },
+            );
+        }
+    }
+
+    let line_index_by_row = lines
+        .iter()
+        .enumerate()
+        .map(|(index, (stable_row, _))| (*stable_row, index))
+        .collect::<HashMap<_, _>>();
+    let unavailable_rows = image_cells
+        .iter()
+        .filter(|image| !data_by_hash.contains_key(&image.data_hash))
+        .map(|image| image.line_idx)
+        .collect::<HashSet<_>>();
+    let terminal_rows = image_cells
+        .iter()
+        .filter(|image| permanently_failed_hashes.contains(&image.data_hash))
+        .map(|image| image.line_idx)
+        .collect::<HashSet<_>>();
+    let mut incomplete_rows = rows_requiring_image_retry(&unavailable_rows, &terminal_rows);
+
+    for image in image_cells {
+        if unavailable_rows.contains(&image.line_idx) {
+            continue;
+        }
+        let Some(validated) = data_by_hash.get(&image.data_hash) else {
+            // Constructing incomplete_rows above made this unreachable. Keep
+            // the row transaction fail-closed if lookup semantics evolve.
+            incomplete_rows.insert(image.line_idx);
+            continue;
+        };
+        let Some(line_index) = line_index_by_row.get(&image.line_idx).copied() else {
+            // validate_structure made this unreachable, but keep the trust
+            // boundary fail-closed if its invariants evolve independently.
+            record_image_hydration_rejection("validated_row_missing");
+            incomplete_rows.insert(image.line_idx);
+            continue;
+        };
+        let Some(cell) = lines[line_index]
+            .1
+            .cells_mut_for_attr_changes_only()
+            .get_mut(image.cell_idx)
+        else {
+            record_image_hydration_rejection("validated_cell_missing");
+            incomplete_rows.insert(image.line_idx);
+            continue;
+        };
+        let (top_left, bottom_right) = image.canonical_texture_coordinates();
+        cell.attrs_mut()
+            .attach_image(Box::new(ImageCell::with_z_index(
+                top_left,
+                bottom_right,
+                Arc::clone(&validated.data),
+                image.z_index,
+                image.padding_left,
+                image.padding_top,
+                image.padding_right,
+                image.padding_bottom,
+                image.image_id,
+                image.placement_id,
+            )));
+    }
+
+    Ok(HydratedLines {
+        lines,
+        incomplete_rows,
+    })
 }
 
 #[allow(
@@ -1534,7 +2510,8 @@ pub(crate) async fn hydrate_render_application_lines(
                 RenderApplicationComponent::Hyperlinks
             }
             SerializedLinesStructureError::ImageLineMissing
-            | SerializedLinesStructureError::ImageCellOutOfRange => {
+            | SerializedLinesStructureError::ImageCellOutOfRange
+            | SerializedLinesStructureError::ImageTextureCoordinatesInvalid => {
                 RenderApplicationComponent::Images
             }
             SerializedLinesStructureError::DuplicateStableRow
@@ -1544,9 +2521,43 @@ pub(crate) async fn hydrate_render_application_lines(
         };
         RenderApplicationNackReason::MalformedOrIncomplete { component }
     };
-    let (mut lines, image_cells) = serialized_lines
-        .extract_data_checked()
-        .map_err(structure_error)?;
+    let counts = serialized_lines.validate_structure().map_err(structure_error)?;
+    let bounded_resource = |resource, requested: usize, limit: usize| {
+        RenderApplicationNackReason::BoundedResourceRejected {
+            resource,
+            requested: u64::try_from(requested).unwrap_or(u64::MAX),
+            limit: u64::try_from(limit).unwrap_or(u64::MAX),
+        }
+    };
+    if counts.lines > MAX_RENDER_APPLICATION_LINES {
+        return Err(bounded_resource(
+            RenderApplicationResource::Lines,
+            counts.lines,
+            MAX_RENDER_APPLICATION_LINES,
+        ));
+    }
+    if counts.cells > MAX_RENDER_APPLICATION_CELLS {
+        return Err(bounded_resource(
+            RenderApplicationResource::Cells,
+            counts.cells,
+            MAX_RENDER_APPLICATION_CELLS,
+        ));
+    }
+    if counts.hyperlink_spans > MAX_RENDER_APPLICATION_HYPERLINK_SPANS {
+        return Err(bounded_resource(
+            RenderApplicationResource::Hyperlinks,
+            counts.hyperlink_spans,
+            MAX_RENDER_APPLICATION_HYPERLINK_SPANS,
+        ));
+    }
+    if counts.images > MAX_RENDER_APPLICATION_IMAGE_REFERENCES {
+        return Err(bounded_resource(
+            RenderApplicationResource::Images,
+            counts.images,
+            MAX_RENDER_APPLICATION_IMAGE_REFERENCES,
+        ));
+    }
+    let (mut lines, image_cells) = serialized_lines.extract_data();
 
     if Instant::now() >= application_deadline {
         return Err(RenderApplicationNackReason::ApplicationFailure {
@@ -1557,8 +2568,10 @@ pub(crate) async fn hydrate_render_application_lines(
         return Ok(lines);
     }
 
-    let mut requests = HashMap::new();
-    let mut data_by_hash = HashMap::new();
+    let connection_identity = rpc.render_connection_identity();
+    let mut requests = Vec::<([u8; 32], Vec<GetImageCell>)>::new();
+    let mut request_indices = HashMap::<[u8; 32], usize>::new();
+    let mut data_by_hash = HashMap::<[u8; 32], ValidatedImageData>::new();
     let mut unique_image_bytes = 0usize;
     for image in &image_cells {
         if Instant::now() >= application_deadline {
@@ -1569,14 +2582,30 @@ pub(crate) async fn hydrate_render_application_lines(
         if data_by_hash.contains_key(&image.data_hash) {
             continue;
         }
-        if let Some(data) = lock_image_lru().get(&image.data_hash) {
-            unique_image_bytes = unique_image_bytes.checked_add(data.len()).ok_or(
-                RenderApplicationNackReason::BoundedResourceRejected {
+        if request_indices.contains_key(&image.data_hash) {
+            push_image_locator(
+                &mut requests,
+                &mut request_indices,
+                image.data_hash,
+                GetImageCell {
+                    pane_id,
+                    line_idx: image.line_idx,
+                    cell_idx: image.cell_idx,
+                    data_hash: image.data_hash,
+                },
+            );
+            continue;
+        }
+        let cached = connection_identity
+            .and_then(|identity| get_cached_validated_image(identity, pane_id, &image.data_hash));
+        if let Some(validated) = cached {
+            unique_image_bytes = unique_image_bytes
+                .checked_add(validated.decoded_bytes)
+                .ok_or(RenderApplicationNackReason::BoundedResourceRejected {
                     resource: RenderApplicationResource::Images,
                     requested: u64::MAX,
                     limit: u64::try_from(max_unique_image_bytes).unwrap_or(u64::MAX),
-                },
-            )?;
+                })?;
             if unique_image_bytes > max_unique_image_bytes {
                 return Err(RenderApplicationNackReason::BoundedResourceRejected {
                     resource: RenderApplicationResource::Images,
@@ -1584,73 +2613,194 @@ pub(crate) async fn hydrate_render_application_lines(
                     limit: u64::try_from(max_unique_image_bytes).unwrap_or(u64::MAX),
                 });
             }
-            data_by_hash.insert(image.data_hash, data);
+            data_by_hash.insert(image.data_hash, validated);
+        } else if let Some(failure) = connection_identity.and_then(|identity| {
+            lock_image_lru().get_failure(identity, pane_id, &image.data_hash, Instant::now())
+        }) {
+            return Err(match failure {
+                CachedImageFailure::Permanent => {
+                    RenderApplicationNackReason::MalformedOrIncomplete {
+                        component: RenderApplicationComponent::Images,
+                    }
+                }
+                CachedImageFailure::Transient { .. } => {
+                    RenderApplicationNackReason::ApplicationFailure {
+                        stage: RenderApplicationStage::Hydrate,
+                    }
+                }
+            });
         } else {
-            requests
-                .entry(image.data_hash)
-                .or_insert_with(|| GetImageCell {
+            push_image_locator(
+                &mut requests,
+                &mut request_indices,
+                image.data_hash,
+                GetImageCell {
                     pane_id,
                     line_idx: image.line_idx,
                     cell_idx: image.cell_idx,
                     data_hash: image.data_hash,
-                });
+                },
+            );
         }
     }
 
-    for (hash, request) in requests {
-        let Some(remaining) = application_deadline.checked_duration_since(Instant::now()) else {
+    let validation_limits = ImageDataValidationLimits {
+        max_decoded_bytes: max_unique_image_bytes,
+        max_frame_count: MAX_DECODED_IMAGE_FRAMES,
+        max_width: MAX_RENDERABLE_IMAGE_AXIS,
+        max_height: MAX_RENDERABLE_IMAGE_AXIS,
+    };
+    let mut unresolved_hashes = requests
+        .iter()
+        .map(|(hash, _)| *hash)
+        .collect::<HashSet<_>>();
+    let hydration = stream::iter(requests.into_iter())
+        .map(|(hash, locators)| async move {
+            let result = async {
+                for request in locators {
+                    let Some(_byte_permit) =
+                        acquire_image_hydration_bytes_until(application_deadline).await
+                    else {
+                        return Err((
+                            RenderApplicationNackReason::ApplicationFailure {
+                                stage: RenderApplicationStage::Hydrate,
+                            },
+                            CachedImageFailure::Transient {
+                                retry_after: Instant::now() + Duration::from_millis(500),
+                            },
+                        ));
+                    };
+                    let response = rpc.get_image_cell(request).await.map_err(|_| {
+                        (
+                            RenderApplicationNackReason::ApplicationFailure {
+                                stage: RenderApplicationStage::Hydrate,
+                            },
+                            CachedImageFailure::Transient {
+                                retry_after: Instant::now() + Duration::from_millis(500),
+                            },
+                        )
+                    })?;
+                    if response.pane_id != pane_id {
+                        return Err((
+                            RenderApplicationNackReason::MalformedOrIncomplete {
+                                component: RenderApplicationComponent::Images,
+                            },
+                            CachedImageFailure::Transient {
+                                retry_after: Instant::now() + Duration::from_millis(500),
+                            },
+                        ));
+                    }
+                    let Some(data) = response.data else {
+                        continue;
+                    };
+                    let validated = match validate_image_off_main_thread(
+                        data,
+                        hash,
+                        validation_limits,
+                    )
+                    .await
+                    {
+                        Ok(validated) => validated,
+                        Err(ImageValidationFailure::Invalid(
+                            ImageDataValidationError::ContentRevisionMismatch,
+                        )) => continue,
+                        Err(ImageValidationFailure::Invalid(
+                            ImageDataValidationError::DecodedByteLimitExceeded {
+                                requested,
+                                limit,
+                            }
+                            | ImageDataValidationError::EncodedByteLimitExceeded {
+                                requested,
+                                limit,
+                            }
+                            | ImageDataValidationError::FrameCountLimitExceeded {
+                                requested,
+                                limit,
+                            },
+                        )) => {
+                            return Err((
+                                RenderApplicationNackReason::BoundedResourceRejected {
+                                    resource: RenderApplicationResource::Images,
+                                    requested: u64::try_from(requested).unwrap_or(u64::MAX),
+                                    limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                                },
+                                CachedImageFailure::Permanent,
+                            ));
+                        }
+                        Err(ImageValidationFailure::Invalid(_)) => {
+                            return Err((
+                                RenderApplicationNackReason::MalformedOrIncomplete {
+                                    component: RenderApplicationComponent::Images,
+                                },
+                                CachedImageFailure::Permanent,
+                            ));
+                        }
+                        Err(ImageValidationFailure::Unavailable(_)) => {
+                            return Err((
+                                RenderApplicationNackReason::ApplicationFailure {
+                                    stage: RenderApplicationStage::Hydrate,
+                                },
+                                CachedImageFailure::Transient {
+                                    retry_after: Instant::now() + Duration::from_millis(500),
+                                },
+                            ));
+                        }
+                    };
+                    return Ok(validated);
+                }
+                Err((
+                    RenderApplicationNackReason::MalformedOrIncomplete {
+                        component: RenderApplicationComponent::Images,
+                    },
+                    CachedImageFailure::Transient {
+                        retry_after: Instant::now() + Duration::from_millis(500),
+                    },
+                ))
+            }
+            .await;
+            (hash, result)
+        })
+        .buffer_unordered(MAX_CONCURRENT_IMAGE_HYDRATIONS);
+    let mut hydration = Box::pin(hydration);
+    let mut fetched = Vec::new();
+    loop {
+        let Some(next) = await_image_work_until(hydration.next(), application_deadline).await else {
+            if let Some(identity) = connection_identity {
+                for hash in unresolved_hashes {
+                    lock_image_lru().record_failure(
+                        identity,
+                        pane_id,
+                        hash,
+                        CachedImageFailure::Transient {
+                            retry_after: Instant::now() + Duration::from_millis(500),
+                        },
+                    );
+                }
+            }
             return Err(RenderApplicationNackReason::ApplicationFailure {
                 stage: RenderApplicationStage::Hydrate,
             });
         };
-        if remaining.is_zero() {
-            return Err(RenderApplicationNackReason::ApplicationFailure {
-                stage: RenderApplicationStage::Hydrate,
-            });
-        }
-        let operation = rpc.get_image_cell(request);
-        let timeout = async move {
-            promise::spawn::sleep(remaining).await;
+        let Some((hash, result)) = next else {
+            break;
         };
-        pin_mut!(operation);
-        pin_mut!(timeout);
-        let response = match select(operation, timeout).await {
-            Either::Left((response, _)) => response,
-            Either::Right(((), _)) => {
-                return Err(RenderApplicationNackReason::ApplicationFailure {
-                    stage: RenderApplicationStage::Hydrate,
-                });
+        unresolved_hashes.remove(&hash);
+        let validated = match result {
+            Ok(validated) => validated,
+            Err((reason, failure)) => {
+                if let Some(identity) = connection_identity {
+                    lock_image_lru().record_failure(identity, pane_id, hash, failure);
+                }
+                return Err(reason);
             }
         };
-        let data = match response {
-            Ok(GetImageCellResponse {
-                data: Some(data), ..
-            }) if data.hash() == hash => data,
-            Ok(GetImageCellResponse {
-                data: Some(_), ..
-            }) => {
-                return Err(RenderApplicationNackReason::MalformedOrIncomplete {
-                    component: RenderApplicationComponent::Images,
-                });
-            }
-            Ok(GetImageCellResponse { data: None, .. }) => {
-                return Err(RenderApplicationNackReason::MalformedOrIncomplete {
-                    component: RenderApplicationComponent::Images,
-                });
-            }
-            Err(_) => {
-                return Err(RenderApplicationNackReason::ApplicationFailure {
-                    stage: RenderApplicationStage::Hydrate,
-                });
-            }
-        };
-        unique_image_bytes = unique_image_bytes.checked_add(data.len()).ok_or(
-            RenderApplicationNackReason::BoundedResourceRejected {
+        unique_image_bytes = unique_image_bytes
+            .checked_add(validated.decoded_bytes)
+            .ok_or(RenderApplicationNackReason::BoundedResourceRejected {
                 resource: RenderApplicationResource::Images,
                 requested: u64::MAX,
                 limit: u64::try_from(max_unique_image_bytes).unwrap_or(u64::MAX),
-            },
-        )?;
+            })?;
         if unique_image_bytes > max_unique_image_bytes {
             return Err(RenderApplicationNackReason::BoundedResourceRejected {
                 resource: RenderApplicationResource::Images,
@@ -1658,8 +2808,27 @@ pub(crate) async fn hydrate_render_application_lines(
                 limit: u64::try_from(max_unique_image_bytes).unwrap_or(u64::MAX),
             });
         }
-        lock_image_lru().put(Arc::clone(&data));
-        data_by_hash.insert(hash, data);
+        fetched.push((hash, validated));
+    }
+    drop(hydration);
+
+    // Publish only after the complete fetched set has passed validation and
+    // the aggregate byte budget. A rejected attempt must not leave a
+    // nondeterministic partial cache prefix.
+    for (hash, validated) in fetched {
+        if validated.data.current_content_hash() != hash {
+            return Err(RenderApplicationNackReason::MalformedOrIncomplete {
+                component: RenderApplicationComponent::Images,
+            });
+        }
+        if let Some(identity) = connection_identity {
+            if !put_cached_validated_image(identity, pane_id, validated.clone()) {
+                return Err(RenderApplicationNackReason::MalformedOrIncomplete {
+                    component: RenderApplicationComponent::Images,
+                });
+            }
+        }
+        data_by_hash.insert(hash, validated);
     }
 
     let line_index_by_row = lines
@@ -1668,7 +2837,7 @@ pub(crate) async fn hydrate_render_application_lines(
         .map(|(index, (stable_row, _))| (*stable_row, index))
         .collect::<HashMap<_, _>>();
     for image in image_cells {
-        let data = data_by_hash.get(&image.data_hash).ok_or(
+        let validated = data_by_hash.get(&image.data_hash).ok_or(
             RenderApplicationNackReason::MalformedOrIncomplete {
                 component: RenderApplicationComponent::Images,
             },
@@ -1685,11 +2854,12 @@ pub(crate) async fn hydrate_render_application_lines(
             .ok_or(RenderApplicationNackReason::MalformedOrIncomplete {
                 component: RenderApplicationComponent::Images,
             })?;
+        let (top_left, bottom_right) = image.canonical_texture_coordinates();
         cell.attrs_mut()
             .attach_image(Box::new(ImageCell::with_z_index(
-                image.top_left,
-                image.bottom_right,
-                Arc::clone(data),
+                top_left,
+                bottom_right,
+                Arc::clone(&validated.data),
                 image.z_index,
                 image.padding_left,
                 image.padding_top,
@@ -1706,6 +2876,55 @@ pub(crate) async fn hydrate_render_application_lines(
 impl RenderableState {
     pub fn get_cursor_position(&self) -> StableCursorPosition {
         self.inner.borrow().cursor_position
+    }
+
+    /// Return a single coherent cache snapshot after normalizing every complete
+    /// logical group touched by `lines` with the caller's exact rule set.
+    pub fn get_lines_with_hyperlinks(
+        &self,
+        lines: Range<StableRowIndex>,
+        rules: &[Rule],
+    ) -> (StableRowIndex, Vec<Line>) {
+        self.inner
+            .borrow_mut()
+            .normalize_implicit_hyperlinks_for_request(lines.clone(), rules);
+        self.get_lines(lines)
+    }
+
+    /// Retain renderer-produced line appdata on the authoritative remote cache
+    /// only when the projected line still exactly matches the cached content.
+    ///
+    /// Remote panes render independent `Line` clones. Without this explicit
+    /// write-back, shape hashes installed on those clones disappear after each
+    /// paint. Equality guards reject predictive-echo, lag-indicator, overlay,
+    /// or stale-response projections, so metadata computed for modified output
+    /// can never poison the source line.
+    pub fn write_back_unchanged_line_appdata(
+        &self,
+        first_row: StableRowIndex,
+        rendered_lines: &[Line],
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        for (offset, rendered) in rendered_lines.iter().enumerate() {
+            let Some(stable_row) = StableRowIndex::try_from(offset)
+                .ok()
+                .and_then(|offset| first_row.checked_add(offset))
+            else {
+                break;
+            };
+            let Some(entry) = inner.lines.get_mut(&stable_row) else {
+                continue;
+            };
+            let cached = match entry {
+                LineEntry::Line(line)
+                | LineEntry::LineAndFetching(line, _)
+                | LineEntry::Stale(line) => line,
+                LineEntry::Fetching(_) => continue,
+            };
+            if cached == rendered {
+                cached.copy_appdata_from(rendered);
+            }
+        }
     }
 
     pub fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
@@ -1898,6 +3117,31 @@ impl RenderableState {
         seqno: SequenceNo,
     ) -> RangeSet<StableRowIndex> {
         let mut inner = self.inner.borrow_mut();
+        Self::poll_before_changed_query(&mut inner);
+        Self::collect_changed_since(&mut inner, lines, seqno)
+    }
+
+    /// Poll the remote source, capture its post-poll sequence fence, and scan
+    /// changed rows within the same `RenderableInner` borrow. Capturing the
+    /// fence before `poll` would make every delta applied by that poll appear
+    /// dirty again on the next renderer query.
+    pub fn get_changed_since_with_source_fence(
+        &self,
+        lines: Range<StableRowIndex>,
+        last_observed_source_end: SequenceNo,
+    ) -> (SequenceNo, RangeSet<StableRowIndex>) {
+        let mut inner = self.inner.borrow_mut();
+        Self::poll_before_changed_query(&mut inner);
+        let source_end = inner.seqno;
+        let baseline = mux::pane::changed_since_query_baseline(
+            last_observed_source_end,
+            source_end,
+        );
+        let changed = Self::collect_changed_since(&mut inner, lines, baseline);
+        (source_end, changed)
+    }
+
+    fn poll_before_changed_query(inner: &mut RenderableInner) {
         if let Err(err) = inner.poll() {
             // We allow for BrokenPromise here for now; for a TLS backed
             // session it indicates that we'll retry.  For a local unix
@@ -1908,7 +3152,13 @@ impl RenderableState {
                 inner.dead = true;
             }
         }
+    }
 
+    fn collect_changed_since(
+        inner: &mut RenderableInner,
+        lines: Range<StableRowIndex>,
+        seqno: SequenceNo,
+    ) -> RangeSet<StableRowIndex> {
         let mut result = RangeSet::new();
         let expired_prediction_rows = inner.expire_stale_predictions(Instant::now());
         for expired_range in expired_prediction_rows.iter() {
@@ -1959,28 +3209,71 @@ impl RenderableState {
     pub fn get_tiered_scrollback_status(&self) -> Option<PaneTieredScrollbackStatus> {
         self.inner.borrow().tiered_scrollback_status
     }
+
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::client::TEST_RENDER_CONNECTION_IDENTITY;
     use super::{
         apply_prediction_reconciliation_to_score, base_poll_interval, expire_predictions,
         initial_last_poll, mark_predictions_dispatched, rebuild_cache_as_stale,
         paste_fits_prediction_budget, push_bounded_prediction,
         reconcile_predictions_after_cached_terminal_change,
         reconcile_predictions_after_terminal_change, render_line_cache_capacity_for_values,
-        reset_prediction_state, should_apply_unilateral_delta, FetchToken, ImageLru, LineEntry,
-        Prediction, PredictionReconciliation, MAX_PENDING_PREDICTIONS, PREDICT_CONFIDENT_SCORE,
+        reset_prediction_state, should_apply_unilateral_delta, CachedImageFailure, FetchToken,
+        ImageLru, LineEntry, Prediction, PredictionReconciliation, ValidatedImageData,
+        MAX_PENDING_PREDICTIONS, PREDICT_CONFIDENT_SCORE,
     };
-    use codec::InputSerial;
+    use crate::client::Client;
+    use crate::domain::{ClientDomainConfig, ClientInner};
+    use crate::pane::ClientPane;
+    use codec::{InputSerial, RenderConnectionIdentity, TopologyStreamId};
+    use config::UnixDomain;
     use lru::LruCache;
+    use mux::MuxSessionIncarnation;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::time::{Duration, Instant, UNIX_EPOCH};
     use termwiz::cell::{Cell, CellAttributes};
+    use termwiz::hyperlink::Rule;
     use termwiz::image::{ImageData, ImageDataType};
     use termwiz::surface::{SequenceNo, SEQ_ZERO};
     use wezterm_term::Line;
+
+    fn test_renderable_state() -> Arc<parking_lot::Mutex<super::RenderableState>> {
+        let domain_id = 731;
+        let unix = UnixDomain {
+            name: "renderable-hyperlink-test".to_string(),
+            ..UnixDomain::default()
+        };
+        let client = Arc::new(ClientInner::new(
+            domain_id,
+            Client::new_test_client(
+                Some(domain_id),
+                ClientDomainConfig::Unix(unix),
+            ),
+            None,
+            None,
+            false,
+        ));
+        let pane = ClientPane::new(
+            &client,
+            733,
+            739,
+            743,
+            wezterm_term::TerminalSize {
+                cols: 80,
+                rows: 24,
+                pixel_width: 800,
+                pixel_height: 480,
+                dpi: 96,
+            },
+            "hyperlink-test",
+            false,
+        );
+        Arc::clone(&pane.renderable)
+    }
 
     fn test_image(width: u32, height: u32, fill: u8) -> Arc<ImageData> {
         Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
@@ -1988,6 +3281,15 @@ mod tests {
             height,
             vec![fill; (width * height * 4) as usize],
         )))
+    }
+
+    fn validated_test_image(width: u32, height: u32, fill: u8) -> ValidatedImageData {
+        let data = test_image(width, height, fill);
+        ValidatedImageData {
+            decoded_bytes: data.len(),
+            source_revision: data.current_content_hash(),
+            data,
+        }
     }
 
     fn input_serial(millis: u64) -> InputSerial {
@@ -2017,6 +3319,276 @@ mod tests {
         let initial = initial_last_poll(now);
 
         assert!(now.duration_since(initial) >= base_poll_interval());
+    }
+
+    #[test]
+    fn cached_hyperlinks_wait_for_complete_logical_group_and_honor_exact_rules() {
+        let renderable = test_renderable_state();
+        let first_rules = vec![
+            Rule::new(r"https://example\.com", "first:$0").expect("valid hyperlink rule"),
+        ];
+        let second_rules = vec![
+            Rule::new(r"https://example\.com", "second:$0").expect("valid hyperlink rule"),
+        ];
+
+        {
+            let state = renderable.lock();
+            let mut inner = state.inner.borrow_mut();
+            inner.seqno = 7;
+            let mut first = Line::from_text(
+                "https://exam",
+                &CellAttributes::default(),
+                inner.seqno,
+                None,
+            );
+            first.set_last_cell_was_wrapped(true, inner.seqno);
+            assert!(inner.put_line(0, first, None));
+            inner.normalize_implicit_hyperlinks_for_request(0..1, &first_rules);
+        }
+
+        let (_, incomplete) = renderable.lock().get_lines(0..1);
+        assert!(
+            incomplete[0]
+                .get_cell(0)
+                .and_then(|cell| cell.attrs().hyperlink().cloned())
+                .is_none(),
+            "a wrapped fragment must fail closed until its successor is cached",
+        );
+
+        {
+            let state = renderable.lock();
+            let mut inner = state.inner.borrow_mut();
+            let second = Line::from_text(
+                "ple.com",
+                &CellAttributes::default(),
+                inner.seqno,
+                None,
+            );
+            assert!(inner.put_line(1, second, None));
+        }
+
+        let (_, first_view) = renderable
+            .lock()
+            .get_lines_with_hyperlinks(0..2, &first_rules);
+        let first_row_link = first_view[0]
+            .get_cell(0)
+            .and_then(|cell| cell.attrs().hyperlink().cloned())
+            .expect("complete logical line should be linked");
+        let second_row_link = first_view[1]
+            .get_cell(0)
+            .and_then(|cell| cell.attrs().hyperlink().cloned())
+            .expect("link should span the wrapped successor");
+        assert!(Arc::ptr_eq(&first_row_link, &second_row_link));
+        assert_eq!(first_row_link.uri(), "first:https://example.com");
+
+        let (_, repeated_view) = renderable
+            .lock()
+            .get_lines_with_hyperlinks(0..2, &first_rules);
+        let repeated_link = repeated_view[0]
+            .get_cell(0)
+            .and_then(|cell| cell.attrs().hyperlink().cloned())
+            .expect("same rules should retain the cached link");
+        assert!(
+            Arc::ptr_eq(&first_row_link, &repeated_link),
+            "same-rule paint and hover snapshots must retain Arc identity",
+        );
+
+        let (_, second_view) = renderable
+            .lock()
+            .get_lines_with_hyperlinks(0..2, &second_rules);
+        let replaced_link = second_view[0]
+            .get_cell(0)
+            .and_then(|cell| cell.attrs().hyperlink().cloned())
+            .expect("replacement rule should produce a link");
+        assert_eq!(replaced_link.uri(), "second:https://example.com");
+        assert!(!Arc::ptr_eq(&first_row_link, &replaced_link));
+    }
+
+    #[test]
+    fn switching_implicit_hyperlink_rules_to_empty_clears_cached_shape_appdata() {
+        let renderable = test_renderable_state();
+        let rules = vec![
+            Rule::new(r"https://example\.com", "linked:$0").expect("valid hyperlink rule"),
+        ];
+        {
+            let state = renderable.lock();
+            let mut inner = state.inner.borrow_mut();
+            inner.seqno = 13;
+            let seqno = inner.seqno;
+            assert!(inner.put_line(
+                0,
+                Line::from_text(
+                    "https://example.com",
+                    &CellAttributes::default(),
+                    seqno,
+                    None,
+                ),
+                None,
+            ));
+        }
+
+        let (first, linked) = renderable.lock().get_lines_with_hyperlinks(0..1, &rules);
+        assert!(
+            linked[0]
+                .get_cell(0)
+                .and_then(|cell| cell.attrs().hyperlink().cloned())
+                .is_some(),
+            "the non-empty rule epoch must first install an implicit link",
+        );
+        let cached_shape = Arc::new(linked[0].compute_shape_hash());
+        linked[0].set_appdata(Arc::clone(&cached_shape));
+        renderable
+            .lock()
+            .write_back_unchanged_line_appdata(first, &linked);
+
+        let (_, unlinked) = renderable.lock().get_lines_with_hyperlinks(0..1, &[]);
+        assert!(
+            unlinked[0]
+                .get_cell(0)
+                .and_then(|cell| cell.attrs().hyperlink().cloned())
+                .is_none(),
+            "an empty replacement rule epoch must remove the implicit link",
+        );
+        assert!(
+            unlinked[0].get_appdata().is_none(),
+            "removing links without advancing the terminal seqno must invalidate cached shape appdata",
+        );
+    }
+
+    #[test]
+    fn rule_change_clears_appdata_when_wrapped_group_is_temporarily_incomplete() {
+        let renderable = test_renderable_state();
+        let first_rules = vec![
+            Rule::new(r"https://example\.com", "first:$0").expect("valid hyperlink rule"),
+        ];
+        let second_rules = vec![
+            Rule::new(r"https://example\.com", "second:$0").expect("valid hyperlink rule"),
+        ];
+        let cached_shape = Arc::new([0x5a_u8; 16]);
+
+        {
+            let state = renderable.lock();
+            let mut inner = state.inner.borrow_mut();
+            inner.seqno = 17;
+            let seqno = inner.seqno;
+            let mut first = Line::from_text(
+                "https://exam",
+                &CellAttributes::default(),
+                inner.seqno,
+                None,
+            );
+            first.set_last_cell_was_wrapped(true, inner.seqno);
+            assert!(inner.put_line(0, first, None));
+            assert!(inner.put_line(
+                1,
+                Line::from_text(
+                    "ple.com",
+                    &CellAttributes::default(),
+                    seqno,
+                    None,
+                ),
+                None,
+            ));
+            inner.normalize_implicit_hyperlinks_for_request(0..2, &first_rules);
+
+            for stable_row in 0..2 {
+                let Some(LineEntry::Line(line)) = inner.lines.get_mut(&stable_row) else {
+                    panic!("complete logical group row {stable_row} must be fresh");
+                };
+                assert!(line.has_hyperlink());
+                line.set_appdata(Arc::clone(&cached_shape));
+            }
+
+            let Some(LineEntry::Line(successor)) = inner.lines.pop(&1) else {
+                panic!("wrapped successor must still be cached");
+            };
+            inner.lines.put(1, LineEntry::Stale(successor));
+        }
+
+        let (_, first_row) = renderable
+            .lock()
+            .get_lines_with_hyperlinks(0..1, &second_rules);
+        assert!(
+            first_row[0]
+                .get_cell(0)
+                .and_then(|cell| cell.attrs().hyperlink().cloned())
+                .is_none(),
+            "an incomplete group must fail closed instead of retaining the prior rule epoch's link",
+        );
+        assert!(
+            first_row[0].get_appdata().is_none(),
+            "the fresh fragment must not retain prior-epoch shape appdata",
+        );
+
+        let state = renderable.lock();
+        let inner = state.inner.borrow();
+        let Some(LineEntry::Stale(successor)) = inner.lines.peek(&1) else {
+            panic!("wrapped successor must remain stale until refetched");
+        };
+        assert!(!successor.has_hyperlink());
+        assert!(
+            successor.get_appdata().is_none(),
+            "the unavailable successor must also lose prior-epoch shape appdata",
+        );
+    }
+
+    #[test]
+    fn unchanged_remote_projection_writes_renderer_appdata_back_to_cache() {
+        let renderable = test_renderable_state();
+        {
+            let state = renderable.lock();
+            let mut inner = state.inner.borrow_mut();
+            inner.seqno = 17;
+            assert!(inner.put_line(
+                0,
+                Line::from_text("stable", &CellAttributes::default(), 17, None),
+                None,
+            ));
+        }
+
+        let (first, projected) = renderable.lock().get_lines(0..1);
+        let marker = Arc::new(0x5eed_u64);
+        projected[0].set_appdata(Arc::clone(&marker));
+        renderable
+            .lock()
+            .write_back_unchanged_line_appdata(first, &projected);
+
+        let (_, repeated) = renderable.lock().get_lines(0..1);
+        let retained = repeated[0]
+            .get_appdata()
+            .expect("unchanged cached row should retain renderer appdata")
+            .downcast::<u64>()
+            .expect("test marker type should be preserved");
+        assert!(Arc::ptr_eq(&marker, &retained));
+    }
+
+    #[test]
+    fn modified_remote_projection_cannot_poison_authoritative_appdata() {
+        let renderable = test_renderable_state();
+        {
+            let state = renderable.lock();
+            let mut inner = state.inner.borrow_mut();
+            inner.seqno = 19;
+            assert!(inner.put_line(
+                0,
+                Line::from_text("source", &CellAttributes::default(), 19, None),
+                None,
+            ));
+        }
+
+        let (first, mut projected) = renderable.lock().get_lines(0..1);
+        projected[0].set_cell(0, Cell::new('X', CellAttributes::default()), SEQ_ZERO);
+        projected[0].set_appdata(Arc::new(0xbad_u64));
+        renderable
+            .lock()
+            .write_back_unchanged_line_appdata(first, &projected);
+
+        let (_, repeated) = renderable.lock().get_lines(0..1);
+        assert_eq!(repeated[0].as_str(), "source");
+        assert!(
+            repeated[0].get_appdata().is_none(),
+            "metadata computed for modified output must not reach the source row",
+        );
     }
 
     #[test]
@@ -2234,6 +3806,55 @@ mod tests {
     }
 
     #[test]
+    fn exact_fetch_cleanup_stales_old_lines_and_preserves_successor_requests() {
+        let renderable = test_renderable_state();
+        let exact = FetchToken::new(Instant::now());
+        let successor = FetchToken::new(Instant::now());
+        let mut requested = rangeset::RangeSet::new();
+        requested.add_range(0..3);
+
+        {
+            let state = renderable.lock();
+            let mut inner = state.inner.borrow_mut();
+            inner.lines.put(
+                0,
+                LineEntry::LineAndFetching(Line::with_width(1, 7), exact.clone()),
+            );
+            inner.lines.put(1, LineEntry::Fetching(exact.clone()));
+            inner.lines.put(2, LineEntry::Fetching(successor.clone()));
+            inner.release_exact_fetch_reservations(&requested, &exact);
+
+            assert!(matches!(inner.lines.peek(&0), Some(LineEntry::Stale(_))));
+            assert!(inner.lines.peek(&1).is_none());
+            assert!(matches!(
+                inner.lines.peek(&2),
+                Some(LineEntry::Fetching(current)) if current.same_request(&successor)
+            ));
+        }
+    }
+
+    #[test]
+    fn dead_pane_fetch_admission_releases_its_exact_reservations() {
+        let renderable = test_renderable_state();
+        let exact = FetchToken::new(Instant::now());
+        let mut requested = rangeset::RangeSet::new();
+        requested.add_range(0..2);
+
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        inner.dead = true;
+        inner.lines.put(
+            0,
+            LineEntry::LineAndFetching(Line::with_width(1, 7), exact.clone()),
+        );
+        inner.lines.put(1, LineEntry::Fetching(exact.clone()));
+        inner.schedule_fetch_lines(requested, exact);
+
+        assert!(matches!(inner.lines.peek(&0), Some(LineEntry::Stale(_))));
+        assert!(inner.lines.peek(&1).is_none());
+    }
+
+    #[test]
     fn tiered_render_cache_uses_hot_budget() {
         assert_eq!(
             render_line_cache_capacity_for_values(100_000, true, 2_000, 48).get(),
@@ -2273,36 +3894,257 @@ mod tests {
     }
 
     #[test]
+    fn geometry_invalidation_retires_old_fetch_tokens() {
+        let mut lines = LruCache::new(NonZeroUsize::new(3).unwrap());
+        let token = FetchToken::new(Instant::now());
+        lines.put(
+            0,
+            LineEntry::LineAndFetching(Line::with_width(80, 1), token.clone()),
+        );
+        lines.put(1, LineEntry::Fetching(token));
+
+        rebuild_cache_as_stale(&mut lines, NonZeroUsize::new(3).unwrap());
+
+        assert!(matches!(lines.peek(&0), Some(LineEntry::Stale(_))));
+        assert!(lines.peek(&1).is_none());
+    }
+
+    #[test]
     fn image_lru_evicts_by_decoded_bytes() {
         let mut cache = ImageLru::new(NonZeroUsize::new(8).unwrap(), 32);
-        let first = test_image(2, 2, 1);
-        let second = test_image(2, 2, 2);
-        let third = test_image(2, 2, 3);
-        let first_hash = first.hash();
-        let second_hash = second.hash();
-        let third_hash = third.hash();
+        let pane_id = 7;
+        let first = validated_test_image(2, 2, 1);
+        let second = validated_test_image(2, 2, 2);
+        let third = validated_test_image(2, 2, 3);
+        let first_hash = first.data.hash();
+        let second_hash = second.data.hash();
+        let third_hash = third.data.hash();
 
-        cache.put(first);
-        cache.put(second);
-        cache.put(third);
+        cache.put(TEST_RENDER_CONNECTION_IDENTITY, pane_id, first);
+        cache.put(TEST_RENDER_CONNECTION_IDENTITY, pane_id, second);
+        cache.put(TEST_RENDER_CONNECTION_IDENTITY, pane_id, third);
 
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.retained_bytes(), 32);
-        assert!(cache.get(&first_hash).is_none());
-        assert!(cache.get(&second_hash).is_some());
-        assert!(cache.get(&third_hash).is_some());
+        assert!(cache
+            .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &first_hash)
+            .is_none());
+        assert!(cache
+            .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &second_hash)
+            .is_some());
+        assert!(cache
+            .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &third_hash)
+            .is_some());
     }
 
     #[test]
     fn image_lru_refuses_single_image_over_budget() {
         let mut cache = ImageLru::new(NonZeroUsize::new(8).unwrap(), 8);
-        let oversized = test_image(2, 2, 4);
-        let hash = oversized.hash();
+        let pane_id = 7;
+        let oversized = validated_test_image(2, 2, 4);
+        let hash = oversized.data.hash();
 
-        cache.put(oversized);
+        cache.put(TEST_RENDER_CONNECTION_IDENTITY, pane_id, oversized);
 
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.retained_bytes(), 0);
-        assert!(cache.get(&hash).is_none());
+        assert!(cache
+            .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &hash)
+            .is_none());
+    }
+
+    #[test]
+    fn image_lru_oversized_replacement_preserves_valid_entry() {
+        let mut cache = ImageLru::new(NonZeroUsize::new(8).unwrap(), 16);
+        let pane_id = 7;
+        let valid = validated_test_image(2, 2, 4);
+        let hash = valid.data.hash();
+        cache.put(TEST_RENDER_CONNECTION_IDENTITY, pane_id, valid);
+
+        let mut forged_accounting = validated_test_image(2, 2, 4);
+        forged_accounting.decoded_bytes = 17;
+        cache.put(
+            TEST_RENDER_CONNECTION_IDENTITY,
+            pane_id,
+            forged_accounting,
+        );
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.retained_bytes(), 16);
+        assert!(cache
+            .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &hash)
+            .is_some());
+    }
+
+    #[test]
+    fn image_lru_rejects_and_evicts_payloads_that_changed_revision() {
+        let mut cache = ImageLru::new(NonZeroUsize::new(8).unwrap(), 32);
+        let pane_id = 7;
+
+        let changed_before_insert = validated_test_image(2, 2, 4);
+        let old_revision = changed_before_insert.source_revision;
+        *changed_before_insert.data.data_mut() =
+            ImageDataType::new_single_frame(2, 2, vec![0x44; 16]);
+        assert_ne!(
+            old_revision,
+            changed_before_insert.data.current_content_hash()
+        );
+        cache.put(
+            TEST_RENDER_CONNECTION_IDENTITY,
+            pane_id,
+            changed_before_insert,
+        );
+        assert_eq!(cache.len(), 0, "a stale cache key must not be published");
+
+        let changed_after_insert = validated_test_image(2, 2, 5);
+        let cached_revision = changed_after_insert.source_revision;
+        let mutable_data = Arc::clone(&changed_after_insert.data);
+        cache.put(
+            TEST_RENDER_CONNECTION_IDENTITY,
+            pane_id,
+            changed_after_insert,
+        );
+        *mutable_data.data_mut() = ImageDataType::new_single_frame(2, 2, vec![0x55; 16]);
+        assert!(
+            cache
+                .get(
+                    TEST_RENDER_CONNECTION_IDENTITY,
+                    pane_id,
+                    &cached_revision,
+                )
+                .is_none(),
+            "a cache hit must fail closed after the mutable payload changes"
+        );
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn image_lru_isolates_connection_and_pane_namespaces() {
+        let mut cache = ImageLru::new(NonZeroUsize::new(8).unwrap(), 32);
+        let pane_id = 7;
+        let image = validated_test_image(2, 2, 9);
+        let hash = image.data.hash();
+        let other_connection = RenderConnectionIdentity::new(
+            TopologyStreamId::from_bytes([0x91; 16]),
+            MuxSessionIncarnation::from_bytes([0x92; 16]),
+        );
+
+        cache.put(TEST_RENDER_CONNECTION_IDENTITY, pane_id, image);
+
+        assert!(cache
+            .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &hash)
+            .is_some());
+        assert!(cache
+            .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id + 1, &hash)
+            .is_none());
+        assert!(cache.get(other_connection, pane_id, &hash).is_none());
+    }
+
+    #[test]
+    fn image_locator_collection_preserves_source_order_and_caps_retry_amplification() {
+        let pane_id = 7;
+        let first_hash = [1; 32];
+        let second_hash = [2; 32];
+        let mut requests = Vec::new();
+        let mut indices = HashMap::new();
+        for cell_idx in 0..MAX_IMAGE_LOCATOR_ATTEMPTS_PER_REVISION.saturating_add(4) {
+            push_image_locator(
+                &mut requests,
+                &mut indices,
+                first_hash,
+                GetImageCell {
+                    pane_id,
+                    line_idx: 3,
+                    cell_idx,
+                    data_hash: first_hash,
+                },
+            );
+        }
+        push_image_locator(
+            &mut requests,
+            &mut indices,
+            second_hash,
+            GetImageCell {
+                pane_id,
+                line_idx: 4,
+                cell_idx: 0,
+                data_hash: second_hash,
+            },
+        );
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0, first_hash);
+        assert_eq!(
+            requests[0].1.len(),
+            MAX_IMAGE_LOCATOR_ATTEMPTS_PER_REVISION
+        );
+        assert_eq!(requests[1].0, second_hash);
+    }
+
+    #[test]
+    fn any_permanent_image_failure_settles_the_whole_row_to_text_fallback() {
+        let unavailable = HashSet::from([10, 11]);
+        let rows_with_permanent_failure = HashSet::from([11]);
+
+        assert_eq!(
+            rows_requiring_image_retry(&unavailable, &rows_with_permanent_failure),
+            HashSet::from([10])
+        );
+    }
+
+    #[test]
+    fn image_lru_negative_cache_is_revision_scoped_and_transiently_expires() {
+        let mut cache = ImageLru::new(NonZeroUsize::new(8).unwrap(), 32);
+        let pane_id = 7;
+        let revision = [0x31; 32];
+        let other_revision = [0x32; 32];
+        let now = Instant::now();
+
+        cache.record_failure(
+            TEST_RENDER_CONNECTION_IDENTITY,
+            pane_id,
+            revision,
+            CachedImageFailure::Permanent,
+        );
+        assert_eq!(
+            cache.get_failure(
+                TEST_RENDER_CONNECTION_IDENTITY,
+                pane_id,
+                &revision,
+                now,
+            ),
+            Some(CachedImageFailure::Permanent)
+        );
+        assert!(
+            cache
+                .get_failure(
+                    TEST_RENDER_CONNECTION_IDENTITY,
+                    pane_id,
+                    &other_revision,
+                    now,
+                )
+                .is_none()
+        );
+
+        cache.record_failure(
+            TEST_RENDER_CONNECTION_IDENTITY,
+            pane_id,
+            other_revision,
+            CachedImageFailure::Transient {
+                retry_after: now + Duration::from_millis(10),
+            },
+        );
+        assert!(
+            cache
+                .get_failure(
+                    TEST_RENDER_CONNECTION_IDENTITY,
+                    pane_id,
+                    &other_revision,
+                    now + Duration::from_millis(11),
+                )
+                .is_none(),
+            "expired transient failures must permit a retry"
+        );
     }
 }

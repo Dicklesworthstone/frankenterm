@@ -313,8 +313,10 @@ impl Surface {
     pub fn add_changes(&mut self, mut changes: Vec<Change>) -> SequenceNo {
         let seq = self.seqno.saturating_sub(1).saturating_add(changes.len());
 
-        for change in &changes {
-            self.apply_change(&change);
+        for change in &mut changes {
+            let original = core::mem::replace(change, Change::Text(String::new()));
+            *change = self.canonicalize_change(original);
+            self.apply_change(change);
         }
 
         self.seqno = self.seqno.saturating_add(changes.len());
@@ -327,10 +329,32 @@ impl Surface {
     pub fn add_change<C: Into<Change>>(&mut self, change: C) -> SequenceNo {
         let seq = self.seqno;
         self.seqno = self.seqno.saturating_add(1);
-        let change = change.into();
+        let change = self.canonicalize_change(change.into());
         self.apply_change(&change);
         self.changes.push(change);
         seq
+    }
+
+    fn canonicalize_change(&self, change: Change) -> Change {
+        #[cfg(feature = "use_image")]
+        {
+            return match change {
+                Change::Image(image) => {
+                    let available_width = self.width.saturating_sub(self.xpos.min(self.width));
+                    image
+                        .clipped_to_cell_bounds(available_width, self.height)
+                        .map(Change::Image)
+                        // Preserve sequence-number continuity while ensuring
+                        // that a rejected image cannot escape through the
+                        // incremental journal to a direct renderer.
+                        .unwrap_or_else(|| Change::Text(String::new()))
+                }
+                change => change,
+            };
+        }
+
+        #[cfg(not(feature = "use_image"))]
+        change
     }
 
     fn apply_change(&mut self, change: &Change) {
@@ -364,48 +388,87 @@ impl Surface {
 
     #[cfg(feature = "use_image")]
     fn add_image(&mut self, image: &Image) {
+        if image.width == 0
+            || image.height == 0
+            || self.width == 0
+            || self.height == 0
+        {
+            return;
+        }
         let top_left_x = image.top_left.x.into_inner();
         let top_left_y = image.top_left.y.into_inner();
-        let xsize = (image.bottom_right.x.into_inner() - top_left_x) / image.width as f32;
-        let ysize = (image.bottom_right.y.into_inner() - top_left_y) / image.height as f32;
+        let bottom_right_x = image.bottom_right.x.into_inner();
+        let bottom_right_y = image.bottom_right.y.into_inner();
+        let xspan = f64::from(bottom_right_x) - f64::from(top_left_x);
+        let yspan = f64::from(bottom_right_y) - f64::from(top_left_y);
 
-        if self.ypos + image.height > self.height {
-            let scroll = (self.ypos + image.height) - self.height;
-            for _ in 0..scroll {
-                self.scroll_screen_up();
-            }
-            self.ypos -= scroll;
+        let original_ypos = self.ypos.min(self.height - 1);
+        let available_rows = self.height.saturating_sub(original_ypos);
+        let scroll = image.height.saturating_sub(available_rows);
+        if scroll > 0 {
+            // One region rotation is O(viewport rows). Repeatedly removing row
+            // zero made a tall image O(rows squared), and an image taller than
+            // the viewport could underflow `ypos` before rendering began.
+            self.scroll_region_up(0, self.height, scroll);
         }
+        self.ypos = original_ypos.saturating_sub(scroll);
+        let source_row_start = image.height.saturating_sub(self.height);
+        let visible_height = image
+            .height
+            .saturating_sub(source_row_start)
+            .min(self.height.saturating_sub(self.ypos));
+        let visible_width = image.width.min(self.width.saturating_sub(self.xpos));
 
-        let mut ypos = 0.0;
-        for y in 0..image.height {
-            let mut xpos = 0.0;
-            for x in 0..image.width {
-                self.lines[self.ypos + y].set_cell(
+        for visible_y in 0..visible_height {
+            let source_y = source_row_start.saturating_add(visible_y);
+            let texture_top = if source_y == 0 {
+                top_left_y
+            } else {
+                (f64::from(top_left_y)
+                    + yspan * source_y as f64 / image.height as f64) as f32
+            };
+            let texture_bottom = if source_y.saturating_add(1) == image.height {
+                bottom_right_y
+            } else {
+                (f64::from(top_left_y)
+                    + yspan * source_y.saturating_add(1) as f64 / image.height as f64) as f32
+            };
+            if texture_top >= texture_bottom {
+                continue;
+            }
+            for x in 0..visible_width {
+                let texture_left = if x == 0 {
+                    top_left_x
+                } else {
+                    (f64::from(top_left_x) + xspan * x as f64 / image.width as f64) as f32
+                };
+                let texture_right = if x + 1 == image.width {
+                    bottom_right_x
+                } else {
+                    (f64::from(top_left_x) + xspan * (x + 1) as f64 / image.width as f64) as f32
+                };
+                if texture_left >= texture_right {
+                    continue;
+                }
+                self.lines[self.ypos + visible_y].set_cell(
                     self.xpos + x,
                     Cell::new(
                         ' ',
                         self.attributes
                             .clone()
                             .set_image(Box::new(ImageCell::new(
-                                TextureCoordinate::new_f32(top_left_x + xpos, top_left_y + ypos),
-                                TextureCoordinate::new_f32(
-                                    top_left_x + xpos + xsize,
-                                    top_left_y + ypos + ysize,
-                                ),
+                                TextureCoordinate::new_f32(texture_left, texture_top),
+                                TextureCoordinate::new_f32(texture_right, texture_bottom),
                                 image.image.clone(),
                             )))
                             .clone(),
                     ),
                     self.seqno,
                 );
-
-                xpos += xsize;
             }
-            ypos += ysize;
         }
 
-        self.xpos += image.width;
+        self.xpos = self.xpos.saturating_add(image.width);
     }
 
     fn clear_screen(&mut self, color: ColorAttribute) {
@@ -2185,7 +2248,7 @@ mod test {
     fn images() {
         // a dummy image blob with nonsense content
         let data = Arc::new(ImageData::with_raw_data(vec![]));
-        let mut s = Surface::new(2, 2);
+        let mut s = Surface::new(4, 2);
         s.add_change(Change::Image(Image {
             top_left: TextureCoordinate::new_f32(0.0, 0.0),
             bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
@@ -2311,6 +2374,131 @@ mod test {
                     .clone()
             ),]]
         );
+    }
+
+    #[cfg(feature = "use_image")]
+    #[test]
+    fn oversized_images_are_clipped_to_the_surface_without_unbounded_rows_or_columns() {
+        let data = Arc::new(ImageData::with_raw_data(vec![]));
+        let mut wide = Surface::new(2, 1);
+        wide.add_change(Change::Image(Image {
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            image: Arc::clone(&data),
+            width: usize::MAX,
+            height: 1,
+        }));
+        assert_eq!(wide.screen_cells()[0].len(), 2);
+        assert_eq!(wide.cursor_position().0, 2);
+
+        let mut tall = Surface::new(1, 2);
+        tall.add_change(Change::Image(Image {
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            image: data,
+            width: 1,
+            height: 4,
+        }));
+        let cells = tall.screen_cells();
+        assert_eq!(cells.len(), 2);
+        let top_image = cells[0][0]
+            .attrs()
+            .images()
+            .and_then(|images| images.into_iter().next())
+            .expect("the first visible row must retain the third source slice");
+        let bottom_image = cells[1][0]
+            .attrs()
+            .images()
+            .and_then(|images| images.into_iter().next())
+            .expect("the last visible row must retain the final source slice");
+        assert_eq!(top_image.top_left(), TextureCoordinate::new_f32(0.0, 0.5));
+        assert_eq!(top_image.bottom_right(), TextureCoordinate::new_f32(1.0, 0.75));
+        assert_eq!(bottom_image.top_left(), TextureCoordinate::new_f32(0.0, 0.75));
+        assert_eq!(bottom_image.bottom_right(), TextureCoordinate::new_f32(1.0, 1.0));
+    }
+
+    #[cfg(feature = "use_image")]
+    #[test]
+    fn invalid_or_zero_surface_image_geometry_is_a_noop() {
+        let data = Arc::new(ImageData::with_raw_data(vec![]));
+        let mut zero = Surface::new(0, 0);
+        zero.add_change(Change::Image(Image {
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            image: Arc::clone(&data),
+            width: usize::MAX,
+            height: usize::MAX,
+        }));
+        assert_eq!(zero.cursor_position(), (0, 0));
+
+        let mut invalid = Surface::new(1, 1);
+        invalid.add_change(Change::Text(String::new()));
+        let before_invalid = invalid.current_seqno();
+        invalid.add_change(Change::Image(Image {
+            top_left: TextureCoordinate::new_f32(f32::INFINITY, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            image: data,
+            width: 1,
+            height: 1,
+        }));
+        assert_eq!(invalid.cursor_position(), (0, 0));
+        assert!(invalid.screen_cells()[0][0].attrs().images().is_none());
+
+        let (_, changes) = invalid.get_changes(before_invalid);
+        assert_eq!(changes.as_ref(), &[Change::Text(String::new())]);
+    }
+
+    #[cfg(feature = "use_image")]
+    #[test]
+    fn incremental_image_change_is_the_same_bounded_geometry_applied_to_the_model() {
+        let data = Arc::new(ImageData::with_raw_data(vec![]));
+        let mut source = Surface::new(2, 2);
+        source.add_change(Change::Text(String::new()));
+        let before = source.current_seqno();
+        source.add_change(Change::Image(Image {
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            image: data,
+            width: 4,
+            height: 4,
+        }));
+
+        let (_, delta) = source.get_changes(before);
+        let [Change::Image(image)] = delta.as_ref() else {
+            panic!("expected one canonical image delta, got {delta:?}");
+        };
+        assert_eq!((image.width, image.height), (2, 2));
+        assert_eq!(image.top_left, TextureCoordinate::new_f32(0.0, 0.5));
+        assert_eq!(image.bottom_right, TextureCoordinate::new_f32(0.5, 1.0));
+
+        let mut replay = Surface::new(2, 2);
+        replay.add_changes(delta.into_owned());
+        assert_eq!(source.screen_cells(), replay.screen_cells());
+        assert_eq!(source.cursor_position(), replay.cursor_position());
+    }
+
+    #[cfg(feature = "use_image")]
+    #[test]
+    fn unrepresentable_max_height_image_at_nonzero_cursor_is_rejected_before_journaling() {
+        let data = Arc::new(ImageData::with_raw_data(vec![]));
+        let mut surface = Surface::new(1, 2);
+        surface.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(1),
+        });
+        let before = surface.current_seqno();
+        surface.add_change(Change::Image(Image {
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            image: data,
+            width: 1,
+            height: usize::MAX,
+        }));
+
+        assert_eq!(surface.cursor_position(), (0, 1));
+        assert!(surface.screen_cells()[1][0].attrs().images().is_none());
+        let (_, delta) = surface.get_changes(before);
+        assert_eq!(delta.as_ref(), &[Change::Text(String::new())]);
     }
 
     // === Position tests ===

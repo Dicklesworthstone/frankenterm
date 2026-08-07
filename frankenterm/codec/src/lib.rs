@@ -719,6 +719,19 @@ const COMPRESSED_MASK: u64 = 1 << 63;
 /// Maximum allowed PDU payload size (256 MB). Prevents allocation bombs from
 /// malformed or malicious length fields.
 const MAX_PDU_SIZE: usize = 256 * 1024 * 1024;
+
+/// Maximum decoded pixel bytes admitted for one ordinary image-hydration
+/// batch. The client also uses this as the per-image encoded-byte ceiling.
+pub const MAX_IMAGE_HYDRATION_DECODED_BYTES: usize = termwiz::image::MAX_IMAGE_WIRE_BYTES;
+/// Bounded wire body for one GetImageCellResponse: the image budget plus a
+/// fixed envelope for enum/vector/animation metadata and varbincode framing.
+pub const MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES: usize =
+    MAX_IMAGE_HYDRATION_DECODED_BYTES + 1024 * 1024;
+/// Worst-case zstd encoder output for a legal response body. For inputs above
+/// 128 KiB, zstd's compress-bound formula is `size + (size >> 8)`.
+pub const MAX_GET_IMAGE_CELL_RESPONSE_ZSTD_ENCODED_BYTES: usize =
+    MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES
+        + (MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES >> 8);
 // `bounded_varbincode` legitimately performs many small reads. Feeding those
 // directly into zstd would turn field decoding into repeated decompressor/FFI
 // calls. Small authority PDUs use a modest floor; larger compressed payloads
@@ -2239,6 +2252,12 @@ macro_rules! pdu_capability_use {
 }
 
 macro_rules! pdu_encoded_body_limit {
+    (GetImageCellResponse, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_GET_IMAGE_CELL_RESPONSE_ZSTD_ENCODED_BYTES,
+        }
+    };
     (ListPanesOrderedV1Response, negotiates_ordered) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
@@ -2782,7 +2801,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 54;
+pub const CODEC_VERSION: usize = 55;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -2806,7 +2825,7 @@ pub const CODEC_VERSION: usize = 54;
 /// at handshake time for the full release cycle before the bump. The CI
 /// guard `scripts/check_codec_version_release_notes.sh` (ft-8smkj) blocks
 /// silent advances.
-pub const CODEC_VERSION_MIN_SUPPORTED: usize = 46;
+pub const CODEC_VERSION_MIN_SUPPORTED: usize = 55;
 
 /// Outcome of [`check_compat`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2929,7 +2948,8 @@ pdu! {
     WindowWorkspaceChanged: 44, 46, server_unilateral, none;
     SetFocusedPane: 45, 46, client_request, none;
     GetImageCell: 46, 46, client_request, none;
-    GetImageCellResponse: 47, 46, server_reply, none;
+    GetImageCellResponse: 47, 46, server_reply, none
+        => deserialize_get_image_cell_response;
     MovePaneToNewTab: 48, 46, client_request, none;
     MovePaneToNewTabResponse: 49, 46, server_reply, none;
     ActivatePaneDirection: 50, 46, client_request, none;
@@ -3952,7 +3972,7 @@ impl TopologyCapabilities {
 
     /// Runtime-advertised capabilities.
     ///
-    /// The v54 codec knows the ordered-window and exact-render bits, but none
+    /// The v55 codec knows the ordered-window and exact-render bits, but none
     /// may be advertised until their mux authority, server dispatch, and client
     /// reconciliation beads complete. Keep this mask intentionally unchanged.
     pub const SERVER_SUPPORTED: Self = Self::FENCED_SNAPSHOT_V1;
@@ -5353,6 +5373,25 @@ where
     values.serialize(serializer)
 }
 
+fn serialize_bounded_newtype_vec<S, T, const MAX: usize>(
+    values: &[T],
+    serializer: S,
+    label: &'static str,
+    newtype_name: &'static str,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    T: Serialize,
+{
+    if values.len() > MAX {
+        return Err(serde::ser::Error::custom(format_args!(
+            "{label} length {} exceeds maximum {MAX}",
+            values.len()
+        )));
+    }
+    serializer.serialize_newtype_struct(newtype_name, values)
+}
+
 struct BoundedVecVisitor<T, const MAX: usize> {
     label: &'static str,
     marker: std::marker::PhantomData<T>,
@@ -5386,14 +5425,20 @@ where
                 self.label
             ))
         })?;
-        while let Some(value) = sequence.next_element()? {
-            if values.len() == MAX {
-                return Err(serde::de::Error::custom(format_args!(
-                    "{} length exceeds maximum {MAX}",
-                    self.label
-                )));
-            }
+        while values.len() < MAX {
+            let Some(value) = sequence.next_element()? else {
+                return Ok(values);
+            };
             values.push(value);
+        }
+        if sequence
+            .next_element::<serde::de::IgnoredAny>()?
+            .is_some()
+        {
+            return Err(serde::de::Error::custom(format_args!(
+                "{} length exceeds maximum {MAX}",
+                self.label
+            )));
         }
         Ok(values)
     }
@@ -5411,6 +5456,48 @@ where
         label,
         marker: std::marker::PhantomData,
     })
+}
+
+struct BoundedNewtypeVecVisitor<T, const MAX: usize> {
+    label: &'static str,
+    marker: std::marker::PhantomData<T>,
+}
+
+impl<'de, T, const MAX: usize> serde::de::Visitor<'de>
+    for BoundedNewtypeVecVisitor<T, MAX>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "a bounded {} newtype", self.label)
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_bounded_vec::<D, T, MAX>(deserializer, self.label)
+    }
+}
+
+fn deserialize_bounded_newtype_vec<'de, D, T, const MAX: usize>(
+    deserializer: D,
+    label: &'static str,
+    newtype_name: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserializer.deserialize_newtype_struct(
+        newtype_name,
+        BoundedNewtypeVecVisitor::<T, MAX> {
+            label,
+            marker: std::marker::PhantomData,
+        },
+    )
 }
 
 struct BoundedMapVisitor<K, V, const MAX: usize> {
@@ -5449,13 +5536,10 @@ where
             ))
         })?;
         let mut entries = 0_usize;
-        while let Some((key, value)) = map.next_entry()? {
-            if entries == MAX {
-                return Err(serde::de::Error::custom(format_args!(
-                    "{} length exceeds maximum {MAX}",
-                    self.label
-                )));
-            }
+        while entries < MAX {
+            let Some((key, value)) = map.next_entry()? else {
+                return Ok(values);
+            };
             if let std::collections::hash_map::Entry::Vacant(entry) = values.entry(key) {
                 entry.insert(value);
             } else {
@@ -5465,6 +5549,12 @@ where
                 )));
             }
             entries += 1;
+        }
+        if map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+            return Err(serde::de::Error::custom(format_args!(
+                "{} length exceeds maximum {MAX}",
+                self.label
+            )));
         }
         Ok(values)
     }
@@ -10332,7 +10422,8 @@ impl RenderApplicationUpdate {
                         RenderApplicationComponent::Hyperlinks
                     }
                     SerializedLinesStructureError::ImageLineMissing
-                    | SerializedLinesStructureError::ImageCellOutOfRange => {
+                    | SerializedLinesStructureError::ImageCellOutOfRange
+                    | SerializedLinesStructureError::ImageTextureCoordinatesInvalid => {
                         RenderApplicationComponent::Images
                     }
                     SerializedLinesStructureError::DuplicateStableRow
@@ -10796,10 +10887,70 @@ struct CellCoordinates {
     cols: Range<usize>,
 }
 
+fn serialize_hyperlink_coordinates<S>(
+    values: &[CellCoordinates],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serialize_bounded_newtype_vec::<S, _, MAX_RENDER_APPLICATION_HYPERLINK_SPANS>(
+        values,
+        serializer,
+        "serialized hyperlink coordinates",
+        bounded_varbincode::SERIALIZED_HYPERLINK_COORDINATES_V1_NEWTYPE,
+    )
+}
+
+fn deserialize_hyperlink_coordinates<'de, D>(
+    deserializer: D,
+) -> Result<Vec<CellCoordinates>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_newtype_vec::<D, _, MAX_RENDER_APPLICATION_HYPERLINK_SPANS>(
+        deserializer,
+        "serialized hyperlink coordinates",
+        bounded_varbincode::SERIALIZED_HYPERLINK_COORDINATES_V1_NEWTYPE,
+    )
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 struct LineHyperlink {
     link: Hyperlink,
+    #[serde(
+        serialize_with = "serialize_hyperlink_coordinates",
+        deserialize_with = "deserialize_hyperlink_coordinates"
+    )]
     coords: Vec<CellCoordinates>,
+}
+
+fn record_serialized_hyperlink_span(
+    hyperlinks: &mut Vec<LineHyperlink>,
+    hyperlink_by_identity: &mut HashMap<*const Hyperlink, (Arc<Hyperlink>, usize)>,
+    link: &Arc<Hyperlink>,
+    line_idx: usize,
+    cols: Range<usize>,
+) {
+    let identity = Arc::as_ptr(link);
+    if let Some((identity_owner, index)) = hyperlink_by_identity.get(&identity) {
+        debug_assert!(Arc::ptr_eq(identity_owner, link));
+        hyperlinks[*index]
+            .coords
+            .push(CellCoordinates { line_idx, cols });
+    } else {
+        let index = hyperlinks.len();
+        hyperlinks.push(LineHyperlink {
+            link: (**link).clone(),
+            coords: vec![CellCoordinates { line_idx, cols }],
+        });
+        // Keep the allocation that supplied the raw identity alive until the
+        // whole serialization pass ends.  Retaining only a cloned Hyperlink
+        // value permits the source Arc to drop after its cells are cleared;
+        // an allocator may then reuse that address for a distinct hyperlink
+        // and spuriously merge their spans (pointer-identity ABA).
+        hyperlink_by_identity.insert(identity, (Arc::clone(link), index));
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -10809,7 +10960,9 @@ pub struct SerializedImageCell {
     // The following fields are taken from termwiz::image::ImageCell
     pub top_left: TextureCoordinate,
     pub bottom_right: TextureCoordinate,
-    /// Image::data::hash() for the ImageCell::data field
+    /// Current content revision for the ImageCell::data field. This is
+    /// intentionally distinct from ImageData's stable object identity because
+    /// Kitty can edit an existing image in place.
     pub data_hash: [u8; 32],
     pub z_index: i32,
     pub padding_left: u16,
@@ -10818,6 +10971,195 @@ pub struct SerializedImageCell {
     pub padding_bottom: u16,
     pub image_id: Option<u32>,
     pub placement_id: Option<u32>,
+}
+
+impl SerializedImageCell {
+    /// Return texture coordinates canonicalized to the renderer's closed unit
+    /// square. Structure validation permits only a tiny f32 serialization
+    /// tolerance outside that square; clamping here prevents that harmless
+    /// rounding residue from reaching atlas or shader arithmetic.
+    #[must_use]
+    pub fn canonical_texture_coordinates(&self) -> (TextureCoordinate, TextureCoordinate) {
+        (
+            TextureCoordinate::new_f32(
+                self.top_left.x.into_inner().clamp(0.0, 1.0),
+                self.top_left.y.into_inner().clamp(0.0, 1.0),
+            ),
+            TextureCoordinate::new_f32(
+                self.bottom_right.x.into_inner().clamp(0.0, 1.0),
+                self.bottom_right.y.into_inner().clamp(0.0, 1.0),
+            ),
+        )
+    }
+}
+
+fn serialize_line_entries<S>(
+    values: &[(StableRowIndex, Line)],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serialize_bounded_newtype_vec::<S, _, MAX_RENDER_APPLICATION_LINES>(
+        values,
+        serializer,
+        "serialized line entries",
+        bounded_varbincode::SERIALIZED_LINE_ENTRIES_V1_NEWTYPE,
+    )
+}
+
+fn deserialize_line_entries<'de, D>(
+    deserializer: D,
+) -> Result<Vec<(StableRowIndex, Line)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_newtype_vec::<D, _, MAX_RENDER_APPLICATION_LINES>(
+        deserializer,
+        "serialized line entries",
+        bounded_varbincode::SERIALIZED_LINE_ENTRIES_V1_NEWTYPE,
+    )
+}
+
+fn serialize_line_hyperlinks<S>(
+    values: &[LineHyperlink],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let total_spans = values.iter().try_fold(0usize, |total, hyperlink| {
+        total.checked_add(hyperlink.coords.len()).ok_or_else(|| {
+            serde::ser::Error::custom("serialized hyperlink span accounting overflowed")
+        })
+    })?;
+    if total_spans > MAX_RENDER_APPLICATION_HYPERLINK_SPANS {
+        return Err(serde::ser::Error::custom(format_args!(
+            "serialized hyperlinks contain {total_spans} spans, exceeding maximum {MAX_RENDER_APPLICATION_HYPERLINK_SPANS}"
+        )));
+    }
+    serialize_bounded_newtype_vec::<S, _, MAX_RENDER_APPLICATION_HYPERLINK_SPANS>(
+        values,
+        serializer,
+        "serialized hyperlinks",
+        bounded_varbincode::SERIALIZED_HYPERLINKS_V1_NEWTYPE,
+    )
+}
+
+struct BoundedLineHyperlinksVisitor;
+
+impl<'de> serde::de::Visitor<'de> for BoundedLineHyperlinksVisitor {
+    type Value = Vec<LineHyperlink>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "at most {MAX_RENDER_APPLICATION_HYPERLINK_SPANS} serialized hyperlink spans"
+        )
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let hinted = sequence.size_hint().unwrap_or(0);
+        if hinted > MAX_RENDER_APPLICATION_HYPERLINK_SPANS {
+            return Err(serde::de::Error::custom(format_args!(
+                "serialized hyperlinks length {hinted} exceeds maximum {MAX_RENDER_APPLICATION_HYPERLINK_SPANS}"
+            )));
+        }
+        let mut hyperlinks = Vec::new();
+        hyperlinks.try_reserve(hinted).map_err(|error| {
+            serde::de::Error::custom(format_args!(
+                "allocating serialized hyperlinks length {hinted} failed: {error}"
+            ))
+        })?;
+        let mut total_spans = 0usize;
+        while hyperlinks.len() < MAX_RENDER_APPLICATION_HYPERLINK_SPANS {
+            let Some(hyperlink) = sequence.next_element::<LineHyperlink>()? else {
+                return Ok(hyperlinks);
+            };
+            total_spans = total_spans
+                .checked_add(hyperlink.coords.len())
+                .ok_or_else(|| {
+                    serde::de::Error::custom(
+                        "serialized hyperlink span accounting overflowed",
+                    )
+                })?;
+            if total_spans > MAX_RENDER_APPLICATION_HYPERLINK_SPANS {
+                return Err(serde::de::Error::custom(format_args!(
+                    "serialized hyperlinks contain {total_spans} spans, exceeding maximum {MAX_RENDER_APPLICATION_HYPERLINK_SPANS}"
+                )));
+            }
+            hyperlinks.push(hyperlink);
+        }
+        if sequence
+            .next_element::<serde::de::IgnoredAny>()?
+            .is_some()
+        {
+            return Err(serde::de::Error::custom(format_args!(
+                "serialized hyperlinks length exceeds maximum {MAX_RENDER_APPLICATION_HYPERLINK_SPANS}"
+            )));
+        }
+        Ok(hyperlinks)
+    }
+}
+
+struct BoundedLineHyperlinksNewtypeVisitor;
+
+impl<'de> serde::de::Visitor<'de> for BoundedLineHyperlinksNewtypeVisitor {
+    type Value = Vec<LineHyperlink>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded serialized-hyperlinks newtype")
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BoundedLineHyperlinksVisitor)
+    }
+}
+
+fn deserialize_line_hyperlinks<'de, D>(
+    deserializer: D,
+) -> Result<Vec<LineHyperlink>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_newtype_struct(
+        bounded_varbincode::SERIALIZED_HYPERLINKS_V1_NEWTYPE,
+        BoundedLineHyperlinksNewtypeVisitor,
+    )
+}
+
+fn serialize_image_references<S>(
+    values: &[SerializedImageCell],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serialize_bounded_newtype_vec::<S, _, MAX_RENDER_APPLICATION_IMAGE_REFERENCES>(
+        values,
+        serializer,
+        "serialized image references",
+        bounded_varbincode::SERIALIZED_IMAGE_REFERENCES_V1_NEWTYPE,
+    )
+}
+
+fn deserialize_image_references<'de, D>(
+    deserializer: D,
+) -> Result<Vec<SerializedImageCell>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_newtype_vec::<D, _, MAX_RENDER_APPLICATION_IMAGE_REFERENCES>(
+        deserializer,
+        "serialized image references",
+        bounded_varbincode::SERIALIZED_IMAGE_REFERENCES_V1_NEWTYPE,
+    )
 }
 
 /// What's all this?
@@ -10829,8 +11171,20 @@ pub struct SerializedImageCell {
 /// method is called.
 #[derive(Deserialize, Serialize, PartialEq, Debug, Default, Clone)]
 pub struct SerializedLines {
+    #[serde(
+        serialize_with = "serialize_line_entries",
+        deserialize_with = "deserialize_line_entries"
+    )]
     lines: Vec<(StableRowIndex, Line)>,
+    #[serde(
+        serialize_with = "serialize_line_hyperlinks",
+        deserialize_with = "deserialize_line_hyperlinks"
+    )]
     hyperlinks: Vec<LineHyperlink>,
+    #[serde(
+        serialize_with = "serialize_image_references",
+        deserialize_with = "deserialize_image_references"
+    )]
     images: Vec<SerializedImageCell>,
 }
 
@@ -10862,6 +11216,8 @@ pub enum SerializedLinesStructureError {
     ImageLineMissing,
     #[error("serialized image references a missing cell")]
     ImageCellOutOfRange,
+    #[error("serialized image has non-finite, reversed, empty, or out-of-range texture coordinates")]
+    ImageTextureCoordinatesInvalid,
 }
 
 impl SerializedLines {
@@ -10916,6 +11272,31 @@ impl SerializedLines {
             if image.cell_idx >= *line_len {
                 return Err(SerializedLinesStructureError::ImageCellOutOfRange);
             }
+            let left = image.top_left.x.into_inner();
+            let top = image.top_left.y.into_inner();
+            let right = image.bottom_right.x.into_inner();
+            let bottom = image.bottom_right.y.into_inner();
+            const TEXTURE_COORDINATE_WIRE_TOLERANCE: f32 = f32::EPSILON * 8.0;
+            if !left.is_finite()
+                || !top.is_finite()
+                || !right.is_finite()
+                || !bottom.is_finite()
+                || left < -TEXTURE_COORDINATE_WIRE_TOLERANCE
+                || top < -TEXTURE_COORDINATE_WIRE_TOLERANCE
+                || right > 1.0 + TEXTURE_COORDINATE_WIRE_TOLERANCE
+                || bottom > 1.0 + TEXTURE_COORDINATE_WIRE_TOLERANCE
+                || left >= right
+                || top >= bottom
+            {
+                return Err(SerializedLinesStructureError::ImageTextureCoordinatesInvalid);
+            }
+            let canonical_left = left.clamp(0.0, 1.0);
+            let canonical_top = top.clamp(0.0, 1.0);
+            let canonical_right = right.clamp(0.0, 1.0);
+            let canonical_bottom = bottom.clamp(0.0, 1.0);
+            if canonical_left >= canonical_right || canonical_top >= canonical_bottom {
+                return Err(SerializedLinesStructureError::ImageTextureCoordinatesInvalid);
+            }
         }
 
         Ok(SerializedLinesResourceCounts {
@@ -10966,8 +11347,11 @@ impl SerializedLines {
 
 impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
     fn from(mut lines: Vec<(StableRowIndex, Line)>) -> Self {
-        let mut hyperlinks = vec![];
+        let mut hyperlinks = Vec::new();
+        let mut hyperlink_by_identity = HashMap::new();
         let mut images = vec![];
+        let mut image_revision_by_identity =
+            HashMap::<*const ImageData, (Arc<ImageData>, [u8; 32])>::new();
 
         for (line_idx, (stable_row_idx, line)) in lines.iter_mut().enumerate() {
             let mut current_link: Option<Arc<Hyperlink>> = None;
@@ -10989,13 +11373,13 @@ impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
                         }
                         Some(prior) => {
                             // It's a different URL, push the current data and start a new one
-                            hyperlinks.push(LineHyperlink {
-                                link: (**prior).clone(),
-                                coords: vec![CellCoordinates {
-                                    line_idx,
-                                    cols: current_range,
-                                }],
-                            });
+                            record_serialized_hyperlink_span(
+                                &mut hyperlinks,
+                                &mut hyperlink_by_identity,
+                                prior,
+                                line_idx,
+                                current_range,
+                            );
                             current_range = x..x + 1;
                             current_link = Some(link);
                         }
@@ -11007,18 +11391,33 @@ impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
                     }
                 } else if let Some(link) = current_link.take() {
                     // Wrap up a prior streak
-                    hyperlinks.push(LineHyperlink {
-                        link: (*link).clone(),
-                        coords: vec![CellCoordinates {
-                            line_idx,
-                            cols: current_range,
-                        }],
-                    });
+                    record_serialized_hyperlink_span(
+                        &mut hyperlinks,
+                        &mut hyperlink_by_identity,
+                        &link,
+                        line_idx,
+                        current_range,
+                    );
                     current_range = 0..0;
                 }
 
                 if let Some(cell_images) = cell.attrs().images() {
                     for imcell in cell_images {
+                        let image_data = imcell.image_data();
+                        let image_identity = Arc::as_ptr(image_data);
+                        let data_hash = if let Some((identity_owner, revision)) =
+                            image_revision_by_identity.get(&image_identity)
+                        {
+                            debug_assert!(Arc::ptr_eq(identity_owner, image_data));
+                            *revision
+                        } else {
+                            let revision = image_data.current_content_hash();
+                            image_revision_by_identity.insert(
+                                image_identity,
+                                (Arc::clone(image_data), revision),
+                            );
+                            revision
+                        };
                         let (padding_left, padding_top, padding_right, padding_bottom) =
                             imcell.padding();
                         images.push(SerializedImageCell {
@@ -11033,7 +11432,7 @@ impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
                             padding_bottom,
                             image_id: imcell.image_id(),
                             placement_id: imcell.placement_id(),
-                            data_hash: imcell.image_data().hash(),
+                            data_hash,
                         });
                     }
                 }
@@ -11041,13 +11440,13 @@ impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
             }
             if let Some(link) = current_link.take() {
                 // Wrap up final streak
-                hyperlinks.push(LineHyperlink {
-                    link: (*link).clone(),
-                    coords: vec![CellCoordinates {
-                        line_idx,
-                        cols: current_range,
-                    }],
-                });
+                record_serialized_hyperlink_span(
+                    &mut hyperlinks,
+                    &mut hyperlink_by_identity,
+                    &link,
+                    line_idx,
+                    current_range,
+                );
             }
         }
 
@@ -11098,10 +11497,84 @@ pub struct GetImageCellResponse {
     pub data: Option<Arc<ImageData>>,
 }
 
+fn deserialize_get_image_cell_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<GetImageCellResponse, Error> {
+    deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "GetImageCellResponse",
+        MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES,
+    )
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
     use proptest::prelude::*;
+
+    thread_local! {
+        static BOUNDED_OVERFLOW_VALUE_DESERIALIZATIONS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    #[derive(Debug)]
+    struct CountedBoundedValue;
+
+    impl<'de> serde::Deserialize<'de> for CountedBoundedValue {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            BOUNDED_OVERFLOW_VALUE_DESERIALIZATIONS.with(|count| count.set(count.get() + 1));
+            let _ = u8::deserialize(deserializer)?;
+            Ok(Self)
+        }
+    }
+
+    #[test]
+    fn bounded_visitors_do_not_materialize_the_first_overflow_value() {
+        BOUNDED_OVERFLOW_VALUE_DESERIALIZATIONS.with(|count| count.set(0));
+        let mut sequence = serde_json::Deserializer::from_str("[1,2,3]");
+        let sequence_error = deserialize_bounded_vec::<_, CountedBoundedValue, 2>(
+            &mut sequence,
+            "counted sequence",
+        )
+        .expect_err("the third sequence value must exceed the bound");
+        assert!(
+            sequence_error.to_string().contains("maximum 2"),
+            "unexpected sequence admission error: {}",
+            sequence_error
+        );
+        BOUNDED_OVERFLOW_VALUE_DESERIALIZATIONS.with(|count| {
+            assert_eq!(
+                count.get(),
+                2,
+                "the first overflow sequence value must be ignored without materializing T"
+            );
+            count.set(0);
+        });
+
+        let mut map = serde_json::Deserializer::from_str(r#"{"a":1,"b":2,"c":3}"#);
+        let map_error = deserialize_bounded_map::<_, String, CountedBoundedValue, 2>(
+            &mut map,
+            "counted map",
+        )
+        .expect_err("the third map value must exceed the bound");
+        assert!(
+            map_error.to_string().contains("maximum 2"),
+            "unexpected map admission error: {}",
+            map_error
+        );
+        BOUNDED_OVERFLOW_VALUE_DESERIALIZATIONS.with(|count| {
+            assert_eq!(
+                count.get(),
+                2,
+                "the first overflow map value must not be deserialized"
+            );
+        });
+    }
 
     fn declared_pdu_frame_header(
         ident: u64,
@@ -16821,9 +17294,9 @@ mod test {
     }
 
     #[test]
-    fn codec_v54_requires_flat_ordered_schema_but_keeps_v53_compatible() {
-        assert_eq!(CODEC_VERSION, 54);
-        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 46);
+    fn codec_v55_requires_atomic_image_wire_redeploy_and_retains_feature_minima() {
+        assert_eq!(CODEC_VERSION, 55);
+        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 55);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
         assert!(!codec_version_supports_ordered_window_v1(51));
@@ -16832,9 +17305,9 @@ mod test {
         assert!(codec_version_supports_ordered_window_v1(54));
         assert!(!codec_version_supports_exact_render_delivery_v1(51));
         assert!(codec_version_supports_exact_render_delivery_v1(52));
-        assert_eq!(
-            check_compat(54, 46, 53, 46).expect("v53 remains in the additive window"),
-            CompatDecision::Compatible { agreed: 53 }
+        assert!(
+            check_compat(55, 55, 54, 46).is_err(),
+            "the image revision and byte-schema change requires an atomic v55 redeploy"
         );
         assert_eq!(<ListPanesCoherent as PduWireIdent>::IDENT, 81);
         assert_eq!(<RenderApplicationResult as PduWireIdent>::IDENT, 85);
@@ -16870,7 +17343,7 @@ mod test {
         );
         assert_eq!(
             Pdu::decode(frame.as_slice())
-                .expect("v54 decoder must retain v50 PDU81")
+                .expect("v55 decoder must retain v50 PDU81 for historical fixture decoding")
                 .pdu,
             legacy
         );
@@ -17591,11 +18064,217 @@ mod test {
         assert!(images.is_empty());
     }
 
+    #[test]
+    fn serialized_lines_preserve_hyperlink_arc_identity_across_physical_rows() {
+        let shared = Arc::new(Hyperlink::new_implicit("https://example.com"));
+        let mut attrs = termwiz::cell::CellAttributes::default();
+        attrs.set_hyperlink(Some(Arc::clone(&shared)));
+        let first = Line::from_text("first", &attrs, 0, None);
+        let second = Line::from_text("second", &attrs, 0, None);
+
+        let serialized = SerializedLines::from(vec![(10, first), (11, second)]);
+        assert_eq!(serialized.hyperlinks.len(), 1);
+        assert_eq!(serialized.hyperlinks[0].coords.len(), 2);
+
+        let (lines, images) = serialized.extract_data();
+        assert!(images.is_empty());
+        let first_link = lines[0]
+            .1
+            .get_cell(0)
+            .and_then(|cell| cell.attrs().hyperlink().cloned())
+            .expect("first row should retain its hyperlink");
+        let second_link = lines[1]
+            .1
+            .get_cell(0)
+            .and_then(|cell| cell.attrs().hyperlink().cloned())
+            .expect("second row should retain its hyperlink");
+        assert!(Arc::ptr_eq(&first_link, &second_link));
+    }
+
+    #[test]
+    fn serialized_lines_do_not_merge_equal_urls_with_distinct_arc_identity() {
+        let first_link = Arc::new(Hyperlink::new_implicit("https://example.com"));
+        let second_link = Arc::new(Hyperlink::new_implicit("https://example.com"));
+        let mut first_attrs = termwiz::cell::CellAttributes::default();
+        first_attrs.set_hyperlink(Some(first_link));
+        let mut second_attrs = termwiz::cell::CellAttributes::default();
+        second_attrs.set_hyperlink(Some(second_link));
+
+        let serialized = SerializedLines::from(vec![
+            (10, Line::from_text("first", &first_attrs, 0, None)),
+            (11, Line::from_text("second", &second_attrs, 0, None)),
+        ]);
+
+        assert_eq!(serialized.hyperlinks.len(), 2);
+        let (lines, _) = serialized.extract_data();
+        let first_link = lines[0]
+            .1
+            .get_cell(0)
+            .and_then(|cell| cell.attrs().hyperlink().cloned())
+            .unwrap();
+        let second_link = lines[1]
+            .1
+            .get_cell(0)
+            .and_then(|cell| cell.attrs().hyperlink().cloned())
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first_link, &second_link));
+    }
+
+    #[test]
+    fn hyperlink_identity_index_owns_each_pointer_for_the_full_pass() {
+        let first = Arc::new(Hyperlink::new_implicit("https://first.example"));
+        let first_identity = Arc::as_ptr(&first);
+        let mut serialized = Vec::new();
+        let mut by_identity = HashMap::new();
+
+        record_serialized_hyperlink_span(
+            &mut serialized,
+            &mut by_identity,
+            &first,
+            0,
+            0..1,
+        );
+        assert_eq!(Arc::strong_count(&first), 2);
+        drop(first);
+
+        let (retained_owner, retained_index) = by_identity
+            .get(&first_identity)
+            .expect("the identity index must retain the source Arc");
+        assert_eq!(*retained_index, 0);
+        assert_eq!(
+            retained_owner.uri(),
+            "https://first.example",
+            "the raw identity cannot outlive its owning allocation"
+        );
+
+        let second = Arc::new(Hyperlink::new_implicit("https://second.example"));
+        record_serialized_hyperlink_span(
+            &mut serialized,
+            &mut by_identity,
+            &second,
+            1,
+            0..1,
+        );
+        assert_eq!(serialized.len(), 2);
+    }
+
     // --- CODEC_VERSION test ---
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 54);
+        assert_eq!(CODEC_VERSION, 55);
+    }
+
+    #[test]
+    fn image_cell_response_has_a_schema_specific_preallocation_cap() {
+        let expected = PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_GET_IMAGE_CELL_RESPONSE_ZSTD_ENCODED_BYTES,
+        };
+        let spec = Pdu::wire_spec_for_ident(GetImageCellResponse::IDENT)
+            .expect("GetImageCellResponse must remain registered");
+        assert_eq!(spec.encoded_body_limit, expected);
+        assert_eq!(
+            spec.encoded_body_limit
+                .maximum_encoded_payload_bytes(false),
+            MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES
+        );
+        assert!(
+            MAX_GET_IMAGE_CELL_RESPONSE_ZSTD_ENCODED_BYTES
+                >= zstd::zstd_safe::compress_bound(
+                    MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES
+                ),
+            "the encoded ceiling must admit zstd's worst-case legal output"
+        );
+        const {
+            assert!(
+                MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES < MAX_PDU_SIZE,
+                "image hydration must not inherit the global allocation envelope"
+            );
+        }
+    }
+
+    #[test]
+    fn image_cell_response_admits_large_raw_byte_buffers_under_image_cap() {
+        use termwiz::image::ImageDataType;
+
+        const WIDTH: u32 = 2_048;
+        const HEIGHT: u32 = 2_049;
+        let pixel_bytes = vec![0x6d; WIDTH as usize * HEIGHT as usize * 4];
+        assert!(
+            pixel_bytes.len() > bounded_varbincode::MAX_CONTAINER_BYTES,
+            "the regression must cross the generic 16 MiB byte-buffer admission"
+        );
+        assert!(pixel_bytes.len() <= MAX_IMAGE_HYDRATION_DECODED_BYTES);
+        let response = GetImageCellResponse {
+            pane_id: 41,
+            data: Some(Arc::new(ImageData::with_data(
+                ImageDataType::new_single_frame(WIDTH, HEIGHT, pixel_bytes),
+            ))),
+        };
+        let mut frame = Vec::new();
+        Pdu::GetImageCellResponse(response)
+            .encode(&mut frame, 9_771)
+            .expect("large but bounded image response must encode");
+        let decoded = Pdu::decode(frame.as_slice())
+            .expect("image-specific byte admission must bypass the generic item cap");
+        let Pdu::GetImageCellResponse(decoded) = decoded.pdu else {
+            panic!("wrong PDU variant");
+        };
+        let data = decoded.data.expect("decoded image payload");
+        assert_eq!(data.len(), WIDTH as usize * HEIGHT as usize * 4);
+    }
+
+    #[test]
+    fn image_cell_response_enforces_animation_frame_cardinality_on_the_binary_wire() {
+        use termwiz::image::{ImageDataType, MAX_IMAGE_WIRE_FRAMES};
+
+        let frame = vec![0x7c; 4];
+        let frame_hash = ImageDataType::hash_bytes(&frame);
+        let accepted = GetImageCellResponse {
+            pane_id: 42,
+            data: Some(Arc::new(ImageData::with_data(ImageDataType::AnimRgba8 {
+                width: 1,
+                height: 1,
+                durations: vec![std::time::Duration::ZERO; MAX_IMAGE_WIRE_FRAMES],
+                frames: vec![frame.clone(); MAX_IMAGE_WIRE_FRAMES],
+                hashes: vec![frame_hash; MAX_IMAGE_WIRE_FRAMES],
+            }))),
+        };
+        let mut frame_bytes = Vec::new();
+        Pdu::GetImageCellResponse(accepted)
+            .encode(&mut frame_bytes, 9_772)
+            .expect("exactly 4096 animation frames must remain wire-admissible");
+        let decoded = Pdu::decode(frame_bytes.as_slice()).unwrap();
+        let Pdu::GetImageCellResponse(decoded) = decoded.pdu else {
+            panic!("wrong PDU variant");
+        };
+        let decoded = decoded.data.expect("decoded animation payload");
+        let decoded = decoded.data();
+        let ImageDataType::AnimRgba8 { frames, .. } = &*decoded else {
+            panic!("expected animated RGBA payload");
+        };
+        assert_eq!(frames.len(), MAX_IMAGE_WIRE_FRAMES);
+
+        let rejected = GetImageCellResponse {
+            pane_id: 43,
+            data: Some(Arc::new(ImageData::with_data(ImageDataType::AnimRgba8 {
+                width: 1,
+                height: 1,
+                durations: vec![std::time::Duration::ZERO; MAX_IMAGE_WIRE_FRAMES + 1],
+                frames: vec![frame; MAX_IMAGE_WIRE_FRAMES + 1],
+                hashes: vec![frame_hash; MAX_IMAGE_WIRE_FRAMES + 1],
+            }))),
+        };
+        let mut rejected_bytes = Vec::new();
+        let error = Pdu::GetImageCellResponse(rejected)
+            .encode(&mut rejected_bytes, 9_773)
+            .expect_err("the 4097th animation frame must be rejected before wire emission");
+        assert!(
+            format!("{error:#}").contains("image durations contain 4097 items"),
+            "unexpected cardinality rejection: {:#}",
+            error
+        );
     }
 
     #[test]
@@ -17655,13 +18334,12 @@ mod test {
                 "wrong minimum dialect for PDU {} ({})",
                 spec.ident, spec.name,
             );
-            assert!((CODEC_VERSION_MIN_SUPPORTED..=CODEC_VERSION)
-                .contains(&spec.min_codec_version));
+            assert!(spec.min_codec_version <= CODEC_VERSION);
         }
 
         assert_eq!(
             Pdu::Ping(Ping {}).minimum_codec_version(),
-            Some(CODEC_VERSION_MIN_SUPPORTED),
+            Some(46),
         );
         assert_eq!(Pdu::Invalid { ident: 5 }.minimum_codec_version(), None);
         assert_eq!(Pdu::Invalid { ident: 5 }.producer(), None);
@@ -17843,9 +18521,9 @@ mod test {
     // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
 
     #[test]
-    fn check_compat_additive_window_keeps_min_supported() {
-        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 46);
-        assert_eq!(CODEC_VERSION, 54);
+    fn check_compat_current_build_requires_atomic_v55_window() {
+        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 55);
+        assert_eq!(CODEC_VERSION, 55);
     }
 
     #[test]
@@ -19778,6 +20456,207 @@ mod test {
         assert_eq!(
             invalid_image_cell.validate_structure(),
             Err(SerializedLinesStructureError::ImageCellOutOfRange)
+        );
+
+        for (top_left, bottom_right) in [
+            (
+                TextureCoordinate::new_f32(f32::INFINITY, 0.0),
+                TextureCoordinate::new_f32(1.0, 1.0),
+            ),
+            (
+                TextureCoordinate::new_f32(0.8, 0.0),
+                TextureCoordinate::new_f32(0.2, 1.0),
+            ),
+            (
+                TextureCoordinate::new_f32(-0.1, 0.0),
+                TextureCoordinate::new_f32(1.0, 1.0),
+            ),
+            (
+                TextureCoordinate::new_f32(0.0, 0.0),
+                TextureCoordinate::new_f32(1.1, 1.0),
+            ),
+            (
+                TextureCoordinate::new_f32(0.0, 0.5),
+                TextureCoordinate::new_f32(1.0, 0.5),
+            ),
+            (
+                TextureCoordinate::new_f32(-4.0 * f32::EPSILON, 0.0),
+                TextureCoordinate::new_f32(0.0, 1.0),
+            ),
+            (
+                TextureCoordinate::new_f32(1.0, 0.0),
+                TextureCoordinate::new_f32(1.0 + 4.0 * f32::EPSILON, 1.0),
+            ),
+            (
+                TextureCoordinate::new_f32(0.0, -4.0 * f32::EPSILON),
+                TextureCoordinate::new_f32(1.0, 0.0),
+            ),
+            (
+                TextureCoordinate::new_f32(0.0, 1.0),
+                TextureCoordinate::new_f32(1.0, 1.0 + 4.0 * f32::EPSILON),
+            ),
+        ] {
+            let invalid_geometry = SerializedLines {
+                lines: vec![(0, line())],
+                hyperlinks: Vec::new(),
+                images: vec![SerializedImageCell {
+                    line_idx: 0,
+                    cell_idx: 0,
+                    top_left,
+                    bottom_right,
+                    data_hash: [0x3c; 32],
+                    z_index: 0,
+                    padding_left: 0,
+                    padding_top: 0,
+                    padding_right: 0,
+                    padding_bottom: 0,
+                    image_id: None,
+                    placement_id: None,
+                }],
+            };
+            assert_eq!(
+                invalid_geometry.validate_structure(),
+                Err(SerializedLinesStructureError::ImageTextureCoordinatesInvalid)
+            );
+        }
+
+        let rounded_geometry = SerializedLines {
+            lines: vec![(0, line())],
+            hyperlinks: Vec::new(),
+            images: vec![SerializedImageCell {
+                line_idx: 0,
+                cell_idx: 0,
+                top_left: TextureCoordinate::new_f32(-4.0 * f32::EPSILON, 0.0),
+                bottom_right: TextureCoordinate::new_f32(1.0 + 4.0 * f32::EPSILON, 1.0),
+                data_hash: [0x5a; 32],
+                z_index: 0,
+                padding_left: 0,
+                padding_top: 0,
+                padding_right: 0,
+                padding_bottom: 0,
+                image_id: None,
+                placement_id: None,
+            }],
+        };
+        assert!(rounded_geometry.validate_structure().is_ok());
+        let (top_left, bottom_right) =
+            rounded_geometry.images[0].canonical_texture_coordinates();
+        assert_eq!(top_left, TextureCoordinate::new_f32(0.0, 0.0));
+        assert_eq!(bottom_right, TextureCoordinate::new_f32(1.0, 1.0));
+    }
+
+    #[test]
+    fn serialized_lines_wire_enforces_aggregate_hyperlink_span_limit() {
+        let first_count = MAX_RENDER_APPLICATION_HYPERLINK_SPANS / 2;
+        let second_count = MAX_RENDER_APPLICATION_HYPERLINK_SPANS - first_count + 1;
+        let coordinate = CellCoordinates {
+            line_idx: 0,
+            cols: 0..1,
+        };
+        let hyperlinks = vec![
+            LineHyperlink {
+                link: Hyperlink::new_implicit("https://first.example"),
+                coords: vec![coordinate.clone(); first_count],
+            },
+            LineHyperlink {
+                link: Hyperlink::new_implicit("https://second.example"),
+                coords: vec![coordinate; second_count],
+            },
+        ];
+
+        let bounded = SerializedLines {
+            lines: Vec::new(),
+            hyperlinks: hyperlinks.clone(),
+            images: Vec::new(),
+        };
+        let encode_error = serde_json::to_vec(&bounded)
+            .expect_err("aggregate hyperlink spans above the limit must not serialize");
+        assert!(
+            encode_error.to_string().contains("65536"),
+            "unexpected aggregate hyperlink encode error: {}",
+            encode_error
+        );
+
+        // Produce a structurally equivalent JSON object without using
+        // SerializedLines' bounded field serializer so the receive-side
+        // aggregate gate is exercised independently.
+        #[derive(Serialize)]
+        struct UnboundedSerializedLines<'a> {
+            lines: &'a [(StableRowIndex, Line)],
+            hyperlinks: &'a [LineHyperlink],
+            images: &'a [SerializedImageCell],
+        }
+        let lines: Vec<(StableRowIndex, Line)> = Vec::new();
+        let images: Vec<SerializedImageCell> = Vec::new();
+        let wire = serde_json::to_vec(&UnboundedSerializedLines {
+            lines: &lines,
+            hyperlinks: &hyperlinks,
+            images: &images,
+        })
+        .unwrap();
+        let decode_error = serde_json::from_slice::<SerializedLines>(&wire)
+            .expect_err("aggregate hyperlink spans above the limit must not deserialize");
+        assert!(
+            decode_error.to_string().contains("65536"),
+            "unexpected aggregate hyperlink decode error: {}",
+            decode_error
+        );
+    }
+
+    #[test]
+    fn serialized_lines_preserve_layered_images_in_one_cell() {
+        use termwiz::cell::CellAttributes;
+        use termwiz::image::{ImageCell, ImageDataType};
+
+        let first_data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![0x11; 4],
+        )));
+        let second_data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![0x22; 4],
+        )));
+        let mut attrs = CellAttributes::default();
+        attrs.attach_image(Box::new(ImageCell::with_z_index(
+            TextureCoordinate::new_f32(0.0, 0.0),
+            TextureCoordinate::new_f32(1.0, 1.0),
+            first_data,
+            -1,
+            0,
+            0,
+            0,
+            0,
+            Some(7),
+            Some(11),
+        )));
+        attrs.attach_image(Box::new(ImageCell::with_z_index(
+            TextureCoordinate::new_f32(0.0, 0.0),
+            TextureCoordinate::new_f32(1.0, 1.0),
+            second_data,
+            2,
+            0,
+            0,
+            0,
+            0,
+            Some(13),
+            Some(17),
+        )));
+
+        let serialized = SerializedLines::from(vec![(
+            5,
+            Line::from_text("x", &attrs, 1, None),
+        )]);
+        assert_eq!(serialized.validate_structure().unwrap().images, 2);
+        let (_, images) = serialized.extract_data_checked().unwrap();
+        assert_eq!(images.len(), 2);
+        assert!(images.iter().all(|image| {
+            image.line_idx == 5 && image.cell_idx == 0
+        }));
+        assert_eq!(
+            images.iter().map(|image| image.z_index).collect::<Vec<_>>(),
+            vec![-1, 2],
         );
     }
 

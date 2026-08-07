@@ -25,6 +25,16 @@ pub(crate) const ORDERED_WINDOWS_V1_NEWTYPE: &str =
     "frankenterm.codec.OrderedWindowsV1";
 pub(crate) const ORDERED_TAB_IDS_V1_NEWTYPE: &str =
     "frankenterm.codec.OrderedTabIdsV1";
+pub(crate) const SERIALIZED_LINE_ENTRIES_V1_NEWTYPE: &str =
+    "frankenterm.codec.SerializedLineEntriesV1";
+pub(crate) const SERIALIZED_HYPERLINKS_V1_NEWTYPE: &str =
+    "frankenterm.codec.SerializedHyperlinksV1";
+pub(crate) const SERIALIZED_HYPERLINK_COORDINATES_V1_NEWTYPE: &str =
+    "frankenterm.codec.SerializedHyperlinkCoordinatesV1";
+pub(crate) const SERIALIZED_IMAGE_REFERENCES_V1_NEWTYPE: &str =
+    "frankenterm.codec.SerializedImageReferencesV1";
+pub(crate) const IMAGE_WIRE_BYTES_V1_NEWTYPE: &str =
+    termwiz::image::IMAGE_WIRE_BYTES_V1_NEWTYPE;
 pub(crate) const EXACT_RENDER_ROW_UTF8_V1_MAX_BYTES: usize = 1_000_000;
 pub(crate) const EXACT_RENDER_METADATA_UTF8_V1_MAX_BYTES: usize = 65_536;
 pub(crate) const ORDERED_WINDOW_SECTION_V1_MAX_BYTES: usize = 512 * 1024;
@@ -33,17 +43,26 @@ pub(crate) const ORDERED_PANE_NODES_V1_MAX_ITEMS: usize = 32_767;
 pub(crate) const ORDERED_PANE_WINDOW_TITLES_V1_MAX_ITEMS: usize = 4_096;
 pub(crate) const ORDERED_WINDOWS_V1_MAX_ITEMS: usize = 4_096;
 pub(crate) const ORDERED_TAB_IDS_V1_MAX_ITEMS: usize = 4_096;
+pub(crate) const SERIALIZED_LINE_ENTRIES_V1_MAX_ITEMS: usize =
+    super::MAX_RENDER_APPLICATION_LINES;
+pub(crate) const SERIALIZED_HYPERLINKS_V1_MAX_ITEMS: usize =
+    super::MAX_RENDER_APPLICATION_HYPERLINK_SPANS;
+pub(crate) const SERIALIZED_HYPERLINK_COORDINATES_V1_MAX_ITEMS: usize =
+    super::MAX_RENDER_APPLICATION_HYPERLINK_SPANS;
+pub(crate) const SERIALIZED_IMAGE_REFERENCES_V1_MAX_ITEMS: usize =
+    super::MAX_RENDER_APPLICATION_IMAGE_REFERENCES;
+pub(crate) const IMAGE_WIRE_BYTES_V1_MAX_BYTES: usize =
+    super::MAX_IMAGE_HYDRATION_DECODED_BYTES;
 
-/// Hard byte budget for any single varbincode container or byte-buffer
-/// allocation. Attacker-controlled leb128 lengths get clamped by this cap
-/// before they reach `vec![0u8; len]` in [`Deserializer::read_vec`] or the
-/// visitor-driven `Vec::with_capacity(size_hint)` preallocation in serde
-/// collection deserializers. 16 MiB is tight enough that a fuzzer cannot
-/// stack multiple allocations into OOM within the libFuzzer 2 GiB limit
-/// while still covering every production PDU we ship. Kept separate from
-/// the outer frame-level [`super::MAX_PDU_SIZE`] (256 MiB) so per-container
-/// blast radius stays small even when the frame is near the wire cap.
-const MAX_CONTAINER_BYTES: usize = 16 * 1024 * 1024;
+/// Default hard byte budget for an unmarked varbincode container or byte
+/// buffer. Attacker-controlled leb128 lengths get clamped before they reach
+/// [`Deserializer::read_vec`] allocation or visitor-driven serde collection
+/// preallocation. Audited schema newtypes may select their own explicit cap;
+/// notably, image bytes use the 64 MiB image-hydration budget, while nested
+/// markers can only tighten an admission already in force. The 16 MiB default
+/// keeps ordinary and fuzzed containers small and remains independent from the
+/// outer frame-level [`super::MAX_PDU_SIZE`] (256 MiB).
+pub(crate) const MAX_CONTAINER_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn deserialize<T: serde::de::DeserializeOwned, R: Read>(reader: &mut R) -> Result<T> {
     let mut deserializer = Deserializer::new(reader);
@@ -106,6 +125,30 @@ impl ContainerAdmission {
         preallocation_maximum: ORDERED_TAB_IDS_V1_MAX_ITEMS,
     };
 
+    const SERIALIZED_LINE_ENTRIES: Self = Self {
+        label: "serialized line entries",
+        maximum: SERIALIZED_LINE_ENTRIES_V1_MAX_ITEMS,
+        preallocation_maximum: SERIALIZED_LINE_ENTRIES_V1_MAX_ITEMS,
+    };
+
+    const SERIALIZED_HYPERLINKS: Self = Self {
+        label: "serialized hyperlinks",
+        maximum: SERIALIZED_HYPERLINKS_V1_MAX_ITEMS,
+        preallocation_maximum: 4_096,
+    };
+
+    const SERIALIZED_HYPERLINK_COORDINATES: Self = Self {
+        label: "serialized hyperlink coordinates",
+        maximum: SERIALIZED_HYPERLINK_COORDINATES_V1_MAX_ITEMS,
+        preallocation_maximum: 4_096,
+    };
+
+    const SERIALIZED_IMAGE_REFERENCES: Self = Self {
+        label: "serialized image references",
+        maximum: SERIALIZED_IMAGE_REFERENCES_V1_MAX_ITEMS,
+        preallocation_maximum: SERIALIZED_IMAGE_REFERENCES_V1_MAX_ITEMS,
+    };
+
     const fn restricted_by(self, requested: Self) -> Self {
         if requested.maximum <= self.maximum {
             requested
@@ -134,6 +177,11 @@ impl ByteBufferAdmission {
     const ORDERED_WINDOW_SECTION: Self = Self {
         label: "ordered-window section bytes",
         maximum: ORDERED_WINDOW_SECTION_V1_MAX_BYTES,
+    };
+
+    const IMAGE_WIRE_BYTES: Self = Self {
+        label: "image wire bytes",
+        maximum: IMAGE_WIRE_BYTES_V1_MAX_BYTES,
     };
 
     const fn restricted_by(self, requested: Self) -> Self {
@@ -453,6 +501,8 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
             Some(ByteBufferAdmission::EXACT_RENDER_METADATA_UTF8)
         } else if name == ORDERED_WINDOW_SECTION_V1_NEWTYPE {
             Some(ByteBufferAdmission::ORDERED_WINDOW_SECTION)
+        } else if name == IMAGE_WIRE_BYTES_V1_NEWTYPE {
+            Some(ByteBufferAdmission::IMAGE_WIRE_BYTES)
         } else {
             None
         };
@@ -466,24 +516,35 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
             Some(ContainerAdmission::ORDERED_WINDOWS)
         } else if name == ORDERED_TAB_IDS_V1_NEWTYPE {
             Some(ContainerAdmission::ORDERED_TAB_IDS)
+        } else if name == SERIALIZED_LINE_ENTRIES_V1_NEWTYPE {
+            Some(ContainerAdmission::SERIALIZED_LINE_ENTRIES)
+        } else if name == SERIALIZED_HYPERLINKS_V1_NEWTYPE {
+            Some(ContainerAdmission::SERIALIZED_HYPERLINKS)
+        } else if name == SERIALIZED_HYPERLINK_COORDINATES_V1_NEWTYPE {
+            Some(ContainerAdmission::SERIALIZED_HYPERLINK_COORDINATES)
+        } else if name == SERIALIZED_IMAGE_REFERENCES_V1_NEWTYPE {
+            Some(ContainerAdmission::SERIALIZED_IMAGE_REFERENCES)
         } else {
             None
         };
         let prior_byte_buffer = self.pending_byte_buffer_admission;
         let prior_container = self.pending_container_admission;
         if let Some(requested) = requested_byte_buffer {
-            self.pending_byte_buffer_admission = Some(
-                prior_byte_buffer
-                    .unwrap_or(ByteBufferAdmission::GLOBAL)
-                    .restricted_by(requested),
-            );
+            self.pending_byte_buffer_admission = Some(match prior_byte_buffer {
+                // A nested schema marker may tighten, but never widen, an
+                // admission already selected by its enclosing schema.
+                Some(prior) => prior.restricted_by(requested),
+                // A top-level schema marker is itself the authority. This is
+                // what permits the audited 64 MiB image payload while ordinary
+                // byte buffers retain the generic 16 MiB ceiling.
+                None => requested,
+            });
         }
         if let Some(requested) = requested_container {
-            self.pending_container_admission = Some(
-                prior_container
-                    .unwrap_or(ContainerAdmission::GLOBAL)
-                    .restricted_by(requested),
-            );
+            self.pending_container_admission = Some(match prior_container {
+                Some(prior) => prior.restricted_by(requested),
+                None => requested,
+            });
         }
         let armed_byte_buffer = self.pending_byte_buffer_admission;
         let armed_container = self.pending_container_admission;
@@ -719,6 +780,120 @@ mod tests {
         }
     }
 
+    macro_rules! marked_vector_type {
+        ($type_name:ident, $visitor_name:ident, $newtype_name:expr) => {
+            #[derive(Debug)]
+            struct $type_name(Vec<u8>);
+
+            struct $visitor_name;
+
+            impl<'de> de::Visitor<'de> for $visitor_name {
+                type Value = $type_name;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter.write_str("a schema-marked vector")
+                }
+
+                fn visit_newtype_struct<D>(
+                    self,
+                    deserializer: D,
+                ) -> std::result::Result<Self::Value, D::Error>
+                where
+                    D: serde::Deserializer<'de>,
+                {
+                    Vec::<u8>::deserialize(deserializer).map($type_name)
+                }
+            }
+
+            impl<'de> Deserialize<'de> for $type_name {
+                fn deserialize<D>(
+                    deserializer: D,
+                ) -> std::result::Result<Self, D::Error>
+                where
+                    D: serde::Deserializer<'de>,
+                {
+                    deserializer.deserialize_newtype_struct($newtype_name, $visitor_name)
+                }
+            }
+        };
+    }
+
+    marked_vector_type!(
+        SerializedLineEntriesVector,
+        SerializedLineEntriesVectorVisitor,
+        SERIALIZED_LINE_ENTRIES_V1_NEWTYPE
+    );
+    marked_vector_type!(
+        SerializedHyperlinksVector,
+        SerializedHyperlinksVectorVisitor,
+        SERIALIZED_HYPERLINKS_V1_NEWTYPE
+    );
+    marked_vector_type!(
+        SerializedHyperlinkCoordinatesVector,
+        SerializedHyperlinkCoordinatesVectorVisitor,
+        SERIALIZED_HYPERLINK_COORDINATES_V1_NEWTYPE
+    );
+    marked_vector_type!(
+        SerializedImageReferencesVector,
+        SerializedImageReferencesVectorVisitor,
+        SERIALIZED_IMAGE_REFERENCES_V1_NEWTYPE
+    );
+
+    #[derive(Debug)]
+    struct ImageWireBytes(Vec<u8>);
+
+    struct ImageWireBytesVisitor;
+
+    impl<'de> de::Visitor<'de> for ImageWireBytesVisitor {
+        type Value = ImageWireBytes;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("schema-marked image bytes")
+        }
+
+        fn visit_newtype_struct<D>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_byte_buf(ImageWireBytesBufferVisitor)
+        }
+    }
+
+    struct ImageWireBytesBufferVisitor;
+
+    impl<'de> de::Visitor<'de> for ImageWireBytesBufferVisitor {
+        type Value = ImageWireBytes;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an image byte buffer")
+        }
+
+        fn visit_byte_buf<E>(
+            self,
+            value: Vec<u8>,
+        ) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(ImageWireBytes(value))
+        }
+    }
+
+    impl<'de> Deserialize<'de> for ImageWireBytes {
+        fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_newtype_struct(
+                IMAGE_WIRE_BYTES_V1_NEWTYPE,
+                ImageWireBytesVisitor,
+            )
+        }
+    }
+
     #[derive(Debug)]
     struct NestedWindowTitleVector(Vec<u8>);
 
@@ -862,6 +1037,52 @@ mod tests {
     fn write_len(wire: &mut Vec<u8>, len: usize) {
         let len = u64::try_from(len).expect("test length fits u64");
         leb128::write::unsigned(wire, len).expect("write in-memory length prefix");
+    }
+
+    fn assert_marked_vector_rejects_prefix<T>(len: usize, expected_label: &str)
+    where
+        T: serde::de::DeserializeOwned + std::fmt::Debug,
+    {
+        let mut wire = Vec::new();
+        write_len(&mut wire, len);
+        let mut reader = wire.as_slice();
+        let error = deserialize::<T, _>(&mut reader)
+            .expect_err("schema admission must reject before reading vector elements");
+        assert!(error.to_string().contains(expected_label), "{}", error);
+    }
+
+    #[test]
+    fn serialized_line_resource_markers_reject_oversized_prefixes_before_allocation() {
+        assert_marked_vector_rejects_prefix::<SerializedLineEntriesVector>(
+            SERIALIZED_LINE_ENTRIES_V1_MAX_ITEMS + 1,
+            "serialized line entries length",
+        );
+        assert_marked_vector_rejects_prefix::<SerializedHyperlinksVector>(
+            SERIALIZED_HYPERLINKS_V1_MAX_ITEMS + 1,
+            "serialized hyperlinks length",
+        );
+        assert_marked_vector_rejects_prefix::<SerializedHyperlinkCoordinatesVector>(
+            SERIALIZED_HYPERLINK_COORDINATES_V1_MAX_ITEMS + 1,
+            "serialized hyperlink coordinates length",
+        );
+        assert_marked_vector_rejects_prefix::<SerializedImageReferencesVector>(
+            SERIALIZED_IMAGE_REFERENCES_V1_MAX_ITEMS + 1,
+            "serialized image references length",
+        );
+    }
+
+    #[test]
+    fn image_wire_marker_rejects_64_mib_plus_one_before_allocating_payload() {
+        let mut wire = Vec::new();
+        write_len(&mut wire, IMAGE_WIRE_BYTES_V1_MAX_BYTES + 1);
+        let mut reader = wire.as_slice();
+        let error = deserialize::<ImageWireBytes, _>(&mut reader)
+            .expect_err("oversized image bytes must fail from the length prefix alone");
+        assert!(
+            error.to_string().contains("image wire bytes length"),
+            "{}",
+            error
+        );
     }
 
     #[test]

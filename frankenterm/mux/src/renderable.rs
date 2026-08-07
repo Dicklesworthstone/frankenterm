@@ -8,6 +8,7 @@ use luahelper::impl_lua_conversion_dynamic;
 use rangeset::RangeSet;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
+use termwiz::hyperlink::Rule;
 use termwiz::surface::SequenceNo;
 
 /// Describes the location of the cursor
@@ -167,6 +168,39 @@ pub fn terminal_with_lines_mut(
     let first = screen.phys_to_stable_row_index(phys_range.start);
 
     screen.with_phys_lines_mut(phys_range, |lines| with_lines.with_lines_mut(first, lines));
+}
+
+/// Apply implicit hyperlink rules and expose the requested physical rows while
+/// one caller-owned terminal guard remains held. This prevents terminal
+/// mutation between the logical-line scan and the render callback and avoids a
+/// second terminal-lock acquisition on the paint hot path.
+pub fn terminal_with_lines_mut_and_apply_hyperlinks(
+    term: &mut Terminal,
+    lines: Range<StableRowIndex>,
+    rules: &[Rule],
+    with_lines: &mut dyn WithPaneLines,
+) {
+    struct ApplyHyperlinks<'a> {
+        rules: &'a [Rule],
+    }
+
+    impl ForEachPaneLogicalLine for ApplyHyperlinks<'_> {
+        fn with_logical_line_mut(
+            &mut self,
+            _stable_range: Range<StableRowIndex>,
+            lines: &mut [&mut Line],
+        ) -> bool {
+            Line::apply_hyperlink_rules(self.rules, lines);
+            true
+        }
+    }
+
+    terminal_for_each_logical_line_in_stable_range_mut(
+        term,
+        lines.clone(),
+        &mut ApplyHyperlinks { rules },
+    );
+    terminal_with_lines_mut(term, lines, with_lines);
 }
 
 /// Implements Pane::get_lines for Terminal

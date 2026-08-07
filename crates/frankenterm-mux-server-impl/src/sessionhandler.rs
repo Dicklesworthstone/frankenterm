@@ -4,6 +4,7 @@ use crate::dispatch::EstablishedOrderedWindowAuthority;
 #[cfg(test)]
 use crate::dispatch::established_ordered_window_authority_for_test;
 use anyhow::{Context, anyhow};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use codec::{
     ActivatePaneDirection, AdjustPaneSize, CODEC_VERSION, CreateFloatingPane, CycleStack,
     CoherentPaneSnapshot, DecodedPdu, EraseScrollbackRequest, ErrorResponse, GetClientList,
@@ -28,9 +29,12 @@ use mux::{CurrentPane, Mux, PaneRegistrationHandle};
 use promise::spawn::spawn_into_main_thread;
 use std::collections::HashMap;
 use std::ops::Deref;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
+#[cfg(test)]
+use termwiz::surface::SEQ_ZERO;
 use termwiz::surface::SequenceNo;
 use url::Url;
 use wezterm_term::StableRowIndex;
@@ -922,6 +926,7 @@ enum PaneRenderPreparationError {
     InputIdentityExhausted,
     SourceChanged,
     TerminalSequenceExhausted,
+    StableRowRangeUnrepresentable,
     StaleAttempt,
     NotificationPrefixChanged,
     SnapshotFailed,
@@ -942,6 +947,9 @@ impl std::fmt::Display for PaneRenderPreparationError {
             Self::SourceChanged => "pane render source changed during snapshot preparation",
             Self::TerminalSequenceExhausted => {
                 "terminal sequence saturated; a fresh render generation is required"
+            }
+            Self::StableRowRangeUnrepresentable => {
+                "pane stable-row range cannot be represented without overflow"
             }
             Self::StaleAttempt => "pane render attempt no longer owns the transaction",
             Self::NotificationPrefixChanged => {
@@ -1032,6 +1040,7 @@ struct PreparedSurfaceChanges {
     response: GetPaneRenderChangesResponse,
     baseline: PaneRenderBaseline,
     source_start: SequenceNo,
+    source_query: SequenceNo,
     source_end: SequenceNo,
 }
 
@@ -1039,9 +1048,11 @@ struct PreparedSurfaceChanges {
 enum SurfacePreparation {
     NoChange {
         source_start: SequenceNo,
+        source_query: SequenceNo,
         source_end: SequenceNo,
     },
     Changes(Box<PreparedSurfaceChanges>),
+    StableRowRangeUnrepresentable,
 }
 
 impl PaneRenderBaseline {
@@ -1086,10 +1097,15 @@ impl PaneRenderBaseline {
             changed = true;
         }
 
-        let old_seqno = self.seqno;
-        let viewport_range = stable_row_range_from_len(dims.physical_top, dims.viewport_rows)
-            .unwrap_or(dims.physical_top..dims.physical_top);
-        let mut all_dirty_lines = pane.get_changed_since(viewport_range.clone(), old_seqno);
+        let Some(viewport_range) =
+            stable_row_range_from_len(dims.physical_top, dims.viewport_rows)
+        else {
+            return SurfacePreparation::StableRowRangeUnrepresentable;
+        };
+        // Capture the query fence and derive the regression/MAX-safe baseline
+        // under the backend's terminal/cache lock where it has one.
+        let (source_query, mut all_dirty_lines) =
+            pane.get_changed_since_with_source_fence(viewport_range.clone(), self.seqno);
         if !all_dirty_lines.is_empty() {
             changed = true;
         }
@@ -1097,38 +1113,49 @@ impl PaneRenderBaseline {
         if !changed && force_with_input_dispatch_serial.is_none() && !force_for_atomic_effects {
             return SurfacePreparation::NoChange {
                 source_start,
+                source_query,
                 source_end: pane.get_current_seqno(),
             };
         }
 
         // Figure out what we're going to send as dirty lines vs bonus lines
         let (first_line, lines) = pane.get_lines(viewport_range);
-        let mut bonus_lines = lines
-            .into_iter()
-            .enumerate()
-            .filter_map(|(idx, mut line)| {
-                let stable_row = stable_row_offset(first_line, idx)?;
-                if all_dirty_lines.contains(stable_row) {
-                    all_dirty_lines.remove(stable_row);
-                    line.compress_for_scrollback();
-                    Some((stable_row, line))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        if stable_row_range_from_len(first_line, lines.len()).is_none() {
+            return SurfacePreparation::StableRowRangeUnrepresentable;
+        }
+        let mut bonus_lines = Vec::new();
+        for (idx, mut line) in lines.into_iter().enumerate() {
+            let Some(stable_row) = stable_row_offset(first_line, idx) else {
+                return SurfacePreparation::StableRowRangeUnrepresentable;
+            };
+            if all_dirty_lines.contains(stable_row) {
+                all_dirty_lines.remove(stable_row);
+                line.compress_for_scrollback();
+                bonus_lines.push((stable_row, line));
+            }
+        }
 
         // Always send the cursor's row, as that tends to the busiest and we don't
         // have a sequencing concept for our idea of the remote state.
-        let (cursor_line_idx, lines) =
-            pane.get_lines(cursor_position.y..cursor_position.y.saturating_add(1));
+        let Some(cursor_range) = stable_row_range_from_len(cursor_position.y, 1) else {
+            return SurfacePreparation::StableRowRangeUnrepresentable;
+        };
+        let (cursor_line_idx, lines) = pane.get_lines(cursor_range);
+        if stable_row_range_from_len(cursor_line_idx, lines.len()).is_none() {
+            return SurfacePreparation::StableRowRangeUnrepresentable;
+        }
         if let Some(mut cursor_line) = lines.into_iter().next() {
             cursor_line.compress_for_scrollback();
-            if bonus_lines
+            if let Err(insertion_idx) = bonus_lines
                 .binary_search_by_key(&cursor_line_idx, |(stable_row, _)| *stable_row)
-                .is_err()
             {
-                bonus_lines.push((cursor_line_idx, cursor_line));
+                // Preserve the stable-row ordering established by the viewport
+                // walk even for a defensive backend whose reported cursor row
+                // falls before that viewport.  Keeping this vector ordered
+                // makes the binary-search dedupe itself valid on later edits
+                // and avoids handing downstream consumers a shape that only
+                // happens to be ordered for ordinary terminal geometry.
+                bonus_lines.insert(insertion_idx, (cursor_line_idx, cursor_line));
             }
         }
 
@@ -1141,7 +1168,7 @@ impl PaneRenderBaseline {
         baseline.tiered_scrollback_status = tiered_scrollback_status;
         baseline.mouse_grabbed = mouse_grabbed;
         baseline.alt_screen_active = alt_screen_active;
-        baseline.seqno = source_start;
+        baseline.seqno = source_query;
 
         let bonus_lines = bonus_lines.into();
         SurfacePreparation::Changes(Box::new(PreparedSurfaceChanges {
@@ -1157,10 +1184,11 @@ impl PaneRenderBaseline {
                 bonus_lines,
                 working_dir: working_dir.map(Into::into),
                 input_serial: force_with_input_dispatch_serial,
-                seqno: source_start,
+                seqno: source_query,
             },
             baseline,
             source_start,
+            source_query,
             source_end,
         }))
     }
@@ -1171,26 +1199,30 @@ impl PerPane {
         &mut self,
         pane: &CurrentPane<'_>,
         force_with_input_dispatch_serial: Option<InputSerial>,
-    ) -> Option<GetPaneRenderChangesResponse> {
+    ) -> Result<Option<GetPaneRenderChangesResponse>, PaneRenderPreparationError> {
         match self.baseline.prepare_surface_changes(
             pane,
             force_with_input_dispatch_serial,
             false,
         ) {
-            SurfacePreparation::NoChange { source_start, .. } => {
+            SurfacePreparation::StableRowRangeUnrepresentable => {
+                self.mark_transactional_dirty();
+                Err(PaneRenderPreparationError::StableRowRangeUnrepresentable)
+            }
+            SurfacePreparation::NoChange { source_query, .. } => {
                 // The legacy transport has no application ACK. Preserve its
                 // established behavior and avoid rescanning an ever-growing
                 // no-visible-change interval while the transactional path
                 // remains dormant.
-                self.baseline.seqno = source_start;
-                None
+                self.baseline.seqno = source_query;
+                Ok(None)
             }
             SurfacePreparation::Changes(prepared) => {
                 let PreparedSurfaceChanges {
                     response, baseline, ..
                 } = *prepared;
                 self.baseline = baseline;
-                Some(response)
+                Ok(Some(response))
             }
         }
     }
@@ -1635,16 +1667,27 @@ impl PaneRenderPreparation {
             force_for_atomic_effects,
         );
 
-        let (source_start, source_end) = match &surface {
+        let (source_start, source_query, source_end) = match &surface {
+            SurfacePreparation::StableRowRangeUnrepresentable => {
+                return Err(PaneRenderPreparationError::StableRowRangeUnrepresentable);
+            }
             SurfacePreparation::NoChange {
                 source_start,
+                source_query,
                 source_end,
-            } => (*source_start, *source_end),
+            } => (*source_start, *source_query, *source_end),
             SurfacePreparation::Changes(prepared) => {
-                (prepared.source_start, prepared.source_end)
+                (
+                    prepared.source_start,
+                    prepared.source_query,
+                    prepared.source_end,
+                )
             }
         };
-        if source_start == SequenceNo::MAX || source_end == SequenceNo::MAX {
+        if source_start == SequenceNo::MAX
+            || source_query == SequenceNo::MAX
+            || source_end == SequenceNo::MAX
+        {
             let outcome = self
                 .state
                 .lock()
@@ -1657,7 +1700,7 @@ impl PaneRenderPreparation {
             ));
             return Err(PaneRenderPreparationError::TerminalSequenceExhausted);
         }
-        if source_start != source_end {
+        if source_start != source_query || source_query != source_end {
             return Err(PaneRenderPreparationError::SourceChanged);
         }
 
@@ -1792,22 +1835,216 @@ impl Drop for PreparedPaneRender {
     }
 }
 
+struct LegacyRenderEnqueueGuard {
+    per_pane: Arc<Mutex<PerPane>>,
+    pane_id: PaneId,
+    prior_baseline: PaneRenderBaseline,
+    installed_baseline: PaneRenderBaseline,
+    armed: bool,
+}
+
+impl LegacyRenderEnqueueGuard {
+    fn new(
+        per_pane: Arc<Mutex<PerPane>>,
+        pane_id: PaneId,
+        prior_baseline: PaneRenderBaseline,
+        installed_baseline: PaneRenderBaseline,
+    ) -> Self {
+        Self {
+            per_pane,
+            pane_id,
+            prior_baseline,
+            installed_baseline,
+            armed: true,
+        }
+    }
+
+    fn acknowledge(mut self) {
+        self.armed = false;
+    }
+
+    fn rollback(mut self) -> anyhow::Result<()> {
+        self.armed = false;
+        retain_legacy_render_after_enqueue_failure(
+            &self.per_pane,
+            self.pane_id,
+            &self.prior_baseline,
+            &self.installed_baseline,
+        )
+    }
+}
+
+impl Drop for LegacyRenderEnqueueGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        match catch_recoverable(
+            RecoverablePanicSite::MuxPaneCallback,
+            AssertUnwindSafe(|| {
+                retain_legacy_render_after_enqueue_failure(
+                    &self.per_pane,
+                    self.pane_id,
+                    &self.prior_baseline,
+                    &self.installed_baseline,
+                )
+            }),
+        ) {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => log::error!(
+                "failed to recover abandoned legacy render enqueue for pane {}: {err:#}",
+                self.pane_id
+            ),
+            Err(err) => log::error!(
+                "legacy render enqueue recovery panicked for pane {}: {err}",
+                self.pane_id
+            ),
+        }
+    }
+}
+
+struct UnsentNotificationsGuard {
+    per_pane: Arc<Mutex<PerPane>>,
+    notifications: Vec<Alert>,
+    next_unsent: usize,
+    armed: bool,
+}
+
+impl UnsentNotificationsGuard {
+    fn new(per_pane: Arc<Mutex<PerPane>>, notifications: Vec<Alert>) -> Self {
+        Self {
+            per_pane,
+            notifications,
+            next_unsent: 0,
+            armed: true,
+        }
+    }
+
+    fn current(&self) -> Option<&Alert> {
+        self.notifications.get(self.next_unsent)
+    }
+
+    fn acknowledge_current(&mut self) {
+        self.next_unsent = self.next_unsent.saturating_add(1);
+    }
+
+    fn acknowledge_all(mut self) {
+        self.armed = false;
+    }
+
+    fn rollback(mut self) -> anyhow::Result<()> {
+        self.armed = false;
+        retain_unsent_notifications_after_enqueue_failure(
+            &self.per_pane,
+            &self.notifications[self.next_unsent..],
+        )
+    }
+}
+
+impl Drop for UnsentNotificationsGuard {
+    fn drop(&mut self) {
+        if !self.armed || self.next_unsent >= self.notifications.len() {
+            return;
+        }
+        self.armed = false;
+        match catch_recoverable(
+            RecoverablePanicSite::MuxPaneCallback,
+            AssertUnwindSafe(|| {
+                retain_unsent_notifications_after_enqueue_failure(
+                    &self.per_pane,
+                    &self.notifications[self.next_unsent..],
+                )
+            }),
+        ) {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                log::error!("failed to retain abandoned pane notifications: {err:#}");
+            }
+            Err(err) => {
+                log::error!("pane notification recovery panicked: {err}");
+            }
+        }
+    }
+}
+
+fn retain_legacy_render_after_enqueue_failure(
+    per_pane: &Arc<Mutex<PerPane>>,
+    pane_id: PaneId,
+    prior_baseline: &PaneRenderBaseline,
+    installed_baseline: &PaneRenderBaseline,
+) -> anyhow::Result<()> {
+    let mut state = per_pane
+        .lock()
+        .map_err(|err| anyhow!("per-pane state lock poisoned during render recovery: {err}"))?;
+    if state.baseline == *installed_baseline {
+        state.baseline.clone_from(prior_baseline);
+    } else {
+        log::error!(
+            "cannot roll back failed legacy render enqueue for pane {pane_id}: the baseline was superseded"
+        );
+    }
+    state.mark_transactional_dirty();
+    Ok(())
+}
+
+fn retain_unsent_notifications_after_enqueue_failure(
+    per_pane: &Arc<Mutex<PerPane>>,
+    unsent: &[Alert],
+) -> anyhow::Result<()> {
+    let mut state = per_pane.lock().map_err(|err| {
+        anyhow!("per-pane state lock poisoned during notification recovery: {err}")
+    })?;
+    let mut retained = unsent.to_vec();
+    retained.append(&mut state.notifications);
+    state.notifications = retained;
+    state.mark_transactional_dirty();
+    Ok(())
+}
+
 fn maybe_push_pane_changes(
     pane: &CurrentPane<'_>,
     sender: PduSender,
     per_pane: Arc<Mutex<PerPane>>,
 ) -> anyhow::Result<()> {
-    let render_changes = {
-        let mut per_pane = per_pane
+    let (render_changes, rollback_guard) = {
+        let mut state = per_pane
             .lock()
             .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
-        per_pane.compute_changes(pane, None)
+        let prior_baseline = state.baseline.clone();
+        let render_changes = state.compute_changes(pane, None)?;
+        let rollback_guard = render_changes.as_ref().map(|_| {
+            LegacyRenderEnqueueGuard::new(
+                Arc::clone(&per_pane),
+                pane.pane_id(),
+                prior_baseline,
+                state.baseline.clone(),
+            )
+        });
+        (render_changes, rollback_guard)
     };
     if let Some(resp) = render_changes {
-        sender.send_bulk(DecodedPdu {
+        let send_result = sender.send_bulk(DecodedPdu {
             pdu: Pdu::GetPaneRenderChangesResponse(resp),
             serial: 0,
-        })?;
+        });
+        match send_result {
+            Ok(()) => {
+                if let Some(guard) = rollback_guard {
+                    guard.acknowledge();
+                }
+            }
+            Err(send_err) => {
+                if let Some(guard) = rollback_guard {
+                    if let Err(recovery_err) = guard.rollback() {
+                        return Err(anyhow!(
+                            "render enqueue failed: {send_err:#}; baseline recovery also failed: {recovery_err:#}"
+                        ));
+                    }
+                }
+                return Err(send_err);
+            }
+        }
     }
 
     let notifications = {
@@ -1832,29 +2069,161 @@ fn maybe_push_pane_changes(
         std::mem::take(&mut per_pane.notifications)
     };
 
-    for alert in notifications {
-        match alert {
-            Alert::PaletteChanged => {
-                sender.send_bulk(DecodedPdu {
-                    pdu: Pdu::SetPalette(SetPalette {
-                        pane_id: pane.pane_id(),
-                        palette: pane.palette(),
-                    }),
-                    serial: 0,
-                })?;
-            }
-            alert => {
-                sender.send_bulk(DecodedPdu {
-                    pdu: Pdu::NotifyAlert(NotifyAlert {
-                        pane_id: pane.pane_id(),
-                        alert,
-                    }),
-                    serial: 0,
-                })?;
+    let mut notifications = UnsentNotificationsGuard::new(Arc::clone(&per_pane), notifications);
+    while let Some(alert) = notifications.current() {
+        let send_result = match alert {
+            Alert::PaletteChanged => sender.send_bulk(DecodedPdu {
+                pdu: Pdu::SetPalette(SetPalette {
+                    pane_id: pane.pane_id(),
+                    palette: pane.palette(),
+                }),
+                serial: 0,
+            }),
+            alert => sender.send_bulk(DecodedPdu {
+                pdu: Pdu::NotifyAlert(NotifyAlert {
+                    pane_id: pane.pane_id(),
+                    alert: alert.clone(),
+                }),
+                serial: 0,
+            }),
+        };
+        match send_result {
+            Ok(()) => notifications.acknowledge_current(),
+            Err(send_err) => {
+                if let Err(recovery_err) = notifications.rollback() {
+                    return Err(anyhow!(
+                        "notification enqueue failed: {send_err:#}; retention also failed: {recovery_err:#}"
+                    ));
+                }
+                return Err(send_err);
             }
         }
     }
+    notifications.acknowledge_all();
     Ok(())
+}
+
+/// A pane input mutation is authoritative once its pane method succeeds.
+/// Render preparation and enqueue happen afterwards and therefore must not
+/// turn that committed input into an RPC error that invites a duplicate retry.
+fn push_pane_changes_after_committed_input(
+    pane: &CurrentPane<'_>,
+    sender: PduSender,
+    per_pane: Arc<Mutex<PerPane>>,
+    operation: &'static str,
+) {
+    let recovery_state = Arc::clone(&per_pane);
+    match catch_recoverable(
+        RecoverablePanicSite::MuxPaneCallback,
+        AssertUnwindSafe(|| maybe_push_pane_changes(pane, sender, per_pane)),
+    ) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            log::error!(
+                "render push failed after committed {operation} for pane {}; preserving the input acknowledgment: {err:#}",
+                pane.pane_id()
+            );
+        }
+        Err(err) => {
+            mark_post_input_render_dirty(&recovery_state, pane.pane_id(), operation);
+            log::error!(
+                "render push panicked after committed {operation} for pane {}; preserving the input acknowledgment: {err}",
+                pane.pane_id()
+            );
+        }
+    }
+}
+
+fn mark_post_input_render_dirty(
+    per_pane: &Arc<Mutex<PerPane>>,
+    pane_id: PaneId,
+    operation: &'static str,
+) {
+    match per_pane.lock() {
+        Ok(mut state) => state.mark_transactional_dirty(),
+        Err(err) => log::error!(
+            "render state lock poisoned while recovering committed {operation} for pane {pane_id}: {err}"
+        ),
+    }
+}
+
+fn push_key_down_changes_after_committed_input(
+    pane: &CurrentPane<'_>,
+    sender: PduSender,
+    per_pane: Arc<Mutex<PerPane>>,
+    pane_id: PaneId,
+    input_serial: InputSerial,
+) {
+    // Force a surface snapshot so the client can measure dispatch RTT and
+    // record the exact terminal-sequence fence sampled after `key_down`.
+    // This acknowledges protocol dispatch only; it does not claim that the
+    // PTY or application has echoed the input.
+    let prepared = catch_recoverable(
+        RecoverablePanicSite::MuxPaneCallback,
+        AssertUnwindSafe(|| -> anyhow::Result<_> {
+            let mut state = per_pane
+                .lock()
+                .map_err(|err| anyhow!("render state lock poisoned: {err}"))?;
+            let prior_baseline = state.baseline.clone();
+            let Some(response) = state.compute_changes(pane, Some(input_serial))? else {
+                return Ok(None);
+            };
+            let rollback = LegacyRenderEnqueueGuard::new(
+                Arc::clone(&per_pane),
+                pane_id,
+                prior_baseline,
+                state.baseline.clone(),
+            );
+            Ok(Some((response, rollback)))
+        }),
+    );
+
+    let (response, rollback) = match prepared {
+        Ok(Ok(Some(prepared))) => prepared,
+        Ok(Ok(None)) => return,
+        Ok(Err(err)) => {
+            log::error!(
+                "render preparation failed after committed key-down for pane {pane_id}; preserving the input acknowledgment: {err:#}"
+            );
+            return;
+        }
+        Err(err) => {
+            mark_post_input_render_dirty(&per_pane, pane_id, "key-down");
+            log::error!(
+                "render preparation panicked after committed key-down for pane {pane_id}; preserving the input acknowledgment: {err}"
+            );
+            return;
+        }
+    };
+
+    match catch_recoverable(
+        RecoverablePanicSite::MuxPaneCallback,
+        AssertUnwindSafe(|| {
+            sender.send_control(DecodedPdu {
+                pdu: Pdu::GetPaneRenderChangesResponse(response),
+                serial: 0,
+            })
+        }),
+    ) {
+        Ok(Ok(())) => rollback.acknowledge(),
+        Ok(Err(err)) => {
+            if let Err(recovery_err) = rollback.rollback() {
+                log::error!(
+                    "render baseline recovery failed after committed key-down for pane {pane_id}: {recovery_err:#}"
+                );
+            }
+            log::error!(
+                "render enqueue failed after committed key-down for pane {pane_id}; preserving the input acknowledgment: {err:#}"
+            );
+        }
+        Err(err) => {
+            // The armed guard restores the exact baseline before returning.
+            drop(rollback);
+            log::error!(
+                "render enqueue panicked after committed key-down for pane {pane_id}; preserving the input acknowledgment: {err}"
+            );
+        }
+    }
 }
 
 fn session_mux(authority: &SessionAuthority) -> anyhow::Result<CurrentSession> {
@@ -3076,7 +3445,12 @@ impl SessionHandler {
                         move || {
                             with_current_pane(&authority, &registration, |pane| {
                                 pane.write_all(&data)?;
-                                maybe_push_pane_changes(pane, sender, per_pane)?;
+                                push_pane_changes_after_committed_input(
+                                    pane,
+                                    sender,
+                                    per_pane,
+                                    "write",
+                                );
                                 Ok(Pdu::UnitResponse(UnitResponse {}))
                             })
                         },
@@ -3143,7 +3517,12 @@ impl SessionHandler {
                         move || {
                             with_current_pane(&authority, &registration, |pane| {
                                 pane.send_paste(&data)?;
-                                maybe_push_pane_changes(pane, sender, per_pane)?;
+                                push_pane_changes_after_committed_input(
+                                    pane,
+                                    sender,
+                                    per_pane,
+                                    "paste",
+                                );
                                 Ok(Pdu::UnitResponse(UnitResponse {}))
                             })
                         },
@@ -3294,25 +3673,13 @@ impl SessionHandler {
                         move || {
                             with_current_pane(&authority, &registration, |pane| {
                                 pane.key_down(event.key, event.modifiers)?;
-
-                                // Force a surface snapshot so the client can
-                                // measure dispatch RTT and record the exact
-                                // terminal-sequence fence sampled after
-                                // `key_down`. This acknowledges protocol
-                                // dispatch only; it does not claim that the PTY
-                                // or application has echoed the input.
-                                let render_changes = {
-                                    let mut per_pane = per_pane.lock().map_err(|err| {
-                                        anyhow!("per-pane state lock poisoned: {err}")
-                                    })?;
-                                    per_pane.compute_changes(pane, Some(input_serial))
-                                };
-                                if let Some(resp) = render_changes {
-                                    sender.send_control(DecodedPdu {
-                                        pdu: Pdu::GetPaneRenderChangesResponse(resp),
-                                        serial: 0,
-                                    })?;
-                                }
+                                push_key_down_changes_after_committed_input(
+                                    pane,
+                                    sender,
+                                    per_pane,
+                                    pane_id,
+                                    input_serial,
+                                );
                                 Ok(Pdu::UnitResponse(UnitResponse {}))
                             })
                         },
@@ -3353,7 +3720,12 @@ impl SessionHandler {
                         move || {
                             with_current_pane(&authority, &registration, |pane| {
                                 pane.mouse_event(event)?;
-                                maybe_push_pane_changes(pane, sender, per_pane)?;
+                                push_pane_changes_after_committed_input(
+                                    pane,
+                                    sender,
+                                    per_pane,
+                                    "mouse event",
+                                );
                                 Ok(Pdu::UnitResponse(UnitResponse {}))
                             })
                         },
@@ -3561,7 +3933,9 @@ impl SessionHandler {
                                     if let Some(cell) = line.get_cell(cell_idx) {
                                         if let Some(images) = cell.attrs().images() {
                                             for im in images {
-                                                if im.image_data().hash() == data_hash {
+                                                if im.image_data().current_content_hash()
+                                                    == data_hash
+                                                {
                                                     data.replace(im.image_data().clone());
                                                     break 'found_data;
                                                 }
@@ -4230,8 +4604,11 @@ mod tests {
         pane_id: PaneId,
         state: Mutex<FakePaneState>,
         changed_lines: Mutex<RangeSet<StableRowIndex>>,
+        changed_since_seqnos: Mutex<Vec<SequenceNo>>,
+        key_down_count: AtomicUsize,
         callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         seqno_on_dimensions: Option<SequenceNo>,
+        cursor_line_start_override: Option<StableRowIndex>,
         // Writer sink for the Pane::writer() trait obligation. FakePane
         // has no PTY; bytes written here are discarded. Keeping a real
         // writable buffer behind a parking_lot mutex (rather than
@@ -4256,9 +4633,12 @@ mod tests {
                 pane_id,
                 callback_probe: None,
                 seqno_on_dimensions: None,
+                cursor_line_start_override: None,
                 writer_sink: ParkingMutex::new(std::io::sink()),
                 mux_registration: Arc::new(mux::PaneRegistrationSlot::default()),
                 changed_lines: Mutex::new(RangeSet::new()),
+                changed_since_seqnos: Mutex::new(Vec::new()),
+                key_down_count: AtomicUsize::new(0),
                 state: Mutex::new(FakePaneState {
                     cursor_position: StableCursorPosition {
                         x: 4,
@@ -4305,6 +4685,18 @@ mod tests {
         fn set_changed_line(&self, stable_row: StableRowIndex) {
             self.changed_lines.lock().unwrap().add(stable_row);
         }
+
+        fn clear_changed_lines(&self) {
+            *self.changed_lines.lock().unwrap() = RangeSet::new();
+        }
+
+        fn take_changed_since_seqnos(&self) -> Vec<SequenceNo> {
+            std::mem::take(&mut *self.changed_since_seqnos.lock().unwrap())
+        }
+
+        fn key_down_count(&self) -> usize {
+            self.key_down_count.load(Ordering::Relaxed)
+        }
     }
 
     impl Pane for FakePane {
@@ -4327,15 +4719,27 @@ mod tests {
         fn get_changed_since(
             &self,
             _lines: Range<StableRowIndex>,
-            _seqno: SequenceNo,
+            seqno: SequenceNo,
         ) -> RangeSet<StableRowIndex> {
-            self.changed_lines.lock().unwrap().clone()
+            self.changed_since_seqnos.lock().unwrap().push(seqno);
+            if self.state.lock().unwrap().seqno <= seqno {
+                RangeSet::new()
+            } else {
+                self.changed_lines.lock().unwrap().clone()
+            }
         }
 
         fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
             let state = self.state.lock().unwrap();
+            let first_line = if lines.start == state.cursor_position.y
+                && lines.end.checked_sub(lines.start) == Some(1)
+            {
+                self.cursor_line_start_override.unwrap_or(lines.start)
+            } else {
+                lines.start
+            };
             (
-                lines.start,
+                first_line,
                 state
                     .lines
                     .iter()
@@ -4413,6 +4817,7 @@ mod tests {
         }
 
         fn key_down(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
+            self.key_down_count.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
 
@@ -9205,6 +9610,168 @@ mod tests {
     }
 
     #[test]
+    fn failed_legacy_render_enqueue_restores_baseline_and_redirties() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        per_pane.lock().unwrap().transactional_dirty = false;
+        let sender = PduSender::new(|_, _| Err(anyhow!("synthetic enqueue failure")));
+
+        let error = registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender, Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect_err("the synthetic render enqueue must fail");
+        assert!(error.to_string().contains("synthetic enqueue failure"));
+
+        let state = per_pane.lock().unwrap();
+        assert_eq!(
+            state.baseline,
+            PaneRenderBaseline::default(),
+            "a render that never entered the queue cannot become authoritative"
+        );
+        assert!(
+            state.transactional_dirty,
+            "failed enqueue must retain an explicit retry obligation"
+        );
+    }
+
+    #[test]
+    fn panicked_legacy_render_enqueue_restores_baseline_and_preserves_input_ack_path() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        per_pane.lock().unwrap().transactional_dirty = false;
+        let sender = PduSender::new(|_, _| -> anyhow::Result<()> {
+            panic!("synthetic render enqueue panic")
+        });
+
+        registration
+            .try_with_current(|current| {
+                push_pane_changes_after_committed_input(
+                    &current,
+                    sender,
+                    Arc::clone(&per_pane),
+                    "test write",
+                );
+            })
+            .expect("test pane registration remains current");
+
+        let state = per_pane.lock().unwrap();
+        assert_eq!(
+            state.baseline,
+            PaneRenderBaseline::default(),
+            "an enqueue panic cannot publish the speculative baseline"
+        );
+        assert!(
+            state.transactional_dirty,
+            "an enqueue panic must retain a render retry obligation"
+        );
+    }
+
+    #[test]
+    fn failed_notification_enqueue_retains_unsent_suffix_and_redirties() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        per_pane.lock().unwrap().transactional_dirty = false;
+        let enqueue_count = Arc::new(AtomicUsize::new(0));
+        let sender = PduSender::new({
+            let enqueue_count = Arc::clone(&enqueue_count);
+            move |_, _| {
+                if enqueue_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Ok(())
+                } else {
+                    Err(anyhow!("synthetic notification enqueue failure"))
+                }
+            }
+        });
+
+        let error = registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender, Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect_err("the synthetic palette enqueue must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("synthetic notification enqueue failure")
+        );
+
+        let state = per_pane.lock().unwrap();
+        assert_eq!(
+            state.baseline.seqno, 11,
+            "the successfully enqueued render baseline remains authoritative"
+        );
+        assert_eq!(state.notifications, vec![Alert::PaletteChanged]);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn panicked_notification_enqueue_retains_unsent_suffix() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        per_pane.lock().unwrap().transactional_dirty = false;
+        let enqueue_count = Arc::new(AtomicUsize::new(0));
+        let sender = PduSender::new({
+            let enqueue_count = Arc::clone(&enqueue_count);
+            move |_, _| {
+                if enqueue_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Ok(())
+                } else {
+                    panic!("synthetic notification enqueue panic")
+                }
+            }
+        });
+
+        registration
+            .try_with_current(|current| {
+                push_pane_changes_after_committed_input(
+                    &current,
+                    sender,
+                    Arc::clone(&per_pane),
+                    "test paste",
+                );
+            })
+            .expect("test pane registration remains current");
+
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.baseline.seqno, 11);
+        assert_eq!(state.notifications, vec![Alert::PaletteChanged]);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn panicked_key_down_render_enqueue_restores_baseline_without_escaping() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        per_pane.lock().unwrap().transactional_dirty = false;
+        let sender = PduSender::new(|_, _| -> anyhow::Result<()> {
+            panic!("synthetic key-down render enqueue panic")
+        });
+
+        registration
+            .try_with_current(|current| {
+                push_key_down_changes_after_committed_input(
+                    &current,
+                    sender,
+                    Arc::clone(&per_pane),
+                    current.pane_id(),
+                    InputSerial::empty(),
+                );
+            })
+            .expect("test pane registration remains current");
+
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.baseline, PaneRenderBaseline::default());
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
     fn transactional_render_prepares_without_lock_and_commits_only_on_exact_ack() {
         let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
@@ -9565,6 +10132,33 @@ mod tests {
     }
 
     #[test]
+    fn transactional_viewport_overflow_retries_without_committing_baseline() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane = Arc::new(FakePane::new(None));
+        pane.state.lock().unwrap().dimensions.physical_top = StableRowIndex::MAX;
+        let pane_dyn: Arc<dyn Pane> = pane;
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+
+        assert_eq!(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                None,
+            )
+            .unwrap_err(),
+            PaneRenderPreparationError::StableRowRangeUnrepresentable
+        );
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.baseline, PaneRenderBaseline::default());
+        assert!(state.transactional_dirty);
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Idle
+        ));
+    }
+
+    #[test]
     fn terminal_sequence_saturation_closes_before_ambiguous_identity() {
         let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let pane = Arc::new(FakePane::new(None));
@@ -9679,6 +10273,7 @@ mod tests {
         let response = registration
             .try_with_current(|current| per_pane.compute_changes(&current, None))
             .expect("test pane registration remains current")
+            .expect("pane surface preparation should succeed")
             .expect("initial pane snapshot should produce a response");
 
         assert_eq!(
@@ -9692,6 +10287,211 @@ mod tests {
     }
 
     #[test]
+    fn legacy_compute_changes_rejects_overflow_without_advancing_baseline() {
+        let pane = Arc::new(FakePane::new(None));
+        pane.state.lock().unwrap().dimensions.physical_top = StableRowIndex::MAX;
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let mut per_pane = PerPane::default();
+
+        let result = registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current");
+        assert!(matches!(
+            result,
+            Err(PaneRenderPreparationError::StableRowRangeUnrepresentable)
+        ));
+        assert_eq!(
+            per_pane.baseline,
+            PaneRenderBaseline::default(),
+            "an unrepresentable viewport must not become the delivered baseline"
+        );
+        assert!(
+            pane.take_changed_since_seqnos().is_empty(),
+            "range validation must fail before querying a misleading empty span"
+        );
+
+        pane.state.lock().unwrap().dimensions.physical_top = 0;
+        let response = registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current")
+            .expect("a representable retry should prepare successfully")
+            .expect("the retained initial snapshot should be delivered on retry");
+        assert_eq!(response.seqno, 11);
+        assert_eq!(per_pane.baseline.seqno, 11);
+    }
+
+    #[test]
+    fn legacy_compute_changes_rejects_unrepresentable_cursor_row() {
+        let pane = Arc::new(FakePane::new(None));
+        pane.state.lock().unwrap().cursor_position.y = StableRowIndex::MAX;
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let mut per_pane = PerPane::default();
+
+        let result = registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current");
+        assert!(matches!(
+            result,
+            Err(PaneRenderPreparationError::StableRowRangeUnrepresentable)
+        ));
+        assert_eq!(
+            per_pane.baseline,
+            PaneRenderBaseline::default(),
+            "an unrepresentable cursor row must not advance the delivered baseline"
+        );
+
+        pane.state.lock().unwrap().cursor_position.y = 0;
+        registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current")
+            .expect("representable cursor retry should prepare successfully")
+            .expect("retained initial snapshot should be delivered on retry");
+    }
+
+    #[test]
+    fn legacy_compute_changes_rejects_unrepresentable_returned_cursor_span() {
+        let mut fake = FakePane::new(None);
+        fake.cursor_line_start_override = Some(StableRowIndex::MAX);
+        let pane = Arc::new(fake);
+        let pane_dyn: Arc<dyn Pane> = pane;
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let mut per_pane = PerPane::default();
+
+        let result = registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current");
+        assert!(matches!(
+            result,
+            Err(PaneRenderPreparationError::StableRowRangeUnrepresentable)
+        ));
+        assert_eq!(
+            per_pane.baseline,
+            PaneRenderBaseline::default(),
+            "an unrepresentable backend cursor span must not advance the baseline"
+        );
+    }
+
+    #[test]
+    fn key_down_ack_survives_post_input_render_range_failure() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let pane = Arc::new(FakePane::new(None));
+        pane.state.lock().unwrap().dimensions.physical_top = StableRowIndex::MAX;
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_dyn).expect("register input ACK test pane");
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+
+        handler.process_one(DecodedPdu {
+            serial: 9_701,
+            pdu: Pdu::SendKeyDown(SendKeyDown {
+                pane_id: pane.pane_id(),
+                event: termwiz::input::KeyEvent {
+                    key: KeyCode::Char('x'),
+                    modifiers: KeyModifiers::NONE,
+                },
+                input_serial: InputSerial::empty(),
+            }),
+        });
+        tick_until_response(&executor, &captured, 1);
+
+        let response = take_response(&captured);
+        assert_eq!(response.serial, 9_701);
+        assert_eq!(response.pdu, Pdu::UnitResponse(UnitResponse {}));
+        assert_eq!(pane.key_down_count(), 1, "the key must be applied exactly once");
+        assert_eq!(
+            handler
+                .per_pane_if_present(pane.pane_id())
+                .expect("key-down should retain per-pane state")
+                .lock()
+                .unwrap()
+                .baseline,
+            PaneRenderBaseline::default(),
+            "failed post-input render preparation must not advance its baseline"
+        );
+    }
+
+    #[test]
+    fn legacy_compute_changes_requeries_from_zero_after_sequence_saturation() {
+        let pane = Arc::new(FakePane::new(None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let mut per_pane = PerPane::default();
+
+        registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current")
+            .expect("initial pane surface preparation should succeed")
+            .expect("initial pane snapshot should produce a response");
+        assert_eq!(per_pane.baseline.seqno, 11);
+        assert_eq!(pane.take_changed_since_seqnos(), vec![SEQ_ZERO]);
+
+        pane.state.lock().unwrap().seqno = SequenceNo::MAX;
+        pane.set_changed_line(0);
+        registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current")
+            .expect("first saturated surface preparation should succeed")
+            .expect("first saturated mutation should produce a response");
+        assert_eq!(per_pane.baseline.seqno, SequenceNo::MAX);
+        assert_eq!(pane.take_changed_since_seqnos(), vec![SEQ_ZERO]);
+
+        pane.clear_changed_lines();
+        pane.set_changed_line(1);
+        let response = registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current")
+            .expect("subsequent saturated surface preparation should succeed")
+            .expect("a later MAX-stamped mutation must not be hidden by a MAX baseline");
+        assert_eq!(response.seqno, SequenceNo::MAX);
+        assert_eq!(pane.take_changed_since_seqnos(), vec![SEQ_ZERO]);
+        let (bonus_lines, _images) = response
+            .bonus_lines
+            .extract_data_checked()
+            .expect("saturated retry lines should remain structurally valid");
+        assert!(bonus_lines.iter().any(|(stable_row, _)| *stable_row == 1));
+    }
+
+    #[test]
+    fn legacy_compute_changes_requeries_from_zero_after_source_regression() {
+        let pane = Arc::new(FakePane::new(None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let mut per_pane = PerPane::default();
+
+        registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current")
+            .expect("initial pane surface preparation should succeed")
+            .expect("initial pane snapshot should produce a response");
+        assert_eq!(per_pane.baseline.seqno, 11);
+        assert_eq!(pane.take_changed_since_seqnos(), vec![SEQ_ZERO]);
+
+        {
+            let mut state = pane.state.lock().unwrap();
+            state.seqno = 3;
+        }
+        pane.set_changed_line(1);
+        let response = registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current")
+            .expect("regressed source preparation should succeed")
+            .expect("a regressed sequence domain requires a full changed-row response");
+        assert_eq!(response.seqno, 3);
+        assert_eq!(per_pane.baseline.seqno, 3);
+        assert_eq!(pane.take_changed_since_seqnos(), vec![SEQ_ZERO]);
+        let (bonus_lines, _images) = response
+            .bonus_lines
+            .extract_data_checked()
+            .expect("source-regression retry lines should remain structurally valid");
+        assert!(bonus_lines.iter().any(|(stable_row, _)| *stable_row == 1));
+    }
+
+    #[test]
     fn compute_changes_detects_cleared_tiered_scrollback_status_without_other_deltas() {
         let pane = Arc::new(FakePane::new(Some(sample_tiered_scrollback_status(12))));
         let pane_dyn: Arc<dyn Pane> = pane.clone();
@@ -9700,7 +10500,8 @@ mod tests {
 
         let initial = registration
             .try_with_current(|current| per_pane.compute_changes(&current, None))
-            .expect("test pane registration remains current");
+            .expect("test pane registration remains current")
+            .expect("pane surface preparation should succeed");
         assert!(
             initial.is_some(),
             "first snapshot should populate cached pane state"
@@ -9709,6 +10510,7 @@ mod tests {
             registration
                 .try_with_current(|current| per_pane.compute_changes(&current, None))
                 .expect("test pane registration remains current")
+                .expect("pane surface preparation should succeed")
                 .is_none(),
             "unchanged pane state should not emit a redundant render delta"
         );
@@ -9718,6 +10520,7 @@ mod tests {
         let response = registration
             .try_with_current(|current| per_pane.compute_changes(&current, None))
             .expect("test pane registration remains current")
+            .expect("pane surface preparation should succeed")
             .expect("clearing tiered scrollback status should produce a response");
 
         assert!(response.dirty_lines.is_empty());
@@ -9735,6 +10538,7 @@ mod tests {
         registration
             .try_with_current(|current| per_pane.compute_changes(&current, None))
             .expect("test pane registration remains current")
+            .expect("pane surface preparation should succeed")
             .expect("initial pane snapshot should produce a response");
         assert_eq!(per_pane.baseline.seqno, 11);
 
@@ -9743,6 +10547,7 @@ mod tests {
             registration
                 .try_with_current(|current| per_pane.compute_changes(&current, None))
                 .expect("test pane registration remains current")
+                .expect("pane surface preparation should succeed")
                 .is_none(),
             "a sequence-only change has no legacy wire effect"
         );
@@ -9763,6 +10568,7 @@ mod tests {
             registration
                 .try_with_current(|current| per_pane.compute_changes(&current, None))
                 .expect("test pane registration remains current")
+                .expect("pane surface preparation should succeed")
                 .is_some(),
             "first snapshot should populate cached pane state"
         );
@@ -9770,6 +10576,7 @@ mod tests {
             registration
                 .try_with_current(|current| per_pane.compute_changes(&current, None))
                 .expect("test pane registration remains current")
+                .expect("pane surface preparation should succeed")
                 .is_none(),
             "unchanged pane state should not emit a redundant render delta"
         );
@@ -9779,6 +10586,7 @@ mod tests {
         let response = registration
             .try_with_current(|current| per_pane.compute_changes(&current, None))
             .expect("test pane registration remains current")
+            .expect("pane surface preparation should succeed")
             .expect("alt-screen transition should produce a response");
 
         assert!(response.alt_screen_active);
@@ -9796,6 +10604,7 @@ mod tests {
         let response = registration
             .try_with_current(|current| per_pane.compute_changes(&current, None))
             .expect("test pane registration remains current")
+            .expect("pane surface preparation should succeed")
             .expect("initial pane snapshot should still produce a response");
 
         let cursor_y = response.cursor_position.y;
@@ -9816,6 +10625,7 @@ mod tests {
         let response = registration
             .try_with_current(|current| per_pane.compute_changes(&current, None))
             .expect("test pane registration remains current")
+            .expect("pane surface preparation should succeed")
             .expect("dirty cursor row should produce a response");
         let (bonus_lines, _images) = response
             .bonus_lines
@@ -9825,6 +10635,39 @@ mod tests {
         assert_eq!(bonus_lines.len(), 1);
         assert_eq!(bonus_lines[0].0, 0);
         assert!(response.dirty_lines.is_empty());
+    }
+
+    #[test]
+    fn compute_changes_keeps_defensive_cursor_row_in_stable_order() {
+        let pane = Arc::new(FakePane::new(None));
+        {
+            let mut state = pane.state.lock().unwrap();
+            state.dimensions.physical_top = 1;
+            state.cursor_position.y = 0;
+        }
+        pane.set_changed_line(1);
+        let pane_dyn: Arc<dyn Pane> = pane;
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let mut per_pane = PerPane::default();
+
+        let response = registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current")
+            .expect("pane surface preparation should succeed")
+            .expect("initial pane snapshot should produce a response");
+        let (bonus_lines, _images) = response
+            .bonus_lines
+            .extract_data_checked()
+            .expect("defensive cursor ordering must remain structurally valid");
+
+        assert_eq!(
+            bonus_lines
+                .iter()
+                .map(|(stable_row, _)| *stable_row)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "a cursor row before the viewport must be inserted, not appended"
+        );
     }
 
     /// Regression: FakePane::writer() previously panicked via

@@ -29,6 +29,7 @@ portable-pty = { workspace=true, features = ["serde_support"]}
 promise.workspace = true
 rangeset.workspace = true
 ratelim.workspace = true
+rayon.workspace = true
 termwiz.workspace = true
 textwrap.workspace = true
 thiserror.workspace = true

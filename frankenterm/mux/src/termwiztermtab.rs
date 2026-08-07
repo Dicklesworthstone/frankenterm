@@ -173,6 +173,21 @@ impl Pane for TermWizTerminalPane {
         terminal_get_dirty_lines(&mut self.terminal.lock(), lines, seqno)
     }
 
+    fn get_changed_since_with_source_fence(
+        &self,
+        lines: Range<StableRowIndex>,
+        last_observed_source_end: SequenceNo,
+    ) -> (SequenceNo, RangeSet<StableRowIndex>) {
+        let mut terminal = self.terminal.lock();
+        let source_end = terminal.current_seqno();
+        let baseline = crate::pane::changed_since_query_baseline(
+            last_observed_source_end,
+            source_end,
+        );
+        let changed = terminal_get_dirty_lines(&mut terminal, lines, baseline);
+        (source_end, changed)
+    }
+
     fn for_each_logical_line_in_stable_range_mut(
         &self,
         lines: Range<StableRowIndex>,
@@ -191,6 +206,20 @@ impl Pane for TermWizTerminalPane {
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines) {
         terminal_with_lines_mut(&mut self.terminal.lock(), lines, with_lines)
+    }
+
+    fn with_lines_mut_and_apply_hyperlinks(
+        &self,
+        lines: Range<StableRowIndex>,
+        rules: &[termwiz::hyperlink::Rule],
+        with_lines: &mut dyn WithPaneLines,
+    ) {
+        terminal_with_lines_mut_and_apply_hyperlinks(
+            &mut self.terminal.lock(),
+            lines,
+            rules,
+            with_lines,
+        )
     }
 
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {

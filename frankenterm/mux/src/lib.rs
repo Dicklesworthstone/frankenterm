@@ -681,6 +681,17 @@ pub enum MuxNotification {
 }
 
 impl MuxNotification {
+    /// Whether publishing this variant requires the mux's private pane
+    /// lifecycle queue authority.
+    ///
+    /// A numeric pane ID is not proof that an add/remove transition actually
+    /// occurred.  These variants must therefore never enter through the
+    /// generic [`Mux::notify`] surface, where an arbitrary caller could forge
+    /// topology and cleanup state.
+    const fn requires_pane_lifecycle_authority(&self) -> bool {
+        matches!(self, Self::PaneAdded(_) | Self::PaneRemoved(_))
+    }
+
     /// Whether this notification describes state represented by a mux
     /// topology snapshot and therefore participates in the revision stream.
     pub const fn is_topology(&self) -> bool {
@@ -886,6 +897,175 @@ struct PreparedPaneRegistration {
 #[derive(Default)]
 struct PaneRetirementTracker {
     generations: Mutex<HashMap<PaneId, Arc<PaneRegistrationGeneration>>>,
+}
+
+/// Pointer-identity token for one authoritative `PaneRemoved` subscriber
+/// fanout.  A GUI cleanup lease retains this exact token so a delayed callback
+/// can never release the reuse fence for a later removal of the same numeric
+/// pane ID.
+#[derive(Debug)]
+struct PaneRemovalCleanupToken {
+    state: Mutex<PaneRemovalCleanupState>,
+    cleanup_complete: Option<Arc<AtomicBool>>,
+    created_at: Instant,
+}
+
+#[derive(Debug)]
+struct PaneRemovalCleanupState {
+    accepting_leases: bool,
+    leases: usize,
+    finalized: bool,
+}
+
+impl PaneRemovalCleanupToken {
+    fn new(cleanup_complete: Option<Arc<AtomicBool>>) -> Self {
+        Self {
+            state: Mutex::new(PaneRemovalCleanupState {
+                accepting_leases: true,
+                leases: 0,
+                finalized: false,
+            }),
+            cleanup_complete,
+            created_at: Instant::now(),
+        }
+    }
+
+    fn try_acquire(&self) -> bool {
+        let mut state = self.state.lock();
+        if !state.accepting_leases || state.finalized {
+            return false;
+        }
+        let Some(leases) = state.leases.checked_add(1) else {
+            return false;
+        };
+        state.leases = leases;
+        true
+    }
+
+    fn close(&self) -> bool {
+        let mut state = self.state.lock();
+        state.accepting_leases = false;
+        if state.leases == 0 && !state.finalized {
+            state.finalized = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release(&self) -> Option<bool> {
+        let mut state = self.state.lock();
+        let leases = state.leases.checked_sub(1)?;
+        state.leases = leases;
+        if !state.accepting_leases && leases == 0 && !state.finalized {
+            state.finalized = true;
+            Some(true)
+        } else {
+            Some(false)
+        }
+    }
+
+    fn mark_cleanup_complete(&self) {
+        if let Some(cleanup_complete) = &self.cleanup_complete {
+            cleanup_complete.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Diagnostic view of deferred `PaneRemoved` cleanup authority.
+///
+/// This snapshot is deliberately observational: age is never treated as
+/// permission to release a fence.  A same-ID pane remains fenced until every
+/// exact lease is completed or dropped by its owner.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PaneRemovalCleanupSnapshot {
+    pub active_fences: usize,
+    pub outstanding_leases: usize,
+    pub oldest_fence_age: Duration,
+}
+
+/// Keeps a removed pane's numeric registry slot fenced while a subscriber
+/// performs deferred, generation-specific cleanup.
+///
+/// This lease can be acquired only synchronously from the authoritative
+/// `PaneRemoved` subscriber callback. Dropping it acknowledges that the
+/// deferred cleanup either ran or was abandoned, allowing same-ID registration
+/// once every subscriber lease has completed.
+pub struct PaneRemovalCleanupLease {
+    owner: Weak<Mux>,
+    pane_id: PaneId,
+    token: Arc<PaneRemovalCleanupToken>,
+    acquired_at: Instant,
+    completed: bool,
+}
+
+impl std::fmt::Debug for PaneRemovalCleanupLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PaneRemovalCleanupLease")
+            .field("pane_id", &self.pane_id)
+            .field(
+                "generation",
+                &(Arc::as_ptr(&self.token) as *const () as usize),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PaneRemovalCleanupLease {
+    fn drop(&mut self) {
+        histogram!("mux.notifications.pane_removed.deferred_cleanup_ms")
+            .record(self.acquired_at.elapsed().as_secs_f64() * 1_000.0);
+        if !self.completed {
+            metrics::counter!("mux.notifications.pane_removed.deferred_cleanup_abandoned")
+                .increment(1);
+        }
+        let owner = self.owner.upgrade();
+        let release = self.token.release();
+        if release.is_some() {
+            if let Some(owner) = &owner {
+                if owner
+                    .pane_removal_cleanup_outstanding_leases
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        count.checked_sub(1)
+                    })
+                    .is_err()
+                {
+                    log::error!(
+                        "PaneRemoved global cleanup observability count underflow for pane {}; exact token release remains authoritative",
+                        self.pane_id
+                    );
+                }
+            }
+        }
+        match release {
+            Some(true) => {
+                if let Some(owner) = &owner {
+                    owner.finalize_pane_removal_cleanup(self.pane_id, &self.token);
+                } else {
+                    self.token.mark_cleanup_complete();
+                }
+            }
+            Some(false) => {}
+            None => {
+                log::error!(
+                    "PaneRemoved cleanup lease count underflow for pane {}; retaining generation completion fence",
+                    self.pane_id
+                );
+            }
+        }
+        if let Some(owner) = owner {
+            owner.record_pane_removal_cleanup_counts();
+        }
+    }
+}
+
+impl PaneRemovalCleanupLease {
+    /// Acknowledge that the deferred subscriber cleanup ran to completion.
+    /// Consuming the lease releases its share of the same-ID reuse fence.
+    pub fn complete(mut self) {
+        self.completed = true;
+    }
 }
 
 impl PaneRetirementTracker {
@@ -1260,6 +1440,18 @@ mod pane_registration_handle {
             seqno: termwiz::surface::SequenceNo,
         ) -> rangeset::RangeSet<frankenterm_term::StableRowIndex> {
             self.pane.get_changed_since(range, seqno)
+        }
+
+        pub fn get_changed_since_with_source_fence(
+            &self,
+            range: std::ops::Range<frankenterm_term::StableRowIndex>,
+            last_observed_source_end: termwiz::surface::SequenceNo,
+        ) -> (
+            termwiz::surface::SequenceNo,
+            rangeset::RangeSet<frankenterm_term::StableRowIndex>,
+        ) {
+            self.pane
+                .get_changed_since_with_source_fence(range, last_observed_source_end)
         }
 
         pub fn get_lines(
@@ -3424,6 +3616,8 @@ pub struct Mux {
     pane_preparations: Mutex<HashMap<PaneId, PanePreparation>>,
     pane_registration: Mutex<()>,
     retiring_pane_ids: Mutex<HashSet<PaneId>>,
+    pane_removal_cleanup_fences: Mutex<HashMap<PaneId, Arc<PaneRemovalCleanupToken>>>,
+    pane_removal_cleanup_outstanding_leases: AtomicUsize,
     pending_pane_lifecycle: Mutex<PendingPaneLifecycleNotifications>,
     windows: RwLock<HashMap<WindowId, Window>>,
     provisional_windows: Mutex<HashSet<WindowId>>,
@@ -4123,6 +4317,8 @@ impl Mux {
             pane_preparations: Mutex::new(HashMap::new()),
             pane_registration: Mutex::new(()),
             retiring_pane_ids: Mutex::new(HashSet::new()),
+            pane_removal_cleanup_fences: Mutex::new(HashMap::new()),
+            pane_removal_cleanup_outstanding_leases: AtomicUsize::new(0),
             pending_pane_lifecycle: Mutex::new(PendingPaneLifecycleNotifications::default()),
             windows: RwLock::new(HashMap::new()),
             provisional_windows: Mutex::new(HashSet::new()),
@@ -4630,6 +4826,37 @@ impl Mux {
         self.subscribe_with_topology(move |envelope| subscriber(envelope.notification))
     }
 
+    /// Subscribe with an exact cleanup lease for each authoritative
+    /// `PaneRemoved` notification.
+    ///
+    /// The lease is minted inside the synchronous subscriber wrapper while the
+    /// mux still owns that removal generation's reuse fence. Consumers that
+    /// defer cleanup must move the lease with their queued work; dropping it
+    /// releases that consumer's share of the fence. While any lease remains,
+    /// same-ID registration fails with `PaneIdCollision` rather than waiting;
+    /// callers performing deliberate hot replacement must retry after cleanup.
+    pub fn subscribe_with_pane_removal_cleanup<F>(
+        self: &Arc<Self>,
+        subscriber: F,
+    ) -> Result<usize, IdAllocationError>
+    where
+        F: Fn(MuxNotification, Option<PaneRemovalCleanupLease>) -> bool
+            + 'static
+            + Send
+            + Sync,
+    {
+        let owner = Arc::downgrade(self);
+        self.subscribe(move |notification| {
+            let cleanup = match &notification {
+                MuxNotification::PaneRemoved(pane_id) => owner
+                    .upgrade()
+                    .and_then(|mux| mux.acquire_pane_removal_cleanup_lease(*pane_id)),
+                _ => None,
+            };
+            subscriber(notification, cleanup)
+        })
+    }
+
     /// Subscribe to mux notifications together with their topology authority.
     ///
     /// Existing in-process consumers should normally use [`Self::subscribe`].
@@ -4709,7 +4936,28 @@ impl Mux {
         }
     }
 
+    /// Publish a generic mux notification.
+    ///
+    /// Pane add/remove transitions are deliberately rejected here: only the
+    /// serialized pane-registration lifecycle can mint their topology and
+    /// deferred-cleanup authority.
     pub fn notify(&self, notification: MuxNotification) {
+        if notification.requires_pane_lifecycle_authority() {
+            metrics::counter!(
+                "mux.notifications.pane_lifecycle.generic_publish_rejected",
+                "variant" => match &notification {
+                    MuxNotification::PaneAdded(_) => "pane_added",
+                    MuxNotification::PaneRemoved(_) => "pane_removed",
+                    _ => unreachable!("lifecycle-authority predicate admitted another variant"),
+                }
+            )
+            .increment(1);
+            log::error!(
+                "refusing forged pane lifecycle publication through generic Mux::notify; use the authoritative pane registration/removal path"
+            );
+            return;
+        }
+
         // Dedupe high-rate Alert variants per (pane, kind) within
         // HIGH_RATE_ALERT_DEDUPE_WINDOW. Saves N_subscribers × clone +
         // box-allocation per dropped notification under bursty agent output.
@@ -5125,6 +5373,155 @@ impl Mux {
         }
     }
 
+    fn begin_pane_removal_cleanup_fanout(
+        &self,
+        pane_id: PaneId,
+        cleanup_complete: Option<Arc<AtomicBool>>,
+    ) -> Option<Arc<PaneRemovalCleanupToken>> {
+        let _registration = self.pane_registration.lock();
+        let retiring = self.retiring_pane_ids.lock();
+        if !retiring.contains(&pane_id) {
+            log::error!(
+                "refusing to publish an unfenced PaneRemoved cleanup generation for pane {pane_id}"
+            );
+            return None;
+        }
+
+        let mut fences = self.pane_removal_cleanup_fences.lock();
+        if fences.contains_key(&pane_id) {
+            log::error!(
+                "refusing to replace the active PaneRemoved cleanup generation for pane {pane_id}"
+            );
+            return None;
+        }
+        let token = Arc::new(PaneRemovalCleanupToken::new(cleanup_complete));
+        fences.insert(pane_id, Arc::clone(&token));
+        drop(fences);
+        drop(retiring);
+        drop(_registration);
+        self.record_pane_removal_cleanup_counts();
+        Some(token)
+    }
+
+    fn acquire_pane_removal_cleanup_lease(
+        self: &Arc<Self>,
+        pane_id: PaneId,
+    ) -> Option<PaneRemovalCleanupLease> {
+        let _registration = self.pane_registration.lock();
+        let retiring = self.retiring_pane_ids.lock();
+        if !retiring.contains(&pane_id) {
+            return None;
+        }
+        let token = Arc::clone(self.pane_removal_cleanup_fences.lock().get(&pane_id)?);
+        if !token.try_acquire() {
+            log::error!(
+                "PaneRemoved cleanup lease was requested outside active fanout or its count exhausted for pane {pane_id}"
+            );
+            return None;
+        }
+        if self
+            .pane_removal_cleanup_outstanding_leases
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .is_err()
+        {
+            let released = token.release();
+            debug_assert_eq!(released, Some(false));
+            log::error!(
+                "PaneRemoved global cleanup lease count exhausted for pane {pane_id}; refusing new deferred authority"
+            );
+            return None;
+        }
+        let lease = PaneRemovalCleanupLease {
+            owner: Arc::downgrade(self),
+            pane_id,
+            token,
+            acquired_at: Instant::now(),
+            completed: false,
+        };
+        drop(retiring);
+        drop(_registration);
+        self.record_pane_removal_cleanup_counts();
+        Some(lease)
+    }
+
+    fn finish_pane_removal_cleanup_fanout(
+        &self,
+        pane_id: PaneId,
+        token: &Arc<PaneRemovalCleanupToken>,
+    ) {
+        if token.close() {
+            self.finalize_pane_removal_cleanup(pane_id, token);
+        }
+    }
+
+    fn finalize_pane_removal_cleanup(
+        &self,
+        pane_id: PaneId,
+        token: &Arc<PaneRemovalCleanupToken>,
+    ) {
+        let _registration = self.pane_registration.lock();
+        let mut retiring = self.retiring_pane_ids.lock();
+        let mut fences = self.pane_removal_cleanup_fences.lock();
+        let Some(active) = fences.get(&pane_id) else {
+            token.mark_cleanup_complete();
+            return;
+        };
+        if !Arc::ptr_eq(active, token) {
+            log::error!(
+                "stale PaneRemoved cleanup generation attempted to release pane {pane_id}; retaining current reuse fence"
+            );
+            token.mark_cleanup_complete();
+            return;
+        }
+        fences.remove(&pane_id);
+        retiring.remove(&pane_id);
+        token.mark_cleanup_complete();
+        histogram!("mux.notifications.pane_removed.cleanup_fence_lifetime_ms")
+            .record(token.created_at.elapsed().as_secs_f64() * 1_000.0);
+        drop(fences);
+        drop(retiring);
+        drop(_registration);
+        self.record_pane_removal_cleanup_counts();
+    }
+
+    /// Return current deferred-cleanup pressure without weakening its
+    /// generation fences.
+    ///
+    /// The scan is bounded by the active removal-fence map and allocates
+    /// nothing. In particular, `oldest_fence_age` is diagnostic only: no age
+    /// threshold can make a pane ID reusable while a lease remains live.
+    #[must_use]
+    pub fn pane_removal_cleanup_snapshot(&self) -> PaneRemovalCleanupSnapshot {
+        let now = Instant::now();
+        let fences = self.pane_removal_cleanup_fences.lock();
+        let mut snapshot = PaneRemovalCleanupSnapshot {
+            active_fences: fences.len(),
+            outstanding_leases: self
+                .pane_removal_cleanup_outstanding_leases
+                .load(Ordering::Acquire),
+            ..PaneRemovalCleanupSnapshot::default()
+        };
+        for token in fences.values() {
+            snapshot.oldest_fence_age = snapshot
+                .oldest_fence_age
+                .max(now.saturating_duration_since(token.created_at));
+        }
+        snapshot
+    }
+
+    fn record_pane_removal_cleanup_counts(&self) {
+        let active_fences = self.pane_removal_cleanup_fences.lock().len();
+        let outstanding_leases = self
+            .pane_removal_cleanup_outstanding_leases
+            .load(Ordering::Acquire);
+        metrics::gauge!("mux.notifications.pane_removed.cleanup_fences_active")
+            .set(active_fences as f64);
+        metrics::gauge!("mux.notifications.pane_removed.cleanup_leases_outstanding")
+            .set(outstanding_leases as f64);
+    }
+
     fn drain_pane_lifecycle_notifications(&self) {
         loop {
             let step = {
@@ -5208,6 +5605,16 @@ impl Mux {
                         cleanup_complete,
                         removal_follow_up,
                     } = pending_notification;
+                    let removal_cleanup_token =
+                        if let PaneLifecycleNotification::Removed(pane_id) = notification {
+                            self.begin_pane_removal_cleanup_fanout(pane_id, cleanup_complete)
+                        } else {
+                            debug_assert!(
+                                cleanup_complete.is_none(),
+                                "only pane removal notifications complete retirement cleanup",
+                            );
+                            None
+                        };
                     self.dispatch_notification_envelope(MuxNotificationEnvelope {
                         notification: notification.into(),
                         topology,
@@ -5227,18 +5634,14 @@ impl Mux {
                         }
                         // The removal queue entry owns the retirement fence. A
                         // caller may complete a ticket reentrantly while an
-                        // earlier callback is draining; clearing in the caller
-                        // would permit same-ID replacement before delivery.
-                        let _registration = self.pane_registration.lock();
-                        self.retiring_pane_ids.lock().remove(&pane_id);
-                        if let Some(cleanup_complete) = cleanup_complete {
-                            cleanup_complete.store(true, Ordering::Release);
+                        // earlier callback is draining. Deferred subscribers
+                        // may extend this exact fence through their queued GUI
+                        // cleanup, preventing a replacement generation from
+                        // being registered and then erased by a bare-ID task.
+                        if let Some(token) = removal_cleanup_token {
+                            self.finish_pane_removal_cleanup_fanout(pane_id, &token);
                         }
                     } else {
-                        debug_assert!(
-                            cleanup_complete.is_none(),
-                            "only pane removal notifications complete retirement cleanup",
-                        );
                         debug_assert_eq!(removal_follow_up, PaneRemovalFollowUp::None);
                     }
                 }
@@ -6759,6 +7162,32 @@ impl Mux {
         let tab = self.remove_tab_internal(tab_id);
         self.prune_dead_windows();
         tab
+    }
+
+    /// Remove and kill only the exact tab generation supplied by the caller.
+    ///
+    /// The pane-registration witness prevents an old `Arc<Tab>` from
+    /// authorizing removal after that same tab object was removed and
+    /// re-registered. Deferred GUI confirmation must retain both authorities
+    /// rather than re-resolving numeric IDs after user think time.
+    pub fn remove_tab_if_same(
+        self: &Arc<Self>,
+        expected: &Arc<Tab>,
+        witness: &PaneRegistrationHandle,
+    ) -> bool {
+        let Some(operation) = witness.operation_guard(self) else {
+            return false;
+        };
+        if !expected
+            .iter_all_panes()
+            .iter()
+            .any(|pane| operation.is_same_pane(pane))
+        {
+            return false;
+        }
+        let removed = self.remove_tab_internal_if_same(expected).is_some();
+        self.prune_dead_windows();
+        removed
     }
 
     /// Drop the LOCAL mirror of a tab without disturbing the remote session.
@@ -10546,6 +10975,59 @@ mod tests {
     }
 
     #[test]
+    fn delayed_exact_tab_removal_uses_origin_mux_after_global_swap() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let origin = Arc::new(Mux::new(None));
+        let replacement_mux = Arc::new(Mux::new(None));
+        let origin_tab = Arc::new(Tab::new(&test_size()));
+        let (origin_pane, _) = KillCountingPane::new(195, test_size());
+        origin_tab.assign_pane(&origin_pane);
+        let replacement_tab = Arc::new(Tab::new(&test_size()));
+        let witness = origin
+            .add_tab_and_active_pane(&origin_tab)
+            .expect("origin tab registration")
+            .expect("new origin pane registration witness");
+        replacement_mux
+            .add_tab_no_panes(&replacement_tab)
+            .expect("replacement tab registration");
+
+        Mux::set_mux(&replacement_mux);
+        assert!(origin.remove_tab_if_same(&origin_tab, &witness));
+        assert!(origin.get_tab(origin_tab.tab_id()).is_none());
+        assert!(
+            replacement_mux
+                .get_tab(replacement_tab.tab_id())
+                .is_some_and(|tab| Arc::ptr_eq(&tab, &replacement_tab)),
+            "exact removal through the captured mux must preserve the global replacement's tab",
+        );
+        assert!(
+            !origin.remove_tab_if_same(&origin_tab, &witness),
+            "a stale exact tab Arc must not acquire removal authority twice",
+        );
+
+        let (successor_pane, successor_kills) = KillCountingPane::new(195, test_size());
+        origin_tab.assign_pane(&successor_pane);
+        let successor_witness = origin
+            .add_tab_and_active_pane(&origin_tab)
+            .expect("same Arc tab may be registered as a later generation")
+            .expect("successor pane registration witness");
+        assert!(
+            !origin.remove_tab_if_same(&origin_tab, &witness),
+            "the old witness must not remove a later registration of the same Arc<Tab>",
+        );
+        assert!(origin
+            .get_tab(origin_tab.tab_id())
+            .is_some_and(|tab| Arc::ptr_eq(&tab, &origin_tab)));
+        assert_eq!(successor_kills.load(Ordering::SeqCst), 0);
+        assert!(origin.remove_tab_if_same(&origin_tab, &successor_witness));
+        assert_eq!(successor_kills.load(Ordering::SeqCst), 1);
+
+        Mux::shutdown();
+    }
+
+    #[test]
     fn exact_title_updates_ignore_global_mux_and_allow_reentrant_getters() {
         let _guard = global_test_lock();
         Mux::shutdown();
@@ -11328,6 +11810,230 @@ mod tests {
     }
 
     #[test]
+    fn deferred_removed_cleanup_fences_replacement_after_subscriber_return() {
+        let mux = Arc::new(Mux::new(None));
+        let (original, _) = KillCountingPane::new(191, test_size());
+        let (replacement, _) = KillCountingPane::new(191, test_size());
+        let escaped_cleanup = Arc::new(Mutex::new(None));
+
+        mux.add_pane(&original).expect("register original pane");
+        assert!(
+            mux.acquire_pane_removal_cleanup_lease(191).is_none(),
+            "cleanup authority must not exist before PaneRemoved fanout",
+        );
+
+        let escaped_cleanup_for_subscriber = Arc::clone(&escaped_cleanup);
+        mux.subscribe_with_pane_removal_cleanup(move |notification, cleanup| {
+            if matches!(notification, MuxNotification::PaneRemoved(191)) {
+                *escaped_cleanup_for_subscriber.lock() = cleanup;
+            }
+            true
+        })
+        .expect("test mux subscription should allocate an identifier");
+
+        mux.remove_pane_if_same(191, &original);
+        assert!(
+            escaped_cleanup.lock().is_some(),
+            "the subscriber must retain exact cleanup authority with its queued work",
+        );
+        let cleanup_snapshot = mux.pane_removal_cleanup_snapshot();
+        assert_eq!(cleanup_snapshot.active_fences, 1);
+        assert_eq!(cleanup_snapshot.outstanding_leases, 1);
+        assert!(
+            mux.acquire_pane_removal_cleanup_lease(191).is_none(),
+            "new leases must not be minted after synchronous fanout closes",
+        );
+        assert!(
+            mux.add_pane(&replacement).is_err(),
+            "same-ID replacement must remain fenced after the subscriber returns",
+        );
+
+        escaped_cleanup
+            .lock()
+            .take()
+            .expect("queued cleanup lease")
+            .complete();
+        assert_eq!(
+            mux.pane_removal_cleanup_snapshot(),
+            PaneRemovalCleanupSnapshot::default(),
+            "completing the final exact lease must clear all cleanup pressure",
+        );
+        mux.add_pane(&replacement)
+            .expect("replacement may register after deferred cleanup acknowledges completion");
+    }
+
+    #[test]
+    fn batch_retirement_uses_the_same_deferred_cleanup_fence() {
+        let mux = Arc::new(Mux::new(None));
+        let (original, _) = KillCountingPane::new(195, test_size());
+        let (replacement, _) = KillCountingPane::new(195, test_size());
+        let escaped_cleanup = Arc::new(Mutex::new(None));
+
+        mux.add_pane(&original).expect("register original pane");
+        let registration = mux
+            .capture_pane_registration(&original)
+            .expect("capture the exact batch-retirement generation");
+        let escaped_cleanup_for_subscriber = Arc::clone(&escaped_cleanup);
+        mux.subscribe_with_pane_removal_cleanup(move |notification, cleanup| {
+            if matches!(notification, MuxNotification::PaneRemoved(195)) {
+                *escaped_cleanup_for_subscriber.lock() = cleanup;
+            }
+            true
+        })
+        .expect("test mux subscription should allocate an identifier");
+
+        assert_eq!(
+            PaneRegistrationHandle::retire_batch_if_current(vec![registration]),
+            1,
+            "the exact batch candidate must retire",
+        );
+        assert!(
+            escaped_cleanup.lock().is_some(),
+            "the hand-built batch removal notification must mint cleanup authority",
+        );
+        assert!(
+            mux.add_pane(&replacement).is_err(),
+            "batch retirement must retain the same-ID fence after subscriber return",
+        );
+
+        escaped_cleanup
+            .lock()
+            .take()
+            .expect("batch cleanup lease")
+            .complete();
+        mux.add_pane(&replacement)
+            .expect("batch-retired pane ID may be reused after deferred cleanup completes");
+    }
+
+    #[test]
+    fn panicking_cleanup_subscriber_releases_its_lease_during_unwind() {
+        let mux = Arc::new(Mux::new(None));
+        let (original, _) = KillCountingPane::new(196, test_size());
+        let (replacement, _) = KillCountingPane::new(196, test_size());
+
+        mux.add_pane(&original).expect("register original pane");
+        mux.subscribe_with_pane_removal_cleanup(|notification, cleanup| {
+            if matches!(notification, MuxNotification::PaneRemoved(196)) {
+                assert!(cleanup.is_some(), "panicking subscriber received its lease");
+                panic!("intentional cleanup-subscriber unwind");
+            }
+            true
+        })
+        .expect("test mux subscription should allocate an identifier");
+
+        mux.remove_pane_if_same(196, &original);
+        mux.add_pane(&replacement).expect(
+            "unwinding a cleanup subscriber must not strand its lease or the same-ID fence",
+        );
+    }
+
+    #[test]
+    fn final_deferred_removed_cleanup_lease_exclusively_releases_reuse_fence() {
+        let mux = Arc::new(Mux::new(None));
+        let (original, _) = KillCountingPane::new(192, test_size());
+        let (replacement, _) = KillCountingPane::new(192, test_size());
+        let cleanups = Arc::new(Mutex::new(Vec::new()));
+
+        mux.add_pane(&original).expect("register original pane");
+        for _ in 0..2 {
+            let cleanups_for_subscriber = Arc::clone(&cleanups);
+            mux.subscribe_with_pane_removal_cleanup(move |notification, cleanup| {
+                if matches!(notification, MuxNotification::PaneRemoved(192)) {
+                    cleanups_for_subscriber
+                        .lock()
+                        .push(cleanup.expect("PaneRemoved subscriber receives a cleanup lease"));
+                }
+                true
+            })
+            .expect("test mux subscription should allocate an identifier");
+        }
+
+        mux.remove_pane_if_same(192, &original);
+        assert_eq!(cleanups.lock().len(), 2);
+
+        cleanups.lock().remove(0).complete();
+        assert!(
+            mux.add_pane(&replacement).is_err(),
+            "one completed window must not release another window's cleanup fence",
+        );
+
+        drop(cleanups.lock().remove(0));
+        mux.add_pane(&replacement).expect(
+            "dropping an abandoned final cleanup must release the fence without claiming success",
+        );
+    }
+
+    #[test]
+    fn old_mux_cleanup_token_cannot_fence_or_remove_same_id_in_new_mux() {
+        let old_mux = Arc::new(Mux::new(None));
+        let new_mux = Arc::new(Mux::new(None));
+        let (old_pane, _) = KillCountingPane::new(193, test_size());
+        let (new_pane, _) = KillCountingPane::new(193, test_size());
+        let escaped_cleanup = Arc::new(Mutex::new(None));
+
+        old_mux.add_pane(&old_pane).expect("register old pane");
+        let escaped_cleanup_for_subscriber = Arc::clone(&escaped_cleanup);
+        old_mux
+            .subscribe_with_pane_removal_cleanup(move |notification, cleanup| {
+                if matches!(notification, MuxNotification::PaneRemoved(193)) {
+                    *escaped_cleanup_for_subscriber.lock() = cleanup;
+                }
+                true
+            })
+            .expect("old mux subscription should allocate an identifier");
+        old_mux.remove_pane_if_same(193, &old_pane);
+
+        new_mux
+            .add_pane(&new_pane)
+            .expect("a different mux owns an independent numeric namespace");
+        escaped_cleanup
+            .lock()
+            .take()
+            .expect("old cleanup lease")
+            .complete();
+
+        assert!(new_mux
+            .get_pane(193)
+            .is_some_and(|pane| Arc::ptr_eq(&pane, &new_pane)));
+    }
+
+    #[test]
+    fn final_cleanup_lease_releases_same_arc_slot_after_mux_owner_destruction() {
+        let old_mux = Arc::new(Mux::new(None));
+        let weak_old_mux = Arc::downgrade(&old_mux);
+        let new_mux = Arc::new(Mux::new(None));
+        let (pane, _) = KillCountingPane::new(194, test_size());
+        let escaped_cleanup = Arc::new(Mutex::new(None));
+
+        old_mux.add_pane(&pane).expect("register old pane generation");
+        let escaped_cleanup_for_subscriber = Arc::clone(&escaped_cleanup);
+        old_mux
+            .subscribe_with_pane_removal_cleanup(move |notification, cleanup| {
+                if matches!(notification, MuxNotification::PaneRemoved(194)) {
+                    *escaped_cleanup_for_subscriber.lock() = cleanup;
+                }
+                true
+            })
+            .expect("old mux subscription should allocate an identifier");
+        old_mux.remove_pane_if_same(194, &pane);
+        drop(old_mux);
+        assert!(weak_old_mux.upgrade().is_none());
+
+        assert!(
+            new_mux.add_pane(&pane).is_err(),
+            "owner destruction must not bypass deferred cleanup authority",
+        );
+        escaped_cleanup
+            .lock()
+            .take()
+            .expect("owner-independent cleanup token")
+            .complete();
+        new_mux
+            .add_pane(&pane)
+            .expect("the final lease must complete the old generation even after owner teardown");
+    }
+
+    #[test]
     fn reentrant_removal_keeps_same_id_fenced_until_queued_removed_dispatch() {
         let mux = Arc::new(Mux::new(None));
         let (original, kills) = KillCountingPane::new(92, test_size());
@@ -12064,6 +12770,33 @@ mod tests {
     }
 
     #[test]
+    fn generic_notify_rejects_forged_pane_lifecycle_variants() {
+        let mux = Mux::new(None);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_subscriber = Arc::clone(&observed);
+        mux.subscribe_with_topology(move |envelope| {
+            observed_for_subscriber.lock().push(envelope);
+            true
+        })
+        .expect("test topology subscription should allocate an identifier");
+
+        mux.notify(MuxNotification::PaneAdded(71));
+        mux.notify(MuxNotification::PaneRemoved(71));
+
+        assert!(
+            observed.lock().is_empty(),
+            "generic notification authority must not publish a forged pane lifecycle",
+        );
+        assert_eq!(
+            mux.topology_snapshot_authority()
+                .expect("rejected lifecycle variants cannot exhaust topology authority")
+                .1,
+            TopologyRevision::default(),
+            "rejected lifecycle variants must not reserve topology revisions",
+        );
+    }
+
+    #[test]
     fn topology_subscriber_receives_checked_revisions_and_non_topology_markers() {
         let mux = Mux::new(None);
         let observed = Arc::new(Mutex::new(Vec::new()));
@@ -12074,7 +12807,7 @@ mod tests {
         })
         .expect("test topology subscription should allocate an identifier");
 
-        mux.notify(MuxNotification::PaneAdded(17));
+        mux.notify(MuxNotification::TabResized(17));
         mux.notify(MuxNotification::SynchronizedOutput {
             pane_id: 17,
             event: SynchronizedOutputEvent::ModeQuery,
@@ -12336,7 +13069,7 @@ mod tests {
         .expect("test topology subscription should allocate an identifier");
 
         mux.notify(MuxNotification::Empty);
-        mux.notify(MuxNotification::PaneRemoved(99));
+        mux.notify(MuxNotification::WindowInvalidated(99));
 
         assert_eq!(
             *observed.lock(),
@@ -12356,7 +13089,7 @@ mod tests {
     #[test]
     fn topology_fence_subscription_captures_an_atomic_baseline() {
         let mux = Mux::new(None);
-        mux.notify(MuxNotification::PaneAdded(17));
+        mux.notify(MuxNotification::TabResized(17));
 
         let observed = Arc::new(Mutex::new(Vec::new()));
         let observed_for_subscriber = Arc::clone(&observed);
@@ -12369,7 +13102,7 @@ mod tests {
 
         assert_ne!(session.as_bytes(), [0; 16]);
         assert_eq!(baseline, TopologyRevision(1));
-        mux.notify(MuxNotification::PaneRemoved(17));
+        mux.notify(MuxNotification::WindowInvalidated(17));
         assert_eq!(
             *observed.lock(),
             vec![MuxTopologyStamp::Revision(TopologyRevision(2))],

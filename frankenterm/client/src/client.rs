@@ -91,6 +91,31 @@ where
     }
 }
 
+/// Poll an already-bound interactive RPC exactly once so that its bounded,
+/// non-blocking transport admission happens in the caller's input-dispatch
+/// turn rather than waiting behind unrelated main-thread executor work.
+///
+/// This helper is intentionally limited to the mux RPC futures produced by
+/// this module: their first poll performs only validation plus `try_send`, then
+/// waits for the reply.  It must not be used for a future whose first poll may
+/// block or perform unbounded work.  A pending future remains pinned at the
+/// same address and is returned for ordinary asynchronous completion.
+pub(crate) fn admit_interactive_rpc_now<F, T>(
+    future: F,
+) -> anyhow::Result<Option<Pin<Box<F>>>>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    let mut future = Box::pin(future);
+    let waker = futures::task::noop_waker();
+    let mut context = TaskContext::from_waker(&waker);
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready(Ok(_)) => Ok(None),
+        Poll::Ready(Err(error)) => Err(error),
+        Poll::Pending => Ok(Some(future)),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcDeliveryCertainty {
     DefinitelyNotSent,
@@ -2282,10 +2307,6 @@ impl RpcGenerationScope {
             .install_codec_authority(generation, codec)
     }
 
-    #[allow(
-        dead_code,
-        reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
-    )]
     pub(crate) fn render_connection_identity(&self) -> Option<RenderConnectionIdentity> {
         self.generation.and_then(|generation| {
             self.rpc_transport
@@ -10915,6 +10936,44 @@ mod tests {
             0
         );
         assert!(receiver.is_closed());
+    }
+
+    #[test]
+    fn interactive_rpc_admission_enqueues_now_and_awaits_without_blocking() {
+        let (client, receiver) = client_with_idle_rpc_queue();
+        let pending = admit_interactive_rpc_now(client.ping())
+            .expect("live interactive RPC admission should succeed")
+            .expect("an admitted RPC should await its reader response");
+
+        let message = receiver
+            .try_recv()
+            .expect("interactive admission must enqueue during the caller's turn");
+        let ReaderMessage::SendPdu { pdu, promise, .. } = message else {
+            panic!("interactive admission enqueued a non-RPC reader message");
+        };
+        assert!(matches!(*pdu, Pdu::Ping(Ping {})));
+        promise
+            .try_send(Ok(Pdu::Pong(Pong {})))
+            .expect("complete admitted interactive RPC");
+        asupersync_block_on(pending).expect("admitted interactive RPC should observe its reply");
+    }
+
+    #[test]
+    fn interactive_rpc_admission_reports_a_closed_queue_immediately() {
+        let (client, receiver) = client_with_idle_rpc_queue();
+        let request = client.ping();
+        drop(receiver);
+
+        let error = admit_interactive_rpc_now(request)
+            .expect_err("closed reader queue must reject interactive input immediately");
+        assert!(matches!(
+            error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::Retired {
+                stage: RpcRetirementStage::Enqueue,
+                certainty: RpcDeliveryCertainty::DefinitelyNotSent,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -19,10 +19,7 @@ use image::codecs::gif::GifEncoder;
 #[cfg(feature = "use_image")]
 use image::codecs::png::PngEncoder;
 #[cfg(feature = "use_image")]
-use image::{
-    Delay, ExtendedColorType, Frame, GenericImage, GenericImageView, ImageBuffer, ImageEncoder,
-    Rgba, RgbaImage,
-};
+use image::{Delay, ExtendedColorType, Frame, ImageEncoder, RgbaImage};
 use std::convert::TryFrom;
 use std::io::Write;
 use terminfo::{capability as cap, Capability as TermInfoCapability};
@@ -72,20 +69,52 @@ fn crop_rgba_region(
     top_left: TextureCoordinate,
     bottom_right: TextureCoordinate,
 ) -> Result<RgbaImage> {
-    let source = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(width, height, data.to_vec())
-        .ok_or_else(|| crate::error::StringWrap("ill formed RGBA image".to_string()))?;
-
     let (left, right) =
         texture_axis_to_pixel_bounds(top_left.x.into_inner(), bottom_right.x.into_inner(), width)?;
     let (top, bottom) =
         texture_axis_to_pixel_bounds(top_left.y.into_inner(), bottom_right.y.into_inner(), height)?;
 
-    let view = source.view(left, top, right - left, bottom - top);
-    let mut cropped = RgbaImage::new(right - left, bottom - top);
-    cropped
-        .copy_from(&*view, 0, 0)
-        .map_err(anyhow::Error::from)?;
-    Ok(cropped)
+    let source_stride = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(|| crate::error::StringWrap("RGBA source stride overflow".to_string()))?;
+    let expected_source_len = source_stride
+        .checked_mul(height as usize)
+        .ok_or_else(|| crate::error::StringWrap("RGBA source length overflow".to_string()))?;
+    crate::ensure!(
+        data.len() == expected_source_len,
+        "ill formed RGBA image: expected {expected_source_len} bytes, got {}",
+        data.len()
+    );
+
+    let crop_width = right - left;
+    let crop_height = bottom - top;
+    let crop_stride = (crop_width as usize)
+        .checked_mul(4)
+        .ok_or_else(|| crate::error::StringWrap("RGBA crop stride overflow".to_string()))?;
+    let crop_len = crop_stride
+        .checked_mul(crop_height as usize)
+        .ok_or_else(|| crate::error::StringWrap("RGBA crop length overflow".to_string()))?;
+    let mut cropped = Vec::new();
+    cropped.try_reserve_exact(crop_len).map_err(|err| {
+        crate::error::StringWrap(format!("unable to reserve {crop_len} RGBA crop bytes: {err}"))
+    })?;
+    let left_byte = (left as usize)
+        .checked_mul(4)
+        .ok_or_else(|| crate::error::StringWrap("RGBA crop offset overflow".to_string()))?;
+    for source_y in top..bottom {
+        let row_start = (source_y as usize)
+            .checked_mul(source_stride)
+            .and_then(|offset| offset.checked_add(left_byte))
+            .ok_or_else(|| crate::error::StringWrap("RGBA crop row offset overflow".to_string()))?;
+        let row_end = row_start
+            .checked_add(crop_stride)
+            .ok_or_else(|| crate::error::StringWrap("RGBA crop row endpoint overflow".to_string()))?;
+        cropped.extend_from_slice(&data[row_start..row_end]);
+    }
+
+    RgbaImage::from_raw(crop_width, crop_height, cropped)
+        .ok_or_else(|| crate::error::StringWrap("ill formed cropped RGBA image".to_string()).into())
 }
 
 #[cfg(feature = "use_image")]
@@ -120,12 +149,19 @@ fn encode_iterm_inline_image(
     bottom_right: TextureCoordinate,
 ) -> Result<Vec<u8>> {
     let full_region = is_full_image_region(top_left, bottom_right);
-    let image_data = image.image.data().clone();
+    let image_data = image.image.data();
 
-    match image_data {
-        ImageDataType::EncodedFile(data) if full_region => Ok(data),
-        ImageDataType::EncodedLease(lease) if full_region => Ok(lease.get_data()?),
-        ImageDataType::EncodedFile(data) => match ImageDataType::EncodedFile(data).decode() {
+    match &*image_data {
+        ImageDataType::EncodedFile(data) if full_region => Ok(data.clone()),
+        ImageDataType::EncodedLease(lease) if full_region => {
+            let lease = lease.clone();
+            drop(image_data);
+            Ok(lease.get_data()?)
+        }
+        ImageDataType::EncodedFile(data) => {
+            let data = data.clone();
+            drop(image_data);
+            match ImageDataType::EncodedFile(data).decode() {
             ImageDataType::EncodedFile(_) | ImageDataType::EncodedLease(_) => {
                 crate::bail!("cannot crop encoded image data unless the format is decodable")
             }
@@ -137,8 +173,11 @@ fn encode_iterm_inline_image(
                 top_left,
                 bottom_right,
             ),
-        },
+            }
+        }
         ImageDataType::EncodedLease(lease) => {
+            let lease = lease.clone();
+            drop(image_data);
             match ImageDataType::EncodedFile(lease.get_data()?).decode() {
                 ImageDataType::EncodedFile(_) | ImageDataType::EncodedLease(_) => {
                     crate::bail!("cannot crop encoded image data unless the format is decodable")
@@ -158,13 +197,11 @@ fn encode_iterm_inline_image(
             height,
             data,
             ..
-        } => encode_png(&crop_rgba_region(
-            width,
-            height,
-            &data,
-            top_left,
-            bottom_right,
-        )?),
+        } => {
+            let cropped = crop_rgba_region(*width, *height, data, top_left, bottom_right)?;
+            drop(image_data);
+            encode_png(&cropped)
+        }
         ImageDataType::AnimRgba8 {
             width,
             height,
@@ -173,15 +210,16 @@ fn encode_iterm_inline_image(
             ..
         } => {
             let mut encoded_frames = Vec::with_capacity(frames.len());
-            for (frame_data, duration) in frames.into_iter().zip(durations) {
-                let frame = crop_rgba_region(width, height, &frame_data, top_left, bottom_right)?;
+            for (frame_data, duration) in frames.iter().zip(durations) {
+                let frame = crop_rgba_region(*width, *height, frame_data, top_left, bottom_right)?;
                 encoded_frames.push(Frame::from_parts(
                     frame,
                     0,
                     0,
-                    Delay::from_saturating_duration(duration),
+                    Delay::from_saturating_duration(*duration),
                 ));
             }
+            drop(image_data);
             encode_gif(encoded_frames)
         }
     }
@@ -915,15 +953,28 @@ impl TerminfoRenderer {
                 },
                 #[cfg(feature = "use_image")]
                 Change::Image(image) => {
+                    let (screen_cols, screen_rows) = out.get_size_in_cells()?;
+                    let available_cols = self
+                        .cursor_position
+                        .map(|(x, _)| screen_cols.saturating_sub(x.min(screen_cols)))
+                        .unwrap_or(screen_cols);
+                    let Some(image) = image.clipped_to_cell_bounds(available_cols, screen_rows)
+                    else {
+                        continue;
+                    };
                     if self.caps.iterm2_image() {
                         let data =
-                            encode_iterm_inline_image(image, image.top_left, image.bottom_right)?;
+                            encode_iterm_inline_image(&image, image.top_left, image.bottom_right)?;
 
                         let file = ITermFileData {
                             name: None,
                             size: Some(data.len()),
-                            width: ITermDimension::Cells(image.width as i64),
-                            height: ITermDimension::Cells(image.height as i64),
+                            width: ITermDimension::Cells(
+                                i64::try_from(image.width).unwrap_or(i64::MAX),
+                            ),
+                            height: ITermDimension::Cells(
+                                i64::try_from(image.height).unwrap_or(i64::MAX),
+                            ),
                             preserve_aspect_ratio: true,
                             inline: true,
                             do_not_move_cursor: false,
