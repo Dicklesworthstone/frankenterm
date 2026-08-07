@@ -3405,6 +3405,16 @@ pub mod process {
         }
     }
 
+    /// Convert an owned capture buffer to text without copying valid UTF-8.
+    /// Invalid UTF-8 retains the historical lossy replacement behavior and
+    /// allocates only on that exceptional path.
+    pub(crate) fn decode_captured_bytes_lossy(bytes: Vec<u8>) -> String {
+        match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+        }
+    }
+
     impl std::fmt::Display for CommandOutputCaptureIncomplete {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(
@@ -3903,6 +3913,14 @@ pub mod process {
         limits: OutputCaptureLimits,
         cancel: Arc<AtomicBool>,
     ) -> std::io::Result<Output> {
+        // A kill-on-drop future can be cancelled while queued for the blocking
+        // pool. Observe that state before allocating descriptors or spawning a
+        // process, so a cancelled operation cannot launch after its caller has
+        // already gone away.
+        if cancel.load(Ordering::SeqCst) {
+            return Err(process_command_cancelled_error());
+        }
+
         let (mut stdout_read, stdout_write) = process_capture_socketpair("stdout")?;
         let (mut stderr_read, stderr_write) = process_capture_socketpair("stderr")?;
         stdout_read
@@ -3931,6 +3949,13 @@ pub mod process {
 
         configure_process_group(&mut cmd)?;
 
+        // Close the remaining queue/setup window. Cancellation can still race
+        // the spawn itself, but the first worker-loop iteration will then
+        // terminate that process tree promptly.
+        if cancel.load(Ordering::SeqCst) {
+            return Err(process_command_cancelled_error());
+        }
+
         let mut child = cmd.spawn()?;
         // `Command` retains custom Stdio handles for possible reuse. Drop it
         // and our original write endpoints immediately so only the child (or
@@ -3949,7 +3974,11 @@ pub mod process {
 
         loop {
             if cancel.load(Ordering::SeqCst) {
-                let already_reaped = matches!(child.try_wait(), Ok(Some(_)));
+                // Once `status` is populated, the leader has been reaped and
+                // its PID/process-group identifier may already be reusable.
+                // Never re-probe and potentially signal that identifier.
+                let already_reaped =
+                    status.is_some() || matches!(child.try_wait(), Ok(Some(_)));
                 if !already_reaped {
                     terminate_child_process(&mut child);
                 }
@@ -3962,10 +3991,7 @@ pub mod process {
                     &mut stderr,
                     limits,
                 );
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "process command cancelled",
-                ));
+                return Err(process_command_cancelled_error());
             }
 
             if let Err(error) = drain_capture_reader(
@@ -4104,6 +4130,13 @@ pub mod process {
         stream: &'static str,
     ) -> std::io::Result<(FileDescriptor, FileDescriptor)> {
         socketpair().map_err(|error| process_capture_setup_error(stream, error))
+    }
+
+    fn process_command_cancelled_error() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "process command cancelled",
+        )
     }
 
     fn process_capture_setup_error(
@@ -4337,6 +4370,21 @@ pub mod process {
             command.stdout_limit(17).stderr_limit(9);
             assert_eq!(command.stdout_limit, 17);
             assert_eq!(command.stderr_limit, 9);
+        }
+
+        #[test]
+        fn valid_capture_text_reuses_its_owned_allocation() {
+            let bytes = b"valid UTF-8 capture".to_vec();
+            let original_pointer = bytes.as_ptr();
+            let text = decode_captured_bytes_lossy(bytes);
+            assert_eq!(text, "valid UTF-8 capture");
+            assert_eq!(text.as_ptr(), original_pointer);
+        }
+
+        #[test]
+        fn invalid_capture_text_retains_lossy_replacement_semantics() {
+            let text = decode_captured_bytes_lossy(vec![b'a', 0xff, b'b']);
+            assert_eq!(text, "a\u{fffd}b");
         }
 
         #[test]

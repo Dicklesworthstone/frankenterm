@@ -9,7 +9,9 @@
 use crate::agent_provider::AgentProvider;
 use crate::error::Remediation;
 use crate::policy::Redactor;
-use crate::runtime_async::process::{Command, CommandOutputLimitExceeded};
+use crate::runtime_async::process::{
+    Command, CommandOutputLimitExceeded, decode_captured_bytes_lossy,
+};
 use crate::suggestions::Platform;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -280,8 +282,7 @@ impl CautClient {
             });
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(stdout)
+        Ok(decode_captured_bytes_lossy(output.stdout))
     }
 }
 

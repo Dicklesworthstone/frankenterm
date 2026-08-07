@@ -10,7 +10,9 @@
 use crate::agent_provider::AgentProvider;
 use crate::error::Remediation;
 use crate::policy::Redactor;
-use crate::runtime_async::process::{Command, CommandOutputLimitExceeded};
+use crate::runtime_async::process::{
+    Command, CommandOutputLimitExceeded, decode_captured_bytes_lossy,
+};
 #[cfg(feature = "cass-export")]
 use crate::storage::{AgentSessionRecord, ExportQuery, Segment, SegmentScanQuery, StorageHandle};
 use crate::suggestions::Platform;
@@ -567,7 +569,7 @@ impl CassClient {
             });
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(decode_captured_bytes_lossy(output.stdout))
     }
 }
 

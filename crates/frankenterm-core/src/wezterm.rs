@@ -2716,7 +2716,9 @@ impl WeztermClient {
             return Err(WeztermError::CommandFailed(stderr_str).into());
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(crate::runtime_async::process::decode_captured_bytes_lossy(
+            output.stdout,
+        ))
     }
 
     fn stderr_is_pane_not_found(stderr: &str) -> bool {

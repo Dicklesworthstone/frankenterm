@@ -478,6 +478,15 @@ fn parse_profile_metadata_bytes(
 ) -> std::result::Result<ProfileMetadata, ProfileMetadataReadFailure> {
     let metadata: ProfileMetadata = serde_json::from_slice(bytes)
         .map_err(|_| ProfileMetadataReadFailure::InvalidSchema)?;
+    validate_profile_metadata(&metadata, expected_service, expected_account)?;
+    Ok(metadata)
+}
+
+fn validate_profile_metadata(
+    metadata: &ProfileMetadata,
+    expected_service: &str,
+    expected_account: &str,
+) -> std::result::Result<(), ProfileMetadataReadFailure> {
     if metadata.service != expected_service || metadata.account != expected_account {
         return Err(ProfileMetadataReadFailure::IdentityMismatch);
     }
@@ -491,7 +500,7 @@ fn parse_profile_metadata_bytes(
         chrono::DateTime::parse_from_rfc3339(timestamp)
             .map_err(|_| ProfileMetadataReadFailure::InvalidTimestamp)?;
     }
-    Ok(metadata)
+    Ok(())
 }
 
 impl ProfileMetadata {
