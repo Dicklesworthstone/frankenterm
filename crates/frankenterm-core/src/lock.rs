@@ -4,8 +4,12 @@
 //! runs at a time. A sidecar metadata file records diagnostic information
 //! for debugging.
 
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+#[cfg(any(unix, windows))]
+use cap_fs_ext::MetadataExt as CapMetadataExt;
+use cap_std::fs::{Dir as CapDir, Metadata as CapMetadata, OpenOptions as CapOpenOptions};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::SystemTime;
@@ -14,17 +18,20 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-// br-ft-zs9v0: lock-holder metadata read observability. The
-// `check_running` helper attempts to surface metadata about the
-// holder of an already-held lock via:
-//     fs::read_to_string(p).ok().and_then(|s| serde_json::from_str(&s).ok())
-// Both .ok() drops are silent — operators investigating a contention
-// incident see "lock held by ?" with no signal whether (a) the
-// metadata file was missing on disk, (b) read failed (permissions /
-// IO error), or (c) parse failed (schema-skewed JSON from a different
-// version of the holder). Each case has a different remediation. This
-// counter aggregates both failure modes (the `phase` field in the
-// structured warn discriminates).
+/// Maximum admitted size of the small lock-holder metadata schema.
+///
+/// Reads are additionally bounded to this limit plus one byte so growth after
+/// the initial metadata check cannot trigger unbounded allocation.
+pub const MAX_LOCK_METADATA_BYTES: usize = 1024;
+const LOCK_METADATA_READ_LIMIT: u64 = MAX_LOCK_METADATA_BYTES as u64 + 1;
+const MAX_LOCK_METADATA_VERSION_BYTES: usize = 128;
+
+// br-ft-zs9v0 / ft-interactive-systems-performance-4tenz.53:
+// lock-holder metadata admission observability. Every unavailable, unsafe,
+// oversized, changed, or invalid sidecar increments this counter. The
+// structured warning contains only fixed phase/kind labels and bounded size
+// information; it deliberately excludes raw paths, I/O errors, parser errors,
+// and metadata contents.
 //
 // Same observability defect family as ft-iwg7x
 // (robot_profile_bootstrap_serde_drop_count), ft-zkthg
@@ -34,24 +41,22 @@ use thiserror::Error;
 // ft-ncijf (mcp_workflow_plan_serde_drop_count), ft-r3d4e
 // (backup_manifest_parse_drop_count), and ft-jtcrv
 // (ars_federation_payload_serde_drop_count).
-static LOCK_METADATA_PARSE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+static LOCK_METADATA_ADMISSION_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// br-ft-zs9v0: cumulative count of lock-holder metadata read or
-/// parse failures observed in `check_running`. Each increment
-/// represents one contention incident where the operator's
-/// "who holds this lock?" diagnostic was silently degraded from a
-/// rich `LockMetadata` to `None`. > 0 means investigate the metadata
-/// sidecar at the affected lock paths.
+/// Cumulative count of rejected or unavailable lock-holder metadata reads.
+///
+/// Each increment means a held lock could not be attributed to a concrete,
+/// safely admitted [`LockMetadata`] record.
 #[must_use]
-pub fn lock_metadata_parse_drop_count() -> u64 {
-    LOCK_METADATA_PARSE_DROP_COUNT.load(AtomicOrdering::Relaxed)
+pub fn lock_metadata_admission_failure_count() -> u64 {
+    LOCK_METADATA_ADMISSION_FAILURE_COUNT.load(AtomicOrdering::Relaxed)
 }
 
 /// Test helper: reset the counter so regression tests can assert
 /// post-bump values without state leakage between tests.
 #[cfg(test)]
-pub(crate) fn reset_lock_metadata_parse_drop_count_for_test() {
-    LOCK_METADATA_PARSE_DROP_COUNT.store(0, AtomicOrdering::Relaxed);
+pub(crate) fn reset_lock_metadata_admission_failure_count_for_test() {
+    LOCK_METADATA_ADMISSION_FAILURE_COUNT.store(0, AtomicOrdering::Relaxed);
 }
 
 #[cfg(test)]
@@ -66,49 +71,257 @@ fn lock_metadata_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
 
 #[inline]
 fn record_lock_metadata_parse_drop() {
-    LOCK_METADATA_PARSE_DROP_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+    LOCK_METADATA_ADMISSION_FAILURE_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
 }
 
-/// br-ft-zs9v0: read + parse the holder metadata sidecar for a held
-/// lock with audit-fidelity counter bump + structured warn on either
-/// failure. Replaces the silent `fs::read_to_string(p).ok().and_then(|s| serde_json::from_str(&s).ok())`
-/// pattern in `check_running` so a missing/unreadable/corrupt sidecar
-/// surfaces via metrics scrape AND log search instead of dissolving
-/// into a `None` that callers cannot distinguish from "no contention".
-fn read_lock_metadata(meta_path: &Path) -> Option<LockMetadata> {
-    let raw = match fs::read_to_string(meta_path) {
-        Ok(s) => s,
-        Err(err) => {
-            record_lock_metadata_parse_drop();
-            tracing::warn!(
-                target: "frankenterm::lock",
-                event = "br-ft-zs9v0",
-                phase = "read_fail",
-                error = %err,
-                meta_path = %meta_path.display(),
-                "failed to read lock metadata sidecar; \
-                 contention diagnostic will report holder as unknown"
-            );
-            return None;
-        }
-    };
-    match serde_json::from_str::<LockMetadata>(&raw) {
-        Ok(m) => Some(m),
-        Err(err) => {
-            record_lock_metadata_parse_drop();
-            tracing::warn!(
-                target: "frankenterm::lock",
-                event = "br-ft-zs9v0",
-                phase = "parse_fail",
-                error = %err,
-                meta_path = %meta_path.display(),
-                meta_len = raw.len(),
-                "lock metadata sidecar failed to deserialize as LockMetadata; \
-                 contention diagnostic will report holder as unknown"
-            );
-            None
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LockMetadataReadFailure {
+    phase: &'static str,
+    kind: &'static str,
+    observed_bytes: Option<u64>,
+}
+
+impl LockMetadataReadFailure {
+    const fn new(phase: &'static str, kind: &'static str) -> Self {
+        Self {
+            phase,
+            kind,
+            observed_bytes: None,
         }
     }
+
+    const fn with_size(phase: &'static str, kind: &'static str, observed_bytes: u64) -> Self {
+        Self {
+            phase,
+            kind,
+            observed_bytes: Some(observed_bytes),
+        }
+    }
+}
+
+fn stable_io_failure(phase: &'static str, error: &io::Error) -> LockMetadataReadFailure {
+    let kind = match error.kind() {
+        io::ErrorKind::NotFound => "not_found",
+        io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::InvalidData => "invalid_data",
+        io::ErrorKind::WouldBlock => "would_block",
+        _ => "io_unavailable",
+    };
+    LockMetadataReadFailure::new(phase, kind)
+}
+
+fn report_lock_metadata_read_failure(failure: LockMetadataReadFailure) {
+    record_lock_metadata_parse_drop();
+    let size_known = failure.observed_bytes.is_some();
+    let observed_bytes = failure
+        .observed_bytes
+        .unwrap_or(0)
+        .min(LOCK_METADATA_READ_LIMIT);
+    tracing::warn!(
+        target: "frankenterm::lock",
+        event = "ft-interactive-systems-performance-4tenz.53",
+        phase = failure.phase,
+        kind = failure.kind,
+        size_known,
+        observed_bytes,
+        max_bytes = MAX_LOCK_METADATA_BYTES as u64,
+        "lock holder metadata was unavailable after bounded admission"
+    );
+}
+
+fn split_metadata_path(meta_path: &Path) -> Option<(&Path, &Path)> {
+    let name = meta_path.file_name()?;
+    let parent = meta_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Some((parent, Path::new(name)))
+}
+
+fn admit_named_metadata(
+    metadata: &CapMetadata,
+    phase: &'static str,
+) -> Result<(), LockMetadataReadFailure> {
+    if metadata.file_type().is_symlink() {
+        return Err(LockMetadataReadFailure::new(phase, "symlink"));
+    }
+    if !metadata.is_file() {
+        return Err(LockMetadataReadFailure::new(phase, "not_regular_file"));
+    }
+    if metadata.len() > MAX_LOCK_METADATA_BYTES as u64 {
+        return Err(LockMetadataReadFailure::with_size(
+            phase,
+            "oversized",
+            metadata.len(),
+        ));
+    }
+    Ok(())
+}
+
+fn metadata_observation_changed(left: &CapMetadata, right: &CapMetadata) -> bool {
+    if left.len() != right.len() {
+        return true;
+    }
+    matches!(
+        (left.modified(), right.modified()),
+        (Ok(left), Ok(right)) if left != right
+    )
+}
+
+#[cfg(unix)]
+fn same_metadata_identity(left: &CapMetadata, right: &CapMetadata) -> Option<bool> {
+    Some(
+        CapMetadataExt::dev(left) == CapMetadataExt::dev(right)
+            && CapMetadataExt::ino(left) == CapMetadataExt::ino(right),
+    )
+}
+
+#[cfg(windows)]
+fn same_metadata_identity(left: &CapMetadata, right: &CapMetadata) -> Option<bool> {
+    Some(
+        CapMetadataExt::volume_serial_number(left)?
+            == CapMetadataExt::volume_serial_number(right)?
+            && CapMetadataExt::file_index(left)? == CapMetadataExt::file_index(right)?,
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_metadata_identity(_left: &CapMetadata, _right: &CapMetadata) -> Option<bool> {
+    None
+}
+
+fn require_same_metadata_identity(
+    left: &CapMetadata,
+    right: &CapMetadata,
+    phase: &'static str,
+) -> Result<(), LockMetadataReadFailure> {
+    match same_metadata_identity(left, right) {
+        Some(true) => Ok(()),
+        Some(false) => Err(LockMetadataReadFailure::new(
+            phase,
+            "namespace_identity_changed",
+        )),
+        None if cfg!(any(unix, windows)) => Err(LockMetadataReadFailure::new(
+            phase,
+            "identity_unavailable",
+        )),
+        None => Ok(()),
+    }
+}
+
+fn read_lock_metadata_admitted_with_hook(
+    meta_path: &Path,
+    after_open: impl FnOnce(),
+) -> Result<LockMetadata, LockMetadataReadFailure> {
+    let (parent, name) = split_metadata_path(meta_path)
+        .ok_or_else(|| LockMetadataReadFailure::new("path", "invalid_leaf"))?;
+    let directory = CapDir::open_ambient_dir(parent, cap_std::ambient_authority())
+        .map_err(|error| stable_io_failure("parent_open", &error))?;
+    let named_before = directory
+        .symlink_metadata(name)
+        .map_err(|error| stable_io_failure("path_before_open", &error))?;
+    admit_named_metadata(&named_before, "path_before_open")?;
+
+    let mut options = CapOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = match directory.open_with(name, &options) {
+        Ok(file) => file,
+        Err(error) => {
+            if let Ok(current) = directory.symlink_metadata(name) {
+                if current.file_type().is_symlink() {
+                    return Err(LockMetadataReadFailure::new("open", "symlink"));
+                }
+                if !current.is_file() {
+                    return Err(LockMetadataReadFailure::new("open", "not_regular_file"));
+                }
+            }
+            return Err(stable_io_failure("open", &error));
+        }
+    };
+    let handle_before = file
+        .metadata()
+        .map_err(|error| stable_io_failure("handle_before_read", &error))?;
+    admit_named_metadata(&handle_before, "handle_before_read")?;
+    require_same_metadata_identity(&named_before, &handle_before, "open_identity")?;
+    if metadata_observation_changed(&named_before, &handle_before) {
+        return Err(LockMetadataReadFailure::new(
+            "open_identity",
+            "metadata_changed",
+        ));
+    }
+
+    after_open();
+
+    let mut raw = Vec::with_capacity(MAX_LOCK_METADATA_BYTES.saturating_add(1));
+    (&mut file)
+        .take(LOCK_METADATA_READ_LIMIT)
+        .read_to_end(&mut raw)
+        .map_err(|error| stable_io_failure("read", &error))?;
+
+    let handle_after = file
+        .metadata()
+        .map_err(|error| stable_io_failure("handle_after_read", &error))?;
+    admit_named_metadata(&handle_after, "handle_after_read")?;
+    require_same_metadata_identity(&handle_before, &handle_after, "read_identity")?;
+    if metadata_observation_changed(&handle_before, &handle_after) {
+        return Err(LockMetadataReadFailure::new(
+            "read_identity",
+            "metadata_changed",
+        ));
+    }
+
+    let named_after = directory
+        .symlink_metadata(name)
+        .map_err(|error| stable_io_failure("path_after_read", &error))?;
+    admit_named_metadata(&named_after, "path_after_read")?;
+    require_same_metadata_identity(&handle_after, &named_after, "path_after_read")?;
+    if metadata_observation_changed(&handle_after, &named_after) {
+        return Err(LockMetadataReadFailure::new(
+            "path_after_read",
+            "metadata_changed",
+        ));
+    }
+
+    if raw.len() > MAX_LOCK_METADATA_BYTES {
+        return Err(LockMetadataReadFailure::with_size(
+            "read",
+            "oversized",
+            u64::try_from(raw.len()).unwrap_or(LOCK_METADATA_READ_LIMIT),
+        ));
+    }
+    let metadata = serde_json::from_slice::<LockMetadata>(&raw).map_err(|_| {
+        LockMetadataReadFailure::with_size(
+            "parse",
+            "invalid_schema",
+            u64::try_from(raw.len()).unwrap_or(LOCK_METADATA_READ_LIMIT),
+        )
+    })?;
+    if !metadata.is_admissible() {
+        return Err(LockMetadataReadFailure::with_size(
+            "validate",
+            "invalid_schema",
+            u64::try_from(raw.len()).unwrap_or(LOCK_METADATA_READ_LIMIT),
+        ));
+    }
+    Ok(metadata)
+}
+
+fn read_lock_metadata_with_hook(
+    meta_path: &Path,
+    after_open: impl FnOnce(),
+) -> Result<LockMetadata, LockMetadataReadFailure> {
+    let result = read_lock_metadata_admitted_with_hook(meta_path, after_open);
+    if let Err(failure) = result {
+        report_lock_metadata_read_failure(failure);
+    }
+    result
+}
+
+/// Read and parse one lock-holder metadata sidecar through bounded, no-follow
+/// admission. Failures are deliberately content-free and mean only that the
+/// holder's identity is unknown; they never mean that the lock is free.
+fn read_lock_metadata(meta_path: &Path) -> Result<LockMetadata, LockMetadataReadFailure> {
+    read_lock_metadata_with_hook(meta_path, || {})
 }
 
 /// Errors that can occur during lock operations.
