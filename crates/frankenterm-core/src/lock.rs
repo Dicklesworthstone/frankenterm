@@ -70,7 +70,7 @@ fn lock_metadata_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[inline]
-fn record_lock_metadata_parse_drop() {
+fn record_lock_metadata_admission_failure() {
     LOCK_METADATA_ADMISSION_FAILURE_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
 }
 
@@ -111,7 +111,7 @@ fn stable_io_failure(phase: &'static str, error: &io::Error) -> LockMetadataRead
 }
 
 fn report_lock_metadata_read_failure(failure: LockMetadataReadFailure) {
-    record_lock_metadata_parse_drop();
+    record_lock_metadata_admission_failure();
     let size_known = failure.observed_bytes.is_some();
     let observed_bytes = failure
         .observed_bytes
@@ -780,14 +780,17 @@ mod tests {
         let lock_path = tmp.path().join("test.lock");
 
         // No lock yet
-        assert!(check_running(&lock_path).is_none());
+        assert_eq!(check_running(&lock_path), LockStatus::Free);
 
         let _lock = WatcherLock::acquire(&lock_path).unwrap();
 
         // Now lock is held
-        let meta = check_running(&lock_path);
-        assert!(meta.is_some());
-        assert_eq!(meta.unwrap().pid, std::process::id());
+        match check_running(&lock_path) {
+            LockStatus::HeldKnown(metadata) => {
+                assert_eq!(metadata.pid, std::process::id());
+            }
+            status => panic!("expected known held lock, got {status:?}"),
+        }
     }
 
     #[test]
@@ -1013,7 +1016,7 @@ mod tests {
     #[test]
     fn read_existing_lock_error_with_corrupt_meta() {
         let _counter_guard = lock_metadata_counter_test_lock();
-        reset_lock_metadata_parse_drop_count_for_test();
+        reset_lock_metadata_admission_failure_count_for_test();
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("test.lock");
         let meta_path = metadata_path(&lock_path);
@@ -1024,13 +1027,13 @@ mod tests {
             read_existing_lock_error(&lock_path),
             LockError::AlreadyRunningNoMeta
         ));
-        assert_eq!(lock_metadata_parse_drop_count(), 1);
+        assert_eq!(lock_metadata_admission_failure_count(), 1);
     }
 
     #[test]
     fn read_existing_lock_error_no_meta_file() {
         let _counter_guard = lock_metadata_counter_test_lock();
-        reset_lock_metadata_parse_drop_count_for_test();
+        reset_lock_metadata_admission_failure_count_for_test();
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("test.lock");
 
@@ -1038,7 +1041,7 @@ mod tests {
             read_existing_lock_error(&lock_path),
             LockError::AlreadyRunningNoMeta
         ));
-        assert_eq!(lock_metadata_parse_drop_count(), 1);
+        assert_eq!(lock_metadata_admission_failure_count(), 1);
     }
 
     #[test]
@@ -1065,10 +1068,10 @@ mod tests {
     }
 
     #[test]
-    fn check_running_no_file_returns_none() {
+    fn check_running_no_file_reports_free() {
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("nonexistent.lock");
-        assert!(check_running(&lock_path).is_none());
+        assert_eq!(check_running(&lock_path), LockStatus::Free);
     }
 
     #[test]
@@ -1194,14 +1197,14 @@ mod tests {
     }
 
     #[test]
-    fn check_running_after_release_returns_none() {
+    fn check_running_after_release_reports_free() {
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("released.lock");
 
         let lock = WatcherLock::acquire(&lock_path).unwrap();
         drop(lock);
 
-        assert!(check_running(&lock_path).is_none());
+        assert_eq!(check_running(&lock_path), LockStatus::Free);
     }
 
     #[test]
@@ -1297,7 +1300,7 @@ mod tests {
     #[test]
     fn read_existing_lock_error_empty_meta_file() {
         let _counter_guard = lock_metadata_counter_test_lock();
-        reset_lock_metadata_parse_drop_count_for_test();
+        reset_lock_metadata_admission_failure_count_for_test();
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("empty.lock");
         let meta_path = metadata_path(&lock_path);
@@ -1308,13 +1311,13 @@ mod tests {
             read_existing_lock_error(&lock_path),
             LockError::AlreadyRunningNoMeta
         ));
-        assert_eq!(lock_metadata_parse_drop_count(), 1);
+        assert_eq!(lock_metadata_admission_failure_count(), 1);
     }
 
     #[test]
     fn read_existing_lock_error_partial_json() {
         let _counter_guard = lock_metadata_counter_test_lock();
-        reset_lock_metadata_parse_drop_count_for_test();
+        reset_lock_metadata_admission_failure_count_for_test();
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("partial.lock");
         let meta_path = metadata_path(&lock_path);
@@ -1325,7 +1328,7 @@ mod tests {
             read_existing_lock_error(&lock_path),
             LockError::AlreadyRunningNoMeta
         ));
-        assert_eq!(lock_metadata_parse_drop_count(), 1);
+        assert_eq!(lock_metadata_admission_failure_count(), 1);
     }
 
     #[test]
@@ -1347,8 +1350,7 @@ mod tests {
         };
         fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
 
-        // check_running should return None because the lock is NOT held
-        assert!(check_running(&lock_path).is_none());
+        assert_eq!(check_running(&lock_path), LockStatus::Free);
     }
 
     #[test]
@@ -1358,11 +1360,11 @@ mod tests {
     }
 }
 
-// br-ft-zs9v0: serialize tests that touch the process-global
-// LOCK_METADATA_PARSE_DROP_COUNT counter so concurrent test threads
+// Serialize tests that touch the process-global metadata-admission counter so
+// concurrent test threads
 // don't race on reset/observe pairs.
 #[cfg(test)]
-mod metadata_parse_drop_tests {
+mod metadata_admission_tests {
     use super::*;
     use tempfile::TempDir;
 
@@ -1382,71 +1384,70 @@ mod metadata_parse_drop_tests {
     #[test]
     fn well_formed_metadata_does_not_bump() {
         let _g = lock();
-        reset_lock_metadata_parse_drop_count_for_test();
+        reset_lock_metadata_admission_failure_count_for_test();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("watcher.lock.meta");
         let raw = serde_json::to_string(&well_formed_metadata()).unwrap();
         fs::write(&path, raw).unwrap();
         let meta = read_lock_metadata(&path);
-        assert!(meta.is_some());
         assert_eq!(meta.unwrap().pid, 1234);
-        assert_eq!(lock_metadata_parse_drop_count(), 0);
+        assert_eq!(lock_metadata_admission_failure_count(), 0);
     }
 
     #[test]
     fn missing_file_bumps_counter_via_read_fail() {
         let _g = lock();
-        reset_lock_metadata_parse_drop_count_for_test();
+        reset_lock_metadata_admission_failure_count_for_test();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("does_not_exist.meta");
         let meta = read_lock_metadata(&path);
-        assert!(meta.is_none());
-        assert_eq!(lock_metadata_parse_drop_count(), 1);
+        assert!(meta.is_err());
+        assert_eq!(lock_metadata_admission_failure_count(), 1);
     }
 
     #[test]
     fn malformed_json_bumps_counter_via_parse_fail() {
         let _g = lock();
-        reset_lock_metadata_parse_drop_count_for_test();
+        reset_lock_metadata_admission_failure_count_for_test();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("watcher.lock.meta");
         fs::write(&path, "{ not valid json").unwrap();
         let meta = read_lock_metadata(&path);
-        assert!(meta.is_none());
-        assert_eq!(lock_metadata_parse_drop_count(), 1);
+        assert!(meta.is_err());
+        assert_eq!(lock_metadata_admission_failure_count(), 1);
     }
 
     #[test]
     fn wrong_shape_bumps_counter_via_parse_fail() {
         let _g = lock();
-        reset_lock_metadata_parse_drop_count_for_test();
+        reset_lock_metadata_admission_failure_count_for_test();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("watcher.lock.meta");
         // valid JSON but missing every required LockMetadata field
         fs::write(&path, r#"{"unrelated": true}"#).unwrap();
         let meta = read_lock_metadata(&path);
-        assert!(meta.is_none());
-        assert_eq!(lock_metadata_parse_drop_count(), 1);
+        assert!(meta.is_err());
+        assert_eq!(lock_metadata_admission_failure_count(), 1);
     }
 
     #[test]
     fn repeated_failures_bump_monotonically() {
         let _g = lock();
-        reset_lock_metadata_parse_drop_count_for_test();
+        reset_lock_metadata_admission_failure_count_for_test();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("watcher.lock.meta");
         fs::write(&path, "garbage").unwrap();
         for _ in 0..5 {
             let _ = read_lock_metadata(&path);
         }
-        assert_eq!(lock_metadata_parse_drop_count(), 5);
+        assert_eq!(lock_metadata_admission_failure_count(), 5);
     }
 
     proptest::proptest! {
         #![proptest_config(proptest::test_runner::Config::with_cases(48))]
 
         // br-ft-zs9v0: any non-LockMetadata-shaped JSON or non-JSON
-        // content must bump the counter exactly once and yield None.
+        // content must bump the counter exactly once and yield an error.
         #[test]
         fn arbitrary_malformed_content_always_bumps(
             shape in proptest::sample::select(vec![
@@ -1465,13 +1466,13 @@ mod metadata_parse_drop_tests {
             ]),
         ) {
             let _g = lock();
-            reset_lock_metadata_parse_drop_count_for_test();
+            reset_lock_metadata_admission_failure_count_for_test();
             let tmp = TempDir::new().unwrap();
             let path = tmp.path().join("watcher.lock.meta");
             fs::write(&path, &shape).unwrap();
             let meta = read_lock_metadata(&path);
-            proptest::prop_assert!(meta.is_none());
-            proptest::prop_assert_eq!(lock_metadata_parse_drop_count(), 1);
+            proptest::prop_assert!(meta.is_err());
+            proptest::prop_assert_eq!(lock_metadata_admission_failure_count(), 1);
         }
     }
 }

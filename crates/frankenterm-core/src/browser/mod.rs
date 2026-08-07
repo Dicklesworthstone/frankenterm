@@ -95,6 +95,7 @@ enum ProfileMetadataReadFailure {
     NotRegularFile,
     Oversized,
     ReadUnavailable,
+    ChangedDuringRead,
     InvalidSchema,
     IdentityMismatch,
     InvalidTimestamp,
@@ -109,6 +110,9 @@ impl ProfileMetadataReadFailure {
             Self::NotRegularFile => "Browser profile metadata is not a regular file",
             Self::Oversized => "Browser profile metadata exceeds the 64 KiB safety limit",
             Self::ReadUnavailable => "Browser profile metadata could not be read safely",
+            Self::ChangedDuringRead => {
+                "Browser profile metadata changed while it was being read"
+            }
             Self::InvalidSchema => "Browser profile metadata does not match the required schema",
             Self::IdentityMismatch => {
                 "Browser profile metadata identity does not match its profile"
@@ -121,6 +125,56 @@ impl ProfileMetadataReadFailure {
 
     fn into_storage_error(self) -> StorageError {
         StorageError::Database(self.detail().to_string())
+    }
+}
+
+/// Observable identity/version snapshot for a profile metadata file.
+///
+/// On Unix, device+inode and nanosecond mtime/ctime make replacement or
+/// mutation detection authoritative for the supported macOS/Linux targets.
+/// Other targets use the portable length+modified-time surface available in
+/// `std`; an adversarial replacement with identical observable metadata is a
+/// residual portability limit, while the hard byte cap and typed schema gate
+/// remain enforced independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfileMetadataFileSnapshot {
+    byte_len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+impl ProfileMetadataFileSnapshot {
+    fn capture(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            byte_len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            modified_seconds: metadata.mtime(),
+            #[cfg(unix)]
+            modified_nanoseconds: metadata.mtime_nsec(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
     }
 }
 
@@ -245,15 +299,19 @@ impl BrowserProfile {
     /// The metadata file tracks when the profile was bootstrapped,
     /// the method used, and when it was last used.
     pub fn write_metadata(&self, metadata: &ProfileMetadata) -> Result<()> {
+        validate_profile_metadata(metadata, &self.service, &self.account)
+            .map_err(ProfileMetadataReadFailure::into_storage_error)?;
         let path = self.metadata_path();
-        let json = serde_json::to_string_pretty(metadata).map_err(|e| {
-            StorageError::Database(format!("Failed to serialize profile metadata: {e}"))
+        let json = serde_json::to_string_pretty(metadata).map_err(|_| {
+            ProfileMetadataReadFailure::InvalidSchema.into_storage_error()
         })?;
-        std::fs::write(&path, json.as_bytes()).map_err(|e| {
-            StorageError::Database(format!(
-                "Failed to write profile metadata to {}: {e}",
-                path.display()
-            ))
+        if u64::try_from(json.len()).unwrap_or(u64::MAX) > PROFILE_METADATA_MAX_BYTES {
+            return Err(ProfileMetadataReadFailure::Oversized
+                .into_storage_error()
+                .into());
+        }
+        std::fs::write(&path, json.as_bytes()).map_err(|_| {
+            StorageError::Database("Browser profile metadata could not be written".to_string())
         })?;
 
         #[cfg(unix)]
@@ -291,8 +349,9 @@ impl BrowserProfile {
         };
         admit_profile_metadata_shape_and_size(metadata.file_type().is_file(), metadata.len())
             .map_err(ProfileMetadataReadFailure::into_storage_error)?;
+        let path_snapshot_before = ProfileMetadataFileSnapshot::capture(&metadata);
 
-        let file = std::fs::File::open(&path).map_err(|_| {
+        let mut file = std::fs::File::open(&path).map_err(|_| {
             ProfileMetadataReadFailure::ReadUnavailable.into_storage_error()
         })?;
         let opened_metadata = file.metadata().map_err(|_| {
@@ -300,8 +359,38 @@ impl BrowserProfile {
         })?;
         admit_profile_metadata_shape_and_size(opened_metadata.is_file(), opened_metadata.len())
             .map_err(ProfileMetadataReadFailure::into_storage_error)?;
-        let data = read_profile_metadata_bounded(file)
+        let opened_snapshot = ProfileMetadataFileSnapshot::capture(&opened_metadata);
+        if opened_snapshot != path_snapshot_before {
+            return Err(ProfileMetadataReadFailure::ChangedDuringRead
+                .into_storage_error()
+                .into());
+        }
+
+        let data = read_profile_metadata_bounded(&mut file)
             .map_err(ProfileMetadataReadFailure::into_storage_error)?;
+        let handle_metadata_after = file.metadata().map_err(|_| {
+            ProfileMetadataReadFailure::MetadataUnavailable.into_storage_error()
+        })?;
+        admit_profile_metadata_shape_and_size(
+            handle_metadata_after.is_file(),
+            handle_metadata_after.len(),
+        )
+        .map_err(ProfileMetadataReadFailure::into_storage_error)?;
+        let handle_snapshot_after = ProfileMetadataFileSnapshot::capture(&handle_metadata_after);
+        let path_metadata_after = std::fs::symlink_metadata(&path).map_err(|_| {
+            ProfileMetadataReadFailure::ChangedDuringRead.into_storage_error()
+        })?;
+        admit_profile_metadata_shape_and_size(
+            path_metadata_after.file_type().is_file(),
+            path_metadata_after.len(),
+        )
+        .map_err(ProfileMetadataReadFailure::into_storage_error)?;
+        let path_snapshot_after = ProfileMetadataFileSnapshot::capture(&path_metadata_after);
+        if handle_snapshot_after != opened_snapshot || path_snapshot_after != handle_snapshot_after {
+            return Err(ProfileMetadataReadFailure::ChangedDuringRead
+                .into_storage_error()
+                .into());
+        }
         let meta = parse_profile_metadata_bytes(&data, &self.service, &self.account)
             .map_err(ProfileMetadataReadFailure::into_storage_error)?;
         Ok(Some(meta))
