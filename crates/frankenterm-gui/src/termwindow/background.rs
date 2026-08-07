@@ -184,6 +184,70 @@ fn checked_background_repeat_count(
     Ok(count as usize)
 }
 
+fn prepare_background_repeat_axis(
+    origin: f32,
+    lower_bound: f32,
+    step: f32,
+    repeat: BackgroundRepeat,
+    scroll_distance: f32,
+) -> anyhow::Result<(f32, bool)> {
+    anyhow::ensure!(
+        origin.is_finite() && lower_bound.is_finite(),
+        "background repeat origin and bound must be finite"
+    );
+    anyhow::ensure!(
+        step.is_finite() && step > 0.0,
+        "background repeat step must be finite and greater than zero"
+    );
+    anyhow::ensure!(
+        scroll_distance.is_finite(),
+        "background scroll distance must be finite"
+    );
+
+    if repeat == BackgroundRepeat::NoRepeat {
+        let adjusted = origin - scroll_distance;
+        anyhow::ensure!(
+            adjusted.is_finite(),
+            "background no-repeat origin overflowed while applying scroll"
+        );
+        return Ok((adjusted, false));
+    }
+
+    // Keep the coordinate close to the viewport even after long scrollback.
+    // The integral tile displacement affects only mirror parity; the
+    // fractional displacement supplies the visible sub-tile phase.
+    let scroll_tiles = scroll_distance / step;
+    anyhow::ensure!(
+        scroll_tiles.is_finite(),
+        "background scroll tile displacement must be finite"
+    );
+    let shifted_origin = origin - scroll_tiles.fract() * step;
+    let backward_steps = ((shifted_origin - lower_bound) / step).ceil().max(0.0);
+    anyhow::ensure!(
+        backward_steps.is_finite()
+            && backward_steps <= MAX_BACKGROUND_TILES_PER_LAYER as f32,
+        "background repeat alignment exceeds the per-layer tile limit"
+    );
+    let normalized_origin = shifted_origin - backward_steps * step;
+    anyhow::ensure!(
+        normalized_origin.is_finite(),
+        "background repeat origin overflowed while aligning to the viewport"
+    );
+
+    if repeat == BackgroundRepeat::Mirror {
+        anyhow::ensure!(
+            scroll_tiles.abs() <= 16_777_216.0,
+            "mirrored background scroll exceeds exact f32 tile parity"
+        );
+    }
+    let scroll_is_odd = scroll_tiles.trunc().rem_euclid(2.0) >= 1.0;
+    let backward_is_odd = backward_steps.rem_euclid(2.0) >= 1.0;
+    Ok((
+        normalized_origin,
+        scroll_is_odd ^ backward_is_odd,
+    ))
+}
+
 fn linear_gradient_projection_half_extent(
     width: f64,
     height: f64,
@@ -1236,11 +1300,11 @@ impl crate::TermWindow {
 
         // log::info!("computed {width}x{height}");
 
-        let mut start_tile = 0;
-        if let Some(factor) = layer.def.attachment.scroll_factor() {
-            let distance = top as f32 * self.render_metrics.cell_size.height as f32 * factor;
-            let num_tiles = distance / repeat_y;
-            if !factor.is_finite() || !num_tiles.is_finite() {
+        let left_pixel = pixel_width / -2.0;
+        let right_pixel = left_pixel + pixel_width;
+        let limit_y = top_pixel + pixel_height;
+        let scroll_distance = if let Some(factor) = layer.def.attachment.scroll_factor() {
+            if !factor.is_finite() {
                 metrics::counter!(
                     "gui.background.layer_rejected.total",
                     "reason" => "invalid_scroll_factor",
@@ -1248,13 +1312,46 @@ impl crate::TermWindow {
                 .increment(1);
                 return Ok(false);
             }
-            origin_y -= (num_tiles.fract() * repeat_y).floor();
-            start_tile = num_tiles.floor() as usize;
-        }
-
-        let limit_y = top_pixel + pixel_height;
+            top as f32 * self.render_metrics.cell_size.height as f32 * factor
+        } else {
+            0.0
+        };
+        let (origin_x, first_x_mirrored) = match prepare_background_repeat_axis(
+            origin_x,
+            left_pixel,
+            repeat_x,
+            layer.def.repeat_x,
+            0.0,
+        ) {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                metrics::counter!(
+                    "gui.background.layer_rejected.total",
+                    "reason" => "invalid_horizontal_repeat",
+                )
+                .increment(1);
+                return Ok(false);
+            }
+        };
+        let (origin_y, first_y_mirrored) = match prepare_background_repeat_axis(
+            origin_y,
+            top_pixel,
+            repeat_y,
+            layer.def.repeat_y,
+            scroll_distance,
+        ) {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                metrics::counter!(
+                    "gui.background.layer_rejected.total",
+                    "reason" => "invalid_vertical_repeat",
+                )
+                .increment(1);
+                return Ok(false);
+            }
+        };
         let x_count = match checked_background_repeat_count(
-            pixel_width,
+            (right_pixel - origin_x).max(0.0),
             repeat_x,
             layer.def.repeat_x,
         ) {
@@ -1298,7 +1395,6 @@ impl crate::TermWindow {
         let mut emitted = false;
 
         for y_offset in 0..y_count {
-            let y_step = start_tile.saturating_add(y_offset);
             let offset_y = y_offset as f32 * repeat_y;
             let origin_y = origin_y + offset_y;
             if origin_y >= limit_y {
@@ -1321,10 +1417,14 @@ impl crate::TermWindow {
                 let mut x2 = coords.max_x();
                 let mut y1 = coords.min_y();
                 let mut y2 = coords.max_y();
-                if layer.def.repeat_x == BackgroundRepeat::Mirror && x_step % 2 == 1 {
+                if layer.def.repeat_x == BackgroundRepeat::Mirror
+                    && (first_x_mirrored ^ (x_step % 2 == 1))
+                {
                     std::mem::swap(&mut x1, &mut x2);
                 }
-                if layer.def.repeat_y == BackgroundRepeat::Mirror && y_step % 2 == 1 {
+                if layer.def.repeat_y == BackgroundRepeat::Mirror
+                    && (first_y_mirrored ^ (y_offset % 2 == 1))
+                {
                     std::mem::swap(&mut y1, &mut y2);
                 }
 
@@ -1399,6 +1499,45 @@ mod tests {
             checked_background_repeat_count(100.0, 30.0, BackgroundRepeat::NoRepeat).unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn repeated_background_origin_extends_backward_and_preserves_mirror_parity() {
+        let (origin, mirrored) = prepare_background_repeat_axis(
+            400.0,
+            -500.0,
+            100.0,
+            BackgroundRepeat::Mirror,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(origin, -500.0);
+        assert!(mirrored, "nine backward tiles invert mirror parity");
+
+        let (scrolled_origin, scrolled_mirrored) = prepare_background_repeat_axis(
+            -500.0,
+            -500.0,
+            100.0,
+            BackgroundRepeat::Mirror,
+            -20.0,
+        )
+        .unwrap();
+        assert_eq!(scrolled_origin, -580.0);
+        assert!(scrolled_mirrored);
+    }
+
+    #[test]
+    fn no_repeat_background_applies_the_full_scroll_distance() {
+        let (origin, mirrored) = prepare_background_repeat_axis(
+            -500.0,
+            -500.0,
+            100.0,
+            BackgroundRepeat::NoRepeat,
+            250.0,
+        )
+        .unwrap();
+        assert_eq!(origin, -750.0);
+        assert!(!mirrored);
     }
 
     #[test]

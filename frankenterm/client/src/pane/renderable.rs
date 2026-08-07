@@ -1660,14 +1660,15 @@ const MAX_DECODED_IMAGE_FRAMES: usize = 4_096;
 const MAX_RENDERABLE_IMAGE_AXIS: u32 = 16_384;
 const ORDINARY_IMAGE_HYDRATION_TIMEOUT: Duration = Duration::from_secs(2);
 // One admitted hydration can temporarily retain the compressed frame, its
-// decompressed typed response, and a canonical decoded pixel replacement.
-// Reserve that full worst-case lifetime before issuing the RPC. Keeping a
-// single global slot prevents multiple panes from multiplying 65 MiB replies
-// on the connection reader and bounds damage until image transfer moves to a
-// cancellable out-of-band channel.
+// decompressed typed response, the accepted decoded-frame aggregate, and the
+// next fully decoded frame that crosses the aggregate limit before validation
+// rejects it. Reserve that full worst-case lifetime before issuing the RPC.
+// Keeping a single global slot prevents multiple panes from multiplying these
+// large replies on the connection reader and bounds damage until image transfer
+// moves to a cancellable out-of-band channel.
 const IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES: usize =
     MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES * 2
-        + MAX_IMAGE_HYDRATION_DECODED_BYTES;
+        + MAX_IMAGE_HYDRATION_DECODED_BYTES * 2;
 const MAX_GLOBAL_IMAGE_HYDRATION_WORKING_SET_BYTES: usize =
     IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES;
 
@@ -1902,8 +1903,13 @@ impl ImageHydrationBytePermit {
 
 impl Drop for ImageHydrationBytePermit {
     fn drop(&mut self) {
-        let prior = IMAGE_HYDRATION_RESERVED_BYTES.fetch_sub(self.bytes, Ordering::AcqRel);
-        debug_assert!(prior >= self.bytes);
+        let bytes = self.bytes;
+        let released = IMAGE_HYDRATION_RESERVED_BYTES.try_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |reserved| reserved.checked_sub(bytes),
+        );
+        debug_assert!(released.is_ok());
     }
 }
 
@@ -1922,8 +1928,12 @@ impl ImageValidationJobPermit {
 
 impl Drop for ImageValidationJobPermit {
     fn drop(&mut self) {
-        let prior = IMAGE_VALIDATION_JOBS.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(prior > 0);
+        let released = IMAGE_VALIDATION_JOBS.try_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |active| active.checked_sub(1),
+        );
+        debug_assert!(released.is_ok());
     }
 }
 
@@ -4145,6 +4155,20 @@ mod tests {
                 )
                 .is_none(),
             "expired transient failures must permit a retry"
+        );
+    }
+
+    #[test]
+    fn image_hydration_reservation_covers_the_rejected_overflow_frame() {
+        assert_eq!(
+            IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES,
+            MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES * 2
+                + MAX_IMAGE_HYDRATION_DECODED_BYTES * 2
+        );
+        assert_eq!(
+            MAX_GLOBAL_IMAGE_HYDRATION_WORKING_SET_BYTES,
+            IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES,
+            "the current envelope intentionally admits one worst-case hydration at a time"
         );
     }
 }
