@@ -43,13 +43,21 @@ fn arb_browser_config() -> impl Strategy<Value = BrowserConfig> {
         any::<bool>(),
         1000u64..120_000,
         1000u64..120_000,
+        1000u64..30_000,
         arb_string(),
     )
         .prop_map(
-            |(headless, navigation_timeout_ms, page_load_timeout_ms, browser_type)| BrowserConfig {
+            |(
                 headless,
                 navigation_timeout_ms,
                 page_load_timeout_ms,
+                readiness_probe_timeout_ms,
+                browser_type,
+            )| BrowserConfig {
+                headless,
+                navigation_timeout_ms,
+                page_load_timeout_ms,
+                readiness_probe_timeout_ms,
                 browser_type,
             },
         )
@@ -137,6 +145,8 @@ fn arb_auth_flow_failure_kind() -> impl Strategy<Value = AuthFlowFailureKind> {
     prop_oneof![
         Just(AuthFlowFailureKind::InvalidUserCode),
         Just(AuthFlowFailureKind::BrowserNotReady),
+        Just(AuthFlowFailureKind::ProfileUnavailable),
+        Just(AuthFlowFailureKind::ProfilePersistenceFailed),
         Just(AuthFlowFailureKind::NavigationFailed),
         Just(AuthFlowFailureKind::SelectorMismatch),
         Just(AuthFlowFailureKind::BotDetected),
@@ -317,6 +327,7 @@ proptest! {
         prop_assert_eq!(val.headless, back.headless);
         prop_assert_eq!(val.navigation_timeout_ms, back.navigation_timeout_ms);
         prop_assert_eq!(val.page_load_timeout_ms, back.page_load_timeout_ms);
+        prop_assert_eq!(val.readiness_probe_timeout_ms, back.readiness_probe_timeout_ms);
         prop_assert_eq!(val.browser_type, back.browser_type);
     }
 

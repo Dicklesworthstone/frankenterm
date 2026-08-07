@@ -5280,7 +5280,15 @@ pub enum DeviceAuthStepOutcome {
 ///
 /// - The device code is validated but **never logged** (secret material).
 /// - Only the code format is checked, not the code content.
-/// - Failure artifacts contain redacted DOM, never session tokens.
+/// - Optional screenshots can contain sensitive page content and are stored in
+///   private per-invocation directories; they are never treated as redacted.
+#[cfg(feature = "browser")]
+pub fn normalize_device_auth_step_code(
+    device_code: &str,
+) -> std::result::Result<String, crate::browser::openai_device::UserCodeError> {
+    crate::browser::openai_device::validate_user_code(device_code)
+}
+
 #[cfg(feature = "browser")]
 pub fn execute_device_auth_step(
     device_code: &str,
@@ -5292,14 +5300,17 @@ pub fn execute_device_auth_step(
     use crate::browser::openai_device::{AuthFlowResult, OpenAiDeviceAuthFlow};
     use crate::browser::{BrowserConfig, BrowserContext};
 
-    // Step 1: Validate device code format before touching the browser
-    if !validate_device_code(device_code) {
-        return DeviceAuthStepOutcome::Failed {
-            error: "Invalid device code format".into(),
-            error_kind: Some("invalid_code".into()),
-            artifacts_dir: None,
-        };
-    }
+    // Step 1: Apply the canonical finite validator before any subprocess probe.
+    let normalized_code = match normalize_device_auth_step_code(device_code) {
+        Ok(code) => code,
+        Err(_) => {
+            return DeviceAuthStepOutcome::Failed {
+                error: "Invalid device code format".into(),
+                error_kind: Some("invalid_code".into()),
+                artifacts_dir: None,
+            };
+        }
+    };
 
     // Step 2: Initialize browser context
     let config = BrowserConfig {
@@ -5322,13 +5333,12 @@ pub fn execute_device_auth_step(
         flow = flow.with_artifacts(dir);
     }
 
-    let result = flow.execute(&ctx, device_code, account, None);
+    let result = flow.execute(&ctx, &normalized_code, account, None);
 
     // Step 4: Map browser result to workflow outcome
     match result {
         AuthFlowResult::Success { elapsed_ms } => {
             tracing::info!(
-                account = %account,
                 elapsed_ms,
                 "Device auth step: success"
             );
@@ -5343,7 +5353,6 @@ pub fn execute_device_auth_step(
             artifacts_dir: art_dir,
         } => {
             tracing::warn!(
-                account = %account,
                 reason = %reason,
                 "Device auth step: interactive bootstrap required"
             );
@@ -5359,7 +5368,6 @@ pub fn execute_device_auth_step(
             artifacts_dir: art_dir,
         } => {
             tracing::error!(
-                account = %account,
                 error = %error,
                 kind = ?kind,
                 "Device auth step: failed"

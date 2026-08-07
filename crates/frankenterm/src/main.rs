@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
@@ -698,19 +699,24 @@ SEE ALSO:
 
     /// Stop a running watcher in the current workspace
     #[command(after_help = r#"EXAMPLES:
-    ft stop                           Graceful shutdown (SIGTERM)
-    ft stop --force                   SIGKILL after timeout
+    ft stop                           Instance-bound cooperative shutdown
+    ft stop --force                   Fail safely if cooperative shutdown times out
     ft stop --timeout 10              Wait 10s before giving up
+
+SAFETY:
+    This command never sends a signal to a numeric PID. --force records an
+    explicit escalation request, but fails safely because no OS-owned process
+    handle is available for a race-free escalation.
 
 SEE ALSO:
     ft watch      Start the watcher daemon
     ft status     Check if watcher is running"#)]
     Stop {
-        /// Force kill with SIGKILL if graceful shutdown times out
+        /// Fail safely if cooperative shutdown times out; never sends a numeric-PID signal
         #[arg(long)]
         force: bool,
 
-        /// Timeout in seconds for graceful shutdown before giving up (or escalating with --force)
+        /// Timeout in seconds for cooperative shutdown and lock settlement
         #[arg(long, default_value = "5")]
         timeout: u64,
     },
@@ -6954,6 +6960,14 @@ const ROBOT_ERR_SESSION_RESUME_NATIVE_PROVIDER_NOT_FOUND: &str =
     "robot.session_resume.native_provider_not_found";
 #[cfg(feature = "session-resume")]
 const ROBOT_ERR_SESSION_RESUME_SUBPROCESS: &str = "robot.session_resume.subprocess_error";
+#[cfg(feature = "session-resume")]
+const ROBOT_ERR_SESSION_RESUME_CANCELLED: &str = "robot.session_resume.cancelled";
+#[cfg(feature = "session-resume")]
+const ROBOT_ERR_SESSION_RESUME_CAPTURE_INCOMPLETE: &str =
+    "robot.session_resume.capture_incomplete";
+#[cfg(feature = "session-resume")]
+const ROBOT_ERR_SESSION_RESUME_CLEANUP_INCOMPLETE: &str =
+    "robot.session_resume.cleanup_incomplete";
 const ROBOT_ERR_INCIDENT_NOT_FOUND: &str = "robot.incident.not_found";
 const ROBOT_ERR_INCIDENT_SOURCE_UNAVAILABLE: &str = "robot.incident.source_unavailable";
 const ROBOT_ERR_INCIDENT_DAG: &str = "robot.incident.dag_error";
@@ -12816,6 +12830,10 @@ struct RobotAgentsDetectData {
 const ROBOT_SESSION_RESUME_LIST_SCHEMA_VERSION: &str = "ft.robot.session_resume.list.v1";
 #[cfg(feature = "session-resume")]
 const ROBOT_SESSION_RESUME_RESUME_SCHEMA_VERSION: &str = "ft.robot.session_resume.resume.v1";
+#[cfg(feature = "session-resume")]
+const ROBOT_SESSION_RESUME_NATIVE_MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(feature = "session-resume")]
+const ROBOT_SESSION_RESUME_NATIVE_MAX_STDERR_BYTES: usize = 256 * 1024;
 
 #[cfg(feature = "session-resume")]
 #[derive(Debug, serde::Serialize)]
@@ -13051,6 +13069,40 @@ fn robot_session_resume_error_response<T>(
             Some("Increase --timeout-secs only when the target command is expected to run that long.".to_string()),
             elapsed_ms,
         ),
+        SessionResumeError::Cancelled => RobotResponse::error_with_code(
+            ROBOT_ERR_SESSION_RESUME_CANCELLED,
+            "session-resume command cancelled",
+            None,
+            elapsed_ms,
+        ),
+        SessionResumeError::CaptureIncomplete {
+            stdout_open,
+            stderr_open,
+            drain_timeout_ms,
+        } => RobotResponse::error_with_code(
+            ROBOT_ERR_SESSION_RESUME_CAPTURE_INCOMPLETE,
+            format!(
+                "session-resume output capture incomplete after {drain_timeout_ms} ms (stdout_open={stdout_open}, stderr_open={stderr_open})"
+            ),
+            Some("Ensure descendants close inherited stdout/stderr descriptors before the session-resume leader exits.".to_string()),
+            elapsed_ms,
+        ),
+        SessionResumeError::CleanupIncomplete {
+            trigger,
+            leader_reaped,
+            signal_helper_settled,
+            process_tree_signalled,
+            stdout_open,
+            stderr_open,
+            settle_timeout_ms,
+        } => RobotResponse::error_with_code(
+            ROBOT_ERR_SESSION_RESUME_CLEANUP_INCOMPLETE,
+            format!(
+                "session-resume process cleanup incomplete after {settle_timeout_ms} ms (trigger={trigger}, leader_reaped={leader_reaped}, signal_helper_settled={signal_helper_settled}, process_tree_signalled={process_tree_signalled}, stdout_open={stdout_open}, stderr_open={stderr_open})"
+            ),
+            Some("Treat the target process state as unknown and verify it before retrying.".to_string()),
+            elapsed_ms,
+        ),
         other => RobotResponse::error_with_code(
             ROBOT_ERR_SESSION_RESUME,
             other.to_string(),
@@ -13156,11 +13208,69 @@ fn build_robot_session_resume_list_data(
 }
 
 #[cfg(feature = "session-resume")]
-fn robot_session_resume_output_text(bytes: &[u8]) -> Option<String> {
+fn robot_session_resume_output_text(bytes: Vec<u8>) -> Option<String> {
     if bytes.is_empty() {
         None
     } else {
-        Some(String::from_utf8_lossy(bytes).into_owned())
+        Some(match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+        })
+    }
+}
+
+#[cfg(feature = "session-resume")]
+fn robot_session_resume_native_command_error(
+    error: &std::io::Error,
+) -> frankenterm_core::session_resume::SessionResumeError {
+    use frankenterm_core::runtime_async::process::{
+        CommandCancelled, CommandOutputCaptureIncomplete, CommandOutputLimitExceeded,
+        CommandProcessCleanupIncomplete, CommandTimedOut,
+    };
+    use frankenterm_core::session_resume::SessionResumeError;
+
+    if CommandTimedOut::from_io_error(error).is_some() {
+        return SessionResumeError::Timeout;
+    }
+    if CommandCancelled::from_io_error(error).is_some() {
+        return SessionResumeError::Cancelled;
+    }
+    if let Some(incomplete) = CommandOutputCaptureIncomplete::from_io_error(error) {
+        return SessionResumeError::CaptureIncomplete {
+            stdout_open: incomplete.stdout_open(),
+            stderr_open: incomplete.stderr_open(),
+            drain_timeout_ms: incomplete.drain_timeout_ms(),
+        };
+    }
+    if let Some(incomplete) = CommandProcessCleanupIncomplete::from_io_error(error) {
+        return SessionResumeError::CleanupIncomplete {
+            trigger: incomplete.trigger(),
+            leader_reaped: incomplete.leader_reaped(),
+            signal_helper_settled: incomplete.signal_helper_settled(),
+            process_tree_signalled: incomplete.process_tree_signalled(),
+            stdout_open: incomplete.stdout_open(),
+            stderr_open: incomplete.stderr_open(),
+            settle_timeout_ms: incomplete.settle_timeout_ms(),
+        };
+    }
+    if let Some(exceeded) = CommandOutputLimitExceeded::from_io_error(error) {
+        return SessionResumeError::SubprocessFailed {
+            code: None,
+            stderr: format!(
+                "native session-resume {} capture limit exceeded: observed at least {} bytes, limit {}",
+                exceeded.stream(),
+                exceeded.observed(),
+                exceeded.limit()
+            ),
+        };
+    }
+
+    SessionResumeError::SubprocessFailed {
+        code: None,
+        stderr: format!(
+            "native session-resume subprocess unavailable ({:?})",
+            error.kind()
+        ),
     }
 }
 
@@ -13172,56 +13282,26 @@ fn robot_session_resume_run_native(
 {
     use frankenterm_core::session_resume::SessionResumeError;
 
-    let mut child = std::process::Command::new(&plan.binary)
+    let mut command = frankenterm_core::runtime_async::process::Command::new(&plan.binary);
+    command
         .args(plan.argv.iter().skip(1))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| SessionResumeError::SubprocessFailed {
-            code: None,
-            stderr: format!("failed to spawn {}: {error}", plan.binary),
-        })?;
-
-    let deadline = Instant::now()
-        .checked_add(Duration::from_secs(timeout_secs.max(1)))
-        .unwrap_or_else(Instant::now);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => {
-                let output = child.wait_with_output().map_err(|error| {
-                    SessionResumeError::SubprocessFailed {
-                        code: None,
-                        stderr: format!("failed to collect {} output: {error}", plan.binary),
-                    }
-                })?;
-                let exit_code = output.status.code().unwrap_or(-1);
-                if !output.status.success() {
-                    return Err(SessionResumeError::SubprocessFailed {
-                        code: output.status.code(),
-                        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    });
-                }
-                return Ok(RobotSessionResumeNativeExecution {
-                    exit_code,
-                    stdout: robot_session_resume_output_text(&output.stdout),
-                    stderr: robot_session_resume_output_text(&output.stderr),
-                });
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(SessionResumeError::Timeout);
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(error) => {
-                return Err(SessionResumeError::SubprocessFailed {
-                    code: None,
-                    stderr: format!("failed while waiting for {}: {error}", plan.binary),
-                });
-            }
-        }
+        .stdout_limit(ROBOT_SESSION_RESUME_NATIVE_MAX_STDOUT_BYTES)
+        .stderr_limit(ROBOT_SESSION_RESUME_NATIVE_MAX_STDERR_BYTES);
+    let output = command
+        .output_blocking(Duration::from_secs(timeout_secs.max(1)))
+        .map_err(|error| robot_session_resume_native_command_error(&error))?;
+    let exit_code = output.status.code().unwrap_or(-1);
+    if !output.status.success() {
+        return Err(SessionResumeError::SubprocessFailed {
+            code: output.status.code(),
+            stderr: "native session-resume subprocess exited unsuccessfully".to_string(),
+        });
     }
+    Ok(RobotSessionResumeNativeExecution {
+        exit_code,
+        stdout: robot_session_resume_output_text(output.stdout),
+        stderr: robot_session_resume_output_text(output.stderr),
+    })
 }
 
 #[cfg(feature = "session-resume")]
@@ -21709,11 +21789,316 @@ async fn check_watcher_running_with_cx(
     cx: &frankenterm_core::cx::Cx,
     lock_path: PathBuf,
     operation: &'static str,
-) -> anyhow::Result<Option<frankenterm_core::lock::LockMetadata>> {
+) -> anyhow::Result<frankenterm_core::lock::LockStatus> {
     run_cli_blocking_with_cx(cx, operation, move || {
         Ok(frankenterm_core::lock::check_running(&lock_path))
     })
     .await
+}
+
+const WATCHER_CONTROL_QUEUE_CAPACITY: usize = 8;
+const WATCHER_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatcherControlAuthSelection {
+    Unauthenticated,
+    Environment,
+    Configured(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatcherControlRequestFailure {
+    IpcDisabled,
+    NoWriteCredential,
+    NoExecutionBudget,
+    Cancelled,
+    TimedOut,
+    Transport,
+    Rejected,
+    InvalidAcknowledgement,
+}
+
+impl std::fmt::Display for WatcherControlRequestFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::IpcDisabled => "watcher IPC is disabled by configuration",
+            Self::NoWriteCredential => {
+                "no current IPC credential authorizes watcher control"
+            }
+            Self::NoExecutionBudget => "watcher control has no execution budget",
+            Self::Cancelled => "watcher control was cancelled",
+            Self::TimedOut => "watcher control timed out",
+            Self::Transport => "watcher control transport failed",
+            Self::Rejected => "watcher rejected the control request",
+            Self::InvalidAcknowledgement => {
+                "watcher returned an invalid control acknowledgement"
+            }
+        };
+        formatter.write_str(message)
+    }
+}
+
+fn ipc_token_allows_watcher_control(
+    token: &frankenterm_core::config::IpcAuthToken,
+    now_ms: u64,
+) -> bool {
+    !token.token.is_empty()
+        && token.expires_at_ms.is_none_or(|expires_at| now_ms < expires_at)
+        && (token.scopes.is_empty()
+            || token
+                .scopes
+                .iter()
+                .copied()
+                .any(|scope| scope.allows(frankenterm_core::config::IpcScope::Write)))
+}
+
+fn select_watcher_control_auth(
+    ipc: &frankenterm_core::config::IpcConfig,
+    environment_token: Option<&str>,
+    now_ms: u64,
+) -> Result<WatcherControlAuthSelection, WatcherControlRequestFailure> {
+    if !ipc.enabled {
+        return Err(WatcherControlRequestFailure::IpcDisabled);
+    }
+
+    let environment_token = environment_token.filter(|token| !token.is_empty());
+    if ipc.tokens.is_empty() {
+        return Ok(if environment_token.is_some() {
+            WatcherControlAuthSelection::Environment
+        } else {
+            WatcherControlAuthSelection::Unauthenticated
+        });
+    }
+
+    if let Some(presented) = environment_token
+        && ipc.tokens.iter().any(|candidate| {
+            candidate.token == presented && ipc_token_allows_watcher_control(candidate, now_ms)
+        })
+    {
+        return Ok(WatcherControlAuthSelection::Environment);
+    }
+
+    ipc.tokens
+        .iter()
+        .position(|candidate| ipc_token_allows_watcher_control(candidate, now_ms))
+        .map(WatcherControlAuthSelection::Configured)
+        .ok_or(WatcherControlRequestFailure::NoWriteCredential)
+}
+
+#[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct WatcherControlAcknowledgement {
+    accepted: bool,
+    action: frankenterm_core::ipc::WatcherControlAction,
+    instance_id: String,
+}
+
+fn validate_watcher_control_acknowledgement(
+    response: &frankenterm_core::ipc::IpcResponse,
+    expected_action: frankenterm_core::ipc::WatcherControlAction,
+    expected_instance_id: &str,
+) -> Result<(), WatcherControlRequestFailure> {
+    if !response.ok {
+        return Err(WatcherControlRequestFailure::Rejected);
+    }
+    let acknowledgement = response
+        .data
+        .as_ref()
+        .cloned()
+        .ok_or(WatcherControlRequestFailure::InvalidAcknowledgement)
+        .and_then(|data| {
+            serde_json::from_value::<WatcherControlAcknowledgement>(data)
+                .map_err(|_| WatcherControlRequestFailure::InvalidAcknowledgement)
+        })?;
+    if !acknowledgement.accepted
+        || acknowledgement.action != expected_action
+        || acknowledgement.instance_id != expected_instance_id
+    {
+        return Err(WatcherControlRequestFailure::InvalidAcknowledgement);
+    }
+    Ok(())
+}
+
+fn admit_watcher_control(
+    expected_instance_id: &str,
+    invocation: frankenterm_core::ipc::IpcWatcherControlInvocation,
+    control_tx: &frankenterm_core::runtime_async::mpsc::Sender<
+        frankenterm_core::ipc::WatcherControlAction,
+    >,
+) -> frankenterm_core::ipc::IpcResponse {
+    let frankenterm_core::ipc::IpcWatcherControlInvocation {
+        control,
+        request_id: _,
+    } = invocation;
+    if control.expected_instance_id != expected_instance_id {
+        return frankenterm_core::ipc::IpcResponse::error_with_code(
+            "ipc.watcher_control.instance_mismatch",
+            "Watcher control request did not match this watcher instance",
+            None,
+        );
+    }
+
+    match control_tx.try_send(control.action) {
+        Ok(()) => frankenterm_core::ipc::IpcResponse::ok_with_data(serde_json::json!({
+            "accepted": true,
+            "action": control.action,
+            "instance_id": expected_instance_id,
+        })),
+        Err(frankenterm_core::runtime_async::mpsc::SendError::Full(_)) => {
+            frankenterm_core::ipc::IpcResponse::error_with_code(
+                "ipc.watcher_control.queue_full",
+                "Watcher control queue is full",
+                None,
+            )
+        }
+        Err(
+            frankenterm_core::runtime_async::mpsc::SendError::Disconnected(_)
+            | frankenterm_core::runtime_async::mpsc::SendError::Cancelled(_),
+        ) => frankenterm_core::ipc::IpcResponse::error_with_code(
+            "ipc.watcher_control.unavailable",
+            "Watcher control queue is unavailable",
+            None,
+        ),
+    }
+}
+
+fn build_watcher_control_handler(
+    expected_instance_id: String,
+    control_tx: frankenterm_core::runtime_async::mpsc::Sender<
+        frankenterm_core::ipc::WatcherControlAction,
+    >,
+) -> frankenterm_core::ipc::IpcWatcherControlHandler {
+    Arc::new(move |invocation| {
+        let response = admit_watcher_control(&expected_instance_id, invocation, &control_tx);
+        Box::pin(async move { response })
+    })
+}
+
+#[cfg(any(unix, windows))]
+async fn request_watcher_control_with_cx(
+    cx: &frankenterm_core::cx::Cx,
+    socket_path: &Path,
+    ipc: &frankenterm_core::config::IpcConfig,
+    action: frankenterm_core::ipc::WatcherControlAction,
+    expected_instance_id: &str,
+    timeout: Duration,
+) -> Result<(), WatcherControlRequestFailure> {
+    if timeout.is_zero() {
+        return Err(WatcherControlRequestFailure::NoExecutionBudget);
+    }
+    if cx.checkpoint().is_err() {
+        return Err(WatcherControlRequestFailure::Cancelled);
+    }
+
+    let environment_token = std::env::var("FT_IPC_TOKEN").ok();
+    let auth_selection = select_watcher_control_auth(
+        ipc,
+        environment_token.as_deref(),
+        now_ms(),
+    )?;
+    let client = match auth_selection {
+        WatcherControlAuthSelection::Environment => {
+            frankenterm_core::ipc::IpcClient::new(socket_path)
+        }
+        WatcherControlAuthSelection::Configured(index) => {
+            frankenterm_core::ipc::IpcClient::with_token(
+                socket_path,
+                ipc.tokens[index].token.clone(),
+            )
+        }
+        WatcherControlAuthSelection::Unauthenticated => {
+            let mut client = frankenterm_core::ipc::IpcClient::new(socket_path);
+            client.set_token(None);
+            client
+        }
+    };
+    let control = frankenterm_core::ipc::WatcherControlRequest {
+        action,
+        expected_instance_id: expected_instance_id.to_string(),
+    };
+
+    let response = match frankenterm_core::runtime_async::timeout_with_cx(
+        cx,
+        timeout,
+        client.watcher_control_with_cx(cx, control, None),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => {
+            return Err(if cx.checkpoint().is_err() {
+                WatcherControlRequestFailure::Cancelled
+            } else {
+                WatcherControlRequestFailure::Transport
+            });
+        }
+        Err(_) => {
+            return Err(if cx.checkpoint().is_err() {
+                WatcherControlRequestFailure::Cancelled
+            } else {
+                WatcherControlRequestFailure::TimedOut
+            });
+        }
+    };
+    validate_watcher_control_acknowledgement(&response, action, expected_instance_id)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatcherStopSettlement {
+    Stopped,
+    StillHeld,
+    ProbeUnavailable,
+}
+
+const fn classify_watcher_stop_settlement(
+    status: &frankenterm_core::lock::LockStatus,
+) -> WatcherStopSettlement {
+    match status {
+        frankenterm_core::lock::LockStatus::Free => WatcherStopSettlement::Stopped,
+        frankenterm_core::lock::LockStatus::HeldKnown(_)
+        | frankenterm_core::lock::LockStatus::HeldUnknown => WatcherStopSettlement::StillHeld,
+        frankenterm_core::lock::LockStatus::ProbeUnavailable => {
+            WatcherStopSettlement::ProbeUnavailable
+        }
+    }
+}
+
+fn same_watcher_identity(
+    status: &frankenterm_core::lock::LockStatus,
+    expected: &frankenterm_core::lock::LockMetadata,
+) -> bool {
+    matches!(
+        status,
+        frankenterm_core::lock::LockStatus::HeldKnown(current)
+            if current.instance_id == expected.instance_id && current.pid == expected.pid
+    )
+}
+
+fn watcher_lock_diagnostic_check(
+    status: &frankenterm_core::lock::LockStatus,
+) -> DiagnosticCheck {
+    match status {
+        frankenterm_core::lock::LockStatus::HeldKnown(meta) => {
+            DiagnosticCheck::ok_with_detail(
+                "daemon status",
+                format!("running (PID {})", meta.pid),
+            )
+        }
+        frankenterm_core::lock::LockStatus::Free => DiagnosticCheck::ok_with_detail(
+            "daemon status",
+            "not running; watcher lock is free",
+        ),
+        frankenterm_core::lock::LockStatus::HeldUnknown => DiagnosticCheck::warning(
+            "daemon status",
+            "watcher lock is held; holder identity metadata is unavailable",
+            "Restore exact lock-holder authority before using instance-bound cooperative control",
+        ),
+        frankenterm_core::lock::LockStatus::ProbeUnavailable => DiagnosticCheck::warning(
+            "daemon status",
+            "watcher lock status could not be probed safely",
+            "Review the configured lock and parent directory permissions",
+        ),
+    }
 }
 
 fn open_cli_read_only_connection(
@@ -25707,87 +26092,6 @@ async fn release_restore_operation_lock(
         drop(lock);
         Ok(())
     })
-    .await
-}
-
-#[cfg(unix)]
-const CLI_PROCESS_HELPER_TIMEOUT: Duration = Duration::from_secs(2);
-
-#[cfg(unix)]
-async fn run_bounded_cli_process_with_cx(
-    cx: &frankenterm_core::cx::Cx,
-    operation: &'static str,
-    timeout: Duration,
-    mut command: frankenterm_core::runtime_async::process::Command,
-) -> anyhow::Result<std::process::Output> {
-    cx.checkpoint()
-        .map_err(|error| anyhow::anyhow!("{operation} cancelled before launch: {error}"))?;
-    if timeout.is_zero() {
-        return Err(anyhow::anyhow!(
-            "{operation} has no remaining execution budget"
-        ));
-    }
-
-    command.kill_on_drop(true);
-    match frankenterm_core::runtime_async::timeout_with_cx(
-        cx,
-        timeout,
-        command.output_with_cx(cx),
-    )
-    .await
-    {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(error)) => {
-            if let Err(cancelled) = cx.checkpoint() {
-                Err(anyhow::anyhow!(
-                    "{operation} cancelled while running: {cancelled}"
-                ))
-            } else {
-                Err(anyhow::anyhow!("{operation} failed: {error}"))
-            }
-        }
-        Err(error) => {
-            if let Err(cancelled) = cx.checkpoint() {
-                Err(anyhow::anyhow!(
-                    "{operation} cancelled while running: {cancelled}"
-                ))
-            } else {
-                Err(anyhow::anyhow!(
-                    "{operation} exceeded its {timeout:?} execution budget: {error}"
-                ))
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-async fn send_unix_signal_with_cx(
-    cx: &frankenterm_core::cx::Cx,
-    pid: i64,
-    signal: &'static str,
-    operation: &'static str,
-    timeout: Duration,
-) -> anyhow::Result<std::process::Output> {
-    if pid <= 0 {
-        return Err(anyhow::anyhow!(
-            "Refusing to signal invalid process identifier {pid}"
-        ));
-    }
-    if !matches!(signal, "TERM" | "KILL" | "HUP") {
-        return Err(anyhow::anyhow!(
-            "Refusing unsupported Unix signal `{signal}`"
-        ));
-    }
-
-    let pid = pid.to_string();
-    let mut command = frankenterm_core::runtime_async::process::Command::new("/bin/kill");
-    command.args(["-s", signal, pid.as_str()]);
-    run_bounded_cli_process_with_cx(
-        cx,
-        operation,
-        timeout.min(CLI_PROCESS_HELPER_TIMEOUT),
-        command,
-    )
     .await
 }
 
@@ -38712,6 +39016,181 @@ async fn settle_snapshot_background_tasks(
     failures
 }
 
+fn reload_watcher_configuration(
+    config_path: Option<&Path>,
+    current_config: &mut frankenterm_core::config::Config,
+    handle: &frankenterm_core::runtime::RuntimeHandle,
+) {
+    use frankenterm_core::config::{Config, ConfigOverrides, HotReloadableConfig};
+
+    match Config::load_with_overrides(config_path, false, &ConfigOverrides::default()) {
+        Ok(new_config) => {
+            let diff = current_config.diff_for_hot_reload(&new_config);
+            if !diff.allowed {
+                tracing::warn!("Config reload blocked: forbidden changes detected");
+                for forbidden_change in &diff.forbidden {
+                    tracing::warn!(
+                        setting = %forbidden_change.name,
+                        reason = %forbidden_change.reason,
+                        "Forbidden config change"
+                    );
+                }
+                tracing::warn!("Restart the watcher to apply these changes");
+            } else if diff.changes.is_empty() {
+                tracing::info!("No configuration changes detected");
+            } else {
+                for change in &diff.changes {
+                    tracing::info!(
+                        setting = %change.name,
+                        "Applying admitted hot-reload config change; values omitted from logs"
+                    );
+                }
+
+                match HotReloadableConfig::from_config(&new_config) {
+                    Ok(hot_config) => {
+                        if handle.apply_config_update(hot_config).is_err() {
+                            tracing::error!("Failed to apply config update");
+                        } else {
+                            *current_config = new_config;
+                            tracing::info!("Config reload complete");
+                        }
+                    }
+                    Err(_) => {
+                        tracing::error!("Rejected invalid hot-reload retention policy");
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            tracing::error!("Failed to reload config");
+        }
+    }
+}
+
+fn process_watcher_control_action(
+    action: frankenterm_core::ipc::WatcherControlAction,
+    config_path: Option<&Path>,
+    current_config: &mut frankenterm_core::config::Config,
+    handle: &frankenterm_core::runtime::RuntimeHandle,
+) -> bool {
+    match action {
+        frankenterm_core::ipc::WatcherControlAction::Stop => {
+            tracing::info!(
+                "Received instance-bound cooperative IPC stop request; initiating graceful shutdown"
+            );
+            true
+        }
+        frankenterm_core::ipc::WatcherControlAction::Reload => {
+            tracing::info!(
+                "Received instance-bound cooperative IPC reload request; attempting config reload"
+            );
+            reload_watcher_configuration(config_path, current_config, handle);
+            false
+        }
+    }
+}
+
+fn coalesce_watcher_control_action(
+    first: frankenterm_core::ipc::WatcherControlAction,
+    control_rx: &mut frankenterm_core::runtime_async::mpsc::Receiver<
+        frankenterm_core::ipc::WatcherControlAction,
+    >,
+) -> frankenterm_core::ipc::WatcherControlAction {
+    let mut selected = first;
+    // At most one full bounded-queue snapshot is drained. This is enough to
+    // observe every action that could have been ahead of an already-accepted
+    // Stop, while continuous authorized producers cannot hold the watcher in
+    // an unbounded coalescing loop.
+    for _ in 0..WATCHER_CONTROL_QUEUE_CAPACITY {
+        match control_rx.try_recv() {
+            Ok(frankenterm_core::ipc::WatcherControlAction::Stop) => {
+                selected = frankenterm_core::ipc::WatcherControlAction::Stop;
+            }
+            Ok(frankenterm_core::ipc::WatcherControlAction::Reload) => {}
+            Err(_) => break,
+        }
+    }
+    selected
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatcherControlReceiveFailure {
+    ContextCancelled,
+    QueueUnavailable,
+}
+
+const fn classify_watcher_control_receive_failure(
+    error: frankenterm_core::runtime_async::mpsc::RecvError,
+) -> WatcherControlReceiveFailure {
+    match error {
+        frankenterm_core::runtime_async::mpsc::RecvError::Cancelled => {
+            WatcherControlReceiveFailure::ContextCancelled
+        }
+        frankenterm_core::runtime_async::mpsc::RecvError::Disconnected
+        | frankenterm_core::runtime_async::mpsc::RecvError::Empty => {
+            WatcherControlReceiveFailure::QueueUnavailable
+        }
+    }
+}
+
+fn log_watcher_control_receive_failure(
+    error: frankenterm_core::runtime_async::mpsc::RecvError,
+) {
+    match classify_watcher_control_receive_failure(error) {
+        WatcherControlReceiveFailure::ContextCancelled => {
+            tracing::info!(
+                "Watcher control wait context cancelled; initiating graceful shutdown"
+            );
+        }
+        WatcherControlReceiveFailure::QueueUnavailable => {
+            tracing::error!(
+                failure_class = ?error,
+                "Watcher control queue closed unexpectedly; initiating graceful shutdown"
+            );
+        }
+    }
+}
+
+async fn wait_for_ctrl_c_or_watcher_control(
+    control_rx: &mut frankenterm_core::runtime_async::mpsc::Receiver<
+        frankenterm_core::ipc::WatcherControlAction,
+    >,
+    control_cx: &frankenterm_core::cx::Cx,
+    config_path: Option<&Path>,
+    current_config: &mut frankenterm_core::config::Config,
+    handle: &frankenterm_core::runtime::RuntimeHandle,
+) -> anyhow::Result<()> {
+    loop {
+        frankenterm_core::runtime_async::select! {
+            ctrl_c_result = frankenterm_core::runtime_async::signal::ctrl_c() => {
+                ctrl_c_result?;
+                tracing::info!("Received Ctrl+C, initiating graceful shutdown");
+                break;
+            }
+            control_result = control_rx.recv(control_cx) => {
+                match control_result {
+                    Ok(first) => {
+                        let action = coalesce_watcher_control_action(first, control_rx);
+                        if process_watcher_control_action(
+                            action,
+                            config_path,
+                            current_config,
+                            handle,
+                        ) {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        log_watcher_control_receive_failure(error);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run the observation watcher daemon.
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn run_watcher(
@@ -38729,7 +39208,6 @@ async fn run_watcher(
     disable_lock: bool,
     dangerous_bind_any: bool,
 ) -> anyhow::Result<()> {
-    use frankenterm_core::config::{Config, ConfigOverrides, HotReloadableConfig};
     use frankenterm_core::events::{Event, EventBus, NotifyDecision};
     use frankenterm_core::lock::WatcherLock;
     use frankenterm_core::notifications::NotificationPipeline;
@@ -39384,12 +39862,18 @@ async fn run_watcher(
     #[cfg(not(feature = "metrics"))]
     let _ = dangerous_bind_any;
 
+    // Retain the original sender for the full wait-loop lifetime so the
+    // receiver cannot become disconnected and spin merely because IPC is
+    // disabled or unavailable. Only a watcher with an exact acquired lock
+    // guard exposes the instance-bound control handler.
+    let (watcher_control_tx_owner, mut watcher_control_rx) =
+        mpsc::channel(WATCHER_CONTROL_QUEUE_CAPACITY);
     let config_path_buf = config_path.map(Path::to_path_buf);
     let ipc_handle: Option<(
         frankenterm_core::runtime_async::mpsc::Sender<()>,
         frankenterm_core::watchdog::WatchdogHandle,
     )> = if config.ipc.enabled {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let ipc_cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -39405,6 +39889,12 @@ async fn run_watcher(
                 config_path_buf.clone(),
                 Arc::clone(&shared_storage),
             ));
+            let watcher_control_handler = _lock_guard.as_ref().map(|lock_guard| {
+                build_watcher_control_handler(
+                    lock_guard.metadata().instance_id.clone(),
+                    watcher_control_tx_owner.clone(),
+                )
+            });
             let ipc_limits = frankenterm_core::ipc::resolve_limits(Some(&config.tuning.ipc));
             match frankenterm_core::ipc::IpcServer::bind_with_permissions_and_limits_with_cx(
                 &ipc_cx,
@@ -39422,12 +39912,13 @@ async fn run_watcher(
                     let ipc_task_cx = ipc_cx.clone();
                     let ipc_task = frankenterm_core::runtime_async::task::spawn(async move {
                         server
-                            .run_with_registry_auth_rpc_and_search_config_with_cx(
+                            .run_with_registry_auth_rpc_control_and_search_config_with_cx(
                                 &ipc_task_cx,
                                 event_bus,
                                 registry,
                                 ipc_auth,
                                 rpc_handler,
+                                watcher_control_handler,
                                 Some(search_config),
                                 shutdown_rx,
                             )
@@ -39451,7 +39942,7 @@ async fn run_watcher(
                 }
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             tracing::warn!("IPC server not supported on this platform");
             None
@@ -39488,8 +39979,11 @@ async fn run_watcher(
         None
     };
 
-    // Start orphan reaper for stuck wezterm cli processes
-    let orphan_reaper_handle = {
+    // Global PID reaping is fail-closed. A non-zero legacy setting starts only
+    // the inert warning surface; the default zero setting allocates no task.
+    let orphan_reaper_handle = if config.cli.orphan_reap_interval_seconds == 0 {
+        None
+    } else {
         let cli_config = config.cli.clone();
         let shutdown_flag = Arc::clone(&handle.shutdown_flag);
         let task_shutdown_flag = Arc::clone(&shutdown_flag);
@@ -39500,7 +39994,10 @@ async fn run_watcher(
             )
             .await;
         });
-        frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(task, shutdown_flag)
+        Some(frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
+            task,
+            shutdown_flag,
+        ))
     };
 
     // Start mux server watchdog (health monitoring + memory tracking)
@@ -39601,14 +40098,19 @@ async fn run_watcher(
         (None, None)
     };
 
-    // Track current config for hot reload
+    // Track current config for hot reload. OS-delivered reload signals and
+    // instance-bound cooperative IPC reload requests call the same application
+    // function. IPC token authentication is additionally enforced when tokens
+    // are configured.
     let mut current_config = config.clone();
+    let watcher_control_cx = (*cx).clone();
 
-    // Wait for signals (SIGINT/SIGTERM to shutdown, SIGHUP to reload config).
+    // Wait for signals (SIGINT/SIGTERM to shutdown, SIGHUP to reload config)
+    // and instance-bound cooperative watcher control.
     //
     // Signal registration can fail under runtimes that don't support it
-    // (e.g. asupersync Phase 0).  In that case we fall back to ctrl_c()-only
-    // shutdown, which is less graceful (no SIGHUP hot-reload) but doesn't crash.
+    // (e.g. asupersync Phase 0). In that case Ctrl-C and instance-bound IPC
+    // control remain available; only OS-delivered SIGHUP reload is absent.
     #[cfg(unix)]
     {
         use frankenterm_core::runtime_async::signal::unix::{SignalKind, signal};
@@ -39621,78 +40123,63 @@ async fn run_watcher(
 
         match signal_reg {
             Ok((mut sigint, mut sigterm, mut sighup)) => {
+                enum WatcherUnixSignal {
+                    Interrupt,
+                    Terminate,
+                    Hangup,
+                }
                 loop {
+                    let next_signal = async {
+                        frankenterm_core::runtime_async::select! {
+                            _ = sigint.recv() => WatcherUnixSignal::Interrupt,
+                            _ = sigterm.recv() => WatcherUnixSignal::Terminate,
+                            _ = sighup.recv() => WatcherUnixSignal::Hangup,
+                        }
+                    };
                     frankenterm_core::runtime_async::select! {
-                        _ = sigint.recv() => {
-                            tracing::info!("Received SIGINT, initiating graceful shutdown");
-                            break;
-                        }
-                        _ = sigterm.recv() => {
-                            tracing::info!("Received SIGTERM, initiating graceful shutdown");
-                            break;
-                        }
-                        _ = sighup.recv() => {
-                            tracing::info!("Received SIGHUP, attempting config reload");
-
-                            // Reload config from disk
-                            match Config::load_with_overrides(config_path, false, &ConfigOverrides::default()) {
-                                Ok(new_config) => {
-                                    // Check what changed
-                                    let diff = current_config.diff_for_hot_reload(&new_config);
-
-                                    if !diff.allowed {
-                                        tracing::warn!(
-                                            "Config reload blocked: forbidden changes detected"
-                                        );
-                                        for fc in &diff.forbidden {
-                                            tracing::warn!(
-                                                setting = %fc.name,
-                                                reason = %fc.reason,
-                                                "Forbidden config change"
-                                            );
-                                        }
-                                        tracing::warn!(
-                                            "Restart the watcher to apply these changes"
-                                        );
-                                    } else if diff.changes.is_empty() {
-                                        tracing::info!("No configuration changes detected");
-                                    } else {
-                                        // Log and apply changes
-                                        for change in &diff.changes {
-                                            tracing::info!(
-                                                setting = %change.name,
-                                                old = %change.old_value,
-                                                new = %change.new_value,
-                                                "Applying config change"
-                                            );
-                                        }
-
-                                        // Create hot-reloadable config and apply to runtime
-                                        match HotReloadableConfig::from_config(&new_config) {
-                                            Ok(hot_config) => {
-                                                if let Err(e) =
-                                                    handle.apply_config_update(hot_config)
-                                                {
-                                                    tracing::error!(
-                                                        error = %e,
-                                                        "Failed to apply config update"
-                                                    );
-                                                } else {
-                                                    current_config = new_config;
-                                                    tracing::info!("Config reload complete");
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    error = %e,
-                                                    "Rejected invalid hot-reload retention policy"
-                                                );
-                                            }
-                                        }
+                        control_result = watcher_control_rx.recv(&watcher_control_cx) => {
+                            match control_result {
+                                Ok(first) => {
+                                    let action = coalesce_watcher_control_action(
+                                        first,
+                                        &mut watcher_control_rx,
+                                    );
+                                    if process_watcher_control_action(
+                                        action,
+                                        config_path,
+                                        &mut current_config,
+                                        handle.as_ref(),
+                                    ) {
+                                        break;
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::error!(error = %e, "Failed to reload config");
+                                Err(error) => {
+                                    log_watcher_control_receive_failure(error);
+                                    break;
+                                }
+                            }
+                        }
+                        signal_kind = next_signal => {
+                            match signal_kind {
+                                WatcherUnixSignal::Interrupt => {
+                                    tracing::info!(
+                                        "Received SIGINT, initiating graceful shutdown"
+                                    );
+                                    break;
+                                }
+                                WatcherUnixSignal::Terminate => {
+                                    tracing::info!(
+                                        "Received SIGTERM, initiating graceful shutdown"
+                                    );
+                                    break;
+                                }
+                                WatcherUnixSignal::Hangup => {
+                                    tracing::info!("Received SIGHUP, attempting config reload");
+                                    reload_watcher_configuration(
+                                        config_path,
+                                        &mut current_config,
+                                        handle.as_ref(),
+                                    );
                                 }
                             }
                         }
@@ -39700,25 +40187,40 @@ async fn run_watcher(
                 }
             }
             Err(e) => {
-                // Runtime doesn't support Unix signal registration (e.g.
-                // asupersync Phase 0).  Fall back to ctrl_c() only -- no
-                // SIGHUP hot-reload, but the watcher still functions.
                 tracing::warn!(
                     error = %e,
-                    "Unix signal registration failed; falling back to Ctrl-C only \
-                     (SIGHUP config reload unavailable)"
+                    "Unix signal registration failed; retaining Ctrl-C and instance-bound IPC control \
+                     (OS-delivered SIGHUP reload unavailable)"
                 );
-                frankenterm_core::runtime_async::signal::ctrl_c().await?;
-                tracing::info!("Received Ctrl+C, initiating graceful shutdown");
+                wait_for_ctrl_c_or_watcher_control(
+                    &mut watcher_control_rx,
+                    &watcher_control_cx,
+                    config_path,
+                    &mut current_config,
+                    handle.as_ref(),
+                )
+                .await?;
             }
         }
     }
 
     #[cfg(not(unix))]
     {
-        frankenterm_core::runtime_async::signal::ctrl_c().await?;
-        tracing::info!("Received Ctrl+C, initiating graceful shutdown");
+        wait_for_ctrl_c_or_watcher_control(
+            &mut watcher_control_rx,
+            &watcher_control_cx,
+            config_path,
+            &mut current_config,
+            handle.as_ref(),
+        )
+        .await?;
     }
+
+    // This explicit post-loop use pins the original sender's lifetime across
+    // every wait branch. The IPC handler may still own a clone until server
+    // shutdown, but the receiver can no longer observe accidental disconnect
+    // merely because no handler was installed.
+    drop(watcher_control_tx_owner);
 
     // Graceful shutdown. Every authority-bearing producer/consumer must reach
     // terminal acknowledgement before the final snapshot can be certified.
@@ -39802,13 +40304,14 @@ async fn run_watcher(
     {
         shutdown_failures.push(error);
     }
-    if let Err(error) = settle_watcher_background_task(
-        "orphan_reaper",
-        orphan_reaper_handle,
-        &background_shutdown_cx,
-        true,
-    )
-    .await
+    if let Some(orphan_reaper_handle) = orphan_reaper_handle
+        && let Err(error) = settle_watcher_background_task(
+            "orphan_reaper",
+            orphan_reaper_handle,
+            &background_shutdown_cx,
+            true,
+        )
+        .await
     {
         shutdown_failures.push(error);
     }
@@ -55652,21 +56155,39 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
 
         Some(Commands::Stop { force, timeout }) => {
             let lock_path = layout.lock_path.clone();
-            let Some(meta) = check_watcher_running_with_cx(
+            let preflight = check_watcher_running_with_cx(
                 cx,
                 lock_path.clone(),
                 "watcher-stop preflight",
             )
-            .await?
-            else {
-                eprintln!("No watcher running in workspace: {}", layout.root.display());
-                std::process::exit(1);
+            .await?;
+            let meta = match preflight {
+                frankenterm_core::lock::LockStatus::HeldKnown(metadata) => metadata,
+                frankenterm_core::lock::LockStatus::Free => {
+                    eprintln!("No watcher running in workspace: {}", layout.root.display());
+                    std::process::exit(1);
+                }
+                frankenterm_core::lock::LockStatus::HeldUnknown => {
+                    eprintln!(
+                        "Refusing to stop the watcher: the lock is held but its owner identity is unavailable."
+                    );
+                    std::process::exit(1);
+                }
+                frankenterm_core::lock::LockStatus::ProbeUnavailable => {
+                    eprintln!(
+                        "Refusing to stop the watcher: the watcher lock could not be probed safely."
+                    );
+                    std::process::exit(1);
+                }
             };
 
             let pid = meta.pid;
-            println!("Stopping watcher (pid {pid}) in {}", layout.root.display());
+            println!(
+                "Requesting cooperative watcher shutdown (pid {pid}) in {}",
+                layout.root.display()
+            );
 
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             {
                 use std::time::{Duration, Instant};
 
@@ -55676,60 +56197,80 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     std::process::exit(1);
                 };
 
-                // Signal through the cancellation-aware, bounded async-process boundary.
-                let term_status = send_unix_signal_with_cx(
+                let request_timeout = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(WATCHER_CONTROL_REQUEST_TIMEOUT);
+                let request_result = request_watcher_control_with_cx(
                     cx,
-                    i64::from(pid),
-                    "TERM",
-                    "watcher termination signal",
-                    CLI_PROCESS_HELPER_TIMEOUT,
+                    &layout.ipc_socket_path,
+                    &config.ipc,
+                    frankenterm_core::ipc::WatcherControlAction::Stop,
+                    &meta.instance_id,
+                    request_timeout,
                 )
                 .await;
 
-                let mut stopped = false;
-                match term_status {
-                    Ok(output) if output.status.success() => {}
-                    Ok(output) => {
-                        if check_watcher_running_with_cx(
-                            cx,
-                            lock_path.clone(),
-                            "watcher-stop signal reconciliation",
-                        )
-                        .await?
-                        .is_none()
-                        {
-                            // The process may have exited between lock discovery and
-                            // signal delivery. Treat only a released lock as success.
-                            stopped = true;
-                        } else {
-                            eprintln!(
-                                "Failed to send SIGTERM to pid {pid} (exit code: {}).",
-                                output.status.code().unwrap_or(-1)
-                            );
-                            eprintln!(
-                                "The process may have already exited or belong to another user."
-                            );
-                            std::process::exit(1);
-                        }
+                if let Err(failure) = request_result {
+                    let reconciliation = check_watcher_running_with_cx(
+                        cx,
+                        lock_path.clone(),
+                        "watcher-stop request reconciliation",
+                    )
+                    .await?;
+                    if classify_watcher_stop_settlement(&reconciliation)
+                        == WatcherStopSettlement::Stopped
+                    {
+                        println!("Watcher stopped before the control reply was received (pid {pid}).");
+                        return Ok(());
                     }
-                    Err(e) => {
-                        eprintln!("Failed to send SIGTERM to pid {pid}: {e}");
-                        std::process::exit(1);
+                    eprintln!("Cooperative watcher stop request failed: {failure}.");
+                    eprintln!(
+                        "The watcher lock is not proven free; no stopped state was inferred."
+                    );
+                    if force {
+                        eprintln!(
+                            "--force cannot safely escalate without an OS-owned process handle; no numeric-PID signal was sent."
+                        );
                     }
+                    std::process::exit(1);
                 }
 
-                // Wait for the lock to be released.
-                while !stopped {
-                    if check_watcher_running_with_cx(
+                // An acknowledgement proves only that the exact watcher
+                // instance accepted and enqueued the request. Completion is
+                // established solely by observing the lock become Free.
+                let mut stopped = false;
+                loop {
+                    let settlement = check_watcher_running_with_cx(
                         cx,
                         lock_path.clone(),
                         "watcher-stop settlement check",
                     )
-                    .await?
-                    .is_none()
-                    {
-                        stopped = true;
-                        break;
+                    .await?;
+                    match &settlement {
+                        frankenterm_core::lock::LockStatus::Free => {
+                            stopped = true;
+                            break;
+                        }
+                        frankenterm_core::lock::LockStatus::HeldKnown(_)
+                            if same_watcher_identity(&settlement, &meta) => {}
+                        frankenterm_core::lock::LockStatus::HeldKnown(_) => {
+                            eprintln!(
+                                "Watcher identity changed while shutdown was settling; refusing to infer success."
+                            );
+                            std::process::exit(1);
+                        }
+                        frankenterm_core::lock::LockStatus::HeldUnknown => {
+                            eprintln!(
+                                "Watcher lock identity became unavailable while shutdown was settling; refusing to infer success."
+                            );
+                            std::process::exit(1);
+                        }
+                        frankenterm_core::lock::LockStatus::ProbeUnavailable => {
+                            eprintln!(
+                                "Watcher lock could not be probed while shutdown was settling; refusing to infer success."
+                            );
+                            std::process::exit(1);
+                        }
                     }
 
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -55748,89 +56289,45 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     })?;
                 }
 
+                if !stopped {
+                    let final_settlement = check_watcher_running_with_cx(
+                        cx,
+                        lock_path,
+                        "watcher-stop final settlement check",
+                    )
+                    .await?;
+                    if classify_watcher_stop_settlement(&final_settlement)
+                        == WatcherStopSettlement::Stopped
+                    {
+                        stopped = true;
+                    }
+                }
+
                 if stopped {
                     println!("Watcher stopped gracefully (pid {pid}).");
-                } else if force {
-                    let Some(current_meta) = check_watcher_running_with_cx(
-                        cx,
-                        lock_path.clone(),
-                        "watcher force-stop identity check",
-                    )
-                    .await?
-                    else {
-                        println!("Watcher stopped gracefully (pid {pid}).");
-                        return Ok(());
-                    };
-                    if current_meta.pid != meta.pid || current_meta.started_at != meta.started_at {
-                        eprintln!(
-                            "Refusing to send SIGKILL: the watcher lock changed ownership while waiting."
-                        );
-                        std::process::exit(1);
-                    }
-
-                    println!("Graceful shutdown timed out. Sending SIGKILL to pid {pid}.");
-                    let kill_status = send_unix_signal_with_cx(
-                        cx,
-                        i64::from(pid),
-                        "KILL",
-                        "watcher force-stop signal",
-                        CLI_PROCESS_HELPER_TIMEOUT,
-                    )
-                    .await;
-
-                    match kill_status {
-                        Ok(output) if output.status.success() => {}
-                        Ok(output) => {
-                            eprintln!(
-                                "Failed to send SIGKILL to pid {pid} (exit code: {}).",
-                                output.status.code().unwrap_or(-1)
-                            );
-                            std::process::exit(1);
-                        }
-                        Err(error) => {
-                            eprintln!("Failed to send SIGKILL to pid {pid}: {error}");
-                            std::process::exit(1);
-                        }
-                    }
-
-                    // Wait briefly for SIGKILL to take effect.
-                    frankenterm_core::runtime_async::sleep_with_cx(
-                        cx,
-                        Duration::from_millis(500),
-                    )
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "Watcher force-stop cancelled while waiting for pid {pid}: {error}"
-                        )
-                    })?;
-                    if check_watcher_running_with_cx(
-                        cx,
-                        lock_path.clone(),
-                        "watcher force-stop settlement check",
-                    )
-                    .await?
-                    .is_none()
-                    {
-                        println!("Watcher killed (pid {pid}).");
-                    } else {
-                        eprintln!(
-                            "Warning: lock still held after SIGKILL. The pid may belong to a different process."
-                        );
-                        std::process::exit(1);
-                    }
                 } else {
                     eprintln!(
-                        "Graceful shutdown timed out after {timeout}s. Use --force to escalate to SIGKILL."
+                        "Cooperative shutdown timed out after {timeout}s; the watcher lock is not proven free."
                     );
+                    if force {
+                        eprintln!(
+                            "--force cannot safely escalate without an OS-owned process handle; no numeric-PID signal was sent."
+                        );
+                    } else {
+                        eprintln!(
+                            "Use a longer --timeout and retry. --force is fail-safe and does not send a numeric-PID signal."
+                        );
+                    }
                     std::process::exit(1);
                 }
             }
 
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             {
-                let _ = (force, timeout);
-                eprintln!("ft stop is only supported on Unix systems.");
+                let _ = (force, timeout, pid);
+                eprintln!(
+                    "ft stop requires a supported local IPC transport on this platform; no numeric-PID signal was sent."
+                );
                 std::process::exit(1);
             }
         }
@@ -60326,12 +60823,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
 
         Some(Commands::Rules { command }) => {
             handle_rules_command(
+                cx,
                 command,
                 &config,
                 cli_config_arg.as_deref(),
                 resolved_config_path.as_deref(),
                 &layout,
-            );
+            )
+            .await;
         }
 
         Some(Commands::Ext { command }) => {
@@ -64615,7 +65114,8 @@ fn load_and_merge_config_profile(
     Ok((base_toml, merged_toml))
 }
 
-fn handle_rules_profile_command(
+async fn handle_rules_profile_command(
+    cx: &frankenterm_core::cx::Cx,
     command: RulesProfileCommands,
     cli_config: Option<&str>,
     resolved_config_path: Option<&Path>,
@@ -64735,38 +65235,100 @@ fn handle_rules_profile_command(
                 config_path.display()
             );
 
-            if let Some(meta) = frankenterm_core::lock::check_running(&layout.lock_path) {
-                #[cfg(unix)]
-                {
-                    let status = frankenterm_core::runtime_async::process::send_unix_signal_to_pid(
-                        i64::from(meta.pid),
-                        "HUP",
+            let watcher_status = match check_watcher_running_with_cx(
+                cx,
+                layout.lock_path.clone(),
+                "rules-profile watcher-control preflight",
+            )
+            .await
+            {
+                Ok(status) => status,
+                Err(_) => {
+                    eprintln!(
+                        "Ruleset was applied, but watcher lock authority could not be probed; no live reload completion is claimed."
                     );
-                    match status {
-                        Ok(s) if s.success() => {
-                            println!("Sent SIGHUP to watcher (pid {}).", meta.pid);
-                        }
-                        Ok(s) => {
-                            eprintln!(
-                                "Failed to signal watcher (pid {}) (exit code: {}).",
-                                meta.pid,
-                                s.code().unwrap_or(-1)
-                            );
-                        }
-                        Err(err) => {
-                            eprintln!("Failed to run kill command: {err}");
+                    return Ok(());
+                }
+            };
+
+            match watcher_status {
+                frankenterm_core::lock::LockStatus::HeldKnown(meta) => {
+                    #[cfg(any(unix, windows))]
+                    {
+                        match request_watcher_control_with_cx(
+                            cx,
+                            &layout.ipc_socket_path,
+                            &base_config.ipc,
+                            frankenterm_core::ipc::WatcherControlAction::Reload,
+                            &meta.instance_id,
+                            WATCHER_CONTROL_REQUEST_TIMEOUT,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                println!(
+                                    "Watcher accepted the instance-bound reload request; queue admission is confirmed, not reload completion."
+                                );
+                            }
+                            Err(failure) => {
+                                let reconciliation = check_watcher_running_with_cx(
+                                    cx,
+                                    layout.lock_path.clone(),
+                                    "rules-profile watcher-control reconciliation",
+                                )
+                                .await;
+                                match reconciliation {
+                                    Ok(frankenterm_core::lock::LockStatus::Free) => {
+                                        println!(
+                                            "Watcher stopped before the reload reply was received; the ruleset remains applied on disk."
+                                        );
+                                    }
+                                    Ok(status) if same_watcher_identity(&status, &meta) => {
+                                        eprintln!(
+                                            "Ruleset was applied, but the running watcher did not accept the reload request: {failure}."
+                                        );
+                                    }
+                                    Ok(frankenterm_core::lock::LockStatus::HeldKnown(_)) => {
+                                        eprintln!(
+                                            "Ruleset was applied, but watcher identity changed during reload dispatch; no live reload completion is claimed."
+                                        );
+                                    }
+                                    Ok(frankenterm_core::lock::LockStatus::HeldUnknown) => {
+                                        eprintln!(
+                                            "Ruleset was applied, but watcher identity became unavailable during reload dispatch; no live reload completion is claimed."
+                                        );
+                                    }
+                                    Ok(frankenterm_core::lock::LockStatus::ProbeUnavailable)
+                                    | Err(_) => {
+                                        eprintln!(
+                                            "Ruleset was applied, but watcher lock authority could not be reconciled after reload dispatch; no live reload completion is claimed."
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
+                    #[cfg(not(any(unix, windows)))]
+                    {
+                        let _ = meta;
+                        eprintln!(
+                            "Ruleset was applied, but local watcher control is unsupported on this platform; no live reload completion is claimed."
+                        );
+                    }
                 }
-                #[cfg(not(unix))]
-                {
-                    println!(
-                        "Watcher reload not supported on this platform (pid {}).",
-                        meta.pid
+                frankenterm_core::lock::LockStatus::Free => {
+                    println!("No watcher running in workspace: {}", layout.root.display());
+                }
+                frankenterm_core::lock::LockStatus::HeldUnknown => {
+                    eprintln!(
+                        "Ruleset was applied, but the held watcher identity is unavailable; no reload request was sent."
                     );
                 }
-            } else {
-                println!("No watcher running in workspace: {}", layout.root.display());
+                frankenterm_core::lock::LockStatus::ProbeUnavailable => {
+                    eprintln!(
+                        "Ruleset was applied, but the watcher lock could not be probed safely; no reload request was sent."
+                    );
+                }
             }
         }
     }
@@ -64944,7 +65506,8 @@ fn handle_ext_command(
 }
 
 /// Handle `ft rules` subcommands
-fn handle_rules_command(
+async fn handle_rules_command(
+    cx: &frankenterm_core::cx::Cx,
     command: RulesCommands,
     config: &frankenterm_core::config::Config,
     cli_config: Option<&str>,
@@ -65089,8 +65652,14 @@ fn handle_rules_command(
         }
 
         RulesCommands::Profile { command } => {
-            if let Err(err) =
-                handle_rules_profile_command(command, cli_config, resolved_config_path, layout)
+            if let Err(err) = handle_rules_profile_command(
+                cx,
+                command,
+                cli_config,
+                resolved_config_path,
+                layout,
+            )
+            .await
             {
                 eprintln!("{err}");
                 std::process::exit(1);
@@ -73776,12 +74345,141 @@ fn run_setup_font_command(
 
 const WEZTERM_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
 
+/// Observable identity/version snapshot for a diagnostic config file.
+///
+/// Unix uses device+inode and nanosecond mtime/ctime, which detects replacement
+/// and mutation on the supported macOS/Linux targets. Other targets use the
+/// portable length+modified-time surface exposed by `std`; replacement with
+/// identical observable metadata remains a portability limit there, while the
+/// byte cap and typed parser still fail closed independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiagnosticFileSnapshot {
+    byte_len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+impl DiagnosticFileSnapshot {
+    fn capture(metadata: &std::fs::Metadata) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(Self {
+            byte_len: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            modified_seconds: metadata.mtime(),
+            #[cfg(unix)]
+            modified_nanoseconds: metadata.mtime_nsec(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+
+    fn capture_cap(metadata: &cap_std::fs::Metadata) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        use cap_fs_ext::OsMetadataExt;
+
+        Ok(Self {
+            byte_len: metadata.len(),
+            modified: metadata.modified()?.into_std(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            modified_seconds: metadata.mtime(),
+            #[cfg(unix)]
+            modified_nanoseconds: metadata.mtime_nsec(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+
+    #[cfg(test)]
+    fn synthetic(byte_len: u64, version: u64) -> Self {
+        let seconds = i64::try_from(version).unwrap_or(i64::MAX);
+        Self {
+            byte_len,
+            modified: std::time::SystemTime::UNIX_EPOCH
+                .checked_add(std::time::Duration::from_secs(version))
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            #[cfg(unix)]
+            device: 1,
+            #[cfg(unix)]
+            inode: version,
+            #[cfg(unix)]
+            modified_seconds: seconds,
+            #[cfg(unix)]
+            modified_nanoseconds: 0,
+            #[cfg(unix)]
+            changed_seconds: seconds,
+            #[cfg(unix)]
+            changed_nanoseconds: 0,
+        }
+    }
+}
+
+fn open_diagnostic_file_nofollow(
+    directory: &cap_std::fs::Dir,
+    leaf: &Path,
+) -> std::io::Result<std::fs::File> {
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    directory
+        .open_with(leaf, &options)
+        .map(cap_std::fs::File::into_std)
+}
+
+fn open_diagnostic_directory_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("diagnostic directory has no parent"))?;
+    let leaf = path
+        .file_name()
+        .map(PathBuf::from)
+        .ok_or_else(|| std::io::Error::other("diagnostic directory has no file name"))?;
+    let parent = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
+    let directory = parent.open_with(&leaf, &options)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(std::io::Error::other(
+            "diagnostic directory path is not a directory",
+        ));
+    }
+    Ok(cap_std::fs::Dir::from_std_file(directory.into_std()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WeztermScrollbackCheckFailure {
     MetadataUnavailable,
     NotRegularFile,
     Oversized,
     ReadUnavailable,
+    ChangedDuringRead,
     InvalidEncoding,
     SettingMissing,
     ConfigMissing,
@@ -73796,6 +74494,7 @@ impl WeztermScrollbackCheckFailure {
             Self::NotRegularFile => "WezTerm config path is not a regular file",
             Self::Oversized => "WezTerm config exceeds the 1 MiB diagnostic safety limit",
             Self::ReadUnavailable => "WezTerm config could not be read safely",
+            Self::ChangedDuringRead => "WezTerm config changed while it was being read",
             Self::InvalidEncoding => "WezTerm config is not valid UTF-8 text",
             Self::SettingMissing => "scrollback_lines is not set in the active WezTerm config",
             Self::ConfigMissing => "No WezTerm config file was found in supported locations",
@@ -73870,27 +74569,71 @@ fn wezterm_config_path_for_output(path: &Path) -> String {
 /// Returns `(scrollback_lines, config_path)` after admitting a finite regular
 /// UTF-8 config file, or a content-free failure classification.
 fn check_wezterm_scrollback() -> Result<(u64, PathBuf), WeztermScrollbackCheckFailure> {
-    // Check common WezTerm config locations
-    let config_paths: Vec<PathBuf> = [
-        dirs::config_dir().map(|path| path.join("wezterm/wezterm.lua")),
-        dirs::home_dir().map(|path| path.join(".wezterm.lua")),
-        dirs::home_dir().map(|path| path.join(".config/wezterm/wezterm.lua")),
+    // Each candidate is resolved beneath an explicitly opened authority root.
+    // cap-std then confines intermediate symlinks to that root, while the final
+    // config leaf is opened with no-follow semantics.
+    let config_candidates: Vec<(PathBuf, PathBuf)> = [
+        dirs::config_dir().map(|root| (root, PathBuf::from("wezterm/wezterm.lua"))),
+        dirs::home_dir().map(|root| (root, PathBuf::from(".wezterm.lua"))),
+        dirs::home_dir().map(|root| (root, PathBuf::from(".config/wezterm/wezterm.lua"))),
     ]
     .into_iter()
     .flatten()
     .collect();
 
-    for config_path in config_paths {
-        let metadata = match std::fs::metadata(&config_path) {
+    for (authority_root, relative_path) in config_candidates {
+        let config_path = authority_root.join(&relative_path);
+        let directory = match cap_std::fs::Dir::open_ambient_dir(
+            &authority_root,
+            cap_std::ambient_authority(),
+        ) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(WeztermScrollbackCheckFailure::MetadataUnavailable),
+        };
+        let metadata = match directory.symlink_metadata(&relative_path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => return Err(WeztermScrollbackCheckFailure::MetadataUnavailable),
         };
         admit_wezterm_config_shape_and_size(metadata.is_file(), metadata.len())?;
+        let path_snapshot_before = DiagnosticFileSnapshot::capture_cap(&metadata)
+            .map_err(|_| WeztermScrollbackCheckFailure::MetadataUnavailable)?;
 
-        let file = std::fs::File::open(&config_path)
+        let mut file = open_diagnostic_file_nofollow(&directory, &relative_path)
             .map_err(|_| WeztermScrollbackCheckFailure::ReadUnavailable)?;
-        let bytes = read_wezterm_config_bounded(file)?;
+        let opened_metadata = file
+            .metadata()
+            .map_err(|_| WeztermScrollbackCheckFailure::MetadataUnavailable)?;
+        admit_wezterm_config_shape_and_size(opened_metadata.is_file(), opened_metadata.len())?;
+        let opened_snapshot = DiagnosticFileSnapshot::capture(&opened_metadata)
+            .map_err(|_| WeztermScrollbackCheckFailure::MetadataUnavailable)?;
+        if opened_snapshot != path_snapshot_before {
+            return Err(WeztermScrollbackCheckFailure::ChangedDuringRead);
+        }
+
+        let bytes = read_wezterm_config_bounded(&mut file)?;
+        let handle_metadata_after = file
+            .metadata()
+            .map_err(|_| WeztermScrollbackCheckFailure::MetadataUnavailable)?;
+        admit_wezterm_config_shape_and_size(
+            handle_metadata_after.is_file(),
+            handle_metadata_after.len(),
+        )?;
+        let handle_snapshot_after = DiagnosticFileSnapshot::capture(&handle_metadata_after)
+            .map_err(|_| WeztermScrollbackCheckFailure::MetadataUnavailable)?;
+        let path_metadata_after = directory
+            .symlink_metadata(&relative_path)
+            .map_err(|_| WeztermScrollbackCheckFailure::ChangedDuringRead)?;
+        admit_wezterm_config_shape_and_size(
+            path_metadata_after.is_file(),
+            path_metadata_after.len(),
+        )?;
+        let path_snapshot_after = DiagnosticFileSnapshot::capture_cap(&path_metadata_after)
+            .map_err(|_| WeztermScrollbackCheckFailure::MetadataUnavailable)?;
+        if handle_snapshot_after != opened_snapshot || path_snapshot_after != handle_snapshot_after {
+            return Err(WeztermScrollbackCheckFailure::ChangedDuringRead);
+        }
         let lines = parse_wezterm_config_bytes(&bytes)?;
         return Ok((lines, config_path));
     }
@@ -76084,7 +76827,12 @@ const LOGS_DIRECTORY_MISSING_DETAIL: &str =
     "shape check: configured logs directory does not exist";
 
 #[cfg(feature = "browser")]
-const BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE: usize = 4_096;
+const BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE: usize = 256;
+
+#[cfg(feature = "browser")]
+const fn browser_diagnostic_entry_is_within_budget(entries_examined: usize) -> bool {
+    entries_examined < BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE
+}
 
 #[cfg(feature = "browser")]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -76140,8 +76888,33 @@ fn scan_browser_profiles_for_diagnostics(
     profiles_root: &Path,
     service: &str,
 ) -> BrowserProfileDiagnosticScan {
-    let service_dir = profiles_root.join(service);
-    let entries = match std::fs::read_dir(&service_dir) {
+    let profiles_directory = match open_diagnostic_directory_nofollow(profiles_root) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return BrowserProfileDiagnosticScan::DirectoryMissing;
+        }
+        Err(_) => return BrowserProfileDiagnosticScan::DirectoryUnavailable,
+    };
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
+    let service_directory = match profiles_directory.open_with(service, &options) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return BrowserProfileDiagnosticScan::DirectoryMissing;
+        }
+        Err(_) => return BrowserProfileDiagnosticScan::DirectoryUnavailable,
+    };
+    if !service_directory
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_dir())
+    {
+        return BrowserProfileDiagnosticScan::DirectoryUnavailable;
+    }
+    let service_directory = cap_std::fs::Dir::from_std_file(service_directory.into_std());
+    let entries = match service_directory.entries() {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return BrowserProfileDiagnosticScan::DirectoryMissing;
@@ -76151,7 +76924,7 @@ fn scan_browser_profiles_for_diagnostics(
 
     let mut counts = BrowserProfileDiagnosticCounts::default();
     for entry_result in entries {
-        if counts.entries_examined >= BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE {
+        if !browser_diagnostic_entry_is_within_budget(counts.entries_examined) {
             counts.truncated = true;
             break;
         }
@@ -76186,7 +76959,7 @@ fn scan_browser_profiles_for_diagnostics(
             service,
             account,
         );
-        if profile.path() != entry.path() {
+        if profile.service != service || profile.account != account {
             counts.metadata_unknown = counts.metadata_unknown.saturating_add(1);
             continue;
         }
@@ -76297,19 +77070,83 @@ const fn diagnostic_reap_deadline_expired(elapsed: std::time::Duration) -> bool 
     elapsed.as_nanos() >= DIAGNOSTIC_COMMAND_LEADER_REAP_TIMEOUT.as_nanos()
 }
 
+fn probe_diagnostic_child_with_deadline(
+    child: &mut std::process::Child,
+    started: std::time::Instant,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    loop {
+        match child.try_wait() {
+            Ok(status) => return Ok(status),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                if diagnostic_reap_deadline_expired(started.elapsed()) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "diagnostic command status probe timed out",
+                    ));
+                }
+                std::thread::sleep(DIAGNOSTIC_COMMAND_CAPTURE_POLL_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn terminate_diagnostic_process_tree(
     child: &mut std::process::Child,
-) -> std::io::Result<std::process::ExitStatus> {
-    let _ = frankenterm_core::runtime_async::process::send_signal_to_process_group(
+) -> std::io::Result<DiagnosticTermination> {
+    // A reaped leader's numeric PID/process-group ID can already have been
+    // reused. Establish that this exact Child is still live before signalling.
+    // Any probe failure is an unknown-identity state and therefore fails
+    // closed without sending a numeric-ID signal.
+    let cleanup_started = std::time::Instant::now();
+    match probe_diagnostic_child_with_deadline(child, cleanup_started)? {
+        Some(status) => {
+            return Ok(DiagnosticTermination {
+                status,
+                signal_helper_settled: true,
+                process_tree_signalled: false,
+            });
+        }
+        None => {}
+    }
+
+    let group_signal = frankenterm_core::runtime_async::process::send_signal_to_process_group(
         child.id(),
         "KILL",
     );
-    let _ = child.kill();
-    let reap_started = std::time::Instant::now();
+    let signal_helper_settled = group_signal.as_ref().err().is_none_or(|error| {
+        frankenterm_core::runtime_async::process::CommandSignalHelperCleanupIncomplete::from_io_error(
+            error,
+        )
+        .is_none()
+    });
+    let process_tree_signalled = group_signal.is_ok_and(|status| status.success());
+    if !process_tree_signalled {
+        // Re-probe after a failed group signal. Only fall back to Child::kill
+        // while the owned child identity is still observably live. Reaping the
+        // leader through that handle does not prove that descendants were
+        // signalled, so the returned structural receipt retains that failure.
+        match probe_diagnostic_child_with_deadline(child, cleanup_started)? {
+            Some(status) => {
+                return Ok(DiagnosticTermination {
+                    status,
+                    signal_helper_settled,
+                    process_tree_signalled: false,
+                });
+            }
+            None => child.kill()?,
+        }
+    }
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) if diagnostic_reap_deadline_expired(reap_started.elapsed()) => {
+            Ok(Some(status)) => {
+                return Ok(DiagnosticTermination {
+                    status,
+                    signal_helper_settled,
+                    process_tree_signalled,
+                });
+            }
+            Ok(None) if diagnostic_reap_deadline_expired(cleanup_started.elapsed()) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "diagnostic command leader reap timed out",
@@ -76317,7 +77154,7 @@ fn terminate_diagnostic_process_tree(
             }
             Ok(None) => std::thread::sleep(DIAGNOSTIC_COMMAND_CAPTURE_POLL_INTERVAL),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                if diagnostic_reap_deadline_expired(reap_started.elapsed()) {
+                if diagnostic_reap_deadline_expired(cleanup_started.elapsed()) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "diagnostic command leader reap timed out",
@@ -76330,10 +77167,111 @@ fn terminate_diagnostic_process_tree(
     }
 }
 
+#[derive(Debug)]
+struct DiagnosticTermination {
+    status: std::process::ExitStatus,
+    signal_helper_settled: bool,
+    process_tree_signalled: bool,
+}
+
+const fn diagnostic_termination_failure_kind(
+    signal_helper_settled: bool,
+    process_tree_signalled: bool,
+) -> Option<&'static str> {
+    if !signal_helper_settled {
+        Some("signal_helper_not_settled")
+    } else if !process_tree_signalled {
+        Some("process_tree_not_signalled")
+    } else {
+        None
+    }
+}
+
 struct NonblockingCommandCapture {
     reader: Option<filedescriptor::FileDescriptor>,
     output: BoundedCommandStream,
     max_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiagnosticCaptureIncomplete {
+    stdout_open: bool,
+    stderr_open: bool,
+    timeout_ms: u128,
+}
+
+impl std::fmt::Display for DiagnosticCaptureIncomplete {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "diagnostic command output capture incomplete after {} ms (stdout_open={}, stderr_open={})",
+            self.timeout_ms, self.stdout_open, self.stderr_open
+        )
+    }
+}
+
+impl std::error::Error for DiagnosticCaptureIncomplete {}
+
+impl DiagnosticCaptureIncomplete {
+    fn into_io_error(self) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, self)
+    }
+
+    fn from_io_error(error: &std::io::Error) -> Option<Self> {
+        error.get_ref()?.downcast_ref::<Self>().copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiagnosticCleanupIncomplete {
+    trigger: &'static str,
+    failure_kind: &'static str,
+}
+
+impl std::fmt::Display for DiagnosticCleanupIncomplete {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "diagnostic command cleanup incomplete (trigger={}, failure_kind={})",
+            self.trigger, self.failure_kind
+        )
+    }
+}
+
+impl std::error::Error for DiagnosticCleanupIncomplete {}
+
+impl DiagnosticCleanupIncomplete {
+    fn from_error(trigger: &'static str, error: &std::io::Error) -> Self {
+        if let Some(existing) = error
+            .get_ref()
+            .and_then(|detail| detail.downcast_ref::<Self>())
+        {
+            return Self {
+                trigger,
+                failure_kind: existing.failure_kind,
+            };
+        }
+        let failure_kind = match error.kind() {
+            std::io::ErrorKind::TimedOut => "timeout",
+            std::io::ErrorKind::Interrupted => "interrupted",
+            std::io::ErrorKind::PermissionDenied => "permission_denied",
+            std::io::ErrorKind::NotFound => "not_found",
+            _ => "unavailable",
+        };
+        Self {
+            trigger,
+            failure_kind,
+        }
+    }
+
+    fn into_io_error(self) -> std::io::Error {
+        std::io::Error::other(self)
+    }
+
+    #[cfg(test)]
+    fn from_io_error(error: &std::io::Error) -> Option<Self> {
+        error.get_ref()?.downcast_ref::<Self>().copied()
+    }
 }
 
 impl NonblockingCommandCapture {
@@ -76380,7 +77318,9 @@ impl NonblockingCommandCapture {
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                // Yield to the supervisor so an EINTR storm cannot postpone
+                // its command deadline indefinitely inside this local drain.
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(()),
                 Err(error) => return Err(error),
             }
         }
@@ -76425,10 +77365,12 @@ fn drain_diagnostic_captures_until_closed(
             return Ok(());
         }
         if started.elapsed() >= DIAGNOSTIC_COMMAND_PIPE_DRAIN_TIMEOUT {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "diagnostic command output drain timed out",
-            ));
+            return Err(DiagnosticCaptureIncomplete {
+                stdout_open: !stdout.is_closed(),
+                stderr_open: !stderr.is_closed(),
+                timeout_ms: DIAGNOSTIC_COMMAND_PIPE_DRAIN_TIMEOUT.as_millis(),
+            }
+            .into_io_error());
         }
         std::thread::sleep(DIAGNOSTIC_COMMAND_CAPTURE_POLL_INTERVAL);
     }
@@ -76444,6 +77386,53 @@ fn bounded_command_output(
         stdout: stdout.into_output(),
         stderr: stderr.into_output(),
     }
+}
+
+fn finish_reaped_diagnostic_output(
+    status: std::process::ExitStatus,
+    mut stdout: NonblockingCommandCapture,
+    mut stderr: NonblockingCommandCapture,
+) -> std::io::Result<BoundedCommandOutput> {
+    // Deliberately receives no Child, PID, or process-group ID. Once try_wait
+    // returned Some, numeric identity can be reused and must never be signalled.
+    drain_diagnostic_captures_until_closed(&mut stdout, &mut stderr)?;
+    Ok(bounded_command_output(status, stdout, stderr))
+}
+
+fn terminate_and_drain_diagnostic_child(
+    child: &mut std::process::Child,
+    stdout: &mut NonblockingCommandCapture,
+    stderr: &mut NonblockingCommandCapture,
+    trigger: &'static str,
+) -> std::io::Result<std::process::ExitStatus> {
+    let termination = terminate_diagnostic_process_tree(child).map_err(|error| {
+        DiagnosticCleanupIncomplete::from_error(trigger, &error).into_io_error()
+    })?;
+    let drain_result = drain_diagnostic_captures_until_closed(stdout, stderr).map_err(|error| {
+        if DiagnosticCaptureIncomplete::from_io_error(&error).is_some() {
+            error
+        } else {
+            DiagnosticCleanupIncomplete::from_error(trigger, &error).into_io_error()
+        }
+    });
+
+    // A successful leader reap is not equivalent to process-tree cleanup. A
+    // failed or uncertain helper can leave both the helper and descendants
+    // alive even when Child::kill reaps the leader. Preserve those structural
+    // failures after the finite pipe drain instead of returning a normal exit
+    // status that would let doctor report a complete cleanup.
+    if let Some(failure_kind) = diagnostic_termination_failure_kind(
+        termination.signal_helper_settled,
+        termination.process_tree_signalled,
+    ) {
+        return Err(DiagnosticCleanupIncomplete {
+            trigger,
+            failure_kind,
+        }
+        .into_io_error());
+    }
+    drain_result?;
+    Ok(termination.status)
 }
 
 /// Run a command with a timeout while retaining only finite stdout/stderr prefixes.
@@ -76468,7 +77457,6 @@ fn run_cmd_with_timeout(
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let mut child = spawn_result?;
-    let process_group_id = child.id();
 
     let start = std::time::Instant::now();
     loop {
@@ -76476,43 +77464,65 @@ fn run_cmd_with_timeout(
             .drain_available()
             .and_then(|()| stderr.drain_available())
         {
-            let _ = terminate_diagnostic_process_tree(&mut child);
-            let _ = drain_diagnostic_captures_until_closed(&mut stdout, &mut stderr);
+            terminate_and_drain_diagnostic_child(
+                &mut child,
+                &mut stdout,
+                &mut stderr,
+                "capture_read_failure",
+            )?;
             return Err(error);
         }
         if stdout.overflowed() || stderr.overflowed() {
-            let status = terminate_diagnostic_process_tree(&mut child)?;
-            let _ = drain_diagnostic_captures_until_closed(&mut stdout, &mut stderr);
+            let status = terminate_and_drain_diagnostic_child(
+                &mut child,
+                &mut stdout,
+                &mut stderr,
+                "capture_limit",
+            )?;
             return Ok(bounded_command_output(status, stdout, stderr));
         }
 
         match child.try_wait() {
             Ok(Some(status)) => {
-                if !stdout.is_closed() || !stderr.is_closed() {
-                    // A descendant may retain inherited output sockets after
-                    // the command leader exits. Terminate the configured tree
-                    // before the finite nonblocking drain.
-                    let _ = frankenterm_core::runtime_async::process::send_signal_to_process_group(
-                        process_group_id,
-                        "KILL",
-                    );
-                }
-                drain_diagnostic_captures_until_closed(&mut stdout, &mut stderr)?;
-                return Ok(bounded_command_output(status, stdout, stderr));
+                return finish_reaped_diagnostic_output(status, stdout, stderr);
             }
             Ok(None) if start.elapsed() >= timeout => {
-                let _ = terminate_diagnostic_process_tree(&mut child);
-                let _ = drain_diagnostic_captures_until_closed(&mut stdout, &mut stderr);
+                terminate_and_drain_diagnostic_child(
+                    &mut child,
+                    &mut stdout,
+                    &mut stderr,
+                    "command_timeout",
+                )?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "diagnostic command timed out",
                 ));
             }
             Ok(None) => std::thread::sleep(DIAGNOSTIC_COMMAND_CAPTURE_POLL_INTERVAL),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                if start.elapsed() >= timeout {
+                    terminate_and_drain_diagnostic_child(
+                        &mut child,
+                        &mut stdout,
+                        &mut stderr,
+                        "status_probe_timeout",
+                    )?;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "diagnostic command status probe timed out",
+                    ));
+                }
+                std::thread::sleep(DIAGNOSTIC_COMMAND_CAPTURE_POLL_INTERVAL);
+            }
+            // A non-transient probe failure makes numeric child/group identity
+            // non-authoritative. Fail closed without signalling it, and report
+            // explicitly that child settlement is unknown.
             Err(error) => {
-                let _ = terminate_diagnostic_process_tree(&mut child);
-                let _ = drain_diagnostic_captures_until_closed(&mut stdout, &mut stderr);
-                return Err(error);
+                return Err(DiagnosticCleanupIncomplete::from_error(
+                    "status_probe_failure",
+                    &error,
+                )
+                .into_io_error());
             }
         }
     }
@@ -76782,42 +77792,8 @@ fn run_diagnostics(
     }
 
     // Check 5: Lock file (watcher status)
-    if let Some(meta) = frankenterm_core::lock::check_running(&layout.lock_path) {
-        checks.push(DiagnosticCheck::ok_with_detail(
-            "daemon status",
-            format!("running (PID {})", meta.pid),
-        ));
-    } else {
-        match std::fs::metadata(&layout.lock_path) {
-            Ok(metadata) if metadata.is_file() => {
-                checks.push(DiagnosticCheck::warning(
-                    "daemon status",
-                    "stale lock (process not running)",
-                    "Remove the configured stale lock file after confirming the daemon is stopped",
-                ));
-            }
-            Ok(_) => {
-                checks.push(DiagnosticCheck::error(
-                    "daemon status",
-                    "configured lock path is not a regular file",
-                    "Move the conflicting path before starting the daemon",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                checks.push(DiagnosticCheck::ok_with_detail(
-                    "daemon status",
-                    "not running",
-                ));
-            }
-            Err(_) => {
-                checks.push(DiagnosticCheck::warning(
-                    "daemon status",
-                    "configured lock metadata could not be inspected",
-                    "Review the configured lock and parent directory permissions",
-                ));
-            }
-        }
-    }
+    let watcher_lock_status = frankenterm_core::lock::check_running(&layout.lock_path);
+    checks.push(watcher_lock_diagnostic_check(&watcher_lock_status));
 
     // Check 6: Logs directory shape and basic permission metadata. This probe
     // deliberately performs no write, so it must not claim actual writability.
@@ -99429,6 +100405,112 @@ A  docs/new-proof.md\n";
         );
     }
 
+    #[cfg(feature = "session-resume")]
+    #[test]
+    fn robot_session_resume_native_runner_uses_bounded_tree_supervision() {
+        use frankenterm_core::runtime_async::process::{
+            CommandOutputLimitExceeded, CommandOutputStream,
+        };
+        use frankenterm_core::session_resume::SessionResumeError;
+
+        let limit_error = CommandOutputLimitExceeded::new(
+            CommandOutputStream::Stdout,
+            ROBOT_SESSION_RESUME_NATIVE_MAX_STDOUT_BYTES.saturating_add(1),
+            ROBOT_SESSION_RESUME_NATIVE_MAX_STDOUT_BYTES,
+        )
+        .into_io_error();
+        let mapped = robot_session_resume_native_command_error(&limit_error);
+        assert!(matches!(
+            mapped,
+            SessionResumeError::SubprocessFailed { code: None, ref stderr }
+                if stderr.contains("stdout capture limit exceeded")
+                    && stderr.contains("16777216")
+        ));
+
+        let injected = std::io::Error::other("/private/AKIAIOSFODNN7EXAMPLE\n\u{202e}");
+        let rendered = robot_session_resume_native_command_error(&injected).to_string();
+        assert!(!rendered.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!rendered.contains('/'));
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\u{202e}'));
+
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn robot_session_resume_run_native(")
+            .expect("native runner source");
+        let tail = &source[start..];
+        let end = tail
+            .find("\n}\n\n#[cfg(feature = \"session-resume\")]\nfn build_robot_session_resume_resume_data")
+            .expect("native runner source boundary");
+        let body = &tail[..end];
+        assert!(body.contains("output_blocking"));
+        assert!(body.contains("ROBOT_SESSION_RESUME_NATIVE_MAX_STDOUT_BYTES"));
+        assert!(body.contains("ROBOT_SESSION_RESUME_NATIVE_MAX_STDERR_BYTES"));
+        assert!(!body.contains("std::process::Command"));
+        assert!(!body.contains("try_wait"));
+        assert!(!body.contains("wait_with_output"));
+        assert!(!body.contains("child.kill"));
+
+        let bytes = b"bounded native output".to_vec();
+        let allocation = bytes.as_ptr();
+        let text = robot_session_resume_output_text(bytes).expect("non-empty output");
+        assert_eq!(text, "bounded native output");
+        assert_eq!(text.as_ptr(), allocation);
+        assert_eq!(
+            robot_session_resume_output_text(vec![0xff]).as_deref(),
+            Some("�")
+        );
+    }
+
+    #[cfg(feature = "session-resume")]
+    #[test]
+    fn robot_session_resume_cancel_and_incomplete_failures_have_stable_codes() {
+        use frankenterm_core::session_resume::SessionResumeError;
+
+        let cancelled = robot_session_resume_error_response::<serde_json::Value>(
+            SessionResumeError::Cancelled,
+            7,
+        );
+        assert_eq!(cancelled.error_code.as_deref(), Some(ROBOT_ERR_SESSION_RESUME_CANCELLED));
+
+        let incomplete = robot_session_resume_error_response::<serde_json::Value>(
+            SessionResumeError::CaptureIncomplete {
+                stdout_open: true,
+                stderr_open: false,
+                drain_timeout_ms: 100,
+            },
+            9,
+        );
+        assert_eq!(
+            incomplete.error_code.as_deref(),
+            Some(ROBOT_ERR_SESSION_RESUME_CAPTURE_INCOMPLETE)
+        );
+        let rendered = serde_json::to_string(&incomplete).expect("response serialization");
+        assert!(rendered.contains("stdout_open=true"));
+        assert!(rendered.contains("stderr_open=false"));
+
+        let cleanup = robot_session_resume_error_response::<serde_json::Value>(
+            SessionResumeError::CleanupIncomplete {
+                trigger:
+                    frankenterm_core::runtime_async::process::CommandCleanupTrigger::TimedOut,
+                leader_reaped: false,
+                signal_helper_settled: true,
+                process_tree_signalled: false,
+                stdout_open: false,
+                stderr_open: true,
+                settle_timeout_ms: 250,
+            },
+            11,
+        );
+        assert_eq!(
+            cleanup.error_code.as_deref(),
+            Some(ROBOT_ERR_SESSION_RESUME_CLEANUP_INCOMPLETE)
+        );
+        let rendered = serde_json::to_string(&cleanup).expect("response serialization");
+        assert!(rendered.contains("trigger=timed_out"));
+        assert!(rendered.contains("process_tree_signalled=false"));
+    }
+
     #[test]
     fn cli_robot_get_text_parses_panes_selector() {
         let cli = Cli::try_parse_from([
@@ -101677,6 +102759,451 @@ A  docs/new-proof.md\n";
     }
 
     #[test]
+    fn watcher_lock_status_classification_is_four_way_and_fail_closed() {
+        use frankenterm_core::lock::{LockMetadata, LockStatus};
+
+        let metadata = LockMetadata {
+            pid: 42,
+            started_at: 1_234,
+            started_at_human: "unix:1234".to_string(),
+            wa_version: "test".to_string(),
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+        };
+        let known = LockStatus::HeldKnown(metadata.clone());
+        assert_eq!(
+            classify_watcher_stop_settlement(&LockStatus::Free),
+            WatcherStopSettlement::Stopped
+        );
+        assert_eq!(
+            classify_watcher_stop_settlement(&known),
+            WatcherStopSettlement::StillHeld
+        );
+        assert_eq!(
+            classify_watcher_stop_settlement(&LockStatus::HeldUnknown),
+            WatcherStopSettlement::StillHeld
+        );
+        assert_eq!(
+            classify_watcher_stop_settlement(&LockStatus::ProbeUnavailable),
+            WatcherStopSettlement::ProbeUnavailable
+        );
+
+        assert!(same_watcher_identity(&known, &metadata));
+        let mut replacement = metadata.clone();
+        replacement.instance_id = "fedcba9876543210fedcba9876543210".to_string();
+        assert!(!same_watcher_identity(
+            &LockStatus::HeldKnown(replacement),
+            &metadata
+        ));
+        let mut different_pid = metadata.clone();
+        different_pid.pid = different_pid.pid.saturating_add(1);
+        assert!(!same_watcher_identity(
+            &LockStatus::HeldKnown(different_pid),
+            &metadata
+        ));
+        let mut different_timestamp = metadata.clone();
+        different_timestamp.started_at = different_timestamp.started_at.saturating_add(1);
+        assert!(same_watcher_identity(
+            &LockStatus::HeldKnown(different_timestamp),
+            &metadata
+        ));
+        assert!(!same_watcher_identity(&LockStatus::HeldUnknown, &metadata));
+        assert!(!same_watcher_identity(&LockStatus::ProbeUnavailable, &metadata));
+        assert!(!same_watcher_identity(&LockStatus::Free, &metadata));
+
+        let free = watcher_lock_diagnostic_check(&LockStatus::Free);
+        assert_eq!(free.status, DiagnosticStatus::Ok);
+        assert!(free.detail.as_deref().is_some_and(|value| value.contains("free")));
+        let known_check = watcher_lock_diagnostic_check(&known);
+        assert_eq!(known_check.status, DiagnosticStatus::Ok);
+        assert!(known_check.detail.as_deref().is_some_and(|value| value.contains("PID 42")));
+        let unknown = watcher_lock_diagnostic_check(&LockStatus::HeldUnknown);
+        assert_eq!(unknown.status, DiagnosticStatus::Warning);
+        assert!(unknown.detail.as_deref().is_some_and(|value| value.contains("held")));
+        let unavailable = watcher_lock_diagnostic_check(&LockStatus::ProbeUnavailable);
+        assert_eq!(unavailable.status, DiagnosticStatus::Warning);
+        assert!(
+            unavailable
+                .detail
+                .as_deref()
+                .is_some_and(|value| value.contains("could not be probed"))
+        );
+    }
+
+    fn watcher_control_invocation(
+        action: frankenterm_core::ipc::WatcherControlAction,
+        expected_instance_id: &str,
+    ) -> frankenterm_core::ipc::IpcWatcherControlInvocation {
+        frankenterm_core::ipc::IpcWatcherControlInvocation {
+            control: frankenterm_core::ipc::WatcherControlRequest {
+                action,
+                expected_instance_id: expected_instance_id.to_string(),
+            },
+            request_id: Some("request-canary".to_string()),
+        }
+    }
+
+    #[test]
+    fn watcher_control_admission_requires_exact_instance_before_queue_effect() {
+        use frankenterm_core::ipc::WatcherControlAction;
+        use frankenterm_core::runtime_async::mpsc::{self, RecvError};
+
+        let actual = "0123456789abcdef0123456789abcdef";
+        let (tx, mut rx) = mpsc::channel(2);
+        for presented in [
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+        ] {
+            let response = admit_watcher_control(
+                actual,
+                watcher_control_invocation(WatcherControlAction::Stop, presented),
+                &tx,
+            );
+            assert!(!response.ok);
+            assert_eq!(
+                response.error_code.as_deref(),
+                Some("ipc.watcher_control.instance_mismatch")
+            );
+            assert!(matches!(rx.try_recv(), Err(RecvError::Empty)));
+        }
+
+        let shorter_actual = "0123456789abcdef0123456789abcde";
+        let response = admit_watcher_control(
+            shorter_actual,
+            watcher_control_invocation(WatcherControlAction::Reload, actual),
+            &tx,
+        );
+        assert!(!response.ok);
+        assert!(matches!(rx.try_recv(), Err(RecvError::Empty)));
+    }
+
+    #[test]
+    fn watcher_control_admission_reports_exact_ack_queue_full_and_disconnect() {
+        use frankenterm_core::ipc::WatcherControlAction;
+        use frankenterm_core::runtime_async::mpsc;
+
+        let instance_id = "0123456789abcdef0123456789abcdef";
+        let (tx, mut rx) = mpsc::channel(1);
+        let response = admit_watcher_control(
+            instance_id,
+            watcher_control_invocation(WatcherControlAction::Reload, instance_id),
+            &tx,
+        );
+        assert!(response.ok);
+        validate_watcher_control_acknowledgement(
+            &response,
+            WatcherControlAction::Reload,
+            instance_id,
+        )
+        .expect("exact acknowledgement");
+        assert_eq!(rx.try_recv().expect("queued reload"), WatcherControlAction::Reload);
+
+        tx.try_send(WatcherControlAction::Reload)
+            .expect("fill bounded control queue");
+        let full = admit_watcher_control(
+            instance_id,
+            watcher_control_invocation(WatcherControlAction::Stop, instance_id),
+            &tx,
+        );
+        assert!(!full.ok);
+        assert_eq!(
+            full.error_code.as_deref(),
+            Some("ipc.watcher_control.queue_full")
+        );
+        assert_eq!(rx.try_recv().expect("original queued action"), WatcherControlAction::Reload);
+
+        drop(rx);
+        let unavailable = admit_watcher_control(
+            instance_id,
+            watcher_control_invocation(WatcherControlAction::Stop, instance_id),
+            &tx,
+        );
+        assert!(!unavailable.ok);
+        assert_eq!(
+            unavailable.error_code.as_deref(),
+            Some("ipc.watcher_control.unavailable")
+        );
+    }
+
+    #[test]
+    fn watcher_control_ack_validation_fails_closed_on_every_authority_mismatch() {
+        use frankenterm_core::ipc::{IpcResponse, WatcherControlAction};
+
+        let instance_id = "0123456789abcdef0123456789abcdef";
+        let cases = [
+            serde_json::json!({
+                "accepted": false,
+                "action": "stop",
+                "instance_id": instance_id,
+            }),
+            serde_json::json!({
+                "accepted": true,
+                "action": "reload",
+                "instance_id": instance_id,
+            }),
+            serde_json::json!({
+                "accepted": true,
+                "action": "stop",
+                "instance_id": "fedcba9876543210fedcba9876543210",
+            }),
+            serde_json::json!({
+                "accepted": true,
+                "action": "stop",
+                "instance_id": instance_id,
+                "unexpected": true,
+            }),
+        ];
+        for data in cases {
+            assert_eq!(
+                validate_watcher_control_acknowledgement(
+                    &IpcResponse::ok_with_data(data),
+                    WatcherControlAction::Stop,
+                    instance_id,
+                ),
+                Err(WatcherControlRequestFailure::InvalidAcknowledgement)
+            );
+        }
+        assert_eq!(
+            validate_watcher_control_acknowledgement(
+                &IpcResponse::error("static rejection"),
+                WatcherControlAction::Stop,
+                instance_id,
+            ),
+            Err(WatcherControlRequestFailure::Rejected)
+        );
+    }
+
+    #[test]
+    fn watcher_control_auth_selection_prefers_valid_environment_then_write_config() {
+        use frankenterm_core::config::{IpcAuthToken, IpcConfig, IpcScope};
+
+        let mut ipc = IpcConfig::default();
+        assert_eq!(
+            select_watcher_control_auth(&ipc, None, 100),
+            Ok(WatcherControlAuthSelection::Unauthenticated)
+        );
+        assert_eq!(
+            select_watcher_control_auth(&ipc, Some("environment"), 100),
+            Ok(WatcherControlAuthSelection::Environment)
+        );
+
+        ipc.tokens = vec![
+            IpcAuthToken {
+                token: "expired".to_string(),
+                scopes: vec![IpcScope::All],
+                expires_at_ms: Some(100),
+            },
+            IpcAuthToken {
+                token: "read-only".to_string(),
+                scopes: vec![IpcScope::Read],
+                expires_at_ms: None,
+            },
+            IpcAuthToken {
+                token: "writer".to_string(),
+                scopes: vec![IpcScope::Write],
+                expires_at_ms: Some(101),
+            },
+        ];
+        assert_eq!(
+            select_watcher_control_auth(&ipc, Some("writer"), 100),
+            Ok(WatcherControlAuthSelection::Environment)
+        );
+        assert_eq!(
+            select_watcher_control_auth(&ipc, Some("invalid"), 100),
+            Ok(WatcherControlAuthSelection::Configured(2))
+        );
+        assert_eq!(
+            select_watcher_control_auth(&ipc, None, 101),
+            Err(WatcherControlRequestFailure::NoWriteCredential)
+        );
+
+        ipc.tokens[1].scopes.clear();
+        assert_eq!(
+            select_watcher_control_auth(&ipc, None, 101),
+            Ok(WatcherControlAuthSelection::Configured(1))
+        );
+        ipc.enabled = false;
+        assert_eq!(
+            select_watcher_control_auth(&ipc, Some("writer"), 99),
+            Err(WatcherControlRequestFailure::IpcDisabled)
+        );
+    }
+
+    #[test]
+    fn watcher_control_coalescing_makes_stop_dominate_reload_backlog() {
+        use frankenterm_core::ipc::WatcherControlAction;
+        use frankenterm_core::runtime_async::mpsc::{self, RecvError};
+
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(WatcherControlAction::Reload).unwrap();
+        tx.try_send(WatcherControlAction::Stop).unwrap();
+        tx.try_send(WatcherControlAction::Reload).unwrap();
+        assert_eq!(
+            coalesce_watcher_control_action(WatcherControlAction::Reload, &mut rx),
+            WatcherControlAction::Stop
+        );
+        assert!(rx.is_empty());
+
+        tx.try_send(WatcherControlAction::Reload).unwrap();
+        tx.try_send(WatcherControlAction::Reload).unwrap();
+        assert_eq!(
+            coalesce_watcher_control_action(WatcherControlAction::Reload, &mut rx),
+            WatcherControlAction::Reload
+        );
+        assert!(rx.is_empty());
+
+        assert_eq!(
+            classify_watcher_control_receive_failure(RecvError::Cancelled),
+            WatcherControlReceiveFailure::ContextCancelled
+        );
+        assert_eq!(
+            classify_watcher_control_receive_failure(RecvError::Disconnected),
+            WatcherControlReceiveFailure::QueueUnavailable
+        );
+        assert_eq!(
+            classify_watcher_control_receive_failure(RecvError::Empty),
+            WatcherControlReceiveFailure::QueueUnavailable
+        );
+    }
+
+    #[test]
+    fn watcher_control_source_has_no_numeric_pid_signal_path() {
+        let source = include_str!("main.rs");
+        let stop_start = source
+            .find("Some(Commands::Stop { force, timeout })")
+            .expect("stop dispatch source");
+        let stop_tail = &source[stop_start..];
+        let stop_end = stop_tail
+            .find("Some(Commands::Restart { .. })")
+            .expect("stop dispatch boundary");
+        let stop_body = &stop_tail[..stop_end];
+
+        let rules_start = source
+            .find("async fn handle_rules_profile_command(")
+            .expect("rules profile source");
+        let rules_tail = &source[rules_start..];
+        let rules_end = rules_tail
+            .find("/// Handle `ft ext` subcommands")
+            .expect("rules profile boundary");
+        let rules_body = &rules_tail[..rules_end];
+
+        let signal_helper = ["send_unix_", "signal_to_pid"].concat();
+        let raw_kill_program = ["/bin/", "kill"].concat();
+        let kill_signal = ["SIG", "KILL"].concat();
+        let term_signal = ["SIG", "TERM"].concat();
+        let hup_signal = ["SIG", "HUP"].concat();
+        for body in [stop_body, rules_body] {
+            assert!(!body.contains(&signal_helper));
+            assert!(!body.contains(&raw_kill_program));
+            assert!(!body.contains(&kill_signal));
+            assert!(!body.contains(&term_signal));
+            assert!(!body.contains(&hup_signal));
+        }
+    }
+
+    #[test]
+    fn watcher_hot_reload_logs_only_admitted_setting_names() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn reload_watcher_configuration(")
+            .expect("reload implementation source");
+        let tail = &source[start..];
+        let end = tail
+            .find("\n}\n\nfn process_watcher_control_action")
+            .expect("reload implementation boundary");
+        let body = &tail[..end];
+        let old_value = ["old", "_value"].concat();
+        let new_value = ["new", "_value"].concat();
+        let raw_error_field = ["error", " = %"].concat();
+        assert!(!body.contains(&old_value));
+        assert!(!body.contains(&new_value));
+        assert!(!body.contains(&raw_error_field));
+        assert!(body.contains("setting = %change.name"));
+    }
+
+    #[test]
+    fn diagnostic_cleanup_failures_are_typed_and_post_reap_cannot_signal() {
+        let capture_error = DiagnosticCaptureIncomplete {
+            stdout_open: true,
+            stderr_open: false,
+            timeout_ms: 500,
+        }
+        .into_io_error();
+        assert_eq!(capture_error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            DiagnosticCaptureIncomplete::from_io_error(&capture_error),
+            Some(DiagnosticCaptureIncomplete {
+                stdout_open: true,
+                stderr_open: false,
+                timeout_ms: 500,
+            })
+        );
+
+        let injected = std::io::Error::other("/private/AKIAIOSFODNN7EXAMPLE\n\u{202e}");
+        let cleanup = DiagnosticCleanupIncomplete::from_error("command_timeout", &injected);
+        let cleanup_error = cleanup.into_io_error();
+        assert_eq!(
+            DiagnosticCleanupIncomplete::from_io_error(&cleanup_error),
+            Some(cleanup)
+        );
+        let rendered = cleanup_error.to_string();
+        assert!(!rendered.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!rendered.contains('/'));
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\u{202e}'));
+
+        let inner = DiagnosticCleanupIncomplete {
+            trigger: "inner_trigger",
+            failure_kind: "process_tree_not_signalled",
+        }
+        .into_io_error();
+        let remapped = DiagnosticCleanupIncomplete::from_error("outer_trigger", &inner);
+        assert_eq!(remapped.trigger, "outer_trigger");
+        assert_eq!(remapped.failure_kind, "process_tree_not_signalled");
+
+        assert_eq!(
+            diagnostic_termination_failure_kind(false, false),
+            Some("signal_helper_not_settled")
+        );
+        assert_eq!(
+            diagnostic_termination_failure_kind(false, true),
+            Some("signal_helper_not_settled")
+        );
+        assert_eq!(
+            diagnostic_termination_failure_kind(true, false),
+            Some("process_tree_not_signalled")
+        );
+        assert_eq!(diagnostic_termination_failure_kind(true, true), None);
+
+        let source = include_str!("main.rs");
+        let finish_start = source
+            .find("fn finish_reaped_diagnostic_output(")
+            .expect("post-reap finisher source");
+        let finish_tail = &source[finish_start..];
+        let finish_end = finish_tail
+            .find("\n}\n\nfn terminate_and_drain_diagnostic_child")
+            .expect("post-reap finisher source boundary");
+        let finish_body = &finish_tail[..finish_end];
+        assert!(!finish_body.contains("send_signal_to_"));
+        assert!(!finish_body.contains("terminate_diagnostic_process_tree"));
+
+        let terminate_start = source
+            .find("fn terminate_diagnostic_process_tree(")
+            .expect("termination source");
+        let terminate_tail = &source[terminate_start..];
+        let terminate_end = terminate_tail
+            .find("\n}\n\nstruct NonblockingCommandCapture")
+            .expect("termination source boundary");
+        let terminate_body = &terminate_tail[..terminate_end];
+        let probe_position = terminate_body
+            .find("probe_diagnostic_child_with_deadline")
+            .expect("pre-signal status probe");
+        let signal_position = terminate_body
+            .find("send_signal_to_process_group")
+            .expect("process-group signal");
+        assert!(probe_position < signal_position);
+    }
+
+    #[test]
     fn diagnostic_command_capture_retains_only_the_configured_prefix() {
         let exact = read_bounded_command_stream(Cursor::new(b"12345678"), 8)
             .expect("read exact bounded stream");
@@ -101781,6 +103308,11 @@ A  docs/new-proof.md\n";
             parse_wezterm_config_bytes(b"return config"),
             Err(WeztermScrollbackCheckFailure::SettingMissing)
         );
+
+        let before = DiagnosticFileSnapshot::synthetic(128, 1);
+        assert_eq!(before, DiagnosticFileSnapshot::synthetic(128, 1));
+        assert_ne!(before, DiagnosticFileSnapshot::synthetic(129, 1));
+        assert_ne!(before, DiagnosticFileSnapshot::synthetic(128, 2));
     }
 
     #[test]
@@ -101790,6 +103322,7 @@ A  docs/new-proof.md\n";
             WeztermScrollbackCheckFailure::NotRegularFile,
             WeztermScrollbackCheckFailure::Oversized,
             WeztermScrollbackCheckFailure::ReadUnavailable,
+            WeztermScrollbackCheckFailure::ChangedDuringRead,
             WeztermScrollbackCheckFailure::InvalidEncoding,
             WeztermScrollbackCheckFailure::SettingMissing,
             WeztermScrollbackCheckFailure::ConfigMissing,
@@ -101991,12 +103524,25 @@ A  docs/new-proof.md\n";
     #[cfg(feature = "browser")]
     #[test]
     fn diagnostic_browser_profile_incomplete_counts_never_claim_completeness() {
+        assert!(browser_diagnostic_entry_is_within_budget(
+            BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE.saturating_sub(1)
+        ));
+        assert!(!browser_diagnostic_entry_is_within_budget(
+            BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE
+        ));
+        let exact_cap = BrowserProfileDiagnosticCounts {
+            entries_examined: BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE,
+            truncated: false,
+            ..BrowserProfileDiagnosticCounts::default()
+        };
+        assert!(exact_cap.detail().contains("scan=complete"));
+
         let incomplete = BrowserProfileDiagnosticCounts {
             entries_examined: BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE,
-            profiles_observed: 4_000,
-            bootstrapped: 3_000,
-            known_unbootstrapped: 500,
-            metadata_unknown: 500,
+            profiles_observed: 250,
+            bootstrapped: 200,
+            known_unbootstrapped: 25,
+            metadata_unknown: 25,
             entries_unclassified: 3,
             truncated: true,
         };
@@ -102006,11 +103552,11 @@ A  docs/new-proof.md\n";
         );
         assert_eq!(check.status, DiagnosticStatus::Warning);
         let detail = check.detail.expect("truncated scan detail");
-        assert!(detail.contains("entries_examined=4096"));
-        assert!(detail.contains("profiles_observed=4000"));
-        assert!(detail.contains("metadata_unknown=500"));
+        assert!(detail.contains("entries_examined=256"));
+        assert!(detail.contains("profiles_observed=250"));
+        assert!(detail.contains("metadata_unknown=25"));
         assert!(detail.contains("entries_unclassified=3"));
-        assert!(detail.contains("scan=truncated_at_4096_entries"));
+        assert!(detail.contains("scan=truncated_at_256_entries"));
         assert!(detail.contains("omitted_entries=unknown"));
         assert!(!detail.contains('/'));
         assert!(!detail.contains('\\'));

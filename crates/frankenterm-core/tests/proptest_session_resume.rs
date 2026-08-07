@@ -12,6 +12,7 @@ use proptest::prelude::*;
 use serde_json::json;
 
 use frankenterm_core::casr_types::*;
+use frankenterm_core::runtime_async::process::{CommandCleanupTrigger, CommandOutputStream};
 use frankenterm_core::session_resume::*;
 
 // ---------------------------------------------------------------------------
@@ -76,6 +77,23 @@ fn arb_list_entry() -> impl Strategy<Value = CasrListEntry> {
 fn arb_antigravity_uuid() -> impl Strategy<Value = String> {
     proptest::string::string_regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
         .expect("valid Antigravity UUID regex")
+}
+
+fn arb_cleanup_trigger() -> impl Strategy<Value = CommandCleanupTrigger> {
+    prop_oneof![
+        Just(CommandCleanupTrigger::Cancelled),
+        Just(CommandCleanupTrigger::TimedOut),
+        Just(CommandCleanupTrigger::CaptureLimit(
+            CommandOutputStream::Stdout
+        )),
+        Just(CommandCleanupTrigger::CaptureLimit(
+            CommandOutputStream::Stderr
+        )),
+        Just(CommandCleanupTrigger::CaptureRead),
+        Just(CommandCleanupTrigger::StdinWrite),
+        Just(CommandCleanupTrigger::ReadinessPoll),
+        Just(CommandCleanupTrigger::StatusProbe),
+    ]
 }
 
 fn path_has_component(path: &str, component: &str) -> bool {
@@ -543,6 +561,63 @@ proptest! {
         let display = e.to_string();
         let code_str = code.to_string();
         prop_assert!(display.contains(&code_str));
+    }
+
+    // 16a. Cooperative cancellation remains distinct from timeout.
+    #[test]
+    fn error_cancelled_has_stable_structural_display(_content in "[QWXZ]{32,64}") {
+        let display = SessionResumeError::Cancelled.to_string();
+        prop_assert_eq!(display, "casr operation cancelled");
+    }
+
+    // 16b. Incomplete capture exposes only bounded structural detail.
+    #[test]
+    fn error_capture_incomplete_has_structural_display(
+        stdout_open in any::<bool>(),
+        stderr_open in any::<bool>(),
+        drain_timeout_ms in 0_u64..60_000,
+    ) {
+        let display = SessionResumeError::CaptureIncomplete {
+            stdout_open,
+            stderr_open,
+            drain_timeout_ms,
+        }
+        .to_string();
+        prop_assert_eq!(
+            display,
+            format!(
+                "casr output capture incomplete after {drain_timeout_ms} ms (stdout_open={stdout_open}, stderr_open={stderr_open})"
+            )
+        );
+    }
+
+    // 16c. Failed cleanup preserves only structural process state.
+    #[test]
+    fn error_cleanup_incomplete_has_structural_display(
+        trigger in arb_cleanup_trigger(),
+        leader_reaped in any::<bool>(),
+        signal_helper_settled in any::<bool>(),
+        process_tree_signalled in any::<bool>(),
+        stdout_open in any::<bool>(),
+        stderr_open in any::<bool>(),
+        settle_timeout_ms in 0_u64..60_000,
+    ) {
+        let display = SessionResumeError::CleanupIncomplete {
+            trigger,
+            leader_reaped,
+            signal_helper_settled,
+            process_tree_signalled,
+            stdout_open,
+            stderr_open,
+            settle_timeout_ms,
+        }
+        .to_string();
+        prop_assert_eq!(
+            display,
+            format!(
+                "casr process cleanup incomplete after {settle_timeout_ms} ms (trigger={trigger}, leader_reaped={leader_reaped}, signal_helper_settled={signal_helper_settled}, process_tree_signalled={process_tree_signalled}, stdout_open={stdout_open}, stderr_open={stderr_open})"
+            )
+        );
     }
 
     // 17. provider_from_list_entry maps known slugs

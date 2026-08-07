@@ -106,6 +106,7 @@ flate2.workspace = true
 zstd.workspace = true
 
 base64 = "0.22.1"
+url.workspace = true
 crossbeam.workspace = true
 shlex.workspace = true
 shell-words.workspace = true

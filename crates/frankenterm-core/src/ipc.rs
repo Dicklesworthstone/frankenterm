@@ -21,6 +21,7 @@ use socket_transport::{AsyncReadExt, AsyncWriteExt, UnixListener, UnixStream};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{IpcAuthToken, IpcScope, SearchConfig};
@@ -38,6 +39,8 @@ pub const MAX_MESSAGE_SIZE: usize = crate::tuning_config::IpcTuning::DEFAULT_MAX
 const IPC_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 #[cfg(any(unix, windows))]
 const IPC_CONNECTION_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+static IPC_INITIAL_REQUEST_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+static IPC_WRITE_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IpcConnectionTaskDrainOutcome {
@@ -50,6 +53,71 @@ enum IpcConnectionTaskDrainOutcome {
         active_tasks: usize,
         unacknowledged_tasks: usize,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpcConnectionAdmission {
+    Admit,
+    RejectAtCapacity,
+}
+
+fn classify_ipc_connection_admission(
+    active_connections: usize,
+    max_concurrent_connections: usize,
+) -> IpcConnectionAdmission {
+    if active_connections < max_concurrent_connections {
+        IpcConnectionAdmission::Admit
+    } else {
+        IpcConnectionAdmission::RejectAtCapacity
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpcLineReadDeadlineOutcome {
+    Completed,
+    TimedOut,
+}
+
+fn classify_ipc_line_read_deadline(timed_out: bool) -> IpcLineReadDeadlineOutcome {
+    if timed_out {
+        IpcLineReadDeadlineOutcome::TimedOut
+    } else {
+        IpcLineReadDeadlineOutcome::Completed
+    }
+}
+
+fn remaining_ipc_io_budget(limit: Duration, elapsed: Duration) -> Option<Duration> {
+    limit
+        .checked_sub(elapsed)
+        .filter(|remaining| !remaining.is_zero())
+}
+
+fn record_ipc_initial_request_timeout() {
+    let timeout_count = IPC_INITIAL_REQUEST_TIMEOUT_COUNT
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    if timeout_count.is_power_of_two() {
+        tracing::warn!(
+            event = "ipc_initial_request_line_timeout",
+            error_class = "ipc_initial_request_deadline_exceeded",
+            timeout_count,
+            "IPC connection closed before its initial request line completed"
+        );
+    }
+}
+
+fn record_ipc_write_timeout() {
+    let timeout_count = IPC_WRITE_TIMEOUT_COUNT
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    if timeout_count.is_power_of_two() {
+        tracing::warn!(
+            event = "ipc_write_timeout",
+            error_class = "ipc_write_deadline_exceeded",
+            timeout_count,
+            "IPC peer write failed to settle before the finite deadline"
+        );
+    }
 }
 
 fn classify_ipc_connection_task_drain(
@@ -89,7 +157,7 @@ mod socket_transport {
         use std::path::Path;
         use std::time::Duration;
 
-        pub use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+        pub use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
         pub use frankenterm_uds::UnixStream;
 
         pub struct UnixListener {
@@ -222,11 +290,52 @@ mod socket_transport {
 pub struct IpcRuntimeLimits {
     pub max_message_size: usize,
     pub accept_poll_interval_ms: u64,
+    pub max_concurrent_connections: usize,
+    pub initial_request_timeout_ms: u64,
+    pub io_timeout_ms: u64,
 }
 
 impl IpcRuntimeLimits {
     fn accept_poll_interval(self) -> Duration {
         Duration::from_millis(self.accept_poll_interval_ms)
+    }
+
+    fn initial_request_timeout(self) -> Duration {
+        Duration::from_millis(self.initial_request_timeout_ms)
+    }
+
+    fn io_timeout(self) -> Duration {
+        Duration::from_millis(self.io_timeout_ms)
+    }
+
+    fn resource_bounds_are_valid(self) -> bool {
+        (crate::tuning_config::IpcTuning::MIN_MAX_MESSAGE_SIZE
+            ..=crate::tuning_config::IpcTuning::MAX_MAX_MESSAGE_SIZE)
+            .contains(&self.max_message_size)
+            && (crate::tuning_config::IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS
+                ..=crate::tuning_config::IpcTuning::MAX_ACCEPT_POLL_INTERVAL_MS)
+                .contains(&self.accept_poll_interval_ms)
+            && (crate::tuning_config::IpcTuning::MIN_MAX_CONCURRENT_CONNECTIONS
+                ..=crate::tuning_config::IpcTuning::MAX_MAX_CONCURRENT_CONNECTIONS)
+                .contains(&self.max_concurrent_connections)
+            && (crate::tuning_config::IpcTuning::MIN_INITIAL_REQUEST_TIMEOUT_MS
+                ..=crate::tuning_config::IpcTuning::MAX_INITIAL_REQUEST_TIMEOUT_MS)
+                .contains(&self.initial_request_timeout_ms)
+            && (crate::tuning_config::IpcTuning::MIN_IO_TIMEOUT_MS
+                ..=crate::tuning_config::IpcTuning::MAX_IO_TIMEOUT_MS)
+                .contains(&self.io_timeout_ms)
+            && crate::tuning_config::IpcTuning {
+                max_message_size: self.max_message_size,
+                accept_poll_interval_ms: self.accept_poll_interval_ms,
+                max_concurrent_connections: self.max_concurrent_connections,
+                initial_request_timeout_ms: self.initial_request_timeout_ms,
+                io_timeout_ms: self.io_timeout_ms,
+            }
+            .aggregate_request_buffer_bytes()
+            .is_some_and(|bytes| {
+                bytes
+                    <= crate::tuning_config::IpcTuning::MAX_AGGREGATE_REQUEST_BUFFER_BYTES
+            })
     }
 
     fn message_read_limit_for(max_message_size: usize) -> u64 {
@@ -255,12 +364,105 @@ pub fn resolve_limits(tuning: Option<&crate::tuning_config::IpcTuning>) -> IpcRu
         Some(tuning) => IpcRuntimeLimits {
             max_message_size: tuning.max_message_size,
             accept_poll_interval_ms: tuning.accept_poll_interval_ms,
+            max_concurrent_connections: tuning.max_concurrent_connections,
+            initial_request_timeout_ms: tuning.initial_request_timeout_ms,
+            io_timeout_ms: tuning.io_timeout_ms,
         },
         None => IpcRuntimeLimits {
             max_message_size: MAX_MESSAGE_SIZE,
             accept_poll_interval_ms:
                 crate::tuning_config::IpcTuning::DEFAULT_ACCEPT_POLL_INTERVAL_MS,
+            max_concurrent_connections:
+                crate::tuning_config::IpcTuning::DEFAULT_MAX_CONCURRENT_CONNECTIONS,
+            initial_request_timeout_ms:
+                crate::tuning_config::IpcTuning::DEFAULT_INITIAL_REQUEST_TIMEOUT_MS,
+            io_timeout_ms: crate::tuning_config::IpcTuning::DEFAULT_IO_TIMEOUT_MS,
         },
+    }
+}
+
+#[cfg(any(unix, windows))]
+struct BoundedIpcJsonBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+#[cfg(any(unix, windows))]
+impl BoundedIpcJsonBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(4096)),
+            limit,
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl std::io::Write for BoundedIpcJsonBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if bytes.len() > remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IPC JSON exceeded the configured message size",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn serialize_ipc_json_bounded<T>(value: &T, max_message_size: usize) -> std::io::Result<Vec<u8>>
+where
+    T: Serialize + ?Sized,
+{
+    let mut output = BoundedIpcJsonBuffer::new(max_message_size);
+    serde_json::to_writer(&mut output, value).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "IPC JSON serialization failed within the configured message size",
+        )
+    })?;
+    Ok(output.bytes)
+}
+
+#[cfg(any(unix, windows))]
+async fn write_ipc_line_with_deadline<W>(
+    cx: &crate::cx::Cx,
+    writer: &mut W,
+    io_timeout: Duration,
+    max_message_size: usize,
+    line: &[u8],
+) -> std::io::Result<()>
+where
+    W: socket_transport::AsyncWrite + Unpin,
+{
+    if line.len() > max_message_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "IPC outbound line exceeded the configured message size",
+        ));
+    }
+    match crate::runtime_async::timeout_with_cx(cx, io_timeout, async {
+        writer.write_all(line).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            record_ipc_write_timeout();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "IPC write deadline exceeded",
+            ))
+        }
     }
 }
 
@@ -502,6 +704,14 @@ pub enum IpcRequest {
         /// Pane ID to modify
         pane_id: u64,
     },
+    /// Ask the owning watcher instance to perform one cooperative control
+    /// action. The expected instance identity is checked by the watcher before
+    /// it acknowledges or enqueues the action; it is never interpreted as a
+    /// numeric process identifier.
+    WatcherControl {
+        /// Strict typed control payload.
+        control: WatcherControlRequest,
+    },
     /// RPC request forwarded to robot handlers.
     Rpc {
         /// Robot command arguments (e.g., ["state"] or ["send", "1", "ls"]).
@@ -539,10 +749,43 @@ impl IpcRequest {
             Self::UserVar { .. } => IpcScope::Write,
             Self::Ping | Self::Status | Self::PaneState { .. } => IpcScope::Read,
             Self::SubscribeEvents { .. } => IpcScope::Read,
-            Self::SetPanePriority { .. } | Self::ClearPanePriority { .. } => IpcScope::Write,
+            Self::SetPanePriority { .. }
+            | Self::ClearPanePriority { .. }
+            | Self::WatcherControl { .. } => IpcScope::Write,
             Self::Rpc { args } => rpc_required_scope(args),
         }
     }
+}
+
+/// Cooperative watcher action carried over the local IPC transport.
+///
+/// The socket's filesystem policy and `IpcScope::Write` gate always apply;
+/// token authentication applies when the endpoint is configured with tokens.
+/// The watcher handler independently binds the request to one exact lock
+/// acquisition through [`WatcherControlRequest::expected_instance_id`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatcherControlAction {
+    /// Begin the watcher's ordinary receipt-producing graceful shutdown.
+    Stop,
+    /// Reload the hot-reloadable configuration in the owning watcher.
+    Reload,
+}
+
+/// Strict watcher-control request.
+///
+/// `expected_instance_id` is the collision-resistant identity from the exact
+/// holder-locked [`crate::lock::LockMetadata`] record admitted by the caller.
+/// The watcher compares it with its own acquired guard before accepting the
+/// action. A PID is intentionally absent: a numeric PID can be recycled after
+/// any userspace preflight check and therefore cannot authorize a signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatcherControlRequest {
+    /// Requested cooperative action.
+    pub action: WatcherControlAction,
+    /// Exact per-acquisition watcher instance identity expected by the caller.
+    pub expected_instance_id: String,
 }
 
 fn rpc_required_scope(args: &[String]) -> IpcScope {
@@ -705,6 +948,30 @@ pub struct IpcRpcRequest {
 pub type IpcRpcHandler = Arc<
     dyn Fn(
             IpcRpcRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IpcResponse> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Parsed watcher-control invocation forwarded to the watcher-owned handler.
+pub struct IpcWatcherControlInvocation {
+    /// Strict action and expected instance identity from the wire request.
+    pub control: WatcherControlRequest,
+    /// Optional caller correlation identity from the IPC envelope.
+    pub request_id: Option<String>,
+}
+
+/// Watcher-owned cooperative control handler.
+///
+/// Keeping this distinct from [`IpcRpcHandler`] prevents a generic robot argv
+/// vector from impersonating a control request inside the server. Transport
+/// authentication and `IpcScope::Write` authorization occur before this
+/// callback, while the callback remains responsible for exact watcher-instance
+/// matching and bounded queue admission. Socket-policy authorization and any
+/// configured token authentication occur before this callback.
+pub type IpcWatcherControlHandler = Arc<
+    dyn Fn(
+            IpcWatcherControlInvocation,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IpcResponse> + Send>>
         + Send
         + Sync,
@@ -892,6 +1159,8 @@ pub struct IpcHandlerContext {
     pub auth: Option<IpcAuth>,
     /// Optional RPC handler (robot/MCP parity).
     pub rpc_handler: Option<IpcRpcHandler>,
+    /// Optional watcher-owned cooperative stop/reload handler.
+    pub watcher_control_handler: Option<IpcWatcherControlHandler>,
     /// Optional search configuration for IPC status enrichment.
     pub search_config: Option<SearchConfig>,
     // NOTE: rate_limiter field was removed in v0.2.0 (StatusUpdate removed)
@@ -906,6 +1175,7 @@ impl IpcHandlerContext {
             registry: None,
             auth: None,
             rpc_handler: None,
+            watcher_control_handler: None,
             search_config: None,
         }
     }
@@ -918,6 +1188,7 @@ impl IpcHandlerContext {
             registry: Some(registry),
             auth: None,
             rpc_handler: None,
+            watcher_control_handler: None,
             search_config: None,
         }
     }
@@ -934,6 +1205,7 @@ impl IpcHandlerContext {
             registry,
             auth,
             rpc_handler: None,
+            watcher_control_handler: None,
             search_config: None,
         }
     }
@@ -958,11 +1230,33 @@ impl IpcHandlerContext {
         rpc_handler: Option<IpcRpcHandler>,
         search_config: Option<SearchConfig>,
     ) -> Self {
+        Self::with_auth_rpc_control_and_search_config(
+            event_bus,
+            registry,
+            auth,
+            rpc_handler,
+            None,
+            search_config,
+        )
+    }
+
+    /// Create a handler context with optional auth, RPC, watcher control, and
+    /// search configuration.
+    #[must_use]
+    pub fn with_auth_rpc_control_and_search_config(
+        event_bus: Arc<EventBus>,
+        registry: Option<Arc<RwLock<PaneRegistry>>>,
+        auth: Option<IpcAuth>,
+        rpc_handler: Option<IpcRpcHandler>,
+        watcher_control_handler: Option<IpcWatcherControlHandler>,
+        search_config: Option<SearchConfig>,
+    ) -> Self {
         Self {
             event_bus,
             registry,
             auth,
             rpc_handler,
+            watcher_control_handler,
             search_config,
         }
     }
@@ -1067,6 +1361,13 @@ impl IpcServer {
                 format!("ipc bind cancelled: {err}"),
             )
         })?;
+
+        if !limits.resource_bounds_are_valid() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid IPC connection or line-read resource limits",
+            ));
+        }
 
         let socket_path = socket_path.as_ref().to_path_buf();
 
@@ -1197,6 +1498,7 @@ impl IpcServer {
         shutdown_rx: &mut mpsc::Receiver<()>,
     ) {
         let mut connection_tasks = crate::runtime_async::task::JoinSet::new();
+        let mut rejected_connections_total = 0_u64;
         let limits = self.limits;
 
         loop {
@@ -1232,23 +1534,70 @@ impl IpcServer {
                         drop(stream);
                         break;
                     }
-                    let ctx = ctx.clone();
-                    connection_tasks.spawn_with_cx(cx, move |child_cx| async move {
-                        if handle_client_with_context_with_cx(
-                            child_cx,
-                            stream,
-                            ctx,
-                            limits.max_message_size,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            tracing::warn!(
-                                error_class = "ipc_client_handler_failed",
-                                "IPC client error"
+
+                    // Reap terminal handlers before making the admission
+                    // decision. JoinSet retains completed entries until they
+                    // are joined, so using its raw length first would reject
+                    // healthy clients after short-lived requests complete.
+                    while let Some(join_result) = connection_tasks.try_join_next() {
+                        if join_result.is_err() {
+                            tracing::debug!(
+                                error_class = "ipc_client_task_join_failed",
+                                "IPC client task failed"
                             );
                         }
-                    });
+                    }
+
+                    match classify_ipc_connection_admission(
+                        connection_tasks.len(),
+                        limits.max_concurrent_connections,
+                    ) {
+                        IpcConnectionAdmission::Admit => {
+                            let ctx = ctx.clone();
+                            let active_before_spawn = connection_tasks.len();
+                            connection_tasks.spawn_with_cx(cx, move |child_cx| async move {
+                                if handle_client_with_context_with_cx(
+                                    child_cx,
+                                    stream,
+                                    ctx,
+                                    limits,
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    tracing::warn!(
+                                        error_class = "ipc_client_handler_failed",
+                                        "IPC client error"
+                                    );
+                                }
+                            });
+                            debug_assert_eq!(
+                                connection_tasks.len(),
+                                active_before_spawn.saturating_add(1)
+                            );
+                            debug_assert!(
+                                connection_tasks.len() <= limits.max_concurrent_connections
+                            );
+                        }
+                        IpcConnectionAdmission::RejectAtCapacity => {
+                            // Do not enqueue a task or retain the accepted FD.
+                            // Telemetry is deliberately fixed/content-free: an
+                            // unauthenticated peer cannot inject log content.
+                            // Emit at powers of two so a connection storm
+                            // cannot turn this guardrail into a log-volume DoS.
+                            rejected_connections_total =
+                                rejected_connections_total.saturating_add(1);
+                            if rejected_connections_total.is_power_of_two() {
+                                tracing::warn!(
+                                    event = "ipc_connection_rejected_at_capacity",
+                                    error_class = "ipc_connection_capacity_exhausted",
+                                    rejected_connections_total,
+                                    "IPC connection rejected at capacity"
+                                );
+                            }
+                            drop(stream);
+                        }
+                    }
                 }
                 Ok(Err(e)) => {
                     tracing::error!(error_kind = ?e.kind(), "Failed to accept IPC connection");
@@ -1257,8 +1606,11 @@ impl IpcServer {
             }
 
             while let Some(join_result) = connection_tasks.try_join_next() {
-                if let Err(join_err) = join_result {
-                    tracing::debug!(error = %join_err, "IPC client task failed");
+                if join_result.is_err() {
+                    tracing::debug!(
+                        error_class = "ipc_client_task_join_failed",
+                        "IPC client task failed"
+                    );
                 }
             }
         }
@@ -1272,9 +1624,9 @@ impl IpcServer {
                 loop {
                     match connection_tasks.drain_next_with_cx(&drain_cx).await {
                         Ok(Some(join_result)) => {
-                            if let Err(join_err) = join_result {
+                            if join_result.is_err() {
                                 tracing::debug!(
-                                    error = %join_err,
+                                    error_class = "ipc_client_task_join_failed_during_shutdown",
                                     "IPC client task failed during shutdown"
                                 );
                             }
@@ -1422,13 +1774,41 @@ impl IpcServer {
         auth: Option<IpcAuth>,
         rpc_handler: Option<IpcRpcHandler>,
         search_config: Option<SearchConfig>,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        self.run_with_registry_auth_rpc_control_and_search_config_with_cx(
+            cx,
+            event_bus,
+            registry,
+            auth,
+            rpc_handler,
+            None,
+            search_config,
+            shutdown_rx,
+        )
+        .await;
+    }
+
+    /// Run with the complete watcher context, including cooperative control.
+    // IPC bootstrap keeps every authority-bearing optional handler explicit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_with_registry_auth_rpc_control_and_search_config_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+        event_bus: Arc<EventBus>,
+        registry: Arc<RwLock<PaneRegistry>>,
+        auth: Option<IpcAuth>,
+        rpc_handler: Option<IpcRpcHandler>,
+        watcher_control_handler: Option<IpcWatcherControlHandler>,
+        search_config: Option<SearchConfig>,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
-        let ctx = Arc::new(IpcHandlerContext::with_auth_rpc_and_search_config(
+        let ctx = Arc::new(IpcHandlerContext::with_auth_rpc_control_and_search_config(
             event_bus,
             Some(registry),
             auth,
             rpc_handler,
+            watcher_control_handler,
             search_config,
         ));
         self.run_with_context_with_cx(cx, ctx, &mut shutdown_rx)
@@ -1682,6 +2062,24 @@ impl IpcServer {
         tracing::warn!("IPC server not supported on this platform");
         Self::recv_shutdown_with_cx(cx, &mut shutdown_rx).await;
     }
+
+    /// Cx-first unsupported-platform server wait with cooperative watcher
+    /// control in the explicit context.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_with_registry_auth_rpc_control_and_search_config_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+        _event_bus: Arc<EventBus>,
+        _registry: Arc<RwLock<PaneRegistry>>,
+        _auth: Option<IpcAuth>,
+        _rpc_handler: Option<IpcRpcHandler>,
+        _watcher_control_handler: Option<IpcWatcherControlHandler>,
+        _search_config: Option<SearchConfig>,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        tracing::warn!("IPC server not supported on this platform");
+        Self::recv_shutdown_with_cx(cx, &mut shutdown_rx).await;
+    }
 }
 
 /// Handle a single client connection with full context.
@@ -1690,20 +2088,20 @@ impl IpcServer {
 ///
 /// Threads the caller's cx into the request dispatcher so registry
 /// lock acquires (via `handle_request_with_context_with_cx`) honor
-/// cancellation from the parent run loop. The line-reading and
-/// response-write paths are left on the legacy IO adapters; those
-/// are already bounded by the configured IPC message limit and the short-lived
-/// request-response lifetime of a single connection, so the
-/// primary value of the cx seam is interrupting slow lock waits
-/// during server shutdown.
+/// cancellation from the parent run loop. The first request-line read is
+/// additionally protected by a finite wall-clock deadline because the
+/// underlying line stream only observes `Cx` at its pre-read checkpoint.
+/// A successfully admitted event subscription remains streaming after that
+/// first-line deadline, until disconnect or watcher cancellation.
 #[cfg(unix)]
 async fn handle_client_with_context_with_cx(
     cx: crate::cx::Cx,
     stream: UnixStream,
     ctx: Arc<IpcHandlerContext>,
-    max_message_size: usize,
+    limits: IpcRuntimeLimits,
 ) -> std::io::Result<()> {
     let start = Instant::now();
+    let max_message_size = limits.max_message_size;
     let (reader, mut writer) = stream.into_split();
 
     let bounded_reader = reader.take(IpcRuntimeLimits::message_read_limit_for(max_message_size));
@@ -1717,27 +2115,37 @@ async fn handle_client_with_context_with_cx(
         socket_transport::buffered(bounded_reader),
         IpcRuntimeLimits::line_cap_for(max_message_size),
     );
-    // Tick 200 (ft-xbnl0.2.3): route the request-line read through
-    // next_line_with_cx(&cx, ...) so the pre-read checkpoint honors
-    // the caller's explicit cx. Previously used the ambient
-    // next_line() — which returns whenever the stream yields but
-    // doesn't observe cx cancellation at the entry checkpoint. A
-    // client that hangs without sending a full line would block
-    // the handler indefinitely even under an outer cx cancel.
-    let Some(line) = socket_transport::next_line_with_cx(&cx, &mut lines).await? else {
+    let request_line = crate::runtime_async::timeout_with_cx(
+        &cx,
+        limits.initial_request_timeout(),
+        socket_transport::next_line_with_cx(&cx, &mut lines),
+    )
+    .await;
+    if classify_ipc_line_read_deadline(request_line.is_err())
+        == IpcLineReadDeadlineOutcome::TimedOut
+    {
+        record_ipc_initial_request_timeout();
+        return Ok(());
+    }
+    let Some(request_line) = request_line.ok() else {
+        unreachable!("completed IPC request-line deadline must retain its read result");
+    };
+    let Some(line) = request_line? else {
         return Ok(());
     };
 
     if line.len() > max_message_size {
         let response = IpcResponse::error("message too large");
-        let response_json = serde_json::to_string(&response)
-            .unwrap_or_else(|_| r#"{"error":"message too large"}"#.to_string());
-        writer.write_all(response_json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        // ft-kccj8: flush before close like every other error arm, so
-        // the typed rejection reaches the peer instead of dying in a
-        // buffered writer.
-        writer.flush().await?;
+        let response_json = serialize_ipc_json_bounded(&response, limits.max_message_size)
+            .unwrap_or_else(|_| br#"{"error":"message too large"}"#.to_vec());
+        write_ipc_line_with_deadline(
+            &cx,
+            &mut writer,
+            limits.io_timeout(),
+            limits.max_message_size,
+            response_json.as_slice(),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1745,11 +2153,18 @@ async fn handle_client_with_context_with_cx(
         Ok(envelope) => envelope,
         Err(e) => {
             let response = IpcResponse::error(format!("invalid request: {e}")).with_timing(start);
-            let response_json = serde_json::to_string(&response)
-                .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
-            writer.write_all(response_json.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
+            let response_json = serialize_ipc_json_bounded(&response, limits.max_message_size)
+                .unwrap_or_else(|_| {
+                    br#"{"error":"response serialization failed"}"#.to_vec()
+                });
+            write_ipc_line_with_deadline(
+                &cx,
+                &mut writer,
+                limits.io_timeout(),
+                limits.max_message_size,
+                response_json.as_slice(),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -1758,11 +2173,18 @@ async fn handle_client_with_context_with_cx(
         let presented = envelope.token.as_deref(); // ubs:ignore - validates request credential, not a literal secret.
         if let Err(err) = auth.authorize(presented, envelope.request.required_scope()) {
             let response = IpcResponse::error(err.message()).with_timing(start);
-            let response_json = serde_json::to_string(&response)
-                .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
-            writer.write_all(response_json.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
+            let response_json = serialize_ipc_json_bounded(&response, limits.max_message_size)
+                .unwrap_or_else(|_| {
+                    br#"{"error":"response serialization failed"}"#.to_vec()
+                });
+            write_ipc_line_with_deadline(
+                &cx,
+                &mut writer,
+                limits.io_timeout(),
+                limits.max_message_size,
+                response_json.as_slice(),
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -1786,6 +2208,8 @@ async fn handle_client_with_context_with_cx(
             severity.clone(),
             rule_id.clone(),
             *heartbeat_interval_ms,
+            limits.io_timeout(),
+            limits.max_message_size,
         )
         .await;
     }
@@ -1793,11 +2217,16 @@ async fn handle_client_with_context_with_cx(
     let response = handle_request_with_context_with_cx(&cx, envelope, &ctx).await;
     let response = response.with_timing(start);
 
-    let response_json = serde_json::to_string(&response)
-        .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
-    writer.write_all(response_json.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
+    let response_json = serialize_ipc_json_bounded(&response, limits.max_message_size)
+        .unwrap_or_else(|_| br#"{"error":"response exceeded configured message size"}"#.to_vec());
+    write_ipc_line_with_deadline(
+        &cx,
+        &mut writer,
+        limits.io_timeout(),
+        limits.max_message_size,
+        response_json.as_slice(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -1807,9 +2236,10 @@ async fn handle_client_with_context_with_cx(
     cx: crate::cx::Cx,
     mut stream: UnixStream,
     ctx: Arc<IpcHandlerContext>,
-    max_message_size: usize,
+    limits: IpcRuntimeLimits,
 ) -> std::io::Result<()> {
     let start = Instant::now();
+    let max_message_size = limits.max_message_size;
 
     let line = {
         let bounded_reader =
@@ -1821,7 +2251,22 @@ async fn handle_client_with_context_with_cx(
             socket_transport::buffered(bounded_reader),
             IpcRuntimeLimits::line_cap_for(max_message_size),
         );
-        let Some(line) = socket_transport::next_line_with_cx(&cx, &mut lines).await? else {
+        let request_line = crate::runtime_async::timeout_with_cx(
+            &cx,
+            limits.initial_request_timeout(),
+            socket_transport::next_line_with_cx(&cx, &mut lines),
+        )
+        .await;
+        if classify_ipc_line_read_deadline(request_line.is_err())
+            == IpcLineReadDeadlineOutcome::TimedOut
+        {
+            record_ipc_initial_request_timeout();
+            return Ok(());
+        }
+        let Some(request_line) = request_line.ok() else {
+            unreachable!("completed IPC request-line deadline must retain its read result");
+        };
+        let Some(line) = request_line? else {
             return Ok(());
         };
         line
@@ -1829,13 +2274,16 @@ async fn handle_client_with_context_with_cx(
 
     if line.len() > max_message_size {
         let response = IpcResponse::error("message too large");
-        let response_json = serde_json::to_string(&response)
-            .unwrap_or_else(|_| r#"{"error":"message too large"}"#.to_string());
-        stream.write_all(response_json.as_bytes()).await?;
-        stream.write_all(b"\n").await?;
-        // ft-kccj8: flush before close so the typed rejection is
-        // observable by the peer.
-        stream.flush().await?;
+        let response_json = serialize_ipc_json_bounded(&response, limits.max_message_size)
+            .unwrap_or_else(|_| br#"{"error":"message too large"}"#.to_vec());
+        write_ipc_line_with_deadline(
+            &cx,
+            &mut stream,
+            limits.io_timeout(),
+            limits.max_message_size,
+            response_json.as_slice(),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1843,11 +2291,18 @@ async fn handle_client_with_context_with_cx(
         Ok(envelope) => envelope,
         Err(e) => {
             let response = IpcResponse::error(format!("invalid request: {e}")).with_timing(start);
-            let response_json = serde_json::to_string(&response)
-                .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
-            stream.write_all(response_json.as_bytes()).await?;
-            stream.write_all(b"\n").await?;
-            stream.flush().await?;
+            let response_json = serialize_ipc_json_bounded(&response, limits.max_message_size)
+                .unwrap_or_else(|_| {
+                    br#"{"error":"response serialization failed"}"#.to_vec()
+                });
+            write_ipc_line_with_deadline(
+                &cx,
+                &mut stream,
+                limits.io_timeout(),
+                limits.max_message_size,
+                response_json.as_slice(),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -1856,11 +2311,18 @@ async fn handle_client_with_context_with_cx(
         let presented = envelope.token.as_deref(); // ubs:ignore - validates request credential, not a literal secret.
         if let Err(err) = auth.authorize(presented, envelope.request.required_scope()) {
             let response = IpcResponse::error(err.message()).with_timing(start);
-            let response_json = serde_json::to_string(&response)
-                .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
-            stream.write_all(response_json.as_bytes()).await?;
-            stream.write_all(b"\n").await?;
-            stream.flush().await?;
+            let response_json = serialize_ipc_json_bounded(&response, limits.max_message_size)
+                .unwrap_or_else(|_| {
+                    br#"{"error":"response serialization failed"}"#.to_vec()
+                });
+            write_ipc_line_with_deadline(
+                &cx,
+                &mut stream,
+                limits.io_timeout(),
+                limits.max_message_size,
+                response_json.as_slice(),
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -1873,11 +2335,16 @@ async fn handle_client_with_context_with_cx(
     let response = handle_request_with_context_with_cx(&cx, envelope, &ctx).await;
     let response = response.with_timing(start);
 
-    let response_json = serde_json::to_string(&response)
-        .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
-    stream.write_all(response_json.as_bytes()).await?;
-    stream.write_all(b"\n").await?;
-    stream.flush().await?;
+    let response_json = serialize_ipc_json_bounded(&response, limits.max_message_size)
+        .unwrap_or_else(|_| br#"{"error":"response exceeded configured message size"}"#.to_vec());
+    write_ipc_line_with_deadline(
+        &cx,
+        &mut stream,
+        limits.io_timeout(),
+        limits.max_message_size,
+        response_json.as_slice(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -2036,7 +2503,8 @@ fn subscribe_event_record(
 /// client as NDJSON, one already-redacted record per line. Persisted detections
 /// carry `cursor = <storage event id>`; live-only signal records carry
 /// `cursor = null`. Idle heartbeats keep the stream live and surface a closed
-/// consumer (the next write fails). Returns `Ok(())` when the consumer
+/// or non-reading consumer (the next write fails or reaches its finite I/O
+/// deadline). Returns `Ok(())` when the consumer
 /// disconnects (broken pipe) or the watcher cx is cancelled — a cancelled cx
 /// ends the stream within at most one heartbeat interval.
 #[cfg(unix)]
@@ -2048,6 +2516,8 @@ async fn stream_subscribe_events<W>(
     severity: Option<String>,
     rule_glob: Option<String>,
     heartbeat_interval_ms: u64,
+    io_timeout: Duration,
+    max_message_size: usize,
 ) -> std::io::Result<()>
 where
     W: socket_transport::AsyncWrite + Unpin,
@@ -2120,12 +2590,17 @@ where
             }
         };
 
-        let mut buf = serde_json::to_string(&record).unwrap_or_default();
-        buf.push('\n');
-        if writer.write_all(buf.as_bytes()).await.is_err() {
-            return Ok(()); // consumer closed the pipe
-        }
-        if writer.flush().await.is_err() {
+        let buf = serialize_ipc_json_bounded(&record, max_message_size)?;
+        if write_ipc_line_with_deadline(
+            cx,
+            writer,
+            io_timeout,
+            max_message_size,
+            buf.as_slice(),
+        )
+            .await
+            .is_err()
+        {
             return Ok(());
         }
     }
@@ -2260,6 +2735,20 @@ async fn handle_request_with_context(
             ttl_ms,
         } => handle_set_pane_priority(pane_id, priority, ttl_ms, ctx).await,
         IpcRequest::ClearPanePriority { pane_id } => handle_clear_pane_priority(pane_id, ctx).await,
+        IpcRequest::WatcherControl { control } => {
+            let Some(handler) = ctx.watcher_control_handler.as_ref() else {
+                return IpcResponse::error_with_code(
+                    "ipc.watcher_control.unavailable",
+                    "Watcher control is unavailable on this IPC endpoint",
+                    None,
+                );
+            };
+            handler(IpcWatcherControlInvocation {
+                control,
+                request_id: envelope.request_id,
+            })
+            .await
+        }
         IpcRequest::Rpc { args } => {
             let Some(handler) = ctx.rpc_handler.as_ref() else {
                 return IpcResponse::error("rpc handler not configured");
@@ -2610,6 +3099,7 @@ async fn handle_clear_pane_priority_with_cx(
 pub struct IpcClient {
     socket_path: PathBuf,
     auth_token: Option<String>,
+    limits: IpcRuntimeLimits,
 }
 
 impl IpcClient {
@@ -2619,6 +3109,7 @@ impl IpcClient {
         Self {
             socket_path: socket_path.as_ref().to_path_buf(),
             auth_token: std::env::var("FT_IPC_TOKEN").ok(),
+            limits: resolve_limits(None),
         }
     }
 
@@ -2628,7 +3119,25 @@ impl IpcClient {
         Self {
             socket_path: socket_path.as_ref().to_path_buf(),
             auth_token: Some(token.into()),
+            limits: resolve_limits(None),
         }
+    }
+
+    /// Replace the client's runtime limits after validating the connection and
+    /// line-read resource bounds.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when a connection or line-read limit falls
+    /// outside the supported finite range.
+    pub fn try_with_runtime_limits(mut self, limits: IpcRuntimeLimits) -> std::io::Result<Self> {
+        if !limits.resource_bounds_are_valid() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid IPC connection or line-read resource limits",
+            ));
+        }
+        self.limits = limits;
+        Ok(self)
     }
 
     /// Update the auth token (use `None` to clear).
@@ -2801,6 +3310,36 @@ impl IpcClient {
             .await
     }
 
+    /// Request one instance-bound cooperative watcher action.
+    ///
+    /// The server still performs the authoritative instance comparison. This
+    /// method merely preserves the strict typed payload over the bounded IPC
+    /// transport; it never converts the identity into a PID or signal target.
+    pub async fn watcher_control(
+        &self,
+        control: WatcherControlRequest,
+        request_id: Option<String>,
+    ) -> Result<IpcResponse, UserVarError> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.watcher_control_with_cx(&cx, control, request_id)
+            .await
+    }
+
+    /// Cx-first [`Self::watcher_control`].
+    pub async fn watcher_control_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        control: WatcherControlRequest,
+        request_id: Option<String>,
+    ) -> Result<IpcResponse, UserVarError> {
+        self.send_request_with_id_with_cx(
+            cx,
+            IpcRequest::WatcherControl { control },
+            request_id,
+        )
+        .await
+    }
+
     /// Call a robot RPC command over IPC.
     ///
     /// # Errors
@@ -2856,9 +3395,11 @@ impl IpcClient {
     ///      creating the socket connection at all.
     ///   3. before write: a cancel here avoids sending a request
     ///      that will immediately be abandoned.
-    ///   4. before read: a cancel here skips waiting on the
-    ///      response — caller sees cancellation rather than
-    ///      blocking on a server that may or may not reply.
+    ///   4. before read: a pre-cancelled caller skips the response wait.
+    ///
+    /// One absolute I/O deadline covers connect, request write/flush, and
+    /// response read (and is shortened by any earlier capability deadline),
+    /// because the underlying socket futures have no direct cancellation wake.
     ///
     /// All cancellation errors wrap into `UserVarError::IpcSendFailed`
     /// with "cancelled" prefix for pattern-matching.
@@ -2883,11 +3424,24 @@ impl IpcClient {
             message: format!("cancelled before connect: {err}"),
         })?;
 
-        let stream = socket_transport::connect(&self.socket_path)
-            .await
-            .map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to connect: {e}"),
+        let io_started = Instant::now();
+        let io_timeout = self.limits.io_timeout();
+        let connect_budget = remaining_ipc_io_budget(io_timeout, io_started.elapsed())
+            .ok_or_else(|| UserVarError::IpcSendFailed {
+                message: "IPC I/O deadline exceeded".to_string(),
             })?;
+        let stream = crate::runtime_async::timeout_with_cx(
+            cx,
+            connect_budget,
+            socket_transport::connect(&self.socket_path),
+        )
+        .await
+        .map_err(|_elapsed| UserVarError::IpcSendFailed {
+            message: "IPC I/O deadline exceeded".to_string(),
+        })?
+        .map_err(|e| UserVarError::IpcSendFailed {
+            message: format!("failed to connect: {e}"),
+        })?;
 
         #[cfg(unix)]
         let (reader, mut writer) = stream.into_split();
@@ -2900,8 +3454,10 @@ impl IpcClient {
             request,
         };
         let request_json =
-            serde_json::to_string(&envelope).map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to serialize request: {e}"),
+            serialize_ipc_json_bounded(&envelope, self.limits.max_message_size).map_err(|_| {
+                UserVarError::IpcSendFailed {
+                    message: "IPC request exceeded the configured message size".to_string(),
+                }
             })?;
 
         cx.checkpoint().map_err(|err| UserVarError::IpcSendFailed {
@@ -2910,46 +3466,42 @@ impl IpcClient {
 
         #[cfg(unix)]
         {
-            writer
-                .write_all(request_json.as_bytes())
-                .await
-                .map_err(|e| UserVarError::IpcSendFailed {
-                    message: format!("failed to send: {e}"),
+            let write_budget = remaining_ipc_io_budget(io_timeout, io_started.elapsed())
+                .ok_or_else(|| UserVarError::IpcSendFailed {
+                    message: "IPC I/O deadline exceeded".to_string(),
                 })?;
-            writer
-                .write_all(b"\n")
-                .await
-                .map_err(|e| UserVarError::IpcSendFailed {
-                    message: format!("failed to send newline: {e}"),
-                })?;
-            writer
-                .flush()
-                .await
-                .map_err(|e| UserVarError::IpcSendFailed {
-                    message: format!("failed to flush: {e}"),
-                })?;
+            crate::runtime_async::timeout_with_cx(cx, write_budget, async {
+                writer.write_all(request_json.as_slice()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await
+            })
+            .await
+            .map_err(|_elapsed| UserVarError::IpcSendFailed {
+                message: "IPC I/O deadline exceeded".to_string(),
+            })?
+            .map_err(|e| UserVarError::IpcSendFailed {
+                message: format!("failed to write request: {e}"),
+            })?;
         }
 
         #[cfg(windows)]
         {
-            stream
-                .write_all(request_json.as_bytes())
-                .await
-                .map_err(|e| UserVarError::IpcSendFailed {
-                    message: format!("failed to send: {e}"),
+            let write_budget = remaining_ipc_io_budget(io_timeout, io_started.elapsed())
+                .ok_or_else(|| UserVarError::IpcSendFailed {
+                    message: "IPC I/O deadline exceeded".to_string(),
                 })?;
-            stream
-                .write_all(b"\n")
-                .await
-                .map_err(|e| UserVarError::IpcSendFailed {
-                    message: format!("failed to send newline: {e}"),
-                })?;
-            stream
-                .flush()
-                .await
-                .map_err(|e| UserVarError::IpcSendFailed {
-                    message: format!("failed to flush: {e}"),
-                })?;
+            crate::runtime_async::timeout_with_cx(cx, write_budget, async {
+                stream.write_all(request_json.as_slice()).await?;
+                stream.write_all(b"\n").await?;
+                stream.flush().await
+            })
+            .await
+            .map_err(|_elapsed| UserVarError::IpcSendFailed {
+                message: "IPC I/O deadline exceeded".to_string(),
+            })?
+            .map_err(|e| UserVarError::IpcSendFailed {
+                message: format!("failed to write request: {e}"),
+            })?;
         }
 
         cx.checkpoint().map_err(|err| UserVarError::IpcSendFailed {
@@ -2962,27 +3514,40 @@ impl IpcClient {
         #[cfg(unix)]
         let mut lines = socket_transport::lines_with_max_length(
             socket_transport::buffered(reader),
-            IpcRuntimeLimits::line_cap_for(MAX_MESSAGE_SIZE),
+            IpcRuntimeLimits::line_cap_for(self.limits.max_message_size),
         );
         #[cfg(windows)]
         let mut lines = socket_transport::lines_with_max_length(
             socket_transport::buffered(&mut stream),
-            IpcRuntimeLimits::line_cap_for(MAX_MESSAGE_SIZE),
+            IpcRuntimeLimits::line_cap_for(self.limits.max_message_size),
         );
-        // Tick 201 (ft-xbnl0.2.3): route the response read through
-        // next_line_with_cx(cx, ...) so the pre-read checkpoint
-        // observes the caller's explicit cx. Previously used ambient
-        // next_line — if the server stalled mid-response, the client
-        // hung on the read until the stream closed or the server
-        // eventually wrote, even when an outer cx-cancel had fired.
-        let line = socket_transport::next_line_with_cx(cx, &mut lines)
-            .await
+        let read_budget = remaining_ipc_io_budget(io_timeout, io_started.elapsed()).ok_or_else(
+            || UserVarError::IpcSendFailed {
+                message: "IPC I/O deadline exceeded".to_string(),
+            },
+        )?;
+        let response_line = crate::runtime_async::timeout_with_cx(
+            cx,
+            read_budget,
+            socket_transport::next_line_with_cx(cx, &mut lines),
+        )
+        .await
+        .map_err(|_elapsed| UserVarError::IpcSendFailed {
+            message: "IPC I/O deadline exceeded".to_string(),
+        })?;
+        let line = response_line
             .map_err(|e| UserVarError::IpcSendFailed {
                 message: format!("failed to read response: {e}"),
             })?
             .ok_or_else(|| UserVarError::IpcSendFailed {
                 message: "failed to read response: server closed connection".to_string(),
             })?;
+
+        if line.len() > self.limits.max_message_size {
+            return Err(UserVarError::IpcSendFailed {
+                message: "IPC response exceeded the configured message size".to_string(),
+            });
+        }
 
         let response: IpcResponse =
             serde_json::from_str(&line).map_err(|e| UserVarError::IpcSendFailed {
@@ -3062,11 +3627,24 @@ impl IpcClient {
             message: format!("cancelled before connect: {err}"),
         })?;
 
-        let mut stream = socket_transport::connect(&self.socket_path)
-            .await
-            .map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to connect: {e}"),
+        let io_started = Instant::now();
+        let io_timeout = self.limits.io_timeout();
+        let connect_budget = remaining_ipc_io_budget(io_timeout, io_started.elapsed())
+            .ok_or_else(|| UserVarError::IpcSendFailed {
+                message: "IPC I/O deadline exceeded".to_string(),
             })?;
+        let mut stream = crate::runtime_async::timeout_with_cx(
+            cx,
+            connect_budget,
+            socket_transport::connect(&self.socket_path),
+        )
+        .await
+        .map_err(|_elapsed| UserVarError::IpcSendFailed {
+            message: "IPC I/O deadline exceeded".to_string(),
+        })?
+        .map_err(|e| UserVarError::IpcSendFailed {
+            message: format!("failed to connect: {e}"),
+        })?;
 
         let envelope = IpcEnvelope {
             token: self.auth_token.clone(),
@@ -3079,8 +3657,10 @@ impl IpcClient {
             },
         };
         let request_json =
-            serde_json::to_string(&envelope).map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to serialize request: {e}"),
+            serialize_ipc_json_bounded(&envelope, self.limits.max_message_size).map_err(|_| {
+                UserVarError::IpcSendFailed {
+                    message: "IPC request exceeded the configured message size".to_string(),
+                }
             })?;
 
         cx.checkpoint().map_err(|err| UserVarError::IpcSendFailed {
@@ -3090,30 +3670,31 @@ impl IpcClient {
         // Write the one-shot subscribe request, then reuse the same stream
         // for the (read-only from here) NDJSON line stream. `UnixStream`
         // implements both `AsyncRead` and `AsyncWrite`, so no split is needed.
-        stream
-            .write_all(request_json.as_bytes())
-            .await
-            .map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to send: {e}"),
+        let write_budget = remaining_ipc_io_budget(io_timeout, io_started.elapsed())
+            .ok_or_else(|| UserVarError::IpcSendFailed {
+                message: "IPC I/O deadline exceeded".to_string(),
             })?;
-        stream
-            .write_all(b"\n")
-            .await
-            .map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to send newline: {e}"),
-            })?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to flush: {e}"),
-            })?;
+        write_ipc_line_with_deadline(
+            cx,
+            &mut stream,
+            write_budget,
+            self.limits.max_message_size,
+            request_json.as_slice(),
+        )
+        .await
+        .map_err(|error| UserVarError::IpcSendFailed {
+            message: if error.kind() == std::io::ErrorKind::TimedOut {
+                "IPC I/O deadline exceeded".to_string()
+            } else {
+                format!("failed to write request: {error}")
+            },
+        })?;
 
         // ft-kccj8: event lines share the message-size contract; see the
         // response-read cap above.
         let lines = socket_transport::lines_with_max_length(
             socket_transport::buffered(stream),
-            IpcRuntimeLimits::line_cap_for(MAX_MESSAGE_SIZE),
+            IpcRuntimeLimits::line_cap_for(self.limits.max_message_size),
         );
         Ok(IpcEventStream { lines })
     }
@@ -3167,6 +3748,16 @@ impl IpcClient {
     pub async fn clear_pane_priority(&self, pane_id: u64) -> Result<IpcResponse, UserVarError> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.clear_pane_priority_with_cx(&cx, pane_id).await
+    }
+
+    pub async fn watcher_control(
+        &self,
+        control: WatcherControlRequest,
+        request_id: Option<String>,
+    ) -> Result<IpcResponse, UserVarError> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.watcher_control_with_cx(&cx, control, request_id)
+            .await
     }
 
     pub async fn call_rpc(
@@ -3223,6 +3814,15 @@ impl IpcClient {
         &self,
         _cx: &crate::cx::Cx,
         _pane_id: u64,
+    ) -> Result<IpcResponse, UserVarError> {
+        Err(Self::unsupported())
+    }
+
+    pub async fn watcher_control_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        _control: WatcherControlRequest,
+        _request_id: Option<String>,
     ) -> Result<IpcResponse, UserVarError> {
         Err(Self::unsupported())
     }
@@ -3581,6 +4181,145 @@ mod tests {
                 unacknowledged_tasks: 1,
             }
         );
+    }
+
+    #[test]
+    fn ipc_connection_admission_never_exceeds_the_configured_ceiling() {
+        assert_eq!(
+            classify_ipc_connection_admission(0, 1),
+            IpcConnectionAdmission::Admit
+        );
+        assert_eq!(
+            classify_ipc_connection_admission(1023, 1024),
+            IpcConnectionAdmission::Admit
+        );
+        assert_eq!(
+            classify_ipc_connection_admission(1024, 1024),
+            IpcConnectionAdmission::RejectAtCapacity
+        );
+        assert_eq!(
+            classify_ipc_connection_admission(1025, 1024),
+            IpcConnectionAdmission::RejectAtCapacity
+        );
+        assert_eq!(
+            classify_ipc_connection_admission(0, 0),
+            IpcConnectionAdmission::RejectAtCapacity
+        );
+    }
+
+    #[test]
+    fn ipc_line_read_deadline_classifier_is_explicit() {
+        assert_eq!(
+            classify_ipc_line_read_deadline(false),
+            IpcLineReadDeadlineOutcome::Completed
+        );
+        assert_eq!(
+            classify_ipc_line_read_deadline(true),
+            IpcLineReadDeadlineOutcome::TimedOut
+        );
+    }
+
+    #[test]
+    fn ipc_io_budget_is_absolute_and_fails_closed_at_the_exact_deadline() {
+        let limit = Duration::from_millis(100);
+        assert_eq!(remaining_ipc_io_budget(limit, Duration::ZERO), Some(limit));
+        assert_eq!(
+            remaining_ipc_io_budget(limit, Duration::from_millis(40)),
+            Some(Duration::from_millis(60))
+        );
+        assert_eq!(remaining_ipc_io_budget(limit, limit), None);
+        assert_eq!(remaining_ipc_io_budget(limit, Duration::from_millis(101)), None);
+    }
+
+    #[test]
+    fn ipc_json_serialization_is_bounded_at_the_exact_byte_limit() {
+        let value = serde_json::json!({"payload": "bounded"});
+        let expected = serde_json::to_vec(&value).expect("fixture serializes");
+
+        let exact = serialize_ipc_json_bounded(&value, expected.len())
+            .expect("exact byte limit must be admitted");
+        assert_eq!(exact, expected);
+
+        let error = serialize_ipc_json_bounded(&value, expected.len() - 1)
+            .expect_err("one byte below the encoded length must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn ipc_runtime_limits_resolve_all_resource_defaults_and_overrides() {
+        let defaults = resolve_limits(None);
+        assert_eq!(
+            defaults.max_concurrent_connections,
+            crate::tuning_config::IpcTuning::DEFAULT_MAX_CONCURRENT_CONNECTIONS
+        );
+        assert_eq!(
+            defaults.initial_request_timeout_ms,
+            crate::tuning_config::IpcTuning::DEFAULT_INITIAL_REQUEST_TIMEOUT_MS
+        );
+        assert_eq!(
+            defaults.io_timeout_ms,
+            crate::tuning_config::IpcTuning::DEFAULT_IO_TIMEOUT_MS
+        );
+        assert!(defaults.resource_bounds_are_valid());
+
+        let mut tuning = crate::tuning_config::IpcTuning::default();
+        tuning.max_concurrent_connections = 2048;
+        tuning.initial_request_timeout_ms = 750;
+        tuning.io_timeout_ms = 45_000;
+        let resolved = resolve_limits(Some(&tuning));
+        assert_eq!(resolved.max_concurrent_connections, 2048);
+        assert_eq!(resolved.initial_request_timeout_ms, 750);
+        assert_eq!(resolved.io_timeout_ms, 45_000);
+        assert!(resolved.resource_bounds_are_valid());
+    }
+
+    #[test]
+    fn ipc_runtime_limit_validation_rejects_each_out_of_range_resource_bound() {
+        let defaults = resolve_limits(None);
+
+        let mut invalid = defaults;
+        invalid.max_message_size = crate::tuning_config::IpcTuning::MIN_MAX_MESSAGE_SIZE - 1;
+        assert!(!invalid.resource_bounds_are_valid());
+        invalid.max_message_size = crate::tuning_config::IpcTuning::MAX_MAX_MESSAGE_SIZE + 1;
+        assert!(!invalid.resource_bounds_are_valid());
+
+        invalid = defaults;
+        invalid.accept_poll_interval_ms =
+            crate::tuning_config::IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS - 1;
+        assert!(!invalid.resource_bounds_are_valid());
+        invalid.accept_poll_interval_ms =
+            crate::tuning_config::IpcTuning::MAX_ACCEPT_POLL_INTERVAL_MS + 1;
+        assert!(!invalid.resource_bounds_are_valid());
+
+        invalid = defaults;
+        invalid.max_concurrent_connections = 0;
+        assert!(!invalid.resource_bounds_are_valid());
+        invalid.max_concurrent_connections =
+            crate::tuning_config::IpcTuning::MAX_MAX_CONCURRENT_CONNECTIONS + 1;
+        assert!(!invalid.resource_bounds_are_valid());
+
+        invalid = defaults;
+        invalid.initial_request_timeout_ms =
+            crate::tuning_config::IpcTuning::MIN_INITIAL_REQUEST_TIMEOUT_MS - 1;
+        assert!(!invalid.resource_bounds_are_valid());
+        invalid.initial_request_timeout_ms =
+            crate::tuning_config::IpcTuning::MAX_INITIAL_REQUEST_TIMEOUT_MS + 1;
+        assert!(!invalid.resource_bounds_are_valid());
+
+        invalid = defaults;
+        invalid.io_timeout_ms = crate::tuning_config::IpcTuning::MIN_IO_TIMEOUT_MS - 1;
+        assert!(!invalid.resource_bounds_are_valid());
+        invalid.io_timeout_ms = crate::tuning_config::IpcTuning::MAX_IO_TIMEOUT_MS + 1;
+        assert!(!invalid.resource_bounds_are_valid());
+
+        invalid = defaults;
+        invalid.max_message_size = crate::tuning_config::IpcTuning::MAX_MAX_MESSAGE_SIZE;
+        invalid.max_concurrent_connections =
+            crate::tuning_config::IpcTuning::MAX_MAX_CONCURRENT_CONNECTIONS;
+        assert!(!invalid.resource_bounds_are_valid());
+
+        invalid.max_concurrent_connections = 3;
+        assert!(invalid.resource_bounds_are_valid());
     }
 
     #[test]
@@ -4223,6 +4962,54 @@ mod tests {
         });
     }
 
+    #[test]
+    fn ipc_server_closes_client_that_misses_initial_request_line_deadline() {
+        run_async_test(async {
+            use crate::runtime_async::unix as compat_unix;
+
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
+            let mut limits = resolve_limits(None);
+            limits.accept_poll_interval_ms = 10;
+            limits.initial_request_timeout_ms = 100;
+            limits.io_timeout_ms = 1_000;
+            limits.max_concurrent_connections = 4;
+            let cx = crate::cx::for_testing();
+
+            let server = IpcServer::bind_with_permissions_and_limits_with_cx(
+                &cx,
+                &socket_path,
+                Some(0o600),
+                limits,
+            )
+            .await
+            .unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+            let server_handle = crate::runtime_async::task::spawn(async move {
+                server.run(event_bus, shutdown_rx).await;
+            });
+
+            crate::runtime_async::sleep(Duration::from_millis(10)).await;
+            let stream = compat_unix::connect(&socket_path).await.unwrap();
+            let (reader, writer_guard) = stream.into_split();
+            let mut lines = compat_unix::lines(compat_unix::buffered(reader));
+
+            let closed = crate::runtime_async::timeout(
+                Duration::from_millis(1_000),
+                compat_unix::next_line(&mut lines),
+            )
+            .await
+            .expect("initial request-line deadline did not close the connection")
+            .expect("reading the deadline-closed connection failed");
+            assert!(closed.is_none());
+
+            drop(writer_guard);
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
+        });
+    }
+
     fn make_pane_info(pane_id: u64) -> crate::wezterm::PaneInfo {
         crate::wezterm::PaneInfo {
             pane_id,
@@ -4693,8 +5480,11 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let socket_path = temp_dir.path().join("test.sock");
             let limits = IpcRuntimeLimits {
-                max_message_size: 64,
+                max_message_size: crate::tuning_config::IpcTuning::MIN_MAX_MESSAGE_SIZE,
                 accept_poll_interval_ms: 10,
+                max_concurrent_connections: 4,
+                initial_request_timeout_ms: 500,
+                io_timeout_ms: 500,
             };
             let cx = crate::cx::for_testing();
 
@@ -4719,7 +5509,7 @@ mod tests {
             let request = IpcRequest::UserVar {
                 pane_id: 1,
                 name: "TEST".to_string(),
-                value: "x".repeat(128),
+                value: "x".repeat(20 * 1024),
             };
             let request_json = serde_json::to_string(&request).unwrap();
             assert!(request_json.len() > limits.max_message_size);
@@ -5169,6 +5959,27 @@ mod tests {
     }
 
     #[test]
+    fn watcher_control_envelope_is_strict_and_write_scoped() {
+        let json = r#"{"type":"watcher_control","control":{"action":"reload","expected_instance_id":"0123456789abcdef0123456789abcdef"}}"#;
+        let envelope: IpcEnvelope = serde_json::from_str(json).unwrap();
+        assert_eq!(envelope.request.required_scope(), IpcScope::Write);
+        let IpcRequest::WatcherControl { control } = envelope.request else {
+            panic!("expected watcher-control request");
+        };
+        assert_eq!(control.action, WatcherControlAction::Reload);
+        assert_eq!(
+            control.expected_instance_id,
+            "0123456789abcdef0123456789abcdef"
+        );
+
+        let unknown_field = r#"{"type":"watcher_control","control":{"action":"stop","expected_instance_id":"0123456789abcdef0123456789abcdef","pid":42}}"#;
+        assert!(serde_json::from_str::<IpcEnvelope>(unknown_field).is_err());
+
+        let unknown_action = r#"{"type":"watcher_control","control":{"action":"kill","expected_instance_id":"0123456789abcdef0123456789abcdef"}}"#;
+        assert!(serde_json::from_str::<IpcEnvelope>(unknown_action).is_err());
+    }
+
+    #[test]
     fn ipc_response_ok_with_data_includes_data() {
         let data = serde_json::json!({"key": "value"});
         let response = IpcResponse::ok_with_data(data.clone());
@@ -5229,6 +6040,7 @@ mod tests {
         assert!(ctx.registry.is_none());
         assert!(ctx.auth.is_none());
         assert!(ctx.rpc_handler.is_none());
+        assert!(ctx.watcher_control_handler.is_none());
         assert!(ctx.search_config.is_none());
     }
 
@@ -5239,6 +6051,90 @@ mod tests {
         let ctx = IpcHandlerContext::with_registry(event_bus, registry);
         assert!(ctx.registry.is_some());
         assert!(ctx.auth.is_none());
+    }
+
+    #[test]
+    fn watcher_control_dispatch_is_typed_and_fails_closed_without_handler() {
+        run_async_test(async {
+            let event_bus = Arc::new(EventBus::new(10));
+            let ctx = IpcHandlerContext::new(event_bus);
+            let response = handle_request_with_context(
+                IpcEnvelope {
+                    token: None,
+                    request_id: Some("control-unavailable".to_string()),
+                    request: IpcRequest::WatcherControl {
+                        control: WatcherControlRequest {
+                            action: WatcherControlAction::Stop,
+                            expected_instance_id:
+                                "0123456789abcdef0123456789abcdef".to_string(),
+                        },
+                    },
+                },
+                &ctx,
+            )
+            .await;
+            assert!(!response.ok);
+            assert_eq!(
+                response.error_code.as_deref(),
+                Some("ipc.watcher_control.unavailable")
+            );
+        });
+    }
+
+    #[test]
+    fn watcher_control_dispatch_preserves_action_identity_and_request_id() {
+        run_async_test(async {
+            let seen = Arc::new(std::sync::Mutex::new(None));
+            let seen_by_handler = Arc::clone(&seen);
+            let handler: IpcWatcherControlHandler = Arc::new(move |invocation| {
+                let seen_by_handler = Arc::clone(&seen_by_handler);
+                Box::pin(async move {
+                    {
+                        let mut seen = seen_by_handler
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        *seen = Some((
+                            invocation.control.clone(),
+                            invocation.request_id.clone(),
+                        ));
+                    }
+                    IpcResponse::ok_with_data(serde_json::json!({
+                        "accepted": true,
+                        "instance_id": invocation.control.expected_instance_id,
+                    }))
+                })
+            });
+            let ctx = IpcHandlerContext::with_auth_rpc_control_and_search_config(
+                Arc::new(EventBus::new(10)),
+                None,
+                None,
+                None,
+                Some(handler),
+                None,
+            );
+            let control = WatcherControlRequest {
+                action: WatcherControlAction::Reload,
+                expected_instance_id: "fedcba9876543210fedcba9876543210".to_string(),
+            };
+            let response = handle_request_with_context(
+                IpcEnvelope {
+                    token: None,
+                    request_id: Some("control-42".to_string()),
+                    request: IpcRequest::WatcherControl {
+                        control: control.clone(),
+                    },
+                },
+                &ctx,
+            )
+            .await;
+            assert!(response.ok);
+            assert_eq!(
+                *seen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                Some((control, Some("control-42".to_string())))
+            );
+        });
     }
 
     #[test]
@@ -5410,6 +6306,28 @@ mod tests {
     fn ipc_client_with_token_stores_token() {
         let client = IpcClient::with_token("/tmp/test.sock", "my-token");
         assert_eq!(client.auth_token.as_deref(), Some("my-token"));
+        assert_eq!(
+            client.limits.io_timeout_ms,
+            crate::tuning_config::IpcTuning::DEFAULT_IO_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn ipc_client_runtime_limits_are_validated_before_use() {
+        let mut valid = resolve_limits(None);
+        valid.io_timeout_ms = 45_000;
+        let client = IpcClient::new("/tmp/test.sock")
+            .try_with_runtime_limits(valid)
+            .expect("valid finite runtime limits");
+        assert_eq!(client.limits.io_timeout_ms, 45_000);
+
+        let mut invalid = valid;
+        invalid.io_timeout_ms = 0;
+        let error = IpcClient::new("/tmp/test.sock")
+            .try_with_runtime_limits(invalid)
+            .err()
+            .expect("zero I/O timeout must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

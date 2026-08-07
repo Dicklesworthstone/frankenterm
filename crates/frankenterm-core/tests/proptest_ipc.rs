@@ -1,12 +1,14 @@
 //! Property-based tests for the `ipc` module.
 //!
-//! Covers `IpcRequest` tagged enum serde roundtrips (all 7 variants),
+//! Covers `IpcRequest` tagged enum serde roundtrips (all 9 variants),
 //! `IpcResponse` serde roundtrips, constructor invariants, and
 //! skip_serializing_if behavior for optional fields.
 
 #![cfg(unix)]
 
-use frankenterm_core::ipc::{IpcRequest, IpcResponse};
+use frankenterm_core::ipc::{
+    IpcRequest, IpcResponse, WatcherControlAction, WatcherControlRequest,
+};
 use proptest::prelude::*;
 
 // =========================================================================
@@ -36,6 +38,19 @@ fn arb_ipc_request() -> impl Strategy<Value = IpcRequest> {
                 ttl_ms,
             }),
         (0_u64..100_000).prop_map(|pane_id| IpcRequest::ClearPanePriority { pane_id }),
+        (
+            prop_oneof![
+                Just(WatcherControlAction::Stop),
+                Just(WatcherControlAction::Reload),
+            ],
+            "[0-9a-f]{32}",
+        )
+            .prop_map(|(action, expected_instance_id)| IpcRequest::WatcherControl {
+                control: WatcherControlRequest {
+                    action,
+                    expected_instance_id,
+                },
+            }),
         proptest::collection::vec("[a-z_]{2,10}", 0..5).prop_map(|args| IpcRequest::Rpc { args }),
         (
             proptest::option::of(0_u64..100_000),
@@ -114,6 +129,7 @@ proptest! {
             IpcRequest::PaneState { .. } => "pane_state",
             IpcRequest::SetPanePriority { .. } => "set_pane_priority",
             IpcRequest::ClearPanePriority { .. } => "clear_pane_priority",
+            IpcRequest::WatcherControl { .. } => "watcher_control",
             IpcRequest::Rpc { .. } => "rpc",
             IpcRequest::SubscribeEvents { .. } => "subscribe_events",
         };

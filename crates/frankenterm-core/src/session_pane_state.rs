@@ -14,7 +14,8 @@
 
 use std::io::{self, Write};
 
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
 use tracing::{debug, trace};
 
 /// Maximum serialized size per pane state (64KB).
@@ -159,9 +160,35 @@ pub struct AgentMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapturedEnv {
     /// Safe environment variables captured.
+    #[serde(serialize_with = "serialize_env_vars_sorted")]
     pub vars: std::collections::HashMap<String, String>,
     /// Number of variables that were redacted.
     pub redacted_count: usize,
+}
+
+/// Serialize captured environment entries in lexical key order.
+///
+/// `HashMap` remains the in-memory representation because capture and restore
+/// callers perform keyed lookups, but its randomized iteration order must not
+/// leak into persisted checkpoint bytes or witness inputs. The bounded pane
+/// serializer rejects impossible cardinalities before reaching this helper;
+/// the ordinary serializer deliberately preserves its historical unbounded
+/// API while making its output reproducible.
+fn serialize_env_vars_sorted<S>(
+    vars: &std::collections::HashMap<String, String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut entries: Vec<_> = vars.iter().collect();
+    entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+
+    let mut map = serializer.serialize_map(Some(entries.len()))?;
+    for (key, value) in entries {
+        map.serialize_entry(key, value)?;
+    }
+    map.end()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -795,6 +822,38 @@ mod tests {
         let (budgeted_json, truncated) = snapshot.to_json_budgeted().unwrap();
         assert!(!truncated);
         assert_eq!(budgeted_json, json);
+    }
+
+    #[test]
+    fn captured_environment_serialization_is_canonical() {
+        let forward = PaneStateSnapshot::new(5, 2000, make_terminal()).with_env_from_iter(
+            [
+                ("TERM".to_owned(), "xterm-256color".to_owned()),
+                ("HOME".to_owned(), "/home/operator".to_owned()),
+                ("EDITOR".to_owned(), "hx".to_owned()),
+            ]
+            .into_iter(),
+        );
+        let reverse = PaneStateSnapshot::new(5, 2000, make_terminal()).with_env_from_iter(
+            [
+                ("EDITOR".to_owned(), "hx".to_owned()),
+                ("HOME".to_owned(), "/home/operator".to_owned()),
+                ("TERM".to_owned(), "xterm-256color".to_owned()),
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(forward, reverse);
+        let canonical_json = forward.to_json().unwrap();
+        assert_eq!(canonical_json, reverse.to_json().unwrap());
+        let editor = canonical_json.find("\"EDITOR\"").unwrap();
+        let home = canonical_json.find("\"HOME\"").unwrap();
+        let term = canonical_json.find("\"TERM\"").unwrap();
+        assert!(editor < home && home < term);
+        assert_eq!(
+            forward.to_json_budgeted().unwrap(),
+            reverse.to_json_budgeted().unwrap()
+        );
     }
 
     // ---- Alt-screen ----

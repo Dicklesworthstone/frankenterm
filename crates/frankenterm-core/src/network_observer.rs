@@ -4,15 +4,30 @@
 //! and connectivity checks via the `rano` subprocess. Maps high latency
 //! or unreachable state to backpressure tier signals.
 
-use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+use crate::subprocess_bridge::{BridgeError, SubprocessBridge};
+use crate::runtime_async::process::{
+    CommandCancellation, CommandCleanupTrigger, CommandOutputStream,
+};
+
+/// Largest admitted wall-clock timeout for one `rano` invocation.
+pub const MAX_NETWORK_OBSERVER_TIMEOUT_SECS: u64 = 300;
+/// Default maximum JSON bytes retained from one `rano` invocation.
+pub const DEFAULT_NETWORK_OBSERVER_STDOUT_LIMIT_BYTES: usize = 256 * 1024;
+/// Hard admission ceiling for JSON bytes retained from one invocation.
+pub const MAX_NETWORK_OBSERVER_STDOUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+/// Default maximum diagnostic bytes retained while supervising `rano`.
+pub const DEFAULT_NETWORK_OBSERVER_STDERR_LIMIT_BYTES: usize = 16 * 1024;
+/// Hard admission ceiling for diagnostic bytes retained from one invocation.
+pub const MAX_NETWORK_OBSERVER_STDERR_LIMIT_BYTES: usize = 256 * 1024;
+/// Maximum positional remote-address bytes admitted into the subprocess argv.
+pub const MAX_NETWORK_OBSERVER_REMOTE_ADDRESS_BYTES: usize = 1_024;
 
 // =============================================================================
 // Types
@@ -39,6 +54,12 @@ pub struct NetworkAttribution {
     /// Organization name if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConnectivityProbe {
+    #[serde(default)]
+    status: String,
 }
 
 /// Connectivity check result.
@@ -103,6 +124,12 @@ pub struct NetworkObserverConfig {
     /// Subprocess timeout.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// Maximum JSON bytes retained from stdout for one invocation.
+    #[serde(default = "default_stdout_limit_bytes")]
+    pub max_stdout_bytes: usize,
+    /// Maximum diagnostic bytes retained from stderr for one invocation.
+    #[serde(default = "default_stderr_limit_bytes")]
+    pub max_stderr_bytes: usize,
 }
 
 fn default_yellow_latency() -> f64 {
@@ -117,12 +144,22 @@ fn default_timeout_secs() -> u64 {
     10
 }
 
+fn default_stdout_limit_bytes() -> usize {
+    DEFAULT_NETWORK_OBSERVER_STDOUT_LIMIT_BYTES
+}
+
+fn default_stderr_limit_bytes() -> usize {
+    DEFAULT_NETWORK_OBSERVER_STDERR_LIMIT_BYTES
+}
+
 impl Default for NetworkObserverConfig {
     fn default() -> Self {
         Self {
             yellow_latency_ms: default_yellow_latency(),
             red_latency_ms: default_red_latency(),
             timeout_secs: default_timeout_secs(),
+            max_stdout_bytes: default_stdout_limit_bytes(),
+            max_stderr_bytes: default_stderr_limit_bytes(),
         }
     }
 }
@@ -136,31 +173,133 @@ impl Default for NetworkObserverConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkObserverError {
     /// The rano binary was not found.
-    BinaryNotFound(String),
+    BinaryNotFound,
+    /// The configured executable did not meet the fixed `rano` path contract.
+    InvalidBinary,
+    /// A remote address was empty, oversized, or unsafe to pass positionally.
+    InvalidRemoteAddress { input_bytes: usize },
     /// Subprocess exited with non-zero code.
-    SubprocessFailed { code: Option<i32>, stderr: String },
+    SubprocessFailed { code: i32 },
     /// Subprocess exceeded configured timeout.
     Timeout { timeout_secs: u64 },
-    /// Subprocess timeout is too large to represent as a monotonic deadline.
+    /// Subprocess timeout is outside the finite admitted range.
     InvalidTimeout { timeout_secs: u64 },
+    /// A configured capture limit is zero or exceeds its hard ceiling.
+    InvalidOutputLimit {
+        stream: CommandOutputStream,
+        requested: usize,
+        maximum: usize,
+    },
+    /// A child crossed an admitted capture limit.
+    OutputTooLarge {
+        stream: CommandOutputStream,
+        observed: usize,
+        limit: usize,
+    },
+    /// Operation was deliberately cancelled by its caller.
+    Cancelled,
+    /// The child leader exited but inherited capture descriptors stayed open.
+    CaptureIncomplete {
+        stdout_open: bool,
+        stderr_open: bool,
+        drain_timeout_ms: u64,
+    },
+    /// Bounded child cleanup could not prove complete settlement.
+    CleanupIncomplete {
+        trigger: CommandCleanupTrigger,
+        leader_reaped: bool,
+        signal_helper_settled: bool,
+        process_tree_signalled: bool,
+        stdout_open: bool,
+        stderr_open: bool,
+        settle_timeout_ms: u64,
+    },
+    /// Other subprocess I/O failure, classified without path or output content.
+    Io { kind: std::io::ErrorKind },
     /// JSON parse failure.
-    ParseFailed(String),
+    ParseFailed,
 }
 
 impl std::fmt::Display for NetworkObserverError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BinaryNotFound(msg) => write!(f, "rano not found: {}", msg),
-            Self::SubprocessFailed { code, stderr } => {
-                write!(f, "rano failed (exit {}): {}", code.unwrap_or(-1), stderr)
-            }
+            Self::BinaryNotFound => f.write_str("rano command unavailable"),
+            Self::InvalidBinary => f.write_str("invalid rano executable configuration"),
+            Self::InvalidRemoteAddress { input_bytes } => write!(
+                f,
+                "invalid remote address (input_bytes={input_bytes})"
+            ),
+            Self::SubprocessFailed { code } => write!(f, "rano failed (exit {code})"),
             Self::Timeout { timeout_secs } => {
                 write!(f, "rano timed out after {timeout_secs}s")
             }
             Self::InvalidTimeout { timeout_secs } => {
-                write!(f, "rano timeout is too large: {timeout_secs}s")
+                write!(
+                    f,
+                    "rano timeout is outside 1..={MAX_NETWORK_OBSERVER_TIMEOUT_SECS}s: {timeout_secs}s"
+                )
             }
-            Self::ParseFailed(msg) => write!(f, "rano parse error: {}", msg),
+            Self::InvalidOutputLimit {
+                stream,
+                requested,
+                maximum,
+            } => write!(
+                f,
+                "invalid rano {stream} capture limit ({requested}; admitted 1..={maximum})"
+            ),
+            Self::OutputTooLarge {
+                stream,
+                observed,
+                limit,
+            } => write!(
+                f,
+                "rano {stream} capture limit exceeded (observed_at_least={observed}, limit={limit})"
+            ),
+            Self::Cancelled => f.write_str("rano operation cancelled"),
+            Self::CaptureIncomplete {
+                stdout_open,
+                stderr_open,
+                drain_timeout_ms,
+            } => write!(
+                f,
+                "rano output capture incomplete after {drain_timeout_ms} ms (stdout_open={stdout_open}, stderr_open={stderr_open})"
+            ),
+            Self::CleanupIncomplete {
+                trigger,
+                leader_reaped,
+                signal_helper_settled,
+                process_tree_signalled,
+                stdout_open,
+                stderr_open,
+                settle_timeout_ms,
+            } => write!(
+                f,
+                "rano cleanup incomplete after {settle_timeout_ms} ms (trigger={trigger}, leader_reaped={leader_reaped}, signal_helper_settled={signal_helper_settled}, process_tree_signalled={process_tree_signalled}, stdout_open={stdout_open}, stderr_open={stderr_open})"
+            ),
+            Self::Io { kind } => write!(f, "rano subprocess I/O failure ({kind:?})"),
+            Self::ParseFailed => f.write_str("rano returned invalid JSON"),
+        }
+    }
+}
+
+impl NetworkObserverError {
+    /// Stable content-free class suitable for structured logs and counters.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::BinaryNotFound => "binary_not_found",
+            Self::InvalidBinary => "invalid_binary",
+            Self::InvalidRemoteAddress { .. } => "invalid_remote_address",
+            Self::SubprocessFailed { .. } => "subprocess_failed",
+            Self::Timeout { .. } => "timeout",
+            Self::InvalidTimeout { .. } => "invalid_timeout",
+            Self::InvalidOutputLimit { .. } => "invalid_output_limit",
+            Self::OutputTooLarge { .. } => "output_too_large",
+            Self::Cancelled => "cancelled",
+            Self::CaptureIncomplete { .. } => "capture_incomplete",
+            Self::CleanupIncomplete { .. } => "cleanup_incomplete",
+            Self::Io { .. } => "io",
+            Self::ParseFailed => "parse_failed",
         }
     }
 }
@@ -198,9 +337,8 @@ impl NetworkObserver {
 
     /// Check if `rano` is available.
     pub fn is_available(&self) -> bool {
-        self.rano_command()
-            .map(|mut command| command.arg("--version").output().is_ok())
-            .unwrap_or(false)
+        self.rano_bridge::<serde_json::Value>()
+            .is_ok_and(|bridge| bridge.is_available())
     }
 
     /// Access the config.
@@ -213,17 +351,34 @@ impl NetworkObserver {
         &self,
         remote_addr: &str,
     ) -> Result<NetworkAttribution, NetworkObserverError> {
-        debug!(bridge = "rano", remote = %remote_addr, "attributing connection");
+        let cancellation = CommandCancellation::new();
+        self.attribute_connection_with_cancellation(remote_addr, &cancellation)
+    }
 
-        let output = self.run_rano(&["attribute", remote_addr, "--json"])?;
-        let attr: NetworkAttribution = serde_json::from_str(&output)
-            .map_err(|e| NetworkObserverError::ParseFailed(e.to_string()))?;
+    /// Attribute a remote connection with cooperative, handle-owned child
+    /// cancellation. Cancellation is checked before spawn and throughout the
+    /// bounded supervisor loop.
+    pub fn attribute_connection_with_cancellation(
+        &self,
+        remote_addr: &str,
+        cancellation: &CommandCancellation,
+    ) -> Result<NetworkAttribution, NetworkObserverError> {
+        validate_remote_address(remote_addr)?;
+        debug!(
+            bridge = "rano",
+            remote_addr_bytes = remote_addr.len(),
+            "attributing connection"
+        );
+
+        let attr: NetworkAttribution = self.invoke_rano(
+            &["attribute", remote_addr, "--json"],
+            Some(cancellation),
+        )?;
 
         debug!(
             bridge = "rano",
-            remote = %remote_addr,
-            provider = %attr.provider,
-            latency_ms = %attr.latency_ms,
+            remote_addr_bytes = remote_addr.len(),
+            provider_bytes = attr.provider.len(),
             "connection attributed"
         );
 
@@ -232,169 +387,140 @@ impl NetworkObserver {
 
     /// Check connectivity status.
     pub fn check_connectivity(&self) -> ConnectivityStatus {
-        match self.run_rano(&["check", "--json"]) {
-            Ok(output) => {
-                let val: serde_json::Value = match serde_json::from_str(&output) {
-                    Ok(v) => v,
-                    Err(_) => return ConnectivityStatus::Unknown,
-                };
-                let status_str = val
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                match status_str {
-                    "connected" => ConnectivityStatus::Connected,
-                    "degraded" => ConnectivityStatus::Degraded,
-                    "unreachable" => ConnectivityStatus::Unreachable,
-                    _ => ConnectivityStatus::Unknown,
-                }
-            }
+        let cancellation = CommandCancellation::new();
+        self.check_connectivity_with_cancellation(&cancellation)
+    }
+
+    /// Check connectivity with cooperative, handle-owned child cancellation.
+    pub fn check_connectivity_with_cancellation(
+        &self,
+        cancellation: &CommandCancellation,
+    ) -> ConnectivityStatus {
+        match self.invoke_rano::<ConnectivityProbe>(
+            &["check", "--json"],
+            Some(cancellation),
+        ) {
+            Ok(probe) => match probe.status.as_str() {
+                "connected" => ConnectivityStatus::Connected,
+                "degraded" => ConnectivityStatus::Degraded,
+                "unreachable" => ConnectivityStatus::Unreachable,
+                _ => ConnectivityStatus::Unknown,
+            },
             Err(e) => {
-                warn!(bridge = "rano", error = %e, "connectivity check failed");
+                warn!(
+                    bridge = "rano",
+                    error_kind = e.kind(),
+                    "connectivity check failed"
+                );
                 ConnectivityStatus::Unknown
             }
         }
     }
 
-    /// Run a rano subprocess and return stdout.
-    fn run_rano(&self, args: &[&str]) -> Result<String, NetworkObserverError> {
-        let timeout_secs = self.config.timeout_secs.max(1);
-        let deadline = Instant::now()
-            .checked_add(Duration::from_secs(timeout_secs))
-            .ok_or(NetworkObserverError::InvalidTimeout { timeout_secs })?;
+    fn invoke_rano<T: DeserializeOwned>(
+        &self,
+        args: &[&str],
+        cancellation: Option<&CommandCancellation>,
+    ) -> Result<T, NetworkObserverError> {
+        let bridge = self.rano_bridge()?;
+        let result = match cancellation {
+            Some(cancellation) => bridge.invoke_with_cancellation(args, cancellation),
+            None => bridge.invoke(args),
+        };
+        result.map_err(|error| self.map_bridge_error(error))
+    }
 
-        let mut command = self.rano_command()?;
-        command
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+    fn rano_bridge<T: DeserializeOwned>(
+        &self,
+    ) -> Result<SubprocessBridge<T>, NetworkObserverError> {
+        self.validate_runtime_limits()?;
+        let binary = self.validated_rano_binary()?;
+        Ok(SubprocessBridge::new(binary)
+            .with_timeout(Duration::from_secs(self.config.timeout_secs))
+            .with_search_paths(std::iter::empty::<std::path::PathBuf>())
+            .with_stdout_limit(self.config.max_stdout_bytes)
+            .with_stderr_limit(self.config.max_stderr_bytes))
+    }
 
-        #[cfg(unix)]
+    fn validate_runtime_limits(&self) -> Result<(), NetworkObserverError> {
+        if self.config.timeout_secs == 0
+            || self.config.timeout_secs > MAX_NETWORK_OBSERVER_TIMEOUT_SECS
         {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-
-        let mut child = command
-            .spawn()
-            .map_err(|e| NetworkObserverError::BinaryNotFound(format!("{}: {}", self.binary, e)))?;
-
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                terminate_rano_child(&mut child);
-                return Err(NetworkObserverError::ParseFailed(
-                    "rano stdout pipe missing".to_string(),
-                ));
-            }
-        };
-        let stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => {
-                terminate_rano_child(&mut child);
-                return Err(NetworkObserverError::ParseFailed(
-                    "rano stderr pipe missing".to_string(),
-                ));
-            }
-        };
-
-        let (pipe_tx, pipe_rx) = mpsc::channel();
-        let stderr_tx = pipe_tx.clone();
-        let stdout_reader = match spawn_rano_pipe_reader("ft-rano-stdout", true, stdout, pipe_tx) {
-            Ok(handle) => handle,
-            Err(err) => {
-                terminate_rano_child(&mut child);
-                return Err(err);
-            }
-        };
-        let stderr_reader = match spawn_rano_pipe_reader("ft-rano-stderr", false, stderr, stderr_tx)
-        {
-            Ok(handle) => handle,
-            Err(err) => {
-                terminate_rano_child(&mut child);
-                let _ = stdout_reader.join();
-                return Err(err);
-            }
-        };
-
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {
-                    if Instant::now() >= deadline {
-                        terminate_rano_child(&mut child);
-                        drop(stdout_reader);
-                        drop(stderr_reader);
-                        return Err(NetworkObserverError::Timeout { timeout_secs });
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => {
-                    terminate_rano_child(&mut child);
-                    drop(stdout_reader);
-                    drop(stderr_reader);
-                    return Err(NetworkObserverError::SubprocessFailed {
-                        code: None,
-                        stderr: format!("failed waiting for rano: {e}"),
-                    });
-                }
-            }
-        };
-
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut pipes_closed = 0;
-        while pipes_closed < 2 {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                terminate_rano_child(&mut child);
-                return Err(NetworkObserverError::Timeout { timeout_secs });
-            }
-
-            match pipe_rx.recv_timeout(remaining) {
-                Ok((is_stdout, data)) => {
-                    let data = data.map_err(|e| NetworkObserverError::SubprocessFailed {
-                        code: None,
-                        stderr: format!(
-                            "failed reading rano {}: {e}",
-                            if is_stdout { "stdout" } else { "stderr" }
-                        ),
-                    })?;
-                    if is_stdout {
-                        stdout = data;
-                    } else {
-                        stderr = data;
-                    }
-                    pipes_closed += 1;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    terminate_rano_child(&mut child);
-                    drop(stdout_reader);
-                    drop(stderr_reader);
-                    return Err(NetworkObserverError::Timeout { timeout_secs });
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    break;
-                }
-            }
-        }
-        let _ = stdout_reader.join();
-        let _ = stderr_reader.join();
-
-        if !status.success() {
-            let stderr = String::from_utf8_lossy(&stderr).to_string();
-            return Err(NetworkObserverError::SubprocessFailed {
-                code: status.code(),
-                stderr,
+            return Err(NetworkObserverError::InvalidTimeout {
+                timeout_secs: self.config.timeout_secs,
             });
         }
+        validate_output_limit(
+            CommandOutputStream::Stdout,
+            self.config.max_stdout_bytes,
+            MAX_NETWORK_OBSERVER_STDOUT_LIMIT_BYTES,
+        )?;
+        validate_output_limit(
+            CommandOutputStream::Stderr,
+            self.config.max_stderr_bytes,
+            MAX_NETWORK_OBSERVER_STDERR_LIMIT_BYTES,
+        )
+    }
 
-        Ok(String::from_utf8_lossy(&stdout).to_string())
+    fn map_bridge_error(&self, error: BridgeError) -> NetworkObserverError {
+        match error {
+            BridgeError::BinaryNotFound => NetworkObserverError::BinaryNotFound,
+            BridgeError::Timeout(_) => NetworkObserverError::Timeout {
+                timeout_secs: self.config.timeout_secs,
+            },
+            BridgeError::ParseError => NetworkObserverError::ParseFailed,
+            BridgeError::ExitCode(code) => NetworkObserverError::SubprocessFailed { code },
+            BridgeError::Cancelled => NetworkObserverError::Cancelled,
+            BridgeError::CaptureIncomplete {
+                stdout_open,
+                stderr_open,
+                drain_timeout_ms,
+            } => NetworkObserverError::CaptureIncomplete {
+                stdout_open,
+                stderr_open,
+                drain_timeout_ms,
+            },
+            BridgeError::CleanupIncomplete {
+                trigger,
+                leader_reaped,
+                signal_helper_settled,
+                process_tree_signalled,
+                stdout_open,
+                stderr_open,
+                settle_timeout_ms,
+            } => NetworkObserverError::CleanupIncomplete {
+                trigger,
+                leader_reaped,
+                signal_helper_settled,
+                process_tree_signalled,
+                stdout_open,
+                stderr_open,
+                settle_timeout_ms,
+            },
+            BridgeError::OutputTooLarge {
+                stream,
+                observed,
+                limit,
+            } => NetworkObserverError::OutputTooLarge {
+                stream,
+                observed,
+                limit,
+            },
+            BridgeError::Io(kind) => NetworkObserverError::Io { kind },
+        }
     }
 
     /// Map an attribution to a backpressure tier.
     pub fn classify_pressure(&self, attr: &NetworkAttribution) -> NetworkPressureTier {
-        if attr.latency_ms >= self.config.red_latency_ms {
+        if !attr.latency_ms.is_finite()
+            || attr.latency_ms < 0.0
+            || !self.config.yellow_latency_ms.is_finite()
+            || self.config.yellow_latency_ms < 0.0
+            || !self.config.red_latency_ms.is_finite()
+            || self.config.red_latency_ms < self.config.yellow_latency_ms
+        {
+            NetworkPressureTier::Black
+        } else if attr.latency_ms >= self.config.red_latency_ms {
             NetworkPressureTier::Red
         } else if attr.latency_ms >= self.config.yellow_latency_ms {
             NetworkPressureTier::Yellow
@@ -413,40 +539,22 @@ impl NetworkObserver {
         }
     }
 
-    fn rano_command(&self) -> Result<Command, NetworkObserverError> {
-        let path_dir = self.validated_rano_path_dir()?;
-        let mut command = Command::new("rano");
-        if let Some(path_dir) = path_dir {
-            command.env("PATH", path_dir);
-        }
-        Ok(command)
-    }
-
-    fn validated_rano_path_dir(&self) -> Result<Option<&Path>, NetworkObserverError> {
+    fn validated_rano_binary(&self) -> Result<&str, NetworkObserverError> {
         let binary = self.binary.as_str();
-        if binary.trim() != binary || binary.is_empty() {
-            return Err(NetworkObserverError::BinaryNotFound(format!(
-                "invalid rano executable {:?}",
-                self.binary
-            )));
+        if binary.trim() != binary || binary.is_empty() || binary.contains('\0') {
+            return Err(NetworkObserverError::InvalidBinary);
         }
         if binary == "rano" {
-            return Ok(None);
+            return Ok(binary);
         }
 
         let path = Path::new(binary);
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty());
         let basename_is_rano = path.file_name().and_then(|name| name.to_str()) == Some("rano");
-        if let (Some(parent), true) = (parent, basename_is_rano) {
-            return Ok(Some(parent));
+        if path.is_absolute() && basename_is_rano {
+            return Ok(binary);
         }
 
-        Err(NetworkObserverError::BinaryNotFound(format!(
-            "invalid rano executable {:?}: only `rano` or an explicit path ending in `rano` is allowed",
-            self.binary
-        )))
+        Err(NetworkObserverError::InvalidBinary)
     }
 }
 
@@ -456,45 +564,34 @@ impl Default for NetworkObserver {
     }
 }
 
-// br-ft-x2oyy: function-level RANO subprocess pipe contract. Reader
-// threads own one pipe and report exactly once; send failure means the
-// parent has already abandoned collection after timeout/cancel.
-fn spawn_rano_pipe_reader<R>(
-    name: &'static str,
-    is_stdout: bool,
-    reader: R,
-    tx: mpsc::Sender<(bool, std::io::Result<Vec<u8>>)>,
-) -> Result<thread::JoinHandle<()>, NetworkObserverError>
-where
-    R: Read + Send + 'static,
-{
-    thread::Builder::new()
-        .name(name.to_string())
-        .spawn(move || {
-            // br-ft-x2oyy: intentional best-effort pipe delivery; send
-            // fails only when the parent already cancelled collection.
-            let _ = tx.send((is_stdout, read_pipe_to_end(reader)));
-        })
-        .map_err(|e| NetworkObserverError::SubprocessFailed {
-            code: None,
-            stderr: format!("failed to spawn {name} pipe reader thread: {e}"),
-        })
-}
-
-fn read_pipe_to_end<R: Read>(mut reader: R) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
-fn terminate_rano_child(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        let _ =
-            crate::runtime_async::process::send_unix_signal_to_process_group(child.id(), "KILL");
+fn validate_remote_address(remote_addr: &str) -> Result<(), NetworkObserverError> {
+    let invalid = remote_addr.is_empty()
+        || remote_addr.len() > MAX_NETWORK_OBSERVER_REMOTE_ADDRESS_BYTES
+        || remote_addr.starts_with('-')
+        || remote_addr.chars().any(|character| {
+            character.is_control() || character.is_whitespace()
+        });
+    if invalid {
+        return Err(NetworkObserverError::InvalidRemoteAddress {
+            input_bytes: remote_addr.len(),
+        });
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    Ok(())
+}
+
+fn validate_output_limit(
+    stream: CommandOutputStream,
+    requested: usize,
+    maximum: usize,
+) -> Result<(), NetworkObserverError> {
+    if requested == 0 || requested > maximum {
+        return Err(NetworkObserverError::InvalidOutputLimit {
+            stream,
+            requested,
+            maximum,
+        });
+    }
+    Ok(())
 }
 
 /// Fail-open: attribute a connection, returning None if rano is unavailable.
@@ -507,8 +604,8 @@ pub fn attribute_failopen(
         Err(e) => {
             warn!(
                 bridge = "rano",
-                remote = %remote_addr,
-                error = %e,
+                remote_addr_bytes = remote_addr.len(),
+                error_kind = e.kind(),
                 "attribution failed, failing open"
             );
             None
@@ -523,8 +620,8 @@ pub fn pressure_failclosed(observer: &NetworkObserver, remote_addr: &str) -> Net
         Err(e) => {
             warn!(
                 bridge = "rano",
-                remote = %remote_addr,
-                error = %e,
+                remote_addr_bytes = remote_addr.len(),
+                error_kind = e.kind(),
                 "pressure attribution failed, failing closed"
             );
             NetworkPressureTier::Black
@@ -559,7 +656,9 @@ mod tests {
         assert_eq!(rt.region, Some("us-east-1".into()));
         assert!((rt.latency_ms - 42.5).abs() < f64::EPSILON);
         assert!(rt.is_trusted);
+        assert_eq!(rt.remote_addr, "10.0.0.1");
         assert_eq!(rt.asn, Some(16509));
+        assert_eq!(rt.org, Some("Amazon".into()));
     }
 
     #[test]
@@ -654,6 +753,14 @@ mod tests {
         assert!((c.yellow_latency_ms - 100.0).abs() < f64::EPSILON);
         assert!((c.red_latency_ms - 500.0).abs() < f64::EPSILON);
         assert_eq!(c.timeout_secs, 10);
+        assert_eq!(
+            c.max_stdout_bytes,
+            DEFAULT_NETWORK_OBSERVER_STDOUT_LIMIT_BYTES
+        );
+        assert_eq!(
+            c.max_stderr_bytes,
+            DEFAULT_NETWORK_OBSERVER_STDERR_LIMIT_BYTES
+        );
     }
 
     #[test]
@@ -662,11 +769,16 @@ mod tests {
             yellow_latency_ms: 50.0,
             red_latency_ms: 200.0,
             timeout_secs: 5,
+            max_stdout_bytes: 100_000,
+            max_stderr_bytes: 4_000,
         };
         let json_str = serde_json::to_string(&c).unwrap();
         let rt: NetworkObserverConfig = serde_json::from_str(&json_str).unwrap();
         assert!((rt.yellow_latency_ms - 50.0).abs() < f64::EPSILON);
         assert!((rt.red_latency_ms - 200.0).abs() < f64::EPSILON);
+        assert_eq!(rt.timeout_secs, 5);
+        assert_eq!(rt.max_stdout_bytes, 100_000);
+        assert_eq!(rt.max_stderr_bytes, 4_000);
     }
 
     #[test]
@@ -674,6 +786,14 @@ mod tests {
         let c: NetworkObserverConfig = serde_json::from_str("{}").unwrap();
         assert!((c.yellow_latency_ms - 100.0).abs() < f64::EPSILON);
         assert!((c.red_latency_ms - 500.0).abs() < f64::EPSILON);
+        assert_eq!(
+            c.max_stdout_bytes,
+            DEFAULT_NETWORK_OBSERVER_STDOUT_LIMIT_BYTES
+        );
+        assert_eq!(
+            c.max_stderr_bytes,
+            DEFAULT_NETWORK_OBSERVER_STDERR_LIMIT_BYTES
+        );
     }
 
     // -- NetworkObserver --
@@ -690,6 +810,7 @@ mod tests {
             yellow_latency_ms: 75.0,
             red_latency_ms: 300.0,
             timeout_secs: 15,
+            ..NetworkObserverConfig::default()
         };
         let obs = NetworkObserver::with_config(config);
         assert!((obs.config().yellow_latency_ms - 75.0).abs() < f64::EPSILON);
@@ -738,10 +859,11 @@ mod tests {
                 yellow_latency_ms: 100.0,
                 red_latency_ms: 500.0,
                 timeout_secs: 1,
+                ..NetworkObserverConfig::default()
             },
         );
 
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let err = obs
             .attribute_connection("10.0.0.1")
             .expect_err("hung subprocess should time out");
@@ -757,6 +879,7 @@ mod tests {
                 yellow_latency_ms: 100.0,
                 red_latency_ms: 500.0,
                 timeout_secs: u64::MAX,
+                ..NetworkObserverConfig::default()
             },
         );
 
@@ -839,6 +962,7 @@ mod tests {
             yellow_latency_ms: 50.0,
             red_latency_ms: 200.0,
             timeout_secs: 10,
+            ..NetworkObserverConfig::default()
         });
         let attr = NetworkAttribution {
             provider: "test".into(),

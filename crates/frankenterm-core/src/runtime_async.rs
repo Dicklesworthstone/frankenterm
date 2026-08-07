@@ -3265,21 +3265,29 @@ pub mod unix {
 /// without depending on any backend-native process layer directly.
 pub mod process {
     use std::ffi::OsStr;
-    use std::io::Read as _;
+    use std::io::{Read as _, Write as _};
     use std::process::{ExitStatus, Output, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use filedescriptor::{
-        poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN,
+        poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT,
     };
 
     const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
     const PROCESS_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
     const PROCESS_TERMINATION_SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
+    const PROCESS_SIGNAL_HELPER_TIMEOUT: Duration = Duration::from_millis(100);
+    const PROCESS_SIGNAL_HELPER_REAP_TIMEOUT: Duration = Duration::from_millis(100);
+    const PROCESS_SIGNAL_HELPER_TOTAL_TIMEOUT: Duration = Duration::from_millis(200);
     const PROCESS_CAPTURE_READ_CHUNK_BYTES: usize = 16 * 1024;
     const PROCESS_CAPTURE_READ_BYTES_PER_TURN: usize = 256 * 1024;
+    const PROCESS_CAPTURE_INITIAL_RESERVE_BYTES: usize = 64 * 1024;
+    const PROCESS_INPUT_WRITE_CHUNK_BYTES: usize = 16 * 1024;
+    const PROCESS_INPUT_WRITE_BYTES_PER_TURN: usize = 256 * 1024;
+    /// Default maximum owned stdin bytes retained by one [`Command`].
+    pub const DEFAULT_COMMAND_STDIN_LIMIT_BYTES: usize = 16 * 1024 * 1024;
     /// Default maximum stdout bytes retained by one [`Command::output`] call.
     /// Callers with a narrower or deliberately wider contract should set it
     /// explicitly with [`Command::stdout_limit`].
@@ -3367,6 +3375,96 @@ pub mod process {
 
     impl std::error::Error for CommandOutputLimitExceeded {}
 
+    /// Stable, content-free detail returned before spawn when configured stdin
+    /// exceeds its explicit byte budget.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CommandInputLimitExceeded {
+        observed: usize,
+        limit: usize,
+    }
+
+    impl CommandInputLimitExceeded {
+        #[must_use]
+        pub const fn observed(&self) -> usize {
+            self.observed
+        }
+
+        #[must_use]
+        pub const fn limit(&self) -> usize {
+            self.limit
+        }
+
+        #[must_use]
+        pub fn from_io_error(error: &std::io::Error) -> Option<&Self> {
+            error.get_ref()?.downcast_ref::<Self>()
+        }
+
+        #[must_use]
+        fn into_io_error(self) -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, self)
+        }
+    }
+
+    impl std::fmt::Display for CommandInputLimitExceeded {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "process command stdin limit exceeded: observed {} bytes, limit {}",
+                self.observed, self.limit
+            )
+        }
+    }
+
+    impl std::error::Error for CommandInputLimitExceeded {}
+
+    /// Stable, content-free detail returned when the supervisor cannot deliver
+    /// all configured stdin bytes to the child.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CommandInputWriteFailed {
+        error_kind: std::io::ErrorKind,
+        written: usize,
+        total: usize,
+    }
+
+    impl CommandInputWriteFailed {
+        #[must_use]
+        pub const fn error_kind(&self) -> std::io::ErrorKind {
+            self.error_kind
+        }
+
+        #[must_use]
+        pub const fn written(&self) -> usize {
+            self.written
+        }
+
+        #[must_use]
+        pub const fn total(&self) -> usize {
+            self.total
+        }
+
+        #[must_use]
+        pub fn from_io_error(error: &std::io::Error) -> Option<&Self> {
+            error.get_ref()?.downcast_ref::<Self>()
+        }
+
+        #[must_use]
+        fn into_io_error(self) -> std::io::Error {
+            std::io::Error::new(self.error_kind, self)
+        }
+    }
+
+    impl std::fmt::Display for CommandInputWriteFailed {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "process command stdin write failed ({:?}, written {} of {} bytes)",
+                self.error_kind, self.written, self.total
+            )
+        }
+    }
+
+    impl std::error::Error for CommandInputWriteFailed {}
+
     /// Stable, content-free failure returned when the child leader exited but
     /// inherited output descriptors did not reach EOF within the bounded drain
     /// window. Returning a partial `Output` as complete would let callers parse
@@ -3408,6 +3506,7 @@ pub mod process {
     /// Convert an owned capture buffer to text without copying valid UTF-8.
     /// Invalid UTF-8 retains the historical lossy replacement behavior and
     /// allocates only on that exceptional path.
+    #[must_use]
     pub(crate) fn decode_captured_bytes_lossy(bytes: Vec<u8>) -> String {
         match String::from_utf8(bytes) {
             Ok(text) => text,
@@ -3427,22 +3526,353 @@ pub mod process {
 
     impl std::error::Error for CommandOutputCaptureIncomplete {}
 
+    /// Stable, content-free detail attached to an interrupted command error.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CommandCancelled;
+
+    impl CommandCancelled {
+        /// Recover the stable detail from a command-capture `io::Error`.
+        #[must_use]
+        pub fn from_io_error(error: &std::io::Error) -> Option<&Self> {
+            error.get_ref()?.downcast_ref::<Self>()
+        }
+
+        #[must_use]
+        fn into_io_error(self) -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::Interrupted, self)
+        }
+    }
+
+    impl std::fmt::Display for CommandCancelled {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("process command cancelled")
+        }
+    }
+
+    impl std::error::Error for CommandCancelled {}
+
+    /// Stable, content-free detail attached to a command deadline error.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CommandTimedOut {
+        timeout_ms: u64,
+    }
+
+    impl CommandTimedOut {
+        #[must_use]
+        pub const fn timeout_ms(&self) -> u64 {
+            self.timeout_ms
+        }
+
+        /// Recover the stable detail from a command-capture `io::Error`.
+        #[must_use]
+        pub fn from_io_error(error: &std::io::Error) -> Option<&Self> {
+            error.get_ref()?.downcast_ref::<Self>()
+        }
+
+        #[must_use]
+        fn into_io_error(self) -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, self)
+        }
+    }
+
+    impl std::fmt::Display for CommandTimedOut {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "process command timed out after {} ms",
+                self.timeout_ms
+            )
+        }
+    }
+
+    impl std::error::Error for CommandTimedOut {}
+
+    /// Bounded signal-helper phase that failed to establish a terminal state.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CommandSignalHelperFailurePhase {
+        CompletionProbe,
+        PostKillProbe,
+        PostKillDeadline,
+    }
+
+    impl std::fmt::Display for CommandSignalHelperFailurePhase {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(match self {
+                Self::CompletionProbe => "completion_probe",
+                Self::PostKillProbe => "post_kill_probe",
+                Self::PostKillDeadline => "post_kill_deadline",
+            })
+        }
+    }
+
+    /// Content-free proof that a spawned `kill`/`taskkill` helper could not be
+    /// confirmed reaped. The helper is never targeted after a non-Interrupted
+    /// status-probe error because its numeric identity is then uncertain.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CommandSignalHelperCleanupIncomplete {
+        phase: CommandSignalHelperFailurePhase,
+        probe_error_kind: Option<std::io::ErrorKind>,
+    }
+
+    impl CommandSignalHelperCleanupIncomplete {
+        #[must_use]
+        pub const fn phase(&self) -> CommandSignalHelperFailurePhase {
+            self.phase
+        }
+
+        #[must_use]
+        pub const fn probe_error_kind(&self) -> Option<std::io::ErrorKind> {
+            self.probe_error_kind
+        }
+
+        #[must_use]
+        pub fn from_io_error(error: &std::io::Error) -> Option<&Self> {
+            error.get_ref()?.downcast_ref::<Self>()
+        }
+
+        #[must_use]
+        fn into_io_error(self) -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, self)
+        }
+    }
+
+    impl std::fmt::Display for CommandSignalHelperCleanupIncomplete {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "process signal helper cleanup incomplete (phase={}, probe_error_kind={:?})",
+                self.phase, self.probe_error_kind
+            )
+        }
+    }
+
+    impl std::error::Error for CommandSignalHelperCleanupIncomplete {}
+
+    /// Stable class identifying the failure that initiated bounded process
+    /// cleanup. It intentionally carries no program, argument, path, PID, or
+    /// child-output content.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CommandCleanupTrigger {
+        Cancelled,
+        TimedOut,
+        CaptureLimit(CommandOutputStream),
+        CaptureRead,
+        StdinWrite,
+        ReadinessPoll,
+        StatusProbe,
+    }
+
+    impl std::fmt::Display for CommandCleanupTrigger {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Cancelled => formatter.write_str("cancelled"),
+                Self::TimedOut => formatter.write_str("timed_out"),
+                Self::CaptureLimit(stream) => write!(formatter, "{stream}_capture_limit"),
+                Self::CaptureRead => formatter.write_str("capture_read"),
+                Self::StdinWrite => formatter.write_str("stdin_write"),
+                Self::ReadinessPoll => formatter.write_str("readiness_poll"),
+                Self::StatusProbe => formatter.write_str("status_probe"),
+            }
+        }
+    }
+
+    /// Stable, content-free detail returned when bounded cleanup could not
+    /// prove leader reap, signal-helper settlement, process-tree signalling,
+    /// and inherited capture-descriptor closure before the shared deadline.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CommandProcessCleanupIncomplete {
+        trigger: CommandCleanupTrigger,
+        leader_reaped: bool,
+        signal_helper_settled: bool,
+        process_tree_signalled: bool,
+        stdout_open: bool,
+        stderr_open: bool,
+        settle_timeout_ms: u64,
+    }
+
+    impl CommandProcessCleanupIncomplete {
+        #[must_use]
+        pub const fn trigger(&self) -> CommandCleanupTrigger {
+            self.trigger
+        }
+
+        #[must_use]
+        pub const fn leader_reaped(&self) -> bool {
+            self.leader_reaped
+        }
+
+        #[must_use]
+        pub const fn signal_helper_settled(&self) -> bool {
+            self.signal_helper_settled
+        }
+
+        #[must_use]
+        pub const fn process_tree_signalled(&self) -> bool {
+            self.process_tree_signalled
+        }
+
+        #[must_use]
+        pub const fn stdout_open(&self) -> bool {
+            self.stdout_open
+        }
+
+        #[must_use]
+        pub const fn stderr_open(&self) -> bool {
+            self.stderr_open
+        }
+
+        #[must_use]
+        pub const fn settle_timeout_ms(&self) -> u64 {
+            self.settle_timeout_ms
+        }
+
+        /// Recover the stable detail from a command-supervisor `io::Error`.
+        #[must_use]
+        pub fn from_io_error(error: &std::io::Error) -> Option<&Self> {
+            error.get_ref()?.downcast_ref::<Self>()
+        }
+
+        #[must_use]
+        fn into_io_error(self) -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, self)
+        }
+    }
+
+    impl std::fmt::Display for CommandProcessCleanupIncomplete {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "process command cleanup incomplete after {} ms (trigger={}, leader_reaped={}, signal_helper_settled={}, process_tree_signalled={}, stdout_open={}, stderr_open={})",
+                self.settle_timeout_ms,
+                self.trigger,
+                self.leader_reaped,
+                self.signal_helper_settled,
+                self.process_tree_signalled,
+                self.stdout_open,
+                self.stderr_open
+            )
+        }
+    }
+
+    impl std::error::Error for CommandProcessCleanupIncomplete {}
+
+    /// Cloneable cancellation signal for synchronous command supervision.
+    #[derive(Debug, Clone, Default)]
+    pub struct CommandCancellation {
+        requested: Arc<AtomicBool>,
+    }
+
+    impl CommandCancellation {
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Request cancellation. Repeated calls are idempotent.
+        pub fn cancel(&self) {
+            self.requested.store(true, Ordering::SeqCst);
+        }
+
+        #[must_use]
+        pub fn is_cancelled(&self) -> bool {
+            self.requested.load(Ordering::SeqCst)
+        }
+
+        fn shared_flag(&self) -> Arc<AtomicBool> {
+            Arc::clone(&self.requested)
+        }
+    }
+
     #[derive(Debug, Clone, Copy)]
     struct OutputCaptureLimits {
         stdout: usize,
         stderr: usize,
     }
 
+    struct OutputCommandSpec {
+        program: std::ffi::OsString,
+        args: Vec<std::ffi::OsString>,
+        envs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+        current_dir: Option<std::path::PathBuf>,
+        stdin: Option<Arc<[u8]>>,
+        stdin_configuration_error: Option<CommandInputLimitExceeded>,
+        stdin_limit: usize,
+        limits: OutputCaptureLimits,
+        exec_busy_retry_delays: Vec<Duration>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct OutputCommandDeadline {
+        at: Instant,
+        timeout_ms: u64,
+    }
+
+    impl OutputCommandDeadline {
+        fn new(timeout: Duration) -> Self {
+            Self {
+                at: process_deadline_after(timeout),
+                timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            }
+        }
+
+        fn is_elapsed(self) -> bool {
+            Instant::now() >= self.at
+        }
+
+        fn remaining(self) -> Duration {
+            self.at.saturating_duration_since(Instant::now())
+        }
+
+        fn into_io_error(self) -> std::io::Error {
+            CommandTimedOut {
+                timeout_ms: self.timeout_ms,
+            }
+            .into_io_error()
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CaptureDrainState {
+        Eof,
+        Pending,
+        QuantumExhausted,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum OutputChildProbeErrorAction {
+        RetryUntilDeadline,
+        StopWithUncertainIdentity,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct OutputCleanupState {
+        leader_reaped: bool,
+        signal_helper_settled: bool,
+        process_tree_signalled: bool,
+        stdout_open: bool,
+        stderr_open: bool,
+    }
+
+    struct CommandInputState {
+        writer: FileDescriptor,
+        bytes: Arc<[u8]>,
+        written: usize,
+    }
+
     /// Async-compatible process command wrapper backed by `std::process::Command`.
     ///
     /// Mirrors the subset of the legacy compat command surface used by callers:
-    /// command/env construction, kill-on-drop, bounded output configuration,
-    /// and async output collection.
+    /// command/env construction, kill-on-drop, bounded owned input, bounded
+    /// output configuration, and async output collection.
     pub struct Command {
         inner: std::process::Command,
         kill_on_drop: bool,
+        stdin: Option<Arc<[u8]>>,
+        stdin_configuration_error: Option<CommandInputLimitExceeded>,
+        stdin_limit: usize,
         stdout_limit: usize,
         stderr_limit: usize,
+        exec_busy_retry_delays: Vec<Duration>,
     }
 
     struct KillOnDropGuard {
@@ -3454,10 +3884,15 @@ pub mod process {
 
     trait ProcessControl {
         fn configure_process_group(cmd: &mut std::process::Command) -> std::io::Result<()>;
-        fn send_signal_to_pid(pid: i64, signal: &str) -> std::io::Result<ExitStatus>;
+        fn send_signal_to_pid(
+            pid: i64,
+            signal: &str,
+            deadline: Instant,
+        ) -> std::io::Result<ExitStatus>;
         fn send_signal_to_process_group(
             process_group_id: u32,
             signal: &str,
+            deadline: Instant,
         ) -> std::io::Result<ExitStatus>;
     }
 
@@ -3493,6 +3928,89 @@ pub mod process {
         ))
     }
 
+    enum SignalHelperReapOutcome {
+        Reaped(ExitStatus),
+        DeadlineElapsed,
+        ProbeUncertain(std::io::ErrorKind),
+    }
+
+    fn reap_signal_helper_until(
+        helper: &mut std::process::Child,
+        deadline: Instant,
+    ) -> SignalHelperReapOutcome {
+        loop {
+            match helper.try_wait() {
+                Ok(Some(status)) => return SignalHelperReapOutcome::Reaped(status),
+                Ok(None) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    return SignalHelperReapOutcome::ProbeUncertain(error.kind());
+                }
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return SignalHelperReapOutcome::DeadlineElapsed;
+            }
+            std::thread::sleep(remaining.min(PROCESS_POLL_INTERVAL));
+        }
+    }
+
+    /// Run the small platform signal helper without ever blocking on
+    /// `Child::wait`/`Command::status`. A wedged `kill`/`taskkill` helper is
+    /// terminated through its owned child handle and given one final finite
+    /// reap window, so process-command cleanup cannot inherit an unbounded
+    /// external wait.
+    fn run_signal_helper(
+        command: &mut std::process::Command,
+        overall_deadline: Instant,
+    ) -> std::io::Result<ExitStatus> {
+        if Instant::now() >= overall_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "process signal helper deadline elapsed before spawn",
+            ));
+        }
+        let mut helper = command.spawn()?;
+        let completion_deadline =
+            process_deadline_after(PROCESS_SIGNAL_HELPER_TIMEOUT).min(overall_deadline);
+        match reap_signal_helper_until(&mut helper, completion_deadline) {
+            SignalHelperReapOutcome::Reaped(status) => return Ok(status),
+            SignalHelperReapOutcome::ProbeUncertain(kind) => {
+                return Err(CommandSignalHelperCleanupIncomplete {
+                    phase: CommandSignalHelperFailurePhase::CompletionProbe,
+                    probe_error_kind: Some(kind),
+                }
+                .into_io_error());
+            }
+            SignalHelperReapOutcome::DeadlineElapsed => {}
+        }
+
+        let _ = helper.kill();
+        let reap_deadline =
+            process_deadline_after(PROCESS_SIGNAL_HELPER_REAP_TIMEOUT).min(overall_deadline);
+        match reap_signal_helper_until(&mut helper, reap_deadline) {
+            SignalHelperReapOutcome::Reaped(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "process signal helper timed out",
+            )),
+            SignalHelperReapOutcome::ProbeUncertain(kind) => {
+                Err(CommandSignalHelperCleanupIncomplete {
+                    phase: CommandSignalHelperFailurePhase::PostKillProbe,
+                    probe_error_kind: Some(kind),
+                }
+                .into_io_error())
+            }
+            SignalHelperReapOutcome::DeadlineElapsed => {
+                Err(CommandSignalHelperCleanupIncomplete {
+                    phase: CommandSignalHelperFailurePhase::PostKillDeadline,
+                    probe_error_kind: None,
+                }
+                .into_io_error())
+            }
+        }
+    }
+
     #[cfg(unix)]
     impl ProcessControl for PlatformProcessControl {
         fn configure_process_group(cmd: &mut std::process::Command) -> std::io::Result<()> {
@@ -3502,31 +4020,38 @@ pub mod process {
             Ok(())
         }
 
-        fn send_signal_to_pid(pid: i64, signal: &str) -> std::io::Result<ExitStatus> {
+        fn send_signal_to_pid(
+            pid: i64,
+            signal: &str,
+            deadline: Instant,
+        ) -> std::io::Result<ExitStatus> {
             validate_unix_signal_target(pid)?;
             validate_unix_signal_name(signal)?;
 
-            std::process::Command::new(unix_kill_command())
+            let mut command = std::process::Command::new(unix_kill_command());
+            command
                 .args(["-s", signal, &pid.to_string()])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
+                .stderr(Stdio::null());
+            run_signal_helper(&mut command, deadline)
         }
 
         fn send_signal_to_process_group(
             process_group_id: u32,
             signal: &str,
+            deadline: Instant,
         ) -> std::io::Result<ExitStatus> {
             validate_unix_signal_target(i64::from(process_group_id))?;
             validate_unix_signal_name(signal)?;
 
-            std::process::Command::new(unix_kill_command())
+            let mut command = std::process::Command::new(unix_kill_command());
+            command
                 .args(["-s", signal, &format!("-{process_group_id}")])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
+                .stderr(Stdio::null());
+            run_signal_helper(&mut command, deadline)
         }
     }
 
@@ -3536,17 +4061,26 @@ pub mod process {
             Ok(())
         }
 
-        fn send_signal_to_pid(pid: i64, signal: &str) -> std::io::Result<ExitStatus> {
+        fn send_signal_to_pid(
+            pid: i64,
+            signal: &str,
+            deadline: Instant,
+        ) -> std::io::Result<ExitStatus> {
             let pid = validate_windows_signal_target(pid)?;
-            run_taskkill(pid, windows_taskkill_force(signal)?)
+            run_taskkill(pid, windows_taskkill_force(signal)?, deadline)
         }
 
         fn send_signal_to_process_group(
             process_group_id: u32,
             signal: &str,
+            deadline: Instant,
         ) -> std::io::Result<ExitStatus> {
             validate_windows_signal_target(i64::from(process_group_id))?;
-            run_taskkill(process_group_id, windows_taskkill_force(signal)?)
+            run_taskkill(
+                process_group_id,
+                windows_taskkill_force(signal)?,
+                deadline,
+            )
         }
     }
 
@@ -3556,7 +4090,11 @@ pub mod process {
             Ok(())
         }
 
-        fn send_signal_to_pid(_pid: i64, _signal: &str) -> std::io::Result<ExitStatus> {
+        fn send_signal_to_pid(
+            _pid: i64,
+            _signal: &str,
+            _deadline: Instant,
+        ) -> std::io::Result<ExitStatus> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "process signaling is unsupported on this platform",
@@ -3566,6 +4104,7 @@ pub mod process {
         fn send_signal_to_process_group(
             _process_group_id: u32,
             _signal: &str,
+            _deadline: Instant,
         ) -> std::io::Result<ExitStatus> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -3609,7 +4148,7 @@ pub mod process {
     }
 
     #[cfg(windows)]
-    fn run_taskkill(pid: u32, force: bool) -> std::io::Result<ExitStatus> {
+    fn run_taskkill(pid: u32, force: bool, deadline: Instant) -> std::io::Result<ExitStatus> {
         let pid_arg = pid.to_string();
         let mut cmd = std::process::Command::new("taskkill");
         cmd.args(["/PID", &pid_arg, "/T"]);
@@ -3619,7 +4158,7 @@ pub mod process {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        cmd.status()
+        run_signal_helper(&mut cmd, deadline)
     }
 
     /// Configure a freshly built command so its subprocess tree can be
@@ -3632,14 +4171,34 @@ pub mod process {
     }
 
     pub fn send_signal_to_pid(pid: i64, signal: &str) -> std::io::Result<ExitStatus> {
-        PlatformProcessControl::send_signal_to_pid(pid, signal)
+        PlatformProcessControl::send_signal_to_pid(
+            pid,
+            signal,
+            process_deadline_after(PROCESS_SIGNAL_HELPER_TOTAL_TIMEOUT),
+        )
     }
 
     pub fn send_signal_to_process_group(
         process_group_id: u32,
         signal: &str,
     ) -> std::io::Result<ExitStatus> {
-        PlatformProcessControl::send_signal_to_process_group(process_group_id, signal)
+        send_signal_to_process_group_until(
+            process_group_id,
+            signal,
+            process_deadline_after(PROCESS_SIGNAL_HELPER_TOTAL_TIMEOUT),
+        )
+    }
+
+    fn send_signal_to_process_group_until(
+        process_group_id: u32,
+        signal: &str,
+        deadline: Instant,
+    ) -> std::io::Result<ExitStatus> {
+        PlatformProcessControl::send_signal_to_process_group(
+            process_group_id,
+            signal,
+            deadline,
+        )
     }
 
     /// Send a process-termination signal by pid. Cross-platform: on Unix it
@@ -3707,8 +4266,12 @@ pub mod process {
             Self {
                 inner: std::process::Command::new(program),
                 kill_on_drop: false,
+                stdin: None,
+                stdin_configuration_error: None,
+                stdin_limit: DEFAULT_COMMAND_STDIN_LIMIT_BYTES,
                 stdout_limit: DEFAULT_COMMAND_STDOUT_LIMIT_BYTES,
                 stderr_limit: DEFAULT_COMMAND_STDERR_LIMIT_BYTES,
+                exec_busy_retry_delays: Vec::new(),
             }
         }
 
@@ -3732,6 +4295,50 @@ pub mod process {
             V: AsRef<OsStr>,
         {
             self.inner.env(key, val);
+            self
+        }
+
+        /// Set the working directory used for the child process.
+        pub fn current_dir<P: AsRef<std::path::Path>>(&mut self, dir: P) -> &mut Self {
+            self.inner.current_dir(dir);
+            self
+        }
+
+        /// Configure an owned stdin payload. The bytes are delivered through
+        /// the same cancellation/deadline-aware nonblocking supervisor as
+        /// output capture; no payload content enters argv, environment, or a
+        /// temporary file. Without this call, stdin remains null.
+        pub fn stdin_bytes<B: Into<Vec<u8>>>(&mut self, bytes: B) -> &mut Self {
+            let bytes = bytes.into();
+            if bytes.len() > self.stdin_limit {
+                self.stdin = None;
+                self.stdin_configuration_error = Some(CommandInputLimitExceeded {
+                    observed: bytes.len(),
+                    limit: self.stdin_limit,
+                });
+            } else {
+                self.stdin = Some(Arc::from(bytes));
+                self.stdin_configuration_error = None;
+            }
+            self
+        }
+
+        /// Set the maximum configured stdin payload size. The limit is checked
+        /// before descriptors are allocated or a child is spawned.
+        pub fn stdin_limit(&mut self, limit: usize) -> &mut Self {
+            self.stdin_limit = limit;
+            let oversized_observed = self
+                .stdin
+                .as_ref()
+                .map(|bytes| bytes.len())
+                .filter(|observed| *observed > self.stdin_limit);
+            if let Some(observed) = oversized_observed {
+                self.stdin = None;
+                self.stdin_configuration_error = Some(CommandInputLimitExceeded {
+                    observed,
+                    limit: self.stdin_limit,
+                });
+            }
             self
         }
 
@@ -3759,24 +4366,47 @@ pub mod process {
             self
         }
 
+        /// Configure bounded retry delays for transient `ETXTBSY` spawn
+        /// failures. This is crate-internal because only integrations that can
+        /// be replaced in place need the write-then-exec race workaround.
+        pub(crate) fn exec_busy_retry_delays(&mut self, delays: &[Duration]) -> &mut Self {
+            self.exec_busy_retry_delays.clear();
+            self.exec_busy_retry_delays.extend_from_slice(delays);
+            self
+        }
+
+        /// Execute synchronously under a finite wall-clock deadline using the
+        /// same bounded nonblocking capture supervisor as [`Self::output`].
+        pub fn output_blocking(&mut self, timeout: Duration) -> std::io::Result<Output> {
+            let cancellation = CommandCancellation::new();
+            self.output_blocking_with_cancellation(timeout, &cancellation)
+        }
+
+        /// Synchronous bounded output collection with cooperative external
+        /// cancellation. Cancellation and timeout errors retain stable typed,
+        /// content-free details for callers to classify.
+        pub fn output_blocking_with_cancellation(
+            &mut self,
+            timeout: Duration,
+            cancellation: &CommandCancellation,
+        ) -> std::io::Result<Output> {
+            run_output_command(
+                self.output_spec(),
+                cancellation.shared_flag(),
+                Some(OutputCommandDeadline::new(timeout)),
+            )
+        }
+
         /// Executes the command and collects its output, running the blocking
         /// I/O on the runtime's blocking thread pool.
         pub async fn output(&mut self) -> std::io::Result<Output> {
             // Build a fresh std::process::Command to move into the closure
             // (std::process::Command is not Send, so we serialize the config).
-            let program = self.get_program();
-            let args = self.get_args();
-            let envs = self.get_envs();
-            let limits = OutputCaptureLimits {
-                stdout: self.stdout_limit,
-                stderr: self.stderr_limit,
-            };
+            let spec = self.output_spec();
             let cancel = Arc::new(AtomicBool::new(false));
             let mut kill_guard = KillOnDropGuard::new(Arc::clone(&cancel), self.kill_on_drop);
 
-            let result = super::spawn_blocking(move || {
-                run_output_command(program, args, envs, limits, cancel)
-            })
+            let result = super::spawn_blocking(move || run_output_command(spec, cancel, None))
             .await
             .map_err(std::io::Error::other)?;
 
@@ -3804,20 +4434,10 @@ pub mod process {
         /// watcher sets `watcher_done` on normal-path exit so it
         /// never leaks past the body.
         pub async fn output_with_cx(&mut self, cx: &crate::cx::Cx) -> std::io::Result<Output> {
-            cx.checkpoint().map_err(|err| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    format!("process command cancelled pre-spawn: {err}"),
-                )
-            })?;
+            cx.checkpoint()
+                .map_err(|_| CommandCancelled.into_io_error())?;
 
-            let program = self.get_program();
-            let args = self.get_args();
-            let envs = self.get_envs();
-            let limits = OutputCaptureLimits {
-                stdout: self.stdout_limit,
-                stderr: self.stderr_limit,
-            };
+            let spec = self.output_spec();
             let cancel = Arc::new(AtomicBool::new(false));
             let mut kill_guard = KillOnDropGuard::new(Arc::clone(&cancel), self.kill_on_drop);
 
@@ -3866,9 +4486,7 @@ pub mod process {
             // long-lived cxs.
             let _watcher_done_guard = WatcherDoneGuard::new(Arc::clone(&watcher_done));
 
-            let result = super::spawn_blocking(move || {
-                run_output_command(program, args, envs, limits, cancel)
-            })
+            let result = super::spawn_blocking(move || run_output_command(spec, cancel, None))
             .await
             .map_err(std::io::Error::other)?;
 
@@ -3890,49 +4508,89 @@ pub mod process {
     }
 
     impl Command {
-        fn get_program(&self) -> std::ffi::OsString {
-            self.inner.get_program().to_os_string()
-        }
-
-        fn get_args(&self) -> Vec<std::ffi::OsString> {
-            self.inner.get_args().map(|a| a.to_os_string()).collect()
-        }
-
-        fn get_envs(&self) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-            self.inner
-                .get_envs()
-                .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string())))
-                .collect()
+        fn output_spec(&self) -> OutputCommandSpec {
+            OutputCommandSpec {
+                program: self.inner.get_program().to_os_string(),
+                args: self.inner.get_args().map(|arg| arg.to_os_string()).collect(),
+                envs: self
+                    .inner
+                    .get_envs()
+                    .filter_map(|(key, value)| {
+                        value.map(|value| (key.to_os_string(), value.to_os_string()))
+                    })
+                    .collect(),
+                current_dir: self.inner.get_current_dir().map(std::path::Path::to_path_buf),
+                stdin: self.stdin.clone(),
+                stdin_configuration_error: self.stdin_configuration_error,
+                stdin_limit: self.stdin_limit,
+                limits: OutputCaptureLimits {
+                    stdout: self.stdout_limit,
+                    stderr: self.stderr_limit,
+                },
+                exec_busy_retry_delays: self.exec_busy_retry_delays.clone(),
+            }
         }
     }
 
     fn run_output_command(
-        program: std::ffi::OsString,
-        args: Vec<std::ffi::OsString>,
-        envs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
-        limits: OutputCaptureLimits,
+        spec: OutputCommandSpec,
         cancel: Arc<AtomicBool>,
+        deadline: Option<OutputCommandDeadline>,
     ) -> std::io::Result<Output> {
         // A kill-on-drop future can be cancelled while queued for the blocking
         // pool. Observe that state before allocating descriptors or spawning a
         // process, so a cancelled operation cannot launch after its caller has
         // already gone away.
-        if cancel.load(Ordering::SeqCst) {
-            return Err(process_command_cancelled_error());
+        check_output_command_abort(&cancel, deadline)?;
+
+        let OutputCommandSpec {
+            program,
+            args,
+            envs,
+            current_dir,
+            stdin,
+            stdin_configuration_error,
+            stdin_limit,
+            limits,
+            exec_busy_retry_delays,
+        } = spec;
+
+        if let Some(error) = stdin_configuration_error {
+            return Err(error.into_io_error());
         }
+        validate_command_input(stdin.as_deref(), stdin_limit)?;
 
         let (mut stdout_read, stdout_write) = process_capture_socketpair("stdout")?;
         let (mut stderr_read, stderr_write) = process_capture_socketpair("stderr")?;
+        let (mut stdin_write, stdin_read) = if stdin.is_some() {
+            let (write, read) = process_capture_socketpair("stdin")?;
+            (Some(write), Some(read))
+        } else {
+            (None, None)
+        };
         stdout_read
             .set_non_blocking(true)
             .map_err(|error| process_capture_setup_error("stdout nonblocking mode", error))?;
         stderr_read
             .set_non_blocking(true)
             .map_err(|error| process_capture_setup_error("stderr nonblocking mode", error))?;
+        if let Some(writer) = stdin_write.as_mut() {
+            writer
+                .set_non_blocking(true)
+                .map_err(|error| process_capture_setup_error("stdin nonblocking mode", error))?;
+        }
 
         let mut cmd = std::process::Command::new(program);
         cmd.args(args);
-        cmd.stdin(Stdio::null());
+        if let Some(stdin_read) = stdin_read.as_ref() {
+            cmd.stdin(
+                stdin_read
+                    .as_stdio()
+                    .map_err(|error| process_capture_setup_error("stdin child handle", error))?,
+            );
+        } else {
+            cmd.stdin(Stdio::null());
+        }
         cmd.stdout(
             stdout_write
                 .as_stdio()
@@ -3946,25 +4604,37 @@ pub mod process {
         for (k, v) in envs {
             cmd.env(k, v);
         }
+        if let Some(current_dir) = current_dir {
+            cmd.current_dir(current_dir);
+        }
 
         configure_process_group(&mut cmd)?;
 
         // Close the remaining queue/setup window. Cancellation can still race
         // the spawn itself, but the first worker-loop iteration will then
         // terminate that process tree promptly.
-        if cancel.load(Ordering::SeqCst) {
-            return Err(process_command_cancelled_error());
-        }
+        check_output_command_abort(&cancel, deadline)?;
 
-        let mut child = cmd.spawn()?;
+        let mut child = spawn_output_child(
+            &mut cmd,
+            &exec_busy_retry_delays,
+            &cancel,
+            deadline,
+        )?;
         // `Command` retains custom Stdio handles for possible reuse. Drop it
         // and our original write endpoints immediately so only the child (or
         // descendants that deliberately inherit them) can keep either stream
         // open. This is essential for reliable EOF detection.
         drop(cmd);
+        drop(stdin_read);
         drop(stdout_write);
         drop(stderr_write);
 
+        let mut stdin_state = stdin.zip(stdin_write).map(|(bytes, writer)| CommandInputState {
+            writer,
+            bytes,
+            written: 0,
+        });
         let mut stdout_reader = Some(stdout_read);
         let mut stderr_reader = Some(stderr_read);
         let mut stdout = Vec::new();
@@ -3974,87 +4644,163 @@ pub mod process {
 
         loop {
             if cancel.load(Ordering::SeqCst) {
-                // Once `status` is populated, the leader has been reaped and
-                // its PID/process-group identifier may already be reusable.
-                // Never re-probe and potentially signal that identifier.
-                let already_reaped =
-                    status.is_some() || matches!(child.try_wait(), Ok(Some(_)));
-                if !already_reaped {
-                    terminate_child_process(&mut child);
-                }
-                settle_output_command(
+                terminate_and_settle_output_command(
                     &mut child,
-                    already_reaped,
+                    status.is_some(),
+                    CommandCleanupTrigger::Cancelled,
+                    &mut stdin_state,
                     &mut stdout_reader,
                     &mut stderr_reader,
                     &mut stdout,
                     &mut stderr,
                     limits,
-                );
+                )?;
                 return Err(process_command_cancelled_error());
             }
+            if let Some(deadline) = deadline
+                && deadline.is_elapsed()
+            {
+                terminate_and_settle_output_command(
+                    &mut child,
+                    status.is_some(),
+                    CommandCleanupTrigger::TimedOut,
+                    &mut stdin_state,
+                    &mut stdout_reader,
+                    &mut stderr_reader,
+                    &mut stdout,
+                    &mut stderr,
+                    limits,
+                )?;
+                return Err(deadline.into_io_error());
+            }
 
-            if let Err(error) = drain_capture_reader(
+            let stdin_quantum_exhausted = match write_command_input(&mut stdin_state) {
+                Ok(quantum_exhausted) => quantum_exhausted,
+                Err(error) => {
+                    terminate_and_settle_output_command(
+                        &mut child,
+                        status.is_some(),
+                        CommandCleanupTrigger::StdinWrite,
+                        &mut stdin_state,
+                        &mut stdout_reader,
+                        &mut stderr_reader,
+                        &mut stdout,
+                        &mut stderr,
+                        limits,
+                    )?;
+                    return Err(error);
+                }
+            };
+
+            let stdout_quantum_exhausted = match drain_capture_reader(
                 &mut stdout_reader,
                 &mut stdout,
                 limits.stdout,
                 CommandOutputStream::Stdout,
             ) {
-                if status.is_none() {
-                    terminate_child_process(&mut child);
+                Ok(quantum_exhausted) => quantum_exhausted,
+                Err(error) => {
+                    terminate_and_settle_output_command(
+                        &mut child,
+                        status.is_some(),
+                        output_cleanup_trigger_for_capture_error(&error),
+                        &mut stdin_state,
+                        &mut stdout_reader,
+                        &mut stderr_reader,
+                        &mut stdout,
+                        &mut stderr,
+                        limits,
+                    )?;
+                    return Err(error);
                 }
-                settle_output_command(
-                    &mut child,
-                    status.is_some(),
-                    &mut stdout_reader,
-                    &mut stderr_reader,
-                    &mut stdout,
-                    &mut stderr,
-                    limits,
-                );
-                return Err(error);
-            }
-            if let Err(error) = drain_capture_reader(
+            };
+            let stderr_quantum_exhausted = match drain_capture_reader(
                 &mut stderr_reader,
                 &mut stderr,
                 limits.stderr,
                 CommandOutputStream::Stderr,
             ) {
-                if status.is_none() {
-                    terminate_child_process(&mut child);
+                Ok(quantum_exhausted) => quantum_exhausted,
+                Err(error) => {
+                    terminate_and_settle_output_command(
+                        &mut child,
+                        status.is_some(),
+                        output_cleanup_trigger_for_capture_error(&error),
+                        &mut stdin_state,
+                        &mut stdout_reader,
+                        &mut stderr_reader,
+                        &mut stdout,
+                        &mut stderr,
+                        limits,
+                    )?;
+                    return Err(error);
                 }
-                settle_output_command(
-                    &mut child,
-                    status.is_some(),
-                    &mut stdout_reader,
-                    &mut stderr_reader,
-                    &mut stdout,
-                    &mut stderr,
-                    limits,
-                );
-                return Err(error);
-            }
+            };
+            let io_quantum_exhausted = stdin_quantum_exhausted
+                || stdout_quantum_exhausted
+                || stderr_quantum_exhausted;
 
             if status.is_none() {
                 match child.try_wait() {
                     Ok(Some(exit_status)) => {
+                        if let Some(input) = stdin_state.take() {
+                            let error = CommandInputWriteFailed {
+                                error_kind: std::io::ErrorKind::BrokenPipe,
+                                written: input.written,
+                                total: input.bytes.len(),
+                            }
+                            .into_io_error();
+                            terminate_and_settle_output_command(
+                                &mut child,
+                                true,
+                                CommandCleanupTrigger::StdinWrite,
+                                &mut stdin_state,
+                                &mut stdout_reader,
+                                &mut stderr_reader,
+                                &mut stdout,
+                                &mut stderr,
+                                limits,
+                            )?;
+                            return Err(error);
+                        }
                         status = Some(exit_status);
                         post_exit_deadline = Some(process_deadline_after(
                             PROCESS_POST_EXIT_DRAIN_TIMEOUT,
                         ));
                     }
                     Ok(None) => {}
+                    Err(error)
+                        if output_child_probe_error_action(&error)
+                            == OutputChildProbeErrorAction::RetryUntilDeadline =>
+                    {
+                        // Return to the deadline/cancellation-aware outer
+                        // loop. Readiness polling below bounds the retry rate,
+                        // so repeated signals cannot create a hot spin.
+                    }
                     Err(error) => {
-                        terminate_child_process(&mut child);
-                        settle_output_command(
+                        // The state probe failed, so the numeric process/group
+                        // identity is not safe to signal. Fail closed: close
+                        // capture within the bounded settlement window and
+                        // preserve the probe error for the caller.
+                        let settlement_deadline =
+                            process_deadline_after(PROCESS_TERMINATION_SETTLE_TIMEOUT);
+                        stdin_state.take();
+                        let cleanup = settle_output_command(
                             &mut child,
+                            false,
+                            true,
                             false,
                             &mut stdout_reader,
                             &mut stderr_reader,
                             &mut stdout,
                             &mut stderr,
                             limits,
+                            settlement_deadline,
                         );
+                        ensure_output_cleanup_complete(
+                            CommandCleanupTrigger::StatusProbe,
+                            cleanup,
+                        )?;
                         return Err(error);
                     }
                 }
@@ -4068,10 +4814,10 @@ pub mod process {
                         stderr,
                     });
                 }
-                let deadline = *post_exit_deadline.get_or_insert_with(|| {
+                let post_exit_at = *post_exit_deadline.get_or_insert_with(|| {
                     process_deadline_after(PROCESS_POST_EXIT_DRAIN_TIMEOUT)
                 });
-                let remaining = deadline.saturating_duration_since(Instant::now());
+                let remaining = post_exit_at.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     let incomplete = CommandOutputCaptureIncomplete {
                         stdout_open: stdout_reader.is_some(),
@@ -4090,37 +4836,55 @@ pub mod process {
                     stderr_reader.take();
                     return Err(incomplete.into_io_error());
                 }
-                if let Err(error) = poll_capture_readers(
+                // A full fair-read quantum means there may already be more
+                // buffered data. Re-enter the loop to check cancellation and
+                // status, then continue draining without a readiness wait.
+                // This avoids throttling high-FD macOS captures, whose safe
+                // readiness fallback must otherwise sleep for one poll tick.
+                if io_quantum_exhausted {
+                    continue;
+                }
+                if let Err(error) = poll_process_io(
+                    stdin_state.as_ref().map(|input| &input.writer),
                     stdout_reader.as_ref(),
                     stderr_reader.as_ref(),
-                    remaining.min(PROCESS_POLL_INTERVAL),
+                    bounded_output_poll_wait(
+                        remaining.min(PROCESS_POLL_INTERVAL),
+                        deadline,
+                    ),
                 ) {
-                    settle_output_command(
+                    terminate_and_settle_output_command(
                         &mut child,
                         true,
+                        CommandCleanupTrigger::ReadinessPoll,
+                        &mut stdin_state,
                         &mut stdout_reader,
                         &mut stderr_reader,
                         &mut stdout,
                         &mut stderr,
                         limits,
-                    );
+                    )?;
                     return Err(error);
                 }
-            } else if let Err(error) = poll_capture_readers(
+            } else if io_quantum_exhausted {
+                continue;
+            } else if let Err(error) = poll_process_io(
+                stdin_state.as_ref().map(|input| &input.writer),
                 stdout_reader.as_ref(),
                 stderr_reader.as_ref(),
-                PROCESS_POLL_INTERVAL,
+                bounded_output_poll_wait(PROCESS_POLL_INTERVAL, deadline),
             ) {
-                terminate_child_process(&mut child);
-                settle_output_command(
+                terminate_and_settle_output_command(
                     &mut child,
                     false,
+                    CommandCleanupTrigger::ReadinessPoll,
+                    &mut stdin_state,
                     &mut stdout_reader,
                     &mut stderr_reader,
                     &mut stdout,
                     &mut stderr,
                     limits,
-                );
+                )?;
                 return Err(error);
             }
         }
@@ -4132,18 +4896,105 @@ pub mod process {
         socketpair().map_err(|error| process_capture_setup_error(stream, error))
     }
 
+    fn validate_command_input(
+        stdin: Option<&[u8]>,
+        limit: usize,
+    ) -> std::io::Result<()> {
+        if let Some(bytes) = stdin
+            && bytes.len() > limit
+        {
+            return Err(CommandInputLimitExceeded {
+                observed: bytes.len(),
+                limit,
+            }
+            .into_io_error());
+        }
+        Ok(())
+    }
+
     fn process_command_cancelled_error() -> std::io::Error {
-        std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "process command cancelled",
-        )
+        CommandCancelled.into_io_error()
+    }
+
+    fn check_output_command_abort(
+        cancel: &AtomicBool,
+        deadline: Option<OutputCommandDeadline>,
+    ) -> std::io::Result<()> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(process_command_cancelled_error());
+        }
+        if let Some(deadline) = deadline
+            && deadline.is_elapsed()
+        {
+            return Err(deadline.into_io_error());
+        }
+        Ok(())
+    }
+
+    fn bounded_output_poll_wait(
+        requested: Duration,
+        deadline: Option<OutputCommandDeadline>,
+    ) -> Duration {
+        deadline.map_or(requested, |deadline| requested.min(deadline.remaining()))
+    }
+
+    fn spawn_output_child(
+        command: &mut std::process::Command,
+        exec_busy_retry_delays: &[Duration],
+        cancel: &AtomicBool,
+        deadline: Option<OutputCommandDeadline>,
+    ) -> std::io::Result<std::process::Child> {
+        let mut retry_delays = exec_busy_retry_delays.iter().copied();
+        loop {
+            check_output_command_abort(cancel, deadline)?;
+            match command.spawn() {
+                Ok(child) => return Ok(child),
+                Err(error) if is_exec_busy_error(&error) => {
+                    let Some(delay) = retry_delays.next() else {
+                        return Err(error);
+                    };
+                    wait_for_output_retry(delay, cancel, deadline)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn is_exec_busy_error(error: &std::io::Error) -> bool {
+        const ETXTBSY: i32 = 26;
+        error.raw_os_error() == Some(ETXTBSY)
+    }
+
+    #[cfg(not(unix))]
+    fn is_exec_busy_error(_error: &std::io::Error) -> bool {
+        false
+    }
+
+    fn wait_for_output_retry(
+        delay: Duration,
+        cancel: &AtomicBool,
+        deadline: Option<OutputCommandDeadline>,
+    ) -> std::io::Result<()> {
+        let retry_deadline = process_deadline_after(delay);
+        loop {
+            check_output_command_abort(cancel, deadline)?;
+            let remaining = retry_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            std::thread::sleep(bounded_output_poll_wait(
+                remaining.min(PROCESS_POLL_INTERVAL),
+                deadline,
+            ));
+        }
     }
 
     fn process_capture_setup_error(
         phase: &'static str,
         error: filedescriptor::Error,
     ) -> std::io::Error {
-        std::io::Error::other(format!("process output capture {phase} failed: {error}"))
+        std::io::Error::other(format!("process command I/O setup {phase} failed: {error}"))
     }
 
     fn append_captured_bytes(
@@ -4152,15 +5003,102 @@ pub mod process {
         limit: usize,
         stream: CommandOutputStream,
     ) -> std::io::Result<()> {
-        let observed = output.len().saturating_add(bytes.len());
+        let observed = output.len().checked_add(bytes.len()).ok_or(
+            CommandOutputLimitExceeded::new(stream, usize::MAX, limit).into_io_error(),
+        )?;
         if observed > limit {
             return Err(CommandOutputLimitExceeded::new(stream, observed, limit).into_io_error());
         }
-        output.try_reserve_exact(bytes.len()).map_err(|_| {
-            std::io::Error::other("process command output capture allocation failed")
-        })?;
+        reserve_capture_capacity(output, observed, limit)?;
         output.extend_from_slice(bytes);
         Ok(())
+    }
+
+    /// Grow geometrically within the caller's byte budget. Calling
+    /// `try_reserve_exact(bytes.len())` for every 16 KiB read can otherwise
+    /// force thousands of reallocations and copies for a legitimate large
+    /// `get-text` response.
+    fn reserve_capture_capacity(
+        output: &mut Vec<u8>,
+        observed: usize,
+        limit: usize,
+    ) -> std::io::Result<()> {
+        if output.capacity() >= observed {
+            return Ok(());
+        }
+        let geometric_target = output
+            .capacity()
+            .saturating_mul(2)
+            .max(PROCESS_CAPTURE_INITIAL_RESERVE_BYTES)
+            .max(observed)
+            .min(limit);
+        output
+            .try_reserve_exact(geometric_target.saturating_sub(output.len()))
+            .map_err(|_| {
+                std::io::Error::other("process command output capture allocation failed")
+            })
+    }
+
+    /// Write a fair, bounded stdin quantum. Returning to the outer supervisor
+    /// after `WouldBlock`/`Interrupted` keeps cancellation, deadline, status,
+    /// and both output streams responsive even when the child reads slowly.
+    fn write_command_input(
+        input_state: &mut Option<CommandInputState>,
+    ) -> std::io::Result<bool> {
+        let Some(input) = input_state.as_mut() else {
+            return Ok(false);
+        };
+        if input.written == input.bytes.len() {
+            input_state.take();
+            return Ok(false);
+        }
+
+        let mut written_this_turn = 0_usize;
+        while written_this_turn < PROCESS_INPUT_WRITE_BYTES_PER_TURN {
+            let remaining_quantum = PROCESS_INPUT_WRITE_BYTES_PER_TURN - written_this_turn;
+            let remaining_input = input.bytes.len() - input.written;
+            let write_len = remaining_quantum
+                .min(remaining_input)
+                .min(PROCESS_INPUT_WRITE_CHUNK_BYTES);
+            match input
+                .writer
+                .write(&input.bytes[input.written..input.written + write_len])
+            {
+                Ok(0) => {
+                    return Err(CommandInputWriteFailed {
+                        error_kind: std::io::ErrorKind::WriteZero,
+                        written: input.written,
+                        total: input.bytes.len(),
+                    }
+                    .into_io_error());
+                }
+                Ok(written) => {
+                    input.written += written;
+                    written_this_turn += written;
+                    if input.written == input.bytes.len() {
+                        input_state.take();
+                        return Ok(false);
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => {
+                    return Err(CommandInputWriteFailed {
+                        error_kind: error.kind(),
+                        written: input.written,
+                        total: input.bytes.len(),
+                    }
+                    .into_io_error());
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Drain a fair, bounded quantum so a continuously writing child cannot
@@ -4170,14 +5108,14 @@ pub mod process {
         output: &mut Vec<u8>,
         limit: usize,
         stream: CommandOutputStream,
-    ) -> std::io::Result<bool> {
+    ) -> std::io::Result<CaptureDrainState> {
         let mut drained = 0_usize;
         let mut chunk = [0_u8; PROCESS_CAPTURE_READ_CHUNK_BYTES];
         while drained < PROCESS_CAPTURE_READ_BYTES_PER_TURN {
             let remaining = PROCESS_CAPTURE_READ_BYTES_PER_TURN - drained;
             let chunk_len = remaining.min(chunk.len());
             match reader.read(&mut chunk[..chunk_len]) {
-                Ok(0) => return Ok(true),
+                Ok(0) => return Ok(CaptureDrainState::Eof),
                 Ok(read) => {
                     append_captured_bytes(output, &chunk[..read], limit, stream)?;
                     drained += read;
@@ -4186,13 +5124,15 @@ pub mod process {
                 // an interrupted syscall; an unbounded local retry could make
                 // repeated signals defeat the settlement deadline.
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                    return Ok(false);
+                    return Ok(CaptureDrainState::Pending);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Ok(CaptureDrainState::Pending);
+                }
                 Err(error) => return Err(error),
             }
         }
-        Ok(false)
+        Ok(CaptureDrainState::QuantumExhausted)
     }
 
     fn drain_capture_reader(
@@ -4200,17 +5140,22 @@ pub mod process {
         output: &mut Vec<u8>,
         limit: usize,
         stream: CommandOutputStream,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<bool> {
         let Some(active_reader) = reader.as_mut() else {
-            return Ok(());
+            return Ok(false);
         };
-        if drain_process_capture(active_reader, output, limit, stream)? {
-            reader.take();
+        match drain_process_capture(active_reader, output, limit, stream)? {
+            CaptureDrainState::Eof => {
+                reader.take();
+                Ok(false)
+            }
+            CaptureDrainState::Pending => Ok(false),
+            CaptureDrainState::QuantumExhausted => Ok(true),
         }
-        Ok(())
     }
 
-    fn poll_capture_readers(
+    fn poll_process_io(
+        stdin: Option<&FileDescriptor>,
         stdout: Option<&FileDescriptor>,
         stderr: Option<&FileDescriptor>,
         wait: Duration,
@@ -4218,6 +5163,11 @@ pub mod process {
         if wait.is_zero() {
             return Ok(());
         }
+        let stdin_pollfd = stdin.map(|stdin| pollfd {
+            fd: stdin.as_socket_descriptor(),
+            events: POLLOUT,
+            revents: 0,
+        });
         let stdout_pollfd = stdout.map(|stdout| pollfd {
             fd: stdout.as_socket_descriptor(),
             events: POLLIN,
@@ -4228,14 +5178,25 @@ pub mod process {
             events: POLLIN,
             revents: 0,
         });
-        match (stdout_pollfd, stderr_pollfd) {
-            (Some(stdout), Some(stderr)) => {
+        match (stdin_pollfd, stdout_pollfd, stderr_pollfd) {
+            (Some(stdin), Some(stdout), Some(stderr)) => {
+                poll_capture_descriptors(&mut [stdin, stdout, stderr], wait)
+            }
+            (Some(stdin), Some(stdout), None) => {
+                poll_capture_descriptors(&mut [stdin, stdout], wait)
+            }
+            (Some(stdin), None, Some(stderr)) => {
+                poll_capture_descriptors(&mut [stdin, stderr], wait)
+            }
+            (None, Some(stdout), Some(stderr)) => {
                 poll_capture_descriptors(&mut [stdout, stderr], wait)
             }
-            (Some(descriptor), None) | (None, Some(descriptor)) => {
+            (Some(descriptor), None, None)
+            | (None, Some(descriptor), None)
+            | (None, None, Some(descriptor)) => {
                 poll_capture_descriptors(&mut [descriptor], wait)
             }
-            (None, None) => {
+            (None, None, None) => {
                 std::thread::sleep(wait);
                 Ok(())
             }
@@ -4279,9 +5240,62 @@ pub mod process {
     }
 
     fn process_deadline_after(duration: Duration) -> Instant {
-        Instant::now()
-            .checked_add(duration)
-            .unwrap_or_else(Instant::now)
+        let now = Instant::now();
+        let mut bounded = duration;
+        loop {
+            if let Some(deadline) = now.checked_add(bounded) {
+                return deadline;
+            }
+
+            // `Instant` has a platform-specific finite range. An overflowing
+            // operator timeout must not become an immediate timeout: clamp it
+            // toward a representable far future by halving only on the
+            // exceptional overflow path. Zero is always representable, so the
+            // loop is finite even on an unusually narrow `Instant` platform.
+            bounded = bounded.checked_div(2).unwrap_or(Duration::ZERO);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn terminate_and_settle_output_command(
+        child: &mut std::process::Child,
+        leader_already_reaped: bool,
+        trigger: CommandCleanupTrigger,
+        stdin_state: &mut Option<CommandInputState>,
+        stdout_reader: &mut Option<FileDescriptor>,
+        stderr_reader: &mut Option<FileDescriptor>,
+        stdout: &mut Vec<u8>,
+        stderr: &mut Vec<u8>,
+        limits: OutputCaptureLimits,
+    ) -> std::io::Result<()> {
+        // Closing the owned writer before termination guarantees that every
+        // supervisor failure path stops retaining secret-bearing input and
+        // gives a still-running child an immediate EOF opportunity.
+        stdin_state.take();
+        // One shared deadline covers the leader probe, external group-signal
+        // helper, direct owned-child kill, reap, and descriptor drain. The
+        // helper receives this exact deadline, so its internal 100 ms phases
+        // cannot add another 200 ms after the advertised settlement budget.
+        let settlement_deadline = process_deadline_after(PROCESS_TERMINATION_SETTLE_TIMEOUT);
+        let (reaped, signal_helper_settled, process_tree_signalled) =
+            terminate_output_child_if_running(
+                child,
+                leader_already_reaped,
+                settlement_deadline,
+            );
+        let cleanup = settle_output_command(
+            child,
+            reaped,
+            signal_helper_settled,
+            process_tree_signalled,
+            stdout_reader,
+            stderr_reader,
+            stdout,
+            stderr,
+            limits,
+            settlement_deadline,
+        );
+        ensure_output_cleanup_complete(trigger, cleanup)
     }
 
     /// Best-effort bounded drain and reap after cancellation or capture
@@ -4291,52 +5305,85 @@ pub mod process {
     fn settle_output_command(
         child: &mut std::process::Child,
         mut reaped: bool,
+        signal_helper_settled: bool,
+        process_tree_signalled: bool,
         stdout_reader: &mut Option<FileDescriptor>,
         stderr_reader: &mut Option<FileDescriptor>,
         stdout: &mut Vec<u8>,
         stderr: &mut Vec<u8>,
         limits: OutputCaptureLimits,
-    ) {
-        let deadline = process_deadline_after(PROCESS_TERMINATION_SETTLE_TIMEOUT);
+        deadline: Instant,
+    ) -> OutputCleanupState {
         loop {
-            if drain_capture_reader(
+            let stdout_quantum_exhausted = match drain_capture_reader(
                 stdout_reader,
                 stdout,
                 limits.stdout,
                 CommandOutputStream::Stdout,
-            )
-            .is_err()
-            {
-                stdout_reader.take();
-            }
-            if drain_capture_reader(
+            ) {
+                Ok(quantum_exhausted) => quantum_exhausted,
+                Err(_) => {
+                    stdout_reader.take();
+                    false
+                }
+            };
+            let stderr_quantum_exhausted = match drain_capture_reader(
                 stderr_reader,
                 stderr,
                 limits.stderr,
                 CommandOutputStream::Stderr,
-            )
-            .is_err()
-            {
-                stderr_reader.take();
-            }
+            ) {
+                Ok(quantum_exhausted) => quantum_exhausted,
+                Err(_) => {
+                    stderr_reader.take();
+                    false
+                }
+            };
 
             if !reaped {
                 match child.try_wait() {
                     Ok(Some(_)) => reaped = true,
                     Ok(None) => {}
-                    Err(_) => return,
+                    Err(error)
+                        if output_child_probe_error_action(&error)
+                            == OutputChildProbeErrorAction::RetryUntilDeadline => {}
+                    Err(_) => {
+                        return output_cleanup_state(
+                            reaped,
+                            signal_helper_settled,
+                            process_tree_signalled,
+                            stdout_reader,
+                            stderr_reader,
+                        );
+                    }
                 }
             }
             if reaped && stdout_reader.is_none() && stderr_reader.is_none() {
-                return;
+                return output_cleanup_state(
+                    reaped,
+                    signal_helper_settled,
+                    process_tree_signalled,
+                    stdout_reader,
+                    stderr_reader,
+                );
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return;
+                return output_cleanup_state(
+                    reaped,
+                    signal_helper_settled,
+                    process_tree_signalled,
+                    stdout_reader,
+                    stderr_reader,
+                );
+            }
+            if stdout_quantum_exhausted || stderr_quantum_exhausted {
+                continue;
             }
             let wait = remaining.min(PROCESS_POLL_INTERVAL);
-            if poll_capture_readers(
+            if poll_process_io(
+                None,
                 stdout_reader.as_ref(),
                 stderr_reader.as_ref(),
                 wait,
@@ -4348,14 +5395,132 @@ pub mod process {
         }
     }
 
-    fn terminate_child_process(child: &mut std::process::Child) {
-        let _ = send_signal_to_process_group(child.id(), "KILL");
+    fn output_cleanup_state(
+        leader_reaped: bool,
+        signal_helper_settled: bool,
+        process_tree_signalled: bool,
+        stdout_reader: &Option<FileDescriptor>,
+        stderr_reader: &Option<FileDescriptor>,
+    ) -> OutputCleanupState {
+        OutputCleanupState {
+            leader_reaped,
+            signal_helper_settled,
+            process_tree_signalled,
+            stdout_open: stdout_reader.is_some(),
+            stderr_open: stderr_reader.is_some(),
+        }
+    }
+
+    fn ensure_output_cleanup_complete(
+        trigger: CommandCleanupTrigger,
+        cleanup: OutputCleanupState,
+    ) -> std::io::Result<()> {
+        if cleanup.leader_reaped
+            && cleanup.signal_helper_settled
+            && cleanup.process_tree_signalled
+            && !cleanup.stdout_open
+            && !cleanup.stderr_open
+        {
+            return Ok(());
+        }
+
+        Err(CommandProcessCleanupIncomplete {
+            trigger,
+            leader_reaped: cleanup.leader_reaped,
+            signal_helper_settled: cleanup.signal_helper_settled,
+            process_tree_signalled: cleanup.process_tree_signalled,
+            stdout_open: cleanup.stdout_open,
+            stderr_open: cleanup.stderr_open,
+            settle_timeout_ms: u64::try_from(PROCESS_TERMINATION_SETTLE_TIMEOUT.as_millis())
+                .unwrap_or(u64::MAX),
+        }
+        .into_io_error())
+    }
+
+    fn output_cleanup_trigger_for_capture_error(
+        error: &std::io::Error,
+    ) -> CommandCleanupTrigger {
+        CommandOutputLimitExceeded::from_io_error(error).map_or(
+            CommandCleanupTrigger::CaptureRead,
+            |exceeded| CommandCleanupTrigger::CaptureLimit(exceeded.stream()),
+        )
+    }
+
+    /// Probe immediately before any numeric PID/process-group signal. A
+    /// successful reap makes that identity reusable, so it must never be
+    /// signalled. Interrupted probes retry only until the shared settlement
+    /// deadline. Every other probe error fails closed without signalling
+    /// because the leader state is unknown.
+    fn terminate_output_child_if_running(
+        child: &mut std::process::Child,
+        leader_already_reaped: bool,
+        probe_deadline: Instant,
+    ) -> (bool, bool, bool) {
+        if leader_already_reaped {
+            // Once the leader has been reaped, its numeric PID/process-group
+            // identity may already have been reused. We therefore skip the
+            // external group signal. Report the leader and (nonexistent)
+            // helper as settled, but never claim that the process tree was
+            // signalled when no such signal was safely issued.
+            return (true, true, false);
+        }
+
+        loop {
+            match child.try_wait() {
+                // The child exited before we could signal its process group.
+                // Its PID is now reusable, so treat the leader as reaped but
+                // do not fabricate process-tree termination proof.
+                Ok(Some(_)) => return (true, true, false),
+                Ok(None) => {
+                    let (signal_helper_settled, process_tree_signalled) =
+                        terminate_child_process(child, probe_deadline);
+                    return (false, signal_helper_settled, process_tree_signalled);
+                }
+                Err(error)
+                    if output_child_probe_error_action(&error)
+                        == OutputChildProbeErrorAction::RetryUntilDeadline =>
+                {
+                    let remaining = probe_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return (false, true, false);
+                    }
+                    std::thread::sleep(remaining.min(PROCESS_POLL_INTERVAL));
+                }
+                Err(_) => return (false, true, false),
+            }
+        }
+    }
+
+    fn output_child_probe_error_action(error: &std::io::Error) -> OutputChildProbeErrorAction {
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            OutputChildProbeErrorAction::RetryUntilDeadline
+        } else {
+            OutputChildProbeErrorAction::StopWithUncertainIdentity
+        }
+    }
+
+    /// This helper is called only immediately after `try_wait` returned
+    /// `Ok(None)`. On Unix, no other owner can reap this `&mut Child` between
+    /// that probe and these signals, so its PID cannot be reused; on Windows,
+    /// `Child::kill` retains the process handle identity. The helper makes no
+    /// safety claim for arbitrary numeric process identifiers.
+    fn terminate_child_process(
+        child: &mut std::process::Child,
+        deadline: Instant,
+    ) -> (bool, bool) {
+        let group_result = send_signal_to_process_group_until(child.id(), "KILL", deadline);
+        let signal_helper_settled = group_result.as_ref().err().is_none_or(|error| {
+            CommandSignalHelperCleanupIncomplete::from_io_error(error).is_none()
+        });
+        let process_tree_signalled = group_result.is_ok_and(|status| status.success());
         let _ = child.kill();
+        (signal_helper_settled, process_tree_signalled)
     }
 
     #[cfg(test)]
     mod output_capture_unit_tests {
         use super::*;
+        use std::io::Read as _;
 
         #[test]
         fn command_capture_defaults_are_finite_and_setters_are_exact() {
@@ -4363,13 +5528,325 @@ pub mod process {
             assert!(DEFAULT_COMMAND_STDOUT_LIMIT_BYTES < usize::MAX);
             assert!(DEFAULT_COMMAND_STDERR_LIMIT_BYTES > 0);
             assert!(DEFAULT_COMMAND_STDERR_LIMIT_BYTES < usize::MAX);
+            assert!(DEFAULT_COMMAND_STDIN_LIMIT_BYTES > 0);
+            assert!(DEFAULT_COMMAND_STDIN_LIMIT_BYTES < usize::MAX);
 
             let mut command = Command::new("not-executed");
+            assert!(command.stdin.is_none());
+            assert!(command.stdin_configuration_error.is_none());
+            assert_eq!(command.stdin_limit, DEFAULT_COMMAND_STDIN_LIMIT_BYTES);
             assert_eq!(command.stdout_limit, DEFAULT_COMMAND_STDOUT_LIMIT_BYTES);
             assert_eq!(command.stderr_limit, DEFAULT_COMMAND_STDERR_LIMIT_BYTES);
-            command.stdout_limit(17).stderr_limit(9);
+            command.stdin_limit(5).stdout_limit(17).stderr_limit(9);
+            assert_eq!(command.stdin_limit, 5);
             assert_eq!(command.stdout_limit, 17);
             assert_eq!(command.stderr_limit, 9);
+        }
+
+        #[test]
+        fn command_cancellation_is_idempotent_and_typed_content_free() {
+            let cancellation = CommandCancellation::new();
+            assert!(!cancellation.is_cancelled());
+            cancellation.cancel();
+            cancellation.cancel();
+            assert!(cancellation.is_cancelled());
+
+            let error = process_command_cancelled_error();
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+            assert!(CommandCancelled::from_io_error(&error).is_some());
+            assert_eq!(error.to_string(), "process command cancelled");
+        }
+
+        #[test]
+        fn command_deadline_error_is_typed_and_content_free() {
+            let deadline = OutputCommandDeadline::new(Duration::from_millis(37));
+            let error = deadline.into_io_error();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            let timed_out = CommandTimedOut::from_io_error(&error)
+                .expect("deadline error must retain stable typed detail");
+            assert_eq!(timed_out.timeout_ms(), 37);
+            assert_eq!(
+                error.to_string(),
+                "process command timed out after 37 ms"
+            );
+        }
+
+        #[test]
+        fn overflowing_deadline_clamps_to_a_future_instant() {
+            let before = Instant::now();
+            let deadline = process_deadline_after(Duration::MAX);
+            assert!(deadline > before);
+            assert!(!OutputCommandDeadline::new(Duration::MAX).is_elapsed());
+        }
+
+        #[test]
+        fn child_probe_errors_retry_only_for_interruption() {
+            let interrupted = std::io::Error::from(std::io::ErrorKind::Interrupted);
+            assert_eq!(
+                output_child_probe_error_action(&interrupted),
+                OutputChildProbeErrorAction::RetryUntilDeadline
+            );
+
+            for kind in [
+                std::io::ErrorKind::Other,
+                std::io::ErrorKind::PermissionDenied,
+                std::io::ErrorKind::InvalidInput,
+            ] {
+                assert_eq!(
+                    output_child_probe_error_action(&std::io::Error::from(kind)),
+                    OutputChildProbeErrorAction::StopWithUncertainIdentity
+                );
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn exec_busy_classifier_is_narrow() {
+            assert!(is_exec_busy_error(&std::io::Error::from_raw_os_error(26)));
+            assert!(!is_exec_busy_error(&std::io::Error::from_raw_os_error(22)));
+            assert!(!is_exec_busy_error(&std::io::Error::from(
+                std::io::ErrorKind::Interrupted
+            )));
+        }
+
+        #[test]
+        fn exec_busy_retry_wait_checks_cancel_and_deadline_before_sleeping() {
+            let cancelled = AtomicBool::new(true);
+            let error = wait_for_output_retry(Duration::MAX, &cancelled, None)
+                .expect_err("pre-cancelled retry wait must not sleep");
+            assert!(CommandCancelled::from_io_error(&error).is_some());
+
+            let active = AtomicBool::new(false);
+            let deadline = OutputCommandDeadline::new(Duration::ZERO);
+            let error = wait_for_output_retry(Duration::MAX, &active, Some(deadline))
+                .expect_err("elapsed command deadline must stop retry wait");
+            assert!(CommandTimedOut::from_io_error(&error).is_some());
+        }
+
+        #[test]
+        fn already_reaped_leader_never_claims_process_tree_was_signalled() {
+            let source = include_str!("runtime_async.rs");
+            let start = source
+                .find("    fn terminate_output_child_if_running(")
+                .expect("termination implementation marker");
+            let end = source[start..]
+                .find("    fn output_child_probe_error_action(")
+                .map(|offset| start + offset)
+                .expect("termination implementation end marker");
+            let implementation = &source[start..end];
+            let reaped_branch_start = implementation
+                .find("if leader_already_reaped")
+                .expect("already-reaped branch marker");
+            let reaped_branch_end = implementation[reaped_branch_start..]
+                .find("\n        loop {")
+                .map(|offset| reaped_branch_start + offset)
+                .expect("already-reaped branch end marker");
+            let reaped_branch = &implementation[reaped_branch_start..reaped_branch_end];
+            assert!(reaped_branch.contains("return (true, true, false);"));
+            assert!(!reaped_branch.contains("return (true, true, true);"));
+            assert!(!implementation.contains("return (true, true, true);"));
+        }
+
+        #[test]
+        fn signal_helper_uncertainty_is_typed_and_content_free() {
+            let error = CommandSignalHelperCleanupIncomplete {
+                phase: CommandSignalHelperFailurePhase::CompletionProbe,
+                probe_error_kind: Some(std::io::ErrorKind::Other),
+            }
+            .into_io_error();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            let incomplete = CommandSignalHelperCleanupIncomplete::from_io_error(&error)
+                .expect("signal helper uncertainty must retain stable typed detail");
+            assert_eq!(
+                incomplete.phase(),
+                CommandSignalHelperFailurePhase::CompletionProbe
+            );
+            assert_eq!(
+                incomplete.probe_error_kind(),
+                Some(std::io::ErrorKind::Other)
+            );
+            assert!(!error.to_string().contains("raw-command-or-output-canary"));
+        }
+
+        #[test]
+        fn cleanup_incomplete_error_is_typed_structural_and_content_free() {
+            let cleanup = OutputCleanupState {
+                leader_reaped: false,
+                signal_helper_settled: true,
+                process_tree_signalled: false,
+                stdout_open: true,
+                stderr_open: false,
+            };
+            let error = ensure_output_cleanup_complete(
+                CommandCleanupTrigger::CaptureLimit(CommandOutputStream::Stdout),
+                cleanup,
+            )
+            .expect_err("unreaped leader must not report successful cleanup");
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            let incomplete = CommandProcessCleanupIncomplete::from_io_error(&error)
+                .expect("cleanup failure must retain stable typed detail");
+            assert_eq!(
+                incomplete.trigger(),
+                CommandCleanupTrigger::CaptureLimit(CommandOutputStream::Stdout)
+            );
+            assert!(!incomplete.leader_reaped());
+            assert!(incomplete.signal_helper_settled());
+            assert!(!incomplete.process_tree_signalled());
+            assert!(incomplete.stdout_open());
+            assert!(!incomplete.stderr_open());
+            assert_eq!(incomplete.settle_timeout_ms(), 250);
+            assert!(!error.to_string().contains("raw-child-output-canary"));
+
+            ensure_output_cleanup_complete(
+                CommandCleanupTrigger::Cancelled,
+                OutputCleanupState {
+                    leader_reaped: true,
+                    signal_helper_settled: true,
+                    process_tree_signalled: true,
+                    stdout_open: false,
+                    stderr_open: false,
+                },
+            )
+            .expect("fully settled process must preserve its initiating result");
+        }
+
+        #[test]
+        fn output_spec_snapshots_limits_directory_and_bounded_retries() {
+            let mut command = Command::new("not-executed");
+            command
+                .current_dir("relative-not-executed")
+                .stdin_bytes(b"owned-input".as_slice())
+                .stdin_limit(19)
+                .stdout_limit(23)
+                .stderr_limit(11)
+                .exec_busy_retry_delays(&[Duration::from_millis(3)]);
+            let spec = command.output_spec();
+            assert_eq!(
+                spec.current_dir.as_deref(),
+                Some(std::path::Path::new("relative-not-executed"))
+            );
+            assert_eq!(spec.stdin.as_deref(), Some(b"owned-input".as_slice()));
+            assert!(spec.stdin_configuration_error.is_none());
+            assert_eq!(spec.stdin_limit, 19);
+            assert_eq!(spec.limits.stdout, 23);
+            assert_eq!(spec.limits.stderr, 11);
+            assert_eq!(spec.exec_busy_retry_delays, [Duration::from_millis(3)]);
+        }
+
+        #[test]
+        fn stdin_limit_accepts_exact_boundary_and_rejects_one_byte_over() {
+            validate_command_input(Some(&[1, 2, 3]), 3)
+                .expect("exact stdin boundary must be accepted");
+            let error = validate_command_input(Some(&[1, 2, 3]), 2)
+                .expect_err("first byte beyond stdin limit must fail before spawn");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            let exceeded = CommandInputLimitExceeded::from_io_error(&error)
+                .expect("stdin limit failure must retain stable typed detail");
+            assert_eq!(exceeded.observed(), 3);
+            assert_eq!(exceeded.limit(), 2);
+
+            let mut command = Command::new("not-executed");
+            command.stdin_limit(2).stdin_bytes(vec![1, 2, 3]);
+            assert!(command.stdin.is_none(), "oversized input must not be retained");
+            let retained_error = command
+                .stdin_configuration_error
+                .expect("oversized setter input must retain only typed detail");
+            assert_eq!(retained_error.observed(), 3);
+            assert_eq!(retained_error.limit(), 2);
+        }
+
+        #[test]
+        fn nonblocking_stdin_writer_delivers_owned_bytes_and_closes_at_eof() {
+            let (mut writer, mut reader) = socketpair().expect("stdin test socketpair");
+            writer
+                .set_non_blocking(true)
+                .expect("nonblocking stdin test writer");
+            let mut state = Some(CommandInputState {
+                writer,
+                bytes: Arc::from(b"secret-owned-stdin".as_slice()),
+                written: 0,
+            });
+            assert!(!write_command_input(&mut state).expect("bounded stdin write"));
+            assert!(state.is_none(), "completed input must close its writer");
+
+            let mut received = Vec::new();
+            reader
+                .read_to_end(&mut received)
+                .expect("closed writer gives deterministic EOF");
+            assert_eq!(received, b"secret-owned-stdin");
+        }
+
+        #[test]
+        fn stdin_write_error_is_typed_and_does_not_echo_payload() {
+            let error = CommandInputWriteFailed {
+                error_kind: std::io::ErrorKind::BrokenPipe,
+                written: 7,
+                total: 19,
+            }
+            .into_io_error();
+            let failed = CommandInputWriteFailed::from_io_error(&error)
+                .expect("stdin write failure must retain stable typed detail");
+            assert_eq!(failed.error_kind(), std::io::ErrorKind::BrokenPipe);
+            assert_eq!(failed.written(), 7);
+            assert_eq!(failed.total(), 19);
+            assert!(!error.to_string().contains("raw-stdin-payload-canary"));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn command_stdin_bytes_roundtrip_through_bounded_supervisor() {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "cat"])
+                .stdin_bytes(b"bounded stdin roundtrip".as_slice())
+                .stdin_limit(64)
+                .stdout_limit(64)
+                .stderr_limit(64);
+            let output = command
+                .output_blocking(Duration::from_secs(2))
+                .expect("bounded stdin roundtrip command");
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"bounded stdin roundtrip");
+            assert!(output.stderr.is_empty());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn blocked_stdin_write_observes_command_deadline() {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "sleep 5"])
+                .stdin_bytes(vec![b'x'; 1024 * 1024])
+                .stdin_limit(1024 * 1024);
+            let started = Instant::now();
+            let error = command
+                .output_blocking(Duration::from_millis(25))
+                .expect_err("non-reading child must not defeat command deadline");
+            assert!(CommandTimedOut::from_io_error(&error).is_some());
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn blocked_stdin_write_observes_cooperative_cancellation() {
+            let cancellation = CommandCancellation::new();
+            let cancel_from_thread = cancellation.clone();
+            let trigger = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(25));
+                cancel_from_thread.cancel();
+            });
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "sleep 5"])
+                .stdin_bytes(vec![b'x'; 1024 * 1024])
+                .stdin_limit(1024 * 1024);
+            let started = Instant::now();
+            let error = command
+                .output_blocking_with_cancellation(Duration::from_secs(5), &cancellation)
+                .expect_err("non-reading child must observe cooperative cancellation");
+            trigger.join().expect("cancellation trigger must finish");
+            assert!(CommandCancelled::from_io_error(&error).is_some());
+            assert!(started.elapsed() < Duration::from_secs(2));
         }
 
         #[test]
@@ -4385,6 +5862,26 @@ pub mod process {
         fn invalid_capture_text_retains_lossy_replacement_semantics() {
             let text = decode_captured_bytes_lossy(vec![b'a', 0xff, b'b']);
             assert_eq!(text, "a\u{fffd}b");
+        }
+
+        #[test]
+        fn capture_reservation_grows_geometrically_and_reuses_capacity() {
+            let mut output = Vec::new();
+            append_captured_bytes(&mut output, b"a", 1024, CommandOutputStream::Stdout)
+                .expect("first bounded reservation");
+            let first_capacity = output.capacity();
+            let first_pointer = output.as_ptr();
+            assert!(first_capacity >= 101);
+
+            append_captured_bytes(
+                &mut output,
+                &[b'b'; 100],
+                1024,
+                CommandOutputStream::Stdout,
+            )
+            .expect("existing geometric reservation should accept the next chunk");
+            assert_eq!(output.as_ptr(), first_pointer);
+            assert_eq!(output.len(), 101);
         }
 
         #[test]
@@ -4461,9 +5958,14 @@ pub mod process {
                 .map(|offset| start + offset)
                 .expect("capture unit-test marker");
             let implementation = &source[start..end];
+            assert!(
+                !implementation.contains("terminate_child_process(&mut child)"),
+                "capture paths must probe through terminate_output_child_if_running"
+            );
             for forbidden in [
                 "read_to_end",
                 "std::thread::Builder",
+                "std::thread::spawn",
                 ".join()",
                 "child.wait()",
             ] {
@@ -4472,6 +5974,28 @@ pub mod process {
                     "production capture must not contain {forbidden}"
                 );
             }
+        }
+
+        #[test]
+        fn production_signal_helpers_have_no_unbounded_wait_primitive() {
+            let source = include_str!("runtime_async.rs");
+            let start = source
+                .find("    trait ProcessControl")
+                .expect("process-control implementation marker");
+            let end = source[start..]
+                .find("    impl KillOnDropGuard")
+                .map(|offset| start + offset)
+                .expect("process-control implementation end marker");
+            let implementation = &source[start..end];
+            for forbidden in [".status()", ".wait()", "wait_with_output", "read_to_end"] {
+                assert!(
+                    !implementation.contains(forbidden),
+                    "production signal helper must not contain {forbidden}"
+                );
+            }
+            assert!(implementation.contains("reap_signal_helper_until"));
+            assert!(implementation.contains("PROCESS_SIGNAL_HELPER_TIMEOUT"));
+            assert!(implementation.contains("PROCESS_SIGNAL_HELPER_REAP_TIMEOUT"));
         }
     }
 

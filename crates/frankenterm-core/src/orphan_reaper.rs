@@ -1,35 +1,31 @@
-//! Orphan reaper for stuck `wezterm cli` helper processes.
+//! Fail-closed orphan-cleanup surface.
 //!
-//! FrankenTerm spawns short-lived `wezterm cli <subcommand>` processes to query
-//! and control the WezTerm mux backend.  These can hang due to lock contention,
-//! socket timeouts, or notification feedback loops.  The orphan reaper
-//! periodically scans for such processes and kills any that exceed a
-//! configurable age threshold.
+//! FrankenTerm historically searched the global process table for old
+//! `wezterm cli` command lines and sent `KILL` to the resulting numeric PIDs.
+//! A command-line match is not proof that FrankenTerm created the process, and
+//! a PID can be recycled between discovery and signalling.  The mechanism is
+//! therefore intentionally inert until subprocesses are registered by owned
+//! child handle plus immutable process identity.
 //!
-//! # Proxy safety
-//!
-//! `wezterm cli --prefer-mux proxy` (and other `proxy` invocations) are
-//! **long-lived SSH session transport processes**.  Killing them severs active
-//! SSH sessions.  The reaper therefore maintains an explicit allowlist of
-//! short-lived helper subcommands and **never** touches `proxy` or any
-//! unrecognized subcommand.
+//! Per-command timeout supervisors remain responsible for children they own.
+//! This module never enumerates or signals processes.  The retained report and
+//! entry points let existing callers fail closed while the handle-owned child
+//! registry tracked by `ft-interactive-systems-performance-4tenz.50.2` is
+//! implemented.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::AtomicBool;
 
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use crate::config::CliConfig;
 
-/// Short-lived `wezterm cli` subcommands that FrankenTerm spawns and that are
-/// safe to reap when they exceed the age threshold.
+/// Historical short-lived `wezterm cli` classifier retained only in tests.
 ///
-/// This allowlist exists because `wezterm cli` also has long-lived subcommands
-/// (notably `proxy`, used as SSH session transport via `--prefer-mux proxy`)
-/// that must NEVER be killed.  Rather than trying to enumerate dangerous
-/// subcommands (a fragile denylist), we enumerate only the ones we spawn.
+/// It demonstrates why command-line classification is insufficient authority:
+/// even a positive match must never result in a process signal.
+#[cfg(test)]
 const REAPABLE_SUBCOMMANDS: &[&str] = &[
     "list",
     "get-text",
@@ -43,27 +39,25 @@ const REAPABLE_SUBCOMMANDS: &[&str] = &[
     "get-pane-direction",
 ];
 
-/// `wezterm`/`wezterm cli` flags that take a separate value token before the
-/// subcommand position.
-///
-/// Keep this list conservative: only flags confirmed in the shipped CLI are
-/// enumerated here so that the orphan reaper remains allowlist-driven.
+/// Historical value-taking flags used by the test-only classifier.
+#[cfg(test)]
 const PRE_SUBCOMMAND_VALUE_FLAGS: &[&str] = &["--config-file", "--config", "--class"];
 
 /// Summary of a single orphan-reaper scan cycle.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ReapReport {
-    /// Number of candidate processes scanned.
+    /// Number of processes scanned. Always zero while global scanning is disabled.
     pub scanned: usize,
-    /// Number of orphan processes successfully killed.
+    /// Number of processes killed. Always zero without handle-owned authority.
     pub killed: usize,
-    /// PIDs that were successfully killed.
+    /// PIDs killed through owned handles. Empty until that registry exists.
     pub killed_pids: Vec<u32>,
-    /// Errors encountered while scanning or killing processes.
+    /// Stable reasons that cleanup did not run, including cancellation.
     pub errors: Vec<String>,
 }
 
-/// A process entry parsed from `ps` output.
+/// A test-only process entry parsed from synthetic historical `ps` output.
+#[cfg(test)]
 #[derive(Debug)]
 struct ProcessEntry {
     pid: u32,
@@ -73,32 +67,22 @@ struct ProcessEntry {
     command: String,
 }
 
-/// Run the orphan reaper loop.  Returns when `shutdown_flag` is set or the
-/// reap interval is configured to zero (disabled).
+/// Enter the fail-closed orphan-cleanup surface.
+///
+/// The function always returns without inspecting or signalling any process.
 pub async fn run_orphan_reaper(config: CliConfig, shutdown_flag: Arc<AtomicBool>) {
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     run_orphan_reaper_with_cx(&cx, config, shutdown_flag).await;
 }
 
-/// Run the orphan reaper loop against the caller's asupersync capability
-/// context (ft-xbnl0.2.x Cx-first entry point).
+/// Cx-aware fail-closed entry point.
 ///
-/// Short-circuits before the first reap if `cx` is already cancelled
-/// — an operator who has abandoned the watch daemon should not trigger
-/// a final orphan scan. Otherwise each inter-cycle sleep is bound via
-/// [`crate::runtime_async::sleep_with_cx`], so budget-driven
-/// cancellation from the outer scope cuts the sleep deterministically
-/// under `LabRuntime` virtual time. Both the `shutdown_flag` and
-/// `cx.is_cancel_requested()` are checked each iteration so either
-/// cancellation path terminates the loop promptly without waiting on
-/// the full reap interval.
-///
-/// The legacy [`run_orphan_reaper`] entry point is preserved for
-/// non-migrated callers; this is strictly additive.
+/// A configured non-zero interval no longer opts into global process-table
+/// scanning.  It emits a content-free warning and returns immediately.
 pub async fn run_orphan_reaper_with_cx(
     cx: &crate::cx::Cx,
     config: CliConfig,
-    shutdown_flag: Arc<AtomicBool>,
+    _shutdown_flag: Arc<AtomicBool>,
 ) {
     if cx.is_cancel_requested() {
         debug!("orphan reaper aborted before first cycle: capability context already cancelled");
@@ -107,77 +91,24 @@ pub async fn run_orphan_reaper_with_cx(
 
     let interval = config.orphan_reap_interval_seconds;
     if interval == 0 {
-        info!("orphan reaper disabled (orphan_reap_interval_seconds = 0)");
+        info!("orphan cleanup disabled");
         return;
     }
 
-    let max_age = config.orphan_max_age_seconds;
-    info!(
-        interval_s = interval,
-        max_age_s = max_age,
-        "orphan reaper started (Cx-aware)"
+    warn!(
+        configured_interval_seconds = interval,
+        "orphan cleanup refused: no handle-owned child identity registry"
     );
-
-    loop {
-        // `sleep_with_cx` returns Err on cancellation; treat as
-        // "time to exit" so the loop terminates cleanly without a
-        // spurious extra reap cycle after cancellation.
-        if crate::runtime_async::sleep_with_cx(cx, Duration::from_secs(interval))
-            .await
-            .is_err()
-        {
-            debug!("orphan reaper shutting down: Cx cancelled during sleep");
-            return;
-        }
-
-        if shutdown_flag.load(Ordering::Relaxed) || cx.is_cancel_requested() {
-            debug!("orphan reaper shutting down");
-            return;
-        }
-
-        // ft-xbnl0.2.3 tick 107: route through the Cx-first reap so
-        // mid-cycle cancellation bails before killing every stale pid.
-        let report = reap_orphans_with_cx(cx, max_age).await;
-        if report.killed > 0 {
-            info!(
-                scanned = report.scanned,
-                killed = report.killed,
-                pids = ?report.killed_pids,
-                "orphan reaper cycle complete"
-            );
-        } else {
-            debug!(scanned = report.scanned, "orphan reaper cycle — no orphans");
-        }
-
-        for err in &report.errors {
-            warn!(error = %err, "orphan reaper error during scan");
-        }
-    }
 }
 
-/// Scan for orphaned `wezterm cli` processes and kill those exceeding
-/// `max_age_seconds`, returning a serializable cycle report.
-pub async fn reap_orphans(max_age_seconds: u64) -> ReapReport {
+/// Return a fail-closed cleanup report without inspecting any process.
+pub async fn reap_orphans(_max_age_seconds: u64) -> ReapReport {
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-    reap_orphans_with_cx(&cx, max_age_seconds).await
+    reap_orphans_with_cx(&cx, _max_age_seconds).await
 }
 
-/// ft-xbnl0.2.3 Cx-first sibling of [`reap_orphans`].
-///
-/// Threads the caller's cx through the reap cycle:
-/// - Pre-flight checkpoint gates entry before `ps` listing.
-/// - Per-kill checkpoint between iterations lets a cancelled
-///   caller stop partway through killing a long list of stale
-///   processes, returning a partial report.
-///   Scan errors and individual kill errors are captured in the
-///   report (not short-circuited) so the caller always gets a
-///   coherent snapshot of what did get reaped.
-pub async fn reap_orphans_with_cx(cx: &crate::cx::Cx, max_age_seconds: u64) -> ReapReport {
-    scan_and_reap_with_cx(cx, max_age_seconds).await
-}
-
-/// Cx-first implementation of a single orphan-reaper cycle.
-async fn scan_and_reap_with_cx(cx: &crate::cx::Cx, max_age_seconds: u64) -> ReapReport {
+/// Cx-aware sibling of [`reap_orphans`].
+pub async fn reap_orphans_with_cx(cx: &crate::cx::Cx, _max_age_seconds: u64) -> ReapReport {
     let mut report = ReapReport::default();
 
     if cx.checkpoint().is_err() {
@@ -185,138 +116,23 @@ async fn scan_and_reap_with_cx(cx: &crate::cx::Cx, max_age_seconds: u64) -> Reap
         return report;
     }
 
-    let entries = match list_wezterm_cli_processes_via_ps_with_cx(cx).await {
-        Ok(entries) => entries,
-        Err(error) => {
-            report.errors.push(error);
-            return report;
-        }
-    };
-    report.scanned = entries.len();
-
-    for entry in entries {
-        if cx.checkpoint().is_err() {
-            report
-                .errors
-                .push("reap cancelled between kills".to_string());
-            break;
-        }
-
-        if entry.age_seconds >= max_age_seconds {
-            debug!(
-                pid = entry.pid,
-                age_s = entry.age_seconds,
-                cmd = %entry.command,
-                "killing orphaned wezterm cli process (cx-first)"
-            );
-            let pid = entry.pid;
-            let kill_result = crate::runtime_async::spawn_blocking(move || {
-                crate::runtime_async::process::send_unix_signal_to_pid(i64::from(pid), "KILL")
-            })
-            .await;
-
-            match kill_result {
-                Ok(Ok(status)) if status.success() => {
-                    report.killed += 1;
-                    report.killed_pids.push(pid);
-                }
-                Ok(Ok(status)) => {
-                    report
-                        .errors
-                        .push(format!("kill -s KILL {pid} exited with {status}"));
-                }
-                Ok(Err(error)) => {
-                    report
-                        .errors
-                        .push(format!("failed to run kill for pid {pid}: {error}"));
-                }
-                Err(error) => {
-                    report.errors.push(format!(
-                        "spawn_blocking failed while killing pid {pid}: {error}"
-                    ));
-                }
-            }
-        }
-    }
-
+    report
+        .errors
+        .push("reap disabled: no handle-owned child identity".to_string());
     report
 }
 
-/// List `wezterm cli` processes that are candidates for reaping.
+/// Parse a synthetic historical `ps -eo pid,etimes,args` line.
 ///
-/// Uses `ps -eo pid,etimes,args` to get PID, elapsed time in seconds, and the
-/// full command line.  Only processes whose command is a direct `wezterm cli
-/// <subcommand>` invocation with a subcommand on the [`REAPABLE_SUBCOMMANDS`]
-/// allowlist are returned.
-///
-/// Specifically excluded:
-/// - `proxy` subcommand (long-lived SSH session transport — killing it severs
-///   active sessions)
-/// - Lines where `wezterm cli` appears only as an argument to another process
-///   (e.g. `grep "wezterm cli"`, `zsh -c "wezterm cli list"`)
-/// - Any unrecognized subcommand (defense in depth — only reap what we know)
-async fn list_wezterm_cli_processes_via_ps() -> Result<Vec<ProcessEntry>, String> {
-    // `etimes` gives elapsed time in seconds (POSIX, works on Linux and macOS).
-    // Use runtime_async::spawn_blocking + std::process::Command to avoid
-    // requiring a Tokio reactor (panics under asupersync runtime).
-    let output = crate::runtime_async::spawn_blocking(|| {
-        std::process::Command::new("ps")
-            .args(["-eo", "pid,etimes,args"])
-            .output()
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))?
-    .map_err(|e| format!("failed to run ps: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "ps exited with status {}",
-            output.status.code().unwrap_or(-1)
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut entries = Vec::new();
-
-    for line in stdout.lines() {
-        let line = line.trim();
-        // Skip the header line.
-        if line.starts_with("PID") || line.is_empty() {
-            continue;
-        }
-
-        if let Some(entry) = parse_ps_line_if_reapable(line) {
-            entries.push(entry);
-        }
-    }
-
-    Ok(entries)
-}
-
-/// ft-xbnl0.2.3 Cx-first sibling of [`list_wezterm_cli_processes_via_ps`].
-///
-/// Pre-flight `cx.checkpoint()` before spawning the blocking `ps`
-/// command and parsing its output. The spawn_blocking body is not
-/// itself cx-aware (asupersync doesn't yet offer a cx-threaded
-/// spawn_blocking), but this sibling at least lets callers bail
-/// from the reaper scan loop without kicking off another full
-/// `ps` fan-out when parent cancellation is already requested.
-async fn list_wezterm_cli_processes_via_ps_with_cx(
-    cx: &crate::cx::Cx,
-) -> Result<Vec<ProcessEntry>, String> {
-    cx.checkpoint()
-        .map_err(|err| format!("list_wezterm_cli_processes_via_ps cancelled: {err}"))?;
-    list_wezterm_cli_processes_via_ps().await
-}
-
-/// Parse a single `ps -eo pid,etimes,args` line and return a [`ProcessEntry`]
-/// only if the command is a directly-invoked `wezterm cli <allowed-subcommand>`.
+/// This is test-only. A positive result conveys no ownership or signal
+/// authority and is never consumed by production code.
 ///
 /// Returns `None` for:
 /// - Non-wezterm processes
 /// - Lines where `wezterm cli` appears only as an argument to a wrapper (grep,
 ///   shell -c, etc.)
 /// - `wezterm cli proxy` and any other non-allowlisted subcommand
+#[cfg(test)]
 fn parse_ps_line_if_reapable(line: &str) -> Option<ProcessEntry> {
     // Expected format: "  PID  ELAPSED  ARGS..."
     // Fields are whitespace-separated, with ARGS potentially containing spaces.
@@ -385,8 +201,24 @@ fn parse_ps_line_if_reapable(line: &str) -> Option<ProcessEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
-    // -- Positive cases: should be accepted --
+    #[test]
+    fn default_configuration_disables_global_reaping() {
+        assert_eq!(CliConfig::default().orphan_reap_interval_seconds, 0);
+    }
+
+    #[test]
+    fn production_source_has_no_process_scan_or_pid_signal_primitive() {
+        let source = include_str!("orphan_reaper.rs");
+        let process_scan = ["Command::new(", "\"ps\")"].concat();
+        let pid_signal = ["send_unix_signal", "_to_pid"].concat();
+        assert!(!source.contains(&process_scan));
+        assert!(!source.contains(&pid_signal));
+    }
+
+    // Historical classifier cases. Even positive classifications never reach
+    // a production scan or signalling path.
 
     #[test]
     fn accepts_simple_list() {
@@ -566,10 +398,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // LabRuntime deterministic tests for the Cx-first reaper loop
-    // (ft-xbnl0.2.x slice). Exercise only the short-circuit paths that do
-    // NOT spawn `ps`; the actual reap cycle requires a real
-    // OS process table which is outside the scope of a deterministic test.
+    // LabRuntime deterministic tests for the Cx-first fail-closed surface.
     // -------------------------------------------------------------------------
 
     mod labruntime_orphan_reaper {
@@ -607,11 +436,7 @@ mod tests {
             );
         }
 
-        /// Pre-flight cancellation: if the Cx is already cancelled on
-        /// entry, the reaper returns before the `interval == 0` check
-        /// and before any `sleep_with_cx` await. A Cx-unaware loop
-        /// would either never start or block on the first sleep; the
-        /// Cx-first entry point must exit immediately.
+        /// Pre-flight cancellation returns before reading configuration.
         #[test]
         fn run_orphan_reaper_with_cx_pre_cancelled_exits_immediately() {
             run_lab(0x0_1FEA_BED5_0505, || async move {
@@ -634,10 +459,7 @@ mod tests {
             });
         }
 
-        /// Interval=0 disables the reaper: it must return immediately
-        /// even under a live Cx. This matches the legacy `run_orphan_reaper`
-        /// contract and avoids a permanent sleep loop when the operator
-        /// has explicitly opted out.
+        /// Interval=0 disables the surface and returns immediately.
         #[test]
         fn run_orphan_reaper_with_cx_interval_zero_disables() {
             run_lab(0x0_1FEA_BED5_0606, || async move {
@@ -653,6 +475,29 @@ mod tests {
                 assert!(
                     !shutdown.load(Ordering::SeqCst),
                     "interval=0 must not touch the shutdown flag"
+                );
+            });
+        }
+
+        #[test]
+        fn configured_interval_still_cannot_scan_or_signal() {
+            run_lab(0x0_1FEA_BED5_0666, || async move {
+                let config = CliConfig {
+                    orphan_reap_interval_seconds: 1,
+                    ..Default::default()
+                };
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let cx = crate::cx::for_request();
+
+                run_orphan_reaper_with_cx(&cx, config, Arc::clone(&shutdown)).await;
+
+                let report = reap_orphans_with_cx(&cx, 0).await;
+                assert_eq!(report.scanned, 0);
+                assert_eq!(report.killed, 0);
+                assert!(report.killed_pids.is_empty());
+                assert_eq!(
+                    report.errors,
+                    vec!["reap disabled: no handle-owned child identity".to_string()]
                 );
             });
         }

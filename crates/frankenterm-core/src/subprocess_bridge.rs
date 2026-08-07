@@ -4,23 +4,27 @@
 //! - binary discovery (PATH first, then project release dirs)
 //! - timeout-bounded process execution
 //! - structured JSON parsing into typed outputs
-//! - fail-open error surfacing via `BridgeError`
+//! - typed, content-free error surfacing via `BridgeError`
 
-use std::io::Read;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::redactor::Redactor;
+use crate::runtime_async::process::{
+    Command, CommandCancellation, CommandCancelled, CommandCleanupTrigger,
+    CommandOutputCaptureIncomplete, CommandOutputLimitExceeded, CommandOutputStream,
+    CommandProcessCleanupIncomplete, CommandTimedOut,
+    DEFAULT_COMMAND_STDERR_LIMIT_BYTES, DEFAULT_COMMAND_STDOUT_LIMIT_BYTES,
+};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const DP_ROOT: &str = "/dp";
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const EXEC_BUSY_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(10), Duration::from_millis(50)];
 
 /// Reusable subprocess bridge for typed JSON CLI integrations.
 #[derive(Debug, Clone)]
@@ -28,6 +32,8 @@ pub struct SubprocessBridge<T> {
     binary_name: String,
     search_paths: Vec<PathBuf>,
     timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
     _phantom: PhantomData<T>,
 }
 
@@ -45,6 +51,8 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
             binary_name: binary.to_string(),
             search_paths: vec![PathBuf::from(DP_ROOT)],
             timeout: DEFAULT_TIMEOUT,
+            stdout_limit: DEFAULT_COMMAND_STDOUT_LIMIT_BYTES,
+            stderr_limit: DEFAULT_COMMAND_STDERR_LIMIT_BYTES,
             _phantom: PhantomData,
         }
     }
@@ -67,11 +75,27 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
         self
     }
 
+    /// Override the maximum retained stdout bytes. Zero permits empty output
+    /// only.
+    #[must_use]
+    pub fn with_stdout_limit(mut self, limit: usize) -> Self {
+        self.stdout_limit = limit;
+        self
+    }
+
+    /// Override the maximum retained stderr bytes. Zero permits empty output
+    /// only.
+    #[must_use]
+    pub fn with_stderr_limit(mut self, limit: usize) -> Self {
+        self.stderr_limit = limit;
+        self
+    }
+
     /// Check whether the target binary can be resolved.
     #[must_use]
     pub fn is_available(&self) -> bool {
         let available = self.resolve_binary().is_ok();
-        debug!(bridge = %self.binary_name, available, "subprocess bridge availability checked");
+        debug!(available, "subprocess bridge availability checked");
         available
     }
 
@@ -80,214 +104,104 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
         self.invoke_with_env(args, &[])
     }
 
+    /// Invoke with cooperative cancellation while retaining the same timeout
+    /// and output bounds as [`Self::invoke`].
+    pub fn invoke_with_cancellation(
+        &self,
+        args: &[&str],
+        cancellation: &CommandCancellation,
+    ) -> Result<T, BridgeError> {
+        self.invoke_with_env_and_cancellation(args, &[], Some(cancellation))
+    }
+
     /// Invoke the CLI with args + temporary environment overrides and parse JSON output.
     pub fn invoke_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Result<T, BridgeError> {
+        self.invoke_with_env_and_cancellation(args, env, None)
+    }
+
+    fn invoke_with_env_and_cancellation(
+        &self,
+        args: &[&str],
+        env: &[(&str, &str)],
+        cancellation: Option<&CommandCancellation>,
+    ) -> Result<T, BridgeError> {
         let binary = self.resolve_binary()?;
-        let redacted_args = redact_args_for_log(args);
         debug!(
-            bridge = %self.binary_name,
-            binary = %binary.display(),
-            args = ?redacted_args,
             timeout_ms = self.timeout.as_millis(),
+            stdout_limit = self.stdout_limit,
+            stderr_limit = self.stderr_limit,
             "invoking subprocess bridge"
         );
 
         let mut cmd = Command::new(&binary);
-        cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.args(args);
+        cmd.kill_on_drop(true);
+        cmd.stdout_limit(self.stdout_limit);
+        cmd.stderr_limit(self.stderr_limit);
+        cmd.exec_busy_retry_delays(&EXEC_BUSY_RETRY_DELAYS);
         for (k, v) in env {
             cmd.env(k, v);
         }
 
-        crate::runtime_async::process::configure_process_group(&mut cmd)
-            .map_err(|err| BridgeError::ExitCode(-1, err.to_string()))?;
-
-        // ETXTBSY (os error 26) on exec is always transient: either the
-        // bridge binary is briefly open for writing (mid-self-update), or
-        // another thread's fork captured a writable fd for it that its
-        // child has not yet CLOEXEC-closed — the classic multithreaded
-        // write-then-exec race (ft-e5jb0; same bounded-retry shape as
-        // robot_ntm_differential::run_ntm_subprocess).
-        let mut child = {
-            const ETXTBSY: i32 = 26;
-            const RETRY_DELAYS_MS: [u64; 2] = [10, 50];
-            let mut delays = RETRY_DELAYS_MS.iter();
-            loop {
-                match cmd.spawn() {
-                    Ok(child) => break child,
-                    Err(err) if err.raw_os_error() == Some(ETXTBSY) => match delays.next() {
-                        Some(delay_ms) => {
-                            std::thread::sleep(Duration::from_millis(*delay_ms));
-                        }
-                        None => return Err(self.map_spawn_error(err)),
-                    },
-                    Err(err) => return Err(self.map_spawn_error(err)),
-                }
-            }
-        };
-        let started = Instant::now();
-
-        let kill_process_group = |child_id: u32| {
-            let _ = crate::runtime_async::process::send_signal_to_process_group(child_id, "KILL");
+        let output = match cancellation {
+            Some(cancellation) => cmd
+                .output_blocking_with_cancellation(self.timeout, cancellation)
+                .map_err(|error| self.map_command_error(&error))?,
+            None => cmd
+                .output_blocking(self.timeout)
+                .map_err(|error| self.map_command_error(&error))?,
         };
 
-        let stdout_stream = match child.stdout.take() {
-            Some(stream) => stream,
-            None => {
-                kill_process_group(child.id());
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(BridgeError::ExitCode(
-                    -1,
-                    "stdout pipe was unavailable".to_string(),
-                ));
-            }
-        };
-        let stderr_stream = match child.stderr.take() {
-            Some(stream) => stream,
-            None => {
-                kill_process_group(child.id());
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(BridgeError::ExitCode(
-                    -1,
-                    "stderr pipe was unavailable".to_string(),
-                ));
-            }
-        };
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let tx_err = tx.clone();
-
-        let stdout_handle =
-            match spawn_subprocess_pipe_reader("ft-subprocess-stdout", true, stdout_stream, tx) {
-                Ok(handle) => handle,
-                Err(err) => {
-                    kill_process_group(child.id());
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(BridgeError::ExitCode(
-                        -1,
-                        format!("failed to spawn stdout pipe reader thread: {err}"),
-                    ));
-                }
-            };
-
-        let stderr_handle = match spawn_subprocess_pipe_reader(
-            "ft-subprocess-stderr",
-            false,
-            stderr_stream,
-            tx_err,
-        ) {
-            Ok(handle) => handle,
-            Err(err) => {
-                kill_process_group(child.id());
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_handle.join();
-                return Err(BridgeError::ExitCode(
-                    -1,
-                    format!("failed to spawn stderr pipe reader thread: {err}"),
-                ));
-            }
-        };
-
-        let mut stdout_data = Vec::new();
-        let mut stderr_data = Vec::new();
-        let mut pipes_closed = 0;
-
-        loop {
-            if started.elapsed() >= self.timeout {
-                kill_process_group(child.id());
-                let _ = child.kill();
-                let _ = child.wait();
-                let err = BridgeError::Timeout(self.timeout);
-                warn!(bridge = %self.binary_name, error = %err, "subprocess bridge timeout");
-                return Err(err);
-            }
-
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    while pipes_closed < 2 {
-                        let remaining = self.timeout.saturating_sub(started.elapsed());
-                        if remaining.is_zero() {
-                            kill_process_group(child.id());
-                            let err = BridgeError::Timeout(self.timeout);
-                            warn!(bridge = %self.binary_name, error = %err, "subprocess bridge timeout waiting for pipe close");
-                            return Err(err);
-                        }
-                        match rx.recv_timeout(remaining) {
-                            Ok((is_stdout, data)) => {
-                                if is_stdout {
-                                    stdout_data = data;
-                                } else {
-                                    stderr_data = data;
-                                }
-                                pipes_closed += 1;
-                            }
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                kill_process_group(child.id());
-                                let err = BridgeError::Timeout(self.timeout);
-                                warn!(bridge = %self.binary_name, error = %err, "subprocess bridge timeout waiting for pipe close");
-                                return Err(err);
-                            }
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                pipes_closed += 1;
-                            }
-                        }
-                    }
-
-                    if !status.success() {
-                        let code = status.code().unwrap_or(-1);
-                        let stderr = String::from_utf8_lossy(&stderr_data).to_string();
-                        let stdout = String::from_utf8_lossy(&stdout_data).to_string();
-                        let detail = if stderr.trim().is_empty() {
-                            stdout
-                        } else {
-                            stderr
-                        };
-                        let err = BridgeError::ExitCode(code, redact_for_error(&detail));
-                        warn!(bridge = %self.binary_name, error = %err, "subprocess bridge command failed");
-                        let _ = stdout_handle.join();
-                        let _ = stderr_handle.join();
-                        return Err(err);
-                    }
-
-                    let stdout = String::from_utf8_lossy(&stdout_data).to_string();
-                    let res = serde_json::from_str(&stdout).map_err(|err| {
-                        let parse_err = BridgeError::ParseError(format!(
-                            "{} (stdout preview: {})",
-                            err,
-                            redact_for_error(&stdout)
-                        ));
-                        warn!(bridge = %self.binary_name, error = %parse_err, "subprocess bridge parse failure");
-                        parse_err
-                    });
-                    let _ = stdout_handle.join();
-                    let _ = stderr_handle.join();
-                    return res;
-                }
-                Ok(None) => {
-                    std::thread::sleep(POLL_INTERVAL);
-                }
-                Err(err) => {
-                    kill_process_group(child.id());
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = stdout_handle.join();
-                    let _ = stderr_handle.join();
-                    let bridge_err = BridgeError::ExitCode(-1, err.to_string());
-                    warn!(bridge = %self.binary_name, error = %bridge_err, "subprocess bridge wait failure");
-                    return Err(bridge_err);
-                }
-            }
+        if !output.status.success() {
+            let code = output.status.code().unwrap_or(-1);
+            let error = BridgeError::ExitCode(code);
+            warn!(error = %error, "subprocess bridge command failed");
+            return Err(error);
         }
+
+        serde_json::from_slice(&output.stdout).map_err(|_| {
+            let parse_error = BridgeError::ParseError;
+            warn!(error = %parse_error, "subprocess bridge parse failure");
+            parse_error
+        })
     }
 
-    fn map_spawn_error(&self, err: std::io::Error) -> BridgeError {
+    fn map_command_error(&self, err: &std::io::Error) -> BridgeError {
         if err.kind() == std::io::ErrorKind::NotFound {
-            return BridgeError::BinaryNotFound(self.binary_name.clone());
+            return BridgeError::BinaryNotFound;
         }
-        BridgeError::ExitCode(-1, err.to_string())
+        if CommandTimedOut::from_io_error(err).is_some() {
+            return BridgeError::Timeout(self.timeout);
+        }
+        if CommandCancelled::from_io_error(err).is_some() {
+            return BridgeError::Cancelled;
+        }
+        if let Some(incomplete) = CommandOutputCaptureIncomplete::from_io_error(err) {
+            return BridgeError::CaptureIncomplete {
+                stdout_open: incomplete.stdout_open(),
+                stderr_open: incomplete.stderr_open(),
+                drain_timeout_ms: incomplete.drain_timeout_ms(),
+            };
+        }
+        if let Some(incomplete) = CommandProcessCleanupIncomplete::from_io_error(err) {
+            return BridgeError::CleanupIncomplete {
+                trigger: incomplete.trigger(),
+                leader_reaped: incomplete.leader_reaped(),
+                signal_helper_settled: incomplete.signal_helper_settled(),
+                process_tree_signalled: incomplete.process_tree_signalled(),
+                stdout_open: incomplete.stdout_open(),
+                stderr_open: incomplete.stderr_open(),
+                settle_timeout_ms: incomplete.settle_timeout_ms(),
+            };
+        }
+        if let Some(exceeded) = CommandOutputLimitExceeded::from_io_error(err) {
+            return BridgeError::OutputTooLarge {
+                stream: exceeded.stream(),
+                observed: exceeded.observed(),
+                limit: exceeded.limit(),
+            };
+        }
+        BridgeError::Io(err.kind())
     }
 
     fn resolve_binary(&self) -> Result<PathBuf, BridgeError> {
@@ -296,7 +210,7 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
             if is_executable_file(&direct) {
                 return Ok(direct);
             }
-            return Err(BridgeError::BinaryNotFound(self.binary_name.clone()));
+            return Err(BridgeError::BinaryNotFound);
         }
 
         if let Some(path_hit) = self.find_in_path() {
@@ -307,7 +221,7 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
             return Ok(search_hit);
         }
 
-        Err(BridgeError::BinaryNotFound(self.binary_name.clone()))
+        Err(BridgeError::BinaryNotFound)
     }
 
     fn find_in_path(&self) -> Option<PathBuf> {
@@ -350,91 +264,6 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
     }
 }
 
-// br-ft-x2oyy: stdio multiplexing pipe reader. Both swallows below
-// are intentional best-effort:
-//   * `stream.read_to_end(&mut buf)` — pipe-side errors (subprocess
-//     terminated, fd closed) leave whatever was already read in `buf`;
-//     the partial read still ships downstream so the consumer can
-//     observe the truncation via the EOF on its receiver.
-//   * `tx.send((is_stdout, buf))` — `mpsc::Sender::send` fails iff the
-//     receiver has been dropped, which means the parent gave up on
-//     this subprocess. There is no recovery path — the parent decides
-//     teardown order, and dropping captured output is the documented
-//     contract for that case (caller had already requested cancel).
-fn spawn_subprocess_pipe_reader<R>(
-    name: &'static str,
-    is_stdout: bool,
-    mut stream: R,
-    tx: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
-) -> Result<std::thread::JoinHandle<()>, std::io::Error>
-where
-    R: Read + Send + 'static,
-{
-    std::thread::Builder::new()
-        .name(name.to_string())
-        .spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stream.read_to_end(&mut buf);
-            // br-ft-x2oyy: intentional best-effort pipe delivery; send
-            // fails only when the parent already cancelled collection.
-            let _ = tx.send((is_stdout, buf));
-        })
-}
-
-fn truncate_for_error(input: &str) -> String {
-    const MAX_LEN: usize = 240;
-    if input.len() <= MAX_LEN {
-        return input.to_string();
-    }
-
-    let mut end = MAX_LEN;
-    while end > 0 && !input.is_char_boundary(end) {
-        end -= 1;
-    }
-
-    let mut out = input[..end].to_string();
-    out.push_str("...");
-    out
-}
-
-fn redact_args_for_log(args: &[&str]) -> Vec<String> {
-    let redactor = Redactor::new();
-    let mut redact_next = false;
-
-    args.iter()
-        .map(|arg| {
-            if redact_next {
-                redact_next = false;
-                return "[REDACTED]".to_string();
-            }
-
-            let lower = arg.to_ascii_lowercase();
-            if matches!(
-                lower.as_str(),
-                "--body" | "--subject" | "--message" | "--text" | "--token" | "--api-key"
-            ) {
-                redact_next = true;
-                return (*arg).to_string();
-            }
-
-            if let Some((flag, _value)) = arg.split_once('=')
-                && matches!(
-                    flag.to_ascii_lowercase().as_str(),
-                    "--body" | "--subject" | "--message" | "--text" | "--token" | "--api-key"
-                )
-            {
-                return format!("{flag}=[REDACTED]");
-            }
-
-            redactor.redact(arg)
-        })
-        .collect()
-}
-
-fn redact_for_error(text: &str) -> String {
-    truncate_for_error(&Redactor::new().redact(text))
-}
-
 fn is_executable_file(path: &Path) -> bool {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -460,24 +289,65 @@ fn is_executable_file(path: &Path) -> bool {
 /// Structured subprocess bridge failures.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum BridgeError {
-    #[error("binary not found: {0}")]
-    BinaryNotFound(String),
+    #[error("subprocess binary not found")]
+    BinaryNotFound,
 
     #[error("timed out after {0:?}")]
     Timeout(Duration),
 
-    #[error("parse error: {0}")]
-    ParseError(String),
+    #[error("subprocess output was not valid JSON")]
+    ParseError,
 
-    #[error("exit code {0}: {1}")]
-    ExitCode(i32, String),
+    #[error("subprocess exited with code {0}")]
+    ExitCode(i32),
+
+    #[error("subprocess command cancelled")]
+    Cancelled,
+
+    #[error(
+        "subprocess output capture incomplete after {drain_timeout_ms} ms (stdout_open={stdout_open}, stderr_open={stderr_open})"
+    )]
+    CaptureIncomplete {
+        stdout_open: bool,
+        stderr_open: bool,
+        drain_timeout_ms: u64,
+    },
+
+    #[error(
+        "subprocess cleanup incomplete after {settle_timeout_ms} ms (trigger={trigger}, leader_reaped={leader_reaped}, signal_helper_settled={signal_helper_settled}, process_tree_signalled={process_tree_signalled}, stdout_open={stdout_open}, stderr_open={stderr_open})"
+    )]
+    CleanupIncomplete {
+        trigger: CommandCleanupTrigger,
+        leader_reaped: bool,
+        signal_helper_settled: bool,
+        process_tree_signalled: bool,
+        stdout_open: bool,
+        stderr_open: bool,
+        settle_timeout_ms: u64,
+    },
+
+    #[error(
+        "subprocess {stream} capture limit exceeded: observed at least {observed} bytes, limit {limit}"
+    )]
+    OutputTooLarge {
+        stream: CommandOutputStream,
+        observed: usize,
+        limit: usize,
+    },
+
+    #[error("subprocess I/O failure: {0:?}")]
+    Io(std::io::ErrorKind),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use serde::Deserialize;
-    use serde_json::{Value, json};
+    #[cfg(unix)]
+    use serde_json::json;
+    use serde_json::Value;
+    #[cfg(unix)]
     use tempfile::tempdir;
 
     #[cfg(unix)]
@@ -504,6 +374,7 @@ mod tests {
         SubprocessBridge::new(binary)
     }
 
+    #[cfg(unix)]
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     struct SamplePayload {
         ok: bool,
@@ -516,6 +387,8 @@ mod tests {
         assert_eq!(b.binary_name, "demo");
         assert_eq!(b.timeout, Duration::from_secs(10));
         assert_eq!(b.search_paths, vec![PathBuf::from("/dp")]);
+        assert_eq!(b.stdout_limit, DEFAULT_COMMAND_STDOUT_LIMIT_BYTES);
+        assert_eq!(b.stderr_limit, DEFAULT_COMMAND_STDERR_LIMIT_BYTES);
     }
 
     #[test]
@@ -539,6 +412,7 @@ mod tests {
         assert!(!b.is_available());
     }
 
+    #[cfg(unix)]
     #[test]
     fn is_available_true_for_path_binary_sh() {
         let b = bridge("sh");
@@ -549,9 +423,10 @@ mod tests {
     fn invoke_binary_not_found() {
         let b = bridge("definitely-missing-binary-xyz");
         let err = b.invoke(&[]).unwrap_err();
-        assert!(matches!(err, BridgeError::BinaryNotFound(_)));
+        assert_eq!(err, BridgeError::BinaryNotFound);
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_parses_json_output_with_shell() {
         let b = bridge("sh");
@@ -562,6 +437,7 @@ mod tests {
         assert_eq!(out["value"], 3);
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_typed_payload_deserializes() {
         let b: SubprocessBridge<SamplePayload> = SubprocessBridge::new("sh");
@@ -577,6 +453,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_with_env_passes_variables() {
         let b = bridge("sh");
@@ -589,6 +466,7 @@ mod tests {
         assert_eq!(out["v"], "expected");
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_with_empty_env_still_works() {
         let b = bridge("sh");
@@ -598,32 +476,25 @@ mod tests {
         assert_eq!(out["ok"], true);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn invoke_nonzero_exit_reports_stderr() {
+    fn invoke_nonzero_exit_discards_stderr_content() {
         let b = bridge("sh");
         let err = b.invoke(&["-c", "echo 'boom' 1>&2; exit 23"]).unwrap_err();
-        match err {
-            BridgeError::ExitCode(code, message) => {
-                assert_eq!(code, 23);
-                assert!(message.contains("boom"));
-            }
-            _ => panic!("expected exit-code error"),
-        }
+        assert_eq!(err, BridgeError::ExitCode(23));
+        assert!(!err.to_string().contains("boom"));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn invoke_nonzero_exit_falls_back_to_stdout_when_stderr_empty() {
+    fn invoke_nonzero_exit_discards_stdout_content() {
         let b = bridge("sh");
         let err = b.invoke(&["-c", "echo 'stdout-only'; exit 7"]).unwrap_err();
-        match err {
-            BridgeError::ExitCode(code, message) => {
-                assert_eq!(code, 7);
-                assert!(message.contains("stdout-only"));
-            }
-            _ => panic!("expected exit-code error"),
-        }
+        assert_eq!(err, BridgeError::ExitCode(7));
+        assert!(!err.to_string().contains("stdout-only"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_timeout_returns_error() {
         let b = bridge("sh").with_timeout(Duration::from_millis(25));
@@ -633,33 +504,29 @@ mod tests {
         assert_eq!(err, BridgeError::Timeout(Duration::from_millis(25)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_invalid_json_returns_parse_error() {
         let b = bridge("sh");
         let err = b.invoke(&["-c", "printf 'not-json'"]).unwrap_err();
-        match err {
-            BridgeError::ParseError(msg) => assert!(msg.contains("stdout preview")),
-            _ => panic!("expected parse error"),
-        }
+        assert_eq!(err, BridgeError::ParseError);
+        assert!(!err.to_string().contains("not-json"));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn invoke_parse_error_redacts_stdout_preview() {
+    fn invoke_parse_error_does_not_retain_stdout_content() {
         let b = bridge("sh");
         let err = b
             .invoke(&["-c", "printf 'token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'"])
             .unwrap_err();
-        match err {
-            BridgeError::ParseError(msg) => {
-                assert!(msg.contains("[REDACTED]"));
-                assert!(!msg.contains("AAAAAAAAAAAAAAAA"));
-            }
-            _ => panic!("expected parse error"),
-        }
+        assert_eq!(err, BridgeError::ParseError);
+        assert!(!err.to_string().contains("AAAAAAAAAAAAAAAA"));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn invoke_exit_error_redacts_child_output_preview() {
+    fn invoke_exit_error_does_not_retain_child_output() {
         let b = bridge("sh");
         let err = b
             .invoke(&[
@@ -667,23 +534,19 @@ mod tests {
                 "printf 'secret=BBBBBBBBBBBBBBBBBBBBBBBB' 1>&2; exit 17",
             ])
             .unwrap_err();
-        match err {
-            BridgeError::ExitCode(code, message) => {
-                assert_eq!(code, 17);
-                assert!(message.contains("[REDACTED]"));
-                assert!(!message.contains("BBBBBBBBBBBBBBBB"));
-            }
-            _ => panic!("expected exit-code error"),
-        }
+        assert_eq!(err, BridgeError::ExitCode(17));
+        assert!(!err.to_string().contains("BBBBBBBBBBBBBBBB"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_empty_output_returns_parse_error() {
         let b = bridge("sh");
         let err = b.invoke(&["-c", "printf ''"]).unwrap_err();
-        assert!(matches!(err, BridgeError::ParseError(_)));
+        assert_eq!(err, BridgeError::ParseError);
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_unicode_json_roundtrip() {
         let b = bridge("sh");
@@ -693,6 +556,7 @@ mod tests {
         assert_eq!(out["msg"], "héllo");
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_large_json_payload() {
         let b = bridge("sh");
@@ -706,6 +570,7 @@ mod tests {
         assert_eq!(out["data"].as_str().unwrap().len(), 2048);
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_path_with_slash_uses_direct_binary() {
         let b: SubprocessBridge<Value> = SubprocessBridge::new("/bin/sh");
@@ -713,6 +578,7 @@ mod tests {
         assert_eq!(out["ok"], true);
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_binary_prefers_path_hit() {
         let b = bridge("sh").with_search_paths(["/definitely/not/used"]);
@@ -721,50 +587,36 @@ mod tests {
     }
 
     #[test]
-    fn truncate_for_error_short_passthrough() {
-        let msg = "short";
-        assert_eq!(truncate_for_error(msg), msg);
-    }
-
-    #[test]
-    fn truncate_for_error_long_adds_ellipsis() {
-        let msg = "x".repeat(500);
-        let truncated = truncate_for_error(&msg);
-        assert!(truncated.ends_with("..."));
-        assert!(truncated.len() < msg.len());
-    }
-
-    #[test]
-    fn redact_args_for_log_masks_agent_mail_body_and_subject_values() {
-        let args = redact_args_for_log(&[
-            "send",
-            "--subject",
-            "handoff token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "--body=secret=BBBBBBBBBBBBBBBBBBBBBBBB",
-            "--to",
-            "peer",
-        ]);
-
-        let rendered = format!("{args:?}");
-        assert!(rendered.contains("--subject"));
-        assert!(rendered.contains("--body=[REDACTED]"));
-        assert!(!rendered.contains("AAAAAAAAAAAAAAAA"));
-        assert!(!rendered.contains("BBBBBBBBBBBBBBBB"));
-    }
-
-    #[test]
-    fn redact_for_error_masks_secret_before_truncating() {
-        let detail = format!("prefix token={} suffix {}", "A".repeat(48), "x".repeat(500));
-        let redacted = redact_for_error(&detail);
-
-        assert!(redacted.contains("[REDACTED]"));
-        assert!(!redacted.contains(&"A".repeat(32)));
-        assert!(redacted.ends_with("..."));
+    fn bridge_error_variants_are_structural_and_content_free() {
+        let secret = "raw-child-output-canary";
+        for error in [
+            BridgeError::BinaryNotFound,
+            BridgeError::ParseError,
+            BridgeError::ExitCode(17),
+            BridgeError::Cancelled,
+            BridgeError::CaptureIncomplete {
+                stdout_open: true,
+                stderr_open: false,
+                drain_timeout_ms: 100,
+            },
+            BridgeError::CleanupIncomplete {
+                trigger: CommandCleanupTrigger::Cancelled,
+                leader_reaped: false,
+                signal_helper_settled: false,
+                process_tree_signalled: false,
+                stdout_open: true,
+                stderr_open: false,
+                settle_timeout_ms: 250,
+            },
+            BridgeError::Io(std::io::ErrorKind::Other),
+        ] {
+            assert!(!error.to_string().contains(secret));
+        }
     }
 
     #[test]
     fn bridge_error_display_binary_not_found() {
-        let err = BridgeError::BinaryNotFound("demo".to_string());
+        let err = BridgeError::BinaryNotFound;
         assert!(err.to_string().contains("binary not found"));
     }
 
@@ -776,14 +628,14 @@ mod tests {
 
     #[test]
     fn bridge_error_display_parse_error() {
-        let err = BridgeError::ParseError("bad json".to_string());
-        assert!(err.to_string().contains("parse error"));
+        let err = BridgeError::ParseError;
+        assert!(err.to_string().contains("not valid JSON"));
     }
 
     #[test]
     fn bridge_error_display_exit_code() {
-        let err = BridgeError::ExitCode(9, "boom".to_string());
-        assert!(err.to_string().contains("exit code 9"));
+        let err = BridgeError::ExitCode(9);
+        assert!(err.to_string().contains("code 9"));
     }
 
     #[test]
@@ -796,26 +648,17 @@ mod tests {
 
     #[test]
     fn bridge_error_equality_binary_not_found() {
-        assert_eq!(
-            BridgeError::BinaryNotFound("x".to_string()),
-            BridgeError::BinaryNotFound("x".to_string())
-        );
+        assert_eq!(BridgeError::BinaryNotFound, BridgeError::BinaryNotFound);
     }
 
     #[test]
     fn bridge_error_equality_parse_error() {
-        assert_eq!(
-            BridgeError::ParseError("a".to_string()),
-            BridgeError::ParseError("a".to_string())
-        );
+        assert_eq!(BridgeError::ParseError, BridgeError::ParseError);
     }
 
     #[test]
     fn bridge_error_equality_exit_code() {
-        assert_eq!(
-            BridgeError::ExitCode(1, "a".to_string()),
-            BridgeError::ExitCode(1, "a".to_string())
-        );
+        assert_eq!(BridgeError::ExitCode(1), BridgeError::ExitCode(1));
     }
 
     #[test]
@@ -914,21 +757,22 @@ mod tests {
 
         let b = bridge("noexec-bin").with_search_paths([dir.path().to_path_buf()]);
         let err = b.invoke(&[]).unwrap_err();
-        assert!(matches!(err, BridgeError::BinaryNotFound(_)));
+        assert_eq!(err, BridgeError::BinaryNotFound);
     }
 
     #[cfg(unix)]
     #[test]
-    fn invoke_permission_denied_direct_path_maps_exit_code() {
+    fn invoke_permission_denied_direct_path_is_rejected_during_resolution() {
         let dir = tempdir().unwrap();
         let bin = dir.path().join("deny-bin");
         write_non_executable(&bin, "#!/bin/sh\nprintf '{\"ok\":true}'\n");
 
         let b: SubprocessBridge<Value> = SubprocessBridge::new(bin.to_string_lossy().as_ref());
         let err = b.invoke(&[]).unwrap_err();
-        assert!(matches!(err, BridgeError::BinaryNotFound(_)));
+        assert_eq!(err, BridgeError::BinaryNotFound);
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_with_multiple_args_roundtrip() {
         let b = bridge("sh");
@@ -946,6 +790,7 @@ mod tests {
         assert_eq!(out["arg2"], "two");
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_no_args_with_sh_c() {
         let b = bridge("sh");
@@ -953,17 +798,16 @@ mod tests {
         assert_eq!(out["ok"], true);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn parse_error_preserves_original_message_text() {
+    fn parse_error_does_not_preserve_original_output_text() {
         let b = bridge("sh");
         let err = b.invoke(&["-c", "printf 'oops'"]).unwrap_err();
-        if let BridgeError::ParseError(msg) = err {
-            assert!(msg.contains("expected value") || msg.contains("stdout preview"));
-        } else {
-            panic!("expected parse error");
-        }
+        assert_eq!(err, BridgeError::ParseError);
+        assert!(!err.to_string().contains("oops"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_with_env_override_last_wins() {
         let b = bridge("sh");
@@ -978,10 +822,11 @@ mod tests {
 
     #[test]
     fn invoke_exit_code_preserves_negative_one_for_signal_or_unknown() {
-        let err = BridgeError::ExitCode(-1, "x".to_string());
-        assert_eq!(err, BridgeError::ExitCode(-1, "x".to_string()));
+        let err = BridgeError::ExitCode(-1);
+        assert_eq!(err, BridgeError::ExitCode(-1));
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_success_with_whitespace_json() {
         let b = bridge("sh");
@@ -989,6 +834,7 @@ mod tests {
         assert_eq!(out["ok"], true);
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_parse_array_json() {
         let b = bridge("sh");
@@ -996,6 +842,7 @@ mod tests {
         assert_eq!(out, json!([1, 2, 3]));
     }
 
+    #[cfg(unix)]
     #[test]
     fn invoke_parse_nested_json_object() {
         let b = bridge("sh");
@@ -1005,14 +852,167 @@ mod tests {
         assert_eq!(out["a"]["b"]["c"], 1);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn invoke_daemon_holds_stdout_times_out() {
+    fn invoke_daemon_holds_stdout_reports_incomplete_capture() {
         let b = bridge("sh").with_timeout(Duration::from_millis(500));
-        let start = Instant::now();
+        let start = std::time::Instant::now();
         // The main 'sh' process exits immediately, but the background 'sleep' process
         // inherits stdout and holds it open.
-        let err = b.invoke(&["-c", "sleep 10 >&1 &"]).unwrap_err();
-        assert!(start.elapsed() < Duration::from_secs(5));
-        assert!(matches!(err, BridgeError::Timeout(_)));
+        let err = b
+            .invoke(&["-c", "sleep 1 >&1 2>/dev/null &"])
+            .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            err,
+            BridgeError::CaptureIncomplete {
+                stdout_open: true,
+                drain_timeout_ms: 100,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invoke_accepts_exact_stdout_cap_and_rejects_one_byte_over() {
+        let payload = r#"{"ok":true}"#;
+        let exact = bridge("sh").with_stdout_limit(payload.len());
+        assert_eq!(
+            exact
+                .invoke(&["-c", "printf '{\"ok\":true}'"])
+                .expect("exact stdout boundary must be accepted"),
+            json!({"ok": true})
+        );
+
+        let over = bridge("sh").with_stdout_limit(payload.len() - 1);
+        let error = over
+            .invoke(&[
+                "-c",
+                "printf '{\"ok\":true}'; while :; do sleep 1; done",
+            ])
+            .expect_err("first byte beyond stdout cap must fail closed");
+        assert!(matches!(
+            error,
+            BridgeError::OutputTooLarge {
+                stream: CommandOutputStream::Stdout,
+                observed,
+                limit
+            } if observed >= payload.len() && limit == payload.len() - 1
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invoke_stderr_overflow_is_typed_and_content_free() {
+        let error = bridge("sh")
+            .with_stderr_limit(1)
+            .invoke(&[
+                "-c",
+                "printf 'raw-child-output-canary' >&2; while :; do sleep 1; done",
+            ])
+            .expect_err("stderr flood must hit the configured cap");
+        assert!(matches!(
+            &error,
+            BridgeError::OutputTooLarge {
+                stream: CommandOutputStream::Stderr,
+                limit: 1,
+                ..
+            }
+        ));
+        assert!(!error.to_string().contains("raw-child-output-canary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invoke_accepts_exact_stderr_cap_and_rejects_one_byte_over() {
+        let exact = bridge("sh").with_stderr_limit(3);
+        let output = exact
+            .invoke(&[
+                "-c",
+                "printf 'abc' >&2; printf '{\"ok\":true}'",
+            ])
+            .expect("exact stderr boundary must be accepted");
+        assert_eq!(output, json!({"ok": true}));
+
+        let over = exact.with_stderr_limit(2);
+        let error = over
+            .invoke(&[
+                "-c",
+                "printf 'abc' >&2; while :; do sleep 1; done",
+            ])
+            .expect_err("first byte beyond stderr cap must fail closed");
+        assert!(matches!(
+            error,
+            BridgeError::OutputTooLarge {
+                stream: CommandOutputStream::Stderr,
+                observed,
+                limit: 2,
+            } if observed >= 3
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invoke_high_volume_stdout_is_stopped_at_finite_cap() {
+        const LIMIT: usize = 64 * 1024;
+        let error = bridge("sh")
+            .with_timeout(Duration::from_secs(2))
+            .with_stdout_limit(LIMIT)
+            .invoke(&["-c", "yes x"])
+            .expect_err("unbounded producer must be stopped at the capture cap");
+        assert!(matches!(
+            error,
+            BridgeError::OutputTooLarge {
+                stream: CommandOutputStream::Stdout,
+                observed,
+                limit: LIMIT,
+            } if observed > LIMIT
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invoke_cooperative_cancellation_is_typed_and_bounded() {
+        let cancellation = CommandCancellation::new();
+        let cancel_from_thread = cancellation.clone();
+        let trigger = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            cancel_from_thread.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = bridge("sh")
+            .with_timeout(Duration::from_secs(5))
+            .invoke_with_cancellation(&["-c", "sleep 10"], &cancellation)
+            .expect_err("explicit cancellation must stop the subprocess");
+        trigger.join().expect("cancellation trigger must finish");
+
+        assert_eq!(error, BridgeError::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn production_bridge_has_no_unbounded_reader_or_child_content_error_path() {
+        let source = include_str!("subprocess_bridge.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
+        for forbidden in [
+            "read_to_end",
+            "std::thread::Builder",
+            "std::thread::spawn",
+            ".join()",
+            "child.wait()",
+            "from_utf8_lossy",
+            "redact_for_error",
+            "binary = %",
+            "args = ?",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "production bridge must not contain {forbidden}"
+            );
+        }
     }
 }

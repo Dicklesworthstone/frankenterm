@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{BootstrapMethod, BrowserContext, BrowserProfile, BrowserStatus, ProfileMetadata};
+use super::{BootstrapMethod, BrowserContext, BrowserProfile, BrowserStatus};
 
 // =============================================================================
 // Configuration
@@ -77,7 +77,7 @@ impl Default for BootstrapConfig {
                 "https://platform.openai.com".to_string(),
                 "https://chatgpt.com".to_string(),
             ],
-            success_text_markers: vec!["Successfully logged in".to_string(), "Welcome".to_string()],
+            success_text_markers: vec!["Successfully logged in".to_string()],
         }
     }
 }
@@ -162,15 +162,16 @@ impl InteractiveBootstrap {
     ) -> BootstrapResult {
         if *ctx.status() != BrowserStatus::Ready {
             return BootstrapResult::Failed {
-                error: format!("Browser context not ready: {:?}", ctx.status()),
+                error: "The browser automation context is not ready".to_string(),
             };
         }
 
         let profile_dir = match profile.ensure_dir() {
             Ok(dir) => dir,
-            Err(e) => {
+            Err(_) => {
                 return BootstrapResult::Failed {
-                    error: format!("Failed to create profile directory: {e}"),
+                    error: "The browser profile directory could not be prepared safely"
+                        .to_string(),
                 };
             }
         };
@@ -178,8 +179,6 @@ impl InteractiveBootstrap {
         let login_url = service_url.unwrap_or(&self.config.login_url);
 
         tracing::info!(
-            profile_dir = %profile_dir.display(),
-            login_url = %login_url,
             timeout_ms = self.config.timeout_ms,
             "Starting interactive bootstrap — operator action required"
         );
@@ -190,22 +189,19 @@ impl InteractiveBootstrap {
 
         match result {
             Ok(ScriptOutcome::Success { storage_state }) => {
-                if let Err(e) = profile.save_storage_state(&storage_state) {
-                    tracing::warn!(error = %e, "Failed to save storage state");
-                }
-
-                let mut metadata =
-                    profile.read_metadata().ok().flatten().unwrap_or_else(|| {
-                        ProfileMetadata::new(&profile.service, &profile.account)
-                    });
-                metadata.record_bootstrap(BootstrapMethod::Interactive);
-                if let Err(e) = profile.write_metadata(&metadata) {
-                    tracing::warn!(error = %e, "Failed to write profile metadata");
+                if profile
+                    .record_authenticated_state(&storage_state, BootstrapMethod::Interactive)
+                    .is_err()
+                {
+                    tracing::error!(elapsed_ms, "Interactive bootstrap storage persistence failed");
+                    return BootstrapResult::Failed {
+                        error: "Interactive login completed, but authenticated browser profile state could not be persisted safely"
+                            .to_string(),
+                    };
                 }
 
                 tracing::info!(
                     elapsed_ms,
-                    profile_dir = %profile_dir.display(),
                     "Interactive bootstrap completed successfully"
                 );
 
@@ -232,9 +228,9 @@ impl InteractiveBootstrap {
                     reason: "Browser window was closed before login completed".to_string(),
                 }
             }
-            Err(e) => {
-                tracing::error!(elapsed_ms, error = %e, "Interactive bootstrap failed");
-                BootstrapResult::Failed { error: e }
+            Err(error) => {
+                tracing::error!(elapsed_ms, "Interactive bootstrap failed");
+                BootstrapResult::Failed { error }
             }
         }
     }
@@ -244,58 +240,112 @@ impl InteractiveBootstrap {
         profile_dir: &Path,
         login_url: &str,
     ) -> Result<ScriptOutcome, String> {
-        let script = self.build_bootstrap_script(profile_dir, login_url);
+        let script = self
+            .build_bootstrap_script(profile_dir, login_url)
+            .map_err(|failure| failure.detail().to_string())?;
+        let output = super::run_node_script_bounded(
+            script,
+            self.config.timeout_ms,
+            super::BROWSER_BOOTSTRAP_MAX_STDOUT_BYTES,
+        )
+        .map_err(|failure| failure.detail().to_string())?;
+        let std::process::Output {
+            status,
+            stdout,
+            stderr,
+        } = output;
+        if !stderr.is_empty() {
+            tracing::debug!(
+                stderr_bytes = stderr.len(),
+                "Bootstrap subprocess stderr (content redacted in logs)"
+            );
+        }
+        drop(stderr);
+        let stdout = String::from_utf8(stdout)
+            .map_err(|_| "Bootstrap returned invalid result text".to_string())?;
 
-        let output = std::process::Command::new("node")
-            .arg("-e")
-            .arg(&script)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .map_err(|e| format!("Failed to spawn node process: {e}"))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "Playwright bootstrap script failed (exit {}): {}",
-                output.status,
-                stderr.lines().take(5).collect::<Vec<_>>().join("; ")
-            ));
+        if !status.success() {
+            return Err("The browser bootstrap subprocess failed".to_string());
         }
 
         Self::parse_bootstrap_result(&stdout)
     }
 
-    fn build_bootstrap_script(&self, profile_dir: &Path, login_url: &str) -> String {
-        let _profile_dir_str = profile_dir.display();
-        let timeout = self.config.timeout_ms;
-        let poll_interval = self.config.poll_interval_ms;
+    fn build_bootstrap_script(
+        &self,
+        profile_dir: &Path,
+        login_url: &str,
+    ) -> Result<String, super::BrowserNodeCommandFailure> {
+        super::admit_browser_timeout(self.config.timeout_ms)?;
+        super::admit_browser_poll_interval(
+            self.config.poll_interval_ms,
+            self.config.timeout_ms,
+        )?;
+        super::admit_browser_url(login_url)?;
+        if self.config.success_url_prefixes.is_empty()
+            && self.config.success_text_markers.is_empty()
+        {
+            return Err(super::BrowserNodeCommandFailure::InvalidConfiguration);
+        }
+        for success_url in &self.config.success_url_prefixes {
+            super::admit_browser_url(success_url)?;
+        }
+        if self
+            .config
+            .success_text_markers
+            .iter()
+            .any(|marker| marker.trim().is_empty())
+        {
+            return Err(super::BrowserNodeCommandFailure::InvalidConfiguration);
+        }
+        super::admit_node_script_input_parts(
+            &[Some(login_url)],
+            &[Some(profile_dir)],
+            &[
+                self.config.success_url_prefixes.as_slice(),
+                self.config.success_text_markers.as_slice(),
+            ],
+        )?;
+        let input = serde_json::json!({
+            "profile_dir": profile_dir.to_string_lossy(),
+            "login_url": login_url,
+            "timeout_ms": self.config.timeout_ms,
+            "poll_interval_ms": self.config.poll_interval_ms,
+            "success_url_prefixes": &self.config.success_url_prefixes,
+            "success_text_markers": &self.config.success_text_markers,
+        });
+        let input_base64 = super::encode_node_script_input(&input)?;
 
-        let success_urls = serde_json::to_string(&self.config.success_url_prefixes)
-            .unwrap_or_else(|_| "[]".to_string());
-        let success_texts = serde_json::to_string(&self.config.success_text_markers)
-            .unwrap_or_else(|_| "[]".to_string());
-
-        let login_url_escaped = login_url.replace('\\', "\\\\").replace('\'', "\\'");
-        let profile_dir_escaped = profile_dir
-            .display()
-            .to_string()
-            .replace('\\', "\\\\")
-            .replace('\'', "\\'");
-
-        format!(
+        super::admit_node_script_source(format!(
             r"
 const {{ chromium }} = require('playwright');
+	const input = JSON.parse(Buffer.from('{input_base64}', 'base64').toString('utf8'));
+
+	function sameOrigin(left, right) {{
+	  try {{ return new URL(left).origin === new URL(right).origin; }} catch (_) {{ return false; }}
+	}}
+
+	function matchesSuccessUrl(currentValue, prefixValue) {{
+	  try {{
+	    const current = new URL(currentValue);
+	    const expected = new URL(prefixValue);
+	    if (current.origin !== expected.origin) return false;
+	    const expectedPath = expected.pathname.endsWith('/')
+	      ? expected.pathname
+	      : expected.pathname + '/';
+	    return current.pathname === expected.pathname || current.pathname.startsWith(expectedPath);
+	  }} catch (_) {{
+	    return false;
+	  }}
+	}}
 
 (async () => {{
-  const TIMEOUT = {timeout};
-  const POLL_INTERVAL = {poll_interval};
-  const profileDir = '{profile_dir_escaped}';
-  const loginUrl = '{login_url_escaped}';
-  const successUrls = {success_urls};
-  const successTexts = {success_texts};
+  const TIMEOUT = input.timeout_ms;
+  const POLL_INTERVAL = input.poll_interval_ms;
+  const profileDir = input.profile_dir;
+  const loginUrl = input.login_url;
+  const successUrls = input.success_url_prefixes;
+  const successTexts = input.success_text_markers;
 
   let browser;
   try {{
@@ -307,7 +357,7 @@ const {{ chromium }} = require('playwright');
     const page = browser.pages()[0] || await browser.newPage();
     page.setDefaultTimeout(TIMEOUT);
 
-    await page.goto(loginUrl, {{ waitUntil: 'domcontentloaded', timeout: 30000 }});
+	    await page.goto(loginUrl, {{ waitUntil: 'domcontentloaded', timeout: Math.min(30000, TIMEOUT) }});
 
     const startTime = Date.now();
     let success = false;
@@ -316,27 +366,33 @@ const {{ chromium }} = require('playwright');
       try {{
         const currentUrl = page.url();
 
-        for (const prefix of successUrls) {{
-          if (currentUrl.startsWith(prefix)) {{
+	        for (const prefix of successUrls) {{
+	          if (matchesSuccessUrl(currentUrl, prefix)) {{
             success = true;
             break;
           }}
         }}
         if (success) break;
 
-        const bodyText = await page.textContent('body').catch(() => '');
-        for (const marker of successTexts) {{
-          if (bodyText && bodyText.includes(marker)) {{
-            success = true;
-            break;
-          }}
-        }}
+	        const markerOriginAllowed = successUrls.some(prefix => sameOrigin(currentUrl, prefix))
+	          || sameOrigin(currentUrl, loginUrl);
+	        if (markerOriginAllowed) {{
+	          const bodyText = await page.textContent('body').catch(() => '');
+	          for (const marker of successTexts) {{
+	            if (bodyText && bodyText.includes(marker)) {{
+	              success = true;
+	              break;
+	            }}
+	          }}
+	        }}
         if (success) break;
       }} catch (e) {{
         // Page might be navigating, ignore transient errors
       }}
 
-      await new Promise(r => setTimeout(r, POLL_INTERVAL));
+	      const remaining = TIMEOUT - (Date.now() - startTime);
+	      if (remaining <= 0) break;
+	      await new Promise(r => setTimeout(r, Math.min(POLL_INTERVAL, remaining)));
     }}
 
     if (success) {{
@@ -351,12 +407,12 @@ const {{ chromium }} = require('playwright');
 
     await browser.close();
   }} catch (err) {{
-    if (err.message && err.message.includes('Browser closed')) {{
+	    const message = String(err && err.message || '').toLowerCase();
+	    if (message.includes('browser') && message.includes('closed')) {{
       console.log(JSON.stringify({{ status: 'browser_closed' }}));
     }} else {{
       console.log(JSON.stringify({{
-        status: 'error',
-        message: err.message
+        status: 'error'
       }}));
       if (browser) await browser.close().catch(() => {{}});
       process.exit(1);
@@ -364,7 +420,7 @@ const {{ chromium }} = require('playwright');
   }}
 }})();
 "
-        )
+        ))
     }
 
     fn parse_bootstrap_result(stdout: &str) -> Result<ScriptOutcome, String> {
@@ -379,15 +435,17 @@ const {{ chromium }} = require('playwright');
             .find(|line| line.starts_with('{'))
             .unwrap_or(trimmed);
 
-        let parsed: serde_json::Value =
-            serde_json::from_str(json_line).map_err(|e| format!("Failed to parse output: {e}"))?;
+        let parsed: serde_json::Value = serde_json::from_str(json_line)
+            .map_err(|_| "Bootstrap returned malformed result JSON".to_string())?;
 
         match parsed.get("status").and_then(|s| s.as_str()) {
             Some("success") => {
                 let state = parsed
                     .get("storage_state")
                     .and_then(|s| s.as_str())
-                    .unwrap_or("{}")
+                    .ok_or_else(|| {
+                        "Bootstrap success result omitted browser storage state".to_string()
+                    })?
                     .as_bytes()
                     .to_vec();
                 Ok(ScriptOutcome::Success {
@@ -396,14 +454,8 @@ const {{ chromium }} = require('playwright');
             }
             Some("timeout") => Ok(ScriptOutcome::Timeout),
             Some("browser_closed") => Ok(ScriptOutcome::BrowserClosed),
-            Some("error") => {
-                let msg = parsed
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown error");
-                Err(msg.to_string())
-            }
-            _ => Err(format!("Unexpected bootstrap output: {json_line}")),
+            Some("error") => Err("The browser bootstrap subprocess failed".to_string()),
+            _ => Err("Bootstrap returned an unrecognized result".to_string()),
         }
     }
 }
@@ -542,36 +594,53 @@ mod tests {
     }
 
     #[test]
-    fn script_contains_login_url() {
+    fn script_transports_login_url_without_plaintext_literal() {
         let bootstrap = InteractiveBootstrap::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
-        let script =
-            bootstrap.build_bootstrap_script(&profile_dir, "https://auth.openai.com/authorize");
-        assert!(script.contains("auth.openai.com/authorize"));
-        assert!(script.contains("/tmp/profile"));
+        let script = bootstrap
+            .build_bootstrap_script(&profile_dir, "https://auth.openai.com/authorize")
+            .expect("bounded bootstrap script");
+        assert!(!script.contains("auth.openai.com/authorize"));
+        assert!(!script.contains("/tmp/profile"));
         assert!(script.contains("headless: false"));
+        let input = super::super::decode_node_script_input(&script);
+        assert_eq!(input["login_url"], "https://auth.openai.com/authorize");
+        assert_eq!(input["profile_dir"], "/tmp/profile");
     }
 
     #[test]
     fn script_contains_success_markers() {
         let bootstrap = InteractiveBootstrap::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
-        let script = bootstrap.build_bootstrap_script(&profile_dir, "https://example.com/login");
-        assert!(script.contains("platform.openai.com"));
-        assert!(script.contains("Successfully logged in"));
+        let script = bootstrap
+            .build_bootstrap_script(&profile_dir, "https://example.com/login")
+            .expect("bounded bootstrap script");
+        let input = super::super::decode_node_script_input(&script);
+        assert!(
+            input["success_url_prefixes"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("https://platform.openai.com")))
+        );
+        assert!(
+            input["success_text_markers"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("Successfully logged in")))
+        );
     }
 
     #[test]
     fn script_exports_storage_state() {
         let bootstrap = InteractiveBootstrap::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
-        let script = bootstrap.build_bootstrap_script(&profile_dir, "https://example.com/login");
+        let script = bootstrap
+            .build_bootstrap_script(&profile_dir, "https://example.com/login")
+            .expect("bounded bootstrap script");
         assert!(script.contains("storageState"));
     }
 
     #[test]
     fn parse_success_with_state() {
-        let stdout = r#"{"status":"success","storage_state":"{\"cookies\":[]}"}"#;
+        let stdout = r#"{"status":"success","storage_state":"{\"cookies\":[],\"origins\":[]}"}"#;
         let result = InteractiveBootstrap::parse_bootstrap_result(stdout);
         match result {
             Ok(ScriptOutcome::Success { storage_state }) => {
@@ -599,7 +668,9 @@ mod tests {
         let result =
             InteractiveBootstrap::parse_bootstrap_result(r#"{"status":"error","message":"crash"}"#);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("crash"));
+        let error = result.unwrap_err();
+        assert_eq!(error, "The browser bootstrap subprocess failed");
+        assert!(!error.contains("crash"));
     }
 
     #[test]
@@ -632,7 +703,7 @@ mod tests {
     #[test]
     fn config_default_text_markers_count() {
         let cfg = BootstrapConfig::default();
-        assert_eq!(cfg.success_text_markers.len(), 2);
+        assert_eq!(cfg.success_text_markers.len(), 1);
     }
 
     #[test]
@@ -671,12 +742,23 @@ mod tests {
     }
 
     #[test]
-    fn script_escapes_single_quotes_in_url() {
+    fn script_round_trips_hostile_values_without_javascript_literal_injection() {
         let bootstrap = InteractiveBootstrap::with_defaults();
-        let profile_dir = PathBuf::from("/tmp/profile");
-        let script = bootstrap.build_bootstrap_script(&profile_dir, "https://example.com/log'in");
-        assert!(!script.contains("log'in"));
-        assert!(script.contains("log\\'in"));
+        let hostile_marker = "logged'in\\\n\u{2028}with token=secret";
+        let profile_dir = PathBuf::from("/tmp/profile'\\\n\u{2028}");
+        let mut config = BootstrapConfig::default();
+        config.success_text_markers = vec![hostile_marker.to_string()];
+        let bootstrap = InteractiveBootstrap::new(config);
+        let script = bootstrap
+            .build_bootstrap_script(&profile_dir, "https://example.com/login")
+            .expect("bounded hostile bootstrap script");
+        assert!(!script.contains(hostile_marker));
+        assert!(!script.contains("token=secret"));
+        assert!(!script.contains('\u{2028}'));
+        let input = super::super::decode_node_script_input(&script);
+        assert_eq!(input["login_url"], "https://example.com/login");
+        assert_eq!(input["profile_dir"], profile_dir.to_string_lossy().as_ref());
+        assert_eq!(input["success_text_markers"][0], hostile_marker);
     }
 
     #[test]
@@ -686,9 +768,13 @@ mod tests {
             ..Default::default()
         };
         let bootstrap = InteractiveBootstrap::new(cfg);
-        let script =
-            bootstrap.build_bootstrap_script(&PathBuf::from("/tmp"), "https://example.com");
-        assert!(script.contains("99000"));
+        let script = bootstrap
+            .build_bootstrap_script(&PathBuf::from("/tmp"), "https://example.com")
+            .expect("bounded bootstrap script");
+        assert_eq!(
+            super::super::decode_node_script_input(&script)["timeout_ms"],
+            99_000
+        );
     }
 
     #[test]
@@ -698,9 +784,74 @@ mod tests {
             ..Default::default()
         };
         let bootstrap = InteractiveBootstrap::new(cfg);
-        let script =
-            bootstrap.build_bootstrap_script(&PathBuf::from("/tmp"), "https://example.com");
-        assert!(script.contains("3500"));
+        let script = bootstrap
+            .build_bootstrap_script(&PathBuf::from("/tmp"), "https://example.com")
+            .expect("bounded bootstrap script");
+        assert_eq!(
+            super::super::decode_node_script_input(&script)["poll_interval_ms"],
+            3_500
+        );
+    }
+
+    #[test]
+    fn bootstrap_script_input_enforces_exact_and_one_over_field_limit() {
+        let exact = "x".repeat(super::super::BROWSER_NODE_INPUT_MAX_FIELD_BYTES);
+        let mut config = BootstrapConfig::default();
+        config.success_text_markers = vec![exact.clone()];
+        let exact_bootstrap = InteractiveBootstrap::new(config);
+        assert!(exact_bootstrap
+            .build_bootstrap_script(Path::new("/tmp/profile"), "https://example.com/login")
+            .is_ok());
+        let one_over = format!("{exact}x");
+        let mut config = BootstrapConfig::default();
+        config.success_text_markers = vec![one_over];
+        let oversized_bootstrap = InteractiveBootstrap::new(config);
+        assert_eq!(
+            oversized_bootstrap
+                .build_bootstrap_script(Path::new("/tmp/profile"), "https://example.com/login"),
+            Err(super::super::BrowserNodeCommandFailure::ScriptOversized)
+        );
+    }
+
+    #[test]
+    fn bootstrap_rejects_invalid_polling_and_unsafe_urls_before_execution() {
+        let mut zero_poll = BootstrapConfig::default();
+        zero_poll.poll_interval_ms = 0;
+        assert_eq!(
+            InteractiveBootstrap::new(zero_poll)
+                .build_bootstrap_script(Path::new("/tmp/profile"), "https://example.com/login"),
+            Err(super::super::BrowserNodeCommandFailure::InvalidPollInterval)
+        );
+
+        let mut over_timeout = BootstrapConfig::default();
+        over_timeout.timeout_ms = 1_000;
+        over_timeout.poll_interval_ms = 1_001;
+        assert_eq!(
+            InteractiveBootstrap::new(over_timeout)
+                .build_bootstrap_script(Path::new("/tmp/profile"), "https://example.com/login"),
+            Err(super::super::BrowserNodeCommandFailure::InvalidPollInterval)
+        );
+
+        assert_eq!(
+            InteractiveBootstrap::with_defaults()
+                .build_bootstrap_script(Path::new("/tmp/profile"), "file:///tmp/login"),
+            Err(super::super::BrowserNodeCommandFailure::InvalidConfiguration)
+        );
+    }
+
+    #[test]
+    fn bootstrap_script_uses_origin_aware_url_matching_and_bounded_final_sleep() {
+        let script = InteractiveBootstrap::with_defaults()
+            .build_bootstrap_script(
+                Path::new("/tmp/profile"),
+                "https://auth.openai.com/authorize",
+            )
+            .expect("bounded bootstrap script");
+        assert!(script.contains("current.origin !== expected.origin"));
+        assert!(!script.contains("currentUrl.startsWith(prefix)"));
+        assert!(script.contains("Math.min(POLL_INTERVAL, remaining)"));
+        assert!(script.contains("markerOriginAllowed"));
+        assert!(script.contains("message.includes('browser') && message.includes('closed')"));
     }
 
     #[test]
@@ -739,5 +890,18 @@ mod tests {
             }
             _ => panic!("Expected Success"),
         }
+    }
+
+    #[test]
+    fn node_runner_is_stdin_bounded_and_never_uses_inline_argv() {
+        let source = include_str!("bootstrap.rs");
+        let start = source.find("fn run_bootstrap_script(").expect("runner source");
+        let tail = &source[start..];
+        let end = tail.find("\n    fn build_bootstrap_script(").expect("runner boundary");
+        let body = &tail[..end];
+        assert!(body.contains("run_node_script_bounded"));
+        assert!(!body.contains("std::process::Command"));
+        assert!(!body.contains(".arg(\"-e\")"));
+        assert!(!body.contains("stderr_summary"));
     }
 }

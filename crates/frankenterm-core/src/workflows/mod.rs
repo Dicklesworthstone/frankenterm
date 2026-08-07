@@ -9798,111 +9798,59 @@ Try again at 3:00 PM UTC.
             assert!(!json.contains("error_kind"));
         }
 
-        // -- execute_device_auth_step: code validation --
+        // -- pure device-auth admission (must never probe or launch a browser) --
 
         #[test]
         fn step_rejects_invalid_device_code() {
-            let tmp =
-                std::env::temp_dir().join(format!("wa_device_auth_test_{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&tmp);
-
-            let outcome = execute_device_auth_step("not-valid", "default", &tmp, None, true);
-            match outcome {
-                DeviceAuthStepOutcome::Failed {
-                    error, error_kind, ..
-                } => {
-                    assert!(error.contains("Invalid device code"));
-                    assert_eq!(error_kind.as_deref(), Some("invalid_code"));
-                }
-                other => panic!("Expected Failed, got {other:?}"),
-            }
-
-            let _ = std::fs::remove_dir_all(&tmp);
+            assert!(normalize_device_auth_step_code("not-valid").is_err());
         }
 
         #[test]
         fn step_rejects_empty_device_code() {
-            let tmp = std::env::temp_dir()
-                .join(format!("wa_device_auth_test_empty_{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&tmp);
-
-            let outcome = execute_device_auth_step("", "default", &tmp, None, true);
-            match outcome {
-                DeviceAuthStepOutcome::Failed { error_kind, .. } => {
-                    assert_eq!(error_kind.as_deref(), Some("invalid_code"));
-                }
-                other => panic!("Expected Failed, got {other:?}"),
-            }
-
-            let _ = std::fs::remove_dir_all(&tmp);
+            assert!(normalize_device_auth_step_code("").is_err());
         }
 
         #[test]
         fn step_rejects_short_parts() {
-            let tmp = std::env::temp_dir()
-                .join(format!("wa_device_auth_test_short_{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&tmp);
-
-            let outcome = execute_device_auth_step("AB-CD", "default", &tmp, None, true);
-            match outcome {
-                DeviceAuthStepOutcome::Failed { error_kind, .. } => {
-                    assert_eq!(error_kind.as_deref(), Some("invalid_code"));
-                }
-                other => panic!("Expected Failed, got {other:?}"),
-            }
-
-            let _ = std::fs::remove_dir_all(&tmp);
+            assert!(normalize_device_auth_step_code("AB-CD").is_err());
         }
 
         #[test]
-        fn step_accepts_valid_code_format_then_fails_browser() {
-            // A valid code format will pass validation but fail at browser init
-            // (Playwright not installed in test env). This verifies the step
-            // progresses past validation to the browser phase.
-            let tmp = std::env::temp_dir()
-                .join(format!("wa_device_auth_test_valid_{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&tmp);
-
-            let outcome = execute_device_auth_step("ABCD-EFGH", "default", &tmp, None, true);
-            match outcome {
-                DeviceAuthStepOutcome::Failed {
-                    error, error_kind, ..
-                } => {
-                    // Should fail at browser init, not code validation
-                    assert_ne!(error_kind.as_deref(), Some("invalid_code"));
-                    assert!(
-                        error.contains("Browser")
-                            || error.contains("browser")
-                            || error.contains("Playwright")
-                            || error.contains("playwright")
-                            || error_kind.as_deref() == Some("browser_not_ready"),
-                        "Expected browser-related error, got: {error}"
-                    );
-                }
-                // If somehow browser init succeeds (unlikely in CI), that's also fine
-                DeviceAuthStepOutcome::Authenticated { .. } => {}
-                DeviceAuthStepOutcome::BootstrapRequired { .. } => {}
-            }
-
-            let _ = std::fs::remove_dir_all(&tmp);
+        fn step_normalizes_valid_code_without_browser_execution() {
+            assert_eq!(
+                normalize_device_auth_step_code("  abcd-efgh  ").expect("valid device code"),
+                "ABCD-EFGH"
+            );
         }
 
         #[test]
         fn step_with_alphanumeric_code() {
-            let tmp = std::env::temp_dir().join(format!(
-                "wa_device_auth_test_alphanum_{}",
-                std::process::id()
-            ));
-            let _ = std::fs::create_dir_all(&tmp);
+            assert_eq!(
+                normalize_device_auth_step_code("AB12-CD34").expect("alphanumeric device code"),
+                "AB12-CD34"
+            );
+        }
 
-            // Alphanumeric codes (including digits) should pass validation
-            let outcome = execute_device_auth_step("AB12-CD34", "default", &tmp, None, true);
-            // Should NOT fail with invalid_code
-            if let DeviceAuthStepOutcome::Failed { error_kind, .. } = &outcome {
-                assert_ne!(error_kind.as_deref(), Some("invalid_code"));
-            }
+        #[test]
+        fn step_rejects_oversized_code_before_any_subprocess_admission() {
+            let oversized = format!("{}-{}", "A".repeat(64), "B".repeat(64));
+            assert!(normalize_device_auth_step_code(&oversized).is_err());
+        }
 
-            let _ = std::fs::remove_dir_all(&tmp);
+        #[test]
+        fn device_auth_unit_tests_do_not_call_the_live_browser_step() {
+            let source = include_str!("mod.rs");
+            let start = source
+                .find("mod device_auth_step_tests {")
+                .expect("device-auth test module");
+            let tail = &source[start..];
+            let end = tail
+                .find("\n    // ========================================================================\n    // Session Resume Step Tests")
+                .expect("device-auth test module boundary");
+            let body = &tail[..end];
+            assert!(!body.contains(concat!("execute_device_auth_", "step(")));
+            assert!(!body.contains(concat!("ensure_", "ready(")));
+            assert!(!body.contains(concat!("Command", "::new(")));
         }
 
         // -- device_auth_outcome_to_step_result mapping --

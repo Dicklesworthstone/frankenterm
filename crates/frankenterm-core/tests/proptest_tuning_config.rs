@@ -257,10 +257,23 @@ fn wire_protocol_tuning_strategy() -> impl Strategy<Value = WireProtocolTuning> 
 }
 
 fn ipc_tuning_strategy() -> impl Strategy<Value = IpcTuning> {
-    (1usize..1_000_000, 1u64..5000).prop_map(|(msg_size, poll)| IpcTuning {
-        max_message_size: msg_size,
-        accept_poll_interval_ms: poll,
-    })
+    (
+        IpcTuning::MIN_MAX_MESSAGE_SIZE..=IpcTuning::MAX_MAX_MESSAGE_SIZE,
+        IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS..=IpcTuning::MAX_ACCEPT_POLL_INTERVAL_MS,
+        IpcTuning::MIN_MAX_CONCURRENT_CONNECTIONS
+            ..=IpcTuning::MAX_MAX_CONCURRENT_CONNECTIONS,
+        IpcTuning::MIN_INITIAL_REQUEST_TIMEOUT_MS..=IpcTuning::MAX_INITIAL_REQUEST_TIMEOUT_MS,
+        IpcTuning::MIN_IO_TIMEOUT_MS..=IpcTuning::MAX_IO_TIMEOUT_MS,
+    )
+        .prop_map(
+            |(msg_size, poll, max_connections, initial_timeout, io_timeout)| IpcTuning {
+                max_message_size: msg_size,
+                accept_poll_interval_ms: poll,
+                max_concurrent_connections: max_connections,
+                initial_request_timeout_ms: initial_timeout,
+                io_timeout_ms: io_timeout,
+            },
+        )
 }
 
 fn wezterm_tuning_strategy() -> impl Strategy<Value = WeztermTuning> {

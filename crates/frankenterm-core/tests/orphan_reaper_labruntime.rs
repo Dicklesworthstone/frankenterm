@@ -6,8 +6,9 @@
 //! `RuntimeFixture::current_thread()` + `rt.block_on(async { ... })`,
 //! feature-gated behind `asupersync-runtime`.
 //!
-//! Plain `#[test]` functions (parse_etime, split_first_token, ReapReport
-//! unit tests, etc.) are NOT ported here — they do not require a runtime.
+//! The production surface is deliberately inert until cleanup can be backed by
+//! an owned child-handle registry. These tests prove that both zero and non-zero
+//! legacy configuration remain process-table- and signal-free.
 
 #![cfg(feature = "asupersync-runtime")]
 
@@ -24,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
-// reap_orphans (async wrapper around spawn_blocking)
+// reap_orphans fail-closed report
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -32,7 +33,13 @@ fn reap_orphans_async_returns_report() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let report: ReapReport = reap_orphans(999_999).await;
-        assert_eq!(report.killed_pids.len(), report.killed);
+        assert_eq!(report.scanned, 0);
+        assert_eq!(report.killed, 0);
+        assert!(report.killed_pids.is_empty());
+        assert_eq!(
+            report.errors,
+            vec!["reap disabled: no handle-owned child identity".to_string()]
+        );
     });
 }
 
@@ -41,7 +48,9 @@ fn reap_orphans_async_zero_max_age() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let report: ReapReport = reap_orphans(0).await;
-        assert_eq!(report.killed_pids.len(), report.killed);
+        assert_eq!(report.scanned, 0);
+        assert_eq!(report.killed, 0);
+        assert!(report.killed_pids.is_empty());
     });
 }
 
@@ -67,11 +76,11 @@ fn run_orphan_reaper_disabled_returns_immediately() {
 }
 
 // ---------------------------------------------------------------------------
-// run_orphan_reaper — shutdown signal
+// run_orphan_reaper — non-zero legacy setting remains inert
 // ---------------------------------------------------------------------------
 
 #[test]
-fn run_orphan_reaper_responds_to_shutdown() {
+fn run_orphan_reaper_nonzero_setting_returns_without_waiting() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let config = CliConfig {
@@ -79,16 +88,11 @@ fn run_orphan_reaper_responds_to_shutdown() {
             ..CliConfig::default()
         };
         let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = shutdown.clone();
+        let shutdown_clone = Arc::clone(&shutdown);
 
         let handle = runtime_async::task::spawn(run_orphan_reaper(config, shutdown_clone));
-
-        // Signal shutdown after a short delay
-        runtime_async::sleep(Duration::from_millis(50)).await;
-        shutdown.store(true, Ordering::Relaxed);
-
-        // Should exit within a reasonable time (after current sleep)
-        let result = runtime_async::timeout(Duration::from_secs(3), handle).await;
-        assert!(result.is_ok(), "reaper should respond to shutdown signal");
+        let result = runtime_async::timeout(Duration::from_millis(100), handle).await;
+        assert!(result.is_ok(), "inert cleanup surface should return immediately");
+        assert!(!shutdown.load(Ordering::Relaxed));
     });
 }

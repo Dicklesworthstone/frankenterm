@@ -39,6 +39,8 @@ mux.workspace = true
 # Portable nonblocking socket-pair capture for finite doctor subprocess probes
 # (also used by the EPIPE integration-test substrate).
 filedescriptor.workspace = true
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 clap.workspace = true
 chrono.workspace = true
 serde.workspace = true

@@ -97,7 +97,7 @@ pub struct Config {
     /// Backpressure policy settings (tiered queue-depth responses)
     pub backpressure: crate::backpressure::BackpressureConfig,
 
-    /// CLI subprocess settings (timeouts, orphan reaper)
+    /// CLI subprocess settings (owned-child timeouts and reserved cleanup policy)
     pub cli: CliConfig,
 
     /// Session snapshot settings (periodic capture, retention)
@@ -4073,17 +4073,19 @@ pub struct VendoredConfig {
 // CLI Config
 // =============================================================================
 
-/// CLI subprocess configuration — timeouts and orphan process reaper.
+/// CLI subprocess configuration — owned-child timeouts and cleanup policy.
 ///
 /// Controls how `wezterm cli` subprocesses are managed to prevent
-/// accumulation of stuck processes under agent swarm workloads.
+/// accumulation of stuck processes under agent swarm workloads. Global
+/// process-table reaping is disabled because numeric PIDs do not establish
+/// child ownership; cleanup must be driven by owned child handles.
 ///
 /// # Example (ft.toml)
 ///
 /// ```toml
 /// [cli]
 /// timeout_seconds = 15
-/// orphan_reap_interval_seconds = 60
+/// orphan_reap_interval_seconds = 0
 /// orphan_max_age_seconds = 30
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4092,11 +4094,14 @@ pub struct CliConfig {
     /// Command timeout in seconds. Processes exceeding this are killed.
     pub timeout_seconds: u64,
 
-    /// How often the orphan reaper scans for stuck processes (seconds).
-    /// Set to 0 to disable the reaper.
+    /// Reserved interval for a future handle-owned child registry.
+    ///
+    /// This must remain zero until the registry can prove child ownership and
+    /// immutable process identity. Non-zero values are rejected at runtime and
+    /// never authorize global process-table scanning or PID signalling.
     pub orphan_reap_interval_seconds: u64,
 
-    /// Maximum age in seconds before a wezterm cli process is considered orphaned.
+    /// Reserved age threshold for handle-owned children.
     pub orphan_max_age_seconds: u64,
 }
 
@@ -4104,7 +4109,7 @@ impl Default for CliConfig {
     fn default() -> Self {
         Self {
             timeout_seconds: 15,
-            orphan_reap_interval_seconds: 60,
+            orphan_reap_interval_seconds: 0,
             orphan_max_age_seconds: 30,
         }
     }

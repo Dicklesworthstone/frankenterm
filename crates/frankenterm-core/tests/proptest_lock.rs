@@ -7,6 +7,8 @@
 use frankenterm_core::lock::LockMetadata;
 use proptest::prelude::*;
 
+const TEST_INSTANCE_ID: &str = "0123456789abcdef0123456789abcdef";
+
 // =========================================================================
 // Strategies
 // =========================================================================
@@ -17,13 +19,15 @@ fn arb_lock_metadata() -> impl Strategy<Value = LockMetadata> {
         0_u64..10_000_000_000,
         "[a-z:0-9 ]{5,25}",
         "[0-9.]{3,10}",
+        "[0-9a-f]{32}",
     )
         .prop_map(
-            |(pid, started_at, started_at_human, wa_version)| LockMetadata {
+            |(pid, started_at, started_at_human, wa_version, instance_id)| LockMetadata {
                 pid,
                 started_at,
                 started_at_human,
                 wa_version,
+                instance_id,
             },
         )
 }
@@ -31,44 +35,64 @@ fn arb_lock_metadata() -> impl Strategy<Value = LockMetadata> {
 fn arb_boundary_metadata() -> impl Strategy<Value = LockMetadata> {
     prop_oneof![
         // Zero PID
-        (Just(0u32), any::<u64>(), "[a-z]{1,10}", "[0-9.]{1,5}").prop_map(
-            |(pid, ts, human, ver)| LockMetadata {
+        (
+            Just(0u32),
+            any::<u64>(),
+            "[a-z]{1,10}",
+            "[0-9.]{1,5}",
+            "[0-9a-f]{32}",
+        )
+            .prop_map(|(pid, ts, human, ver, instance_id)| LockMetadata {
                 pid,
                 started_at: ts,
                 started_at_human: human,
                 wa_version: ver,
-            }
-        ),
+                instance_id,
+            }),
         // Max PID
-        (Just(u32::MAX), any::<u64>(), "[a-z]{1,10}", "[0-9.]{1,5}").prop_map(
-            |(pid, ts, human, ver)| LockMetadata {
+        (
+            Just(u32::MAX),
+            any::<u64>(),
+            "[a-z]{1,10}",
+            "[0-9.]{1,5}",
+            "[0-9a-f]{32}",
+        )
+            .prop_map(|(pid, ts, human, ver, instance_id)| LockMetadata {
                 pid,
                 started_at: ts,
                 started_at_human: human,
                 wa_version: ver,
-            }
-        ),
+                instance_id,
+            }),
         // Max timestamp
-        (any::<u32>(), Just(u64::MAX), "[a-z]{1,10}", "[0-9.]{1,5}").prop_map(
-            |(pid, ts, human, ver)| LockMetadata {
+        (
+            any::<u32>(),
+            Just(u64::MAX),
+            "[a-z]{1,10}",
+            "[0-9.]{1,5}",
+            "[0-9a-f]{32}",
+        )
+            .prop_map(|(pid, ts, human, ver, instance_id)| LockMetadata {
                 pid,
                 started_at: ts,
                 started_at_human: human,
                 wa_version: ver,
-            }
-        ),
+                instance_id,
+            }),
         // Empty strings
         (
             any::<u32>(),
             any::<u64>(),
             Just(String::new()),
-            Just(String::new())
+            Just(String::new()),
+            "[0-9a-f]{32}",
         )
-            .prop_map(|(pid, ts, human, ver)| LockMetadata {
+            .prop_map(|(pid, ts, human, ver, instance_id)| LockMetadata {
                 pid,
                 started_at: ts,
                 started_at_human: human,
                 wa_version: ver,
+                instance_id,
             }),
     ]
 }
@@ -98,6 +122,7 @@ proptest! {
         prop_assert_eq!(back.started_at, meta.started_at);
         prop_assert_eq!(&back.started_at_human, &meta.started_at_human);
         prop_assert_eq!(&back.wa_version, &meta.wa_version);
+        prop_assert_eq!(&back.instance_id, &meta.instance_id);
     }
 
     /// Serialization is deterministic.
@@ -117,6 +142,7 @@ proptest! {
         prop_assert_eq!(back.started_at, meta.started_at);
         prop_assert_eq!(&back.started_at_human, &meta.started_at_human);
         prop_assert_eq!(&back.wa_version, &meta.wa_version);
+        prop_assert_eq!(&back.instance_id, &meta.instance_id);
     }
 
     /// JSON always contains expected field names.
@@ -127,6 +153,7 @@ proptest! {
         prop_assert!(json.contains("\"started_at\""), "should contain started_at field");
         prop_assert!(json.contains("\"started_at_human\""), "should contain started_at_human field");
         prop_assert!(json.contains("\"wa_version\""), "should contain wa_version field");
+        prop_assert!(json.contains("\"instance_id\""), "should contain instance_id field");
     }
 }
 
@@ -145,13 +172,13 @@ proptest! {
         prop_assert!(value.is_object(), "should serialize as a JSON object");
     }
 
-    /// JSON object has exactly 4 fields.
+    /// JSON object has exactly 5 fields.
     #[test]
     fn prop_metadata_json_field_count(meta in arb_lock_metadata()) {
         let json = serde_json::to_string(&meta).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         let obj = value.as_object().unwrap();
-        prop_assert_eq!(obj.len(), 4, "LockMetadata should have exactly 4 fields, got {}", obj.len());
+        prop_assert_eq!(obj.len(), 5, "LockMetadata should have exactly 5 fields, got {}", obj.len());
     }
 
     /// PID serializes as a JSON integer.
@@ -184,6 +211,8 @@ proptest! {
             "started_at_human should be a JSON string");
         prop_assert!(value.get("wa_version").unwrap().is_string(),
             "wa_version should be a JSON string");
+        prop_assert!(value.get("instance_id").unwrap().is_string(),
+            "instance_id should be a JSON string");
     }
 }
 
@@ -203,6 +232,7 @@ proptest! {
         prop_assert_eq!(back.started_at, meta.started_at);
         prop_assert_eq!(&back.started_at_human, &meta.started_at_human);
         prop_assert_eq!(&back.wa_version, &meta.wa_version);
+        prop_assert_eq!(&back.instance_id, &meta.instance_id);
     }
 
     /// Max u64 timestamp roundtrips correctly.
@@ -213,6 +243,7 @@ proptest! {
             started_at: u64::MAX,
             started_at_human: "max".to_string(),
             wa_version: "0.1.0".to_string(),
+            instance_id: TEST_INSTANCE_ID.to_string(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: LockMetadata = serde_json::from_str(&json).unwrap();
@@ -227,6 +258,7 @@ proptest! {
             started_at: 0,
             started_at_human: String::new(),
             wa_version: String::new(),
+            instance_id: TEST_INSTANCE_ID.to_string(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: LockMetadata = serde_json::from_str(&json).unwrap();
@@ -234,6 +266,7 @@ proptest! {
         prop_assert_eq!(back.started_at, 0u64);
         prop_assert!(back.started_at_human.is_empty());
         prop_assert!(back.wa_version.is_empty());
+        prop_assert_eq!(back.instance_id, TEST_INSTANCE_ID);
     }
 }
 
@@ -252,6 +285,7 @@ proptest! {
         prop_assert_eq!(cloned.started_at, meta.started_at);
         prop_assert_eq!(&cloned.started_at_human, &meta.started_at_human);
         prop_assert_eq!(&cloned.wa_version, &meta.wa_version);
+        prop_assert_eq!(&cloned.instance_id, &meta.instance_id);
     }
 
     /// Clone serializes identically to original.
@@ -307,6 +341,7 @@ proptest! {
         prop_assert_eq!(from_compact.started_at, from_pretty.started_at);
         prop_assert_eq!(&from_compact.started_at_human, &from_pretty.started_at_human);
         prop_assert_eq!(&from_compact.wa_version, &from_pretty.wa_version);
+        prop_assert_eq!(&from_compact.instance_id, &from_pretty.instance_id);
     }
 
     /// Pretty JSON is always longer than (or equal to) compact JSON.
@@ -329,6 +364,7 @@ proptest! {
         prop_assert_eq!(from_value.started_at, from_str.started_at);
         prop_assert_eq!(&from_value.started_at_human, &from_str.started_at_human);
         prop_assert_eq!(&from_value.wa_version, &from_str.wa_version);
+        prop_assert_eq!(&from_value.instance_id, &from_str.instance_id);
     }
 }
 
@@ -347,10 +383,12 @@ proptest! {
             started_at: 1000,
             started_at_human: "unix:1000".to_string(),
             wa_version: version.clone(),
+            instance_id: TEST_INSTANCE_ID.to_string(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: LockMetadata = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(&back.wa_version, &version);
+        prop_assert_eq!(back.instance_id, TEST_INSTANCE_ID);
     }
 
     /// Unicode in human-readable timestamp survives roundtrip.
@@ -363,10 +401,12 @@ proptest! {
             started_at: 999,
             started_at_human: human.clone(),
             wa_version: "1.0.0".to_string(),
+            instance_id: TEST_INSTANCE_ID.to_string(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: LockMetadata = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(&back.started_at_human, &human);
+        prop_assert_eq!(back.instance_id, TEST_INSTANCE_ID);
     }
 }
 
@@ -381,6 +421,7 @@ fn metadata_with_zero_pid() {
         started_at: 0,
         started_at_human: "unix:0".to_string(),
         wa_version: "0.0.0".to_string(),
+        instance_id: TEST_INSTANCE_ID.to_string(),
     };
     let json = serde_json::to_string(&meta).unwrap();
     let back: LockMetadata = serde_json::from_str(&json).unwrap();
@@ -395,6 +436,7 @@ fn metadata_with_max_pid() {
         started_at: u64::MAX,
         started_at_human: "max".to_string(),
         wa_version: "999.999.999".to_string(),
+        instance_id: TEST_INSTANCE_ID.to_string(),
     };
     let json = serde_json::to_string(&meta).unwrap();
     let back: LockMetadata = serde_json::from_str(&json).unwrap();
@@ -423,12 +465,14 @@ proptest! {
             started_at,
             started_at_human: human.clone(),
             wa_version: ver.clone(),
+            instance_id: TEST_INSTANCE_ID.to_string(),
         };
         let meta_b = LockMetadata {
             pid: pid_b,
             started_at,
             started_at_human: human.clone(),
             wa_version: ver.clone(),
+            instance_id: TEST_INSTANCE_ID.to_string(),
         };
 
         let back_a: LockMetadata = serde_json::from_str(&serde_json::to_string(&meta_a).unwrap()).unwrap();
@@ -438,6 +482,7 @@ proptest! {
         prop_assert_eq!(back_a.started_at, back_b.started_at);
         prop_assert_eq!(&back_a.started_at_human, &back_b.started_at_human);
         prop_assert_eq!(&back_a.wa_version, &back_b.wa_version);
+        prop_assert_eq!(&back_a.instance_id, &back_b.instance_id);
     }
 
     /// Changing only started_at preserves all other fields after roundtrip.
@@ -454,12 +499,14 @@ proptest! {
             started_at: ts_a,
             started_at_human: human.clone(),
             wa_version: ver.clone(),
+            instance_id: TEST_INSTANCE_ID.to_string(),
         };
         let meta_b = LockMetadata {
             pid,
             started_at: ts_b,
             started_at_human: human.clone(),
             wa_version: ver.clone(),
+            instance_id: TEST_INSTANCE_ID.to_string(),
         };
 
         let back_a: LockMetadata = serde_json::from_str(&serde_json::to_string(&meta_a).unwrap()).unwrap();
@@ -468,6 +515,7 @@ proptest! {
         prop_assert_eq!(back_a.pid, back_b.pid);
         prop_assert_eq!(&back_a.started_at_human, &back_b.started_at_human);
         prop_assert_eq!(&back_a.wa_version, &back_b.wa_version);
+        prop_assert_eq!(&back_a.instance_id, &back_b.instance_id);
     }
 }
 
@@ -490,12 +538,14 @@ proptest! {
             started_at: base_ts,
             started_at_human: "same".to_string(),
             wa_version: "1.0.0".to_string(),
+            instance_id: TEST_INSTANCE_ID.to_string(),
         };
         let meta_b = LockMetadata {
             pid: pid_b,
             started_at: base_ts,
             started_at_human: "same".to_string(),
             wa_version: "1.0.0".to_string(),
+            instance_id: TEST_INSTANCE_ID.to_string(),
         };
         let json_a = serde_json::to_string(&meta_a).unwrap();
         let json_b = serde_json::to_string(&meta_b).unwrap();
@@ -513,16 +563,36 @@ proptest! {
             started_at: ts_a,
             started_at_human: "same".to_string(),
             wa_version: "1.0.0".to_string(),
+            instance_id: TEST_INSTANCE_ID.to_string(),
         };
         let meta_b = LockMetadata {
             pid: 1,
             started_at: ts_b,
             started_at_human: "same".to_string(),
             wa_version: "1.0.0".to_string(),
+            instance_id: TEST_INSTANCE_ID.to_string(),
         };
         let json_a = serde_json::to_string(&meta_a).unwrap();
         let json_b = serde_json::to_string(&meta_b).unwrap();
         prop_assert_ne!(&json_a, &json_b, "different timestamps should produce different JSON");
+    }
+
+    /// The per-acquisition identity participates in the serialized identity
+    /// even when legacy PID/time fields collide exactly.
+    #[test]
+    fn prop_different_instance_ids_different_json(suffix in "[0-9a-f]{31}") {
+        let mut meta_a = LockMetadata {
+            pid: 1,
+            started_at: 12_345,
+            started_at_human: "unix:12345".to_string(),
+            wa_version: "1.0.0".to_string(),
+            instance_id: format!("0{suffix}"),
+        };
+        let json_a = serde_json::to_string(&meta_a).unwrap();
+        meta_a.instance_id = format!("f{suffix}");
+        let json_b = serde_json::to_string(&meta_a).unwrap();
+
+        prop_assert_ne!(json_a, json_b);
     }
 }
 
@@ -537,7 +607,7 @@ proptest! {
     #[test]
     fn prop_json_size_bounded(meta in arb_lock_metadata()) {
         let json = serde_json::to_string(&meta).unwrap();
-        // Minimum: {"pid":0,"started_at":0,"started_at_human":"","wa_version":""} = ~60 bytes
+        // Minimum includes the required per-acquisition instance identity.
         prop_assert!(json.len() >= 50, "JSON too short: {} bytes", json.len());
         // Maximum: reasonable upper bound (no field should be extremely long in our strategy)
         prop_assert!(json.len() < 500, "JSON too large: {} bytes", json.len());
@@ -553,15 +623,16 @@ proptest! {
 }
 
 // =========================================================================
-// Robustness: extra fields in JSON are tolerated
+// Robustness: unrecognized fields fail closed
 // =========================================================================
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// Deserialization ignores extra fields (forward compatibility).
+    /// Unknown fields are rejected so lock-holder identity admission cannot
+    /// silently accept a schema with unreviewed semantics.
     #[test]
-    fn prop_extra_fields_tolerated(meta in arb_lock_metadata(), extra_val in any::<u32>()) {
+    fn prop_extra_fields_rejected(meta in arb_lock_metadata(), extra_val in any::<u32>()) {
         let json = serde_json::to_string(&meta).unwrap();
         // Inject an extra field
         let augmented = json.replacen(
@@ -569,11 +640,8 @@ proptest! {
             &format!(",\"extra_field\":{}}}", extra_val),
             1,
         );
-        let back: LockMetadata = serde_json::from_str(&augmented).unwrap();
-        prop_assert_eq!(back.pid, meta.pid);
-        prop_assert_eq!(back.started_at, meta.started_at);
-        prop_assert_eq!(&back.started_at_human, &meta.started_at_human);
-        prop_assert_eq!(&back.wa_version, &meta.wa_version);
+        let result = serde_json::from_str::<LockMetadata>(&augmented);
+        prop_assert!(result.is_err(), "unknown lock metadata fields must fail admission");
     }
 
     /// Deserialization fails when a required field is missing.
@@ -582,13 +650,24 @@ proptest! {
         let _json = serde_json::to_string(&meta).unwrap();
         // Create JSON without pid — deserialization must fail
         let partial = format!(
-            "{{\"started_at\":{},\"started_at_human\":\"{}\",\"wa_version\":\"{}\"}}",
+            "{{\"started_at\":{},\"started_at_human\":\"{}\",\"wa_version\":\"{}\",\"instance_id\":\"{}\"}}",
             meta.started_at,
             meta.started_at_human.replace('\\', "\\\\").replace('"', "\\\""),
             meta.wa_version.replace('\\', "\\\\").replace('"', "\\\""),
+            meta.instance_id,
         );
         let result: Result<LockMetadata, _> = serde_json::from_str(&partial);
         prop_assert!(result.is_err(), "should fail when pid is missing");
+    }
+
+    /// The acquisition identity is required; old four-field metadata must not
+    /// silently regain authority through a default value.
+    #[test]
+    fn prop_missing_instance_id_fails(meta in arb_lock_metadata()) {
+        let mut value = serde_json::to_value(&meta).unwrap();
+        value.as_object_mut().unwrap().remove("instance_id");
+        let result = serde_json::from_value::<LockMetadata>(value);
+        prop_assert!(result.is_err(), "should fail when instance_id is missing");
     }
 }
 
@@ -607,6 +686,7 @@ proptest! {
             started_at: 0,
             started_at_human: "t".to_string(),
             wa_version: "v".to_string(),
+            instance_id: TEST_INSTANCE_ID.to_string(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: LockMetadata = serde_json::from_str(&json).unwrap();
@@ -621,6 +701,7 @@ proptest! {
             started_at: ts,
             started_at_human: "t".to_string(),
             wa_version: "v".to_string(),
+            instance_id: TEST_INSTANCE_ID.to_string(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: LockMetadata = serde_json::from_str(&json).unwrap();

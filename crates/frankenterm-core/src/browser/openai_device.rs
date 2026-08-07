@@ -1,8 +1,8 @@
 //! OpenAI/Codex device auth flow via Playwright.
 //!
 //! Automates the device-code authorization flow at `auth.openai.com/codex/device`.
-//! The flow assumes a persistent Playwright browser profile already exists for the
-//! target account (created via [`super::BrowserProfile`]).
+//! The flow safely prepares and then reuses a persistent Playwright browser
+//! profile for the target account via [`super::BrowserProfile`].
 //!
 //! # Flow
 //!
@@ -22,14 +22,17 @@
 //! # Safety
 //!
 //! - Passwords, tokens, cookies, and session data are **never** logged.
-//! - On failure, artifacts (screenshot, redacted DOM snippet) are saved to the
-//!   workspace artifacts directory.
+//! - When explicitly configured, failure artifacts are written to private
+//!   per-invocation files. Screenshots can contain sensitive page content and
+//!   must be handled accordingly; only textual reports are content-free.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{BrowserContext, BrowserStatus};
+use super::{BootstrapMethod, BrowserContext, BrowserStatus};
+
+const USER_CODE_MAX_BYTES: usize = 128;
 
 // =============================================================================
 // User code validation
@@ -48,6 +51,11 @@ pub fn validate_user_code(code: &str) -> Result<String, UserCodeError> {
 
     if trimmed.is_empty() {
         return Err(UserCodeError::Empty);
+    }
+    if trimmed.len() > USER_CODE_MAX_BYTES {
+        return Err(UserCodeError::TooLong {
+            max_bytes: USER_CODE_MAX_BYTES,
+        });
     }
 
     // Normalize to uppercase
@@ -84,6 +92,8 @@ pub enum UserCodeError {
     InvalidFormat { expected: String },
     /// Code contained non-ASCII or non-alphanumeric characters.
     InvalidCharacters,
+    /// Code exceeded the finite pre-normalization byte limit.
+    TooLong { max_bytes: usize },
 }
 
 impl std::fmt::Display for UserCodeError {
@@ -98,6 +108,9 @@ impl std::fmt::Display for UserCodeError {
                     f,
                     "user code contains invalid characters (expected ASCII letters or digits only)"
                 )
+            }
+            Self::TooLong { max_bytes } => {
+                write!(f, "user code exceeds the {max_bytes}-byte safety limit")
             }
         }
     }
@@ -153,6 +166,10 @@ pub enum AuthFlowFailureKind {
     InvalidUserCode,
     /// Browser context was not ready (Playwright not available, etc.).
     BrowserNotReady,
+    /// The isolated browser profile directory could not be prepared safely.
+    ProfileUnavailable,
+    /// Auth succeeded in the browser but durable profile state could not be committed.
+    ProfilePersistenceFailed,
     /// Navigation to the auth page failed or timed out.
     NavigationFailed,
     /// Could not find expected page elements (selectors changed).
@@ -165,6 +182,38 @@ pub enum AuthFlowFailureKind {
     PlaywrightError,
     /// An unexpected/unclassified error occurred.
     Unknown,
+}
+
+impl AuthFlowFailureKind {
+    pub(super) const fn stable_detail(&self) -> &'static str {
+        match self {
+            Self::InvalidUserCode => "The device user code is invalid",
+            Self::BrowserNotReady => "The browser automation context is not ready",
+            Self::ProfileUnavailable => {
+                "The isolated browser profile directory is unavailable"
+            }
+            Self::ProfilePersistenceFailed => {
+                "Authenticated browser profile state could not be persisted safely"
+            }
+            Self::NavigationFailed => "Browser navigation did not complete successfully",
+            Self::SelectorMismatch => "The authentication page layout was not recognized",
+            Self::BotDetected => "The authentication service requested human verification",
+            Self::VerificationFailed => "Authentication completion could not be verified",
+            Self::PlaywrightError => "The browser automation subprocess failed",
+            Self::Unknown => "The browser authentication flow returned an unrecognized result",
+        }
+    }
+
+    pub(super) fn from_script_label(label: Option<&str>) -> Self {
+        match label {
+            Some("VerificationFailed") => Self::VerificationFailed,
+            Some("SelectorMismatch") => Self::SelectorMismatch,
+            Some("NavigationFailed") => Self::NavigationFailed,
+            Some("BotDetected") => Self::BotDetected,
+            Some("PlaywrightError") => Self::PlaywrightError,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 // =============================================================================
@@ -239,7 +288,11 @@ impl Default for DevicePageSelectors {
 // Failure artifacts
 // =============================================================================
 
-/// Captures failure artifacts for debugging without leaking secrets.
+/// Captures private failure artifacts for debugging.
+///
+/// Screenshots are intentionally exact diagnostic evidence and can contain
+/// sensitive page content. Their 0600 mode and 0700 parent directory limit
+/// access; callers must not publish them as though they were redacted.
 #[derive(Debug, Clone)]
 pub struct ArtifactCapture {
     /// Root directory for artifacts (e.g., `<workspace>/.ft/artifacts/`).
@@ -257,6 +310,10 @@ pub enum ArtifactKind {
     FailureReport,
 }
 
+pub(super) const SCREENSHOT_ARTIFACT_MAX_BYTES: usize = 32 * 1024 * 1024;
+const REDACTED_DOM_ARTIFACT_MAX_BYTES: usize = 2 * 1024 * 1024;
+const FAILURE_REPORT_ARTIFACT_MAX_BYTES: usize = 64 * 1024;
+
 impl ArtifactCapture {
     /// Create a new artifact capture rooted at the given directory.
     #[must_use]
@@ -268,16 +325,15 @@ impl ArtifactCapture {
 
     /// Create the artifacts directory for a specific flow invocation.
     ///
-    /// Returns the path to the per-invocation directory.
+    /// Returns a freshly created 0700 path beneath the configured root. The
+    /// flow name is a finite strict component and neither the root, flow, nor
+    /// invocation leaf may be a symlink while admitted. A same-UID actor can
+    /// still replace a returned pathname after admission; JavaScript writers
+    /// therefore use exclusive creation and Rust writers re-open the directory
+    /// without following its final component.
     pub fn ensure_invocation_dir(&self, flow_name: &str) -> Result<PathBuf, std::io::Error> {
-        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        let pid = std::process::id();
-        let dir = self
-            .artifacts_root
-            .join(flow_name)
-            .join(format!("{timestamp}_{pid}"));
-        std::fs::create_dir_all(&dir)?;
-        Ok(dir)
+        super::create_private_invocation_directory(&self.artifacts_root, flow_name)
+            .map_err(|_| std::io::Error::other("artifact invocation directory is unavailable"))
     }
 
     /// Write a text artifact to the invocation directory.
@@ -286,16 +342,17 @@ impl ArtifactCapture {
         kind: ArtifactKind,
         content: &[u8],
     ) -> Result<PathBuf, std::io::Error> {
-        let filename = match kind {
-            ArtifactKind::Screenshot => "screenshot.png",
-            ArtifactKind::RedactedDom => "redacted_dom.html",
-            ArtifactKind::FailureReport => "failure_report.txt",
+        let (filename, max_bytes) = match kind {
+            ArtifactKind::Screenshot => ("screenshot.png", SCREENSHOT_ARTIFACT_MAX_BYTES),
+            ArtifactKind::RedactedDom => ("redacted_dom.html", REDACTED_DOM_ARTIFACT_MAX_BYTES),
+            ArtifactKind::FailureReport => {
+                ("failure_report.txt", FAILURE_REPORT_ARTIFACT_MAX_BYTES)
+            }
         };
-        let path = dir.join(filename);
-        std::fs::write(&path, content)?;
+        let path = super::write_private_file_create_new(dir, filename, content, max_bytes)
+            .map_err(|_| std::io::Error::other("artifact could not be written safely"))?;
         tracing::debug!(
             artifact_kind = ?kind,
-            path = %path.display(),
             bytes = content.len(),
             "Wrote failure artifact"
         );
@@ -380,7 +437,9 @@ impl OpenAiDeviceAuthFlow {
         // Step 2: Verify browser context is ready
         if *ctx.status() != BrowserStatus::Ready {
             return AuthFlowResult::Failed {
-                error: format!("Browser context not ready: {:?}", ctx.status()),
+                error: AuthFlowFailureKind::BrowserNotReady
+                    .stable_detail()
+                    .to_string(),
                 kind: AuthFlowFailureKind::BrowserNotReady,
                 artifacts_dir: None,
             };
@@ -388,12 +447,20 @@ impl OpenAiDeviceAuthFlow {
 
         // Step 3: Resolve the browser profile
         let profile = ctx.profile("openai", account);
-        let profile_dir = profile.path();
+        let profile_dir = match profile.ensure_dir() {
+            Ok(path) => path,
+            Err(_) => {
+                return AuthFlowResult::Failed {
+                    error: AuthFlowFailureKind::ProfileUnavailable
+                        .stable_detail()
+                        .to_string(),
+                    kind: AuthFlowFailureKind::ProfileUnavailable,
+                    artifacts_dir: None,
+                };
+            }
+        };
 
         tracing::info!(
-            profile_dir = %profile_dir.display(),
-            account = %account,
-            device_url = %self.config.device_url,
             "Starting OpenAI device auth flow"
         );
         // NOTE: user_code is intentionally NOT logged (secret material)
@@ -407,13 +474,26 @@ impl OpenAiDeviceAuthFlow {
             &normalized_code,
             email,
             artifacts_dir.as_deref(),
+            ctx.config().headless,
         );
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         match result {
             Ok(outcome) => match outcome {
-                PlaywrightOutcome::Success => {
+                PlaywrightOutcome::Success { storage_state } => {
+                    if profile
+                        .record_authenticated_state(&storage_state, BootstrapMethod::Automated)
+                        .is_err()
+                    {
+                        return AuthFlowResult::Failed {
+                            error: AuthFlowFailureKind::ProfilePersistenceFailed
+                                .stable_detail()
+                                .to_string(),
+                            kind: AuthFlowFailureKind::ProfilePersistenceFailed,
+                            artifacts_dir,
+                        };
+                    }
                     tracing::info!(elapsed_ms, "Device auth flow completed successfully");
                     AuthFlowResult::Success { elapsed_ms }
                 }
@@ -432,7 +512,6 @@ impl OpenAiDeviceAuthFlow {
             Err(e) => {
                 tracing::error!(
                     elapsed_ms,
-                    error = %e.error,
                     kind = ?e.kind,
                     "Device auth flow failed"
                 );
@@ -444,14 +523,9 @@ impl OpenAiDeviceAuthFlow {
                          Error: {}\n\
                          Kind: {:?}\n\
                          Elapsed: {elapsed_ms}ms\n\
-                         Device URL: {}\n\
-                         Profile dir: {}\n\
-                         Account: {account}\n\
-                         Note: user_code redacted for security\n",
+                         Sensitive execution inputs: redacted\n",
                         e.error,
                         e.kind,
-                        self.config.device_url,
-                        profile_dir.display(),
                     );
                     let _ = ArtifactCapture::write_artifact(
                         dir,
@@ -474,11 +548,8 @@ impl OpenAiDeviceAuthFlow {
             .as_ref()
             .and_then(|a| match a.ensure_invocation_dir("openai_device") {
                 Ok(dir) => Some(dir),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Failed to create artifacts directory; continuing without artifacts"
-                    );
+                Err(_) => {
+                    tracing::warn!("Failed to create artifacts directory; continuing without artifacts");
                     None
                 }
             })
@@ -486,7 +557,8 @@ impl OpenAiDeviceAuthFlow {
 
     /// Run the Playwright subprocess that performs the actual browser automation.
     ///
-    /// This generates an inline Node.js script and executes it via `node -e`.
+    /// This generates a Node.js script and delivers it through bounded stdin
+    /// to `node -`; sensitive flow values never enter argv or the environment.
     /// The script:
     /// 1. Launches a browser with the given profile directory
     /// 2. Navigates to the device auth URL
@@ -499,39 +571,43 @@ impl OpenAiDeviceAuthFlow {
         user_code: &str,
         email: Option<&str>,
         artifacts_dir: Option<&Path>,
+        headless: bool,
     ) -> Result<PlaywrightOutcome, PlaywrightFlowError> {
-        let script = self.build_playwright_script(profile_dir, user_code, email, artifacts_dir);
-
-        let output = std::process::Command::new("node")
-            .arg("-e")
-            .arg(&script)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .map_err(|e| PlaywrightFlowError {
-                error: format!("Failed to spawn node process: {e}"),
+        let script = self
+            .build_playwright_script(profile_dir, user_code, email, artifacts_dir, headless)
+            .map_err(|failure| PlaywrightFlowError {
+                error: failure.detail().to_string(),
                 kind: AuthFlowFailureKind::PlaywrightError,
             })?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // Log stderr at debug level (may contain Playwright progress info)
-        // but NEVER log stdout which may contain page content with secrets
+        let output = super::run_node_script_bounded(
+            script,
+            self.config.flow_timeout_ms,
+            super::BROWSER_BOOTSTRAP_MAX_STDOUT_BYTES,
+        )
+        .map_err(|failure| PlaywrightFlowError {
+            error: failure.detail().to_string(),
+            kind: AuthFlowFailureKind::PlaywrightError,
+        })?;
+        let std::process::Output {
+            status,
+            stdout,
+            stderr,
+        } = output;
         if !stderr.is_empty() {
             tracing::debug!(
-                stderr_lines = stderr.lines().count(),
+                stderr_bytes = stderr.len(),
                 "Playwright subprocess stderr (content redacted in logs)"
             );
         }
+        drop(stderr);
+        let stdout = String::from_utf8(stdout).map_err(|_| PlaywrightFlowError {
+            error: "Playwright returned invalid result text".to_string(),
+            kind: AuthFlowFailureKind::PlaywrightError,
+        })?;
 
-        if !output.status.success() {
+        if !status.success() {
             // Parse structured error from stdout if possible
-            return Err(Self::parse_playwright_error(
-                &stdout,
-                &stderr,
-                output.status,
-            ));
+            return Err(Self::parse_playwright_error(&stdout));
         }
 
         // Parse the JSON result from stdout
@@ -541,7 +617,7 @@ impl OpenAiDeviceAuthFlow {
     /// Build the Node.js/Playwright script for the device auth flow.
     ///
     /// The script outputs a JSON result to stdout with one of:
-    /// - `{"status":"success"}`
+    /// - `{"status":"success","storage_state":"..."}`
     /// - `{"status":"interactive_required","reason":"..."}`
     /// - `{"status":"error","kind":"...","message":"..."}`
     fn build_playwright_script(
@@ -550,52 +626,104 @@ impl OpenAiDeviceAuthFlow {
         user_code: &str,
         email: Option<&str>,
         artifacts_dir: Option<&Path>,
-    ) -> String {
-        let profile_dir_str = profile_dir
-            .display()
-            .to_string()
-            .replace('\\', "\\\\")
-            .replace('\'', "\\'");
-        let device_url = &self.config.device_url;
-        let timeout = self.config.flow_timeout_ms;
-        let headless = serde_json::to_string(&false).unwrap(); // always visible for device auth
-
+        headless: bool,
+    ) -> Result<String, super::BrowserNodeCommandFailure> {
         let sel = &self.config.selectors;
-        let code_input_sel = &sel.code_input;
-        let submit_sel = &sel.submit_button;
-        let email_prompt_sel = &sel.email_prompt;
-        let email_submit_sel = &sel.email_submit;
-        let password_sel = &sel.password_prompt;
-        let success_sel = &sel.success_marker;
+        super::admit_browser_timeout(self.config.flow_timeout_ms)?;
+        super::admit_browser_url(&self.config.device_url)?;
+        for selector_group in [
+            &sel.code_input,
+            &sel.submit_button,
+            &sel.email_prompt,
+            &sel.email_input,
+            &sel.email_submit,
+            &sel.password_prompt,
+            &sel.success_marker,
+        ] {
+            super::admit_selector_group(selector_group)?;
+        }
+        super::admit_node_script_input_parts(
+            &[
+                Some(&self.config.device_url),
+                Some(user_code),
+                email,
+                Some(&sel.code_input),
+                Some(&sel.submit_button),
+                Some(&sel.email_prompt),
+                Some(&sel.email_input),
+                Some(&sel.email_submit),
+                Some(&sel.password_prompt),
+                Some(&sel.success_marker),
+            ],
+            &[Some(profile_dir), artifacts_dir],
+            &[],
+        )?;
+        let input = serde_json::json!({
+            "profile_dir": profile_dir.to_string_lossy(),
+            "device_url": &self.config.device_url,
+            "user_code": user_code,
+            "email": email,
+            "artifacts_dir": artifacts_dir.map(|path| path.to_string_lossy().into_owned()),
+            "timeout_ms": self.config.flow_timeout_ms,
+            "headless": headless,
+            "screenshot_max_bytes": SCREENSHOT_ARTIFACT_MAX_BYTES,
+            "selectors": {
+                "code_input": &sel.code_input,
+                "submit_button": &sel.submit_button,
+                "email_prompt": &sel.email_prompt,
+                "email_input": &sel.email_input,
+                "email_submit": &sel.email_submit,
+                "password_prompt": &sel.password_prompt,
+                "success_marker": &sel.success_marker,
+            },
+        });
+        let input_base64 = super::encode_node_script_input(&input)?;
 
-        let email_js = email
-            .map(|e| format!("'{}'", e.replace('\'', "\\'")))
-            .unwrap_or_else(|| "null".to_string());
-
-        let artifacts_js = artifacts_dir
-            .map(|d| format!("'{}'", d.display()))
-            .unwrap_or_else(|| "null".to_string());
-
-        // Note: user_code is passed as a variable, not interpolated into selectors,
-        // to prevent injection. The script handles it as a value-only parameter.
-        let user_code_escaped = user_code.replace('\\', "\\\\").replace('\'', "\\'");
-
-        format!(
+        super::admit_node_script_source(format!(
             r#"
 const {{ chromium }} = require('playwright');
+const input = JSON.parse(Buffer.from('{input_base64}', 'base64').toString('utf8'));
+const fs = require('node:fs/promises');
+
+async function captureScreenshot(page, directory) {{
+  try {{
+    const png = await page.screenshot({{ fullPage: false, timeout: Math.min(5000, input.timeout_ms) }});
+    if (png.length > input.screenshot_max_bytes) return false;
+    await fs.writeFile(directory + '/screenshot.png', png, {{ flag: 'wx', mode: 0o600 }});
+    return true;
+  }} catch (_) {{
+    return false;
+  }}
+}}
+
+function sameOrigin(left, right) {{
+  try {{ return new URL(left).origin === new URL(right).origin; }} catch (_) {{ return false; }}
+}}
 
 (async () => {{
-  const TIMEOUT = {timeout};
-  const profileDir = '{profile_dir_str}';
-  const deviceUrl = '{device_url}';
-  const userCode = '{user_code_escaped}';
-  const email = {email_js};
-  const artifactsDir = {artifacts_js};
+  const TIMEOUT = input.timeout_ms;
+  const profileDir = input.profile_dir;
+  const deviceUrl = input.device_url;
+  const userCode = input.user_code;
+  const email = input.email;
+  const artifactsDir = input.artifacts_dir;
+  const selectors = input.selectors;
+
+  async function finishSuccess() {{
+    if (!sameOrigin(page.url(), deviceUrl)) {{
+      console.log(JSON.stringify({{ status: 'error', kind: 'VerificationFailed' }}));
+    }} else {{
+      const state = await browser.storageState();
+      console.log(JSON.stringify({{ status: 'success', storage_state: JSON.stringify(state) }}));
+    }}
+    await browser.close();
+    process.exit(0);
+  }}
 
   let browser, context, page;
   try {{
     browser = await chromium.launchPersistentContext(profileDir, {{
-      headless: {headless},
+      headless: input.headless,
       timeout: TIMEOUT,
     }});
     page = browser.pages()[0] || await browser.newPage();
@@ -605,11 +733,11 @@ const {{ chromium }} = require('playwright');
     await page.goto(deviceUrl, {{ waitUntil: 'domcontentloaded', timeout: TIMEOUT }});
 
     // Detect page state
-    const passwordEl = await page.$("{password_sel}");
+    const passwordEl = await page.$(selectors.password_prompt);
     if (passwordEl) {{
       // Password/MFA required — cannot automate
       if (artifactsDir) {{
-        await page.screenshot({{ path: artifactsDir + '/screenshot.png', fullPage: true }});
+        await captureScreenshot(page, artifactsDir);
       }}
       console.log(JSON.stringify({{
         status: 'interactive_required',
@@ -620,16 +748,29 @@ const {{ chromium }} = require('playwright');
     }}
 
     // Check for email prompt
-    const emailEl = await page.$("{email_prompt_sel}");
-    if (emailEl && email) {{
-      await emailEl.fill(email);
-      const emailSubmit = await page.$("{email_submit_sel}");
+    const emailPromptEl = await page.$(selectors.email_prompt);
+    if (emailPromptEl && email) {{
+      const emailInput = await page.$(selectors.email_input);
+      if (!emailInput) throw new Error('email input selector did not match');
+      await emailInput.fill(email);
+      const emailSubmit = await page.$(selectors.email_submit);
       if (emailSubmit) await emailSubmit.click();
       // Wait for navigation after email submission
       await page.waitForLoadState('domcontentloaded', {{ timeout: TIMEOUT }});
-    }} else if (emailEl && !email) {{
+
+      const postEmailPassword = await page.$(selectors.password_prompt);
+      if (postEmailPassword) {{
+        if (artifactsDir) await captureScreenshot(page, artifactsDir);
+        console.log(JSON.stringify({{
+          status: 'interactive_required',
+          reason: 'Password or MFA prompt detected — interactive bootstrap required'
+        }}));
+        await browser.close();
+        process.exit(0);
+      }}
+    }} else if (emailPromptEl && !email) {{
       if (artifactsDir) {{
-        await page.screenshot({{ path: artifactsDir + '/screenshot.png', fullPage: true }});
+        await captureScreenshot(page, artifactsDir);
       }}
       console.log(JSON.stringify({{
         status: 'interactive_required',
@@ -640,11 +781,11 @@ const {{ chromium }} = require('playwright');
     }}
 
     // Fill the user code
-    const codeInput = await page.waitForSelector("{code_input_sel}", {{ timeout: TIMEOUT }});
+    const codeInput = await page.waitForSelector(selectors.code_input, {{ timeout: TIMEOUT }});
     await codeInput.fill(userCode);
 
     // Submit
-    const submitBtn = await page.$("{submit_sel}");
+    const submitBtn = await page.$(selectors.submit_button);
     if (submitBtn) {{
       await submitBtn.click();
     }} else {{
@@ -653,28 +794,20 @@ const {{ chromium }} = require('playwright');
     }}
 
     // Verify success
-    const successSelectors = "{success_sel}".split(', ');
-    let found = false;
-    for (const sel of successSelectors) {{
-      try {{
-        await page.waitForSelector(sel, {{ timeout: 10000 }});
-        found = true;
-        break;
-      }} catch (_) {{}}
-    }}
-
-    if (!found) {{
-      // Try checking page text content
-      const bodyText = await page.textContent('body');
-      const markers = ['Successfully', 'Device connected', "You're all set", 'authorized'];
-      found = markers.some(m => bodyText && bodyText.includes(m));
-    }}
+    const successSelectors = selectors.success_marker.split(', ');
+    const successTimeout = Math.min(10000, TIMEOUT);
+    const successChecks = successSelectors.map(sel =>
+      page.waitForSelector(sel, {{ timeout: successTimeout }})
+        .then(() => true)
+        .catch(() => false)
+    );
+    const found = (await Promise.all(successChecks)).some(Boolean);
 
     if (found) {{
-      console.log(JSON.stringify({{ status: 'success' }}));
+      await finishSuccess();
     }} else {{
       if (artifactsDir) {{
-        await page.screenshot({{ path: artifactsDir + '/screenshot.png', fullPage: true }});
+        await captureScreenshot(page, artifactsDir);
       }}
       console.log(JSON.stringify({{
         status: 'error',
@@ -687,20 +820,19 @@ const {{ chromium }} = require('playwright');
   }} catch (err) {{
     if (page && artifactsDir) {{
       try {{
-        await page.screenshot({{ path: artifactsDir + '/screenshot.png', fullPage: true }});
+        await captureScreenshot(page, artifactsDir);
       }} catch (_) {{}}
     }}
     console.log(JSON.stringify({{
       status: 'error',
-      kind: 'PlaywrightError',
-      message: err.message
+      kind: 'PlaywrightError'
     }}));
     if (browser) await browser.close().catch(() => {{}});
     process.exit(1);
   }}
 }})();
 "#
-        )
+        ))
     }
 
     /// Parse a successful Playwright script result from stdout JSON.
@@ -721,84 +853,74 @@ const {{ chromium }} = require('playwright');
             .unwrap_or(trimmed);
 
         let parsed: serde_json::Value =
-            serde_json::from_str(json_line).map_err(|e| PlaywrightFlowError {
-                error: format!("Failed to parse Playwright output as JSON: {e}"),
+            serde_json::from_str(json_line).map_err(|_| PlaywrightFlowError {
+                error: "Playwright returned malformed result JSON".to_string(),
                 kind: AuthFlowFailureKind::PlaywrightError,
             })?;
 
         match parsed.get("status").and_then(|s| s.as_str()) {
-            Some("success") => Ok(PlaywrightOutcome::Success),
+            Some("success") => {
+                let storage_state = parsed
+                    .get("storage_state")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| PlaywrightFlowError {
+                        error: AuthFlowFailureKind::ProfilePersistenceFailed
+                            .stable_detail()
+                            .to_string(),
+                        kind: AuthFlowFailureKind::ProfilePersistenceFailed,
+                    })?
+                    .as_bytes()
+                    .to_vec();
+                Ok(PlaywrightOutcome::Success { storage_state })
+            }
             Some("interactive_required") => {
-                let reason = parsed
-                    .get("reason")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("interactive login required")
-                    .to_string();
+                let reason = match parsed.get("reason").and_then(|value| value.as_str()) {
+                    Some("Password or MFA prompt detected — interactive bootstrap required") => {
+                        "Password or MFA prompt detected — interactive bootstrap required"
+                    }
+                    Some("Email prompt detected but no email provided") => {
+                        "Email prompt detected but no email provided"
+                    }
+                    _ => "Interactive login is required to continue",
+                }
+                .to_string();
                 Ok(PlaywrightOutcome::InteractiveRequired(reason))
             }
             Some("error") => {
-                let kind_str = parsed
-                    .get("kind")
-                    .and_then(|k| k.as_str())
-                    .unwrap_or("Unknown");
-                let message = parsed
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown error")
-                    .to_string();
-                let kind = match kind_str {
-                    "VerificationFailed" => AuthFlowFailureKind::VerificationFailed,
-                    "SelectorMismatch" => AuthFlowFailureKind::SelectorMismatch,
-                    "NavigationFailed" => AuthFlowFailureKind::NavigationFailed,
-                    "BotDetected" => AuthFlowFailureKind::BotDetected,
-                    _ => AuthFlowFailureKind::PlaywrightError,
-                };
+                let kind = AuthFlowFailureKind::from_script_label(
+                    parsed.get("kind").and_then(serde_json::Value::as_str),
+                );
                 Err(PlaywrightFlowError {
-                    error: message,
+                    error: kind.stable_detail().to_string(),
                     kind,
                 })
             }
             _ => Err(PlaywrightFlowError {
-                error: format!("Unexpected Playwright output status: {json_line}"),
+                error: AuthFlowFailureKind::Unknown.stable_detail().to_string(),
                 kind: AuthFlowFailureKind::Unknown,
             }),
         }
     }
 
     /// Parse error information from a failed Playwright subprocess.
-    fn parse_playwright_error(
-        stdout: &str,
-        stderr: &str,
-        status: std::process::ExitStatus,
-    ) -> PlaywrightFlowError {
+    fn parse_playwright_error(stdout: &str) -> PlaywrightFlowError {
         // Try to get structured error from stdout first
         if let Some(json_line) = stdout.trim().lines().rev().find(|l| l.starts_with('{')) {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_line) {
-                if let Some(message) = parsed.get("message").and_then(|m| m.as_str()) {
-                    let kind_str = parsed
-                        .get("kind")
-                        .and_then(|k| k.as_str())
-                        .unwrap_or("PlaywrightError");
-                    let kind = match kind_str {
-                        "VerificationFailed" => AuthFlowFailureKind::VerificationFailed,
-                        "SelectorMismatch" => AuthFlowFailureKind::SelectorMismatch,
-                        "NavigationFailed" => AuthFlowFailureKind::NavigationFailed,
-                        "BotDetected" => AuthFlowFailureKind::BotDetected,
-                        _ => AuthFlowFailureKind::PlaywrightError,
-                    };
-                    return PlaywrightFlowError {
-                        error: message.to_string(),
-                        kind,
-                    };
-                }
+                let kind = AuthFlowFailureKind::from_script_label(
+                    parsed.get("kind").and_then(serde_json::Value::as_str),
+                );
+                return PlaywrightFlowError {
+                    error: kind.stable_detail().to_string(),
+                    kind,
+                };
             }
         }
 
-        // Fallback: use stderr
-        let stderr_summary = stderr.lines().take(5).collect::<Vec<_>>().join("; ");
-
         PlaywrightFlowError {
-            error: format!("Playwright process exited with {status}: {stderr_summary}"),
+            error: AuthFlowFailureKind::PlaywrightError
+                .stable_detail()
+                .to_string(),
             kind: AuthFlowFailureKind::PlaywrightError,
         }
     }
@@ -807,7 +929,7 @@ const {{ chromium }} = require('playwright');
 /// Internal outcome from the Playwright subprocess.
 enum PlaywrightOutcome {
     /// Flow completed successfully.
-    Success,
+    Success { storage_state: Vec<u8> },
     /// Interactive login is required (password/MFA or missing email).
     InteractiveRequired(String),
 }
@@ -825,6 +947,11 @@ struct PlaywrightFlowError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn canonical_system_temp_dir() -> PathBuf {
+        std::fs::canonicalize(std::env::temp_dir())
+            .expect("system temporary directory must be resolvable")
+    }
 
     // =========================================================================
     // User code validation tests
@@ -913,6 +1040,22 @@ mod tests {
         // Unicode letters should fail (only ASCII allowed)
         let result = validate_user_code("ÀBCD-ÉFGH");
         assert!(matches!(result, Err(UserCodeError::InvalidCharacters)));
+    }
+
+    #[test]
+    fn validate_user_code_enforces_exact_pre_normalization_limit() {
+        let exact = format!("{}-{}", "a".repeat(63), "b".repeat(64));
+        assert_eq!(exact.len(), USER_CODE_MAX_BYTES);
+        assert!(validate_user_code(&exact).is_ok());
+
+        let one_over = format!("{}-{}", "a".repeat(64), "b".repeat(64));
+        assert_eq!(one_over.len(), USER_CODE_MAX_BYTES + 1);
+        assert_eq!(
+            validate_user_code(&one_over),
+            Err(UserCodeError::TooLong {
+                max_bytes: USER_CODE_MAX_BYTES,
+            })
+        );
     }
 
     // =========================================================================
@@ -1032,6 +1175,8 @@ mod tests {
         let kinds = vec![
             AuthFlowFailureKind::InvalidUserCode,
             AuthFlowFailureKind::BrowserNotReady,
+            AuthFlowFailureKind::ProfileUnavailable,
+            AuthFlowFailureKind::ProfilePersistenceFailed,
             AuthFlowFailureKind::NavigationFailed,
             AuthFlowFailureKind::SelectorMismatch,
             AuthFlowFailureKind::BotDetected,
@@ -1116,14 +1261,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn execute_rejects_an_unavailable_profile_before_subprocess_admission() {
+        let flow = OpenAiDeviceAuthFlow::with_defaults();
+        let temp = tempfile::tempdir().expect("isolated profile admission root");
+        let unavailable_data_dir = temp.path().join("not-a-directory");
+        std::fs::write(&unavailable_data_dir, b"profile root obstruction")
+            .expect("profile root obstruction fixture");
+        let mut ctx = super::super::BrowserContext::new(
+            super::super::BrowserConfig::default(),
+            &unavailable_data_dir,
+        );
+        ctx.status = BrowserStatus::Ready;
+
+        let result = flow.execute(&ctx, "ABCD-EFGH", "test-account", None);
+        match result {
+            AuthFlowResult::Failed {
+                error,
+                kind,
+                artifacts_dir,
+            } => {
+                assert_eq!(kind, AuthFlowFailureKind::ProfileUnavailable);
+                assert_eq!(error, kind.stable_detail());
+                assert!(artifacts_dir.is_none());
+            }
+            _ => panic!("Expected profile admission to fail before subprocess execution"),
+        }
+    }
+
     // =========================================================================
     // Playwright result parsing tests
     // =========================================================================
 
     #[test]
     fn parse_success_result() {
-        let result = OpenAiDeviceAuthFlow::parse_playwright_result(r#"{"status":"success"}"#);
-        assert!(matches!(result, Ok(PlaywrightOutcome::Success)));
+        let result = OpenAiDeviceAuthFlow::parse_playwright_result(
+            r#"{"status":"success","storage_state":"{\"cookies\":[],\"origins\":[]}"}"#,
+        );
+        assert!(matches!(result, Ok(PlaywrightOutcome::Success { .. })));
     }
 
     #[test]
@@ -1133,7 +1308,8 @@ mod tests {
         );
         match result {
             Ok(PlaywrightOutcome::InteractiveRequired(reason)) => {
-                assert_eq!(reason, "password needed");
+                assert_eq!(reason, "Interactive login is required to continue");
+                assert!(!reason.contains("password needed"));
             }
             _ => panic!("Expected InteractiveRequired"),
         }
@@ -1147,7 +1323,11 @@ mod tests {
         match result {
             Err(e) => {
                 assert_eq!(e.kind, AuthFlowFailureKind::VerificationFailed);
-                assert_eq!(e.error, "no marker");
+                assert_eq!(
+                    e.error,
+                    AuthFlowFailureKind::VerificationFailed.stable_detail()
+                );
+                assert!(!e.error.contains("no marker"));
             }
             _ => panic!("Expected error"),
         }
@@ -1161,9 +1341,9 @@ mod tests {
 
     #[test]
     fn parse_output_with_preceding_lines() {
-        let output = "Debugger attached.\nSome warning\n{\"status\":\"success\"}";
+        let output = "Debugger attached.\nSome warning\n{\"status\":\"success\",\"storage_state\":\"{\\\"cookies\\\":[],\\\"origins\\\":[]}\"}";
         let result = OpenAiDeviceAuthFlow::parse_playwright_result(output);
-        assert!(matches!(result, Ok(PlaywrightOutcome::Success)));
+        assert!(matches!(result, Ok(PlaywrightOutcome::Success { .. })));
     }
 
     #[test]
@@ -1184,7 +1364,8 @@ mod tests {
 
     #[test]
     fn artifact_capture_creates_dir() {
-        let temp = std::env::temp_dir().join(format!("wa_artifact_test_{}", std::process::id()));
+        let temp =
+            canonical_system_temp_dir().join(format!("wa_artifact_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let capture = ArtifactCapture::new(&temp);
@@ -1197,14 +1378,22 @@ mod tests {
 
     #[test]
     fn artifact_write_and_read() {
-        let temp =
-            std::env::temp_dir().join(format!("wa_artifact_write_test_{}", std::process::id()));
+        let temp = canonical_system_temp_dir().join(format!(
+            "wa_artifact_write_test_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&temp);
-        std::fs::create_dir_all(&temp).unwrap();
+        let invocation = ArtifactCapture::new(&temp)
+            .ensure_invocation_dir("openai_device")
+            .expect("private artifact invocation");
 
         let content = b"Test failure report";
-        let path =
-            ArtifactCapture::write_artifact(&temp, ArtifactKind::FailureReport, content).unwrap();
+        let path = ArtifactCapture::write_artifact(
+            &invocation,
+            ArtifactKind::FailureReport,
+            content,
+        )
+        .unwrap();
         assert_eq!(path.file_name().unwrap(), "failure_report.txt");
         assert_eq!(std::fs::read(&path).unwrap(), content);
 
@@ -1213,16 +1402,22 @@ mod tests {
 
     #[test]
     fn artifact_write_screenshot() {
-        let temp = std::env::temp_dir().join(format!(
+        let temp = canonical_system_temp_dir().join(format!(
             "wa_artifact_screenshot_test_{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&temp);
-        std::fs::create_dir_all(&temp).unwrap();
+        let invocation = ArtifactCapture::new(&temp)
+            .ensure_invocation_dir("openai_device")
+            .expect("private artifact invocation");
 
         let content = b"\x89PNG fake screenshot data";
-        let path =
-            ArtifactCapture::write_artifact(&temp, ArtifactKind::Screenshot, content).unwrap();
+        let path = ArtifactCapture::write_artifact(
+            &invocation,
+            ArtifactKind::Screenshot,
+            content,
+        )
+        .unwrap();
         assert_eq!(path.file_name().unwrap(), "screenshot.png");
 
         let _ = std::fs::remove_dir_all(&temp);
@@ -1230,17 +1425,165 @@ mod tests {
 
     #[test]
     fn artifact_write_redacted_dom() {
-        let temp =
-            std::env::temp_dir().join(format!("wa_artifact_dom_test_{}", std::process::id()));
+        let temp = canonical_system_temp_dir().join(format!(
+            "wa_artifact_dom_test_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&temp);
-        std::fs::create_dir_all(&temp).unwrap();
+        let invocation = ArtifactCapture::new(&temp)
+            .ensure_invocation_dir("openai_device")
+            .expect("private artifact invocation");
 
         let content = b"<html><body>[REDACTED]</body></html>";
-        let path =
-            ArtifactCapture::write_artifact(&temp, ArtifactKind::RedactedDom, content).unwrap();
+        let path = ArtifactCapture::write_artifact(
+            &invocation,
+            ArtifactKind::RedactedDom,
+            content,
+        )
+        .unwrap();
         assert_eq!(path.file_name().unwrap(), "redacted_dom.html");
 
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_directories_and_files_are_private_exclusive_and_nofollow() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().expect("isolated artifact root");
+        let temp_path = std::fs::canonicalize(temp.path()).expect("canonical artifact root");
+        let root = temp_path.join("artifacts");
+        let capture = ArtifactCapture::new(&root);
+        assert!(capture.ensure_invocation_dir("").is_err());
+        assert!(capture.ensure_invocation_dir("../escape").is_err());
+        assert!(capture.ensure_invocation_dir(&"x".repeat(65)).is_err());
+
+        let invocation = capture
+            .ensure_invocation_dir("openai_device")
+            .expect("fresh private invocation directory");
+        assert_eq!(
+            std::fs::metadata(&invocation)
+                .expect("invocation metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let report = b"finite content-free report";
+        let report_path = ArtifactCapture::write_artifact(
+            &invocation,
+            ArtifactKind::FailureReport,
+            report,
+        )
+        .expect("exclusive report creation");
+        assert_eq!(
+            std::fs::metadata(&report_path)
+                .expect("report metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(
+            ArtifactCapture::write_artifact(
+                &invocation,
+                ArtifactKind::FailureReport,
+                b"must not overwrite",
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&report_path).expect("retained report"), report);
+
+        let symlink_invocation = capture
+            .ensure_invocation_dir("openai_device")
+            .expect("second private invocation directory");
+        let outside = temp_path.join("outside.txt");
+        std::fs::write(&outside, b"outside must remain unchanged").expect("outside fixture");
+        symlink(&outside, symlink_invocation.join("failure_report.txt"))
+            .expect("preplanted artifact symlink");
+        assert!(
+            ArtifactCapture::write_artifact(
+                &symlink_invocation,
+                ArtifactKind::FailureReport,
+                b"must not follow",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&outside).expect("outside fixture remains readable"),
+            b"outside must remain unchanged"
+        );
+
+        let oversized = vec![b'x'; FAILURE_REPORT_ARTIFACT_MAX_BYTES.saturating_add(1)];
+        let oversized_invocation = capture
+            .ensure_invocation_dir("openai_device")
+            .expect("oversized artifact invocation directory");
+        assert!(
+            ArtifactCapture::write_artifact(
+                &oversized_invocation,
+                ArtifactKind::FailureReport,
+                &oversized,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_directory_traversal_rejects_preplanted_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("isolated artifact traversal root");
+        let temp_path =
+            std::fs::canonicalize(temp.path()).expect("canonical artifact traversal root");
+        let root = temp_path.join("artifacts");
+        let outside = temp_path.join("outside");
+        std::fs::create_dir(&root).expect("artifact root fixture");
+        std::fs::create_dir(&outside).expect("outside fixture");
+        symlink(&outside, root.join("google_auth")).expect("flow symlink fixture");
+        let capture = ArtifactCapture::new(&root);
+        assert!(capture.ensure_invocation_dir("google_auth").is_err());
+        assert!(
+            std::fs::read_dir(&outside)
+                .expect("outside directory remains readable")
+                .next()
+                .is_none()
+        );
+
+        let linked_root = temp_path.join("linked-root");
+        symlink(&outside, &linked_root).expect("root symlink fixture");
+        assert!(
+            ArtifactCapture::new(linked_root)
+                .ensure_invocation_dir("openai_device")
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_capture_never_tightens_permissions_on_a_caller_owned_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("isolated artifact permission root");
+        let broad_root = temp.path().join("caller-owned");
+        std::fs::create_dir(&broad_root).expect("caller-owned root fixture");
+        std::fs::set_permissions(&broad_root, std::fs::Permissions::from_mode(0o755))
+            .expect("broad root permissions fixture");
+
+        assert!(
+            ArtifactCapture::new(&broad_root)
+                .ensure_invocation_dir("openai_device")
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::metadata(&broad_root)
+                .expect("caller-owned root metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
     }
 
     // =========================================================================
@@ -1267,24 +1610,18 @@ mod tests {
 
     #[test]
     fn parse_playwright_error_with_json() {
-        let stdout = r#"{"status":"error","kind":"NavigationFailed","message":"timeout"}"#;
-        let status = std::process::Command::new("false")
-            .status()
-            .unwrap_or_else(|_| std::process::ExitStatus::default());
-        let err = OpenAiDeviceAuthFlow::parse_playwright_error(stdout, "", status);
+        let stdout = r#"{"status":"error","kind":"NavigationFailed","message":"/private/secret"}"#;
+        let err = OpenAiDeviceAuthFlow::parse_playwright_error(stdout);
         assert_eq!(err.kind, AuthFlowFailureKind::NavigationFailed);
-        assert_eq!(err.error, "timeout");
+        assert_eq!(err.error, AuthFlowFailureKind::NavigationFailed.stable_detail());
+        assert!(!err.error.contains("secret"));
     }
 
     #[test]
-    fn parse_playwright_error_fallback_to_stderr() {
-        let stderr = "Error: browser not found\nsome detail";
-        let status = std::process::Command::new("false")
-            .status()
-            .unwrap_or_else(|_| std::process::ExitStatus::default());
-        let err = OpenAiDeviceAuthFlow::parse_playwright_error("", stderr, status);
+    fn parse_playwright_error_fallback_is_content_free() {
+        let err = OpenAiDeviceAuthFlow::parse_playwright_error("");
         assert_eq!(err.kind, AuthFlowFailureKind::PlaywrightError);
-        assert!(err.error.contains("browser not found"));
+        assert_eq!(err.error, AuthFlowFailureKind::PlaywrightError.stable_detail());
     }
 
     // =========================================================================
@@ -1292,22 +1629,39 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn script_contains_device_url() {
+    fn script_transports_sensitive_input_as_structured_base64() {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
-        let script = flow.build_playwright_script(&profile_dir, "ABCD-EFGH", None, None);
-        assert!(script.contains("auth.openai.com/codex/device"));
-        assert!(script.contains("ABCD-EFGH"));
-        assert!(script.contains("/tmp/profile"));
+        let script = flow
+            .build_playwright_script(&profile_dir, "ABCD-EFGH", None, None, false)
+            .expect("bounded OpenAI script");
+        assert!(!script.contains("auth.openai.com/codex/device"));
+        assert!(!script.contains("ABCD-EFGH"));
+        assert!(!script.contains("/tmp/profile"));
+        let input = super::super::decode_node_script_input(&script);
+        assert_eq!(input["device_url"], "https://auth.openai.com/codex/device");
+        assert_eq!(input["user_code"], "ABCD-EFGH");
+        assert_eq!(input["profile_dir"], "/tmp/profile");
     }
 
     #[test]
     fn script_with_email() {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
-        let script =
-            flow.build_playwright_script(&profile_dir, "ABCD-EFGH", Some("user@example.com"), None);
-        assert!(script.contains("user@example.com"));
+        let script = flow
+            .build_playwright_script(
+                &profile_dir,
+                "ABCD-EFGH",
+                Some("user@example.com"),
+                None,
+                false,
+            )
+            .expect("bounded OpenAI script");
+        assert!(!script.contains("user@example.com"));
+        assert_eq!(
+            super::super::decode_node_script_input(&script)["email"],
+            "user@example.com"
+        );
     }
 
     #[test]
@@ -1315,34 +1669,137 @@ mod tests {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
         let artifacts_dir = PathBuf::from("/tmp/artifacts");
-        let script =
-            flow.build_playwright_script(&profile_dir, "ABCD-EFGH", None, Some(&artifacts_dir));
-        assert!(script.contains("/tmp/artifacts"));
+        let script = flow
+            .build_playwright_script(
+                &profile_dir,
+                "ABCD-EFGH",
+                None,
+                Some(&artifacts_dir),
+                false,
+            )
+            .expect("bounded OpenAI script");
+        assert!(!script.contains("/tmp/artifacts"));
+        assert_eq!(
+            super::super::decode_node_script_input(&script)["artifacts_dir"],
+            "/tmp/artifacts"
+        );
     }
 
     #[test]
-    fn script_escapes_single_quotes_in_code() {
+    fn script_input_round_trips_hostile_text_without_literal_injection() {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
-        let profile_dir = PathBuf::from("/tmp/profile");
-        // This shouldn't normally happen but tests defensive coding
-        let script = flow.build_playwright_script(&profile_dir, "AB'D-EF'H", None, None);
-        // Single quotes should be escaped
-        assert!(script.contains("\\'"));
+        let hostile = "AB'\\\n\u{2028}D-EF'H";
+        let profile_dir = PathBuf::from("/tmp/hostile'\\\n\u{2028}");
+        let script = flow
+            .build_playwright_script(
+                &profile_dir,
+                hostile,
+                Some("mail'\\\n\u{2028}@example.com"),
+                None,
+                false,
+            )
+            .expect("bounded hostile OpenAI script");
+        assert!(!script.contains(hostile));
+        assert!(!script.contains('\u{2028}'));
+        let input = super::super::decode_node_script_input(&script);
+        assert_eq!(input["user_code"], hostile);
+        assert_eq!(input["profile_dir"], profile_dir.to_string_lossy().as_ref());
+        assert_eq!(input["email"], "mail'\\\n\u{2028}@example.com");
     }
 
     #[test]
     fn script_null_email_when_none() {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
-        let script = flow.build_playwright_script(&profile_dir, "ABCD-EFGH", None, None);
-        assert!(script.contains("const email = null"));
+        let script = flow
+            .build_playwright_script(&profile_dir, "ABCD-EFGH", None, None, false)
+            .expect("bounded OpenAI script");
+        assert!(super::super::decode_node_script_input(&script)["email"].is_null());
     }
 
     #[test]
     fn script_null_artifacts_when_none() {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
-        let script = flow.build_playwright_script(&profile_dir, "ABCD-EFGH", None, None);
-        assert!(script.contains("const artifactsDir = null"));
+        let script = flow
+            .build_playwright_script(&profile_dir, "ABCD-EFGH", None, None, false)
+            .expect("bounded OpenAI script");
+        assert!(super::super::decode_node_script_input(&script)["artifacts_dir"].is_null());
+    }
+
+    #[test]
+    fn openai_script_input_enforces_exact_and_one_over_field_limit() {
+        let flow = OpenAiDeviceAuthFlow::with_defaults();
+        let exact = "x".repeat(super::super::BROWSER_NODE_INPUT_MAX_FIELD_BYTES);
+        assert!(
+            flow.build_playwright_script(
+                Path::new("/tmp/profile"),
+                "ABCD-EFGH",
+                Some(&exact),
+                None,
+                false,
+            )
+            .is_ok()
+        );
+        let one_over = format!("{exact}x");
+        assert_eq!(
+            flow.build_playwright_script(
+                Path::new("/tmp/profile"),
+                "ABCD-EFGH",
+                Some(&one_over),
+                None,
+                false,
+            ),
+            Err(super::super::BrowserNodeCommandFailure::ScriptOversized)
+        );
+    }
+
+    #[test]
+    fn success_requires_storage_state() {
+        let result = OpenAiDeviceAuthFlow::parse_playwright_result(r#"{"status":"success"}"#);
+        match result {
+            Err(error) => assert_eq!(
+                error.kind,
+                AuthFlowFailureKind::ProfilePersistenceFailed
+            ),
+            _ => panic!("success without durable state must fail closed"),
+        }
+    }
+
+    #[test]
+    fn script_honors_headless_and_avoids_sequential_or_generic_success_checks() {
+        let flow = OpenAiDeviceAuthFlow::with_defaults();
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "ABCD-EFGH",
+                None,
+                None,
+                true,
+            )
+            .expect("bounded headless OpenAI script");
+        let input = super::super::decode_node_script_input(&script);
+        assert_eq!(input["headless"], true);
+        assert!(script.contains("headless: input.headless"));
+        assert!(script.contains("Promise.all(successChecks)"));
+        assert!(script.contains("postEmailPassword"));
+        assert!(script.contains("sameOrigin(page.url(), deviceUrl)"));
+        assert!(script.contains("browser.storageState()"));
+        assert!(script.contains("fullPage: false"));
+        assert!(!script.contains("'authorized'"));
+        assert!(!script.contains("page.textContent('body')"));
+    }
+
+    #[test]
+    fn node_runner_is_stdin_bounded_and_never_uses_inline_argv() {
+        let source = include_str!("openai_device.rs");
+        let start = source.find("fn run_playwright_flow(").expect("runner source");
+        let tail = &source[start..];
+        let end = tail.find("\n    /// Build the Node.js/Playwright script").expect("runner boundary");
+        let body = &tail[..end];
+        assert!(body.contains("run_node_script_bounded"));
+        assert!(!body.contains("std::process::Command"));
+        assert!(!body.contains(".arg(\"-e\")"));
+        assert!(!body.contains("stderr_summary"));
     }
 }

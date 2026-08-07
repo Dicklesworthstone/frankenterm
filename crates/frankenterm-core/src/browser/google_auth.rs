@@ -24,15 +24,15 @@
 //! # Safety
 //!
 //! - Passwords, tokens, cookies, and session data are **never** logged.
-//! - On failure, artifacts (screenshot, redacted DOM snippet) are saved to the
-//!   workspace artifacts directory.
+//! - When explicitly configured, failure artifacts are private and bounded;
+//!   screenshots can contain sensitive page content and are not redacted.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::openai_device::{ArtifactCapture, ArtifactKind, AuthFlowFailureKind, AuthFlowResult};
-use super::{BrowserContext, BrowserStatus};
+use super::{BootstrapMethod, BrowserContext, BrowserStatus};
 
 // =============================================================================
 // Auth flow configuration
@@ -173,7 +173,9 @@ impl GoogleAuthFlow {
         // Step 1: Verify browser context is ready
         if *ctx.status() != BrowserStatus::Ready {
             return AuthFlowResult::Failed {
-                error: format!("Browser context not ready: {:?}", ctx.status()),
+                error: AuthFlowFailureKind::BrowserNotReady
+                    .stable_detail()
+                    .to_string(),
                 kind: AuthFlowFailureKind::BrowserNotReady,
                 artifacts_dir: None,
             };
@@ -181,15 +183,22 @@ impl GoogleAuthFlow {
 
         // Step 2: Resolve the browser profile
         let profile = ctx.profile("google", account);
-        let profile_dir = profile.path();
+        let profile_dir = match profile.ensure_dir() {
+            Ok(path) => path,
+            Err(_) => {
+                return AuthFlowResult::Failed {
+                    error: AuthFlowFailureKind::ProfileUnavailable
+                        .stable_detail()
+                        .to_string(),
+                    kind: AuthFlowFailureKind::ProfileUnavailable,
+                    artifacts_dir: None,
+                };
+            }
+        };
 
         let target_url = auth_url.unwrap_or(&self.config.auth_url);
 
-        tracing::info!(
-            profile_dir = %profile_dir.display(),
-            account = %account,
-            "Starting Google OAuth auth flow"
-        );
+        tracing::info!("Starting Google OAuth auth flow");
         // NOTE: auth_url is intentionally NOT logged (may contain OAuth tokens)
 
         // Step 3: Build and run the Playwright script
@@ -197,13 +206,31 @@ impl GoogleAuthFlow {
         let artifacts_dir = self.prepare_artifacts_dir();
 
         let result =
-            self.run_playwright_flow(&profile_dir, target_url, email, artifacts_dir.as_deref());
+            self.run_playwright_flow(
+                &profile_dir,
+                target_url,
+                email,
+                artifacts_dir.as_deref(),
+                ctx.config().headless,
+            );
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         match result {
             Ok(outcome) => match outcome {
-                PlaywrightOutcome::Success => {
+                PlaywrightOutcome::Success { storage_state } => {
+                    if profile
+                        .record_authenticated_state(&storage_state, BootstrapMethod::Automated)
+                        .is_err()
+                    {
+                        return AuthFlowResult::Failed {
+                            error: AuthFlowFailureKind::ProfilePersistenceFailed
+                                .stable_detail()
+                                .to_string(),
+                            kind: AuthFlowFailureKind::ProfilePersistenceFailed,
+                            artifacts_dir,
+                        };
+                    }
                     tracing::info!(elapsed_ms, "Google auth flow completed successfully");
                     AuthFlowResult::Success { elapsed_ms }
                 }
@@ -222,7 +249,6 @@ impl GoogleAuthFlow {
             Err(e) => {
                 tracing::error!(
                     elapsed_ms,
-                    error = %e.error,
                     kind = ?e.kind,
                     "Google auth flow failed"
                 );
@@ -233,12 +259,9 @@ impl GoogleAuthFlow {
                          Error: {}\n\
                          Kind: {:?}\n\
                          Elapsed: {elapsed_ms}ms\n\
-                         Profile dir: {}\n\
-                         Account: {account}\n\
-                         Note: auth_url redacted for security\n",
+                         Sensitive execution inputs: redacted\n",
                         e.error,
                         e.kind,
-                        profile_dir.display(),
                     );
                     let _ = ArtifactCapture::write_artifact(
                         dir,
@@ -261,11 +284,8 @@ impl GoogleAuthFlow {
             .as_ref()
             .and_then(|a| match a.ensure_invocation_dir("google_auth") {
                 Ok(dir) => Some(dir),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Failed to create artifacts directory; continuing without artifacts"
-                    );
+                Err(_) => {
+                    tracing::warn!("Failed to create artifacts directory; continuing without artifacts");
                     None
                 }
             })
@@ -278,36 +298,42 @@ impl GoogleAuthFlow {
         auth_url: &str,
         email: Option<&str>,
         artifacts_dir: Option<&Path>,
+        headless: bool,
     ) -> Result<PlaywrightOutcome, PlaywrightFlowError> {
-        let script = self.build_playwright_script(profile_dir, auth_url, email, artifacts_dir);
-
-        let output = std::process::Command::new("node")
-            .arg("-e")
-            .arg(&script)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .map_err(|e| PlaywrightFlowError {
-                error: format!("Failed to spawn node process: {e}"),
+        let script = self
+            .build_playwright_script(profile_dir, auth_url, email, artifacts_dir, headless)
+            .map_err(|failure| PlaywrightFlowError {
+                error: failure.detail().to_string(),
                 kind: AuthFlowFailureKind::PlaywrightError,
             })?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
+        let output = super::run_node_script_bounded(
+            script,
+            self.config.flow_timeout_ms,
+            super::BROWSER_BOOTSTRAP_MAX_STDOUT_BYTES,
+        )
+        .map_err(|failure| PlaywrightFlowError {
+            error: failure.detail().to_string(),
+            kind: AuthFlowFailureKind::PlaywrightError,
+        })?;
+        let std::process::Output {
+            status,
+            stdout,
+            stderr,
+        } = output;
         if !stderr.is_empty() {
             tracing::debug!(
-                stderr_lines = stderr.lines().count(),
+                stderr_bytes = stderr.len(),
                 "Playwright subprocess stderr (content redacted in logs)"
             );
         }
+        drop(stderr);
+        let stdout = String::from_utf8(stdout).map_err(|_| PlaywrightFlowError {
+            error: "Playwright returned invalid result text".to_string(),
+            kind: AuthFlowFailureKind::PlaywrightError,
+        })?;
 
-        if !output.status.success() {
-            return Err(Self::parse_playwright_error(
-                &stdout,
-                &stderr,
-                output.status,
-            ));
+        if !status.success() {
+            return Err(Self::parse_playwright_error(&stdout));
         }
 
         Self::parse_playwright_result(&stdout)
@@ -320,49 +346,104 @@ impl GoogleAuthFlow {
         auth_url: &str,
         email: Option<&str>,
         artifacts_dir: Option<&Path>,
-    ) -> String {
-        let profile_dir_str = profile_dir
-            .display()
-            .to_string()
-            .replace('\\', "\\\\")
-            .replace('\'', "\\'");
-        let timeout = self.config.flow_timeout_ms;
-
+        headless: bool,
+    ) -> Result<String, super::BrowserNodeCommandFailure> {
         let sel = &self.config.selectors;
-        let signed_in_sel = &sel.signed_in_marker;
-        let email_input_sel = &sel.email_input;
-        let email_next_sel = &sel.email_next;
-        let password_sel = &sel.password_prompt;
-        let mfa_sel = &sel.mfa_indicator;
-        let security_key_sel = &sel.security_key_indicator;
-        let sso_sel = &sel.sso_indicator;
-        let verify_sel = &sel.verify_indicator;
+        super::admit_browser_timeout(self.config.flow_timeout_ms)?;
+        super::admit_browser_url(auth_url)?;
+        for selector_group in [
+            &sel.signed_in_marker,
+            &sel.email_input,
+            &sel.email_next,
+            &sel.password_prompt,
+            &sel.mfa_indicator,
+            &sel.security_key_indicator,
+            &sel.sso_indicator,
+            &sel.verify_indicator,
+        ] {
+            super::admit_selector_group(selector_group)?;
+        }
+        super::admit_node_script_input_parts(
+            &[
+                Some(auth_url),
+                email,
+                Some(&sel.signed_in_marker),
+                Some(&sel.email_input),
+                Some(&sel.email_next),
+                Some(&sel.password_prompt),
+                Some(&sel.mfa_indicator),
+                Some(&sel.security_key_indicator),
+                Some(&sel.sso_indicator),
+                Some(&sel.verify_indicator),
+            ],
+            &[Some(profile_dir), artifacts_dir],
+            &[],
+        )?;
+        let input = serde_json::json!({
+            "profile_dir": profile_dir.to_string_lossy(),
+            "auth_url": auth_url,
+            "email": email,
+            "artifacts_dir": artifacts_dir.map(|path| path.to_string_lossy().into_owned()),
+            "timeout_ms": self.config.flow_timeout_ms,
+            "headless": headless,
+            "screenshot_max_bytes": super::openai_device::SCREENSHOT_ARTIFACT_MAX_BYTES,
+            "selectors": {
+                "signed_in_marker": &sel.signed_in_marker,
+                "email_input": &sel.email_input,
+                "email_next": &sel.email_next,
+                "password_prompt": &sel.password_prompt,
+                "mfa_indicator": &sel.mfa_indicator,
+                "security_key_indicator": &sel.security_key_indicator,
+                "sso_indicator": &sel.sso_indicator,
+                "verify_indicator": &sel.verify_indicator,
+            },
+        });
+        let input_base64 = super::encode_node_script_input(&input)?;
 
-        let email_js = email
-            .map(|e| format!("'{}'", e.replace('\'', "\\'")))
-            .unwrap_or_else(|| "null".to_string());
-
-        let artifacts_js = artifacts_dir
-            .map(|d| format!("'{}'", d.display()))
-            .unwrap_or_else(|| "null".to_string());
-
-        let auth_url_escaped = auth_url.replace('\\', "\\\\").replace('\'', "\\'");
-
-        format!(
+        super::admit_node_script_source(format!(
             r#"
 const {{ chromium }} = require('playwright');
+const input = JSON.parse(Buffer.from('{input_base64}', 'base64').toString('utf8'));
+const fs = require('node:fs/promises');
+
+async function captureScreenshot(page, directory) {{
+  try {{
+    const png = await page.screenshot({{ fullPage: false, timeout: Math.min(5000, input.timeout_ms) }});
+    if (png.length > input.screenshot_max_bytes) return false;
+    await fs.writeFile(directory + '/screenshot.png', png, {{ flag: 'wx', mode: 0o600 }});
+    return true;
+  }} catch (_) {{
+    return false;
+  }}
+}}
+
+function sameOrigin(left, right) {{
+  try {{ return new URL(left).origin === new URL(right).origin; }} catch (_) {{ return false; }}
+}}
 
 (async () => {{
-  const TIMEOUT = {timeout};
-  const profileDir = '{profile_dir_str}';
-  const authUrl = '{auth_url_escaped}';
-  const email = {email_js};
-  const artifactsDir = {artifacts_js};
+  const TIMEOUT = input.timeout_ms;
+  const profileDir = input.profile_dir;
+  const authUrl = input.auth_url;
+  const email = input.email;
+  const artifactsDir = input.artifacts_dir;
+  const selectors = input.selectors;
+
+  async function finishSuccess() {{
+    if (!sameOrigin(page.url(), authUrl)) {{
+      console.log(JSON.stringify({{ status: 'error', kind: 'VerificationFailed' }}));
+    }} else {{
+      const state = await browser.storageState();
+      console.log(JSON.stringify({{ status: 'success', storage_state: JSON.stringify(state) }}));
+    }}
+    await browser.close();
+    process.exit(0);
+  }}
 
   let browser, context, page;
   try {{
     browser = await chromium.launchPersistentContext(profileDir, {{
-      headless: false,
+      headless: input.headless,
       timeout: TIMEOUT,
     }});
     page = browser.pages()[0] || await browser.newPage();
@@ -375,7 +456,7 @@ const {{ chromium }} = require('playwright');
     await page.waitForTimeout(2000);
 
     // Check if already signed in (account avatar/profile visible)
-    const signedInSelectors = "{signed_in_sel}".split(', ');
+    const signedInSelectors = selectors.signed_in_marker.split(', ');
     let alreadySignedIn = false;
     for (const sel of signedInSelectors) {{
       try {{
@@ -385,13 +466,11 @@ const {{ chromium }} = require('playwright');
     }}
 
     if (alreadySignedIn) {{
-      console.log(JSON.stringify({{ status: 'success' }}));
-      await browser.close();
-      process.exit(0);
+      await finishSuccess();
     }}
 
     // Check for "Verify it's you" / captcha
-    const verifySelectors = "{verify_sel}".split(', ');
+    const verifySelectors = selectors.verify_indicator.split(', ');
     let verifyDetected = false;
     for (const sel of verifySelectors) {{
       try {{
@@ -402,7 +481,7 @@ const {{ chromium }} = require('playwright');
 
     if (verifyDetected) {{
       if (artifactsDir) {{
-        await page.screenshot({{ path: artifactsDir + '/screenshot.png', fullPage: true }});
+        await captureScreenshot(page, artifactsDir);
       }}
       console.log(JSON.stringify({{
         status: 'interactive_required',
@@ -413,7 +492,7 @@ const {{ chromium }} = require('playwright');
     }}
 
     // Check for SSO/enterprise IdP redirect
-    const ssoSelectors = "{sso_sel}".split(', ');
+    const ssoSelectors = selectors.sso_indicator.split(', ');
     let ssoDetected = false;
     for (const sel of ssoSelectors) {{
       try {{
@@ -424,7 +503,7 @@ const {{ chromium }} = require('playwright');
 
     if (ssoDetected) {{
       if (artifactsDir) {{
-        await page.screenshot({{ path: artifactsDir + '/screenshot.png', fullPage: true }});
+        await captureScreenshot(page, artifactsDir);
       }}
       console.log(JSON.stringify({{
         status: 'interactive_required',
@@ -435,7 +514,7 @@ const {{ chromium }} = require('playwright');
     }}
 
     // Check for security key prompt
-    const securityKeySelectors = "{security_key_sel}".split(', ');
+    const securityKeySelectors = selectors.security_key_indicator.split(', ');
     let securityKeyDetected = false;
     for (const sel of securityKeySelectors) {{
       try {{
@@ -446,7 +525,7 @@ const {{ chromium }} = require('playwright');
 
     if (securityKeyDetected) {{
       if (artifactsDir) {{
-        await page.screenshot({{ path: artifactsDir + '/screenshot.png', fullPage: true }});
+        await captureScreenshot(page, artifactsDir);
       }}
       console.log(JSON.stringify({{
         status: 'interactive_required',
@@ -457,7 +536,7 @@ const {{ chromium }} = require('playwright');
     }}
 
     // Check for MFA / 2-step verification
-    const mfaSelectors = "{mfa_sel}".split(', ');
+    const mfaSelectors = selectors.mfa_indicator.split(', ');
     let mfaDetected = false;
     for (const sel of mfaSelectors) {{
       try {{
@@ -468,7 +547,7 @@ const {{ chromium }} = require('playwright');
 
     if (mfaDetected) {{
       if (artifactsDir) {{
-        await page.screenshot({{ path: artifactsDir + '/screenshot.png', fullPage: true }});
+        await captureScreenshot(page, artifactsDir);
       }}
       console.log(JSON.stringify({{
         status: 'interactive_required',
@@ -479,10 +558,10 @@ const {{ chromium }} = require('playwright');
     }}
 
     // Check for password prompt
-    const passwordEl = await page.$('{password_sel}');
+    const passwordEl = await page.$(selectors.password_prompt);
     if (passwordEl) {{
       if (artifactsDir) {{
-        await page.screenshot({{ path: artifactsDir + '/screenshot.png', fullPage: true }});
+        await captureScreenshot(page, artifactsDir);
       }}
       console.log(JSON.stringify({{
         status: 'interactive_required',
@@ -493,10 +572,10 @@ const {{ chromium }} = require('playwright');
     }}
 
     // Check for email prompt
-    const emailEl = await page.$('{email_input_sel}');
+    const emailEl = await page.$(selectors.email_input);
     if (emailEl && email) {{
       await emailEl.fill(email);
-      const emailNext = await page.$('{email_next_sel}');
+      const emailNext = await page.$(selectors.email_next);
       if (emailNext) await emailNext.click();
 
       // Wait for navigation after email submission
@@ -504,10 +583,10 @@ const {{ chromium }} = require('playwright');
       await page.waitForTimeout(2000);
 
       // After email: check for password/MFA/SSO/security key
-      const postEmailPassword = await page.$('{password_sel}');
+      const postEmailPassword = await page.$(selectors.password_prompt);
       if (postEmailPassword) {{
         if (artifactsDir) {{
-          await page.screenshot({{ path: artifactsDir + '/screenshot.png', fullPage: true }});
+          await captureScreenshot(page, artifactsDir);
         }}
         console.log(JSON.stringify({{
           status: 'interactive_required',
@@ -528,7 +607,7 @@ const {{ chromium }} = require('playwright');
 
       if (postEmailMfa) {{
         if (artifactsDir) {{
-          await page.screenshot({{ path: artifactsDir + '/screenshot.png', fullPage: true }});
+          await captureScreenshot(page, artifactsDir);
         }}
         console.log(JSON.stringify({{
           status: 'interactive_required',
@@ -536,6 +615,25 @@ const {{ chromium }} = require('playwright');
         }}));
         await browser.close();
         process.exit(0);
+      }}
+
+      for (const [candidateSelectors, reason] of [
+        [verifySelectors, 'Verification challenge or captcha detected — human intervention required'],
+        [ssoSelectors, 'SSO/enterprise identity provider detected — human must complete SSO flow'],
+        [securityKeySelectors, 'Security key prompt detected — human must use physical security key']
+      ]) {{
+        let detected = false;
+        for (const sel of candidateSelectors) {{
+          try {{
+            if (await page.$(sel)) {{ detected = true; break; }}
+          }} catch (_) {{}}
+        }}
+        if (detected) {{
+          if (artifactsDir) await captureScreenshot(page, artifactsDir);
+          console.log(JSON.stringify({{ status: 'interactive_required', reason }}));
+          await browser.close();
+          process.exit(0);
+        }}
       }}
 
       // Re-check if we landed on a signed-in page (e.g., OAuth consent)
@@ -547,13 +645,11 @@ const {{ chromium }} = require('playwright');
       }}
 
       if (alreadySignedIn) {{
-        console.log(JSON.stringify({{ status: 'success' }}));
-        await browser.close();
-        process.exit(0);
+        await finishSuccess();
       }}
     }} else if (emailEl && !email) {{
       if (artifactsDir) {{
-        await page.screenshot({{ path: artifactsDir + '/screenshot.png', fullPage: true }});
+        await captureScreenshot(page, artifactsDir);
       }}
       console.log(JSON.stringify({{
         status: 'interactive_required',
@@ -565,7 +661,7 @@ const {{ chromium }} = require('playwright');
 
     // Unrecognized page state
     if (artifactsDir) {{
-      await page.screenshot({{ path: artifactsDir + '/screenshot.png', fullPage: true }});
+      await captureScreenshot(page, artifactsDir);
     }}
     console.log(JSON.stringify({{
       status: 'error',
@@ -577,20 +673,19 @@ const {{ chromium }} = require('playwright');
   }} catch (err) {{
     if (page && artifactsDir) {{
       try {{
-        await page.screenshot({{ path: artifactsDir + '/screenshot.png', fullPage: true }});
+        await captureScreenshot(page, artifactsDir);
       }} catch (_) {{}}
     }}
     console.log(JSON.stringify({{
       status: 'error',
-      kind: 'PlaywrightError',
-      message: err.message
+      kind: 'PlaywrightError'
     }}));
     if (browser) await browser.close().catch(() => {{}});
     process.exit(1);
   }}
 }})();
 "#
-        )
+        ))
     }
 
     /// Parse a successful Playwright script result from stdout JSON.
@@ -610,82 +705,74 @@ const {{ chromium }} = require('playwright');
             .unwrap_or(trimmed);
 
         let parsed: serde_json::Value =
-            serde_json::from_str(json_line).map_err(|e| PlaywrightFlowError {
-                error: format!("Failed to parse Playwright output as JSON: {e}"),
+            serde_json::from_str(json_line).map_err(|_| PlaywrightFlowError {
+                error: "Playwright returned malformed result JSON".to_string(),
                 kind: AuthFlowFailureKind::PlaywrightError,
             })?;
 
         match parsed.get("status").and_then(|s| s.as_str()) {
-            Some("success") => Ok(PlaywrightOutcome::Success),
+            Some("success") => {
+                let storage_state = parsed
+                    .get("storage_state")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| PlaywrightFlowError {
+                        error: AuthFlowFailureKind::ProfilePersistenceFailed
+                            .stable_detail()
+                            .to_string(),
+                        kind: AuthFlowFailureKind::ProfilePersistenceFailed,
+                    })?
+                    .as_bytes()
+                    .to_vec();
+                Ok(PlaywrightOutcome::Success { storage_state })
+            }
             Some("interactive_required") => {
-                let reason = parsed
-                    .get("reason")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("interactive login required")
-                    .to_string();
+                let reason = match parsed.get("reason").and_then(serde_json::Value::as_str) {
+                    Some("Verification challenge or captcha detected — human intervention required") => "Verification challenge or captcha detected — human intervention required",
+                    Some("SSO/enterprise identity provider detected — human must complete SSO flow") => "SSO/enterprise identity provider detected — human must complete SSO flow",
+                    Some("Security key prompt detected — human must use physical security key") => "Security key prompt detected — human must use physical security key",
+                    Some("MFA / 2-step verification required — human must complete verification") => "MFA / 2-step verification required — human must complete verification",
+                    Some("Password prompt detected — interactive bootstrap required") => "Password prompt detected — interactive bootstrap required",
+                    Some("Password required after email entry — interactive bootstrap required") => "Password required after email entry — interactive bootstrap required",
+                    Some("MFA / 2-step verification after email — human must complete verification") => "MFA / 2-step verification after email — human must complete verification",
+                    Some("Email prompt detected but no email provided — interactive bootstrap required") => "Email prompt detected but no email provided — interactive bootstrap required",
+                    _ => "Interactive login is required to continue",
+                }.to_string();
                 Ok(PlaywrightOutcome::InteractiveRequired(reason))
             }
             Some("error") => {
-                let kind_str = parsed
-                    .get("kind")
-                    .and_then(|k| k.as_str())
-                    .unwrap_or("Unknown");
-                let message = parsed
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown error")
-                    .to_string();
-                let kind = match kind_str {
-                    "VerificationFailed" => AuthFlowFailureKind::VerificationFailed,
-                    "SelectorMismatch" => AuthFlowFailureKind::SelectorMismatch,
-                    "NavigationFailed" => AuthFlowFailureKind::NavigationFailed,
-                    "BotDetected" => AuthFlowFailureKind::BotDetected,
-                    _ => AuthFlowFailureKind::PlaywrightError,
-                };
+                let kind = AuthFlowFailureKind::from_script_label(
+                    parsed.get("kind").and_then(serde_json::Value::as_str),
+                );
                 Err(PlaywrightFlowError {
-                    error: message,
+                    error: kind.stable_detail().to_string(),
                     kind,
                 })
             }
             _ => Err(PlaywrightFlowError {
-                error: format!("Unexpected Playwright output status: {json_line}"),
+                error: AuthFlowFailureKind::Unknown.stable_detail().to_string(),
                 kind: AuthFlowFailureKind::Unknown,
             }),
         }
     }
 
     /// Parse error information from a failed Playwright subprocess.
-    fn parse_playwright_error(
-        stdout: &str,
-        stderr: &str,
-        status: std::process::ExitStatus,
-    ) -> PlaywrightFlowError {
+    fn parse_playwright_error(stdout: &str) -> PlaywrightFlowError {
         if let Some(json_line) = stdout.trim().lines().rev().find(|l| l.starts_with('{')) {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_line) {
-                if let Some(message) = parsed.get("message").and_then(|m| m.as_str()) {
-                    let kind_str = parsed
-                        .get("kind")
-                        .and_then(|k| k.as_str())
-                        .unwrap_or("PlaywrightError");
-                    let kind = match kind_str {
-                        "VerificationFailed" => AuthFlowFailureKind::VerificationFailed,
-                        "SelectorMismatch" => AuthFlowFailureKind::SelectorMismatch,
-                        "NavigationFailed" => AuthFlowFailureKind::NavigationFailed,
-                        "BotDetected" => AuthFlowFailureKind::BotDetected,
-                        _ => AuthFlowFailureKind::PlaywrightError,
-                    };
-                    return PlaywrightFlowError {
-                        error: message.to_string(),
-                        kind,
-                    };
-                }
+                let kind = AuthFlowFailureKind::from_script_label(
+                    parsed.get("kind").and_then(serde_json::Value::as_str),
+                );
+                return PlaywrightFlowError {
+                    error: kind.stable_detail().to_string(),
+                    kind,
+                };
             }
         }
 
-        let stderr_summary = stderr.lines().take(5).collect::<Vec<_>>().join("; ");
-
         PlaywrightFlowError {
-            error: format!("Playwright process exited with {status}: {stderr_summary}"),
+            error: AuthFlowFailureKind::PlaywrightError
+                .stable_detail()
+                .to_string(),
             kind: AuthFlowFailureKind::PlaywrightError,
         }
     }
@@ -694,7 +781,7 @@ const {{ chromium }} = require('playwright');
 /// Internal outcome from the Playwright subprocess.
 enum PlaywrightOutcome {
     /// Flow completed successfully (already authenticated).
-    Success,
+    Success { storage_state: Vec<u8> },
     /// Interactive login is required (password/MFA/SSO/captcha/security key).
     InteractiveRequired(String),
 }
@@ -834,15 +921,14 @@ mod tests {
 
     #[test]
     fn parse_success_result() {
-        let stdout = r#"{"status":"success"}"#;
+        let stdout = r#"{"status":"success","storage_state":"{\"cookies\":[],\"origins\":[]}"}"#;
         let result = GoogleAuthFlow::parse_playwright_result(stdout);
-        assert!(matches!(result, Ok(PlaywrightOutcome::Success)));
+        assert!(matches!(result, Ok(PlaywrightOutcome::Success { .. })));
     }
 
     #[test]
     fn parse_interactive_required_result() {
-        let stdout =
-            r#"{"status":"interactive_required","reason":"MFA / 2-step verification required"}"#;
+        let stdout = r#"{"status":"interactive_required","reason":"MFA / 2-step verification required — human must complete verification"}"#;
         let result = GoogleAuthFlow::parse_playwright_result(stdout);
         match result {
             Ok(PlaywrightOutcome::InteractiveRequired(reason)) => {
@@ -860,7 +946,8 @@ mod tests {
         match result {
             Err(e) => {
                 assert_eq!(e.kind, AuthFlowFailureKind::SelectorMismatch);
-                assert!(e.error.contains("No selectors matched"));
+                assert_eq!(e.error, AuthFlowFailureKind::SelectorMismatch.stable_detail());
+                assert!(!e.error.contains("No selectors matched"));
             }
             _ => panic!("Expected error"),
         }
@@ -874,9 +961,9 @@ mod tests {
 
     #[test]
     fn parse_result_finds_last_json_line() {
-        let stdout = "debug output\n{\"status\":\"success\"}";
+        let stdout = "debug output\n{\"status\":\"success\",\"storage_state\":\"{\\\"cookies\\\":[],\\\"origins\\\":[]}\"}";
         let result = GoogleAuthFlow::parse_playwright_result(stdout);
-        assert!(matches!(result, Ok(PlaywrightOutcome::Success)));
+        assert!(matches!(result, Ok(PlaywrightOutcome::Success { .. })));
     }
 
     #[test]
@@ -896,15 +983,20 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn script_contains_auth_url() {
+    fn script_transports_auth_url_without_plaintext_literal() {
         let flow = GoogleAuthFlow::with_defaults();
         let script = flow.build_playwright_script(
             Path::new("/tmp/profile"),
             "https://accounts.google.com/",
             None,
             None,
+            false,
+        ).expect("bounded Google script");
+        assert!(!script.contains("accounts.google.com"));
+        assert_eq!(
+            super::super::decode_node_script_input(&script)["auth_url"],
+            "https://accounts.google.com/"
         );
-        assert!(script.contains("accounts.google.com"));
     }
 
     #[test]
@@ -915,8 +1007,13 @@ mod tests {
             "https://accounts.google.com/",
             Some("user@gmail.com"),
             None,
+            false,
+        ).expect("bounded Google script");
+        assert!(!script.contains("user@gmail.com"));
+        assert_eq!(
+            super::super::decode_node_script_input(&script)["email"],
+            "user@gmail.com"
         );
-        assert!(script.contains("user@gmail.com"));
     }
 
     #[test]
@@ -927,8 +1024,9 @@ mod tests {
             "https://accounts.google.com/",
             None,
             None,
-        );
-        assert!(script.contains("const email = null;"));
+            false,
+        ).expect("bounded Google script");
+        assert!(super::super::decode_node_script_input(&script)["email"].is_null());
     }
 
     #[test]
@@ -939,9 +1037,14 @@ mod tests {
             "https://accounts.google.com/",
             None,
             None,
-        );
+            false,
+        ).expect("bounded Google script");
         assert!(script.contains("alreadySignedIn"));
-        assert!(script.contains("googleusercontent"));
+        assert!(
+            super::super::decode_node_script_input(&script)["selectors"]["signed_in_marker"]
+                .as_str()
+                .is_some_and(|value| value.contains("googleusercontent"))
+        );
     }
 
     #[test]
@@ -952,8 +1055,13 @@ mod tests {
             "https://accounts.google.com/",
             None,
             None,
+            false,
+        ).expect("bounded Google script");
+        assert!(
+            super::super::decode_node_script_input(&script)["selectors"]["password_prompt"]
+                .as_str()
+                .is_some_and(|value| value.contains("password"))
         );
-        assert!(script.contains("password"));
         assert!(script.contains("interactive_required"));
     }
 
@@ -965,8 +1073,13 @@ mod tests {
             "https://accounts.google.com/",
             None,
             None,
+            false,
+        ).expect("bounded Google script");
+        assert!(
+            super::super::decode_node_script_input(&script)["selectors"]["mfa_indicator"]
+                .as_str()
+                .is_some_and(|value| value.contains("2-Step Verification"))
         );
-        assert!(script.contains("2-Step Verification"));
         assert!(script.contains("mfaDetected"));
     }
 
@@ -978,8 +1091,14 @@ mod tests {
             "https://accounts.google.com/",
             None,
             None,
+            false,
+        ).expect("bounded Google script");
+        assert!(
+            super::super::decode_node_script_input(&script)["selectors"]
+                ["security_key_indicator"]
+                .as_str()
+                .is_some_and(|value| value.contains("security key"))
         );
-        assert!(script.contains("security key"));
         assert!(script.contains("securityKeyDetected"));
     }
 
@@ -991,8 +1110,13 @@ mod tests {
             "https://accounts.google.com/",
             None,
             None,
+            false,
+        ).expect("bounded Google script");
+        assert!(
+            super::super::decode_node_script_input(&script)["selectors"]["sso_indicator"]
+                .as_str()
+                .is_some_and(|value| value.contains("identity provider"))
         );
-        assert!(script.contains("identity provider"));
         assert!(script.contains("ssoDetected"));
     }
 
@@ -1004,8 +1128,13 @@ mod tests {
             "https://accounts.google.com/o/oauth2/auth?client_id=123",
             None,
             None,
+            false,
+        ).expect("bounded Google script");
+        assert!(!script.contains("oauth2/auth?client_id=123"));
+        assert_eq!(
+            super::super::decode_node_script_input(&script)["auth_url"],
+            "https://accounts.google.com/o/oauth2/auth?client_id=123"
         );
-        assert!(script.contains("oauth2/auth?client_id=123"));
     }
 
     // =========================================================================
@@ -1014,22 +1143,98 @@ mod tests {
 
     #[test]
     fn parse_playwright_error_from_json() {
-        let stdout = r#"{"status":"error","kind":"NavigationFailed","message":"timeout"}"#;
-        let error =
-            GoogleAuthFlow::parse_playwright_error(stdout, "", std::process::ExitStatus::default());
+        let stdout = r#"{"status":"error","kind":"NavigationFailed","message":"/private/secret"}"#;
+        let error = GoogleAuthFlow::parse_playwright_error(stdout);
         assert_eq!(error.kind, AuthFlowFailureKind::NavigationFailed);
-        assert!(error.error.contains("timeout"));
+        assert_eq!(error.error, AuthFlowFailureKind::NavigationFailed.stable_detail());
+        assert!(!error.error.contains("secret"));
     }
 
     #[test]
-    fn parse_playwright_error_from_stderr_fallback() {
-        let error = GoogleAuthFlow::parse_playwright_error(
-            "",
-            "Error: Browser closed unexpectedly",
-            std::process::ExitStatus::default(),
-        );
+    fn parse_playwright_error_fallback_is_content_free() {
+        let error = GoogleAuthFlow::parse_playwright_error("");
         assert_eq!(error.kind, AuthFlowFailureKind::PlaywrightError);
-        assert!(error.error.contains("Browser closed"));
+        assert_eq!(error.error, AuthFlowFailureKind::PlaywrightError.stable_detail());
+    }
+
+    #[test]
+    fn hostile_google_input_round_trips_without_javascript_literal_injection() {
+        let hostile_email = "mail'\\\n\u{2028}@example.com";
+        let flow = GoogleAuthFlow::with_defaults();
+        let script = flow.build_playwright_script(
+            Path::new("/tmp/profile'\\\n"),
+            "https://example.invalid/login?token=secret",
+            Some(hostile_email),
+            None,
+            false,
+        ).expect("bounded hostile Google script");
+        assert!(!script.contains(hostile_email));
+        assert!(!script.contains("token=secret"));
+        assert!(!script.contains('\u{2028}'));
+        let input = super::super::decode_node_script_input(&script);
+        assert_eq!(input["auth_url"], "https://example.invalid/login?token=secret");
+        assert_eq!(input["email"], hostile_email);
+    }
+
+    #[test]
+    fn google_script_input_enforces_exact_and_one_over_field_limit() {
+        let flow = GoogleAuthFlow::with_defaults();
+        let exact = "x".repeat(super::super::BROWSER_NODE_INPUT_MAX_FIELD_BYTES);
+        assert!(
+            flow.build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://accounts.google.com/",
+                Some(&exact),
+                None,
+                false,
+            )
+                .is_ok()
+        );
+        let one_over = format!("{exact}x");
+        assert_eq!(
+            flow.build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://accounts.google.com/",
+                Some(&one_over),
+                None,
+                false,
+            ),
+            Err(super::super::BrowserNodeCommandFailure::ScriptOversized)
+        );
+    }
+
+    #[test]
+    fn script_propagates_headless_policy_and_checks_post_email_challenges() {
+        let flow = GoogleAuthFlow::with_defaults();
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://accounts.google.com/",
+                None,
+                None,
+                true,
+            )
+            .expect("bounded headless Google script");
+        let input = super::super::decode_node_script_input(&script);
+        assert_eq!(input["headless"], true);
+        assert!(script.contains("headless: input.headless"));
+        assert!(script.contains("candidateSelectors"));
+        assert!(script.contains("sameOrigin(page.url(), authUrl)"));
+        assert!(script.contains("browser.storageState()"));
+        assert!(script.contains("fullPage: false"));
+    }
+
+    #[test]
+    fn node_runner_is_stdin_bounded_and_never_uses_inline_argv() {
+        let source = include_str!("google_auth.rs");
+        let start = source.find("fn run_playwright_flow(").expect("runner source");
+        let tail = &source[start..];
+        let end = tail.find("\n    /// Build the Node.js/Playwright script").expect("runner boundary");
+        let body = &tail[..end];
+        assert!(body.contains("run_node_script_bounded"));
+        assert!(!body.contains("std::process::Command"));
+        assert!(!body.contains(".arg(\"-e\")"));
+        assert!(!body.contains("stderr_summary"));
     }
 
     // -- Additional coverage to reach 30 tests --

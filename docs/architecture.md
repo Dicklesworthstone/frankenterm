@@ -64,7 +64,8 @@ Watcher startup currently wires these components in-process:
    - metrics server (feature-gated)
    - snapshot engine
    - scheduled backups
-   - orphan reaper
+   - fail-closed orphan-cleanup safety barrier (no global process scan or PID
+     signalling; reserved for a future handle-owned child registry)
    - mux watchdog.
 
 ### Observation runtime internals (`crates/frankenterm-core/src/runtime.rs`)

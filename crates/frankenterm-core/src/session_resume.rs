@@ -9,14 +9,22 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::casr_types::{
     CanonicalMessage, CanonicalSession, CasrListEntry, CasrProviderStatus, CasrResumeOutput,
+};
+use crate::runtime_async::process::{
+    Command, CommandCancellation, CommandCancelled, CommandCleanupTrigger,
+    CommandOutputCaptureIncomplete, CommandOutputLimitExceeded,
+    CommandOutputStream, CommandProcessCleanupIncomplete, CommandTimedOut,
+    DEFAULT_COMMAND_STDERR_LIMIT_BYTES, DEFAULT_COMMAND_STDOUT_LIMIT_BYTES,
+    decode_captured_bytes_lossy,
 };
 
 // =============================================================================
@@ -74,11 +82,7 @@ impl NativeResumePlan {
             return Ok(());
         }
 
-        Err(SessionResumeError::NativeProviderNotFound {
-            provider_slug: self.provider_slug.clone(),
-            binary: self.binary.clone(),
-            message: format!("{} binary was not found on PATH", self.binary),
-        })
+        Err(SessionResumeError::NativeProviderNotFound)
     }
 }
 
@@ -164,7 +168,108 @@ fn default_timeout_secs() -> u64 {
     30
 }
 
-const CASR_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const CASR_STDOUT_LIMIT_BYTES: usize = DEFAULT_COMMAND_STDOUT_LIMIT_BYTES;
+const CASR_STDERR_LIMIT_BYTES: usize = DEFAULT_COMMAND_STDERR_LIMIT_BYTES;
+
+/// Hard admission ceiling for a caller-requested CASR stdout capture budget.
+/// Parsing a JSON payload has non-trivial memory amplification, so an embedding
+/// caller may widen the default but may not turn this bridge into an effectively
+/// unbounded collector.
+pub const MAX_CASR_STDOUT_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+/// Hard admission ceiling for caller-requested CASR stderr capture.
+pub const MAX_CASR_STDERR_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum number of sessions admitted from all discovery sources combined.
+pub const MAX_SESSION_DISCOVERY_ENTRIES: usize = 10_000;
+/// Maximum bytes admitted for a session identifier crossing into argv or a
+/// public discovery result.
+pub const MAX_SESSION_RESUME_ID_BYTES: usize = 256;
+/// Maximum bytes admitted for a provider slug crossing into argv.
+pub const MAX_SESSION_RESUME_PROVIDER_BYTES: usize = 64;
+const SESSION_RESUME_CX_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Finite identity for a session-discovery source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionDiscoverySource {
+    Casr,
+    NativeAntigravity,
+    Merged,
+}
+
+impl std::fmt::Display for SessionDiscoverySource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Casr => "casr",
+            Self::NativeAntigravity => "native_antigravity",
+            Self::Merged => "merged",
+        })
+    }
+}
+
+/// Why one discovery source could not provide a complete result.
+///
+/// These labels deliberately carry no executable path, home directory,
+/// session identifier, or subprocess output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionDiscoveryIncompleteReason {
+    Unavailable,
+    TimedOut,
+    SubprocessFailed,
+    InvalidOutput,
+    OutputCaptureIncomplete,
+    DirectoryUnreadable,
+    DirectoryEntryUnreadable,
+}
+
+/// Explicit evidence that a returned discovery report is partial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SessionDiscoveryIncomplete {
+    pub source: SessionDiscoverySource,
+    pub reason: SessionDiscoveryIncompleteReason,
+}
+
+/// Bounded discovery result. Callers must consult [`Self::is_complete`] before
+/// presenting the entries as an exhaustive inventory.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionDiscoveryResult {
+    pub entries: Vec<CasrListEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete: Vec<SessionDiscoveryIncomplete>,
+}
+
+impl SessionDiscoveryResult {
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.incomplete.is_empty()
+    }
+
+    fn mark_incomplete(
+        &mut self,
+        source: SessionDiscoverySource,
+        reason: SessionDiscoveryIncompleteReason,
+    ) {
+        let evidence = SessionDiscoveryIncomplete { source, reason };
+        if !self.incomplete.contains(&evidence) {
+            self.incomplete.push(evidence);
+        }
+    }
+}
+
+/// Finite reason that a native Antigravity conversation identifier was
+/// rejected before it could cross into argv.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeSessionIdInvalidReason {
+    WrongShape,
+}
+
+impl std::fmt::Display for NativeSessionIdInvalidReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::WrongShape => "wrong_shape",
+        })
+    }
+}
 
 /// Build the checked native Antigravity resume plan with the mandatory model pin.
 pub fn antigravity_native_resume_plan(
@@ -181,17 +286,14 @@ pub fn antigravity_native_resume_plan_with_model(
     let trimmed_id = session_id.trim();
     if !is_valid_antigravity_conversation_id(trimmed_id) {
         return Err(SessionResumeError::InvalidNativeSessionId {
-            provider_slug: AgentProvider::Antigravity.slug().to_string(),
-            session_id: session_id.to_string(),
-            reason: "expected canonical UUID filename stem with no path separators".to_string(),
+            input_bytes: session_id.len(),
+            reason: NativeSessionIdInvalidReason::WrongShape,
         });
     }
 
     if model_name != ANTIGRAVITY_MODEL {
         return Err(SessionResumeError::NonPinnedNativeModel {
-            provider_slug: AgentProvider::Antigravity.slug().to_string(),
-            requested_model: model_name.to_string(),
-            required_model: ANTIGRAVITY_MODEL.to_string(),
+            requested_model_bytes: model_name.len(),
         });
     }
 
@@ -238,7 +340,7 @@ pub fn is_valid_antigravity_conversation_id(session_id: &str) -> bool {
 fn binary_exists_on_path(binary: &str, path_env: Option<&str>) -> bool {
     let binary_path = Path::new(binary);
     if binary_path.components().count() > 1 {
-        return binary_path.is_file();
+        return is_executable_binary(binary_path);
     }
 
     let Some(paths) = path_env
@@ -248,7 +350,23 @@ fn binary_exists_on_path(binary: &str, path_env: Option<&str>) -> bool {
         return false;
     };
 
-    std::env::split_paths(&paths).any(|dir| dir.join(binary).is_file())
+    std::env::split_paths(&paths).any(|dir| is_executable_binary(&dir.join(binary)))
+}
+
+#[cfg(unix)]
+fn is_executable_binary(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) | Err(_) => return false,
+    };
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable_binary(path: &Path) -> bool {
+    path.is_file()
 }
 
 impl Default for SessionResumeConfig {
@@ -290,93 +408,247 @@ pub struct RecorderCasrExport {
 #[derive(Debug, Clone)]
 pub struct SessionResumer {
     config: SessionResumeConfig,
+    stdout_limit: usize,
+    stderr_limit: usize,
 }
 
 /// Error type for session resume operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionResumeError {
     /// The casr binary was not found or not executable.
-    CasrNotFound(String),
+    CasrNotFound,
     /// The subprocess exited with a non-zero code.
-    SubprocessFailed { code: Option<i32>, stderr: String },
+    SubprocessFailed { code: Option<i32> },
     /// Failed to parse JSON output from casr.
-    ParseError(String),
+    ParseError { output_bytes: usize },
     /// The requested session was not found.
-    SessionNotFound(String),
+    SessionNotFound { identifier_bytes: usize },
     /// Provider is not installed.
-    ProviderNotInstalled(String),
+    ProviderNotInstalled,
     /// Native provider binary was not found.
-    NativeProviderNotFound {
-        provider_slug: String,
-        binary: String,
-        message: String,
-    },
+    NativeProviderNotFound,
     /// Native provider session id is malformed or unsafe.
     InvalidNativeSessionId {
-        provider_slug: String,
-        session_id: String,
-        reason: String,
+        input_bytes: usize,
+        reason: NativeSessionIdInvalidReason,
     },
     /// Native provider model override violated the provider contract.
-    NonPinnedNativeModel {
-        provider_slug: String,
-        requested_model: String,
-        required_model: String,
+    NonPinnedNativeModel { requested_model_bytes: usize },
+    /// A general CASR session identifier was rejected before argv assembly.
+    InvalidSessionIdentifier { input_bytes: usize },
+    /// A provider slug was rejected before argv assembly.
+    InvalidProviderSlug { input_bytes: usize },
+    /// A configured working directory is unavailable or is not a directory.
+    WorkingDirectoryUnavailable,
+    /// A caller-requested capture limit exceeded the bridge's hard admission
+    /// ceiling.
+    InvalidOutputLimit {
+        stream: CommandOutputStream,
+        requested: usize,
+        maximum: usize,
     },
-    /// Operation was cancelled or timed out.
+    /// The subprocess crossed an admitted capture limit.
+    CaptureLimitExceeded {
+        stream: CommandOutputStream,
+        observed: usize,
+        limit: usize,
+    },
+    /// A discovery source or merged result crossed the bounded entry ceiling.
+    DiscoveryLimitExceeded {
+        source: SessionDiscoverySource,
+        limit: usize,
+    },
+    /// The async blocking executor or cancellation bridge failed without a
+    /// trustworthy caller-cancellation classification.
+    AsyncInfrastructureFailure,
+    /// Operation exceeded its configured wall-clock deadline.
     Timeout,
+    /// Operation was deliberately cancelled by its caller.
+    Cancelled,
+    /// The child leader exited but inherited output descriptors did not close
+    /// inside the finite post-exit drain window.
+    CaptureIncomplete {
+        stdout_open: bool,
+        stderr_open: bool,
+        drain_timeout_ms: u64,
+    },
+    /// The initiating failure was observed, but bounded process cleanup could
+    /// not prove leader reap, process-tree signalling, and capture closure.
+    CleanupIncomplete {
+        trigger: CommandCleanupTrigger,
+        leader_reaped: bool,
+        signal_helper_settled: bool,
+        process_tree_signalled: bool,
+        stdout_open: bool,
+        stderr_open: bool,
+        settle_timeout_ms: u64,
+    },
 }
 
 impl std::fmt::Display for SessionResumeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CasrNotFound(msg) => write!(f, "casr not found: {}", msg),
-            Self::SubprocessFailed { code, stderr } => {
-                write!(f, "casr failed (exit {}): {}", code.unwrap_or(-1), stderr)
+            Self::CasrNotFound => f.write_str("casr command unavailable"),
+            Self::SubprocessFailed { code } => {
+                write!(f, "casr subprocess failed (exit {})", code.unwrap_or(-1))
             }
-            Self::ParseError(msg) => write!(f, "casr parse error: {}", msg),
-            Self::SessionNotFound(id) => write!(f, "session not found: {}", id),
-            Self::ProviderNotInstalled(slug) => {
-                write!(f, "provider not installed: {}", slug)
+            Self::ParseError { output_bytes } => {
+                write!(f, "casr returned invalid JSON ({output_bytes} bytes)")
             }
-            Self::NativeProviderNotFound {
-                provider_slug,
-                binary,
-                message,
-            } => write!(
-                f,
-                "native provider {} binary not found ({}): {}",
-                provider_slug, binary, message
-            ),
+            Self::SessionNotFound { identifier_bytes } => {
+                write!(f, "session not found (identifier_bytes={identifier_bytes})")
+            }
+            Self::ProviderNotInstalled => f.write_str("provider not installed"),
+            Self::NativeProviderNotFound => {
+                f.write_str("native provider binary unavailable")
+            }
             Self::InvalidNativeSessionId {
-                provider_slug,
-                session_id,
+                input_bytes,
                 reason,
             } => write!(
                 f,
-                "invalid native provider {} session id {:?}: {}",
-                provider_slug, session_id, reason
+                "invalid native provider session id (input_bytes={input_bytes}, reason={reason})"
             ),
             Self::NonPinnedNativeModel {
-                provider_slug,
-                requested_model,
-                required_model,
+                requested_model_bytes,
             } => write!(
                 f,
-                "native provider {} requires model {:?}, got {:?}",
-                provider_slug, required_model, requested_model
+                "native provider model is not the required pinned model (requested_bytes={requested_model_bytes})"
             ),
+            Self::InvalidSessionIdentifier { input_bytes } => write!(
+                f,
+                "invalid session identifier (input_bytes={input_bytes})"
+            ),
+            Self::InvalidProviderSlug { input_bytes } => {
+                write!(f, "invalid provider slug (input_bytes={input_bytes})")
+            }
+            Self::WorkingDirectoryUnavailable => {
+                f.write_str("session-resume working directory unavailable")
+            }
+            Self::InvalidOutputLimit {
+                stream,
+                requested,
+                maximum,
+            } => write!(
+                f,
+                "invalid casr {stream} capture limit ({requested} > {maximum})"
+            ),
+            Self::CaptureLimitExceeded {
+                stream,
+                observed,
+                limit,
+            } => write!(
+                f,
+                "casr {stream} capture limit exceeded (observed_at_least={observed}, limit={limit})"
+            ),
+            Self::DiscoveryLimitExceeded { source, limit } => write!(
+                f,
+                "{source} session discovery exceeded the {limit}-entry limit"
+            ),
+            Self::AsyncInfrastructureFailure => {
+                f.write_str("session-resume async infrastructure failed")
+            }
             Self::Timeout => write!(f, "casr operation timed out"),
+            Self::Cancelled => write!(f, "casr operation cancelled"),
+            Self::CaptureIncomplete {
+                stdout_open,
+                stderr_open,
+                drain_timeout_ms,
+            } => write!(
+                f,
+                "casr output capture incomplete after {drain_timeout_ms} ms (stdout_open={stdout_open}, stderr_open={stderr_open})"
+            ),
+            Self::CleanupIncomplete {
+                trigger,
+                leader_reaped,
+                signal_helper_settled,
+                process_tree_signalled,
+                stdout_open,
+                stderr_open,
+                settle_timeout_ms,
+            } => write!(
+                f,
+                "casr process cleanup incomplete after {settle_timeout_ms} ms (trigger={trigger}, leader_reaped={leader_reaped}, signal_helper_settled={signal_helper_settled}, process_tree_signalled={process_tree_signalled}, stdout_open={stdout_open}, stderr_open={stderr_open})"
+            ),
         }
     }
 }
 
 impl std::error::Error for SessionResumeError {}
 
+fn validate_session_identifier(session_id: &str) -> Result<(), SessionResumeError> {
+    if session_id.is_empty()
+        || session_id.len() > MAX_SESSION_RESUME_ID_BYTES
+        || session_id.chars().any(char::is_control)
+    {
+        return Err(SessionResumeError::InvalidSessionIdentifier {
+            input_bytes: session_id.len(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_provider_slug(provider_slug: &str) -> Result<(), SessionResumeError> {
+    if provider_slug.is_empty()
+        || provider_slug.len() > MAX_SESSION_RESUME_PROVIDER_BYTES
+        || !provider_slug.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+        })
+    {
+        return Err(SessionResumeError::InvalidProviderSlug {
+            input_bytes: provider_slug.len(),
+        });
+    }
+    Ok(())
+}
+
+fn map_spawn_blocking_error(
+    error: &crate::runtime_async::SpawnBlockingWithCxError,
+) -> SessionResumeError {
+    if error.is_cancelled() {
+        SessionResumeError::Cancelled
+    } else {
+        SessionResumeError::AsyncInfrastructureFailure
+    }
+}
+
+struct SessionCommandCancellationGuard {
+    cancellation: CommandCancellation,
+    watcher_done: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl SessionCommandCancellationGuard {
+    fn new(cancellation: CommandCancellation, watcher_done: Arc<AtomicBool>) -> Self {
+        Self {
+            cancellation,
+            watcher_done,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionCommandCancellationGuard {
+    fn drop(&mut self) {
+        self.watcher_done.store(true, Ordering::SeqCst);
+        if self.armed {
+            self.cancellation.cancel();
+        }
+    }
+}
+
 impl SessionResumer {
     /// Create a new resumer with the given config.
     pub fn new(config: SessionResumeConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            stdout_limit: CASR_STDOUT_LIMIT_BYTES,
+            stderr_limit: CASR_STDERR_LIMIT_BYTES,
+        }
     }
 
     /// Create a resumer with default config.
@@ -389,12 +661,41 @@ impl SessionResumer {
         &self.config
     }
 
+    /// Override subprocess capture limits for unusually large CASR datasets or
+    /// stricter embedding contexts.
+    #[must_use]
+    pub fn with_output_limits(
+        mut self,
+        stdout_limit: usize,
+        stderr_limit: usize,
+    ) -> Result<Self, SessionResumeError> {
+        if stdout_limit > MAX_CASR_STDOUT_LIMIT_BYTES {
+            return Err(SessionResumeError::InvalidOutputLimit {
+                stream: CommandOutputStream::Stdout,
+                requested: stdout_limit,
+                maximum: MAX_CASR_STDOUT_LIMIT_BYTES,
+            });
+        }
+        if stderr_limit > MAX_CASR_STDERR_LIMIT_BYTES {
+            return Err(SessionResumeError::InvalidOutputLimit {
+                stream: CommandOutputStream::Stderr,
+                requested: stderr_limit,
+                maximum: MAX_CASR_STDERR_LIMIT_BYTES,
+            });
+        }
+        self.stdout_limit = stdout_limit;
+        self.stderr_limit = stderr_limit;
+        Ok(self)
+    }
+
     /// Discover sessions across all installed providers.
     ///
-    /// Calls `casr list --json` and parses the output.
-    pub fn discover_sessions(&self) -> Result<Vec<CasrListEntry>, SessionResumeError> {
+    /// Native Antigravity discovery is independent of CASR. A CASR failure
+    /// therefore returns a typed partial report instead of discarding valid
+    /// native entries.
+    pub fn discover_sessions(&self) -> Result<SessionDiscoveryResult, SessionResumeError> {
         self.discover_sessions_with_native_antigravity(
-            discover_current_home_antigravity_conversations(),
+            discover_current_home_antigravity_conversations()?,
         )
     }
 
@@ -405,45 +706,146 @@ impl SessionResumer {
     pub fn discover_sessions_in_home(
         &self,
         home_dir: &Path,
-    ) -> Result<Vec<CasrListEntry>, SessionResumeError> {
+    ) -> Result<SessionDiscoveryResult, SessionResumeError> {
         self.discover_sessions_with_native_antigravity(
-            discover_antigravity_conversations_from_home(home_dir),
+            discover_antigravity_conversations_from_home(home_dir)?,
         )
     }
 
-    fn discover_sessions_with_native_antigravity<I>(
+    /// Cx-first discovery. Filesystem scanning and JSON parsing stay off the
+    /// async worker; CASR execution observes both the configured wall timeout
+    /// and caller cancellation through the canonical command supervisor.
+    pub async fn discover_sessions_with_cx(
         &self,
-        native_antigravity_sessions: I,
-    ) -> Result<Vec<CasrListEntry>, SessionResumeError>
-    where
-        I: IntoIterator<Item = CasrListEntry>,
-    {
-        info!(session_resume = true, "discovering sessions via casr list");
+        cx: &crate::cx::Cx,
+    ) -> Result<SessionDiscoveryResult, SessionResumeError> {
+        let home = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from);
+        let native = discover_antigravity_conversations_with_cx(cx, home).await?;
+        self.discover_sessions_with_native_antigravity_with_cx(cx, native)
+            .await
+    }
 
-        let output = self.run_casr(&["list", "--json"])?;
-        let mut entries: Vec<CasrListEntry> = serde_json::from_str(&output)
-            .map_err(|e| SessionResumeError::ParseError(e.to_string()))?;
-        append_deduped_native_antigravity_sessions(&mut entries, native_antigravity_sessions);
+    /// Cx-first discovery rooted at an explicit home directory.
+    pub async fn discover_sessions_in_home_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        home_dir: &Path,
+    ) -> Result<SessionDiscoveryResult, SessionResumeError> {
+        let native =
+            discover_antigravity_conversations_with_cx(cx, Some(home_dir.to_path_buf())).await?;
+        self.discover_sessions_with_native_antigravity_with_cx(cx, native)
+            .await
+    }
+
+    fn discover_sessions_with_native_antigravity(
+        &self,
+        mut native: SessionDiscoveryResult,
+    ) -> Result<SessionDiscoveryResult, SessionResumeError> {
+        info!(session_resume = true, "discovering sessions");
+
+        match self.run_casr(&["list", "--json"]) {
+            Ok(output) => {
+                match parse_casr_discovery_entries(&output) {
+                    Ok(casr_entries) => {
+                        merge_session_discovery_entries(&mut native, casr_entries)?;
+                    }
+                    Err(error) => {
+                        let Some(reason) = casr_discovery_incomplete_reason(&error) else {
+                            return Err(error);
+                        };
+                        native.mark_incomplete(SessionDiscoverySource::Casr, reason);
+                    }
+                }
+            }
+            Err(error) => {
+                let Some(reason) = casr_discovery_incomplete_reason(&error) else {
+                    return Err(error);
+                };
+                native.mark_incomplete(SessionDiscoverySource::Casr, reason);
+            }
+        }
 
         info!(
             session_resume = true,
-            sessions_found = entries.len(),
+            sessions_found = native.entries.len(),
+            discovery_complete = native.is_complete(),
             "discovered sessions"
         );
-        Ok(entries)
+        Ok(native)
+    }
+
+    async fn discover_sessions_with_native_antigravity_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        mut native: SessionDiscoveryResult,
+    ) -> Result<SessionDiscoveryResult, SessionResumeError> {
+        info!(session_resume = true, "discovering sessions");
+
+        match self.run_casr_with_cx(cx, &["list", "--json"]).await {
+            Ok(output) => {
+                let parsed = crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+                    parse_casr_discovery_entries(&output)
+                })
+                .await
+                .map_err(|error| map_spawn_blocking_error(&error))?;
+                match parsed {
+                    Ok(casr_entries) => {
+                        merge_session_discovery_entries(&mut native, casr_entries)?;
+                    }
+                    Err(error) => {
+                        let Some(reason) = casr_discovery_incomplete_reason(&error) else {
+                            return Err(error);
+                        };
+                        native.mark_incomplete(SessionDiscoverySource::Casr, reason);
+                    }
+                }
+            }
+            Err(error) => {
+                let Some(reason) = casr_discovery_incomplete_reason(&error) else {
+                    return Err(error);
+                };
+                native.mark_incomplete(SessionDiscoverySource::Casr, reason);
+            }
+        }
+
+        info!(
+            session_resume = true,
+            sessions_found = native.entries.len(),
+            discovery_complete = native.is_complete(),
+            "discovered sessions"
+        );
+        Ok(native)
     }
 
     /// Discover sessions filtered by provider.
     pub fn discover_sessions_for_provider(
         &self,
         provider: &AgentProvider,
-    ) -> Result<Vec<CasrListEntry>, SessionResumeError> {
-        let all = self.discover_sessions()?;
+    ) -> Result<SessionDiscoveryResult, SessionResumeError> {
+        let mut report = self.discover_sessions()?;
         let slug = provider.slug();
-        Ok(all
-            .into_iter()
-            .filter(|e| e.provider.as_deref() == Some(slug))
-            .collect())
+        validate_provider_slug(slug)?;
+        report
+            .entries
+            .retain(|entry| entry.provider.as_deref() == Some(slug));
+        Ok(report)
+    }
+
+    /// Cx-first provider-filtered discovery.
+    pub async fn discover_sessions_for_provider_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        provider: &AgentProvider,
+    ) -> Result<SessionDiscoveryResult, SessionResumeError> {
+        let slug = provider.slug();
+        validate_provider_slug(slug)?;
+        let mut report = self.discover_sessions_with_cx(cx).await?;
+        report
+            .entries
+            .retain(|entry| entry.provider.as_deref() == Some(slug));
+        Ok(report)
     }
 
     /// Resume a session into a target provider.
@@ -454,10 +856,10 @@ impl SessionResumer {
         session_id: &str,
         target_provider: &AgentProvider,
     ) -> Result<CasrResumeOutput, SessionResumeError> {
+        validate_session_identifier(session_id)?;
+        validate_provider_slug(target_provider.slug())?;
         info!(
             session_resume = true,
-            source_session_id = %session_id,
-            target_provider = %target_provider,
             dry_run = self.config.dry_run,
             "resuming session"
         );
@@ -474,17 +876,56 @@ impl SessionResumer {
         }
 
         let output = self.run_casr(&args)?;
+        let output_bytes = output.len();
         let result: CasrResumeOutput = serde_json::from_str(&output)
-            .map_err(|e| SessionResumeError::ParseError(e.to_string()))?;
+            .map_err(|_| SessionResumeError::ParseError { output_bytes })?;
 
         if !result.ok {
-            warn!(
-                session_resume = true,
-                session_id = %session_id,
-                "resume reported failure"
-            );
+            warn!(session_resume = true, "resume reported failure");
         }
 
+        Ok(result)
+    }
+
+    /// Cx-first session resume. The subprocess never blocks the async worker,
+    /// and caller cancellation reaches the bounded process supervisor.
+    pub async fn resume_session_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        session_id: &str,
+        target_provider: &AgentProvider,
+    ) -> Result<CasrResumeOutput, SessionResumeError> {
+        validate_session_identifier(session_id)?;
+        validate_provider_slug(target_provider.slug())?;
+        info!(
+            session_resume = true,
+            dry_run = self.config.dry_run,
+            "resuming session"
+        );
+
+        let mut args = vec![
+            "resume",
+            session_id,
+            "--target",
+            target_provider.slug(),
+            "--json",
+        ];
+        if self.config.dry_run {
+            args.push("--dry-run");
+        }
+
+        let output = self.run_casr_with_cx(cx, &args).await?;
+        let output_bytes = output.len();
+        let result = crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+            serde_json::from_str::<CasrResumeOutput>(&output)
+                .map_err(|_| SessionResumeError::ParseError { output_bytes })
+        })
+        .await
+        .map_err(|error| map_spawn_blocking_error(&error))??;
+
+        if !result.ok {
+            warn!(session_resume = true, "resume reported failure");
+        }
         Ok(result)
     }
 
@@ -493,9 +934,25 @@ impl SessionResumer {
     /// Calls `casr providers --json`.
     pub fn list_providers(&self) -> Result<Vec<CasrProviderStatus>, SessionResumeError> {
         let output = self.run_casr(&["providers", "--json"])?;
+        let output_bytes = output.len();
         let providers: Vec<CasrProviderStatus> = serde_json::from_str(&output)
-            .map_err(|e| SessionResumeError::ParseError(e.to_string()))?;
+            .map_err(|_| SessionResumeError::ParseError { output_bytes })?;
         Ok(providers)
+    }
+
+    /// Cx-first provider inventory.
+    pub async fn list_providers_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<Vec<CasrProviderStatus>, SessionResumeError> {
+        let output = self.run_casr_with_cx(cx, &["providers", "--json"]).await?;
+        let output_bytes = output.len();
+        crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+            serde_json::from_str::<Vec<CasrProviderStatus>>(&output)
+                .map_err(|_| SessionResumeError::ParseError { output_bytes })
+        })
+        .await
+        .map_err(|error| map_spawn_blocking_error(&error))?
     }
 
     /// Check if a specific provider is installed.
@@ -503,14 +960,49 @@ impl SessionResumer {
         &self,
         provider: &AgentProvider,
     ) -> Result<bool, SessionResumeError> {
+        validate_provider_slug(provider.slug())?;
         let providers = self.list_providers()?;
         let slug = provider.slug();
         Ok(providers.iter().any(|p| p.slug == slug && p.installed))
     }
 
+    /// Cx-first provider availability check.
+    pub async fn is_provider_installed_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        provider: &AgentProvider,
+    ) -> Result<bool, SessionResumeError> {
+        validate_provider_slug(provider.slug())?;
+        let providers = self.list_providers_with_cx(cx).await?;
+        let slug = provider.slug();
+        Ok(providers.iter().any(|candidate| {
+            candidate.slug == slug && candidate.installed
+        }))
+    }
+
     /// Check if `casr` is available on PATH.
     pub fn is_casr_available(&self) -> bool {
         self.run_casr_with_options(&["--version"], false).is_ok()
+    }
+
+    /// Cx-first CASR availability probe. Cancellation is not collapsed into a
+    /// false availability result.
+    pub async fn is_casr_available_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<bool, SessionResumeError> {
+        match self
+            .run_casr_with_options_with_cx(cx, &["--version"], false)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(SessionResumeError::Cancelled) => Err(SessionResumeError::Cancelled),
+            Err(error @ SessionResumeError::CleanupIncomplete { .. }) => Err(error),
+            Err(SessionResumeError::AsyncInfrastructureFailure) => {
+                Err(SessionResumeError::AsyncInfrastructureFailure)
+            }
+            Err(_) => Ok(false),
+        }
     }
 
     /// Export recorder data as a CASR-compatible session.
@@ -555,257 +1047,198 @@ impl SessionResumer {
         self.run_casr_with_options(args, true)
     }
 
+    async fn run_casr_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        args: &[&str],
+    ) -> Result<String, SessionResumeError> {
+        self.run_casr_with_options_with_cx(cx, args, true).await
+    }
+
     fn run_casr_with_options(
         &self,
         args: &[&str],
         apply_working_dir: bool,
     ) -> Result<String, SessionResumeError> {
-        let mut cmd = Command::new(&self.config.casr_binary);
-        cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        self.run_casr_with_options_and_cancellation(args, apply_working_dir, None)
+    }
 
-        if apply_working_dir {
-            if let Some(ref dir) = self.config.working_dir {
-                if !dir.is_dir() {
-                    return Err(SessionResumeError::SubprocessFailed {
-                        code: None,
-                        stderr: format!(
-                            "working directory is unavailable or not a directory: {}",
-                            dir.display()
-                        ),
-                    });
-                }
-                cmd.current_dir(dir);
-            }
-        }
+    fn run_casr_with_options_and_cancellation(
+        &self,
+        args: &[&str],
+        apply_working_dir: bool,
+        cancellation: Option<&CommandCancellation>,
+    ) -> Result<String, SessionResumeError> {
+        let mut cmd = self.build_casr_command(args, apply_working_dir)?;
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-
-        let mut child = cmd.spawn().map_err(|e| self.map_spawn_error(e))?;
         let timeout = Duration::from_secs(self.config.timeout_secs);
-        let started = Instant::now();
-
-        let stdout_stream = match child.stdout.take() {
-            Some(stream) => stream,
-            None => {
-                kill_casr_process_tree(&mut child);
-                let _ = child.wait();
-                return Err(SessionResumeError::SubprocessFailed {
-                    code: None,
-                    stderr: "casr stdout pipe was unavailable".to_string(),
-                });
-            }
-        };
-        let stderr_stream = match child.stderr.take() {
-            Some(stream) => stream,
-            None => {
-                kill_casr_process_tree(&mut child);
-                let _ = child.wait();
-                return Err(SessionResumeError::SubprocessFailed {
-                    code: None,
-                    stderr: "casr stderr pipe was unavailable".to_string(),
-                });
-            }
-        };
-        let (tx, rx) = std::sync::mpsc::channel();
-        let tx_err = tx.clone();
-
-        let stdout_handle = match spawn_casr_pipe_reader("ft-casr-stdout", true, stdout_stream, tx)
-        {
-            Ok(handle) => handle,
-            Err(err) => {
-                kill_casr_process_tree(&mut child);
-                let _ = child.wait();
-                return Err(SessionResumeError::SubprocessFailed {
-                    code: None,
-                    stderr: format!("failed to spawn casr stdout reader thread: {err}"),
-                });
-            }
+        let output = match cancellation {
+            Some(cancellation) => cmd
+                .output_blocking_with_cancellation(timeout, cancellation)
+                .map_err(|error| self.map_command_error(&error))?,
+            None => cmd
+                .output_blocking(timeout)
+                .map_err(|error| self.map_command_error(&error))?,
         };
 
-        let stderr_handle =
-            match spawn_casr_pipe_reader("ft-casr-stderr", false, stderr_stream, tx_err) {
-                Ok(handle) => handle,
-                Err(err) => {
-                    kill_casr_process_tree(&mut child);
-                    let _ = child.wait();
-                    let _ = stdout_handle.join();
-                    return Err(SessionResumeError::SubprocessFailed {
-                        code: None,
-                        stderr: format!("failed to spawn casr stderr reader thread: {err}"),
-                    });
-                }
-            };
+        if !output.status.success() {
+            return Err(SessionResumeError::SubprocessFailed {
+                code: output.status.code(),
+            });
+        }
 
-        let mut stdout_data = Vec::new();
-        let mut stderr_data = Vec::new();
-        let mut pipes_closed = 0usize;
+        Ok(decode_captured_bytes_lossy(output.stdout))
+    }
 
-        loop {
-            if started.elapsed() >= timeout {
-                kill_casr_process_tree(&mut child);
-                let _ = child.wait();
-                let _ = collect_casr_pipe_output(
-                    &rx,
-                    &mut stdout_data,
-                    &mut stderr_data,
-                    &mut pipes_closed,
-                    Duration::from_millis(100),
-                );
-                let _ = stdout_handle.join();
-                let _ = stderr_handle.join();
-                return Err(SessionResumeError::Timeout);
-            }
-
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    collect_casr_pipe_output(
-                        &rx,
-                        &mut stdout_data,
-                        &mut stderr_data,
-                        &mut pipes_closed,
-                        timeout.saturating_sub(started.elapsed()),
-                    )?;
-                    let _ = stdout_handle.join();
-                    let _ = stderr_handle.join();
-
-                    if !status.success() {
-                        let stderr = String::from_utf8_lossy(&stderr_data).to_string();
-                        return Err(SessionResumeError::SubprocessFailed {
-                            code: status.code(),
-                            stderr,
-                        });
+    async fn run_casr_with_options_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        args: &[&str],
+        apply_working_dir: bool,
+    ) -> Result<String, SessionResumeError> {
+        cx.checkpoint().map_err(|_| SessionResumeError::Cancelled)?;
+        let mut cmd = self.build_casr_command(args, apply_working_dir)?;
+        let timeout = Duration::from_secs(self.config.timeout_secs);
+        let cancellation = CommandCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let watcher_cancellation = cancellation.clone();
+        let watcher_done = Arc::new(AtomicBool::new(false));
+        let watcher_done_inner = Arc::clone(&watcher_done);
+        let watcher_failed = Arc::new(AtomicBool::new(false));
+        let watcher_failed_inner = Arc::clone(&watcher_failed);
+        let watcher_cx = cx.clone();
+        let watcher_handle = crate::runtime_async::task::spawn_with_cx(
+            cx,
+            move |_child_cx| async move {
+                while !watcher_done_inner.load(Ordering::SeqCst) {
+                    if watcher_cx.checkpoint().is_err() {
+                        watcher_cancellation.cancel();
+                        return;
                     }
-
-                    return Ok(String::from_utf8_lossy(&stdout_data).to_string());
+                    if crate::runtime_async::sleep_with_cx(
+                        &watcher_cx,
+                        SESSION_RESUME_CX_POLL_INTERVAL,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        if watcher_cx.checkpoint().is_ok() {
+                            watcher_failed_inner.store(true, Ordering::SeqCst);
+                        }
+                        watcher_cancellation.cancel();
+                        return;
+                    }
                 }
-                Ok(None) => {
-                    std::thread::sleep(CASR_POLL_INTERVAL);
-                }
-                Err(e) => {
-                    kill_casr_process_tree(&mut child);
-                    let _ = child.wait();
-                    let _ = stdout_handle.join();
-                    let _ = stderr_handle.join();
-                    return Err(SessionResumeError::SubprocessFailed {
-                        code: None,
-                        stderr: e.to_string(),
-                    });
-                }
-            }
-        }
-    }
+            },
+        );
+        let mut cancellation_guard =
+            SessionCommandCancellationGuard::new(cancellation, Arc::clone(&watcher_done));
 
-    fn map_spawn_error(&self, err: std::io::Error) -> SessionResumeError {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            return SessionResumeError::CasrNotFound(format!(
-                "{}: {}",
-                self.config.casr_binary, err
-            ));
-        }
-
-        SessionResumeError::SubprocessFailed {
-            code: None,
-            stderr: err.to_string(),
-        }
-    }
-}
-
-// br-ft-x2oyy: stdio multiplexing pipe reader (twin of
-// `subprocess_bridge::spawn_subprocess_pipe_reader`). Both swallows
-// below are intentional best-effort:
-//   * `stream.read_to_end(&mut buf)` — pipe-side errors leave the
-//     partial read in `buf`, which still ships downstream so the
-//     consumer observes truncation via EOF on its receiver.
-//   * `tx.send((is_stdout, buf))` — `mpsc::Sender::send` fails iff
-//     the receiver has been dropped (parent gave up on this casr
-//     invocation). Dropping captured output on caller-side cancel is
-//     the documented contract; no recovery path exists here.
-fn spawn_casr_pipe_reader<R>(
-    name: &'static str,
-    is_stdout: bool,
-    mut stream: R,
-    tx: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
-) -> Result<std::thread::JoinHandle<()>, std::io::Error>
-where
-    R: std::io::Read + Send + 'static,
-{
-    std::thread::Builder::new()
-        .name(name.to_string())
-        .spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stream.read_to_end(&mut buf);
-            // br-ft-x2oyy: intentional best-effort pipe delivery; send
-            // fails only when resume collection already timed out/cancelled.
-            let _ = tx.send((is_stdout, buf));
+        let worker_result = crate::runtime_async::spawn_blocking(move || {
+            cmd.output_blocking_with_cancellation(timeout, &worker_cancellation)
         })
-}
+        .await;
+        watcher_done.store(true, Ordering::SeqCst);
+        let watcher_result = watcher_handle.await;
 
-fn collect_casr_pipe_output(
-    rx: &std::sync::mpsc::Receiver<(bool, Vec<u8>)>,
-    stdout_data: &mut Vec<u8>,
-    stderr_data: &mut Vec<u8>,
-    pipes_closed: &mut usize,
-    timeout: Duration,
-) -> Result<(), SessionResumeError> {
-    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-        warn!("casr pipe collection timeout is too large for Instant: {timeout:?}");
-        SessionResumeError::Timeout
-    })?;
-
-    while *pipes_closed < 2 {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(SessionResumeError::Timeout);
+        if worker_result.is_err()
+            || watcher_result.is_err()
+            || watcher_failed.load(Ordering::SeqCst)
+        {
+            return Err(SessionResumeError::AsyncInfrastructureFailure);
         }
+        let output = worker_result
+            .map_err(|_| SessionResumeError::AsyncInfrastructureFailure)?
+            .map_err(|error| self.map_command_error(&error))?;
+        cancellation_guard.disarm();
 
-        match rx.recv_timeout(remaining) {
-            Ok((is_stdout, data)) => {
-                if is_stdout {
-                    *stdout_data = data;
-                } else {
-                    *stderr_data = data;
-                }
-                *pipes_closed += 1;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return Err(SessionResumeError::Timeout);
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                *pipes_closed = 2;
-            }
+        if !output.status.success() {
+            return Err(SessionResumeError::SubprocessFailed {
+                code: output.status.code(),
+            });
         }
+        Ok(decode_captured_bytes_lossy(output.stdout))
     }
 
-    Ok(())
+    fn build_casr_command(
+        &self,
+        args: &[&str],
+        apply_working_dir: bool,
+    ) -> Result<Command, SessionResumeError> {
+        let mut cmd = Command::new(&self.config.casr_binary);
+        cmd.args(args);
+        cmd.kill_on_drop(true);
+        cmd.stdout_limit(self.stdout_limit);
+        cmd.stderr_limit(self.stderr_limit);
+
+        if apply_working_dir
+            && let Some(ref dir) = self.config.working_dir
+        {
+            if !dir.is_dir() {
+                return Err(SessionResumeError::WorkingDirectoryUnavailable);
+            }
+            cmd.current_dir(dir);
+        }
+        Ok(cmd)
+    }
+
+    fn map_command_error(&self, err: &std::io::Error) -> SessionResumeError {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return SessionResumeError::CasrNotFound;
+        }
+        if CommandTimedOut::from_io_error(err).is_some() {
+            return SessionResumeError::Timeout;
+        }
+        if CommandCancelled::from_io_error(err).is_some() {
+            return SessionResumeError::Cancelled;
+        }
+        if let Some(incomplete) = CommandOutputCaptureIncomplete::from_io_error(err) {
+            return SessionResumeError::CaptureIncomplete {
+                stdout_open: incomplete.stdout_open(),
+                stderr_open: incomplete.stderr_open(),
+                drain_timeout_ms: incomplete.drain_timeout_ms(),
+            };
+        }
+        if let Some(incomplete) = CommandProcessCleanupIncomplete::from_io_error(err) {
+            return SessionResumeError::CleanupIncomplete {
+                trigger: incomplete.trigger(),
+                leader_reaped: incomplete.leader_reaped(),
+                signal_helper_settled: incomplete.signal_helper_settled(),
+                process_tree_signalled: incomplete.process_tree_signalled(),
+                stdout_open: incomplete.stdout_open(),
+                stderr_open: incomplete.stderr_open(),
+                settle_timeout_ms: incomplete.settle_timeout_ms(),
+            };
+        }
+        if let Some(exceeded) = CommandOutputLimitExceeded::from_io_error(err) {
+            return SessionResumeError::CaptureLimitExceeded {
+                stream: exceeded.stream(),
+                observed: exceeded.observed(),
+                limit: exceeded.limit(),
+            };
+        }
+
+        SessionResumeError::SubprocessFailed { code: None }
+    }
 }
 
-#[cfg(unix)]
-fn kill_casr_process_tree(child: &mut std::process::Child) {
-    let _ = crate::runtime_async::process::send_unix_signal_to_process_group(child.id(), "KILL");
-    let _ = child.kill();
-}
-
-#[cfg(not(unix))]
-fn kill_casr_process_tree(child: &mut std::process::Child) {
-    let _ = child.kill();
-}
-
-/// Fail-open: if casr is unavailable, return empty results instead of errors.
-pub fn discover_sessions_failopen(config: &SessionResumeConfig) -> Vec<CasrListEntry> {
+/// Fail-open discovery that preserves typed evidence whenever a source could
+/// not be enumerated. The returned entries are never silently presented as a
+/// complete inventory.
+pub fn discover_sessions_failopen(config: &SessionResumeConfig) -> SessionDiscoveryResult {
     let resumer = SessionResumer::new(config.clone());
     match resumer.discover_sessions() {
-        Ok(entries) => entries,
-        Err(e) => {
+        Ok(report) => report,
+        Err(error) => {
             warn!(
                 session_resume = true,
-                error = %e,
-                "casr unavailable, failing open with empty session list"
+                error = %error,
+                "session discovery failed open with explicit incompleteness evidence"
             );
-            vec![]
+            let (source, reason) = discovery_error_incomplete_evidence(&error);
+            let mut report = SessionDiscoveryResult::default();
+            report.mark_incomplete(source, reason);
+            report
         }
     }
 }
@@ -824,38 +1257,57 @@ pub fn antigravity_conversations_dir(home_dir: &Path) -> PathBuf {
 /// The Antigravity CLI stores one SQLite database per conversation at
 /// `~/.gemini/antigravity-cli/conversations/<uuid>.db`; that filename stem is
 /// the id accepted by `agy --conversation <uuid>`.
-pub fn discover_antigravity_conversations_from_home(home_dir: &Path) -> Vec<CasrListEntry> {
+pub fn discover_antigravity_conversations_from_home(
+    home_dir: &Path,
+) -> Result<SessionDiscoveryResult, SessionResumeError> {
     discover_antigravity_conversations_in_dir(&antigravity_conversations_dir(home_dir))
 }
 
 /// Discover native Antigravity conversations under an explicit conversations dir.
-pub fn discover_antigravity_conversations_in_dir(conversations_dir: &Path) -> Vec<CasrListEntry> {
+pub fn discover_antigravity_conversations_in_dir(
+    conversations_dir: &Path,
+) -> Result<SessionDiscoveryResult, SessionResumeError> {
     let dir_entries = match fs::read_dir(conversations_dir) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SessionDiscoveryResult::default());
+        }
         Err(err) => {
             warn!(
                 session_resume = true,
                 provider = "agy",
-                path = %conversations_dir.display(),
-                error = %err,
+                error_kind = ?err.kind(),
                 "failed to read Antigravity conversations directory"
             );
-            return Vec::new();
+            let mut report = SessionDiscoveryResult::default();
+            report.mark_incomplete(
+                SessionDiscoverySource::NativeAntigravity,
+                SessionDiscoveryIncompleteReason::DirectoryUnreadable,
+            );
+            return Ok(report);
         }
     };
 
-    let mut entries = Vec::new();
-    for dir_entry in dir_entries {
+    let mut report = SessionDiscoveryResult::default();
+    for (entry_index, dir_entry) in dir_entries.enumerate() {
+        if entry_index >= MAX_SESSION_DISCOVERY_ENTRIES {
+            return Err(SessionResumeError::DiscoveryLimitExceeded {
+                source: SessionDiscoverySource::NativeAntigravity,
+                limit: MAX_SESSION_DISCOVERY_ENTRIES,
+            });
+        }
         let dir_entry = match dir_entry {
             Ok(entry) => entry,
             Err(err) => {
                 warn!(
                     session_resume = true,
                     provider = "agy",
-                    path = %conversations_dir.display(),
-                    error = %err,
+                    error_kind = ?err.kind(),
                     "failed to read Antigravity conversation directory entry"
+                );
+                report.mark_incomplete(
+                    SessionDiscoverySource::NativeAntigravity,
+                    SessionDiscoveryIncompleteReason::DirectoryEntryUnreadable,
                 );
                 continue;
             }
@@ -878,8 +1330,7 @@ pub fn discover_antigravity_conversations_in_dir(conversations_dir: &Path) -> Ve
             warn!(
                 session_resume = true,
                 provider = "agy",
-                conversation_id = %session_id,
-                path = %path.display(),
+                candidate_bytes = session_id.len(),
                 "ignored Antigravity conversation database with invalid UUID filename stem"
             );
             continue;
@@ -890,20 +1341,7 @@ pub fn discover_antigravity_conversations_in_dir(conversations_dir: &Path) -> Ve
             .ok()
             .and_then(|metadata| metadata.modified().ok())
             .and_then(system_time_to_epoch_millis);
-        let resume_plan = match antigravity_native_resume_plan(&session_id) {
-            Ok(plan) => plan,
-            Err(err) => {
-                warn!(
-                    session_resume = true,
-                    provider = "agy",
-                    conversation_id = %session_id,
-                    path = %path.display(),
-                    error = %err,
-                    "failed to build Antigravity native resume plan"
-                );
-                continue;
-            }
-        };
+        let resume_plan = antigravity_native_resume_plan(&session_id)?;
         let mut extra = std::collections::HashMap::new();
         extra.insert(
             "discovery_source".to_string(),
@@ -934,7 +1372,7 @@ pub fn discover_antigravity_conversations_in_dir(conversations_dir: &Path) -> Ve
             serde_json::json!(ANTIGRAVITY_METADATA_FALLBACK_REASON),
         );
 
-        entries.push(CasrListEntry {
+        report.entries.push(CasrListEntry {
             session_id,
             provider: Some(AgentProvider::Antigravity.slug().to_string()),
             title: Some("Antigravity conversation (metadata schema not read)".to_string()),
@@ -946,47 +1384,157 @@ pub fn discover_antigravity_conversations_in_dir(conversations_dir: &Path) -> Ve
         });
     }
 
-    entries.sort_by(|left, right| {
+    report.entries.sort_by(|left, right| {
         left.session_id
             .cmp(&right.session_id)
             .then_with(|| left.path.cmp(&right.path))
     });
-    entries
+    Ok(report)
 }
 
 /// Discover Antigravity conversations under the process HOME, if available.
-pub fn discover_current_home_antigravity_conversations() -> Vec<CasrListEntry> {
+pub fn discover_current_home_antigravity_conversations(
+) -> Result<SessionDiscoveryResult, SessionResumeError> {
     let Some(home) = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
     else {
-        return Vec::new();
+        return Ok(SessionDiscoveryResult::default());
     };
     discover_antigravity_conversations_from_home(&home)
 }
 
-fn append_deduped_native_antigravity_sessions<I>(entries: &mut Vec<CasrListEntry>, native: I)
-where
-    I: IntoIterator<Item = CasrListEntry>,
-{
-    let mut seen = entries
-        .iter()
-        .map(|entry| {
-            (
-                provider_from_list_entry(entry).slug().to_string(),
-                entry.session_id.clone(),
-            )
-        })
-        .collect::<HashSet<_>>();
+async fn discover_antigravity_conversations_with_cx(
+    cx: &crate::cx::Cx,
+    home_dir: Option<PathBuf>,
+) -> Result<SessionDiscoveryResult, SessionResumeError> {
+    let Some(home_dir) = home_dir else {
+        cx.checkpoint().map_err(|_| SessionResumeError::Cancelled)?;
+        return Ok(SessionDiscoveryResult::default());
+    };
+    crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+        discover_antigravity_conversations_from_home(&home_dir)
+    })
+    .await
+    .map_err(|error| map_spawn_blocking_error(&error))?
+}
 
-    for entry in native {
+fn validate_discovery_entry(entry: &CasrListEntry) -> Result<(), SessionResumeError> {
+    validate_session_identifier(&entry.session_id)?;
+    if let Some(provider) = entry.provider.as_deref() {
+        validate_provider_slug(provider)?;
+    }
+    Ok(())
+}
+
+fn parse_casr_discovery_entries(
+    output: &str,
+) -> Result<Vec<CasrListEntry>, SessionResumeError> {
+    let output_bytes = output.len();
+    let entries: Vec<CasrListEntry> = serde_json::from_str(output)
+        .map_err(|_| SessionResumeError::ParseError { output_bytes })?;
+    if entries.len() > MAX_SESSION_DISCOVERY_ENTRIES {
+        return Err(SessionResumeError::DiscoveryLimitExceeded {
+            source: SessionDiscoverySource::Casr,
+            limit: MAX_SESSION_DISCOVERY_ENTRIES,
+        });
+    }
+    for entry in &entries {
+        validate_discovery_entry(entry)?;
+    }
+    Ok(entries)
+}
+
+/// Merge a CASR inventory with an independently discovered native inventory.
+/// CASR ordering wins, duplicates are removed by finite provider/session
+/// identity, and admission is all-or-nothing when the combined cap is crossed.
+pub fn merge_session_discovery_entries(
+    native: &mut SessionDiscoveryResult,
+    casr_entries: Vec<CasrListEntry>,
+) -> Result<(), SessionResumeError> {
+    if native.entries.len() > MAX_SESSION_DISCOVERY_ENTRIES {
+        return Err(SessionResumeError::DiscoveryLimitExceeded {
+            source: SessionDiscoverySource::NativeAntigravity,
+            limit: MAX_SESSION_DISCOVERY_ENTRIES,
+        });
+    }
+    if casr_entries.len() > MAX_SESSION_DISCOVERY_ENTRIES {
+        return Err(SessionResumeError::DiscoveryLimitExceeded {
+            source: SessionDiscoverySource::Casr,
+            limit: MAX_SESSION_DISCOVERY_ENTRIES,
+        });
+    }
+
+    for entry in native.entries.iter().chain(&casr_entries) {
+        validate_discovery_entry(entry)?;
+    }
+
+    let capacity = native.entries.len().saturating_add(casr_entries.len());
+    let mut seen = HashSet::with_capacity(capacity);
+    let mut merged = Vec::with_capacity(capacity);
+    for entry in casr_entries.into_iter().chain(native.entries.iter().cloned()) {
         let key = (
             provider_from_list_entry(&entry).slug().to_string(),
             entry.session_id.clone(),
         );
         if seen.insert(key) {
-            entries.push(entry);
+            if merged.len() == MAX_SESSION_DISCOVERY_ENTRIES {
+                return Err(SessionResumeError::DiscoveryLimitExceeded {
+                    source: SessionDiscoverySource::Merged,
+                    limit: MAX_SESSION_DISCOVERY_ENTRIES,
+                });
+            }
+            merged.push(entry);
         }
+    }
+    native.entries = merged;
+    Ok(())
+}
+
+fn casr_discovery_incomplete_reason(
+    error: &SessionResumeError,
+) -> Option<SessionDiscoveryIncompleteReason> {
+    match error {
+        SessionResumeError::CasrNotFound => Some(SessionDiscoveryIncompleteReason::Unavailable),
+        SessionResumeError::Timeout => Some(SessionDiscoveryIncompleteReason::TimedOut),
+        SessionResumeError::SubprocessFailed { .. }
+        | SessionResumeError::WorkingDirectoryUnavailable => {
+            Some(SessionDiscoveryIncompleteReason::SubprocessFailed)
+        }
+        SessionResumeError::ParseError { .. }
+        | SessionResumeError::InvalidSessionIdentifier { .. }
+        | SessionResumeError::InvalidProviderSlug { .. }
+        | SessionResumeError::CaptureLimitExceeded { .. } => {
+            Some(SessionDiscoveryIncompleteReason::InvalidOutput)
+        }
+        SessionResumeError::CaptureIncomplete { .. } => {
+            Some(SessionDiscoveryIncompleteReason::OutputCaptureIncomplete)
+        }
+        SessionResumeError::DiscoveryLimitExceeded { .. }
+        | SessionResumeError::InvalidOutputLimit { .. }
+        | SessionResumeError::AsyncInfrastructureFailure
+        | SessionResumeError::Cancelled
+        | SessionResumeError::CleanupIncomplete { .. }
+        | SessionResumeError::SessionNotFound { .. }
+        | SessionResumeError::ProviderNotInstalled
+        | SessionResumeError::NativeProviderNotFound
+        | SessionResumeError::InvalidNativeSessionId { .. }
+        | SessionResumeError::NonPinnedNativeModel { .. } => None,
+    }
+}
+
+fn discovery_error_incomplete_evidence(
+    error: &SessionResumeError,
+) -> (SessionDiscoverySource, SessionDiscoveryIncompleteReason) {
+    match error {
+        SessionResumeError::DiscoveryLimitExceeded { source, .. } => {
+            (*source, SessionDiscoveryIncompleteReason::InvalidOutput)
+        }
+        _ => (
+            SessionDiscoverySource::Merged,
+            casr_discovery_incomplete_reason(error)
+                .unwrap_or(SessionDiscoveryIncompleteReason::SubprocessFailed),
+        ),
     }
 }
 
@@ -1006,18 +1554,25 @@ pub fn provider_from_list_entry(entry: &CasrListEntry) -> AgentProvider {
 
 /// Build a summary line for a list entry (for TUI/CLI display).
 pub fn summarize_entry(entry: &CasrListEntry) -> String {
-    let provider = entry.provider.as_deref().unwrap_or("?");
-    let title = entry
-        .title
-        .as_deref()
-        .unwrap_or("(untitled)")
-        .chars()
-        .take(60)
-        .collect::<String>();
+    let provider = crate::output::truncate_bounded(
+        entry.provider.as_deref().unwrap_or("?"),
+        32,
+        MAX_SESSION_RESUME_PROVIDER_BYTES,
+    );
+    let session_id = crate::output::truncate_bounded(
+        &entry.session_id,
+        80,
+        MAX_SESSION_RESUME_ID_BYTES,
+    );
+    let title = crate::output::truncate_bounded(
+        entry.title.as_deref().unwrap_or("(untitled)"),
+        60,
+        256,
+    );
     let msgs = entry.messages;
     format!(
         "[{}] {} ({} msgs) — {}",
-        provider, entry.session_id, msgs, title
+        provider, session_id, msgs, title
     )
 }
 
@@ -1125,7 +1680,8 @@ mod tests {
 
     #[test]
     fn antigravity_native_resume_plan_reports_missing_binary_provider_specifically() {
-        let plan = antigravity_native_resume_plan("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let plan =
+            antigravity_native_resume_plan("123e4567-e89b-12d3-a456-426614174000").unwrap();
         let empty_path = tempfile::tempdir().expect("temp empty path");
         let err = plan
             .require_binary_available_in_path(Some(empty_path.path().to_str().unwrap()))
@@ -1140,6 +1696,28 @@ mod tests {
             } if provider_slug.as_str() == "agy" && binary.as_str() == "agy"
         ));
         assert!(err.to_string().contains("native provider agy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_native_resume_plan_rejects_non_executable_path_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let plan =
+            antigravity_native_resume_plan("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let path_dir = tempfile::tempdir().expect("temporary PATH directory");
+        let candidate = path_dir.path().join(ANTIGRAVITY_BINARY);
+        fs::write(&candidate, b"not executable").expect("write non-executable PATH fixture");
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o644))
+            .expect("mark PATH fixture non-executable");
+
+        let error = plan
+            .require_binary_available_in_path(Some(path_dir.path().to_str().unwrap()))
+            .expect_err("a regular file without execute permission is not an available binary");
+        assert!(matches!(
+            error,
+            SessionResumeError::NativeProviderNotFound { .. }
+        ));
     }
 
     #[test]
@@ -1410,11 +1988,32 @@ mod tests {
 
         let e = SessionResumeError::Timeout;
         assert!(e.to_string().contains("timed out"));
+
+        let e = SessionResumeError::Cancelled;
+        assert!(e.to_string().contains("cancelled"));
+
+        let e = SessionResumeError::CaptureIncomplete {
+            stdout_open: true,
+            stderr_open: false,
+            drain_timeout_ms: 100,
+        };
+        assert!(e.to_string().contains("capture incomplete"));
+
+        let e = SessionResumeError::CleanupIncomplete {
+            trigger: CommandCleanupTrigger::TimedOut,
+            leader_reaped: false,
+            signal_helper_settled: true,
+            process_tree_signalled: false,
+            stdout_open: false,
+            stderr_open: false,
+            settle_timeout_ms: 250,
+        };
+        assert!(e.to_string().contains("process cleanup incomplete"));
     }
 
     #[test]
     fn error_is_std_error() {
-        let e: Box<dyn std::error::Error> = Box::new(SessionResumeError::Timeout);
+        let e: Box<dyn std::error::Error> = Box::new(SessionResumeError::Cancelled);
         assert!(!e.to_string().is_empty());
     }
 
@@ -1610,29 +2209,19 @@ mod tests {
 
         let err = r.discover_sessions().unwrap_err();
         assert!(matches!(
-            err,
+            &err,
             SessionResumeError::SubprocessFailed { code: None, .. }
         ));
+        assert!(!err.to_string().contains("/definitely/nonexistent"));
     }
 
     #[test]
-    fn collect_casr_pipe_output_rejects_unrepresentable_timeout() {
-        let (_tx, rx) = std::sync::mpsc::channel();
-        let mut stdout_data = Vec::new();
-        let mut stderr_data = Vec::new();
-        let mut pipes_closed = 0usize;
-
-        let err = collect_casr_pipe_output(
-            &rx,
-            &mut stdout_data,
-            &mut stderr_data,
-            &mut pipes_closed,
-            Duration::MAX,
-        )
-        .unwrap_err();
-
-        assert_eq!(err, SessionResumeError::Timeout);
-        assert_eq!(pipes_closed, 0);
+    fn resumer_defaults_to_finite_canonical_capture_limits() {
+        let resumer = SessionResumer::with_defaults();
+        assert_eq!(resumer.stdout_limit, CASR_STDOUT_LIMIT_BYTES);
+        assert_eq!(resumer.stderr_limit, CASR_STDERR_LIMIT_BYTES);
+        assert!(resumer.stdout_limit > 0 && resumer.stdout_limit < usize::MAX);
+        assert!(resumer.stderr_limit > 0 && resumer.stderr_limit < usize::MAX);
     }
 
     #[cfg(unix)]
@@ -1644,7 +2233,7 @@ mod tests {
             ..Default::default()
         });
 
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let err = r.run_casr(&["-c", "sleep 5"]).unwrap_err();
 
         assert_eq!(err, SessionResumeError::Timeout);
@@ -1668,5 +2257,193 @@ mod tests {
             .expect("large stdout should not deadlock the CASR runner");
 
         assert_eq!(output.len(), 131072);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_casr_accepts_exact_stdout_cap_and_rejects_one_byte_over() {
+        let exact = SessionResumer::new(SessionResumeConfig {
+            casr_binary: "sh".into(),
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .with_output_limits(3, 64);
+        assert_eq!(
+            exact
+                .run_casr(&["-c", "printf 'abc'"])
+                .expect("exact stdout boundary must be accepted"),
+            "abc"
+        );
+
+        let over = exact.clone().with_output_limits(2, 64);
+        let error = over
+            .run_casr(&["-c", "printf 'abc'; while :; do sleep 1; done"])
+            .expect_err("first byte beyond stdout cap must fail closed");
+        assert!(matches!(
+            &error,
+            SessionResumeError::SubprocessFailed {
+                code: None,
+                stderr
+            } if stderr.contains("stdout capture limit exceeded")
+                && stderr.contains("limit 2")
+        ));
+        assert!(!error.to_string().contains("abc"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_casr_accepts_exact_stderr_cap_and_rejects_one_byte_over() {
+        let exact = SessionResumer::new(SessionResumeConfig {
+            casr_binary: "sh".into(),
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .with_output_limits(64, 3);
+        assert_eq!(
+            exact
+                .run_casr(&["-c", "printf 'abc' >&2; printf 'ok'"])
+                .expect("exact stderr boundary must be accepted"),
+            "ok"
+        );
+
+        let over = exact.with_output_limits(64, 2);
+        let error = over
+            .run_casr(&[
+                "-c",
+                "printf 'abc' >&2; while :; do sleep 1; done",
+            ])
+            .expect_err("first byte beyond stderr cap must fail closed");
+        assert!(matches!(
+            &error,
+            SessionResumeError::SubprocessFailed {
+                code: None,
+                stderr,
+            } if stderr.contains("stderr capture limit exceeded")
+                && stderr.contains("limit 2")
+        ));
+        assert!(!error.to_string().contains("abc"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_casr_high_volume_stdout_is_stopped_at_finite_cap() {
+        const LIMIT: usize = 64 * 1024;
+        let resumer = SessionResumer::new(SessionResumeConfig {
+            casr_binary: "sh".into(),
+            timeout_secs: 2,
+            ..Default::default()
+        })
+        .with_output_limits(LIMIT, 64);
+        let error = resumer
+            .run_casr(&["-c", "yes x"])
+            .expect_err("unbounded producer must be stopped at the capture cap");
+        assert!(matches!(
+            &error,
+            SessionResumeError::SubprocessFailed {
+                code: None,
+                stderr,
+            } if stderr.contains("stdout capture limit exceeded")
+                && stderr.contains("limit 65536")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_casr_nonzero_stderr_is_not_retained_in_error() {
+        let resumer = SessionResumer::new(SessionResumeConfig {
+            casr_binary: "sh".into(),
+            timeout_secs: 5,
+            ..Default::default()
+        });
+        let error = resumer
+            .run_casr(&[
+                "-c",
+                "printf 'raw-child-output-canary' >&2; exit 19",
+            ])
+            .expect_err("nonzero child must fail");
+        assert!(matches!(
+            &error,
+            SessionResumeError::SubprocessFailed { code: Some(19), .. }
+        ));
+        assert!(!error.to_string().contains("raw-child-output-canary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_casr_escaped_descendant_reports_incomplete_capture_finitely() {
+        let resumer = SessionResumer::new(SessionResumeConfig {
+            casr_binary: "sh".into(),
+            timeout_secs: 5,
+            ..Default::default()
+        });
+        let started = std::time::Instant::now();
+        let error = resumer
+            .run_casr(&["-c", "sleep 1 >&1 2>/dev/null &"])
+            .expect_err("inherited output descriptor must fail closed");
+        assert_eq!(
+            error,
+            SessionResumeError::CaptureIncomplete {
+                stdout_open: true,
+                stderr_open: false,
+                drain_timeout_ms: 100,
+            }
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_casr_cooperative_cancellation_is_finite() {
+        let resumer = SessionResumer::new(SessionResumeConfig {
+            casr_binary: "sh".into(),
+            timeout_secs: 5,
+            ..Default::default()
+        });
+        let cancellation = CommandCancellation::new();
+        let cancel_from_thread = cancellation.clone();
+        let trigger = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            cancel_from_thread.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = resumer
+            .run_casr_with_options_and_cancellation(
+                &["-c", "sleep 10"],
+                true,
+                Some(&cancellation),
+            )
+            .expect_err("explicit cancellation must stop the subprocess");
+        trigger.join().expect("cancellation trigger must finish");
+        assert_eq!(error, SessionResumeError::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn production_casr_bridge_has_no_unbounded_reader_or_child_content_error_path() {
+        let source = include_str!("session_resume.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
+        let start = production
+            .find("    fn run_casr(")
+            .expect("casr subprocess implementation marker");
+        let implementation = &production[start..];
+        for forbidden in [
+            "read_to_end",
+            "std::thread::Builder",
+            "std::thread::spawn",
+            ".join()",
+            "child.wait()",
+            "from_utf8_lossy",
+            "stderr = %",
+            "binary = %",
+            "args = ?",
+        ] {
+            assert!(
+                !implementation.contains(forbidden),
+                "production casr bridge must not contain {forbidden}"
+            );
+        }
     }
 }

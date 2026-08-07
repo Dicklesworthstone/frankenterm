@@ -2693,7 +2693,9 @@ impl WeztermClient {
     /// strings to structured variants.
     fn finalize_cli_output(output: std::process::Output) -> Result<String> {
         if !output.status.success() {
-            let stderr_full = String::from_utf8_lossy(&output.stderr);
+            let stderr_full = crate::runtime_async::process::decode_captured_bytes_lossy(
+                output.stderr,
+            );
             let stderr_str = if stderr_full.len() > MAX_CLI_ERROR_OUTPUT_BYTES {
                 // Truncate at a char boundary to avoid splitting multi-byte characters
                 let mut end = MAX_CLI_ERROR_OUTPUT_BYTES;
@@ -2702,7 +2704,7 @@ impl WeztermClient {
                 }
                 stderr_full[..end].to_string()
             } else {
-                stderr_full.into_owned()
+                stderr_full
             };
 
             // Categorize common error patterns

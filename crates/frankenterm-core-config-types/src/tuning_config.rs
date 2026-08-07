@@ -782,6 +782,19 @@ pub struct IpcTuning {
     /// IPC connection accept poll interval (ms).
     /// Source: ipc.rs IPC_ACCEPT_POLL_INTERVAL = 100
     pub accept_poll_interval_ms: u64,
+
+    /// Hard ceiling for concurrently admitted IPC client connections.
+    /// Long-lived event subscriptions count against this limit.
+    pub max_concurrent_connections: usize,
+
+    /// Deadline for an accepted client to send its first complete request line
+    /// (ms). This bounds idle/incomplete-request resource retention.
+    pub initial_request_timeout_ms: u64,
+
+    /// Per-operation IPC I/O deadline (ms). A one-shot client applies one
+    /// absolute deadline across connect/write/flush/read; the server applies
+    /// the same bound to each response or streaming record emission.
+    pub io_timeout_ms: u64,
 }
 
 impl IpcTuning {
@@ -790,8 +803,48 @@ impl IpcTuning {
     /// Exposed as a const so callers that cannot access a TuningConfig instance
     /// (e.g., CLI validation in main.rs) can reference the single source of truth.
     pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 128 * 1024;
+    /// Smallest supported IPC message size limit (16 KiB).
+    pub const MIN_MAX_MESSAGE_SIZE: usize = 16 * 1024;
+    /// Largest supported IPC message size limit (64 MiB).
+    pub const MAX_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
     /// Default IPC accept poll interval (ms).
     pub const DEFAULT_ACCEPT_POLL_INTERVAL_MS: u64 = 100;
+    /// Smallest supported IPC accept poll interval (ms).
+    pub const MIN_ACCEPT_POLL_INTERVAL_MS: u64 = 10;
+    /// Largest supported IPC accept poll interval (ms).
+    pub const MAX_ACCEPT_POLL_INTERVAL_MS: u64 = 1_000;
+    /// Default concurrent connection ceiling. This supports large local agent
+    /// fleets while keeping accepted socket/task retention finite.
+    pub const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 1024;
+    /// Smallest supported concurrent connection ceiling.
+    pub const MIN_MAX_CONCURRENT_CONNECTIONS: usize = 1;
+    /// Largest supported concurrent connection ceiling.
+    pub const MAX_MAX_CONCURRENT_CONNECTIONS: usize = 16_384;
+    /// Default initial request-line deadline (ms).
+    pub const DEFAULT_INITIAL_REQUEST_TIMEOUT_MS: u64 = 5_000;
+    /// Smallest supported initial request-line deadline (ms).
+    pub const MIN_INITIAL_REQUEST_TIMEOUT_MS: u64 = 100;
+    /// Largest supported initial request-line deadline (ms).
+    pub const MAX_INITIAL_REQUEST_TIMEOUT_MS: u64 = 60_000;
+    /// Default IPC I/O deadline (ms).
+    pub const DEFAULT_IO_TIMEOUT_MS: u64 = 30_000;
+    /// Smallest supported IPC I/O deadline (ms).
+    pub const MIN_IO_TIMEOUT_MS: u64 = 100;
+    /// Largest supported IPC I/O deadline (ms).
+    pub const MAX_IO_TIMEOUT_MS: u64 = 300_000;
+    /// Maximum aggregate request-line buffering envelope across all admitted
+    /// connections. The server line reader may retain `2 * max_message_size +
+    /// 2` bytes per connection to deliver typed oversize rejections.
+    pub const MAX_AGGREGATE_REQUEST_BUFFER_BYTES: usize = 512 * 1024 * 1024;
+
+    /// Compute the worst-case aggregate request-line buffering envelope.
+    #[must_use]
+    pub fn aggregate_request_buffer_bytes(&self) -> Option<usize> {
+        self.max_message_size
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(2))
+            .and_then(|bytes| bytes.checked_mul(self.max_concurrent_connections))
+    }
 }
 
 impl Default for IpcTuning {
@@ -799,6 +852,9 @@ impl Default for IpcTuning {
         Self {
             max_message_size: Self::DEFAULT_MAX_MESSAGE_SIZE,
             accept_poll_interval_ms: Self::DEFAULT_ACCEPT_POLL_INTERVAL_MS,
+            max_concurrent_connections: Self::DEFAULT_MAX_CONCURRENT_CONNECTIONS,
+            initial_request_timeout_ms: Self::DEFAULT_INITIAL_REQUEST_TIMEOUT_MS,
+            io_timeout_ms: Self::DEFAULT_IO_TIMEOUT_MS,
         }
     }
 }
@@ -1017,11 +1073,44 @@ impl TuningConfig {
         }
 
         // IPC
-        if self.ipc.max_message_size < 16 * 1024 {
+        if self.ipc.max_message_size < IpcTuning::MIN_MAX_MESSAGE_SIZE {
             errors.push("tuning.ipc.max_message_size must be >= 16KB".into());
         }
-        if self.ipc.accept_poll_interval_ms < 10 {
+        if self.ipc.max_message_size > IpcTuning::MAX_MAX_MESSAGE_SIZE {
+            errors.push("tuning.ipc.max_message_size must be <= 64MB".into());
+        }
+        if self.ipc.accept_poll_interval_ms < IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS {
             errors.push("tuning.ipc.accept_poll_interval_ms must be >= 10".into());
+        }
+        if self.ipc.accept_poll_interval_ms > IpcTuning::MAX_ACCEPT_POLL_INTERVAL_MS {
+            errors.push("tuning.ipc.accept_poll_interval_ms must be <= 1000".into());
+        }
+        if self.ipc.max_concurrent_connections < IpcTuning::MIN_MAX_CONCURRENT_CONNECTIONS {
+            errors.push("tuning.ipc.max_concurrent_connections must be >= 1".into());
+        }
+        if self.ipc.max_concurrent_connections > IpcTuning::MAX_MAX_CONCURRENT_CONNECTIONS {
+            errors.push("tuning.ipc.max_concurrent_connections must be <= 16384".into());
+        }
+        if self.ipc.initial_request_timeout_ms < IpcTuning::MIN_INITIAL_REQUEST_TIMEOUT_MS {
+            errors.push("tuning.ipc.initial_request_timeout_ms must be >= 100".into());
+        }
+        if self.ipc.initial_request_timeout_ms > IpcTuning::MAX_INITIAL_REQUEST_TIMEOUT_MS {
+            errors.push("tuning.ipc.initial_request_timeout_ms must be <= 60000".into());
+        }
+        if self.ipc.io_timeout_ms < IpcTuning::MIN_IO_TIMEOUT_MS {
+            errors.push("tuning.ipc.io_timeout_ms must be >= 100".into());
+        }
+        if self.ipc.io_timeout_ms > IpcTuning::MAX_IO_TIMEOUT_MS {
+            errors.push("tuning.ipc.io_timeout_ms must be <= 300000".into());
+        }
+        if self
+            .ipc
+            .aggregate_request_buffer_bytes()
+            .is_none_or(|bytes| bytes > IpcTuning::MAX_AGGREGATE_REQUEST_BUFFER_BYTES)
+        {
+            errors.push(
+                "tuning.ipc aggregate request buffer envelope must be <= 512MB".into(),
+            );
         }
 
         errors
@@ -1184,6 +1273,9 @@ default_port = 9000
         // IPC
         assert_eq!(cfg.ipc.max_message_size, 128 * 1024);
         assert_eq!(cfg.ipc.accept_poll_interval_ms, 100);
+        assert_eq!(cfg.ipc.max_concurrent_connections, 1024);
+        assert_eq!(cfg.ipc.initial_request_timeout_ms, 5_000);
+        assert_eq!(cfg.ipc.io_timeout_ms, 30_000);
 
         // Wezterm
         assert_eq!(cfg.wezterm.timeout_secs, 30);
@@ -1231,6 +1323,151 @@ default_port = 9000
             errors.len() >= 6,
             "expected multiple errors including ingest/search bounds: {errors:?}"
         );
+    }
+
+    #[test]
+    fn ipc_resource_bounds_accept_exact_edges_and_reject_outside_values() {
+        let mut cfg = TuningConfig::default();
+
+        cfg.ipc.max_message_size = IpcTuning::MIN_MAX_MESSAGE_SIZE;
+        assert!(
+            cfg.validate()
+                .iter()
+                .all(|error| !error.contains("ipc.max_message_size"))
+        );
+        cfg.ipc.max_message_size = IpcTuning::MAX_MAX_MESSAGE_SIZE;
+        assert!(
+            cfg.validate()
+                .iter()
+                .all(|error| !error.contains("ipc.max_message_size"))
+        );
+        cfg.ipc.max_message_size = IpcTuning::MIN_MAX_MESSAGE_SIZE - 1;
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|error| error == "tuning.ipc.max_message_size must be >= 16KB"));
+        cfg.ipc.max_message_size = IpcTuning::MAX_MAX_MESSAGE_SIZE + 1;
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|error| error == "tuning.ipc.max_message_size must be <= 64MB"));
+
+        cfg = TuningConfig::default();
+        cfg.ipc.accept_poll_interval_ms = IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS;
+        assert!(
+            cfg.validate()
+                .iter()
+                .all(|error| !error.contains("accept_poll_interval_ms"))
+        );
+        cfg.ipc.accept_poll_interval_ms = IpcTuning::MAX_ACCEPT_POLL_INTERVAL_MS;
+        assert!(
+            cfg.validate()
+                .iter()
+                .all(|error| !error.contains("accept_poll_interval_ms"))
+        );
+        cfg.ipc.accept_poll_interval_ms = IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS - 1;
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|error| error == "tuning.ipc.accept_poll_interval_ms must be >= 10"));
+        cfg.ipc.accept_poll_interval_ms = IpcTuning::MAX_ACCEPT_POLL_INTERVAL_MS + 1;
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|error| error == "tuning.ipc.accept_poll_interval_ms must be <= 1000"));
+
+        cfg = TuningConfig::default();
+        cfg.ipc.max_concurrent_connections = IpcTuning::MIN_MAX_CONCURRENT_CONNECTIONS;
+        assert!(
+            cfg.validate()
+                .iter()
+                .all(|error| !error.contains("max_concurrent_connections"))
+        );
+        cfg.ipc.max_concurrent_connections = IpcTuning::MAX_MAX_CONCURRENT_CONNECTIONS;
+        assert!(
+            cfg.validate()
+                .iter()
+                .all(|error| !error.contains("max_concurrent_connections"))
+        );
+        cfg.ipc.max_concurrent_connections = IpcTuning::MIN_MAX_CONCURRENT_CONNECTIONS - 1;
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|error| error == "tuning.ipc.max_concurrent_connections must be >= 1"));
+        cfg.ipc.max_concurrent_connections = IpcTuning::MAX_MAX_CONCURRENT_CONNECTIONS + 1;
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|error| error == "tuning.ipc.max_concurrent_connections must be <= 16384"));
+
+        cfg = TuningConfig::default();
+        cfg.ipc.initial_request_timeout_ms = IpcTuning::MIN_INITIAL_REQUEST_TIMEOUT_MS;
+        assert!(
+            cfg.validate()
+                .iter()
+                .all(|error| !error.contains("initial_request_timeout_ms"))
+        );
+        cfg.ipc.initial_request_timeout_ms = IpcTuning::MAX_INITIAL_REQUEST_TIMEOUT_MS;
+        assert!(
+            cfg.validate()
+                .iter()
+                .all(|error| !error.contains("initial_request_timeout_ms"))
+        );
+        cfg.ipc.initial_request_timeout_ms = IpcTuning::MIN_INITIAL_REQUEST_TIMEOUT_MS - 1;
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|error| error == "tuning.ipc.initial_request_timeout_ms must be >= 100"));
+        cfg.ipc.initial_request_timeout_ms = IpcTuning::MAX_INITIAL_REQUEST_TIMEOUT_MS + 1;
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|error| error == "tuning.ipc.initial_request_timeout_ms must be <= 60000"));
+
+        cfg = TuningConfig::default();
+        cfg.ipc.io_timeout_ms = IpcTuning::MIN_IO_TIMEOUT_MS;
+        assert!(
+            cfg.validate()
+                .iter()
+                .all(|error| !error.contains("io_timeout_ms"))
+        );
+        cfg.ipc.io_timeout_ms = IpcTuning::MAX_IO_TIMEOUT_MS;
+        assert!(
+            cfg.validate()
+                .iter()
+                .all(|error| !error.contains("io_timeout_ms"))
+        );
+        cfg.ipc.io_timeout_ms = IpcTuning::MIN_IO_TIMEOUT_MS - 1;
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|error| error == "tuning.ipc.io_timeout_ms must be >= 100"));
+        cfg.ipc.io_timeout_ms = IpcTuning::MAX_IO_TIMEOUT_MS + 1;
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|error| error == "tuning.ipc.io_timeout_ms must be <= 300000"));
+
+        cfg = TuningConfig::default();
+        assert_eq!(
+            cfg.ipc.aggregate_request_buffer_bytes(),
+            Some((2 * IpcTuning::DEFAULT_MAX_MESSAGE_SIZE + 2) * 1024)
+        );
+        assert!(
+            cfg.ipc.aggregate_request_buffer_bytes().unwrap()
+                <= IpcTuning::MAX_AGGREGATE_REQUEST_BUFFER_BYTES
+        );
+
+        cfg.ipc.max_message_size = IpcTuning::MAX_MAX_MESSAGE_SIZE;
+        cfg.ipc.max_concurrent_connections = IpcTuning::MAX_MAX_CONCURRENT_CONNECTIONS;
+        assert!(cfg.validate().iter().any(|error| {
+            error == "tuning.ipc aggregate request buffer envelope must be <= 512MB"
+        }));
+
+        cfg.ipc.max_concurrent_connections = 3;
+        assert!(cfg.validate().iter().all(|error| {
+            error != "tuning.ipc aggregate request buffer envelope must be <= 512MB"
+        }));
     }
 
     // ── br-ft-g681u: web SSE rate + body-size invariants ──
@@ -1451,6 +1688,23 @@ default_port = 9000
 
         let ip = IpcTuning::default();
         assert_eq!(ip.max_message_size, IpcTuning::DEFAULT_MAX_MESSAGE_SIZE);
+        assert_eq!(IpcTuning::MIN_MAX_MESSAGE_SIZE, 16 * 1024);
+        assert_eq!(IpcTuning::MAX_MAX_MESSAGE_SIZE, 64 * 1024 * 1024);
+        assert_eq!(IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS, 10);
+        assert_eq!(IpcTuning::MAX_ACCEPT_POLL_INTERVAL_MS, 1_000);
+        assert_eq!(
+            IpcTuning::MAX_AGGREGATE_REQUEST_BUFFER_BYTES,
+            512 * 1024 * 1024
+        );
+        assert_eq!(
+            ip.max_concurrent_connections,
+            IpcTuning::DEFAULT_MAX_CONCURRENT_CONNECTIONS
+        );
+        assert_eq!(
+            ip.initial_request_timeout_ms,
+            IpcTuning::DEFAULT_INITIAL_REQUEST_TIMEOUT_MS
+        );
+        assert_eq!(ip.io_timeout_ms, IpcTuning::DEFAULT_IO_TIMEOUT_MS);
 
         let wz = WeztermTuning::default();
         assert_eq!(wz.timeout_secs, WeztermTuning::DEFAULT_TIMEOUT_SECS);
