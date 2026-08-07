@@ -3297,7 +3297,7 @@ impl StorageHandle {
                 // contract after every wake so an expired deadline cannot turn
                 // this watcher into a non-yielding hot loop.
                 if cx.checkpoint().is_err() {
-                    return Ok(());
+                    return Ok::<(), crate::runtime_async::ContextError>(());
                 }
                 sleep_result?;
             }
