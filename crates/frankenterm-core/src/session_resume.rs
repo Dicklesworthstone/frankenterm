@@ -218,6 +218,7 @@ pub enum SessionDiscoveryIncompleteReason {
     SubprocessFailed,
     InvalidOutput,
     OutputCaptureIncomplete,
+    LimitExceeded,
     DirectoryUnreadable,
     DirectoryEntryUnreadable,
 }
@@ -1528,7 +1529,7 @@ fn discovery_error_incomplete_evidence(
 ) -> (SessionDiscoverySource, SessionDiscoveryIncompleteReason) {
     match error {
         SessionResumeError::DiscoveryLimitExceeded { source, .. } => {
-            (*source, SessionDiscoveryIncompleteReason::InvalidOutput)
+            (*source, SessionDiscoveryIncompleteReason::LimitExceeded)
         }
         _ => (
             SessionDiscoverySource::Merged,
@@ -1656,11 +1657,11 @@ mod tests {
         assert!(matches!(
             &err,
             SessionResumeError::InvalidNativeSessionId {
-                provider_slug,
-                ..
-            } if provider_slug.as_str() == "agy"
+                input_bytes,
+                reason: NativeSessionIdInvalidReason::WrongShape,
+            } if *input_bytes == bad_id.len()
         ));
-        assert!(err.to_string().contains("agy"));
+        assert!(!err.to_string().contains(bad_id));
 
         let err = antigravity_native_resume_plan_with_model(
             "123e4567-e89b-12d3-a456-426614174000",
@@ -1670,12 +1671,10 @@ mod tests {
         assert!(matches!(
             &err,
             SessionResumeError::NonPinnedNativeModel {
-                provider_slug,
-                required_model,
-                ..
-            } if provider_slug.as_str() == "agy" && required_model.as_str() == ANTIGRAVITY_MODEL
+                requested_model_bytes,
+            } if *requested_model_bytes == "Gemini 3.1 Pro".len()
         ));
-        assert!(err.to_string().contains(ANTIGRAVITY_MODEL));
+        assert!(!err.to_string().contains("Gemini 3.1 Pro"));
     }
 
     #[test]
@@ -1687,15 +1686,8 @@ mod tests {
             .require_binary_available_in_path(Some(empty_path.path().to_str().unwrap()))
             .unwrap_err();
 
-        assert!(matches!(
-            &err,
-            SessionResumeError::NativeProviderNotFound {
-                provider_slug,
-                binary,
-                ..
-            } if provider_slug.as_str() == "agy" && binary.as_str() == "agy"
-        ));
-        assert!(err.to_string().contains("native provider agy"));
+        assert_eq!(err, SessionResumeError::NativeProviderNotFound);
+        assert_eq!(err.to_string(), "native provider binary unavailable");
     }
 
     #[cfg(unix)]
@@ -1714,10 +1706,7 @@ mod tests {
         let error = plan
             .require_binary_available_in_path(Some(path_dir.path().to_str().unwrap()))
             .expect_err("a regular file without execute permission is not an available binary");
-        assert!(matches!(
-            error,
-            SessionResumeError::NativeProviderNotFound { .. }
-        ));
+        assert_eq!(error, SessionResumeError::NativeProviderNotFound);
     }
 
     #[test]
@@ -1833,17 +1822,18 @@ mod tests {
     }
 
     #[test]
-    fn resumer_discover_fails_gracefully_when_binary_missing() {
+    fn resumer_discover_retains_typed_partial_report_when_binary_missing() {
         let r = SessionResumer::new(SessionResumeConfig {
             casr_binary: "/nonexistent/casr-binary-that-does-not-exist".into(),
             ..Default::default()
         });
-        let result = r.discover_sessions();
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            SessionResumeError::CasrNotFound(_)
-        ));
+        let report = r.discover_sessions().expect("native discovery remains usable");
+        assert!(report.entries.is_empty());
+        assert!(!report.is_complete());
+        assert!(report.incomplete.contains(&SessionDiscoveryIncomplete {
+            source: SessionDiscoverySource::Casr,
+            reason: SessionDiscoveryIncompleteReason::Unavailable,
+        }));
     }
 
     #[test]
@@ -1947,44 +1937,36 @@ mod tests {
 
     #[test]
     fn error_display() {
-        let e = SessionResumeError::CasrNotFound("no binary".into());
-        assert!(e.to_string().contains("casr not found"));
+        let e = SessionResumeError::CasrNotFound;
+        assert!(e.to_string().contains("unavailable"));
 
-        let e = SessionResumeError::SubprocessFailed {
-            code: Some(1),
-            stderr: "fail".into(),
-        };
+        let e = SessionResumeError::SubprocessFailed { code: Some(1) };
         assert!(e.to_string().contains("exit 1"));
 
-        let e = SessionResumeError::ParseError("bad json".into());
-        assert!(e.to_string().contains("parse error"));
+        let e = SessionResumeError::ParseError { output_bytes: 8 };
+        assert!(e.to_string().contains("8 bytes"));
 
-        let e = SessionResumeError::SessionNotFound("abc".into());
-        assert!(e.to_string().contains("abc"));
-
-        let e = SessionResumeError::ProviderNotInstalled("codex".into());
-        assert!(e.to_string().contains("codex"));
-
-        let e = SessionResumeError::NativeProviderNotFound {
-            provider_slug: "agy".into(),
-            binary: "agy".into(),
-            message: "missing".into(),
+        let e = SessionResumeError::SessionNotFound {
+            identifier_bytes: 3,
         };
-        assert!(e.to_string().contains("native provider agy"));
+        assert!(e.to_string().contains("identifier_bytes=3"));
+
+        let e = SessionResumeError::ProviderNotInstalled;
+        assert_eq!(e.to_string(), "provider not installed");
+
+        let e = SessionResumeError::NativeProviderNotFound;
+        assert_eq!(e.to_string(), "native provider binary unavailable");
 
         let e = SessionResumeError::InvalidNativeSessionId {
-            provider_slug: "agy".into(),
-            session_id: "../bad".into(),
-            reason: "bad id".into(),
+            input_bytes: 6,
+            reason: NativeSessionIdInvalidReason::WrongShape,
         };
-        assert!(e.to_string().contains("invalid native provider agy"));
+        assert!(e.to_string().contains("input_bytes=6"));
 
         let e = SessionResumeError::NonPinnedNativeModel {
-            provider_slug: "agy".into(),
-            requested_model: "Gemini 3.1 Pro".into(),
-            required_model: ANTIGRAVITY_MODEL.into(),
+            requested_model_bytes: 14,
         };
-        assert!(e.to_string().contains(ANTIGRAVITY_MODEL));
+        assert!(e.to_string().contains("requested_bytes=14"));
 
         let e = SessionResumeError::Timeout;
         assert!(e.to_string().contains("timed out"));
@@ -2020,13 +2002,18 @@ mod tests {
     // -- Helper functions --
 
     #[test]
-    fn discover_sessions_failopen_returns_empty() {
+    fn discover_sessions_failopen_marks_empty_inventory_incomplete() {
         let config = SessionResumeConfig {
             casr_binary: "/nonexistent/casr-binary-that-does-not-exist".into(),
             ..Default::default()
         };
         let result = discover_sessions_failopen(&config);
-        assert!(result.is_empty());
+        assert!(result.entries.is_empty());
+        assert!(!result.is_complete());
+        assert!(result.incomplete.contains(&SessionDiscoveryIncomplete {
+            source: SessionDiscoverySource::Casr,
+            reason: SessionDiscoveryIncompleteReason::Unavailable,
+        }));
     }
 
     #[test]
@@ -2179,13 +2166,16 @@ mod tests {
     }
 
     #[test]
-    fn resumer_discover_for_provider_fails_gracefully() {
+    fn resumer_discover_for_provider_preserves_partial_evidence() {
         let r = SessionResumer::new(SessionResumeConfig {
             casr_binary: "/nonexistent/casr-binary-that-does-not-exist".into(),
             ..Default::default()
         });
-        let result = r.discover_sessions_for_provider(&AgentProvider::Codex);
-        assert!(result.is_err());
+        let report = r
+            .discover_sessions_for_provider(&AgentProvider::Codex)
+            .expect("provider filtering keeps the partial report");
+        assert!(report.entries.is_empty());
+        assert!(!report.is_complete());
     }
 
     #[test]
@@ -2200,19 +2190,20 @@ mod tests {
     }
 
     #[test]
-    fn discover_sessions_invalid_working_dir_is_not_not_found() {
+    fn discover_sessions_invalid_working_dir_is_typed_partial_without_path() {
         let r = SessionResumer::new(SessionResumeConfig {
             casr_binary: "rustc".into(),
             working_dir: Some(PathBuf::from("/definitely/nonexistent/casr-working-dir")),
             ..Default::default()
         });
 
-        let err = r.discover_sessions().unwrap_err();
-        assert!(matches!(
-            &err,
-            SessionResumeError::SubprocessFailed { code: None, .. }
-        ));
-        assert!(!err.to_string().contains("/definitely/nonexistent"));
+        let report = r
+            .discover_sessions()
+            .expect("native inventory remains available when CASR cwd is invalid");
+        assert!(report.incomplete.contains(&SessionDiscoveryIncomplete {
+            source: SessionDiscoverySource::Casr,
+            reason: SessionDiscoveryIncompleteReason::SubprocessFailed,
+        }));
     }
 
     #[test]
@@ -2267,7 +2258,8 @@ mod tests {
             timeout_secs: 5,
             ..Default::default()
         })
-        .with_output_limits(3, 64);
+        .with_output_limits(3, 64)
+        .expect("limits are below hard admission ceilings");
         assert_eq!(
             exact
                 .run_casr(&["-c", "printf 'abc'"])
@@ -2275,17 +2267,20 @@ mod tests {
             "abc"
         );
 
-        let over = exact.clone().with_output_limits(2, 64);
+        let over = exact
+            .clone()
+            .with_output_limits(2, 64)
+            .expect("limits are below hard admission ceilings");
         let error = over
             .run_casr(&["-c", "printf 'abc'; while :; do sleep 1; done"])
             .expect_err("first byte beyond stdout cap must fail closed");
         assert!(matches!(
             &error,
-            SessionResumeError::SubprocessFailed {
-                code: None,
-                stderr
-            } if stderr.contains("stdout capture limit exceeded")
-                && stderr.contains("limit 2")
+            SessionResumeError::CaptureLimitExceeded {
+                stream: CommandOutputStream::Stdout,
+                observed: 3,
+                limit: 2,
+            }
         ));
         assert!(!error.to_string().contains("abc"));
     }
@@ -2298,7 +2293,8 @@ mod tests {
             timeout_secs: 5,
             ..Default::default()
         })
-        .with_output_limits(64, 3);
+        .with_output_limits(64, 3)
+        .expect("limits are below hard admission ceilings");
         assert_eq!(
             exact
                 .run_casr(&["-c", "printf 'abc' >&2; printf 'ok'"])
@@ -2306,7 +2302,9 @@ mod tests {
             "ok"
         );
 
-        let over = exact.with_output_limits(64, 2);
+        let over = exact
+            .with_output_limits(64, 2)
+            .expect("limits are below hard admission ceilings");
         let error = over
             .run_casr(&[
                 "-c",
@@ -2315,11 +2313,11 @@ mod tests {
             .expect_err("first byte beyond stderr cap must fail closed");
         assert!(matches!(
             &error,
-            SessionResumeError::SubprocessFailed {
-                code: None,
-                stderr,
-            } if stderr.contains("stderr capture limit exceeded")
-                && stderr.contains("limit 2")
+            SessionResumeError::CaptureLimitExceeded {
+                stream: CommandOutputStream::Stderr,
+                observed: 3,
+                limit: 2,
+            }
         ));
         assert!(!error.to_string().contains("abc"));
     }
@@ -2333,17 +2331,18 @@ mod tests {
             timeout_secs: 2,
             ..Default::default()
         })
-        .with_output_limits(LIMIT, 64);
+        .with_output_limits(LIMIT, 64)
+        .expect("limits are below hard admission ceilings");
         let error = resumer
             .run_casr(&["-c", "yes x"])
             .expect_err("unbounded producer must be stopped at the capture cap");
         assert!(matches!(
             &error,
-            SessionResumeError::SubprocessFailed {
-                code: None,
-                stderr,
-            } if stderr.contains("stdout capture limit exceeded")
-                && stderr.contains("limit 65536")
+            SessionResumeError::CaptureLimitExceeded {
+                stream: CommandOutputStream::Stdout,
+                observed,
+                limit: LIMIT,
+            } if *observed > LIMIT
         ));
     }
 

@@ -4,8 +4,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use proptest::prelude::*;
@@ -145,7 +143,9 @@ fn antigravity_discovery_lists_only_conversation_db_files() {
         .expect("write invalid db-name fixture");
     fs::create_dir_all(conversations.join("directory.db")).expect("create db-named directory");
 
-    let entries = discover_antigravity_conversations_from_home(home);
+    let report = discover_antigravity_conversations_from_home(home)
+        .expect("bounded native discovery succeeds");
+    let entries = report.entries;
 
     assert_eq!(entries.len(), 1);
     let entry = &entries[0];
@@ -217,7 +217,9 @@ fn antigravity_discovery_is_disjoint_from_legacy_gemini_tmp_chats() {
     fs::write(legacy_gmi_chats.join("session-legacy.json"), b"{}")
         .expect("write legacy gmi fixture");
 
-    let entries = discover_antigravity_conversations_from_home(home);
+    let report = discover_antigravity_conversations_from_home(home)
+        .expect("bounded native discovery succeeds");
+    let entries = report.entries;
 
     assert_eq!(entries.len(), 1);
     let discovered_path = entries[0].path.as_deref().expect("agy entry path");
@@ -231,7 +233,6 @@ fn antigravity_discovery_is_disjoint_from_legacy_gemini_tmp_chats() {
     }));
 }
 
-#[cfg(unix)]
 #[test]
 fn antigravity_e2e_fixture_merges_casr_and_native_sessions_without_cross_listing() {
     let temp = tempfile::tempdir().expect("temp home");
@@ -256,46 +257,23 @@ fn antigravity_e2e_fixture_merges_casr_and_native_sessions_without_cross_listing
     let legacy_gmi_path = legacy_gmi_chats.join(format!("{legacy_session_id}.json"));
     fs::write(&legacy_gmi_path, b"{}").expect("write legacy gmi fixture");
 
-    let casr_payload = json!([
-        {
-            "session_id": legacy_session_id,
-            "provider": "gemini",
-            "title": "legacy Gemini CLI session",
-            "messages": 1,
-            "workspace": null,
-            "started_at": null,
-            "path": legacy_gmi_path.display().to_string(),
-        }
-    ])
-    .to_string();
-    let fake_casr = temp.path().join("fake-casr");
-    fs::write(
-        &fake_casr,
-        format!(
-            "#!/bin/sh\n\
-             if [ \"$1\" = \"list\" ] && [ \"$2\" = \"--json\" ]; then\n\
-             cat <<'JSON'\n\
-             {casr_payload}\n\
-             JSON\n\
-             exit 0\n\
-             fi\n\
-             echo \"unexpected fake casr args: $*\" >&2\n\
-             exit 42\n"
-        ),
+    let mut report = discover_antigravity_conversations_from_home(home)
+        .expect("bounded native discovery succeeds");
+    merge_session_discovery_entries(
+        &mut report,
+        vec![CasrListEntry {
+            session_id: legacy_session_id.to_string(),
+            provider: Some("gemini".to_string()),
+            title: Some("legacy Gemini CLI session".to_string()),
+            messages: 1,
+            workspace: None,
+            started_at: None,
+            path: Some(legacy_gmi_path.display().to_string()),
+            extra: HashMap::new(),
+        }],
     )
-    .expect("write fake casr fixture");
-    fs::set_permissions(&fake_casr, fs::Permissions::from_mode(0o755))
-        .expect("make fake casr executable");
-
-    let resumer = SessionResumer::new(SessionResumeConfig {
-        casr_binary: fake_casr.display().to_string(),
-        working_dir: None,
-        timeout_secs: 5,
-        dry_run: false,
-    });
-    let entries = resumer
-        .discover_sessions_in_home(home)
-        .expect("fake casr plus native agy discovery succeeds");
+    .expect("pure CASR/native merge succeeds");
+    let entries = report.entries;
 
     for entry in &entries {
         let provider = provider_from_list_entry(entry);
@@ -544,11 +522,14 @@ proptest! {
         prop_assert_eq!(rt.pane_ids, vec![pane_id]);
     }
 
-    // 15. SessionResumeError display contains relevant info
+    // 15. SessionResumeError display does not retain untrusted content
     #[test]
-    fn error_display_contains_message(msg in "[a-z ]{1,30}") {
-        let e = SessionResumeError::CasrNotFound(msg.clone());
-        prop_assert!(e.to_string().contains(&msg));
+    fn error_display_is_content_free(msg in "[QWXZ]{32,64}") {
+        let e = SessionResumeError::InvalidSessionIdentifier {
+            input_bytes: msg.len(),
+        };
+        prop_assert!(!e.to_string().contains(&msg));
+        prop_assert!(e.to_string().contains(&msg.len().to_string()));
     }
 
     // 16. SessionResumeError::SubprocessFailed includes exit code
@@ -556,7 +537,6 @@ proptest! {
     fn error_subprocess_includes_code(code in 1..127i32) {
         let e = SessionResumeError::SubprocessFailed {
             code: Some(code),
-            stderr: "fail".into(),
         };
         let display = e.to_string();
         let code_str = code.to_string();
@@ -658,7 +638,8 @@ proptest! {
             ..Default::default()
         };
         let result = discover_sessions_failopen(&config);
-        prop_assert!(result.is_empty());
+        prop_assert!(result.entries.is_empty());
+        prop_assert!(!result.is_complete());
     }
 
     // 21. AgentProvider from_slug known aliases

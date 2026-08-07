@@ -474,7 +474,7 @@ impl OpenAiDeviceAuthFlow {
             &normalized_code,
             email,
             artifacts_dir.as_deref(),
-            ctx.config().headless,
+            ctx.config(),
         );
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -571,10 +571,16 @@ impl OpenAiDeviceAuthFlow {
         user_code: &str,
         email: Option<&str>,
         artifacts_dir: Option<&Path>,
-        headless: bool,
+        browser_config: &super::BrowserConfig,
     ) -> Result<PlaywrightOutcome, PlaywrightFlowError> {
         let script = self
-            .build_playwright_script(profile_dir, user_code, email, artifacts_dir, headless)
+            .build_playwright_script_with_browser_config(
+                profile_dir,
+                user_code,
+                email,
+                artifacts_dir,
+                browser_config,
+            )
             .map_err(|failure| PlaywrightFlowError {
                 error: failure.detail().to_string(),
                 kind: AuthFlowFailureKind::PlaywrightError,
@@ -620,16 +626,18 @@ impl OpenAiDeviceAuthFlow {
     /// - `{"status":"success","storage_state":"..."}`
     /// - `{"status":"interactive_required","reason":"..."}`
     /// - `{"status":"error","kind":"...","message":"..."}`
-    fn build_playwright_script(
+    fn build_playwright_script_with_browser_config(
         &self,
         profile_dir: &Path,
         user_code: &str,
         email: Option<&str>,
         artifacts_dir: Option<&Path>,
-        headless: bool,
+        browser_config: &super::BrowserConfig,
     ) -> Result<String, super::BrowserNodeCommandFailure> {
         let sel = &self.config.selectors;
         super::admit_browser_timeout(self.config.flow_timeout_ms)?;
+        super::admit_browser_timeout(browser_config.navigation_timeout_ms)?;
+        super::admit_browser_timeout(browser_config.page_load_timeout_ms)?;
         super::admit_browser_url(&self.config.device_url)?;
         for selector_group in [
             &sel.code_input,
@@ -665,7 +673,9 @@ impl OpenAiDeviceAuthFlow {
             "email": email,
             "artifacts_dir": artifacts_dir.map(|path| path.to_string_lossy().into_owned()),
             "timeout_ms": self.config.flow_timeout_ms,
-            "headless": headless,
+            "headless": browser_config.headless,
+            "navigation_timeout_ms": browser_config.navigation_timeout_ms,
+            "page_load_timeout_ms": browser_config.page_load_timeout_ms,
             "screenshot_max_bytes": SCREENSHOT_ARTIFACT_MAX_BYTES,
             "selectors": {
                 "code_input": &sel.code_input,
@@ -702,6 +712,8 @@ function sameOrigin(left, right) {{
 
 (async () => {{
   const TIMEOUT = input.timeout_ms;
+  const NAVIGATION_TIMEOUT = Math.min(input.navigation_timeout_ms, TIMEOUT);
+  const PAGE_LOAD_TIMEOUT = Math.min(input.page_load_timeout_ms, TIMEOUT);
   const profileDir = input.profile_dir;
   const deviceUrl = input.device_url;
   const userCode = input.user_code;
@@ -727,10 +739,10 @@ function sameOrigin(left, right) {{
       timeout: TIMEOUT,
     }});
     page = browser.pages()[0] || await browser.newPage();
-    page.setDefaultTimeout(TIMEOUT);
+    page.setDefaultTimeout(PAGE_LOAD_TIMEOUT);
 
     // Navigate to device auth page
-    await page.goto(deviceUrl, {{ waitUntil: 'domcontentloaded', timeout: TIMEOUT }});
+    await page.goto(deviceUrl, {{ waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT }});
 
     // Detect page state
     const passwordEl = await page.$(selectors.password_prompt);
@@ -756,7 +768,7 @@ function sameOrigin(left, right) {{
       const emailSubmit = await page.$(selectors.email_submit);
       if (emailSubmit) await emailSubmit.click();
       // Wait for navigation after email submission
-      await page.waitForLoadState('domcontentloaded', {{ timeout: TIMEOUT }});
+      await page.waitForLoadState('domcontentloaded', {{ timeout: PAGE_LOAD_TIMEOUT }});
 
       const postEmailPassword = await page.$(selectors.password_prompt);
       if (postEmailPassword) {{
@@ -833,6 +845,28 @@ function sameOrigin(left, right) {{
 }})();
 "#
         ))
+    }
+
+    #[cfg(test)]
+    fn build_playwright_script(
+        &self,
+        profile_dir: &Path,
+        user_code: &str,
+        email: Option<&str>,
+        artifacts_dir: Option<&Path>,
+        headless: bool,
+    ) -> Result<String, super::BrowserNodeCommandFailure> {
+        let browser_config = super::BrowserConfig {
+            headless,
+            ..super::BrowserConfig::default()
+        };
+        self.build_playwright_script_with_browser_config(
+            profile_dir,
+            user_code,
+            email,
+            artifacts_dir,
+            &browser_config,
+        )
     }
 
     /// Parse a successful Playwright script result from stdout JSON.

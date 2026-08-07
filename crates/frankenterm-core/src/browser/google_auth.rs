@@ -94,7 +94,7 @@ impl Default for GooglePageSelectors {
                 "[data-ogsr-up], [data-profileimagecssurl], img[data-src*='googleusercontent']"
                     .to_string(),
             email_input: "input[type='email']".to_string(),
-            email_next: "#identifierNext, button[type='button']".to_string(),
+            email_next: "#identifierNext, button[type='submit']".to_string(),
             password_prompt: "input[type='password']".to_string(),
             mfa_indicator: "text=2-Step Verification, text=Verify it's you, #totpPin".to_string(),
             security_key_indicator: "text=Use your security key, text=Insert your security key"
@@ -211,7 +211,7 @@ impl GoogleAuthFlow {
                 target_url,
                 email,
                 artifacts_dir.as_deref(),
-                ctx.config().headless,
+                ctx.config(),
             );
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -298,10 +298,16 @@ impl GoogleAuthFlow {
         auth_url: &str,
         email: Option<&str>,
         artifacts_dir: Option<&Path>,
-        headless: bool,
+        browser_config: &super::BrowserConfig,
     ) -> Result<PlaywrightOutcome, PlaywrightFlowError> {
         let script = self
-            .build_playwright_script(profile_dir, auth_url, email, artifacts_dir, headless)
+            .build_playwright_script_with_browser_config(
+                profile_dir,
+                auth_url,
+                email,
+                artifacts_dir,
+                browser_config,
+            )
             .map_err(|failure| PlaywrightFlowError {
                 error: failure.detail().to_string(),
                 kind: AuthFlowFailureKind::PlaywrightError,
@@ -340,16 +346,18 @@ impl GoogleAuthFlow {
     }
 
     /// Build the Node.js/Playwright script for the Google OAuth flow.
-    fn build_playwright_script(
+    fn build_playwright_script_with_browser_config(
         &self,
         profile_dir: &Path,
         auth_url: &str,
         email: Option<&str>,
         artifacts_dir: Option<&Path>,
-        headless: bool,
+        browser_config: &super::BrowserConfig,
     ) -> Result<String, super::BrowserNodeCommandFailure> {
         let sel = &self.config.selectors;
         super::admit_browser_timeout(self.config.flow_timeout_ms)?;
+        super::admit_browser_timeout(browser_config.navigation_timeout_ms)?;
+        super::admit_browser_timeout(browser_config.page_load_timeout_ms)?;
         super::admit_browser_url(auth_url)?;
         for selector_group in [
             &sel.signed_in_marker,
@@ -385,7 +393,9 @@ impl GoogleAuthFlow {
             "email": email,
             "artifacts_dir": artifacts_dir.map(|path| path.to_string_lossy().into_owned()),
             "timeout_ms": self.config.flow_timeout_ms,
-            "headless": headless,
+            "headless": browser_config.headless,
+            "navigation_timeout_ms": browser_config.navigation_timeout_ms,
+            "page_load_timeout_ms": browser_config.page_load_timeout_ms,
             "screenshot_max_bytes": super::openai_device::SCREENSHOT_ARTIFACT_MAX_BYTES,
             "selectors": {
                 "signed_in_marker": &sel.signed_in_marker,
@@ -423,6 +433,8 @@ function sameOrigin(left, right) {{
 
 (async () => {{
   const TIMEOUT = input.timeout_ms;
+  const NAVIGATION_TIMEOUT = Math.min(input.navigation_timeout_ms, TIMEOUT);
+  const PAGE_LOAD_TIMEOUT = Math.min(input.page_load_timeout_ms, TIMEOUT);
   const profileDir = input.profile_dir;
   const authUrl = input.auth_url;
   const email = input.email;
@@ -447,10 +459,10 @@ function sameOrigin(left, right) {{
       timeout: TIMEOUT,
     }});
     page = browser.pages()[0] || await browser.newPage();
-    page.setDefaultTimeout(TIMEOUT);
+    page.setDefaultTimeout(PAGE_LOAD_TIMEOUT);
 
     // Navigate to auth page
-    await page.goto(authUrl, {{ waitUntil: 'domcontentloaded', timeout: TIMEOUT }});
+    await page.goto(authUrl, {{ waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT }});
 
     // Wait for any redirects to settle
     await page.waitForTimeout(2000);
@@ -579,7 +591,7 @@ function sameOrigin(left, right) {{
       if (emailNext) await emailNext.click();
 
       // Wait for navigation after email submission
-      await page.waitForLoadState('domcontentloaded', {{ timeout: TIMEOUT }});
+      await page.waitForLoadState('domcontentloaded', {{ timeout: PAGE_LOAD_TIMEOUT }});
       await page.waitForTimeout(2000);
 
       // After email: check for password/MFA/SSO/security key
@@ -686,6 +698,28 @@ function sameOrigin(left, right) {{
 }})();
 "#
         ))
+    }
+
+    #[cfg(test)]
+    fn build_playwright_script(
+        &self,
+        profile_dir: &Path,
+        auth_url: &str,
+        email: Option<&str>,
+        artifacts_dir: Option<&Path>,
+        headless: bool,
+    ) -> Result<String, super::BrowserNodeCommandFailure> {
+        let browser_config = super::BrowserConfig {
+            headless,
+            ..super::BrowserConfig::default()
+        };
+        self.build_playwright_script_with_browser_config(
+            profile_dir,
+            auth_url,
+            email,
+            artifacts_dir,
+            &browser_config,
+        )
     }
 
     /// Parse a successful Playwright script result from stdout JSON.

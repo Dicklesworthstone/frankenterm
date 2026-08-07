@@ -11,10 +11,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::subprocess_bridge::{BridgeError, SubprocessBridge};
 use crate::runtime_async::process::{
     CommandCancellation, CommandCleanupTrigger, CommandOutputStream,
 };
+use crate::subprocess_bridge::{BridgeError, SubprocessBridge};
 
 /// Largest admitted wall-clock timeout for one `rano` invocation.
 pub const MAX_NETWORK_OBSERVER_TIMEOUT_SECS: u64 = 300;
@@ -372,7 +372,7 @@ impl NetworkObserver {
 
         let attr: NetworkAttribution = self.invoke_rano(
             &["attribute", remote_addr, "--json"],
-            Some(cancellation),
+            cancellation,
         )?;
 
         debug!(
@@ -388,28 +388,12 @@ impl NetworkObserver {
     /// Check connectivity status.
     pub fn check_connectivity(&self) -> ConnectivityStatus {
         let cancellation = CommandCancellation::new();
-        self.check_connectivity_with_cancellation(&cancellation)
-    }
-
-    /// Check connectivity with cooperative, handle-owned child cancellation.
-    pub fn check_connectivity_with_cancellation(
-        &self,
-        cancellation: &CommandCancellation,
-    ) -> ConnectivityStatus {
-        match self.invoke_rano::<ConnectivityProbe>(
-            &["check", "--json"],
-            Some(cancellation),
-        ) {
-            Ok(probe) => match probe.status.as_str() {
-                "connected" => ConnectivityStatus::Connected,
-                "degraded" => ConnectivityStatus::Degraded,
-                "unreachable" => ConnectivityStatus::Unreachable,
-                _ => ConnectivityStatus::Unknown,
-            },
-            Err(e) => {
+        match self.check_connectivity_with_cancellation(&cancellation) {
+            Ok(status) => status,
+            Err(error) => {
                 warn!(
                     bridge = "rano",
-                    error_kind = e.kind(),
+                    error_kind = error.kind(),
                     "connectivity check failed"
                 );
                 ConnectivityStatus::Unknown
@@ -417,17 +401,34 @@ impl NetworkObserver {
         }
     }
 
+    /// Check connectivity with cooperative, handle-owned child cancellation.
+    /// Unlike [`Self::check_connectivity`], this variant preserves the typed
+    /// cancellation or supervision failure for its caller.
+    pub fn check_connectivity_with_cancellation(
+        &self,
+        cancellation: &CommandCancellation,
+    ) -> Result<ConnectivityStatus, NetworkObserverError> {
+        let probe = self.invoke_rano::<ConnectivityProbe>(
+            &["check", "--json"],
+            cancellation,
+        )?;
+        Ok(match probe.status.as_str() {
+            "connected" => ConnectivityStatus::Connected,
+            "degraded" => ConnectivityStatus::Degraded,
+            "unreachable" => ConnectivityStatus::Unreachable,
+            _ => ConnectivityStatus::Unknown,
+        })
+    }
+
     fn invoke_rano<T: DeserializeOwned>(
         &self,
         args: &[&str],
-        cancellation: Option<&CommandCancellation>,
+        cancellation: &CommandCancellation,
     ) -> Result<T, NetworkObserverError> {
         let bridge = self.rano_bridge()?;
-        let result = match cancellation {
-            Some(cancellation) => bridge.invoke_with_cancellation(args, cancellation),
-            None => bridge.invoke(args),
-        };
-        result.map_err(|error| self.map_bridge_error(error))
+        bridge
+            .invoke_with_cancellation(args, cancellation)
+            .map_err(|error| self.map_bridge_error(error))
     }
 
     fn rano_bridge<T: DeserializeOwned>(
@@ -871,8 +872,46 @@ mod tests {
         assert_eq!(err, NetworkObserverError::Timeout { timeout_secs: 1 });
     }
 
+    #[cfg(unix)]
     #[test]
-    fn observer_rejects_unrepresentable_timeout_before_spawning() {
+    fn pre_cancelled_observer_never_spawns_child() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        let script = dir.path().join("rano");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n/usr/bin/touch '{}'\nprintf '%s\\n' '{{}}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+
+        let observer = NetworkObserver::with_binary(
+            script.to_string_lossy().into_owned(),
+            NetworkObserverConfig::default(),
+        );
+        let cancellation = CommandCancellation::new();
+        cancellation.cancel();
+
+        assert_eq!(
+            observer.attribute_connection_with_cancellation("10.0.0.1", &cancellation),
+            Err(NetworkObserverError::Cancelled)
+        );
+        assert!(
+            !marker.exists(),
+            "pre-cancelled invocation must be gated before spawn"
+        );
+    }
+
+    #[test]
+    fn observer_rejects_timeout_above_hard_ceiling_before_spawning() {
         let obs = NetworkObserver::with_binary(
             "should-not-be-executed",
             NetworkObserverConfig {
@@ -885,13 +924,107 @@ mod tests {
 
         let err = obs
             .attribute_connection("10.0.0.1")
-            .expect_err("unrepresentable timeout should be rejected before spawn");
+            .expect_err("timeout above hard ceiling should be rejected before spawn");
         assert_eq!(
             err,
             NetworkObserverError::InvalidTimeout {
                 timeout_secs: u64::MAX,
             }
         );
+    }
+
+    #[test]
+    fn observer_rejects_zero_timeout_and_unbounded_capture_limits_before_resolution() {
+        let zero_timeout = NetworkObserver::with_binary(
+            "not-a-rano-binary",
+            NetworkObserverConfig {
+                timeout_secs: 0,
+                ..NetworkObserverConfig::default()
+            },
+        );
+        assert_eq!(
+            zero_timeout
+                .attribute_connection("10.0.0.1")
+                .expect_err("zero timeout must fail before binary resolution"),
+            NetworkObserverError::InvalidTimeout { timeout_secs: 0 }
+        );
+
+        let oversized_stdout = NetworkObserver::with_binary(
+            "not-a-rano-binary",
+            NetworkObserverConfig {
+                max_stdout_bytes: usize::MAX,
+                ..NetworkObserverConfig::default()
+            },
+        );
+        assert_eq!(
+            oversized_stdout
+                .attribute_connection("10.0.0.1")
+                .expect_err("unbounded stdout capture must fail before binary resolution"),
+            NetworkObserverError::InvalidOutputLimit {
+                stream: CommandOutputStream::Stdout,
+                requested: usize::MAX,
+                maximum: MAX_NETWORK_OBSERVER_STDOUT_LIMIT_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn remote_address_admission_is_finite_and_content_free() {
+        for invalid in ["", "--json", "host name", "host\nname"] {
+            let error = validate_remote_address(invalid)
+                .expect_err("unsafe positional address must be rejected");
+            assert_eq!(error.kind(), "invalid_remote_address");
+            if !invalid.is_empty() {
+                assert!(!error.to_string().contains(invalid));
+            }
+        }
+
+        let oversized = "x".repeat(MAX_NETWORK_OBSERVER_REMOTE_ADDRESS_BYTES + 1);
+        assert_eq!(
+            validate_remote_address(&oversized),
+            Err(NetworkObserverError::InvalidRemoteAddress {
+                input_bytes: oversized.len(),
+            })
+        );
+        assert!(validate_remote_address("2001:db8::1").is_ok());
+    }
+
+    #[test]
+    fn network_observer_uses_only_canonical_bounded_subprocess_supervision() {
+        let source = include_str!("network_observer.rs");
+        let production = source
+            .split("// =============================================================================\n// Tests")
+            .next()
+            .expect("production source prefix");
+
+        for required in [
+            "SubprocessBridge",
+            "invoke_with_cancellation",
+            "with_stdout_limit",
+            "with_stderr_limit",
+            "MAX_NETWORK_OBSERVER_TIMEOUT_SECS",
+        ] {
+            assert!(
+                production.contains(required),
+                "production path must retain {required}"
+            );
+        }
+
+        for forbidden in [
+            ["std::", "process"].concat(),
+            ["read_", "to_end"].concat(),
+            ["thread::", "spawn"].concat(),
+            ["send_unix_", "signal"].concat(),
+            [".wa", "it("].concat(),
+            [".ki", "ll("].concat(),
+            ["error = ", "%e"].concat(),
+            ["remote = ", "%remote_addr"].concat(),
+        ] {
+            assert!(
+                !production.contains(&forbidden),
+                "production path must not contain {forbidden}"
+            );
+        }
     }
 
     // -- Backpressure classification --
@@ -939,6 +1072,36 @@ mod tests {
             org: None,
         };
         assert_eq!(obs.classify_pressure(&attr), NetworkPressureTier::Red);
+    }
+
+    #[test]
+    fn classify_pressure_rejects_invalid_measurements_and_thresholds() {
+        let make_attr = |latency_ms| NetworkAttribution {
+            provider: "test".into(),
+            region: None,
+            latency_ms,
+            is_trusted: false,
+            remote_addr: "1.1.1.1".into(),
+            asn: None,
+            org: None,
+        };
+        let observer = NetworkObserver::new();
+        for latency_ms in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            assert_eq!(
+                observer.classify_pressure(&make_attr(latency_ms)),
+                NetworkPressureTier::Black
+            );
+        }
+
+        let invalid_thresholds = NetworkObserver::with_config(NetworkObserverConfig {
+            yellow_latency_ms: 500.0,
+            red_latency_ms: 100.0,
+            ..NetworkObserverConfig::default()
+        });
+        assert_eq!(
+            invalid_thresholds.classify_pressure(&make_attr(50.0)),
+            NetworkPressureTier::Black
+        );
     }
 
     #[test]
