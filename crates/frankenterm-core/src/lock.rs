@@ -455,7 +455,8 @@ impl WatcherHandoffRecord {
 }
 
 /// Diagnostic metadata written alongside the lock file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LockMetadata {
     /// Process ID of the lock holder.
     pub pid: u32,
@@ -481,6 +482,30 @@ impl LockMetadata {
             wa_version: crate::VERSION.to_string(),
         }
     }
+
+    fn is_admissible(&self) -> bool {
+        self.pid != 0
+            && self.started_at_human == chrono_lite_format(self.started_at)
+            && !self.wa_version.is_empty()
+            && self.wa_version.len() <= MAX_LOCK_METADATA_VERSION_BYTES
+            && !self.wa_version.chars().any(char::is_control)
+    }
+}
+
+/// Truthful result of probing the watcher lock.
+///
+/// A held lock with unavailable metadata remains distinct from a free lock,
+/// and inability to probe the lock itself remains distinct from both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockStatus {
+    /// The lock was acquired by the probe and is therefore currently free.
+    Free,
+    /// The lock is held and its bounded metadata passed admission.
+    HeldKnown(LockMetadata),
+    /// The lock is held, but its metadata is missing, unsafe, or invalid.
+    HeldUnknown,
+    /// The lock file could not be opened or probed reliably.
+    ProbeUnavailable,
 }
 
 /// Simple ISO-8601 timestamp formatting without chrono dependency.
@@ -653,25 +678,39 @@ pub fn read_watcher_handoff_record(
 fn read_existing_lock_error(lock_path: &Path) -> LockError {
     let meta_path = metadata_path(lock_path);
     match read_lock_metadata(&meta_path) {
-        Some(meta) => LockError::AlreadyRunning {
+        Ok(meta) => LockError::AlreadyRunning {
             pid: meta.pid,
             started_at: meta.started_at_human,
         },
-        None => LockError::AlreadyRunningNoMeta,
+        Err(_) => LockError::AlreadyRunningNoMeta,
     }
 }
 
 /// Check if a watcher is currently running without acquiring the lock.
 ///
-/// Returns `Some(metadata)` if the lock is held, `None` if it's free.
+/// This never treats rejected holder metadata as evidence that the lock is
+/// free. Callers must handle every [`LockStatus`] variant explicitly.
 #[must_use]
-pub fn check_running(lock_path: &Path) -> Option<LockMetadata> {
-    let lock_file = OpenOptions::new()
+pub fn check_running(lock_path: &Path) -> LockStatus {
+    let lock_file = match OpenOptions::new()
         .read(true)
         .write(true)
         .create(false)
         .open(lock_path)
-        .ok()?;
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return LockStatus::Free,
+        Err(error) => {
+            tracing::warn!(
+                target: "frankenterm::lock",
+                event = "ft-interactive-systems-performance-4tenz.53",
+                phase = "lock_open",
+                kind = stable_io_failure("lock_open", &error).kind,
+                "watcher lock status probe was unavailable"
+            );
+            return LockStatus::ProbeUnavailable;
+        }
+    };
 
     // Try to acquire lock - if it fails, something is holding it
     match lock_file.try_lock_exclusive() {
@@ -679,18 +718,26 @@ pub fn check_running(lock_path: &Path) -> Option<LockMetadata> {
             // We got the lock, so nothing was holding it
             // Release immediately by dropping the file handle
             drop(lock_file);
-            None
+            LockStatus::Free
         }
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-            // Lock is held, try to read metadata.
-            // br-ft-zs9v0: route through read_lock_metadata so read-fail
-            // and parse-fail bump LOCK_METADATA_PARSE_DROP_COUNT and emit
-            // phase-tagged structured warns instead of silently
-            // substituting None.
+            // Lock state is authoritative even when holder metadata is not.
             let meta_path = metadata_path(lock_path);
-            read_lock_metadata(&meta_path)
+            match read_lock_metadata(&meta_path) {
+                Ok(metadata) => LockStatus::HeldKnown(metadata),
+                Err(_) => LockStatus::HeldUnknown,
+            }
         }
-        Err(_) => None,
+        Err(error) => {
+            tracing::warn!(
+                target: "frankenterm::lock",
+                event = "ft-interactive-systems-performance-4tenz.53",
+                phase = "lock_probe",
+                kind = stable_io_failure("lock_probe", &error).kind,
+                "watcher lock status probe was unavailable"
+            );
+            LockStatus::ProbeUnavailable
+        }
     }
 }
 
