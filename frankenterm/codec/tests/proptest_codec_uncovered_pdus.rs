@@ -26,8 +26,8 @@
 //! default auto-compression path.
 
 use codec::{
-    CompressionMode, ErrorResponse, MovePaneToNewTab, Pdu, Ping, Pong, Resize, SendPaste,
-    SetClipboard, SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane,
+    CompressionMode, ErrorResponse, InputSerial, MovePaneToNewTab, Pdu, Ping, Pong, Resize,
+    SendPaste, SetClipboard, SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane,
     StreamingPduBuffer, UnitResponse, WriteToPane,
 };
 use config::keyassignment::SpawnTabDomain;
@@ -103,6 +103,7 @@ enum WireFramingPdu {
     SendPaste {
         pane_id: usize,
         data: String,
+        input_serial: InputSerial,
     },
     SetClipboard {
         pane_id: usize,
@@ -139,9 +140,14 @@ impl WireFramingPdu {
                 pane_id: *pane_id,
                 data: data.clone(),
             }),
-            Self::SendPaste { pane_id, data } => Pdu::SendPaste(SendPaste {
+            Self::SendPaste {
+                pane_id,
+                data,
+                input_serial,
+            } => Pdu::SendPaste(SendPaste {
                 pane_id: *pane_id,
                 data: data.clone(),
+                input_serial: *input_serial,
             }),
             Self::SetClipboard {
                 pane_id,
@@ -206,8 +212,13 @@ fn arb_wire_framing_pdu() -> impl Strategy<Value = WireFramingPdu> {
             proptest::collection::vec(any::<u8>(), 0..128)
         )
             .prop_map(|(pane_id, data)| WireFramingPdu::WriteToPane { pane_id, data }),
-        (0usize..=4096, arb_small_string())
-            .prop_map(|(pane_id, data)| WireFramingPdu::SendPaste { pane_id, data }),
+        (0usize..=4096, arb_small_string(), any::<u64>()).prop_map(
+            |(pane_id, data, millis)| WireFramingPdu::SendPaste {
+                pane_id,
+                data,
+                input_serial: InputSerial::from_millis_since_epoch(millis),
+            },
+        ),
         (
             0usize..=4096,
             prop::option::of(arb_small_string()),

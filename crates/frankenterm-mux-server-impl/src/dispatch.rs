@@ -1,7 +1,7 @@
 #![allow(clippy::future_not_send)]
 #![allow(clippy::type_repetition_in_bounds)]
 use crate::sessionhandler::{
-    PduDeliveryClass, PduSender, SessionAuthority, SessionHandler, SessionOwner,
+    PduDeliveryClass, PduSender, PerPane, SessionAuthority, SessionHandler, SessionOwner,
     frozen_window_order_to_codec, validate_ordered_snapshot_projection,
 };
 use anyhow::Context;
@@ -69,6 +69,8 @@ const DORMANT_OUTBOUND_PROTOCOL_FAILURE: &str =
     "mux server attempted to emit a protocol family without live activation authority";
 const OUTBOUND_WIRE_AUTHORITY_FAILURE: &str =
     "mux server attempted to emit a protocol family with the wrong wire role";
+const PANE_ALERT_BACKLOG_FAILURE: &str =
+    "mux pane alert backlog could not retain a delivery obligation";
 const TOPOLOGY_FENCE_MAX_EVENTS: usize = 4096;
 const TOPOLOGY_FENCE_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
 /// Accounted topology values retain their original 4 MiB connection ceiling;
@@ -6105,6 +6107,31 @@ fn dispatch_client_request_if_admitted(
     Ok(RequestDispatchOutcome::Dispatched)
 }
 
+fn retain_pane_alert_or_trip(
+    per_pane: &Arc<std::sync::Mutex<PerPane>>,
+    terminal: &DispatchTerminal,
+    pane_id: mux::pane::PaneId,
+    alert: wezterm_term::Alert,
+) -> anyhow::Result<()> {
+    let retention = match per_pane.lock() {
+        Ok(mut state) => state.push_notification(alert),
+        Err(err) => {
+            terminal.trip(PANE_ALERT_BACKLOG_FAILURE);
+            anyhow::bail!("per-pane lock poisoned while retaining alert for pane {pane_id}: {err}");
+        }
+    };
+    if let Err(err) = retention {
+        terminal.trip(PANE_ALERT_BACKLOG_FAILURE);
+        metrics::counter!(
+            "mux.dispatch.pane_alert_backlog_terminal",
+            "reason" => "retention_rejected"
+        )
+        .increment(1);
+        anyhow::bail!("cannot retain mux alert for pane {pane_id}: {err}");
+    }
+    Ok(())
+}
+
 async fn process_async_with_mux<T>(
     mut stream: T,
     config: DispatchRuntimeConfig,
@@ -6324,12 +6351,12 @@ where
                             // was already removed, re-inserting a fresh PerPane here
                             // would leak because no later PaneRemoved can retire it.
                             if let Some(per_pane) = handler.per_pane_if_present(pane_id) {
-                                {
-                                    let mut per_pane = per_pane.lock().map_err(|err| {
-                                        anyhow::anyhow!("per-pane lock poisoned: {err}")
-                                    })?;
-                                    per_pane.notifications.push(alert);
-                                }
+                                retain_pane_alert_or_trip(
+                                    &per_pane,
+                                    &terminal,
+                                    pane_id,
+                                    alert,
+                                )?;
                                 handler.schedule_tracked_pane_push(pane_id);
                             }
                         }
@@ -6703,6 +6730,38 @@ mod tests {
             terminal,
             TopologyStreamId::from_bytes([0x5a; 16]),
         )
+    }
+
+    #[test]
+    fn pane_alert_retention_rejection_trips_the_affected_dispatch_terminal() {
+        let per_pane = Arc::new(std::sync::Mutex::new(PerPane::default()));
+        {
+            let mut state = per_pane.lock().unwrap();
+            for _ in 0..(codec::MAX_RENDER_APPLICATION_ALERTS * 2) {
+                state
+                    .push_notification(Alert::Bell)
+                    .expect("fill the bounded exact-event backlog");
+            }
+        }
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+
+        let error = retain_pane_alert_or_trip(&per_pane, &terminal, 91, Alert::Bell)
+            .expect_err("an unretainable exact event must fail the connection closed");
+
+        assert!(
+            error.to_string().contains("exact-event alert backlog capacity"),
+            "typed retention failure should survive dispatch propagation: {error:#}"
+        );
+        assert!(terminal.is_tripped());
+        assert_eq!(
+            terminal_rx.try_recv().expect("terminal reason"),
+            PANE_ALERT_BACKLOG_FAILURE
+        );
+        assert_eq!(
+            per_pane.lock().unwrap().notifications.len(),
+            codec::MAX_RENDER_APPLICATION_ALERTS * 2,
+            "rejection must not mutate the exact retained prefix"
+        );
     }
 
     fn bound_topology_coordinator() -> (

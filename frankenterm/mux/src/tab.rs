@@ -3,7 +3,8 @@ use crate::layout::{redistribute_panes, LayoutCycle, PaneStack, SwapLayout};
 use crate::pane::*;
 use crate::renderable::StableCursorPosition;
 use crate::{
-    Mux, MuxNotification, MuxNotificationEnvelope, PaneRegistrationHandle, WindowId,
+    Mux, MuxNotification, MuxNotificationEnvelope, PaneOperationGuard, PaneRegistrationHandle,
+    WindowId,
 };
 use bintree::PathBranch;
 use config::configuration;
@@ -3643,6 +3644,64 @@ impl Tab {
         self.inner.lock().snapshot_panes_callback_free()
     }
 
+    /// Freeze the structural pane pointers and retain the topology lock while
+    /// `f` commits a callback-free mux transaction derived from that snapshot.
+    /// Any mux registry guards must be acquired before entering; the callback
+    /// must not invoke pane code or attempt to reacquire this tab.
+    pub(crate) fn with_pane_snapshot_callback_free<R>(
+        &self,
+        f: impl FnOnce(Vec<Arc<dyn Pane>>) -> R,
+    ) -> R {
+        let inner = self.inner.lock();
+        f(inner.snapshot_panes_callback_free())
+    }
+
+    /// Freeze several exact tabs in a stable identity order and execute one
+    /// callback-free mux transaction derived from all of their pane snapshots.
+    ///
+    /// Window retirement needs a single structural cut across every tab it
+    /// owns. Locking only the tab that supplied a delayed-operation witness
+    /// would leave sibling tabs mutable between window-map retirement and the
+    /// pane-registry census. `tabs` must not contain the same exact `Arc<Tab>`
+    /// more than once. Any mux registry guards must be acquired before calling
+    /// this method, and `f` must not invoke pane code or reacquire any tab.
+    pub(crate) fn with_pane_snapshots_callback_free<R>(
+        tabs: &[Arc<Self>],
+        expected: Option<(&Arc<Self>, &PaneOperationGuard)>,
+        f: impl FnOnce(Vec<Vec<Arc<dyn Pane>>>) -> R,
+    ) -> Option<R> {
+        let mut lock_order = tabs.iter().enumerate().collect::<Vec<_>>();
+        lock_order.sort_unstable_by_key(|(_, tab)| Arc::as_ptr(tab) as usize);
+        debug_assert!(lock_order.windows(2).all(|pair| {
+            !Arc::ptr_eq(pair[0].1, pair[1].1)
+        }));
+
+        let guards = lock_order
+            .iter()
+            .map(|(_, tab)| tab.inner.lock())
+            .collect::<Vec<_>>();
+        let mut snapshots = vec![Vec::new(); tabs.len()];
+        for ((original_index, _), guard) in lock_order.iter().zip(&guards) {
+            snapshots[*original_index] = guard.snapshot_panes_callback_free();
+        }
+
+        if let Some((expected_tab, operation)) = expected {
+            let expected_index = tabs
+                .iter()
+                .position(|tab| Arc::ptr_eq(tab, expected_tab))?;
+            if !snapshots[expected_index]
+                .iter()
+                .any(|pane| operation.is_same_pane(pane))
+            {
+                return None;
+            }
+        }
+
+        let result = f(snapshots);
+        drop(guards);
+        Some(result)
+    }
+
     /// Execute `f` only while this exact tab has no structural pane entries.
     ///
     /// The tab topology lock remains held throughout `f`, so the callback must
@@ -3652,6 +3711,28 @@ impl Tab {
         let inner = self.inner.lock();
         if inner.snapshot_panes_callback_free().is_empty() {
             Some(f())
+        } else {
+            None
+        }
+    }
+
+    /// Execute `f` only while this tab still structurally contains the exact
+    /// pane held by `operation`.
+    ///
+    /// The callback-free tab lock remains held throughout `f`, so a delayed
+    /// destructive transaction can bind its commit to both tab identity and
+    /// pane-generation authority. Any mux registry guards must be acquired
+    /// before entering; the callback must not invoke pane code or attempt to
+    /// reacquire this tab.
+    pub(crate) fn with_exact_pane_operation<R>(
+        &self,
+        operation: &PaneOperationGuard,
+        f: impl FnOnce(Vec<Arc<dyn Pane>>) -> R,
+    ) -> Option<R> {
+        let inner = self.inner.lock();
+        let panes = inner.snapshot_panes_callback_free();
+        if panes.iter().any(|pane| operation.is_same_pane(pane)) {
+            Some(f(panes))
         } else {
             None
         }

@@ -3465,6 +3465,16 @@ struct RemovedPaneRegistration {
     lifecycle_notification: PaneLifecycleNotificationTicket,
 }
 
+struct RemovedTabRegistration {
+    structural_panes: Vec<Arc<dyn Pane>>,
+    removed_panes: Vec<RemovedPaneRegistration>,
+    output_batches: Vec<Arc<PaneOutputBatch>>,
+}
+
+struct RemovedWindowRegistration {
+    removed_tabs: Vec<RemovedTabRegistration>,
+}
+
 /// Discriminant key for the high-rate Alert variants we dedupe per pane.
 ///
 /// `CurrentWorkingDirectoryChanged` (OSC 7) re-emits on every shell prompt
@@ -6829,78 +6839,168 @@ impl Mux {
         if expected.is_some_and(|expected| !Arc::ptr_eq(expected, &tab)) {
             return None;
         }
-        let pane_candidates: Vec<(PaneId, Arc<dyn Pane>)> = tab
-            .iter_all_panes()
-            .into_iter()
-            .map(|pane| (pane.pane_id(), pane))
-            .collect();
 
         let (removed_panes, output_batches) = {
             let _registration = self.pane_registration.lock();
+            let mut tabs = self.tabs.write();
+            if !tabs
+                .get(&tab_id)
+                .is_some_and(|registered| Arc::ptr_eq(registered, &tab))
             {
-                let mut tabs = self.tabs.write();
-                if !tabs
-                    .get(&tab_id)
-                    .is_some_and(|registered| Arc::ptr_eq(registered, &tab))
-                {
-                    return None;
-                }
+                return None;
+            }
+            let mut windows = self.windows.write();
+            let retired_identities = HashSet::from([Arc::as_ptr(&tab) as usize]);
+            if !Self::preflight_exact_tab_detach_locked(
+                &windows,
+                &retired_identities,
+                None,
+                "tab retirement",
+            ) {
+                return None;
+            }
+            let result = tab.with_pane_snapshot_callback_free(|pane_snapshot| {
+                let pane_candidates = self.resolve_tab_pane_candidates_locked(pane_snapshot);
                 tabs.remove(&tab_id);
+                self.take_tab_pane_candidates_for_removal_locked(pane_candidates)
+            });
+            // Keep tab-map authority until every old exact parentage edge has
+            // retired. Otherwise the same Arc<Tab> can be repurposed and
+            // reattached between registry retirement and this window sweep.
+            for window in windows.values_mut() {
+                window.remove_tabs_by_exact_identity_set(&retired_identities);
             }
-            for (pane_id, expected) in &pane_candidates {
-                self.cancel_pane_preparation_locked(*pane_id, Some(expected));
+            result
+        };
+        self.finish_taken_tab_pane_state(&removed_panes, output_batches);
+        Some((tab, removed_panes))
+    }
+
+    /// Resolve callback-free structural pane pointers to the numeric slots
+    /// already owned by the pane registry or an in-flight preparation. The
+    /// caller holds `pane_registration`, so the two maps cannot change between
+    /// this census and retirement.
+    fn resolve_tab_pane_candidates_locked(
+        &self,
+        pane_snapshot: Vec<Arc<dyn Pane>>,
+    ) -> Vec<(PaneId, Arc<dyn Pane>)> {
+        self.resolve_tab_pane_candidate_batches_locked(std::slice::from_ref(&pane_snapshot))
+            .pop()
+            .expect("one pane snapshot produces one candidate batch")
+    }
+
+    /// Batch variant of [`Self::resolve_tab_pane_candidates_locked`]. A
+    /// window can own many tabs, so scanning the global pane registries once
+    /// avoids turning close latency into `tabs * registered_panes` work.
+    fn resolve_tab_pane_candidate_batches_locked(
+        &self,
+        pane_snapshots: &[Vec<Arc<dyn Pane>>],
+    ) -> Vec<Vec<(PaneId, Arc<dyn Pane>)>> {
+        if pane_snapshots.iter().all(Vec::is_empty) {
+            return pane_snapshots.iter().map(|_| Vec::new()).collect();
+        }
+        let preparations = self.pane_preparations.lock();
+        let panes = self.panes.read();
+        let structural_identities = pane_snapshots
+            .iter()
+            .flatten()
+            .map(|pane| Arc::as_ptr(pane) as *const () as usize)
+            .collect::<HashSet<_>>();
+        let mut pane_ids_by_identity = HashMap::with_capacity(structural_identities.len());
+        for (pane_id, registered) in panes.iter() {
+            let identity = Arc::as_ptr(&registered.pane) as *const () as usize;
+            if structural_identities.contains(&identity) {
+                pane_ids_by_identity.insert(identity, *pane_id);
             }
-            let removed_panes = {
-                let mut panes = self.panes.write();
-                pane_candidates
-                    .into_iter()
-                    .filter_map(|(pane_id, expected)| {
-                        if panes
-                            .get(&pane_id)
-                            .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &expected))
-                        {
-                            panes.remove(&pane_id).map(|registered| {
-                                let pane = Arc::clone(&registered.pane);
-                                let generation = Arc::clone(&registered.generation);
-                                drop(registered);
-                                (pane_id, pane, generation)
-                            })
-                        } else {
-                            None
-                        }
+        }
+        for (pane_id, preparing) in preparations.iter() {
+            let identity = Weak::as_ptr(&preparing.pane) as *const () as usize;
+            if structural_identities.contains(&identity) {
+                pane_ids_by_identity.entry(identity).or_insert(*pane_id);
+            }
+        }
+        pane_snapshots
+            .iter()
+            .map(|snapshot| {
+                snapshot
+                    .iter()
+                    .filter_map(|pane| {
+                        let identity = Arc::as_ptr(pane) as *const () as usize;
+                        let pane_id = pane_ids_by_identity.remove(&identity)?;
+                        Some((pane_id, Arc::clone(pane)))
                     })
-                    .collect::<Vec<_>>()
-            };
-            {
-                let mut retiring = self.retiring_pane_ids.lock();
-                for (pane_id, _, _) in &removed_panes {
-                    retiring.insert(*pane_id);
-                }
-            }
-            let output_batches = removed_panes
-                .iter()
-                .filter_map(|(pane_id, _, generation)| {
-                    self.take_pending_pane_output_batch_locked(*pane_id, generation)
-                })
-                .collect::<Vec<_>>();
-            let removed_panes = removed_panes
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Remove the pane-registry entries in one already-authorized tab
+    /// snapshot. The caller holds `pane_registration` and has already removed
+    /// the exact tab from `tabs`.
+    fn take_tab_pane_candidates_for_removal_locked(
+        &self,
+        pane_candidates: Vec<(PaneId, Arc<dyn Pane>)>,
+    ) -> (Vec<RemovedPaneRegistration>, Vec<Arc<PaneOutputBatch>>) {
+        for (pane_id, expected) in &pane_candidates {
+            self.cancel_pane_preparation_locked(*pane_id, Some(expected));
+        }
+        let removed_panes = {
+            let mut panes = self.panes.write();
+            pane_candidates
                 .into_iter()
-                .map(|(pane_id, pane, generation)| {
-                    let lifecycle_notification = self.enqueue_pane_removal_notification_locked(
-                        pane_id,
-                        &generation,
-                        PaneRemovalFollowUp::None,
-                    );
-                    RemovedPaneRegistration {
-                        pane_id,
-                        pane,
-                        generation,
-                        lifecycle_notification,
+                .filter_map(|(pane_id, expected)| {
+                    if panes
+                        .get(&pane_id)
+                        .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &expected))
+                    {
+                        panes.remove(&pane_id).map(|registered| {
+                            let pane = Arc::clone(&registered.pane);
+                            let generation = Arc::clone(&registered.generation);
+                            drop(registered);
+                            (pane_id, pane, generation)
+                        })
+                    } else {
+                        None
                     }
                 })
-                .collect::<Vec<_>>();
-            (removed_panes, output_batches)
+                .collect::<Vec<_>>()
         };
+        {
+            let mut retiring = self.retiring_pane_ids.lock();
+            for (pane_id, _, _) in &removed_panes {
+                retiring.insert(*pane_id);
+            }
+        }
+        let output_batches = removed_panes
+            .iter()
+            .filter_map(|(pane_id, _, generation)| {
+                self.take_pending_pane_output_batch_locked(*pane_id, generation)
+            })
+            .collect::<Vec<_>>();
+        let removed_panes = removed_panes
+            .into_iter()
+            .map(|(pane_id, pane, generation)| {
+                let lifecycle_notification = self.enqueue_pane_removal_notification_locked(
+                    pane_id,
+                    &generation,
+                    PaneRemovalFollowUp::None,
+                );
+                RemovedPaneRegistration {
+                    pane_id,
+                    pane,
+                    generation,
+                    lifecycle_notification,
+                }
+            })
+            .collect::<Vec<_>>();
+        (removed_panes, output_batches)
+    }
+
+    fn finish_taken_tab_pane_state(
+        &self,
+        removed_panes: &[RemovedPaneRegistration],
+        output_batches: Vec<Arc<PaneOutputBatch>>,
+    ) {
         for output_batch in output_batches {
             histogram!("mux.notifications.pane_output.removal_forced_seal_rate").record(1.);
             output_batch.seal();
@@ -6910,7 +7010,96 @@ impl Mux {
             .map(|removed| removed.pane_id)
             .collect::<Vec<_>>();
         self.discard_removed_pane_states(&pane_ids);
-        Some((tab, removed_panes))
+    }
+
+    /// Check that an exact-parentage sweep can reserve every affected
+    /// ordered-window revision before any tab or pane registry is changed.
+    /// The caller holds `windows` for writing, so a successful preflight stays
+    /// valid through the subsequent infallible detach operations.
+    fn preflight_exact_tab_detach_locked(
+        windows: &HashMap<WindowId, Window>,
+        removals: &HashSet<usize>,
+        excluded_window: Option<WindowId>,
+        operation: &'static str,
+    ) -> bool {
+        windows.iter().all(|(window_id, window)| {
+            excluded_window == Some(*window_id)
+                || Self::window_can_detach_exact_tabs(
+                    *window_id,
+                    window,
+                    removals,
+                    operation,
+                )
+        })
+    }
+
+    /// Return false only when this window both contains a doomed exact tab
+    /// identity and cannot reserve the single revision used by its batched
+    /// removal. Merely inspecting an exhausted but unaffected window must not
+    /// block unrelated retirement.
+    fn window_can_detach_exact_tabs(
+        window_id: WindowId,
+        window: &Window,
+        removals: &HashSet<usize>,
+        operation: &'static str,
+    ) -> bool {
+        let affected = window
+            .iter()
+            .any(|tab| removals.contains(&(Arc::as_ptr(tab) as usize)));
+        if !affected {
+            return true;
+        }
+        if let Err(err) = window.next_order_revision() {
+            log::error!(
+                "refusing {operation} in window {window_id} before structural commit: {err}"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Atomically validate a delayed pane witness against an exact tab and
+    /// commit that tab's registry retirement while its topology lock remains
+    /// held. Pane IDs are resolved through the authoritative pane registry,
+    /// avoiding re-entrant pane callbacks under the tab lock.
+    fn take_tab_and_panes_for_removal_with_operation(
+        &self,
+        expected: &Arc<Tab>,
+        operation: &PaneOperationGuard,
+    ) -> Option<(Arc<Tab>, Vec<RemovedPaneRegistration>)> {
+        let tab_id = expected.tab_id();
+        let (removed_panes, output_batches) = {
+            let _registration = self.pane_registration.lock();
+            let mut tabs = self.tabs.write();
+            if !tabs
+                .get(&tab_id)
+                .is_some_and(|registered| Arc::ptr_eq(registered, expected))
+            {
+                return None;
+            }
+            let mut windows = self.windows.write();
+            let retired_identities = HashSet::from([Arc::as_ptr(expected) as usize]);
+            if !Self::preflight_exact_tab_detach_locked(
+                &windows,
+                &retired_identities,
+                None,
+                "witnessed tab retirement",
+            ) {
+                return None;
+            }
+            let result = expected
+                .with_exact_pane_operation(operation, |pane_snapshot| {
+                    let pane_candidates = self.resolve_tab_pane_candidates_locked(pane_snapshot);
+                    tabs.remove(&tab_id);
+                    self.take_tab_pane_candidates_for_removal_locked(pane_candidates)
+                })?;
+            for window in windows.values_mut() {
+                window.remove_tabs_by_exact_identity_set(&retired_identities);
+            }
+            result
+        };
+        self.finish_taken_tab_pane_state(&removed_panes, output_batches);
+        Some((Arc::clone(expected), removed_panes))
     }
 
     fn remove_tab_internal(&self, tab_id: TabId) -> Option<Arc<Tab>> {
@@ -6918,12 +7107,6 @@ impl Mux {
 
         let (tab, removed_panes) = self.take_tab_and_panes_for_removal(tab_id, None)?;
 
-        {
-            let mut windows = self.windows.write();
-            for w in windows.values_mut() {
-                w.remove_tab_if_same(&tab);
-            }
-        }
         self.flush_window_notifications();
 
         let pane_ids: Vec<PaneId> = removed_panes
@@ -6939,10 +7122,6 @@ impl Mux {
         Some(tab)
     }
 
-    fn remove_tab_internal_if_same(&self, expected: &Arc<Tab>) -> Option<Arc<Tab>> {
-        self.remove_tab_internal_if_same_with_pane_disposition(expected, true)
-    }
-
     fn remove_tab_internal_if_same_with_pane_disposition(
         &self,
         expected: &Arc<Tab>,
@@ -6953,12 +7132,6 @@ impl Mux {
 
         let (tab, removed_panes) = self.take_tab_and_panes_for_removal(tab_id, Some(expected))?;
 
-        {
-            let mut windows = self.windows.write();
-            for window in windows.values_mut() {
-                window.remove_tab_if_same(&tab);
-            }
-        }
         self.flush_window_notifications();
 
         log::debug!(
@@ -6976,26 +7149,34 @@ impl Mux {
     fn remove_empty_tab_internal_if_same(&self, expected: &Arc<Tab>) -> Option<Arc<Tab>> {
         let tab_id = expected.tab_id();
         let tab = {
-            // Match the staged pane-prune lock order. Holding `Tab::inner`
-            // through the registry removal closes the final "dead tab gained a
+            // Map authority precedes `Tab::inner`, matching window mutation
+            // paths that retain the tab map while reconciling active panes.
+            // Holding both through removal closes the final "dead tab gained a
             // pane" race without invoking pane callbacks in this scope.
             let _registration = self.pane_registration.lock();
-            expected
-                .with_structurally_empty(|| {
-                    let mut tabs = self.tabs.write();
-                    let matches = tabs
-                        .get(&tab_id)
-                        .is_some_and(|current| Arc::ptr_eq(current, expected));
-                    matches.then(|| tabs.remove(&tab_id)).flatten()
-                })
-                .flatten()
-        }?;
-
-        {
+            let mut tabs = self.tabs.write();
+            if !tabs
+                .get(&tab_id)
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+            {
+                return None;
+            }
             let mut windows = self.windows.write();
+            let retired_identities = HashSet::from([Arc::as_ptr(expected) as usize]);
+            if !Self::preflight_exact_tab_detach_locked(
+                &windows,
+                &retired_identities,
+                None,
+                "empty-tab retirement",
+            ) {
+                return None;
+            }
+            let tab = expected
+                .with_structurally_empty(|| tabs.remove(&tab_id))
+                .flatten()?;
             let provisional_windows = self.provisional_windows.lock();
             windows.retain(|window_id, window| {
-                let detached = window.remove_tab_if_same(&tab);
+                let detached = window.remove_tabs_by_exact_identity_set(&retired_identities);
                 let remove = detached
                     && window.is_empty()
                     && !provisional_windows.contains(window_id);
@@ -7004,7 +7185,8 @@ impl Mux {
                 }
                 !remove
             });
-        }
+            tab
+        };
         self.flush_window_notifications();
         self.recompute_pane_count();
         Some(tab)
@@ -7012,6 +7194,177 @@ impl Mux {
 
     fn remove_window_internal(&self, window_id: WindowId) {
         self.remove_window_internal_with_notification(window_id, true);
+    }
+
+    /// Stage a complete window retirement before releasing registration
+    /// authority. All exact tabs owned by the window remain topology-locked
+    /// from their pane census through window, tab, and pane registry commit.
+    /// An optional delayed-operation witness is validated in that same frozen
+    /// structural cut.
+    fn take_window_and_tabs_for_removal(
+        &self,
+        window_id: WindowId,
+        expected: Option<(&Arc<Tab>, &PaneOperationGuard)>,
+    ) -> Option<RemovedWindowRegistration> {
+        let mut removed_tabs = {
+            let _registration = self.pane_registration.lock();
+            let mut tabs = self.tabs.write();
+            if expected.is_some_and(|(expected_tab, _)| {
+                !tabs
+                    .get(&expected_tab.tab_id())
+                    .is_some_and(|registered| Arc::ptr_eq(registered, expected_tab))
+            }) {
+                return None;
+            }
+
+            let mut windows = self.windows.write();
+            let window = windows.get(&window_id)?;
+            if expected.is_some_and(|(expected_tab, _)| {
+                !window
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, expected_tab))
+            }) {
+                return None;
+            }
+
+            let mut seen = HashSet::new();
+            let retired_tabs = window
+                .iter()
+                .filter(|tab| {
+                    tabs.get(&tab.tab_id())
+                        .is_some_and(|registered| Arc::ptr_eq(registered, tab))
+                        && seen.insert(Arc::as_ptr(tab) as usize)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let retired_identities = retired_tabs
+                .iter()
+                .map(|tab| Arc::as_ptr(tab) as usize)
+                .collect::<HashSet<_>>();
+            if !Self::preflight_exact_tab_detach_locked(
+                &windows,
+                &retired_identities,
+                Some(window_id),
+                "window duplicate-parent retirement",
+            ) {
+                return None;
+            }
+
+            let removed_tabs = Tab::with_pane_snapshots_callback_free(
+                &retired_tabs,
+                expected,
+                |pane_snapshots| {
+                    windows
+                        .remove(&window_id)
+                        .expect("validated window remains present under the write guard");
+                    let was_provisional = self.provisional_windows.lock().remove(&window_id);
+                    if !was_provisional {
+                        // Preserve the established parent-before-child
+                        // topology stream: the window ceases to exist before
+                        // its panes, and its revision is reserved first.
+                        self.queue_window_notification(MuxNotification::WindowRemoved(window_id));
+                    }
+                    for tab in &retired_tabs {
+                        tabs.remove(&tab.tab_id());
+                    }
+
+                    let pane_candidate_batches =
+                        self.resolve_tab_pane_candidate_batches_locked(&pane_snapshots);
+                    pane_snapshots
+                        .into_iter()
+                        .zip(pane_candidate_batches)
+                        .map(|(structural_panes, pane_candidates)| {
+                            let (removed_panes, output_batches) = self
+                                .take_tab_pane_candidates_for_removal_locked(pane_candidates);
+                            RemovedTabRegistration {
+                                structural_panes,
+                                removed_panes,
+                                output_batches,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                },
+            )?;
+
+            // Tab topology locks are now released, but map authority remains
+            // held while malformed duplicate parentage is reconciled. Window
+            // removal may inspect an active tab, so this preserves the global
+            // `tabs -> windows -> Tab::inner` lock order without self-deadlock.
+            for survivor in windows.values_mut() {
+                survivor.remove_tabs_by_exact_identity_set(&retired_identities);
+            }
+            removed_tabs
+        };
+
+        for removed in &mut removed_tabs {
+            self.finish_taken_tab_pane_state(
+                &removed.removed_panes,
+                std::mem::take(&mut removed.output_batches),
+            );
+        }
+        Some(RemovedWindowRegistration { removed_tabs })
+    }
+
+    /// Finish a structurally committed window retirement. Every callback runs
+    /// after the window, tab, and pane registries have rejected the doomed
+    /// identities, so re-entrant topology work cannot resurrect them.
+    fn finish_removed_window(&self, removed_window: RemovedWindowRegistration) {
+        // Pane retirement can synchronously dispatch PaneRemoved. Drain the
+        // already-queued parent removal first on the established inline path;
+        // protocol bridges additionally enforce the reserved revision order
+        // when a configured scheduler requires main-thread window delivery.
+        self.flush_window_notifications();
+
+        let mut domains_of_window = HashSet::new();
+        for removed_tab in &removed_window.removed_tabs {
+            for pane in &removed_tab.structural_panes {
+                match catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    std::panic::AssertUnwindSafe(|| pane.domain_id()),
+                ) {
+                    Ok(domain_id) => {
+                        domains_of_window.insert(domain_id);
+                    }
+                    Err(_) => {
+                        log::error!(
+                            "pane domain callback panicked during window retirement; continuing cleanup"
+                        );
+                    }
+                }
+            }
+        }
+
+        for domain_id in domains_of_window {
+            if let Some(domain) = self.get_domain(domain_id) {
+                let detach = catch_recoverable(
+                    RecoverablePanicSite::MuxWindowCallback,
+                    std::panic::AssertUnwindSafe(|| {
+                        if !domain.detachable() {
+                            return Ok(());
+                        }
+                        log::info!("detaching domain {domain_id}");
+                        domain.detach().map_err(|err| format!("{err:#}"))
+                    }),
+                );
+                match detach {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        log::error!("while detaching domain {domain_id}: {err}");
+                    }
+                    Err(_) => {
+                        log::error!(
+                            "domain {domain_id} callback panicked during window retirement; continuing cleanup"
+                        );
+                    }
+                }
+            }
+        }
+
+        for removed_tab in removed_window.removed_tabs {
+            for removed in removed_tab.removed_panes {
+                self.finish_pane_removal(removed, true);
+            }
+        }
     }
 
     fn cancel_provisional_window(&self, window_id: WindowId, mut activity: Option<Activity>) {
@@ -7112,42 +7465,8 @@ impl Mux {
             return;
         }
 
-        let window = {
-            let mut windows = self.windows.write();
-            let window = windows.remove(&window_id);
-            let was_provisional = self.provisional_windows.lock().remove(&window_id);
-            if window.is_some() && !was_provisional {
-                self.queue_window_notification(MuxNotification::WindowRemoved(window_id));
-            }
-            window
-        };
-        if let Some(window) = window {
-            // Gather all the domains referenced by this window
-            let mut domains_of_window = HashSet::new();
-            for tab in window.iter() {
-                for pane in tab.iter_panes_ignoring_zoom() {
-                    domains_of_window.insert(pane.pane.domain_id());
-                }
-            }
-
-            for domain_id in domains_of_window {
-                if let Some(domain) = self.get_domain(domain_id) {
-                    if domain.detachable() {
-                        log::info!("detaching domain");
-                        if let Err(err) = domain.detach() {
-                            log::error!(
-                                "while detaching domain {domain_id} {}: {err:#}",
-                                domain.domain_name()
-                            );
-                        }
-                    }
-                }
-            }
-
-            let tabs = window.iter().cloned().collect::<Vec<_>>();
-            for tab in tabs {
-                self.remove_tab_internal_if_same(&tab);
-            }
+        if let Some(removed_window) = self.take_window_and_tabs_for_removal(window_id, None) {
+            self.finish_removed_window(removed_window);
         }
         self.recompute_pane_count();
         self.flush_window_notifications();
@@ -7178,16 +7497,30 @@ impl Mux {
         let Some(operation) = witness.operation_guard(self) else {
             return false;
         };
-        if !expected
-            .iter_all_panes()
-            .iter()
-            .any(|pane| operation.is_same_pane(pane))
-        {
+        let Some((tab, removed_panes)) =
+            self.take_tab_and_panes_for_removal_with_operation(expected, &operation)
+        else {
             return false;
+        };
+        // The delayed-operation lease authorizes only the frozen structural
+        // commit above. Release it before attaching retirement cleanup so the
+        // PaneRemoved lifecycle can complete before the later prune pass; the
+        // retired-ID fence still prevents same-ID reuse through subscriber
+        // cleanup.
+        drop(operation);
+        self.flush_window_notifications();
+
+        log::debug!(
+            "removing {} panes from exact witnessed tab {}",
+            removed_panes.len(),
+            tab.tab_id()
+        );
+        for removed in removed_panes {
+            self.finish_pane_removal(removed, true);
         }
-        let removed = self.remove_tab_internal_if_same(expected).is_some();
+        self.recompute_pane_count();
         self.prune_dead_windows();
-        removed
+        true
     }
 
     /// Drop the LOCAL mirror of a tab without disturbing the remote session.
@@ -7204,12 +7537,6 @@ impl Mux {
 
         let (tab, removed_panes) = self.take_tab_and_panes_for_removal(tab_id, None)?;
 
-        {
-            let mut windows = self.windows.write();
-            for w in windows.values_mut() {
-                w.remove_tab_if_same(&tab);
-            }
-        }
         self.flush_window_notifications();
 
         log::debug!(
@@ -7332,7 +7659,14 @@ impl Mux {
             let provisional_windows = self.provisional_windows.lock();
             let mut dead_windows = Vec::new();
             for (window_id, window) in windows.iter_mut() {
-                window.remove_tabs_by_exact_identity_set(&stale_identities);
+                if Self::window_can_detach_exact_tabs(
+                    *window_id,
+                    window,
+                    &stale_identities,
+                    "stale-parent prune",
+                ) {
+                    window.remove_tabs_by_exact_identity_set(&stale_identities);
+                }
                 if window.is_empty() && !provisional_windows.contains(window_id) {
                     dead_windows.push(*window_id);
                 }
@@ -7356,6 +7690,39 @@ impl Mux {
     pub fn kill_window(&self, window_id: WindowId) {
         self.remove_window_internal(window_id);
         self.prune_dead_windows();
+    }
+
+    /// Kill a window only while it still contains the exact tab generation
+    /// observed by a delayed caller.
+    ///
+    /// The pane witness binds the tab to the originating mux generation; the
+    /// window-map transaction binds the final removal to exact tab identity.
+    /// This is the deferred-confirmation counterpart to [`Self::kill_window`].
+    pub fn kill_window_if_contains_exact_tab(
+        self: &Arc<Self>,
+        window_id: WindowId,
+        expected_tab: &Arc<Tab>,
+        witness: &PaneRegistrationHandle,
+    ) -> bool {
+        let Some(operation) = witness.operation_guard(self) else {
+            return false;
+        };
+        let Some(removed_window) = self.take_window_and_tabs_for_removal(
+            window_id,
+            Some((expected_tab, &operation)),
+        )
+        else {
+            return false;
+        };
+        // Structural authority has committed. Do not retain the witness lease
+        // through domain callbacks and pruning; pane retirement retains its
+        // separate same-ID reuse fence until cleanup fanout is complete.
+        drop(operation);
+        self.finish_removed_window(removed_window);
+        self.recompute_pane_count();
+        self.flush_window_notifications();
+        self.prune_dead_windows();
+        true
     }
 
     pub fn get_window(&self, window_id: WindowId) -> Option<MappedRwLockReadGuard<'_, Window>> {
@@ -7951,7 +8318,8 @@ impl Mux {
         // notification to lazily retain-drop stale callbacks can leak
         // subscribers in long-idle sessions.
         if let Some(tmux_domain) = removed.downcast_ref::<TmuxDomain>() {
-            if let Some(sub_id) = tmux_domain.inner.notification_sub_id.lock().take() {
+            let sub_id = tmux_domain.inner.notification_sub_id.lock().take();
+            if let Some(sub_id) = sub_id {
                 let _ = self.unsubscribe(sub_id);
             }
         }
@@ -8611,7 +8979,9 @@ mod tests {
         on_reader: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         on_actions: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         on_kill: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        on_domain_id: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         focus_events: Arc<Mutex<Vec<bool>>>,
+        pane_id_calls: Option<Arc<AtomicUsize>>,
         mux_registration: Arc<PaneRegistrationSlot>,
         fail_reader: bool,
         search_pending: bool,
@@ -8640,7 +9010,9 @@ mod tests {
                 on_reader: Mutex::new(None),
                 on_actions: Mutex::new(None),
                 on_kill: Mutex::new(None),
+                on_domain_id: Mutex::new(None),
                 focus_events: Arc::new(Mutex::new(Vec::new())),
+                pane_id_calls: None,
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader,
                 search_pending: false,
@@ -8664,7 +9036,9 @@ mod tests {
                 on_reader: Mutex::new(None),
                 on_actions: Mutex::new(None),
                 on_kill: Mutex::new(None),
+                on_domain_id: Mutex::new(None),
                 focus_events: Arc::new(Mutex::new(Vec::new())),
+                pane_id_calls: None,
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
                 search_pending: true,
@@ -8689,7 +9063,9 @@ mod tests {
                 on_reader: Mutex::new(Some(Box::new(on_reader))),
                 on_actions: Mutex::new(None),
                 on_kill: Mutex::new(None),
+                on_domain_id: Mutex::new(None),
                 focus_events: Arc::new(Mutex::new(Vec::new())),
+                pane_id_calls: None,
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
                 search_pending: false,
@@ -8714,7 +9090,9 @@ mod tests {
                 on_reader: Mutex::new(None),
                 on_actions: Mutex::new(None),
                 on_kill: Mutex::new(Some(Box::new(on_kill))),
+                on_domain_id: Mutex::new(None),
                 focus_events: Arc::new(Mutex::new(Vec::new())),
+                pane_id_calls: None,
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
                 search_pending: false,
@@ -8739,7 +9117,9 @@ mod tests {
                 on_reader: Mutex::new(None),
                 on_actions: Mutex::new(Some(Box::new(on_actions))),
                 on_kill: Mutex::new(None),
+                on_domain_id: Mutex::new(None),
                 focus_events: Arc::new(Mutex::new(Vec::new())),
+                pane_id_calls: None,
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
                 search_pending: false,
@@ -8763,18 +9143,50 @@ mod tests {
                 on_reader: Mutex::new(None),
                 on_actions: Mutex::new(None),
                 on_kill: Mutex::new(None),
+                on_domain_id: Mutex::new(None),
                 focus_events: Arc::clone(&focus_events),
+                pane_id_calls: None,
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
                 search_pending: false,
             });
             (pane, focus_events)
         }
+
+        fn new_with_pane_id_counter(
+            id: PaneId,
+            size: TerminalSize,
+        ) -> (Arc<dyn Pane>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+            let kills = Arc::new(AtomicUsize::new(0));
+            let pane_id_calls = Arc::new(AtomicUsize::new(0));
+            let pane: Arc<dyn Pane> = Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                kills: Arc::clone(&kills),
+                actions: Arc::new(AtomicUsize::new(0)),
+                binds: AtomicUsize::new(0),
+                writes: Mutex::new(Vec::new()),
+                reader: Mutex::new(None),
+                on_reader: Mutex::new(None),
+                on_actions: Mutex::new(None),
+                on_kill: Mutex::new(None),
+                on_domain_id: Mutex::new(None),
+                focus_events: Arc::new(Mutex::new(Vec::new())),
+                pane_id_calls: Some(Arc::clone(&pane_id_calls)),
+                mux_registration: Arc::new(PaneRegistrationSlot::default()),
+                fail_reader: false,
+                search_pending: false,
+            });
+            (pane, kills, pane_id_calls)
+        }
     }
 
     #[async_trait::async_trait(?Send)]
     impl Pane for KillCountingPane {
         fn pane_id(&self) -> PaneId {
+            if let Some(calls) = &self.pane_id_calls {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }
             self.id
         }
 
@@ -8860,7 +9272,8 @@ mod tests {
         }
 
         fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
-            if let Some(on_reader) = self.on_reader.lock().take() {
+            let on_reader = self.on_reader.lock().take();
+            if let Some(on_reader) = on_reader {
                 on_reader();
             }
             if self.fail_reader {
@@ -8894,7 +9307,8 @@ mod tests {
         }
 
         fn perform_actions(&self, actions: Vec<Action>) {
-            if let Some(on_actions) = self.on_actions.lock().take() {
+            let on_actions = self.on_actions.lock().take();
+            if let Some(on_actions) = on_actions {
                 on_actions();
             }
             self.actions.fetch_add(actions.len(), Ordering::SeqCst);
@@ -8906,7 +9320,8 @@ mod tests {
 
         fn kill(&self) {
             self.kills.fetch_add(1, Ordering::SeqCst);
-            if let Some(on_kill) = self.on_kill.lock().take() {
+            let on_kill = self.on_kill.lock().take();
+            if let Some(on_kill) = on_kill {
                 on_kill();
             }
         }
@@ -8920,6 +9335,10 @@ mod tests {
         }
 
         fn domain_id(&self) -> DomainId {
+            let on_domain_id = self.on_domain_id.lock().take();
+            if let Some(on_domain_id) = on_domain_id {
+                on_domain_id();
+            }
             1
         }
 
@@ -9044,6 +9463,53 @@ mod tests {
                 .recv_timeout(Duration::from_secs(30))
                 .map_err(|err| anyhow!("window-removal test did not release detach: {err}"))?;
             Ok(())
+        }
+
+        fn state(&self) -> DomainState {
+            DomainState::Attached
+        }
+    }
+
+    struct PanicDetachTestDomain {
+        detaches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Domain for PanicDetachTestDomain {
+        async fn spawn_pane(
+            &self,
+            _mux: &Arc<Mux>,
+            _size: TerminalSize,
+            _command: Option<CommandBuilder>,
+            _command_dir: Option<String>,
+        ) -> anyhow::Result<Arc<dyn Pane>> {
+            Err(anyhow!("panic detach test domain cannot spawn panes"))
+        }
+
+        fn detachable(&self) -> bool {
+            true
+        }
+
+        fn domain_id(&self) -> DomainId {
+            1
+        }
+
+        fn domain_name(&self) -> &str {
+            "panic-detach-test"
+        }
+
+        async fn attach(
+            &self,
+            _mux: &Arc<Mux>,
+            _owner_client_id: Option<Arc<ClientId>>,
+            _window_id: Option<WindowId>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn detach(&self) -> anyhow::Result<()> {
+            self.detaches.fetch_add(1, Ordering::SeqCst);
+            panic!("intentional domain detach panic during window retirement");
         }
 
         fn state(&self) -> DomainState {
@@ -11008,6 +11474,10 @@ mod tests {
         );
 
         let (successor_pane, successor_kills) = KillCountingPane::new(195, test_size());
+        let detached_origin = origin_tab
+            .remove_pane(195)
+            .expect("removed tab retains its prior pane tree until explicitly repurposed");
+        assert!(Arc::ptr_eq(&detached_origin, &origin_pane));
         origin_tab.assign_pane(&successor_pane);
         let successor_witness = origin
             .add_tab_and_active_pane(&origin_tab)
@@ -11017,12 +11487,574 @@ mod tests {
             !origin.remove_tab_if_same(&origin_tab, &witness),
             "the old witness must not remove a later registration of the same Arc<Tab>",
         );
-        assert!(origin
-            .get_tab(origin_tab.tab_id())
-            .is_some_and(|tab| Arc::ptr_eq(&tab, &origin_tab)));
+        assert!(
+            origin
+                .get_tab(origin_tab.tab_id())
+                .is_some_and(|tab| Arc::ptr_eq(&tab, &origin_tab))
+        );
         assert_eq!(successor_kills.load(Ordering::SeqCst), 0);
         assert!(origin.remove_tab_if_same(&origin_tab, &successor_witness));
         assert_eq!(successor_kills.load(Ordering::SeqCst), 1);
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn exact_tab_removal_uses_callback_free_structural_census() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let tab = Arc::new(Tab::new(&test_size()));
+        let (pane, kills, pane_id_calls) =
+            KillCountingPane::new_with_pane_id_counter(198, test_size());
+        tab.assign_pane(&pane);
+        let witness = mux
+            .add_tab_and_active_pane(&tab)
+            .expect("tab registration")
+            .expect("pane registration witness");
+        let calls_before_removal = pane_id_calls.load(Ordering::SeqCst);
+
+        assert!(mux.remove_tab_if_same(&tab, &witness));
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            pane_id_calls.load(Ordering::SeqCst),
+            calls_before_removal,
+            "tab retirement must resolve registered pane IDs without invoking pane callbacks",
+        );
+
+        let ordinary_tab = Arc::new(Tab::new(&test_size()));
+        let (ordinary_pane, ordinary_kills, ordinary_pane_id_calls) =
+            KillCountingPane::new_with_pane_id_counter(199, test_size());
+        ordinary_tab.assign_pane(&ordinary_pane);
+        mux.add_tab_and_active_pane(&ordinary_tab)
+            .expect("ordinary tab registration")
+            .expect("ordinary pane registration witness");
+        let ordinary_calls_before_removal = ordinary_pane_id_calls.load(Ordering::SeqCst);
+
+        assert!(mux.remove_tab(ordinary_tab.tab_id()).is_some());
+        assert_eq!(ordinary_kills.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ordinary_pane_id_calls.load(Ordering::SeqCst),
+            ordinary_calls_before_removal,
+            "ordinary tab retirement must use the same callback-free structural census",
+        );
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn delayed_exact_window_removal_rejects_replaced_contents() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let origin_tab = Arc::new(Tab::new(&test_size()));
+        let (origin_pane, origin_kills) = KillCountingPane::new(196, test_size());
+        origin_tab.assign_pane(&origin_pane);
+        let origin_witness = mux
+            .add_tab_and_active_pane(&origin_tab)
+            .expect("origin tab registration")
+            .expect("origin pane registration witness");
+
+        let replacement_tab = Arc::new(Tab::new(&test_size()));
+        let (replacement_pane, replacement_kills) = KillCountingPane::new(197, test_size());
+        replacement_tab.assign_pane(&replacement_pane);
+        mux.add_tab_and_active_pane(&replacement_tab)
+            .expect("replacement tab registration")
+            .expect("replacement pane registration witness");
+
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&origin_tab, window_id)
+            .expect("origin tab window attachment");
+        drop(window);
+
+        {
+            let mut window = mux
+                .get_window_mut(window_id)
+                .expect("origin window remains registered");
+            assert!(window.remove_tab_if_same(&origin_tab));
+            window
+                .push(&replacement_tab)
+                .expect("replacement contents fit in origin window");
+        }
+
+        assert!(
+            !mux.kill_window_if_contains_exact_tab(window_id, &origin_tab, &origin_witness),
+            "a delayed close must not kill a window after its exact originating tab left",
+        );
+        assert!(mux.get_window(window_id).is_some_and(|window| {
+            window
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate, &replacement_tab))
+        }));
+        assert_eq!(origin_kills.load(Ordering::SeqCst), 0);
+        assert_eq!(replacement_kills.load(Ordering::SeqCst), 0);
+
+        mux.add_tab_to_window(&origin_tab, window_id)
+            .expect("origin tab may be reattached to its still-live window");
+        assert!(mux.kill_window_if_contains_exact_tab(window_id, &origin_tab, &origin_witness));
+        assert!(mux.get_window(window_id).is_none());
+        assert_eq!(origin_kills.load(Ordering::SeqCst), 1);
+        assert_eq!(replacement_kills.load(Ordering::SeqCst), 1);
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn exact_window_retirement_rejects_reentrant_and_concurrent_tab_reattachment() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let doomed_tab = Arc::new(Tab::new(&test_size()));
+        let (doomed_pane, doomed_kills) = KillCountingPane::new(200, test_size());
+        doomed_tab.assign_pane(&doomed_pane);
+        let doomed_witness = mux
+            .add_tab_and_active_pane(&doomed_tab)
+            .expect("doomed tab registration")
+            .expect("doomed pane registration witness");
+
+        let survivor_tab = Arc::new(Tab::new(&test_size()));
+        let (survivor_pane, survivor_kills) = KillCountingPane::new(201, test_size());
+        survivor_tab.assign_pane(&survivor_pane);
+        mux.add_tab_and_active_pane(&survivor_tab)
+            .expect("survivor tab registration")
+            .expect("survivor pane registration witness");
+
+        let doomed_window = mux.new_empty_window(None, None);
+        let doomed_window_id = *doomed_window;
+        mux.add_tab_to_window(&doomed_tab, doomed_window_id)
+            .expect("doomed window attachment");
+        drop(doomed_window);
+
+        let survivor_window = mux.new_empty_window(None, None);
+        let survivor_window_id = *survivor_window;
+        mux.add_tab_to_window(&survivor_tab, survivor_window_id)
+            .expect("survivor window attachment");
+        drop(survivor_window);
+
+        let callback_ran = Arc::new(AtomicBool::new(false));
+        let reattach_succeeded = Arc::new(AtomicBool::new(false));
+        let concurrent_reattach_succeeded = Arc::new(AtomicBool::new(false));
+        let callback_mux = Arc::clone(&mux);
+        let callback_tab = Arc::clone(&doomed_tab);
+        let observed_callback = Arc::clone(&callback_ran);
+        let observed_reattach = Arc::clone(&reattach_succeeded);
+        let observed_concurrent_reattach = Arc::clone(&concurrent_reattach_succeeded);
+        doomed_pane
+            .downcast_ref::<KillCountingPane>()
+            .expect("test pane concrete type")
+            .on_domain_id
+            .lock()
+            .replace(Box::new(move || {
+                observed_callback.store(true, Ordering::SeqCst);
+                if callback_mux
+                    .add_tab_to_window(&callback_tab, survivor_window_id)
+                    .is_ok()
+                {
+                    observed_reattach.store(true, Ordering::SeqCst);
+                }
+                let concurrent_mux = Arc::clone(&callback_mux);
+                let concurrent_tab = Arc::clone(&callback_tab);
+                let concurrent_reattached = std::thread::spawn(move || {
+                    concurrent_mux
+                        .add_tab_to_window(&concurrent_tab, survivor_window_id)
+                        .is_ok()
+                })
+                .join()
+                .expect("concurrent reattachment probe must not panic");
+                observed_concurrent_reattach.store(concurrent_reattached, Ordering::SeqCst);
+            }));
+
+        assert!(mux.kill_window_if_contains_exact_tab(
+            doomed_window_id,
+            &doomed_tab,
+            &doomed_witness,
+        ));
+        assert!(callback_ran.load(Ordering::SeqCst));
+        assert!(
+            !reattach_succeeded.load(Ordering::SeqCst),
+            "all doomed tab registrations must retire before pane callbacks can re-enter the mux",
+        );
+        assert!(
+            !concurrent_reattach_succeeded.load(Ordering::SeqCst),
+            "a concurrent caller must not reattach a doomed tab after structural retirement",
+        );
+        assert_eq!(doomed_kills.load(Ordering::SeqCst), 1);
+        assert_eq!(survivor_kills.load(Ordering::SeqCst), 0);
+        assert!(mux.get_tab(doomed_tab.tab_id()).is_none());
+        assert!(mux.get_pane(200).is_none());
+        assert!(mux.get_window(survivor_window_id).is_some_and(|window| {
+            window.len() == 1
+                && window
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, &survivor_tab))
+        }));
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn ordinary_window_kill_retires_every_owned_tab_and_pane() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let first_tab = Arc::new(Tab::new(&test_size()));
+        let (first_pane, first_kills, first_pane_id_calls) =
+            KillCountingPane::new_with_pane_id_counter(202, test_size());
+        first_tab.assign_pane(&first_pane);
+        mux.add_tab_and_active_pane(&first_tab)
+            .expect("first tab registration")
+            .expect("first pane registration witness");
+
+        let second_tab = Arc::new(Tab::new(&test_size()));
+        let (second_pane, second_kills, second_pane_id_calls) =
+            KillCountingPane::new_with_pane_id_counter(203, test_size());
+        second_tab.assign_pane(&second_pane);
+        mux.add_tab_and_active_pane(&second_tab)
+            .expect("second tab registration")
+            .expect("second pane registration witness");
+
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&first_tab, window_id)
+            .expect("first tab window attachment");
+        mux.add_tab_to_window(&second_tab, window_id)
+            .expect("second tab window attachment");
+        drop(window);
+        let first_calls_before_removal = first_pane_id_calls.load(Ordering::SeqCst);
+        let second_calls_before_removal = second_pane_id_calls.load(Ordering::SeqCst);
+
+        mux.kill_window(window_id);
+
+        assert!(mux.get_window(window_id).is_none());
+        assert!(mux.get_tab(first_tab.tab_id()).is_none());
+        assert!(mux.get_tab(second_tab.tab_id()).is_none());
+        assert!(mux.get_pane(202).is_none());
+        assert!(mux.get_pane(203).is_none());
+        assert_eq!(first_kills.load(Ordering::SeqCst), 1);
+        assert_eq!(second_kills.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            first_pane_id_calls.load(Ordering::SeqCst),
+            first_calls_before_removal,
+            "window retirement must not invoke pane-id callbacks for its first tab",
+        );
+        assert_eq!(
+            second_pane_id_calls.load(Ordering::SeqCst),
+            second_calls_before_removal,
+            "window retirement must freeze sibling tabs through the same callback-free census",
+        );
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn exhausted_parent_window_rejects_ordinary_and_witnessed_tab_retirement_atomically() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let tab = Arc::new(Tab::new(&test_size()));
+        let (pane, kills) = KillCountingPane::new(206, test_size());
+        tab.assign_pane(&pane);
+        let witness = mux
+            .add_tab_and_active_pane(&tab)
+            .expect("tab registration")
+            .expect("pane witness");
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("tab window attachment");
+        drop(window);
+        mux.get_window_mut(window_id)
+            .expect("window remains registered")
+            .set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
+
+        assert!(
+            !mux.remove_tab_if_same(&tab, &witness),
+            "witnessed retirement must fail before changing any registry",
+        );
+        assert!(
+            mux.remove_tab(tab.tab_id()).is_none(),
+            "ordinary retirement must obey the same fail-closed preflight",
+        );
+        assert!(mux
+            .get_tab(tab.tab_id())
+            .is_some_and(|registered| Arc::ptr_eq(&registered, &tab)));
+        assert!(mux
+            .get_pane(206)
+            .is_some_and(|registered| Arc::ptr_eq(&registered, &pane)));
+        assert!(mux.get_window(window_id).is_some_and(|window| {
+            window.order_revision().get() == u64::MAX - 1
+                && window
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, &tab))
+        }));
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn exhausted_parent_window_rejects_empty_tab_retirement_atomically() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let tab = Arc::new(Tab::new(&test_size()));
+        mux.add_tab_no_panes(&tab).expect("empty tab registration");
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("empty tab window attachment");
+        drop(window);
+        mux.get_window_mut(window_id)
+            .expect("window remains registered")
+            .set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
+
+        assert!(
+            !mux.remove_empty_tab_local_only_if_same(&tab),
+            "empty-tab cleanup must reject before removing the tab registry entry",
+        );
+        assert!(mux
+            .get_tab(tab.tab_id())
+            .is_some_and(|registered| Arc::ptr_eq(&registered, &tab)));
+        assert!(mux.get_window(window_id).is_some_and(|window| {
+            window.order_revision().get() == u64::MAX - 1
+                && window
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, &tab))
+        }));
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn exhausted_duplicate_parent_rejects_window_retirement_before_any_commit() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let tab = Arc::new(Tab::new(&test_size()));
+        let (pane, kills) = KillCountingPane::new(207, test_size());
+        tab.assign_pane(&pane);
+        let witness = mux
+            .add_tab_and_active_pane(&tab)
+            .expect("tab registration")
+            .expect("pane witness");
+
+        let doomed = mux.new_empty_window(None, None);
+        let doomed_id = *doomed;
+        mux.add_tab_to_window(&tab, doomed_id)
+            .expect("canonical parent attachment");
+        drop(doomed);
+
+        let duplicate = mux.new_empty_window(None, None);
+        let duplicate_id = *duplicate;
+        {
+            let mut windows = mux.windows.write();
+            let duplicate = windows
+                .get_mut(&duplicate_id)
+                .expect("duplicate-parent fixture window");
+            duplicate
+                .push(&tab)
+                .expect("a standalone window cannot detect another parent");
+            duplicate
+                .set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
+        }
+        drop(duplicate);
+
+        assert!(
+            !mux.kill_window_if_contains_exact_tab(doomed_id, &tab, &witness),
+            "an exhausted surviving duplicate parent must reject the whole retirement",
+        );
+        assert!(mux.get_window(doomed_id).is_some());
+        assert!(mux.get_window(duplicate_id).is_some_and(|window| {
+            window.order_revision().get() == u64::MAX - 1
+                && window
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, &tab))
+        }));
+        assert!(mux
+            .get_tab(tab.tab_id())
+            .is_some_and(|registered| Arc::ptr_eq(&registered, &tab)));
+        assert!(mux
+            .get_pane(207)
+            .is_some_and(|registered| Arc::ptr_eq(&registered, &pane)));
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn exhausted_stale_parent_prune_is_non_panicking_and_zero_mutation() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let tab = Arc::new(Tab::new(&test_size()));
+        mux.add_tab_no_panes(&tab).expect("stale tab registration");
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("stale tab window attachment");
+        drop(window);
+        assert!(mux.remove_tab_registration_if_same(tab.tab_id(), &tab));
+        mux.get_window_mut(window_id)
+            .expect("stale parent remains registered")
+            .set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
+
+        mux.prune_dead_windows();
+
+        assert!(mux.get_tab(tab.tab_id()).is_none());
+        assert!(mux.get_window(window_id).is_some_and(|window| {
+            window.order_revision().get() == u64::MAX - 1
+                && window
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, &tab))
+        }));
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn window_retirement_publishes_parent_before_panes_without_consuming_target_revision() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let tab = Arc::new(Tab::new(&test_size()));
+        let (pane, kills) = KillCountingPane::new(208, test_size());
+        tab.assign_pane(&pane);
+        mux.add_tab_and_active_pane(&tab)
+            .expect("tab registration")
+            .expect("pane witness");
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("tab window attachment");
+        drop(window);
+        mux.get_window_mut(window_id)
+            .expect("target window remains registered")
+            .set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_subscriber = Arc::clone(&observed);
+        mux.subscribe_with_topology(move |envelope| {
+            let kind = match envelope.notification {
+                MuxNotification::WindowRemoved(id) if id == window_id => Some("window"),
+                MuxNotification::PaneRemoved(208) => Some("pane"),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                let MuxTopologyStamp::Revision(revision) = envelope.topology else {
+                    panic!("retirement topology event must carry a live revision");
+                };
+                observed_for_subscriber.lock().push((kind, revision.get()));
+            }
+            true
+        })
+        .expect("topology subscription");
+
+        mux.kill_window(window_id);
+
+        let observed = observed.lock();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].0, "window");
+        assert_eq!(observed[1].0, "pane");
+        assert!(
+            observed[0].1 < observed[1].1,
+            "parent removal must reserve and publish before child removal: {:?}",
+            *observed,
+        );
+        assert!(mux.get_window(window_id).is_none());
+        assert!(mux.get_tab(tab.tab_id()).is_none());
+        assert!(mux.get_pane(208).is_none());
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn window_retirement_completes_cleanup_after_pane_domain_callback_panic() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let tab = Arc::new(Tab::new(&test_size()));
+        let (pane, kills) = KillCountingPane::new(204, test_size());
+        tab.assign_pane(&pane);
+        mux.add_tab_and_active_pane(&tab)
+            .expect("panic test tab registration")
+            .expect("panic test pane registration witness");
+
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("panic test window attachment");
+        drop(window);
+
+        pane.downcast_ref::<KillCountingPane>()
+            .expect("test pane concrete type")
+            .on_domain_id
+            .lock()
+            .replace(Box::new(|| {
+                panic!("intentional pane domain callback panic during window retirement");
+            }));
+
+        mux.kill_window(window_id);
+
+        assert!(mux.get_window(window_id).is_none());
+        assert!(mux.get_tab(tab.tab_id()).is_none());
+        assert!(mux.get_pane(204).is_none());
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            1,
+            "a recovered domain callback panic must not strand pane retirement",
+        );
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn window_retirement_completes_cleanup_after_domain_detach_panic() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let detaches = Arc::new(AtomicUsize::new(0));
+        let domain: Arc<dyn Domain> = Arc::new(PanicDetachTestDomain {
+            detaches: Arc::clone(&detaches),
+        });
+        mux.add_domain(&domain).expect("register panic test domain");
+
+        let tab = Arc::new(Tab::new(&test_size()));
+        let (pane, kills) = KillCountingPane::new(205, test_size());
+        tab.assign_pane(&pane);
+        mux.add_tab_and_active_pane(&tab)
+            .expect("detach panic test tab registration")
+            .expect("detach panic test pane registration witness");
+
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("detach panic test window attachment");
+        drop(window);
+
+        mux.kill_window(window_id);
+
+        assert_eq!(detaches.load(Ordering::SeqCst), 1);
+        assert!(mux.get_window(window_id).is_none());
+        assert!(mux.get_tab(tab.tab_id()).is_none());
+        assert!(mux.get_pane(205).is_none());
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            1,
+            "a recovered domain detach panic must not strand pane retirement",
+        );
 
         Mux::shutdown();
     }
@@ -13006,6 +14038,21 @@ mod tests {
             .topology_snapshot_authority()
             .expect("topology authority should be live")
             .1;
+        let removal_revisions = Arc::new(Mutex::new(Vec::new()));
+        let removal_revisions_for_subscriber = Arc::clone(&removal_revisions);
+        mux.subscribe_with_topology(move |envelope| {
+            match envelope {
+                MuxNotificationEnvelope {
+                    notification: MuxNotification::WindowRemoved(id),
+                    topology: MuxTopologyStamp::Revision(revision),
+                } if id == window_id => {
+                    removal_revisions_for_subscriber.lock().push(revision);
+                }
+                _ => {}
+            }
+            true
+        })
+        .expect("window-removal subscriber should register");
 
         let mux_for_removal = Arc::clone(&mux);
         let remover = std::thread::spawn(move || mux_for_removal.kill_window(window_id));
@@ -13018,22 +14065,7 @@ mod tests {
             .topology_snapshot_authority()
             .expect("topology authority should remain live")
             .1;
-        let removal_revision = mux
-            .pending_window_notifications
-            .lock()
-            .queue
-            .iter()
-            .find_map(|action| match action {
-                PendingWindowAction::Notification {
-                    envelope:
-                        MuxNotificationEnvelope {
-                            notification: MuxNotification::WindowRemoved(id),
-                            topology: MuxTopologyStamp::Revision(revision),
-                        },
-                    ..
-                } if *id == window_id => Some(*revision),
-                _ => None,
-            });
+        let removal_revision = removal_revisions.lock().last().copied();
 
         detach_release_tx
             .send(())
@@ -13043,8 +14075,8 @@ mod tests {
             window_was_removed,
             "the window registry mutation precedes the detachable-domain callback",
         );
-        let removal_revision =
-            removal_revision.expect("WindowRemoved must be queued before the callback starts");
+        let removal_revision = removal_revision
+            .expect("WindowRemoved must be published before the detachable callback starts");
         assert!(
             removal_revision > before && removal_revision <= during_callback,
             "WindowRemoved revision {} must be reserved after the pre-removal snapshot {} and \

@@ -1,9 +1,9 @@
 #![no_main]
 
 use codec::{
-    DecodedPdu, ErrorResponse, GetClientList, GetCodecVersion, GetPaneRenderChanges, KillPane,
-    ListPanes, ListPanesTabStacks, Pdu, Ping, Pong, RenameWorkspace, SendPaste, SetActiveWorkspace,
-    SetClientId, SetFocusedPane, SetWindowWorkspace, UnitResponse, WriteToPane,
+    DecodedPdu, ErrorResponse, GetClientList, GetCodecVersion, GetPaneRenderChanges, InputSerial,
+    KillPane, ListPanes, ListPanesTabStacks, Pdu, Ping, Pong, RenameWorkspace, SendPaste,
+    SetActiveWorkspace, SetClientId, SetFocusedPane, SetWindowWorkspace, UnitResponse, WriteToPane,
 };
 use frankenterm_mux_server_impl::sessionhandler::{PduSender, SessionHandler};
 use libfuzzer_sys::arbitrary::{Arbitrary, Result as ArbitraryResult, Unstructured};
@@ -97,6 +97,7 @@ enum FuzzPdu {
     SendPaste {
         pane_id: usize,
         data: String,
+        input_serial_millis: u64,
     },
 }
 
@@ -144,6 +145,7 @@ impl<'a> Arbitrary<'a> for FuzzPdu {
             17 => Self::SendPaste {
                 pane_id: bounded_id(u)?,
                 data: bounded_string(u)?,
+                input_serial_millis: u64::arbitrary(u)?,
             },
             _ => Self::Ping,
         })
@@ -204,7 +206,15 @@ impl FuzzPdu {
                 Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id })
             }
             Self::WriteToPane { pane_id, data } => Pdu::WriteToPane(WriteToPane { pane_id, data }),
-            Self::SendPaste { pane_id, data } => Pdu::SendPaste(SendPaste { pane_id, data }),
+            Self::SendPaste {
+                pane_id,
+                data,
+                input_serial_millis,
+            } => Pdu::SendPaste(SendPaste {
+                pane_id,
+                data,
+                input_serial: InputSerial::from_millis_since_epoch(input_serial_millis),
+            }),
         }
     }
 }

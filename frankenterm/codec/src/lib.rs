@@ -2801,7 +2801,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 55;
+pub const CODEC_VERSION: usize = 56;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -2825,7 +2825,7 @@ pub const CODEC_VERSION: usize = 55;
 /// at handshake time for the full release cycle before the bump. The CI
 /// guard `scripts/check_codec_version_release_notes.sh` (ft-8smkj) blocks
 /// silent advances.
-pub const CODEC_VERSION_MIN_SUPPORTED: usize = 55;
+pub const CODEC_VERSION_MIN_SUPPORTED: usize = 56;
 
 /// Outcome of [`check_compat`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2919,11 +2919,11 @@ pdu! {
     UnitResponse: 10, 46, server_reply, none;
     SendKeyDown: 11, 46, client_request, none;
     SendMouseEvent: 12, 46, client_request, none;
-    SendPaste: 13, 46, client_request, none;
+    SendPaste: 13, 56, client_request, none;
     Resize: 14, 46, client_request, none;
     SetClipboard: 20, 46, server_unilateral, none;
     GetLines: 22, 46, client_request, none;
-    GetLinesResponse: 23, 46, server_reply, none;
+    GetLinesResponse: 23, 55, server_reply, none;
     GetPaneRenderChanges: 24, 46, client_request, none;
     GetPaneRenderChangesResponse: 25, 46, server_reply_or_unilateral, none;
     GetCodecVersion: 26, 46, client_request, none;
@@ -2948,7 +2948,7 @@ pdu! {
     WindowWorkspaceChanged: 44, 46, server_unilateral, none;
     SetFocusedPane: 45, 46, client_request, none;
     GetImageCell: 46, 46, client_request, none;
-    GetImageCellResponse: 47, 46, server_reply, none
+    GetImageCellResponse: 47, 55, server_reply, none
         => deserialize_get_image_cell_response;
     MovePaneToNewTab: 48, 46, client_request, none;
     MovePaneToNewTabResponse: 49, 46, server_reply, none;
@@ -3972,7 +3972,7 @@ impl TopologyCapabilities {
 
     /// Runtime-advertised capabilities.
     ///
-    /// The v55 codec knows the ordered-window and exact-render bits, but none
+    /// The v56 codec knows the ordered-window and exact-render bits, but none
     /// may be advertised until their mux authority, server dispatch, and client
     /// reconciliation beads complete. Keep this mask intentionally unchanged.
     pub const SERVER_SUPPORTED: Self = Self::FENCED_SNAPSHOT_V1;
@@ -9684,6 +9684,9 @@ pub struct WriteToPane {
 pub struct SendPaste {
     pub pane_id: PaneId,
     pub data: String,
+    /// Exact client-generated identity for the dispatch fence returned after
+    /// this paste has been committed to the pane.
+    pub input_serial: InputSerial,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
@@ -9715,6 +9718,16 @@ static LAST_INPUT_SERIAL: std::sync::atomic::AtomicU64 =
 impl InputSerial {
     pub const fn empty() -> Self {
         Self(0)
+    }
+
+    /// Constructs an exact wire-domain identity without routing through
+    /// platform-specific [`std::time::SystemTime`] arithmetic.
+    ///
+    /// The full `u64` domain is valid on the wire, including values that a
+    /// particular operating system cannot represent as an epoch-relative
+    /// `SystemTime`.
+    pub const fn from_millis_since_epoch(millis: u64) -> Self {
+        Self(millis)
     }
 
     pub fn now() -> Self {
@@ -12108,6 +12121,27 @@ mod test {
         assert!(c > a);
     }
 
+    #[test]
+    fn input_serial_raw_domain_constructor_roundtrips_edge_values() {
+        for millis in [0, 1, u64::MAX - 1, u64::MAX] {
+            let input_serial = InputSerial::from_millis_since_epoch(millis);
+            assert_eq!(input_serial.0, millis);
+
+            let pdu = Pdu::SendPaste(SendPaste {
+                pane_id: 3,
+                data: "edge".to_string(),
+                input_serial,
+            });
+            let mut encoded = Vec::new();
+            pdu.encode(&mut encoded, millis)
+                .expect("edge input serial should encode");
+            let decoded = Pdu::decode(encoded.as_slice())
+                .expect("edge input serial should decode");
+            assert_eq!(decoded.serial, millis);
+            assert_eq!(decoded.pdu, pdu);
+        }
+    }
+
     // --- Pdu::is_user_input tests ---
 
     #[test]
@@ -12119,7 +12153,8 @@ mod test {
         .is_user_input());
         assert!(Pdu::SendPaste(SendPaste {
             pane_id: 0,
-            data: String::new()
+            data: String::new(),
+            input_serial: InputSerial::empty(),
         })
         .is_user_input());
         assert!(Pdu::Resize(Resize {
@@ -12240,6 +12275,7 @@ mod test {
         let pdu = Pdu::SendPaste(SendPaste {
             pane_id: 3,
             data: "clipboard text".into(),
+            input_serial: InputSerial::now(),
         });
         pdu.encode(&mut buf, 500).unwrap();
         let decoded = Pdu::decode(buf.as_slice()).unwrap();
@@ -17294,9 +17330,9 @@ mod test {
     }
 
     #[test]
-    fn codec_v55_requires_atomic_image_wire_redeploy_and_retains_feature_minima() {
-        assert_eq!(CODEC_VERSION, 55);
-        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 55);
+    fn codec_v56_requires_atomic_paste_wire_redeploy_and_retains_feature_minima() {
+        assert_eq!(CODEC_VERSION, 56);
+        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 56);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
         assert!(!codec_version_supports_ordered_window_v1(51));
@@ -17306,8 +17342,8 @@ mod test {
         assert!(!codec_version_supports_exact_render_delivery_v1(51));
         assert!(codec_version_supports_exact_render_delivery_v1(52));
         assert!(
-            check_compat(55, 55, 54, 46).is_err(),
-            "the image revision and byte-schema change requires an atomic v55 redeploy"
+            check_compat(56, 56, 55, 55).is_err(),
+            "the SendPaste byte-schema change requires an atomic v56 redeploy"
         );
         assert_eq!(<ListPanesCoherent as PduWireIdent>::IDENT, 81);
         assert_eq!(<RenderApplicationResult as PduWireIdent>::IDENT, 85);
@@ -17343,7 +17379,7 @@ mod test {
         );
         assert_eq!(
             Pdu::decode(frame.as_slice())
-                .expect("v55 decoder must retain v50 PDU81 for historical fixture decoding")
+                .expect("v56 decoder must retain v50 PDU81 for historical fixture decoding")
                 .pdu,
             legacy
         );
@@ -18162,7 +18198,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 55);
+        assert_eq!(CODEC_VERSION, 56);
     }
 
     #[test]
@@ -18320,6 +18356,8 @@ mod test {
     fn pdu_wire_registry_minimum_dialects_are_exhaustive() {
         for spec in Pdu::all_wire_specs() {
             let expected = match spec.ident {
+                13 => 56,
+                23 | 47 => 55,
                 0..=74 => 46,
                 75..=78 => 47,
                 79..=80 => 48,
@@ -18342,6 +18380,15 @@ mod test {
             Some(46),
         );
         assert_eq!(Pdu::Invalid { ident: 5 }.minimum_codec_version(), None);
+        assert_eq!(<SendPaste as PduWireIdent>::WIRE_SPEC.min_codec_version, 56);
+        assert_eq!(
+            <GetLinesResponse as PduWireIdent>::WIRE_SPEC.min_codec_version,
+            55
+        );
+        assert_eq!(
+            <GetImageCellResponse as PduWireIdent>::WIRE_SPEC.min_codec_version,
+            55
+        );
         assert_eq!(Pdu::Invalid { ident: 5 }.producer(), None);
         assert_eq!(
             Pdu::Invalid { ident: 5 }.required_topology_capabilities(),
@@ -18521,9 +18568,9 @@ mod test {
     // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
 
     #[test]
-    fn check_compat_current_build_requires_atomic_v55_window() {
-        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 55);
-        assert_eq!(CODEC_VERSION, 55);
+    fn check_compat_current_build_requires_atomic_v56_window() {
+        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 56);
+        assert_eq!(CODEC_VERSION, 56);
     }
 
     #[test]

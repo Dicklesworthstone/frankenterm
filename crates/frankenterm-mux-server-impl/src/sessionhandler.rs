@@ -891,6 +891,330 @@ struct PendingPaneRenderCommit {
     covered_notifications: Vec<Alert>,
 }
 
+/// Maximum alert backlog retained for one pane while its client is stalled.
+///
+/// One complete wire-sized prefix may be protected by an in-flight render
+/// application while one further wire-sized suffix absorbs newer events.  The
+/// suffix coalesces only replaceable state. Exact-event obligations are never
+/// evicted; an unretainable event is rejected so dispatch can fail the affected
+/// connection closed. The protected prefix is never mutated before its exact
+/// application ACK or NACK.
+const MAX_PENDING_PANE_ALERTS: usize = codec::MAX_RENDER_APPLICATION_ALERTS * 2;
+const MAX_PENDING_PANE_ALERT_TEXT_BYTES: usize =
+    codec::MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES * 2;
+
+fn pane_alert_text_bytes(alert: &Alert) -> Option<usize> {
+    match alert {
+        Alert::ToastNotification { title, body, .. } => title
+            .as_ref()
+            .map_or(0, String::len)
+            .checked_add(body.len()),
+        Alert::IconTitleChanged(title) | Alert::TabTitleChanged(title) => {
+            Some(title.as_ref().map_or(0, String::len))
+        }
+        Alert::WindowTitleChanged(title) => Some(title.len()),
+        Alert::SetUserVar { name, value } => name.len().checked_add(value.len()),
+        Alert::SetProfileRequested { name } => Some(name.len()),
+        Alert::MouseShapeRequested { shape } => Some(shape.len()),
+        Alert::ImageAltText { text, .. } => Some(text.len()),
+        Alert::Bell
+        | Alert::CurrentWorkingDirectoryChanged
+        | Alert::PaletteChanged
+        | Alert::OutputSinceFocusLost
+        | Alert::Progress(_) => Some(0),
+    }
+}
+
+fn pane_alerts_coalesce(existing: &Alert, incoming: &Alert) -> bool {
+    match (existing, incoming) {
+        (Alert::CurrentWorkingDirectoryChanged, Alert::CurrentWorkingDirectoryChanged)
+        | (Alert::PaletteChanged, Alert::PaletteChanged)
+        | (Alert::OutputSinceFocusLost, Alert::OutputSinceFocusLost)
+        | (Alert::Progress(_), Alert::Progress(_))
+        | (Alert::IconTitleChanged(_), Alert::IconTitleChanged(_))
+        | (Alert::WindowTitleChanged(_), Alert::WindowTitleChanged(_))
+        | (Alert::TabTitleChanged(_), Alert::TabTitleChanged(_))
+        | (Alert::MouseShapeRequested { .. }, Alert::MouseShapeRequested { .. }) => true,
+        _ => false,
+    }
+}
+
+fn pane_alert_is_exact_event(alert: &Alert) -> bool {
+    matches!(
+        alert,
+        Alert::Bell
+            | Alert::ToastNotification { .. }
+            | Alert::SetUserVar { .. }
+            | Alert::SetProfileRequested { .. }
+            | Alert::ImageAltText { .. }
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PaneAlertBacklogError {
+    TextAccountingOverflow,
+    AccountingDrift,
+    CapacityInvariantExceeded,
+    ProtectedPrefixInvalid,
+    SingleAlertTextLimit,
+    ExactEventCapacityExhausted,
+    StateCapacityExhausted,
+}
+
+impl std::fmt::Display for PaneAlertBacklogError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::TextAccountingOverflow => "pane alert text accounting overflowed",
+            Self::AccountingDrift => "pane alert retained-byte accounting drifted",
+            Self::CapacityInvariantExceeded => "pane alert retained capacity invariant exceeded",
+            Self::ProtectedPrefixInvalid => "pane alert protected prefix is invalid",
+            Self::SingleAlertTextLimit => "pane alert exceeds the per-application text limit",
+            Self::ExactEventCapacityExhausted => {
+                "pane exact-event alert backlog capacity is exhausted"
+            }
+            Self::StateCapacityExhausted => "pane state alert backlog capacity is exhausted",
+        })
+    }
+}
+
+impl std::error::Error for PaneAlertBacklogError {}
+
+#[derive(Debug, Default)]
+pub(crate) struct PendingPaneAlerts {
+    entries: Vec<Alert>,
+    retained_text_bytes: usize,
+    protected_prefix_len: usize,
+}
+
+impl PendingPaneAlerts {
+    fn checked_text_bytes(entries: &[Alert]) -> Option<usize> {
+        entries.iter().try_fold(0usize, |total, alert| {
+            pane_alert_text_bytes(alert).and_then(|bytes| total.checked_add(bytes))
+        })
+    }
+
+    fn validate_accounting(&self) -> Result<(), PaneAlertBacklogError> {
+        // Check the hard retained capacities before the exact accounting scan;
+        // this makes every validation O(n) with n provably bounded at 128.
+        if self.entries.len() > MAX_PENDING_PANE_ALERTS
+            || self.retained_text_bytes > MAX_PENDING_PANE_ALERT_TEXT_BYTES
+        {
+            return Err(PaneAlertBacklogError::CapacityInvariantExceeded);
+        }
+        if self.protected_prefix_len > self.entries.len()
+            || self.protected_prefix_len > codec::MAX_RENDER_APPLICATION_ALERTS
+        {
+            return Err(PaneAlertBacklogError::ProtectedPrefixInvalid);
+        }
+        let exact = Self::checked_text_bytes(&self.entries)
+            .ok_or(PaneAlertBacklogError::TextAccountingOverflow)?;
+        if exact != self.retained_text_bytes {
+            return Err(PaneAlertBacklogError::AccountingDrift);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn push(&mut self, alert: Alert) -> Result<(), PaneAlertBacklogError> {
+        self.validate_accounting()?;
+        let incoming_bytes = pane_alert_text_bytes(&alert)
+            .ok_or(PaneAlertBacklogError::TextAccountingOverflow)?;
+        if incoming_bytes > codec::MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES {
+            metrics::counter!(
+                "mux.server.pane_alert_backlog_rejected",
+                "reason" => "single_alert_text_limit"
+            )
+            .increment(1);
+            return Err(PaneAlertBacklogError::SingleAlertTextLimit);
+        }
+
+        // The validation, coalescing scan, and stable retain below are O(n),
+        // intentionally bounded by MAX_PENDING_PANE_ALERTS (currently 128).
+        // Appending at the end preserves the new state's true temporal
+        // position relative to exact-event obligations.
+        let mut coalesced_count = 0usize;
+        let mut replaced_bytes = 0usize;
+        for existing in &self.entries[self.protected_prefix_len..] {
+            if pane_alerts_coalesce(existing, &alert) {
+                coalesced_count = coalesced_count
+                    .checked_add(1)
+                    .ok_or(PaneAlertBacklogError::TextAccountingOverflow)?;
+                replaced_bytes = replaced_bytes
+                    .checked_add(
+                        pane_alert_text_bytes(existing)
+                            .ok_or(PaneAlertBacklogError::TextAccountingOverflow)?,
+                    )
+                    .ok_or(PaneAlertBacklogError::TextAccountingOverflow)?;
+            }
+        }
+        if coalesced_count != 0 {
+            let retained_text_bytes = self
+                .retained_text_bytes
+                .checked_sub(replaced_bytes)
+                .and_then(|bytes| bytes.checked_add(incoming_bytes))
+                .ok_or(PaneAlertBacklogError::TextAccountingOverflow)?;
+            if retained_text_bytes > MAX_PENDING_PANE_ALERT_TEXT_BYTES {
+                metrics::counter!(
+                    "mux.server.pane_alert_backlog_rejected",
+                    "reason" => "state_capacity"
+                )
+                .increment(1);
+                return Err(PaneAlertBacklogError::StateCapacityExhausted);
+            }
+            let protected_prefix_len = self.protected_prefix_len;
+            let mut index = 0usize;
+            self.entries.retain(|existing| {
+                let retain = index < protected_prefix_len
+                    || !pane_alerts_coalesce(existing, &alert);
+                index += 1;
+                retain
+            });
+            self.entries.push(alert);
+            self.retained_text_bytes = retained_text_bytes;
+            metrics::counter!("mux.server.pane_alert_backlog_coalesced").increment(1);
+            debug_assert!(self.validate_accounting().is_ok());
+            return Ok(());
+        }
+
+        let retained_text_bytes = self
+            .retained_text_bytes
+            .checked_add(incoming_bytes)
+            .ok_or(PaneAlertBacklogError::TextAccountingOverflow)?;
+        if self.entries.len() >= MAX_PENDING_PANE_ALERTS
+            || retained_text_bytes > MAX_PENDING_PANE_ALERT_TEXT_BYTES
+        {
+            let (error, reason) = if pane_alert_is_exact_event(&alert) {
+                (
+                    PaneAlertBacklogError::ExactEventCapacityExhausted,
+                    "exact_event_capacity",
+                )
+            } else {
+                (
+                    PaneAlertBacklogError::StateCapacityExhausted,
+                    "state_capacity",
+                )
+            };
+            metrics::counter!(
+                "mux.server.pane_alert_backlog_rejected",
+                "reason" => reason
+            )
+            .increment(1);
+            return Err(error);
+        }
+
+        self.retained_text_bytes = retained_text_bytes;
+        self.entries.push(alert);
+        debug_assert!(self.validate_accounting().is_ok());
+        Ok(())
+    }
+
+    fn protect_prefix(&mut self, len: usize) {
+        debug_assert!(len <= self.entries.len());
+        debug_assert!(len <= codec::MAX_RENDER_APPLICATION_ALERTS);
+        self.protected_prefix_len = len.min(self.entries.len());
+    }
+
+    fn wire_prefix_len_up_to(&self, max_len: usize) -> Result<usize, PaneAlertBacklogError> {
+        self.validate_accounting()?;
+        let mut retained_bytes = 0usize;
+        let mut len = 0usize;
+        for alert in self
+            .entries
+            .iter()
+            .take(max_len.min(codec::MAX_RENDER_APPLICATION_ALERTS))
+        {
+            let alert_bytes = pane_alert_text_bytes(alert)
+                .ok_or(PaneAlertBacklogError::TextAccountingOverflow)?;
+            let next_bytes = retained_bytes
+                .checked_add(alert_bytes)
+                .ok_or(PaneAlertBacklogError::TextAccountingOverflow)?;
+            if next_bytes > codec::MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES {
+                break;
+            }
+            retained_bytes = next_bytes;
+            len += 1;
+        }
+        Ok(len)
+    }
+
+    fn clear_protection(&mut self) {
+        self.protected_prefix_len = 0;
+    }
+
+    fn drain_prefix(&mut self, len: usize) -> Result<(), PaneAlertBacklogError> {
+        self.validate_accounting()?;
+        if len > self.entries.len() || len > self.protected_prefix_len {
+            return Err(PaneAlertBacklogError::ProtectedPrefixInvalid);
+        }
+        let removed_bytes = Self::checked_text_bytes(&self.entries[..len])
+            .ok_or(PaneAlertBacklogError::TextAccountingOverflow)?;
+        let retained_text_bytes = self
+            .retained_text_bytes
+            .checked_sub(removed_bytes)
+            .ok_or(PaneAlertBacklogError::AccountingDrift)?;
+        self.entries.drain(..len);
+        self.retained_text_bytes = retained_text_bytes;
+        self.protected_prefix_len -= len;
+        debug_assert!(self.validate_accounting().is_ok());
+        Ok(())
+    }
+
+    fn protected_batch_up_to(
+        &mut self,
+        max_len: usize,
+    ) -> Result<Vec<Alert>, PaneAlertBacklogError> {
+        let len = self.wire_prefix_len_up_to(max_len)?;
+        if self.protected_prefix_len != 0 {
+            return Err(PaneAlertBacklogError::ProtectedPrefixInvalid);
+        }
+        let batch = self.entries[..len].to_vec();
+        self.protect_prefix(len);
+        Ok(batch)
+    }
+
+    fn acknowledge_protected_front(
+        &mut self,
+        expected: &Alert,
+    ) -> Result<(), PaneAlertBacklogError> {
+        self.validate_accounting()?;
+        if self.protected_prefix_len == 0 || self.entries.first() != Some(expected) {
+            return Err(PaneAlertBacklogError::ProtectedPrefixInvalid);
+        }
+        self.drain_prefix(1)
+    }
+
+    fn release_protected_prefix(
+        &mut self,
+        expected: &[Alert],
+    ) -> Result<(), PaneAlertBacklogError> {
+        self.validate_accounting()?;
+        if self.protected_prefix_len != expected.len()
+            || self.entries.get(..expected.len()) != Some(expected)
+        {
+            return Err(PaneAlertBacklogError::ProtectedPrefixInvalid);
+        }
+        self.clear_protection();
+        Ok(())
+    }
+
+    fn as_slice(&self) -> &[Alert] {
+        &self.entries
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl PartialEq<Vec<Alert>> for PendingPaneAlerts {
+    fn eq(&self, other: &Vec<Alert>) -> bool {
+        self.entries == *other
+    }
+}
+
 #[derive(Debug, Default)]
 enum PaneRenderTransactionPhase {
     #[default]
@@ -927,8 +1251,11 @@ enum PaneRenderPreparationError {
     SourceChanged,
     TerminalSequenceExhausted,
     StableRowRangeUnrepresentable,
+    LegacyBaselineSuperseded,
+    LegacyAttemptIdentityExhausted,
     StaleAttempt,
     NotificationPrefixChanged,
+    NotificationBacklogInvalid,
     SnapshotFailed,
     StateLockPoisoned,
 }
@@ -951,9 +1278,18 @@ impl std::fmt::Display for PaneRenderPreparationError {
             Self::StableRowRangeUnrepresentable => {
                 "pane stable-row range cannot be represented without overflow"
             }
+            Self::LegacyBaselineSuperseded => {
+                "pane legacy render baseline changed during lock-free preparation"
+            }
+            Self::LegacyAttemptIdentityExhausted => {
+                "pane legacy render attempt identity exhausted before wrap or reuse"
+            }
             Self::StaleAttempt => "pane render attempt no longer owns the transaction",
             Self::NotificationPrefixChanged => {
                 "pane notification prefix changed during transaction preparation"
+            }
+            Self::NotificationBacklogInvalid => {
+                "pane notification backlog accounting or capacity is invalid"
             }
             Self::SnapshotFailed => "pane semantic snapshot preparation failed",
             Self::StateLockPoisoned => "pane render transaction state lock is poisoned",
@@ -977,7 +1313,8 @@ pub(crate) struct PerPane {
     render_generation: u64,
     next_render_attempt: Option<u64>,
     next_input_epoch: Option<u64>,
-    pub(crate) notifications: Vec<Alert>,
+    baseline_revision: u64,
+    pub(crate) notifications: PendingPaneAlerts,
 }
 
 impl Default for PerPane {
@@ -989,7 +1326,8 @@ impl Default for PerPane {
             render_generation: 1,
             next_render_attempt: Some(1),
             next_input_epoch: Some(1),
-            notifications: Vec::new(),
+            baseline_revision: 0,
+            notifications: PendingPaneAlerts::default(),
         }
     }
 }
@@ -1195,6 +1533,7 @@ impl PaneRenderBaseline {
 }
 
 impl PerPane {
+    #[cfg(test)]
     fn compute_changes(
         &mut self,
         pane: &CurrentPane<'_>,
@@ -1228,6 +1567,82 @@ impl PerPane {
     }
 }
 
+/// Prepare a legacy render without holding the per-pane state lock across any
+/// pane callback, then publish its speculative baseline only if the exact
+/// baseline sampled before preparation is still current.
+fn prepare_legacy_render_enqueue(
+    pane: &CurrentPane<'_>,
+    per_pane: &Arc<Mutex<PerPane>>,
+    force_with_input_dispatch_serial: Option<InputSerial>,
+) -> anyhow::Result<
+    Option<(
+        GetPaneRenderChangesResponse,
+        LegacyRenderEnqueueGuard,
+    )>,
+> {
+    let pane_id = pane.pane_id();
+    let (prior_baseline, prior_revision) = {
+        let mut state = per_pane
+            .lock()
+            .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
+        state.ensure_legacy_transport_idle()?;
+        (state.baseline.clone(), state.baseline_revision)
+    };
+    let surface = prior_baseline.prepare_surface_changes(
+        pane,
+        force_with_input_dispatch_serial,
+        false,
+    );
+
+    let mut state = per_pane
+        .lock()
+        .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
+    state.ensure_legacy_transport_idle()?;
+    if state.baseline != prior_baseline || state.baseline_revision != prior_revision {
+        state.mark_transactional_dirty();
+        return Err(PaneRenderPreparationError::LegacyBaselineSuperseded.into());
+    }
+
+    match surface {
+        SurfacePreparation::StableRowRangeUnrepresentable => {
+            state.mark_transactional_dirty();
+            Err(PaneRenderPreparationError::StableRowRangeUnrepresentable.into())
+        }
+        SurfacePreparation::NoChange { source_query, .. } => {
+            if state.baseline.seqno != source_query {
+                let Some(next_revision) = prior_revision.checked_add(1) else {
+                    state.mark_transactional_dirty();
+                    return Err(
+                        PaneRenderPreparationError::LegacyAttemptIdentityExhausted.into(),
+                    );
+                };
+                state.baseline.seqno = source_query;
+                state.baseline_revision = next_revision;
+            }
+            Ok(None)
+        }
+        SurfacePreparation::Changes(prepared) => {
+            let PreparedSurfaceChanges {
+                response, baseline, ..
+            } = *prepared;
+            let Some(installed_revision) = prior_revision.checked_add(1) else {
+                state.mark_transactional_dirty();
+                return Err(PaneRenderPreparationError::LegacyAttemptIdentityExhausted.into());
+            };
+            state.baseline = baseline;
+            state.baseline_revision = installed_revision;
+            drop(state);
+            let rollback = LegacyRenderEnqueueGuard::new(
+                Arc::clone(per_pane),
+                pane_id,
+                prior_baseline,
+                installed_revision,
+            );
+            Ok(Some((response, rollback)))
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 #[allow(
     dead_code,
@@ -1245,6 +1660,30 @@ struct PaneRenderBeginSnapshot {
     reason = "live ownership transfers to the delivery coordinator under ft-interactive-systems-performance-4tenz.5.5.10"
 )]
 impl PerPane {
+    fn ensure_legacy_transport_idle(&mut self) -> Result<(), PaneRenderPreparationError> {
+        match self.transaction_phase {
+            PaneRenderTransactionPhase::Idle => {
+                if self.notifications.protected_prefix_len == 0 {
+                    Ok(())
+                } else {
+                    // No transaction can own an alert prefix in Idle. Clear
+                    // only that stale local marker, retain every alert, and
+                    // require a fresh preparation rather than draining data
+                    // under contradictory authority.
+                    self.notifications.clear_protection();
+                    self.transactional_dirty = true;
+                    Err(PaneRenderPreparationError::NotificationPrefixChanged)
+                }
+            }
+            PaneRenderTransactionPhase::Preparing { .. }
+            | PaneRenderTransactionPhase::InFlight { .. } => {
+                self.mark_transactional_dirty();
+                Err(PaneRenderPreparationError::Busy)
+            }
+            PaneRenderTransactionPhase::Closed => Err(PaneRenderPreparationError::Closed),
+        }
+    }
+
     fn mark_transactional_dirty(&mut self) {
         self.transactional_dirty = true;
         match &mut self.transaction_phase {
@@ -1256,9 +1695,13 @@ impl PerPane {
         }
     }
 
-    pub(crate) fn push_notification(&mut self, alert: Alert) {
-        self.notifications.push(alert);
+    pub(crate) fn push_notification(
+        &mut self,
+        alert: Alert,
+    ) -> Result<(), PaneAlertBacklogError> {
+        self.notifications.push(alert)?;
         self.mark_transactional_dirty();
+        Ok(())
     }
 
     fn begin_transactional_preparation(
@@ -1276,6 +1719,10 @@ impl PerPane {
             PaneRenderTransactionPhase::Closed => {
                 return Err(PaneRenderPreparationError::Closed);
             }
+        }
+        if self.notifications.protected_prefix_len != 0 {
+            self.close_transaction();
+            return Err(PaneRenderPreparationError::NotificationPrefixChanged);
         }
 
         let attempt = self
@@ -1309,10 +1756,21 @@ impl PerPane {
             attempt,
             input_epoch,
         };
+        let covered_notifications_len = match self
+            .notifications
+            .wire_prefix_len_up_to(self.notifications.len())
+        {
+            Ok(len) => len,
+            Err(_) => {
+                self.close_transaction();
+                return Err(PaneRenderPreparationError::NotificationBacklogInvalid);
+            }
+        };
         let covered_notifications = self
             .notifications
+            .as_slice()
             .iter()
-            .take(codec::MAX_RENDER_APPLICATION_ALERTS)
+            .take(covered_notifications_len)
             .cloned()
             .collect::<Vec<_>>();
         let has_uncovered_notifications =
@@ -1322,6 +1780,7 @@ impl PerPane {
             token,
             redirtied: false,
         };
+        self.notifications.protect_prefix(covered_notifications.len());
         Ok(PaneRenderBeginSnapshot {
             token,
             baseline: self.baseline.clone(),
@@ -1346,6 +1805,7 @@ impl PerPane {
             };
         }
         self.transaction_phase = PaneRenderTransactionPhase::Idle;
+        self.notifications.clear_protection();
         self.transactional_dirty = true;
         PaneRenderSettlement::Retried
     }
@@ -1369,6 +1829,7 @@ impl PerPane {
             };
         }
         self.transaction_phase = PaneRenderTransactionPhase::Closed;
+        self.notifications.clear_protection();
         self.transactional_dirty = true;
         PaneRenderSettlement::Closed
     }
@@ -1402,6 +1863,7 @@ impl PerPane {
         }
 
         self.transaction_phase = PaneRenderTransactionPhase::Idle;
+        self.notifications.clear_protection();
         self.transactional_dirty = redirtied;
         if redirtied {
             PaneRenderSettlement::SettledNoChangeRedirtied
@@ -1431,10 +1893,12 @@ impl PerPane {
         }
         if self
             .notifications
+            .as_slice()
             .get(..snapshot.covered_notifications.len())
             != Some(snapshot.covered_notifications.as_slice())
         {
             self.transaction_phase = PaneRenderTransactionPhase::Closed;
+            self.notifications.clear_protection();
             self.transactional_dirty = true;
             return Err(PaneRenderPreparationError::NotificationPrefixChanged);
         }
@@ -1482,10 +1946,12 @@ impl PerPane {
         }
         if self
             .notifications
+            .as_slice()
             .get(..pending.covered_notifications.len())
             != Some(pending.covered_notifications.as_slice())
         {
             self.transaction_phase = PaneRenderTransactionPhase::Closed;
+            self.notifications.clear_protection();
             self.transactional_dirty = true;
             return PaneRenderSettlement::FailedClosed;
         }
@@ -1495,8 +1961,25 @@ impl PerPane {
             covered_notifications,
             ..
         } = *pending;
-        self.notifications.drain(..covered_notifications.len());
+        let Some(next_baseline_revision) = self.baseline_revision.checked_add(1) else {
+            self.transaction_phase = PaneRenderTransactionPhase::Closed;
+            self.notifications.clear_protection();
+            self.transactional_dirty = true;
+            return PaneRenderSettlement::FailedClosed;
+        };
+        if self
+            .notifications
+            .drain_prefix(covered_notifications.len())
+            .is_err()
+        {
+            self.transaction_phase = PaneRenderTransactionPhase::Closed;
+            self.notifications.clear_protection();
+            self.transactional_dirty = true;
+            return PaneRenderSettlement::FailedClosed;
+        }
+        self.notifications.clear_protection();
         self.baseline = baseline;
+        self.baseline_revision = next_baseline_revision;
         self.transaction_phase = PaneRenderTransactionPhase::Idle;
         self.transactional_dirty = redirtied || !self.notifications.is_empty();
         if self.transactional_dirty {
@@ -1519,12 +2002,14 @@ impl PerPane {
             };
         }
         self.transaction_phase = PaneRenderTransactionPhase::Idle;
+        self.notifications.clear_protection();
         self.transactional_dirty = true;
         PaneRenderSettlement::Retried
     }
 
     fn close_transaction(&mut self) {
         self.transaction_phase = PaneRenderTransactionPhase::Closed;
+        self.notifications.clear_protection();
         self.transactional_dirty = true;
     }
 }
@@ -1839,7 +2324,7 @@ struct LegacyRenderEnqueueGuard {
     per_pane: Arc<Mutex<PerPane>>,
     pane_id: PaneId,
     prior_baseline: PaneRenderBaseline,
-    installed_baseline: PaneRenderBaseline,
+    installed_revision: u64,
     armed: bool,
 }
 
@@ -1848,13 +2333,13 @@ impl LegacyRenderEnqueueGuard {
         per_pane: Arc<Mutex<PerPane>>,
         pane_id: PaneId,
         prior_baseline: PaneRenderBaseline,
-        installed_baseline: PaneRenderBaseline,
+        installed_revision: u64,
     ) -> Self {
         Self {
             per_pane,
             pane_id,
             prior_baseline,
-            installed_baseline,
+            installed_revision,
             armed: true,
         }
     }
@@ -1863,14 +2348,30 @@ impl LegacyRenderEnqueueGuard {
         self.armed = false;
     }
 
+    fn recover(&self) -> anyhow::Result<()> {
+        match catch_recoverable(
+            RecoverablePanicSite::MuxPaneCallback,
+            AssertUnwindSafe(|| {
+                retain_legacy_render_after_enqueue_failure(
+                    &self.per_pane,
+                    self.pane_id,
+                    &self.prior_baseline,
+                    self.installed_revision,
+                )
+            }),
+        ) {
+            Ok(result) => result,
+            Err(err) => Err(anyhow!(
+                "legacy render enqueue recovery panicked for pane {}: {err}",
+                self.pane_id
+            )),
+        }
+    }
+
     fn rollback(mut self) -> anyhow::Result<()> {
+        let result = self.recover();
         self.armed = false;
-        retain_legacy_render_after_enqueue_failure(
-            &self.per_pane,
-            self.pane_id,
-            &self.prior_baseline,
-            &self.installed_baseline,
-        )
+        result
     }
 }
 
@@ -1880,26 +2381,11 @@ impl Drop for LegacyRenderEnqueueGuard {
             return;
         }
         self.armed = false;
-        match catch_recoverable(
-            RecoverablePanicSite::MuxPaneCallback,
-            AssertUnwindSafe(|| {
-                retain_legacy_render_after_enqueue_failure(
-                    &self.per_pane,
-                    self.pane_id,
-                    &self.prior_baseline,
-                    &self.installed_baseline,
-                )
-            }),
-        ) {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => log::error!(
+        if let Err(err) = self.recover() {
+            log::error!(
                 "failed to recover abandoned legacy render enqueue for pane {}: {err:#}",
                 self.pane_id
-            ),
-            Err(err) => log::error!(
-                "legacy render enqueue recovery panicked for pane {}: {err}",
-                self.pane_id
-            ),
+            );
         }
     }
 }
@@ -1925,20 +2411,59 @@ impl UnsentNotificationsGuard {
         self.notifications.get(self.next_unsent)
     }
 
-    fn acknowledge_current(&mut self) {
-        self.next_unsent = self.next_unsent.saturating_add(1);
+    fn acknowledge_current(&mut self) -> anyhow::Result<()> {
+        let expected = self
+            .notifications
+            .get(self.next_unsent)
+            .ok_or_else(|| anyhow!("no protected pane notification remains to acknowledge"))?;
+        let mut state = self.per_pane.lock().map_err(|err| {
+            anyhow!("per-pane state lock poisoned during notification commit: {err}")
+        })?;
+        state
+            .notifications
+            .acknowledge_protected_front(expected)
+            .map_err(anyhow::Error::from)?;
+        drop(state);
+        self.next_unsent = self
+            .next_unsent
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("pane notification acknowledgement index overflowed"))?;
+        Ok(())
     }
 
     fn acknowledge_all(mut self) {
         self.armed = false;
     }
 
+    fn recover(&self) -> anyhow::Result<()> {
+        match catch_recoverable(
+            RecoverablePanicSite::MuxPaneCallback,
+            AssertUnwindSafe(|| {
+                let unsent = self.notifications.get(self.next_unsent..).ok_or_else(|| {
+                    anyhow!("pane notification recovery index exceeded its protected batch")
+                })?;
+                let mut state = self.per_pane.lock().map_err(|err| {
+                    anyhow!(
+                        "per-pane state lock poisoned during notification recovery: {err}"
+                    )
+                })?;
+                state
+                    .notifications
+                    .release_protected_prefix(unsent)
+                    .map_err(anyhow::Error::from)?;
+                state.mark_transactional_dirty();
+                Ok(())
+            }),
+        ) {
+            Ok(result) => result,
+            Err(err) => Err(anyhow!("pane notification recovery panicked: {err}")),
+        }
+    }
+
     fn rollback(mut self) -> anyhow::Result<()> {
+        let result = self.recover();
         self.armed = false;
-        retain_unsent_notifications_after_enqueue_failure(
-            &self.per_pane,
-            &self.notifications[self.next_unsent..],
-        )
+        result
     }
 }
 
@@ -1948,22 +2473,8 @@ impl Drop for UnsentNotificationsGuard {
             return;
         }
         self.armed = false;
-        match catch_recoverable(
-            RecoverablePanicSite::MuxPaneCallback,
-            AssertUnwindSafe(|| {
-                retain_unsent_notifications_after_enqueue_failure(
-                    &self.per_pane,
-                    &self.notifications[self.next_unsent..],
-                )
-            }),
-        ) {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                log::error!("failed to retain abandoned pane notifications: {err:#}");
-            }
-            Err(err) => {
-                log::error!("pane notification recovery panicked: {err}");
-            }
+        if let Err(err) = self.recover() {
+            log::error!("failed to retain abandoned pane notifications: {err:#}");
         }
     }
 }
@@ -1972,13 +2483,20 @@ fn retain_legacy_render_after_enqueue_failure(
     per_pane: &Arc<Mutex<PerPane>>,
     pane_id: PaneId,
     prior_baseline: &PaneRenderBaseline,
-    installed_baseline: &PaneRenderBaseline,
+    installed_revision: u64,
 ) -> anyhow::Result<()> {
     let mut state = per_pane
         .lock()
         .map_err(|err| anyhow!("per-pane state lock poisoned during render recovery: {err}"))?;
-    if state.baseline == *installed_baseline {
+    if state.baseline_revision == installed_revision {
+        let current_config_generation = state.baseline.config_generation;
+        let current_sent_initial_palette = state.baseline.sent_initial_palette;
         state.baseline.clone_from(prior_baseline);
+        // Palette/config bookkeeping is committed independently after the
+        // surface enqueue. Preserve a newer metadata update while rolling back
+        // only the speculative surface baseline owned by this exact revision.
+        state.baseline.config_generation = current_config_generation;
+        state.baseline.sent_initial_palette = current_sent_initial_palette;
     } else {
         log::error!(
             "cannot roll back failed legacy render enqueue for pane {pane_id}: the baseline was superseded"
@@ -1988,118 +2506,134 @@ fn retain_legacy_render_after_enqueue_failure(
     Ok(())
 }
 
-fn retain_unsent_notifications_after_enqueue_failure(
-    per_pane: &Arc<Mutex<PerPane>>,
-    unsent: &[Alert],
-) -> anyhow::Result<()> {
-    let mut state = per_pane.lock().map_err(|err| {
-        anyhow!("per-pane state lock poisoned during notification recovery: {err}")
-    })?;
-    let mut retained = unsent.to_vec();
-    retained.append(&mut state.notifications);
-    state.notifications = retained;
-    state.mark_transactional_dirty();
-    Ok(())
-}
-
 fn maybe_push_pane_changes(
     pane: &CurrentPane<'_>,
     sender: PduSender,
     per_pane: Arc<Mutex<PerPane>>,
 ) -> anyhow::Result<()> {
-    let (render_changes, rollback_guard) = {
-        let mut state = per_pane
-            .lock()
-            .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
-        let prior_baseline = state.baseline.clone();
-        let render_changes = state.compute_changes(pane, None)?;
-        let rollback_guard = render_changes.as_ref().map(|_| {
-            LegacyRenderEnqueueGuard::new(
-                Arc::clone(&per_pane),
-                pane.pane_id(),
-                prior_baseline,
-                state.baseline.clone(),
-            )
-        });
-        (render_changes, rollback_guard)
-    };
-    if let Some(resp) = render_changes {
+    if let Some((resp, rollback_guard)) =
+        prepare_legacy_render_enqueue(pane, &per_pane, None)?
+    {
         let send_result = sender.send_bulk(DecodedPdu {
             pdu: Pdu::GetPaneRenderChangesResponse(resp),
             serial: 0,
         });
         match send_result {
-            Ok(()) => {
-                if let Some(guard) = rollback_guard {
-                    guard.acknowledge();
-                }
-            }
+            Ok(()) => rollback_guard.acknowledge(),
             Err(send_err) => {
-                if let Some(guard) = rollback_guard {
-                    if let Err(recovery_err) = guard.rollback() {
-                        return Err(anyhow!(
-                            "render enqueue failed: {send_err:#}; baseline recovery also failed: {recovery_err:#}"
-                        ));
-                    }
-                }
-                return Err(send_err);
-            }
-        }
-    }
-
-    let notifications = {
-        let mut per_pane = per_pane
-            .lock()
-            .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
-        let config = config::configuration();
-        if per_pane.baseline.config_generation != config.generation() {
-            per_pane.baseline.config_generation = config.generation();
-            // If the config changed, it may have changed colors
-            // in the palette that we need to push down, so we
-            // synthesize a palette change notification to let
-            // the client know
-            per_pane.notifications.push(Alert::PaletteChanged);
-            per_pane.baseline.sent_initial_palette = true;
-        }
-
-        if !per_pane.baseline.sent_initial_palette {
-            per_pane.notifications.push(Alert::PaletteChanged);
-            per_pane.baseline.sent_initial_palette = true;
-        }
-        std::mem::take(&mut per_pane.notifications)
-    };
-
-    let mut notifications = UnsentNotificationsGuard::new(Arc::clone(&per_pane), notifications);
-    while let Some(alert) = notifications.current() {
-        let send_result = match alert {
-            Alert::PaletteChanged => sender.send_bulk(DecodedPdu {
-                pdu: Pdu::SetPalette(SetPalette {
-                    pane_id: pane.pane_id(),
-                    palette: pane.palette(),
-                }),
-                serial: 0,
-            }),
-            alert => sender.send_bulk(DecodedPdu {
-                pdu: Pdu::NotifyAlert(NotifyAlert {
-                    pane_id: pane.pane_id(),
-                    alert: alert.clone(),
-                }),
-                serial: 0,
-            }),
-        };
-        match send_result {
-            Ok(()) => notifications.acknowledge_current(),
-            Err(send_err) => {
-                if let Err(recovery_err) = notifications.rollback() {
+                if let Err(recovery_err) = rollback_guard.rollback() {
                     return Err(anyhow!(
-                        "notification enqueue failed: {send_err:#}; retention also failed: {recovery_err:#}"
+                        "render enqueue failed: {send_err:#}; baseline recovery also failed: {recovery_err:#}"
                     ));
                 }
                 return Err(send_err);
             }
         }
     }
-    notifications.acknowledge_all();
+
+    let config_generation = config::configuration().generation();
+    let (mut notifications_remaining, first_notification_batch) = {
+        let mut per_pane = per_pane
+            .lock()
+            .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
+        per_pane.ensure_legacy_transport_idle()?;
+        if per_pane.baseline.config_generation != config_generation {
+            // If the config changed, it may have changed colors
+            // in the palette that we need to push down, so we
+            // synthesize a palette change notification to let
+            // the client know
+            per_pane
+                .notifications
+                .push(Alert::PaletteChanged)
+                .map_err(anyhow::Error::from)?;
+            per_pane.baseline.config_generation = config_generation;
+            per_pane.baseline.sent_initial_palette = true;
+        }
+
+        if !per_pane.baseline.sent_initial_palette {
+            per_pane
+                .notifications
+                .push(Alert::PaletteChanged)
+                .map_err(anyhow::Error::from)?;
+            per_pane.baseline.sent_initial_palette = true;
+        }
+        let notifications_remaining = per_pane.notifications.len();
+        let batch = per_pane
+            .notifications
+            .protected_batch_up_to(notifications_remaining)
+            .map_err(anyhow::Error::from)?;
+        (notifications_remaining, batch)
+    };
+
+    let mut next_notification_batch = Some(first_notification_batch);
+    while notifications_remaining != 0 {
+        let batch = next_notification_batch
+            .take()
+            .ok_or_else(|| anyhow!("pane notification batch authority was lost"))?;
+        let batch_len = batch.len();
+        let mut notifications = UnsentNotificationsGuard::new(Arc::clone(&per_pane), batch);
+        if batch_len == 0 || batch_len > notifications_remaining {
+            notifications.rollback()?;
+            anyhow::bail!("pane notification batch made no bounded forward progress");
+        }
+        while let Some(alert) = notifications.current() {
+            let send_result = match alert {
+                Alert::PaletteChanged => sender.send_bulk(DecodedPdu {
+                    pdu: Pdu::SetPalette(SetPalette {
+                        pane_id: pane.pane_id(),
+                        palette: pane.palette(),
+                    }),
+                    serial: 0,
+                }),
+                alert => sender.send_bulk(DecodedPdu {
+                    pdu: Pdu::NotifyAlert(NotifyAlert {
+                        pane_id: pane.pane_id(),
+                        alert: alert.clone(),
+                    }),
+                    serial: 0,
+                }),
+            };
+            match send_result {
+                Ok(()) => {
+                    if let Err(commit_err) = notifications.acknowledge_current() {
+                        if let Err(recovery_err) = notifications.rollback() {
+                            return Err(anyhow!(
+                                "notification enqueue committed but local settlement failed: {commit_err:#}; protection recovery also failed: {recovery_err:#}"
+                            ));
+                        }
+                        return Err(anyhow!(
+                            "notification enqueue committed but local settlement failed: {commit_err:#}"
+                        ));
+                    }
+                }
+                Err(send_err) => {
+                    if let Err(recovery_err) = notifications.rollback() {
+                        return Err(anyhow!(
+                            "notification enqueue failed: {send_err:#}; retention also failed: {recovery_err:#}"
+                        ));
+                    }
+                    return Err(send_err);
+                }
+            }
+        }
+        notifications.acknowledge_all();
+        notifications_remaining = notifications_remaining
+            .checked_sub(batch_len)
+            .ok_or_else(|| anyhow!("pane notification batch accounting underflowed"))?;
+        if notifications_remaining != 0 {
+            let batch = {
+                let mut state = per_pane
+                    .lock()
+                    .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
+                state.ensure_legacy_transport_idle()?;
+                state
+                    .notifications
+                    .protected_batch_up_to(notifications_remaining)
+                    .map_err(anyhow::Error::from)?
+            };
+            next_notification_batch = Some(batch);
+        }
+    }
     Ok(())
 }
 
@@ -2119,6 +2653,7 @@ fn push_pane_changes_after_committed_input(
     ) {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
+            mark_post_input_render_dirty(&recovery_state, pane.pane_id(), operation);
             log::error!(
                 "render push failed after committed {operation} for pane {}; preserving the input acknowledgment: {err:#}",
                 pane.pane_id()
@@ -2147,34 +2682,22 @@ fn mark_post_input_render_dirty(
     }
 }
 
-fn push_key_down_changes_after_committed_input(
+fn push_input_dispatch_changes_after_committed_input(
     pane: &CurrentPane<'_>,
     sender: PduSender,
     per_pane: Arc<Mutex<PerPane>>,
-    pane_id: PaneId,
     input_serial: InputSerial,
+    operation: &'static str,
 ) {
+    let pane_id = pane.pane_id();
     // Force a surface snapshot so the client can measure dispatch RTT and
-    // record the exact terminal-sequence fence sampled after `key_down`.
+    // record the exact terminal-sequence fence sampled after the pane input.
     // This acknowledges protocol dispatch only; it does not claim that the
     // PTY or application has echoed the input.
     let prepared = catch_recoverable(
         RecoverablePanicSite::MuxPaneCallback,
-        AssertUnwindSafe(|| -> anyhow::Result<_> {
-            let mut state = per_pane
-                .lock()
-                .map_err(|err| anyhow!("render state lock poisoned: {err}"))?;
-            let prior_baseline = state.baseline.clone();
-            let Some(response) = state.compute_changes(pane, Some(input_serial))? else {
-                return Ok(None);
-            };
-            let rollback = LegacyRenderEnqueueGuard::new(
-                Arc::clone(&per_pane),
-                pane_id,
-                prior_baseline,
-                state.baseline.clone(),
-            );
-            Ok(Some((response, rollback)))
+        AssertUnwindSafe(|| {
+            prepare_legacy_render_enqueue(pane, &per_pane, Some(input_serial))
         }),
     );
 
@@ -2182,15 +2705,16 @@ fn push_key_down_changes_after_committed_input(
         Ok(Ok(Some(prepared))) => prepared,
         Ok(Ok(None)) => return,
         Ok(Err(err)) => {
+            mark_post_input_render_dirty(&per_pane, pane_id, operation);
             log::error!(
-                "render preparation failed after committed key-down for pane {pane_id}; preserving the input acknowledgment: {err:#}"
+                "render preparation failed after committed {operation} for pane {pane_id}; preserving the input acknowledgment: {err:#}"
             );
             return;
         }
         Err(err) => {
-            mark_post_input_render_dirty(&per_pane, pane_id, "key-down");
+            mark_post_input_render_dirty(&per_pane, pane_id, operation);
             log::error!(
-                "render preparation panicked after committed key-down for pane {pane_id}; preserving the input acknowledgment: {err}"
+                "render preparation panicked after committed {operation} for pane {pane_id}; preserving the input acknowledgment: {err}"
             );
             return;
         }
@@ -2209,18 +2733,18 @@ fn push_key_down_changes_after_committed_input(
         Ok(Err(err)) => {
             if let Err(recovery_err) = rollback.rollback() {
                 log::error!(
-                    "render baseline recovery failed after committed key-down for pane {pane_id}: {recovery_err:#}"
+                    "render baseline recovery failed after committed {operation} for pane {pane_id}: {recovery_err:#}"
                 );
             }
             log::error!(
-                "render enqueue failed after committed key-down for pane {pane_id}; preserving the input acknowledgment: {err:#}"
+                "render enqueue failed after committed {operation} for pane {pane_id}; preserving the input acknowledgment: {err:#}"
             );
         }
         Err(err) => {
             // The armed guard restores the exact baseline before returning.
             drop(rollback);
             log::error!(
-                "render enqueue panicked after committed key-down for pane {pane_id}; preserving the input acknowledgment: {err}"
+                "render enqueue panicked after committed {operation} for pane {pane_id}; preserving the input acknowledgment: {err}"
             );
         }
     }
@@ -3504,7 +4028,11 @@ impl SessionHandler {
                 })
                 .detach();
             }
-            Pdu::SendPaste(SendPaste { pane_id, data }) => {
+            Pdu::SendPaste(SendPaste {
+                pane_id,
+                data,
+                input_serial,
+            }) => {
                 let Some(registration) =
                     capture_pane_or_respond(&authority, pane_id, &send_response)
                 else {
@@ -3517,10 +4045,11 @@ impl SessionHandler {
                         move || {
                             with_current_pane(&authority, &registration, |pane| {
                                 pane.send_paste(&data)?;
-                                push_pane_changes_after_committed_input(
+                                push_input_dispatch_changes_after_committed_input(
                                     pane,
                                     sender,
                                     per_pane,
+                                    input_serial,
                                     "paste",
                                 );
                                 Ok(Pdu::UnitResponse(UnitResponse {}))
@@ -3673,12 +4202,12 @@ impl SessionHandler {
                         move || {
                             with_current_pane(&authority, &registration, |pane| {
                                 pane.key_down(event.key, event.modifiers)?;
-                                push_key_down_changes_after_committed_input(
+                                push_input_dispatch_changes_after_committed_input(
                                     pane,
                                     sender,
                                     per_pane,
-                                    pane_id,
                                     input_serial,
+                                    "key-down",
                                 );
                                 Ok(Pdu::UnitResponse(UnitResponse {}))
                             })
@@ -4555,7 +5084,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::ops::Range;
     use std::sync::Barrier;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use termwiz::surface::Line;
     use wezterm_term::color::ColorPalette;
@@ -4606,6 +5135,7 @@ mod tests {
         changed_lines: Mutex<RangeSet<StableRowIndex>>,
         changed_since_seqnos: Mutex<Vec<SequenceNo>>,
         key_down_count: AtomicUsize,
+        paste_count: AtomicUsize,
         callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         seqno_on_dimensions: Option<SequenceNo>,
         cursor_line_start_override: Option<StableRowIndex>,
@@ -4639,6 +5169,7 @@ mod tests {
                 changed_lines: Mutex::new(RangeSet::new()),
                 changed_since_seqnos: Mutex::new(Vec::new()),
                 key_down_count: AtomicUsize::new(0),
+                paste_count: AtomicUsize::new(0),
                 state: Mutex::new(FakePaneState {
                     cursor_position: StableCursorPosition {
                         x: 4,
@@ -4696,6 +5227,10 @@ mod tests {
 
         fn key_down_count(&self) -> usize {
             self.key_down_count.load(Ordering::Relaxed)
+        }
+
+        fn paste_count(&self) -> usize {
+            self.paste_count.load(Ordering::Relaxed)
         }
     }
 
@@ -4786,6 +5321,7 @@ mod tests {
         }
 
         fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
+            self.paste_count.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
 
@@ -7719,7 +8255,11 @@ mod tests {
                 Self::WriteToPane { pane_id, data } => {
                     Pdu::WriteToPane(WriteToPane { pane_id, data })
                 }
-                Self::SendPaste { pane_id, data } => Pdu::SendPaste(SendPaste { pane_id, data }),
+                Self::SendPaste { pane_id, data } => Pdu::SendPaste(SendPaste {
+                    pane_id,
+                    data,
+                    input_serial: InputSerial::empty(),
+                }),
                 Self::SendKeyDown { pane_id } => Pdu::SendKeyDown(SendKeyDown {
                     pane_id,
                     event: termwiz::input::KeyEvent {
@@ -9610,6 +10150,101 @@ mod tests {
     }
 
     #[test]
+    fn legacy_render_preparation_drops_per_pane_lock_before_pane_callbacks() {
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(7_701, {
+            let per_pane = Arc::clone(&per_pane);
+            let callback_count = Arc::clone(&callback_count);
+            Arc::new(move || {
+                assert!(
+                    per_pane.try_lock().is_ok(),
+                    "legacy pane callbacks must not run under the per-pane state lock"
+                );
+                callback_count.fetch_add(1, Ordering::Relaxed);
+            })
+        }));
+        let (_mux, registration) = register_test_pane(&pane);
+        let (sender, _captured) = capturing_sender();
+
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender, Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect("lock-free legacy render preparation should send");
+
+        assert_eq!(callback_count.load(Ordering::Relaxed), 1);
+        assert_eq!(per_pane.lock().unwrap().baseline.seqno, 11);
+    }
+
+    #[test]
+    fn legacy_render_preparation_rejects_a_superseded_baseline() {
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        per_pane.lock().unwrap().transactional_dirty = false;
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(7_702, {
+            let per_pane = Arc::clone(&per_pane);
+            Arc::new(move || {
+                let mut state = per_pane
+                    .try_lock()
+                    .expect("pane callback must be able to supersede the sampled baseline");
+                state.baseline.title = "newer-baseline".to_string();
+            })
+        }));
+        let (_mux, registration) = register_test_pane(&pane);
+        let send_count = Arc::new(AtomicUsize::new(0));
+        let sender = PduSender::new({
+            let send_count = Arc::clone(&send_count);
+            move |_, _| {
+                send_count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        });
+
+        let error = registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender, Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect_err("a superseded baseline must reject the stale prepared snapshot");
+
+        assert!(error.to_string().contains("baseline changed"));
+        assert_eq!(send_count.load(Ordering::Relaxed), 0);
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.baseline.title, "newer-baseline");
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn post_input_pane_callback_panic_does_not_poison_render_state_or_escape() {
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        per_pane.lock().unwrap().transactional_dirty = false;
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(
+            7_703,
+            Arc::new(|| panic!("synthetic pane snapshot panic")),
+        ));
+        let (_mux, registration) = register_test_pane(&pane);
+        let (sender, _captured) = capturing_sender();
+
+        registration
+            .try_with_current(|current| {
+                push_pane_changes_after_committed_input(
+                    &current,
+                    sender,
+                    Arc::clone(&per_pane),
+                    "test write",
+                );
+            })
+            .expect("test pane registration remains current");
+
+        let state = per_pane
+            .lock()
+            .expect("lock-free pane callback panic must not poison render state");
+        assert_eq!(state.baseline, PaneRenderBaseline::default());
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
     fn failed_legacy_render_enqueue_restores_baseline_and_redirties() {
         let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
         let (_mux, registration) = register_test_pane(&pane);
@@ -9635,6 +10270,82 @@ mod tests {
             state.transactional_dirty,
             "failed enqueue must retain an explicit retry obligation"
         );
+    }
+
+    #[test]
+    fn stale_legacy_enqueue_failure_cannot_roll_back_a_newer_render_revision() {
+        let pane = Arc::new(FakePane::new(None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        per_pane.lock().unwrap().transactional_dirty = false;
+        let sender = PduSender::new({
+            let pane = Arc::clone(&pane);
+            let registration = registration.clone();
+            let per_pane = Arc::clone(&per_pane);
+            move |_, _| {
+                {
+                    let mut pane_state = pane.state.lock().unwrap();
+                    pane_state.title = "newer-render".to_string();
+                    pane_state.seqno = 12;
+                }
+                let nested = registration
+                    .try_with_current(|current| {
+                        prepare_legacy_render_enqueue(&current, &per_pane, None)
+                    })
+                    .expect("nested registration remains exact")
+                    .expect("newer render preparation succeeds")
+                    .expect("newer pane state produces a render");
+                assert_eq!(nested.0.title, "newer-render");
+                nested.1.acknowledge();
+                Err(anyhow!("outer enqueue failed after nested render committed"))
+            }
+        });
+
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender, Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect_err("the outer synthetic enqueue must fail");
+
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.baseline.title, "newer-render");
+        assert_eq!(state.baseline.seqno, 12);
+        assert_eq!(state.baseline_revision, 2);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn legacy_render_rollback_preserves_newer_palette_metadata() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let (_, rollback) = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current")
+            .expect("initial render preparation succeeds")
+            .expect("initial pane state produces a render");
+        {
+            let mut state = per_pane.lock().unwrap();
+            state.baseline.config_generation = 91;
+            state.baseline.sent_initial_palette = true;
+        }
+
+        rollback
+            .rollback()
+            .expect("exact render revision rollback should succeed");
+
+        let state = per_pane.lock().unwrap();
+        let expected = PaneRenderBaseline {
+            config_generation: 91,
+            sent_initial_palette: true,
+            ..PaneRenderBaseline::default()
+        };
+        assert_eq!(state.baseline, expected);
+        assert!(state.transactional_dirty);
     }
 
     #[test]
@@ -9745,6 +10456,163 @@ mod tests {
     }
 
     #[test]
+    fn failed_notification_enqueue_releases_prefix_without_merging_concurrent_suffix() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        per_pane.lock().unwrap().transactional_dirty = false;
+        let enqueue_count = Arc::new(AtomicUsize::new(0));
+        let sender = PduSender::new({
+            let enqueue_count = Arc::clone(&enqueue_count);
+            let per_pane = Arc::clone(&per_pane);
+            move |_, _| {
+                if enqueue_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    return Ok(());
+                }
+                per_pane
+                    .try_lock()
+                    .expect("notification sender callback runs outside the pane-state lock")
+                    .push_notification(Alert::Bell)
+                    .expect("retain concurrent exact event behind protected prefix");
+                Err(anyhow!("synthetic notification enqueue failure"))
+            }
+        });
+
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender, Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect_err("the synthetic palette enqueue must fail");
+
+        let state = per_pane.lock().unwrap();
+        assert_eq!(
+            state.notifications,
+            vec![Alert::PaletteChanged, Alert::Bell],
+            "rollback must retain the untouched protected prefix before its concurrent suffix"
+        );
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn legacy_notification_push_drains_every_initial_bounded_wire_batch() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        {
+            let mut state = per_pane.lock().unwrap();
+            state.baseline.sent_initial_palette = true;
+            state.baseline.config_generation = config::configuration().generation();
+            for _ in 0..=codec::MAX_RENDER_APPLICATION_ALERTS {
+                state
+                    .push_notification(Alert::Bell)
+                    .expect("retain a two-batch exact-event backlog");
+            }
+        }
+        let (sender, captured) = capturing_sender();
+
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender, Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect("bounded legacy batches should all enqueue");
+
+        let alert_count = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|decoded| matches!(&decoded.pdu, Pdu::NotifyAlert(_)))
+            .count();
+        assert_eq!(alert_count, codec::MAX_RENDER_APPLICATION_ALERTS + 1);
+        let state = per_pane.lock().unwrap();
+        assert!(state.notifications.is_empty());
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+    }
+
+    #[test]
+    fn legacy_notification_batches_do_not_absorb_reentrant_post_snapshot_suffix() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        {
+            let mut state = per_pane.lock().unwrap();
+            state.baseline.sent_initial_palette = true;
+            state.baseline.config_generation = config::configuration().generation();
+            for _ in 0..=codec::MAX_RENDER_APPLICATION_ALERTS {
+                state
+                    .push_notification(Alert::Bell)
+                    .expect("retain a two-batch initial exact-event obligation");
+            }
+        }
+        let captured = Arc::new(Mutex::new(Vec::<DecodedPdu>::new()));
+        let injected = Arc::new(AtomicBool::new(false));
+        let sender = PduSender::new({
+            let captured = Arc::clone(&captured);
+            let injected = Arc::clone(&injected);
+            let per_pane = Arc::clone(&per_pane);
+            move |decoded, _| {
+                let is_alert = matches!(&decoded.pdu, Pdu::NotifyAlert(_));
+                captured.lock().unwrap().push(decoded);
+                if is_alert && !injected.swap(true, Ordering::Relaxed) {
+                    per_pane
+                        .try_lock()
+                        .expect("notification callback runs outside pane-state authority")
+                        .push_notification(Alert::Bell)
+                        .expect("retain reentrant exact event behind initial obligation");
+                }
+                Ok(())
+            }
+        });
+
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender.clone(), Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect("the bounded initial alert obligation should enqueue");
+
+        let first_push_alert_count = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|decoded| matches!(&decoded.pdu, Pdu::NotifyAlert(_)))
+            .count();
+        assert_eq!(
+            first_push_alert_count,
+            codec::MAX_RENDER_APPLICATION_ALERTS + 1,
+            "the first push must drain exactly its initial snapshot obligation"
+        );
+        {
+            let state = per_pane.lock().unwrap();
+            assert_eq!(state.notifications, vec![Alert::Bell]);
+            assert_eq!(state.notifications.protected_prefix_len, 0);
+        }
+
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender, Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect("the separately scheduled suffix should enqueue");
+
+        let total_alert_count = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|decoded| matches!(&decoded.pdu, Pdu::NotifyAlert(_)))
+            .count();
+        assert_eq!(
+            total_alert_count,
+            codec::MAX_RENDER_APPLICATION_ALERTS + 2
+        );
+        let state = per_pane.lock().unwrap();
+        assert!(state.notifications.is_empty());
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+    }
+
+    #[test]
     fn panicked_key_down_render_enqueue_restores_baseline_without_escaping() {
         let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
         let (_mux, registration) = register_test_pane(&pane);
@@ -9756,12 +10624,12 @@ mod tests {
 
         registration
             .try_with_current(|current| {
-                push_key_down_changes_after_committed_input(
+                push_input_dispatch_changes_after_committed_input(
                     &current,
                     sender,
                     Arc::clone(&per_pane),
-                    current.pane_id(),
                     InputSerial::empty(),
+                    "key-down",
                 );
             })
             .expect("test pane registration remains current");
@@ -9778,7 +10646,8 @@ mod tests {
         per_pane
             .lock()
             .unwrap()
-            .push_notification(Alert::Bell);
+            .push_notification(Alert::Bell)
+            .expect("retain initial exact event");
         let callback_count = Arc::new(AtomicUsize::new(0));
         let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(77, {
             let per_pane = Arc::clone(&per_pane);
@@ -9909,6 +10778,123 @@ mod tests {
     }
 
     #[test]
+    fn transactional_ack_advances_shared_baseline_revision_and_exhaustion_fails_closed() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+
+        let first = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                None,
+            )
+            .expect("prepare first transactional render"),
+        );
+        assert_eq!(
+            first.acknowledge(),
+            PaneRenderSettlement::AcknowledgedClean
+        );
+        assert_eq!(per_pane.lock().unwrap().baseline_revision, 1);
+
+        {
+            let mut state = per_pane.lock().unwrap();
+            state.baseline_revision = u64::MAX;
+            state.mark_transactional_dirty();
+        }
+        let exhausted = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                Some(InputSerial::empty()),
+            )
+            .expect("prepare render before shared baseline identity exhaustion"),
+        );
+        assert_eq!(
+            exhausted.acknowledge(),
+            PaneRenderSettlement::FailedClosed
+        );
+        let state = per_pane.lock().unwrap();
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(state.baseline_revision, u64::MAX);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn legacy_render_cannot_mutate_an_active_transaction() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        per_pane
+            .lock()
+            .unwrap()
+            .push_notification(Alert::Bell)
+            .expect("retain exact event before transaction");
+        let preparation = begin_transactional_pane_render(
+            Arc::clone(&per_pane),
+            pane.pane_id(),
+            None,
+        )
+        .expect("transactional preparation owns the pane");
+
+        let result = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("legacy preparation must reject an active transaction"),
+        };
+        assert!(error.to_string().contains("already active"));
+        {
+            let state = per_pane.lock().unwrap();
+            assert!(matches!(
+                state.transaction_phase,
+                PaneRenderTransactionPhase::Preparing { .. }
+            ));
+            assert_eq!(state.notifications, vec![Alert::Bell]);
+            assert_eq!(state.notifications.protected_prefix_len, 1);
+        }
+
+        drop(preparation);
+        let state = per_pane.lock().unwrap();
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Idle
+        ));
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+    }
+
+    #[test]
+    fn transactional_preparation_fails_closed_on_an_unowned_protected_prefix() {
+        let mut state = PerPane::default();
+        state
+            .push_notification(Alert::Bell)
+            .expect("retain exact event before corrupting prefix authority");
+        state.notifications.protect_prefix(1);
+
+        assert_eq!(
+            state
+                .begin_transactional_preparation(81, None)
+                .expect_err("idle state cannot silently adopt an unowned protected prefix"),
+            PaneRenderPreparationError::NotificationPrefixChanged
+        );
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(state.notifications, vec![Alert::Bell]);
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
     fn transactional_alerts_are_exact_events_or_coalesced_state_until_ack() {
         let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
@@ -9924,7 +10910,9 @@ mod tests {
                 Alert::Progress(Progress::Percentage(50)),
                 Alert::PaletteChanged,
             ] {
-                state.push_notification(alert);
+                state
+                    .push_notification(alert)
+                    .expect("retain bounded transactional alert");
             }
         }
 
@@ -9960,7 +10948,11 @@ mod tests {
             alert.alert == Alert::Progress(Progress::Percentage(25))
         }));
         assert_eq!(first.nack(), PaneRenderSettlement::Retried);
-        assert_eq!(per_pane.lock().unwrap().notifications.len(), 6);
+        assert_eq!(
+            per_pane.lock().unwrap().notifications.len(),
+            4,
+            "state-like alerts are coalesced before they consume backlog capacity"
+        );
 
         let retry = expect_prepared(
             prepare_transactional_for_registration(
@@ -9973,7 +10965,8 @@ mod tests {
         per_pane
             .lock()
             .unwrap()
-            .push_notification(Alert::Bell);
+            .push_notification(Alert::Bell)
+            .expect("retain event arriving behind protected prefix");
         assert_eq!(
             retry.acknowledge(),
             PaneRenderSettlement::AcknowledgedRedirtied
@@ -9992,7 +10985,9 @@ mod tests {
         {
             let mut state = per_pane.lock().unwrap();
             for _ in 0..=codec::MAX_RENDER_APPLICATION_ALERTS {
-                state.push_notification(Alert::Bell);
+                state
+                    .push_notification(Alert::Bell)
+                    .expect("retain bounded exact event batch");
             }
         }
 
@@ -10015,6 +11010,231 @@ mod tests {
         let state = per_pane.lock().unwrap();
         assert_eq!(state.notifications, vec![Alert::Bell]);
         assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn pane_alert_backlog_is_count_bounded_without_mutating_in_flight_prefix() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        {
+            let mut state = per_pane.lock().unwrap();
+            for _ in 0..MAX_PENDING_PANE_ALERTS {
+                state
+                    .push_notification(Alert::Bell)
+                    .expect("fill exact-event backlog to its hard bound");
+            }
+        }
+
+        let prepared = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                None,
+            )
+            .expect("bounded backlog should prepare its exact first wire prefix"),
+        );
+        assert_eq!(prepared.alerts.len(), codec::MAX_RENDER_APPLICATION_ALERTS);
+
+        {
+            let mut state = per_pane.lock().unwrap();
+            let error = state
+                .push_notification(Alert::ToastNotification {
+                    title: None,
+                    body: "cannot-fit".to_string(),
+                    focus: false,
+                })
+                .expect_err("a full exact-event backlog must reject before mutation");
+            assert_eq!(
+                error,
+                PaneAlertBacklogError::ExactEventCapacityExhausted
+            );
+            assert_eq!(state.notifications.len(), MAX_PENDING_PANE_ALERTS);
+            assert!(state.notifications.as_slice()
+                .iter()
+                .all(|alert| *alert == Alert::Bell));
+        }
+
+        assert_eq!(
+            prepared.acknowledge(),
+            PaneRenderSettlement::AcknowledgedRedirtied
+        );
+        let state = per_pane.lock().unwrap();
+        assert_eq!(
+            state.notifications.len(),
+            codec::MAX_RENDER_APPLICATION_ALERTS
+        );
+        assert!(state
+            .notifications
+            .as_slice()
+            .iter()
+            .all(|alert| *alert == Alert::Bell));
+    }
+
+    #[test]
+    fn pane_alert_backlog_enforces_per_alert_and_aggregate_text_bounds() {
+        let mut alerts = PendingPaneAlerts::default();
+        assert_eq!(
+            alerts
+                .push(Alert::WindowTitleChanged("x".repeat(
+                    codec::MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES + 1,
+                )))
+                .expect_err("an individually unencodable alert must be rejected"),
+            PaneAlertBacklogError::SingleAlertTextLimit
+        );
+        assert!(
+            alerts.is_empty(),
+            "an individually unencodable alert must not enter retained state"
+        );
+
+        let chunk_len = codec::MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES * 3 / 4;
+        for index in 0..2 {
+            alerts
+                .push(Alert::ToastNotification {
+                    title: None,
+                    body: format!("{index}{}", "x".repeat(chunk_len - 1)),
+                    focus: false,
+                })
+                .expect("two large exact events fit the retained-byte bound");
+        }
+        assert_eq!(
+            alerts
+                .push(Alert::ToastNotification {
+                title: None,
+                body: format!("2{}", "x".repeat(chunk_len - 1)),
+                focus: false,
+                })
+                .expect_err("aggregate overflow must reject without eviction"),
+            PaneAlertBacklogError::ExactEventCapacityExhausted
+        );
+        assert_eq!(alerts.len(), 2);
+        assert!(alerts.retained_text_bytes <= MAX_PENDING_PANE_ALERT_TEXT_BYTES);
+        assert!(matches!(
+            alerts.as_slice().first(),
+            Some(Alert::ToastNotification { body, .. }) if body.starts_with('0')
+        ));
+        assert!(matches!(
+            alerts.as_slice().last(),
+            Some(Alert::ToastNotification { body, .. }) if body.starts_with('1')
+        ));
+        assert_eq!(alerts.wire_prefix_len_up_to(alerts.len()).unwrap(), 1);
+    }
+
+    #[test]
+    fn pane_alert_backlog_fails_closed_on_counter_drift_without_mutation() {
+        let mut alerts = PendingPaneAlerts::default();
+        alerts
+            .push(Alert::WindowTitleChanged("retained".to_string()))
+            .expect("retain initial state alert");
+        let before = alerts.entries.clone();
+        alerts.retained_text_bytes += 1;
+
+        assert_eq!(
+            alerts
+                .push(Alert::Bell)
+                .expect_err("counter drift must reject before queue mutation"),
+            PaneAlertBacklogError::AccountingDrift
+        );
+        assert_eq!(alerts.entries, before);
+        assert_eq!(alerts.retained_text_bytes, "retained".len() + 1);
+    }
+
+    #[test]
+    fn pane_alert_backlog_validates_hard_capacity_invariants_before_mutation() {
+        let mut over_count = PendingPaneAlerts {
+            entries: vec![Alert::Bell; MAX_PENDING_PANE_ALERTS + 1],
+            retained_text_bytes: 0,
+            protected_prefix_len: 0,
+        };
+        assert_eq!(
+            over_count
+                .push(Alert::Bell)
+                .expect_err("an over-count retained backlog must fail closed"),
+            PaneAlertBacklogError::CapacityInvariantExceeded
+        );
+        assert_eq!(over_count.len(), MAX_PENDING_PANE_ALERTS + 1);
+
+        let mut over_bytes = PendingPaneAlerts {
+            entries: Vec::new(),
+            retained_text_bytes: MAX_PENDING_PANE_ALERT_TEXT_BYTES + 1,
+            protected_prefix_len: 0,
+        };
+        assert_eq!(
+            over_bytes
+                .push(Alert::Bell)
+                .expect_err("an over-byte retained backlog must fail closed"),
+            PaneAlertBacklogError::CapacityInvariantExceeded
+        );
+        assert!(over_bytes.is_empty());
+        assert_eq!(
+            over_bytes.retained_text_bytes,
+            MAX_PENDING_PANE_ALERT_TEXT_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn pane_alert_backlog_coalesces_only_replaceable_unprotected_state() {
+        let mut alerts = PendingPaneAlerts::default();
+        alerts
+            .push(Alert::Progress(Progress::Percentage(25)))
+            .expect("retain initial state");
+        let protected = alerts
+            .protected_batch_up_to(usize::MAX)
+            .expect("protect wire prefix");
+        alerts
+            .push(Alert::Progress(Progress::Percentage(50)))
+            .expect("retain newer state behind protected prefix");
+        alerts
+            .push(Alert::Progress(Progress::Percentage(75)))
+            .expect("coalesce replaceable suffix state");
+        alerts
+            .push(Alert::SetUserVar {
+                name: "mode".to_string(),
+                value: "one".to_string(),
+            })
+            .expect("retain first exact user-var event");
+        alerts
+            .push(Alert::SetUserVar {
+                name: "mode".to_string(),
+                value: "two".to_string(),
+            })
+            .expect("retain repeated exact user-var event without coalescing");
+
+        assert_eq!(alerts.len(), 4);
+        assert_eq!(
+            alerts.as_slice()[0],
+            Alert::Progress(Progress::Percentage(25))
+        );
+        assert_eq!(
+            alerts.as_slice()[1],
+            Alert::Progress(Progress::Percentage(75))
+        );
+        alerts
+            .release_protected_prefix(&protected)
+            .expect("release exact protected prefix");
+    }
+
+    #[test]
+    fn pane_alert_state_coalescing_preserves_position_after_interleaved_exact_event() {
+        let mut alerts = PendingPaneAlerts::default();
+        alerts
+            .push(Alert::WindowTitleChanged("old".to_string()))
+            .expect("retain old replaceable state");
+        alerts
+            .push(Alert::Bell)
+            .expect("retain interleaved exact event");
+        alerts
+            .push(Alert::WindowTitleChanged("new".to_string()))
+            .expect("coalesce state at its new temporal position");
+
+        assert_eq!(
+            alerts.as_slice(),
+            &[Alert::Bell, Alert::WindowTitleChanged("new".to_string())]
+        );
+        assert_eq!(alerts.retained_text_bytes, "new".len());
+        assert_eq!(alerts.protected_prefix_len, 0);
+        assert!(alerts.validate_accounting().is_ok());
     }
 
     #[test]
@@ -10403,15 +11623,108 @@ mod tests {
         assert_eq!(response.serial, 9_701);
         assert_eq!(response.pdu, Pdu::UnitResponse(UnitResponse {}));
         assert_eq!(pane.key_down_count(), 1, "the key must be applied exactly once");
+        let per_pane = handler
+            .per_pane_if_present(pane.pane_id())
+            .expect("key-down should retain per-pane state");
+        let state = per_pane.lock().unwrap();
         assert_eq!(
-            handler
-                .per_pane_if_present(pane.pane_id())
-                .expect("key-down should retain per-pane state")
-                .lock()
-                .unwrap()
-                .baseline,
+            state.baseline,
             PaneRenderBaseline::default(),
             "failed post-input render preparation must not advance its baseline"
+        );
+        assert!(
+            state.transactional_dirty,
+            "failed post-input render preparation must retain a retry obligation"
+        );
+    }
+
+    #[test]
+    fn paste_propagates_exact_input_serial_in_forced_dispatch_fence() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let pane = Arc::new(FakePane::new(None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_dyn)
+            .expect("register paste dispatch-fence test pane");
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let input_serial = InputSerial::now();
+
+        handler.process_one(DecodedPdu {
+            serial: 9_702,
+            pdu: Pdu::SendPaste(SendPaste {
+                pane_id: pane.pane_id(),
+                data: "paste".to_string(),
+                input_serial,
+            }),
+        });
+        tick_until_response(&executor, &captured, 2);
+
+        let responses = captured.lock().unwrap();
+        assert_eq!(responses.len(), 2);
+        match &responses[0] {
+            DecodedPdu {
+                serial: 0,
+                pdu: Pdu::GetPaneRenderChangesResponse(response),
+            } => {
+                assert_eq!(response.pane_id, pane.pane_id());
+                assert_eq!(response.input_serial, Some(input_serial));
+                assert_eq!(response.seqno, 11);
+            }
+            other => panic!("expected forced paste dispatch-fence response, got {other:?}"),
+        }
+        assert_eq!(
+            responses[1],
+            DecodedPdu {
+                serial: 9_702,
+                pdu: Pdu::UnitResponse(UnitResponse {}),
+            }
+        );
+        assert_eq!(pane.paste_count(), 1, "the paste must be applied exactly once");
+    }
+
+    #[test]
+    fn paste_ack_survives_post_input_render_range_failure_and_redirties() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let pane = Arc::new(FakePane::new(None));
+        pane.state.lock().unwrap().dimensions.physical_top = StableRowIndex::MAX;
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_dyn)
+            .expect("register paste ACK failure-path test pane");
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+
+        handler.process_one(DecodedPdu {
+            serial: 9_703,
+            pdu: Pdu::SendPaste(SendPaste {
+                pane_id: pane.pane_id(),
+                data: "paste".to_string(),
+                input_serial: InputSerial::now(),
+            }),
+        });
+        tick_until_response(&executor, &captured, 1);
+
+        let response = take_response(&captured);
+        assert_eq!(response.serial, 9_703);
+        assert_eq!(response.pdu, Pdu::UnitResponse(UnitResponse {}));
+        assert_eq!(pane.paste_count(), 1, "the paste must be applied exactly once");
+        let per_pane = handler
+            .per_pane_if_present(pane.pane_id())
+            .expect("paste should retain per-pane state");
+        let state = per_pane.lock().unwrap();
+        assert_eq!(
+            state.baseline,
+            PaneRenderBaseline::default(),
+            "failed post-paste render preparation must not advance its baseline"
+        );
+        assert!(
+            state.transactional_dirty,
+            "failed post-paste render preparation must retain a retry obligation"
         );
     }
 

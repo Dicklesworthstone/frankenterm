@@ -14,8 +14,8 @@
 //!   (determinism), when compression mode is fixed.
 
 use codec::{
-    ErrorResponse, GetCodecVersion, GetCodecVersionResponse, KillPane, LivenessResponse,
-    PaneFocused, PaneRemoved, Pdu, Ping, Pong, RenameWorkspace, Resize, SendPaste,
+    ErrorResponse, GetCodecVersion, GetCodecVersionResponse, InputSerial, KillPane,
+    LivenessResponse, PaneFocused, PaneRemoved, Pdu, Ping, Pong, RenameWorkspace, Resize, SendPaste,
     SetActiveWorkspace, SetFocusedPane, SetPaneZoomed, SetWindowWorkspace, TabAddedToWindow,
     StreamingPduBuffer, TabResized, TabTitleChanged, UnitResponse, WindowTitleChanged,
     WindowWorkspaceChanged, WriteToPane,
@@ -84,6 +84,7 @@ enum FuzzPdu {
     SendPaste {
         pane_id: u32,
         data: String,
+        input_serial_millis: u64,
     },
     Resize {
         containing_tab_id: u32,
@@ -205,6 +206,7 @@ impl<'a> Arbitrary<'a> for FuzzPdu {
             20 => Self::SendPaste {
                 pane_id: u32::arbitrary(u)?,
                 data: bounded_string(u)?,
+                input_serial_millis: u64::arbitrary(u)?,
             },
             21 => Self::Resize {
                 containing_tab_id: u32::arbitrary(u)?,
@@ -326,9 +328,14 @@ fn build_pdu(fp: &FuzzPdu) -> Pdu {
             pane_id: *pane_id as usize,
             data: data.clone(),
         }),
-        FuzzPdu::SendPaste { pane_id, data } => Pdu::SendPaste(SendPaste {
+        FuzzPdu::SendPaste {
+            pane_id,
+            data,
+            input_serial_millis,
+        } => Pdu::SendPaste(SendPaste {
             pane_id: *pane_id as usize,
             data: data.clone(),
+            input_serial: InputSerial::from_millis_since_epoch(*input_serial_millis),
         }),
         FuzzPdu::Resize {
             containing_tab_id,

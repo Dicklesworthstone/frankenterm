@@ -168,7 +168,11 @@ fn arb_layout_names() -> impl Strategy<Value = Vec<String>> {
 }
 
 fn arb_send_paste() -> impl Strategy<Value = SendPaste> {
-    (arb_id(), arb_small_string()).prop_map(|(pane_id, data)| SendPaste { pane_id, data })
+    (arb_id(), arb_small_string(), any::<u64>()).prop_map(|(pane_id, data, millis)| SendPaste {
+        pane_id,
+        data,
+        input_serial: InputSerial::from_millis_since_epoch(millis),
+    })
 }
 
 fn arb_set_layout_cycle() -> impl Strategy<Value = SetLayoutCycle> {
@@ -527,7 +531,7 @@ fn arb_send_key_down() -> impl Strategy<Value = SendKeyDown> {
     (arb_id(), arb_key_event(), any::<u64>()).prop_map(|(pane_id, event, millis)| SendKeyDown {
         pane_id,
         event,
-        input_serial: (std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis)).into(),
+        input_serial: InputSerial::from_millis_since_epoch(millis),
     })
 }
 
@@ -948,9 +952,7 @@ fn arb_rich_get_pane_render_changes_response() -> impl Strategy<Value = GetPaneR
                     title,
                     working_dir: None,
                     bonus_lines: SerializedLines::default(),
-                    input_serial: input_serial_ms.map(|millis| {
-                        (std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis)).into()
-                    }),
+                    input_serial: input_serial_ms.map(InputSerial::from_millis_since_epoch),
                     seqno,
                 }
             },
@@ -1845,8 +1847,7 @@ proptest! {
 
     #[test]
     fn input_serial_json_roundtrip_preserves_millis(millis in any::<u64>()) {
-        let payload: InputSerial =
-            (std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis)).into();
+        let payload = InputSerial::from_millis_since_epoch(millis);
 
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: InputSerial = serde_json::from_str(&json).unwrap();
@@ -1855,10 +1856,8 @@ proptest! {
 
     #[test]
     fn input_serial_order_matches_millis_order(a in any::<u64>(), b in any::<u64>()) {
-        let left: InputSerial =
-            (std::time::UNIX_EPOCH + std::time::Duration::from_millis(a)).into();
-        let right: InputSerial =
-            (std::time::UNIX_EPOCH + std::time::Duration::from_millis(b)).into();
+        let left = InputSerial::from_millis_since_epoch(a);
+        let right = InputSerial::from_millis_since_epoch(b);
 
         prop_assert_eq!(left.cmp(&right), a.cmp(&b));
     }
