@@ -75976,6 +75976,8 @@ const PLAYWRIGHT_VERSION_MAX_STDOUT_BYTES: usize = 512;
 const DIAGNOSTIC_COMMAND_MAX_STDERR_BYTES: usize = 16 * 1024;
 const DIAGNOSTIC_COMMAND_PIPE_DRAIN_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(500);
+const DIAGNOSTIC_COMMAND_LEADER_REAP_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(500);
 const DIAGNOSTIC_COMMAND_CAPTURE_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(5);
 const DIAGNOSTIC_COMMAND_DRAIN_SLICE_BYTES: usize = 1024 * 1024;
@@ -76028,6 +76030,10 @@ fn configure_diagnostic_command(cmd: &mut std::process::Command) -> std::io::Res
     frankenterm_core::runtime_async::process::configure_process_group(cmd)
 }
 
+const fn diagnostic_reap_deadline_expired(elapsed: std::time::Duration) -> bool {
+    elapsed.as_nanos() >= DIAGNOSTIC_COMMAND_LEADER_REAP_TIMEOUT.as_nanos()
+}
+
 fn terminate_diagnostic_process_tree(
     child: &mut std::process::Child,
 ) -> std::io::Result<std::process::ExitStatus> {
@@ -76036,7 +76042,29 @@ fn terminate_diagnostic_process_tree(
         "KILL",
     );
     let _ = child.kill();
-    child.wait()
+    let reap_started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if diagnostic_reap_deadline_expired(reap_started.elapsed()) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "diagnostic command leader reap timed out",
+                ));
+            }
+            Ok(None) => std::thread::sleep(DIAGNOSTIC_COMMAND_CAPTURE_POLL_INTERVAL),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                if diagnostic_reap_deadline_expired(reap_started.elapsed()) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "diagnostic command leader reap timed out",
+                    ));
+                }
+                std::thread::sleep(DIAGNOSTIC_COMMAND_CAPTURE_POLL_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 struct NonblockingCommandCapture {
@@ -76278,6 +76306,7 @@ fn admit_single_line_output(
 enum WeztermListProbeFailure {
     NonSuccess,
     Oversized,
+    StderrOversized,
     Io,
 }
 
@@ -76293,6 +76322,7 @@ impl WeztermListProbeFailure {
         match self {
             Self::NonSuccess => "CLI probe returned a non-success status",
             Self::Oversized => "CLI pane list exceeded the safety limit",
+            Self::StderrOversized => "CLI diagnostic output exceeded the safety limit",
             Self::Io => "CLI probe could not be completed",
         }
     }
@@ -76318,6 +76348,7 @@ fn playwright_local_version_command() -> std::process::Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlaywrightProbeFailure {
     NonSuccess,
+    StderrOversized,
     Io,
 }
 
@@ -76330,6 +76361,9 @@ impl PlaywrightProbeFailure {
     const fn diagnostic_detail(self) -> &'static str {
         match self {
             Self::NonSuccess => "local Playwright probe returned a non-success status",
+            Self::StderrOversized => {
+                "local Playwright diagnostic output exceeded the safety limit"
+            }
             Self::Io => "local Playwright probe could not be completed",
         }
     }
@@ -76462,19 +76496,31 @@ fn run_diagnostics(
 
     // Check 6: Logs directory writability
     if layout.logs_dir.exists() {
-        let test_file = layout.logs_dir.join(".wa_doctor_test");
-        match std::fs::write(&test_file, "test") {
-            Ok(()) => {
-                let _ = std::fs::remove_file(&test_file);
+        match std::fs::metadata(&layout.logs_dir) {
+            Ok(metadata) if !metadata.is_dir() => {
+                checks.push(DiagnosticCheck::error(
+                    "logs directory",
+                    "configured logs path is not a directory",
+                    "Move the conflicting path and create a logs directory",
+                ));
+            }
+            Ok(metadata) if metadata.permissions().readonly() => {
+                checks.push(DiagnosticCheck::error(
+                    "logs directory",
+                    "directory permissions are read-only",
+                    format!("Check permissions: chmod 755 {}", layout.logs_dir.display()),
+                ));
+            }
+            Ok(_) => {
                 checks.push(DiagnosticCheck::ok_with_detail(
                     "logs directory",
                     layout.logs_dir.display().to_string(),
                 ));
             }
-            Err(e) => {
+            Err(_) => {
                 checks.push(DiagnosticCheck::error(
                     "logs directory",
-                    format!("not writable: {}", e),
+                    "directory metadata could not be inspected",
                     format!("Check permissions: chmod 755 {}", layout.logs_dir.display()),
                 ));
             }
@@ -76551,6 +76597,13 @@ fn run_diagnostics(
                 "WezTerm CLI",
                 SingleLineOutputAdmissionError::Oversized.wezterm_diagnostic_detail(),
                 "Ensure the active backend bridge returns a valid bounded version",
+            ));
+        }
+        Ok(output) if output.stderr.overflowed => {
+            checks.push(DiagnosticCheck::error(
+                "WezTerm CLI",
+                "wezterm --version diagnostic output exceeded the safety limit",
+                "Ensure the active backend bridge returns bounded diagnostics",
             ));
         }
         Ok(output) if output.status.success() => {
@@ -76735,6 +76788,13 @@ fn run_diagnostics(
                 "Reduce active pane count or inspect the backend bridge response",
             ));
         }
+        Ok(output) if output.stderr.overflowed => {
+            checks.push(DiagnosticCheck::error(
+                "WezTerm connection",
+                WeztermListProbeFailure::StderrOversized.diagnostic_detail(),
+                "Inspect the backend bridge without exposing raw diagnostic output",
+            ));
+        }
         Ok(output) if output.status.success() => {
             match serde_json::from_slice::<Vec<serde::de::IgnoredAny>>(&output.stdout.bytes) {
                 Ok(panes) => {
@@ -76802,6 +76862,13 @@ fn run_diagnostics(
                     "Playwright",
                     SingleLineOutputAdmissionError::Oversized.playwright_diagnostic_detail(),
                     "Install Playwright locally before using browser automation",
+                ));
+            }
+            Ok(output) if output.stderr.overflowed => {
+                checks.push(DiagnosticCheck::warning(
+                    "Playwright",
+                    PlaywrightProbeFailure::StderrOversized.diagnostic_detail(),
+                    "Inspect the local Playwright installation without exposing raw diagnostics",
                 ));
             }
             Ok(output) if output.status.success() => {
@@ -101315,6 +101382,19 @@ A  docs/new-proof.md\n";
                 .collect::<Vec<_>>(),
             vec!["--static-canary".to_string()]
         );
+    }
+
+    #[test]
+    fn diagnostic_subprocess_reap_deadline_is_exact_and_finite() {
+        let just_before = DIAGNOSTIC_COMMAND_LEADER_REAP_TIMEOUT
+            .saturating_sub(std::time::Duration::from_nanos(1));
+        assert!(!diagnostic_reap_deadline_expired(just_before));
+        assert!(diagnostic_reap_deadline_expired(
+            DIAGNOSTIC_COMMAND_LEADER_REAP_TIMEOUT
+        ));
+        assert!(diagnostic_reap_deadline_expired(
+            DIAGNOSTIC_COMMAND_LEADER_REAP_TIMEOUT + std::time::Duration::from_millis(1)
+        ));
     }
 
     #[test]
