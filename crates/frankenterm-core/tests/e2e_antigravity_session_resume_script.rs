@@ -150,12 +150,14 @@ fn validate_scenario(scenario: &Value, log_jsonl: &Path, project_root: &Path) {
     let resumer = SessionResumer::new(SessionResumeConfig {
         casr_binary: casr_binary.to_string(),
         working_dir: Some(project_root.to_path_buf()),
+        home_dir: Some(home.clone()),
         timeout_secs: 5,
         dry_run: false,
     });
     let entries = resumer
         .discover_sessions_in_home(&home)
-        .unwrap_or_else(|err| panic!("{scenario_id}: discover_sessions_in_home failed: {err}"));
+        .unwrap_or_else(|err| panic!("{scenario_id}: discover_sessions_in_home failed: {err}"))
+        .entries;
 
     for entry in &entries {
         let provider = provider_from_list_entry(entry);
@@ -250,14 +252,7 @@ fn validate_scenario(scenario: &Value, log_jsonl: &Path, project_root: &Path) {
                 .require_binary_available_in_path(Some(path_env))
                 .expect_err("missing agy binary must fail closed");
             assert!(
-                matches!(
-                    err,
-                    SessionResumeError::NativeProviderNotFound {
-                        ref provider_slug,
-                        ref binary,
-                        ..
-                    } if provider_slug == "agy" && binary == "agy"
-                ),
+                matches!(err, SessionResumeError::NativeProviderNotFound),
                 "{scenario_id}: expected provider-specific missing agy error, got {err:?}"
             );
             log_jsonl_record(
@@ -273,7 +268,7 @@ fn validate_scenario(scenario: &Value, log_jsonl: &Path, project_root: &Path) {
                     "session_id": uuid,
                     "path": path_env,
                     "exit_code": 1,
-                    "expected": "NativeProviderNotFound(provider=agy,binary=agy)",
+                    "expected": "NativeProviderNotFound",
                     "actual": err.to_string(),
                     "duration_ms": duration_ms(started),
                     "status": "pass",
@@ -433,8 +428,11 @@ fn log_optional_real_smoke(log_jsonl: &Path, project_root: &Path) {
         return;
     };
     let started = Instant::now();
-    let entries =
-        frankenterm_core::session_resume::discover_antigravity_conversations_from_home(&home);
+    let entries = frankenterm_core::session_resume::discover_antigravity_conversations_from_home(
+        &home,
+    )
+    .expect("bounded read-only real-home discovery")
+    .entries;
     for entry in &entries {
         log_jsonl_record(
             log_jsonl,

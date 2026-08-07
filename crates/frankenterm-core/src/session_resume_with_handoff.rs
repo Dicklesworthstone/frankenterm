@@ -1,7 +1,7 @@
 //! Handoff-capsule-aware session resume planner
 //! (ft-1650n.5 slice 3).
 //!
-//! Wraps [`crate::session_resume::SessionResumer`] with a two-phase
+//! Wraps [`crate::session_resume::SessionResumer`] with a three-state
 //! commit shape that integrates [`crate::handoff_capsule`]:
 //!
 //!   PRE-RESUME    plan.preflight_validate(...)
@@ -13,14 +13,14 @@
 //!
 //!   RESUME         validated.invoke_resume(&SessionResumer)
 //!     → delegates to SessionResumer::resume_session
-//!     → runs the casr subprocess
+//!     → consumes validated authority and returns completion authority
 //!
-//!   POST-RESUME   validated.apply_to_resumed_session(resume_output)
+//!   POST-RESUME   completed.apply_to_resumed_session(outcomes)
 //!     → produces an AppliedHandoffSummary recording which Allowed
 //!       sections were applied, with per-section apply outcomes
 //!       (Applied / SkippedByPolicy / Errored)
 //!
-//! # Why two-phase?
+//! # Why three states?
 //!
 //! Resume invokes a casr subprocess that ultimately mutates pane
 //! state. We MUST NOT spend that side-effect on a capsule that's
@@ -37,7 +37,10 @@ use crate::casr_types::CasrResumeOutput;
 use crate::handoff_capsule::{
     CapsuleSection, CapsuleValidationError, HandoffCapsule, ValidationOutcome,
 };
-use crate::session_resume::{AgentProvider, SessionResumeError, SessionResumer};
+use crate::session_resume::{
+    AgentProvider, MAX_SESSION_RESUME_ID_BYTES, SessionResumeError, SessionResumer,
+    validate_provider_slug,
+};
 use crate::session_topology::LifecycleEntityKind;
 
 /// Plan for resuming a session with handoff-capsule integration.
@@ -45,8 +48,9 @@ use crate::session_topology::LifecycleEntityKind;
 /// Construct from a capsule + destination passport + resume target;
 /// call [`HandoffAwareResumePlan::preflight_validate`] to check
 /// compatibility BEFORE the casr subprocess fires. Only the returned
-/// [`ValidatedHandoffResumePlan`] can invoke the resume or record apply
-/// outcomes, so callers cannot bypass preflight accidentally.
+/// [`ValidatedHandoffResumePlan`] can invoke the resume, and only the resulting
+/// [`CompletedHandoffResume`] can record apply outcomes. Callers therefore
+/// cannot bypass either preflight or the corresponding resume invocation.
 #[derive(Debug)]
 pub struct HandoffAwareResumePlan<'a> {
     capsule: &'a HandoffCapsule,
@@ -102,7 +106,7 @@ pub struct ValidatedHandoffResumePlan<'a> {
     validation: ValidationOutcome,
 }
 
-impl ValidatedHandoffResumePlan<'_> {
+impl<'a> ValidatedHandoffResumePlan<'a> {
     /// Exact preflight decision carried by this authority.
     #[must_use]
     pub fn validation(&self) -> &ValidationOutcome {
@@ -110,29 +114,61 @@ impl ValidatedHandoffResumePlan<'_> {
     }
 
     /// Phase 2 — invoke the underlying SessionResumer. The type system proves
-    /// that capsule integrity and destination compatibility were checked.
+    /// that capsule integrity and destination compatibility were checked. The
+    /// authority is single-use and becomes [`CompletedHandoffResume`].
     pub fn invoke_resume(
-        &self,
+        self,
         resumer: &SessionResumer,
-    ) -> Result<CasrResumeOutput, SessionResumeError> {
-        resumer.resume_session(&self.session_id, &self.target_provider)
+    ) -> Result<CompletedHandoffResume<'a>, SessionResumeError> {
+        let resume_output = resumer.resume_session(&self.session_id, &self.target_provider)?;
+        Ok(CompletedHandoffResume {
+            validated: self,
+            resume_output,
+        })
     }
 
     /// Cx-first Phase 2. Caller cancellation reaches the bounded subprocess
     /// supervisor through [`SessionResumer::resume_session_with_cx`].
     pub async fn invoke_resume_with_cx(
-        &self,
+        self,
         cx: &crate::cx::Cx,
         resumer: &SessionResumer,
-    ) -> Result<CasrResumeOutput, SessionResumeError> {
-        resumer
+    ) -> Result<CompletedHandoffResume<'a>, SessionResumeError> {
+        let resume_output = resumer
             .resume_session_with_cx(cx, &self.session_id, &self.target_provider)
-            .await
+            .await?;
+        Ok(CompletedHandoffResume {
+            validated: self,
+            resume_output,
+        })
+    }
+}
+
+/// Single-use authority proving that preflight succeeded and the corresponding
+/// resume invocation returned. Only this state can record apply outcomes.
+#[derive(Debug)]
+pub struct CompletedHandoffResume<'a> {
+    validated: ValidatedHandoffResumePlan<'a>,
+    resume_output: CasrResumeOutput,
+}
+
+impl CompletedHandoffResume<'_> {
+    /// Inspect the invocation result before deciding whether to apply accepted
+    /// capsule sections.
+    #[must_use]
+    pub fn resume_output(&self) -> &CasrResumeOutput {
+        &self.resume_output
+    }
+
+    /// Consume the completion authority without applying handoff sections.
+    #[must_use]
+    pub fn into_resume_output(self) -> CasrResumeOutput {
+        self.resume_output
     }
 
     /// Phase 3 — record per-section apply outcomes. Pure-function:
-    /// takes the post-resume CasrResumeOutput + the validation
-    /// outcome and produces an [`AppliedHandoffSummary`]. Does not
+    /// takes the carried post-resume output + validation outcome and produces
+    /// an [`AppliedHandoffSummary`]. Does not
     /// itself mutate the resumed session — the caller is responsible
     /// for actually applying each accepted section to whatever store
     /// receives the inheritance (passport store, pending-approval
@@ -141,18 +177,59 @@ impl ValidatedHandoffResumePlan<'_> {
     /// labels are enforced; duplicates, omissions, and unaccepted outcomes are
     /// rejected rather than producing a misleading clean summary.
     pub fn apply_to_resumed_session(
-        &self,
-        resume_output: &CasrResumeOutput,
+        self,
         per_section_outcomes: Vec<SectionApplyOutcome>,
     ) -> Result<AppliedHandoffSummary, HandoffApplySummaryError> {
-        validate_apply_outcomes(self.capsule, &self.validation, &per_section_outcomes)?;
+        if !self.resume_output.ok {
+            return Err(HandoffApplySummaryError::ResumeReportedFailure);
+        }
+        if self.resume_output.dry_run {
+            return Err(HandoffApplySummaryError::ResumeWasDryRun);
+        }
+        if self.resume_output.source_session_id.as_deref()
+            != Some(self.validated.session_id.as_str())
+        {
+            return Err(HandoffApplySummaryError::SourceSessionMismatch);
+        }
+        let Some(output_target_provider) = self.resume_output.target_provider.as_deref() else {
+            return Err(HandoffApplySummaryError::TargetProviderMismatch);
+        };
+        if validate_provider_slug(output_target_provider).is_err()
+            || AgentProvider::from_slug(output_target_provider) != self.validated.target_provider
+        {
+            return Err(HandoffApplySummaryError::TargetProviderMismatch);
+        }
+        let Some(resumed_session_id) = self.resume_output.target_session_id.as_deref() else {
+            return Err(HandoffApplySummaryError::MissingResumedSessionId);
+        };
+        if resumed_session_id.is_empty()
+            || resumed_session_id.len() > MAX_SESSION_RESUME_ID_BYTES
+            || resumed_session_id.trim() != resumed_session_id
+            || resumed_session_id.chars().any(char::is_control)
+        {
+            return Err(HandoffApplySummaryError::InvalidResumedSessionId {
+                identifier_bytes: resumed_session_id.len(),
+            });
+        }
+        let resumed_session_id = resumed_session_id.to_string();
+        validate_apply_outcomes(
+            self.validated.capsule,
+            &self.validated.validation,
+            &per_section_outcomes,
+        )?;
+        let ValidatedHandoffResumePlan {
+            capsule,
+            session_id,
+            target_provider,
+            validation,
+        } = self.validated;
         Ok(AppliedHandoffSummary {
-            session_id: self.session_id.clone(),
-            target_provider_slug: self.target_provider.slug().to_string(),
-            resumed_session_id: resume_output.target_session_id.clone().unwrap_or_default(),
-            capsule_version: self.capsule.version,
-            accepted_indices: self.validation.accepted.clone(),
-            skipped_count: self.validation.skipped.len(),
+            session_id,
+            target_provider_slug: target_provider.slug().to_string(),
+            resumed_session_id,
+            capsule_version: capsule.version,
+            accepted_indices: validation.accepted,
+            skipped_count: validation.skipped.len(),
             applied: per_section_outcomes,
         })
     }
@@ -162,6 +239,12 @@ impl ValidatedHandoffResumePlan<'_> {
 /// only finite indices/counts, never capsule content or operator error text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandoffApplySummaryError {
+    ResumeReportedFailure,
+    ResumeWasDryRun,
+    SourceSessionMismatch,
+    TargetProviderMismatch,
+    MissingResumedSessionId,
+    InvalidResumedSessionId { identifier_bytes: usize },
     InvalidAcceptedSectionIndex { section_index: usize },
     DuplicateAcceptedSectionIndex { section_index: usize },
     DuplicateSectionOutcome { section_index: usize },
@@ -173,6 +256,29 @@ pub enum HandoffApplySummaryError {
 impl std::fmt::Display for HandoffApplySummaryError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (kind, section_index) = match self {
+            Self::ResumeReportedFailure => {
+                return formatter.write_str("cannot apply handoff after failed resume");
+            }
+            Self::ResumeWasDryRun => {
+                return formatter.write_str("cannot apply handoff after dry-run resume");
+            }
+            Self::SourceSessionMismatch => {
+                return formatter
+                    .write_str("resume output did not match the requested source session");
+            }
+            Self::TargetProviderMismatch => {
+                return formatter
+                    .write_str("resume output did not match the requested target provider");
+            }
+            Self::MissingResumedSessionId => {
+                return formatter.write_str("resume output omitted the resumed session identity");
+            }
+            Self::InvalidResumedSessionId { identifier_bytes } => {
+                return write!(
+                    formatter,
+                    "resume output carried invalid session identity (identifier_bytes={identifier_bytes})"
+                );
+            }
             Self::InvalidAcceptedSectionIndex { section_index } => {
                 ("invalid_accepted_index", section_index)
             }
@@ -446,13 +552,33 @@ mod tests {
         }
     }
 
+    fn completed_resume<'a>(
+        capsule: &'a HandoffCapsule,
+        destination_passport: Option<&'a CapabilityPassport>,
+        resume_output: CasrResumeOutput,
+    ) -> CompletedHandoffResume<'a> {
+        let validated = HandoffAwareResumePlan::new(
+            capsule,
+            destination_passport,
+            "src-session",
+            AgentProvider::ClaudeCode,
+        )
+        .preflight_validate()
+        .expect("validate ok");
+        CompletedHandoffResume {
+            validated,
+            resume_output,
+        }
+    }
+
     #[test]
     fn preflight_validate_returns_full_acceptance_when_destination_satisfies_all() {
         let capsule = sample_capsule();
         let dest = dest_passport(&["inherit_mission_state", "inherit_pending_approvals"]);
         let provider = AgentProvider::ClaudeCode;
         let plan = HandoffAwareResumePlan::new(&capsule, Some(&dest), "src-session", provider);
-        let outcome = plan.preflight_validate().expect("validate ok");
+        let validated = plan.preflight_validate().expect("validate ok");
+        let outcome = validated.validation();
         assert!(outcome.is_fully_accepted());
         // 3 sections, all accepted.
         assert_eq!(outcome.accepted, vec![0, 1, 2]);
@@ -471,7 +597,8 @@ mod tests {
             "src-session",
             AgentProvider::ClaudeCode,
         );
-        let outcome = plan.preflight_validate().expect("validate ok");
+        let validated = plan.preflight_validate().expect("validate ok");
+        let outcome = validated.validation();
         assert!(!outcome.is_fully_accepted());
         assert_eq!(outcome.accepted, vec![0, 1]);
         assert_eq!(outcome.skipped.len(), 1);
@@ -505,7 +632,8 @@ mod tests {
         let capsule = sample_capsule();
         let plan =
             HandoffAwareResumePlan::new(&capsule, None, "src-session", AgentProvider::ClaudeCode);
-        let outcome = plan.preflight_validate().expect("validate ok");
+        let validated = plan.preflight_validate().expect("validate ok");
+        let outcome = validated.validation();
         // Only ContextSummary (unguarded) accepted; Mission +
         // Approvals skipped.
         assert_eq!(outcome.accepted, vec![0]);
@@ -513,42 +641,84 @@ mod tests {
     }
 
     #[test]
+    fn completed_authority_carries_the_exact_resume_output() {
+        let capsule = sample_capsule();
+        let expected = fake_resume_output();
+        let completed = completed_resume(&capsule, None, expected.clone());
+        assert_eq!(completed.resume_output(), &expected);
+        assert_eq!(completed.into_resume_output(), expected);
+    }
+
+    #[test]
+    fn handoff_typestate_surface_is_single_use_and_ordered() {
+        let source = include_str!("session_resume_with_handoff.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
+        let unvalidated_start = production
+            .find("impl<'a> HandoffAwareResumePlan<'a> {")
+            .expect("unvalidated plan implementation");
+        let validated_start = production
+            .find("impl<'a> ValidatedHandoffResumePlan<'a> {")
+            .expect("validated plan implementation");
+        let completed_start = production
+            .find("impl CompletedHandoffResume<'_> {")
+            .expect("completed authority implementation");
+        let error_start = production
+            .find("pub enum HandoffApplySummaryError {")
+            .expect("completed authority boundary");
+
+        let unvalidated = &production[unvalidated_start..validated_start];
+        let validated = &production[validated_start..completed_start];
+        let completed = &production[completed_start..error_start];
+        assert!(!unvalidated.contains("pub fn invoke_resume("));
+        assert!(!unvalidated.contains("apply_to_resumed_session"));
+        assert!(validated.contains("pub fn invoke_resume(\n        self,"));
+        assert!(validated.contains("pub async fn invoke_resume_with_cx(\n        self,"));
+        assert!(!validated.contains("apply_to_resumed_session"));
+        assert!(completed.contains("pub fn apply_to_resumed_session(\n        self,"));
+
+        let authority_start = production
+            .find("pub struct CompletedHandoffResume<'a> {")
+            .expect("completed authority declaration");
+        let authority = &production[authority_start..completed_start];
+        assert!(authority.contains("    validated: ValidatedHandoffResumePlan<'a>,"));
+        assert!(authority.contains("    resume_output: CasrResumeOutput,"));
+        assert!(!authority.contains("pub validated:"));
+        assert!(!authority.contains("pub resume_output:"));
+    }
+
+    #[test]
     fn apply_to_resumed_session_records_per_section_dispositions() {
         let capsule = sample_capsule();
         let dest = dest_passport(&["inherit_mission_state", "inherit_pending_approvals"]);
-        let plan = HandoffAwareResumePlan::new(
-            &capsule,
-            Some(&dest),
-            "src-session",
-            AgentProvider::ClaudeCode,
-        );
-        let validation = plan.preflight_validate().expect("validate ok");
-        let resume_output = fake_resume_output();
-        let summary = plan.apply_to_resumed_session(
-            &resume_output,
-            &validation,
-            vec![
-                SectionApplyOutcome {
-                    section_index: 0,
-                    section_label: "context_summary".into(),
-                    disposition: SectionDisposition::Applied,
-                },
-                SectionApplyOutcome {
-                    section_index: 1,
-                    section_label: "mission_state".into(),
-                    disposition: SectionDisposition::SkippedByPolicy {
-                        reason: skip_by_policy_reasons::OPERATOR_OPTED_OUT.into(),
+        let completed = completed_resume(&capsule, Some(&dest), fake_resume_output());
+        let summary = completed
+            .apply_to_resumed_session(
+                vec![
+                    SectionApplyOutcome {
+                        section_index: 0,
+                        section_label: "context_summary".into(),
+                        disposition: SectionDisposition::Applied,
                     },
-                },
-                SectionApplyOutcome {
-                    section_index: 2,
-                    section_label: "pending_approvals".into(),
-                    disposition: SectionDisposition::Errored {
-                        error: "approval queue full".into(),
+                    SectionApplyOutcome {
+                        section_index: 1,
+                        section_label: "mission_state".into(),
+                        disposition: SectionDisposition::SkippedByPolicy {
+                            reason: skip_by_policy_reasons::OPERATOR_OPTED_OUT.into(),
+                        },
                     },
-                },
-            ],
-        );
+                    SectionApplyOutcome {
+                        section_index: 2,
+                        section_label: "pending_approvals".into(),
+                        disposition: SectionDisposition::Errored {
+                            error: "approval queue full".into(),
+                        },
+                    },
+                ],
+            )
+            .expect("one canonical outcome per accepted section");
         assert_eq!(summary.session_id, "src-session");
         assert_eq!(summary.target_provider_slug, "claude-code");
         assert_eq!(summary.resumed_session_id, "casr-resumed-session-id");
@@ -588,6 +758,218 @@ mod tests {
             ],
         };
         assert!(summary.is_clean());
+    }
+
+    #[test]
+    fn apply_summary_rejects_missing_duplicate_unaccepted_and_mislabeled_outcomes() {
+        let capsule = sample_capsule();
+        let dest = dest_passport(&["inherit_mission_state", "inherit_pending_approvals"]);
+        let completed = || completed_resume(&capsule, Some(&dest), fake_resume_output());
+
+        let missing = completed()
+            .apply_to_resumed_session(
+                vec![
+                    SectionApplyOutcome {
+                        section_index: 0,
+                        section_label: "context_summary".into(),
+                        disposition: SectionDisposition::Applied,
+                    },
+                    SectionApplyOutcome {
+                        section_index: 1,
+                        section_label: "mission_state".into(),
+                        disposition: SectionDisposition::Applied,
+                    },
+                ],
+            )
+            .expect_err("an accepted section cannot be omitted");
+        assert_eq!(
+            missing,
+            HandoffApplySummaryError::MissingAcceptedSectionOutcome { section_index: 2 }
+        );
+
+        let duplicate = completed()
+            .apply_to_resumed_session(
+                vec![
+                    SectionApplyOutcome {
+                        section_index: 0,
+                        section_label: "context_summary".into(),
+                        disposition: SectionDisposition::Applied,
+                    },
+                    SectionApplyOutcome {
+                        section_index: 0,
+                        section_label: "context_summary".into(),
+                        disposition: SectionDisposition::Applied,
+                    },
+                ],
+            )
+            .expect_err("duplicate accounting cannot satisfy coverage");
+        assert_eq!(
+            duplicate,
+            HandoffApplySummaryError::DuplicateSectionOutcome { section_index: 0 }
+        );
+
+        let unaccepted = completed()
+            .apply_to_resumed_session(
+                vec![SectionApplyOutcome {
+                    section_index: 99,
+                    section_label: "context_summary".into(),
+                    disposition: SectionDisposition::Applied,
+                }],
+            )
+            .expect_err("unaccepted section cannot be recorded");
+        assert_eq!(
+            unaccepted,
+            HandoffApplySummaryError::UnacceptedSectionOutcome { section_index: 99 }
+        );
+
+        let mislabeled = completed()
+            .apply_to_resumed_session(
+                vec![
+                    SectionApplyOutcome {
+                        section_index: 0,
+                        section_label: "mission_state".into(),
+                        disposition: SectionDisposition::Applied,
+                    },
+                    SectionApplyOutcome {
+                        section_index: 1,
+                        section_label: "mission_state".into(),
+                        disposition: SectionDisposition::Applied,
+                    },
+                    SectionApplyOutcome {
+                        section_index: 2,
+                        section_label: "pending_approvals".into(),
+                        disposition: SectionDisposition::Applied,
+                    },
+                ],
+            )
+            .expect_err("section labels must match the capsule authority");
+        assert_eq!(
+            mislabeled,
+            HandoffApplySummaryError::SectionLabelMismatch { section_index: 0 }
+        );
+    }
+
+    #[test]
+    fn apply_summary_requires_successful_non_dry_resume_with_bounded_identity() {
+        let capsule = sample_capsule();
+        let dest = dest_passport(&["inherit_mission_state", "inherit_pending_approvals"]);
+        let outcomes = || {
+            vec![
+                SectionApplyOutcome {
+                    section_index: 0,
+                    section_label: "context_summary".into(),
+                    disposition: SectionDisposition::Applied,
+                },
+                SectionApplyOutcome {
+                    section_index: 1,
+                    section_label: "mission_state".into(),
+                    disposition: SectionDisposition::Applied,
+                },
+                SectionApplyOutcome {
+                    section_index: 2,
+                    section_label: "pending_approvals".into(),
+                    disposition: SectionDisposition::Applied,
+                },
+            ]
+        };
+
+        let mut output = fake_resume_output();
+        output.ok = false;
+        assert_eq!(
+            completed_resume(&capsule, Some(&dest), output.clone())
+                .apply_to_resumed_session(outcomes()),
+            Err(HandoffApplySummaryError::ResumeReportedFailure)
+        );
+
+        output.ok = true;
+        output.dry_run = true;
+        assert_eq!(
+            completed_resume(&capsule, Some(&dest), output.clone())
+                .apply_to_resumed_session(outcomes()),
+            Err(HandoffApplySummaryError::ResumeWasDryRun)
+        );
+
+        output.dry_run = false;
+        output.source_session_id = Some("different-source-session-canary".into());
+        let source_error = completed_resume(&capsule, Some(&dest), output.clone())
+            .apply_to_resumed_session(outcomes())
+            .expect_err("resume output must bind to the requested source session");
+        assert_eq!(source_error, HandoffApplySummaryError::SourceSessionMismatch);
+        assert!(!source_error.to_string().contains("different-source-session-canary"));
+
+        output.source_session_id = Some("src-session".into());
+        output.target_provider = Some("../different-provider-canary".into());
+        let provider_error = completed_resume(&capsule, Some(&dest), output.clone())
+            .apply_to_resumed_session(outcomes())
+            .expect_err("resume output must bind to the requested target provider");
+        assert_eq!(
+            provider_error,
+            HandoffApplySummaryError::TargetProviderMismatch
+        );
+        assert!(!provider_error.to_string().contains("different-provider-canary"));
+
+        output.target_provider = Some("claude-code".into());
+        output.target_session_id = None;
+        assert_eq!(
+            completed_resume(&capsule, Some(&dest), output.clone())
+                .apply_to_resumed_session(outcomes()),
+            Err(HandoffApplySummaryError::MissingResumedSessionId)
+        );
+
+        output.target_session_id = Some("bad\nidentity".into());
+        assert_eq!(
+            completed_resume(&capsule, Some(&dest), output)
+                .apply_to_resumed_session(outcomes()),
+            Err(HandoffApplySummaryError::InvalidResumedSessionId {
+                identifier_bytes: "bad\nidentity".len(),
+            })
+        );
+    }
+
+    #[test]
+    fn is_clean_rejects_structurally_incomplete_deserialized_summaries() {
+        let summary = AppliedHandoffSummary {
+            session_id: "x".into(),
+            target_provider_slug: "claude-code".into(),
+            resumed_session_id: "x".into(),
+            capsule_version: 1,
+            accepted_indices: vec![0, 1],
+            skipped_count: 0,
+            applied: vec![SectionApplyOutcome {
+                section_index: 0,
+                section_label: "context_summary".into(),
+                disposition: SectionDisposition::Applied,
+            }],
+        };
+        assert!(!summary.has_complete_outcome_coverage());
+        assert!(!summary.is_clean());
+    }
+
+    #[test]
+    fn apply_outcome_validator_rejects_corrupt_validation_authority() {
+        let capsule = sample_capsule();
+        let no_outcomes = Vec::new();
+        let invalid = ValidationOutcome {
+            accepted: vec![capsule.sections.len()],
+            skipped: Vec::new(),
+        };
+        assert_eq!(
+            validate_apply_outcomes(&capsule, &invalid, &no_outcomes),
+            Err(HandoffApplySummaryError::InvalidAcceptedSectionIndex {
+                section_index: capsule.sections.len(),
+            })
+        );
+
+        let duplicate = ValidationOutcome {
+            accepted: vec![0, 0],
+            skipped: Vec::new(),
+        };
+        assert_eq!(
+            validate_apply_outcomes(&capsule, &duplicate, &no_outcomes),
+            Err(HandoffApplySummaryError::DuplicateAcceptedSectionIndex {
+                section_index: 0,
+            })
+        );
     }
 
     #[test]

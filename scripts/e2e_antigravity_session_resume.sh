@@ -604,7 +604,7 @@ for scenario in manifest["scenarios"]:
         assert list_gmi is not None
         assert_has_session(list_gmi, "gemini", legacy_id, f"{scenario_id}:list-gmi")
 
-    if agy_uuid and not scenario.get("expect_missing_agy_binary"):
+    if agy_uuid:
         dry_run = run_ft(
             scenario,
             "public-resume-agy-dry-run",
@@ -625,35 +625,15 @@ for scenario in manifest["scenarios"]:
         if dry_run["data"]["command_argv"] != expected:
             raise AssertionError(f"{scenario_id}: dry-run command drifted: {dry_run['data']!r}")
 
-        executed = run_ft(
+        unavailable = run_ft(
             scenario,
-            "public-resume-agy-execute",
+            "public-resume-agy-interactive-terminal-required",
             [
                 "session-resume",
                 "resume",
                 agy_uuid,
                 "--provider",
                 "agy",
-                "--home",
-                scenario["home"],
-                "--casr-binary",
-                scenario["casr_binary"],
-            ],
-        )
-        if executed["data"]["native_execution"]["exit_code"] != 0:
-            raise AssertionError(f"{scenario_id}: fake agy did not exit cleanly")
-
-    if agy_uuid and scenario.get("expect_missing_agy_binary"):
-        missing = run_ft(
-            scenario,
-            "public-resume-agy-missing-binary",
-            [
-                "session-resume",
-                "resume",
-                agy_uuid,
-                "--provider",
-                "agy",
-                "--dry-run",
                 "--home",
                 scenario["home"],
                 "--casr-binary",
@@ -661,8 +641,10 @@ for scenario in manifest["scenarios"]:
             ],
             expect_ok=False,
         )
-        if missing.get("error_code") != "robot.session_resume.native_provider_not_found":
-            raise AssertionError(f"{scenario_id}: wrong missing-binary code {missing!r}")
+        if unavailable.get("error_code") != "robot.feature_not_available":
+            raise AssertionError(
+                f"{scenario_id}: non-dry native resume must require an owned mux PTY: {unavailable!r}"
+            )
 
     if legacy_id:
         legacy_resume = run_ft(

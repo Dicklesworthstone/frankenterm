@@ -15,7 +15,7 @@ The direct harness builds a minimal public `ft` binary with
 ```bash
 ft robot --format json session-resume list --provider agy --home <fixture-home>
 ft robot --format json session-resume list --provider gmi --home <fixture-home>
-ft robot --format json session-resume resume <uuid> --provider agy --home <fixture-home>
+ft robot --format json session-resume resume <uuid> --provider agy --dry-run --home <fixture-home>
 ft robot --format json session-resume resume <legacy-id> --provider gmi --dry-run --home <fixture-home>
 ```
 
@@ -66,7 +66,11 @@ Scenario coverage:
 - `legacy-gmi-only`: preserves legacy `~/.gemini/tmp/<hash>/chats/session-*.json`.
 - `mixed`: proves the agy and gmi roots do not cross-list each other.
 - `malformed-irrelevant`: ignores non-`.db`, directory, and non-UUID `.db` entries.
-- `missing-agy-binary`: fails closed with `robot.session_resume.native_provider_not_found`.
+- `missing-agy-binary`: still returns the exact model-pinned dry-run plan without
+  claiming that a provider process was executed.
+- every non-dry native resume fails closed with `robot.feature_not_available`
+  until the owned mux-PTY execution path is implemented; the harness never
+  mistakes captured subprocess output for a usable interactive session.
 - `optional-real-smoke`: opt in with `FT_AGY_E2E_REAL_HOME=/path/to/home` for read-only discovery.
 
 The public robot surface is the user-level contract. The core cargo wrapper is

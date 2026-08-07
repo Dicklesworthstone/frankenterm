@@ -38,7 +38,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{BootstrapMethod, BrowserContext, BrowserProfile, BrowserStatus};
+use super::{
+    BootstrapMethod, BrowserAuthService, BrowserContext, BrowserProfile, BrowserStatus,
+    UnsupportedBrowserAuthService,
+};
 
 // =============================================================================
 // Configuration
@@ -48,6 +51,9 @@ use super::{BootstrapMethod, BrowserContext, BrowserProfile, BrowserStatus};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BootstrapConfig {
+    /// Auth service whose fixed origin/path policy governs this flow.
+    pub service: BrowserAuthService,
+
     /// URL to navigate to for login (e.g., `https://auth.openai.com/authorize`).
     pub login_url: String,
 
@@ -59,8 +65,11 @@ pub struct BootstrapConfig {
     /// Default: 2 seconds.
     pub poll_interval_ms: u64,
 
-    /// URLs that indicate successful login (prefix match).
-    /// When the browser navigates to any of these, the bootstrap is complete.
+    /// Service-admitted URLs that may indicate successful login.
+    ///
+    /// A non-root path admits that path and its descendants. An origin root is
+    /// admitted only at the exact `/` path and must also match one of
+    /// [`Self::success_text_markers`].
     pub success_url_prefixes: Vec<String>,
 
     /// Page text markers that indicate successful login.
@@ -69,18 +78,84 @@ pub struct BootstrapConfig {
 
 impl Default for BootstrapConfig {
     fn default() -> Self {
-        Self {
-            login_url: "https://auth.openai.com/authorize".to_string(),
-            timeout_ms: 300_000, // 5 minutes
-            poll_interval_ms: 2_000,
-            success_url_prefixes: vec![
-                "https://platform.openai.com".to_string(),
-                "https://chatgpt.com".to_string(),
-            ],
-            success_text_markers: vec!["Successfully logged in".to_string()],
-        }
+        Self::for_service(BrowserAuthService::OpenAi)
     }
 }
+
+impl BootstrapConfig {
+    /// Build the supported, service-specific interactive-login policy.
+    #[must_use]
+    pub fn for_service(service: BrowserAuthService) -> Self {
+        let (login_url, success_url_prefixes, success_text_markers) = match service {
+            BrowserAuthService::OpenAi => (
+                "https://auth.openai.com/authorize",
+                vec![
+                    "https://platform.openai.com".to_string(),
+                    "https://chatgpt.com".to_string(),
+                ],
+                vec!["Successfully logged in".to_string()],
+            ),
+            BrowserAuthService::Google => (
+                "https://accounts.google.com/",
+                vec!["https://myaccount.google.com".to_string()],
+                vec!["Manage your Google Account".to_string()],
+            ),
+            BrowserAuthService::Anthropic => (
+                "https://console.anthropic.com/login",
+                vec![
+                    "https://console.anthropic.com/dashboard".to_string(),
+                    "https://console.anthropic.com/settings".to_string(),
+                    "https://console.anthropic.com/workspaces".to_string(),
+                ],
+                vec!["API Keys".to_string()],
+            ),
+        };
+        Self {
+            service,
+            login_url: login_url.to_string(),
+            timeout_ms: 300_000,
+            poll_interval_ms: 2_000,
+            success_url_prefixes,
+            success_text_markers,
+        }
+    }
+
+    /// Parse a CLI/config service name and build its fixed bootstrap policy.
+    pub fn try_for_service_name(
+        service: &str,
+    ) -> std::result::Result<Self, UnsupportedBrowserAuthService> {
+        BrowserAuthService::try_from(service).map(Self::for_service)
+    }
+
+    /// Replace the preset login URL after enforcing this service's exact
+    /// origin/path policy and the browser-input size limit.
+    ///
+    /// Validation happens before `self` is changed, so rejection preserves the
+    /// prior known-good URL. The returned error never contains caller input.
+    pub fn set_login_url_override(
+        &mut self,
+        login_url: &str,
+    ) -> std::result::Result<(), BrowserBootstrapConfigError> {
+        super::admit_bootstrap_login_url(self.service, login_url)
+            .map_err(|_| BrowserBootstrapConfigError)?;
+        super::admit_node_script_input_parts(&[Some(login_url)], &[], &[])
+            .map_err(|_| BrowserBootstrapConfigError)?;
+        self.login_url = login_url.to_string();
+        Ok(())
+    }
+}
+
+/// Content-free rejection for an invalid interactive-bootstrap configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserBootstrapConfigError;
+
+impl std::fmt::Display for BrowserBootstrapConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Browser bootstrap configuration is invalid")
+    }
+}
+
+impl std::error::Error for BrowserBootstrapConfigError {}
 
 // =============================================================================
 // Result types
@@ -165,6 +240,31 @@ impl InteractiveBootstrap {
                 error: "The browser automation context is not ready".to_string(),
             };
         }
+        if profile.service() != self.config.service.as_str() {
+            return BootstrapResult::Failed {
+                error: "The browser profile does not match the selected authentication service"
+                    .to_string(),
+            };
+        }
+        if profile.validate_identity().is_err() {
+            return BootstrapResult::Failed {
+                error: "The browser profile identity is invalid".to_string(),
+            };
+        }
+
+        let login_url = service_url.unwrap_or(&self.config.login_url);
+        let script = match self.build_bootstrap_script_with_browser_config(
+            profile.path(),
+            login_url,
+            ctx.config(),
+        ) {
+            Ok(script) => script,
+            Err(failure) => {
+                return BootstrapResult::Failed {
+                    error: failure.detail().to_string(),
+                };
+            }
+        };
 
         let profile_dir = match profile.ensure_dir() {
             Ok(dir) => dir,
@@ -175,22 +275,47 @@ impl InteractiveBootstrap {
                 };
             }
         };
-
-        let login_url = service_url.unwrap_or(&self.config.login_url);
+        let operation_lock = match profile
+            .acquire_operation_lock(ctx.config().profile_lock_timeout_ms)
+        {
+            Ok(operation_lock) => operation_lock,
+            Err(_) => {
+                return BootstrapResult::Failed {
+                    error: "The browser profile is already in use or could not be locked safely"
+                        .to_string(),
+                };
+            }
+        };
 
         tracing::info!(
             timeout_ms = self.config.timeout_ms,
             "Starting interactive bootstrap — operator action required"
         );
 
+        if !operation_lock.is_current_for(profile) {
+            return BootstrapResult::Failed {
+                error: "The browser profile changed before interactive login could start"
+                    .to_string(),
+            };
+        }
+
         let start = std::time::Instant::now();
-        let result = self.run_bootstrap_script(&profile_dir, login_url);
+        let result = self.run_bootstrap_script(script);
+        if !operation_lock.is_current_for(profile) {
+            return BootstrapResult::Failed {
+                error: "The browser profile changed during interactive login".to_string(),
+            };
+        }
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         match result {
             Ok(ScriptOutcome::Success { storage_state }) => {
                 if profile
-                    .record_authenticated_state(&storage_state, BootstrapMethod::Interactive)
+                    .record_authenticated_state_with_lock(
+                        &storage_state,
+                        BootstrapMethod::Interactive,
+                        &operation_lock,
+                    )
                     .is_err()
                 {
                     tracing::error!(elapsed_ms, "Interactive bootstrap storage persistence failed");
@@ -235,14 +360,7 @@ impl InteractiveBootstrap {
         }
     }
 
-    fn run_bootstrap_script(
-        &self,
-        profile_dir: &Path,
-        login_url: &str,
-    ) -> Result<ScriptOutcome, String> {
-        let script = self
-            .build_bootstrap_script(profile_dir, login_url)
-            .map_err(|failure| failure.detail().to_string())?;
+    fn run_bootstrap_script(&self, script: String) -> Result<ScriptOutcome, String> {
         let output = super::run_node_script_bounded(
             script,
             self.config.timeout_ms,
@@ -271,24 +389,36 @@ impl InteractiveBootstrap {
         Self::parse_bootstrap_result(&stdout)
     }
 
-    fn build_bootstrap_script(
+    fn build_bootstrap_script_with_browser_config(
         &self,
         profile_dir: &Path,
         login_url: &str,
+        browser_config: &super::BrowserConfig,
     ) -> Result<String, super::BrowserNodeCommandFailure> {
         super::admit_browser_timeout(self.config.timeout_ms)?;
+        super::admit_browser_timeout(browser_config.navigation_timeout_ms)?;
+        super::admit_browser_timeout(browser_config.page_load_timeout_ms)?;
         super::admit_browser_poll_interval(
             self.config.poll_interval_ms,
             self.config.timeout_ms,
         )?;
-        super::admit_browser_url(login_url)?;
-        if self.config.success_url_prefixes.is_empty()
-            && self.config.success_text_markers.is_empty()
-        {
+        super::admit_bootstrap_login_url(self.config.service, login_url)?;
+        // Page text by itself is not authentication evidence: an attacker or
+        // ordinary login page can render the same words. Every success must
+        // first be bound to a service-admitted origin/path.
+        if self.config.success_url_prefixes.is_empty() {
             return Err(super::BrowserNodeCommandFailure::InvalidConfiguration);
         }
         for success_url in &self.config.success_url_prefixes {
-            super::admit_browser_url(success_url)?;
+            super::admit_bootstrap_success_url(self.config.service, success_url)?;
+        }
+        let root_success_requires_marker = self
+            .config
+            .success_url_prefixes
+            .iter()
+            .any(|url| url::Url::parse(url).is_ok_and(|parsed| parsed.path() == "/"));
+        if root_success_requires_marker && self.config.success_text_markers.is_empty() {
+            return Err(super::BrowserNodeCommandFailure::InvalidConfiguration);
         }
         if self
             .config
@@ -311,6 +441,8 @@ impl InteractiveBootstrap {
             "login_url": login_url,
             "timeout_ms": self.config.timeout_ms,
             "poll_interval_ms": self.config.poll_interval_ms,
+            "navigation_timeout_ms": browser_config.navigation_timeout_ms,
+            "page_load_timeout_ms": browser_config.page_load_timeout_ms,
             "success_url_prefixes": &self.config.success_url_prefixes,
             "success_text_markers": &self.config.success_text_markers,
         });
@@ -321,15 +453,12 @@ impl InteractiveBootstrap {
 const {{ chromium }} = require('playwright');
 	const input = JSON.parse(Buffer.from('{input_base64}', 'base64').toString('utf8'));
 
-	function sameOrigin(left, right) {{
-	  try {{ return new URL(left).origin === new URL(right).origin; }} catch (_) {{ return false; }}
-	}}
-
 	function matchesSuccessUrl(currentValue, prefixValue) {{
 	  try {{
 	    const current = new URL(currentValue);
 	    const expected = new URL(prefixValue);
 	    if (current.origin !== expected.origin) return false;
+	    if (expected.pathname === '/') return current.pathname === '/';
 	    const expectedPath = expected.pathname.endsWith('/')
 	      ? expected.pathname
 	      : expected.pathname + '/';
@@ -342,10 +471,13 @@ const {{ chromium }} = require('playwright');
 (async () => {{
   const TIMEOUT = input.timeout_ms;
   const POLL_INTERVAL = input.poll_interval_ms;
+  const NAVIGATION_TIMEOUT = Math.min(input.navigation_timeout_ms, TIMEOUT);
+  const PAGE_LOAD_TIMEOUT = Math.min(input.page_load_timeout_ms, TIMEOUT);
   const profileDir = input.profile_dir;
   const loginUrl = input.login_url;
   const successUrls = input.success_url_prefixes;
   const successTexts = input.success_text_markers;
+  const startTime = Date.now();
 
   let browser;
   try {{
@@ -355,36 +487,32 @@ const {{ chromium }} = require('playwright');
     }});
 
     const page = browser.pages()[0] || await browser.newPage();
-    page.setDefaultTimeout(TIMEOUT);
+    page.setDefaultTimeout(PAGE_LOAD_TIMEOUT);
 
-	    await page.goto(loginUrl, {{ waitUntil: 'domcontentloaded', timeout: Math.min(30000, TIMEOUT) }});
+    await page.goto(loginUrl, {{ waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT }});
 
-    const startTime = Date.now();
     let success = false;
 
     while (Date.now() - startTime < TIMEOUT) {{
       try {{
         const currentUrl = page.url();
-
-	        for (const prefix of successUrls) {{
-	          if (matchesSuccessUrl(currentUrl, prefix)) {{
+        const matchedSuccessUrl = successUrls.find(prefix =>
+          matchesSuccessUrl(currentUrl, prefix)
+        );
+        if (matchedSuccessUrl) {{
+          const expectedPath = new URL(matchedSuccessUrl).pathname;
+          if (expectedPath !== '/') {{
             success = true;
-            break;
+          }} else {{
+            const bodyText = await page.textContent('body').catch(() => '');
+            for (const marker of successTexts) {{
+              if (bodyText && bodyText.includes(marker)) {{
+                success = true;
+                break;
+              }}
+            }}
           }}
         }}
-        if (success) break;
-
-	        const markerOriginAllowed = successUrls.some(prefix => sameOrigin(currentUrl, prefix))
-	          || sameOrigin(currentUrl, loginUrl);
-	        if (markerOriginAllowed) {{
-	          const bodyText = await page.textContent('body').catch(() => '');
-	          for (const marker of successTexts) {{
-	            if (bodyText && bodyText.includes(marker)) {{
-	              success = true;
-	              break;
-	            }}
-	          }}
-	        }}
         if (success) break;
       }} catch (e) {{
         // Page might be navigating, ignore transient errors
@@ -399,7 +527,7 @@ const {{ chromium }} = require('playwright');
       const state = await browser.storageState();
       console.log(JSON.stringify({{
         status: 'success',
-        storage_state: JSON.stringify(state)
+        storage_state: state
       }}));
     }} else {{
       console.log(JSON.stringify({{ status: 'timeout' }}));
@@ -423,6 +551,19 @@ const {{ chromium }} = require('playwright');
         ))
     }
 
+    #[cfg(test)]
+    fn build_bootstrap_script(
+        &self,
+        profile_dir: &Path,
+        login_url: &str,
+    ) -> Result<String, super::BrowserNodeCommandFailure> {
+        self.build_bootstrap_script_with_browser_config(
+            profile_dir,
+            login_url,
+            &super::BrowserConfig::default(),
+        )
+    }
+
     fn parse_bootstrap_result(stdout: &str) -> Result<ScriptOutcome, String> {
         let trimmed = stdout.trim();
         if trimmed.is_empty() {
@@ -442,12 +583,12 @@ const {{ chromium }} = require('playwright');
             Some("success") => {
                 let state = parsed
                     .get("storage_state")
-                    .and_then(|s| s.as_str())
+                    .filter(|value| value.is_object())
                     .ok_or_else(|| {
                         "Bootstrap success result omitted browser storage state".to_string()
-                    })?
-                    .as_bytes()
-                    .to_vec();
+                    })?;
+                let state = serde_json::to_vec(state)
+                    .map_err(|_| "Bootstrap returned invalid browser storage state".to_string())?;
                 Ok(ScriptOutcome::Success {
                     storage_state: state,
                 })
@@ -482,11 +623,76 @@ mod tests {
     #[test]
     fn config_defaults() {
         let cfg = BootstrapConfig::default();
+        assert_eq!(cfg.service, BrowserAuthService::OpenAi);
         assert_eq!(cfg.timeout_ms, 300_000);
         assert_eq!(cfg.poll_interval_ms, 2_000);
         assert!(!cfg.login_url.is_empty());
         assert!(!cfg.success_url_prefixes.is_empty());
         assert!(!cfg.success_text_markers.is_empty());
+    }
+
+    #[test]
+    fn service_presets_are_complete_and_pass_their_exact_url_policy() {
+        for service in [
+            BrowserAuthService::OpenAi,
+            BrowserAuthService::Google,
+            BrowserAuthService::Anthropic,
+        ] {
+            let config = BootstrapConfig::for_service(service);
+            assert_eq!(config.service, service);
+            assert_eq!(
+                BootstrapConfig::try_for_service_name(service.as_str())
+                    .expect("supported service")
+                    .service,
+                service
+            );
+            assert!(
+                super::super::admit_bootstrap_login_url(service, &config.login_url).is_ok()
+            );
+            assert!(
+                !config.success_url_prefixes.is_empty()
+                    || !config.success_text_markers.is_empty()
+            );
+            for success_url in &config.success_url_prefixes {
+                assert!(
+                    super::super::admit_bootstrap_success_url(service, success_url).is_ok()
+                );
+            }
+        }
+
+        let unsupported = BootstrapConfig::try_for_service_name("unknown-service")
+            .expect_err("unsupported service must fail closed");
+        assert_eq!(
+            unsupported.to_string(),
+            "Unsupported browser authentication service"
+        );
+    }
+
+    #[test]
+    fn login_url_override_is_atomic_service_scoped_and_content_free_on_rejection() {
+        let mut config = BootstrapConfig::for_service(BrowserAuthService::Google);
+        config
+            .set_login_url_override(
+                "https://accounts.google.com/o/oauth2/v2/auth?client_id=public",
+            )
+            .expect("admitted Google bootstrap URL");
+        assert_eq!(
+            config.login_url,
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id=public"
+        );
+
+        let retained = config.login_url.clone();
+        let hostile = "https://auth.openai.com/authorize?token=secret";
+        let error = config
+            .set_login_url_override(hostile)
+            .expect_err("cross-service URL must fail closed");
+        assert_eq!(config.login_url, retained);
+        assert_eq!(
+            error.to_string(),
+            "Browser bootstrap configuration is invalid"
+        );
+        assert!(!error.to_string().contains(hostile));
+        assert!(!error.to_string().contains("secret"));
     }
 
     #[test]
@@ -503,8 +709,9 @@ mod tests {
     }
 
     #[test]
-    fn config_custom_values() {
+    fn arbitrary_origin_config_is_rejected_before_script_execution() {
         let cfg = BootstrapConfig {
+            service: BrowserAuthService::OpenAi,
             login_url: "https://custom.auth/login".to_string(),
             timeout_ms: 60_000,
             poll_interval_ms: 1_000,
@@ -513,6 +720,13 @@ mod tests {
         };
         assert_eq!(cfg.timeout_ms, 60_000);
         assert_eq!(cfg.success_url_prefixes.len(), 1);
+        assert_eq!(
+            InteractiveBootstrap::new(cfg).build_bootstrap_script(
+                Path::new("/tmp/profile"),
+                "https://custom.auth/login",
+            ),
+            Err(super::super::BrowserNodeCommandFailure::InvalidConfiguration)
+        );
     }
 
     #[test]
@@ -594,6 +808,59 @@ mod tests {
     }
 
     #[test]
+    fn execute_rejects_invalid_configuration_before_profile_directory_creation() {
+        let temp = tempfile::tempdir().expect("isolated bootstrap root");
+        let mut ctx = super::super::BrowserContext::new(
+            super::super::BrowserConfig::default(),
+            temp.path(),
+        );
+        ctx.status = BrowserStatus::Ready;
+        let profile = ctx.profile("openai", "invalid-config");
+        let mut config = BootstrapConfig::default();
+        config.poll_interval_ms = 0;
+        let result = InteractiveBootstrap::new(config).execute(&ctx, &profile, None);
+        assert!(matches!(result, BootstrapResult::Failed { .. }));
+        assert!(!profile.path().exists());
+    }
+
+    #[test]
+    fn execute_rejects_profile_from_another_service_before_any_side_effect() {
+        let temp = tempfile::tempdir().expect("isolated bootstrap root");
+        let mut ctx = super::super::BrowserContext::new(
+            super::super::BrowserConfig::default(),
+            temp.path(),
+        );
+        ctx.status = BrowserStatus::Ready;
+        let google_profile = ctx.profile("google", "service-mismatch");
+
+        let result = InteractiveBootstrap::with_defaults().execute(
+            &ctx,
+            &google_profile,
+            None,
+        );
+
+        assert!(matches!(result, BootstrapResult::Failed { .. }));
+        assert!(!google_profile.path().exists());
+    }
+
+    #[test]
+    fn execute_rejects_invalid_profile_identity_before_any_side_effect() {
+        let temp = tempfile::tempdir().expect("isolated bootstrap identity root");
+        let mut ctx = super::super::BrowserContext::new(
+            super::super::BrowserConfig::default(),
+            temp.path(),
+        );
+        ctx.status = BrowserStatus::Ready;
+        let invalid_profile = ctx.profile("openai", "spoof\u{202e}txt");
+
+        let result =
+            InteractiveBootstrap::with_defaults().execute(&ctx, &invalid_profile, None);
+
+        assert!(matches!(result, BootstrapResult::Failed { .. }));
+        assert!(!ctx.profiles_root().exists());
+    }
+
+    #[test]
     fn script_transports_login_url_without_plaintext_literal() {
         let bootstrap = InteractiveBootstrap::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
@@ -613,7 +880,7 @@ mod tests {
         let bootstrap = InteractiveBootstrap::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
         let script = bootstrap
-            .build_bootstrap_script(&profile_dir, "https://example.com/login")
+            .build_bootstrap_script(&profile_dir, "https://auth.openai.com/authorize")
             .expect("bounded bootstrap script");
         let input = super::super::decode_node_script_input(&script);
         assert!(
@@ -633,14 +900,14 @@ mod tests {
         let bootstrap = InteractiveBootstrap::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
         let script = bootstrap
-            .build_bootstrap_script(&profile_dir, "https://example.com/login")
+            .build_bootstrap_script(&profile_dir, "https://auth.openai.com/authorize")
             .expect("bounded bootstrap script");
         assert!(script.contains("storageState"));
     }
 
     #[test]
     fn parse_success_with_state() {
-        let stdout = r#"{"status":"success","storage_state":"{\"cookies\":[],\"origins\":[]}"}"#;
+        let stdout = r#"{"status":"success","storage_state":{"cookies":[],"origins":[]}}"#;
         let result = InteractiveBootstrap::parse_bootstrap_result(stdout);
         match result {
             Ok(ScriptOutcome::Success { storage_state }) => {
@@ -649,6 +916,10 @@ mod tests {
             }
             _ => panic!("Expected Success"),
         }
+        assert!(InteractiveBootstrap::parse_bootstrap_result(
+            r#"{"status":"success","storage_state":"{\"cookies\":[],\"origins\":[]}"}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -750,13 +1021,19 @@ mod tests {
         config.success_text_markers = vec![hostile_marker.to_string()];
         let bootstrap = InteractiveBootstrap::new(config);
         let script = bootstrap
-            .build_bootstrap_script(&profile_dir, "https://example.com/login")
+            .build_bootstrap_script(
+                &profile_dir,
+                "https://auth.openai.com/authorize?token=secret",
+            )
             .expect("bounded hostile bootstrap script");
         assert!(!script.contains(hostile_marker));
         assert!(!script.contains("token=secret"));
         assert!(!script.contains('\u{2028}'));
         let input = super::super::decode_node_script_input(&script);
-        assert_eq!(input["login_url"], "https://example.com/login");
+        assert_eq!(
+            input["login_url"],
+            "https://auth.openai.com/authorize?token=secret"
+        );
         assert_eq!(input["profile_dir"], profile_dir.to_string_lossy().as_ref());
         assert_eq!(input["success_text_markers"][0], hostile_marker);
     }
@@ -769,7 +1046,10 @@ mod tests {
         };
         let bootstrap = InteractiveBootstrap::new(cfg);
         let script = bootstrap
-            .build_bootstrap_script(&PathBuf::from("/tmp"), "https://example.com")
+            .build_bootstrap_script(
+                &PathBuf::from("/tmp"),
+                "https://auth.openai.com/authorize",
+            )
             .expect("bounded bootstrap script");
         assert_eq!(
             super::super::decode_node_script_input(&script)["timeout_ms"],
@@ -785,11 +1065,49 @@ mod tests {
         };
         let bootstrap = InteractiveBootstrap::new(cfg);
         let script = bootstrap
-            .build_bootstrap_script(&PathBuf::from("/tmp"), "https://example.com")
+            .build_bootstrap_script(
+                &PathBuf::from("/tmp"),
+                "https://auth.openai.com/authorize",
+            )
             .expect("bounded bootstrap script");
         assert_eq!(
             super::super::decode_node_script_input(&script)["poll_interval_ms"],
             3_500
+        );
+    }
+
+    #[test]
+    fn bootstrap_script_propagates_and_validates_browser_operation_timeouts() {
+        let bootstrap = InteractiveBootstrap::with_defaults();
+        let browser_config = super::super::BrowserConfig {
+            navigation_timeout_ms: 12_345,
+            page_load_timeout_ms: 23_456,
+            ..super::super::BrowserConfig::default()
+        };
+        let script = bootstrap
+            .build_bootstrap_script_with_browser_config(
+                Path::new("/tmp/profile"),
+                "https://auth.openai.com/authorize",
+                &browser_config,
+            )
+            .expect("bounded bootstrap timeout configuration");
+        let input = super::super::decode_node_script_input(&script);
+        assert_eq!(input["navigation_timeout_ms"], 12_345);
+        assert_eq!(input["page_load_timeout_ms"], 23_456);
+        assert!(script.contains("timeout: NAVIGATION_TIMEOUT"));
+        assert!(script.contains("page.setDefaultTimeout(PAGE_LOAD_TIMEOUT)"));
+
+        let invalid = super::super::BrowserConfig {
+            page_load_timeout_ms: 0,
+            ..super::super::BrowserConfig::default()
+        };
+        assert_eq!(
+            bootstrap.build_bootstrap_script_with_browser_config(
+                Path::new("/tmp/profile"),
+                "https://auth.openai.com/authorize",
+                &invalid,
+            ),
+            Err(super::super::BrowserNodeCommandFailure::InvalidTimeout)
         );
     }
 
@@ -800,7 +1118,10 @@ mod tests {
         config.success_text_markers = vec![exact.clone()];
         let exact_bootstrap = InteractiveBootstrap::new(config);
         assert!(exact_bootstrap
-            .build_bootstrap_script(Path::new("/tmp/profile"), "https://example.com/login")
+            .build_bootstrap_script(
+                Path::new("/tmp/profile"),
+                "https://auth.openai.com/authorize",
+            )
             .is_ok());
         let one_over = format!("{exact}x");
         let mut config = BootstrapConfig::default();
@@ -808,7 +1129,10 @@ mod tests {
         let oversized_bootstrap = InteractiveBootstrap::new(config);
         assert_eq!(
             oversized_bootstrap
-                .build_bootstrap_script(Path::new("/tmp/profile"), "https://example.com/login"),
+                .build_bootstrap_script(
+                    Path::new("/tmp/profile"),
+                    "https://auth.openai.com/authorize",
+                ),
             Err(super::super::BrowserNodeCommandFailure::ScriptOversized)
         );
     }
@@ -819,7 +1143,10 @@ mod tests {
         zero_poll.poll_interval_ms = 0;
         assert_eq!(
             InteractiveBootstrap::new(zero_poll)
-                .build_bootstrap_script(Path::new("/tmp/profile"), "https://example.com/login"),
+                .build_bootstrap_script(
+                    Path::new("/tmp/profile"),
+                    "https://auth.openai.com/authorize",
+                ),
             Err(super::super::BrowserNodeCommandFailure::InvalidPollInterval)
         );
 
@@ -828,7 +1155,10 @@ mod tests {
         over_timeout.poll_interval_ms = 1_001;
         assert_eq!(
             InteractiveBootstrap::new(over_timeout)
-                .build_bootstrap_script(Path::new("/tmp/profile"), "https://example.com/login"),
+                .build_bootstrap_script(
+                    Path::new("/tmp/profile"),
+                    "https://auth.openai.com/authorize",
+                ),
             Err(super::super::BrowserNodeCommandFailure::InvalidPollInterval)
         );
 
@@ -836,6 +1166,41 @@ mod tests {
             InteractiveBootstrap::with_defaults()
                 .build_bootstrap_script(Path::new("/tmp/profile"), "file:///tmp/login"),
             Err(super::super::BrowserNodeCommandFailure::InvalidConfiguration)
+        );
+    }
+
+    #[test]
+    fn bootstrap_success_evidence_is_bound_to_an_admitted_destination() {
+        let mut marker_only = BootstrapConfig::default();
+        marker_only.success_url_prefixes.clear();
+        assert_eq!(
+            InteractiveBootstrap::new(marker_only).build_bootstrap_script(
+                Path::new("/tmp/profile"),
+                "https://auth.openai.com/authorize",
+            ),
+            Err(super::super::BrowserNodeCommandFailure::InvalidConfiguration)
+        );
+
+        let mut unproven_root = BootstrapConfig::default();
+        unproven_root.success_text_markers.clear();
+        assert_eq!(
+            InteractiveBootstrap::new(unproven_root).build_bootstrap_script(
+                Path::new("/tmp/profile"),
+                "https://auth.openai.com/authorize",
+            ),
+            Err(super::super::BrowserNodeCommandFailure::InvalidConfiguration)
+        );
+
+        let mut specific_authenticated_path =
+            BootstrapConfig::for_service(BrowserAuthService::Anthropic);
+        specific_authenticated_path.success_text_markers.clear();
+        assert!(
+            InteractiveBootstrap::new(specific_authenticated_path)
+                .build_bootstrap_script(
+                    Path::new("/tmp/profile"),
+                    "https://console.anthropic.com/login",
+                )
+                .is_ok()
         );
     }
 
@@ -848,9 +1213,14 @@ mod tests {
             )
             .expect("bounded bootstrap script");
         assert!(script.contains("current.origin !== expected.origin"));
+        assert!(script.contains("expected.pathname === '/'"));
+        assert!(script.contains("current.pathname === '/'"));
+        assert!(script.contains("const matchedSuccessUrl"));
+        assert!(script.contains("expectedPath !== '/'"));
         assert!(!script.contains("currentUrl.startsWith(prefix)"));
         assert!(script.contains("Math.min(POLL_INTERVAL, remaining)"));
-        assert!(script.contains("markerOriginAllowed"));
+        assert!(!script.contains("markerOriginAllowed"));
+        assert!(!script.contains("sameOrigin"));
         assert!(script.contains("message.includes('browser') && message.includes('closed')"));
     }
 
@@ -897,7 +1267,9 @@ mod tests {
         let source = include_str!("bootstrap.rs");
         let start = source.find("fn run_bootstrap_script(").expect("runner source");
         let tail = &source[start..];
-        let end = tail.find("\n    fn build_bootstrap_script(").expect("runner boundary");
+        let end = tail
+            .find("\n    fn build_bootstrap_script_with_browser_config(")
+            .expect("runner boundary");
         let body = &tail[..end];
         assert!(body.contains("run_node_script_bounded"));
         assert!(!body.contains("std::process::Command"));

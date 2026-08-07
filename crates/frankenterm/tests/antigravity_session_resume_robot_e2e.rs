@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 const BEAD_ID: &str = "ft-agy-provider-q8o4y-685af.5";
 const ANTIGRAVITY_MODEL: &str = "Gemini 3.1 Pro (High)";
-const MISSING_AGY_ERROR_CODE: &str = "robot.session_resume.native_provider_not_found";
+const INTERACTIVE_TERMINAL_REQUIRED_ERROR_CODE: &str = "robot.feature_not_available";
 
 #[test]
 fn robot_session_resume_public_surface_lists_and_resumes_agy_without_cross_listing_gmi() {
@@ -223,89 +223,56 @@ fn validate_public_surface_scenario(
     }
 
     if let Some(uuid) = agy_uuid {
-        if expect_missing_agy_binary {
-            let missing = run_robot_json(RobotRun {
-                scenario,
-                project_root,
-                ft_bin,
-                stdout_dir,
-                stderr_dir,
-                log_jsonl,
-                step: "public-resume-agy-missing-binary",
-                expect_ok: false,
-                args: vec![
-                    "session-resume".into(),
-                    "resume".into(),
-                    uuid.into(),
-                    "--provider".into(),
-                    "agy".into(),
-                    "--dry-run".into(),
-                    "--home".into(),
-                    home.display().to_string(),
-                    "--casr-binary".into(),
-                    casr_binary.into(),
-                ],
-            });
-            assert_eq!(
-                missing.get("error_code").and_then(Value::as_str),
-                Some(MISSING_AGY_ERROR_CODE),
-                "{scenario_id}: missing agy binary must fail closed with provider-specific error"
-            );
-        } else {
-            let dry_run = run_robot_json(RobotRun {
-                scenario,
-                project_root,
-                ft_bin,
-                stdout_dir,
-                stderr_dir,
-                log_jsonl,
-                step: "public-resume-agy-dry-run",
-                expect_ok: true,
-                args: vec![
-                    "session-resume".into(),
-                    "resume".into(),
-                    uuid.into(),
-                    "--provider".into(),
-                    "antigravity".into(),
-                    "--dry-run".into(),
-                    "--home".into(),
-                    home.display().to_string(),
-                    "--casr-binary".into(),
-                    casr_binary.into(),
-                ],
-            });
-            assert_resume_payload_has_agy_argv(&dry_run, uuid, scenario_id, true);
+        let dry_run = run_robot_json(RobotRun {
+            scenario,
+            project_root,
+            ft_bin,
+            stdout_dir,
+            stderr_dir,
+            log_jsonl,
+            step: "public-resume-agy-dry-run",
+            expect_ok: true,
+            args: vec![
+                "session-resume".into(),
+                "resume".into(),
+                uuid.into(),
+                "--provider".into(),
+                "antigravity".into(),
+                "--dry-run".into(),
+                "--home".into(),
+                home.display().to_string(),
+                "--casr-binary".into(),
+                casr_binary.into(),
+            ],
+        });
+        assert_resume_payload_has_agy_argv(&dry_run, uuid, scenario_id, true);
 
-            let executed = run_robot_json(RobotRun {
-                scenario,
-                project_root,
-                ft_bin,
-                stdout_dir,
-                stderr_dir,
-                log_jsonl,
-                step: "public-resume-agy-execute",
-                expect_ok: true,
-                args: vec![
-                    "session-resume".into(),
-                    "resume".into(),
-                    uuid.into(),
-                    "--provider".into(),
-                    "agy".into(),
-                    "--home".into(),
-                    home.display().to_string(),
-                    "--casr-binary".into(),
-                    casr_binary.into(),
-                ],
-            });
-            assert_resume_payload_has_agy_argv(&executed, uuid, scenario_id, false);
-            assert_eq!(
-                executed
-                    .pointer("/data/native_execution/exit_code")
-                    .and_then(Value::as_i64),
-                Some(0),
-                "{scenario_id}: fake agy process must exit successfully"
-            );
-        }
+        let unavailable = run_robot_json(RobotRun {
+            scenario,
+            project_root,
+            ft_bin,
+            stdout_dir,
+            stderr_dir,
+            log_jsonl,
+            step: "public-resume-agy-interactive-terminal-required",
+            expect_ok: false,
+            args: vec![
+                "session-resume".into(),
+                "resume".into(),
+                uuid.into(),
+                "--provider".into(),
+                "agy".into(),
+                "--home".into(),
+                home.display().to_string(),
+                "--casr-binary".into(),
+                casr_binary.into(),
+            ],
+        });
+        assert_eq!(
+            unavailable.get("error_code").and_then(Value::as_str),
+            Some(INTERACTIVE_TERMINAL_REQUIRED_ERROR_CODE),
+            "{scenario_id}: non-dry native resume must require an owned mux PTY"
+        );
     }
 
     if let Some(session_id) = legacy_id {

@@ -28,6 +28,8 @@ pub const DEFAULT_NETWORK_OBSERVER_STDERR_LIMIT_BYTES: usize = 16 * 1024;
 pub const MAX_NETWORK_OBSERVER_STDERR_LIMIT_BYTES: usize = 256 * 1024;
 /// Maximum positional remote-address bytes admitted into the subprocess argv.
 pub const MAX_NETWORK_OBSERVER_REMOTE_ADDRESS_BYTES: usize = 1_024;
+/// Maximum bytes admitted for one provider, region, or organization label.
+pub const MAX_NETWORK_OBSERVER_LABEL_BYTES: usize = 1_024;
 
 // =============================================================================
 // Types
@@ -58,7 +60,6 @@ pub struct NetworkAttribution {
 
 #[derive(Debug, Deserialize)]
 struct ConnectivityProbe {
-    #[serde(default)]
     status: String,
 }
 
@@ -218,6 +219,8 @@ pub enum NetworkObserverError {
     Io { kind: std::io::ErrorKind },
     /// JSON parse failure.
     ParseFailed,
+    /// JSON was syntactically valid but violated the finite response contract.
+    InvalidResponse { field: &'static str },
 }
 
 impl std::fmt::Display for NetworkObserverError {
@@ -278,6 +281,9 @@ impl std::fmt::Display for NetworkObserverError {
             ),
             Self::Io { kind } => write!(f, "rano subprocess I/O failure ({kind:?})"),
             Self::ParseFailed => f.write_str("rano returned invalid JSON"),
+            Self::InvalidResponse { field } => {
+                write!(f, "rano returned an invalid {field} field")
+            }
         }
     }
 }
@@ -300,6 +306,7 @@ impl NetworkObserverError {
             Self::CleanupIncomplete { .. } => "cleanup_incomplete",
             Self::Io { .. } => "io",
             Self::ParseFailed => "parse_failed",
+            Self::InvalidResponse { .. } => "invalid_response",
         }
     }
 }
@@ -322,7 +329,7 @@ impl NetworkObserver {
     /// Create with custom config.
     pub fn with_config(config: NetworkObserverConfig) -> Self {
         Self {
-            binary: "rano".to_string(),
+            binary: default_rano_binary().to_string(),
             config,
         }
     }
@@ -374,6 +381,7 @@ impl NetworkObserver {
             &["attribute", remote_addr, "--json"],
             cancellation,
         )?;
+        validate_attribution_response(&attr, remote_addr)?;
 
         debug!(
             bridge = "rano",
@@ -412,12 +420,17 @@ impl NetworkObserver {
             &["check", "--json"],
             cancellation,
         )?;
-        Ok(match probe.status.as_str() {
+        let status = match probe.status.as_str() {
             "connected" => ConnectivityStatus::Connected,
             "degraded" => ConnectivityStatus::Degraded,
             "unreachable" => ConnectivityStatus::Unreachable,
-            _ => ConnectivityStatus::Unknown,
-        })
+            _ => {
+                return Err(NetworkObserverError::InvalidResponse {
+                    field: "connectivity_status",
+                });
+            }
+        };
+        Ok(status)
     }
 
     fn invoke_rano<T: DeserializeOwned>(
@@ -425,6 +438,9 @@ impl NetworkObserver {
         args: &[&str],
         cancellation: &CommandCancellation,
     ) -> Result<T, NetworkObserverError> {
+        if cancellation.is_cancelled() {
+            return Err(NetworkObserverError::Cancelled);
+        }
         let bridge = self.rano_bridge()?;
         bridge
             .invoke_with_cancellation(args, cancellation)
@@ -545,12 +561,15 @@ impl NetworkObserver {
         if binary.trim() != binary || binary.is_empty() || binary.contains('\0') {
             return Err(NetworkObserverError::InvalidBinary);
         }
-        if binary == "rano" {
+        if binary == "rano" || (cfg!(windows) && binary.eq_ignore_ascii_case("rano.exe")) {
             return Ok(binary);
         }
 
         let path = Path::new(binary);
-        let basename_is_rano = path.file_name().and_then(|name| name.to_str()) == Some("rano");
+        let basename = path.file_name().and_then(|name| name.to_str());
+        let basename_is_rano = basename == Some("rano")
+            || (cfg!(windows)
+                && basename.is_some_and(|name| name.eq_ignore_ascii_case("rano.exe")));
         if path.is_absolute() && basename_is_rano {
             return Ok(binary);
         }
@@ -578,6 +597,50 @@ fn validate_remote_address(remote_addr: &str) -> Result<(), NetworkObserverError
         });
     }
     Ok(())
+}
+
+fn validate_attribution_response(
+    attribution: &NetworkAttribution,
+    requested_remote_addr: &str,
+) -> Result<(), NetworkObserverError> {
+    validate_response_label("provider", &attribution.provider)?;
+    if let Some(region) = attribution.region.as_deref() {
+        validate_response_label("region", region)?;
+    }
+    if let Some(org) = attribution.org.as_deref() {
+        validate_response_label("org", org)?;
+    }
+    if !attribution.latency_ms.is_finite() || attribution.latency_ms < 0.0 {
+        return Err(NetworkObserverError::InvalidResponse {
+            field: "latency_ms",
+        });
+    }
+    if validate_remote_address(&attribution.remote_addr).is_err()
+        || attribution.remote_addr != requested_remote_addr
+    {
+        return Err(NetworkObserverError::InvalidResponse {
+            field: "remote_addr",
+        });
+    }
+    Ok(())
+}
+
+fn validate_response_label(
+    field: &'static str,
+    label: &str,
+) -> Result<(), NetworkObserverError> {
+    if label.is_empty()
+        || label.len() > MAX_NETWORK_OBSERVER_LABEL_BYTES
+        || label.trim() != label
+        || label.chars().any(char::is_control)
+    {
+        return Err(NetworkObserverError::InvalidResponse { field });
+    }
+    Ok(())
+}
+
+const fn default_rano_binary() -> &'static str {
+    if cfg!(windows) { "rano.exe" } else { "rano" }
 }
 
 fn validate_output_limit(
@@ -819,25 +882,36 @@ mod tests {
 
     #[test]
     fn observer_rano_not_available() {
-        // rano is unlikely to be installed in test env
-        let obs = NetworkObserver::new();
-        // Just ensure it doesn't panic
-        let _ = obs.is_available();
+        let dir = tempfile::tempdir().expect("isolated missing-rano directory");
+        let binary = dir.path().join(default_rano_binary());
+        let obs = NetworkObserver::with_binary(
+            binary.to_string_lossy().into_owned(),
+            NetworkObserverConfig::default(),
+        );
+        assert!(!obs.is_available());
     }
 
     #[test]
     fn observer_attribute_fails_gracefully() {
-        let obs = NetworkObserver::new();
+        let dir = tempfile::tempdir().expect("isolated missing-rano directory");
+        let binary = dir.path().join(default_rano_binary());
+        let obs = NetworkObserver::with_binary(
+            binary.to_string_lossy().into_owned(),
+            NetworkObserverConfig::default(),
+        );
         let result = obs.attribute_connection("10.0.0.1");
-        // rano not installed → BridgeError
-        assert!(result.is_err());
+        assert!(matches!(result, Err(NetworkObserverError::BinaryNotFound)));
     }
 
     #[test]
     fn observer_check_connectivity_fails_gracefully() {
-        let obs = NetworkObserver::new();
+        let dir = tempfile::tempdir().expect("isolated missing-rano directory");
+        let binary = dir.path().join(default_rano_binary());
+        let obs = NetworkObserver::with_binary(
+            binary.to_string_lossy().into_owned(),
+            NetworkObserverConfig::default(),
+        );
         let status = obs.check_connectivity();
-        // rano not installed → Unknown
         assert_eq!(status, ConnectivityStatus::Unknown);
     }
 
@@ -883,10 +957,7 @@ mod tests {
         let script = dir.path().join("rano");
         fs::write(
             &script,
-            format!(
-                "#!/bin/sh\n/usr/bin/touch '{}'\nprintf '%s\\n' '{{}}'\n",
-                marker.display()
-            ),
+            "#!/bin/sh\n: > \"${0%/*}/spawned\"\nprintf '%s\\n' '{}'\n",
         )
         .unwrap();
         let mut perms = fs::metadata(&script).unwrap().permissions();
@@ -900,10 +971,10 @@ mod tests {
         let cancellation = CommandCancellation::new();
         cancellation.cancel();
 
-        assert_eq!(
-            observer.attribute_connection_with_cancellation("10.0.0.1", &cancellation),
-            Err(NetworkObserverError::Cancelled)
-        );
+        let error = observer
+            .attribute_connection_with_cancellation("10.0.0.1", &cancellation)
+            .expect_err("pre-cancel must surface a typed cancellation");
+        assert_eq!(error, NetworkObserverError::Cancelled);
         assert!(
             !marker.exists(),
             "pre-cancelled invocation must be gated before spawn"
@@ -969,6 +1040,22 @@ mod tests {
     }
 
     #[test]
+    fn connectivity_cancellation_is_typed_and_precedes_binary_resolution() {
+        let observer = NetworkObserver::with_binary(
+            "not-a-rano-binary",
+            NetworkObserverConfig::default(),
+        );
+        let cancellation = CommandCancellation::new();
+        cancellation.cancel();
+        assert_eq!(
+            observer
+                .check_connectivity_with_cancellation(&cancellation)
+                .expect_err("cancellable API must preserve cancellation"),
+            NetworkObserverError::Cancelled
+        );
+    }
+
+    #[test]
     fn remote_address_admission_is_finite_and_content_free() {
         for invalid in ["", "--json", "host name", "host\nname"] {
             let error = validate_remote_address(invalid)
@@ -987,6 +1074,67 @@ mod tests {
             })
         );
         assert!(validate_remote_address("2001:db8::1").is_ok());
+    }
+
+    #[test]
+    fn attribution_response_rejects_semantically_invalid_or_log_unsafe_data() {
+        let valid = NetworkAttribution {
+            provider: "Example Network".into(),
+            region: Some("us-east-1".into()),
+            latency_ms: 4.5,
+            is_trusted: false,
+            remote_addr: "2001:db8::1".into(),
+            asn: None,
+            org: Some("Example Org".into()),
+        };
+        assert!(validate_attribution_response(&valid, "2001:db8::1").is_ok());
+
+        let mut invalid = valid.clone();
+        invalid.latency_ms = -1.0;
+        assert_eq!(
+            validate_attribution_response(&invalid, "2001:db8::1"),
+            Err(NetworkObserverError::InvalidResponse {
+                field: "latency_ms"
+            })
+        );
+
+        invalid = valid.clone();
+        invalid.provider = "provider\nforged-log-line".into();
+        assert_eq!(
+            validate_attribution_response(&invalid, "2001:db8::1"),
+            Err(NetworkObserverError::InvalidResponse { field: "provider" })
+        );
+
+        invalid = valid;
+        invalid.remote_addr = "--not-a-positional-address".into();
+        assert_eq!(
+            validate_attribution_response(&invalid, "2001:db8::1"),
+            Err(NetworkObserverError::InvalidResponse {
+                field: "remote_addr"
+            })
+        );
+
+        let mut mismatched = NetworkAttribution {
+            provider: "Example Network".into(),
+            region: None,
+            latency_ms: 1.0,
+            is_trusted: false,
+            remote_addr: "203.0.113.2".into(),
+            asn: None,
+            org: None,
+        };
+        assert_eq!(
+            validate_attribution_response(&mismatched, "203.0.113.1"),
+            Err(NetworkObserverError::InvalidResponse {
+                field: "remote_addr"
+            })
+        );
+        mismatched.remote_addr = "203.0.113.1".into();
+        mismatched.region = Some(" ".into());
+        assert_eq!(
+            validate_attribution_response(&mismatched, "203.0.113.1"),
+            Err(NetworkObserverError::InvalidResponse { field: "region" })
+        );
     }
 
     #[test]
@@ -1181,14 +1329,24 @@ mod tests {
 
     #[test]
     fn attribute_failopen_returns_none() {
-        let obs = NetworkObserver::new();
+        let dir = tempfile::tempdir().expect("isolated missing-rano directory");
+        let binary = dir.path().join(default_rano_binary());
+        let obs = NetworkObserver::with_binary(
+            binary.to_string_lossy().into_owned(),
+            NetworkObserverConfig::default(),
+        );
         let result = attribute_failopen(&obs, "10.0.0.1");
         assert!(result.is_none());
     }
 
     #[test]
     fn pressure_failclosed_returns_black() {
-        let obs = NetworkObserver::new();
+        let dir = tempfile::tempdir().expect("isolated missing-rano directory");
+        let binary = dir.path().join(default_rano_binary());
+        let obs = NetworkObserver::with_binary(
+            binary.to_string_lossy().into_owned(),
+            NetworkObserverConfig::default(),
+        );
         let tier = pressure_failclosed(&obs, "10.0.0.1");
         assert_eq!(tier, NetworkPressureTier::Black);
     }

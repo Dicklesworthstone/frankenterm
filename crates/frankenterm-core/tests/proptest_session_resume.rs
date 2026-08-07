@@ -32,6 +32,7 @@ fn arb_config() -> impl Strategy<Value = SessionResumeConfig> {
     (any::<bool>(), 1..120u64).prop_map(|(dry_run, timeout)| SessionResumeConfig {
         casr_binary: "casr".to_string(),
         working_dir: Some(PathBuf::from("/tmp/ws")),
+        home_dir: Some(PathBuf::from("/tmp/home")),
         timeout_secs: timeout,
         dry_run,
     })
@@ -134,17 +135,49 @@ fn antigravity_discovery_lists_only_conversation_db_files() {
     let conversation_id = "123e4567-e89b-12d3-a456-426614174000";
     fs::write(
         conversations.join(format!("{conversation_id}.db")),
-        b"sqlite",
+        b"SQLite format 3\0fixture",
     )
     .expect("write agy db fixture");
     fs::write(conversations.join("not-a-conversation.sqlite"), b"sqlite")
         .expect("write non-db fixture");
     fs::write(conversations.join("not-a-uuid.db"), b"sqlite")
         .expect("write invalid db-name fixture");
+    fs::write(
+        conversations.join("223e4567-e89b-12d3-a456-426614174000.db"),
+        b"not a sqlite database",
+    )
+    .expect("write UUID-shaped junk fixture");
     fs::create_dir_all(conversations.join("directory.db")).expect("create db-named directory");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        conversations.join(format!("{conversation_id}.db")),
+        conversations.join("323e4567-e89b-12d3-a456-426614174000.db"),
+    )
+    .expect("create UUID-shaped symlink fixture");
 
     let report = discover_antigravity_conversations_from_home(home)
         .expect("bounded native discovery succeeds");
+    #[cfg(unix)]
+    {
+        assert!(!report.is_complete());
+        assert!(report.incomplete.contains(&SessionDiscoveryIncomplete {
+            source: SessionDiscoverySource::NativeAntigravity,
+            reason: SessionDiscoveryIncompleteReason::SymlinkRejected,
+        }));
+        assert_eq!(
+            report.require_complete_for_absence_claim(),
+            Err(SessionResumeError::DiscoveryIncomplete {
+                source: SessionDiscoverySource::NativeAntigravity,
+                reason: SessionDiscoveryIncompleteReason::SymlinkRejected,
+            }),
+            "an uninspected UUID-shaped symlink must not authorize absence",
+        );
+    }
+    #[cfg(not(unix))]
+    assert!(
+        report.is_complete(),
+        "ordinary non-file and invalid-header junk remains ignorable"
+    );
     let entries = report.entries;
 
     assert_eq!(entries.len(), 1);
@@ -196,6 +229,48 @@ fn antigravity_discovery_lists_only_conversation_db_files() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn non_session_db_symlink_does_not_invalidate_native_absence_authority() {
+    let temp = tempfile::tempdir().expect("temp home");
+    let conversations = antigravity_conversations_dir(temp.path());
+    fs::create_dir_all(&conversations).expect("create agy conversations dir");
+    let target = temp.path().join("unrelated-target");
+    fs::write(&target, b"not a session database").expect("write unrelated target");
+    std::os::unix::fs::symlink(&target, conversations.join("notes.db"))
+        .expect("create non-session db symlink");
+
+    let report = discover_antigravity_conversations_from_home(temp.path())
+        .expect("bounded native discovery succeeds");
+    assert!(report.entries.is_empty());
+    assert!(
+        report.is_complete(),
+        "only UUID-shaped db names can affect Antigravity absence authority"
+    );
+    report
+        .require_complete_for_absence_claim()
+        .expect("irrelevant symlink must not block an absence claim");
+}
+
+#[test]
+fn empty_explicit_home_is_rejected_before_native_or_casr_discovery() {
+    let resumer = SessionResumer::new(SessionResumeConfig {
+        casr_binary: "must-not-run".to_string(),
+        home_dir: Some(PathBuf::from("different-home")),
+        ..Default::default()
+    });
+
+    assert_eq!(
+        resumer.discover_sessions_in_home(Path::new("")),
+        Err(SessionResumeError::InvalidHomeDirectory)
+    );
+    assert_eq!(
+        resumer.discover_sessions_in_home(Path::new("relative-home")),
+        Err(SessionResumeError::InvalidHomeDirectory),
+        "relative paths would resolve differently for native scanning and a CASR working directory"
+    );
+}
+
 #[test]
 fn antigravity_discovery_is_disjoint_from_legacy_gemini_tmp_chats() {
     let temp = tempfile::tempdir().expect("temp home");
@@ -204,7 +279,7 @@ fn antigravity_discovery_is_disjoint_from_legacy_gemini_tmp_chats() {
     fs::create_dir_all(&conversations).expect("create agy conversations dir");
     fs::write(
         conversations.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.db"),
-        b"sqlite",
+        b"SQLite format 3\0fixture",
     )
     .expect("write agy db fixture");
 
@@ -243,7 +318,7 @@ fn antigravity_e2e_fixture_merges_casr_and_native_sessions_without_cross_listing
     fs::create_dir_all(&conversations).expect("create agy conversations dir");
     fs::write(
         conversations.join(format!("{conversation_id}.db")),
-        b"sqlite",
+        b"SQLite format 3\0fixture",
     )
     .expect("write agy db fixture");
 
@@ -630,16 +705,18 @@ proptest! {
         prop_assert!(summary.contains(&count_str));
     }
 
-    // 20. discover_sessions_failopen never panics
+    // 20. Fail-open conversion never retains arbitrary identifier content.
     #[test]
-    fn failopen_never_panics(suffix in "[a-z]{3,10}") {
-        let config = SessionResumeConfig {
-            casr_binary: format!("/nonexistent-{}", suffix),
-            ..Default::default()
-        };
-        let result = discover_sessions_failopen(&config);
+    fn failopen_never_panics(suffix in "[QWXZ]{32,64}") {
+        let result = SessionDiscoveryResult::fail_open_from_error(
+            &SessionResumeError::InvalidSessionIdentifier {
+                input_bytes: suffix.len(),
+            },
+        );
         prop_assert!(result.entries.is_empty());
         prop_assert!(!result.is_complete());
+        let json = serde_json::to_string(&result).expect("serialize typed incomplete report");
+        prop_assert!(!json.contains(&suffix));
     }
 
     // 21. AgentProvider from_slug known aliases
@@ -785,10 +862,8 @@ proptest! {
         let is_non_pinned_antigravity_model_error = matches!(
             &err,
             SessionResumeError::NonPinnedNativeModel {
-                provider_slug,
-                required_model,
-                ..
-            } if provider_slug.as_str() == "agy" && required_model.as_str() == ANTIGRAVITY_MODEL
+                requested_model_bytes,
+            } if *requested_model_bytes == model.len()
         );
         prop_assert!(is_non_pinned_antigravity_model_error);
     }

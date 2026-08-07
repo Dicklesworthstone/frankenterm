@@ -286,19 +286,29 @@ proptest! {
     // 20. Observer with missing binary: attribute fails
     #[test]
     fn observer_missing_binary_attribute_fails(suffix in "[a-z]{3,10}") {
+        let root = tempfile::tempdir().expect("isolated missing-rano root");
+        let path = root.path()
+            .join(suffix)
+            .join(if cfg!(windows) { "rano.exe" } else { "rano" });
         let obs = NetworkObserver::with_binary(
-            format!("/nonexistent-{}", suffix),
+            path.to_string_lossy().into_owned(),
             NetworkObserverConfig::default(),
         );
-        let result = obs.attribute_connection("10.0.0.1");
-        prop_assert!(result.is_err());
+        prop_assert!(matches!(
+            obs.attribute_connection("10.0.0.1"),
+            Err(NetworkObserverError::BinaryNotFound)
+        ));
     }
 
     // 21. Observer with missing binary: check_connectivity returns Unknown
     #[test]
     fn observer_missing_binary_connectivity_unknown(suffix in "[a-z]{3,10}") {
+        let root = tempfile::tempdir().expect("isolated missing-rano root");
+        let path = root.path()
+            .join(suffix)
+            .join(if cfg!(windows) { "rano.exe" } else { "rano" });
         let obs = NetworkObserver::with_binary(
-            format!("/nonexistent-{}", suffix),
+            path.to_string_lossy().into_owned(),
             NetworkObserverConfig::default(),
         );
         let status = obs.check_connectivity();
@@ -308,8 +318,12 @@ proptest! {
     // 22. attribute_failopen returns None for missing binary
     #[test]
     fn failopen_attribution_returns_none(suffix in "[a-z]{3,10}") {
+        let root = tempfile::tempdir().expect("isolated missing-rano root");
+        let path = root.path()
+            .join(suffix)
+            .join(if cfg!(windows) { "rano.exe" } else { "rano" });
         let obs = NetworkObserver::with_binary(
-            format!("/nonexistent-{}", suffix),
+            path.to_string_lossy().into_owned(),
             NetworkObserverConfig::default(),
         );
         let result = attribute_failopen(&obs, "10.0.0.1");
@@ -319,8 +333,12 @@ proptest! {
     // 23. pressure_failclosed returns Black for missing binary
     #[test]
     fn failclosed_pressure_returns_black(suffix in "[a-z]{3,10}") {
+        let root = tempfile::tempdir().expect("isolated missing-rano root");
+        let path = root.path()
+            .join(suffix)
+            .join(if cfg!(windows) { "rano.exe" } else { "rano" });
         let obs = NetworkObserver::with_binary(
-            format!("/nonexistent-{}", suffix),
+            path.to_string_lossy().into_owned(),
             NetworkObserverConfig::default(),
         );
         let tier = pressure_failclosed(&obs, "10.0.0.1");

@@ -445,10 +445,68 @@ impl OpenAiDeviceAuthFlow {
             };
         }
 
+        if super::admit_automated_auth_url(
+            super::BrowserAuthService::OpenAi,
+            &self.config.device_url,
+        )
+        .is_err()
+        {
+            return AuthFlowResult::Failed {
+                error: AuthFlowFailureKind::PlaywrightError
+                    .stable_detail()
+                    .to_string(),
+                kind: AuthFlowFailureKind::PlaywrightError,
+                artifacts_dir: None,
+            };
+        }
+
         // Step 3: Resolve the browser profile
-        let profile = ctx.profile("openai", account);
+        let profile = match ctx.try_profile("openai", account) {
+            Ok(profile) => profile,
+            Err(_) => {
+                return AuthFlowResult::Failed {
+                    error: AuthFlowFailureKind::ProfileUnavailable
+                        .stable_detail()
+                        .to_string(),
+                    kind: AuthFlowFailureKind::ProfileUnavailable,
+                    artifacts_dir: None,
+                };
+            }
+        };
+        if self
+            .build_playwright_script_with_browser_config(
+                profile.path(),
+                &normalized_code,
+                email,
+                None,
+                ctx.config(),
+            )
+            .is_err()
+        {
+            return AuthFlowResult::Failed {
+                error: AuthFlowFailureKind::PlaywrightError
+                    .stable_detail()
+                    .to_string(),
+                kind: AuthFlowFailureKind::PlaywrightError,
+                artifacts_dir: None,
+            };
+        }
         let profile_dir = match profile.ensure_dir() {
             Ok(path) => path,
+            Err(_) => {
+                return AuthFlowResult::Failed {
+                    error: AuthFlowFailureKind::ProfileUnavailable
+                        .stable_detail()
+                        .to_string(),
+                    kind: AuthFlowFailureKind::ProfileUnavailable,
+                    artifacts_dir: None,
+                };
+            }
+        };
+        let profile_lock = match profile
+            .acquire_operation_lock(ctx.config().profile_lock_timeout_ms)
+        {
+            Ok(profile_lock) => profile_lock,
             Err(_) => {
                 return AuthFlowResult::Failed {
                     error: AuthFlowFailureKind::ProfileUnavailable
@@ -469,6 +527,16 @@ impl OpenAiDeviceAuthFlow {
         let start = std::time::Instant::now();
         let artifacts_dir = self.prepare_artifacts_dir();
 
+        if !profile_lock.is_current_for(&profile) {
+            return AuthFlowResult::Failed {
+                error: AuthFlowFailureKind::ProfileUnavailable
+                    .stable_detail()
+                    .to_string(),
+                kind: AuthFlowFailureKind::ProfileUnavailable,
+                artifacts_dir,
+            };
+        }
+
         let result = self.run_playwright_flow(
             &profile_dir,
             &normalized_code,
@@ -477,13 +545,27 @@ impl OpenAiDeviceAuthFlow {
             ctx.config(),
         );
 
+        if !profile_lock.is_current_for(&profile) {
+            return AuthFlowResult::Failed {
+                error: AuthFlowFailureKind::ProfileUnavailable
+                    .stable_detail()
+                    .to_string(),
+                kind: AuthFlowFailureKind::ProfileUnavailable,
+                artifacts_dir,
+            };
+        }
+
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         match result {
             Ok(outcome) => match outcome {
                 PlaywrightOutcome::Success { storage_state } => {
                     if profile
-                        .record_authenticated_state(&storage_state, BootstrapMethod::Automated)
+                        .record_authenticated_state_with_lock(
+                            &storage_state,
+                            BootstrapMethod::Automated,
+                            &profile_lock,
+                        )
                         .is_err()
                     {
                         return AuthFlowResult::Failed {
@@ -623,7 +705,7 @@ impl OpenAiDeviceAuthFlow {
     /// Build the Node.js/Playwright script for the device auth flow.
     ///
     /// The script outputs a JSON result to stdout with one of:
-    /// - `{"status":"success","storage_state":"..."}`
+    /// - `{"status":"success","storage_state":{...}}`
     /// - `{"status":"interactive_required","reason":"..."}`
     /// - `{"status":"error","kind":"...","message":"..."}`
     fn build_playwright_script_with_browser_config(
@@ -638,7 +720,10 @@ impl OpenAiDeviceAuthFlow {
         super::admit_browser_timeout(self.config.flow_timeout_ms)?;
         super::admit_browser_timeout(browser_config.navigation_timeout_ms)?;
         super::admit_browser_timeout(browser_config.page_load_timeout_ms)?;
-        super::admit_browser_url(&self.config.device_url)?;
+        super::admit_automated_auth_url(
+            super::BrowserAuthService::OpenAi,
+            &self.config.device_url,
+        )?;
         for selector_group in [
             &sel.code_input,
             &sel.submit_button,
@@ -706,8 +791,18 @@ async function captureScreenshot(page, directory) {{
   }}
 }}
 
-function sameOrigin(left, right) {{
-  try {{ return new URL(left).origin === new URL(right).origin; }} catch (_) {{ return false; }}
+function matchesDeviceDestination(currentValue, deviceValue) {{
+  try {{
+    const current = new URL(currentValue);
+    const expected = new URL(deviceValue);
+    if (current.origin !== expected.origin) return false;
+    const expectedPath = expected.pathname.endsWith('/')
+      ? expected.pathname
+      : expected.pathname + '/';
+    return current.pathname === expected.pathname || current.pathname.startsWith(expectedPath);
+  }} catch (_) {{
+    return false;
+  }}
 }}
 
 (async () => {{
@@ -722,11 +817,11 @@ function sameOrigin(left, right) {{
   const selectors = input.selectors;
 
   async function finishSuccess() {{
-    if (!sameOrigin(page.url(), deviceUrl)) {{
+    if (!matchesDeviceDestination(page.url(), deviceUrl)) {{
       console.log(JSON.stringify({{ status: 'error', kind: 'VerificationFailed' }}));
     }} else {{
       const state = await browser.storageState();
-      console.log(JSON.stringify({{ status: 'success', storage_state: JSON.stringify(state) }}));
+      console.log(JSON.stringify({{ status: 'success', storage_state: state }}));
     }}
     await browser.close();
     process.exit(0);
@@ -742,7 +837,13 @@ function sameOrigin(left, right) {{
     page.setDefaultTimeout(PAGE_LOAD_TIMEOUT);
 
     // Navigate to device auth page
-    await page.goto(deviceUrl, {{ waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT }});
+    try {{
+      await page.goto(deviceUrl, {{ waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT }});
+    }} catch (_) {{
+      console.log(JSON.stringify({{ status: 'error', kind: 'NavigationFailed' }}));
+      await browser.close().catch(() => {{}});
+      process.exit(1);
+    }}
 
     // Detect page state
     const passwordEl = await page.$(selectors.password_prompt);
@@ -763,10 +864,18 @@ function sameOrigin(left, right) {{
     const emailPromptEl = await page.$(selectors.email_prompt);
     if (emailPromptEl && email) {{
       const emailInput = await page.$(selectors.email_input);
-      if (!emailInput) throw new Error('email input selector did not match');
+      if (!emailInput) {{
+        console.log(JSON.stringify({{ status: 'error', kind: 'SelectorMismatch' }}));
+        await browser.close();
+        process.exit(1);
+      }}
       await emailInput.fill(email);
       const emailSubmit = await page.$(selectors.email_submit);
-      if (emailSubmit) await emailSubmit.click();
+      if (emailSubmit) {{
+        await emailSubmit.click();
+      }} else {{
+        await emailInput.press('Enter');
+      }}
       // Wait for navigation after email submission
       await page.waitForLoadState('domcontentloaded', {{ timeout: PAGE_LOAD_TIMEOUT }});
 
@@ -793,7 +902,17 @@ function sameOrigin(left, right) {{
     }}
 
     // Fill the user code
-    const codeInput = await page.waitForSelector(selectors.code_input, {{ timeout: TIMEOUT }});
+    let codeInput;
+    try {{
+      codeInput = await page.waitForSelector(
+        selectors.code_input,
+        {{ timeout: PAGE_LOAD_TIMEOUT }}
+      );
+    }} catch (_) {{
+      console.log(JSON.stringify({{ status: 'error', kind: 'SelectorMismatch' }}));
+      await browser.close().catch(() => {{}});
+      process.exit(1);
+    }}
     await codeInput.fill(userCode);
 
     // Submit
@@ -811,9 +930,8 @@ function sameOrigin(left, right) {{
     const successChecks = successSelectors.map(sel =>
       page.waitForSelector(sel, {{ timeout: successTimeout }})
         .then(() => true)
-        .catch(() => false)
     );
-    const found = (await Promise.all(successChecks)).some(Boolean);
+    const found = await Promise.any(successChecks).catch(() => false);
 
     if (found) {{
       await finishSuccess();
@@ -896,15 +1014,20 @@ function sameOrigin(left, right) {{
             Some("success") => {
                 let storage_state = parsed
                     .get("storage_state")
-                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| value.is_object())
                     .ok_or_else(|| PlaywrightFlowError {
                         error: AuthFlowFailureKind::ProfilePersistenceFailed
                             .stable_detail()
                             .to_string(),
                         kind: AuthFlowFailureKind::ProfilePersistenceFailed,
-                    })?
-                    .as_bytes()
-                    .to_vec();
+                    })?;
+                let storage_state =
+                    serde_json::to_vec(storage_state).map_err(|_| PlaywrightFlowError {
+                        error: AuthFlowFailureKind::ProfilePersistenceFailed
+                            .stable_detail()
+                            .to_string(),
+                        kind: AuthFlowFailureKind::ProfilePersistenceFailed,
+                    })?;
                 Ok(PlaywrightOutcome::Success { storage_state })
             }
             Some("interactive_required") => {
@@ -1245,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_custom_config() {
+    fn custom_origin_config_is_rejected_before_script_execution() {
         let cfg = OpenAiDeviceAuthConfig {
             device_url: "https://custom.auth/device".to_string(),
             flow_timeout_ms: 30_000,
@@ -1254,6 +1377,16 @@ mod tests {
         let flow = OpenAiDeviceAuthFlow::new(cfg);
         assert_eq!(flow.config().device_url, "https://custom.auth/device");
         assert_eq!(flow.config().flow_timeout_ms, 30_000);
+        assert_eq!(
+            flow.build_playwright_script_with_browser_config(
+                Path::new("/tmp/profile"),
+                "ABCD-EFGH",
+                None,
+                None,
+                &super::super::BrowserConfig::default(),
+            ),
+            Err(super::super::BrowserNodeCommandFailure::InvalidConfiguration)
+        );
     }
 
     // =========================================================================
@@ -1296,6 +1429,79 @@ mod tests {
     }
 
     #[test]
+    fn execute_rejects_untrusted_device_url_before_profile_creation() {
+        let temp = tempfile::tempdir().expect("isolated OpenAI URL rejection root");
+        let mut ctx = super::super::BrowserContext::new(
+            super::super::BrowserConfig::default(),
+            temp.path(),
+        );
+        ctx.status = BrowserStatus::Ready;
+        let mut config = OpenAiDeviceAuthConfig::default();
+        config.device_url = "https://127.0.0.1/codex/device".to_string();
+        let result = OpenAiDeviceAuthFlow::new(config).execute(
+            &ctx,
+            "ABCD-EFGH",
+            "untrusted-url",
+            None,
+        );
+        assert!(matches!(
+            result,
+            AuthFlowResult::Failed {
+                kind: AuthFlowFailureKind::PlaywrightError,
+                ..
+            }
+        ));
+        assert!(!ctx.profile("openai", "untrusted-url").path().exists());
+    }
+
+    #[test]
+    fn execute_rejects_invalid_selectors_before_profile_creation() {
+        let temp = tempfile::tempdir().expect("isolated OpenAI preflight root");
+        let mut ctx = super::super::BrowserContext::new(
+            super::super::BrowserConfig::default(),
+            temp.path(),
+        );
+        ctx.status = BrowserStatus::Ready;
+        let mut config = OpenAiDeviceAuthConfig::default();
+        config.selectors.success_marker.clear();
+        let result = OpenAiDeviceAuthFlow::new(config).execute(
+            &ctx,
+            "ABCD-EFGH",
+            "invalid-selectors",
+            None,
+        );
+        assert!(matches!(
+            result,
+            AuthFlowResult::Failed {
+                kind: AuthFlowFailureKind::PlaywrightError,
+                ..
+            }
+        ));
+        assert!(!ctx.profile("openai", "invalid-selectors").path().exists());
+    }
+
+    #[test]
+    fn execute_rejects_invalid_account_identity_before_profile_creation() {
+        let temp = tempfile::tempdir().expect("isolated OpenAI identity root");
+        let mut ctx = BrowserContext::new(super::super::BrowserConfig::default(), temp.path());
+        ctx.status = BrowserStatus::Ready;
+        let result = OpenAiDeviceAuthFlow::with_defaults().execute(
+            &ctx,
+            "ABCD-EFGH",
+            "spoof\u{202e}txt",
+            None,
+        );
+        assert!(matches!(
+            result,
+            AuthFlowResult::Failed {
+                kind: AuthFlowFailureKind::ProfileUnavailable,
+                ..
+            }
+        ));
+        assert!(!ctx.profiles_root().exists());
+    }
+
+    #[test]
     fn execute_rejects_an_unavailable_profile_before_subprocess_admission() {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
         let temp = tempfile::tempdir().expect("isolated profile admission root");
@@ -1330,7 +1536,7 @@ mod tests {
     #[test]
     fn parse_success_result() {
         let result = OpenAiDeviceAuthFlow::parse_playwright_result(
-            r#"{"status":"success","storage_state":"{\"cookies\":[],\"origins\":[]}"}"#,
+            r#"{"status":"success","storage_state":{"cookies":[],"origins":[]}}"#,
         );
         assert!(matches!(result, Ok(PlaywrightOutcome::Success { .. })));
     }
@@ -1375,7 +1581,7 @@ mod tests {
 
     #[test]
     fn parse_output_with_preceding_lines() {
-        let output = "Debugger attached.\nSome warning\n{\"status\":\"success\",\"storage_state\":\"{\\\"cookies\\\":[],\\\"origins\\\":[]}\"}";
+        let output = "Debugger attached.\nSome warning\n{\"status\":\"success\",\"storage_state\":{\"cookies\":[],\"origins\":[]}}";
         let result = OpenAiDeviceAuthFlow::parse_playwright_result(output);
         assert!(matches!(result, Ok(PlaywrightOutcome::Success { .. })));
     }
@@ -1798,6 +2004,10 @@ mod tests {
             ),
             _ => panic!("success without durable state must fail closed"),
         }
+        assert!(OpenAiDeviceAuthFlow::parse_playwright_result(
+            r#"{"status":"success","storage_state":"{\"cookies\":[],\"origins\":[]}"}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -1815,13 +2025,53 @@ mod tests {
         let input = super::super::decode_node_script_input(&script);
         assert_eq!(input["headless"], true);
         assert!(script.contains("headless: input.headless"));
-        assert!(script.contains("Promise.all(successChecks)"));
+        assert!(script.contains("Promise.any(successChecks)"));
+        assert!(!script.contains("Promise.all(successChecks)"));
         assert!(script.contains("postEmailPassword"));
-        assert!(script.contains("sameOrigin(page.url(), deviceUrl)"));
+        assert!(script.contains("matchesDeviceDestination(page.url(), deviceUrl)"));
         assert!(script.contains("browser.storageState()"));
         assert!(script.contains("fullPage: false"));
         assert!(!script.contains("'authorized'"));
         assert!(!script.contains("page.textContent('body')"));
+    }
+
+    #[test]
+    fn script_propagates_and_validates_browser_operation_timeouts() {
+        let flow = OpenAiDeviceAuthFlow::with_defaults();
+        let browser_config = super::super::BrowserConfig {
+            navigation_timeout_ms: 12_345,
+            page_load_timeout_ms: 23_456,
+            ..super::super::BrowserConfig::default()
+        };
+        let script = flow
+            .build_playwright_script_with_browser_config(
+                Path::new("/tmp/profile"),
+                "ABCD-EFGH",
+                None,
+                None,
+                &browser_config,
+            )
+            .expect("bounded OpenAI timeout configuration");
+        let input = super::super::decode_node_script_input(&script);
+        assert_eq!(input["navigation_timeout_ms"], 12_345);
+        assert_eq!(input["page_load_timeout_ms"], 23_456);
+        assert!(script.contains("timeout: NAVIGATION_TIMEOUT"));
+        assert!(script.contains("page.setDefaultTimeout(PAGE_LOAD_TIMEOUT)"));
+
+        let invalid = super::super::BrowserConfig {
+            navigation_timeout_ms: 0,
+            ..super::super::BrowserConfig::default()
+        };
+        assert_eq!(
+            flow.build_playwright_script_with_browser_config(
+                Path::new("/tmp/profile"),
+                "ABCD-EFGH",
+                None,
+                None,
+                &invalid,
+            ),
+            Err(super::super::BrowserNodeCommandFailure::InvalidTimeout)
+        );
     }
 
     #[test]

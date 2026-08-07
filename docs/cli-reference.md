@@ -235,13 +235,21 @@ ft export <segments|events|audit|workflows|sessions> [--pane-id <id>] [--since <
 
 ```bash
 ft learn [<track>] [--status] [--achievements] [--reset] [--complete] [--skip]
-ft auth test <service> [--account <name>] [--headful]
-ft auth status <service> [--account <name>] [--all]
-ft auth bootstrap <service> [--account <name>]
+ft auth test <service> [--account <name>] [--timeout-secs <1..=1800>]
+ft auth status <service> [--account <name>]
+ft auth status --all
+ft auth bootstrap <service> [--account <name>] [--timeout-secs <1..=1800>]
 ```
 
 Notes:
 - `ft auth` requires the `browser` feature to enable Playwright-based flows.
+- `ft auth test` validates bounded local runtime/profile/storage-state evidence;
+  it does not launch a browser or prove that a remote service still accepts the
+  persisted credentials.
+- `ft auth status --all` uses bounded, no-symlink profile discovery and reports
+  whether the scan was incomplete or truncated.
+- `ft auth bootstrap` is the explicitly interactive command and opens a visible
+  browser window.
 
 ## Feature-gated commands
 

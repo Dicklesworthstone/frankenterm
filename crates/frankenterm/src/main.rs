@@ -1620,8 +1620,7 @@ SEE ALSO:
 
     /// Browser authentication testing and profile management
     #[command(after_help = r#"EXAMPLES:
-    ft auth test openai --account work      Test OpenAI device auth
-    ft auth test openai --headful           Debug mode (visible browser)
+    ft auth test openai --account work      Validate local OpenAI auth evidence
     ft auth status openai                   Check profile health
 
 SEE ALSO:
@@ -6791,16 +6790,15 @@ enum SyncCommands {
 
 #[derive(Subcommand)]
 enum AuthCommands {
-    /// Test browser authentication flow for a service
+    /// Validate local browser runtime/profile evidence without launching a browser
     #[command(after_help = r#"EXAMPLES:
-    ft auth test openai --account work     Test OpenAI auth with 'work' profile
-    ft auth test openai --headful          Debug mode (visible browser)
-    ft auth test openai --timeout-secs 120 Custom timeout
+    ft auth test openai --account work     Validate local state for 'work'
+    ft auth test openai --timeout-secs 120 Bound the runtime readiness probe
 
 OUTCOMES:
-    Success     Profile authenticated, automated auth works
-    NeedsHuman  Interactive bootstrap required (MFA/password)
-    Fail        Automation error (selector change, network, etc.)"#)]
+    LocalStateReady  Runtime and persisted state are locally valid; live auth is unverified
+    NeedsHuman       Interactive bootstrap is required
+    Fail             Runtime, profile, metadata, or state validation failed"#)]
     Test {
         /// Service to test (e.g., "openai")
         service: String,
@@ -6809,11 +6807,7 @@ OUTCOMES:
         #[arg(long, default_value = "default")]
         account: String,
 
-        /// Run browser in visible (non-headless) mode for debugging
-        #[arg(long)]
-        headful: bool,
-
-        /// Flow timeout in seconds (default: 60)
+        /// Runtime readiness-probe timeout in seconds (1..=1800; default: 60)
         #[arg(long, default_value = "60")]
         timeout_secs: u64,
 
@@ -6836,7 +6830,7 @@ OUTCOMES:
         account: String,
 
         /// Check all profiles
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["service", "account"])]
         all: bool,
 
         /// Output as JSON
@@ -6872,20 +6866,19 @@ NOTE: Opens a visible browser window. You must complete login manually."#)]
     },
 }
 
-/// Outcome of a browser auth test, matching the auth realities matrix.
+/// Outcome of a local browser-auth evidence check.
 #[cfg(feature = "browser")]
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "outcome")]
 enum AuthTestOutcome {
-    /// Profile is authenticated; automated auth flow succeeds.
-    #[serde(rename = "success")]
-    Success {
+    /// Local runtime and persisted state are valid. This does not prove that a
+    /// remote service still accepts the credentials.
+    #[serde(rename = "local_state_ready")]
+    LocalStateReady {
         service: String,
         account: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        elapsed_ms: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        last_bootstrapped: Option<String>,
+        live_auth_verified: bool,
+        last_bootstrapped: String,
     },
     /// Interactive login required (MFA/password).
     #[serde(rename = "needs_human")]
@@ -6906,6 +6899,15 @@ enum AuthTestOutcome {
     },
 }
 
+#[cfg(feature = "browser")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AuthEvidenceState {
+    Missing,
+    Valid,
+    InvalidOrUnavailable,
+}
+
 /// Profile status for `ft auth status`.
 #[cfg(feature = "browser")]
 #[derive(Debug, Clone, serde::Serialize)]
@@ -6913,7 +6915,11 @@ struct AuthProfileStatus {
     service: String,
     account: String,
     profile_exists: bool,
-    has_storage_state: bool,
+    storage_state: AuthEvidenceState,
+    metadata_state: AuthEvidenceState,
+    local_evidence_only: bool,
+    #[serde(skip)]
+    profile_path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     bootstrapped_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6922,6 +6928,134 @@ struct AuthProfileStatus {
     last_used_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     automated_use_count: Option<u64>,
+}
+
+#[cfg(feature = "browser")]
+#[derive(Debug, Clone, serde::Serialize)]
+struct AuthStatusScan {
+    scope: &'static str,
+    entries_examined: usize,
+    metadata_bytes_examined: u64,
+    unclassified_entries: usize,
+    truncated: bool,
+    complete: bool,
+}
+
+#[cfg(feature = "browser")]
+#[derive(Debug, Clone, serde::Serialize)]
+struct AuthStatusReport {
+    profiles: Vec<AuthProfileStatus>,
+    scan: AuthStatusScan,
+    live_auth_verified: bool,
+}
+
+#[cfg(feature = "browser")]
+const AUTH_BROWSER_TIMEOUT_MAX_SECS: u64 = 30 * 60;
+
+#[cfg(feature = "browser")]
+fn auth_browser_timeout_ms(timeout_secs: u64) -> Option<u64> {
+    if (1..=AUTH_BROWSER_TIMEOUT_MAX_SECS).contains(&timeout_secs) {
+        timeout_secs.checked_mul(1000)
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "browser")]
+fn auth_identity_for_display(value: &str) -> String {
+    bounded_terminal_diagnostic(value, 128, 512)
+}
+
+#[cfg(feature = "browser")]
+fn classify_auth_profile_evidence(
+    profile: &frankenterm_core::browser::BrowserProfile,
+    service: &str,
+    account: &str,
+) -> AuthTestOutcome {
+    use frankenterm_core::browser::StorageStateValidation;
+
+    // Metadata and state are independent persisted evidence. Always validate
+    // metadata even when state is absent; otherwise a malformed/torn metadata
+    // file is silently downgraded to an ordinary interactive-login prompt.
+    let metadata = match profile.read_metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return AuthTestOutcome::Fail {
+                service: service.to_string(),
+                account: account.to_string(),
+                error: "Profile metadata is invalid or unavailable".to_string(),
+                next_step: Some("Re-run ft auth bootstrap for this profile".to_string()),
+            };
+        }
+    };
+
+    match profile.validate_storage_state() {
+        Ok(StorageStateValidation::Valid) => {
+            let Some(metadata) = metadata else {
+                return AuthTestOutcome::Fail {
+                    service: service.to_string(),
+                    account: account.to_string(),
+                    error: "Persisted browser state has incomplete matching metadata".to_string(),
+                    next_step: Some("Re-run ft auth bootstrap for this profile".to_string()),
+                };
+            };
+            let Some(last_bootstrapped) = metadata.bootstrapped_at else {
+                return AuthTestOutcome::Fail {
+                    service: service.to_string(),
+                    account: account.to_string(),
+                    error: "Persisted browser state has incomplete matching metadata".to_string(),
+                    next_step: Some("Re-run ft auth bootstrap for this profile".to_string()),
+                };
+            };
+            if metadata.bootstrap_method.is_none() {
+                return AuthTestOutcome::Fail {
+                    service: service.to_string(),
+                    account: account.to_string(),
+                    error: "Persisted browser state has incomplete matching metadata".to_string(),
+                    next_step: Some("Re-run ft auth bootstrap for this profile".to_string()),
+                };
+            }
+            AuthTestOutcome::LocalStateReady {
+                service: service.to_string(),
+                account: account.to_string(),
+                live_auth_verified: false,
+                last_bootstrapped,
+            }
+        }
+        Ok(StorageStateValidation::Missing)
+            if metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.storage_state_sha256.is_some()) =>
+        {
+            AuthTestOutcome::Fail {
+                service: service.to_string(),
+                account: account.to_string(),
+                error: "Persisted browser state and metadata do not form a complete pair"
+                    .to_string(),
+                next_step: Some("Re-run ft auth bootstrap for this profile".to_string()),
+            }
+        }
+        Ok(StorageStateValidation::Missing) if profile.exists() => {
+            AuthTestOutcome::NeedsHuman {
+                service: service.to_string(),
+                account: account.to_string(),
+                reason: "Profile exists but has no persisted storage state".to_string(),
+                next_step: "Run ft auth bootstrap for this profile".to_string(),
+            }
+        }
+        Ok(StorageStateValidation::Missing) => AuthTestOutcome::NeedsHuman {
+            service: service.to_string(),
+            account: account.to_string(),
+            reason: "No browser profile found for this service/account".to_string(),
+            next_step: "Run ft auth bootstrap for this profile".to_string(),
+        },
+        Err(_) => AuthTestOutcome::Fail {
+            service: service.to_string(),
+            account: account.to_string(),
+            error: "Persisted browser storage state is invalid or unavailable".to_string(),
+            next_step: Some("Re-run ft auth bootstrap for this profile".to_string()),
+        },
+    }
 }
 
 const ROBOT_ERR_INVALID_ARGS: &str = "robot.invalid_args";
@@ -6960,6 +7094,9 @@ const ROBOT_ERR_SESSION_RESUME_NATIVE_PROVIDER_NOT_FOUND: &str =
     "robot.session_resume.native_provider_not_found";
 #[cfg(feature = "session-resume")]
 const ROBOT_ERR_SESSION_RESUME_SUBPROCESS: &str = "robot.session_resume.subprocess_error";
+#[cfg(feature = "session-resume")]
+const ROBOT_ERR_SESSION_RESUME_EFFECT_INDETERMINATE: &str =
+    "robot.session_resume.effect_indeterminate";
 #[cfg(feature = "session-resume")]
 const ROBOT_ERR_SESSION_RESUME_CANCELLED: &str = "robot.session_resume.cancelled";
 #[cfg(feature = "session-resume")]
@@ -12827,13 +12964,9 @@ struct RobotAgentsDetectData {
 }
 
 #[cfg(feature = "session-resume")]
-const ROBOT_SESSION_RESUME_LIST_SCHEMA_VERSION: &str = "ft.robot.session_resume.list.v1";
+const ROBOT_SESSION_RESUME_LIST_SCHEMA_VERSION: &str = "ft.robot.session_resume.list.v2";
 #[cfg(feature = "session-resume")]
-const ROBOT_SESSION_RESUME_RESUME_SCHEMA_VERSION: &str = "ft.robot.session_resume.resume.v1";
-#[cfg(feature = "session-resume")]
-const ROBOT_SESSION_RESUME_NATIVE_MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
-#[cfg(feature = "session-resume")]
-const ROBOT_SESSION_RESUME_NATIVE_MAX_STDERR_BYTES: usize = 256 * 1024;
+const ROBOT_SESSION_RESUME_RESUME_SCHEMA_VERSION: &str = "ft.robot.session_resume.resume.v2";
 
 #[cfg(feature = "session-resume")]
 #[derive(Debug, serde::Serialize)]
@@ -12844,6 +12977,8 @@ struct RobotSessionResumeListData {
     casr_binary: String,
     sessions: Vec<RobotSessionResumeEntry>,
     count: usize,
+    discovery_complete: bool,
+    incomplete: Vec<frankenterm_core::session_resume::SessionDiscoveryIncomplete>,
     warnings: Vec<String>,
 }
 
@@ -12875,36 +13010,25 @@ struct RobotSessionResumeResumeData {
     command_argv: Vec<String>,
     command_display: String,
     model_name: Option<String>,
-    native_execution: Option<RobotSessionResumeNativeExecution>,
     casr_resume: Option<frankenterm_core::casr_types::CasrResumeOutput>,
 }
 
 #[cfg(feature = "session-resume")]
-#[derive(Debug, serde::Serialize)]
-struct RobotSessionResumeNativeExecution {
-    exit_code: i32,
-    stdout: Option<String>,
-    stderr: Option<String>,
-}
-
-#[cfg(feature = "session-resume")]
 fn robot_session_resume_home(home: Option<PathBuf>) -> Option<PathBuf> {
-    home.or_else(|| {
-        std::env::var_os("HOME")
-            .filter(|home| !home.is_empty())
-            .map(PathBuf::from)
-    })
+    home.or_else(frankenterm_core::session_resume::session_resume_home_dir)
 }
 
 #[cfg(feature = "session-resume")]
 fn robot_session_resume_config(
     casr_binary: String,
+    home_dir: Option<PathBuf>,
     timeout_secs: u64,
     dry_run: bool,
 ) -> frankenterm_core::session_resume::SessionResumeConfig {
     frankenterm_core::session_resume::SessionResumeConfig {
         casr_binary,
         working_dir: None,
+        home_dir,
         timeout_secs,
         dry_run,
     }
@@ -12915,14 +13039,6 @@ fn robot_session_resume_provider(
     provider: Option<&str>,
 ) -> Option<frankenterm_core::session_resume::AgentProvider> {
     provider.map(frankenterm_core::session_resume::AgentProvider::from_slug)
-}
-
-#[cfg(feature = "session-resume")]
-fn robot_session_resume_entry_matches_provider(
-    entry: &frankenterm_core::casr_types::CasrListEntry,
-    provider: &frankenterm_core::session_resume::AgentProvider,
-) -> bool {
-    frankenterm_core::session_resume::provider_from_list_entry(entry).slug() == provider.slug()
 }
 
 #[cfg(feature = "session-resume")]
@@ -13013,54 +13129,174 @@ fn robot_session_resume_error_response<T>(
     use frankenterm_core::session_resume::SessionResumeError;
 
     match err {
-        SessionResumeError::CasrNotFound(message) => RobotResponse::error_with_code(
+        SessionResumeError::CasrNotFound => RobotResponse::error_with_code(
             ROBOT_ERR_SESSION_RESUME,
-            format!("casr is unavailable for legacy session resume: {message}"),
+            "casr is unavailable for legacy session resume",
             Some("Install casr or pass --casr-binary for legacy gmi/gemini sessions.".to_string()),
             elapsed_ms,
         ),
-        SessionResumeError::NativeProviderNotFound {
-            provider_slug,
-            binary,
-            message,
-        } => RobotResponse::error_with_code(
+        SessionResumeError::NativeProviderNotFound => RobotResponse::error_with_code(
             ROBOT_ERR_SESSION_RESUME_NATIVE_PROVIDER_NOT_FOUND,
-            format!("native provider {provider_slug} is unavailable: {message}"),
-            Some(format!(
-                "Install `{binary}` and ensure it is on PATH; frankenterm will not substitute another provider."
-            )),
+            "the requested native provider binary is unavailable",
+            Some(
+                "Install the requested provider binary and ensure it is on PATH; FrankenTerm will not substitute another provider."
+                    .to_string(),
+            ),
             elapsed_ms,
         ),
-        SessionResumeError::InvalidNativeSessionId { reason, .. } => {
+        SessionResumeError::NativeInteractiveTerminalRequired => {
+            RobotResponse::error_with_code(
+                ROBOT_ERR_FEATURE_NOT_AVAILABLE,
+                "native resume requires an owned interactive mux terminal and is not yet executable from Robot Mode",
+                Some(
+                    "Re-run with --dry-run to obtain the exact pinned command plan; do not treat captured subprocess output as a resumed interactive session."
+                        .to_string(),
+                ),
+                elapsed_ms,
+            )
+        }
+        SessionResumeError::InvalidNativeSessionId {
+            input_bytes,
+            reason,
+        } => {
             RobotResponse::error_with_code(
                 ROBOT_ERR_INVALID_ARGS,
-                reason,
+                format!(
+                    "invalid native session id (input_bytes={input_bytes}, reason={reason})"
+                ),
                 Some("Use the UUID shown by `ft robot session-resume list --provider agy`.".to_string()),
                 elapsed_ms,
             )
         }
-        SessionResumeError::SessionNotFound(session_id) => RobotResponse::error_with_code(
+        SessionResumeError::SessionNotFound { identifier_bytes } => RobotResponse::error_with_code(
             ROBOT_ERR_SESSION_RESUME_NOT_FOUND,
-            format!("session {session_id:?} was not found for the requested provider"),
+            format!("session was not found for the requested provider (identifier_bytes={identifier_bytes})"),
             Some("Run `ft robot session-resume list --provider <provider>` and use one of the returned session_id values.".to_string()),
             elapsed_ms,
         ),
-        SessionResumeError::SubprocessFailed { code, stderr } => RobotResponse::error_with_code(
+        SessionResumeError::SubprocessFailed { code } => RobotResponse::error_with_code(
             ROBOT_ERR_SESSION_RESUME_SUBPROCESS,
-            format!(
-                "session-resume subprocess failed with exit {}: {}",
-                code.unwrap_or(-1),
-                stderr
-            ),
+            format!("session-resume subprocess failed with exit {}", code.unwrap_or(-1)),
             None,
             elapsed_ms,
         ),
         SessionResumeError::NonPinnedNativeModel {
-            required_model, ..
+            requested_model_bytes,
         } => RobotResponse::error_with_code(
             ROBOT_ERR_INVALID_ARGS,
-            format!("Antigravity resume must use the pinned model {required_model:?}"),
+            format!("native resume rejected a non-pinned model (requested_bytes={requested_model_bytes})"),
             Some("Do not override the Antigravity model pin.".to_string()),
+            elapsed_ms,
+        ),
+        SessionResumeError::ParseError { output_bytes } => RobotResponse::error_with_code(
+            ROBOT_ERR_SESSION_RESUME_SUBPROCESS,
+            format!("session-resume returned invalid JSON ({output_bytes} bytes)"),
+            None,
+            elapsed_ms,
+        ),
+        SessionResumeError::ResumeRejected => RobotResponse::error_with_code(
+            ROBOT_ERR_SESSION_RESUME_SUBPROCESS,
+            "session-resume provider reported that the operation failed",
+            Some("Inspect provider state before deciding whether a retry is safe.".to_string()),
+            elapsed_ms,
+        ),
+        SessionResumeError::ResumeEffectIndeterminate { cause } => {
+            RobotResponse::error_with_code(
+                ROBOT_ERR_SESSION_RESUME_EFFECT_INDETERMINATE,
+                format!(
+                    "session-resume lost authoritative mutation completion (cause={cause})"
+                ),
+                Some(
+                    "Do not retry automatically. Reconcile the provider session inventory and active mux state first; the requested resume may already have taken effect."
+                        .to_string(),
+                ),
+                elapsed_ms,
+            )
+        }
+        SessionResumeError::ProviderNotInstalled => RobotResponse::error_with_code(
+            ROBOT_ERR_SESSION_RESUME,
+            "the requested session-resume provider is not installed",
+            Some("Install the requested provider and retry without changing provider identity.".to_string()),
+            elapsed_ms,
+        ),
+        SessionResumeError::InvalidSessionIdentifier { input_bytes } => {
+            RobotResponse::error_with_code(
+                ROBOT_ERR_INVALID_ARGS,
+                format!("invalid session identifier (input_bytes={input_bytes})"),
+                None,
+                elapsed_ms,
+            )
+        }
+        SessionResumeError::InvalidProviderSlug { input_bytes } => {
+            RobotResponse::error_with_code(
+                ROBOT_ERR_INVALID_ARGS,
+                format!("invalid provider slug (input_bytes={input_bytes})"),
+                None,
+                elapsed_ms,
+            )
+        }
+        SessionResumeError::WorkingDirectoryUnavailable => RobotResponse::error_with_code(
+            ROBOT_ERR_SESSION_RESUME,
+            "session-resume working directory is unavailable",
+            None,
+            elapsed_ms,
+        ),
+        SessionResumeError::InvalidHomeDirectory => RobotResponse::error_with_code(
+            ROBOT_ERR_INVALID_ARGS,
+            "session-resume home directory must be a non-empty absolute path",
+            Some("Pass an absolute --home path or omit --home to use the platform home resolver.".to_string()),
+            elapsed_ms,
+        ),
+        SessionResumeError::InvalidTimeout { requested, maximum } => {
+            RobotResponse::error_with_code(
+                ROBOT_ERR_INVALID_ARGS,
+                format!("invalid session-resume timeout ({requested}; admitted 1..={maximum}s)"),
+                None,
+                elapsed_ms,
+            )
+        }
+        SessionResumeError::InvalidOutputLimit {
+            stream,
+            requested,
+            maximum,
+        } => RobotResponse::error_with_code(
+            ROBOT_ERR_INVALID_ARGS,
+            format!("invalid session-resume {stream} capture limit ({requested}; maximum={maximum})"),
+            None,
+            elapsed_ms,
+        ),
+        SessionResumeError::CaptureLimitExceeded {
+            stream,
+            observed,
+            limit,
+        } => RobotResponse::error_with_code(
+            ROBOT_ERR_SESSION_RESUME_SUBPROCESS,
+            format!("session-resume {stream} capture limit exceeded (observed_at_least={observed}, limit={limit})"),
+            None,
+            elapsed_ms,
+        ),
+        SessionResumeError::DiscoveryLimitExceeded { source, limit } => {
+            RobotResponse::error_with_code(
+                ROBOT_ERR_SESSION_RESUME,
+                format!("{source} session discovery exceeded the {limit}-entry limit"),
+                Some("Narrow the provider/home scope or archive stale provider sessions before retrying.".to_string()),
+                elapsed_ms,
+            )
+        }
+        SessionResumeError::DiscoveryIncomplete { source, reason } => {
+            RobotResponse::error_with_code(
+                ROBOT_ERR_SESSION_RESUME,
+                format!(
+                    "cannot prove the requested session is absent because discovery is incomplete (source={source}, reason={reason})"
+                ),
+                Some("Resolve the reported discovery source and retry before assuming the session does not exist.".to_string()),
+                elapsed_ms,
+            )
+        }
+        SessionResumeError::AsyncInfrastructureFailure => RobotResponse::error_with_code(
+            ROBOT_ERR_SESSION_RESUME,
+            "session-resume async infrastructure failed",
+            Some("Retry only after confirming the previous operation did not complete.".to_string()),
             elapsed_ms,
         ),
         SessionResumeError::Timeout => RobotResponse::error_with_code(
@@ -13103,64 +13339,52 @@ fn robot_session_resume_error_response<T>(
             Some("Treat the target process state as unknown and verify it before retrying.".to_string()),
             elapsed_ms,
         ),
-        other => RobotResponse::error_with_code(
-            ROBOT_ERR_SESSION_RESUME,
-            other.to_string(),
-            None,
-            elapsed_ms,
-        ),
     }
 }
 
 #[cfg(feature = "session-resume")]
-fn robot_session_resume_discover_entries(
+async fn robot_session_resume_discover_entries(
+    cx: &frankenterm_core::cx::Cx,
     provider_filter: Option<&frankenterm_core::session_resume::AgentProvider>,
     home: Option<&Path>,
     casr_binary: &str,
     timeout_secs: u64,
 ) -> Result<
-    (
-        Vec<frankenterm_core::casr_types::CasrListEntry>,
-        Vec<String>,
-    ),
+    frankenterm_core::session_resume::SessionDiscoveryResult,
     frankenterm_core::session_resume::SessionResumeError,
 > {
     use frankenterm_core::session_resume::AgentProvider;
 
-    let mut warnings = Vec::new();
     if matches!(provider_filter, Some(AgentProvider::Antigravity)) {
-        let entries = home
-            .map(frankenterm_core::session_resume::discover_antigravity_conversations_from_home)
-            .unwrap_or_default();
-        return Ok((entries, warnings));
+        return match home {
+            Some(home) => {
+                frankenterm_core::session_resume::discover_antigravity_conversations_from_home_with_cx(
+                    cx, home,
+                )
+                .await
+            }
+            None => {
+                frankenterm_core::session_resume::discover_current_home_antigravity_conversations_with_cx(cx)
+                    .await
+            }
+        };
     }
 
-    let config = robot_session_resume_config(casr_binary.to_string(), timeout_secs, false);
+    let config = robot_session_resume_config(
+        casr_binary.to_string(),
+        home.map(Path::to_path_buf),
+        timeout_secs,
+        false,
+    );
     let resumer = frankenterm_core::session_resume::SessionResumer::new(config);
-    let mut entries = match home {
-        Some(home) => resumer.discover_sessions_in_home(home),
-        None => resumer.discover_sessions(),
+    let mut report = match home {
+        Some(home) => resumer.discover_sessions_in_home_with_cx(cx, home).await?,
+        None => resumer.discover_sessions_with_cx(cx).await?,
     };
-
-    if let Err(error) = &entries {
-        if provider_filter.is_some() {
-            return Err(error.clone());
-        }
-        warnings.push(format!(
-            "casr discovery failed ({error}); returning native Antigravity sessions only"
-        ));
-        entries = Ok(home
-            .map(frankenterm_core::session_resume::discover_antigravity_conversations_from_home)
-            .unwrap_or_else(
-                frankenterm_core::session_resume::discover_current_home_antigravity_conversations,
-            ));
-    }
-
-    let mut entries = entries?;
     if let Some(provider) = provider_filter {
-        entries.retain(|entry| robot_session_resume_entry_matches_provider(entry, provider));
+        report.retain_provider(provider);
     }
-    entries.sort_by(|left, right| {
+    report.entries.sort_by(|left, right| {
         let left_provider = frankenterm_core::session_resume::provider_from_list_entry(left)
             .slug()
             .to_string();
@@ -13172,25 +13396,44 @@ fn robot_session_resume_discover_entries(
             .then_with(|| left.session_id.cmp(&right.session_id))
             .then_with(|| left.path.cmp(&right.path))
     });
-    Ok((entries, warnings))
+    Ok(report)
 }
 
 #[cfg(feature = "session-resume")]
-fn build_robot_session_resume_list_data(
+async fn build_robot_session_resume_list_data(
+    cx: &frankenterm_core::cx::Cx,
     provider: Option<String>,
     home: Option<PathBuf>,
     casr_binary: String,
     timeout_secs: u64,
 ) -> Result<RobotSessionResumeListData, frankenterm_core::session_resume::SessionResumeError> {
+    frankenterm_core::session_resume::validate_session_resume_timeout_secs(timeout_secs)?;
+    if let Some(provider) = provider.as_deref() {
+        frankenterm_core::session_resume::validate_provider_slug(provider)?;
+    }
     let provider_filter = robot_session_resume_provider(provider.as_deref());
     let resolved_home = robot_session_resume_home(home);
-    let (entries, warnings) = robot_session_resume_discover_entries(
+    let report = robot_session_resume_discover_entries(
+        cx,
         provider_filter.as_ref(),
         resolved_home.as_deref(),
         &casr_binary,
         timeout_secs,
-    )?;
-    let sessions = entries
+    )
+    .await?;
+    let discovery_complete = report.is_complete();
+    let incomplete = report.incomplete;
+    let warnings = incomplete
+        .iter()
+        .map(|item| {
+            format!(
+                "session discovery is incomplete (source={}, reason={})",
+                item.source, item.reason
+            )
+        })
+        .collect();
+    let sessions = report
+        .entries
         .into_iter()
         .map(robot_session_resume_entry)
         .collect::<Vec<_>>();
@@ -13203,109 +13446,15 @@ fn build_robot_session_resume_list_data(
         casr_binary,
         sessions,
         count,
+        discovery_complete,
+        incomplete,
         warnings,
     })
 }
 
 #[cfg(feature = "session-resume")]
-fn robot_session_resume_output_text(bytes: Vec<u8>) -> Option<String> {
-    if bytes.is_empty() {
-        None
-    } else {
-        Some(match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
-        })
-    }
-}
-
-#[cfg(feature = "session-resume")]
-fn robot_session_resume_native_command_error(
-    error: &std::io::Error,
-) -> frankenterm_core::session_resume::SessionResumeError {
-    use frankenterm_core::runtime_async::process::{
-        CommandCancelled, CommandOutputCaptureIncomplete, CommandOutputLimitExceeded,
-        CommandProcessCleanupIncomplete, CommandTimedOut,
-    };
-    use frankenterm_core::session_resume::SessionResumeError;
-
-    if CommandTimedOut::from_io_error(error).is_some() {
-        return SessionResumeError::Timeout;
-    }
-    if CommandCancelled::from_io_error(error).is_some() {
-        return SessionResumeError::Cancelled;
-    }
-    if let Some(incomplete) = CommandOutputCaptureIncomplete::from_io_error(error) {
-        return SessionResumeError::CaptureIncomplete {
-            stdout_open: incomplete.stdout_open(),
-            stderr_open: incomplete.stderr_open(),
-            drain_timeout_ms: incomplete.drain_timeout_ms(),
-        };
-    }
-    if let Some(incomplete) = CommandProcessCleanupIncomplete::from_io_error(error) {
-        return SessionResumeError::CleanupIncomplete {
-            trigger: incomplete.trigger(),
-            leader_reaped: incomplete.leader_reaped(),
-            signal_helper_settled: incomplete.signal_helper_settled(),
-            process_tree_signalled: incomplete.process_tree_signalled(),
-            stdout_open: incomplete.stdout_open(),
-            stderr_open: incomplete.stderr_open(),
-            settle_timeout_ms: incomplete.settle_timeout_ms(),
-        };
-    }
-    if let Some(exceeded) = CommandOutputLimitExceeded::from_io_error(error) {
-        return SessionResumeError::SubprocessFailed {
-            code: None,
-            stderr: format!(
-                "native session-resume {} capture limit exceeded: observed at least {} bytes, limit {}",
-                exceeded.stream(),
-                exceeded.observed(),
-                exceeded.limit()
-            ),
-        };
-    }
-
-    SessionResumeError::SubprocessFailed {
-        code: None,
-        stderr: format!(
-            "native session-resume subprocess unavailable ({:?})",
-            error.kind()
-        ),
-    }
-}
-
-#[cfg(feature = "session-resume")]
-fn robot_session_resume_run_native(
-    plan: &frankenterm_core::session_resume::NativeResumePlan,
-    timeout_secs: u64,
-) -> Result<RobotSessionResumeNativeExecution, frankenterm_core::session_resume::SessionResumeError>
-{
-    use frankenterm_core::session_resume::SessionResumeError;
-
-    let mut command = frankenterm_core::runtime_async::process::Command::new(&plan.binary);
-    command
-        .args(plan.argv.iter().skip(1))
-        .stdout_limit(ROBOT_SESSION_RESUME_NATIVE_MAX_STDOUT_BYTES)
-        .stderr_limit(ROBOT_SESSION_RESUME_NATIVE_MAX_STDERR_BYTES);
-    let output = command
-        .output_blocking(Duration::from_secs(timeout_secs.max(1)))
-        .map_err(|error| robot_session_resume_native_command_error(&error))?;
-    let exit_code = output.status.code().unwrap_or(-1);
-    if !output.status.success() {
-        return Err(SessionResumeError::SubprocessFailed {
-            code: output.status.code(),
-            stderr: "native session-resume subprocess exited unsuccessfully".to_string(),
-        });
-    }
-    Ok(RobotSessionResumeNativeExecution {
-        exit_code,
-        stdout: robot_session_resume_output_text(output.stdout),
-        stderr: robot_session_resume_output_text(output.stderr),
-    })
-}
-
-#[cfg(feature = "session-resume")]
-fn build_robot_session_resume_resume_data(
+async fn build_robot_session_resume_resume_data(
+    cx: &frankenterm_core::cx::Cx,
     session_id: String,
     provider: String,
     dry_run: bool,
@@ -13315,34 +13464,45 @@ fn build_robot_session_resume_resume_data(
 ) -> Result<RobotSessionResumeResumeData, frankenterm_core::session_resume::SessionResumeError> {
     use frankenterm_core::session_resume::AgentProvider;
 
+    frankenterm_core::session_resume::validate_session_resume_timeout_secs(timeout_secs)?;
+    frankenterm_core::session_resume::validate_session_identifier(&session_id)?;
+    frankenterm_core::session_resume::validate_provider_slug(&provider)?;
     let provider = frankenterm_core::session_resume::AgentProvider::from_slug(&provider);
     let resolved_home = robot_session_resume_home(home);
-    let (entries, _) = robot_session_resume_discover_entries(
+    let mut report = robot_session_resume_discover_entries(
+        cx,
         Some(&provider),
         resolved_home.as_deref(),
         &casr_binary,
         timeout_secs,
-    )?;
-    let entry = entries
-        .into_iter()
-        .find(|entry| entry.session_id == session_id)
-        .ok_or_else(|| {
-            frankenterm_core::session_resume::SessionResumeError::SessionNotFound(
-                session_id.clone(),
-            )
-        })?;
+    )
+    .await?;
+    let entry_index = report
+        .entries
+        .iter()
+        .position(|entry| entry.session_id == session_id);
+    let entry = match entry_index {
+        Some(index) => report.entries.swap_remove(index),
+        None => {
+            report.require_complete_for_absence_claim()?;
+            return Err(
+                frankenterm_core::session_resume::SessionResumeError::SessionNotFound {
+                    identifier_bytes: session_id.len(),
+                },
+            );
+        }
+    };
     let source_path = entry.path.clone();
 
     if provider == AgentProvider::Antigravity {
         let plan = provider
             .checked_native_resume_plan(&session_id)?
             .expect("Antigravity has a native resume plan");
-        plan.require_binary_available_in_path(None)?;
-        let native_execution = if dry_run {
-            None
-        } else {
-            Some(robot_session_resume_run_native(&plan, timeout_secs)?)
-        };
+        if !dry_run {
+            return Err(
+                frankenterm_core::session_resume::SessionResumeError::NativeInteractiveTerminalRequired,
+            );
+        }
         return Ok(RobotSessionResumeResumeData {
             schema_version: ROBOT_SESSION_RESUME_RESUME_SCHEMA_VERSION,
             provider: provider.slug().to_string(),
@@ -13353,7 +13513,6 @@ fn build_robot_session_resume_resume_data(
             command_argv: plan.argv.clone(),
             command_display: robot_session_resume_command_display(&plan.argv),
             model_name: plan.model_name.clone(),
-            native_execution,
             casr_resume: None,
         });
     }
@@ -13372,9 +13531,16 @@ fn build_robot_session_resume_resume_data(
         }
         argv
     };
-    let config = robot_session_resume_config(casr_binary, timeout_secs, dry_run);
+    let config = robot_session_resume_config(
+        casr_binary,
+        resolved_home,
+        timeout_secs,
+        dry_run,
+    );
     let resumer = frankenterm_core::session_resume::SessionResumer::new(config);
-    let casr_resume = resumer.resume_session(&session_id, &provider)?;
+    let casr_resume = resumer
+        .resume_session_with_cx(cx, &session_id, &provider)
+        .await?;
 
     Ok(RobotSessionResumeResumeData {
         schema_version: ROBOT_SESSION_RESUME_RESUME_SCHEMA_VERSION,
@@ -13386,7 +13552,6 @@ fn build_robot_session_resume_resume_data(
         command_display: robot_session_resume_command_display(&command_argv),
         command_argv,
         model_name: robot_session_resume_model_name(&entry),
-        native_execution: None,
         casr_resume: Some(casr_resume),
     })
 }
@@ -41940,11 +42105,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         timeout_secs,
                     } => {
                         let response = match build_robot_session_resume_list_data(
+                            cx,
                             provider,
                             home,
                             casr_binary,
                             timeout_secs,
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(data) => RobotResponse::success(data, elapsed_ms(start)),
                             Err(err) => robot_session_resume_error_response(err, elapsed_ms(start)),
                         };
@@ -41959,13 +42127,16 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         timeout_secs,
                     } => {
                         let response = match build_robot_session_resume_resume_data(
+                            cx,
                             session_id,
                             provider,
                             dry_run,
                             home,
                             casr_binary,
                             timeout_secs,
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(data) => RobotResponse::success(data, elapsed_ms(start)),
                             Err(err) => robot_session_resume_error_response(err, elapsed_ms(start)),
                         };
@@ -73503,66 +73674,73 @@ async fn handle_auth_command(
     layout: &frankenterm_core::config::WorkspaceLayout,
     verbose: bool,
 ) -> anyhow::Result<()> {
-    use frankenterm_core::browser::{BrowserConfig, BrowserContext, BrowserProfile};
+    use frankenterm_core::browser::{
+        BrowserAuthService, BrowserConfig, BrowserContext, BrowserProfile,
+        discover_browser_profiles_bounded,
+    };
 
     match command {
         AuthCommands::Test {
             service,
             account,
-            headful,
-            timeout_secs: _,
+            timeout_secs,
             json,
         } => {
+            let timeout_ms = auth_browser_timeout_ms(timeout_secs);
             let config = BrowserConfig {
-                headless: !headful,
+                headless: true,
+                readiness_probe_timeout_ms: timeout_ms.unwrap_or(0),
                 ..Default::default()
             };
             let mut ctx = BrowserContext::new(config, &layout.ft_dir);
 
-            let outcome = match ctx.ensure_ready() {
-                Ok(()) => {
-                    let profile = ctx.profile(&service, &account);
-                    if profile.has_storage_state() {
-                        let metadata = profile.read_metadata().ok().flatten();
-                        AuthTestOutcome::Success {
-                            service: service.clone(),
-                            account: account.clone(),
-                            elapsed_ms: None,
-                            last_bootstrapped: metadata
-                                .as_ref()
-                                .and_then(|m| m.bootstrapped_at.clone()),
-                        }
-                    } else if profile.exists() {
-                        AuthTestOutcome::NeedsHuman {
-                            service: service.clone(),
-                            account: account.clone(),
-                            reason: "Profile exists but no storage state \
-                                     (session expired or never bootstrapped)"
-                                .into(),
-                            next_step: format!(
-                                "Run: ft auth bootstrap {service} --account {account}"
-                            ),
-                        }
-                    } else {
-                        AuthTestOutcome::NeedsHuman {
-                            service: service.clone(),
-                            account: account.clone(),
-                            reason: "No browser profile found for this service/account".into(),
-                            next_step: format!(
-                                "Run: ft auth bootstrap {service} --account {account}"
-                            ),
-                        }
-                    }
-                }
-                Err(e) => AuthTestOutcome::Fail {
+            let outcome = if timeout_ms.is_none() {
+                AuthTestOutcome::Fail {
                     service: service.clone(),
                     account: account.clone(),
-                    error: format!("Browser initialization failed: {e}"),
-                    next_step: Some(
-                        "Check that Playwright is installed: npx playwright install chromium"
-                            .into(),
+                    error: format!(
+                        "Readiness timeout must be between 1 and {AUTH_BROWSER_TIMEOUT_MAX_SECS} seconds"
                     ),
-                },
+                    next_step: None,
+                }
+            } else if BrowserAuthService::try_from(service.as_str()).is_err() {
+                AuthTestOutcome::Fail {
+                    service: service.clone(),
+                    account: account.clone(),
+                    error: "Unsupported browser authentication service".to_string(),
+                    next_step: Some(
+                        "Use one of the supported services: openai, google, anthropic"
+                            .to_string(),
+                    ),
+                }
+            } else if ctx.try_profile(&service, &account).is_err() {
+                AuthTestOutcome::Fail {
+                    service: service.clone(),
+                    account: account.clone(),
+                    error: "Browser profile identity is invalid".to_string(),
+                    next_step: Some(
+                        "Use a non-empty bounded account name without terminal or bidi controls"
+                            .to_string(),
+                    ),
+                }
+            } else {
+                match ctx.ensure_ready() {
+                    Ok(()) => {
+                        let profile = ctx
+                            .try_profile(&service, &account)
+                            .expect("identity was validated before runtime readiness");
+                        classify_auth_profile_evidence(&profile, &service, &account)
+                    }
+                    Err(_) => AuthTestOutcome::Fail {
+                        service: service.clone(),
+                        account: account.clone(),
+                        error: "Browser runtime readiness validation failed".to_string(),
+                        next_step: Some(
+                            "Ensure Node can resolve the 'playwright' module and its Chromium browser bundle is installed"
+                                .into(),
+                        ),
+                    },
+                }
             };
 
             if json {
@@ -73571,21 +73749,33 @@ async fn handle_auth_command(
                     serde_json::to_string_pretty(&outcome)
                         .unwrap_or_else(|e| serialize_simple_display_error(&e))
                 );
+                if matches!(outcome, AuthTestOutcome::Fail { .. }) {
+                    std::process::exit(1);
+                }
             } else {
                 match &outcome {
-                    AuthTestOutcome::Success {
+                    AuthTestOutcome::LocalStateReady {
                         service,
                         account,
                         last_bootstrapped,
                         ..
                     } => {
-                        println!("✓ Auth test passed: {service}/{account}");
-                        if let Some(ts) = last_bootstrapped {
-                            println!("  Bootstrapped: {ts}");
-                        }
+                        let display_service = auth_identity_for_display(service);
+                        let display_account = auth_identity_for_display(account);
+                        println!("✓ Local auth state is valid: {display_service}/{display_account}");
+                        println!("  Live service authentication: not verified");
+                        println!("  Bootstrapped: {last_bootstrapped}");
                         if verbose {
-                            let profile = ctx.profile(service, account);
-                            println!("  Profile: {}", profile.path().display());
+                            if let Ok(profile) = ctx.try_profile(service, account) {
+                                println!(
+                                    "  Profile: {}",
+                                    bounded_terminal_diagnostic(
+                                        &profile.path().display().to_string(),
+                                        256,
+                                        1_024,
+                                    )
+                                );
+                            }
                         }
                     }
                     AuthTestOutcome::NeedsHuman {
@@ -73594,9 +73784,14 @@ async fn handle_auth_command(
                         reason,
                         next_step,
                     } => {
-                        println!("⚠ Auth test: needs human: {service}/{account}");
-                        println!("  Reason: {reason}");
-                        println!("  Next: {next_step}");
+                        let display_service = auth_identity_for_display(service);
+                        let display_account = auth_identity_for_display(account);
+                        println!("⚠ Auth test: needs human: {display_service}/{display_account}");
+                        println!("  Reason: {}", bounded_terminal_diagnostic(reason, 256, 1_024));
+                        println!(
+                            "  Next: {}",
+                            bounded_terminal_diagnostic(next_step, 256, 1_024)
+                        );
                     }
                     AuthTestOutcome::Fail {
                         service,
@@ -73604,10 +73799,18 @@ async fn handle_auth_command(
                         error,
                         next_step,
                     } => {
-                        eprintln!("✗ Auth test failed: {service}/{account}");
-                        eprintln!("  Error: {error}");
+                        let display_service = auth_identity_for_display(service);
+                        let display_account = auth_identity_for_display(account);
+                        eprintln!("✗ Auth test failed: {display_service}/{display_account}");
+                        eprintln!(
+                            "  Error: {}",
+                            bounded_terminal_diagnostic(error, 256, 1_024)
+                        );
                         if let Some(step) = next_step {
-                            eprintln!("  Next: {step}");
+                            eprintln!(
+                                "  Next: {}",
+                                bounded_terminal_diagnostic(step, 256, 1_024)
+                            );
                         }
                         std::process::exit(1);
                     }
@@ -73626,71 +73829,128 @@ async fn handle_auth_command(
             let profiles_root = ctx.profiles_root();
 
             let mut statuses: Vec<AuthProfileStatus> = Vec::new();
+            let scan: AuthStatusScan;
 
             if all {
-                if profiles_root.is_dir() {
-                    if let Ok(services) = std::fs::read_dir(profiles_root) {
-                        for svc_entry in services.flatten() {
-                            if !svc_entry.path().is_dir() {
-                                continue;
-                            }
-                            let svc_name = svc_entry.file_name().to_string_lossy().to_string();
-                            if let Ok(accounts) = std::fs::read_dir(svc_entry.path()) {
-                                for acct_entry in accounts.flatten() {
-                                    if !acct_entry.path().is_dir() {
-                                        continue;
-                                    }
-                                    let acct_name =
-                                        acct_entry.file_name().to_string_lossy().to_string();
-                                    let profile =
-                                        BrowserProfile::new(profiles_root, &svc_name, &acct_name);
-                                    statuses.push(build_profile_status(&profile));
-                                }
-                            }
+                let discovery = match discover_browser_profiles_bounded(profiles_root) {
+                    Ok(discovery) => discovery,
+                    Err(_) => {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "ok": false,
+                                    "error": "Browser profile discovery failed safely",
+                                    "error_code": "E_BROWSER_PROFILE_DISCOVERY",
+                                }))?
+                            );
+                        } else {
+                            eprintln!("Error: Browser profile discovery failed safely");
                         }
+                        std::process::exit(1);
                     }
+                };
+                for profile in &discovery.profiles {
+                    statuses.push(build_profile_status(profile));
                 }
-
-                if statuses.is_empty() {
-                    if json {
-                        println!("[]");
-                    } else {
-                        println!("No browser profiles found.");
-                        println!("  Profiles dir: {}", profiles_root.display());
-                        println!("  Hint: Run 'ft auth bootstrap <service>' to create one.");
-                    }
-                    return Ok(());
-                }
+                scan = AuthStatusScan {
+                    scope: "all_profiles",
+                    entries_examined: discovery.entries_examined,
+                    metadata_bytes_examined: discovery.metadata_bytes_examined,
+                    unclassified_entries: discovery.unclassified_entries,
+                    truncated: discovery.truncated,
+                    complete: discovery.is_complete(),
+                };
             } else {
                 let svc = service.as_deref().unwrap_or_else(|| {
                     eprintln!("Error: --service is required unless --all is used.");
                     std::process::exit(1);
                 });
-                let profile = BrowserProfile::new(profiles_root, svc, &account);
+                if BrowserAuthService::try_from(svc).is_err() {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ok": false,
+                                "error": "Unsupported browser authentication service",
+                                "error_code": "E_BROWSER_SERVICE_UNSUPPORTED",
+                            }))?
+                        );
+                    } else {
+                        eprintln!("Error: Unsupported browser authentication service");
+                        eprintln!("Supported services: openai, google, anthropic");
+                    }
+                    std::process::exit(1);
+                }
+                let profile = match BrowserProfile::try_new(profiles_root, svc, &account) {
+                    Ok(profile) => profile,
+                    Err(_) => {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "ok": false,
+                                    "error": "Browser profile identity is invalid",
+                                    "error_code": "E_BROWSER_PROFILE_IDENTITY_INVALID",
+                                }))?
+                            );
+                        } else {
+                            eprintln!("Error: Browser profile identity is invalid");
+                        }
+                        std::process::exit(1);
+                    }
+                };
                 statuses.push(build_profile_status(&profile));
+                scan = AuthStatusScan {
+                    scope: "single_profile",
+                    entries_examined: 1,
+                    metadata_bytes_examined: 0,
+                    unclassified_entries: 0,
+                    truncated: false,
+                    complete: true,
+                };
             }
+
+            let report = AuthStatusReport {
+                profiles: statuses,
+                scan,
+                live_auth_verified: false,
+            };
 
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&statuses)
+                    serde_json::to_string_pretty(&report)
                         .unwrap_or_else(|e| serialize_simple_display_error(&e))
                 );
             } else {
-                for status in &statuses {
-                    println!("Profile: {}/{}", status.service, status.account);
+                if report.profiles.is_empty() {
+                    if report.scan.complete {
+                        println!("No browser profiles found.");
+                    } else {
+                        println!("No safely classified browser profiles found.");
+                    }
+                    println!("  Hint: Run 'ft auth bootstrap <service>' to create one.");
+                }
+                for status in &report.profiles {
+                    println!(
+                        "Profile: {}/{}",
+                        auth_identity_for_display(&status.service),
+                        auth_identity_for_display(&status.account)
+                    );
                     println!(
                         "  Exists: {}",
                         if status.profile_exists { "yes" } else { "no" }
                     );
                     println!(
                         "  Storage state: {}",
-                        if status.has_storage_state {
-                            "yes"
-                        } else {
-                            "no"
-                        }
+                        auth_evidence_state_label(status.storage_state)
                     );
+                    println!(
+                        "  Metadata state: {}",
+                        auth_evidence_state_label(status.metadata_state)
+                    );
+                    println!("  Live service authentication: not verified");
                     if let Some(ts) = &status.bootstrapped_at {
                         println!("  Bootstrapped: {ts}");
                     }
@@ -73704,11 +73964,25 @@ async fn handle_auth_command(
                         println!("  Automated uses: {count}");
                     }
                     if verbose {
-                        let profile =
-                            BrowserProfile::new(profiles_root, &status.service, &status.account);
-                        println!("  Path: {}", profile.path().display());
+                        println!(
+                            "  Path: {}",
+                            bounded_terminal_diagnostic(
+                                &status.profile_path.display().to_string(),
+                                256,
+                                1_024,
+                            )
+                        );
                     }
                     println!();
+                }
+                if !report.scan.complete {
+                    println!(
+                        "Warning: profile scan incomplete (entries_examined={}, metadata_bytes_examined={}, unclassified_entries={}, truncated={}).",
+                        report.scan.entries_examined,
+                        report.scan.metadata_bytes_examined,
+                        report.scan.unclassified_entries,
+                        report.scan.truncated
+                    );
                 }
             }
         }
@@ -73724,39 +73998,115 @@ async fn handle_auth_command(
                 BootstrapConfig, BootstrapResult, InteractiveBootstrap,
             };
 
+            let Some(timeout_ms) = auth_browser_timeout_ms(timeout_secs) else {
+                let message = format!(
+                    "Bootstrap timeout must be between 1 and {AUTH_BROWSER_TIMEOUT_MAX_SECS} seconds"
+                );
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": false,
+                            "error": message,
+                            "error_code": "E_BROWSER_TIMEOUT_INVALID",
+                        }))?
+                    );
+                } else {
+                    eprintln!("Error: {message}");
+                }
+                std::process::exit(1);
+            };
+
+            let mut bootstrap_config = match BootstrapConfig::try_for_service_name(&service) {
+                Ok(config) => config,
+                Err(_) => {
+                    let message = "Unsupported browser authentication service";
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ok": false,
+                                "error": message,
+                                "error_code": "E_BROWSER_SERVICE_UNSUPPORTED",
+                            }))?
+                        );
+                    } else {
+                        eprintln!("Error: {message}");
+                        eprintln!("Supported services: openai, google, anthropic");
+                    }
+                    std::process::exit(1);
+                }
+            };
+            bootstrap_config.timeout_ms = timeout_ms;
+            if login_url.as_deref().is_some_and(|url| {
+                bootstrap_config.set_login_url_override(url).is_err()
+            }) {
+                let message = "Login URL is not admitted for the selected service";
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": false,
+                            "error": message,
+                            "error_code": "E_BROWSER_LOGIN_URL_INVALID",
+                        }))?
+                    );
+                } else {
+                    eprintln!("Error: {message}");
+                }
+                std::process::exit(1);
+            }
+
             let config = BrowserConfig {
                 headless: false, // Bootstrap always visible
                 ..Default::default()
             };
             let mut ctx = BrowserContext::new(config, &layout.ft_dir);
 
-            if let Err(e) = ctx.ensure_ready() {
+            let profile = match ctx.try_profile(&service, &account) {
+                Ok(profile) => profile,
+                Err(_) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ok": false,
+                                "error": "Browser profile identity is invalid",
+                                "error_code": "E_BROWSER_PROFILE_IDENTITY_INVALID",
+                            }))?
+                        );
+                    } else {
+                        eprintln!("Error: Browser profile identity is invalid");
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            if ctx.ensure_ready().is_err() {
                 if json {
                     let resp = serde_json::json!({
                         "ok": false,
-                        "error": format!("Browser initialization failed: {e}"),
+                        "error": "Browser runtime readiness validation failed",
                         "error_code": "E_BROWSER_NOT_READY",
-                        "hint": "Check that Playwright is installed: npx playwright install chromium",
+                        "hint": "Ensure Node can resolve the 'playwright' module and its Chromium browser bundle is installed",
                     });
                     println!("{}", serde_json::to_string_pretty(&resp)?);
                 } else {
-                    eprintln!("Error: Browser initialization failed: {e}");
-                    eprintln!("Hint: npx playwright install chromium");
+                    eprintln!("Error: Browser runtime readiness validation failed");
+                    eprintln!(
+                        "Hint: Ensure Node can resolve the 'playwright' module and its Chromium browser bundle is installed"
+                    );
                 }
                 std::process::exit(1);
             }
 
-            let profile = ctx.profile(&service, &account);
-
-            let mut bootstrap_config = BootstrapConfig::default();
-            if let Some(url) = &login_url {
-                bootstrap_config.login_url.clone_from(url);
-            }
-            bootstrap_config.timeout_ms = timeout_secs * 1000;
-
             if !json {
-                println!("Starting interactive bootstrap for {service}/{account}");
-                println!("  Login URL: {}", bootstrap_config.login_url);
+                println!(
+                    "Starting interactive bootstrap for {}/{}",
+                    auth_identity_for_display(&service),
+                    auth_identity_for_display(&account)
+                );
+                println!("  Login URL: configured");
                 println!("  Timeout: {timeout_secs}s");
                 println!();
                 println!("A browser window will open. Complete login manually.");
@@ -73765,7 +74115,7 @@ async fn handle_auth_command(
             }
 
             let bootstrap = InteractiveBootstrap::new(bootstrap_config);
-            let result = bootstrap.execute(&ctx, &profile, login_url.as_deref());
+            let result = bootstrap.execute(&ctx, &profile, None);
 
             match &result {
                 BootstrapResult::Success {
@@ -73779,17 +74129,32 @@ async fn handle_auth_command(
                             "service": service,
                             "account": account,
                             "elapsed_ms": elapsed_ms,
-                            "profile_dir": profile_dir.display().to_string(),
+                            "profile_persisted": true,
                         });
                         println!("{}", serde_json::to_string_pretty(&resp)?);
                     } else {
-                        println!("✓ Bootstrap complete: {service}/{account}");
+                        println!(
+                            "✓ Bootstrap complete: {}/{}",
+                            auth_identity_for_display(&service),
+                            auth_identity_for_display(&account)
+                        );
                         println!("  Elapsed: {elapsed_ms}ms");
                         if verbose {
-                            println!("  Profile: {}", profile_dir.display());
+                            println!(
+                                "  Profile: {}",
+                                bounded_terminal_diagnostic(
+                                    &profile_dir.display().to_string(),
+                                    256,
+                                    1_024,
+                                )
+                            );
                         }
                         println!();
-                        println!("You can now run: ft auth test {service} --account {account}");
+                        println!(
+                            "You can now run auth test for: {}/{}",
+                            auth_identity_for_display(&service),
+                            auth_identity_for_display(&account)
+                        );
                     }
                 }
                 BootstrapResult::Timeout { waited_ms } => {
@@ -73805,8 +74170,10 @@ async fn handle_auth_command(
                         println!("{}", serde_json::to_string_pretty(&resp)?);
                     } else {
                         eprintln!(
-                            "✗ Bootstrap timed out after {}s: {service}/{account}",
-                            waited_ms / 1000
+                            "✗ Bootstrap timed out after {}s: {}/{}",
+                            waited_ms / 1000,
+                            auth_identity_for_display(&service),
+                            auth_identity_for_display(&account)
                         );
                         eprintln!(
                             "  Hint: Use --timeout-secs to increase (current: {timeout_secs}s)"
@@ -73825,8 +74192,12 @@ async fn handle_auth_command(
                         });
                         println!("{}", serde_json::to_string_pretty(&resp)?);
                     } else {
-                        println!("Bootstrap cancelled: {reason}");
+                        eprintln!(
+                            "Bootstrap cancelled: {}",
+                            bounded_terminal_diagnostic(reason, 256, 1_024)
+                        );
                     }
+                    std::process::exit(1);
                 }
                 BootstrapResult::Failed { error } => {
                     if json {
@@ -73840,8 +74211,15 @@ async fn handle_auth_command(
                         });
                         println!("{}", serde_json::to_string_pretty(&resp)?);
                     } else {
-                        eprintln!("✗ Bootstrap failed: {service}/{account}");
-                        eprintln!("  Error: {error}");
+                        eprintln!(
+                            "✗ Bootstrap failed: {}/{}",
+                            auth_identity_for_display(&service),
+                            auth_identity_for_display(&account)
+                        );
+                        eprintln!(
+                            "  Error: {}",
+                            bounded_terminal_diagnostic(error, 256, 1_024)
+                        );
                     }
                     std::process::exit(1);
                 }
@@ -73854,12 +74232,28 @@ async fn handle_auth_command(
 
 #[cfg(feature = "browser")]
 fn build_profile_status(profile: &frankenterm_core::browser::BrowserProfile) -> AuthProfileStatus {
-    let metadata = profile.read_metadata().ok().flatten();
+    let (metadata_state, metadata) = match profile.read_metadata() {
+        Ok(Some(metadata)) => (AuthEvidenceState::Valid, Some(metadata)),
+        Ok(None) => (AuthEvidenceState::Missing, None),
+        Err(_) => (AuthEvidenceState::InvalidOrUnavailable, None),
+    };
+    let storage_state = match profile.validate_storage_state() {
+        Ok(frankenterm_core::browser::StorageStateValidation::Valid) => {
+            AuthEvidenceState::Valid
+        }
+        Ok(frankenterm_core::browser::StorageStateValidation::Missing) => {
+            AuthEvidenceState::Missing
+        }
+        Err(_) => AuthEvidenceState::InvalidOrUnavailable,
+    };
     AuthProfileStatus {
-        service: profile.service.clone(),
-        account: profile.account.clone(),
+        service: profile.service().to_string(),
+        account: profile.account().to_string(),
         profile_exists: profile.exists(),
-        has_storage_state: profile.has_storage_state(),
+        storage_state,
+        metadata_state,
+        local_evidence_only: true,
+        profile_path: profile.path(),
         bootstrapped_at: metadata.as_ref().and_then(|m| m.bootstrapped_at.clone()),
         bootstrap_method: metadata.as_ref().and_then(|m| {
             m.bootstrap_method
@@ -73868,6 +74262,15 @@ fn build_profile_status(profile: &frankenterm_core::browser::BrowserProfile) -> 
         }),
         last_used_at: metadata.as_ref().and_then(|m| m.last_used_at.clone()),
         automated_use_count: metadata.map(|m| m.automated_use_count),
+    }
+}
+
+#[cfg(feature = "browser")]
+const fn auth_evidence_state_label(state: AuthEvidenceState) -> &'static str {
+    match state {
+        AuthEvidenceState::Missing => "missing",
+        AuthEvidenceState::Valid => "valid",
+        AuthEvidenceState::InvalidOrUnavailable => "invalid or unavailable",
     }
 }
 
@@ -76803,8 +77206,6 @@ fn wezterm_cli_list_command() -> std::process::Command {
 
 const WEZTERM_VERSION_MAX_STDOUT_BYTES: usize = 512;
 const WEZTERM_LIST_MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
-#[cfg(feature = "browser")]
-const PLAYWRIGHT_VERSION_MAX_STDOUT_BYTES: usize = 512;
 const DIAGNOSTIC_COMMAND_MAX_STDERR_BYTES: usize = 16 * 1024;
 const DIAGNOSTIC_COMMAND_PIPE_DRAIN_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(500);
@@ -76827,14 +77228,6 @@ const LOGS_DIRECTORY_MISSING_DETAIL: &str =
     "shape check: configured logs directory does not exist";
 
 #[cfg(feature = "browser")]
-const BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE: usize = 256;
-
-#[cfg(feature = "browser")]
-const fn browser_diagnostic_entry_is_within_budget(entries_examined: usize) -> bool {
-    entries_examined < BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE
-}
-
-#[cfg(feature = "browser")]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct BrowserProfileDiagnosticCounts {
     entries_examined: usize,
@@ -76850,10 +77243,7 @@ struct BrowserProfileDiagnosticCounts {
 impl BrowserProfileDiagnosticCounts {
     fn detail(self) -> String {
         let scan = if self.truncated {
-            format!(
-                "truncated_at_{}_entries; omitted_entries=unknown",
-                BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE
-            )
+            "truncated_at_profile_discovery_limit; omitted_entries=unknown".to_string()
         } else {
             "complete".to_string()
         };
@@ -76878,7 +77268,6 @@ impl BrowserProfileDiagnosticCounts {
 #[cfg(feature = "browser")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowserProfileDiagnosticScan {
-    DirectoryMissing,
     DirectoryUnavailable,
     Observed(BrowserProfileDiagnosticCounts),
 }
@@ -76888,82 +77277,21 @@ fn scan_browser_profiles_for_diagnostics(
     profiles_root: &Path,
     service: &str,
 ) -> BrowserProfileDiagnosticScan {
-    let profiles_directory = match open_diagnostic_directory_nofollow(profiles_root) {
-        Ok(directory) => directory,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return BrowserProfileDiagnosticScan::DirectoryMissing;
-        }
+    let discovery = match frankenterm_core::browser::discover_browser_profiles_for_service_bounded(
+        profiles_root,
+        service,
+    ) {
+        Ok(discovery) => discovery,
         Err(_) => return BrowserProfileDiagnosticScan::DirectoryUnavailable,
     };
-    let mut options = cap_std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .follow(FollowSymlinks::No)
-        .maybe_dir(true);
-    let service_directory = match profiles_directory.open_with(service, &options) {
-        Ok(directory) => directory,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return BrowserProfileDiagnosticScan::DirectoryMissing;
-        }
-        Err(_) => return BrowserProfileDiagnosticScan::DirectoryUnavailable,
+    let mut counts = BrowserProfileDiagnosticCounts {
+        entries_examined: discovery.entries_examined,
+        profiles_observed: discovery.profiles.len(),
+        entries_unclassified: discovery.unclassified_entries,
+        truncated: discovery.truncated,
+        ..BrowserProfileDiagnosticCounts::default()
     };
-    if !service_directory
-        .metadata()
-        .is_ok_and(|metadata| metadata.is_dir())
-    {
-        return BrowserProfileDiagnosticScan::DirectoryUnavailable;
-    }
-    let service_directory = cap_std::fs::Dir::from_std_file(service_directory.into_std());
-    let entries = match service_directory.entries() {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return BrowserProfileDiagnosticScan::DirectoryMissing;
-        }
-        Err(_) => return BrowserProfileDiagnosticScan::DirectoryUnavailable,
-    };
-
-    let mut counts = BrowserProfileDiagnosticCounts::default();
-    for entry_result in entries {
-        if !browser_diagnostic_entry_is_within_budget(counts.entries_examined) {
-            counts.truncated = true;
-            break;
-        }
-        counts.entries_examined = counts.entries_examined.saturating_add(1);
-
-        let entry = match entry_result {
-            Ok(entry) => entry,
-            Err(_) => {
-                counts.entries_unclassified = counts.entries_unclassified.saturating_add(1);
-                continue;
-            }
-        };
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(_) => {
-                counts.entries_unclassified = counts.entries_unclassified.saturating_add(1);
-                continue;
-            }
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-
-        counts.profiles_observed = counts.profiles_observed.saturating_add(1);
-        let account_name = entry.file_name();
-        let Some(account) = account_name.to_str() else {
-            counts.metadata_unknown = counts.metadata_unknown.saturating_add(1);
-            continue;
-        };
-        let profile = frankenterm_core::browser::BrowserProfile::new(
-            profiles_root,
-            service,
-            account,
-        );
-        if profile.service != service || profile.account != account {
-            counts.metadata_unknown = counts.metadata_unknown.saturating_add(1);
-            continue;
-        }
-
+    for profile in discovery.profiles {
         match profile.read_metadata() {
             Ok(Some(metadata)) if metadata.bootstrapped_at.is_some() => {
                 counts.bootstrapped = counts.bootstrapped.saturating_add(1);
@@ -76972,8 +77300,11 @@ fn scan_browser_profiles_for_diagnostics(
                 counts.known_unbootstrapped =
                     counts.known_unbootstrapped.saturating_add(1);
             }
-            Ok(None) | Err(_) => {
+            Ok(None) => {
                 counts.metadata_unknown = counts.metadata_unknown.saturating_add(1);
+            }
+            Err(_) => {
+                counts.entries_unclassified = counts.entries_unclassified.saturating_add(1);
             }
         }
     }
@@ -76987,10 +77318,6 @@ fn browser_profile_diagnostic_check(
     scan: BrowserProfileDiagnosticScan,
 ) -> DiagnosticCheck {
     match scan {
-        BrowserProfileDiagnosticScan::DirectoryMissing => DiagnosticCheck::ok_with_detail(
-            check_name,
-            "profile directory absent; profiles_observed=0; scan=complete",
-        ),
         BrowserProfileDiagnosticScan::DirectoryUnavailable => DiagnosticCheck::warning(
             check_name,
             "profile directory could not be inspected safely",
@@ -77546,15 +77873,6 @@ impl SingleLineOutputAdmissionError {
         }
     }
 
-    #[cfg(feature = "browser")]
-    const fn playwright_diagnostic_detail(self) -> &'static str {
-        match self {
-            Self::Oversized => "Playwright version output exceeded the safety limit",
-            Self::InvalidEncoding => "Playwright returned invalid version text",
-            Self::Empty => "Playwright returned no version text",
-            Self::ContainsControl => "Playwright returned unsafe control characters",
-        }
-    }
 }
 
 fn admit_single_line_output(
@@ -77597,47 +77915,6 @@ impl WeztermListProbeFailure {
             Self::Oversized => "CLI pane list exceeded the safety limit",
             Self::StderrOversized => "CLI diagnostic output exceeded the safety limit",
             Self::Io => "CLI probe could not be completed",
-        }
-    }
-}
-
-#[cfg(feature = "browser")]
-fn playwright_local_version_command() -> std::process::Command {
-    let mut command = std::process::Command::new("npx");
-    // `--no-install` is retained by modern npx as the compatibility spelling
-    // for declining package installation. `--offline` additionally fails
-    // closed before registry access, including on npm versions that translate
-    // the former flag internally.
-    command.args([
-        "--no-install",
-        "--offline",
-        "playwright",
-        "--version",
-    ]);
-    command
-}
-
-#[cfg(feature = "browser")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlaywrightProbeFailure {
-    NonSuccess,
-    StderrOversized,
-    Io,
-}
-
-#[cfg(feature = "browser")]
-impl PlaywrightProbeFailure {
-    fn from_io_error(_error: &std::io::Error) -> Self {
-        Self::Io
-    }
-
-    const fn diagnostic_detail(self) -> &'static str {
-        match self {
-            Self::NonSuccess => "local Playwright probe returned a non-success status",
-            Self::StderrOversized => {
-                "local Playwright diagnostic output exceeded the safety limit"
-            }
-            Self::Io => "local Playwright probe could not be completed",
         }
     }
 }
@@ -78155,75 +78432,19 @@ fn run_diagnostics(
     {
         // Profile directory check only — no browser launch needed
 
-        // Check: Playwright available
-        match run_cmd_with_timeout(
-            &mut playwright_local_version_command(),
-            wezterm_timeout,
-            PLAYWRIGHT_VERSION_MAX_STDOUT_BYTES,
-            DIAGNOSTIC_COMMAND_MAX_STDERR_BYTES,
-        ) {
-            Ok(output) if output.stdout.overflowed => {
-                checks.push(DiagnosticCheck::warning(
-                    "Playwright",
-                    SingleLineOutputAdmissionError::Oversized.playwright_diagnostic_detail(),
-                    "Install Playwright locally before using browser automation",
-                ));
-            }
-            Ok(output) if output.stderr.overflowed => {
-                checks.push(DiagnosticCheck::warning(
-                    "Playwright",
-                    PlaywrightProbeFailure::StderrOversized.diagnostic_detail(),
-                    "Inspect the local Playwright installation without exposing raw diagnostics",
-                ));
-            }
-            Ok(output) if output.status.success() => {
-                match admit_single_line_output(&output.stdout) {
-                    Ok(version) => {
-                        checks.push(DiagnosticCheck::ok_with_detail(
-                            "Playwright",
-                            bounded_terminal_diagnostic(version, 128, 256),
-                        ));
-                    }
-                    Err(error) => {
-                        checks.push(DiagnosticCheck::warning(
-                            "Playwright",
-                            error.playwright_diagnostic_detail(),
-                            "Install Playwright locally before using browser automation",
-                        ));
-                    }
-                }
-            }
-            Ok(output) => {
-                tracing::debug!(
-                    exit_code = ?output.status.code(),
-                    stderr_overflowed = output.stderr.overflowed,
-                    retained_stderr_bytes = output.stderr.bytes.len(),
-                    "local Playwright probe returned a non-success status"
-                );
-                checks.push(DiagnosticCheck::warning(
-                    "Playwright",
-                    PlaywrightProbeFailure::NonSuccess.diagnostic_detail(),
-                    "Install Playwright locally before using browser automation",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-                checks.push(DiagnosticCheck::warning(
-                    "Playwright",
-                    "local Playwright probe timed out",
-                    "Check the local Node.js and Playwright installation",
-                ));
-            }
-            Err(error) => {
-                tracing::debug!(
-                    error_kind = ?error.kind(),
-                    "local Playwright probe could not be completed"
-                );
-                checks.push(DiagnosticCheck::warning(
-                    "Playwright",
-                    PlaywrightProbeFailure::from_io_error(&error).diagnostic_detail(),
-                    "Install Node.js and Playwright locally before using browser automation",
-                ));
-            }
+        // Check the exact Node-module capability used by auth flows. This
+        // loads Playwright and inspects Chromium's persistent-context entry
+        // point, but never launches a browser.
+        match frankenterm_core::browser::probe_playwright_chromium_capability(wezterm_timeout) {
+            Ok(()) => checks.push(DiagnosticCheck::ok_with_detail(
+                "Playwright",
+                "exact Chromium persistent-context capability is available",
+            )),
+            Err(error) => checks.push(DiagnosticCheck::warning(
+                "Playwright",
+                error.detail(),
+                "Ensure Node can resolve the 'playwright' module and its Chromium browser bundle is installed",
+            )),
         }
 
         // Check browser profiles for each service
@@ -93842,17 +94063,26 @@ log_level = "debug"
         use super::*;
 
         #[test]
-        fn auth_test_outcome_success_json() {
-            let outcome = AuthTestOutcome::Success {
+        fn auth_status_all_rejects_an_account_selector_instead_of_ignoring_it() {
+            assert!(
+                Cli::try_parse_from(["ft", "auth", "status", "--all", "--account", "work"])
+                    .is_err()
+            );
+            assert!(Cli::try_parse_from(["ft", "auth", "status", "--all"]).is_ok());
+        }
+
+        #[test]
+        fn auth_test_outcome_local_state_ready_is_explicitly_not_live_auth() {
+            let outcome = AuthTestOutcome::LocalStateReady {
                 service: "openai".into(),
                 account: "default".into(),
-                elapsed_ms: Some(1234),
-                last_bootstrapped: Some("2025-01-01T00:00:00Z".into()),
+                live_auth_verified: false,
+                last_bootstrapped: "2025-01-01T00:00:00Z".into(),
             };
             let json = serde_json::to_string(&outcome).unwrap();
-            assert!(json.contains(r#""outcome":"success""#));
+            assert!(json.contains(r#""outcome":"local_state_ready""#));
             assert!(json.contains(r#""service":"openai""#));
-            assert!(json.contains(r#""elapsed_ms":1234"#));
+            assert!(json.contains(r#""live_auth_verified":false"#));
         }
 
         #[test]
@@ -93897,25 +94127,15 @@ log_level = "debug"
         }
 
         #[test]
-        fn auth_test_outcome_success_omits_none_fields() {
-            let outcome = AuthTestOutcome::Success {
-                service: "openai".into(),
-                account: "default".into(),
-                elapsed_ms: None,
-                last_bootstrapped: None,
-            };
-            let json = serde_json::to_string(&outcome).unwrap();
-            assert!(!json.contains("elapsed_ms"));
-            assert!(!json.contains("last_bootstrapped"));
-        }
-
-        #[test]
         fn auth_profile_status_serialization() {
             let status = AuthProfileStatus {
                 service: "openai".into(),
                 account: "default".into(),
                 profile_exists: true,
-                has_storage_state: true,
+                storage_state: AuthEvidenceState::Valid,
+                metadata_state: AuthEvidenceState::Valid,
+                local_evidence_only: true,
+                profile_path: PathBuf::from("/redacted-test-profile"),
                 bootstrapped_at: Some("2025-06-01T00:00:00Z".into()),
                 bootstrap_method: Some("interactive".into()),
                 last_used_at: Some("2025-06-02T00:00:00Z".into()),
@@ -93923,8 +94143,12 @@ log_level = "debug"
             };
             let json = serde_json::to_string_pretty(&status).unwrap();
             assert!(json.contains(r#""profile_exists": true"#));
-            assert!(json.contains(r#""has_storage_state": true"#));
+            assert!(json.contains(r#""storage_state": "valid""#));
+            assert!(json.contains(r#""metadata_state": "valid""#));
+            assert!(json.contains(r#""local_evidence_only": true"#));
             assert!(json.contains(r#""automated_use_count": 42"#));
+            assert!(!json.contains("redacted-test-profile"));
+            assert!(!json.contains("profile_path"));
         }
 
         #[test]
@@ -93933,7 +94157,10 @@ log_level = "debug"
                 service: "openai".into(),
                 account: "default".into(),
                 profile_exists: false,
-                has_storage_state: false,
+                storage_state: AuthEvidenceState::Missing,
+                metadata_state: AuthEvidenceState::Missing,
+                local_evidence_only: true,
+                profile_path: PathBuf::from("/redacted-test-profile"),
                 bootstrapped_at: None,
                 bootstrap_method: None,
                 last_used_at: None,
@@ -93944,15 +94171,16 @@ log_level = "debug"
             assert!(!json.contains("bootstrap_method"));
             assert!(!json.contains("last_used_at"));
             assert!(!json.contains("automated_use_count"));
+            assert!(!json.contains("redacted-test-profile"));
+            assert!(!json.contains("profile_path"));
         }
 
         #[test]
         fn build_profile_status_no_profile() {
-            let tmp = std::env::temp_dir().join(format!("wa_auth_test_{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&tmp);
+            let tmp = tempfile::tempdir().expect("isolated auth-profile root");
 
             let profile = frankenterm_core::browser::BrowserProfile::new(
-                &tmp,
+                tmp.path(),
                 "nonexistent_service",
                 "nonexistent_account",
             );
@@ -93961,38 +94189,40 @@ log_level = "debug"
             assert_eq!(status.service, "nonexistent_service");
             assert_eq!(status.account, "nonexistent_account");
             assert!(!status.profile_exists);
-            assert!(!status.has_storage_state);
+            assert_eq!(status.storage_state, AuthEvidenceState::Missing);
+            assert_eq!(status.metadata_state, AuthEvidenceState::Missing);
+            assert!(status.local_evidence_only);
             assert!(status.bootstrapped_at.is_none());
             assert!(status.bootstrap_method.is_none());
-
-            let _ = std::fs::remove_dir_all(&tmp);
         }
 
         #[test]
         fn build_profile_status_with_profile_dir() {
-            let tmp =
-                std::env::temp_dir().join(format!("wa_auth_test_profile_{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&tmp);
+            let tmp = tempfile::tempdir().expect("isolated auth-profile root");
 
-            let profile =
-                frankenterm_core::browser::BrowserProfile::new(&tmp, "testservice", "testaccount");
+            let profile = frankenterm_core::browser::BrowserProfile::new(
+                tmp.path(),
+                "testservice",
+                "testaccount",
+            );
             let _ = profile.ensure_dir();
 
             let status = build_profile_status(&profile);
             assert!(status.profile_exists);
-            assert!(!status.has_storage_state);
+            assert_eq!(status.storage_state, AuthEvidenceState::Missing);
+            assert_eq!(status.metadata_state, AuthEvidenceState::Missing);
             assert!(status.bootstrapped_at.is_none());
-
-            let _ = std::fs::remove_dir_all(&tmp);
         }
 
         #[test]
         fn build_profile_status_with_metadata() {
-            let tmp =
-                std::env::temp_dir().join(format!("wa_auth_test_meta_{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&tmp);
+            let tmp = tempfile::tempdir().expect("isolated auth-profile root");
 
-            let profile = frankenterm_core::browser::BrowserProfile::new(&tmp, "openai", "default");
+            let profile = frankenterm_core::browser::BrowserProfile::new(
+                tmp.path(),
+                "openai",
+                "default",
+            );
             let _ = profile.ensure_dir();
 
             let mut metadata = frankenterm_core::browser::ProfileMetadata::new("openai", "default");
@@ -94002,29 +94232,124 @@ log_level = "debug"
 
             let status = build_profile_status(&profile);
             assert!(status.profile_exists);
+            assert_eq!(status.metadata_state, AuthEvidenceState::Valid);
             assert!(status.bootstrapped_at.is_some());
             assert_eq!(status.bootstrap_method.as_deref(), Some("interactive"));
             assert!(status.last_used_at.is_some());
             assert_eq!(status.automated_use_count, Some(1));
-
-            let _ = std::fs::remove_dir_all(&tmp);
         }
 
         #[test]
         fn build_profile_status_with_storage_state() {
-            let tmp =
-                std::env::temp_dir().join(format!("wa_auth_test_storage_{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&tmp);
+            let tmp = tempfile::tempdir().expect("isolated auth-profile root");
 
-            let profile = frankenterm_core::browser::BrowserProfile::new(&tmp, "openai", "default");
+            let profile = frankenterm_core::browser::BrowserProfile::new(
+                tmp.path(),
+                "openai",
+                "default",
+            );
             let _ = profile.ensure_dir();
-            let _ = profile.save_storage_state(b"{\"cookies\": []}");
+            profile
+                .save_storage_state(br#"{"cookies":[],"origins":[]}"#)
+                .expect("valid bounded storage-state fixture");
 
             let status = build_profile_status(&profile);
             assert!(status.profile_exists);
-            assert!(status.has_storage_state);
+            assert_eq!(status.storage_state, AuthEvidenceState::Valid);
+            assert!(matches!(
+                classify_auth_profile_evidence(&profile, "openai", "default"),
+                AuthTestOutcome::Fail { ref error, .. }
+                    if error == "Persisted browser state has incomplete matching metadata"
+            ));
+        }
 
-            let _ = std::fs::remove_dir_all(&tmp);
+        #[test]
+        fn classify_auth_profile_evidence_reaches_local_ready_from_a_real_bound_pair() {
+            let tmp = tempfile::tempdir().expect("isolated auth-profile root");
+            let profile = frankenterm_core::browser::BrowserProfile::try_new(
+                tmp.path(),
+                "openai",
+                "default",
+            )
+            .expect("valid profile identity");
+            profile
+                .record_authenticated_state(
+                    br#"{"cookies":[],"origins":[]}"#,
+                    frankenterm_core::browser::BootstrapMethod::Interactive,
+                )
+                .expect("commit bound state and metadata");
+            let expected_timestamp = profile
+                .read_metadata()
+                .expect("read committed metadata")
+                .and_then(|metadata| metadata.bootstrapped_at)
+                .expect("interactive commit records bootstrap time");
+
+            assert!(matches!(
+                classify_auth_profile_evidence(&profile, "openai", "default"),
+                AuthTestOutcome::LocalStateReady {
+                    ref service,
+                    ref account,
+                    live_auth_verified: false,
+                    ref last_bootstrapped,
+                } if service == "openai"
+                    && account == "default"
+                    && last_bootstrapped == &expected_timestamp
+            ));
+        }
+
+        #[test]
+        fn classify_auth_profile_evidence_rejects_bad_metadata_even_without_state() {
+            let tmp = tempfile::tempdir().expect("isolated auth-profile root");
+            let profile = frankenterm_core::browser::BrowserProfile::try_new(
+                tmp.path(),
+                "openai",
+                "default",
+            )
+            .expect("valid profile identity");
+            profile.ensure_dir().expect("create private profile directory");
+            std::fs::write(profile.metadata_path(), b"{not-json")
+                .expect("write malformed metadata fixture");
+
+            assert!(matches!(
+                classify_auth_profile_evidence(&profile, "openai", "default"),
+                AuthTestOutcome::Fail { ref error, .. }
+                    if error == "Profile metadata is invalid or unavailable"
+            ));
+        }
+
+        #[test]
+        fn auth_timeout_conversion_is_checked_and_finite() {
+            assert_eq!(auth_browser_timeout_ms(0), None);
+            assert_eq!(auth_browser_timeout_ms(1), Some(1_000));
+            assert_eq!(
+                auth_browser_timeout_ms(AUTH_BROWSER_TIMEOUT_MAX_SECS),
+                Some(1_800_000)
+            );
+            assert_eq!(
+                auth_browser_timeout_ms(AUTH_BROWSER_TIMEOUT_MAX_SECS + 1),
+                None
+            );
+            assert_eq!(auth_browser_timeout_ms(u64::MAX), None);
+        }
+
+        #[test]
+        fn auth_status_report_exposes_incomplete_scan_and_live_auth_nonclaim() {
+            let report = AuthStatusReport {
+                profiles: Vec::new(),
+                scan: AuthStatusScan {
+                    scope: "all_profiles",
+                    entries_examined: 4096,
+                    metadata_bytes_examined: 1024,
+                    unclassified_entries: 2,
+                    truncated: true,
+                    complete: false,
+                },
+                live_auth_verified: false,
+            };
+            let json = serde_json::to_string(&report).unwrap();
+            assert!(json.contains(r#""truncated":true"#));
+            assert!(json.contains(r#""complete":false"#));
+            assert!(json.contains(r#""live_auth_verified":false"#));
         }
     }
 
@@ -100360,118 +100685,141 @@ A  docs/new-proof.md\n";
     #[cfg(feature = "session-resume")]
     #[test]
     fn robot_session_resume_list_data_reads_native_agy_without_casr() {
-        use std::fs;
+        run_async_test(async {
+            use std::fs;
 
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let conversation_id = "123e4567-e89b-12d3-a456-426614174000";
-        let conversations = temp_dir
-            .path()
-            .join(".gemini/antigravity-cli/conversations");
-        fs::create_dir_all(&conversations).expect("create conversations dir");
-        fs::write(
-            conversations.join(format!("{conversation_id}.db")),
-            b"SQLite fixture",
-        )
-        .expect("write db fixture");
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let conversation_id = "123e4567-e89b-12d3-a456-426614174000";
+            let conversations = temp_dir
+                .path()
+                .join(".gemini/antigravity-cli/conversations");
+            fs::create_dir_all(&conversations).expect("create conversations dir");
+            fs::write(
+                conversations.join(format!("{conversation_id}.db")),
+                b"SQLite format 3\0fixture",
+            )
+            .expect("write db fixture");
+            let cx = frankenterm_core::cx::for_testing();
 
-        let data = build_robot_session_resume_list_data(
-            Some("agy".to_string()),
-            Some(temp_dir.path().to_path_buf()),
-            "/missing/casr".to_string(),
-            1,
-        )
-        .expect("agy listing should not require casr");
+            let data = build_robot_session_resume_list_data(
+                &cx,
+                Some("agy".to_string()),
+                Some(temp_dir.path().to_path_buf()),
+                "/missing/casr".to_string(),
+                1,
+            )
+            .await
+            .expect("agy listing should not require casr");
 
-        assert_eq!(
-            data.schema_version,
-            ROBOT_SESSION_RESUME_LIST_SCHEMA_VERSION
-        );
-        assert_eq!(data.provider_filter.as_deref(), Some("agy"));
-        assert_eq!(data.count, 1);
-        assert!(data.warnings.is_empty());
-        let entry = &data.sessions[0];
-        assert_eq!(entry.provider, "agy");
-        assert_eq!(entry.session_id, conversation_id);
-        assert_eq!(entry.resume_kind, "native");
-        assert_eq!(
-            entry.native_resume_command.as_ref().expect("native argv"),
-            &vec![
-                "agy".to_string(),
-                "--conversation".to_string(),
-                conversation_id.to_string(),
-                "--model".to_string(),
-                frankenterm_core::session_resume::ANTIGRAVITY_MODEL.to_string(),
-            ]
-        );
+            assert_eq!(
+                data.schema_version,
+                ROBOT_SESSION_RESUME_LIST_SCHEMA_VERSION
+            );
+            assert_eq!(data.provider_filter.as_deref(), Some("agy"));
+            assert_eq!(data.count, 1);
+            assert!(data.discovery_complete);
+            assert!(data.incomplete.is_empty());
+            assert!(data.warnings.is_empty());
+            let entry = &data.sessions[0];
+            assert_eq!(entry.provider, "agy");
+            assert_eq!(entry.session_id, conversation_id);
+            assert_eq!(entry.resume_kind, "native");
+            assert_eq!(
+                entry.native_resume_command.as_ref().expect("native argv"),
+                &vec![
+                    "agy".to_string(),
+                    "--conversation".to_string(),
+                    conversation_id.to_string(),
+                    "--model".to_string(),
+                    frankenterm_core::session_resume::ANTIGRAVITY_MODEL.to_string(),
+                ]
+            );
+        });
     }
 
     #[cfg(feature = "session-resume")]
     #[test]
-    fn robot_session_resume_native_runner_uses_bounded_tree_supervision() {
-        use frankenterm_core::runtime_async::process::{
-            CommandOutputLimitExceeded, CommandOutputStream,
-        };
-        use frankenterm_core::session_resume::SessionResumeError;
+    fn robot_session_resume_native_is_plan_only_until_mux_pty_ownership_exists() {
+        run_async_test(async {
+            use std::fs;
 
-        let limit_error = CommandOutputLimitExceeded::new(
-            CommandOutputStream::Stdout,
-            ROBOT_SESSION_RESUME_NATIVE_MAX_STDOUT_BYTES.saturating_add(1),
-            ROBOT_SESSION_RESUME_NATIVE_MAX_STDOUT_BYTES,
-        )
-        .into_io_error();
-        let mapped = robot_session_resume_native_command_error(&limit_error);
-        assert!(matches!(
-            mapped,
-            SessionResumeError::SubprocessFailed { code: None, ref stderr }
-                if stderr.contains("stdout capture limit exceeded")
-                    && stderr.contains("16777216")
-        ));
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let conversation_id = "123e4567-e89b-12d3-a456-426614174000";
+            let conversations = temp_dir
+                .path()
+                .join(".gemini/antigravity-cli/conversations");
+            fs::create_dir_all(&conversations).expect("create conversations dir");
+            fs::write(
+                conversations.join(format!("{conversation_id}.db")),
+                b"SQLite format 3\0fixture",
+            )
+            .expect("write db fixture");
+            let cx = frankenterm_core::cx::for_testing();
 
-        let injected = std::io::Error::other("/private/AKIAIOSFODNN7EXAMPLE\n\u{202e}");
-        let rendered = robot_session_resume_native_command_error(&injected).to_string();
-        assert!(!rendered.contains("AKIAIOSFODNN7EXAMPLE"));
-        assert!(!rendered.contains('/'));
-        assert!(!rendered.contains('\n'));
-        assert!(!rendered.contains('\u{202e}'));
+            let error = build_robot_session_resume_resume_data(
+                &cx,
+                conversation_id.to_string(),
+                "agy".to_string(),
+                false,
+                Some(temp_dir.path().to_path_buf()),
+                "/missing/casr".to_string(),
+                1,
+            )
+            .await
+            .expect_err("native execution without an owned mux PTY must fail closed");
+            assert_eq!(
+                error,
+                frankenterm_core::session_resume::SessionResumeError::NativeInteractiveTerminalRequired
+            );
 
-        let source = include_str!("main.rs");
-        let start = source
-            .find("fn robot_session_resume_run_native(")
-            .expect("native runner source");
-        let tail = &source[start..];
-        let end = tail
-            .find("\n}\n\n#[cfg(feature = \"session-resume\")]\nfn build_robot_session_resume_resume_data")
-            .expect("native runner source boundary");
-        let body = &tail[..end];
-        assert!(body.contains("output_blocking"));
-        assert!(body.contains("ROBOT_SESSION_RESUME_NATIVE_MAX_STDOUT_BYTES"));
-        assert!(body.contains("ROBOT_SESSION_RESUME_NATIVE_MAX_STDERR_BYTES"));
-        assert!(!body.contains("std::process::Command"));
-        assert!(!body.contains("try_wait"));
-        assert!(!body.contains("wait_with_output"));
-        assert!(!body.contains("child.kill"));
-
-        let bytes = b"bounded native output".to_vec();
-        let allocation = bytes.as_ptr();
-        let text = robot_session_resume_output_text(bytes).expect("non-empty output");
-        assert_eq!(text, "bounded native output");
-        assert_eq!(text.as_ptr(), allocation);
-        assert_eq!(
-            robot_session_resume_output_text(vec![0xff]).as_deref(),
-            Some("�")
-        );
+            let plan = build_robot_session_resume_resume_data(
+                &cx,
+                conversation_id.to_string(),
+                "agy".to_string(),
+                true,
+                Some(temp_dir.path().to_path_buf()),
+                "/missing/casr".to_string(),
+                1,
+            )
+            .await
+            .expect("dry-run must return the exact native command plan without executing it");
+            assert_eq!(plan.schema_version, "ft.robot.session_resume.resume.v2");
+            assert!(plan.dry_run);
+            assert_eq!(plan.resume_kind, "native");
+            assert_eq!(plan.command_argv[0], "agy");
+            assert!(plan.casr_resume.is_none());
+        });
     }
 
     #[cfg(feature = "session-resume")]
     #[test]
     fn robot_session_resume_cancel_and_incomplete_failures_have_stable_codes() {
-        use frankenterm_core::session_resume::SessionResumeError;
+        use frankenterm_core::session_resume::{
+            ResumeEffectIndeterminateCause, SessionResumeError,
+        };
 
         let cancelled = robot_session_resume_error_response::<serde_json::Value>(
             SessionResumeError::Cancelled,
             7,
         );
         assert_eq!(cancelled.error_code.as_deref(), Some(ROBOT_ERR_SESSION_RESUME_CANCELLED));
+
+        let indeterminate = robot_session_resume_error_response::<serde_json::Value>(
+            SessionResumeError::ResumeEffectIndeterminate {
+                cause: ResumeEffectIndeterminateCause::Cancelled,
+            },
+            8,
+        );
+        assert_eq!(
+            indeterminate.error_code.as_deref(),
+            Some(ROBOT_ERR_SESSION_RESUME_EFFECT_INDETERMINATE)
+        );
+        assert!(
+            indeterminate
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("Do not retry automatically"))
+        );
 
         let incomplete = robot_session_resume_error_response::<serde_json::Value>(
             SessionResumeError::CaptureIncomplete {
@@ -103425,60 +103773,36 @@ A  docs/new-proof.md\n";
 
     #[cfg(feature = "browser")]
     #[test]
-    fn diagnostic_playwright_probe_is_offline_and_non_installing() {
-        let mut command = playwright_local_version_command();
-        configure_diagnostic_command(&mut command)
-            .expect("configure Playwright diagnostic process group");
-        assert_eq!(command.get_program(), "npx");
-        let args: Vec<String> = command
-            .get_args()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            args,
-            vec![
-                "--no-install".to_string(),
-                "--offline".to_string(),
-                "playwright".to_string(),
-                "--version".to_string(),
-            ]
-        );
-    }
+    fn diagnostic_playwright_probe_reuses_exact_auth_capability_and_safe_details() {
+        use frankenterm_core::browser::PlaywrightCapabilityProbeError;
 
-    #[cfg(feature = "browser")]
-    #[test]
-    fn diagnostic_playwright_output_and_failures_are_admitted_safely() {
-        let output = BoundedCommandStream {
-            bytes: b"Version 1.55.0\n".to_vec(),
-            overflowed: false,
-        };
-        assert_eq!(admit_single_line_output(&output), Ok("Version 1.55.0"));
-
-        let secret_bearing = BoundedCommandStream {
-            bytes: b"Version AKIAIOSFODNN7EXAMPLE".to_vec(),
-            overflowed: false,
-        };
-        let public_detail = bounded_terminal_diagnostic(
-            admit_single_line_output(&secret_bearing).expect("admit bounded Playwright version"),
-            128,
-            256,
-        );
-        assert!(!public_detail.contains("AKIAIOSFODNN7EXAMPLE"));
-        assert!(public_detail.contains("[REDACTED]"));
-
-        let injected_io_error =
-            std::io::Error::other("AKIAIOSFODNN7EXAMPLE\n\u{202e}forged");
+        let _exact_probe = frankenterm_core::browser::probe_playwright_chromium_capability;
         for detail in [
-            PlaywrightProbeFailure::NonSuccess.diagnostic_detail(),
-            PlaywrightProbeFailure::StderrOversized.diagnostic_detail(),
-            PlaywrightProbeFailure::from_io_error(&injected_io_error).diagnostic_detail(),
+            PlaywrightCapabilityProbeError::InvalidTimeout.detail(),
+            PlaywrightCapabilityProbeError::TimedOut.detail(),
+            PlaywrightCapabilityProbeError::Unavailable.detail(),
+            PlaywrightCapabilityProbeError::MissingCapability.detail(),
+            PlaywrightCapabilityProbeError::InvalidOutput.detail(),
         ] {
             assert!(!detail.contains("AKIAIOSFODNN7EXAMPLE"));
             assert!(!detail.contains("forged"));
             assert!(!detail.contains('\n'));
             assert!(!detail.contains('\u{202e}'));
-            assert!(detail.len() <= 80);
+            assert!(detail.len() <= 96);
         }
+
+        let source = include_str!("main.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production source prefix");
+        let diagnostics = production
+            .split("fn run_diagnostics(")
+            .nth(1)
+            .expect("diagnostics source");
+        assert!(diagnostics.contains("probe_playwright_chromium_capability"));
+        assert!(!diagnostics.contains("playwright_local_version_command"));
+        assert!(!diagnostics.contains("npx"));
     }
 
     #[cfg(feature = "browser")]
@@ -103524,21 +103848,17 @@ A  docs/new-proof.md\n";
     #[cfg(feature = "browser")]
     #[test]
     fn diagnostic_browser_profile_incomplete_counts_never_claim_completeness() {
-        assert!(browser_diagnostic_entry_is_within_budget(
-            BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE.saturating_sub(1)
-        ));
-        assert!(!browser_diagnostic_entry_is_within_budget(
-            BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE
-        ));
+        let discovery_limit =
+            frankenterm_core::browser::BROWSER_PROFILE_DISCOVERY_MAX_ENTRIES;
         let exact_cap = BrowserProfileDiagnosticCounts {
-            entries_examined: BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE,
+            entries_examined: discovery_limit,
             truncated: false,
             ..BrowserProfileDiagnosticCounts::default()
         };
         assert!(exact_cap.detail().contains("scan=complete"));
 
         let incomplete = BrowserProfileDiagnosticCounts {
-            entries_examined: BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE,
+            entries_examined: discovery_limit,
             profiles_observed: 250,
             bootstrapped: 200,
             known_unbootstrapped: 25,
@@ -103552,11 +103872,11 @@ A  docs/new-proof.md\n";
         );
         assert_eq!(check.status, DiagnosticStatus::Warning);
         let detail = check.detail.expect("truncated scan detail");
-        assert!(detail.contains("entries_examined=256"));
+        assert!(detail.contains(&format!("entries_examined={discovery_limit}")));
         assert!(detail.contains("profiles_observed=250"));
         assert!(detail.contains("metadata_unknown=25"));
         assert!(detail.contains("entries_unclassified=3"));
-        assert!(detail.contains("scan=truncated_at_256_entries"));
+        assert!(detail.contains("scan=truncated_at_profile_discovery_limit"));
         assert!(detail.contains("omitted_entries=unknown"));
         assert!(!detail.contains('/'));
         assert!(!detail.contains('\\'));
@@ -103568,16 +103888,6 @@ A  docs/new-proof.md\n";
     #[cfg(feature = "browser")]
     #[test]
     fn diagnostic_browser_profile_directory_failures_are_content_free() {
-        let missing = browser_profile_diagnostic_check(
-            "Browser: Google",
-            BrowserProfileDiagnosticScan::DirectoryMissing,
-        );
-        assert_eq!(missing.status, DiagnosticStatus::Ok);
-        assert_eq!(
-            missing.detail.as_deref(),
-            Some("profile directory absent; profiles_observed=0; scan=complete")
-        );
-
         let unavailable = browser_profile_diagnostic_check(
             "Browser: Google",
             BrowserProfileDiagnosticScan::DirectoryUnavailable,

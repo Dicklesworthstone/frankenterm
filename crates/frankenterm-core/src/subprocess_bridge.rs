@@ -205,8 +205,8 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
     }
 
     fn resolve_binary(&self) -> Result<PathBuf, BridgeError> {
-        if self.binary_name.contains(std::path::MAIN_SEPARATOR) {
-            let direct = PathBuf::from(&self.binary_name);
+        let direct = PathBuf::from(&self.binary_name);
+        if direct.is_absolute() || direct.components().count() > 1 {
             if is_executable_file(&direct) {
                 return Ok(direct);
             }

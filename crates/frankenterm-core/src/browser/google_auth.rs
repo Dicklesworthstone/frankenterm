@@ -181,8 +181,48 @@ impl GoogleAuthFlow {
             };
         }
 
+        let target_url = auth_url.unwrap_or(&self.config.auth_url);
+        if super::admit_automated_auth_url(super::BrowserAuthService::Google, target_url).is_err() {
+            return AuthFlowResult::Failed {
+                error: AuthFlowFailureKind::PlaywrightError
+                    .stable_detail()
+                    .to_string(),
+                kind: AuthFlowFailureKind::PlaywrightError,
+                artifacts_dir: None,
+            };
+        }
+
         // Step 2: Resolve the browser profile
-        let profile = ctx.profile("google", account);
+        let profile = match ctx.try_profile("google", account) {
+            Ok(profile) => profile,
+            Err(_) => {
+                return AuthFlowResult::Failed {
+                    error: AuthFlowFailureKind::ProfileUnavailable
+                        .stable_detail()
+                        .to_string(),
+                    kind: AuthFlowFailureKind::ProfileUnavailable,
+                    artifacts_dir: None,
+                };
+            }
+        };
+        if self
+            .build_playwright_script_with_browser_config(
+                profile.path(),
+                target_url,
+                email,
+                None,
+                ctx.config(),
+            )
+            .is_err()
+        {
+            return AuthFlowResult::Failed {
+                error: AuthFlowFailureKind::PlaywrightError
+                    .stable_detail()
+                    .to_string(),
+                kind: AuthFlowFailureKind::PlaywrightError,
+                artifacts_dir: None,
+            };
+        }
         let profile_dir = match profile.ensure_dir() {
             Ok(path) => path,
             Err(_) => {
@@ -195,8 +235,20 @@ impl GoogleAuthFlow {
                 };
             }
         };
-
-        let target_url = auth_url.unwrap_or(&self.config.auth_url);
+        let profile_lock = match profile
+            .acquire_operation_lock(ctx.config().profile_lock_timeout_ms)
+        {
+            Ok(profile_lock) => profile_lock,
+            Err(_) => {
+                return AuthFlowResult::Failed {
+                    error: AuthFlowFailureKind::ProfileUnavailable
+                        .stable_detail()
+                        .to_string(),
+                    kind: AuthFlowFailureKind::ProfileUnavailable,
+                    artifacts_dir: None,
+                };
+            }
+        };
 
         tracing::info!("Starting Google OAuth auth flow");
         // NOTE: auth_url is intentionally NOT logged (may contain OAuth tokens)
@@ -204,6 +256,16 @@ impl GoogleAuthFlow {
         // Step 3: Build and run the Playwright script
         let start = std::time::Instant::now();
         let artifacts_dir = self.prepare_artifacts_dir();
+
+        if !profile_lock.is_current_for(&profile) {
+            return AuthFlowResult::Failed {
+                error: AuthFlowFailureKind::ProfileUnavailable
+                    .stable_detail()
+                    .to_string(),
+                kind: AuthFlowFailureKind::ProfileUnavailable,
+                artifacts_dir,
+            };
+        }
 
         let result =
             self.run_playwright_flow(
@@ -214,13 +276,27 @@ impl GoogleAuthFlow {
                 ctx.config(),
             );
 
+        if !profile_lock.is_current_for(&profile) {
+            return AuthFlowResult::Failed {
+                error: AuthFlowFailureKind::ProfileUnavailable
+                    .stable_detail()
+                    .to_string(),
+                kind: AuthFlowFailureKind::ProfileUnavailable,
+                artifacts_dir,
+            };
+        }
+
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         match result {
             Ok(outcome) => match outcome {
                 PlaywrightOutcome::Success { storage_state } => {
                     if profile
-                        .record_authenticated_state(&storage_state, BootstrapMethod::Automated)
+                        .record_authenticated_state_with_lock(
+                            &storage_state,
+                            BootstrapMethod::Automated,
+                            &profile_lock,
+                        )
                         .is_err()
                     {
                         return AuthFlowResult::Failed {
@@ -358,7 +434,7 @@ impl GoogleAuthFlow {
         super::admit_browser_timeout(self.config.flow_timeout_ms)?;
         super::admit_browser_timeout(browser_config.navigation_timeout_ms)?;
         super::admit_browser_timeout(browser_config.page_load_timeout_ms)?;
-        super::admit_browser_url(auth_url)?;
+        super::admit_automated_auth_url(super::BrowserAuthService::Google, auth_url)?;
         for selector_group in [
             &sel.signed_in_marker,
             &sel.email_input,
@@ -427,8 +503,19 @@ async function captureScreenshot(page, directory) {{
   }}
 }}
 
-function sameOrigin(left, right) {{
-  try {{ return new URL(left).origin === new URL(right).origin; }} catch (_) {{ return false; }}
+function matchesAuthDestination(currentValue, authValue) {{
+  try {{
+    const current = new URL(currentValue);
+    const expected = new URL(authValue);
+    if (current.origin !== expected.origin) return false;
+    if (expected.pathname === '/') return current.pathname === '/';
+    const expectedPath = expected.pathname.endsWith('/')
+      ? expected.pathname
+      : expected.pathname + '/';
+    return current.pathname === expected.pathname || current.pathname.startsWith(expectedPath);
+  }} catch (_) {{
+    return false;
+  }}
 }}
 
 (async () => {{
@@ -442,11 +529,11 @@ function sameOrigin(left, right) {{
   const selectors = input.selectors;
 
   async function finishSuccess() {{
-    if (!sameOrigin(page.url(), authUrl)) {{
+    if (!matchesAuthDestination(page.url(), authUrl)) {{
       console.log(JSON.stringify({{ status: 'error', kind: 'VerificationFailed' }}));
     }} else {{
       const state = await browser.storageState();
-      console.log(JSON.stringify({{ status: 'success', storage_state: JSON.stringify(state) }}));
+      console.log(JSON.stringify({{ status: 'success', storage_state: state }}));
     }}
     await browser.close();
     process.exit(0);
@@ -462,7 +549,13 @@ function sameOrigin(left, right) {{
     page.setDefaultTimeout(PAGE_LOAD_TIMEOUT);
 
     // Navigate to auth page
-    await page.goto(authUrl, {{ waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT }});
+    try {{
+      await page.goto(authUrl, {{ waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT }});
+    }} catch (_) {{
+      console.log(JSON.stringify({{ status: 'error', kind: 'NavigationFailed' }}));
+      await browser.close().catch(() => {{}});
+      process.exit(1);
+    }}
 
     // Wait for any redirects to settle
     await page.waitForTimeout(2000);
@@ -588,7 +681,11 @@ function sameOrigin(left, right) {{
     if (emailEl && email) {{
       await emailEl.fill(email);
       const emailNext = await page.$(selectors.email_next);
-      if (emailNext) await emailNext.click();
+      if (emailNext) {{
+        await emailNext.click();
+      }} else {{
+        await emailEl.press('Enter');
+      }}
 
       // Wait for navigation after email submission
       await page.waitForLoadState('domcontentloaded', {{ timeout: PAGE_LOAD_TIMEOUT }});
@@ -748,15 +845,20 @@ function sameOrigin(left, right) {{
             Some("success") => {
                 let storage_state = parsed
                     .get("storage_state")
-                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| value.is_object())
                     .ok_or_else(|| PlaywrightFlowError {
                         error: AuthFlowFailureKind::ProfilePersistenceFailed
                             .stable_detail()
                             .to_string(),
                         kind: AuthFlowFailureKind::ProfilePersistenceFailed,
-                    })?
-                    .as_bytes()
-                    .to_vec();
+                    })?;
+                let storage_state =
+                    serde_json::to_vec(storage_state).map_err(|_| PlaywrightFlowError {
+                        error: AuthFlowFailureKind::ProfilePersistenceFailed
+                            .stable_detail()
+                            .to_string(),
+                        kind: AuthFlowFailureKind::ProfilePersistenceFailed,
+                    })?;
                 Ok(PlaywrightOutcome::Success { storage_state })
             }
             Some("interactive_required") => {
@@ -912,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_with_custom_config() {
+    fn custom_origin_config_is_rejected_before_script_execution() {
         let config = GoogleAuthConfig {
             auth_url: "https://custom.google.com/oauth".to_string(),
             flow_timeout_ms: 30_000,
@@ -921,6 +1023,16 @@ mod tests {
         let flow = GoogleAuthFlow::new(config);
         assert_eq!(flow.config().auth_url, "https://custom.google.com/oauth");
         assert_eq!(flow.config().flow_timeout_ms, 30_000);
+        assert_eq!(
+            flow.build_playwright_script_with_browser_config(
+                Path::new("/tmp/profile"),
+                &flow.config().auth_url,
+                None,
+                None,
+                &super::super::BrowserConfig::default(),
+            ),
+            Err(super::super::BrowserNodeCommandFailure::InvalidConfiguration)
+        );
     }
 
     #[test]
@@ -949,15 +1061,102 @@ mod tests {
         }
     }
 
+    #[test]
+    fn execute_rejects_untrusted_auth_url_before_profile_creation() {
+        let temp = tempfile::tempdir().expect("isolated Google URL rejection root");
+        let mut ctx = super::super::BrowserContext::new(
+            super::super::BrowserConfig::default(),
+            temp.path(),
+        );
+        ctx.status = BrowserStatus::Ready;
+        let result = GoogleAuthFlow::with_defaults().execute(
+            &ctx,
+            "untrusted-url",
+            Some("https://127.0.0.1/o/oauth2/v2/auth"),
+            None,
+        );
+        assert!(matches!(
+            result,
+            AuthFlowResult::Failed {
+                kind: AuthFlowFailureKind::PlaywrightError,
+                ..
+            }
+        ));
+        assert!(!ctx.profile("google", "untrusted-url").path().exists());
+    }
+
+    #[test]
+    fn execute_rejects_invalid_selectors_before_profile_creation() {
+        let temp = tempfile::tempdir().expect("isolated Google preflight root");
+        let mut ctx = super::super::BrowserContext::new(
+            super::super::BrowserConfig::default(),
+            temp.path(),
+        );
+        ctx.status = BrowserStatus::Ready;
+        let mut config = GoogleAuthConfig::default();
+        config.selectors.signed_in_marker.clear();
+        let result = GoogleAuthFlow::new(config).execute(
+            &ctx,
+            "invalid-selectors",
+            None,
+            None,
+        );
+        assert!(matches!(
+            result,
+            AuthFlowResult::Failed {
+                kind: AuthFlowFailureKind::PlaywrightError,
+                ..
+            }
+        ));
+        assert!(!ctx.profile("google", "invalid-selectors").path().exists());
+    }
+
+    #[test]
+    fn execute_rejects_invalid_account_identity_before_profile_creation() {
+        let temp = tempfile::tempdir().expect("isolated Google identity root");
+        let mut ctx = BrowserContext::new(super::super::BrowserConfig::default(), temp.path());
+        ctx.status = BrowserStatus::Ready;
+        let result = GoogleAuthFlow::new(GoogleAuthConfig::default()).execute(
+            &ctx,
+            "spoof\u{202e}txt",
+            None,
+            None,
+        );
+        assert!(matches!(
+            result,
+            AuthFlowResult::Failed {
+                kind: AuthFlowFailureKind::ProfileUnavailable,
+                ..
+            }
+        ));
+        assert!(!ctx.profiles_root().exists());
+    }
+
     // =========================================================================
     // Playwright result parsing
     // =========================================================================
 
     #[test]
     fn parse_success_result() {
-        let stdout = r#"{"status":"success","storage_state":"{\"cookies\":[],\"origins\":[]}"}"#;
+        let stdout = r#"{"status":"success","storage_state":{"cookies":[],"origins":[]}}"#;
         let result = GoogleAuthFlow::parse_playwright_result(stdout);
         assert!(matches!(result, Ok(PlaywrightOutcome::Success { .. })));
+    }
+
+    #[test]
+    fn success_requires_storage_state() {
+        let result = GoogleAuthFlow::parse_playwright_result(r#"{"status":"success"}"#);
+        match result {
+            Err(error) => assert_eq!(
+                error.kind,
+                AuthFlowFailureKind::ProfilePersistenceFailed
+            ),
+            _ => panic!("success without durable state must fail closed"),
+        }
+        assert!(GoogleAuthFlow::parse_playwright_result(
+            r#"{"status":"success","storage_state":"{\"cookies\":[],\"origins\":[]}"}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -995,7 +1194,7 @@ mod tests {
 
     #[test]
     fn parse_result_finds_last_json_line() {
-        let stdout = "debug output\n{\"status\":\"success\",\"storage_state\":\"{\\\"cookies\\\":[],\\\"origins\\\":[]}\"}";
+        let stdout = "debug output\n{\"status\":\"success\",\"storage_state\":{\"cookies\":[],\"origins\":[]}}";
         let result = GoogleAuthFlow::parse_playwright_result(stdout);
         assert!(matches!(result, Ok(PlaywrightOutcome::Success { .. })));
     }
@@ -1197,7 +1396,7 @@ mod tests {
         let flow = GoogleAuthFlow::with_defaults();
         let script = flow.build_playwright_script(
             Path::new("/tmp/profile'\\\n"),
-            "https://example.invalid/login?token=secret",
+            "https://accounts.google.com/o/oauth2/v2/auth?token=secret",
             Some(hostile_email),
             None,
             false,
@@ -1206,7 +1405,10 @@ mod tests {
         assert!(!script.contains("token=secret"));
         assert!(!script.contains('\u{2028}'));
         let input = super::super::decode_node_script_input(&script);
-        assert_eq!(input["auth_url"], "https://example.invalid/login?token=secret");
+        assert_eq!(
+            input["auth_url"],
+            "https://accounts.google.com/o/oauth2/v2/auth?token=secret"
+        );
         assert_eq!(input["email"], hostile_email);
     }
 
@@ -1253,9 +1455,49 @@ mod tests {
         assert_eq!(input["headless"], true);
         assert!(script.contains("headless: input.headless"));
         assert!(script.contains("candidateSelectors"));
-        assert!(script.contains("sameOrigin(page.url(), authUrl)"));
+        assert!(script.contains("matchesAuthDestination(page.url(), authUrl)"));
+        assert!(script.contains("expected.pathname === '/'"));
         assert!(script.contains("browser.storageState()"));
         assert!(script.contains("fullPage: false"));
+    }
+
+    #[test]
+    fn script_propagates_and_validates_browser_operation_timeouts() {
+        let flow = GoogleAuthFlow::with_defaults();
+        let browser_config = super::super::BrowserConfig {
+            navigation_timeout_ms: 12_345,
+            page_load_timeout_ms: 23_456,
+            ..super::super::BrowserConfig::default()
+        };
+        let script = flow
+            .build_playwright_script_with_browser_config(
+                Path::new("/tmp/profile"),
+                "https://accounts.google.com/",
+                None,
+                None,
+                &browser_config,
+            )
+            .expect("bounded Google timeout configuration");
+        let input = super::super::decode_node_script_input(&script);
+        assert_eq!(input["navigation_timeout_ms"], 12_345);
+        assert_eq!(input["page_load_timeout_ms"], 23_456);
+        assert!(script.contains("timeout: NAVIGATION_TIMEOUT"));
+        assert!(script.contains("page.setDefaultTimeout(PAGE_LOAD_TIMEOUT)"));
+
+        let invalid = super::super::BrowserConfig {
+            page_load_timeout_ms: 0,
+            ..super::super::BrowserConfig::default()
+        };
+        assert_eq!(
+            flow.build_playwright_script_with_browser_config(
+                Path::new("/tmp/profile"),
+                "https://accounts.google.com/",
+                None,
+                None,
+                &invalid,
+            ),
+            Err(super::super::BrowserNodeCommandFailure::InvalidTimeout)
+        );
     }
 
     #[test]

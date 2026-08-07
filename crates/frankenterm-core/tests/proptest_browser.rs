@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use proptest::prelude::*;
 
 use frankenterm_core::browser::{
-    BootstrapMethod, BrowserConfig, ProfileMetadata,
+    BootstrapMethod, BrowserAuthService, BrowserConfig, BrowserProfile, ProfileMetadata,
     anthropic_auth::{AnthropicAuthConfig, AnthropicPageSelectors},
     bootstrap::{BootstrapConfig, BootstrapResult},
     google_auth::{GoogleAuthConfig, GooglePageSelectors},
@@ -44,6 +44,7 @@ fn arb_browser_config() -> impl Strategy<Value = BrowserConfig> {
         1000u64..120_000,
         1000u64..120_000,
         1000u64..30_000,
+        1000u64..30_000,
         arb_string(),
     )
         .prop_map(
@@ -52,15 +53,25 @@ fn arb_browser_config() -> impl Strategy<Value = BrowserConfig> {
                 navigation_timeout_ms,
                 page_load_timeout_ms,
                 readiness_probe_timeout_ms,
+                profile_lock_timeout_ms,
                 browser_type,
             )| BrowserConfig {
                 headless,
                 navigation_timeout_ms,
                 page_load_timeout_ms,
                 readiness_probe_timeout_ms,
+                profile_lock_timeout_ms,
                 browser_type,
             },
         )
+}
+
+fn arb_browser_auth_service() -> impl Strategy<Value = BrowserAuthService> {
+    prop_oneof![
+        Just(BrowserAuthService::OpenAi),
+        Just(BrowserAuthService::Google),
+        Just(BrowserAuthService::Anthropic),
+    ]
 }
 
 fn arb_bootstrap_method() -> impl Strategy<Value = BootstrapMethod> {
@@ -78,6 +89,7 @@ fn arb_profile_metadata() -> impl Strategy<Value = ProfileMetadata> {
         prop::option::of(arb_bootstrap_method()),
         prop::option::of("[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z"),
         0u64..10_000,
+        prop::option::of("[0-9a-f]{64}"),
     )
         .prop_map(
             |(
@@ -87,6 +99,7 @@ fn arb_profile_metadata() -> impl Strategy<Value = ProfileMetadata> {
                 bootstrap_method,
                 last_used_at,
                 automated_use_count,
+                storage_state_sha256,
             )| {
                 ProfileMetadata {
                     service,
@@ -95,6 +108,7 @@ fn arb_profile_metadata() -> impl Strategy<Value = ProfileMetadata> {
                     bootstrap_method,
                     last_used_at,
                     automated_use_count,
+                    storage_state_sha256,
                 }
             },
         )
@@ -102,6 +116,7 @@ fn arb_profile_metadata() -> impl Strategy<Value = ProfileMetadata> {
 
 fn arb_bootstrap_config() -> impl Strategy<Value = BootstrapConfig> {
     (
+        arb_browser_auth_service(),
         arb_url(),
         1000u64..600_000,
         500u64..10_000,
@@ -110,6 +125,7 @@ fn arb_bootstrap_config() -> impl Strategy<Value = BootstrapConfig> {
     )
         .prop_map(
             |(
+                service,
                 login_url,
                 timeout_ms,
                 poll_interval_ms,
@@ -117,6 +133,7 @@ fn arb_bootstrap_config() -> impl Strategy<Value = BootstrapConfig> {
                 success_text_markers,
             )| {
                 BootstrapConfig {
+                    service,
                     login_url,
                     timeout_ms,
                     poll_interval_ms,
@@ -328,7 +345,37 @@ proptest! {
         prop_assert_eq!(val.navigation_timeout_ms, back.navigation_timeout_ms);
         prop_assert_eq!(val.page_load_timeout_ms, back.page_load_timeout_ms);
         prop_assert_eq!(val.readiness_probe_timeout_ms, back.readiness_probe_timeout_ms);
+        prop_assert_eq!(val.profile_lock_timeout_ms, back.profile_lock_timeout_ms);
         prop_assert_eq!(val.browser_type, back.browser_type);
+    }
+
+    #[test]
+    fn browser_auth_service_comparison_is_exact(
+        service in arb_browser_auth_service(),
+        prefix in "[a-z]{0,8}",
+        suffix in "[a-z]{0,8}",
+    ) {
+        let canonical = service.as_str();
+        prop_assert_eq!(BrowserAuthService::try_from(canonical), Ok(service));
+
+        let decorated = format!("{prefix}{canonical}{suffix}");
+        if decorated != canonical {
+            prop_assert!(BrowserAuthService::try_from(decorated.as_str()).is_err());
+        }
+        prop_assert!(BrowserAuthService::try_from(canonical.to_ascii_uppercase().as_str()).is_err());
+    }
+
+    #[test]
+    fn fallible_profile_identity_rejects_control_and_bidi_injection(
+        prefix in "[a-z0-9]{0,16}",
+        suffix in "[a-z0-9]{0,16}",
+        injected in prop_oneof![Just('\n'), Just('\u{1b}'), Just('\u{202e}'), Just('\u{2066}')],
+    ) {
+        let hostile = format!("{prefix}{injected}{suffix}");
+        prop_assert!(
+            BrowserProfile::try_new(PathBuf::from("/not/inspected"), "openai", &hostile)
+                .is_err()
+        );
     }
 
     #[test]
@@ -346,12 +393,14 @@ proptest! {
         prop_assert_eq!(&val.account, &back.account);
         prop_assert_eq!(val.automated_use_count, back.automated_use_count);
         prop_assert_eq!(&val.bootstrap_method, &back.bootstrap_method);
+        prop_assert_eq!(&val.storage_state_sha256, &back.storage_state_sha256);
     }
 
     #[test]
     fn bootstrap_config_serde_roundtrip(val in arb_bootstrap_config()) {
         let json = serde_json::to_string(&val).unwrap();
         let back: BootstrapConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val.service, back.service);
         prop_assert_eq!(&val.login_url, &back.login_url);
         prop_assert_eq!(val.timeout_ms, back.timeout_ms);
         prop_assert_eq!(val.poll_interval_ms, back.poll_interval_ms);
