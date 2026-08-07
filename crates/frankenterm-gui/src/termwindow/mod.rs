@@ -89,7 +89,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use termwiz::hyperlink::Hyperlink;
-use termwiz::surface::{SEQ_ZERO, SequenceNo};
+use termwiz::surface::SequenceNo;
 use wezterm_dynamic::Value;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
@@ -281,7 +281,7 @@ pub struct PaneState {
     /// deliberately independent from `selection.seqno`: a selection's fence
     /// must remain fixed for its lifetime, while the renderer must advance
     /// after every successful dirty query.
-    render_dirty_seqno: SequenceNo,
+    render_dirty: frankenterm_gui::RenderDirtySequenceFence,
     selection: Selection,
     /// If is_some(), rather than display the actual tab
     /// contents, we're overlaying a little internal application
@@ -290,22 +290,6 @@ pub struct PaneState {
 
     bell_start: Option<Instant>,
     pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
-}
-
-impl PaneState {
-    /// Return the renderer query fence, failing closed if a pane implementation
-    /// replaced its underlying sequence domain and moved backwards.
-    fn render_dirty_baseline(&self, source_end: SequenceNo) -> SequenceNo {
-        if source_end < self.render_dirty_seqno {
-            SEQ_ZERO
-        } else {
-            self.render_dirty_seqno
-        }
-    }
-
-    fn advance_render_dirty_seqno(&mut self, source_end: SequenceNo) {
-        self.render_dirty_seqno = source_end;
-    }
 }
 
 /// Data used when synchronously formatting pane and window titles
@@ -4549,10 +4533,14 @@ impl TermWindow {
         // pre-query fence means such concurrent changes can be observed twice,
         // but can never be skipped.
         let source_end = pane.get_current_seqno();
-        let render_seqno = self.pane_state(pane_id).render_dirty_baseline(source_end);
+        let render_seqno = self
+            .pane_state(pane_id)
+            .render_dirty
+            .query_baseline(source_end);
         let dirty = pane.get_changed_since(visible_range.clone(), render_seqno);
         self.pane_state(pane_id)
-            .advance_render_dirty_seqno(source_end);
+            .render_dirty
+            .advance_after_query(source_end);
 
         // Per ft-camu6 (cont of ft-jvj78): wire PTY-write dirty
         // marks into the per-pane DirtyLineBitmap. The term layer's
@@ -8139,23 +8127,6 @@ mod tests {
         assert!(DirtyEventSource::Viewport.is_whole_screen());
     }
 
-    #[test]
-    fn pane_state_render_dirty_fence_advances_independently() {
-        let mut state = PaneState::default();
-        assert_eq!(state.render_dirty_baseline(41), SEQ_ZERO);
-        state.advance_render_dirty_seqno(41);
-        assert_eq!(state.render_dirty_baseline(42), 41);
-        assert_eq!(state.selection.seqno, SEQ_ZERO);
-    }
-
-    #[test]
-    fn pane_state_render_dirty_fence_fails_closed_on_sequence_regression() {
-        let mut state = PaneState::default();
-        state.advance_render_dirty_seqno(99);
-        assert_eq!(state.render_dirty_baseline(3), SEQ_ZERO);
-        state.advance_render_dirty_seqno(3);
-        assert_eq!(state.render_dirty_baseline(4), 3);
-    }
     use std::collections::HashMap;
 
     /// ft-d6nrd: redraw predicate is FALSE only when both the

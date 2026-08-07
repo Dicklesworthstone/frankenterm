@@ -198,6 +198,38 @@ pub fn checked_stable_row_range_from_top(
     Some(top..end)
 }
 
+/// Per-pane source-sequence fence for incremental renderer damage discovery.
+///
+/// The caller captures `source_end` before asking the pane for changed rows,
+/// then advances this fence only after that query returns. Mutations concurrent
+/// with the query may therefore be observed again, but cannot be skipped.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RenderDirtySequenceFence {
+    last_observed: termwiz::surface::SequenceNo,
+}
+
+impl RenderDirtySequenceFence {
+    /// Sequence from which the next dirty query must start. A source sequence
+    /// regression means the pane changed sequence domains, so fail closed to a
+    /// full query from `SEQ_ZERO`.
+    #[must_use]
+    pub fn query_baseline(
+        self,
+        source_end: termwiz::surface::SequenceNo,
+    ) -> termwiz::surface::SequenceNo {
+        if source_end < self.last_observed {
+            termwiz::surface::SEQ_ZERO
+        } else {
+            self.last_observed
+        }
+    }
+
+    /// Commit the pre-query source fence after the dirty query returned.
+    pub fn advance_after_query(&mut self, source_end: termwiz::surface::SequenceNo) {
+        self.last_observed = source_end;
+    }
+}
+
 #[must_use]
 pub fn terminal_u16_from_usize(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
@@ -889,7 +921,8 @@ pub mod owner_last_guard {
 #[cfg(test)]
 mod selection_lifecycle_tests {
     use super::{
-        checked_stable_row_range_from_top, should_preserve_dirty_selection_during_mouse_drag,
+        RenderDirtySequenceFence, checked_stable_row_range_from_top,
+        should_preserve_dirty_selection_during_mouse_drag,
     };
     use wezterm_term::StableRowIndex;
 
@@ -941,6 +974,23 @@ mod selection_lifecycle_tests {
             None
         );
         assert_eq!(checked_stable_row_range_from_top(0, usize::MAX), None);
+    }
+
+    #[test]
+    fn render_dirty_sequence_fence_advances_independently() {
+        let mut fence = RenderDirtySequenceFence::default();
+        assert_eq!(fence.query_baseline(41), termwiz::surface::SEQ_ZERO);
+        fence.advance_after_query(41);
+        assert_eq!(fence.query_baseline(42), 41);
+    }
+
+    #[test]
+    fn render_dirty_sequence_fence_fails_closed_on_source_regression() {
+        let mut fence = RenderDirtySequenceFence::default();
+        fence.advance_after_query(99);
+        assert_eq!(fence.query_baseline(3), termwiz::surface::SEQ_ZERO);
+        fence.advance_after_query(3);
+        assert_eq!(fence.query_baseline(4), 3);
     }
 }
 
