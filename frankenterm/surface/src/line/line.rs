@@ -1805,7 +1805,7 @@ struct MemoizedWrapPointCache {
     entries: std::collections::HashMap<MemoizedWrapPointCacheKey, MemoizedWrapPointCacheEntry>,
     order: std::collections::VecDeque<MemoizedWrapPointCacheKey>,
     #[cfg(test)]
-    hits: usize,
+    key_hits: std::collections::HashMap<MemoizedWrapPointCacheKey, usize>,
 }
 
 #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
@@ -1814,7 +1814,10 @@ impl MemoizedWrapPointCache {
         let entry = self.entries.get(&key).cloned();
         #[cfg(test)]
         if entry.is_some() {
-            self.hits = self.hits.saturating_add(1);
+            self.key_hits
+                .entry(key)
+                .and_modify(|hits| *hits = hits.saturating_add(1))
+                .or_insert(1);
         }
         entry
     }
@@ -1830,6 +1833,8 @@ impl MemoizedWrapPointCache {
                 break;
             };
             self.entries.remove(&evicted);
+            #[cfg(test)]
+            self.key_hits.remove(&evicted);
         }
 
         self.entries.insert(key, entry);
@@ -1840,12 +1845,17 @@ impl MemoizedWrapPointCache {
     fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
-        self.hits = 0;
+        self.key_hits.clear();
     }
 
     #[cfg(test)]
     fn peek(&self, key: MemoizedWrapPointCacheKey) -> Option<MemoizedWrapPointCacheEntry> {
         self.entries.get(&key).cloned()
+    }
+
+    #[cfg(test)]
+    fn hits_for_key(&self, key: MemoizedWrapPointCacheKey) -> usize {
+        self.key_hits.get(&key).copied().unwrap_or(0)
     }
 }
 
@@ -1886,11 +1896,9 @@ fn memoized_wrap_point_cache_clear_for_test() {
 }
 
 #[cfg(all(test, feature = "std", not(ft_disable_memoized_wrap_points)))]
-fn memoized_wrap_point_cache_hits_for_test() -> usize {
-    memoized_wrap_point_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .hits
+fn memoized_wrap_point_cache_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 #[cfg(all(test, feature = "std", not(ft_disable_memoized_wrap_points)))]
@@ -1899,18 +1907,42 @@ fn memoized_wrap_point_cache_entry_for_test(
     width: usize,
     cost_model: MonospaceKpCostModel,
 ) -> Option<MemoizedWrapPointCacheEntry> {
-    let mut cells: Vec<CellRef> = line.visible_cells().collect();
-    let end_idx = cells.iter().rposition(|c| c.str() != " ")?;
-    cells.truncate(end_idx + 1);
-    let key = MemoizedWrapPointCacheKey {
-        shape_hash: compute_wrap_shape_hash(line.bits, &cells),
-        width,
-        cost_model,
-    };
+    let key = memoized_wrap_point_cache_key_for_test(line, width, cost_model)?;
     memoized_wrap_point_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .peek(key)
+}
+
+#[cfg(all(test, feature = "std", not(ft_disable_memoized_wrap_points)))]
+fn memoized_wrap_point_cache_key_for_test(
+    line: &Line,
+    width: usize,
+    cost_model: MonospaceKpCostModel,
+) -> Option<MemoizedWrapPointCacheKey> {
+    let mut cells: Vec<CellRef> = line.visible_cells().collect();
+    let end_idx = cells.iter().rposition(|c| c.str() != " ")?;
+    cells.truncate(end_idx + 1);
+    Some(MemoizedWrapPointCacheKey {
+        shape_hash: compute_wrap_shape_hash(line.bits, &cells),
+        width,
+        cost_model,
+    })
+}
+
+#[cfg(all(test, feature = "std", not(ft_disable_memoized_wrap_points)))]
+fn memoized_wrap_point_cache_key_hits_for_test(
+    line: &Line,
+    width: usize,
+    cost_model: MonospaceKpCostModel,
+) -> usize {
+    let Some(key) = memoized_wrap_point_cache_key_for_test(line, width, cost_model) else {
+        return 0;
+    };
+    memoized_wrap_point_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .hits_for_key(key)
 }
 
 /// Reusable prefix-width storage for resize-time line wrapping.
@@ -2795,6 +2827,9 @@ mod tests {
     #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
     #[test]
     fn memoized_wrap_points_match_fresh_recompute_after_hit_and_mutation_ft_3vdce() {
+        let _cache_test_guard = memoized_wrap_point_cache_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let attrs = CellAttributes::default();
         let width = 5usize;
         let cost_model = MonospaceKpCostModel {
@@ -2808,15 +2843,17 @@ mod tests {
         let original_miss_entry =
             cached_wrap_entry_for_test(&line, width, cost_model, "original miss");
         assert_eq!(
-            memoized_wrap_point_cache_hits_for_test(),
+            memoized_wrap_point_cache_key_hits_for_test(&line, width, cost_model),
             0,
             "first wrap should populate the cache without a hit"
         );
 
-        let hits_before_original_hit = memoized_wrap_point_cache_hits_for_test();
+        let hits_before_original_hit =
+            memoized_wrap_point_cache_key_hits_for_test(&line, width, cost_model);
         let original_hit = line.clone().wrap_with_report(width, 2, cost_model);
         assert!(
-            memoized_wrap_point_cache_hits_for_test() > hits_before_original_hit,
+            memoized_wrap_point_cache_key_hits_for_test(&line, width, cost_model)
+                > hits_before_original_hit,
             "second wrap of unchanged content+width must hit the memoized entry"
         );
         let original_hit_entry =
@@ -2853,13 +2890,14 @@ mod tests {
         let _ = line.clone().wrap_with_report(width, 4, cost_model);
         let original_cached_before_mutation =
             cached_wrap_entry_for_test(&line, width, cost_model, "pre-mutation original");
-        let hits_before_mutation = memoized_wrap_point_cache_hits_for_test();
 
         line.set_cell_grapheme(0, "中", 2, attrs.clone(), 5);
+        let mutated_hits_before_miss =
+            memoized_wrap_point_cache_key_hits_for_test(&line, width, cost_model);
         let mutated_miss = line.clone().wrap_with_report(width, 6, cost_model);
         assert_eq!(
-            memoized_wrap_point_cache_hits_for_test(),
-            hits_before_mutation,
+            memoized_wrap_point_cache_key_hits_for_test(&line, width, cost_model),
+            mutated_hits_before_miss,
             "content mutation must not hit the stale cache entry for the old content"
         );
         let mutated_miss_entry =
@@ -2869,10 +2907,12 @@ mod tests {
             "test fixture must change wrap points after mutation"
         );
 
-        let hits_before_mutated_hit = memoized_wrap_point_cache_hits_for_test();
+        let hits_before_mutated_hit =
+            memoized_wrap_point_cache_key_hits_for_test(&line, width, cost_model);
         let mutated_hit = line.clone().wrap_with_report(width, 7, cost_model);
         assert!(
-            memoized_wrap_point_cache_hits_for_test() > hits_before_mutated_hit,
+            memoized_wrap_point_cache_key_hits_for_test(&line, width, cost_model)
+                > hits_before_mutated_hit,
             "second wrap of mutated content+width must hit its new memoized entry"
         );
         let mutated_hit_entry = cached_wrap_entry_for_test(&line, width, cost_model, "mutated hit");
@@ -3111,6 +3151,10 @@ mod tests {
 
     #[test]
     fn width_prefix_scratch_preserves_wrap_report_equivalence() {
+        #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+        let _cache_test_guard = memoized_wrap_point_cache_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut tuned_model = MonospaceKpCostModel::terminal_default();
         tuned_model.badness_scale = 37_000;
         tuned_model.forced_break_penalty = 9_000;
@@ -3142,6 +3186,13 @@ mod tests {
         for (name, text, width, model) in cases {
             let expected: Line = text.into();
             let expected = expected.wrap_with_report(width, 7, model);
+            // `expected` may populate the process-wide wrap cache. Force the
+            // first scratch-backed call down the computation path so this test
+            // proves that the caller-owned prefix allocation is actually
+            // established, rather than incorrectly requiring a cache hit to
+            // allocate scratch it does not need.
+            #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+            memoized_wrap_point_cache_clear_for_test();
             let actual: Line = text.into();
             let actual =
                 actual.wrap_with_report_and_width_prefix_scratch(width, 7, model, &mut scratch);
@@ -3152,7 +3203,26 @@ mod tests {
                 "case {} should retain prefix storage",
                 name
             );
+            let retained_capacity = scratch.capacity();
+
+            // A subsequent memoized call must leave caller-owned storage
+            // empty; a miss would rebuild the prefix and make this test fail.
+            scratch.clear();
+            let cached: Line = text.into();
+            let cached =
+                cached.wrap_with_report_and_width_prefix_scratch(width, 7, model, &mut scratch);
+            assert_eq!(cached, expected, "cached case {}", name);
+            #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+            assert!(
+                scratch.widths.is_empty(),
+                "cached case {} must be a hit",
+                name
+            );
+            assert_eq!(scratch.capacity(), retained_capacity, "cached case {}", name);
         }
+
+        #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+        memoized_wrap_point_cache_clear_for_test();
     }
 
     #[derive(Debug, Clone, Copy)]

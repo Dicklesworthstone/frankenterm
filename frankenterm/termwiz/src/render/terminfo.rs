@@ -1000,7 +1000,9 @@ impl TerminfoRenderer {
                                 self.cursor_left(Self::term_count_from_usize(image.width), out)?;
                             }
                         }
-                        self.cursor_up(Self::term_count_from_usize(image.height), out)?;
+                        self.cursor_up(Self::term_count_from_usize(
+                            image.height.saturating_sub(1),
+                        ), out)?;
                     }
                     self.cursor_position = None;
                 }
@@ -1810,6 +1812,43 @@ mod test {
             message.contains("cannot crop encoded image data unless the format is decodable"),
             "unexpected error: {}",
             message
+        );
+    }
+
+    #[cfg(feature = "use_image")]
+    #[test]
+    fn text_image_fallback_restores_only_rows_it_descended() {
+        let one_row_image = || Change::Image(Image {
+            width: 2,
+            height: 1,
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            image: Arc::new(ImageData::with_raw_data(vec![])),
+        });
+        let mut one_row = FakeTerm::new(xterm_terminfo());
+        one_row.render(&[one_row_image()]).unwrap();
+        let one_row_rendered = String::from_utf8(one_row.write.buf).unwrap();
+        assert_eq!(one_row_rendered, "  ");
+
+        let mut out = FakeTerm::new(xterm_terminfo());
+        let image = Change::Image(Image {
+            width: 2,
+            height: 2,
+            top_left: TextureCoordinate::new_f32(0.0, 0.0),
+            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+            image: Arc::new(ImageData::with_raw_data(vec![])),
+        });
+
+        out.render(&[image]).unwrap();
+
+        let rendered = String::from_utf8(out.write.buf).unwrap();
+        assert!(
+            rendered.contains("\u{1b}[1A"),
+            "two painted rows descend once and must move up exactly once: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("\u{1b}[2A"),
+            "the fallback must not move one row above its starting position: {rendered:?}"
         );
     }
 

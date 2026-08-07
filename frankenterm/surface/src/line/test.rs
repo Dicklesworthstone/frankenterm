@@ -3,6 +3,7 @@
 use super::*;
 use crate::hyperlink::{Hyperlink, Rule};
 use crate::line::clusterline::ClusteredLine;
+use crate::line::storage::CellStorage;
 use crate::SEQ_ZERO;
 use alloc::format;
 use alloc::sync::Arc;
@@ -273,50 +274,31 @@ C(
 #[test]
 fn cluster_representation_double_width() {
     let line: Line = "❤ 😍🤢he❤ 😍🤢llo❤ 😍🤢".into();
+    let expected_visible_cells = line
+        .visible_cells()
+        .map(|cell| cell.as_cell())
+        .collect::<Vec<_>>();
+    let expected_cell_geometry = line
+        .visible_cells()
+        .map(|cell| (cell.cell_index(), cell.width()))
+        .collect::<Vec<_>>();
     let mut compressed = line.clone();
     compressed.compress_for_scrollback();
-    k9::snapshot!(
-        &compressed.cells,
-        r#"
-C(
-    ClusteredLine {
-        text: "❤ 😍🤢he❤ 😍🤢llo❤ 😍🤢",
-        is_double_wide: Some(
-            FixedBitSet {
-                data: [
-                    2626580,
-                ],
-                length: 23,
-            },
-        ),
-        clusters: [
-            Cluster {
-                cell_width: 23,
-                attrs: CellAttributes {
-                    attributes: 0,
-                    intensity: Normal,
-                    underline: None,
-                    blink: None,
-                    italic: false,
-                    reverse: false,
-                    strikethrough: false,
-                    invisible: false,
-                    wrapped: false,
-                    overline: false,
-                    semantic_type: Output,
-                    foreground: Default,
-                    background: Default,
-                    fat: None,
-                },
-            },
-        ],
-        len: 23,
-        last_cell_width: Some(
-            2,
-        ),
-    },
-)
-"#
+    assert!(matches!(&compressed.cells, CellStorage::C(_)));
+    assert_eq!(
+        compressed
+            .visible_cells()
+            .map(|cell| cell.as_cell())
+            .collect::<Vec<_>>(),
+        expected_visible_cells
+    );
+    assert_eq!(
+        compressed
+            .visible_cells()
+            .map(|cell| (cell.cell_index(), cell.width()))
+            .collect::<Vec<_>>(),
+        expected_cell_geometry,
+        "cluster compression must preserve the exact double-width bit positions"
     );
     compressed.coerce_vec_storage();
     assert_eq!(line, compressed);

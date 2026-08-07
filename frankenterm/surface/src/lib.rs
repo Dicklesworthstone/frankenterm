@@ -2465,7 +2465,7 @@ mod test {
 
         let (_, delta) = source.get_changes(before);
         let [Change::Image(image)] = delta.as_ref() else {
-            panic!("expected one canonical image delta, got {delta:?}");
+            panic!("expected one canonical image delta, got {:?}", delta);
         };
         assert_eq!((image.width, image.height), (2, 2));
         assert_eq!(image.top_left, TextureCoordinate::new_f32(0.0, 0.5));

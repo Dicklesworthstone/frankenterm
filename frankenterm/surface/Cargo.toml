@@ -32,7 +32,7 @@ frankenterm-input-types.workspace = true
 default = []
 std = ["fancy-regex/std", "frankenterm-cell/std", "frankenterm-dynamic/std", "frankenterm-escape-parser/std", "fixedbitset/std", "fancy-regex/perf", "fancy-regex/unicode"]
 appdata = ["std"]
-use_serde = ["serde"] #, "frankenterm-color-types/use_serde", "frankenterm-blob-leases/serde", "bitflags/serde", "frankenterm-input-types/serde", "frankenterm-escape-parser/use_serde", "frankenterm-cell/use_serde"]
+use_serde = ["dep:serde", "frankenterm-cell/use_serde"]
 use_image = ["frankenterm-cell/use_image"] # "image", "dep:image", "frankenterm-escape-parser/use_image", "frankenterm-escape-parser/kitty-shm", "frankenterm-cell/use_image"]
 
 [dev-dependencies]
