@@ -613,21 +613,6 @@ pub struct Config {
     #[dynamic(default = "default_mux_tmux_response_timeout_ms")]
     pub mux_tmux_response_timeout_ms: u64,
 
-    /// Number of panes in a tab above which resize operations are
-    /// parallelized. Default: 8.
-    #[dynamic(default = "default_resize_fanout_parallel_threshold")]
-    pub resize_fanout_parallel_threshold: usize,
-
-    /// Minimum number of panes per resize batch when parallelizing.
-    /// Default: 4.
-    #[dynamic(default = "default_resize_fanout_min_batch_size")]
-    pub resize_fanout_min_batch_size: usize,
-
-    /// Maximum number of worker threads for parallel resize.
-    /// Default: 8.
-    #[dynamic(default = "default_resize_fanout_max_workers")]
-    pub resize_fanout_max_workers: usize,
-
     /// Minimum width in cells for floating panes. Default: 5.
     #[dynamic(default = "default_min_floating_pane_width")]
     pub min_floating_pane_width: usize,
@@ -2182,18 +2167,6 @@ fn default_connui_poll_timeout_ms() -> u64 {
 
 fn default_ssh_terminal_poll_timeout_ms() -> u64 {
     200
-}
-
-fn default_resize_fanout_parallel_threshold() -> usize {
-    8
-}
-
-fn default_resize_fanout_min_batch_size() -> usize {
-    4
-}
-
-fn default_resize_fanout_max_workers() -> usize {
-    8
 }
 
 fn default_min_floating_pane_width() -> usize {

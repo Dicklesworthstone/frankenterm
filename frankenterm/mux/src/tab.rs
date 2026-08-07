@@ -643,6 +643,7 @@ struct ExactPaneRemovalCandidate {
 struct DeferredTabCallbacks {
     changed: bool,
     removed: HashSet<PaneIdentity>,
+    zoom_work: Vec<(Arc<dyn Pane>, bool)>,
     resize_work: Vec<(Arc<dyn Pane>, TerminalSize)>,
     prior_focus: Option<Arc<dyn Pane>>,
     current_focus: Option<Arc<dyn Pane>>,
@@ -681,12 +682,26 @@ impl DeferredTabCallbacks {
 
     fn execute(self, mux: Option<&Mux>) {
         let DeferredTabCallbacks {
+            zoom_work,
             resize_work,
             prior_focus,
             current_focus,
             topology_notifications,
             ..
         } = self;
+        for (pane, zoomed) in zoom_work {
+            if catch_recoverable(
+                RecoverablePanicSite::MuxPaneCallback,
+                AssertUnwindSafe(|| pane.set_zoomed(zoomed)),
+            )
+            .is_err()
+            {
+                log::error!(
+                    "pane zoom callback panicked for exact pane identity {:p}",
+                    Arc::as_ptr(&pane)
+                );
+            }
+        }
         execute_pane_resize_work(resize_work);
 
         let focus_changed = match (&prior_focus, &current_focus) {
@@ -930,6 +945,11 @@ pub struct FloatingPaneRect {
 
 struct FloatingPane {
     pane: Arc<dyn Pane>,
+    /// Stable numeric identity admitted before the pane enters the tab lock.
+    /// Keeping it with the topology prevents ordinary floating-pane lookups,
+    /// focus reconciliation, and resize preparation from calling reentrant
+    /// `Pane::pane_id` while `Tab::inner` is held.
+    pane_id: PaneId,
     rect: FloatingPaneRect,
     z_order: u32,
     visible: bool,
@@ -2819,28 +2839,6 @@ fn collect_pane_resize_work(
     }
 }
 
-fn compute_resize_fanout_workers(work_len: usize, available_parallelism: usize) -> usize {
-    let cfg = configuration();
-    if work_len < cfg.resize_fanout_parallel_threshold {
-        return 1;
-    }
-
-    let mut workers = work_len
-        .min(available_parallelism.max(1))
-        .min(cfg.resize_fanout_max_workers);
-    while workers > 1 && work_len.div_ceil(workers) < cfg.resize_fanout_min_batch_size {
-        workers -= 1;
-    }
-    workers.max(1)
-}
-
-fn resize_fanout_workers_for_host(work_len: usize) -> usize {
-    let available = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    compute_resize_fanout_workers(work_len, available)
-}
-
 fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
     let mut work = Vec::new();
     collect_pane_resize_work(tree, size, &mut work);
@@ -2848,71 +2846,63 @@ fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
 }
 
 fn execute_pane_resize_work(work: Vec<(Arc<dyn Pane>, TerminalSize)>) {
-    if work.len() <= 1 {
-        for (pane, pane_size) in work {
-            invoke_pane_resize(&pane, pane_size);
-        }
-        return;
+    // Preserve one deterministic effect order until the persistent bounded
+    // resize executor (ft-interactive-systems-performance-4tenz.7.2) owns
+    // admission and sequencing. A fresh scoped thread fanout can fail after
+    // earlier buckets have already resized their panes; crossbeam then resumes
+    // the spawn panic and leaves the tab's committed geometry only partially
+    // applied. Serial execution cannot fail at an OS-thread admission boundary
+    // and gives every collected pane its resize callback exactly once in tree
+    // order.
+    for (pane, pane_size) in work {
+        invoke_pane_resize(&pane, pane_size);
     }
-
-    let work_len = work.len();
-    let worker_count = resize_fanout_workers_for_host(work_len);
-
-    if worker_count <= 1 {
-        for (pane, pane_size) in work {
-            invoke_pane_resize(&pane, pane_size);
-        }
-        return;
-    }
-
-    let bucket_len = work_len.div_ceil(worker_count);
-    let mut buckets = Vec::with_capacity(worker_count);
-    let mut iter = work.into_iter();
-    while buckets.len() < worker_count {
-        let mut bucket = Vec::with_capacity(bucket_len);
-        for _ in 0..bucket_len {
-            if let Some(item) = iter.next() {
-                bucket.push(item);
-            } else {
-                break;
-            }
-        }
-        if bucket.is_empty() {
-            break;
-        }
-        buckets.push(bucket);
-    }
-
-    log::trace!(
-        "apply_sizes_from_splits fanout panes={} workers={} bucket_len={}",
-        work_len,
-        buckets.len(),
-        bucket_len
-    );
-
-    let _ = crossbeam::thread::scope(|scope| {
-        for bucket in buckets {
-            scope.spawn(move |_| {
-                for (pane, pane_size) in bucket {
-                    invoke_pane_resize(&pane, pane_size);
-                }
-            });
-        }
-    });
 }
 
 fn invoke_pane_resize(pane: &Arc<dyn Pane>, pane_size: TerminalSize) {
-    if catch_recoverable(
+    match catch_recoverable(
         RecoverablePanicSite::MuxPaneCallback,
         AssertUnwindSafe(|| pane.resize(pane_size)),
-    )
-    .is_err()
-    {
-        log::error!(
-            "pane resize callback panicked for exact pane identity {:p}",
-            Arc::as_ptr(pane)
-        );
+    ) {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            // Do not interpolate the arbitrary pane error: it can contain
+            // unbounded remote/provider content. The exact in-process identity
+            // and target geometry are sufficient to correlate this failure.
+            log::error!(
+                "pane resize callback returned an error for exact pane identity {:p} at rows={} cols={} pixel_width={} pixel_height={} dpi={}",
+                Arc::as_ptr(pane),
+                pane_size.rows,
+                pane_size.cols,
+                pane_size.pixel_width,
+                pane_size.pixel_height,
+                pane_size.dpi,
+            );
+        }
+        Err(_) => {
+            log::error!(
+                "pane resize callback panicked for exact pane identity {:p}",
+                Arc::as_ptr(pane)
+            );
+        }
     }
+}
+
+fn observe_pane_id_for_mutation(pane: &Arc<dyn Pane>) -> anyhow::Result<PaneId> {
+    catch_recoverable(
+        RecoverablePanicSite::MuxPaneCallback,
+        AssertUnwindSafe(|| pane.pane_id()),
+    )
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "pane identity callback panicked for exact pane identity {:p}",
+            Arc::as_ptr(pane)
+        )
+    })
+}
+
+fn exact_pane_identity_set(panes: &[Arc<dyn Pane>]) -> HashSet<PaneIdentity> {
+    panes.iter().map(pane_identity).collect()
 }
 
 fn cell_dimensions(size: &TerminalSize) -> TerminalSize {
@@ -2990,12 +2980,31 @@ impl Tab {
         &self,
         size: TerminalSize,
         root: PaneNode,
-        make_pane: F,
+        mut make_pane: F,
     ) -> anyhow::Result<()>
     where
         F: FnMut(PaneEntry) -> anyhow::Result<Arc<dyn Pane>>,
     {
-        self.inner.lock().sync_with_pane_tree(size, root, make_pane)
+        let mut active = None;
+        let mut zoomed = None;
+        log::debug!("sync_with_pane_tree with size {:?}", size);
+        // `make_pane` is caller-supplied and may re-enter the mux. Build the
+        // complete replacement tree before acquiring the tab topology lock.
+        let tree = build_from_pane_tree(
+            root.into_tree(),
+            &mut active,
+            &mut zoomed,
+            &mut make_pane,
+        )?;
+        self.sync_with_prepared_pane_tree(
+            size,
+            PreparedPaneTree {
+                tree,
+                active,
+                zoomed,
+            },
+        );
+        Ok(())
     }
 
     /// Install a pane tree prepared directly from a validated flat arena.
@@ -3008,9 +3017,16 @@ impl Tab {
         size: TerminalSize,
         prepared: PreparedPaneTree,
     ) {
-        self.inner
-            .lock()
-            .sync_with_prepared_pane_tree(size, prepared);
+        let mux = Mux::try_get();
+        let callbacks = {
+            let mut inner = self.inner.lock();
+            let mut callbacks = inner.install_prepared_pane_tree(size, prepared);
+            if let Some(mux) = mux.as_deref() {
+                callbacks.reserve_topology_notifications(mux, self.tab_id);
+            }
+            callbacks
+        };
+        callbacks.execute(mux.as_deref());
     }
 
     /// Encode one coherent tab snapshot using caller-supplied owner metadata.
@@ -3252,11 +3268,30 @@ impl Tab {
 
     /// Sets the zoom state, returns the prior state
     pub fn set_zoomed(&self, zoomed: bool) -> bool {
-        self.inner.lock().set_zoomed(zoomed)
+        let mux = Mux::try_get();
+        let (prior, callbacks) = {
+            let mut inner = self.inner.lock();
+            let (prior, mut callbacks) = inner.prepare_set_zoomed(zoomed);
+            if let Some(mux) = mux.as_deref() {
+                callbacks.reserve_topology_notifications(mux, self.tab_id);
+            }
+            (prior, callbacks)
+        };
+        callbacks.execute(mux.as_deref());
+        prior
     }
 
     pub fn toggle_zoom(&self) {
-        self.inner.lock().toggle_zoom()
+        let mux = Mux::try_get();
+        let callbacks = {
+            let mut inner = self.inner.lock();
+            let mut callbacks = inner.prepare_toggle_zoom();
+            if let Some(mux) = mux.as_deref() {
+                callbacks.reserve_topology_notifications(mux, self.tab_id);
+            }
+            callbacks
+        };
+        callbacks.execute(mux.as_deref());
     }
 
     pub fn contains_pane(&self, pane: PaneId) -> bool {
@@ -3282,7 +3317,50 @@ impl Tab {
         pane: Arc<dyn Pane>,
         rect: FloatingPaneRect,
     ) -> anyhow::Result<PositionedFloatingPane> {
-        self.inner.lock().add_floating_pane(pane, rect)
+        const ADMISSION_ATTEMPTS: usize = 3;
+        let pane_id = observe_pane_id_for_mutation(&pane)?;
+
+        for _ in 0..ADMISSION_ATTEMPTS {
+            let snapshot = self.snapshot_panes_callback_free();
+            let observed = Self::observe_panes(snapshot.clone());
+            if observed.iter().any(|candidate| candidate.pane_id.is_none()) {
+                anyhow::bail!(
+                    "cannot prove floating-pane id uniqueness because an existing pane identity callback panicked"
+                );
+            }
+            if observed
+                .iter()
+                .any(|candidate| candidate.pane_id == Some(pane_id))
+            {
+                anyhow::bail!(
+                    "pane {pane_id} is already present in tab {}; floating panes require a detached pane",
+                    self.tab_id
+                );
+            }
+
+            let expected_identities = exact_pane_identity_set(&snapshot);
+            let mux = Mux::try_get();
+            let (positioned, callbacks) = {
+                let mut inner = self.inner.lock();
+                let current = inner.snapshot_panes_callback_free();
+                if exact_pane_identity_set(&current) != expected_identities {
+                    continue;
+                }
+                let (positioned, mut callbacks) =
+                    inner.prepare_add_floating_pane(pane.clone(), pane_id, rect);
+                if let Some(mux) = mux.as_deref() {
+                    callbacks.reserve_topology_notifications(mux, self.tab_id);
+                }
+                (positioned, callbacks)
+            };
+            callbacks.execute(mux.as_deref());
+            return Ok(positioned);
+        }
+
+        anyhow::bail!(
+            "tab {} topology changed during all {ADMISSION_ATTEMPTS} floating-pane admission attempts",
+            self.tab_id
+        )
     }
 
     pub fn set_floating_pane_rect(
@@ -3290,7 +3368,18 @@ impl Tab {
         pane_id: PaneId,
         rect: FloatingPaneRect,
     ) -> Option<PositionedFloatingPane> {
-        self.inner.lock().set_floating_pane_rect(pane_id, rect)
+        let mux = Mux::try_get();
+        let (positioned, callbacks) = {
+            let mut inner = self.inner.lock();
+            let (positioned, mut callbacks) =
+                inner.prepare_set_floating_pane_rect(pane_id, rect);
+            if let Some(mux) = mux.as_deref() {
+                callbacks.reserve_topology_notifications(mux, self.tab_id);
+            }
+            (positioned, callbacks)
+        };
+        callbacks.execute(mux.as_deref());
+        positioned
     }
 
     pub fn set_floating_pane_visible(&self, pane_id: PaneId, visible: bool) -> bool {
@@ -3360,7 +3449,16 @@ impl Tab {
     /// first.  For large resizes this tends to proportionally adjust
     /// the relative sizes of the elements in a split.
     pub fn resize(&self, size: TerminalSize) {
-        self.inner.lock().resize(size)
+        let mux = Mux::try_get();
+        let callbacks = {
+            let mut inner = self.inner.lock();
+            let mut callbacks = inner.prepare_resize(size);
+            if let Some(mux) = mux.as_deref() {
+                callbacks.reserve_topology_notifications(mux, self.tab_id);
+            }
+            callbacks
+        };
+        callbacks.execute(mux.as_deref());
     }
 
     /// Called when running in the mux server after an individual pane
@@ -3389,7 +3487,16 @@ impl Tab {
     /// The adjusted size is propogated downwards to contained children and
     /// their panes are resized accordingly.
     pub fn resize_split_by(&self, split_index: usize, delta: isize) {
-        self.inner.lock().resize_split_by(split_index, delta)
+        let mux = Mux::try_get();
+        let callbacks = {
+            let mut inner = self.inner.lock();
+            let mut callbacks = inner.prepare_resize_split_by(split_index, delta);
+            if let Some(mux) = mux.as_deref() {
+                callbacks.reserve_topology_notifications(mux, self.tab_id);
+            }
+            callbacks
+        };
+        callbacks.execute(mux.as_deref());
     }
 
     /// Returns `true` if the given pane is currently collapsed (hidden
@@ -3417,9 +3524,23 @@ impl Tab {
         min_height: Option<usize>,
         max_height: Option<usize>,
     ) -> Option<PaneConstraints> {
-        self.inner
-            .lock()
-            .update_pane_constraints(pane_id, min_width, max_width, min_height, max_height)
+        let mux = Mux::try_get();
+        let (updated, callbacks) = {
+            let mut inner = self.inner.lock();
+            let (updated, mut callbacks) = inner.prepare_update_pane_constraints(
+                pane_id,
+                min_width,
+                max_width,
+                min_height,
+                max_height,
+            );
+            if let Some(mux) = mux.as_deref() {
+                callbacks.reserve_topology_notifications(mux, self.tab_id);
+            }
+            (updated, callbacks)
+        };
+        callbacks.execute(mux.as_deref());
+        updated
     }
 
     /// Set the layout cycle for swap-layout support.
@@ -3490,7 +3611,16 @@ impl Tab {
     /// Adjusts the size of the active pane in the specified direction
     /// by the specified amount.
     pub fn adjust_pane_size(&self, direction: PaneDirection, amount: usize) {
-        self.inner.lock().adjust_pane_size(direction, amount)
+        let mux = Mux::try_get();
+        let callbacks = {
+            let mut inner = self.inner.lock();
+            let mut callbacks = inner.prepare_adjust_pane_size(direction, amount);
+            if let Some(mux) = mux.as_deref() {
+                callbacks.reserve_topology_notifications(mux, self.tab_id);
+            }
+            callbacks
+        };
+        callbacks.execute(mux.as_deref());
     }
 
     /// Activate an adjacent pane in the specified direction.
@@ -3892,42 +4022,7 @@ impl Tab {
     /// Resolve the active pane without invoking a `Pane` method while the tab
     /// topology lock is held.
     pub(crate) fn get_active_pane_callback_free(&self) -> Option<Arc<dyn Pane>> {
-        let (zoomed, floating_focus, floating, tree_active) = {
-            let inner = self.inner.lock();
-            (
-                inner.zoomed.as_ref().map(Arc::clone),
-                inner.floating_focus,
-                inner
-                    .floating_panes
-                    .iter()
-                    .filter(|floating| floating.visible)
-                    .map(|floating| Arc::clone(&floating.pane))
-                    .collect::<Vec<_>>(),
-                inner.raw_tree_active_pane(),
-            )
-        };
-        if zoomed.is_some() {
-            return zoomed;
-        }
-        if let Some(focused_id) = floating_focus {
-            for pane in floating {
-                match catch_recoverable(
-                    RecoverablePanicSite::MuxPaneCallback,
-                    AssertUnwindSafe(|| pane.pane_id()),
-                ) {
-                    Ok(pane_id) if pane_id == focused_id => return Some(pane),
-                    Ok(_) => {}
-                    Err(_) => {
-                        log::error!(
-                            "Pane::pane_id panicked while resolving active floating pane {:p}; \
-                             retaining callback safety",
-                            Arc::as_ptr(&pane)
-                        );
-                    }
-                }
-            }
-        }
-        tree_active
+        self.inner.lock().raw_active_pane_retained_id()
     }
 
     #[cfg(test)]
@@ -4022,33 +4117,11 @@ impl TabInner {
         }
     }
 
-    fn sync_with_pane_tree<F>(
+    fn install_prepared_pane_tree(
         &mut self,
         size: TerminalSize,
-        root: PaneNode,
-        mut make_pane: F,
-    ) -> anyhow::Result<()>
-    where
-        F: FnMut(PaneEntry) -> anyhow::Result<Arc<dyn Pane>>,
-    {
-        let mut active = None;
-        let mut zoomed = None;
-
-        log::debug!("sync_with_pane_tree with size {:?}", size);
-
-        let tree = build_from_pane_tree(root.into_tree(), &mut active, &mut zoomed, &mut make_pane)?;
-        self.sync_with_prepared_pane_tree(
-            size,
-            PreparedPaneTree {
-                tree,
-                active,
-                zoomed,
-            },
-        );
-        Ok(())
-    }
-
-    fn sync_with_prepared_pane_tree(&mut self, size: TerminalSize, prepared: PreparedPaneTree) {
+        prepared: PreparedPaneTree,
+    ) -> DeferredTabCallbacks {
         let PreparedPaneTree {
             tree,
             active,
@@ -4087,15 +4160,15 @@ impl TabInner {
         self.zoomed = zoomed;
         self.size = size;
 
-        self.resize(size);
+        let callbacks = self.prepare_resize_for_reflow(size);
 
         log::debug!(
-            "sync tab: {:#?} zoomed: {} {:#?}",
+            "sync tab: {:#?} zoomed: {}",
             size,
             self.zoomed.is_some(),
-            self.iter_panes()
         );
         assert!(self.pane.is_some());
+        callbacks
     }
 
     /// Returns a count of how many panes are in this tab
@@ -4126,37 +4199,64 @@ impl TabInner {
     }
 
     /// Sets the zoom state, returns the prior state
-    fn set_zoomed(&mut self, zoomed: bool) -> bool {
+    fn prepare_set_zoomed(&mut self, zoomed: bool) -> (bool, DeferredTabCallbacks) {
+        let prior = self.zoomed.is_some();
         if self.zoomed.is_some() == zoomed {
             // Current zoom state matches intended zoom state,
             // so we have nothing to do.
-            return zoomed;
+            return (prior, DeferredTabCallbacks::default());
         }
-        self.toggle_zoom();
-        !zoomed
+        (prior, self.prepare_toggle_zoom())
     }
 
-    fn toggle_zoom(&mut self) {
+    fn prepare_toggle_zoom(&mut self) -> DeferredTabCallbacks {
+        let mut callbacks = DeferredTabCallbacks::default();
         let size = self.size;
-        if self.zoomed.take().is_some() {
+        if let Some(pane) = self.zoomed.take() {
             // We were zoomed, but now we are not.
             // Re-apply the size to the panes
-            if let Some(pane) = self.get_active_pane() {
-                pane.set_zoomed(false);
-            }
+            callbacks.zoom_work.push((pane, false));
+            callbacks.changed = true;
             self.size = self.size_before_zoom;
-            self.resize(size);
+            let mut resize_callbacks = self.prepare_resize_for_reflow(size);
+            callbacks
+                .resize_work
+                .append(&mut resize_callbacks.resize_work);
+            callbacks.changed |= resize_callbacks.changed;
         } else {
             // We weren't zoomed, but now we want to zoom.
             // Locate the active pane
             self.size_before_zoom = size;
-            if let Some(pane) = self.get_active_pane() {
-                pane.set_zoomed(true);
-                pane.resize(size).ok();
+            if let Some(pane) = self.raw_active_pane_retained_id() {
+                callbacks.zoom_work.push((Arc::clone(&pane), true));
+                callbacks.resize_work.push((Arc::clone(&pane), size));
                 self.zoomed.replace(pane);
+                callbacks.changed = true;
             }
         }
-        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        callbacks
+    }
+
+    /// Legacy inner call surface retained while older compound mutations are
+    /// migrated to return deferred callbacks to their outer `Tab` boundary.
+    /// New code must use `prepare_set_zoomed`/`prepare_toggle_zoom`.
+    fn set_zoomed(&mut self, zoomed: bool) -> bool {
+        let mux = Mux::try_get();
+        let (prior, mut callbacks) = self.prepare_set_zoomed(zoomed);
+        if let Some(mux) = mux.as_deref() {
+            callbacks.reserve_topology_notifications(mux, self.id);
+        }
+        callbacks.execute(mux.as_deref());
+        prior
+    }
+
+    fn toggle_zoom(&mut self) {
+        let mux = Mux::try_get();
+        let mut callbacks = self.prepare_toggle_zoom();
+        if let Some(mux) = mux.as_deref() {
+            callbacks.reserve_topology_notifications(mux, self.id);
+        }
+        callbacks.execute(mux.as_deref());
     }
 
     fn contains_pane(&self, pane: PaneId) -> bool {
@@ -4181,7 +4281,7 @@ impl TabInner {
             || self
                 .floating_panes
                 .iter()
-                .any(|floating| floating.pane.pane_id() == pane)
+                .any(|floating| floating.pane_id == pane)
     }
 
     fn has_panes_in_domain(&self, domain_id: DomainId) -> bool {
@@ -4223,7 +4323,7 @@ impl TabInner {
 
         self.floating_panes
             .iter()
-            .find(|floating| floating.pane.pane_id() == pane_id)
+            .find(|floating| floating.pane_id == pane_id)
             .map(|floating| floating.pane.domain_id())
             .or_else(|| {
                 self.pane_stacks
@@ -4272,7 +4372,7 @@ impl TabInner {
     fn floating_index_by_id(&self, pane_id: PaneId) -> Option<usize> {
         self.floating_panes
             .iter()
-            .position(|floating| floating.pane.pane_id() == pane_id)
+            .position(|floating| floating.pane_id == pane_id)
     }
 
     fn next_floating_z_order(&mut self) -> u32 {
@@ -4300,8 +4400,8 @@ impl TabInner {
 
     fn positioned_floating_pane(&self, floating: &FloatingPane) -> PositionedFloatingPane {
         PositionedFloatingPane {
-            pane_id: floating.pane.pane_id(),
-            is_focused: self.floating_focus == Some(floating.pane.pane_id()),
+            pane_id: floating.pane_id,
+            is_focused: self.floating_focus == Some(floating.pane_id),
             left: floating.rect.left,
             top: floating.rect.top,
             width: floating.rect.width,
@@ -4314,25 +4414,20 @@ impl TabInner {
         }
     }
 
-    fn add_floating_pane(
+    fn prepare_add_floating_pane(
         &mut self,
         pane: Arc<dyn Pane>,
+        pane_id: PaneId,
         rect: FloatingPaneRect,
-    ) -> anyhow::Result<PositionedFloatingPane> {
-        let prior = self.get_active_pane();
+    ) -> (PositionedFloatingPane, DeferredTabCallbacks) {
+        let prior = self.raw_active_pane_retained_id();
         let rect = self.clamp_floating_rect(rect);
-        let pane_id = pane.pane_id();
-        if self.contains_pane(pane_id) {
-            return Err(anyhow::anyhow!(
-                "pane {pane_id} is already present in tab {}; floating panes require a detached pane",
-                self.id
-            ));
-        }
-        pane.resize(self.floating_pane_size(rect)).ok();
+        let pane_size = self.floating_pane_size(rect);
         let z_order = self.next_floating_z_order();
 
         let floating = FloatingPane {
             pane: Arc::clone(&pane),
+            pane_id,
             rect,
             z_order,
             visible: true,
@@ -4341,27 +4436,71 @@ impl TabInner {
         };
         self.floating_panes.push(floating);
         self.floating_focus = Some(pane_id);
-
-        self.advise_focus_change(prior);
-        Ok(self.positioned_floating_pane(self.floating_panes.last().expect("floating pane added")))
+        let positioned = self
+            .positioned_floating_pane(self.floating_panes.last().expect("floating pane added"));
+        let mut callbacks = DeferredTabCallbacks {
+            changed: true,
+            prior_focus: prior,
+            current_focus: Some(Arc::clone(&pane)),
+            current_focus_id: Some(pane_id),
+            ..DeferredTabCallbacks::default()
+        };
+        callbacks.resize_work.push((pane, pane_size));
+        (positioned, callbacks)
     }
 
-    fn set_floating_pane_rect(
+    fn prepare_set_floating_pane_rect(
         &mut self,
         pane_id: PaneId,
         rect: FloatingPaneRect,
-    ) -> Option<PositionedFloatingPane> {
-        let idx = self.floating_index_by_id(pane_id)?;
+    ) -> (Option<PositionedFloatingPane>, DeferredTabCallbacks) {
+        let Some(idx) = self.floating_index_by_id(pane_id) else {
+            return (None, DeferredTabCallbacks::default());
+        };
         let rect = self.clamp_floating_rect(rect);
         let size = self.floating_pane_size(rect);
-        {
-            let floating = self.floating_panes.get_mut(idx)?;
-            floating.rect = rect;
-            floating.pane.resize(size).ok();
+        let floating = self
+            .floating_panes
+            .get_mut(idx)
+            .expect("floating index remains valid");
+        if floating.rect == rect {
+            return (
+                Some(PositionedFloatingPane {
+                    pane_id: floating.pane_id,
+                    is_focused: self.floating_focus == Some(floating.pane_id),
+                    left: floating.rect.left,
+                    top: floating.rect.top,
+                    width: floating.rect.width,
+                    height: floating.rect.height,
+                    z_order: floating.z_order,
+                    visible: floating.visible,
+                    pinned: floating.pinned,
+                    opacity: floating.opacity,
+                    pane: Arc::clone(&floating.pane),
+                }),
+                DeferredTabCallbacks::default(),
+            );
         }
-        self.floating_panes
-            .get(idx)
-            .map(|floating| self.positioned_floating_pane(floating))
+        floating.rect = rect;
+        let positioned = PositionedFloatingPane {
+            pane_id: floating.pane_id,
+            is_focused: self.floating_focus == Some(floating.pane_id),
+            left: floating.rect.left,
+            top: floating.rect.top,
+            width: floating.rect.width,
+            height: floating.rect.height,
+            z_order: floating.z_order,
+            visible: floating.visible,
+            pinned: floating.pinned,
+            opacity: floating.opacity,
+            pane: Arc::clone(&floating.pane),
+        };
+        let mut callbacks = DeferredTabCallbacks {
+            changed: true,
+            ..DeferredTabCallbacks::default()
+        };
+        callbacks.resize_work.push((Arc::clone(&floating.pane), size));
+        (Some(positioned), callbacks)
     }
 
     fn set_floating_pane_visible(&mut self, pane_id: PaneId, visible: bool) -> bool {
@@ -4448,7 +4587,7 @@ impl TabInner {
         let pane_id = self.floating_focus?;
         self.floating_panes
             .iter()
-            .find(|floating| floating.visible && floating.pane.pane_id() == pane_id)
+            .find(|floating| floating.visible && floating.pane_id == pane_id)
             .map(|floating| Arc::clone(&floating.pane))
     }
 
@@ -4586,20 +4725,23 @@ impl TabInner {
         self.pane_stacks = remapped;
     }
 
-    fn resize_floating_panes_to_fit(&mut self) {
+    fn prepare_floating_pane_resizes_to_fit(
+        &mut self,
+        resize_work: &mut Vec<(Arc<dyn Pane>, TerminalSize)>,
+    ) {
         for idx in 0..self.floating_panes.len() {
             let rect = self.clamp_floating_rect(self.floating_panes[idx].rect);
             self.floating_panes[idx].rect = rect;
-            self.floating_panes[idx]
-                .pane
-                .resize(self.floating_pane_size(rect))
-                .ok();
+            resize_work.push((
+                Arc::clone(&self.floating_panes[idx].pane),
+                self.floating_pane_size(rect),
+            ));
         }
         if let Some(pane_id) = self.floating_focus {
             let has_visible_focus = self
                 .floating_panes
                 .iter()
-                .any(|floating| floating.visible && floating.pane.pane_id() == pane_id);
+                .any(|floating| floating.visible && floating.pane_id == pane_id);
             if !has_visible_focus {
                 self.floating_focus = None;
             }
@@ -5303,37 +5445,43 @@ impl TabInner {
         leaves.get(self.active).cloned()
     }
 
-    fn raw_active_pane_callback_free(
-        &self,
-        pane_ids: &HashMap<PaneIdentity, PaneId>,
-    ) -> Option<Arc<dyn Pane>> {
+    fn raw_active_pane_retained_id(&self) -> Option<Arc<dyn Pane>> {
         if let Some(zoomed) = &self.zoomed {
             return Some(Arc::clone(zoomed));
         }
         if let Some(focused_id) = self.floating_focus {
-            if let Some(focused) = self.floating_panes.iter().find(|floating| {
-                floating.visible
-                    && pane_ids.get(&pane_identity(&floating.pane)) == Some(&focused_id)
-            }) {
+            if let Some(focused) = self
+                .floating_panes
+                .iter()
+                .find(|floating| floating.visible && floating.pane_id == focused_id)
+            {
                 return Some(Arc::clone(&focused.pane));
             }
         }
         self.raw_tree_active_pane()
     }
 
+    fn raw_active_pane_callback_free(
+        &self,
+        _pane_ids: &HashMap<PaneIdentity, PaneId>,
+    ) -> Option<Arc<dyn Pane>> {
+        self.raw_active_pane_retained_id()
+    }
+
     fn raw_active_pane_callback_free_with_tree_active(
         &self,
-        pane_ids: &HashMap<PaneIdentity, PaneId>,
+        _pane_ids: &HashMap<PaneIdentity, PaneId>,
         tree_active: Arc<dyn Pane>,
     ) -> Arc<dyn Pane> {
         if let Some(zoomed) = &self.zoomed {
             return Arc::clone(zoomed);
         }
         if let Some(focused_id) = self.floating_focus {
-            if let Some(focused) = self.floating_panes.iter().find(|floating| {
-                floating.visible
-                    && pane_ids.get(&pane_identity(&floating.pane)) == Some(&focused_id)
-            }) {
+            if let Some(focused) = self
+                .floating_panes
+                .iter()
+                .find(|floating| floating.visible && floating.pane_id == focused_id)
+            {
                 return Arc::clone(&focused.pane);
             }
         }
@@ -5581,16 +5729,24 @@ impl TabInner {
         ))
     }
 
-    fn update_pane_constraints(
+    fn prepare_update_pane_constraints(
         &mut self,
         pane_id: PaneId,
         min_width: Option<usize>,
         max_width: Option<usize>,
         min_height: Option<usize>,
         max_height: Option<usize>,
-    ) -> Option<PaneConstraints> {
-        let pane = self.find_pane_by_id(pane_id)?;
-        let mut updated = effective_pane_constraints(&pane, &self.constraint_overrides);
+    ) -> (Option<PaneConstraints>, DeferredTabCallbacks) {
+        let Some(pane) = self.find_pane_by_id(pane_id) else {
+            return (None, DeferredTabCallbacks::default());
+        };
+        let intrinsic = pane.pane_constraints();
+        let prior = self
+            .constraint_overrides
+            .get(&pane_id)
+            .copied()
+            .unwrap_or(intrinsic);
+        let mut updated = prior;
         if let Some(value) = min_width {
             updated.min_width = value;
         }
@@ -5604,15 +5760,17 @@ impl TabInner {
             updated.max_height = Some(value);
         }
         let updated = normalize_runtime_pane_constraints(updated);
-        if updated == pane.pane_constraints() {
+        if updated == prior {
+            return (Some(updated), DeferredTabCallbacks::default());
+        }
+        if updated == intrinsic {
             self.constraint_overrides.remove(&pane_id);
         } else {
             self.constraint_overrides.insert(pane_id, updated);
         }
 
         let size = self.size;
-        self.resize(size);
-        Some(updated)
+        (Some(updated), self.prepare_resize_for_reflow(size))
     }
 
     /// Compute the resize budget for a split identified by its topological
@@ -5837,15 +5995,31 @@ impl TabInner {
         self.size
     }
 
-    fn resize(&mut self, size: TerminalSize) {
+    fn prepare_resize(&mut self, size: TerminalSize) -> DeferredTabCallbacks {
+        self.prepare_resize_impl(size, false)
+    }
+
+    fn prepare_resize_for_reflow(&mut self, size: TerminalSize) -> DeferredTabCallbacks {
+        self.prepare_resize_impl(size, true)
+    }
+
+    fn prepare_resize_impl(
+        &mut self,
+        size: TerminalSize,
+        force_reflow: bool,
+    ) -> DeferredTabCallbacks {
+        let mut callbacks = DeferredTabCallbacks::default();
         if size.rows == 0 || size.cols == 0 {
             // Ignore "impossible" resize requests
-            return;
+            return callbacks;
+        }
+        if !force_reflow && self.size == size {
+            return callbacks;
         }
 
         if let Some(zoomed) = &self.zoomed {
             self.size = size;
-            zoomed.resize(size).ok();
+            callbacks.resize_work.push((Arc::clone(zoomed), size));
         } else {
             let dims = cell_dimensions(&size);
             let width_constraints = compute_axis_constraints(
@@ -5915,11 +6089,25 @@ impl TabInner {
             self.size = size;
 
             // And then resize the individual panes to match
-            apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size);
+            collect_pane_resize_work(
+                self.pane.as_ref().expect("pane tree retained during resize"),
+                &size,
+                &mut callbacks.resize_work,
+            );
         }
 
-        self.resize_floating_panes_to_fit();
-        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        self.prepare_floating_pane_resizes_to_fit(&mut callbacks.resize_work);
+        callbacks.changed = true;
+        callbacks
+    }
+
+    fn resize(&mut self, size: TerminalSize) {
+        let mux = Mux::try_get();
+        let mut callbacks = self.prepare_resize(size);
+        if let Some(mux) = mux.as_deref() {
+            callbacks.reserve_topology_notifications(mux, self.id);
+        }
+        callbacks.execute(mux.as_deref());
     }
 
     fn apply_pane_size(&mut self, pane_size: TerminalSize, cursor: &mut Cursor) {
@@ -6046,9 +6234,14 @@ impl TabInner {
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
     }
 
-    fn resize_split_by(&mut self, split_index: usize, delta: isize) {
+    fn prepare_resize_split_by(
+        &mut self,
+        split_index: usize,
+        delta: isize,
+    ) -> DeferredTabCallbacks {
+        let mut callbacks = DeferredTabCallbacks::default();
         if self.zoomed.is_some() {
-            return;
+            return callbacks;
         }
 
         let mut cursor = self.pane.take().unwrap().cursor();
@@ -6068,18 +6261,22 @@ impl TabInner {
                 Err(c) => {
                     // Didn't find it
                     self.pane.replace(c.tree());
-                    return;
+                    return callbacks;
                 }
             }
         }
 
         // Now cursor is looking at the split
-        self.adjust_node_at_cursor(&mut cursor, delta);
-        self.cascade_size_from_cursor(cursor);
-        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        if !self.adjust_node_at_cursor(&mut cursor, delta) {
+            self.pane.replace(cursor.tree());
+            return callbacks;
+        }
+        self.cascade_size_from_cursor(cursor, &mut callbacks.resize_work);
+        callbacks.changed = true;
+        callbacks
     }
 
-    fn adjust_node_at_cursor(&mut self, cursor: &mut Cursor, delta: isize) {
+    fn adjust_node_at_cursor(&mut self, cursor: &mut Cursor, delta: isize) -> bool {
         let cell_dimensions = self.cell_dimensions();
         let (
             left_width_constraints,
@@ -6107,9 +6304,11 @@ impl TabInner {
                     right_height_constraints,
                 )
             }
-            _ => return,
+            _ => return false,
         };
         if let Ok(Some(node)) = cursor.node_mut() {
+            let before_first = node.first;
+            let before_second = node.second;
             match node.direction {
                 SplitDirection::Horizontal => {
                     let width = node.width();
@@ -6148,10 +6347,16 @@ impl TabInner {
                     }
                 }
             }
+            return node.first != before_first || node.second != before_second;
         }
+        false
     }
 
-    fn cascade_size_from_cursor(&mut self, mut cursor: Cursor) {
+    fn cascade_size_from_cursor(
+        &mut self,
+        mut cursor: Cursor,
+        resize_work: &mut Vec<(Arc<dyn Pane>, TerminalSize)>,
+    ) {
         // Now we need to cascade this down to children
         match cursor.preorder_next() {
             Ok(c) => cursor = c,
@@ -6176,8 +6381,9 @@ impl TabInner {
             };
 
             if cursor.is_leaf() {
-                // Apply our size to the tty
-                cursor.leaf_mut().map(|pane| pane.resize(pane_size));
+                if let Some(pane) = cursor.leaf_mut() {
+                    resize_work.push((Arc::clone(pane), pane_size));
+                }
             } else {
                 self.apply_pane_size(pane_size, &mut cursor);
             }
@@ -6189,12 +6395,16 @@ impl TabInner {
                 }
             }
         }
-        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
     }
 
-    fn adjust_pane_size(&mut self, direction: PaneDirection, amount: usize) {
+    fn prepare_adjust_pane_size(
+        &mut self,
+        direction: PaneDirection,
+        amount: usize,
+    ) -> DeferredTabCallbacks {
+        let mut callbacks = DeferredTabCallbacks::default();
         if self.zoomed.is_some() {
-            return;
+            return callbacks;
         }
         let active_index = self.active;
         let mut cursor = self.pane.take().unwrap().cursor();
@@ -6214,7 +6424,7 @@ impl TabInner {
                 Err(c) => {
                     // Didn't find it
                     self.pane.replace(c.tree());
-                    return;
+                    return callbacks;
                 }
             }
         }
@@ -6233,9 +6443,13 @@ impl TabInner {
                 Ok(mut c) => {
                     if let Ok(Some(node)) = c.node_mut() {
                         if node.direction == split_direction {
-                            self.adjust_node_at_cursor(&mut c, delta);
-                            self.cascade_size_from_cursor(c);
-                            return;
+                            if !self.adjust_node_at_cursor(&mut c, delta) {
+                                self.pane.replace(c.tree());
+                                return callbacks;
+                            }
+                            self.cascade_size_from_cursor(c, &mut callbacks.resize_work);
+                            callbacks.changed = true;
+                            return callbacks;
                         }
                     }
 
@@ -6244,7 +6458,7 @@ impl TabInner {
 
                 Err(c) => {
                     self.pane.replace(c.tree());
-                    return;
+                    return callbacks;
                 }
             }
         }
@@ -8764,6 +8978,7 @@ mod test {
             );
             inner.floating_panes.push(FloatingPane {
                 pane: floating,
+                pane_id: 802,
                 rect: FloatingPaneRect {
                     left: 0,
                     top: 0,
@@ -8908,6 +9123,7 @@ mod test {
             );
             inner.floating_panes.push(FloatingPane {
                 pane: shared,
+                pane_id: 913,
                 rect: FloatingPaneRect {
                     left: 0,
                     top: 0,
@@ -9027,6 +9243,7 @@ mod test {
             inner.pane = None;
             inner.floating_panes.push(FloatingPane {
                 pane: FakePane::new_with_pane_id_probe(933, size, Arc::clone(&probe)),
+                pane_id: 933,
                 rect: FloatingPaneRect {
                     left: 0,
                     top: 0,
@@ -9254,6 +9471,7 @@ mod test {
             let tab = weak_tab.upgrade().expect("test retains tab");
             tab.inner.lock().floating_panes.push(FloatingPane {
                 pane: FakePane::new(950_usize.saturating_add(ordinal), size),
+                pane_id: 950_usize.saturating_add(ordinal),
                 rect: FloatingPaneRect {
                     left: 0,
                     top: 0,
@@ -10213,24 +10431,50 @@ mod test {
     }
 
     #[test]
-    fn resize_fanout_worker_plan_stays_sequential_for_small_work() {
-        assert_eq!(1, compute_resize_fanout_workers(1, 16));
-        assert_eq!(1, compute_resize_fanout_workers(7, 16));
-    }
+    fn pane_resize_work_runs_once_in_input_order_on_the_calling_thread() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let caller_thread = std::thread::current().id();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut work = Vec::new();
 
-    #[test]
-    fn resize_fanout_worker_plan_caps_worker_count() {
+        for pane_id in 1..=16 {
+            let observed_for_callback = Arc::clone(&observed);
+            work.push((
+                FakePane::new_with_callback_probe(
+                    pane_id,
+                    size,
+                    false,
+                    false,
+                    Arc::new(move || {
+                        observed_for_callback
+                            .lock()
+                            .push((pane_id, std::thread::current().id()));
+                    }),
+                ),
+                size,
+            ));
+        }
+
+        execute_pane_resize_work(work);
+
+        let observed = observed.lock();
         assert_eq!(
-            configuration().resize_fanout_max_workers,
-            compute_resize_fanout_workers(256, 64)
+            observed.iter().map(|(pane_id, _)| *pane_id).collect::<Vec<_>>(),
+            (1..=16).collect::<Vec<_>>(),
+            "resize effects must preserve the prepared tree order",
         );
-    }
-
-    #[test]
-    fn resize_fanout_worker_plan_enforces_min_batch_size() {
-        assert_eq!(2, compute_resize_fanout_workers(9, 16));
-        assert_eq!(3, compute_resize_fanout_workers(12, 16));
-        assert_eq!(2, compute_resize_fanout_workers(8, 16));
+        assert!(
+            observed
+                .iter()
+                .all(|(_, callback_thread)| *callback_thread == caller_thread),
+            "resize effects must not cross a fallible transient thread-spawn boundary",
+        );
     }
 
     proptest! {

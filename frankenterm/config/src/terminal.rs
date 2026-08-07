@@ -525,11 +525,8 @@ mod tests {
     }
 
     #[test]
-    fn resize_fanout_defaults_match_original_constants() {
+    fn floating_pane_defaults_match_original_constants() {
         let handle = ConfigHandle::default_config();
-        assert_eq!(handle.resize_fanout_parallel_threshold, 8);
-        assert_eq!(handle.resize_fanout_min_batch_size, 4);
-        assert_eq!(handle.resize_fanout_max_workers, 8);
         assert_eq!(handle.min_floating_pane_width, 5);
         assert_eq!(handle.min_floating_pane_height, 3);
     }

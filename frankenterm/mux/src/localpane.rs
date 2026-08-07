@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
 use config::{configuration, ExitBehavior, ExitBehaviorMessaging};
 use fancy_regex::Regex;
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_dynamic::Value;
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{
@@ -26,6 +27,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::{TryFrom, TryInto};
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::sync::Arc;
@@ -390,7 +392,12 @@ struct PendingResize {
     size: TerminalSize,
     pty_size: PtySize,
     enqueued_at: Instant,
+    recoverable_panic_retries: u8,
+    apply_error_retries: u8,
 }
+
+const MAX_RESIZE_RECOVERABLE_PANIC_RETRIES: u8 = 2;
+const MAX_RESIZE_APPLY_ERROR_RETRIES: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResizeEnqueueOutcome {
@@ -416,6 +423,67 @@ struct ResizeQueueState {
     pending: Option<PendingResize>,
     next_seq: u64,
     worker_running: bool,
+    /// Last PTY geometry whose `MasterPty::resize` call completed successfully.
+    ///
+    /// Terminal geometry alone is not sufficient no-op authority: an older
+    /// in-flight intent can resize the PTY and then be superseded before its
+    /// terminal commit. The winning intent must reconcile both sides even when
+    /// the terminal has already returned to its requested geometry.
+    last_proven_pty_size: Option<PtySize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeFailureKind {
+    RecoverablePanic,
+    ApplyError,
+}
+
+impl ResizeFailureKind {
+    fn retry_limit(self) -> u8 {
+        match self {
+            Self::RecoverablePanic => MAX_RESIZE_RECOVERABLE_PANIC_RETRIES,
+            Self::ApplyError => MAX_RESIZE_APPLY_ERROR_RETRIES,
+        }
+    }
+
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::RecoverablePanic => "recoverable_panic",
+            Self::ApplyError => "apply_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeFailureRecovery {
+    Requeued { retry: u8 },
+    Superseded { by_seq: u64 },
+    ExhaustedRetained { retries: u8 },
+}
+
+impl ResizeFailureRecovery {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Requeued { .. } => "requeued",
+            Self::Superseded { .. } => "superseded",
+            Self::ExhaustedRetained { .. } => "exhausted_retained",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ResizeCommitDecision<T> {
+    Committed(T),
+    Superseded { by_seq: u64 },
+}
+
+fn resize_is_proven_noop(
+    current_size: TerminalSize,
+    target_size: TerminalSize,
+    last_proven_pty_size: Option<PtySize>,
+    target_pty_size: PtySize,
+) -> bool {
+    current_size == target_size && last_proven_pty_size == Some(target_pty_size)
 }
 
 impl ResizeQueueState {
@@ -440,6 +508,8 @@ impl ResizeQueueState {
             size,
             pty_size,
             enqueued_at,
+            recoverable_panic_retries: 0,
+            apply_error_retries: 0,
         });
 
         ResizeEnqueueOutcome {
@@ -460,8 +530,120 @@ impl ResizeQueueState {
     }
 
     fn superseded_by(&self, token: ResizeCancellationToken) -> Option<u64> {
-        (self.next_seq > token.seq).then_some(self.next_seq)
+        // Exactly one intent may be in flight and the queue retains at most
+        // one newer coalesced intent. Generation inequality therefore means
+        // superseded, including the u64::MAX -> 0 wrap. Aliasing would require
+        // 2^64 enqueues before one in-flight attempt reaches any cancellation
+        // boundary, which is outside the physical in-flight-cycle contract.
+        (self.next_seq != token.seq).then_some(self.next_seq)
     }
+
+    /// Preserve a dequeued intent after a callback panic or apply error.
+    ///
+    /// A newer pending intent always wins. Otherwise the exact dequeued
+    /// target is retried a bounded number of times. After the budget is
+    /// exhausted, retain that target while releasing worker admission: a
+    /// future resize can replace it and start a fresh worker, while the last
+    /// requested geometry is never silently forgotten behind a stale
+    /// `worker_running=true` latch.
+    fn recover_failed_intent(
+        &mut self,
+        mut intent: PendingResize,
+        failure: ResizeFailureKind,
+    ) -> ResizeFailureRecovery {
+        if let Some(newer) = self.pending.as_ref() {
+            return ResizeFailureRecovery::Superseded { by_seq: newer.seq };
+        }
+
+        let retries = match failure {
+            ResizeFailureKind::RecoverablePanic => &mut intent.recoverable_panic_retries,
+            ResizeFailureKind::ApplyError => &mut intent.apply_error_retries,
+        };
+        if *retries < failure.retry_limit() {
+            *retries = (*retries).saturating_add(1);
+            let retry = *retries;
+            self.pending = Some(intent);
+            self.worker_running = true;
+            ResizeFailureRecovery::Requeued { retry }
+        } else {
+            let retries = *retries;
+            self.pending = Some(intent);
+            self.worker_running = false;
+            ResizeFailureRecovery::ExhaustedRetained { retries }
+        }
+    }
+}
+
+fn settle_resize_worker_spawn<T, E>(spawn_result: Result<T, E>, run_inline: impl FnOnce()) {
+    if spawn_result.is_err() {
+        run_inline();
+    }
+}
+
+fn catch_resize_intent<T>(
+    resize_queue: &Mutex<ResizeQueueState>,
+    pending: PendingResize,
+    apply: impl FnOnce() -> T,
+) -> Result<T, ResizeFailureRecovery> {
+    match catch_recoverable(
+        RecoverablePanicSite::MuxPaneCallback,
+        AssertUnwindSafe(apply),
+    ) {
+        Ok(result) => Ok(result),
+        Err(_) => Err(
+            resize_queue
+                .lock()
+                .recover_failed_intent(pending, ResizeFailureKind::RecoverablePanic),
+        ),
+    }
+}
+
+fn recover_resize_apply_error<T, E>(
+    resize_queue: &Mutex<ResizeQueueState>,
+    pending: PendingResize,
+    result: Result<T, E>,
+) -> Result<T, (E, ResizeFailureRecovery)> {
+    result.map_err(|error| {
+        let recovery = resize_queue
+            .lock()
+            .recover_failed_intent(pending, ResizeFailureKind::ApplyError);
+        (error, recovery)
+    })
+}
+
+fn record_resize_failure(kind: ResizeFailureKind, recovery: ResizeFailureRecovery) {
+    metrics::counter!(
+        "mux.localpane.resize.intent_failure",
+        "kind" => kind.metric_label(),
+        "settlement" => recovery.metric_label(),
+    )
+    .increment(1);
+}
+
+/// Linearize the last supersession check with its terminal commit.
+///
+/// The caller acquires the terminal lock before entering this helper. The
+/// resulting order is therefore `terminal -> resize_queue`. Enqueue and
+/// dequeue paths hold `resize_queue` only long enough to mutate queue state
+/// and release it before touching the terminal or spawning a worker; no
+/// inverse `resize_queue -> terminal` critical section is permitted. Holding
+/// the queue guard through `commit` means a newer intent linearizes either
+/// before the check (and rejects this commit) or after the commit, never in
+/// the stale check/commit gap.
+fn with_resize_commit_barrier<T>(
+    resize_queue: &Mutex<ResizeQueueState>,
+    token: ResizeCancellationToken,
+    commit: impl FnOnce() -> T,
+) -> (ResizeCommitDecision<T>, Duration) {
+    let wait_start = Instant::now();
+    let queue = resize_queue.lock();
+    let wait = wait_start.elapsed();
+    if let Some(by_seq) = queue.superseded_by(token) {
+        return (ResizeCommitDecision::Superseded { by_seq }, wait);
+    }
+    let value = commit();
+    drop(queue);
+    (ResizeCommitDecision::Committed(value), wait)
 }
 
 #[derive(Clone, Copy)]
@@ -1791,104 +1973,208 @@ impl LocalPane {
         pty: Arc<Mutex<Box<dyn MasterPty>>>,
         resize_queue: Arc<Mutex<ResizeQueueState>>,
     ) {
+        let worker_terminal = Arc::clone(&terminal);
+        #[cfg(feature = "disruptor-pane-io")]
+        let worker_action_ring = Arc::clone(&action_ring);
+        let worker_pty = Arc::clone(&pty);
         let worker_queue = Arc::clone(&resize_queue);
-        let spawn_result =
-            std::thread::Builder::new()
-                .name(format!("pane-resize-{}", pane_id))
-                .spawn(move || {
-                    while let Some(pending) = {
-                        let mut queue = worker_queue.lock();
-                        queue.dequeue_for_worker()
-                    } {
-                        let queue_wait = pending.enqueued_at.elapsed();
-                        let completion_start = Instant::now();
-                        let token = ResizeCancellationToken::new(pending.seq);
-                        match Self::apply_resize_sync(
-                            pane_id,
-                            terminal.as_ref(),
-                            #[cfg(feature = "disruptor-pane-io")]
-                            action_ring.as_ref(),
-                            pty.as_ref(),
-                            pending.seq,
-                            pending.size,
-                            pending.pty_size,
-                            || {
-                                let queue = worker_queue.lock();
-                                queue.superseded_by(token)
-                            },
-                        ) {
-                            Ok(metrics) => {
-                                if metrics.cancelled {
-                                    log::trace!(
-                                        "LocalPane::resize cancelled pane_id={} seq={} commit_id={} rejected_frame={} superseded_by_seq={} stage={} queue_wait_us={} completion_us={} current={}x{} target={}x{} probe_lock_wait_us={} pty_lock_wait_us={} pty_resize_us={} pty_resize_attempts={} pty_retry_backoff_us={} swap_barrier_wait_us={} terminal_apply_lock_wait_us={} terminal_resize_us={}",
-                                        pane_id,
-                                        pending.seq,
-                                        metrics.commit_id,
-                                        metrics.rejected_frame,
-                                        metrics.superseded_by_seq.unwrap_or_default(),
-                                        metrics.cancelled_stage.unwrap_or("unknown"),
-                                        queue_wait.as_micros(),
-                                        completion_start.elapsed().as_micros(),
-                                        metrics.current_size.cols,
-                                        metrics.current_size.rows,
-                                        metrics.target_size.cols,
-                                        metrics.target_size.rows,
-                                        metrics.probe_lock_wait.as_micros(),
-                                        metrics.pty_lock_wait.as_micros(),
-                                        metrics.pty_resize_elapsed.as_micros(),
-                                        metrics.pty_resize_attempts,
-                                        metrics.pty_retry_backoff_elapsed.as_micros(),
-                                        metrics.swap_barrier_wait.as_micros(),
-                                        metrics.terminal_apply_lock_wait.as_micros(),
-                                        metrics.terminal_resize_elapsed.as_micros(),
-                                    );
-                                } else {
-                                    log::trace!(
-                                        "LocalPane::resize complete pane_id={} seq={} commit_id={} rejected_frame={} queue_wait_us={} completion_us={} noop={} current={}x{} target={}x{} probe_lock_wait_us={} pty_lock_wait_us={} pty_resize_us={} pty_resize_attempts={} pty_retry_backoff_us={} swap_barrier_wait_us={} terminal_apply_lock_wait_us={} terminal_resize_us={}",
-                                        pane_id,
-                                        pending.seq,
-                                        metrics.commit_id,
-                                        metrics.rejected_frame,
-                                        queue_wait.as_micros(),
-                                        completion_start.elapsed().as_micros(),
-                                        metrics.noop,
-                                        metrics.current_size.cols,
-                                        metrics.current_size.rows,
-                                        metrics.target_size.cols,
-                                        metrics.target_size.rows,
-                                        metrics.probe_lock_wait.as_micros(),
-                                        metrics.pty_lock_wait.as_micros(),
-                                        metrics.pty_resize_elapsed.as_micros(),
-                                        metrics.pty_resize_attempts,
-                                        metrics.pty_retry_backoff_elapsed.as_micros(),
-                                        metrics.swap_barrier_wait.as_micros(),
-                                        metrics.terminal_apply_lock_wait.as_micros(),
-                                        metrics.terminal_resize_elapsed.as_micros(),
-                                    );
-                                }
-                            }
-                            Err(err) => {
-                                log::error!(
-                                    "LocalPane::resize error pane_id={} seq={} target={}x{} error={:#}",
-                                    pane_id,
-                                    pending.seq,
-                                    pending.size.cols,
-                                    pending.size.rows,
-                                    err
-                                );
-                            }
-                        }
-                    }
-                });
+        let spawn_result = std::thread::Builder::new()
+            .name(format!("pane-resize-{}", pane_id))
+            .spawn(move || {
+                Self::run_resize_worker(
+                    pane_id,
+                    worker_terminal,
+                    #[cfg(feature = "disruptor-pane-io")]
+                    worker_action_ring,
+                    worker_pty,
+                    worker_queue,
+                );
+            });
 
-        if let Err(err) = spawn_result {
+        if let Err(err) = &spawn_result {
             log::error!(
-                "failed to spawn resize worker pane_id={} error={:#}",
+                "failed to spawn resize worker; settling inline pane_id={} error={:#}",
                 pane_id,
                 err
             );
+        }
+        settle_resize_worker_spawn(spawn_result, || {
+            // The queue still owns the latest coalesced target and still marks
+            // this worker as running. Drain it on the caller rather than
+            // clearing admission and stranding the final resize indefinitely.
+            // Thread creation failure is exceptional; correctness takes
+            // precedence over keeping this rare fallback off the caller.
+            Self::run_resize_worker(
+                pane_id,
+                terminal,
+                #[cfg(feature = "disruptor-pane-io")]
+                action_ring,
+                pty,
+                resize_queue,
+            );
+        });
+    }
+
+    fn run_resize_worker(
+        pane_id: PaneId,
+        terminal: Arc<Mutex<Terminal>>,
+        #[cfg(feature = "disruptor-pane-io")] action_ring: Arc<ArrayQueue<Vec<Action>>>,
+        pty: Arc<Mutex<Box<dyn MasterPty>>>,
+        resize_queue: Arc<Mutex<ResizeQueueState>>,
+    ) {
+        while let Some(pending) = {
             let mut queue = resize_queue.lock();
-            queue.worker_running = false;
+            queue.dequeue_for_worker()
+        } {
+            let queue_wait = pending.enqueued_at.elapsed();
+            let completion_start = Instant::now();
+            let token = ResizeCancellationToken::new(pending.seq);
+            let apply_result = catch_resize_intent(resize_queue.as_ref(), pending, || {
+                Self::apply_resize_sync(
+                    pane_id,
+                    terminal.as_ref(),
+                    #[cfg(feature = "disruptor-pane-io")]
+                    action_ring.as_ref(),
+                    pty.as_ref(),
+                    resize_queue.as_ref(),
+                    pending.seq,
+                    pending.size,
+                    pending.pty_size,
+                    token,
+                )
+            });
+            let settled_apply_result = apply_result.map(|result| {
+                recover_resize_apply_error(resize_queue.as_ref(), pending, result)
+            });
+            match settled_apply_result {
+                Ok(Ok(metrics)) => {
+                    if metrics.cancelled {
+                        log::trace!(
+                            "LocalPane::resize cancelled pane_id={} seq={} commit_id={} rejected_frame={} superseded_by_seq={} stage={} queue_wait_us={} completion_us={} current={}x{} target={}x{} probe_lock_wait_us={} pty_lock_wait_us={} pty_resize_us={} pty_resize_attempts={} pty_retry_backoff_us={} swap_barrier_wait_us={} terminal_apply_lock_wait_us={} terminal_resize_us={}",
+                            pane_id,
+                            pending.seq,
+                            metrics.commit_id,
+                            metrics.rejected_frame,
+                            metrics.superseded_by_seq.unwrap_or_default(),
+                            metrics.cancelled_stage.unwrap_or("unknown"),
+                            queue_wait.as_micros(),
+                            completion_start.elapsed().as_micros(),
+                            metrics.current_size.cols,
+                            metrics.current_size.rows,
+                            metrics.target_size.cols,
+                            metrics.target_size.rows,
+                            metrics.probe_lock_wait.as_micros(),
+                            metrics.pty_lock_wait.as_micros(),
+                            metrics.pty_resize_elapsed.as_micros(),
+                            metrics.pty_resize_attempts,
+                            metrics.pty_retry_backoff_elapsed.as_micros(),
+                            metrics.swap_barrier_wait.as_micros(),
+                            metrics.terminal_apply_lock_wait.as_micros(),
+                            metrics.terminal_resize_elapsed.as_micros(),
+                        );
+                    } else {
+                        log::trace!(
+                            "LocalPane::resize complete pane_id={} seq={} commit_id={} rejected_frame={} queue_wait_us={} completion_us={} noop={} current={}x{} target={}x{} probe_lock_wait_us={} pty_lock_wait_us={} pty_resize_us={} pty_resize_attempts={} pty_retry_backoff_us={} swap_barrier_wait_us={} terminal_apply_lock_wait_us={} terminal_resize_us={}",
+                            pane_id,
+                            pending.seq,
+                            metrics.commit_id,
+                            metrics.rejected_frame,
+                            queue_wait.as_micros(),
+                            completion_start.elapsed().as_micros(),
+                            metrics.noop,
+                            metrics.current_size.cols,
+                            metrics.current_size.rows,
+                            metrics.target_size.cols,
+                            metrics.target_size.rows,
+                            metrics.probe_lock_wait.as_micros(),
+                            metrics.pty_lock_wait.as_micros(),
+                            metrics.pty_resize_elapsed.as_micros(),
+                            metrics.pty_resize_attempts,
+                            metrics.pty_retry_backoff_elapsed.as_micros(),
+                            metrics.swap_barrier_wait.as_micros(),
+                            metrics.terminal_apply_lock_wait.as_micros(),
+                            metrics.terminal_resize_elapsed.as_micros(),
+                        );
+                    }
+                }
+                Ok(Err((err, recovery))) => {
+                    record_resize_failure(ResizeFailureKind::ApplyError, recovery);
+                    match recovery {
+                        ResizeFailureRecovery::Requeued { retry } => {
+                            log::error!(
+                                "LocalPane::resize apply error pane_id={} seq={} target={}x{} retry={}/{} action=requeued error={:#}",
+                                pane_id,
+                                pending.seq,
+                                pending.size.cols,
+                                pending.size.rows,
+                                retry,
+                                MAX_RESIZE_APPLY_ERROR_RETRIES,
+                                err,
+                            );
+                        }
+                        ResizeFailureRecovery::Superseded { by_seq } => {
+                            log::error!(
+                                "LocalPane::resize apply error pane_id={} seq={} target={}x{} action=superseded superseded_by_seq={} error={:#}",
+                                pane_id,
+                                pending.seq,
+                                pending.size.cols,
+                                pending.size.rows,
+                                by_seq,
+                                err,
+                            );
+                        }
+                        ResizeFailureRecovery::ExhaustedRetained { retries } => {
+                            log::error!(
+                                "LocalPane::resize apply error retry budget exhausted pane_id={} seq={} target={}x{} retries={} action=retained_worker_released error={:#}",
+                                pane_id,
+                                pending.seq,
+                                pending.size.cols,
+                                pending.size.rows,
+                                retries,
+                                err,
+                            );
+                            return;
+                        }
+                    }
+                }
+                Err(recovery) => {
+                    record_resize_failure(ResizeFailureKind::RecoverablePanic, recovery);
+                    match recovery {
+                        ResizeFailureRecovery::Requeued { retry } => {
+                            log::error!(
+                                "LocalPane::resize recovered callback panic pane_id={} seq={} target={}x{} retry={}/{} action=requeued",
+                                pane_id,
+                                pending.seq,
+                                pending.size.cols,
+                                pending.size.rows,
+                                retry,
+                                MAX_RESIZE_RECOVERABLE_PANIC_RETRIES,
+                            );
+                        }
+                        ResizeFailureRecovery::Superseded { by_seq } => {
+                            log::error!(
+                                "LocalPane::resize recovered callback panic pane_id={} seq={} target={}x{} action=superseded superseded_by_seq={}",
+                                pane_id,
+                                pending.seq,
+                                pending.size.cols,
+                                pending.size.rows,
+                                by_seq,
+                            );
+                        }
+                        ResizeFailureRecovery::ExhaustedRetained { retries } => {
+                            log::error!(
+                                "LocalPane::resize callback panic retry budget exhausted pane_id={} seq={} target={}x{} retries={} action=retained_worker_released",
+                                pane_id,
+                                pending.seq,
+                                pending.size.cols,
+                                pending.size.rows,
+                                retries,
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1897,10 +2183,11 @@ impl LocalPane {
         terminal: &Mutex<Terminal>,
         #[cfg(feature = "disruptor-pane-io")] action_ring: &ArrayQueue<Vec<Action>>,
         pty: &Mutex<Box<dyn MasterPty>>,
+        resize_queue: &Mutex<ResizeQueueState>,
         commit_id: u64,
         size: TerminalSize,
         pty_size: PtySize,
-        mut superseded_by: impl FnMut() -> Option<u64>,
+        token: ResizeCancellationToken,
     ) -> Result<ResizeApplyMetrics, Error> {
         let terminal_probe_lock_start = Instant::now();
         #[cfg(feature = "disruptor-pane-io")]
@@ -1913,28 +2200,11 @@ impl LocalPane {
         let current_size = terminal.lock().get_size();
         let terminal_probe_lock_wait = terminal_probe_lock_start.elapsed();
 
-        if current_size == size {
-            return Ok(ResizeApplyMetrics {
-                commit_id,
-                current_size,
-                target_size: size,
-                probe_lock_wait: terminal_probe_lock_wait,
-                pty_lock_wait: Duration::default(),
-                pty_resize_elapsed: Duration::default(),
-                pty_resize_attempts: 0,
-                pty_retry_backoff_elapsed: Duration::default(),
-                swap_barrier_wait: Duration::default(),
-                terminal_apply_lock_wait: Duration::default(),
-                terminal_resize_elapsed: Duration::default(),
-                noop: true,
-                rejected_frame: false,
-                cancelled: false,
-                cancelled_stage: None,
-                superseded_by_seq: None,
-            });
-        }
-
-        if let Some(superseded_by_seq) = superseded_by() {
+        let (superseded_by_seq, last_proven_pty_size) = {
+            let queue = resize_queue.lock();
+            (queue.superseded_by(token), queue.last_proven_pty_size)
+        };
+        if let Some(superseded_by_seq) = superseded_by_seq {
             return Ok(ResizeApplyMetrics {
                 commit_id,
                 current_size,
@@ -1955,39 +2225,71 @@ impl LocalPane {
             });
         }
 
-        let policy = pty_resize_retry_policy();
+        if resize_is_proven_noop(current_size, size, last_proven_pty_size, pty_size) {
+            return Ok(ResizeApplyMetrics {
+                commit_id,
+                current_size,
+                target_size: size,
+                probe_lock_wait: terminal_probe_lock_wait,
+                pty_lock_wait: Duration::default(),
+                pty_resize_elapsed: Duration::default(),
+                pty_resize_attempts: 0,
+                pty_retry_backoff_elapsed: Duration::default(),
+                swap_barrier_wait: Duration::default(),
+                terminal_apply_lock_wait: Duration::default(),
+                terminal_resize_elapsed: Duration::default(),
+                noop: true,
+                rejected_frame: false,
+                cancelled: false,
+                cancelled_stage: None,
+                superseded_by_seq: None,
+            });
+        }
+
+        let pty_size_is_proven = last_proven_pty_size == Some(pty_size);
         let mut pty_lock_wait = Duration::default();
         let mut pty_resize_elapsed = Duration::default();
-        let (_, retry_stats) = retry_with_backoff(policy, |attempt| {
-            let pty_lock_start = Instant::now();
-            let pty = pty.lock();
-            pty_lock_wait += pty_lock_start.elapsed();
-            let pty_resize_start = Instant::now();
-            let result = pty.resize(pty_size);
-            pty_resize_elapsed += pty_resize_start.elapsed();
-            drop(pty);
-            if let Err(err) = result {
-                log::warn!(
-                    "LocalPane::resize pty retry pane_id={} attempt={}/{} target={}x{} error={:#}",
-                    pane_id,
-                    attempt,
-                    policy.max_attempts,
-                    size.cols,
-                    size.rows,
-                    err
-                );
-                return Err(err);
-            }
-            Ok(())
-        })
-        .map_err(|(err, stats)| {
-            err.context(format!(
-                "pty resize failed after {} attempts for pane_id={} target={}x{}",
-                stats.attempts, pane_id, size.cols, size.rows
-            ))
-        })?;
+        let retry_stats = if pty_size_is_proven {
+            ResizeRetryStats::default()
+        } else {
+            // A failed or panicking PTY callback can leave the kernel-side
+            // geometry ambiguous. Invalidate proof before the first attempt;
+            // only a completed callback below may restore it.
+            resize_queue.lock().last_proven_pty_size = None;
+            let policy = pty_resize_retry_policy();
+            let (_, retry_stats) = retry_with_backoff(policy, |attempt| {
+                let pty_lock_start = Instant::now();
+                let pty = pty.lock();
+                pty_lock_wait += pty_lock_start.elapsed();
+                let pty_resize_start = Instant::now();
+                let result = pty.resize(pty_size);
+                pty_resize_elapsed += pty_resize_start.elapsed();
+                drop(pty);
+                if let Err(err) = result {
+                    log::warn!(
+                        "LocalPane::resize pty retry pane_id={} attempt={}/{} target={}x{} error={:#}",
+                        pane_id,
+                        attempt,
+                        policy.max_attempts,
+                        size.cols,
+                        size.rows,
+                        err
+                    );
+                    return Err(err);
+                }
+                Ok(())
+            })
+            .map_err(|(err, stats)| {
+                err.context(format!(
+                    "pty resize failed after {} attempts for pane_id={} target={}x{}",
+                    stats.attempts, pane_id, size.cols, size.rows
+                ))
+            })?;
+            resize_queue.lock().last_proven_pty_size = Some(pty_size);
+            retry_stats
+        };
 
-        if let Some(superseded_by_seq) = superseded_by() {
+        if let Some(superseded_by_seq) = resize_queue.lock().superseded_by(token) {
             return Ok(ResizeApplyMetrics {
                 commit_id,
                 current_size,
@@ -2013,29 +2315,43 @@ impl LocalPane {
         #[cfg(feature = "disruptor-pane-io")]
         Self::drain_action_ring_into(action_ring, &mut terminal);
         let terminal_apply_lock_wait = terminal_apply_lock_start.elapsed();
-        if let Some(superseded_by_seq) = superseded_by() {
-            return Ok(ResizeApplyMetrics {
-                commit_id,
-                current_size,
-                target_size: size,
-                probe_lock_wait: terminal_probe_lock_wait,
-                pty_lock_wait,
-                pty_resize_elapsed,
-                pty_resize_attempts: retry_stats.attempts,
-                pty_retry_backoff_elapsed: retry_stats.backoff_elapsed,
-                swap_barrier_wait: terminal_apply_lock_wait,
-                terminal_apply_lock_wait,
-                terminal_resize_elapsed: Duration::default(),
-                noop: false,
-                rejected_frame: true,
-                cancelled: true,
-                cancelled_stage: Some("before_present_commit"),
-                superseded_by_seq: Some(superseded_by_seq),
-            });
-        }
-        let terminal_resize_start = Instant::now();
-        terminal.resize(size);
-        let terminal_resize_elapsed = terminal_resize_start.elapsed();
+        let (commit_decision, swap_barrier_wait) = with_resize_commit_barrier(
+            resize_queue,
+            token,
+            || {
+                if terminal.get_size() == size {
+                    return Duration::default();
+                }
+                let terminal_resize_start = Instant::now();
+                terminal.resize(size);
+                terminal_resize_start.elapsed()
+            },
+        );
+        let terminal_resize_elapsed = match commit_decision {
+            ResizeCommitDecision::Committed(elapsed) => elapsed,
+            ResizeCommitDecision::Superseded {
+                by_seq: superseded_by_seq,
+            } => {
+                return Ok(ResizeApplyMetrics {
+                    commit_id,
+                    current_size,
+                    target_size: size,
+                    probe_lock_wait: terminal_probe_lock_wait,
+                    pty_lock_wait,
+                    pty_resize_elapsed,
+                    pty_resize_attempts: retry_stats.attempts,
+                    pty_retry_backoff_elapsed: retry_stats.backoff_elapsed,
+                    swap_barrier_wait,
+                    terminal_apply_lock_wait,
+                    terminal_resize_elapsed: Duration::default(),
+                    noop: false,
+                    rejected_frame: true,
+                    cancelled: true,
+                    cancelled_stage: Some("before_present_commit"),
+                    superseded_by_seq: Some(superseded_by_seq),
+                });
+            }
+        };
 
         Ok(ResizeApplyMetrics {
             commit_id,
@@ -2046,7 +2362,7 @@ impl LocalPane {
             pty_resize_elapsed,
             pty_resize_attempts: retry_stats.attempts,
             pty_retry_backoff_elapsed: retry_stats.backoff_elapsed,
-            swap_barrier_wait: terminal_apply_lock_wait,
+            swap_barrier_wait,
             terminal_apply_lock_wait,
             terminal_resize_elapsed,
             noop: false,
@@ -2871,6 +3187,80 @@ mod tests {
     }
 
     #[test]
+    fn resize_queue_cancellation_survives_sequence_wrap() {
+        let mut queue = ResizeQueueState {
+            next_seq: u64::MAX - 1,
+            ..ResizeQueueState::default()
+        };
+        let now = Instant::now();
+
+        let max = queue.enqueue(term_size(80, 24), pty_size(80, 24), now);
+        assert_eq!(max.seq, u64::MAX);
+        let max_token = ResizeCancellationToken::new(max.seq);
+        assert_eq!(queue.superseded_by(max_token), None);
+        queue
+            .dequeue_for_worker()
+            .expect("max-generation intent must enter the worker");
+
+        let wrapped = queue.enqueue(term_size(120, 40), pty_size(120, 40), now);
+        assert_eq!(wrapped.seq, 0);
+        assert_eq!(
+            queue.superseded_by(max_token),
+            Some(0),
+            "generation inequality must reject the pre-wrap in-flight intent",
+        );
+        assert_eq!(
+            queue.superseded_by(ResizeCancellationToken::new(wrapped.seq)),
+            None,
+            "the wrapped generation itself remains current",
+        );
+    }
+
+    #[test]
+    fn supersession_back_to_terminal_size_still_requires_pty_reconciliation() {
+        let terminal_a = term_size(80, 24);
+        let pty_a = pty_size(80, 24);
+        let terminal_b = term_size(120, 40);
+        let pty_b = pty_size(120, 40);
+        let mut queue = ResizeQueueState::default();
+
+        let first = queue.enqueue(terminal_b, pty_b, Instant::now());
+        queue
+            .dequeue_for_worker()
+            .expect("first intent must enter the worker");
+        // Model the first intent completing its PTY resize before it loses the
+        // terminal-present race to a newer request that returns to size A.
+        queue.last_proven_pty_size = Some(pty_b);
+        let winner = queue.enqueue(terminal_a, pty_a, Instant::now());
+        assert_eq!(
+            queue.superseded_by(ResizeCancellationToken::new(first.seq)),
+            Some(winner.seq),
+        );
+
+        let winning_intent = queue
+            .dequeue_for_worker()
+            .expect("winning return-to-A intent must remain queued");
+        assert_eq!(winning_intent.seq, winner.seq);
+        assert!(
+            !resize_is_proven_noop(
+                terminal_a,
+                winning_intent.size,
+                queue.last_proven_pty_size,
+                winning_intent.pty_size,
+            ),
+            "terminal equality must not hide the PTY left at superseded size B",
+        );
+
+        queue.last_proven_pty_size = Some(pty_a);
+        assert!(resize_is_proven_noop(
+            terminal_a,
+            winning_intent.size,
+            queue.last_proven_pty_size,
+            winning_intent.pty_size,
+        ));
+    }
+
+    #[test]
     fn replay_cancellation_race_coalesces_to_latest_intent() {
         let mut replay = ResizeReplayHarness::default();
 
@@ -3322,6 +3712,321 @@ mod tests {
         let o3 = queue.enqueue(term_size(100, 24), pty_size(100, 24), now);
         assert_eq!(o3.queue_depth_hint, 2);
     }
+
+    #[test]
+    fn resize_worker_spawn_failure_settles_the_latest_retained_intent_inline() {
+        let queue = Arc::new(Mutex::new(ResizeQueueState::default()));
+        {
+            let mut queue = queue.lock();
+            let first = queue.enqueue(term_size(80, 24), pty_size(80, 24), Instant::now());
+            assert!(first.spawn_worker);
+            let latest = queue.enqueue(term_size(120, 40), pty_size(120, 40), Instant::now());
+            assert!(!latest.spawn_worker);
+            assert_eq!(latest.replaced_seq, Some(first.seq));
+        }
+
+        let settled = Arc::new(Mutex::new(Vec::new()));
+        let queue_for_fallback = Arc::clone(&queue);
+        let settled_for_fallback = Arc::clone(&settled);
+        settle_resize_worker_spawn(Err::<(), _>("injected spawn failure"), move || {
+            while let Some(pending) = queue_for_fallback.lock().dequeue_for_worker() {
+                settled_for_fallback
+                    .lock()
+                    .push((pending.seq, pending.size));
+            }
+        });
+
+        let settled = settled.lock();
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].0, 2);
+        assert_eq!(settled[0].1, term_size(120, 40));
+        let queue = queue.lock();
+        assert!(queue.pending.is_none());
+        assert!(
+            !queue.worker_running,
+            "inline settlement must release worker admission after draining",
+        );
+    }
+
+    #[test]
+    fn resize_worker_spawn_success_does_not_run_inline_fallback() {
+        let ran_inline = Arc::new(AtomicBool::new(false));
+        let ran_inline_for_fallback = Arc::clone(&ran_inline);
+
+        settle_resize_worker_spawn(Ok::<(), &str>(()), move || {
+            ran_inline_for_fallback.store(true, Ordering::Release);
+        });
+
+        assert!(!ran_inline.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn resize_intent_catch_requeues_dequeued_latest_target_after_panic() {
+        let queue = Mutex::new(ResizeQueueState::default());
+        let initial = queue
+            .lock()
+            .enqueue(term_size(80, 24), pty_size(80, 24), Instant::now());
+        let pending = queue
+            .lock()
+            .dequeue_for_worker()
+            .expect("initial intent must enter the worker");
+
+        let outcome: Result<(), ResizeFailureRecovery> =
+            catch_resize_intent(&queue, pending, || panic!("injected resize callback panic"));
+
+        assert_eq!(outcome, Err(ResizeFailureRecovery::Requeued { retry: 1 }));
+        let queue = queue.lock();
+        let retained = queue
+            .pending
+            .expect("caught panic must preserve the dequeued latest target");
+        assert_eq!(retained.seq, initial.seq);
+        assert_eq!(retained.size, term_size(80, 24));
+        assert_eq!(retained.recoverable_panic_retries, 1);
+        assert_eq!(retained.apply_error_retries, 0);
+        assert!(queue.worker_running);
+    }
+
+    #[test]
+    fn resize_worker_panic_recovery_retains_latest_intent_without_replacement() {
+        let mut queue = ResizeQueueState::default();
+        let initial = queue.enqueue(term_size(80, 24), pty_size(80, 24), Instant::now());
+        assert!(initial.spawn_worker);
+        let mut intent = queue
+            .dequeue_for_worker()
+            .expect("initial intent must enter the worker");
+
+        for retry in 1..=MAX_RESIZE_RECOVERABLE_PANIC_RETRIES {
+            assert_eq!(
+                queue.recover_failed_intent(intent, ResizeFailureKind::RecoverablePanic),
+                ResizeFailureRecovery::Requeued { retry },
+            );
+            assert!(queue.worker_running);
+            intent = queue
+                .dequeue_for_worker()
+                .expect("recoverable panic must requeue the exact latest intent");
+            assert_eq!(intent.seq, initial.seq);
+            assert_eq!(intent.size, term_size(80, 24));
+            assert_eq!(intent.recoverable_panic_retries, retry);
+        }
+
+        assert_eq!(
+            queue.recover_failed_intent(intent, ResizeFailureKind::RecoverablePanic),
+            ResizeFailureRecovery::ExhaustedRetained {
+                retries: MAX_RESIZE_RECOVERABLE_PANIC_RETRIES,
+            },
+        );
+        let retained = queue
+            .pending
+            .expect("exhaustion must retain rather than forget the last requested target");
+        assert_eq!(retained.seq, initial.seq);
+        assert_eq!(retained.size, term_size(80, 24));
+        assert!(!queue.worker_running);
+    }
+
+    #[test]
+    fn resize_worker_panic_recovery_prefers_newer_pending_intent() {
+        let mut queue = ResizeQueueState::default();
+        let initial = queue.enqueue(term_size(80, 24), pty_size(80, 24), Instant::now());
+        let panicked = queue
+            .dequeue_for_worker()
+            .expect("initial intent must enter the worker");
+        let newer = queue.enqueue(term_size(120, 40), pty_size(120, 40), Instant::now());
+        assert!(!newer.spawn_worker);
+
+        assert_eq!(
+            queue.recover_failed_intent(panicked, ResizeFailureKind::RecoverablePanic),
+            ResizeFailureRecovery::Superseded {
+                by_seq: newer.seq,
+            },
+        );
+        let retained = queue
+            .pending
+            .expect("newer target must remain admitted after older callback panic");
+        assert_eq!(retained.seq, newer.seq);
+        assert_eq!(retained.size, term_size(120, 40));
+        assert_eq!(retained.recoverable_panic_retries, 0);
+        assert_eq!(retained.apply_error_retries, 0);
+        assert!(queue.worker_running);
+        assert_ne!(initial.seq, newer.seq);
+    }
+
+    #[test]
+    fn resize_worker_apply_error_retries_then_retains_exact_target() {
+        let queue = Mutex::new(ResizeQueueState::default());
+        let initial = queue
+            .lock()
+            .enqueue(term_size(80, 24), pty_size(80, 24), Instant::now());
+        let first_attempt = queue
+            .lock()
+            .dequeue_for_worker()
+            .expect("initial intent must enter the worker");
+
+        let first_result: Result<(), (&str, ResizeFailureRecovery)> =
+            recover_resize_apply_error(&queue, first_attempt, Err("injected apply error"));
+        assert_eq!(
+            first_result,
+            Err((
+                "injected apply error",
+                ResizeFailureRecovery::Requeued { retry: 1 },
+            )),
+        );
+
+        let second_attempt = queue
+            .lock()
+            .dequeue_for_worker()
+            .expect("ordinary apply error must requeue the exact latest intent");
+        assert_eq!(second_attempt.seq, initial.seq);
+        assert_eq!(second_attempt.size, term_size(80, 24));
+        assert_eq!(second_attempt.recoverable_panic_retries, 0);
+        assert_eq!(second_attempt.apply_error_retries, 1);
+
+        let second_result: Result<(), (&str, ResizeFailureRecovery)> =
+            recover_resize_apply_error(&queue, second_attempt, Err("persistent apply error"));
+        assert_eq!(
+            second_result,
+            Err((
+                "persistent apply error",
+                ResizeFailureRecovery::ExhaustedRetained {
+                    retries: MAX_RESIZE_APPLY_ERROR_RETRIES,
+                },
+            )),
+        );
+
+        let queue = queue.lock();
+        let retained = queue
+            .pending
+            .expect("retry exhaustion must retain the last requested geometry");
+        assert_eq!(retained.seq, initial.seq);
+        assert_eq!(retained.size, term_size(80, 24));
+        assert_eq!(retained.apply_error_retries, MAX_RESIZE_APPLY_ERROR_RETRIES);
+        assert!(!queue.worker_running);
+    }
+
+    #[test]
+    fn resize_worker_apply_error_prefers_newer_pending_intent() {
+        let queue = Mutex::new(ResizeQueueState::default());
+        let initial = queue
+            .lock()
+            .enqueue(term_size(80, 24), pty_size(80, 24), Instant::now());
+        let failed = queue
+            .lock()
+            .dequeue_for_worker()
+            .expect("initial intent must enter the worker");
+        let newer = queue
+            .lock()
+            .enqueue(term_size(120, 40), pty_size(120, 40), Instant::now());
+
+        let result: Result<(), (&str, ResizeFailureRecovery)> =
+            recover_resize_apply_error(&queue, failed, Err("injected apply error"));
+        assert_eq!(
+            result,
+            Err((
+                "injected apply error",
+                ResizeFailureRecovery::Superseded { by_seq: newer.seq },
+            )),
+        );
+        let queue = queue.lock();
+        let retained = queue
+            .pending
+            .expect("newer target must survive an older intent's apply error");
+        assert_eq!(retained.seq, newer.seq);
+        assert_eq!(retained.size, term_size(120, 40));
+        assert_eq!(retained.apply_error_retries, 0);
+        assert!(queue.worker_running);
+        assert_ne!(initial.seq, newer.seq);
+    }
+
+    #[test]
+    fn resize_commit_barrier_rejects_intent_superseded_before_entry() {
+        let queue = Mutex::new(ResizeQueueState::default());
+        let first = queue
+            .lock()
+            .enqueue(term_size(80, 24), pty_size(80, 24), Instant::now());
+        queue.lock().dequeue_for_worker();
+        let newer = queue
+            .lock()
+            .enqueue(term_size(120, 40), pty_size(120, 40), Instant::now());
+        let committed = AtomicBool::new(false);
+
+        let (decision, _) = with_resize_commit_barrier(
+            &queue,
+            ResizeCancellationToken::new(first.seq),
+            || committed.store(true, Ordering::Release),
+        );
+
+        assert_eq!(
+            decision,
+            ResizeCommitDecision::Superseded {
+                by_seq: newer.seq,
+            },
+        );
+        assert!(
+            !committed.load(Ordering::Acquire),
+            "a target superseded before the barrier must never commit",
+        );
+    }
+
+    #[test]
+    fn resize_commit_barrier_closes_check_to_commit_enqueue_gap() {
+        let queue = Arc::new(Mutex::new(ResizeQueueState::default()));
+        let initial = queue
+            .lock()
+            .enqueue(term_size(80, 24), pty_size(80, 24), Instant::now());
+        queue.lock().dequeue_for_worker();
+
+        let (attempt_tx, attempt_rx) = sync_channel(0);
+        let (probe_tx, probe_rx) = sync_channel(0);
+        let (enqueued_tx, enqueued_rx) = sync_channel(0);
+        let queue_for_enqueue = Arc::clone(&queue);
+        let enqueuer = std::thread::spawn(move || {
+            attempt_tx
+                .send(())
+                .expect("commit barrier probe must start");
+            let acquired_during_commit = queue_for_enqueue.try_lock().is_some();
+            probe_tx
+                .send(acquired_during_commit)
+                .expect("commit barrier probe result must be observed");
+            let outcome = queue_for_enqueue.lock().enqueue(
+                term_size(120, 40),
+                pty_size(120, 40),
+                Instant::now(),
+            );
+            enqueued_tx
+                .send(outcome)
+                .expect("post-commit enqueue result must be observed");
+        });
+
+        let committed = AtomicBool::new(false);
+        let (decision, _) = with_resize_commit_barrier(
+            queue.as_ref(),
+            ResizeCancellationToken::new(initial.seq),
+            || {
+                attempt_rx
+                    .recv()
+                    .expect("enqueuer must reach the locked commit barrier");
+                assert!(
+                    !probe_rx
+                        .recv()
+                        .expect("enqueuer must report whether it crossed the barrier"),
+                    "enqueue must not linearize between the final stale check and commit",
+                );
+                assert_eq!(enqueued_rx.try_recv(), Err(TryRecvError::Empty));
+                committed.store(true, Ordering::Release);
+            },
+        );
+
+        assert_eq!(decision, ResizeCommitDecision::Committed(()));
+        assert!(committed.load(Ordering::Acquire));
+        let newer = enqueued_rx
+            .recv()
+            .expect("enqueue must complete after the commit guard is released");
+        enqueuer.join().expect("barrier probe thread must finish");
+        assert!(newer.seq > initial.seq);
+        assert_eq!(
+            queue.lock().pending.as_ref().map(|pending| pending.seq),
+            Some(newer.seq),
+        );
+    }
 }
 
 /// ft-87qfi keep-gate: the lock-free SPSC ring's concurrency contract.
@@ -3447,15 +4152,22 @@ mod disruptor_ring_keep_gate {
 
         let terminal = Mutex::new(test_terminal(size));
         let pty: Mutex<Box<dyn MasterPty>> = Mutex::new(Box::new(TestMasterPty));
+        let resize_queue = Mutex::new(ResizeQueueState {
+            pending: None,
+            next_seq: 1,
+            worker_running: true,
+            last_proven_pty_size: Some(pty_size(10, 1)),
+        });
         let metrics = LocalPane::apply_resize_sync(
             7,
             &terminal,
             &ring,
             &pty,
+            &resize_queue,
             1,
             size,
             pty_size(10, 1),
-            || None,
+            ResizeCancellationToken::new(1),
         )
         .expect("resize probe should succeed");
 
