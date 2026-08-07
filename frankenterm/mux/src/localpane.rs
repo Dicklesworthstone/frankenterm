@@ -408,6 +408,11 @@ struct ResizeEnqueueOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeEnqueueError {
+    SequenceExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResizeCancellationToken {
     seq: u64,
 }
@@ -487,18 +492,21 @@ fn resize_is_proven_noop(
 }
 
 impl ResizeQueueState {
-    fn enqueue(
+    fn try_enqueue(
         &mut self,
         size: TerminalSize,
         pty_size: PtySize,
         enqueued_at: Instant,
-    ) -> ResizeEnqueueOutcome {
-        self.next_seq = self.next_seq.wrapping_add(1);
-        let seq = self.next_seq;
+    ) -> Result<ResizeEnqueueOutcome, ResizeEnqueueError> {
+        let seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(ResizeEnqueueError::SequenceExhausted)?;
         let replaced_seq = self.pending.as_ref().map(|pending| pending.seq);
         let spawn_worker = !self.worker_running;
         let queue_depth_hint = if self.worker_running { 2 } else { 1 };
 
+        self.next_seq = seq;
         if spawn_worker {
             self.worker_running = true;
         }
@@ -512,12 +520,23 @@ impl ResizeQueueState {
             apply_error_retries: 0,
         });
 
-        ResizeEnqueueOutcome {
+        Ok(ResizeEnqueueOutcome {
             seq,
             replaced_seq,
             spawn_worker,
             queue_depth_hint,
-        }
+        })
+    }
+
+    #[cfg(test)]
+    fn enqueue(
+        &mut self,
+        size: TerminalSize,
+        pty_size: PtySize,
+        enqueued_at: Instant,
+    ) -> ResizeEnqueueOutcome {
+        self.try_enqueue(size, pty_size, enqueued_at)
+            .expect("test resize generation must remain below u64::MAX")
     }
 
     fn dequeue_for_worker(&mut self) -> Option<PendingResize> {
@@ -532,9 +551,8 @@ impl ResizeQueueState {
     fn superseded_by(&self, token: ResizeCancellationToken) -> Option<u64> {
         // Exactly one intent may be in flight and the queue retains at most
         // one newer coalesced intent. Generation inequality therefore means
-        // superseded, including the u64::MAX -> 0 wrap. Aliasing would require
-        // 2^64 enqueues before one in-flight attempt reaches any cancellation
-        // boundary, which is outside the physical in-flight-cycle contract.
+        // superseded. `try_enqueue` rejects exhaustion rather than wrapping,
+        // so an ancient in-flight token can never alias a current generation.
         (self.next_seq != token.seq).then_some(self.next_seq)
     }
 
@@ -679,6 +697,11 @@ struct ResizeRetryStats {
     backoff_elapsed: Duration,
 }
 
+enum PtyResizeAttemptFailure {
+    Superseded { by_seq: u64 },
+    Apply(Error),
+}
+
 fn pty_resize_retry_policy() -> ResizeRetryPolicy {
     ResizeRetryPolicy {
         max_attempts: 3,
@@ -708,12 +731,17 @@ fn next_resize_retry_attempt(attempt: usize) -> usize {
     attempt.saturating_add(1)
 }
 
-fn retry_with_backoff<T, E, F>(
+enum RetryStepError<E> {
+    Retry(E),
+    Stop(E),
+}
+
+fn retry_with_backoff_controlled<T, E, F>(
     policy: ResizeRetryPolicy,
     mut op: F,
 ) -> Result<(T, ResizeRetryStats), (E, ResizeRetryStats)>
 where
-    F: FnMut(usize) -> Result<T, E>,
+    F: FnMut(usize) -> Result<T, RetryStepError<E>>,
 {
     let mut stats = ResizeRetryStats::default();
     let max_attempts = policy.max_attempts.max(1);
@@ -722,7 +750,8 @@ where
         stats.attempts = attempt;
         match op(attempt) {
             Ok(value) => return Ok((value, stats)),
-            Err(err) => {
+            Err(RetryStepError::Stop(err)) => return Err((err, stats)),
+            Err(RetryStepError::Retry(err)) => {
                 if attempt == max_attempts {
                     return Err((err, stats));
                 }
@@ -733,6 +762,18 @@ where
             }
         }
     }
+}
+
+fn retry_with_backoff<T, E, F>(
+    policy: ResizeRetryPolicy,
+    mut op: F,
+) -> Result<(T, ResizeRetryStats), (E, ResizeRetryStats)>
+where
+    F: FnMut(usize) -> Result<T, E>,
+{
+    retry_with_backoff_controlled(policy, |attempt| {
+        op(attempt).map_err(RetryStepError::Retry)
+    })
 }
 
 pub struct LocalPane {
@@ -1936,9 +1977,22 @@ impl LocalPane {
         };
         let enqueued_at = Instant::now();
 
-        let outcome = {
+        let outcome = match {
             let mut queue = self.resize_queue.lock();
-            queue.enqueue(size, pty_size, enqueued_at)
+            queue.try_enqueue(size, pty_size, enqueued_at)
+        } {
+            Ok(outcome) => outcome,
+            Err(ResizeEnqueueError::SequenceExhausted) => {
+                metrics::counter!(
+                    "mux.localpane.resize.intent_rejected",
+                    "reason" => "sequence_exhausted",
+                )
+                .increment(1);
+                anyhow::bail!(
+                    "resize generation exhausted for pane_id={}; refusing ambiguous resize intent",
+                    self.pane_id
+                );
+            }
         };
 
         log::trace!(
@@ -2257,10 +2311,21 @@ impl LocalPane {
             // only a completed callback below may restore it.
             resize_queue.lock().last_proven_pty_size = None;
             let policy = pty_resize_retry_policy();
-            let (_, retry_stats) = retry_with_backoff(policy, |attempt| {
+            let retry_result = retry_with_backoff_controlled(policy, |attempt| {
+                if let Some(by_seq) = resize_queue.lock().superseded_by(token) {
+                    return Err(RetryStepError::Stop(
+                        PtyResizeAttemptFailure::Superseded { by_seq },
+                    ));
+                }
                 let pty_lock_start = Instant::now();
                 let pty = pty.lock();
                 pty_lock_wait += pty_lock_start.elapsed();
+                if let Some(by_seq) = resize_queue.lock().superseded_by(token) {
+                    drop(pty);
+                    return Err(RetryStepError::Stop(
+                        PtyResizeAttemptFailure::Superseded { by_seq },
+                    ));
+                }
                 let pty_resize_start = Instant::now();
                 let result = pty.resize(pty_size);
                 pty_resize_elapsed += pty_resize_start.elapsed();
@@ -2275,16 +2340,41 @@ impl LocalPane {
                         size.rows,
                         err
                     );
-                    return Err(err);
+                    return Err(RetryStepError::Retry(PtyResizeAttemptFailure::Apply(
+                        err,
+                    )));
                 }
                 Ok(())
-            })
-            .map_err(|(err, stats)| {
-                err.context(format!(
-                    "pty resize failed after {} attempts for pane_id={} target={}x{}",
-                    stats.attempts, pane_id, size.cols, size.rows
-                ))
-            })?;
+            });
+            let retry_stats = match retry_result {
+                Ok(((), stats)) => stats,
+                Err((PtyResizeAttemptFailure::Superseded { by_seq }, stats)) => {
+                    return Ok(ResizeApplyMetrics {
+                        commit_id,
+                        current_size,
+                        target_size: size,
+                        probe_lock_wait: terminal_probe_lock_wait,
+                        pty_lock_wait,
+                        pty_resize_elapsed,
+                        pty_resize_attempts: stats.attempts.saturating_sub(1),
+                        pty_retry_backoff_elapsed: stats.backoff_elapsed,
+                        swap_barrier_wait: Duration::default(),
+                        terminal_apply_lock_wait: Duration::default(),
+                        terminal_resize_elapsed: Duration::default(),
+                        noop: false,
+                        rejected_frame: true,
+                        cancelled: true,
+                        cancelled_stage: Some("before_pty_retry"),
+                        superseded_by_seq: Some(by_seq),
+                    });
+                }
+                Err((PtyResizeAttemptFailure::Apply(err), stats)) => {
+                    return Err(err.context(format!(
+                        "pty resize failed after {} attempts for pane_id={} target={}x{}",
+                        stats.attempts, pane_id, size.cols, size.rows
+                    )));
+                }
+            };
             resize_queue.lock().last_proven_pty_size = Some(pty_size);
             retry_stats
         };
@@ -2995,6 +3085,70 @@ mod tests {
     }
 
     #[test]
+    fn controlled_retry_stops_without_sleeping_or_invoking_later_attempts() {
+        let policy = ResizeRetryPolicy {
+            max_attempts: 5,
+            base_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(1),
+        };
+        let mut seen_attempts = Vec::new();
+
+        let result: Result<(&'static str, ResizeRetryStats), (&'static str, ResizeRetryStats)> =
+            retry_with_backoff_controlled(policy, |attempt| {
+                seen_attempts.push(attempt);
+                Err(RetryStepError::Stop("superseded"))
+            });
+
+        let (err, stats) = result.expect_err("stop directive must terminate retry immediately");
+        assert_eq!(err, "superseded");
+        assert_eq!(stats.attempts, 1);
+        assert_eq!(stats.backoff_elapsed, Duration::default());
+        assert_eq!(seen_attempts, vec![1]);
+    }
+
+    #[test]
+    fn controlled_retry_does_not_apply_stale_resize_after_supersession() {
+        let policy = ResizeRetryPolicy {
+            max_attempts: 5,
+            base_backoff: Duration::default(),
+            max_backoff: Duration::default(),
+        };
+        let queue = Mutex::new(ResizeQueueState::default());
+        let first = queue
+            .lock()
+            .enqueue(term_size(80, 24), pty_size(80, 24), Instant::now());
+        queue
+            .lock()
+            .dequeue_for_worker()
+            .expect("first intent must enter the worker");
+        let token = ResizeCancellationToken::new(first.seq);
+        let mut simulated_pty_calls = 0usize;
+
+        let result: Result<((), ResizeRetryStats), (&'static str, ResizeRetryStats)> =
+            retry_with_backoff_controlled(policy, |attempt| {
+                if queue.lock().superseded_by(token).is_some() {
+                    return Err(RetryStepError::Stop("superseded"));
+                }
+                simulated_pty_calls += 1;
+                if attempt == 1 {
+                    queue.lock().enqueue(
+                        term_size(120, 40),
+                        pty_size(120, 40),
+                        Instant::now(),
+                    );
+                    return Err(RetryStepError::Retry("transient apply failure"));
+                }
+                Ok(())
+            });
+
+        let (err, stats) = result.expect_err("newer intent must stop the stale retry loop");
+        assert_eq!(err, "superseded");
+        assert_eq!(stats.attempts, 2);
+        assert_eq!(simulated_pty_calls, 1);
+        assert_eq!(queue.lock().pending.as_ref().map(|intent| intent.seq), Some(2));
+    }
+
+    #[test]
     fn retry_with_backoff_treats_zero_attempt_budget_as_one_attempt() {
         let policy = ResizeRetryPolicy {
             max_attempts: 0,
@@ -3187,7 +3341,7 @@ mod tests {
     }
 
     #[test]
-    fn resize_queue_cancellation_survives_sequence_wrap() {
+    fn resize_queue_rejects_sequence_exhaustion_without_mutating_authority() {
         let mut queue = ResizeQueueState {
             next_seq: u64::MAX - 1,
             ..ResizeQueueState::default()
@@ -3202,17 +3356,18 @@ mod tests {
             .dequeue_for_worker()
             .expect("max-generation intent must enter the worker");
 
-        let wrapped = queue.enqueue(term_size(120, 40), pty_size(120, 40), now);
-        assert_eq!(wrapped.seq, 0);
+        assert_eq!(
+            queue.try_enqueue(term_size(120, 40), pty_size(120, 40), now),
+            Err(ResizeEnqueueError::SequenceExhausted),
+            "generation exhaustion must fail closed rather than alias zero",
+        );
+        assert_eq!(queue.next_seq, u64::MAX);
+        assert!(queue.pending.is_none());
+        assert!(queue.worker_running);
         assert_eq!(
             queue.superseded_by(max_token),
-            Some(0),
-            "generation inequality must reject the pre-wrap in-flight intent",
-        );
-        assert_eq!(
-            queue.superseded_by(ResizeCancellationToken::new(wrapped.seq)),
             None,
-            "the wrapped generation itself remains current",
+            "a rejected resize must not supersede the admitted max generation",
         );
     }
 
