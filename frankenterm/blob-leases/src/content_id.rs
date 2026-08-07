@@ -24,7 +24,7 @@ impl std::fmt::Display for ContentId {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(fmt, "sha256-")?;
         for byte in &self.0 {
-            write!(fmt, "{byte:x}")?;
+            write!(fmt, "{byte:02x}")?;
         }
         Ok(())
     }
@@ -145,12 +145,23 @@ mod tests {
 
     #[test]
     fn display_hex_length_is_consistent() {
-        // SHA-256 produces 32 bytes = 64 hex chars (with possible zero-stripped per-byte)
+        // SHA-256 produces exactly 32 bytes = 64 canonical hex characters.
         let id = ContentId::for_bytes(b"length check");
         let display = format!("{id}");
         let hex_part = display.strip_prefix("sha256-").unwrap();
-        // Each byte is 1-2 hex chars, so between 32 and 64 chars
-        assert!(hex_part.len() >= 32 && hex_part.len() <= 64);
+        assert_eq!(hex_part.len(), 64);
+    }
+
+    #[test]
+    fn display_preserves_leading_zero_nibbles_without_ambiguity() {
+        let id = ContentId::for_bytes(b"leading-zero-regression");
+        let display = format!("{id}");
+        let expected = id
+            .as_hash_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(display, format!("sha256-{expected}"));
     }
 
     #[test]

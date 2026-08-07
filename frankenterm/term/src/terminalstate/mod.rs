@@ -3186,8 +3186,8 @@ mod tests {
 
         // 2 KiB Rgba payload. Width/height claim 16x16 (= 1024
         // bytes by the substrate's width*height*4 ensure check)
-        // but the actual data is 2 KiB → the cap check at line
-        // ~905 of kitty.rs fires before width/height validation.
+        // but the actual data is 2 KiB, so bounded source loading rejects it
+        // before width/height validation or image-id allocation.
         let oversized = vec![0u8; 2048];
         let img = KittyImage::TransmitData {
             transmit: KittyImageTransmit {
@@ -3208,7 +3208,7 @@ mod tests {
         assert!(result.is_err(), "oversized Kitty payload must return Err",);
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("exceeds per-image cap"),
+            err_msg.contains("per-image cap") && err_msg.contains("2048"),
             "error message must explain the cap violation, got: {}",
             err_msg,
         );

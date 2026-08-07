@@ -6,8 +6,6 @@ use frankenterm_cell::Cell;
 use frankenterm_surface::change::ImageData;
 use frankenterm_surface::TextureCoordinate;
 use humansize::{SizeFormatter, DECIMAL};
-use num_traits::{One, Zero};
-use ordered_float::NotNan;
 use std::convert::TryFrom;
 use std::sync::Arc;
 
@@ -108,48 +106,34 @@ impl TerminalState {
             anyhow::bail!("image draw region has zero dimensions");
         }
 
-        let (fullcells_width, remainder_width_cell, x_delta_divisor) = match params.columns {
+        let (fullcells_width, remainder_width_cell) = match params.columns {
             Some(cols) => {
-                let target_pixels = checked_explicit_cell_span_pixels(
+                checked_explicit_cell_span_pixels(
                     IMAGE_CELL_SPAN_COLUMNS,
                     cols,
                     physical_cols,
                     cell_pixel_width,
                 )?;
-                let x_delta_divisor = checked_texture_delta_divisor(
-                    IMAGE_CELL_SPAN_COLUMNS,
-                    target_pixels,
-                    params.image_width,
-                    draw_width,
-                )?;
-                (cols, 0, x_delta_divisor)
+                (cols, 0)
             }
             None => (
                 draw_width as usize / cell_pixel_width,
                 draw_width as usize % cell_pixel_width,
-                params.image_width,
             ),
         };
-        let (fullcells_height, remainder_height_cell, y_delta_divisor) = match params.rows {
+        let (fullcells_height, remainder_height_cell) = match params.rows {
             Some(rows) => {
-                let target_pixels = checked_explicit_cell_span_pixels(
+                checked_explicit_cell_span_pixels(
                     IMAGE_CELL_SPAN_ROWS,
                     rows,
                     physical_rows,
                     cell_pixel_height,
                 )?;
-                let y_delta_divisor = checked_texture_delta_divisor(
-                    IMAGE_CELL_SPAN_ROWS,
-                    target_pixels,
-                    params.image_height,
-                    draw_height,
-                )?;
-                (rows, 0, y_delta_divisor)
+                (rows, 0)
             }
             None => (
                 draw_height as usize / cell_pixel_height,
                 draw_height as usize % cell_pixel_height,
-                params.image_height,
             ),
         };
 
@@ -167,33 +151,56 @@ impl TerminalState {
         )?;
         let first_row = self.screen().visible_row_to_stable_row(self.cursor.y);
 
-        let mut ypos = NotNan::new(params.source_origin_y as f32 / params.image_height as f32)
-            .with_context(|| format!("computing ypos {params:#?}"))?
-            .into_inner();
-        let start_xpos = NotNan::new(params.source_origin_x as f32 / params.image_width as f32)
-            .context("computing xpos")?
-            .into_inner();
-
         let cursor_x = self.cursor.x;
 
-        let width_in_cells = checked_cell_count(
+        let occupied_pixel_width = target_pixel_width
+            .checked_add(cell_padding_left as usize)
+            .context("image placement columns padded target span overflows")?;
+        let occupied_pixel_height = target_pixel_height
+            .checked_add(cell_padding_top as usize)
+            .context("image placement rows padded target span overflows")?;
+        let requested_width_in_cells = checked_ceil_cell_count(
             IMAGE_CELL_SPAN_COLUMNS,
-            fullcells_width,
-            remainder_width_cell > 0,
+            occupied_pixel_width,
+            cell_pixel_width,
         )?;
-        let height_in_cells = checked_cell_count(
+        let requested_height_in_cells = checked_ceil_cell_count(
             IMAGE_CELL_SPAN_ROWS,
-            fullcells_height,
-            remainder_height_cell > 0,
+            occupied_pixel_height,
+            cell_pixel_height,
         )?;
+
+        // Image dimensions are peer/config controlled. Never let an implicit
+        // skinny image expand a line or generate scrollback in work
+        // proportional to millions of source pixels. Horizontal placement is
+        // clipped to the visible row. A scrolling vertical placement retains
+        // the final viewport of output cells, while a fixed-cursor placement
+        // retains the leading rows that fit below the cursor.
+        let width_in_cells = requested_width_in_cells
+            .min(physical_cols.saturating_sub(cursor_x.min(physical_cols)));
+        let available_fixed_rows = remaining_rows_from_cursor(physical_rows, self.cursor.y);
         let height_in_cells = if params.do_not_move_cursor {
-            height_in_cells.min(remaining_rows_from_cursor(
-                self.screen().physical_rows,
-                self.cursor.y,
-            ))
+            requested_height_in_cells.min(available_fixed_rows)
         } else {
-            height_in_cells
+            requested_height_in_cells.min(physical_rows)
         };
+        let first_source_cell_row = if params.do_not_move_cursor {
+            0
+        } else {
+            requested_height_in_cells.saturating_sub(height_in_cells)
+        };
+
+        if width_in_cells == 0 || height_in_cells == 0 {
+            // A cursor outside the drawable viewport or a fixed placement
+            // below its final row has no representable cells. In particular,
+            // do not advance/scroll vertically when horizontal clipping left
+            // no cells to attach.
+            return Ok(PlacementInfo {
+                first_row,
+                rows: 0,
+                cols: 0,
+            });
+        }
 
         log::debug!(
             "image is {}x{} cells (cell is {}x{}), target pixel dims {}x{}, {:?}, (term is {}x{}@{}x{})",
@@ -210,13 +217,34 @@ impl TerminalState {
             self.pixel_height
         );
 
-        let mut remain_y = target_pixel_height;
         for y in 0..height_in_cells {
-            let padding_bottom = cell_pixel_height.saturating_sub(remain_y) as u16;
-            let y_delta = (remain_y.min(cell_pixel_height) as f32) / y_delta_divisor as f32;
-            remain_y = remain_y.saturating_sub(cell_pixel_height);
+            let source_cell_y = first_source_cell_row.saturating_add(y);
+            let Some(y_slice) = image_cell_slice(
+                IMAGE_CELL_SPAN_ROWS,
+                source_cell_y,
+                cell_pixel_height,
+                cell_padding_top as usize,
+                target_pixel_height,
+            )? else {
+                continue;
+            };
+            let texture_top = normalized_texture_position(
+                IMAGE_CELL_SPAN_ROWS,
+                params.source_origin_y,
+                draw_height,
+                y_slice.content_start,
+                target_pixel_height,
+                params.image_height,
+            )?;
+            let texture_bottom = normalized_texture_position(
+                IMAGE_CELL_SPAN_ROWS,
+                params.source_origin_y,
+                draw_height,
+                y_slice.content_end,
+                target_pixel_height,
+                params.image_height,
+            )?;
 
-            let mut xpos = start_xpos;
             let cursor_y = if params.do_not_move_cursor {
                 self.cursor.y.saturating_add(usize_to_i64_saturating(y))
             } else {
@@ -226,21 +254,42 @@ impl TerminalState {
                 "setting cells for y={} x=[{}..{}]",
                 cursor_y,
                 cursor_x,
-                cursor_x.saturating_add(fullcells_width)
+                cursor_x.saturating_add(width_in_cells)
             );
-            let mut remain_x = target_pixel_width;
             for x in 0..width_in_cells {
-                let padding_right = cell_pixel_width.saturating_sub(remain_x) as u16;
-                let x_delta = (remain_x.min(cell_pixel_width) as f32) / x_delta_divisor as f32;
-                remain_x = remain_x.saturating_sub(cell_pixel_width);
+                let Some(x_slice) = image_cell_slice(
+                    IMAGE_CELL_SPAN_COLUMNS,
+                    x,
+                    cell_pixel_width,
+                    cell_padding_left as usize,
+                    target_pixel_width,
+                )? else {
+                    continue;
+                };
+                let texture_left = normalized_texture_position(
+                    IMAGE_CELL_SPAN_COLUMNS,
+                    params.source_origin_x,
+                    draw_width,
+                    x_slice.content_start,
+                    target_pixel_width,
+                    params.image_width,
+                )?;
+                let texture_right = normalized_texture_position(
+                    IMAGE_CELL_SPAN_COLUMNS,
+                    params.source_origin_x,
+                    draw_width,
+                    x_slice.content_end,
+                    target_pixel_width,
+                    params.image_width,
+                )?;
                 log::debug!(
-                    "x_delta {} ({} px), y_delta {} ({} px), padding_right={}, padding_bottom={}",
-                    x_delta,
-                    x_delta * x_delta_divisor as f32,
-                    y_delta,
-                    y_delta * y_delta_divisor as f32,
-                    padding_right,
-                    padding_bottom
+                    "texture x=[{}, {}], y=[{}, {}], padding_right={}, padding_bottom={}",
+                    texture_left,
+                    texture_right,
+                    texture_top,
+                    texture_bottom,
+                    x_slice.padding_after,
+                    y_slice.padding_after
                 );
                 let cell_x = cursor_x.saturating_add(x);
                 let mut cell = self
@@ -249,14 +298,14 @@ impl TerminalState {
                     .cloned()
                     .unwrap_or_else(Cell::blank);
                 let img = Box::new(ImageCell::with_z_index(
-                    TextureCoordinate::new_f32(xpos, ypos),
-                    TextureCoordinate::new_f32(xpos + x_delta, ypos + y_delta),
+                    TextureCoordinate::new_f32(texture_left, texture_top),
+                    TextureCoordinate::new_f32(texture_right, texture_bottom),
                     params.data.clone(),
                     params.z_index,
-                    cell_padding_left,
-                    cell_padding_top,
-                    padding_right,
-                    padding_bottom,
+                    checked_padding(IMAGE_CELL_SPAN_COLUMNS, x_slice.padding_before)?,
+                    checked_padding(IMAGE_CELL_SPAN_ROWS, y_slice.padding_before)?,
+                    checked_padding(IMAGE_CELL_SPAN_COLUMNS, x_slice.padding_after)?,
+                    checked_padding(IMAGE_CELL_SPAN_ROWS, y_slice.padding_after)?,
                     params.image_id,
                     params.placement_id,
                 ));
@@ -268,29 +317,12 @@ impl TerminalState {
                 };
 
                 self.screen_mut().set_cell(cell_x, cursor_y, &cell, seqno);
-                xpos += x_delta;
             }
-            ypos += y_delta;
             if !params.do_not_move_cursor && y < height_in_cells - 1 {
                 self.new_line(false);
             }
         }
 
-        // adjust cursor position if the drawn cells move beyond current cell
-        let x_padding_shift: i64 = one_or_zero(checked_padded_image_exceeds_cell_span(
-            IMAGE_CELL_SPAN_COLUMNS,
-            draw_width,
-            cell_padding_left,
-            cell_pixel_width,
-            width_in_cells,
-        )?);
-        let y_padding_shift: i64 = one_or_zero(checked_padded_image_exceeds_cell_span(
-            IMAGE_CELL_SPAN_ROWS,
-            draw_height,
-            cell_padding_top,
-            cell_pixel_height,
-            height_in_cells,
-        )?);
         if !params.do_not_move_cursor {
             // Sixel places the cursor under the left corner of the image,
             // unless sixel_scrolls_right is enabled.
@@ -302,10 +334,8 @@ impl TerminalState {
 
             if bottom_right {
                 self.set_cursor_pos(
-                    &Position::Relative(
-                        usize_to_i64_saturating(width_in_cells).saturating_add(x_padding_shift),
-                    ),
-                    &Position::Relative(y_padding_shift),
+                    &Position::Relative(usize_to_i64_saturating(width_in_cells)),
+                    &Position::Relative(0),
                 );
             }
         }
@@ -373,15 +403,6 @@ pub(crate) fn dimensions(data: &[u8]) -> anyhow::Result<ImageInfo> {
     })
 }
 
-/// Returns `1` if `b` is true, else `0`,
-fn one_or_zero<T: Zero + One>(b: bool) -> T {
-    if b {
-        T::one()
-    } else {
-        T::zero()
-    }
-}
-
 fn checked_explicit_cell_span_pixels(
     axis: &str,
     span: usize,
@@ -403,22 +424,45 @@ fn checked_explicit_cell_span_pixels(
     })
 }
 
-fn checked_texture_delta_divisor(
+fn normalized_texture_position(
     axis: &str,
-    target_pixels: usize,
-    image_pixels: u32,
+    source_origin: u32,
     draw_pixels: u32,
-) -> anyhow::Result<u32> {
-    let target_pixels = u32::try_from(target_pixels).with_context(|| {
-        format!("image placement {axis} target pixel span exceeds u32: {target_pixels}")
+    consumed_target_pixels: usize,
+    total_target_pixels: usize,
+    image_pixels: u32,
+) -> anyhow::Result<f32> {
+    if total_target_pixels == 0 || image_pixels == 0 {
+        anyhow::bail!("image placement {axis} texture normalization has a zero divisor");
+    }
+    if consumed_target_pixels > total_target_pixels {
+        anyhow::bail!(
+            "image placement {axis} consumed pixels {consumed_target_pixels} exceed target {total_target_pixels}"
+        );
+    }
+    let source_end = source_origin.checked_add(draw_pixels).ok_or_else(|| {
+        anyhow::anyhow!("image placement {axis} source endpoint overflowed")
     })?;
-    target_pixels
-        .checked_mul(image_pixels)
-        .map(|value| value / draw_pixels)
-        .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            anyhow::anyhow!("image placement {axis} texture delta divisor overflows or is zero")
-        })
+    if source_end > image_pixels {
+        anyhow::bail!(
+            "image placement {axis} source endpoint {source_end} exceeds image size {image_pixels}"
+        );
+    }
+
+    // Derive each endpoint from integer progress rather than repeatedly adding
+    // an f32 delta.  Cumulative addition can drift beyond 1.0 on the final
+    // cell, which later peers correctly reject as malformed texture geometry.
+    // Computing in f64 and handling the final endpoint explicitly also makes
+    // adjacent cells share the exact same representable boundary.
+    let source_position = if consumed_target_pixels == total_target_pixels {
+        f64::from(source_end)
+    } else {
+        f64::from(source_origin)
+            + f64::from(draw_pixels)
+                * (consumed_target_pixels as f64 / total_target_pixels as f64)
+    };
+    let normalized = (source_position / f64::from(image_pixels)) as f32;
+    Ok(normalized.clamp(0.0, 1.0))
 }
 
 fn checked_target_pixels(
@@ -433,9 +477,17 @@ fn checked_target_pixels(
         .ok_or_else(|| anyhow::anyhow!("image placement {axis} target pixel span overflows"))
 }
 
-fn checked_cell_count(axis: &str, full_cells: usize, has_remainder: bool) -> anyhow::Result<usize> {
+fn checked_ceil_cell_count(
+    axis: &str,
+    pixel_extent: usize,
+    cell_pixels: usize,
+) -> anyhow::Result<usize> {
+    if pixel_extent == 0 || cell_pixels == 0 {
+        anyhow::bail!("image placement {axis} cell count has a zero extent");
+    }
+    let full_cells = pixel_extent / cell_pixels;
     full_cells
-        .checked_add(one_or_zero::<usize>(has_remainder))
+        .checked_add(usize::from(!pixel_extent.is_multiple_of(cell_pixels)))
         .ok_or_else(|| anyhow::anyhow!("image placement {axis} cell count overflows"))
 }
 
@@ -444,21 +496,51 @@ fn remaining_rows_from_cursor(physical_rows: usize, cursor_y: i64) -> usize {
     physical_rows.saturating_sub(cursor_y)
 }
 
-fn checked_padded_image_exceeds_cell_span(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImageCellSlice {
+    content_start: usize,
+    content_end: usize,
+    padding_before: usize,
+    padding_after: usize,
+}
+
+fn image_cell_slice(
     axis: &str,
-    draw_pixels: u32,
-    padding_pixels: u16,
+    cell_index: usize,
     cell_pixels: usize,
-    cells: usize,
-) -> anyhow::Result<bool> {
-    let drawn_with_padding = usize::try_from(draw_pixels)
-        .with_context(|| format!("image placement {axis} draw pixels exceed usize"))?
-        .checked_add(padding_pixels as usize)
-        .ok_or_else(|| anyhow::anyhow!("image placement {axis} padded draw span overflows"))?;
-    let cell_span = cells.checked_mul(cell_pixels).ok_or_else(|| {
-        anyhow::anyhow!("image placement {axis} cell span overflows: {cells} * {cell_pixels}")
+    content_offset: usize,
+    content_pixels: usize,
+) -> anyhow::Result<Option<ImageCellSlice>> {
+    if cell_pixels == 0 || content_pixels == 0 {
+        anyhow::bail!("image placement {axis} cell slice has a zero extent");
+    }
+    let cell_start = cell_index.checked_mul(cell_pixels).ok_or_else(|| {
+        anyhow::anyhow!("image placement {axis} cell offset overflows")
     })?;
-    Ok(drawn_with_padding > cell_span)
+    let cell_end = cell_start.checked_add(cell_pixels).ok_or_else(|| {
+        anyhow::anyhow!("image placement {axis} cell endpoint overflows")
+    })?;
+    let content_end = content_offset.checked_add(content_pixels).ok_or_else(|| {
+        anyhow::anyhow!("image placement {axis} content endpoint overflows")
+    })?;
+    let intersection_start = cell_start.max(content_offset);
+    let intersection_end = cell_end.min(content_end);
+    if intersection_start >= intersection_end {
+        return Ok(None);
+    }
+
+    Ok(Some(ImageCellSlice {
+        content_start: intersection_start.saturating_sub(content_offset),
+        content_end: intersection_end.saturating_sub(content_offset),
+        padding_before: intersection_start.saturating_sub(cell_start),
+        padding_after: cell_end.saturating_sub(intersection_end),
+    }))
+}
+
+fn checked_padding(axis: &str, pixels: usize) -> anyhow::Result<u16> {
+    u16::try_from(pixels).with_context(|| {
+        format!("image placement {axis} padding {pixels} pixels exceeds wire representation")
+    })
 }
 
 fn usize_to_u16_saturating(value: usize) -> u16 {
@@ -660,33 +742,161 @@ mod tests {
     }
 
     #[test]
-    fn padded_image_span_checks_boundary_without_overflow() {
-        assert!(
-            !checked_padded_image_exceeds_cell_span(IMAGE_CELL_SPAN_COLUMNS, 9, 1, 5, 2).unwrap()
+    fn image_cell_slices_apply_leading_and_trailing_padding_only_at_edges() {
+        assert_eq!(
+            image_cell_slice(IMAGE_CELL_SPAN_COLUMNS, 0, 8, 3, 8).unwrap(),
+            Some(ImageCellSlice {
+                content_start: 0,
+                content_end: 5,
+                padding_before: 3,
+                padding_after: 0,
+            })
         );
-        assert!(
-            checked_padded_image_exceeds_cell_span(IMAGE_CELL_SPAN_COLUMNS, 9, 2, 5, 2).unwrap()
+        assert_eq!(
+            image_cell_slice(IMAGE_CELL_SPAN_COLUMNS, 1, 8, 3, 8).unwrap(),
+            Some(ImageCellSlice {
+                content_start: 5,
+                content_end: 8,
+                padding_before: 0,
+                padding_after: 5,
+            })
         );
-        assert!(checked_padded_image_exceeds_cell_span(
-            IMAGE_CELL_SPAN_COLUMNS,
-            1,
-            0,
-            usize::MAX,
-            2
-        )
-        .is_err());
+        assert_eq!(
+            image_cell_slice(IMAGE_CELL_SPAN_COLUMNS, 2, 8, 3, 8).unwrap(),
+            None
+        );
     }
 
     #[test]
-    fn image_cell_count_and_remaining_rows_are_saturating() {
+    fn image_cell_count_and_remaining_rows_are_bounded() {
         assert_eq!(
-            checked_cell_count(IMAGE_CELL_SPAN_COLUMNS, 4, true).unwrap(),
+            checked_ceil_cell_count(IMAGE_CELL_SPAN_COLUMNS, 17, 4).unwrap(),
             5
         );
-        assert!(checked_cell_count(IMAGE_CELL_SPAN_COLUMNS, usize::MAX, true).is_err());
+        assert_eq!(
+            checked_ceil_cell_count(IMAGE_CELL_SPAN_COLUMNS, usize::MAX, 1).unwrap(),
+            usize::MAX
+        );
         assert_eq!(remaining_rows_from_cursor(24, -1), 24);
         assert_eq!(remaining_rows_from_cursor(24, 10), 14);
         assert_eq!(remaining_rows_from_cursor(24, i64::MAX), 0);
+    }
+
+    fn sole_image_cell(
+        terminal: &mut TerminalState,
+        x: usize,
+        y: i64,
+    ) -> frankenterm_cell::image::ImageCell {
+        terminal
+            .screen_mut()
+            .get_cell(x, y)
+            .and_then(|cell| cell.attrs().images())
+            .and_then(|mut images| images.pop())
+            .expect("expected exactly one image on the requested cell")
+    }
+
+    #[test]
+    fn kitty_offsets_expand_output_extent_and_only_pad_edge_cells() {
+        let mut terminal = test_terminal_state();
+        let mut params = test_image_attach_params();
+        params.cell_padding_left = 3;
+        params.cell_padding_top = 5;
+
+        let info = terminal
+            .assign_image_to_cells(params)
+            .expect("offset Kitty placement should attach");
+        assert_eq!((info.cols, info.rows), (2, 2));
+        assert_eq!((terminal.cursor.x, terminal.cursor.y), (2, 1));
+
+        let top_left = sole_image_cell(&mut terminal, 0, 0);
+        let top_right = sole_image_cell(&mut terminal, 1, 0);
+        let bottom_left = sole_image_cell(&mut terminal, 0, 1);
+        let bottom_right = sole_image_cell(&mut terminal, 1, 1);
+        assert_eq!(top_left.padding(), (3, 5, 0, 0));
+        assert_eq!(top_right.padding(), (0, 5, 5, 0));
+        assert_eq!(bottom_left.padding(), (3, 0, 0, 11));
+        assert_eq!(bottom_right.padding(), (0, 0, 5, 11));
+        assert_eq!(top_left.top_left(), TextureCoordinate::new_f32(0.0, 0.0));
+        assert_eq!(
+            top_left.bottom_right(),
+            TextureCoordinate::new_f32(0.625, 0.6875)
+        );
+        assert_eq!(
+            bottom_right.top_left(),
+            TextureCoordinate::new_f32(0.625, 0.6875)
+        );
+        assert_eq!(
+            bottom_right.bottom_right(),
+            TextureCoordinate::new_f32(1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn explicit_downscale_without_padding_does_not_invent_cursor_spill() {
+        let mut terminal = test_terminal_state();
+        let mut params = test_image_attach_params();
+        params.image_width = 100;
+        params.image_height = 100;
+        params.source_width = Some(100);
+        params.source_height = Some(100);
+
+        let info = terminal
+            .assign_image_to_cells(params)
+            .expect("explicitly downscaled placement should attach");
+        assert_eq!((info.cols, info.rows), (1, 1));
+        assert_eq!((terminal.cursor.x, terminal.cursor.y), (1, 0));
+        let image = sole_image_cell(&mut terminal, 0, 0);
+        assert_eq!(image.padding(), (0, 0, 0, 0));
+        assert_eq!(image.top_left(), TextureCoordinate::new_f32(0.0, 0.0));
+        assert_eq!(image.bottom_right(), TextureCoordinate::new_f32(1.0, 1.0));
+    }
+
+    #[test]
+    fn implicit_skinny_images_are_clipped_to_bounded_terminal_work() {
+        let mut wide_terminal = test_terminal_state();
+        let mut wide = test_image_attach_params();
+        wide.image_width = 25_000_000;
+        wide.image_height = 1;
+        wide.source_width = Some(25_000_000);
+        wide.source_height = Some(1);
+        wide.columns = None;
+        wide.rows = None;
+        let wide_info = wide_terminal
+            .assign_image_to_cells(wide)
+            .expect("wide placement should be safely clipped");
+        assert_eq!(wide_info.cols, 80);
+        assert_eq!(wide_info.rows, 1);
+        assert_eq!(wide_terminal.cursor.x, 79);
+
+        let mut tall_terminal = test_terminal_state();
+        let mut tall = test_image_attach_params();
+        tall.image_width = 1;
+        tall.image_height = 25_000_000;
+        tall.source_width = Some(1);
+        tall.source_height = Some(25_000_000);
+        tall.columns = None;
+        tall.rows = None;
+        let tall_info = tall_terminal
+            .assign_image_to_cells(tall)
+            .expect("tall placement should retain only bounded final rows");
+        assert_eq!(tall_info.cols, 1);
+        assert_eq!(tall_info.rows, 24);
+        assert_eq!(tall_terminal.cursor.y, 23);
+    }
+
+    #[test]
+    fn horizontally_clipped_image_cannot_scroll_without_attaching_cells() {
+        let mut terminal = test_terminal_state();
+        terminal.cursor.x = terminal.screen().physical_cols;
+        terminal.cursor.y = 7;
+        let before_cursor = (terminal.cursor.x, terminal.cursor.y);
+
+        let info = terminal
+            .assign_image_to_cells(test_image_attach_params())
+            .expect("fully clipped placement should be a benign no-op");
+
+        assert_eq!((info.cols, info.rows), (0, 0));
+        assert_eq!((terminal.cursor.x, terminal.cursor.y), before_cursor);
     }
 
     #[test]
@@ -764,19 +974,4 @@ mod tests {
         assert!(err.to_string().contains("Ignoring image data"));
     }
 
-    // ── one_or_zero ────────────────────────────────────────
-
-    #[test]
-    fn one_or_zero_true() {
-        assert_eq!(one_or_zero::<usize>(true), 1);
-        assert_eq!(one_or_zero::<i32>(true), 1);
-        assert_eq!(one_or_zero::<i64>(true), 1);
-    }
-
-    #[test]
-    fn one_or_zero_false() {
-        assert_eq!(one_or_zero::<usize>(false), 0);
-        assert_eq!(one_or_zero::<i32>(false), 0);
-        assert_eq!(one_or_zero::<i64>(false), 0);
-    }
 }

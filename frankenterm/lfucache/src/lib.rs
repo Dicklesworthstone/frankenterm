@@ -448,6 +448,41 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         None
     }
 
+    /// Remove every live entry accepted by `predicate` while preserving the
+    /// cache's hash, recency, frequency, and S3-FIFO segment invariants.
+    ///
+    /// Keys are cloned before removal because each call to [`Self::remove`]
+    /// mutates all three intrusive indexes. This is intended for bounded
+    /// ownership cleanup (for example, retiring all render-cache entries for a
+    /// closed pane), not as a hot lookup path.
+    pub fn remove_where<F>(&mut self, predicate: F) -> Vec<(K, V)>
+    where
+        F: Fn(&K, &V) -> bool,
+    {
+        let keys = self
+            .recency_index
+            .iter()
+            .filter(|entry| predicate(&entry.key, &entry.value))
+            .map(|entry| entry.key.clone())
+            .collect::<Vec<_>>();
+
+        keys.into_iter()
+            .filter_map(|key| self.remove(&key))
+            .collect()
+    }
+
+    /// Remove matching live entries and S3-FIFO ghost keys. Use this variant
+    /// when ownership is encoded entirely in the key and retired keys must not
+    /// influence a later ghost-hit admission decision.
+    pub fn remove_keys_where<F>(&mut self, predicate: F) -> Vec<(K, V)>
+    where
+        F: Fn(&K) -> bool,
+    {
+        let removed = self.remove_where(|key, _| predicate(key));
+        self.s3_ghost.retain(|key| !predicate(key));
+        removed
+    }
+
     pub fn get<'a, Q>(&'a mut self, k: &Q) -> Option<&'a V>
     where
         K: Borrow<Q>,
@@ -1237,6 +1272,45 @@ mod test {
         assert_eq!(cache.len(), 1);
         assert!(cache.get(&1).is_none());
         assert!(cache.get(&2).is_some());
+    }
+
+    #[test]
+    fn remove_where_purges_only_matching_entries_and_preserves_indexes() {
+        let mut cache = LfuCacheU64::<&'static str>::with_capacity(5);
+        cache.put(1, "owner-a");
+        cache.put(2, "owner-b");
+        cache.put(3, "owner-a");
+        cache.put(4, "owner-c");
+        assert!(cache.get(&3).is_some());
+
+        let mut removed = cache.remove_where(|_, value| *value == "owner-a");
+        removed.sort_by_key(|(key, _)| *key);
+
+        assert_eq!(removed, vec![(1, "owner-a"), (3, "owner-a")]);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&1).is_none());
+        assert!(cache.get(&2).is_some());
+        assert!(cache.get(&3).is_none());
+        assert!(cache.get(&4).is_some());
+
+        cache.put(5, "owner-d");
+        assert_eq!(cache.len(), 3, "indexes remain usable after bulk removal");
+    }
+
+    #[test]
+    fn remove_keys_where_also_purges_s3fifo_ghost_identity() {
+        let mut cache = LfuCacheU64::<&'static str>::with_capacity_and_policy(
+            5,
+            CacheEvictionPolicy::S3Fifo,
+        );
+        cache.put(10, "retired");
+        cache.put(20, "live");
+        cache.s3_ghost.push_back(10);
+        cache.s3_ghost.push_back(30);
+
+        assert_eq!(cache.remove_keys_where(|key| *key == 10), vec![(10, "retired")]);
+        assert_eq!(cache.s3_ghost.iter().copied().collect::<Vec<_>>(), vec![30]);
+        assert!(cache.get(&20).is_some());
     }
 
     #[test]

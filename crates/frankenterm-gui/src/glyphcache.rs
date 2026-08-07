@@ -12,23 +12,22 @@ use frankenterm_core::font_features::{AxisVector, GlyphFormat, derive_axis_atlas
 use frankenterm_core::subpixel_positioning::SubpixelBin;
 use frankenterm_font::units::*;
 use frankenterm_font::{FontConfiguration, GlyphInfo, LoadedFont, LoadedFontId};
-use image::{
-    AnimationDecoder, DynamicImage, Frame, Frames, ImageDecoder, ImageFormat, ImageResult, Limits,
-};
 use lfucache::LfuCache;
 use ordered_float::NotNan;
 use std::cell::RefCell;
-use std::io::Seek;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
-use std::sync::{Arc, LazyLock, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use termwiz::color::RgbColor;
-use termwiz::image::{ImageData, ImageDataType};
+use termwiz::image::{
+    ImageData, ImageDataType, ImageDataValidationLimits, MAX_IMAGE_WIRE_BYTES,
+    MAX_IMAGE_WIRE_FRAMES,
+};
 use termwiz::surface::CursorShape;
 use wezterm_bidi::Direction;
-use wezterm_blob_leases::{BlobLease, BlobManager, BoxedReader};
+use wezterm_blob_leases::{BlobLease, BlobManager};
 use wezterm_term::Underline;
 use window::bitmaps::atlas::{Atlas, OutOfTextureSpace, Sprite};
 use window::bitmaps::{BitmapImage, Image, ImageTexture, Texture2d};
@@ -292,7 +291,7 @@ struct BlankFrameKey {
 /// holding the mutex for the sake of safety.
 struct DecodedImageHandle<'a> {
     current_frame: usize,
-    h: MutexGuard<'a, ImageDataType>,
+    h: termwiz::image::ImageDataReadGuard<'a>,
 }
 
 // br-ft-82pp1: DecodedImageHandle is the read-only adapter that
@@ -392,147 +391,256 @@ impl DecodedFrame {
 
 struct FrameDecoder {}
 
-impl FrameDecoder {
-    pub fn start(lease: BlobLease) -> anyhow::Result<Receiver<DecodedFrame>> {
-        let (tx, rx) = sync_channel(2);
+const MAX_FRAME_DECODER_WORKERS: usize = 2;
+const MAX_PENDING_FRAME_DECODERS: usize = 8;
+const MAX_FRAME_DECODER_DECODED_BYTES: usize = MAX_IMAGE_WIRE_BYTES;
+const MAX_FRAME_DECODER_AXIS: u32 = 16_384;
+const MAX_QUEUED_FRAME_DECODER_BYTES: usize = MAX_IMAGE_WIRE_BYTES * 2;
 
-        let buf_reader = lease.get_reader().context("lease.get_reader()")?;
-        let reader = image::ImageReader::new(buf_reader)
-            .with_guessed_format()
-            .context("guess format from lease")?;
-        let format = reader
-            .format()
-            .ok_or_else(|| anyhow::anyhow!("cannot determine image format"))?;
+static FRAME_DECODER_JOBS: AtomicUsize = AtomicUsize::new(0);
+static FRAME_DECODER_QUEUED_BYTES: AtomicUsize = AtomicUsize::new(0);
+static FRAME_DECODER_POOL: LazyLock<Result<rayon::ThreadPool, String>> = LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(MAX_FRAME_DECODER_WORKERS)
+        .thread_name(|index| format!("ft-frame-decoder-{index}"))
+        .build()
+        .map_err(|error| error.to_string())
+});
 
-        std::thread::Builder::new()
-            .name("image-frame-decoder".to_string())
-            .spawn(move || {
-                if let Err(err) = Self::run_decoder_thread(reader, format, tx) {
-                    if err
-                        .downcast_ref::<std::sync::mpsc::SendError<DecodedFrame>>()
-                        .is_none()
-                    {
-                        log::error!("Error decoding image: {err:#}");
-                    }
-                }
+struct FrameDecoderJobPermit;
+
+impl FrameDecoderJobPermit {
+    fn try_acquire() -> Option<Self> {
+        FRAME_DECODER_JOBS
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_PENDING_FRAME_DECODERS).then_some(active + 1)
             })
-            .context("spawn image frame decoder thread")?;
+            .ok()
+            .map(|_| Self)
+    }
+}
 
-        Ok(rx)
+impl Drop for FrameDecoderJobPermit {
+    fn drop(&mut self) {
+        let released = FRAME_DECODER_JOBS.try_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |active| active.checked_sub(1),
+        );
+        debug_assert!(released.is_ok());
+    }
+}
+
+struct FrameDecoderReceiver {
+    receiver: Receiver<QueuedDecodedFrame>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl FrameDecoderReceiver {
+    fn try_recv(&self) -> Result<DecodedFrame, TryRecvError> {
+        self.receiver
+            .try_recv()
+            .map(QueuedDecodedFrame::into_frame)
+    }
+}
+
+impl Drop for FrameDecoderReceiver {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+struct QueuedFrameBudget {
+    bytes: usize,
+}
+
+impl QueuedFrameBudget {
+    fn try_acquire(bytes: usize) -> Option<Self> {
+        FRAME_DECODER_QUEUED_BYTES
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                let next = queued.checked_add(bytes)?;
+                (next <= MAX_QUEUED_FRAME_DECODER_BYTES).then_some(next)
+            })
+            .ok()
+            .map(|_| Self { bytes })
     }
 
-    fn run_decoder_thread(
-        reader: image::ImageReader<BoxedReader>,
-        format: ImageFormat,
-        tx: SyncSender<DecodedFrame>,
-    ) -> anyhow::Result<()> {
-        let start = Instant::now();
-        let limits = Limits::default();
-        let mut frames = match format {
-            ImageFormat::Gif => {
-                let mut reader = reader.into_inner();
-                reader.rewind().context("rewinding reader for gif")?;
-                let mut decoder =
-                    image::codecs::gif::GifDecoder::new(reader).context("GifDecoder::new")?;
-                decoder
-                    .set_limits(limits)
-                    .context("GifDecoder::set_limits")?;
-                decoder.into_frames()
-            }
-            ImageFormat::Png => {
-                let mut reader = reader.into_inner();
-                reader.rewind().context("rewinding reader for png")?;
-                let decoder = image::codecs::png::PngDecoder::with_limits(reader, limits.clone())
-                    .context("PngDecoder::with_limits")?;
-                if decoder.is_apng().unwrap_or(false) {
-                    decoder.apng()?.into_frames()
-                } else {
-                    let buf = DynamicImage::from_decoder(decoder)?.into_rgba8();
-                    let delay = image::Delay::from_numer_denom_ms(u32::MAX, 1);
-                    let frame = Frame::from_parts(buf, 0, 0, delay);
-                    Frames::new(Box::new(std::iter::once(ImageResult::Ok(frame))))
-                }
-            }
-            ImageFormat::WebP => {
-                let mut reader = reader.into_inner();
-                reader.rewind().context("rewinding reader for WebP")?;
-                let mut decoder =
-                    image::codecs::webp::WebPDecoder::new(reader).context("WebPDecoder")?;
-                decoder
-                    .set_limits(limits)
-                    .context("WebPDecoder::set_limits")?;
-                decoder.into_frames()
-            }
-            _ => {
-                let buf = reader.decode().context("decode image")?;
-                let delay = image::Delay::from_numer_denom_ms(u32::MAX, 1);
-                let frame = Frame::from_parts(buf.into_rgba8(), 0, 0, delay);
-                Frames::new(Box::new(std::iter::once(ImageResult::Ok(frame))))
-            }
-        };
-
-        let frame = frames.next().ok_or_else(|| {
+    fn split(&mut self, bytes: usize) -> anyhow::Result<Self> {
+        let remaining = self.bytes;
+        let new_remaining = remaining.checked_sub(bytes).ok_or_else(|| {
             anyhow::anyhow!(
-                "Unable to decode image data. Either it is corrupt, or \
-                    the Image format is not fully supported by \
-                    https://github.com/image-rs/image/blob/main/README.md#supported-image-formats"
+                "decoded-frame bytes exceed the decoder's reserved queue budget: \
+                 requested {bytes}, remaining {remaining}"
             )
         })?;
-        let frame = frame.context("first frame result")?;
+        self.bytes = new_remaining;
+        Ok(Self { bytes })
+    }
+}
 
-        let mut decoded_frames = vec![];
-        let (width, height) = frame.buffer().dimensions();
-        let width = width as usize;
-        let height = height as usize;
+impl Drop for QueuedFrameBudget {
+    fn drop(&mut self) {
+        let bytes = self.bytes;
+        let released = FRAME_DECODER_QUEUED_BYTES.try_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |queued| queued.checked_sub(bytes),
+        );
+        debug_assert!(released.is_ok());
+    }
+}
 
-        let duration: Duration = frame.delay().into();
-        log::debug!("first frame took {:?} to decode.", start.elapsed());
+struct QueuedDecodedFrame {
+    frame: DecodedFrame,
+    budget: QueuedFrameBudget,
+}
 
-        let data = frame.into_buffer().into_raw();
-        let lease = BlobManager::store(&data).context("BlobManager::store")?;
-        let decoded_frame = DecodedFrame {
-            lease,
-            width,
-            height,
-            duration,
-        };
-        tx.send(decoded_frame.clone())
-            .context("sending first frame")?;
-        decoded_frames.push(decoded_frame);
+impl QueuedDecodedFrame {
+    fn into_frame(self) -> DecodedFrame {
+        let Self { frame, budget } = self;
+        drop(budget);
+        frame
+    }
+}
 
-        while let Some(frame) = frames.next() {
-            let frame = frame?;
+impl FrameDecoder {
+    pub fn start(image_data: Arc<ImageData>) -> anyhow::Result<FrameDecoderReceiver> {
+        let (tx, rx) = channel();
+        let permit = FrameDecoderJobPermit::try_acquire()
+            .context("bounded image frame-decoder queue is full")?;
+        let pool = FRAME_DECODER_POOL
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("image frame-decoder pool is unavailable: {error}"))?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        pool.spawn(move || {
+            let _permit = permit;
+            if let Err(err) = Self::run_decoder(image_data, tx, &worker_cancelled) {
+                if !worker_cancelled.load(Ordering::Acquire)
+                    && err
+                        .downcast_ref::<std::sync::mpsc::SendError<QueuedDecodedFrame>>()
+                        .is_none()
+                {
+                    log::error!("Error decoding image: {err:#}");
+                }
+            }
+        });
 
-            let duration: Duration = frame.delay().into();
-            let data = frame.into_buffer().into_raw();
-            let lease = BlobManager::store(&data).context("BlobManager::store")?;
+        Ok(FrameDecoderReceiver {
+            receiver: rx,
+            cancelled,
+        })
+    }
 
-            let decoded_frame = DecodedFrame {
-                lease,
+    fn run_decoder(
+        image_data: Arc<ImageData>,
+        tx: Sender<QueuedDecodedFrame>,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<()> {
+        let start = Instant::now();
+        let revision = image_data.hash();
+        let normalized = image_data
+            .normalize_for_content_revision_with_limits(
+                revision,
+                MAX_IMAGE_WIRE_BYTES,
+                ImageDataValidationLimits {
+                    max_decoded_bytes: MAX_FRAME_DECODER_DECODED_BYTES,
+                    max_frame_count: MAX_IMAGE_WIRE_FRAMES,
+                    max_width: MAX_FRAME_DECODER_AXIS,
+                    max_height: MAX_FRAME_DECODER_AXIS,
+                },
+                &|| cancelled.load(Ordering::Acquire),
+            )
+            .context("bounded frame decode")?;
+        let mut queued_budget = QueuedFrameBudget::try_acquire(normalized.summary.decoded_bytes)
+            .context("global decoded-frame queue byte budget is exhausted")?;
+        let decoded = normalized
+            .replacement
+            .context("encoded frame decode did not produce decoded data")?
+            .into_data();
+        let mut frame_count = 0usize;
+        let mut decoded_bytes = 0usize;
+        let mut send_frame = |data: Vec<u8>, duration: Duration, width: u32, height: u32| {
+            if cancelled.load(Ordering::Acquire) {
+                anyhow::bail!("image frame decode was cancelled");
+            }
+            let expected_bytes = checked_decoded_frame_bytes(width as usize, height as usize)
+                .context("decoded-frame dimensions overflow")?;
+            if data.len() != expected_bytes {
+                anyhow::bail!(
+                    "decoded-frame byte length mismatch: expected {expected_bytes}, got {}",
+                    data.len()
+                );
+            }
+            decoded_bytes = decoded_bytes
+                .checked_add(data.len())
+                .context("decoded-frame byte total overflow")?;
+            frame_count = frame_count
+                .checked_add(1)
+                .context("decoded-frame count overflow")?;
+            let bytes = data.len();
+            let frame = DecodedFrame {
+                lease: BlobManager::store(&data).context("BlobManager::store decoded frame")?,
                 duration,
+                width: width as usize,
+                height: height as usize,
+            };
+            let budget = queued_budget.split(bytes)?;
+            tx.send(QueuedDecodedFrame {
+                frame,
+                budget,
+            })
+            .context("sending decoded frame")?;
+            Ok::<(), anyhow::Error>(())
+        };
+
+        match decoded {
+            ImageDataType::Rgba8 {
                 width,
                 height,
-            };
-            tx.send(decoded_frame.clone()).context("sending a frame")?;
-            decoded_frames.push(decoded_frame);
+                data,
+                ..
+            } => send_frame(data, Duration::from_secs(86_400), width, height)?,
+            ImageDataType::AnimRgba8 {
+                width,
+                height,
+                durations,
+                frames,
+                ..
+            } => {
+                if frames.is_empty() {
+                    anyhow::bail!("bounded frame decode produced no animation frames");
+                }
+                if frames.len() != durations.len() {
+                    anyhow::bail!(
+                        "bounded frame decode produced {} frames but {} durations",
+                        frames.len(),
+                        durations.len()
+                    );
+                }
+                for (data, duration) in frames.into_iter().zip(durations) {
+                    send_frame(data, duration, width, height)?;
+                }
+            }
+            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
+                anyhow::bail!("bounded frame decode retained encoded data")
+            }
         }
 
-        drop(frames);
-
         let elapsed = start.elapsed();
-        let fps = decoded_frames.len() as f32 / elapsed.as_secs_f32();
+        let fps = frame_count as f32 / elapsed.as_secs_f32();
 
         log::debug!(
             "decoded {} frames, {} bytes in {elapsed:?}, {fps} fps",
-            decoded_frames.len(),
-            decoded_frames.len() * width * height * 4
+            frame_count,
+            decoded_bytes,
         );
         Ok(())
     }
 }
 
 enum FrameSource {
-    Decoder(Receiver<DecodedFrame>),
+    Decoder(FrameDecoderReceiver),
     FrameIndex(usize),
 }
 
@@ -544,7 +652,7 @@ struct FrameState {
 }
 
 impl FrameState {
-    fn new(rx: Receiver<DecodedFrame>) -> Self {
+    fn new(rx: FrameDecoderReceiver) -> Self {
         const TRANSPARENT_SIZE: usize = 1;
         static TRANSPARENT: LazyLock<BlobLease> = LazyLock::new(|| {
             let mut data = vec![];
@@ -567,32 +675,6 @@ impl FrameState {
         }
     }
 
-    fn wait_for_first_frame(&mut self, duration: Duration) {
-        if !self.frames.is_empty() {
-            // Already decoded the first frame
-            return;
-        }
-
-        match &mut self.source {
-            FrameSource::Decoder(rx) => match rx.recv_timeout(duration) {
-                Ok(frame) => {
-                    self.frames.push(frame.clone());
-                    self.current_frame = frame;
-                    self.load_state = LoadState::Loaded;
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    self.source = FrameSource::FrameIndex(0);
-                    log::warn!("image decoder thread terminated");
-                    self.load_state = LoadState::Failed;
-                    self.current_frame.duration = Duration::from_secs(86400);
-                    self.frames.push(self.current_frame.clone());
-                }
-            },
-            FrameSource::FrameIndex(_) => {}
-        }
-    }
-
     fn load_next_frame(&mut self) -> bool {
         match &mut self.source {
             FrameSource::Decoder(rx) => match rx.try_recv() {
@@ -604,8 +686,8 @@ impl FrameState {
                 }
                 Err(TryRecvError::Empty) => false,
                 Err(TryRecvError::Disconnected) => {
-                    self.source = FrameSource::FrameIndex(0);
                     if self.frames.is_empty() {
+                        self.source = FrameSource::FrameIndex(0);
                         log::warn!("image decoder thread terminated");
                         self.load_state = LoadState::Failed;
                         self.current_frame.duration = Duration::from_secs(86400);
@@ -616,20 +698,35 @@ impl FrameState {
                         // that it has a long duration so that we don't waste
                         // resources ticking to the same frame over and over
                         self.frames[0].duration = Duration::from_secs(86400);
+                        self.current_frame = self.frames[0].clone();
+                        self.source = FrameSource::FrameIndex(0);
                         true
                     } else {
+                        // The decoder path presents each received frame, so at
+                        // disconnect `current_frame` is the last frame. Advance
+                        // from that exact index rather than resetting the cursor
+                        // to zero and then skipping frame zero on the next tick.
+                        let mut next_index = self.frames.len() - 1;
+                        Self::advance_frame_index(&self.frames, &mut next_index);
+                        self.current_frame = self.frames[next_index].clone();
+                        self.source = FrameSource::FrameIndex(next_index);
                         true
                     }
                 }
             },
             FrameSource::FrameIndex(idx) => {
-                *idx = *idx + 1;
-                if *idx >= self.frames.len() {
-                    *idx = 0;
-                }
+                Self::advance_frame_index(&self.frames, idx);
                 self.current_frame = self.frames[*idx].clone();
                 true
             }
+        }
+    }
+
+    fn advance_frame_index(frames: &[DecodedFrame], idx: &mut usize) {
+        debug_assert!(!frames.is_empty());
+        *idx = (*idx).checked_add(1).unwrap_or(0);
+        if *idx >= frames.len() {
+            *idx = usize::from(frames.len() > 1 && frames[0].duration.is_zero());
         }
     }
 
@@ -639,6 +736,15 @@ impl FrameState {
 
     fn frame_hash(&self) -> [u8; 32] {
         self.current_frame.lease.content_id().as_hash_bytes()
+    }
+
+    fn next_frame_due(&self, due: Instant) -> Option<Instant> {
+        match (&self.source, self.load_state) {
+            (_, LoadState::Failed) => None,
+            (FrameSource::Decoder(_), LoadState::Loading | LoadState::Loaded) => Some(due),
+            (FrameSource::FrameIndex(_), LoadState::Loaded) if self.frames.len() > 1 => Some(due),
+            (FrameSource::FrameIndex(_), LoadState::Loading | LoadState::Loaded) => None,
+        }
     }
 
     fn retained_bytes(&self) -> usize {
@@ -680,34 +786,27 @@ impl DecodedImage {
         }
     }
 
-    fn start_frame_decoder(lease: BlobLease, image_data: &Arc<ImageData>) -> Self {
-        match FrameDecoder::start(lease.clone()) {
-            Ok(rx) => Self {
-                frame_start: RefCell::new(Instant::now()),
-                current_frame: RefCell::new(0),
-                image: Arc::clone(image_data),
-                frames: RefCell::new(Some(FrameState::new(rx))),
-                load_state: LoadState::Loading,
-            },
-            Err(err) => {
-                log::error!("failed to start FrameDecoder: {err:#}");
-                Self::failed()
-            }
-        }
+    fn start_frame_decoder(image_data: &Arc<ImageData>) -> anyhow::Result<Self> {
+        let rx = FrameDecoder::start(Arc::clone(image_data))?;
+        Ok(Self {
+            frame_start: RefCell::new(Instant::now()),
+            current_frame: RefCell::new(0),
+            image: Arc::clone(image_data),
+            frames: RefCell::new(Some(FrameState::new(rx))),
+            load_state: LoadState::Loading,
+        })
     }
 
-    fn load(image_data: &Arc<ImageData>) -> Self {
-        match &*image_data.data() {
-            ImageDataType::EncodedLease(lease) => {
-                Self::start_frame_decoder(lease.clone(), image_data)
-            }
-            ImageDataType::EncodedFile(data) => match BlobManager::store(&data) {
-                Ok(lease) => Self::start_frame_decoder(lease, image_data),
-                Err(err) => {
-                    log::error!("Unable to move file data to blob manager: {err:#}");
-                    Self::failed()
-                }
-            },
+    fn load(image_data: &Arc<ImageData>) -> anyhow::Result<Self> {
+        let is_encoded = matches!(
+            &*image_data.data(),
+            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_)
+        );
+        if is_encoded {
+            return Self::start_frame_decoder(image_data);
+        }
+
+        Ok(match &*image_data.data() {
             ImageDataType::AnimRgba8 { durations, .. } => {
                 let current_frame = if durations.len() > 1 && durations[0].as_millis() == 0 {
                     // Skip possible 0-duration root frame
@@ -724,14 +823,17 @@ impl DecodedImage {
                 }
             }
 
-            _ => Self {
+            ImageDataType::Rgba8 { .. } => Self {
                 frame_start: RefCell::new(Instant::now()),
                 current_frame: RefCell::new(0),
                 image: Arc::clone(image_data),
                 frames: RefCell::new(None),
                 load_state: LoadState::Loaded,
             },
-        }
+            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => unreachable!(
+                "encoded images return through the bounded frame decoder above"
+            ),
+        })
     }
 
     fn retained_bytes(&self) -> usize {
@@ -1553,17 +1655,16 @@ impl GlyphCache {
                 let mut frames = decoded.frames.borrow_mut();
                 let frames = frames.as_mut().expect("to have frames");
 
-                let mut next = None;
                 let mut decoded_frame_start = decoded.frame_start.borrow_mut();
                 let mut decoded_current_frame = decoded.current_frame.borrow_mut();
 
-                // Wait up to the approx limit of human tolerable delay for
-                // the first frame to be decoded, so that we can avoid showing
-                // a flash of the black frame in the common case
-                let max_duration = Duration::from_millis(125).max(min_frame_duration);
-                if let Some(remain) = max_duration.checked_sub(decoded_frame_start.elapsed()) {
-                    frames.wait_for_first_frame(remain);
-                }
+                // This function runs on the GUI render path. Decoding and blob
+                // I/O happen in the bounded worker pool, and presentation must
+                // only poll their result; waiting here (the historical code
+                // waited for as long as 125 ms) directly turns an image miss
+                // into visible input and resize latency. The transparent frame
+                // below is a non-blocking placeholder and `next_due` schedules
+                // another poll at the renderer's bounded frame cadence.
 
                 let now = Instant::now();
                 // We round up the frame duration to at least the minimum
@@ -1581,7 +1682,7 @@ impl GlyphCache {
                 if now >= next_due {
                     // Advance to next frame
                     if frames.load_next_frame() {
-                        *decoded_current_frame = *decoded_current_frame + 1;
+                        *decoded_current_frame = (*decoded_current_frame).wrapping_add(1);
                         *decoded_frame_start = now;
                         next_due =
                             *decoded_frame_start + frames.frame_duration().max(min_frame_duration);
@@ -1589,12 +1690,14 @@ impl GlyphCache {
                     }
                 }
 
-                next.replace(next_due);
-
                 let hash = frames.frame_hash();
 
                 if let Some(sprite) = frame_cache.get(&hash) {
-                    return Ok((sprite.clone(), next, frames.load_state));
+                    return Ok((
+                        sprite.clone(),
+                        frames.next_frame_due(next_due),
+                        frames.load_state,
+                    ));
                 }
 
                 let Some(expected_byte_size) = frames.current_frame.checked_decoded_bytes() else {
@@ -1611,7 +1714,11 @@ impl GlyphCache {
                         padding,
                         scale_down,
                     )?;
-                    return Ok((sprite, next, frames.load_state));
+                    return Ok((
+                        sprite,
+                        frames.next_frame_due(next_due),
+                        frames.load_state,
+                    ));
                 };
 
                 let frame_data = match frames.current_frame.lease.get_data() {
@@ -1663,7 +1770,9 @@ impl GlyphCache {
 
                 Ok((
                     sprite,
-                    Some(*decoded_frame_start + frames.frame_duration().max(min_frame_duration)),
+                    frames.next_frame_due(
+                        *decoded_frame_start + frames.frame_duration().max(min_frame_duration),
+                    ),
                     frames.load_state,
                 ))
             }
@@ -1700,7 +1809,11 @@ impl GlyphCache {
         padding: Option<usize>,
         allow_image: AllowImage,
     ) -> anyhow::Result<(Sprite, Option<Instant>, LoadState)> {
-        let hash = image_data.hash();
+        // `ImageData::hash` is stable object/source identity. Kitty edits can
+        // mutate decoded pixels in place, so renderer cache authority must use
+        // the mutation-maintained current revision or it will return a sprite
+        // uploaded for the prior pixels indefinitely.
+        let hash = image_data.current_content_hash();
 
         let cached = {
             self.image_cache.get(&hash).map(|decoded| {
@@ -1721,7 +1834,31 @@ impl GlyphCache {
             return result;
         }
 
-        let decoded = DecodedImage::load(image_data);
+        let decoded = match DecodedImage::load(image_data) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                // Queue/pool admission failures are transient resource
+                // pressure. Render a placeholder for this attempt but do not
+                // poison the cache; a later frame may retry admission.
+                log::debug!("image decoder admission deferred: {error:#}");
+                let failed = DecodedImage::failed();
+                let (sprite, _, _) = Self::cached_image_impl(
+                    &mut self.frame_cache,
+                    &mut self.blank_frame_cache,
+                    &mut self.atlas,
+                    &failed,
+                    padding,
+                    self.min_frame_duration,
+                    allow_image,
+                )?;
+                let retry_delay = self.min_frame_duration.max(Duration::from_millis(1));
+                return Ok((
+                    sprite,
+                    Some(Instant::now() + retry_delay),
+                    LoadState::Loading,
+                ));
+            }
+        };
         let res = Self::cached_image_impl(
             &mut self.frame_cache,
             &mut self.blank_frame_cache,
@@ -2735,28 +2872,24 @@ mod tests {
     }
 
     #[test]
-    fn gui_visual_placeholder_invalid_encoded_image_loads_as_failed() {
+    fn gui_visual_placeholder_invalid_encoded_image_decoder_settles_as_failed() {
         let image = Arc::new(ImageData::with_data(ImageDataType::EncodedFile(vec![
             0x00, 0x01, 0x02, 0x03,
         ])));
 
-        let decoded = DecodedImage::load(&image);
-
-        assert_eq!(decoded.load_state, LoadState::Failed);
-        assert!(decoded.frames.borrow().is_none());
-
-        match &*decoded.image.data() {
-            ImageDataType::Rgba8 {
-                width,
-                height,
-                data,
-                ..
-            } => {
-                assert_eq!((*width, *height), (1, 1));
-                assert_eq!(data.as_slice(), &[0, 0, 0, 0]);
-            }
-            other => panic!("expected transparent fallback image, got {other:?}"),
+        let decoded = DecodedImage::load(&image).expect("decoder admission should succeed");
+        let mut frames = decoded.frames.borrow_mut();
+        let state = frames.as_mut().expect("encoded image has a frame state");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state.load_state == LoadState::Loading {
+            let _ = state.load_next_frame();
+            assert!(
+                Instant::now() < deadline,
+                "bounded decoder did not settle invalid input before its test deadline"
+            );
+            std::thread::sleep(Duration::from_millis(1));
         }
+        assert_eq!(state.load_state, LoadState::Failed);
     }
 
     #[test]
@@ -2766,9 +2899,24 @@ mod tests {
             0xde, 0xad, 0xbe, 0xef,
         ])));
 
-        let (sprite, next_due, load_state) = cache
-            .cached_image(&image, Some(1), AllowImage::Yes)
-            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (sprite, next_due, load_state) = loop {
+            let result = cache
+                .cached_image(&image, Some(1), AllowImage::Yes)
+                .unwrap();
+            if result.2 != LoadState::Loading {
+                break result;
+            }
+            assert!(
+                result.1.is_some(),
+                "an in-flight decoder must schedule another non-blocking poll"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "cached invalid image did not settle before its test deadline"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
 
         assert_eq!(load_state, LoadState::Failed);
         assert!(next_due.is_none());
@@ -2782,10 +2930,105 @@ mod tests {
         assert_eq!(checked_decoded_frame_bytes(usize::MAX, 2), None);
     }
 
+    fn decoder_test_frame(pixel: u8, duration: Duration) -> DecodedFrame {
+        DecodedFrame {
+            lease: BlobManager::store(&[pixel, pixel, pixel, 0xff])
+                .expect("store decoder test frame"),
+            duration,
+            width: 1,
+            height: 1,
+        }
+    }
+
+    fn disconnected_frame_state(frames: Vec<DecodedFrame>) -> FrameState {
+        let (tx, receiver) = channel();
+        drop(tx);
+        let current_frame = frames.last().expect("at least one test frame").clone();
+        FrameState {
+            source: FrameSource::Decoder(FrameDecoderReceiver {
+                receiver,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }),
+            current_frame,
+            frames,
+            load_state: LoadState::Loaded,
+        }
+    }
+
+    #[test]
+    fn decoder_disconnect_wraps_from_last_frame_to_first_without_skipping_it() {
+        let first = decoder_test_frame(0x11, Duration::from_millis(10));
+        let first_hash = first.lease.content_id();
+        let second = decoder_test_frame(0x22, Duration::from_millis(20));
+        let mut state = disconnected_frame_state(vec![first, second]);
+
+        assert!(state.load_next_frame());
+        assert!(matches!(&state.source, FrameSource::FrameIndex(0)));
+        assert_eq!(state.current_frame.lease.content_id(), first_hash);
+    }
+
+    #[test]
+    fn decoder_disconnect_skips_zero_duration_animation_root_on_wrap() {
+        let root = decoder_test_frame(0x11, Duration::ZERO);
+        let first_visible = decoder_test_frame(0x22, Duration::from_millis(20));
+        let first_visible_hash = first_visible.lease.content_id();
+        let last = decoder_test_frame(0x33, Duration::from_millis(30));
+        let mut state = disconnected_frame_state(vec![root, first_visible, last]);
+
+        assert!(state.load_next_frame());
+        assert!(matches!(&state.source, FrameSource::FrameIndex(1)));
+        assert_eq!(state.current_frame.lease.content_id(), first_visible_hash);
+    }
+
+    #[test]
+    fn decoder_disconnect_updates_the_live_single_frame_duration() {
+        let frame = decoder_test_frame(0x44, Duration::from_millis(1));
+        let mut state = disconnected_frame_state(vec![frame]);
+
+        assert!(state.load_next_frame());
+        assert!(matches!(&state.source, FrameSource::FrameIndex(0)));
+        assert_eq!(state.frame_duration(), Duration::from_secs(86_400));
+        assert_eq!(state.current_frame.duration, state.frames[0].duration);
+    }
+
+    #[test]
+    fn glyph_image_cache_keys_mutable_images_by_current_content_revision() {
+        let (mut cache, _) = test_glyph_cache();
+        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![0x11, 0x22, 0x33, 0xff],
+        )));
+        let first_revision = image.current_content_hash();
+        let (first_sprite, _, _) = cache
+            .cached_image(&image, None, AllowImage::Yes)
+            .expect("first revision should upload");
+
+        *image.data_mut() = ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![0xaa, 0xbb, 0xcc, 0xff],
+        );
+        let second_revision = image.current_content_hash();
+        assert_ne!(first_revision, second_revision);
+
+        let (second_sprite, _, _) = cache
+            .cached_image(&image, None, AllowImage::Yes)
+            .expect("mutated revision should upload independently");
+
+        assert_ne!(
+            first_sprite.coords, second_sprite.coords,
+            "a Kitty-style in-place edit must not reuse the prior revision's atlas sprite"
+        );
+        assert!(cache.image_cache.get(&first_revision).is_some());
+        assert!(cache.image_cache.get(&second_revision).is_some());
+    }
+
     fn small_decoded_image() -> DecodedImage {
         DecodedImage::load(&Arc::new(ImageData::with_data(
             ImageDataType::new_single_frame(1, 1, vec![0, 0, 0, 0]),
         )))
+        .expect("decoded image does not need worker admission")
     }
 
     #[test]
