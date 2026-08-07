@@ -22,6 +22,8 @@ pub struct CleanupResult {
     pub deleted_by_count: usize,
     /// Sessions deleted by size budget.
     pub deleted_by_size: usize,
+    /// Orphaned restore-attempt lifecycle rows cleaned.
+    pub orphaned_restore_lifecycle_rows: usize,
     /// Orphaned checkpoint rows cleaned.
     pub orphaned_checkpoints: usize,
     /// Orphaned pane_state rows cleaned.
@@ -41,6 +43,7 @@ impl CleanupResult {
     #[must_use]
     pub fn any_work_done(&self) -> bool {
         self.total_sessions_deleted() > 0
+            || self.orphaned_restore_lifecycle_rows > 0
             || self.orphaned_checkpoints > 0
             || self.orphaned_pane_states > 0
     }
@@ -60,6 +63,17 @@ mod tests {
         };
 
         assert_eq!(result.total_sessions_deleted(), usize::MAX);
+        assert!(result.any_work_done());
+    }
+
+    #[test]
+    fn orphaned_restore_lifecycle_rows_are_reported_as_work() {
+        let result = CleanupResult {
+            orphaned_restore_lifecycle_rows: 1,
+            ..CleanupResult::default()
+        };
+
+        assert_eq!(result.total_sessions_deleted(), 0);
         assert!(result.any_work_done());
     }
 }

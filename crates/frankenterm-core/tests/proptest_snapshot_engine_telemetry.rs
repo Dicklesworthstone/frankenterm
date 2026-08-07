@@ -60,6 +60,8 @@ fn telemetry_starts_at_zero() {
     assert_eq!(snap.triggers_accepted, 0);
     assert_eq!(snap.panes_captured, 0);
     assert_eq!(snap.bytes_persisted, 0);
+    assert_eq!(snap.persisted_text_bytes, 0);
+    assert_eq!(snap.pane_states_truncated, 0);
 }
 
 #[test]
@@ -103,6 +105,8 @@ fn snapshot_serde_roundtrip() {
         triggers_accepted: 98,
         panes_captured: 500,
         bytes_persisted: 1_000_000,
+        persisted_text_bytes: 1_500_000,
+        pane_states_truncated: 7,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
     let back: SnapshotEngineTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -192,6 +196,8 @@ proptest! {
         accepted in 0u64..50000,
         panes in 0u64..100000,
         bytes in 0u64..10_000_000,
+        persisted_text_bytes in 0u64..20_000_000,
+        pane_states_truncated in 0u64..100_000,
     ) {
         let snap = SnapshotEngineTelemetrySnapshot {
             captures_attempted: attempted,
@@ -204,6 +210,8 @@ proptest! {
             triggers_accepted: accepted,
             panes_captured: panes,
             bytes_persisted: bytes,
+            persisted_text_bytes,
+            pane_states_truncated,
         };
 
         let json = serde_json::to_string(&snap).expect("serialize");

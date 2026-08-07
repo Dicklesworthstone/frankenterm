@@ -13,6 +13,8 @@ use crate::config::DistributedTlsConfig;
 use crate::config::{DistributedAuthMode, DistributedConfig};
 #[cfg(feature = "distributed")]
 use crate::cx::Cx;
+#[cfg(feature = "distributed")]
+use crate::runtime_async::http as runtime_http;
 
 #[cfg(feature = "distributed")]
 use rustls::client::danger::HandshakeSignatureValid;
@@ -42,9 +44,8 @@ use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
 /// TLS configuration bundle for distributed mode.
 ///
-/// Holds pre-built rustls configurations that can be converted into
-/// asupersync [`TlsAcceptor`](asupersync::tls::TlsAcceptor) and
-/// [`TlsConnector`](asupersync::tls::TlsConnector) for production use.
+/// Holds pre-built rustls configurations that can be converted into canonical
+/// runtime-async TLS acceptors/connectors for production use.
 #[cfg(feature = "distributed")]
 #[derive(Clone)]
 pub struct DistributedTlsBundle {
@@ -54,18 +55,18 @@ pub struct DistributedTlsBundle {
 
 #[cfg(feature = "distributed")]
 impl DistributedTlsBundle {
-    /// Create an asupersync [`TlsAcceptor`](asupersync::tls::TlsAcceptor)
-    /// from the server configuration for accepting inbound TLS connections.
+    /// Create a canonical runtime-async TLS acceptor from the server
+    /// configuration for accepting inbound TLS connections.
     #[must_use]
-    pub fn acceptor(&self) -> asupersync::tls::TlsAcceptor {
-        asupersync::tls::TlsAcceptor::new((*self.server).clone())
+    pub fn acceptor(&self) -> crate::runtime_async::tls::TlsAcceptor {
+        crate::runtime_async::tls::TlsAcceptor::new((*self.server).clone())
     }
 
-    /// Create an asupersync [`TlsConnector`](asupersync::tls::TlsConnector)
-    /// from the client configuration for initiating outbound TLS connections.
+    /// Create a canonical runtime-async TLS connector from the client
+    /// configuration for initiating outbound TLS connections.
     #[must_use]
-    pub fn connector(&self) -> asupersync::tls::TlsConnector {
-        asupersync::tls::TlsConnector::new((*self.client).clone())
+    pub fn connector(&self) -> crate::runtime_async::tls::TlsConnector {
+        crate::runtime_async::tls::TlsConnector::new((*self.client).clone())
     }
 }
 
@@ -941,8 +942,8 @@ pub fn build_tls_server_name(bind_addr: &str) -> Result<ServerName<'static>, Dis
 
 /// Cancel-aware HTTP/1.1 client utility for the `distributed` feature.
 ///
-/// Wraps [`asupersync::http::h1::http_client::HttpClient`] for making HTTP
-/// requests to trusted peer URLs without pulling in reqwest.
+/// Wraps [`crate::runtime_async::http::HttpClient`] for making HTTP requests to
+/// trusted peer URLs without pulling in reqwest.
 ///
 /// NOTE: this is NOT the node-to-node wire transport. Inter-node traffic uses a
 /// JSON-lines protocol over raw TCP/TLS (`WireEnvelope::to_json` + newline
@@ -955,10 +956,11 @@ pub fn build_tls_server_name(bind_addr: &str) -> Result<ServerName<'static>, Dis
 /// For plain HTTP (loopback testing, health checks), use [`Self::plaintext()`].
 /// For HTTPS with standard WebPKI roots, use [`Self::new()`].
 /// For mTLS with custom certificates, use [`DistributedTlsBundle::connector()`]
-/// with raw [`asupersync::net::TcpStream`] + TLS handshake + HTTP/1.1 framing.
+/// with [`crate::runtime_async::net::TcpStream`] + TLS handshake + HTTP/1.1
+/// framing.
 #[cfg(feature = "distributed")]
 pub struct DistributedHttpClient {
-    inner: asupersync::http::h1::http_client::HttpClient,
+    inner: runtime_http::HttpClient,
 }
 
 #[cfg(feature = "distributed")]
@@ -987,7 +989,7 @@ impl DistributedHttpClient {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: asupersync::http::h1::http_client::HttpClient::builder()
+            inner: runtime_http::HttpClient::builder()
                 .no_redirects()
                 .build(),
         }
@@ -1013,10 +1015,9 @@ impl DistributedHttpClient {
         &self,
         cx: &Cx,
         url: &str,
-    ) -> Result<asupersync::http::h1::types::Response, asupersync::http::h1::http_client::ClientError>
-    {
+    ) -> Result<runtime_http::Response, runtime_http::ClientError> {
         if cx.is_cancel_requested() {
-            return Err(asupersync::http::h1::http_client::ClientError::Cancelled);
+            return Err(runtime_http::ClientError::Cancelled);
         }
         race_with_cx_cancel(cx, self.inner.get(url).send(cx)).await
     }
@@ -1032,10 +1033,9 @@ impl DistributedHttpClient {
         cx: &Cx,
         url: &str,
         body: Vec<u8>,
-    ) -> Result<asupersync::http::h1::types::Response, asupersync::http::h1::http_client::ClientError>
-    {
+    ) -> Result<runtime_http::Response, runtime_http::ClientError> {
         if cx.is_cancel_requested() {
-            return Err(asupersync::http::h1::http_client::ClientError::Cancelled);
+            return Err(runtime_http::ClientError::Cancelled);
         }
         race_with_cx_cancel(cx, self.inner.post(url).body(body).send(cx)).await
     }
@@ -1083,27 +1083,33 @@ impl DistributedHttpClient {
 async fn race_with_cx_cancel<F>(
     cx: &Cx,
     inner: F,
-) -> Result<asupersync::http::h1::types::Response, asupersync::http::h1::http_client::ClientError>
+) -> Result<runtime_http::Response, runtime_http::ClientError>
 where
-    F: std::future::Future<
-            Output = Result<
-                asupersync::http::h1::types::Response,
-                asupersync::http::h1::http_client::ClientError,
-            >,
-        >,
+    F: std::future::Future<Output = Result<runtime_http::Response, runtime_http::ClientError>>,
 {
     use futures::future::{Either, select};
 
     let inner = std::pin::pin!(inner);
     let cancel_watcher = async {
         loop {
-            let _ =
-                crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(50)).await;
+            if crate::runtime_async::sleep_with_cx(
+                cx,
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .is_err()
+            {
+                let error = if cx.is_cancel_requested() {
+                    runtime_http::ClientError::Cancelled
+                } else {
+                    runtime_http::ClientError::DeadlineExceeded
+                };
+                return Err::<runtime_http::Response, runtime_http::ClientError>(error);
+            }
             if cx.is_cancel_requested() {
-                return Err::<
-                    asupersync::http::h1::types::Response,
-                    asupersync::http::h1::http_client::ClientError,
-                >(asupersync::http::h1::http_client::ClientError::Cancelled);
+                return Err::<runtime_http::Response, runtime_http::ClientError>(
+                    runtime_http::ClientError::Cancelled,
+                );
             }
         }
     };
@@ -4800,21 +4806,10 @@ KBAhs4snj5QspGFqkazmIw==
     /// cx-cancel says "operator pulled the plug"; budget-expired says
     /// "the time-box on this operation is over".
     ///
-    /// Current observed behavior depends on whether the inner asupersync
-    /// HttpClient observes cx budget at entry. Rather than pin a specific
-    /// outcome that might evolve, this test only pins that the call does
-    /// NOT hang unboundedly. Uses an outer 10s timeout_ceiling to catch
-    /// any regression that broke ALL budget-handling paths.
-    ///
-    /// Test outcomes (all acceptable snapshots):
-    /// 1. Outer timeout fires (client ignored budget, we caught the
-    ///    hang defensively): elapsed ~= 10s, Err from outer timeout.
-    /// 2. Client observed budget, fast-failed: elapsed << 10s,
-    ///    Err from the client.
-    /// 3. (Unlikely) Client succeeded anyway: elapsed << 10s, Ok.
-    ///
-    /// Prints the observed shape to stderr for operator inspection.
-    /// Assertion is only "does not hang" — bounded elapsed < 15s.
+    /// The cancellation watcher must treat an expired budget as a terminal
+    /// deadline result. Ignoring the failed budget-aware sleep would make the
+    /// watcher loop forever without yielding, preventing even an outer timeout
+    /// from being polled.
     #[cfg(feature = "distributed")]
     #[test]
     fn distributed_http_client_with_expired_budget_does_not_hang() {
@@ -4847,11 +4842,15 @@ KBAhs4snj5QspGFqkazmIw==
             let elapsed = started.elapsed();
 
             assert!(
-                elapsed < std::time::Duration::from_secs(15),
-                "expired-budget cx must not cause an unbounded hang; took {elapsed:?}"
+                elapsed < std::time::Duration::from_secs(1),
+                "expired-budget cx must fail promptly; took {elapsed:?}"
             );
-            eprintln!(
-                "tick 378: expired-budget cx elapsed={elapsed:?}, outer_timeout_result={result:?}"
+            assert!(
+                matches!(
+                    &result,
+                    Ok(Err(runtime_http::ClientError::DeadlineExceeded))
+                ),
+                "expired-budget cx must return DeadlineExceeded; got {result:?}"
             );
         });
     }

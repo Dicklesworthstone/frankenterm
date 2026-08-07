@@ -114,7 +114,7 @@ pub struct Config {
         skip_serializing,
         deserialize_with = "reject_unsupported_session_table"
     )]
-    unsupported_session_table: (),
+    _unsupported_session_table: (),
 
     /// Semantic search settings (embedding models, fusion, daemon)
     pub search: SearchConfig,

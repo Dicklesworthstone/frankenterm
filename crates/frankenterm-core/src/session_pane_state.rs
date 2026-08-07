@@ -1,13 +1,18 @@
 //! Per-pane terminal state snapshot for session persistence.
 //!
-//! Captures and serializes terminal state (cursor, alt-screen, scrollback ref,
-//! process info, curated env vars) for each pane. Stored in
+//! Models terminal state (cursor, alt-screen, scrollback ref, optional process
+//! and agent observations, and curated env vars) for each pane. The production
+//! snapshot writer projects a bounded subset into
 //! `mux_pane_state.terminal_state_json` and related columns.
 //!
 //! # Size budget
 //!
-//! Each pane snapshot targets ≤64KB serialized. If exceeded, env and argv are
-//! truncated and a warning is logged.
+//! [`PaneStateSnapshot::to_json_budgeted`] never returns more than 64 KiB. It
+//! progressively removes optional observations if necessary. Production row
+//! persistence has an independent whole-row budget at the actual SQLite
+//! projection boundary.
+
+use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
@@ -19,7 +24,7 @@ pub const PANE_STATE_SIZE_BUDGET: usize = 65_536;
 pub const PANE_STATE_SCHEMA_VERSION: u32 = 1;
 
 /// Environment variable names that are safe to capture.
-const SAFE_ENV_VARS: &[&str] = &[
+pub(crate) const SAFE_ENV_VARS: &[&str] = &[
     "PATH",
     "HOME",
     "SHELL",
@@ -51,6 +56,12 @@ const SENSITIVE_VAR_PATTERNS: &[&str] = &[
     "PRIVATE",
     "PASSWD",
 ];
+
+/// Maximum variable-name size admitted to case-insensitive sensitive-name
+/// classification. Real environment names fit comfortably within this bound;
+/// adversarial iterator inputs cannot force an unbounded Unicode case-fold
+/// allocation merely to update redaction telemetry.
+const MAX_ENV_NAME_CLASSIFICATION_BYTES: usize = 256;
 
 // =============================================================================
 // Core types
@@ -153,6 +164,261 @@ pub struct CapturedEnv {
     pub redacted_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneStateRetention {
+    env: bool,
+    argv: bool,
+    agent: bool,
+    process_context: bool,
+    title: bool,
+}
+
+impl PaneStateRetention {
+    const FULL: Self = Self {
+        env: true,
+        argv: true,
+        agent: true,
+        process_context: true,
+        title: true,
+    };
+
+    fn effective_for(self, snapshot: &PaneStateSnapshot) -> Self {
+        let process = snapshot.foreground_process.as_ref();
+        let has_process_context =
+            snapshot.cwd.is_some() || snapshot.shell.is_some() || process.is_some();
+        Self {
+            env: self.env && snapshot.env.is_some(),
+            argv: self.process_context
+                && self.argv
+                && process.is_some_and(|process| process.argv.is_some()),
+            agent: self.agent && snapshot.agent.is_some(),
+            process_context: self.process_context && has_process_context,
+            title: self.title && !snapshot.terminal.title.is_empty(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ProcessInfoProjection<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    argv: Option<&'a [String]>,
+}
+
+#[derive(Serialize)]
+struct TerminalStateProjection<'a> {
+    rows: u16,
+    cols: u16,
+    cursor_row: u16,
+    cursor_col: u16,
+    is_alt_screen: bool,
+    title: &'a str,
+}
+
+#[derive(Serialize)]
+struct PaneStateSnapshotProjection<'a> {
+    schema_version: u32,
+    pane_id: u64,
+    captured_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    foreground_process: Option<ProcessInfoProjection<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shell: Option<&'a str>,
+    terminal: TerminalStateProjection<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scrollback_ref: Option<&'a ScrollbackRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<&'a AgentMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    env: Option<&'a CapturedEnv>,
+}
+
+impl<'a> PaneStateSnapshotProjection<'a> {
+    fn new(snapshot: &'a PaneStateSnapshot, retain: PaneStateRetention) -> Self {
+        let foreground_process = if retain.process_context {
+            snapshot
+                .foreground_process
+                .as_ref()
+                .map(|process| ProcessInfoProjection {
+                    name: &process.name,
+                    pid: process.pid,
+                    argv: if retain.argv {
+                        process.argv.as_deref()
+                    } else {
+                        None
+                    },
+                })
+        } else {
+            None
+        };
+
+        Self {
+            schema_version: snapshot.schema_version,
+            pane_id: snapshot.pane_id,
+            captured_at: snapshot.captured_at,
+            cwd: if retain.process_context {
+                snapshot.cwd.as_deref()
+            } else {
+                None
+            },
+            foreground_process,
+            shell: if retain.process_context {
+                snapshot.shell.as_deref()
+            } else {
+                None
+            },
+            terminal: TerminalStateProjection {
+                rows: snapshot.terminal.rows,
+                cols: snapshot.terminal.cols,
+                cursor_row: snapshot.terminal.cursor_row,
+                cursor_col: snapshot.terminal.cursor_col,
+                is_alt_screen: snapshot.terminal.is_alt_screen,
+                title: if retain.title {
+                    &snapshot.terminal.title
+                } else {
+                    ""
+                },
+            },
+            scrollback_ref: snapshot.scrollback_ref.as_ref(),
+            agent: if retain.agent {
+                snapshot.agent.as_ref()
+            } else {
+                None
+            },
+            env: if retain.env {
+                snapshot.env.as_ref()
+            } else {
+                None
+            },
+        }
+    }
+}
+
+fn projection_raw_text_exceeds_budget(
+    snapshot: &PaneStateSnapshot,
+    retain: PaneStateRetention,
+) -> bool {
+    let mut raw_bytes = 0usize;
+    let mut exceeds = |additional: usize| match raw_bytes.checked_add(additional) {
+        Some(total) if total <= PANE_STATE_SIZE_BUDGET => {
+            raw_bytes = total;
+            false
+        }
+        _ => true,
+    };
+
+    if retain.process_context {
+        if exceeds(snapshot.cwd.as_ref().map_or(0, String::len))
+            || exceeds(snapshot.shell.as_ref().map_or(0, String::len))
+        {
+            return true;
+        }
+        if let Some(process) = &snapshot.foreground_process {
+            if exceeds(process.name.len()) {
+                return true;
+            }
+            if retain.argv && let Some(argv) = &process.argv {
+                // Each JSON string contributes at least two quotes and all
+                // but one element contributes a comma. This makes even a
+                // caller-supplied vector of empty strings bounded before
+                // we iterate its elements.
+                if exceeds(argv.len().saturating_mul(3)) {
+                    return true;
+                }
+                for argument in argv {
+                    if exceeds(argument.len()) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    if retain.title && exceeds(snapshot.terminal.title.len()) {
+        return true;
+    }
+    if retain.agent && let Some(agent) = &snapshot.agent {
+        if exceeds(agent.agent_type.len())
+            || exceeds(agent.session_id.as_ref().map_or(0, String::len))
+            || exceeds(agent.state.as_ref().map_or(0, String::len))
+        {
+            return true;
+        }
+    }
+    if retain.env && let Some(env) = &snapshot.env {
+        // Four quotes and a colon are unavoidable for every key/value
+        // pair. Bound an adversarial map of empty strings before walking
+        // it, then count the retained raw bytes with early exit.
+        if exceeds(env.vars.len().saturating_mul(5)) {
+            return true;
+        }
+        for (key, value) in &env.vars {
+            if exceeds(key.len()) || exceeds(value.len()) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    overflowed: bool,
+}
+
+impl BoundedJsonWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(1024)),
+            limit,
+            overflowed: false,
+        }
+    }
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let admitted = self
+            .bytes
+            .len()
+            .checked_add(buffer.len())
+            .is_some_and(|length| length <= self.limit);
+        if !admitted {
+            self.overflowed = true;
+            return Err(io::Error::other("pane state JSON size budget exceeded"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_projection_to_budget(
+    projection: &PaneStateSnapshotProjection<'_>,
+) -> Result<Option<String>, serde_json::Error> {
+    let mut writer = BoundedJsonWriter::new(PANE_STATE_SIZE_BUDGET);
+    if let Err(error) = serde_json::to_writer(&mut writer, projection) {
+        if writer.overflowed {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+
+    let json = String::from_utf8(writer.bytes).map_err(|error| {
+        serde_json::Error::io(io::Error::new(io::ErrorKind::InvalidData, error))
+    })?;
+    Ok(Some(json))
+}
+
 // =============================================================================
 // Construction
 // =============================================================================
@@ -199,7 +465,7 @@ impl PaneStateSnapshot {
     /// Set scrollback reference.
     #[must_use]
     pub fn with_scrollback(mut self, scrollback: ScrollbackRef) -> Self {
-        debug!(
+        trace!(
             pane_id = self.pane_id,
             seq = scrollback.output_segments_seq,
             segments = scrollback.total_segments_captured,
@@ -221,11 +487,26 @@ impl PaneStateSnapshot {
     /// Only captures variables from the safe-list and redacts sensitive ones.
     #[must_use]
     pub fn with_env_from_current(mut self) -> Self {
-        let env = capture_env_from_iter(std::env::vars());
+        // `std::env::vars()` panics when the process environment contains a
+        // non-UTF-8 key or value. Environment observation is best-effort, so
+        // skip those entries without exposing their content instead of taking
+        // down snapshot capture.
+        let mut non_utf8_entries = 0usize;
+        let utf8_vars = std::env::vars_os().filter_map(|(key, value)| {
+            match (key.into_string(), value.into_string()) {
+                (Ok(key), Ok(value)) => Some((key, value)),
+                _ => {
+                    non_utf8_entries = non_utf8_entries.saturating_add(1);
+                    None
+                }
+            }
+        });
+        let env = capture_env_from_iter(utf8_vars);
         trace!(
             pane_id = self.pane_id,
             var_count = env.vars.len(),
             redacted_count = env.redacted_count,
+            non_utf8_entries = non_utf8_entries,
             "Environment capture for pane"
         );
         self.env = Some(env);
@@ -256,38 +537,92 @@ impl PaneStateSnapshot {
 
     /// Serialize to JSON, enforcing the size budget.
     ///
-    /// If the serialized form exceeds `PANE_STATE_SIZE_BUDGET`, env and argv
-    /// are progressively truncated. Returns the JSON and whether truncation
-    /// occurred.
+    /// If the serialized form exceeds `PANE_STATE_SIZE_BUDGET`, optional
+    /// observations are progressively removed in a deterministic order. The
+    /// returned JSON is always within the budget. Each attempt writes through
+    /// a bounded buffer, so an oversized caller-controlled string is never
+    /// cloned into a correspondingly oversized temporary JSON allocation.
     pub fn to_json_budgeted(&self) -> Result<(String, bool), serde_json::Error> {
-        let json = serde_json::to_string(self)?;
-        if json.len() <= PANE_STATE_SIZE_BUDGET {
-            return Ok((json, false));
+        let stages = [
+            (PaneStateRetention::FULL, "none"),
+            (
+                PaneStateRetention {
+                    env: false,
+                    ..PaneStateRetention::FULL
+                },
+                "environment",
+            ),
+            (
+                PaneStateRetention {
+                    env: false,
+                    argv: false,
+                    ..PaneStateRetention::FULL
+                },
+                "process_argv",
+            ),
+            (
+                PaneStateRetention {
+                    env: false,
+                    argv: false,
+                    agent: false,
+                    ..PaneStateRetention::FULL
+                },
+                "agent_metadata",
+            ),
+            (
+                PaneStateRetention {
+                    env: false,
+                    argv: false,
+                    agent: false,
+                    process_context: false,
+                    ..PaneStateRetention::FULL
+                },
+                "process_context",
+            ),
+            (
+                PaneStateRetention {
+                    env: false,
+                    argv: false,
+                    agent: false,
+                    process_context: false,
+                    title: false,
+                },
+                "terminal_title",
+            ),
+        ];
+
+        let mut previous_effective_retention = None;
+        for (index, (retain, truncation_tier)) in stages.into_iter().enumerate() {
+            let effective_retention = retain.effective_for(self);
+            if previous_effective_retention == Some(effective_retention) {
+                continue;
+            }
+            previous_effective_retention = Some(effective_retention);
+
+            let json = if projection_raw_text_exceeds_budget(self, retain) {
+                None
+            } else {
+                let projection = PaneStateSnapshotProjection::new(self, retain);
+                serialize_projection_to_budget(&projection)?
+            };
+            if let Some(json) = json {
+                let truncated = index != 0;
+                if truncated {
+                    debug!(
+                        pane_id = self.pane_id,
+                        truncation_tier = truncation_tier,
+                        retained_bytes = json.len(),
+                        budget = PANE_STATE_SIZE_BUDGET,
+                        "Pane state truncated to size budget"
+                    );
+                }
+                return Ok((json, truncated));
+            }
         }
 
-        // Truncate: remove env first, then argv
-        tracing::warn!(
-            pane_id = self.pane_id,
-            actual_bytes = json.len(),
-            budget = PANE_STATE_SIZE_BUDGET,
-            "Pane state exceeds size budget, truncating"
-        );
-
-        let mut truncated = self.clone();
-        truncated.env = None;
-
-        let json = serde_json::to_string(&truncated)?;
-        if json.len() <= PANE_STATE_SIZE_BUDGET {
-            return Ok((json, true));
-        }
-
-        // Also truncate argv
-        if let Some(ref mut proc) = truncated.foreground_process {
-            proc.argv = None;
-        }
-
-        let json = serde_json::to_string(&truncated)?;
-        Ok((json, true))
+        Err(serde_json::Error::io(io::Error::other(
+            "fixed pane state projection exceeds size budget",
+        )))
     }
 
     /// Deserialize from JSON.
@@ -308,10 +643,23 @@ impl PaneStateSnapshot {
 fn capture_env_from_iter(vars: impl Iterator<Item = (String, String)>) -> CapturedEnv {
     let mut captured = std::collections::HashMap::new();
     let mut redacted_count = 0usize;
+    let max_safe_name_bytes = SAFE_ENV_VARS
+        .iter()
+        .map(|name| name.len())
+        .max()
+        .unwrap_or(0);
 
     for (key, value) in vars {
-        if is_sensitive_var(&key) {
-            redacted_count += 1;
+        // Preserve redaction telemetry for ordinary sensitive names even when
+        // they are longer than every allow-listed name. Keep the case-fold
+        // bounded so an arbitrary caller key cannot force an equally large
+        // Unicode allocation/scan.
+        if key.len() <= MAX_ENV_NAME_CLASSIFICATION_BYTES && is_sensitive_var(&key) {
+            redacted_count = redacted_count.saturating_add(1);
+            continue;
+        }
+
+        if key.len() > max_safe_name_bytes {
             continue;
         }
 
@@ -348,8 +696,8 @@ impl PaneStateSnapshot {
         is_alt_screen: bool,
     ) -> Self {
         let terminal = TerminalState {
-            rows: terminal_dimension(pane.effective_rows()),
-            cols: terminal_dimension(pane.effective_cols()),
+            rows: terminal_size_dimension(pane.effective_rows()),
+            cols: terminal_size_dimension(pane.effective_cols()),
             cursor_row: terminal_dimension(pane.cursor_y.unwrap_or(0)),
             cursor_col: terminal_dimension(pane.cursor_x.unwrap_or(0)),
             is_alt_screen,
@@ -362,7 +710,7 @@ impl PaneStateSnapshot {
             snapshot.cwd = Some(parsed.path);
         }
 
-        debug!(
+        trace!(
             pane_id = pane.pane_id,
             has_cwd = snapshot.cwd.is_some(),
             alt_screen = is_alt_screen,
@@ -371,6 +719,10 @@ impl PaneStateSnapshot {
 
         snapshot
     }
+}
+
+fn terminal_size_dimension(value: u32) -> u16 {
+    terminal_dimension(value.max(1))
 }
 
 fn terminal_dimension(value: u32) -> u16 {
@@ -404,6 +756,9 @@ mod tests {
         let json = snapshot.to_json().unwrap();
         let restored = PaneStateSnapshot::from_json(&json).unwrap();
         assert_eq!(snapshot, restored);
+        let (budgeted_json, truncated) = snapshot.to_json_budgeted().unwrap();
+        assert!(!truncated);
+        assert_eq!(budgeted_json, json);
     }
 
     #[test]
@@ -429,11 +784,17 @@ mod tests {
                 agent_type: "claude_code".to_string(),
                 session_id: Some("sess-123".to_string()),
                 state: Some("working".to_string()),
-            });
+            })
+            .with_env_from_iter(
+                [("PATH".to_owned(), "/usr/bin".to_owned())].into_iter(),
+            );
 
         let json = snapshot.to_json().unwrap();
         let restored = PaneStateSnapshot::from_json(&json).unwrap();
         assert_eq!(snapshot, restored);
+        let (budgeted_json, truncated) = snapshot.to_json_budgeted().unwrap();
+        assert!(!truncated);
+        assert_eq!(budgeted_json, json);
     }
 
     // ---- Alt-screen ----
@@ -527,6 +888,62 @@ mod tests {
         assert!(json.len() <= PANE_STATE_SIZE_BUDGET);
     }
 
+    #[test]
+    fn size_budget_huge_title_cwd_process_and_agent_is_hard_bounded() {
+        let hostile = "\u{1}".repeat(PANE_STATE_SIZE_BUDGET * 2);
+        let mut snapshot = PaneStateSnapshot::new(7, 1000, TerminalState {
+            title: hostile.clone(),
+            ..make_terminal()
+        })
+        .with_cwd(hostile.clone())
+        .with_shell(hostile.clone())
+        .with_process(ProcessInfo {
+            name: hostile.clone(),
+            pid: Some(1),
+            argv: Some(vec![hostile.clone()]),
+        })
+        .with_agent(AgentMetadata {
+            agent_type: hostile.clone(),
+            session_id: Some(hostile.clone()),
+            state: Some(hostile),
+        });
+        snapshot.env = Some(CapturedEnv {
+            vars: std::collections::HashMap::from([(
+                "PATH".to_owned(),
+                "x".repeat(PANE_STATE_SIZE_BUDGET * 2),
+            )]),
+            redacted_count: 0,
+        });
+
+        let (json, truncated) = snapshot.to_json_budgeted().unwrap();
+        assert!(truncated);
+        assert!(json.len() <= PANE_STATE_SIZE_BUDGET);
+        let restored = PaneStateSnapshot::from_json(&json).unwrap();
+        assert!(restored.env.is_none());
+        assert!(restored.foreground_process.is_none());
+        assert!(restored.cwd.is_none());
+        assert!(restored.shell.is_none());
+        assert!(restored.agent.is_none());
+        assert!(restored.terminal.title.is_empty());
+    }
+
+    #[test]
+    fn size_budget_accounts_for_json_escape_expansion() {
+        let snapshot = PaneStateSnapshot::new(8, 1000, TerminalState {
+            title: "\u{1}".repeat(PANE_STATE_SIZE_BUDGET / 2),
+            ..make_terminal()
+        });
+
+        let (json, truncated) = snapshot.to_json_budgeted().unwrap();
+        assert!(truncated);
+        assert!(json.len() <= PANE_STATE_SIZE_BUDGET);
+        assert!(PaneStateSnapshot::from_json(&json)
+            .unwrap()
+            .terminal
+            .title
+            .is_empty());
+    }
+
     // ---- Schema version forward compat ----
 
     #[test]
@@ -590,6 +1007,7 @@ mod tests {
 
     #[test]
     fn terminal_dimensions_saturate_instead_of_wrapping() {
+        assert_eq!(terminal_size_dimension(0), 1);
         assert_eq!(terminal_dimension(u32::from(u16::MAX)), u16::MAX);
         assert_eq!(terminal_dimension(u32::from(u16::MAX) + 1), u16::MAX);
         assert_eq!(terminal_dimension(u32::MAX), u16::MAX);
@@ -710,6 +1128,46 @@ mod tests {
         assert_eq!(env.redacted_count, 0);
     }
 
+    #[test]
+    fn env_drops_oversized_names_before_sensitive_classification() {
+        let oversized_sensitive_name = format!("{}TOKEN", "X".repeat(1_000_000));
+        let env = capture_env_from_iter(
+            vec![(oversized_sensitive_name, "must-not-be-captured".to_string())].into_iter(),
+        );
+        assert!(env.vars.is_empty());
+        assert_eq!(env.redacted_count, 0);
+    }
+
+    #[test]
+    fn env_counts_common_sensitive_name_longer_than_allowlist_names() {
+        let env = capture_env_from_iter(
+            [("AWS_SECRET_ACCESS_KEY".to_owned(), "must-not-be-captured".to_owned())]
+                .into_iter(),
+        );
+        assert!(env.vars.is_empty());
+        assert_eq!(env.redacted_count, 1);
+    }
+
+    #[test]
+    fn env_sensitive_classification_cap_is_exact() {
+        let suffix = "_TOKEN";
+        let at_cap = format!(
+            "{}{}",
+            "X".repeat(MAX_ENV_NAME_CLASSIFICATION_BYTES - suffix.len()),
+            suffix
+        );
+        let over_cap = format!("X{at_cap}");
+        let env = capture_env_from_iter(
+            [
+                (at_cap, "at-cap".to_owned()),
+                (over_cap, "over-cap".to_owned()),
+            ]
+            .into_iter(),
+        );
+        assert!(env.vars.is_empty());
+        assert_eq!(env.redacted_count, 1);
+    }
+
     // ---- with_env_from_iter via builder ----
 
     #[test]
@@ -749,9 +1207,10 @@ mod tests {
 
         let (json, truncated) = snapshot.to_json_budgeted().unwrap();
         assert!(truncated);
-        // After truncation, env removed; if still too big, argv removed too
         let restored: PaneStateSnapshot = serde_json::from_str(&json).unwrap();
         assert!(restored.env.is_none());
+        assert!(restored.foreground_process.as_ref().unwrap().argv.is_none());
+        assert!(json.len() <= PANE_STATE_SIZE_BUDGET);
     }
 
     // ---- ProcessInfo fields ----
@@ -1012,37 +1471,49 @@ mod tests {
 
     #[test]
     fn size_budget_at_exact_boundary_not_truncated() {
-        // Build a snapshot, measure its base size, then pad env to reach exactly the budget
-        let base = PaneStateSnapshot::new(0, 1000, make_terminal());
-        let base_json = base.to_json().unwrap();
-        let base_len = base_json.len();
-
-        // We need to add env vars that bring the total to exactly PANE_STATE_SIZE_BUDGET
-        // The overhead for env wrapping is: ,"env":{"vars":{"K":"V"},"redacted_count":0}
-        // We'll pad with a single large value
-        let overhead_estimate = 50; // {"vars":{"X":"..."},"redacted_count":0} + ,"env":
-        let padding_needed = PANE_STATE_SIZE_BUDGET - base_len - overhead_estimate;
-
-        let mut vars = std::collections::HashMap::new();
-        vars.insert("X".to_string(), "y".repeat(padding_needed));
-        let mut snapshot = PaneStateSnapshot::new(0, 1000, make_terminal());
-        snapshot.env = Some(CapturedEnv {
-            vars,
+        let mut empty_value_snapshot = PaneStateSnapshot::new(0, 1000, make_terminal());
+        empty_value_snapshot.env = Some(CapturedEnv {
+            vars: std::collections::HashMap::from([("X".to_owned(), String::new())]),
             redacted_count: 0,
         });
+        let empty_value_bytes = empty_value_snapshot.to_json().unwrap().len();
+        let padding_needed = PANE_STATE_SIZE_BUDGET
+            .checked_sub(empty_value_bytes)
+            .expect("fixed snapshot must fit below the pane-state budget");
 
-        let (json, truncated) = snapshot.to_json_budgeted().unwrap();
-        // It might be slightly under or over; the point is the boundary logic works
-        if json.len() <= PANE_STATE_SIZE_BUDGET {
-            assert!(!truncated);
-        } else {
-            assert!(truncated);
-        }
+        let mut exact_snapshot = empty_value_snapshot;
+        exact_snapshot
+            .env
+            .as_mut()
+            .unwrap()
+            .vars
+            .insert("X".to_owned(), "y".repeat(padding_needed));
+        let exact_json = exact_snapshot.to_json().unwrap();
+        assert_eq!(exact_json.len(), PANE_STATE_SIZE_BUDGET);
+
+        let (budgeted_json, truncated) = exact_snapshot.to_json_budgeted().unwrap();
+        assert!(!truncated);
+        assert_eq!(budgeted_json, exact_json);
+
+        exact_snapshot
+            .env
+            .as_mut()
+            .unwrap()
+            .vars
+            .insert("X".to_owned(), "y".repeat(padding_needed + 1));
+        let (budgeted_json, truncated) = exact_snapshot.to_json_budgeted().unwrap();
+        assert!(truncated);
+        assert!(budgeted_json.len() <= PANE_STATE_SIZE_BUDGET);
+        assert!(
+            PaneStateSnapshot::from_json(&budgeted_json)
+                .unwrap()
+                .env
+                .is_none()
+        );
     }
 
     #[test]
-    fn size_budget_only_argv_large_removes_env_first() {
-        // Snapshot with no env but large argv still under budget is not truncated
+    fn size_budget_small_argv_without_env_is_not_truncated() {
         let snapshot = PaneStateSnapshot::new(0, 1000, make_terminal()).with_process(ProcessInfo {
             name: "test".to_string(),
             pid: Some(1),

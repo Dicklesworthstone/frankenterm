@@ -963,7 +963,13 @@ pub enum SplitDirection {
 /// layouts. Keeping the full 1..=99 range is required to reproduce heavily
 /// asymmetric saved layouts without silently distorting them to 10..=90.
 const fn normalize_split_percent(percent: u8) -> u8 {
-    percent.clamp(1, 99)
+    if percent < 1 {
+        1
+    } else if percent > 99 {
+        99
+    } else {
+        percent
+    }
 }
 
 /// Target for spawning a new root pane/tab.
@@ -1085,25 +1091,27 @@ fn wezterm_binary() -> String {
     std::env::var(WEZTERM_CLI_ENV).unwrap_or_else(|_| "wezterm".to_string())
 }
 
-/// Inject `--no-auto-start` after the `cli` subcommand when the guard is
-/// enabled. The flag is a `wezterm cli`-level option, NOT a top-level
+/// Inject `--no-auto-start` after the `cli` subcommand. The flag is a
+/// `wezterm cli`-level option, NOT a top-level
 /// `wezterm` flag — `wezterm --no-auto-start cli ...` errors with
 /// "unexpected argument". When `args` doesn't start with `cli`, the
-/// guard is a no-op (callers should not enable the flag for non-cli
-/// invocations). See ft-dvgzi.1.1.
-fn inject_no_auto_start<'a>(args: &'a [&'a str], enabled: bool) -> Vec<&'a str> {
-    if !enabled {
-        return args.to_vec();
-    }
+/// command is rejected before process construction. See
+/// ft-dvgzi.1.1.
+fn no_auto_start_cli_args<'a>(
+    args: &'a [&'a str],
+) -> std::result::Result<Vec<&'a str>, WeztermError> {
     match args.split_first() {
+        Some((&"cli", ["--no-auto-start", ..])) => Ok(args.to_vec()),
         Some((&"cli", rest)) => {
             let mut out = Vec::with_capacity(args.len() + 1);
             out.push("cli");
             out.push("--no-auto-start");
             out.extend_from_slice(rest);
-            out
+            Ok(out)
         }
-        _ => args.to_vec(),
+        _ => Err(WeztermError::CommandFailed(
+            "refusing non-cli bridge subprocess command".to_string(),
+        )),
     }
 }
 
@@ -1127,16 +1135,6 @@ fn inject_no_auto_start<'a>(args: &'a [&'a str], enabled: bool) -> Vec<&'a str> 
 pub struct WeztermClient {
     /// Optional socket path override (WEZTERM_UNIX_SOCKET)
     socket_path: Option<String>,
-    /// Pass `--no-auto-start` to every `wezterm cli` invocation.
-    ///
-    /// When true (default for [`Self::with_socket`]) the wezterm CLI is
-    /// forbidden from autospawning a daemonized `wezterm-mux-server` if our
-    /// configured socket is briefly unreachable. Without this flag, transient
-    /// connect-failures silently redirect commands to the user's interactive
-    /// mux at `~/.local/share/wezterm/pid` — a real isolation breach for
-    /// any caller using a hermetic mux socket (sandbox, container, test
-    /// fixture, custom domain). See ft-dvgzi.1.1.
-    no_auto_start: bool,
     /// Command timeout in seconds
     timeout_secs: u64,
     /// Retry attempts for safe operations
@@ -1165,14 +1163,15 @@ impl Default for WeztermClient {
 }
 
 impl WeztermClient {
-    /// Create a new client with default socket detection
+    /// Create a new client with default socket detection.
+    ///
+    /// CLI fallback always carries
+    /// `--no-auto-start`; merely listing or inspecting panes must never launch
+    /// a mux server or GUI and steal operator focus.
     #[must_use]
     pub fn new() -> Self {
         Self {
             socket_path: None,
-            // No explicit socket → preserve historical autostart behavior so
-            // unparameterized callers can still bring up a mux on demand.
-            no_auto_start: false,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -1192,15 +1191,12 @@ impl WeztermClient {
 
     /// Create a new client with a specific socket path.
     ///
-    /// Defaults to `no_auto_start = true`: callers that explicitly chose a
-    /// socket should not silently fall back to the user's global mux when
-    /// that socket is transiently unreachable. Override via
-    /// [`Self::with_no_auto_start`] if a fallback IS desired.
+    /// Callers that explicitly choose a socket must not silently fall back to
+    /// the user's global mux when that socket is transiently unreachable.
     #[must_use]
     pub fn with_socket(socket_path: impl Into<String>) -> Self {
         Self {
             socket_path: Some(socket_path.into()),
-            no_auto_start: true,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -1222,24 +1218,6 @@ impl WeztermClient {
     #[must_use]
     pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = timeout_secs;
-        self
-    }
-
-    /// Toggle whether `--no-auto-start` is passed to spawned `wezterm cli`
-    /// subprocesses.
-    ///
-    /// When `true`, the wezterm CLI is forbidden from autospawning a
-    /// daemonized `wezterm-mux-server` if our configured socket is briefly
-    /// unreachable — preventing the silent fallback to the user's global mux
-    /// (`~/.local/share/wezterm/pid`) that ft-dvgzi.1's hermetic-fixture
-    /// tests surfaced.
-    ///
-    /// Defaults: `false` for [`Self::new`] (preserves historical
-    /// auto-on-demand startup), `true` for [`Self::with_socket`] (caller
-    /// explicitly chose a socket — falling back to a different one is a bug).
-    #[must_use]
-    pub fn with_no_auto_start(mut self, value: bool) -> Self {
-        self.no_auto_start = value;
         self
     }
 
@@ -2266,7 +2244,9 @@ impl WeztermClient {
     /// WezTerm spawn/split-pane returns just the pane ID as a number.
     fn parse_pane_id(output: &str) -> Result<u64> {
         output.trim().parse::<u64>().map_err(|_| {
-            WeztermError::ParseError(format!("Invalid pane ID: {}", output.trim())).into()
+            // CLI output is an untrusted transport payload. Do not copy it
+            // into an error that can reach logs or operator-facing responses.
+            WeztermError::ParseError("CLI returned an invalid pane ID".to_string()).into()
         })
     }
 
@@ -2489,6 +2469,16 @@ impl WeztermClient {
                 CliMutationCircuitEvidence::Ignore,
             );
         }
+        let guarded_args = match no_auto_start_cli_args(args) {
+            Ok(args) => args,
+            Err(error) => {
+                return Self::cli_effect_result(
+                    effect,
+                    Err(error.into()),
+                    CliMutationCircuitEvidence::Ignore,
+                );
+            }
+        };
 
         if let Some(ref socket) = self.socket_path {
             if !std::path::Path::new(socket).exists() {
@@ -2503,7 +2493,7 @@ impl WeztermClient {
         let mut cmd = Command::new(wezterm_binary());
         // `--no-auto-start` is a subcommand-level flag on `cli`, not a
         // top-level flag; insert it immediately after `cli` (ft-dvgzi.1.1).
-        cmd.args(inject_no_auto_start(args, self.no_auto_start));
+        cmd.args(guarded_args);
         cmd.kill_on_drop(true);
 
         if let Some(ref socket) = self.socket_path {
@@ -7001,8 +6991,11 @@ mod tests {
 
     #[test]
     fn parse_pane_id_invalid() {
-        let result = WeztermClient::parse_pane_id("not-a-number");
-        assert!(result.is_err());
+        let secret = "SECRET invalid-pane-id transport payload";
+        let error = WeztermClient::parse_pane_id(secret).expect_err("invalid pane id must fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("invalid pane ID"));
+        assert!(!rendered.contains(secret));
     }
 
     #[test]
@@ -7315,6 +7308,32 @@ mod tests {
         assert_eq!(client.retry_attempts, DEFAULT_RETRY_ATTEMPTS);
         assert_eq!(client.retry_delay_ms, DEFAULT_RETRY_DELAY_MS);
         assert!(client.socket_path.is_none());
+    }
+
+    #[test]
+    fn no_auto_start_guard_has_stable_cli_argument_placement() {
+        assert_eq!(
+            no_auto_start_cli_args(&["cli", "list", "--format", "json"]).unwrap(),
+            vec!["cli", "--no-auto-start", "list", "--format", "json"]
+        );
+        assert_eq!(
+            no_auto_start_cli_args(&["cli", "--no-auto-start", "list"]).unwrap(),
+            vec!["cli", "--no-auto-start", "list"]
+        );
+        assert_eq!(
+            no_auto_start_cli_args(&["cli", "send-text", "--", "--no-auto-start"]).unwrap(),
+            vec![
+                "cli",
+                "--no-auto-start",
+                "send-text",
+                "--",
+                "--no-auto-start"
+            ]
+        );
+        assert!(matches!(
+            no_auto_start_cli_args(&["start", "--always-new-process"]),
+            Err(WeztermError::CommandFailed(_))
+        ));
     }
 
     #[test]

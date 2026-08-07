@@ -5,14 +5,13 @@
 //! - SessionRestoreConfig serde roundtrip preserves all fields
 //! - SessionRestoreConfig default values are correct
 //! - SessionRestoreConfig partial JSON deserialization via its explicit wire form
-//! - RestoreSummary count invariants: layout-settled + layout-failed == expected
-//! - RestoreSummary counts always >= 0 (usize semantics)
+//! - RestoreSummary failure and settled counts match an independent raw-field oracle
+//! - Unexpected backend failure IDs never inflate expected source-pane counts
 //! - format_restore_summary contains session_id and count info
-//! - format_restore_summary includes failed pane details when present
-//! - SessionInfo serialization never panics for valid inputs
-//! - CheckpointInfo serialization never panics
-//! - SessionDoctorReport serialization never panics
-//! - SessionDoctorReport: unclean_sessions <= total_sessions (db invariant)
+//! - format_restore_summary includes independently derived, sorted, bounded failure details
+//! - SessionInfo serialization preserves the exact public field catalog
+//! - CheckpointInfo serialization preserves checkpoint identity and counts
+//! - SessionDoctorReport serialization preserves every diagnostic count
 //! - CleanupResult: total == age + count + size
 //! - CleanupResult: any_work_done iff total > 0 or orphans > 0
 //! - In-memory SQLite: find_unclean_sessions returns only unclean
@@ -22,9 +21,9 @@
 //! - In-memory SQLite: session_doctor counts are consistent
 //! - In-memory SQLite: delete_session cascades correctly
 //! - In-memory SQLite: show_session returns session + checkpoints
-//! - RestoreResult pane_id_map keys are unique (HashMap invariant)
 //! - CheckpointData pane_states are loadable from DB
-//! - format_epoch_ms produces valid HH:MM:SS UTC format
+
+use std::collections::{HashMap, HashSet};
 
 use proptest::prelude::*;
 use rusqlite::{Connection, params};
@@ -451,7 +450,12 @@ fn arb_restore_summary() -> impl Strategy<Value = RestoreSummary> {
         0u64..60000,
     )
         .prop_map(
-            |(session_id, checkpoint_id, layout_result, pane_states, elapsed_ms)| {
+            |(session_id, checkpoint_id, layout_result, mut pane_states, elapsed_ms)| {
+                // A persisted checkpoint admits each source pane identity once.
+                // Keep the generated summaries inside that production domain;
+                // malformed mappings and failures remain intentionally broad.
+                let mut seen_source_pane_ids = HashSet::with_capacity(pane_states.len());
+                pane_states.retain(|pane| seen_source_pane_ids.insert(pane.pane_id));
                 RestoreSummary {
                     session_id,
                     checkpoint_id,
@@ -460,15 +464,81 @@ fn arb_restore_summary() -> impl Strategy<Value = RestoreSummary> {
                     layout_result,
                     pane_states,
                     process_launch_report: None,
-                    // This broad structural strategy deliberately generates
-                    // incomplete, unexpected, and colliding mappings and has
-                    // no process-disposition report. It must never fabricate
+                    // This structural strategy deliberately generates
+                    // incomplete, unexpected, and colliding mappings and has no
+                    // process-disposition report. It must never fabricate
                     // production clean authority.
                     restore_authority_resolved: false,
                     elapsed_ms,
                 }
             },
         )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestoreCountOracle {
+    expected: usize,
+    failed: usize,
+    settled: usize,
+}
+
+/// Compute count truth directly from the public restore evidence without
+/// calling any `RestoreSummary` count method or formatting helper.
+fn independent_failed_source_ids(summary: &RestoreSummary) -> Vec<u64> {
+    let expected_source_ids = summary
+        .pane_states
+        .iter()
+        .map(|pane| pane.pane_id)
+        .collect::<HashSet<_>>();
+    let explicit_failures = summary
+        .layout_result
+        .failed_panes
+        .iter()
+        .map(|(pane_id, _)| *pane_id)
+        .collect::<HashSet<_>>();
+    let mut target_multiplicity = HashMap::with_capacity(summary.layout_result.pane_id_map.len());
+    for target_pane_id in summary.layout_result.pane_id_map.values() {
+        *target_multiplicity.entry(*target_pane_id).or_insert(0_usize) += 1;
+    }
+
+    let mut failed = expected_source_ids
+        .iter()
+        .filter(|source_pane_id| {
+            let mapped_target = summary.layout_result.pane_id_map.get(source_pane_id);
+            mapped_target.is_none()
+                || explicit_failures.contains(source_pane_id)
+                || mapped_target.is_some_and(|target_pane_id| {
+                    target_multiplicity
+                        .get(target_pane_id)
+                        .is_some_and(|count| *count > 1)
+                })
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    failed.sort_unstable();
+    failed
+}
+
+fn independent_restore_count_oracle(summary: &RestoreSummary) -> RestoreCountOracle {
+    let failed = independent_failed_source_ids(summary).len();
+    let expected = summary.pane_states.len();
+    RestoreCountOracle {
+        expected,
+        failed,
+        settled: expected.saturating_sub(failed),
+    }
+}
+
+fn restored_pane_stub(pane_id: u64) -> RestoredPaneState {
+    RestoredPaneState {
+        pane_id,
+        cwd: None,
+        command: None,
+        terminal_state: None,
+        agent_metadata: None,
+        scrollback_checkpoint_seq: None,
+        last_output_at: None,
+    }
 }
 
 fn arb_session_info() -> impl Strategy<Value = SessionInfo> {
@@ -538,16 +608,33 @@ fn arb_checkpoint_info() -> impl Strategy<Value = CheckpointInfo> {
 }
 
 fn arb_session_doctor_report() -> impl Strategy<Value = SessionDoctorReport> {
-    (0usize..100, 0usize..100, 0usize..1000, 0usize..100).prop_flat_map(
-        |(total_sessions, total_checkpoints, orphaned_pane_states, total_data_bytes)| {
+    (
+        0usize..100,
+        0usize..100,
+        0usize..100,
+        0usize..100,
+        0usize..100,
+        0usize..1000,
+    )
+        .prop_flat_map(
+        |(
+            total_sessions,
+            total_checkpoints,
+            orphaned_checkpoints,
+            orphaned_pane_states,
+            invalid_resolved_restore_chains,
+            total_data_bytes,
+        )| {
             // unclean_sessions must be <= total_sessions
             let max_unclean = total_sessions;
             (0..=max_unclean).prop_map(move |unclean_sessions| SessionDoctorReport {
                 total_sessions,
                 unclean_sessions,
                 total_checkpoints,
+                orphaned_checkpoints,
                 orphaned_pane_states,
                 unresolved_restore_attempts: 0,
+                invalid_resolved_restore_chains,
                 outcome_complete_restore_attempts: 0,
                 reconciliation_required_restore_attempts: 0,
                 orphaned_restore_intents: 0,
@@ -564,12 +651,14 @@ fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
         0usize..50,
         0usize..50,
         0usize..50,
+        0usize..50,
     )
         .prop_map(
             |(
                 deleted_by_age,
                 deleted_by_count,
                 deleted_by_size,
+                orphaned_restore_lifecycle_rows,
                 orphaned_checkpoints,
                 orphaned_pane_states,
             )| {
@@ -577,6 +666,7 @@ fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
                     deleted_by_age,
                     deleted_by_count,
                     deleted_by_size,
+                    orphaned_restore_lifecycle_rows,
                     orphaned_checkpoints,
                     orphaned_pane_states,
                 }
@@ -606,16 +696,6 @@ proptest! {
     }
 
     // ================================================================
-    // 2. SessionRestoreConfig default values are correct
-    // ================================================================
-    #[test]
-    fn config_default_values(_dummy in 0u8..1) {
-        let config = SessionRestoreConfig::default();
-        prop_assert!(!config.auto_restore, "default auto_restore should be false");
-        prop_assert!(!config.restore_scrollback, "default restore_scrollback should be false");
-    }
-
-    // ================================================================
     // 3. SessionRestoreConfig partial JSON fills defaults
     // ================================================================
     #[test]
@@ -630,43 +710,35 @@ proptest! {
     }
 
     // ================================================================
-    // 4. SessionRestoreConfig empty JSON uses all defaults
+    // 5. RestoreSummary count methods match an independent raw-field oracle
     // ================================================================
     #[test]
-    fn config_empty_json_all_defaults(_dummy in 0u8..1) {
-        let config: SessionRestoreConfig = serde_json::from_str("{}").unwrap();
-        let default_config = SessionRestoreConfig::default();
-
-        prop_assert_eq!(config.auto_restore, default_config.auto_restore);
-        prop_assert_eq!(config.restore_scrollback, default_config.restore_scrollback);
+    fn restore_summary_counts_match_independent_oracle(summary in arb_restore_summary()) {
+        let oracle = independent_restore_count_oracle(&summary);
+        prop_assert_eq!(summary.expected_pane_count(), oracle.expected);
+        prop_assert_eq!(summary.layout_failed_pane_count(), oracle.failed);
+        prop_assert_eq!(summary.layout_settled_pane_count(), oracle.settled);
+        prop_assert!(oracle.failed <= oracle.expected);
+        prop_assert!(oracle.settled <= oracle.expected);
+        prop_assert_eq!(oracle.settled.checked_add(oracle.failed), Some(oracle.expected));
     }
 
     // ================================================================
-    // 5. RestoreSummary: restored + failed == total
+    // 6. Unexpected backend failure IDs do not inflate source counts
     // ================================================================
     #[test]
-    fn restore_summary_count_invariant(summary in arb_restore_summary()) {
-        let restored = summary.layout_settled_pane_count();
-        let failed = summary.layout_failed_pane_count();
-        let total = summary.expected_pane_count();
+    fn restore_summary_ignores_unexpected_failure_ids(mut summary in arb_restore_summary()) {
+        let before = independent_restore_count_oracle(&summary);
+        summary.layout_result.failed_panes.push((
+            u64::MAX,
+            "backend-only failure id must not become source progress".to_string(),
+        ));
+        let after = independent_restore_count_oracle(&summary);
 
-        prop_assert_eq!(
-            total, restored + failed,
-            "expected_pane_count ({}) must equal layout-settled ({}) + layout-failed ({})", total, restored, failed
-        );
-    }
-
-    // ================================================================
-    // 6. RestoreSummary: counts are non-negative (usize semantics)
-    // ================================================================
-    #[test]
-    fn restore_summary_counts_non_negative(summary in arb_restore_summary()) {
-        // usize is always >= 0, but we verify the methods work without panic
-        let _restored = summary.layout_settled_pane_count();
-        let _failed = summary.layout_failed_pane_count();
-        let _total = summary.expected_pane_count();
-        // If we got here without panic, the invariant holds.
-        prop_assert!(true);
+        prop_assert_eq!(after, before);
+        prop_assert_eq!(summary.expected_pane_count(), before.expected);
+        prop_assert_eq!(summary.layout_failed_pane_count(), before.failed);
+        prop_assert_eq!(summary.layout_settled_pane_count(), before.settled);
     }
 
     // ================================================================
@@ -688,11 +760,8 @@ proptest! {
     #[test]
     fn format_summary_contains_counts(summary in arb_restore_summary()) {
         let text = format_restore_summary(&summary);
-        let expected = format!(
-            "{}/{}",
-            summary.layout_settled_pane_count(),
-            summary.expected_pane_count()
-        );
+        let oracle = independent_restore_count_oracle(&summary);
+        let expected = format!("{}/{}", oracle.settled, oracle.expected);
         prop_assert!(
             text.contains(&expected),
             "formatted summary should contain '{}', got: '{}'",
@@ -706,9 +775,12 @@ proptest! {
     #[test]
     fn format_summary_lists_failed_panes(summary in arb_restore_summary()) {
         let text = format_restore_summary(&summary);
-        if summary.layout_failed_pane_count() > 0 {
+        let failed_source_ids = independent_failed_source_ids(&summary);
+        if failed_source_ids.is_empty() {
+            prop_assert!(!text.contains("Failed panes:"));
+        } else {
             prop_assert!(
-                text.contains("Failed panes"),
+                text.contains("Failed panes:"),
                 "summary with failures should contain 'Failed panes'"
             );
             let expected_ids = summary
@@ -716,16 +788,47 @@ proptest! {
                 .iter()
                 .map(|pane| pane.pane_id)
                 .collect::<std::collections::HashSet<_>>();
-            for (id, _err) in &summary.layout_result.failed_panes {
-                if !expected_ids.contains(id) {
-                    continue;
-                }
-                let id_str = format!("pane {}", id);
-                prop_assert!(
-                    text.contains(&id_str),
-                    "summary should contain failed pane id '{}'", id_str
-                );
+            let explicitly_failed = summary
+                .layout_result
+                .failed_panes
+                .iter()
+                .map(|(pane_id, _)| *pane_id)
+                .filter(|pane_id| expected_ids.contains(pane_id))
+                .collect::<HashSet<_>>();
+            let mut target_multiplicity = HashMap::new();
+            for target_pane_id in summary.layout_result.pane_id_map.values() {
+                *target_multiplicity.entry(*target_pane_id).or_insert(0_usize) += 1;
             }
+            let mut previous_position = None;
+            for pane_id in &failed_source_ids {
+                let reason = if explicitly_failed.contains(pane_id) {
+                    "layout restoration reported failure"
+                } else if summary
+                    .layout_result
+                    .pane_id_map
+                    .get(pane_id)
+                    .is_some_and(|target_pane_id| {
+                        target_multiplicity
+                            .get(target_pane_id)
+                            .is_some_and(|count| *count > 1)
+                    })
+                {
+                    "layout mapping collided on a duplicate target pane"
+                } else {
+                    "layout backend returned no mapping or explicit failure"
+                };
+                let expected_line = format!("  pane {pane_id}: {reason}\n");
+                let position = text.find(&expected_line).ok_or_else(|| {
+                    TestCaseError::fail(format!(
+                        "formatted summary omitted expected failure line {expected_line:?}: {text:?}"
+                    ))
+                })?;
+                if let Some(previous) = previous_position {
+                    prop_assert!(previous < position, "failed pane details must be sorted");
+                }
+                previous_position = Some(position);
+            }
+            prop_assert!(!text.contains("additional failed panes omitted"));
         }
     }
 
@@ -744,46 +847,66 @@ proptest! {
     }
 
     // ================================================================
-    // 11. SessionInfo serialization never panics
+    // 11. SessionInfo serialization preserves its exact public fields
     // ================================================================
     #[test]
-    fn session_info_serialization_no_panic(info in arb_session_info()) {
-        let json = serde_json::to_string(&info);
-        prop_assert!(json.is_ok(), "SessionInfo serialization should not panic");
-
-        let json_str = json.unwrap();
-        prop_assert!(json_str.contains(&info.session_id),
-            "serialized SessionInfo should contain session_id");
+    fn session_info_serialization_preserves_fields(info in arb_session_info()) {
+        let value = serde_json::to_value(&info).unwrap();
+        let expected = serde_json::json!({
+            "session_id": &info.session_id,
+            "created_at": info.created_at,
+            "last_checkpoint_at": info.last_checkpoint_at,
+            "shutdown_clean": info.shutdown_clean,
+            "ft_version": &info.ft_version,
+            "host_id": &info.host_id,
+            "checkpoint_count": info.checkpoint_count,
+            "pane_count": info.pane_count,
+        });
+        prop_assert_eq!(value, expected);
     }
 
     // ================================================================
-    // 12. CheckpointInfo serialization never panics
+    // 12. CheckpointInfo serialization preserves identity and counts
     // ================================================================
     #[test]
-    fn checkpoint_info_serialization_no_panic(info in arb_checkpoint_info()) {
-        let json = serde_json::to_string(&info);
-        prop_assert!(json.is_ok(), "CheckpointInfo serialization should not panic");
+    fn checkpoint_info_serialization_preserves_fields(info in arb_checkpoint_info()) {
+        let checkpoint_role = match info.checkpoint_role {
+            CheckpointRole::Snapshot => "snapshot",
+            CheckpointRole::RestoreIntent => "restore_intent",
+            CheckpointRole::RestoreReceipt => "restore_receipt",
+        };
+        let value = serde_json::to_value(&info).unwrap();
+        let expected = serde_json::json!({
+            "id": info.id,
+            "checkpoint_at": info.checkpoint_at,
+            "checkpoint_type": &info.checkpoint_type,
+            "checkpoint_role": checkpoint_role,
+            "pane_count": info.pane_count,
+            "total_bytes": info.total_bytes,
+        });
+        prop_assert_eq!(value, expected);
     }
 
     // ================================================================
-    // 13. SessionDoctorReport serialization never panics
+    // 13. SessionDoctorReport serialization preserves every count
     // ================================================================
     #[test]
-    fn doctor_report_serialization_no_panic(report in arb_session_doctor_report()) {
-        let json = serde_json::to_string(&report);
-        prop_assert!(json.is_ok(), "SessionDoctorReport serialization should not panic");
-    }
-
-    // ================================================================
-    // 14. SessionDoctorReport: unclean <= total (constructed via strategy)
-    // ================================================================
-    #[test]
-    fn doctor_report_unclean_leq_total(report in arb_session_doctor_report()) {
-        prop_assert!(
-            report.unclean_sessions <= report.total_sessions,
-            "unclean_sessions ({}) must be <= total_sessions ({})",
-            report.unclean_sessions, report.total_sessions
-        );
+    fn doctor_report_serialization_preserves_fields(report in arb_session_doctor_report()) {
+        let value = serde_json::to_value(&report).unwrap();
+        let expected = serde_json::json!({
+            "total_sessions": report.total_sessions,
+            "unclean_sessions": report.unclean_sessions,
+            "total_checkpoints": report.total_checkpoints,
+            "orphaned_checkpoints": report.orphaned_checkpoints,
+            "orphaned_pane_states": report.orphaned_pane_states,
+            "unresolved_restore_attempts": report.unresolved_restore_attempts,
+            "invalid_resolved_restore_chains": report.invalid_resolved_restore_chains,
+            "outcome_complete_restore_attempts": report.outcome_complete_restore_attempts,
+            "reconciliation_required_restore_attempts": report.reconciliation_required_restore_attempts,
+            "orphaned_restore_intents": report.orphaned_restore_intents,
+            "total_data_bytes": report.total_data_bytes,
+        });
+        prop_assert_eq!(value, expected);
     }
 
     // ================================================================
@@ -806,38 +929,12 @@ proptest! {
     #[test]
     fn cleanup_any_work_done_iff_nonzero(result in arb_cleanup_result()) {
         let expected = result.total_sessions_deleted() > 0
+            || result.orphaned_restore_lifecycle_rows > 0
             || result.orphaned_checkpoints > 0
             || result.orphaned_pane_states > 0;
         prop_assert_eq!(
             result.any_work_done(), expected,
             "any_work_done should be true iff total_deleted > 0 or orphans > 0"
-        );
-    }
-
-    // ================================================================
-    // 17. CleanupResult: zero result means no work done
-    // ================================================================
-    #[test]
-    fn cleanup_default_is_no_work(_dummy in 0u8..1) {
-        let result = CleanupResult::default();
-        prop_assert!(!result.any_work_done(),
-            "default CleanupResult should have no work done");
-        prop_assert_eq!(result.total_sessions_deleted(), 0usize,
-            "default CleanupResult should have 0 total deleted");
-    }
-
-    // ================================================================
-    // 18. RestoreResult pane_id_map: all old IDs unique (HashMap invariant)
-    // ================================================================
-    #[test]
-    fn restore_result_pane_id_map_keys_unique(result in arb_restore_result()) {
-        let keys: Vec<u64> = result.pane_id_map.keys().copied().collect();
-        let mut sorted = keys.clone();
-        sorted.sort();
-        sorted.dedup();
-        prop_assert_eq!(
-            keys.len(), sorted.len(),
-            "pane_id_map keys should be unique"
         );
     }
 
@@ -868,27 +965,6 @@ proptest! {
         prop_assert_eq!(agent.agent_type, deserialized.agent_type, "agent_type mismatch");
         prop_assert_eq!(agent.session_id, deserialized.session_id, "session_id mismatch");
         prop_assert_eq!(agent.state, deserialized.state, "state mismatch");
-    }
-
-    // ================================================================
-    // 21. format_epoch_ms produces valid HH:MM:SS UTC format
-    // ================================================================
-    #[test]
-    fn format_epoch_ms_valid_format(epoch_ms in 0u64..5_000_000_000_000) {
-        // format_epoch_ms is private, but we can test via format_restore_summary
-        // which calls it internally. Instead, re-derive the expected format.
-        let secs = epoch_ms / 1000;
-        let hours = (secs / 3600) % 24;
-        let mins = (secs / 60) % 60;
-        let s = secs % 60;
-        let expected = format!("{:02}:{:02}:{:02} UTC", hours, mins, s);
-
-        // Validate format structure: HH:MM:SS UTC
-        prop_assert!(hours < 24, "hours ({}) must be < 24", hours);
-        prop_assert!(mins < 60, "mins ({}) must be < 60", mins);
-        prop_assert!(s < 60, "seconds ({}) must be < 60", s);
-        prop_assert!(expected.ends_with(" UTC"), "format should end with UTC");
-        prop_assert_eq!(expected.len(), 12usize, "format should be 12 chars: HH:MM:SS UTC");
     }
 
     // ================================================================
@@ -1251,112 +1327,10 @@ proptest! {
     }
 
     // ================================================================
-    // 31. SessionRestoreConfig Debug is non-empty
+    // 37. Manually constructed zero-pane summary has explicit status text
     // ================================================================
     #[test]
-    fn config_debug_nonempty(_dummy in 0..1_u8) {
-        let config = SessionRestoreConfig::default();
-        let dbg = format!("{:?}", config);
-        prop_assert!(!dbg.is_empty());
-    }
-
-    // ================================================================
-    // 32. SessionRestoreConfig Clone preserves fields
-    // ================================================================
-    #[test]
-    fn config_clone_preserves_ext(_dummy in 0..1_u8) {
-        let config = SessionRestoreConfig::default();
-        let cloned = config.clone();
-        prop_assert_eq!(cloned.auto_restore, config.auto_restore);
-        prop_assert_eq!(cloned.restore_scrollback, config.restore_scrollback);
-    }
-
-    // ================================================================
-    // 33. SessionInfo serializes to valid JSON (Serialize-only)
-    // ================================================================
-    #[test]
-    fn session_info_serialize_valid(
-        clean in proptest::bool::ANY,
-    ) {
-        let info = SessionInfo {
-            session_id: "test-sess".into(),
-            created_at: 1000,
-            last_checkpoint_at: Some(2000),
-            shutdown_clean: clean,
-            ft_version: "0.1.0".into(),
-            host_id: Some("host-1".into()),
-            checkpoint_count: 3,
-            pane_count: Some(5),
-        };
-        let json = serde_json::to_string(&info).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        prop_assert!(value.is_object());
-        prop_assert_eq!(value["shutdown_clean"].as_bool(), Some(clean));
-    }
-
-    // ================================================================
-    // 34. CheckpointInfo serializes to valid JSON
-    // ================================================================
-    #[test]
-    fn checkpoint_info_serialize_valid(
-        pane_count in 0_usize..20,
-        total_bytes in 0_usize..100_000,
-    ) {
-        let info = CheckpointInfo {
-            id: 42,
-            checkpoint_at: 5000,
-            checkpoint_type: "periodic".into(),
-            checkpoint_role: CheckpointRole::Snapshot,
-            pane_count,
-            total_bytes,
-        };
-        let json = serde_json::to_string(&info).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        prop_assert!(value.is_object());
-        prop_assert_eq!(value["id"].as_i64(), Some(42));
-    }
-
-    // ================================================================
-    // 35. SessionDoctorReport serializes to valid JSON
-    // ================================================================
-    #[test]
-    fn doctor_report_serialize_valid(
-        total in 0_usize..50,
-        unclean in 0_usize..50,
-    ) {
-        let report = SessionDoctorReport {
-            total_sessions: total,
-            unclean_sessions: unclean.min(total),
-            total_checkpoints: 10,
-            orphaned_pane_states: 0,
-            unresolved_restore_attempts: 0,
-            outcome_complete_restore_attempts: 0,
-            reconciliation_required_restore_attempts: 0,
-            orphaned_restore_intents: 0,
-            total_data_bytes: 1024,
-        };
-        let json = serde_json::to_string(&report).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        prop_assert!(value.is_object());
-        prop_assert_eq!(value["total_sessions"].as_u64(), Some(total as u64));
-    }
-
-    // ================================================================
-    // 36. SessionRestoreConfig serde deterministic
-    // ================================================================
-    #[test]
-    fn config_serde_deterministic(_dummy in 0..1_u8) {
-        let config = SessionRestoreConfig::default();
-        let j1 = serde_json::to_string(&config).unwrap();
-        let j2 = serde_json::to_string(&config).unwrap();
-        prop_assert_eq!(j1, j2);
-    }
-
-    // ================================================================
-    // 37. format_restore_summary non-empty with DB-created summary
-    // ================================================================
-    #[test]
-    fn format_summary_basic_nonempty(
+    fn format_summary_manual_zero_pane_status(
         session_id in "[a-z]{5,10}",
     ) {
         let layout = RestoreResult {
@@ -1378,7 +1352,13 @@ proptest! {
             elapsed_ms: 50,
         };
         let formatted = format_restore_summary(&summary);
-        prop_assert!(!formatted.is_empty());
+        prop_assert!(formatted.contains(&format!(
+            "Session {}: layout/authority settled for 0/0 panes in 50ms",
+            summary.session_id
+        )));
+        prop_assert!(formatted.contains(
+            "Process continuity, historical scrollback, and full-session continuity were not restored."
+        ));
     }
 
     // ================================================================
@@ -1490,4 +1470,107 @@ proptest! {
         prop_assert_eq!(checkpoints[1].pane_count, first_panes);
         prop_assert_eq!(checkpoints[1].total_bytes, first_bytes);
     }
+}
+
+#[test]
+fn session_restore_config_defaults_and_empty_json_agree() {
+    let from_default = SessionRestoreConfig::default();
+    let from_json: SessionRestoreConfig = serde_json::from_str("{}").unwrap();
+    assert!(!from_default.auto_restore);
+    assert!(!from_default.restore_scrollback);
+    assert_eq!(from_json.auto_restore, from_default.auto_restore);
+    assert_eq!(from_json.restore_scrollback, from_default.restore_scrollback);
+}
+
+#[test]
+fn cleanup_result_default_has_no_work() {
+    let result = CleanupResult::default();
+    assert!(!result.any_work_done());
+    assert_eq!(result.total_sessions_deleted(), 0);
+}
+
+#[test]
+fn format_restore_summary_caps_sorted_missing_mapping_details() {
+    let pane_states = (0_u64..25)
+        .map(restored_pane_stub)
+        .collect::<Vec<_>>();
+    let summary = RestoreSummary {
+        session_id: "bounded-failure-details".to_string(),
+        checkpoint_id: 1,
+        intent_checkpoint_id: 2,
+        outcome_checkpoint_id: 3,
+        layout_result: RestoreResult {
+            pane_id_map: HashMap::new(),
+            failed_panes: Vec::new(),
+            windows_created: 0,
+            tabs_created: 0,
+            panes_created: 0,
+        },
+        pane_states,
+        process_launch_report: None,
+        restore_authority_resolved: false,
+        elapsed_ms: 1,
+    };
+
+    let formatted = format_restore_summary(&summary);
+    let mut previous_position = None;
+    for pane_id in 0_u64..20 {
+        let expected_line = format!(
+            "  pane {pane_id}: layout backend returned no mapping or explicit failure\n"
+        );
+        let position = formatted
+            .find(&expected_line)
+            .unwrap_or_else(|| panic!("missing bounded detail line {expected_line:?}"));
+        if let Some(previous) = previous_position {
+            assert!(previous < position, "failure details must be sorted");
+        }
+        previous_position = Some(position);
+    }
+    for pane_id in 20_u64..25 {
+        assert!(!formatted.contains(&format!("  pane {pane_id}:")));
+    }
+    assert!(formatted.contains("  ... 5 additional failed panes omitted\n"));
+}
+
+#[test]
+fn format_restore_summary_distinguishes_missing_explicit_and_collision_failures() {
+    let summary = RestoreSummary {
+        session_id: "failure-reason-catalog".to_string(),
+        checkpoint_id: 1,
+        intent_checkpoint_id: 2,
+        outcome_checkpoint_id: 3,
+        layout_result: RestoreResult {
+            pane_id_map: HashMap::from([(3, 100), (5, 100), (7, 107)]),
+            failed_panes: vec![(7, "private-backend-detail".to_string())],
+            windows_created: 1,
+            tabs_created: 1,
+            panes_created: 3,
+        },
+        pane_states: [9_u64, 7, 5, 3]
+            .into_iter()
+            .map(restored_pane_stub)
+            .collect(),
+        process_launch_report: None,
+        restore_authority_resolved: false,
+        elapsed_ms: 1,
+    };
+
+    let formatted = format_restore_summary(&summary);
+    let expected_lines = [
+        "  pane 3: layout mapping collided on a duplicate target pane\n",
+        "  pane 5: layout mapping collided on a duplicate target pane\n",
+        "  pane 7: layout restoration reported failure\n",
+        "  pane 9: layout backend returned no mapping or explicit failure\n",
+    ];
+    let mut previous_position = None;
+    for expected_line in expected_lines {
+        let position = formatted
+            .find(expected_line)
+            .unwrap_or_else(|| panic!("missing failure detail {expected_line:?}"));
+        if let Some(previous) = previous_position {
+            assert!(previous < position, "failure details must be sorted");
+        }
+        previous_position = Some(position);
+    }
+    assert!(!formatted.contains("private-backend-detail"));
 }

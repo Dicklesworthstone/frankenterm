@@ -240,6 +240,24 @@ fn insert_orphaned_pane_state(conn: &Connection, fake_checkpoint_id: i64, pane_i
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 }
 
+/// Insert an orphaned restore lifecycle row (FK disabled temporarily).
+fn insert_orphaned_restore_lifecycle(conn: &Connection, intent_id: i64) {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+    conn.execute(
+        "INSERT INTO restore_attempt_lifecycle (
+             intent_checkpoint_id, session_id, source_checkpoint_id,
+             status, created_at
+         ) VALUES (?1, ?2, ?3, 'intent', 1000)",
+        params![
+            intent_id,
+            format!("missing-session-{intent_id}"),
+            intent_id.saturating_add(1)
+        ],
+    )
+    .unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+}
+
 fn count_sessions(conn: &Connection) -> i64 {
     conn.query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row.get(0))
         .unwrap()
@@ -298,16 +316,18 @@ fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
         any::<usize>(),
         0..100usize,
         0..100usize,
+        0..100usize,
     )
-        .prop_map(
-            |(age, count, size, orphan_cp, orphan_ps)| CleanupResult {
+        .prop_map(|(age, count, size, orphan_lifecycle, orphan_cp, orphan_ps)| {
+            CleanupResult {
                 deleted_by_age: age,
                 deleted_by_count: count,
                 deleted_by_size: size,
+                orphaned_restore_lifecycle_rows: orphan_lifecycle,
                 orphaned_checkpoints: orphan_cp,
                 orphaned_pane_states: orphan_ps,
-            },
-        )
+            }
+        })
 }
 
 fn arb_config() -> impl Strategy<Value = SessionRetentionConfig> {
@@ -358,14 +378,16 @@ proptest! {
     #[test]
     fn any_work_done_iff_total_or_orphans_positive(result in arb_cleanup_result()) {
         let expected = result.total_sessions_deleted() > 0
+            || result.orphaned_restore_lifecycle_rows > 0
             || result.orphaned_checkpoints > 0
             || result.orphaned_pane_states > 0;
         prop_assert_eq!(
             result.any_work_done(),
             expected,
-            "any_work_done() should be {} for total={}, orphan_cp={}, orphan_ps={}",
+            "any_work_done() should be {} for total={}, orphan_lifecycle={}, orphan_cp={}, orphan_ps={}",
             expected,
             result.total_sessions_deleted(),
+            result.orphaned_restore_lifecycle_rows,
             result.orphaned_checkpoints,
             result.orphaned_pane_states
         );
@@ -439,6 +461,11 @@ proptest! {
         prop_assert_eq!(result.deleted_by_age, 0usize, "default age should be 0");
         prop_assert_eq!(result.deleted_by_count, 0usize, "default count should be 0");
         prop_assert_eq!(result.deleted_by_size, 0usize, "default size should be 0");
+        prop_assert_eq!(
+            result.orphaned_restore_lifecycle_rows,
+            0usize,
+            "default orphan lifecycle should be 0"
+        );
         prop_assert_eq!(result.orphaned_checkpoints, 0usize, "default orphan_cp should be 0");
         prop_assert_eq!(result.orphaned_pane_states, 0usize, "default orphan_ps should be 0");
         prop_assert!(!result.any_work_done(), "default should report no work done");
@@ -719,12 +746,17 @@ proptest! {
 
     #[test]
     fn orphan_cleanup_removes_all_orphans(
+        num_orphan_lifecycle in 0..8usize,
         num_orphan_cp in 0..8usize,
         num_orphan_ps in 0..8usize,
         num_valid_sessions in 0..5usize,
     ) {
         let conn = make_test_db();
         let now = epoch_ms() as i64;
+
+        for i in 0..num_orphan_lifecycle {
+            insert_orphaned_restore_lifecycle(&conn, 1_000_000 + i as i64 * 2);
+        }
 
         // Insert valid sessions with checkpoints and pane states
         for i in 0..num_valid_sessions {
@@ -754,6 +786,10 @@ proptest! {
 
         let result = cleanup_sessions(&conn, &config).unwrap();
 
+        prop_assert_eq!(
+            result.orphaned_restore_lifecycle_rows,
+            num_orphan_lifecycle
+        );
         prop_assert_eq!(
             result.orphaned_checkpoints, num_orphan_cp,
             "should clean {} orphaned checkpoints, got {}",
@@ -787,6 +823,20 @@ proptest! {
             )
             .unwrap();
         prop_assert_eq!(remaining_orphan_ps, 0i64, "no orphaned pane states should remain");
+
+        let remaining_orphan_lifecycle: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM restore_attempt_lifecycle
+                 WHERE session_id NOT IN (SELECT session_id FROM mux_sessions)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        prop_assert_eq!(
+            remaining_orphan_lifecycle,
+            0i64,
+            "no orphaned restore lifecycle rows should remain"
+        );
     }
 
     /// ft-rt6ol: the LINKED orphan shape — an orphan checkpoint that still has
@@ -974,6 +1024,10 @@ proptest! {
             second.deleted_by_size, 0usize,
             "second run should delete 0 by size, got {}",
             second.deleted_by_size
+        );
+        prop_assert_eq!(
+            second.orphaned_restore_lifecycle_rows, 0usize,
+            "second run should find 0 orphaned restore lifecycle rows"
         );
         prop_assert_eq!(
             second.orphaned_checkpoints, 0usize,
@@ -1356,6 +1410,11 @@ proptest! {
         prop_assert_eq!(cloned.deleted_by_age, result.deleted_by_age, "age preserved");
         prop_assert_eq!(cloned.deleted_by_count, result.deleted_by_count, "count preserved");
         prop_assert_eq!(cloned.deleted_by_size, result.deleted_by_size, "size preserved");
+        prop_assert_eq!(
+            cloned.orphaned_restore_lifecycle_rows,
+            result.orphaned_restore_lifecycle_rows,
+            "orphan lifecycle preserved"
+        );
         prop_assert_eq!(cloned.orphaned_checkpoints, result.orphaned_checkpoints, "orphan_cp preserved");
         prop_assert_eq!(cloned.orphaned_pane_states, result.orphaned_pane_states, "orphan_ps preserved");
         prop_assert_eq!(cloned.total_sessions_deleted(), result.total_sessions_deleted(), "total preserved");
@@ -1376,6 +1435,11 @@ proptest! {
             prop_assert_eq!(result.deleted_by_age, 0usize, "age must be 0 when no work");
             prop_assert_eq!(result.deleted_by_count, 0usize, "count must be 0 when no work");
             prop_assert_eq!(result.deleted_by_size, 0usize, "size must be 0 when no work");
+            prop_assert_eq!(
+                result.orphaned_restore_lifecycle_rows,
+                0usize,
+                "orphan lifecycle must be 0 when no work"
+            );
             prop_assert_eq!(result.orphaned_checkpoints, 0usize, "orphan_cp must be 0 when no work");
             prop_assert_eq!(result.orphaned_pane_states, 0usize, "orphan_ps must be 0 when no work");
         }
@@ -1627,6 +1691,7 @@ proptest! {
         prop_assert!(count_pane_states(&conn) >= 1, "valid pane state preserved");
 
         // Verify orphans cleaned
+        prop_assert_eq!(result.orphaned_restore_lifecycle_rows, 0);
         prop_assert_eq!(
             result.orphaned_checkpoints, num_orphan_cp,
             "orphaned checkpoints cleaned"
@@ -1647,7 +1712,7 @@ proptest! {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// 31. CleanupResult serde roundtrip
+// 31. CleanupResult Clone preserves every receipt field
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
@@ -1659,6 +1724,10 @@ proptest! {
         prop_assert_eq!(cloned.deleted_by_age, result.deleted_by_age);
         prop_assert_eq!(cloned.deleted_by_count, result.deleted_by_count);
         prop_assert_eq!(cloned.deleted_by_size, result.deleted_by_size);
+        prop_assert_eq!(
+            cloned.orphaned_restore_lifecycle_rows,
+            result.orphaned_restore_lifecycle_rows
+        );
         prop_assert_eq!(cloned.orphaned_checkpoints, result.orphaned_checkpoints);
         prop_assert_eq!(cloned.orphaned_pane_states, result.orphaned_pane_states);
     }

@@ -9,16 +9,21 @@
 //! 2. Delete excess closed sessions beyond `max_closed_sessions` (oldest first)
 //! 3. If the summed snapshot pane-state JSON estimate exceeds
 //!    `max_total_size_mb`, delete oldest closed sessions
-//! 4. Clean orphaned data (pane_state without checkpoint, checkpoint without session)
+//! 4. Clean orphaned data (lifecycle/checkpoint rows without a session and
+//!    pane-state rows without a checkpoint)
 //!
 //! Cascade: session deletion cascades to checkpoints -> pane_state via FK.
 
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use tracing::{debug, info, warn};
 
+use crate::checkpoint_witness::{
+    MAX_CHECKPOINT_METADATA_BYTES, MAX_CHECKPOINT_SESSION_ID_BYTES,
+};
 use crate::config::SessionRetentionConfig;
 
 // [ft-xcsm0 / ft-8nqx0 Phase 4] CleanupResult lifted to the audit-types
@@ -33,6 +38,13 @@ pub use frankenterm_core_audit_types::session_retention_types::CleanupResult;
 struct SizeCleanupOutcome {
     deleted: usize,
     shortfall_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OrphanCleanupOutcome {
+    orphaned_restore_lifecycle_rows: usize,
+    orphaned_checkpoints: usize,
+    orphaned_pane_states: usize,
 }
 
 /// Finite phase in which session-cleanup completion became unobservable.
@@ -153,13 +165,16 @@ pub fn cleanup_sessions(
     }
 
     // 4. Clean orphaned data
-    let (orphan_cp, orphan_ps) = cleanup_orphaned_data(conn)?;
-    result.orphaned_checkpoints = orphan_cp;
-    result.orphaned_pane_states = orphan_ps;
-    if orphan_cp > 0 || orphan_ps > 0 {
+    let orphaned = cleanup_orphaned_data(conn)?;
+    result.orphaned_restore_lifecycle_rows =
+        orphaned.orphaned_restore_lifecycle_rows;
+    result.orphaned_checkpoints = orphaned.orphaned_checkpoints;
+    result.orphaned_pane_states = orphaned.orphaned_pane_states;
+    if orphaned != OrphanCleanupOutcome::default() {
         warn!(
-            orphaned_checkpoints = orphan_cp,
-            orphaned_pane_states = orphan_ps,
+            orphaned_restore_lifecycle_rows = orphaned.orphaned_restore_lifecycle_rows,
+            orphaned_checkpoints = orphaned.orphaned_checkpoints,
+            orphaned_pane_states = orphaned.orphaned_pane_states,
             "Cleaned up orphaned session data"
         );
     }
@@ -206,7 +221,12 @@ pub(crate) fn has_unresolved_restore_intent(
              SELECT 1
              FROM restore_attempt_lifecycle AS lifecycle
              WHERE lifecycle.session_id = ?1
-               AND lifecycle.status <> 'resolved'
+               AND CASE
+                       WHEN typeof(lifecycle.status) = 'text'
+                        AND lifecycle.status = 'resolved'
+                       THEN 0
+                       ELSE 1
+                   END = 1
          ) OR EXISTS (
              SELECT 1
              FROM session_checkpoints AS intent
@@ -223,11 +243,28 @@ pub(crate) fn has_unresolved_restore_intent(
              FROM session_checkpoints AS intent
              WHERE intent.session_id = ?1
                AND intent.checkpoint_role = 'restore_receipt'
-               AND json_valid(intent.metadata_json)
-               AND json_extract(
-                       intent.metadata_json,
-                       '$.restore_attempt.phase'
-                   ) = 'intent'
+               AND CASE
+                       WHEN typeof(intent.metadata_json) != 'text'
+                         OR length(CAST(intent.metadata_json AS BLOB)) > ?2
+                       THEN 1
+                       WHEN NOT json_valid(intent.metadata_json)
+                       THEN 1
+                       WHEN json_extract(
+                           intent.metadata_json,
+                           '$.restore_attempt.phase'
+                       ) = 'outcome'
+                       THEN 0
+                       WHEN json_type(
+                               intent.metadata_json,
+                               '$.restore_attempt'
+                            ) IS NULL
+                        AND json_type(
+                               intent.metadata_json,
+                               '$.old_to_new'
+                            ) = 'object'
+                       THEN 0
+                       ELSE 1
+                   END = 1
                AND NOT EXISTS (
                    SELECT 1
                    FROM restore_attempt_lifecycle AS lifecycle
@@ -235,7 +272,10 @@ pub(crate) fn has_unresolved_restore_intent(
                      AND lifecycle.session_id = intent.session_id
                )
          )",
-        [session_id],
+        rusqlite::params![
+            session_id,
+            i64::try_from(MAX_CHECKPOINT_METADATA_BYTES).unwrap_or(i64::MAX),
+        ],
         |row| row.get::<_, bool>(0),
     )
 }
@@ -309,9 +349,16 @@ fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize,
                        )
                    ) < ?1
                AND shutdown_clean = 1
+               AND typeof(session_id) = 'text'
+               AND length(CAST(session_id AS BLOB)) BETWEEN 1 AND ?2
              ORDER BY session_id ASC",
         )?;
-        stmt.query_map([cutoff_ms], |row| {
+        stmt.query_map(
+            rusqlite::params![
+                cutoff_ms,
+                i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX),
+            ],
+            |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .collect::<Result<_, _>>()?
@@ -356,6 +403,8 @@ fn delete_excess_closed_sessions(
             "SELECT session_id, shutdown_clean, clean_checkpoint_id
              FROM mux_sessions
              WHERE shutdown_clean = 1
+               AND typeof(session_id) = 'text'
+               AND length(CAST(session_id AS BLOB)) BETWEEN 1 AND ?1
              ORDER BY MAX(
                           created_at,
                           COALESCE(last_checkpoint_at, created_at),
@@ -368,7 +417,10 @@ fn delete_excess_closed_sessions(
                       ) DESC,
                       session_id DESC",
         )?;
-        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        stmt.query_map(
+            [i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX)],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?
             .collect::<Result<_, _>>()?
     };
     let mut retained = 0usize;
@@ -462,6 +514,8 @@ fn delete_sessions_by_size(
              FROM mux_sessions s
              LEFT JOIN session_checkpoints c ON c.session_id = s.session_id
              WHERE s.shutdown_clean = 1
+               AND typeof(s.session_id) = 'text'
+               AND length(CAST(s.session_id AS BLOB)) BETWEEN 1 AND ?1
              GROUP BY s.session_id
              HAVING COALESCE(SUM(c.total_bytes), 0) > 0
              ORDER BY MAX(
@@ -473,7 +527,9 @@ fn delete_sessions_by_size(
         )?;
 
         let sessions = stmt
-            .query_map([], |row| {
+            .query_map(
+                [i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX)],
+                |row| {
                 let session_id = row.get(0)?;
                 let session_bytes: i64 = row.get(1)?;
                 let session_bytes = u64::try_from(session_bytes).map_err(|_| {
@@ -527,7 +583,6 @@ fn delete_sessions_by_size(
 
         freed = freed.saturating_add(session_bytes);
         deleted = deleted.saturating_add(1);
-
     }
 
     tx.commit()?;
@@ -547,8 +602,10 @@ fn delete_sessions_by_size(
 
 /// Clean orphaned data that lost its parent reference.
 ///
-/// Returns (orphaned_checkpoints, orphaned_pane_states).
-fn cleanup_orphaned_data(conn: &Connection) -> Result<(usize, usize), rusqlite::Error> {
+/// Returns exact direct-row counts for every orphan authority shape removed by
+/// this transaction. Foreign-key cascade effects are excluded from SQLite's
+/// direct change counts, so children are deleted explicitly before parents.
+fn cleanup_orphaned_data(conn: &Connection) -> Result<OrphanCleanupOutcome, rusqlite::Error> {
     // ft-rt6ol + ft-kccj8: delete pane_state CHILDREN first, with a predicate
     // that names both orphan shapes explicitly — rows whose checkpoint is
     // already gone, and rows whose checkpoint is about to be removed as a
@@ -567,7 +624,7 @@ fn cleanup_orphaned_data(conn: &Connection) -> Result<(usize, usize), rusqlite::
     // remove its lifecycle rows first. Otherwise the deferred intent FK can
     // correctly prevent the following checkpoint cleanup from erasing durable
     // evidence whose parent session is already irretrievably absent.
-    tx.execute(
+    let orphaned_restore_lifecycle_rows = tx.execute(
         "DELETE FROM restore_attempt_lifecycle
          WHERE session_id NOT IN (
              SELECT session_id FROM mux_sessions
@@ -599,7 +656,11 @@ fn cleanup_orphaned_data(conn: &Connection) -> Result<(usize, usize), rusqlite::
     )?;
 
     tx.commit()?;
-    Ok((orphan_cp, orphan_ps))
+    Ok(OrphanCleanupOutcome {
+        orphaned_restore_lifecycle_rows,
+        orphaned_checkpoints: orphan_cp,
+        orphaned_pane_states: orphan_ps,
+    })
 }
 
 /// Run cleanup asynchronously via spawn_blocking.
@@ -679,16 +740,25 @@ pub(crate) fn cleanup_sessions_from_path(
         OpenFlags::default() | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
     );
     let conn = connection.map_err(|error| {
-        warn!(error = %error, "session cleanup database open failed");
+        warn!(
+            error_class = session_cleanup_database_error_class(&error),
+            "session cleanup database open failed"
+        );
         SessionCleanupError::DatabaseOpen
     })?;
     conn.busy_timeout(Duration::from_secs(5)).map_err(|error| {
-        warn!(error = %error, "session cleanup busy policy setup failed");
+        warn!(
+            error_class = session_cleanup_database_error_class(&error),
+            "session cleanup busy policy setup failed"
+        );
         SessionCleanupError::DatabasePreparation
     })?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
         .map_err(|error| {
-            warn!(error = %error, "session cleanup database preparation failed");
+            warn!(
+                error_class = session_cleanup_database_error_class(&error),
+                "session cleanup database preparation failed"
+            );
             SessionCleanupError::DatabasePreparation
         })?;
     cleanup_sessions(&conn, config).map_err(|error| {
@@ -696,13 +766,43 @@ pub(crate) fn cleanup_sessions_from_path(
         // Any earlier phase may be durable when a later phase fails, so a
         // generic database error would fabricate retry safety until exact
         // partial receipts/continuations land.
-        warn!(error = %error, "session cleanup execution outcome is indeterminate");
+        warn!(
+            error_class = session_cleanup_database_error_class(&error),
+            "session cleanup execution outcome is indeterminate"
+        );
         SessionCleanupError::IndeterminateCleanup {
             phase: SessionCleanupIndeterminatePhase::CleanupExecution,
         }
     })
 }
 
+/// Collapse SQLite/rusqlite failures into a finite, content-free telemetry
+/// class. Raw error displays are deliberately excluded because SQLite error
+/// messages can contain database paths, schema fragments, or persisted values.
+fn session_cleanup_database_error_class(error: &rusqlite::Error) -> &'static str {
+    use rusqlite::ffi::ErrorCode;
+
+    match error.sqlite_error_code() {
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => "contention",
+        Some(ErrorCode::OperationAborted | ErrorCode::OperationInterrupted) => "interrupted",
+        Some(ErrorCode::PermissionDenied | ErrorCode::ReadOnly | ErrorCode::CannotOpen) => {
+            "access"
+        }
+        Some(ErrorCode::SystemIoFailure | ErrorCode::DiskFull) => "storage_io",
+        Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) => "invalid_database",
+        Some(
+            ErrorCode::TooBig
+            | ErrorCode::ConstraintViolation
+            | ErrorCode::TypeMismatch
+            | ErrorCode::ParameterOutOfRange,
+        ) => "data_contract",
+        Some(ErrorCode::OutOfMemory) => "resource_exhausted",
+        Some(_) => "database_failure",
+        None => "rusqlite_contract",
+    }
+}
+
+#[cfg(test)]
 fn classify_session_cleanup_blocking_failure(
     error: crate::runtime_async::SpawnBlockingWithCxError,
 ) -> SessionCleanupError {
@@ -841,6 +941,31 @@ mod tests {
             error.to_string(),
             "session cleanup outcome is indeterminate during cleanup_execution; reconcile durable state before retrying"
         );
+    }
+
+    #[test]
+    fn database_error_telemetry_class_never_exposes_sqlite_message_content() {
+        let canary = "credential-canary /private/database/path";
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::CannotOpen,
+                extended_code: rusqlite::ffi::SQLITE_CANTOPEN,
+            },
+            Some(canary.to_owned()),
+        );
+
+        assert!(error.to_string().contains(canary));
+        let class = session_cleanup_database_error_class(&error);
+        assert_eq!(class, "access");
+        assert!(!class.contains(canary));
+
+        let wrapped_content = rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::other(canary),
+        ));
+        assert!(wrapped_content.to_string().contains(canary));
+        let wrapped_class = session_cleanup_database_error_class(&wrapped_content);
+        assert_eq!(wrapped_class, "rusqlite_contract");
+        assert!(!wrapped_class.contains(canary));
     }
 
     fn make_test_db() -> Connection {
@@ -1014,6 +1139,38 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_candidate_queries_retain_oversized_session_identity() {
+        let conn = make_test_db();
+        let old = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer")
+            - 90 * 86_400_000;
+        let oversized_session_id = "s".repeat(MAX_CHECKPOINT_SESSION_ID_BYTES + 1);
+        conn.execute(
+            "INSERT INTO mux_sessions (
+                 session_id, created_at, last_checkpoint_at, shutdown_clean,
+                 topology_json, ft_version
+             ) VALUES (?1, ?2, ?2, 1, '{}', '0.1.0')",
+            rusqlite::params![oversized_session_id, old],
+        )
+        .expect("insert oversized session identity fixture");
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, checkpoint_role
+             ) VALUES (?1, ?2, 'periodic', 'legacy:oversized-session',
+                       0, 1048576, 'snapshot')",
+            rusqlite::params![oversized_session_id, old],
+        )
+        .expect("insert oversized session checkpoint fixture");
+
+        assert_eq!(delete_sessions_by_age(&conn, 30).unwrap(), 0);
+        assert_eq!(delete_excess_closed_sessions(&conn, 0).unwrap(), 0);
+        let size = delete_sessions_by_size(&conn, 0).unwrap();
+        assert_eq!(size.deleted, 0);
+        assert_eq!(size.shortfall_bytes, 1_048_576);
+        assert_eq!(count_sessions(&conn), 1);
+    }
+
+    #[test]
     fn age_cleanup_never_deletes_session_with_corrupt_v2_clean_receipt() {
         let conn = make_test_db();
         let old = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer")
@@ -1089,6 +1246,75 @@ mod tests {
         assert_eq!(size.deleted, 0);
         assert!(size.shortfall_bytes > 0);
         assert_eq!(count_sessions(&conn), 1);
+    }
+
+    #[test]
+    fn corrupt_or_oversized_legacy_receipt_metadata_fails_closed() {
+        let conn = make_test_db();
+        let cases = [
+            ("corrupt-legacy-receipt", "{".to_string()),
+            (
+                "oversized-legacy-receipt",
+                "x".repeat(MAX_CHECKPOINT_METADATA_BYTES + 1),
+            ),
+        ];
+
+        for (session_id, metadata_json) in cases {
+            insert_session(&conn, session_id, 1_000, false);
+            conn.execute(
+                "INSERT INTO session_checkpoints (
+                     session_id, checkpoint_at, checkpoint_type, state_hash,
+                     pane_count, total_bytes, metadata_json, checkpoint_role
+                 ) VALUES (?1, 1001, 'startup', 'corrupt:legacy-receipt',
+                           0, 0, ?2, 'restore_receipt')",
+                rusqlite::params![session_id, metadata_json],
+            )
+            .expect("insert corrupt legacy receipt fixture");
+            assert!(
+                has_unresolved_restore_intent(&conn, session_id)
+                    .expect("classify corrupt legacy receipt"),
+                "{session_id} must remain unresolved"
+            );
+        }
+    }
+
+    #[test]
+    fn finite_invalid_lifecycle_status_fails_closed_as_unresolved() {
+        let conn = make_test_db();
+        insert_session(&conn, "invalid-lifecycle-status", 1_000, false);
+        let source_id = insert_checkpoint(&conn, "invalid-lifecycle-status", 1_001, 0);
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, metadata_json, checkpoint_role
+             ) VALUES (
+                 'invalid-lifecycle-status', 1002, 'startup', 'pending:rsi2',
+                 0, 0,
+                 '{\"old_to_new\":{},\"restore_attempt\":{\"phase\":\"intent\"}}',
+                 'restore_intent'
+             )",
+            [],
+        )
+        .expect("insert intent fixture");
+        let intent_id = conn.last_insert_rowid();
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("permit lifecycle corruption fixture");
+        conn.execute(
+            "INSERT INTO restore_attempt_lifecycle (
+                 intent_checkpoint_id, session_id, source_checkpoint_id,
+                 status, created_at, resolved_at
+             ) VALUES (?1, 'invalid-lifecycle-status', ?2,
+                       'corrupt-status', 1002, 1002)",
+            rusqlite::params![intent_id, source_id],
+        )
+        .expect("insert invalid lifecycle status fixture");
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")
+            .expect("restore constraint enforcement");
+
+        assert!(
+            has_unresolved_restore_intent(&conn, "invalid-lifecycle-status")
+                .expect("classify invalid lifecycle status")
+        );
     }
 
     #[test]
@@ -1518,9 +1744,10 @@ mod tests {
         assert_eq!(count_sessions(&conn), 1);
         assert_eq!(count_checkpoints(&conn), 2);
 
-        let (orphan_checkpoints, orphan_pane_states) = cleanup_orphaned_data(&conn).unwrap();
-        assert_eq!(orphan_checkpoints, 1);
-        assert_eq!(orphan_pane_states, 0);
+        let orphaned = cleanup_orphaned_data(&conn).unwrap();
+        assert_eq!(orphaned.orphaned_restore_lifecycle_rows, 0);
+        assert_eq!(orphaned.orphaned_checkpoints, 1);
+        assert_eq!(orphaned.orphaned_pane_states, 0);
         assert_eq!(count_sessions(&conn), 1);
         assert_eq!(count_checkpoints(&conn), 1);
     }
@@ -1572,8 +1799,8 @@ mod tests {
 
         assert_eq!(count_checkpoints(&conn), 2);
 
-        let (orphan_cp, _) = cleanup_orphaned_data(&conn).unwrap();
-        assert_eq!(orphan_cp, 1);
+        let orphaned = cleanup_orphaned_data(&conn).unwrap();
+        assert_eq!(orphaned.orphaned_checkpoints, 1);
         assert_eq!(count_checkpoints(&conn), 1);
     }
 
@@ -1599,8 +1826,8 @@ mod tests {
 
         assert_eq!(count_pane_states(&conn), 2);
 
-        let (_, orphan_ps) = cleanup_orphaned_data(&conn).unwrap();
-        assert_eq!(orphan_ps, 1);
+        let orphaned = cleanup_orphaned_data(&conn).unwrap();
+        assert_eq!(orphaned.orphaned_pane_states, 1);
         assert_eq!(count_pane_states(&conn), 1);
     }
 
@@ -1637,10 +1864,13 @@ mod tests {
         assert_eq!(count_pane_states(&conn), 1);
 
         // One pass must remove BOTH the orphan checkpoint and its child.
-        let (orphan_cp, orphan_ps) = cleanup_orphaned_data(&conn).unwrap();
-        assert_eq!(orphan_cp, 1, "orphan checkpoint removed");
+        let orphaned = cleanup_orphaned_data(&conn).unwrap();
         assert_eq!(
-            orphan_ps, 1,
+            orphaned.orphaned_checkpoints, 1,
+            "orphan checkpoint removed"
+        );
+        assert_eq!(
+            orphaned.orphaned_pane_states, 1,
             "its pane_state child collected in the same pass"
         );
         assert_eq!(count_checkpoints(&conn), 0);
@@ -1680,8 +1910,10 @@ mod tests {
         .expect("seed orphan restore lifecycle");
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
-        let (orphan_cp, orphan_ps) = cleanup_orphaned_data(&conn).unwrap();
-        assert_eq!((orphan_cp, orphan_ps), (1, 0));
+        let orphaned = cleanup_orphaned_data(&conn).unwrap();
+        assert_eq!(orphaned.orphaned_restore_lifecycle_rows, 1);
+        assert_eq!(orphaned.orphaned_checkpoints, 1);
+        assert_eq!(orphaned.orphaned_pane_states, 0);
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM restore_attempt_lifecycle",
@@ -1689,6 +1921,44 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count retained lifecycle rows"),
+            0
+        );
+    }
+
+    #[test]
+    fn full_cleanup_reports_lifecycle_only_orphan_as_completed_work() {
+        let conn = make_test_db();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO restore_attempt_lifecycle (
+                 intent_checkpoint_id, session_id, source_checkpoint_id,
+                 status, created_at
+             ) VALUES (999, 'missing-session', 998, 'intent', 1000)",
+            [],
+        )
+        .expect("seed lifecycle-only orphan");
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        let config = SessionRetentionConfig {
+            max_age_days: 0,
+            max_closed_sessions: 0,
+            max_total_size_mb: 0,
+            cleanup_interval_hours: 0,
+        };
+        let result = cleanup_sessions(&conn, &config).expect("clean lifecycle-only orphan");
+
+        assert_eq!(result.total_sessions_deleted(), 0);
+        assert_eq!(result.orphaned_restore_lifecycle_rows, 1);
+        assert_eq!(result.orphaned_checkpoints, 0);
+        assert_eq!(result.orphaned_pane_states, 0);
+        assert!(result.any_work_done());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM restore_attempt_lifecycle",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count remaining lifecycle rows"),
             0
         );
     }
@@ -1779,16 +2049,28 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_result_any_work_done_orphan_restore_lifecycle_only() {
+        let result = CleanupResult {
+            orphaned_restore_lifecycle_rows: 2,
+            ..Default::default()
+        };
+        assert!(result.any_work_done());
+        assert_eq!(result.total_sessions_deleted(), 0);
+    }
+
+    #[test]
     fn cleanup_result_debug() {
         let result = CleanupResult {
             deleted_by_age: 1,
             deleted_by_count: 2,
             deleted_by_size: 3,
+            orphaned_restore_lifecycle_rows: 6,
             orphaned_checkpoints: 4,
             orphaned_pane_states: 5,
         };
         let dbg = format!("{result:?}");
         assert!(dbg.contains("CleanupResult"));
+        assert!(dbg.contains("orphaned_restore_lifecycle_rows"));
     }
 
     #[test]
@@ -1819,6 +2101,7 @@ mod tests {
             deleted_by_age: 0,
             deleted_by_count: 0,
             deleted_by_size: 0,
+            orphaned_restore_lifecycle_rows: 0,
             orphaned_checkpoints: 1,
             orphaned_pane_states: 0,
         };
@@ -1969,6 +2252,7 @@ mod tests {
         assert_eq!(r.deleted_by_age, 0);
         assert_eq!(r.deleted_by_count, 0);
         assert_eq!(r.deleted_by_size, 0);
+        assert_eq!(r.orphaned_restore_lifecycle_rows, 0);
         assert_eq!(r.orphaned_checkpoints, 0);
         assert_eq!(r.orphaned_pane_states, 0);
         assert_eq!(r.total_sessions_deleted(), 0);
@@ -2167,17 +2451,19 @@ mod tests {
         let cp = insert_checkpoint(&conn, "valid", now, 1024);
         insert_pane_state(&conn, cp, 1);
 
-        let (orphan_cp, orphan_ps) = cleanup_orphaned_data(&conn).unwrap();
-        assert_eq!(orphan_cp, 0);
-        assert_eq!(orphan_ps, 0);
+        assert_eq!(
+            cleanup_orphaned_data(&conn).unwrap(),
+            OrphanCleanupOutcome::default()
+        );
     }
 
     #[test]
     fn orphan_cleanup_on_empty_db() {
         let conn = make_test_db();
-        let (orphan_cp, orphan_ps) = cleanup_orphaned_data(&conn).unwrap();
-        assert_eq!(orphan_cp, 0);
-        assert_eq!(orphan_ps, 0);
+        assert_eq!(
+            cleanup_orphaned_data(&conn).unwrap(),
+            OrphanCleanupOutcome::default()
+        );
     }
 
     // ── Size cleanup: sessions with no checkpoints ──

@@ -1087,6 +1087,19 @@ fn validate_restore_snapshot(
     })
 }
 
+/// Run the exact layout-restorer preflight used by [`LayoutRestorer`] without
+/// retaining its derived execution plan. Session restore calls this before it
+/// persists a durable restore intent, so malformed topology can never create a
+/// reconciliation-required lifecycle merely because the execution layer has a
+/// stronger validator than the admission layer.
+pub(crate) fn validate_restore_snapshot_for_admission(
+    snapshot: &TopologySnapshot,
+    restore_working_dirs: bool,
+    restore_split_ratios: bool,
+) -> crate::Result<()> {
+    validate_restore_snapshot(snapshot, restore_working_dirs, restore_split_ratios).map(drop)
+}
+
 fn validate_pane_tree(
     node: &PaneNode,
     depth: usize,

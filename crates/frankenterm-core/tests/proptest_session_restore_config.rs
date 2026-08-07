@@ -6,30 +6,30 @@
 //! retired `restore_max_lines` key is rejected even when null; `LogConfig`
 //! continues to use ordinary serde defaults.
 //!
-//! Properties:
-//!  1. SessionRestoreConfig JSON serde roundtrip preserves all fields
-//!  2. SessionRestoreConfig serialization is deterministic
-//!  3. SessionRestoreConfig default from empty JSON
-//!  4. SessionRestoreConfig partial JSON fills missing with defaults
-//!  5. SessionRestoreConfig Default() matches serde default
-//!  6. SessionRestoreConfig TOML roundtrip preserves all fields
-//!  7. SessionRestoreConfig double roundtrip (JSON→struct→JSON) is stable
-//!  8. SessionRestoreConfig JSON with extra fields deserializes (forward compat)
-//!  9. SessionRestoreConfig all 4 bool combos produce valid configs
-//! 10. LogConfig JSON serde roundtrip preserves all fields
-//! 11. LogConfig serialization is deterministic
-//! 12. LogConfig default from empty JSON
-//! 13. LogConfig partial level fills missing with defaults
-//! 14. LogConfig Default() matches serde default
-//! 15. LogConfig TOML roundtrip preserves all fields
-//! 16. LogConfig double roundtrip (JSON→struct→JSON) is stable
-//! 17. LogConfig JSON with extra fields deserializes (forward compat)
-//! 18. LogConfig partial with only format fills missing with defaults
-//! 19. LogConfig file path roundtrips through JSON
-//! 20. SessionRestoreConfig TOML double roundtrip is stable
-//! 21. LogConfig TOML double roundtrip is stable
-//! 22. SessionRestoreConfig negation of bool fields roundtrips
-//! 23. Explicit retired restore_max_lines values fail closed
+//! Generated properties (numbered to match the test comments below):
+//!  1. SessionRestoreConfig JSON roundtrip
+//!  2. SessionRestoreConfig deterministic JSON
+//!  3. SessionRestoreConfig partial JSON defaults
+//!  4. SessionRestoreConfig TOML roundtrip
+//!  5. SessionRestoreConfig stable JSON double roundtrip
+//!  6. SessionRestoreConfig unknown-field tolerance
+//!  7. LogConfig JSON roundtrip
+//!  8. LogConfig deterministic JSON
+//!  9. LogConfig partial-level defaults
+//! 10. LogConfig TOML roundtrip
+//! 11. LogConfig stable JSON double roundtrip
+//! 12. LogConfig unknown-field tolerance
+//! 13. LogConfig partial-format defaults
+//! 14. LogConfig file-path field JSON and TOML roundtrip
+//! 15. SessionRestoreConfig stable TOML double roundtrip
+//! 16. LogConfig stable TOML double roundtrip
+//! 17. Negated SessionRestoreConfig JSON roundtrip
+//! 18. SessionRestoreConfig exact serialized field catalog
+//! 19. Non-ASCII LogConfig file-path JSON and TOML roundtrip
+//!
+//! Fixed examples below the generated properties cover defaults, the complete
+//! four-value boolean matrix, and retired-key rejection without pretending a
+//! one-value generator is a property.
 
 use frankenterm_core::logging::LogConfig;
 use frankenterm_core::session_restore::SessionRestoreConfig;
@@ -70,6 +70,20 @@ fn arb_log_config() -> impl Strategy<Value = LogConfig> {
         })
 }
 
+fn arb_non_ascii_log_path() -> impl Strategy<Value = String> {
+    (
+        prop_oneof![
+            Just("日志"),
+            Just("résultats"),
+            Just("данные"),
+            Just("δοκιμές"),
+            Just("🚀"),
+        ],
+        "[a-z0-9_-]{1,16}",
+    )
+        .prop_map(|(directory, stem)| format!("{directory}/{stem}.log"))
+}
+
 // =========================================================================
 // SessionRestoreConfig properties
 // =========================================================================
@@ -94,15 +108,7 @@ proptest! {
         prop_assert_eq!(&j1, &j2);
     }
 
-    /// Property 3: Empty JSON deserializes to default values.
-    #[test]
-    fn prop_restore_config_default_from_empty(_dummy in 0..1_u8) {
-        let config: SessionRestoreConfig = serde_json::from_str("{}").unwrap();
-        prop_assert!(!config.auto_restore);
-        prop_assert!(!config.restore_scrollback);
-    }
-
-    /// Property 4: Partial JSON fills missing fields with defaults.
+    /// Property 3: Partial JSON fills missing fields with defaults.
     #[test]
     fn prop_restore_config_partial(auto_restore in any::<bool>()) {
         let json = format!("{{\"auto_restore\":{}}}", auto_restore);
@@ -112,16 +118,7 @@ proptest! {
         prop_assert!(!config.restore_scrollback);
     }
 
-    /// Property 5: Default() matches serde default from empty JSON.
-    #[test]
-    fn prop_restore_config_default_consistent(_dummy in 0..1_u8) {
-        let from_default = SessionRestoreConfig::default();
-        let from_json: SessionRestoreConfig = serde_json::from_str("{}").unwrap();
-        prop_assert_eq!(from_default.auto_restore, from_json.auto_restore);
-        prop_assert_eq!(from_default.restore_scrollback, from_json.restore_scrollback);
-    }
-
-    /// Property 6: TOML roundtrip preserves all fields.
+    /// Property 4: TOML roundtrip preserves all fields.
     #[test]
     fn prop_restore_config_toml_roundtrip(config in arb_session_restore_config()) {
         let toml_str = toml::to_string(&config).unwrap();
@@ -132,7 +129,7 @@ proptest! {
             "restore_scrollback mismatch after TOML roundtrip");
     }
 
-    /// Property 7: Double roundtrip (serialize→deserialize→serialize) is stable.
+    /// Property 5: Double roundtrip (serialize→deserialize→serialize) is stable.
     #[test]
     fn prop_restore_config_double_roundtrip(config in arb_session_restore_config()) {
         let json1 = serde_json::to_string(&config).unwrap();
@@ -142,7 +139,7 @@ proptest! {
             "double roundtrip should produce identical JSON");
     }
 
-    /// Property 8: JSON with extra fields deserializes correctly (forward compat).
+    /// Property 6: JSON with extra fields deserializes correctly (forward compat).
     #[test]
     fn prop_restore_config_forward_compat(config in arb_session_restore_config()) {
         let json = format!(
@@ -156,23 +153,6 @@ proptest! {
             "extra fields should not affect restore_scrollback");
     }
 
-    /// Property 9: All 4 boolean combinations produce valid configs.
-    #[test]
-    fn prop_restore_config_all_bool_combos(_dummy in 0..1_u8) {
-        for auto in [false, true] {
-            for scrollback in [false, true] {
-                let config = SessionRestoreConfig {
-                    auto_restore: auto,
-                    restore_scrollback: scrollback,
-                };
-                let json = serde_json::to_string(&config).unwrap();
-                let back: SessionRestoreConfig = serde_json::from_str(&json).unwrap();
-                prop_assert_eq!(back.auto_restore, auto);
-                prop_assert_eq!(back.restore_scrollback, scrollback);
-            }
-        }
-    }
-
 }
 
 // =========================================================================
@@ -182,7 +162,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(30))]
 
-    /// Property 13: JSON serde roundtrip preserves all fields.
+    /// Property 7: JSON serde roundtrip preserves all fields.
     #[test]
     fn prop_log_config_serde(config in arb_log_config()) {
         let json = serde_json::to_string(&config).unwrap();
@@ -192,7 +172,7 @@ proptest! {
         prop_assert_eq!(back.file, config.file);
     }
 
-    /// Property 14: Serialization is deterministic.
+    /// Property 8: Serialization is deterministic.
     #[test]
     fn prop_log_config_deterministic(config in arb_log_config()) {
         let j1 = serde_json::to_string(&config).unwrap();
@@ -200,16 +180,7 @@ proptest! {
         prop_assert_eq!(&j1, &j2);
     }
 
-    /// Property 15: Empty JSON deserializes to default values.
-    #[test]
-    fn prop_log_config_default_from_empty(_dummy in 0..1_u8) {
-        let config: LogConfig = serde_json::from_str("{}").unwrap();
-        prop_assert_eq!(&config.level, "info");
-        prop_assert_eq!(config.format, frankenterm_core::config::LogFormat::Pretty);
-        prop_assert!(config.file.is_none());
-    }
-
-    /// Property 16: Partial JSON fills missing fields with defaults.
+    /// Property 9: Partial JSON fills missing fields with defaults.
     #[test]
     fn prop_log_config_partial_level(level in "[a-z]{3,10}") {
         let json = format!("{{\"level\":\"{}\"}}", level);
@@ -219,17 +190,7 @@ proptest! {
         prop_assert!(config.file.is_none());
     }
 
-    /// Property 17: Default() matches serde default from empty JSON.
-    #[test]
-    fn prop_log_config_default_consistent(_dummy in 0..1_u8) {
-        let from_default = LogConfig::default();
-        let from_json: LogConfig = serde_json::from_str("{}").unwrap();
-        prop_assert_eq!(&from_default.level, &from_json.level);
-        prop_assert_eq!(from_default.format, from_json.format);
-        prop_assert_eq!(from_default.file, from_json.file);
-    }
-
-    /// Property 18: TOML roundtrip preserves all fields.
+    /// Property 10: TOML roundtrip preserves all fields.
     #[test]
     fn prop_log_config_toml_roundtrip(config in arb_log_config()) {
         let toml_str = toml::to_string(&config).unwrap();
@@ -242,7 +203,7 @@ proptest! {
             "file mismatch after TOML roundtrip");
     }
 
-    /// Property 19: Double roundtrip (serialize→deserialize→serialize) is stable.
+    /// Property 11: Double roundtrip (serialize→deserialize→serialize) is stable.
     #[test]
     fn prop_log_config_double_roundtrip(config in arb_log_config()) {
         let json1 = serde_json::to_string(&config).unwrap();
@@ -252,29 +213,23 @@ proptest! {
             "double roundtrip should produce identical JSON");
     }
 
-    /// Property 20: JSON with extra fields deserializes correctly (forward compat).
+    /// Property 12: JSON with extra fields deserializes correctly (forward compat).
     #[test]
     fn prop_log_config_forward_compat(config in arb_log_config()) {
-        let file_json = match &config.file {
-            Some(p) => format!("\"{}\"", p.display()),
-            None => "null".to_string(),
-        };
-        let format_str = match config.format {
-            frankenterm_core::config::LogFormat::Pretty => "\"pretty\"",
-            frankenterm_core::config::LogFormat::Json => "\"json\"",
-        };
-        let json = format!(
-            "{{\"level\":\"{}\",\"format\":{},\"file\":{},\"verbose\":true,\"rotation\":\"daily\"}}",
-            config.level, format_str, file_json
-        );
-        let back: LogConfig = serde_json::from_str(&json).unwrap();
+        let mut value = serde_json::to_value(&config).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("verbose".to_string(), serde_json::json!(true));
+        object.insert("rotation".to_string(), serde_json::json!("daily"));
+        let back: LogConfig = serde_json::from_value(value).unwrap();
         prop_assert_eq!(&back.level, &config.level,
             "extra fields should not affect level");
         prop_assert_eq!(back.format, config.format,
             "extra fields should not affect format");
+        prop_assert_eq!(back.file, config.file,
+            "extra fields should not affect file");
     }
 
-    /// Property 21: Partial JSON with only format fills missing with defaults.
+    /// Property 13: Partial JSON with only format fills missing with defaults.
     #[test]
     fn prop_log_config_partial_format_only(
         format in prop_oneof![
@@ -296,7 +251,7 @@ proptest! {
             "file should default to None");
     }
 
-    /// Property 22: File path roundtrips through JSON.
+    /// Property 14: File-path field roundtrips through JSON and TOML.
     #[test]
     fn prop_log_config_file_path_roundtrip(
         path in "[a-z]{3,10}/[a-z]{3,10}\\.log"
@@ -307,15 +262,22 @@ proptest! {
             file: Some(std::path::PathBuf::from(&path)),
         };
         let json = serde_json::to_string(&config).unwrap();
-        let back: LogConfig = serde_json::from_str(&json).unwrap();
+        let json_back: LogConfig = serde_json::from_str(&json).unwrap();
+        let toml = toml::to_string(&config).unwrap();
+        let toml_back: LogConfig = toml::from_str(&toml).unwrap();
         prop_assert_eq!(
-            back.file.as_ref().map(|p| p.to_string_lossy().to_string()),
+            json_back.file.as_ref().map(|p| p.to_string_lossy().to_string()),
             Some(path.clone()),
-            "file path should roundtrip: expected {}", path
+            "JSON file path should roundtrip: expected {}", path
+        );
+        prop_assert_eq!(
+            toml_back.file.as_ref().map(|p| p.to_string_lossy().to_string()),
+            Some(path.clone()),
+            "TOML file path should roundtrip: expected {}", path
         );
     }
 
-    /// Property 23: SessionRestoreConfig TOML double roundtrip is stable.
+    /// Property 15: SessionRestoreConfig TOML double roundtrip is stable.
     #[test]
     fn prop_restore_config_toml_double_roundtrip(config in arb_session_restore_config()) {
         let toml1 = toml::to_string(&config).unwrap();
@@ -325,7 +287,7 @@ proptest! {
             "TOML double roundtrip should produce identical output");
     }
 
-    /// Property 24: LogConfig TOML double roundtrip is stable.
+    /// Property 16: LogConfig TOML double roundtrip is stable.
     #[test]
     fn prop_log_config_toml_double_roundtrip(config in arb_log_config()) {
         let toml1 = toml::to_string(&config).unwrap();
@@ -335,7 +297,7 @@ proptest! {
             "TOML double roundtrip should produce identical output");
     }
 
-    /// Property 25: Negation of bool fields roundtrips correctly.
+    /// Property 17: Negation of bool fields roundtrips correctly.
     #[test]
     fn prop_restore_config_negation_roundtrip(config in arb_session_restore_config()) {
         let negated = SessionRestoreConfig {
@@ -350,53 +312,36 @@ proptest! {
             "negated restore_scrollback mismatch");
     }
 
-    /// Property 26: SessionRestoreConfig Clone preserves all fields.
+    /// Property 18: SessionRestoreConfig JSON has its exact field catalog.
     #[test]
-    fn prop_restore_config_clone(config in arb_session_restore_config()) {
-        let cloned = config.clone();
-        prop_assert_eq!(cloned.auto_restore, config.auto_restore);
-        prop_assert_eq!(cloned.restore_scrollback, config.restore_scrollback);
-    }
-
-    /// Property 27: SessionRestoreConfig Debug output is non-empty.
-    #[test]
-    fn prop_restore_config_debug_nonempty(config in arb_session_restore_config()) {
-        let dbg = format!("{:?}", config);
-        prop_assert!(!dbg.is_empty());
-    }
-
-    /// Property 28: SessionRestoreConfig JSON has exactly 2 fields.
-    #[test]
-    fn prop_restore_config_json_field_count(config in arb_session_restore_config()) {
+    fn prop_restore_config_json_field_catalog(config in arb_session_restore_config()) {
         let json = serde_json::to_string(&config).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         let obj = value.as_object().unwrap();
-        prop_assert_eq!(obj.len(), 2, "SessionRestoreConfig should have 2 JSON fields");
+        let keys = obj
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        prop_assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["auto_restore", "restore_scrollback"])
+        );
     }
 
-    /// Property 29: LogConfig Clone preserves all fields.
+    /// Property 19: Non-ASCII file paths roundtrip through JSON and TOML.
     #[test]
-    fn prop_log_config_clone(config in arb_log_config()) {
-        let cloned = config.clone();
-        prop_assert_eq!(&cloned.level, &config.level);
-        prop_assert_eq!(cloned.format, config.format);
-        prop_assert_eq!(cloned.file, config.file);
-    }
-
-    /// Property 30: LogConfig Debug output is non-empty.
-    #[test]
-    fn prop_log_config_debug_nonempty(config in arb_log_config()) {
-        let dbg = format!("{:?}", config);
-        prop_assert!(!dbg.is_empty());
-    }
-
-    /// Property 31: LogConfig JSON is a valid UTF-8 object.
-    #[test]
-    fn prop_log_config_json_valid_utf8(config in arb_log_config()) {
+    fn prop_log_config_non_ascii_file_path_roundtrip(path in arb_non_ascii_log_path()) {
+        let config = LogConfig {
+            level: "info".to_string(),
+            format: frankenterm_core::config::LogFormat::Json,
+            file: Some(std::path::PathBuf::from(&path)),
+        };
         let json = serde_json::to_string(&config).unwrap();
-        prop_assert!(std::str::from_utf8(json.as_bytes()).is_ok());
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        prop_assert!(value.is_object());
+        let json_back: LogConfig = serde_json::from_str(&json).unwrap();
+        let toml = toml::to_string(&config).unwrap();
+        let toml_back: LogConfig = toml::from_str(&toml).unwrap();
+        prop_assert_eq!(json_back.file.as_deref(), config.file.as_deref());
+        prop_assert_eq!(toml_back.file.as_deref(), config.file.as_deref());
     }
 }
 
@@ -410,6 +355,36 @@ fn restore_config_explicit_true_fields_roundtrip() {
     let config: SessionRestoreConfig = serde_json::from_str(json).unwrap();
     assert!(config.auto_restore);
     assert!(config.restore_scrollback);
+}
+
+#[test]
+fn restore_config_defaults_match_empty_json_and_all_boolean_combinations_roundtrip() {
+    let from_default = SessionRestoreConfig::default();
+    let from_json: SessionRestoreConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(from_default.auto_restore, from_json.auto_restore);
+    assert_eq!(from_default.restore_scrollback, from_json.restore_scrollback);
+
+    for auto_restore in [false, true] {
+        for restore_scrollback in [false, true] {
+            let config = SessionRestoreConfig {
+                auto_restore,
+                restore_scrollback,
+            };
+            let encoded = serde_json::to_string(&config).unwrap();
+            let decoded: SessionRestoreConfig = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.auto_restore, auto_restore);
+            assert_eq!(decoded.restore_scrollback, restore_scrollback);
+        }
+    }
+}
+
+#[test]
+fn log_config_defaults_match_empty_json() {
+    let from_default = LogConfig::default();
+    let from_json: LogConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(from_default.level, from_json.level);
+    assert_eq!(from_default.format, from_json.format);
+    assert_eq!(from_default.file, from_json.file);
 }
 
 #[test]

@@ -24,8 +24,13 @@ use tracing::{debug, info, warn};
 
 use crate::checkpoint_witness::{
     CHECKPOINT_ROLE_RESTORE_INTENT, CHECKPOINT_ROLE_RESTORE_RECEIPT, CHECKPOINT_ROLE_SNAPSHOT,
-    RESTORE_INTENT_WITNESS_PREFIX, RESTORE_RECEIPT_WITNESS_PREFIX, SNAPSHOT_WITNESS_PREFIX,
-    PersistedPaneState, canonical_json_string, checkpoint_witness,
+    MAX_CHECKPOINT_METADATA_BYTES, MAX_CHECKPOINT_ROLE_BYTES,
+    MAX_CHECKPOINT_SESSION_ID_BYTES, MAX_CHECKPOINT_STATE_HASH_BYTES,
+    MAX_CHECKPOINT_TYPE_BYTES, MAX_PERSISTED_CHECKPOINT_TEXT_BYTES,
+    MAX_PERSISTED_PANE_TEXT_BYTES, MAX_SESSION_FT_VERSION_BYTES,
+    MAX_SESSION_HOST_ID_BYTES, RESTORE_INTENT_WITNESS_PREFIX,
+    RESTORE_RECEIPT_WITNESS_PREFIX, SNAPSHOT_WITNESS_PREFIX, PersistedPaneState,
+    canonical_json_string, checkpoint_witness, persisted_checkpoint_text_bytes,
 };
 use crate::restore_layout::{
     LayoutRestoreInterruptionReason, LayoutRestorer, RestoreConfig, RestoreResult,
@@ -38,7 +43,9 @@ use crate::snapshot_engine::{
     run_checkpoint_authority_sync, run_checkpoint_authority_with_cx,
 };
 use crate::session_pane_state::{AgentMetadata, TerminalState};
-use crate::session_topology::{PaneNode, TopologySnapshot};
+use crate::session_topology::{
+    MAX_SNAPSHOT_BYTES, MAX_TOPOLOGY_PANES, TopologySnapshot,
+};
 use crate::wezterm::WeztermHandle;
 
 // =============================================================================
@@ -54,11 +61,57 @@ pub enum RestoreError {
     #[error("invalid persisted value for {field}: {value}")]
     InvalidPersistedValue { field: &'static str, value: i64 },
 
+    #[error("invalid or oversized persisted text for {field}")]
+    InvalidPersistedText { field: &'static str },
+
+    #[error("invalid session selector")]
+    InvalidSessionSelector,
+
+    #[error(
+        "invalid session query window (limit={limit}, offset={offset}; limit must be 1..={max_limit} and offset must be <= {max_offset})"
+    )]
+    InvalidQueryWindow {
+        limit: usize,
+        offset: usize,
+        max_limit: usize,
+        max_offset: usize,
+    },
+
+    #[error(
+        "{resource} query has {observed} rows, exceeding the non-paged limit of {limit}; use the paged query API"
+    )]
+    QueryResultLimit {
+        resource: &'static str,
+        observed: usize,
+        limit: usize,
+    },
+
     #[error("no restorable sessions found")]
     NoSessions,
 
+    #[error(
+        "{session_count} unclean session(s) require recovery but are not automatically restorable: {reason}"
+    )]
+    UncleanSessionsNotRestorable {
+        session_count: usize,
+        reason: UncleanSessionBlockReason,
+    },
+
+    #[error("detected checkpoint {checkpoint_id} changed after restore admission")]
+    DetectedCheckpointChanged { checkpoint_id: i64 },
+
     #[error("checkpoint data is corrupt")]
     CorruptCheckpoint(String),
+
+    #[error(
+        "checkpoint {checkpoint_id} exceeds the {resource} resource limit ({observed} > {limit})"
+    )]
+    CheckpointResourceLimit {
+        checkpoint_id: i64,
+        resource: &'static str,
+        observed: usize,
+        limit: usize,
+    },
 
     #[error("topology deserialization failed")]
     TopologyParse(String),
@@ -127,6 +180,9 @@ pub enum RestoreError {
         reason: RestoreInterruptionReason,
     },
 
+    #[error("restore settled partially and requires reconciliation")]
+    PartialRestore { summary: Box<RestoreSummary> },
+
     #[error(
         "scrollback replay is unavailable because the mux API has no safe terminal-output injection channel; retry with layout-only restore"
     )]
@@ -156,6 +212,32 @@ pub enum RestoreInterruptionReason {
 pub enum RestoreInfrastructureFailure {
     BlockingRuntimeFailure,
     CancellationWatcherTimerFailure,
+}
+
+/// Finite reason why durable unclean state cannot currently produce an
+/// automatic restore candidate. `RestoreError::UncleanSessionsNotRestorable`
+/// preserves the essential clean-vs-blocked distinction without carrying
+/// session identifiers or persisted content into diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UncleanSessionBlockReason {
+    NoSnapshotCheckpoint,
+    EmptyOrMissingCheckpoint,
+    LegacyUnverifiedAutoRestore,
+    Mixed,
+}
+
+impl std::fmt::Display for UncleanSessionBlockReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::NoSnapshotCheckpoint => "no snapshot checkpoint",
+            Self::EmptyOrMissingCheckpoint => "empty or missing checkpoint data",
+            Self::LegacyUnverifiedAutoRestore => {
+                "legacy-unverified checkpoint requires manual recovery"
+            }
+            Self::Mixed => "multiple recovery blockers",
+        })
+    }
 }
 
 impl std::fmt::Display for RestoreInfrastructureFailure {
@@ -196,10 +278,63 @@ impl std::fmt::Debug for RestoreError {
                 .field("field", field)
                 .field("value", value)
                 .finish(),
+            Self::InvalidPersistedText { field } => formatter
+                .debug_struct("RestoreError::InvalidPersistedText")
+                .field("field", field)
+                .finish(),
+            Self::InvalidSessionSelector => {
+                formatter.write_str("RestoreError::InvalidSessionSelector")
+            }
+            Self::InvalidQueryWindow {
+                limit,
+                offset,
+                max_limit,
+                max_offset,
+            } => formatter
+                .debug_struct("RestoreError::InvalidQueryWindow")
+                .field("limit", limit)
+                .field("offset", offset)
+                .field("max_limit", max_limit)
+                .field("max_offset", max_offset)
+                .finish(),
+            Self::QueryResultLimit {
+                resource,
+                observed,
+                limit,
+            } => formatter
+                .debug_struct("RestoreError::QueryResultLimit")
+                .field("resource", resource)
+                .field("observed", observed)
+                .field("limit", limit)
+                .finish(),
             Self::NoSessions => formatter.write_str("RestoreError::NoSessions"),
+            Self::UncleanSessionsNotRestorable {
+                session_count,
+                reason,
+            } => formatter
+                .debug_struct("RestoreError::UncleanSessionsNotRestorable")
+                .field("session_count", session_count)
+                .field("reason", reason)
+                .finish(),
+            Self::DetectedCheckpointChanged { checkpoint_id } => formatter
+                .debug_struct("RestoreError::DetectedCheckpointChanged")
+                .field("checkpoint_id", checkpoint_id)
+                .finish(),
             Self::CorruptCheckpoint(_) => {
                 formatter.write_str("RestoreError::CorruptCheckpoint")
             }
+            Self::CheckpointResourceLimit {
+                checkpoint_id,
+                resource,
+                observed,
+                limit,
+            } => formatter
+                .debug_struct("RestoreError::CheckpointResourceLimit")
+                .field("checkpoint_id", checkpoint_id)
+                .field("resource", resource)
+                .field("observed", observed)
+                .field("limit", limit)
+                .finish(),
             Self::TopologyParse(_) => formatter.write_str("RestoreError::TopologyParse"),
             Self::Wezterm(_) => formatter.write_str("RestoreError::MuxOperation"),
             Self::Interrupted { phase, reason } => formatter
@@ -255,9 +390,32 @@ impl std::fmt::Debug for RestoreError {
                 .field("phase", phase)
                 .field("reason", reason)
                 .finish(),
+            Self::PartialRestore { summary } => formatter
+                .debug_struct("RestoreError::PartialRestore")
+                .field("checkpoint_id", &summary.checkpoint_id)
+                .field("intent_checkpoint_id", &summary.intent_checkpoint_id)
+                .field("outcome_checkpoint_id", &summary.outcome_checkpoint_id)
+                .field(
+                    "restore_authority_resolved",
+                    &summary.restore_authority_resolved,
+                )
+                .finish(),
             Self::SafeScrollbackReplayUnavailable => {
                 formatter.write_str("RestoreError::SafeScrollbackReplayUnavailable")
             }
+        }
+    }
+}
+
+impl RestoreError {
+    /// Durable partial receipt carried by a non-successful restore outcome.
+    /// Callers can render exact progress without treating the `Result` as
+    /// success or losing the intent/outcome IDs needed for reconciliation.
+    #[must_use]
+    pub fn partial_restore_summary(&self) -> Option<&RestoreSummary> {
+        match self {
+            Self::PartialRestore { summary } => Some(summary.as_ref()),
+            _ => None,
         }
     }
 }
@@ -368,7 +526,10 @@ fn restore_snapshot_interruption_reason(error: &SnapshotError) -> RestoreInterru
         | SnapshotError::AuthorityReconciliationRequired { .. }
         | SnapshotError::LockPoisoned
         | SnapshotError::LockPolledAfterCompletion => RestoreInterruptionReason::IntegrityFailure,
-        SnapshotError::Topology(_) | SnapshotError::Serialization(_) => {
+        SnapshotError::Topology(_)
+        | SnapshotError::PaneIdentitySetMismatch { .. }
+        | SnapshotError::ProjectionResourceLimit { .. }
+        | SnapshotError::Serialization(_) => {
             RestoreInterruptionReason::ValidationFailure
         }
         SnapshotError::InProgress
@@ -560,6 +721,32 @@ fn decode_bool(value: i64, field: &'static str) -> Result<bool, RestoreError> {
     }
 }
 
+fn validate_session_selector(session_id: &str) -> Result<(), RestoreError> {
+    if session_id.is_empty() || session_id.len() > MAX_CHECKPOINT_SESSION_ID_BYTES {
+        return Err(RestoreError::InvalidSessionSelector);
+    }
+    Ok(())
+}
+
+fn decode_required_bounded_text(
+    value: Option<String>,
+    field: &'static str,
+) -> Result<String, RestoreError> {
+    value.ok_or(RestoreError::InvalidPersistedText { field })
+}
+
+fn decode_optional_bounded_text(
+    value: Option<String>,
+    was_present: i64,
+    field: &'static str,
+) -> Result<Option<String>, RestoreError> {
+    let was_present = decode_bool(was_present, field)?;
+    if was_present != value.is_some() {
+        return Err(RestoreError::InvalidPersistedText { field });
+    }
+    Ok(value)
+}
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -666,9 +853,10 @@ pub struct SessionCandidate {
     pub session_id: String,
     pub created_at: u64,
     pub last_checkpoint_at: Option<u64>,
-    /// Mutable latest-session summary retained for CLI compatibility. Restore
-    /// authority comes exclusively from `CheckpointData::topology_json`.
-    pub topology_json: String,
+    /// Exact snapshot selected by bounded detection, when detection performed
+    /// that selection. Restore still reloads and verifies this row before any
+    /// external mux effect.
+    pub selected_checkpoint_id: Option<i64>,
     pub ft_version: String,
     pub host_id: Option<String>,
 }
@@ -679,7 +867,7 @@ impl std::fmt::Debug for SessionCandidate {
             .debug_struct("SessionCandidate")
             .field("has_session_id", &!self.session_id.is_empty())
             .field("has_last_checkpoint", &self.last_checkpoint_at.is_some())
-            .field("topology_bytes", &self.topology_json.len())
+            .field("selected_checkpoint_id", &self.selected_checkpoint_id)
             .field("has_ft_version", &!self.ft_version.is_empty())
             .field("has_host_id", &self.host_id.is_some())
             .finish()
@@ -749,6 +937,12 @@ pub struct CheckpointData {
     pub verification: CheckpointVerification,
     /// Exact persisted consistency witness for this checkpoint row.
     pub state_hash: String,
+    /// Exact bounded metadata bytes loaded with this row. Coverage by a
+    /// recomputed v2 witness is indicated separately by `verification`.
+    ///
+    /// Callers must parse a purpose-specific bounded projection and must not
+    /// emit this potentially sensitive payload directly.
+    metadata_json: Option<String>,
     /// Topology owned by this exact checkpoint. Receipts have no topology.
     pub topology_json: Option<String>,
     /// Exact intent causally settled by this outcome receipt. Snapshot and
@@ -769,6 +963,7 @@ impl std::fmt::Debug for CheckpointData {
             .field("has_session_id", &!self.session_id.is_empty())
             .field("has_checkpoint_type", &!self.checkpoint_type.is_empty())
             .field("has_state_hash", &!self.state_hash.is_empty())
+            .field("has_metadata", &self.metadata_json.is_some())
             .field("has_topology", &self.topology_json.is_some())
             .field(
                 "restore_intent_checkpoint_id",
@@ -778,6 +973,17 @@ impl std::fmt::Debug for CheckpointData {
             .field("loaded_pane_count", &self.pane_states.len())
             .field("total_bytes", &self.total_bytes)
             .finish()
+    }
+}
+
+impl CheckpointData {
+    /// Return the exact bounded metadata JSON loaded with this checkpoint.
+    /// Consult [`CheckpointData::verification`] before treating those bytes as
+    /// covered by a recomputed v2 consistency witness; legacy rows are exposed
+    /// for explicit recovery but remain unverified.
+    #[must_use]
+    pub fn metadata_json(&self) -> Option<&str> {
+        self.metadata_json.as_deref()
     }
 }
 
@@ -877,6 +1083,33 @@ fn duplicate_target_source_pane_ids(pane_id_map: &HashMap<u64, u64>) -> HashSet<
         .collect()
 }
 
+/// Retain only source-owned, one-to-one mappings that are not also classified
+/// as failed. Raw mux results may report a mapping and a failure for the same
+/// source, or map multiple sources onto one target. Neither shape is an
+/// authoritative success, but both must remain representable in the separate
+/// failure/anomaly evidence of a durable partial receipt.
+fn authoritative_persisted_pane_mapping(
+    expected_pane_ids: &HashSet<u64>,
+    failed_source_pane_ids: &[u64],
+    raw_pane_id_map: &HashMap<u64, u64>,
+) -> HashMap<u64, u64> {
+    let mut failed_source_pane_ids = failed_source_pane_ids.iter().copied().collect::<HashSet<_>>();
+    failed_source_pane_ids.extend(duplicate_target_source_pane_ids(raw_pane_id_map));
+    let mut ordered_expected_pane_ids = expected_pane_ids.iter().copied().collect::<Vec<_>>();
+    ordered_expected_pane_ids.sort_unstable();
+    let mut persisted_target_ids = HashSet::new();
+    ordered_expected_pane_ids
+        .into_iter()
+        .filter_map(|old_id| {
+            if failed_source_pane_ids.contains(&old_id) {
+                return None;
+            }
+            let new_id = *raw_pane_id_map.get(&old_id)?;
+            persisted_target_ids.insert(new_id).then_some((old_id, new_id))
+        })
+        .collect()
+}
+
 impl RestoreSummary {
     fn failed_expected_pane_ids_for(&self, expected: &HashSet<u64>) -> HashSet<u64> {
         let mut failed = expected
@@ -971,6 +1204,21 @@ fn open_query_conn(db_path: &str) -> Result<Connection, RestoreError> {
     Ok(conn)
 }
 
+/// Run a multi-statement observation against one stable SQLite read snapshot.
+/// Payload admission intentionally uses separate scalar, aggregate, and text
+/// statements so oversized values never cross into Rust before their limits
+/// pass; the surrounding transaction keeps those statements causally aligned.
+fn with_query_snapshot<T>(
+    db_path: &str,
+    operation: impl FnOnce(&Connection) -> Result<T, RestoreError>,
+) -> Result<T, RestoreError> {
+    let mut conn = open_query_conn(db_path)?;
+    let tx = conn.transaction()?;
+    let result = operation(&tx)?;
+    tx.commit()?;
+    Ok(result)
+}
+
 type RestoreAmbiguity = (i64, Option<i64>, String);
 
 /// Return the causal-first restore attempt that makes a new restore unsafe.
@@ -982,16 +1230,26 @@ fn restore_ambiguity_from_conn(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Option<RestoreAmbiguity>, RestoreError> {
-    conn.query_row(
+    let unresolved = conn.query_row(
         "SELECT intent_checkpoint_id, outcome_checkpoint_id, status
          FROM (
              SELECT lifecycle.intent_checkpoint_id AS intent_checkpoint_id,
                     lifecycle.outcome_checkpoint_id AS outcome_checkpoint_id,
-                    lifecycle.status AS status,
+                    CASE lifecycle.status
+                        WHEN 'intent' THEN 'intent'
+                        WHEN 'outcome_complete' THEN 'outcome_complete'
+                        WHEN 'reconciliation_required' THEN 'reconciliation_required'
+                        ELSE 'invalid_lifecycle'
+                    END AS status,
                     0 AS ambiguity_kind
              FROM restore_attempt_lifecycle AS lifecycle
              WHERE lifecycle.session_id = ?1
-               AND lifecycle.status <> 'resolved'
+               AND CASE
+                       WHEN typeof(lifecycle.status) = 'text'
+                        AND lifecycle.status = 'resolved'
+                       THEN 0
+                       ELSE 1
+                   END = 1
 
              UNION ALL
 
@@ -1004,15 +1262,29 @@ fn restore_ambiguity_from_conn(
                AND (
                    intent.checkpoint_role = 'restore_intent'
                    OR (
-                       intent.checkpoint_role = 'restore_receipt'
+                   intent.checkpoint_role = 'restore_receipt'
                        AND CASE
-                           WHEN json_valid(intent.metadata_json)
-                           THEN json_extract(
+                           WHEN typeof(intent.metadata_json) != 'text'
+                             OR length(CAST(intent.metadata_json AS BLOB)) > ?2
+                           THEN 1
+                           WHEN NOT json_valid(intent.metadata_json)
+                           THEN 1
+                           WHEN json_extract(
                                intent.metadata_json,
                                '$.restore_attempt.phase'
-                           )
-                           ELSE NULL
-                       END = 'intent'
+                           ) = 'outcome'
+                           THEN 0
+                           WHEN json_type(
+                                   intent.metadata_json,
+                                   '$.restore_attempt'
+                                ) IS NULL
+                            AND json_type(
+                                   intent.metadata_json,
+                                   '$.old_to_new'
+                                ) = 'object'
+                           THEN 0
+                           ELSE 1
+                       END = 1
                    )
                )
                AND NOT EXISTS (
@@ -1024,11 +1296,160 @@ fn restore_ambiguity_from_conn(
          )
          ORDER BY intent_checkpoint_id ASC, ambiguity_kind ASC
          LIMIT 1",
-        [session_id],
+        rusqlite::params![
+            session_id,
+            i64::try_from(MAX_CHECKPOINT_METADATA_BYTES).unwrap_or(i64::MAX),
+        ],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
     .optional()
-    .map_err(RestoreError::from)
+    .map_err(RestoreError::from)?;
+    // A resolved lifecycle suppresses replay only while its exact outcome
+    // remains a valid verified authority chain. Historical/corrupt databases
+    // can lose the outcome row with foreign keys disabled; treating that as a
+    // clean absence would allow the older source snapshot to be replayed.
+    let mut resolved_stmt = conn.prepare(
+        "SELECT CASE
+                    WHEN typeof(intent_checkpoint_id) = 'integer'
+                     AND intent_checkpoint_id > 0
+                    THEN intent_checkpoint_id
+                END,
+                CASE
+                    WHEN typeof(outcome_checkpoint_id) = 'integer'
+                     AND outcome_checkpoint_id > 0
+                    THEN outcome_checkpoint_id
+                END
+         FROM restore_attempt_lifecycle
+         WHERE session_id = ?1
+           AND typeof(status) = 'text'
+           AND status = 'resolved'
+         ORDER BY intent_checkpoint_id ASC",
+    )?;
+    let mut resolved_rows = resolved_stmt.query([session_id])?;
+    let mut invalid_resolved = None;
+    while let Some(row) = resolved_rows.next()? {
+        let intent_checkpoint_id = row.get::<_, Option<i64>>(0)?;
+        let outcome_checkpoint_id = row.get::<_, Option<i64>>(1)?;
+        let Some(intent_checkpoint_id) = intent_checkpoint_id else {
+            invalid_resolved = Some((
+                -1,
+                outcome_checkpoint_id,
+                "invalid_resolved_chain".to_string(),
+            ));
+            break;
+        };
+        let Some(outcome_checkpoint_id) = outcome_checkpoint_id else {
+            invalid_resolved = Some((
+                intent_checkpoint_id,
+                None,
+                "invalid_resolved_chain".to_string(),
+            ));
+            break;
+        };
+        if !resolved_restore_chain_row_is_valid(
+            conn,
+            session_id,
+            intent_checkpoint_id,
+            outcome_checkpoint_id,
+        )? {
+            invalid_resolved = Some((
+                intent_checkpoint_id,
+                Some(outcome_checkpoint_id),
+                "invalid_resolved_chain".to_string(),
+            ));
+            break;
+        }
+    }
+    Ok(match (unresolved, invalid_resolved) {
+        (Some(unresolved), Some(invalid_resolved)) => {
+            if unresolved.0 <= invalid_resolved.0 {
+                Some(unresolved)
+            } else {
+                Some(invalid_resolved)
+            }
+        }
+        (Some(unresolved), None) => Some(unresolved),
+        (None, Some(invalid_resolved)) => Some(invalid_resolved),
+        (None, None) => None,
+    })
+}
+
+fn resolved_restore_chain_row_is_valid(
+    conn: &Connection,
+    session_id: &str,
+    intent_checkpoint_id: i64,
+    outcome_checkpoint_id: i64,
+) -> Result<bool, RestoreError> {
+    let session_exists = conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM mux_sessions WHERE session_id = ?1
+         )",
+        [session_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !session_exists {
+        return Ok(false);
+    }
+    let outcome = match load_checkpoint_by_id_from_conn(conn, outcome_checkpoint_id) {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return Ok(false),
+        Err(RestoreError::Database(error)) => return Err(RestoreError::Database(error)),
+        Err(_error) => return Ok(false),
+    };
+    match validate_restore_authority_chain(conn, session_id, &outcome, "resolved", false) {
+        Ok(validated_intent_id) => Ok(validated_intent_id == intent_checkpoint_id),
+        Err(RestoreError::Database(error)) => Err(RestoreError::Database(error)),
+        Err(_error) => Ok(false),
+    }
+}
+
+fn count_invalid_resolved_restore_chains_from_conn(
+    conn: &Connection,
+) -> Result<usize, RestoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT CASE
+                    WHEN typeof(intent_checkpoint_id) = 'integer'
+                     AND intent_checkpoint_id > 0
+                    THEN intent_checkpoint_id
+                END,
+                CASE
+                    WHEN typeof(session_id) = 'text'
+                     AND length(CAST(session_id AS BLOB)) BETWEEN 1 AND ?1
+                    THEN session_id
+                END,
+                CASE
+                    WHEN typeof(outcome_checkpoint_id) = 'integer'
+                     AND outcome_checkpoint_id > 0
+                    THEN outcome_checkpoint_id
+                END
+         FROM restore_attempt_lifecycle
+         WHERE typeof(status) = 'text' AND status = 'resolved'
+         ORDER BY intent_checkpoint_id ASC",
+    )?;
+    let mut rows = stmt.query([
+        i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX),
+    ])?;
+    let mut invalid = 0usize;
+    while let Some(row) = rows.next()? {
+        let intent_checkpoint_id = row.get::<_, Option<i64>>(0)?;
+        let session_id = row.get::<_, Option<String>>(1)?;
+        let outcome_checkpoint_id = row.get::<_, Option<i64>>(2)?;
+        let valid = match (intent_checkpoint_id, session_id, outcome_checkpoint_id) {
+            (Some(intent_checkpoint_id), Some(session_id), Some(outcome_checkpoint_id)) => {
+                resolved_restore_chain_row_is_valid(
+                    conn,
+                    &session_id,
+                    intent_checkpoint_id,
+                    outcome_checkpoint_id,
+                )?
+            }
+            _ => false,
+        };
+        if !valid {
+            invalid = invalid.saturating_add(1);
+        }
+    }
+    Ok(invalid)
 }
 
 /// Validate the exact clean-session authority row. V2 receipts are accepted
@@ -1066,16 +1487,42 @@ pub(crate) fn assess_clean_authority(
         return Ok(false);
     }
 
-    let checkpoint_identity: Option<(String, String, i64)> = conn
+    let checkpoint_identity: Option<(Option<String>, Option<String>, Option<i64>)> = conn
         .query_row(
-            "SELECT checkpoint_role, state_hash, checkpoint_at
+            "SELECT CASE
+                        WHEN typeof(checkpoint_role) = 'text'
+                         AND length(CAST(checkpoint_role AS BLOB))
+                             BETWEEN 1 AND ?3
+                        THEN checkpoint_role
+                    END,
+                    CASE
+                        WHEN typeof(state_hash) = 'text'
+                         AND length(CAST(state_hash AS BLOB))
+                             BETWEEN 1 AND ?4
+                        THEN state_hash
+                    END,
+                    CASE
+                        WHEN typeof(checkpoint_at) = 'integer'
+                         AND checkpoint_at >= 0
+                        THEN checkpoint_at
+                    END
              FROM session_checkpoints
              WHERE id = ?1 AND session_id = ?2",
-            rusqlite::params![clean_checkpoint_id, session_id],
+            rusqlite::params![
+                clean_checkpoint_id,
+                session_id,
+                i64::try_from(MAX_CHECKPOINT_ROLE_BYTES).unwrap_or(i64::MAX),
+                i64::try_from(MAX_CHECKPOINT_STATE_HASH_BYTES).unwrap_or(i64::MAX),
+            ],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((checkpoint_role_raw, stored_state_hash, checkpoint_at)) = checkpoint_identity else {
+    let Some((
+        Some(checkpoint_role_raw),
+        Some(stored_state_hash),
+        Some(checkpoint_at),
+    )) = checkpoint_identity
+    else {
         return Ok(false);
     };
     let summary_checkpoint_at = conn
@@ -1096,7 +1543,7 @@ pub(crate) fn assess_clean_authority(
         Ok(role) => role,
         Err(_error) => {
             warn!(
-                %session_id,
+                session_id_bytes = session_id.len(),
                 checkpoint_id = clean_checkpoint_id,
                 "Rejecting clean-session authority with an invalid role"
             );
@@ -1108,7 +1555,7 @@ pub(crate) fn assess_clean_authority(
         || stored_state_hash.starts_with(RESTORE_RECEIPT_WITNESS_PREFIX);
     if !is_v2 {
         debug!(
-            %session_id,
+            session_id_bytes = session_id.len(),
             checkpoint_id = clean_checkpoint_id,
             role = %checkpoint_role,
             "Rejecting legacy-unverified clean-session authority"
@@ -1122,7 +1569,7 @@ pub(crate) fn assess_clean_authority(
         Err(RestoreError::Database(error)) => return Err(RestoreError::Database(error)),
         Err(_error) => {
             warn!(
-                %session_id,
+                session_id_bytes = session_id.len(),
                 checkpoint_id = clean_checkpoint_id,
                 "Rejecting corrupt clean-session authority"
             );
@@ -1151,7 +1598,7 @@ pub(crate) fn assess_clean_authority(
                     return Err(RestoreError::Database(message));
                 }
                 warn!(
-                    %session_id,
+                    session_id_bytes = session_id.len(),
                     checkpoint_id = clean_checkpoint_id,
                     "Rejecting clean restore authority with an invalid causal chain"
                 );
@@ -1164,18 +1611,42 @@ pub(crate) fn assess_clean_authority(
 
 /// Find sessions that did not shut down cleanly.
 pub fn find_unclean_sessions(db_path: &str) -> Result<Vec<SessionCandidate>, RestoreError> {
-    let conn = open_query_conn(db_path)?;
+    with_query_snapshot(db_path, find_unclean_sessions_from_conn)
+}
+
+fn find_unclean_sessions_from_conn(
+    conn: &Connection,
+) -> Result<Vec<SessionCandidate>, RestoreError> {
     let mut stmt = conn.prepare(
-        "SELECT session.session_id,
+        "SELECT CASE
+                    WHEN typeof(session.session_id) = 'text'
+                     AND length(CAST(session.session_id AS BLOB)) BETWEEN 1 AND ?1
+                    THEN session.session_id
+                END,
                 session.created_at,
                 (SELECT causal.checkpoint_at
                  FROM session_checkpoints AS causal
                  WHERE causal.session_id = session.session_id
                  ORDER BY causal.id DESC
                  LIMIT 1) AS last_checkpoint_at,
-                session.topology_json,
-                session.ft_version,
-                session.host_id,
+                (SELECT snapshot.id
+                 FROM session_checkpoints AS snapshot
+                 WHERE snapshot.session_id = session.session_id
+                   AND snapshot.checkpoint_role = 'snapshot'
+                 ORDER BY snapshot.id DESC
+                 LIMIT 1) AS selected_checkpoint_id,
+                CASE
+                    WHEN typeof(session.ft_version) = 'text'
+                     AND length(CAST(session.ft_version AS BLOB)) BETWEEN 1 AND ?2
+                    THEN session.ft_version
+                END,
+                CASE
+                    WHEN session.host_id IS NULL THEN NULL
+                    WHEN typeof(session.host_id) = 'text'
+                     AND length(CAST(session.host_id AS BLOB)) <= ?3
+                    THEN session.host_id
+                END,
+                session.host_id IS NOT NULL,
                 session.shutdown_clean,
                 session.clean_checkpoint_id
          FROM mux_sessions AS session
@@ -1188,16 +1659,23 @@ pub fn find_unclean_sessions(db_path: &str) -> Result<Vec<SessionCandidate>, Res
                   session.session_id ASC",
     )?;
 
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(
+        rusqlite::params![
+            i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX),
+            i64::try_from(MAX_SESSION_FT_VERSION_BYTES).unwrap_or(i64::MAX),
+            i64::try_from(MAX_SESSION_HOST_ID_BYTES).unwrap_or(i64::MAX),
+        ],
+        |row| {
         Ok((
-            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(0)?,
             row.get::<_, i64>(1)?,
             row.get::<_, Option<i64>>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
             row.get::<_, i64>(6)?,
-            row.get::<_, Option<i64>>(7)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, Option<i64>>(8)?,
         ))
     })?;
 
@@ -1207,14 +1685,28 @@ pub fn find_unclean_sessions(db_path: &str) -> Result<Vec<SessionCandidate>, Res
             session_id,
             created_at,
             last_checkpoint_at,
-            topology_json,
+            selected_checkpoint_id,
             ft_version,
             host_id,
+            host_id_present,
             shutdown_clean,
             clean_checkpoint_id,
         ) = row?;
+        let session_id = decode_required_bounded_text(
+            session_id,
+            "mux_sessions.session_id",
+        )?;
+        let ft_version = decode_required_bounded_text(
+            ft_version,
+            "mux_sessions.ft_version",
+        )?;
+        let host_id = decode_optional_bounded_text(
+            host_id,
+            host_id_present,
+            "mux_sessions.host_id",
+        )?;
         if assess_clean_authority(
-            &conn,
+            conn,
             &session_id,
             shutdown_clean,
             clean_checkpoint_id,
@@ -1226,9 +1718,9 @@ pub fn find_unclean_sessions(db_path: &str) -> Result<Vec<SessionCandidate>, Res
             created_at: decode_u64(created_at, "mux_sessions.created_at")?,
             last_checkpoint_at: decode_opt_u64(
                 last_checkpoint_at,
-                "mux_sessions.last_checkpoint_at",
+                "session_checkpoints.checkpoint_at",
             )?,
-            topology_json,
+            selected_checkpoint_id,
             ft_version,
             host_id,
         });
@@ -1242,37 +1734,227 @@ pub fn load_latest_checkpoint(
     db_path: &str,
     session_id: &str,
 ) -> Result<Option<CheckpointData>, RestoreError> {
-    let conn = open_query_conn(db_path)?;
+    validate_session_selector(session_id)?;
+    with_query_snapshot(db_path, |conn| {
+        // Purpose is explicit in schema v36. Do not infer it from pane-row
+        // presence or the overloaded `startup` checkpoint type: a genuine
+        // empty snapshot is still a snapshot, while a receipt is never one.
+        let checkpoint_id = conn.query_row(
+            "SELECT c.id
+             FROM session_checkpoints c
+             WHERE c.session_id = ?1
+               AND c.checkpoint_role = 'snapshot'
+             ORDER BY c.id DESC
+             LIMIT 1",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        );
 
-    // Purpose is explicit in schema v36. Do not infer it from pane-row
-    // presence or the overloaded `startup` checkpoint type: a genuine empty
-    // snapshot is still a snapshot, while a restore receipt is never one.
-    let checkpoint_id = conn.query_row(
-        "SELECT c.id
-         FROM session_checkpoints c
-         WHERE c.session_id = ?1
-           AND c.checkpoint_role = 'snapshot'
-         ORDER BY c.id DESC
-         LIMIT 1",
-        [session_id],
-        |row| row.get::<_, i64>(0),
-    );
-
-    match checkpoint_id {
-        Ok(id) => load_checkpoint_by_id_from_conn(&conn, id),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(_error) => Err(RestoreError::Database(
-            "checkpoint lookup failed".to_string(),
-        )),
-    }
+        match checkpoint_id {
+            Ok(id) => load_checkpoint_by_id_from_conn(conn, id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(_error) => Err(RestoreError::Database(
+                "checkpoint lookup failed".to_string(),
+            )),
+        }
+    })
 }
 
-fn unresolved_restore_attempt(
-    db_path: &str,
-    session_id: &str,
-) -> Result<Option<RestoreAmbiguity>, RestoreError> {
-    let conn = open_query_conn(db_path)?;
-    restore_ambiguity_from_conn(&conn, session_id)
+#[derive(Debug, Clone, Copy)]
+struct RestoreCandidateCheckpoint {
+    checkpoint_at: u64,
+    verification: CheckpointVerification,
+}
+
+/// Read only the bounded scalar admission data needed to rank a candidate.
+/// Full topology/pane JSON and the v2 witness are loaded only after the
+/// selected checkpoint has passed this descriptor admission.
+fn restore_candidate_checkpoint_from_conn(
+    conn: &Connection,
+    checkpoint_id: i64,
+) -> Result<Option<RestoreCandidateCheckpoint>, RestoreError> {
+    let header = conn
+        .query_row(
+            "SELECT checkpoint_at,
+                    pane_count,
+                    total_bytes,
+                    CASE
+                        WHEN typeof(state_hash) = 'text'
+                         AND length(CAST(state_hash AS BLOB)) BETWEEN 1 AND ?2
+                        THEN state_hash
+                    END,
+                    CASE
+                        WHEN topology_json IS NULL THEN NULL
+                        ELSE length(CAST(topology_json AS BLOB))
+                    END,
+                    CASE
+                        WHEN metadata_json IS NULL THEN NULL
+                        ELSE length(CAST(metadata_json AS BLOB))
+                    END
+             FROM session_checkpoints
+             WHERE id = ?1 AND checkpoint_role = 'snapshot'",
+            rusqlite::params![
+                checkpoint_id,
+                i64::try_from(MAX_CHECKPOINT_STATE_HASH_BYTES).unwrap_or(i64::MAX),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        checkpoint_at_raw,
+        pane_count_raw,
+        total_bytes_raw,
+        state_hash,
+        topology_bytes_raw,
+        metadata_bytes_raw,
+    )) = header
+    else {
+        return Ok(None);
+    };
+    let checkpoint_at = decode_u64(checkpoint_at_raw, "session_checkpoints.checkpoint_at")?;
+    let pane_count = decode_usize(pane_count_raw, "session_checkpoints.pane_count")?;
+    let total_bytes = decode_usize(total_bytes_raw, "session_checkpoints.total_bytes")?;
+    let state_hash = state_hash.ok_or_else(|| {
+        RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} has an invalid or oversized state hash"
+        ))
+    })?;
+    let topology_bytes = topology_bytes_raw
+        .map(|bytes| decode_usize(bytes, "session_checkpoints.topology_json_bytes"))
+        .transpose()?
+        .ok_or(RestoreError::CheckpointTopologyUnavailable { checkpoint_id })?;
+    let metadata_bytes = metadata_bytes_raw
+        .map(|bytes| decode_usize(bytes, "session_checkpoints.metadata_json_bytes"))
+        .transpose()?
+        .unwrap_or(0);
+    if pane_count == 0 {
+        return Ok(None);
+    }
+    for (resource, observed, limit) in [
+        ("pane_count", pane_count, MAX_TOPOLOGY_PANES),
+        (
+            "historical_payload_bytes",
+            total_bytes,
+            MAX_PERSISTED_CHECKPOINT_TEXT_BYTES,
+        ),
+        ("topology_json_bytes", topology_bytes, MAX_SNAPSHOT_BYTES),
+        (
+            "metadata_json_bytes",
+            metadata_bytes,
+            MAX_CHECKPOINT_METADATA_BYTES,
+        ),
+    ] {
+        if observed > limit {
+            return Err(RestoreError::CheckpointResourceLimit {
+                checkpoint_id,
+                resource,
+                observed,
+                limit,
+            });
+        }
+    }
+
+    let preflight_row_limit = pane_count.checked_add(1).ok_or_else(|| {
+        RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} candidate row limit overflows usize"
+        ))
+    })?;
+    let (
+        stored_pane_count_raw,
+        pane_text_bytes_raw,
+        max_pane_text_bytes_raw,
+        invalid_text_rows,
+    ): (i64, i64, i64, i64) = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(
+                        COALESCE(length(CAST(cwd AS BLOB)), 0)
+                      + COALESCE(length(CAST(command AS BLOB)), 0)
+                      + COALESCE(length(CAST(env_json AS BLOB)), 0)
+                      + COALESCE(length(CAST(terminal_state_json AS BLOB)), 0)
+                      + COALESCE(length(CAST(agent_metadata_json AS BLOB)), 0)
+                    ), 0),
+                    COALESCE(MAX(
+                        COALESCE(length(CAST(cwd AS BLOB)), 0)
+                      + COALESCE(length(CAST(command AS BLOB)), 0)
+                      + COALESCE(length(CAST(env_json AS BLOB)), 0)
+                      + COALESCE(length(CAST(terminal_state_json AS BLOB)), 0)
+                      + COALESCE(length(CAST(agent_metadata_json AS BLOB)), 0)
+                    ), 0),
+                    COALESCE(SUM(CASE
+                        WHEN typeof(terminal_state_json) != 'text'
+                          OR (cwd IS NOT NULL AND typeof(cwd) != 'text')
+                          OR (command IS NOT NULL AND typeof(command) != 'text')
+                          OR (env_json IS NOT NULL AND typeof(env_json) != 'text')
+                          OR (agent_metadata_json IS NOT NULL
+                              AND typeof(agent_metadata_json) != 'text')
+                        THEN 1 ELSE 0 END), 0)
+             FROM (
+                 SELECT cwd, command, env_json, terminal_state_json,
+                        agent_metadata_json
+                 FROM mux_pane_state
+                 WHERE checkpoint_id = ?1
+                 LIMIT ?2
+             ) AS bounded_pane_rows",
+            rusqlite::params![
+                checkpoint_id,
+                i64::try_from(preflight_row_limit).unwrap_or(i64::MAX),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    let stored_pane_count = decode_usize(stored_pane_count_raw, "mux_pane_state.row_count")?;
+    let pane_text_bytes = decode_usize(pane_text_bytes_raw, "mux_pane_state.text_bytes")?;
+    let max_pane_text_bytes = decode_usize(
+        max_pane_text_bytes_raw,
+        "mux_pane_state.max_row_text_bytes",
+    )?;
+    let admitted_bytes = topology_bytes
+        .checked_add(metadata_bytes)
+        .and_then(|bytes| bytes.checked_add(pane_text_bytes))
+        .ok_or_else(|| {
+            RestoreError::CorruptCheckpoint(format!(
+                "checkpoint {checkpoint_id} candidate byte count overflows usize"
+            ))
+        })?;
+    if invalid_text_rows != 0 || stored_pane_count != pane_count {
+        return Err(RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} has an inadmissible pane projection"
+        )));
+    }
+    if max_pane_text_bytes > MAX_PERSISTED_PANE_TEXT_BYTES {
+        return Err(RestoreError::CheckpointResourceLimit {
+            checkpoint_id,
+            resource: "pane_text_row_bytes",
+            observed: max_pane_text_bytes,
+            limit: MAX_PERSISTED_PANE_TEXT_BYTES,
+        });
+    }
+    if admitted_bytes > MAX_PERSISTED_CHECKPOINT_TEXT_BYTES {
+        return Err(RestoreError::CheckpointResourceLimit {
+            checkpoint_id,
+            resource: "checkpoint_text_bytes",
+            observed: admitted_bytes,
+            limit: MAX_PERSISTED_CHECKPOINT_TEXT_BYTES,
+        });
+    }
+
+    let verification = if state_hash.starts_with(SNAPSHOT_WITNESS_PREFIX) {
+        CheckpointVerification::VerifiedV2
+    } else {
+        CheckpointVerification::LegacyUnverified
+    };
+    Ok(Some(RestoreCandidateCheckpoint {
+        checkpoint_at,
+        verification,
+    }))
 }
 
 /// Load a specific checkpoint by row ID, including pane states.
@@ -1280,8 +1962,9 @@ pub fn load_checkpoint_by_id(
     db_path: &str,
     checkpoint_id: i64,
 ) -> Result<Option<CheckpointData>, RestoreError> {
-    let conn = open_query_conn(db_path)?;
-    load_checkpoint_by_id_from_conn(&conn, checkpoint_id)
+    with_query_snapshot(db_path, |conn| {
+        load_checkpoint_by_id_from_conn(conn, checkpoint_id)
+    })
 }
 
 /// Cx-first checkpoint lookup that keeps SQLite reads, JSON decoding, and v2
@@ -1299,29 +1982,77 @@ pub async fn load_checkpoint_by_id_with_cx(
     .map_err(|error| restore_blocking_error("checkpoint lookup", error))?
 }
 
-fn load_checkpoint_by_id_from_conn(
+pub(crate) fn load_checkpoint_by_id_from_conn(
     conn: &Connection,
     checkpoint_id: i64,
 ) -> Result<Option<CheckpointData>, RestoreError> {
     let checkpoint = conn.query_row(
-        "SELECT session_id, checkpoint_at, checkpoint_type, checkpoint_role,
-                state_hash, pane_count, total_bytes, metadata_json, topology_json,
+        "SELECT
+                CASE
+                    WHEN typeof(session_id) = 'text'
+                     AND length(CAST(session_id AS BLOB)) BETWEEN 1 AND ?2
+                    THEN session_id
+                END,
+                checkpoint_at,
+                CASE
+                    WHEN typeof(checkpoint_type) = 'text'
+                     AND length(CAST(checkpoint_type AS BLOB)) BETWEEN 1 AND ?3
+                    THEN checkpoint_type
+                END,
+                CASE
+                    WHEN typeof(checkpoint_role) = 'text'
+                     AND length(CAST(checkpoint_role AS BLOB)) BETWEEN 1 AND ?4
+                    THEN checkpoint_role
+                END,
+                CASE
+                    WHEN typeof(state_hash) = 'text'
+                     AND length(CAST(state_hash AS BLOB)) BETWEEN 1 AND ?5
+                    THEN state_hash
+                END,
+                pane_count,
+                total_bytes,
+                CASE
+                    WHEN metadata_json IS NULL THEN 0
+                    WHEN typeof(metadata_json) = 'text' THEN 1
+                    ELSE 2
+                END,
+                CASE
+                    WHEN metadata_json IS NULL THEN 0
+                    ELSE length(CAST(metadata_json AS BLOB))
+                END,
+                CASE
+                    WHEN topology_json IS NULL THEN 0
+                    WHEN typeof(topology_json) = 'text' THEN 1
+                    ELSE 2
+                END,
+                CASE
+                    WHEN topology_json IS NULL THEN 0
+                    ELSE length(CAST(topology_json AS BLOB))
+                END,
                 restore_intent_checkpoint_id
          FROM session_checkpoints
          WHERE id = ?1",
-        [checkpoint_id],
+        rusqlite::params![
+            checkpoint_id,
+            i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX),
+            i64::try_from(MAX_CHECKPOINT_TYPE_BYTES).unwrap_or(i64::MAX),
+            i64::try_from(MAX_CHECKPOINT_ROLE_BYTES).unwrap_or(i64::MAX),
+            i64::try_from(MAX_CHECKPOINT_STATE_HASH_BYTES).unwrap_or(i64::MAX),
+        ],
         |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
                 row.get::<_, i64>(5)?,
                 row.get::<_, i64>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, Option<i64>>(11)?,
             ))
         },
     );
@@ -1334,8 +2065,10 @@ fn load_checkpoint_by_id_from_conn(
         stored_state_hash,
         pane_count_raw,
         total_bytes_raw,
-        metadata_json,
-        topology_json,
+        metadata_kind,
+        metadata_bytes_raw,
+        topology_kind,
+        topology_bytes_raw,
         restore_intent_checkpoint_id,
     ) = match checkpoint {
         Ok(c) => c,
@@ -1346,36 +2079,311 @@ fn load_checkpoint_by_id_from_conn(
             ));
         }
     };
+    let session_id = session_id.ok_or_else(|| {
+        RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} has an invalid or oversized session id"
+        ))
+    })?;
+    let checkpoint_type = checkpoint_type.ok_or_else(|| {
+        RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} has an invalid or oversized checkpoint type"
+        ))
+    })?;
+    let checkpoint_role_raw = checkpoint_role_raw.ok_or_else(|| {
+        RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} has an invalid or oversized checkpoint role"
+        ))
+    })?;
+    let stored_state_hash = stored_state_hash.ok_or_else(|| {
+        RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} has an invalid or oversized state hash"
+        ))
+    })?;
     let checkpoint_at = decode_u64(checkpoint_at_raw, "session_checkpoints.checkpoint_at")?;
     let pane_count = decode_usize(pane_count_raw, "session_checkpoints.pane_count")?;
     let total_bytes = decode_usize(total_bytes_raw, "session_checkpoints.total_bytes")?;
+    if pane_count > MAX_TOPOLOGY_PANES {
+        return Err(RestoreError::CheckpointResourceLimit {
+            checkpoint_id,
+            resource: "pane_count",
+            observed: pane_count,
+            limit: MAX_TOPOLOGY_PANES,
+        });
+    }
+    if total_bytes > MAX_PERSISTED_CHECKPOINT_TEXT_BYTES {
+        return Err(RestoreError::CheckpointResourceLimit {
+            checkpoint_id,
+            resource: "historical_payload_bytes",
+            observed: total_bytes,
+            limit: MAX_PERSISTED_CHECKPOINT_TEXT_BYTES,
+        });
+    }
+    let metadata_bytes = decode_usize(
+        metadata_bytes_raw,
+        "session_checkpoints.metadata_json_bytes",
+    )?;
+    if !matches!(metadata_kind, 0 | 1) || (metadata_kind == 0 && metadata_bytes != 0) {
+        return Err(RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} has non-text metadata"
+        )));
+    }
+    if metadata_bytes > MAX_CHECKPOINT_METADATA_BYTES {
+        return Err(RestoreError::CheckpointResourceLimit {
+            checkpoint_id,
+            resource: "metadata_json_bytes",
+            observed: metadata_bytes,
+            limit: MAX_CHECKPOINT_METADATA_BYTES,
+        });
+    }
+    let topology_bytes = decode_usize(
+        topology_bytes_raw,
+        "session_checkpoints.topology_json_bytes",
+    )?;
+    if !matches!(topology_kind, 0 | 1) || (topology_kind == 0 && topology_bytes != 0) {
+        return Err(RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} has non-text topology"
+        )));
+    }
+    if topology_bytes > MAX_SNAPSHOT_BYTES {
+        return Err(RestoreError::CheckpointResourceLimit {
+            checkpoint_id,
+            resource: "topology_json_bytes",
+            observed: topology_bytes,
+            limit: MAX_SNAPSHOT_BYTES,
+        });
+    }
     let checkpoint_role = CheckpointRole::from_db(checkpoint_id, &checkpoint_role_raw)?;
+    let expected_pane_row_count = match checkpoint_role {
+        CheckpointRole::Snapshot => pane_count,
+        CheckpointRole::RestoreIntent | CheckpointRole::RestoreReceipt => 0,
+    };
+    let preflight_row_limit = expected_pane_row_count.checked_add(1).ok_or_else(|| {
+        RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} pane preflight row limit overflows usize"
+        ))
+    })?;
 
-    // Load the exact persisted pane projection. `env_json` is deliberately
-    // included even though restore does not re-inject environment variables:
-    // it participates in the row-local v2 consistency witness.
+    // Preflight row count and byte sizes without returning any payload text to
+    // Rust. A corrupt declaration therefore cannot become an unbounded Vec
+    // capacity or cause oversized TEXT values to be materialized first.
+    let (stored_pane_count_raw, pane_text_bytes_raw, max_pane_text_bytes_raw, invalid_text_rows):
+        (i64, i64, i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(
+                    COALESCE(length(CAST(cwd AS BLOB)), 0)
+                  + COALESCE(length(CAST(command AS BLOB)), 0)
+                  + COALESCE(length(CAST(env_json AS BLOB)), 0)
+                  + COALESCE(length(CAST(terminal_state_json AS BLOB)), 0)
+                  + COALESCE(length(CAST(agent_metadata_json AS BLOB)), 0)
+                ), 0),
+                COALESCE(MAX(
+                    COALESCE(length(CAST(cwd AS BLOB)), 0)
+                  + COALESCE(length(CAST(command AS BLOB)), 0)
+                  + COALESCE(length(CAST(env_json AS BLOB)), 0)
+                  + COALESCE(length(CAST(terminal_state_json AS BLOB)), 0)
+                  + COALESCE(length(CAST(agent_metadata_json AS BLOB)), 0)
+                ), 0),
+                COALESCE(SUM(CASE
+                    WHEN typeof(terminal_state_json) != 'text'
+                      OR (cwd IS NOT NULL AND typeof(cwd) != 'text')
+                      OR (command IS NOT NULL AND typeof(command) != 'text')
+                      OR (env_json IS NOT NULL AND typeof(env_json) != 'text')
+                      OR (agent_metadata_json IS NOT NULL
+                          AND typeof(agent_metadata_json) != 'text')
+                    THEN 1 ELSE 0 END), 0)
+         FROM (
+             SELECT cwd, command, env_json, terminal_state_json,
+                    agent_metadata_json
+             FROM mux_pane_state
+             WHERE checkpoint_id = ?1
+             LIMIT ?2
+         ) AS bounded_pane_rows",
+        rusqlite::params![
+            checkpoint_id,
+            i64::try_from(preflight_row_limit).unwrap_or(i64::MAX),
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let stored_pane_count = decode_usize(stored_pane_count_raw, "mux_pane_state.row_count")?;
+    let pane_text_bytes = decode_usize(pane_text_bytes_raw, "mux_pane_state.text_bytes")?;
+    let max_pane_text_bytes = decode_usize(
+        max_pane_text_bytes_raw,
+        "mux_pane_state.max_row_text_bytes",
+    )?;
+    if invalid_text_rows != 0 {
+        return Err(RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} stores non-text pane payload columns"
+        )));
+    }
+    if stored_pane_count != expected_pane_row_count {
+        return Err(RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} role {} expects {expected_pane_row_count} pane rows but stores {stored_pane_count}",
+            checkpoint_role.as_db_str()
+        )));
+    }
+    if max_pane_text_bytes > MAX_PERSISTED_PANE_TEXT_BYTES {
+        return Err(RestoreError::CheckpointResourceLimit {
+            checkpoint_id,
+            resource: "pane_text_row_bytes",
+            observed: max_pane_text_bytes,
+            limit: MAX_PERSISTED_PANE_TEXT_BYTES,
+        });
+    }
+    let admitted_checkpoint_bytes = topology_bytes
+        .checked_add(metadata_bytes)
+        .and_then(|bytes| bytes.checked_add(pane_text_bytes))
+        .ok_or_else(|| {
+            RestoreError::CorruptCheckpoint(format!(
+                "checkpoint {checkpoint_id} admitted text byte count overflows usize"
+            ))
+        })?;
+    if admitted_checkpoint_bytes > MAX_PERSISTED_CHECKPOINT_TEXT_BYTES {
+        return Err(RestoreError::CheckpointResourceLimit {
+            checkpoint_id,
+            resource: "checkpoint_text_bytes",
+            observed: admitted_checkpoint_bytes,
+            limit: MAX_PERSISTED_CHECKPOINT_TEXT_BYTES,
+        });
+    }
+
+    // Materialize topology and metadata only after every scalar and aggregate
+    // byte limit has passed. Repeat the exact bounded header identity in this
+    // statement so a concurrent rewrite cannot substitute a different large
+    // payload between admission and allocation. Pane rows are checked again
+    // below, and the final witness recomputation rejects same-size mutation.
+    let payload = conn
+        .query_row(
+            "SELECT metadata_json, topology_json
+             FROM session_checkpoints
+             WHERE id = ?1
+               AND session_id = ?2
+               AND checkpoint_at = ?3
+               AND checkpoint_type = ?4
+               AND checkpoint_role = ?5
+               AND state_hash = ?6
+               AND pane_count = ?7
+               AND total_bytes = ?8
+               AND restore_intent_checkpoint_id IS ?9
+               AND CASE
+                       WHEN metadata_json IS NULL THEN 0
+                       WHEN typeof(metadata_json) = 'text' THEN 1
+                       ELSE 2
+                   END = ?10
+               AND CASE
+                       WHEN metadata_json IS NULL THEN 0
+                       ELSE length(CAST(metadata_json AS BLOB))
+                   END = ?11
+               AND CASE
+                       WHEN topology_json IS NULL THEN 0
+                       WHEN typeof(topology_json) = 'text' THEN 1
+                       ELSE 2
+                   END = ?12
+               AND CASE
+                       WHEN topology_json IS NULL THEN 0
+                       ELSE length(CAST(topology_json AS BLOB))
+                   END = ?13",
+            rusqlite::params![
+                checkpoint_id,
+                session_id.as_str(),
+                checkpoint_at_raw,
+                checkpoint_type.as_str(),
+                checkpoint_role_raw.as_str(),
+                stored_state_hash.as_str(),
+                pane_count_raw,
+                total_bytes_raw,
+                restore_intent_checkpoint_id,
+                metadata_kind,
+                metadata_bytes_raw,
+                topology_kind,
+                topology_bytes_raw,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            RestoreError::CorruptCheckpoint(format!(
+                "checkpoint {checkpoint_id} changed after bounded header admission"
+            ))
+        })?;
+    let (metadata_json, topology_json) = payload;
+    if metadata_json.is_some() != (metadata_kind == 1)
+        || topology_json.is_some() != (topology_kind == 1)
+    {
+        return Err(RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} payload nullability changed after admission"
+        )));
+    }
+
+    // Load at most the admitted count plus one. The WHERE predicates repeat
+    // the row-local text/type admission at read time, so a concurrent rewrite
+    // cannot make an oversized string cross the SQL-to-Rust boundary between
+    // preflight and this statement.
     let mut stmt = conn.prepare(
         "SELECT pane_id, cwd, command, env_json, terminal_state_json,
                 agent_metadata_json, scrollback_checkpoint_seq, last_output_at
          FROM mux_pane_state
          WHERE checkpoint_id = ?1
-         ORDER BY pane_id ASC, id ASC",
+           AND typeof(terminal_state_json) = 'text'
+           AND (cwd IS NULL OR typeof(cwd) = 'text')
+           AND (command IS NULL OR typeof(command) = 'text')
+           AND (env_json IS NULL OR typeof(env_json) = 'text')
+           AND (agent_metadata_json IS NULL OR typeof(agent_metadata_json) = 'text')
+           AND COALESCE(length(CAST(cwd AS BLOB)), 0)
+             + COALESCE(length(CAST(command AS BLOB)), 0)
+             + COALESCE(length(CAST(env_json AS BLOB)), 0)
+             + COALESCE(length(CAST(terminal_state_json AS BLOB)), 0)
+             + COALESCE(length(CAST(agent_metadata_json AS BLOB)), 0) <= ?2
+         ORDER BY pane_id ASC, id ASC
+         LIMIT ?3",
     )?;
-
-    let persisted_panes = stmt
-        .query_map([checkpoint_id], |row| {
-            Ok(PersistedPaneState {
-                pane_id: row.get(0)?,
-                cwd: row.get(1)?,
-                command: row.get(2)?,
-                env_json: row.get(3)?,
-                terminal_state_json: row.get(4)?,
-                agent_metadata_json: row.get(5)?,
-                scrollback_checkpoint_seq: row.get(6)?,
-                last_output_at: row.get(7)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let row_limit = expected_pane_row_count.checked_add(1).ok_or_else(|| {
+        RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} pane row limit overflows usize"
+        ))
+    })?;
+    let mut rows = stmt.query(rusqlite::params![
+        checkpoint_id,
+        i64::try_from(MAX_PERSISTED_PANE_TEXT_BYTES).unwrap_or(i64::MAX),
+        i64::try_from(row_limit).unwrap_or(i64::MAX),
+    ])?;
+    let mut persisted_panes = Vec::with_capacity(expected_pane_row_count);
+    while let Some(row) = rows.next()? {
+        if persisted_panes.len() == expected_pane_row_count {
+            return Err(RestoreError::CorruptCheckpoint(format!(
+                "checkpoint {checkpoint_id} stores more than {expected_pane_row_count} pane rows"
+            )));
+        }
+        persisted_panes.push(PersistedPaneState {
+            pane_id: row.get(0)?,
+            cwd: row.get(1)?,
+            command: row.get(2)?,
+            env_json: row.get(3)?,
+            terminal_state_json: row.get(4)?,
+            agent_metadata_json: row.get(5)?,
+            scrollback_checkpoint_seq: row.get(6)?,
+            last_output_at: row.get(7)?,
+        });
+    }
+    let loaded_checkpoint_bytes = persisted_checkpoint_text_bytes(
+        topology_json.as_deref(),
+        metadata_json.as_deref(),
+        &persisted_panes,
+    )
+    .ok_or_else(|| {
+        RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} loaded text byte count overflows usize"
+        ))
+    })?;
+    if loaded_checkpoint_bytes != admitted_checkpoint_bytes {
+        return Err(RestoreError::CorruptCheckpoint(format!(
+            "checkpoint {checkpoint_id} changed while its bounded payload was loaded"
+        )));
+    }
 
     validate_checkpoint_structure(
         checkpoint_id,
@@ -1447,6 +2455,7 @@ fn load_checkpoint_by_id_from_conn(
         checkpoint_role,
         verification,
         state_hash: stored_state_hash,
+        metadata_json,
         topology_json,
         restore_intent_checkpoint_id,
         pane_count,
@@ -1806,6 +2815,20 @@ fn validate_restore_outcome_metadata(
                 "restore outcome {checkpoint_id} overflows its process disposition count"
             ))
         })?;
+    let v3_source_identity_consistent = if *evidence_version == RESTORE_OUTCOME_EVIDENCE_VERSION {
+        failed_source_pane_ids.as_ref().is_some_and(|failed_ids| {
+            mapped_panes
+                .checked_add(failed_ids.len())
+                .is_some_and(|covered_count| covered_count == *expected_panes)
+                && metadata.old_to_new.keys().all(|source_id| {
+                    source_id
+                        .parse::<u64>()
+                        .is_ok_and(|source_id| failed_ids.binary_search(&source_id).is_err())
+                })
+        })
+    } else {
+        true
+    };
     let process_state_consistent = if !*layout_complete {
         !*process_plan_evaluated
             && *process_plans_total == 0
@@ -1946,6 +2969,7 @@ fn validate_restore_outcome_metadata(
         || *process_plan_evaluated != (*process_plans_total > 0)
         || !process_state_consistent
         || (*process_interrupted && !*attempt_interrupted)
+        || !v3_source_identity_consistent
         || !interruption_shape_consistent
         || !interruption_phase_consistent;
     if invalid {
@@ -2075,6 +3099,11 @@ fn mark_session_restored(db_path: &str, session_id: &str) -> Result<(), RestoreE
 fn prepare_restore_mapping(
     pane_id_map: &HashMap<u64, u64>,
 ) -> Result<(BTreeMap<String, u64>, i64), RestoreError> {
+    if pane_id_map.len() > MAX_TOPOLOGY_PANES {
+        return Err(RestoreError::Bookkeeping(format!(
+            "restore pane mapping exceeds the {MAX_TOPOLOGY_PANES}-pane topology limit"
+        )));
+    }
     let pane_count = i64::try_from(pane_id_map.len()).map_err(|_| {
         RestoreError::Bookkeeping("restore pane mapping count exceeds SQLite INTEGER".to_string())
     })?;
@@ -2091,6 +3120,7 @@ fn prepare_restore_mapping(
     Ok((ordered_mapping, pane_count))
 }
 
+#[cfg(test)]
 fn prepare_restore_receipt_metadata(
     pane_id_map: &HashMap<u64, u64>,
 ) -> Result<(String, i64), RestoreError> {
@@ -2385,9 +3415,19 @@ fn validate_restore_authority_chain(
         )));
     }
 
-    let lifecycle: Option<(i64, Option<i64>, String, i64, Option<i64>)> = conn
+    let lifecycle: Option<(i64, Option<i64>, Option<String>, i64, Option<i64>)> = conn
         .query_row(
-            "SELECT source_checkpoint_id, outcome_checkpoint_id, status,
+            "SELECT source_checkpoint_id, outcome_checkpoint_id,
+                    CASE
+                        WHEN typeof(status) = 'text'
+                         AND status IN (
+                             'intent',
+                             'outcome_complete',
+                             'resolved',
+                             'reconciliation_required'
+                         )
+                        THEN status
+                    END,
                     created_at, resolved_at
              FROM restore_attempt_lifecycle
              WHERE intent_checkpoint_id = ?1 AND session_id = ?2",
@@ -2406,7 +3446,7 @@ fn validate_restore_authority_chain(
     let Some((
         lifecycle_source_id,
         lifecycle_outcome_id,
-        lifecycle_status,
+        Some(lifecycle_status),
         lifecycle_created_at,
         resolved_at,
     )) = lifecycle
@@ -2743,15 +3783,15 @@ where
     }
 }
 
-/// Persist a restore receipt while deliberately leaving the source session
-/// unclean. Process disposition evaluation must settle before the exact receipt
-/// can authorize the separate clean transition.
-fn persist_restore_receipt_unclean(
+/// Persist and transaction-locally verify a restore receipt. Complete evidence
+/// may bind clean session authority and resolve the lifecycle in this same
+/// transaction; partial evidence always settles as reconciliation-required.
+fn persist_restore_receipt_settled(
     db_path: &str,
     session_id: &str,
     pane_id_map: &HashMap<u64, u64>,
     evidence: &RestoreOutcomeEvidence,
-    require_intent_cas: bool,
+    resolve_complete: bool,
 ) -> Result<RestoreReceipt, RestoreAuthorityDbError> {
     let conn = open_conn(db_path).map_err(|source| RestoreAuthorityDbError::RetrySafe {
         source,
@@ -2759,7 +3799,8 @@ fn persist_restore_receipt_unclean(
     // br-ft-0n4nx: route through the shared clock-anomaly helper so
     // a pre-epoch host clock can't silently produce checkpoint_at=0
     // for every persisted record (collision on the persisted column).
-    let now_ms = crate::clock_anomaly::epoch_ms_i64("ft.session_restore.clock");
+    let now_ms = crate::clock_anomaly::epoch_ms_i64("ft.session_restore.clock")
+        .max(evidence.intent.checkpoint_at);
 
     let (metadata_json, pane_count, prepared_metadata) =
         prepare_restore_outcome_metadata(pane_id_map, evidence)
@@ -2767,88 +3808,125 @@ fn persist_restore_receipt_unclean(
 
     run_restore_authority_transaction(&conn, |tx| {
         crate::session_retention::ensure_session_authority_tables_have_no_unaudited_triggers(tx)?;
-        if require_intent_cas {
-            let persisted_intent =
-                load_checkpoint_by_id_from_conn(tx, evidence.intent.checkpoint_id)?.ok_or_else(
-                    || {
-                        RestoreError::Bookkeeping(format!(
-                            "restore intent {} disappeared before outcome commit",
-                            evidence.intent.checkpoint_id
-                        ))
-                    },
-                )?;
-            let persisted_source =
-                load_checkpoint_by_id_from_conn(tx, evidence.source.checkpoint_id)?.ok_or_else(
-                    || {
-                        RestoreError::Bookkeeping(format!(
-                            "restore source {} disappeared before outcome commit",
-                            evidence.source.checkpoint_id
-                        ))
-                    },
-                )?;
-            let source_pane_ids = persisted_source
-                .pane_states
-                .iter()
-                .map(|pane| pane.pane_id)
-                .collect::<HashSet<_>>();
-            let session_authority: Option<(i64, Option<i64>)> = tx
-                .query_row(
-                    "SELECT shutdown_clean, clean_checkpoint_id
-                     FROM mux_sessions WHERE session_id = ?1",
-                    [session_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            let lifecycle: Option<(String, i64, Option<i64>)> = tx
-                .query_row(
-                    "SELECT status, source_checkpoint_id, outcome_checkpoint_id
-                     FROM restore_attempt_lifecycle
-                     WHERE intent_checkpoint_id = ?1 AND session_id = ?2",
-                    rusqlite::params![evidence.intent.checkpoint_id, session_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?;
-            if persisted_intent.session_id != session_id
-                || persisted_intent.checkpoint_role != CheckpointRole::RestoreIntent
-                || persisted_intent.checkpoint_at
-                    != decode_u64(
-                        evidence.intent.checkpoint_at,
-                        "session_checkpoints.checkpoint_at",
-                )?
-                || persisted_intent.state_hash != evidence.intent.state_hash
-                || persisted_intent.verification != CheckpointVerification::VerifiedV2
-                || persisted_source.session_id != session_id
-                || persisted_source.checkpoint_role != CheckpointRole::Snapshot
-                || persisted_source.checkpoint_at != evidence.source.checkpoint_at
-                || persisted_source.state_hash != evidence.source.state_hash
-                || persisted_source.pane_count != evidence.source.pane_count
-                || evidence.expected_panes != source_pane_ids.len()
-                || pane_id_map
-                    .keys()
-                    .any(|pane_id| !source_pane_ids.contains(pane_id))
-                || evidence
-                    .failed_source_pane_ids
-                    .iter()
-                    .any(|pane_id| !source_pane_ids.contains(pane_id))
-                || evidence
-                    .duplicate_target_source_pane_ids
-                    .iter()
-                    .any(|pane_id| !source_pane_ids.contains(pane_id))
-                || session_authority != Some((0, None))
-                || lifecycle
-                    != Some((
-                        "intent".to_string(),
-                        evidence.source.checkpoint_id,
-                        None,
+        let persisted_intent =
+            load_checkpoint_by_id_from_conn(tx, evidence.intent.checkpoint_id)?.ok_or_else(
+                || {
+                    RestoreError::Bookkeeping(format!(
+                        "restore intent {} disappeared before outcome commit",
+                        evidence.intent.checkpoint_id
                     ))
-            {
-                return Err(RestoreError::Bookkeeping(format!(
-                    "restore intent {} or its lifecycle changed before outcome commit",
-                    evidence.intent.checkpoint_id
-                )));
-            }
+                },
+            )?;
+        let persisted_source =
+            load_checkpoint_by_id_from_conn(tx, evidence.source.checkpoint_id)?.ok_or_else(
+                || {
+                    RestoreError::Bookkeeping(format!(
+                        "restore source {} disappeared before outcome commit",
+                        evidence.source.checkpoint_id
+                    ))
+                },
+            )?;
+        let source_pane_ids = persisted_source
+            .pane_states
+            .iter()
+            .map(|pane| pane.pane_id)
+            .collect::<HashSet<_>>();
+        let failed_source_pane_ids = evidence
+            .failed_source_pane_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let covered_source_pane_ids = pane_id_map
+            .keys()
+            .copied()
+            .chain(failed_source_pane_ids.iter().copied())
+            .collect::<HashSet<_>>();
+        let session_authority: Option<(i64, Option<i64>, Option<i64>, Option<i64>)> = tx
+            .query_row(
+                "SELECT session.shutdown_clean,
+                        session.clean_checkpoint_id,
+                        session.last_checkpoint_at,
+                        (
+                            SELECT latest.id
+                            FROM session_checkpoints AS latest
+                            WHERE latest.session_id = session.session_id
+                            ORDER BY latest.id DESC
+                            LIMIT 1
+                        )
+                 FROM mux_sessions AS session
+                 WHERE session.session_id = ?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let lifecycle: Option<(String, i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT CASE status
+                            WHEN 'intent' THEN 'intent'
+                            WHEN 'outcome_complete' THEN 'outcome_complete'
+                            WHEN 'reconciliation_required' THEN 'reconciliation_required'
+                            WHEN 'resolved' THEN 'resolved'
+                            ELSE 'invalid_lifecycle'
+                        END,
+                        source_checkpoint_id,
+                        outcome_checkpoint_id
+                 FROM restore_attempt_lifecycle
+                 WHERE intent_checkpoint_id = ?1 AND session_id = ?2",
+                rusqlite::params![evidence.intent.checkpoint_id, session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if persisted_intent.session_id != session_id
+            || persisted_intent.checkpoint_role != CheckpointRole::RestoreIntent
+            || persisted_intent.checkpoint_at
+                != decode_u64(
+                    evidence.intent.checkpoint_at,
+                    "session_checkpoints.checkpoint_at",
+                )?
+            || persisted_intent.state_hash != evidence.intent.state_hash
+            || persisted_intent.verification != CheckpointVerification::VerifiedV2
+            || persisted_source.session_id != session_id
+            || persisted_source.checkpoint_role != CheckpointRole::Snapshot
+            || persisted_source.checkpoint_at != evidence.source.checkpoint_at
+            || persisted_source.state_hash != evidence.source.state_hash
+            || persisted_source.pane_count != evidence.source.pane_count
+            || evidence.expected_panes != source_pane_ids.len()
+            || covered_source_pane_ids != source_pane_ids
+            || pane_id_map
+                .keys()
+                .any(|pane_id| failed_source_pane_ids.contains(pane_id))
+            || pane_id_map
+                .keys()
+                .any(|pane_id| !source_pane_ids.contains(pane_id))
+            || evidence
+                .failed_source_pane_ids
+                .iter()
+                .any(|pane_id| !source_pane_ids.contains(pane_id))
+            || failed_source_pane_ids.len() != evidence.failed_source_pane_ids.len()
+            || evidence
+                .duplicate_target_source_pane_ids
+                .iter()
+                .any(|pane_id| !source_pane_ids.contains(pane_id))
+            || session_authority
+                != Some((
+                    0,
+                    None,
+                    Some(evidence.intent.checkpoint_at),
+                    Some(evidence.intent.checkpoint_id),
+                ))
+            || lifecycle
+                != Some((
+                    "intent".to_string(),
+                    evidence.source.checkpoint_id,
+                    None,
+                ))
+        {
+            return Err(RestoreError::Bookkeeping(format!(
+                "restore intent {} or its lifecycle changed before outcome commit",
+                evidence.intent.checkpoint_id
+            )));
         }
-        let intent_link = require_intent_cas.then_some(evidence.intent.checkpoint_id);
+        let intent_link = Some(evidence.intent.checkpoint_id);
         let receipt = insert_restore_receipt(
             tx,
             session_id,
@@ -2890,46 +3968,96 @@ fn persist_restore_receipt_unclean(
                 receipt.checkpoint_id
             )));
         }
-        if require_intent_cas {
-            let next_status = if restore_outcome_evidence_is_complete(evidence) {
-                "outcome_complete"
-            } else {
-                "reconciliation_required"
-            };
-            let lifecycle_updated = tx.execute(
-                "UPDATE restore_attempt_lifecycle
-                 SET outcome_checkpoint_id = ?2, status = ?3
-                 WHERE intent_checkpoint_id = ?1
-                   AND session_id = ?4
-                   AND source_checkpoint_id = ?5
-                   AND status = 'intent'
-                   AND outcome_checkpoint_id IS NULL",
-                rusqlite::params![
-                    evidence.intent.checkpoint_id,
-                    receipt.checkpoint_id,
-                    next_status,
-                    session_id,
-                    evidence.source.checkpoint_id,
-                ],
-            )?;
-            if lifecycle_updated != 1 {
-                return Err(RestoreError::Bookkeeping(format!(
-                    "restore intent {} lifecycle did not accept outcome {}",
-                    evidence.intent.checkpoint_id, receipt.checkpoint_id
-                )));
-            }
+        let evidence_complete = restore_outcome_evidence_is_complete(evidence);
+        let resolve_clean = resolve_complete && evidence_complete;
+        let next_status = if resolve_clean {
+            "resolved"
+        } else if evidence_complete {
+            "outcome_complete"
+        } else {
+            "reconciliation_required"
+        };
+        let resolved_at = resolve_clean.then_some(now_ms.max(evidence.intent.checkpoint_at));
+        let lifecycle_updated = tx.execute(
+            "UPDATE restore_attempt_lifecycle
+             SET outcome_checkpoint_id = ?2, status = ?3, resolved_at = ?6
+             WHERE intent_checkpoint_id = ?1
+               AND session_id = ?4
+               AND source_checkpoint_id = ?5
+               AND status = 'intent'
+               AND outcome_checkpoint_id IS NULL
+               AND resolved_at IS NULL",
+            rusqlite::params![
+                evidence.intent.checkpoint_id,
+                receipt.checkpoint_id,
+                next_status,
+                session_id,
+                evidence.source.checkpoint_id,
+                resolved_at,
+            ],
+        )?;
+        if lifecycle_updated != 1 {
+            return Err(RestoreError::Bookkeeping(format!(
+                "restore intent {} lifecycle did not accept outcome {}",
+                evidence.intent.checkpoint_id, receipt.checkpoint_id
+            )));
         }
+        let clean_flag = if resolve_clean { 1_i64 } else { 0_i64 };
         let updated = tx.execute(
             "UPDATE mux_sessions
              SET last_checkpoint_at = ?2,
-                 shutdown_clean = 0,
-                 clean_checkpoint_id = NULL
+                 shutdown_clean = ?3,
+                 clean_checkpoint_id = ?4
              WHERE session_id = ?1",
-            rusqlite::params![session_id, now_ms],
+            rusqlite::params![
+                session_id,
+                now_ms,
+                clean_flag,
+                resolve_clean.then_some(receipt.checkpoint_id),
+            ],
         )?;
         if updated != 1 {
             return Err(RestoreError::Bookkeeping(format!(
                 "restore receipt references missing session {session_id}"
+            )));
+        }
+        let settled_session: (i64, i64, Option<i64>) = tx.query_row(
+            "SELECT last_checkpoint_at, shutdown_clean, clean_checkpoint_id
+             FROM mux_sessions WHERE session_id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let settled_lifecycle: (String, Option<i64>, Option<i64>) = tx.query_row(
+            "SELECT CASE status
+                        WHEN 'intent' THEN 'intent'
+                        WHEN 'outcome_complete' THEN 'outcome_complete'
+                        WHEN 'reconciliation_required' THEN 'reconciliation_required'
+                        WHEN 'resolved' THEN 'resolved'
+                        ELSE 'invalid_lifecycle'
+                    END,
+                    outcome_checkpoint_id,
+                    resolved_at
+             FROM restore_attempt_lifecycle
+             WHERE intent_checkpoint_id = ?1 AND session_id = ?2",
+            rusqlite::params![evidence.intent.checkpoint_id, session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if settled_session
+            != (
+                now_ms,
+                clean_flag,
+                resolve_clean.then_some(receipt.checkpoint_id),
+            )
+            || settled_lifecycle
+                != (
+                    next_status.to_string(),
+                    Some(receipt.checkpoint_id),
+                    resolved_at,
+                )
+        {
+            return Err(RestoreError::Bookkeeping(format!(
+                "restore outcome {} failed transaction-local authority settlement",
+                receipt.checkpoint_id
             )));
         }
         Ok(receipt)
@@ -2947,7 +4075,6 @@ fn persist_restore_intent_unclean(
     let conn = open_conn(db_path).map_err(|source| RestoreAuthorityDbError::RetrySafe {
         source,
     })?;
-    let now_ms = crate::clock_anomaly::epoch_ms_i64("ft.session_restore.intent.clock");
     let metadata_json = prepare_restore_intent_metadata(source)
         .map_err(|source| RestoreAuthorityDbError::RetrySafe { source })?;
     let source_checkpoint_at = i64::try_from(source.checkpoint_at).map_err(|_| {
@@ -2957,6 +4084,8 @@ fn persist_restore_intent_unclean(
             ),
         }
     })?;
+    let now_ms = crate::clock_anomaly::epoch_ms_i64("ft.session_restore.intent.clock")
+        .max(source_checkpoint_at);
 
     run_restore_authority_transaction(&conn, |tx| {
         crate::session_retention::ensure_session_authority_tables_have_no_unaudited_triggers(tx)?;
@@ -3078,6 +4207,7 @@ fn persist_restore_intent_unclean(
 
 /// Bind one immutable, deterministic-latest restore receipt as the exact clean
 /// authority only after layout and process disposition evaluation have settled.
+#[cfg(test)]
 fn mark_restore_receipt_clean(
     db_path: &str,
     session_id: &str,
@@ -3229,7 +4359,13 @@ fn finalize_restore_for_test(
     pane_id_map: &HashMap<u64, u64>,
     mark_clean: bool,
 ) -> Result<i64, RestoreError> {
-    if load_latest_checkpoint(db_path, session_id)?.is_none() {
+    let needs_verified_snapshot_source = load_latest_checkpoint(db_path, session_id)?.is_none_or(
+        |checkpoint| {
+            checkpoint.checkpoint_role != CheckpointRole::Snapshot
+                || checkpoint.verification != CheckpointVerification::VerifiedV2
+        },
+    );
+    if needs_verified_snapshot_source {
         let mut conn = open_conn(db_path)?;
         let session_exists = conn
             .query_row(
@@ -3265,7 +4401,7 @@ fn finalize_restore_for_test(
                     tab_id,
                     title: None,
                     active_pane_id: Some(pane_id),
-                    pane_tree: PaneNode::Leaf {
+                    pane_tree: crate::session_topology::PaneNode::Leaf {
                         pane_id,
                         rows: 24,
                         cols: 80,
@@ -3396,7 +4532,11 @@ fn finalize_restore_for_test(
             rusqlite::params![state_hash, checkpoint_id],
         )?;
         tx.execute(
-            "UPDATE mux_sessions SET last_checkpoint_at = ?2 WHERE session_id = ?1",
+            "UPDATE mux_sessions
+             SET last_checkpoint_at = ?2,
+                 shutdown_clean = 0,
+                 clean_checkpoint_id = NULL
+             WHERE session_id = ?1",
             rusqlite::params![session_id, checkpoint_at],
         )?;
         tx.commit()?;
@@ -3420,17 +4560,16 @@ fn finalize_restore_for_test(
     let mut evidence = complete_test_restore_outcome_evidence(pane_id_map.len());
     evidence.intent = intent;
     evidence.source = source;
-    let receipt =
-        persist_restore_receipt_unclean(db_path, session_id, pane_id_map, &evidence, true)
-        .map_err(|_error| {
-            RestoreError::Bookkeeping("test restore outcome did not settle".to_string())
-        })?;
-    if mark_clean {
-        mark_restore_receipt_clean(db_path, session_id, &receipt)
-            .map_err(|_error| {
-                RestoreError::Bookkeeping("test restore clean mark did not settle".to_string())
-            })?;
-    }
+    let receipt = persist_restore_receipt_settled(
+        db_path,
+        session_id,
+        pane_id_map,
+        &evidence,
+        mark_clean,
+    )
+    .map_err(|_error| {
+        RestoreError::Bookkeeping("test restore outcome did not settle".to_string())
+    })?;
     Ok(receipt.checkpoint_id)
 }
 
@@ -3440,6 +4579,14 @@ fn validate_restore_topology(
     persisted_pane_ids: &[u64],
     topology: &TopologySnapshot,
 ) -> Result<(), RestoreError> {
+    crate::restore_layout::validate_restore_snapshot_for_admission(topology, true, true).map_err(
+        |_error| {
+            RestoreError::CorruptCheckpoint(format!(
+                "checkpoint {checkpoint_id} topology failed layout preflight"
+            ))
+        },
+    )?;
+
     let mut topology_pane_ids = topology.pane_ids();
     if topology_pane_ids.len() != pane_count {
         return Err(RestoreError::CorruptCheckpoint(format!(
@@ -3470,63 +4617,7 @@ fn validate_restore_topology(
         )));
     }
 
-    for window in &topology.windows {
-        if window
-            .active_tab_index
-            .is_some_and(|active_index| active_index >= window.tabs.len())
-        {
-            return Err(RestoreError::CorruptCheckpoint(format!(
-                "checkpoint {} window {} has an out-of-range active tab index",
-                checkpoint_id, window.window_id
-            )));
-        }
-        for tab in &window.tabs {
-            validate_restore_pane_tree(checkpoint_id, &tab.pane_tree)?;
-            if let Some(active_pane_id) = tab.active_pane_id {
-                let mut tab_pane_ids = Vec::new();
-                tab.pane_tree.collect_pane_ids(&mut tab_pane_ids);
-                if !tab_pane_ids.contains(&active_pane_id) {
-                    return Err(RestoreError::CorruptCheckpoint(format!(
-                        "checkpoint {} tab {} names active pane {} outside its pane tree",
-                        checkpoint_id, tab.tab_id, active_pane_id
-                    )));
-                }
-            }
-        }
-    }
-
     Ok(())
-}
-
-fn validate_restore_pane_tree(
-    checkpoint_id: i64,
-    pane_tree: &PaneNode,
-) -> Result<(), RestoreError> {
-    match pane_tree {
-        PaneNode::Leaf { .. } => Ok(()),
-        PaneNode::HSplit { children } | PaneNode::VSplit { children } => {
-            if children.len() < 2 {
-                return Err(RestoreError::CorruptCheckpoint(format!(
-                    "checkpoint {checkpoint_id} topology contains a split with fewer than two children"
-                )));
-            }
-            for (ratio, child) in children {
-                if !ratio.is_finite() || *ratio <= 0.0 {
-                    return Err(RestoreError::CorruptCheckpoint(format!(
-                        "checkpoint {checkpoint_id} topology contains a non-positive split ratio"
-                    )));
-                }
-                validate_restore_pane_tree(checkpoint_id, child)?;
-            }
-            let ratio_sum: f64 = children.iter().map(|(ratio, _)| *ratio).sum();
-            if !ratio_sum.is_finite() {
-                return Err(RestoreError::CorruptCheckpoint(format!(
-                    "checkpoint {checkpoint_id} topology split ratios overflow"
-                )));
-            }
-            Ok(())
-        }
-    }
 }
 
 // =============================================================================
@@ -3546,50 +4637,159 @@ pub struct SessionInfo {
     pub pane_count: Option<usize>,
 }
 
-/// List all sessions with their checkpoint counts.
+/// Default number of session summaries or checkpoint summaries returned by
+/// the operator-facing paged query APIs.
+pub const DEFAULT_SESSION_QUERY_LIMIT: usize = 50;
+/// Hard maximum number of summaries materialized by one session query.
+pub const MAX_SESSION_QUERY_LIMIT: usize = 200;
+/// Hard maximum offset accepted by the bounded session query APIs.
+pub const MAX_SESSION_QUERY_OFFSET: usize = 100_000;
+
+/// One bounded page of saved-session summaries.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionListPage {
+    pub sessions: Vec<SessionInfo>,
+    pub total_sessions: usize,
+    pub limit: usize,
+    pub offset: usize,
+    pub has_more: bool,
+}
+
+fn validate_session_query_window(limit: usize, offset: usize) -> Result<(), RestoreError> {
+    if limit == 0 || limit > MAX_SESSION_QUERY_LIMIT || offset > MAX_SESSION_QUERY_OFFSET {
+        return Err(RestoreError::InvalidQueryWindow {
+            limit,
+            offset,
+            max_limit: MAX_SESSION_QUERY_LIMIT,
+            max_offset: MAX_SESSION_QUERY_OFFSET,
+        });
+    }
+    Ok(())
+}
+
+/// List all sessions with their checkpoint counts when the result fits within
+/// one bounded page. Larger histories fail closed so callers cannot
+/// accidentally materialize an unbounded result; use [`list_sessions_page`]
+/// for explicit pagination.
 pub fn list_sessions(db_path: &str) -> Result<Vec<SessionInfo>, RestoreError> {
-    let conn = open_query_conn(db_path)?;
+    with_query_snapshot(db_path, list_sessions_from_conn)
+}
+
+fn list_sessions_from_conn(conn: &Connection) -> Result<Vec<SessionInfo>, RestoreError> {
+    let page = list_sessions_page_from_conn(conn, MAX_SESSION_QUERY_LIMIT, 0)?;
+    if page.has_more {
+        return Err(RestoreError::QueryResultLimit {
+            resource: "session_summaries",
+            observed: page.total_sessions,
+            limit: MAX_SESSION_QUERY_LIMIT,
+        });
+    }
+    Ok(page.sessions)
+}
+
+/// Return one bounded page of saved-session summaries and exact pagination
+/// metadata from a single SQLite read snapshot.
+pub fn list_sessions_page(
+    db_path: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<SessionListPage, RestoreError> {
+    validate_session_query_window(limit, offset)?;
+    with_query_snapshot(db_path, |conn| {
+        list_sessions_page_from_conn(conn, limit, offset)
+    })
+}
+
+fn list_sessions_page_from_conn(
+    conn: &Connection,
+    limit: usize,
+    offset: usize,
+) -> Result<SessionListPage, RestoreError> {
+    validate_session_query_window(limit, offset)?;
+    let total_sessions = decode_usize(
+        conn.query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row.get(0))?,
+        "mux_sessions.count",
+    )?;
+    let fetch_limit = limit.saturating_add(1);
     let mut stmt = conn.prepare(
-        "SELECT s.session_id, s.created_at,
+        "SELECT CASE
+                    WHEN typeof(s.session_id) = 'text'
+                     AND length(CAST(s.session_id AS BLOB)) BETWEEN 1 AND ?1
+                    THEN s.session_id
+                END,
+                s.created_at,
                 (SELECT causal.checkpoint_at
                  FROM session_checkpoints AS causal
                  WHERE causal.session_id = s.session_id
-                 ORDER BY causal.id DESC
+                 ORDER BY causal.checkpoint_at DESC, causal.id DESC
                  LIMIT 1) AS last_checkpoint_at,
                 s.shutdown_clean, s.clean_checkpoint_id,
-                s.ft_version, s.host_id,
+                CASE
+                    WHEN typeof(s.ft_version) = 'text'
+                     AND length(CAST(s.ft_version AS BLOB)) BETWEEN 1 AND ?2
+                    THEN s.ft_version
+                END,
+                CASE
+                    WHEN s.host_id IS NULL THEN NULL
+                    WHEN typeof(s.host_id) = 'text'
+                     AND length(CAST(s.host_id AS BLOB)) <= ?3
+                    THEN s.host_id
+                END,
+                s.host_id IS NOT NULL,
                 (SELECT COUNT(*) FROM session_checkpoints c WHERE c.session_id = s.session_id),
                 (SELECT c.pane_count FROM session_checkpoints c
                  WHERE c.session_id = s.session_id
                    AND c.checkpoint_role = 'snapshot'
-                 ORDER BY c.id DESC LIMIT 1)
+                 ORDER BY c.checkpoint_at DESC, c.id DESC LIMIT 1)
          FROM mux_sessions s
          ORDER BY COALESCE((
-                      SELECT MAX(causal.id)
+                      SELECT causal.checkpoint_at
                       FROM session_checkpoints AS causal
                       WHERE causal.session_id = s.session_id
+                      ORDER BY causal.checkpoint_at DESC, causal.id DESC
+                      LIMIT 1
+                  ), -1) DESC,
+                  COALESCE((
+                      SELECT causal.id
+                      FROM session_checkpoints AS causal
+                      WHERE causal.session_id = s.session_id
+                      ORDER BY causal.checkpoint_at DESC, causal.id DESC
+                      LIMIT 1
                   ), -1) DESC,
                   s.created_at DESC,
-                  s.session_id ASC",
+                  s.session_id ASC
+         LIMIT ?4 OFFSET ?5",
     )?;
 
-    let raw_sessions = stmt
-        .query_map([], |row| {
+    let mut raw_sessions = stmt
+        .query_map(
+            rusqlite::params![
+                i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX),
+                i64::try_from(MAX_SESSION_FT_VERSION_BYTES).unwrap_or(i64::MAX),
+                i64::try_from(MAX_SESSION_HOST_ID_BYTES).unwrap_or(i64::MAX),
+                i64::try_from(fetch_limit).unwrap_or(i64::MAX),
+                i64::try_from(offset).unwrap_or(i64::MAX),
+            ],
+            |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, Option<i64>>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, Option<i64>>(4)?,
-                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, i64>(7)?,
-                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Option<i64>>(9)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    raw_sessions
+    let has_more = raw_sessions.len() > limit;
+    raw_sessions.truncate(limit);
+
+    let sessions = raw_sessions
         .into_iter()
         .map(
             |(
@@ -3600,11 +4800,25 @@ pub fn list_sessions(db_path: &str) -> Result<Vec<SessionInfo>, RestoreError> {
                 clean_checkpoint_id,
                 ft_version,
                 host_id,
+                host_id_present,
                 checkpoint_count,
                 pane_count,
             )| {
+                let session_id = decode_required_bounded_text(
+                    session_id,
+                    "mux_sessions.session_id",
+                )?;
+                let ft_version = decode_required_bounded_text(
+                    ft_version,
+                    "mux_sessions.ft_version",
+                )?;
+                let host_id = decode_optional_bounded_text(
+                    host_id,
+                    host_id_present,
+                    "mux_sessions.host_id",
+                )?;
                 let shutdown_clean = assess_clean_authority(
-                    &conn,
+                    conn,
                     &session_id,
                     shutdown_clean,
                     clean_checkpoint_id,
@@ -3614,7 +4828,7 @@ pub fn list_sessions(db_path: &str) -> Result<Vec<SessionInfo>, RestoreError> {
                     created_at: decode_u64(created_at, "mux_sessions.created_at")?,
                     last_checkpoint_at: decode_opt_u64(
                         last_checkpoint_at,
-                        "mux_sessions.last_checkpoint_at",
+                        "session_checkpoints.checkpoint_at",
                     )?,
                     shutdown_clean,
                     ft_version,
@@ -3624,7 +4838,15 @@ pub fn list_sessions(db_path: &str) -> Result<Vec<SessionInfo>, RestoreError> {
                 })
             },
         )
-        .collect()
+        .collect::<Result<Vec<_>, RestoreError>>()?;
+
+    Ok(SessionListPage {
+        sessions,
+        total_sessions,
+        limit,
+        offset,
+        has_more,
+    })
 }
 
 /// Checkpoint summary for show command.
@@ -3638,33 +4860,117 @@ pub struct CheckpointInfo {
     pub total_bytes: usize,
 }
 
-/// Show detailed session info including checkpoints.
+/// One bounded page of checkpoint summaries for a selected session.
+#[derive(Debug, Clone)]
+pub struct SessionShowPage {
+    pub session: SessionCandidate,
+    pub checkpoints: Vec<CheckpointInfo>,
+    pub total_checkpoints: usize,
+    pub limit: usize,
+    pub offset: usize,
+    pub has_more: bool,
+}
+
+/// Show detailed session info including checkpoints when the checkpoint
+/// history fits within one bounded page. Larger histories fail closed; use
+/// [`show_session_page`] for explicit pagination.
 pub fn show_session(
     db_path: &str,
     session_id: &str,
 ) -> Result<(SessionCandidate, Vec<CheckpointInfo>), RestoreError> {
-    let conn = open_query_conn(db_path)?;
+    validate_session_selector(session_id)?;
+    with_query_snapshot(db_path, |conn| show_session_from_conn(conn, session_id))
+}
 
+fn show_session_from_conn(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<(SessionCandidate, Vec<CheckpointInfo>), RestoreError> {
+    let page = show_session_page_from_conn(
+        conn,
+        session_id,
+        MAX_SESSION_QUERY_LIMIT,
+        0,
+    )?;
+    if page.has_more {
+        return Err(RestoreError::QueryResultLimit {
+            resource: "checkpoint_summaries",
+            observed: page.total_checkpoints,
+            limit: MAX_SESSION_QUERY_LIMIT,
+        });
+    }
+    Ok((page.session, page.checkpoints))
+}
+
+/// Return one bounded page of checkpoint summaries for a selected session.
+pub fn show_session_page(
+    db_path: &str,
+    session_id: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<SessionShowPage, RestoreError> {
+    validate_session_selector(session_id)?;
+    validate_session_query_window(limit, offset)?;
+    with_query_snapshot(db_path, |conn| {
+        show_session_page_from_conn(conn, session_id, limit, offset)
+    })
+}
+
+fn show_session_page_from_conn(
+    conn: &Connection,
+    session_id: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<SessionShowPage, RestoreError> {
+    validate_session_query_window(limit, offset)?;
     // Get session
     let session = conn
         .query_row(
-            "SELECT session.session_id, session.created_at,
+            "SELECT CASE
+                        WHEN typeof(session.session_id) = 'text'
+                         AND length(CAST(session.session_id AS BLOB)) BETWEEN 1 AND ?2
+                        THEN session.session_id
+                    END,
+                    session.created_at,
                     (SELECT causal.checkpoint_at
                      FROM session_checkpoints AS causal
                      WHERE causal.session_id = session.session_id
-                     ORDER BY causal.id DESC
+                     ORDER BY causal.checkpoint_at DESC, causal.id DESC
                      LIMIT 1) AS last_checkpoint_at,
-                    session.topology_json, session.ft_version, session.host_id
+                    (SELECT snapshot.id
+                     FROM session_checkpoints AS snapshot
+                     WHERE snapshot.session_id = session.session_id
+                       AND snapshot.checkpoint_role = 'snapshot'
+                     ORDER BY snapshot.checkpoint_at DESC, snapshot.id DESC
+                     LIMIT 1),
+                    CASE
+                        WHEN typeof(session.ft_version) = 'text'
+                         AND length(CAST(session.ft_version AS BLOB)) BETWEEN 1 AND ?3
+                        THEN session.ft_version
+                    END,
+                    CASE
+                        WHEN session.host_id IS NULL THEN NULL
+                        WHEN typeof(session.host_id) = 'text'
+                         AND length(CAST(session.host_id AS BLOB)) <= ?4
+                        THEN session.host_id
+                    END,
+                    session.host_id IS NOT NULL
              FROM mux_sessions AS session WHERE session.session_id = ?1",
-            [session_id],
+            rusqlite::params![
+                session_id,
+                i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX),
+                i64::try_from(MAX_SESSION_FT_VERSION_BYTES).unwrap_or(i64::MAX),
+                i64::try_from(MAX_SESSION_HOST_ID_BYTES).unwrap_or(i64::MAX),
+            ],
             |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             },
         )
@@ -3673,39 +4979,95 @@ pub fn show_session(
             _other => RestoreError::Database("session lookup failed".to_string()),
         })?;
     let session = SessionCandidate {
-        session_id: session.0,
+        session_id: decode_required_bounded_text(
+            session.0,
+            "mux_sessions.session_id",
+        )?,
         created_at: decode_u64(session.1, "mux_sessions.created_at")?,
-        last_checkpoint_at: decode_opt_u64(session.2, "mux_sessions.last_checkpoint_at")?,
-        topology_json: session.3,
-        ft_version: session.4,
-        host_id: session.5,
+        last_checkpoint_at: decode_opt_u64(
+            session.2,
+            "session_checkpoints.checkpoint_at",
+        )?,
+        selected_checkpoint_id: session.3,
+        ft_version: decode_required_bounded_text(
+            session.4,
+            "mux_sessions.ft_version",
+        )?,
+        host_id: decode_optional_bounded_text(
+            session.5,
+            session.6,
+            "mux_sessions.host_id",
+        )?,
     };
+
+    let total_checkpoints = decode_usize(
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_checkpoints WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?,
+        "session_checkpoints.count",
+    )?;
+    let fetch_limit = limit.saturating_add(1);
 
     // Get checkpoints
     let mut stmt = conn.prepare(
-        "SELECT id, checkpoint_at, checkpoint_type, checkpoint_role, pane_count, total_bytes
+        "SELECT id,
+                checkpoint_at,
+                CASE
+                    WHEN typeof(checkpoint_type) = 'text'
+                     AND length(CAST(checkpoint_type AS BLOB)) BETWEEN 1 AND ?2
+                    THEN checkpoint_type
+                END,
+                CASE
+                    WHEN typeof(checkpoint_role) = 'text'
+                     AND length(CAST(checkpoint_role AS BLOB)) BETWEEN 1 AND ?3
+                    THEN checkpoint_role
+                END,
+                pane_count,
+                total_bytes
          FROM session_checkpoints
          WHERE session_id = ?1
-         ORDER BY id DESC",
+         ORDER BY checkpoint_at DESC, id DESC
+         LIMIT ?4 OFFSET ?5",
     )?;
 
-    let raw_checkpoints = stmt
-        .query_map([session_id], |row| {
+    let mut raw_checkpoints = stmt
+        .query_map(
+            rusqlite::params![
+                session_id,
+                i64::try_from(MAX_CHECKPOINT_TYPE_BYTES).unwrap_or(i64::MAX),
+                i64::try_from(MAX_CHECKPOINT_ROLE_BYTES).unwrap_or(i64::MAX),
+                i64::try_from(fetch_limit).unwrap_or(i64::MAX),
+                i64::try_from(offset).unwrap_or(i64::MAX),
+            ],
+            |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
+    let has_more = raw_checkpoints.len() > limit;
+    raw_checkpoints.truncate(limit);
+
     let checkpoints = raw_checkpoints
         .into_iter()
         .map(
             |(id, checkpoint_at, checkpoint_type, checkpoint_role, pane_count, total_bytes)| {
+                let checkpoint_type = decode_required_bounded_text(
+                    checkpoint_type,
+                    "session_checkpoints.checkpoint_type",
+                )?;
+                let checkpoint_role = decode_required_bounded_text(
+                    checkpoint_role,
+                    "session_checkpoints.checkpoint_role",
+                )?;
                 Ok(CheckpointInfo {
                     id,
                     checkpoint_at: decode_u64(checkpoint_at, "session_checkpoints.checkpoint_at")?,
@@ -3718,7 +5080,14 @@ pub fn show_session(
         )
         .collect::<Result<Vec<_>, RestoreError>>()?;
 
-    Ok((session, checkpoints))
+    Ok(SessionShowPage {
+        session,
+        checkpoints,
+        total_checkpoints,
+        limit,
+        offset,
+        has_more,
+    })
 }
 
 /// Session health check result.
@@ -3727,8 +5096,10 @@ pub struct SessionDoctorReport {
     pub total_sessions: usize,
     pub unclean_sessions: usize,
     pub total_checkpoints: usize,
+    pub orphaned_checkpoints: usize,
     pub orphaned_pane_states: usize,
     pub unresolved_restore_attempts: usize,
+    pub invalid_resolved_restore_chains: usize,
     pub outcome_complete_restore_attempts: usize,
     pub reconciliation_required_restore_attempts: usize,
     pub orphaned_restore_intents: usize,
@@ -3737,52 +5108,100 @@ pub struct SessionDoctorReport {
 
 /// Run health check on session data.
 pub fn session_doctor(db_path: &str) -> Result<SessionDoctorReport, RestoreError> {
-    let conn = open_query_conn(db_path)?;
+    with_query_snapshot(db_path, session_doctor_from_conn)
+}
 
+fn session_doctor_from_conn(conn: &Connection) -> Result<SessionDoctorReport, RestoreError> {
     let total_sessions: i64 =
         conn.query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row.get(0))?;
 
     let mut shutdown_stmt = conn.prepare(
-        "SELECT session_id, shutdown_clean, clean_checkpoint_id
+        "SELECT CASE
+                    WHEN typeof(session_id) = 'text'
+                     AND length(CAST(session_id AS BLOB)) BETWEEN 1 AND ?1
+                    THEN session_id
+                END,
+                shutdown_clean,
+                clean_checkpoint_id
          FROM mux_sessions",
     )?;
-    let shutdown_rows = shutdown_stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-        ))
-    })?;
+    let shutdown_rows = shutdown_stmt.query_map(
+        [i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX)],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        },
+    )?;
     let mut unclean_sessions = 0usize;
     for row in shutdown_rows {
         let (session_id, shutdown_clean, clean_checkpoint_id) = row?;
+        let session_id = decode_required_bounded_text(
+            session_id,
+            "mux_sessions.session_id",
+        )?;
         if !assess_clean_authority(
-            &conn,
+            conn,
             &session_id,
             shutdown_clean,
             clean_checkpoint_id,
         )? {
-            unclean_sessions += 1;
+            unclean_sessions = unclean_sessions.saturating_add(1);
         }
     }
+    let invalid_resolved_restore_chains =
+        count_invalid_resolved_restore_chains_from_conn(conn)?;
 
     let total_checkpoints: i64 =
         conn.query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
             row.get(0)
         })?;
 
-    let orphaned_pane_states: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM mux_pane_state
-         WHERE checkpoint_id NOT IN (SELECT id FROM session_checkpoints)",
+    let orphaned_checkpoints: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM session_checkpoints AS checkpoint
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM mux_sessions AS session
+             WHERE session.session_id = checkpoint.session_id
+         )",
         [],
         |row| row.get(0),
     )?;
 
-    let total_data_bytes: i64 = conn.query_row(
-        "SELECT COALESCE(SUM(total_bytes), 0) FROM session_checkpoints",
+    let orphaned_pane_states: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM mux_pane_state AS pane
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM session_checkpoints AS checkpoint
+             WHERE checkpoint.id = pane.checkpoint_id
+         )
+         OR EXISTS (
+             SELECT 1
+             FROM session_checkpoints AS checkpoint
+             WHERE checkpoint.id = pane.checkpoint_id
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM mux_sessions AS session
+                   WHERE session.session_id = checkpoint.session_id
+               )
+         )",
         [],
         |row| row.get(0),
     )?;
+
+    let (total_data_bytes, minimum_data_bytes): (i64, Option<i64>) = conn.query_row(
+        "SELECT COALESCE(SUM(total_bytes), 0), MIN(total_bytes)
+         FROM session_checkpoints",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if let Some(minimum_data_bytes) = minimum_data_bytes {
+        decode_usize(minimum_data_bytes, "session_checkpoints.total_bytes")?;
+    }
 
     let (
         unresolved_restore_attempts,
@@ -3790,7 +5209,12 @@ pub fn session_doctor(db_path: &str) -> Result<SessionDoctorReport, RestoreError
         reconciliation_required_restore_attempts,
     ): (i64, i64, i64) = conn.query_row(
         "SELECT
-             COUNT(*) FILTER (WHERE status <> 'resolved'),
+             COUNT(*) FILTER (
+                 WHERE CASE
+                     WHEN typeof(status) = 'text' AND status = 'resolved' THEN 0
+                     ELSE 1
+                 END = 1
+             ),
              COUNT(*) FILTER (WHERE status = 'outcome_complete'),
              COUNT(*) FILTER (WHERE status = 'reconciliation_required')
          FROM restore_attempt_lifecycle",
@@ -3804,8 +5228,28 @@ pub fn session_doctor(db_path: &str) -> Result<SessionDoctorReport, RestoreError
              intent.checkpoint_role = 'restore_intent'
              OR (
                  intent.checkpoint_role = 'restore_receipt'
-                 AND json_valid(intent.metadata_json)
-                 AND json_extract(intent.metadata_json, '$.restore_attempt.phase') = 'intent'
+                 AND CASE
+                     WHEN typeof(intent.metadata_json) != 'text'
+                       OR length(CAST(intent.metadata_json AS BLOB)) > ?1
+                     THEN 1
+                     WHEN NOT json_valid(intent.metadata_json)
+                     THEN 1
+                     WHEN json_extract(
+                         intent.metadata_json,
+                         '$.restore_attempt.phase'
+                     ) = 'outcome'
+                     THEN 0
+                     WHEN json_type(
+                             intent.metadata_json,
+                             '$.restore_attempt'
+                          ) IS NULL
+                      AND json_type(
+                             intent.metadata_json,
+                             '$.old_to_new'
+                          ) = 'object'
+                     THEN 0
+                     ELSE 1
+                 END = 1
              )
          )
          AND NOT EXISTS (
@@ -3814,7 +5258,7 @@ pub fn session_doctor(db_path: &str) -> Result<SessionDoctorReport, RestoreError
              WHERE lifecycle.session_id = intent.session_id
                AND lifecycle.intent_checkpoint_id = intent.id
          )",
-        [],
+        [i64::try_from(MAX_CHECKPOINT_METADATA_BYTES).unwrap_or(i64::MAX)],
         |row| row.get(0),
     )?;
 
@@ -3822,11 +5266,16 @@ pub fn session_doctor(db_path: &str) -> Result<SessionDoctorReport, RestoreError
         total_sessions: decode_usize(total_sessions, "mux_sessions.count")?,
         unclean_sessions,
         total_checkpoints: decode_usize(total_checkpoints, "session_checkpoints.count")?,
+        orphaned_checkpoints: decode_usize(
+            orphaned_checkpoints,
+            "session_checkpoints.orphaned_count",
+        )?,
         orphaned_pane_states: decode_usize(orphaned_pane_states, "mux_pane_state.orphaned_count")?,
         unresolved_restore_attempts: decode_usize(
             unresolved_restore_attempts,
             "restore_attempt_lifecycle.unresolved_count",
         )?,
+        invalid_resolved_restore_chains,
         outcome_complete_restore_attempts: decode_usize(
             outcome_complete_restore_attempts,
             "restore_attempt_lifecycle.outcome_complete_count",
@@ -3843,8 +5292,8 @@ pub fn session_doctor(db_path: &str) -> Result<SessionDoctorReport, RestoreError
     })
 }
 
-/// Cx-first list operation that keeps SQLite and witness verification off the
-/// async worker for large session histories.
+/// Cx-first compatibility list operation that keeps SQLite work off the async
+/// worker and fails closed when the history exceeds one maximum-sized page.
 pub async fn list_sessions_with_cx(
     cx: &crate::cx::Cx,
     db_path: &str,
@@ -3855,12 +5304,30 @@ pub async fn list_sessions_with_cx(
         .map_err(|error| restore_blocking_error("session list", error))?
 }
 
-/// Cx-first detailed session query.
+/// Cx-first bounded session-list page query.
+pub async fn list_sessions_page_with_cx(
+    cx: &crate::cx::Cx,
+    db_path: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<SessionListPage, RestoreError> {
+    validate_session_query_window(limit, offset)?;
+    let db_path = db_path.to_string();
+    crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+        list_sessions_page(&db_path, limit, offset)
+    })
+    .await
+    .map_err(|error| restore_blocking_error("session list page", error))?
+}
+
+/// Cx-first compatibility session query that fails closed when checkpoint
+/// summaries exceed one maximum-sized page.
 pub async fn show_session_with_cx(
     cx: &crate::cx::Cx,
     db_path: &str,
     session_id: &str,
 ) -> Result<(SessionCandidate, Vec<CheckpointInfo>), RestoreError> {
+    validate_session_selector(session_id)?;
     let db_path = db_path.to_string();
     let session_id = session_id.to_string();
     crate::runtime_async::spawn_blocking_with_cx(cx, move || {
@@ -3868,6 +5335,25 @@ pub async fn show_session_with_cx(
     })
     .await
     .map_err(|error| restore_blocking_error("session show", error))?
+}
+
+/// Cx-first bounded checkpoint-summary page query for one session.
+pub async fn show_session_page_with_cx(
+    cx: &crate::cx::Cx,
+    db_path: &str,
+    session_id: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<SessionShowPage, RestoreError> {
+    validate_session_selector(session_id)?;
+    validate_session_query_window(limit, offset)?;
+    let db_path = db_path.to_string();
+    let session_id = session_id.to_string();
+    crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+        show_session_page(&db_path, &session_id, limit, offset)
+    })
+    .await
+    .map_err(|error| restore_blocking_error("session show page", error))?
 }
 
 /// Cx-first health query with bounded blocking-pool execution.
@@ -3883,6 +5369,7 @@ pub async fn session_doctor_with_cx(
 
 /// Delete a session and all its checkpoints (cascading via SQL).
 pub fn delete_session(db_path: &str, session_id: &str) -> Result<bool, RestoreError> {
+    validate_session_selector(session_id)?;
     let db_path = Arc::new(db_path.to_string());
     let session_id = session_id.to_string();
     run_checkpoint_authority_sync(
@@ -3905,6 +5392,7 @@ pub async fn delete_session_with_cx(
     db_path: &str,
     session_id: &str,
 ) -> Result<bool, RestoreError> {
+    validate_session_selector(session_id)?;
     let db_path = Arc::new(db_path.to_string());
     let session_id = session_id.to_string();
     run_checkpoint_authority_with_cx(
@@ -3966,62 +5454,6 @@ fn delete_session_authoritatively(
 }
 
 // =============================================================================
-// Restore banner
-// =============================================================================
-
-/// Generate a restore banner for a pane.
-#[cfg(test)]
-fn restore_banner(
-    old_pane_id: u64,
-    session_id: &str,
-    checkpoint_at: u64,
-    pane_state: Option<&RestoredPaneState>,
-) -> String {
-    let time_str = format_epoch_ms(checkpoint_at);
-    let mut lines = Vec::new();
-
-    lines.push(format!(
-        "\x1b[1;36m═══ Session restored from checkpoint at {time_str} ═══\x1b[0m"
-    ));
-
-    // Show agent context if available
-    if let Some(state) = pane_state {
-        if let Some(ref agent) = state.agent_metadata {
-            let agent_info = match (&agent.state, &agent.session_id) {
-                (Some(st), Some(sid)) => {
-                    format!("{} (session {}, state: {})", agent.agent_type, sid, st)
-                }
-                (Some(st), None) => format!("{} (state: {})", agent.agent_type, st),
-                _ => agent.agent_type.clone(),
-            };
-            lines.push(format!(
-                "\x1b[1;33m═══ Previously running: {agent_info} ═══\x1b[0m"
-            ));
-        }
-        if let Some(ref cmd) = state.command {
-            lines.push(format!("\x1b[90m═══ Process: {cmd} ═══\x1b[0m"));
-        }
-    }
-
-    lines.push(format!(
-        "\x1b[90m═══ Previous output: ft session show {session_id} --pane {old_pane_id} ═══\x1b[0m"
-    ));
-
-    lines.join("\r\n") + "\r\n"
-}
-
-/// Format epoch ms to human-readable string.
-#[cfg(test)]
-fn format_epoch_ms(epoch_ms: u64) -> String {
-    let secs = epoch_ms / 1000;
-    let hours = (secs / 3600) % 24;
-    let mins = (secs / 60) % 60;
-    let s = secs % 60;
-    // Use UTC for simplicity; downstream could localize
-    format!("{hours:02}:{mins:02}:{s:02} UTC")
-}
-
-// =============================================================================
 // Session restore engine
 // =============================================================================
 
@@ -4029,6 +5461,29 @@ fn format_epoch_ms(epoch_ms: u64) -> String {
 pub struct SessionRestorer {
     db_path: Arc<String>,
     config: SessionRestoreConfig,
+}
+
+fn record_unclean_block_reason(
+    current: &mut Option<UncleanSessionBlockReason>,
+    next: UncleanSessionBlockReason,
+) {
+    *current = Some(match *current {
+        None => next,
+        Some(existing) if existing == next => existing,
+        Some(_) => UncleanSessionBlockReason::Mixed,
+    });
+}
+
+fn ensure_detected_checkpoint_remains_nonempty(
+    checkpoint: &CheckpointData,
+) -> Result<(), RestoreError> {
+    if checkpoint.pane_states.is_empty() {
+        Err(RestoreError::DetectedCheckpointChanged {
+            checkpoint_id: checkpoint.checkpoint_id,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 impl SessionRestorer {
@@ -4044,10 +5499,19 @@ impl SessionRestorer {
 
     /// Detect unclean sessions that can be restored.
     ///
-    /// Returns the best candidate with the most recent restorable checkpoint,
-    /// or `None` if no unclean session has usable pane-state data.
+    /// Returns the candidate with the newest bounded, non-empty snapshot
+    /// descriptor. Complete JSON decoding and witness verification happen when
+    /// that exact checkpoint is loaded; detection never materializes every
+    /// historical pane projection.
     pub fn detect(&self) -> Result<Option<SessionCandidate>, RestoreError> {
-        let candidates = find_unclean_sessions(&self.db_path)?;
+        with_query_snapshot(&self.db_path, |conn| self.detect_from_conn(conn))
+    }
+
+    fn detect_from_conn(
+        &self,
+        conn: &Connection,
+    ) -> Result<Option<SessionCandidate>, RestoreError> {
+        let mut candidates = find_unclean_sessions_from_conn(conn)?;
 
         if candidates.is_empty() {
             debug!("No unclean sessions found — clean startup");
@@ -4058,13 +5522,20 @@ impl SessionRestorer {
             count = candidates.len(),
             "Detected unclean session(s) from previous run"
         );
-
-        let mut best: Option<(SessionCandidate, u64, i64)> = None;
+        let unclean_session_count = candidates.len();
+        candidates.sort_unstable_by(|left, right| {
+            right
+                .selected_checkpoint_id
+                .unwrap_or(i64::MIN)
+                .cmp(&left.selected_checkpoint_id.unwrap_or(i64::MIN))
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
         let mut first_error: Option<RestoreError> = None;
+        let mut block_reason: Option<UncleanSessionBlockReason> = None;
 
         for candidate in candidates {
             if let Some((intent_checkpoint_id, outcome_checkpoint_id, status)) =
-                unresolved_restore_attempt(&self.db_path, &candidate.session_id)?
+                restore_ambiguity_from_conn(conn, &candidate.session_id)?
             {
                 let error = RestoreError::RestoreAttemptRequiresReconciliation {
                     session_id: candidate.session_id.clone(),
@@ -4073,7 +5544,7 @@ impl SessionRestorer {
                     status,
                 };
                 warn!(
-                    session_id = %candidate.session_id,
+                    session_id_bytes = candidate.session_id.len(),
                     "Skipping session with an unresolved restore attempt"
                 );
                 if first_error.is_none() {
@@ -4081,47 +5552,57 @@ impl SessionRestorer {
                 }
                 continue;
             }
-            match load_latest_checkpoint(&self.db_path, &candidate.session_id) {
+            let Some(checkpoint_id) = candidate.selected_checkpoint_id else {
+                warn!(
+                    session_id_bytes = candidate.session_id.len(),
+                    "Skipping unclean session with no snapshot checkpoint"
+                );
+                record_unclean_block_reason(
+                    &mut block_reason,
+                    UncleanSessionBlockReason::NoSnapshotCheckpoint,
+                );
+                continue;
+            };
+            match restore_candidate_checkpoint_from_conn(conn, checkpoint_id) {
                 Ok(Some(checkpoint))
                     if self.config.auto_restore
                         && checkpoint.verification == CheckpointVerification::LegacyUnverified =>
                 {
                     warn!(
-                        session_id = %candidate.session_id,
-                        checkpoint_id = checkpoint.checkpoint_id,
+                        session_id_bytes = candidate.session_id.len(),
+                        checkpoint_id,
                         checkpoint_at = checkpoint.checkpoint_at,
                         "Skipping legacy-unverified checkpoint in auto-restore mode"
                     );
-                }
-                Ok(Some(checkpoint)) if !checkpoint.pane_states.is_empty() => {
-                    let checkpoint_at = checkpoint.checkpoint_at;
-                    let checkpoint_id = checkpoint.checkpoint_id;
-                    if best
-                        .as_ref()
-                        .is_none_or(|(_, _, best_checkpoint_id)| {
-                            checkpoint_id > *best_checkpoint_id
-                        })
-                    {
-                        best = Some((candidate, checkpoint_at, checkpoint_id));
-                    }
+                    record_unclean_block_reason(
+                        &mut block_reason,
+                        UncleanSessionBlockReason::LegacyUnverifiedAutoRestore,
+                    );
                 }
                 Ok(Some(checkpoint)) => {
-                    warn!(
-                        session_id = %candidate.session_id,
-                        checkpoint_id = checkpoint.checkpoint_id,
+                    info!(
+                        session_id_bytes = candidate.session_id.len(),
+                        checkpoint_id,
                         checkpoint_at = checkpoint.checkpoint_at,
-                        "Skipping unclean session with empty checkpoint data"
+                        ft_version_bytes = candidate.ft_version.len(),
+                        "Best restore candidate identified from bounded descriptor"
                     );
+                    return Ok(Some(candidate));
                 }
                 Ok(None) => {
                     warn!(
-                        session_id = %candidate.session_id,
-                        "Skipping unclean session with no checkpoints"
+                        session_id_bytes = candidate.session_id.len(),
+                        checkpoint_id,
+                        "Skipping unclean session with empty or missing checkpoint data"
+                    );
+                    record_unclean_block_reason(
+                        &mut block_reason,
+                        UncleanSessionBlockReason::EmptyOrMissingCheckpoint,
                     );
                 }
                 Err(error) => {
                     warn!(
-                        session_id = %candidate.session_id,
+                        session_id_bytes = candidate.session_id.len(),
                         "Skipping unclean session with unreadable checkpoint data"
                     );
                     if first_error.is_none() {
@@ -4130,24 +5611,13 @@ impl SessionRestorer {
                 }
             }
         }
-
-        let Some((best, checkpoint_at, checkpoint_id)) = best else {
-            if let Some(error) = first_error {
-                return Err(error);
-            }
-            debug!("No restorable unclean sessions found");
-            return Ok(None);
-        };
-
-        info!(
-            session_id = %best.session_id,
-            checkpoint_id,
-            checkpoint_at,
-            ft_version = %best.ft_version,
-            "Best restore candidate identified"
-        );
-
-        Ok(Some(best))
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Err(RestoreError::UncleanSessionsNotRestorable {
+            session_count: unclean_session_count,
+            reason: block_reason.unwrap_or(UncleanSessionBlockReason::Mixed),
+        })
     }
 
     /// Load checkpoint data for a session candidate.
@@ -4155,13 +5625,22 @@ impl SessionRestorer {
         &self,
         session: &SessionCandidate,
     ) -> Result<CheckpointData, RestoreError> {
-        let checkpoint =
-            load_latest_checkpoint(&self.db_path, &session.session_id)?.ok_or_else(|| {
-                RestoreError::CorruptCheckpoint("no checkpoints found for session".to_string())
-            })?;
+        let checkpoint = match session.selected_checkpoint_id {
+            Some(checkpoint_id) => load_checkpoint_by_id(&self.db_path, checkpoint_id)?,
+            None => load_latest_checkpoint(&self.db_path, &session.session_id)?,
+        }
+        .ok_or_else(|| {
+            RestoreError::CorruptCheckpoint("no checkpoints found for session".to_string())
+        })?;
+        if checkpoint.session_id != session.session_id {
+            return Err(RestoreError::CorruptCheckpoint(format!(
+                "selected checkpoint {} belongs to another session",
+                checkpoint.checkpoint_id
+            )));
+        }
 
         info!(
-            session_id = %session.session_id,
+            session_id_bytes = session.session_id.len(),
             checkpoint_id = checkpoint.checkpoint_id,
             checkpoint_at = checkpoint.checkpoint_at,
             checkpoint_role = %checkpoint.checkpoint_role,
@@ -4289,7 +5768,7 @@ impl SessionRestorer {
         let total_panes = topology.pane_count();
 
         info!(
-            session_id = %session.session_id,
+            session_id_bytes = session.session_id.len(),
             windows = topology.windows.len(),
             panes = total_panes,
             "Restoring session topology (cx-first)"
@@ -4455,13 +5934,13 @@ impl SessionRestorer {
         if attempt_interruption.is_some() {
             process_disposition_complete = false;
             warn!(
-                session_id = %session.session_id,
+                session_id_bytes = session.session_id.len(),
                 intent_checkpoint_id = intent.checkpoint_id,
                 "Layout attempt stopped; skipping all further external effects and settling an unclean outcome"
             );
         } else if !layout_complete {
             warn!(
-                session_id = %session.session_id,
+                session_id_bytes = session.session_id.len(),
                 restored_panes = restored_expected_pane_count,
                 failed_panes = failed_expected_pane_count,
                 "Session restore incomplete; leaving source session unclean for reconciliation"
@@ -4490,7 +5969,7 @@ impl SessionRestorer {
                     || report.interruption().is_some()
                 {
                     warn!(
-                        session_id = %session.session_id,
+                        session_id_bytes = session.session_id.len(),
                         plans_total = report.plans_total(),
                         plans_settled = report.plans_settled(),
                         sampled_results = report.result_sample().len(),
@@ -4501,7 +5980,7 @@ impl SessionRestorer {
                     );
                 } else {
                     info!(
-                        session_id = %session.session_id,
+                        session_id_bytes = session.session_id.len(),
                         plans_total = report.plans_total(),
                         plans_settled = report.plans_settled(),
                         sampled_results = report.result_sample().len(),
@@ -4560,7 +6039,7 @@ impl SessionRestorer {
                 .map(|interruption| interruption.receipt_phase),
             interruption_reason: attempt_interruption.map(|interruption| interruption.reason),
             // The current evaluator has only settled Manual/Skip categories;
-            // retain the persisted v1/v2 compatibility field as an enforced
+            // retain the legacy compatibility field as an enforced
             // zero until a schema migration removes it atomically.
             process_failed: 0,
             process_manual: process_report.map_or(0, LaunchReport::manual_count),
@@ -4570,18 +6049,15 @@ impl SessionRestorer {
         // malformed backend result (unexpected source IDs or duplicate target
         // IDs) must still settle to an unclean outcome receipt rather than
         // losing durable evidence after external effects have occurred.
-        let mut ordered_expected_pane_ids = expected_pane_ids.iter().copied().collect::<Vec<_>>();
-        ordered_expected_pane_ids.sort_unstable();
-        let mut persisted_target_ids = HashSet::new();
-        let persisted_pane_id_map = ordered_expected_pane_ids
-            .into_iter()
-            .filter_map(|old_id| {
-                let new_id = *layout_result.pane_id_map.get(&old_id)?;
-                persisted_target_ids.insert(new_id).then_some((old_id, new_id))
-            })
-            .collect::<HashMap<_, _>>();
+        let persisted_pane_id_map = authoritative_persisted_pane_mapping(
+            &expected_pane_ids,
+            &outcome_evidence.failed_source_pane_ids,
+            &layout_result.pane_id_map,
+        );
         let mut outcome_evidence = outcome_evidence;
         outcome_evidence.mapped_panes = persisted_pane_id_map.len();
+        let restore_complete = restore_outcome_evidence_is_complete(&outcome_evidence)
+            && process_disposition_complete;
         let db_path = Arc::clone(&self.db_path);
         let session_id = session.session_id.clone();
         let pane_id_map = persisted_pane_id_map;
@@ -4596,12 +6072,12 @@ impl SessionRestorer {
             db_path,
             SnapshotAuthorityOperation::RestoreReceiptCommit,
             move |db_path| {
-                persist_restore_receipt_unclean(
+                persist_restore_receipt_settled(
                     db_path,
                     &session_id,
                     &pane_id_map,
                     &receipt_evidence,
-                    true,
+                    restore_complete,
                 )
             },
         )
@@ -4616,7 +6092,8 @@ impl SessionRestorer {
         debug!(
             checkpoint_id = receipt.checkpoint_id,
             intent_checkpoint_id = intent.checkpoint_id,
-            "Persisted unclean restore outcome receipt"
+            restore_complete,
+            "Persisted and transactionally settled restore outcome receipt"
         );
 
         if let Some(interruption) = attempt_interruption {
@@ -4629,41 +6106,14 @@ impl SessionRestorer {
             });
         }
 
-        let restore_complete = restore_outcome_evidence_is_complete(&outcome_evidence)
-            && process_disposition_complete;
         if restore_complete {
-            let db_path = Arc::clone(&self.db_path);
-            let session_id = session.session_id.clone();
-            let receipt_for_mark = receipt.clone();
-            // The outcome is already durable and complete. Caller
-            // cancellation at this point must not strand an otherwise exact
-            // receipt in outcome_complete merely because final clean binding
-            // reused the canceled capability.
-            let clean_binding_cx =
-                crate::cx::Cx::for_request_with_budget(crate::cx::Budget::MINIMAL);
-            run_checkpoint_authority_with_cx(
-                &clean_binding_cx,
-                db_path,
-                SnapshotAuthorityOperation::RestoreCleanMark,
-                move |db_path| {
-                    mark_restore_receipt_clean(db_path, &session_id, &receipt_for_mark)
-                },
-            )
-            .await
-            .map_err(|error| RestoreError::RestoreAttemptInterrupted {
-                session_id: session.session_id.clone(),
-                intent_checkpoint_id: intent.checkpoint_id,
-                outcome_checkpoint_id: Some(receipt.checkpoint_id),
-                phase: "clean receipt binding",
-                reason: restore_snapshot_interruption_reason(&error),
-            })?;
             debug!(
                 checkpoint_id = receipt.checkpoint_id,
-                "Bound exact restore receipt as clean authority"
+                "Restore receipt, clean authority, and lifecycle resolved atomically"
             );
         } else if layout_complete {
             warn!(
-                session_id = %session.session_id,
+                session_id_bytes = session.session_id.len(),
                 checkpoint_id = receipt.checkpoint_id,
                 "Process disposition evaluation requires follow-up; leaving source session unclean"
             );
@@ -4677,7 +6127,7 @@ impl SessionRestorer {
         };
 
         info!(
-            session_id = %session.session_id,
+            session_id_bytes = session.session_id.len(),
             restored = restored_expected_pane_count,
             failed = failed_expected_pane_count,
             total = total_panes,
@@ -4686,7 +6136,7 @@ impl SessionRestorer {
             "Session restore finished (cx-first)"
         );
 
-        Ok(RestoreSummary {
+        let summary = RestoreSummary {
             session_id: session.session_id.clone(),
             checkpoint_id: checkpoint.checkpoint_id,
             intent_checkpoint_id: intent.checkpoint_id,
@@ -4696,7 +6146,14 @@ impl SessionRestorer {
             process_launch_report,
             restore_authority_resolved: restore_complete,
             elapsed_ms: elapsed,
-        })
+        };
+        if restore_complete {
+            Ok(summary)
+        } else {
+            Err(RestoreError::PartialRestore {
+                summary: Box::new(summary),
+            })
+        }
     }
 
     /// Run the full detection + restore flow.
@@ -4753,13 +6210,13 @@ impl SessionRestorer {
         .await
         .map_err(|error| restore_blocking_error("detected checkpoint load", error))??;
 
-        if checkpoint.pane_states.is_empty() {
+        if let Err(error) = ensure_detected_checkpoint_remains_nonempty(&checkpoint) {
             warn!(
-                session_id = %session.session_id,
+                session_id_bytes = session.session_id.len(),
                 checkpoint_id = checkpoint.checkpoint_id,
-                "Checkpoint became empty after detection; skipping restore and leaving the session unclean"
+                "Checkpoint became empty after detection; refusing a false clean/no-op result"
             );
-            return Ok(None);
+            return Err(error);
         }
 
         cx.checkpoint().map_err(|error| {
@@ -4945,7 +6402,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::session_pane_state::AgentMetadata;
     use crate::session_topology::{PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot};
     use crate::wezterm::{
         MockWezterm, MoveDirection, SplitDirection, WeztermFuture, WeztermInterface,
@@ -5129,6 +6585,386 @@ mod tests {
             validate_restore_outcome_metadata(3, &unknown_version),
             Err(RestoreError::CorruptCheckpoint(_))
         ));
+    }
+
+    #[test]
+    fn v3_outcome_rejects_source_identity_claimed_as_both_mapped_and_failed() {
+        let mut overlap = persisted_outcome_with_process_counts(2, 2, 0, 2, 0);
+        overlap.old_to_new.remove("0");
+        let Some(PersistedRestoreAttempt::Outcome {
+            mapped_panes,
+            reported_layout_failures,
+            failed_source_pane_ids,
+            layout_complete,
+            process_plan_evaluated,
+            process_plans_total,
+            process_plans_settled,
+            attempt_interrupted,
+            interruption_phase,
+            interruption_reason,
+            process_manual,
+            ..
+        }) = overlap.restore_attempt.as_mut()
+        else {
+            unreachable!("test helper always constructs outcome metadata");
+        };
+        *mapped_panes = 1;
+        *reported_layout_failures = 1;
+        *failed_source_pane_ids = Some(vec![1]);
+        *layout_complete = false;
+        *process_plan_evaluated = false;
+        *process_plans_total = 0;
+        *process_plans_settled = 0;
+        *process_manual = 0;
+        *attempt_interrupted = true;
+        *interruption_phase = Some(RestoreInterruptionPhase::LayoutRestoration);
+        *interruption_reason = Some(RestoreInterruptionReason::BackendFailure);
+
+        assert!(matches!(
+            validate_restore_outcome_metadata(3, &overlap),
+            Err(RestoreError::CorruptCheckpoint(_))
+        ));
+    }
+
+    #[test]
+    fn persisted_mapping_excludes_explicit_failures_and_all_duplicate_targets() {
+        let expected = HashSet::from([1_u64, 2, 3]);
+        let explicit_raw = HashMap::from([(1_u64, 10_u64), (2, 20), (3, 30)]);
+
+        let explicit_failure =
+            authoritative_persisted_pane_mapping(&expected, &[1], &explicit_raw);
+        assert_eq!(explicit_failure, HashMap::from([(2, 20), (3, 30)]));
+
+        let duplicate_raw = HashMap::from([(1_u64, 10_u64), (2, 20), (3, 20)]);
+        let duplicate_failures =
+            authoritative_persisted_pane_mapping(&expected, &[], &duplicate_raw);
+        assert_eq!(duplicate_failures, HashMap::from([(1, 10)]));
+    }
+
+    #[test]
+    fn v3_outcome_missing_unmapped_source_identity_rolls_back_atomically() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-v3-coverage", false);
+        let source_id = insert_checkpoint(&conn, "sess-v3-coverage", 5_000, 1);
+        insert_pane_state(&conn, source_id, 7, Some("/tmp"), Some("bash"));
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = 5000
+             WHERE session_id = 'sess-v3-coverage'",
+            [],
+        )
+        .expect("source must be the exact latest session authority");
+        let source_checkpoint = load_checkpoint_by_id(&db_path, source_id)
+            .expect("source lookup should succeed")
+            .expect("source checkpoint should exist");
+        let source = RestoreIntentSource {
+            checkpoint_id: source_checkpoint.checkpoint_id,
+            checkpoint_at: source_checkpoint.checkpoint_at,
+            checkpoint_role: source_checkpoint.checkpoint_role,
+            state_hash: source_checkpoint.state_hash,
+            pane_count: source_checkpoint.pane_count,
+        };
+        let intent = persist_restore_intent_unclean(&db_path, "sess-v3-coverage", &source)
+            .expect("intent should persist");
+        let mut evidence = complete_test_restore_outcome_evidence(1);
+        evidence.intent = intent.clone();
+        evidence.source = source;
+        evidence.mapped_panes = 0;
+        evidence.layout_complete = false;
+        evidence.process_plan_evaluated = false;
+        evidence.process_plans_total = 0;
+        evidence.process_plans_settled = 0;
+        evidence.process_manual = 0;
+        evidence.attempt_interrupted = true;
+        evidence.interruption_phase = Some(RestoreInterruptionPhase::LayoutRestoration);
+        evidence.interruption_reason = Some(RestoreInterruptionReason::BackendFailure);
+
+        let error = persist_restore_receipt_settled(
+            &db_path,
+            "sess-v3-coverage",
+            &HashMap::new(),
+            &evidence,
+            true,
+        )
+        .expect_err("missing failure identity must roll back the outcome");
+        assert!(matches!(error, RestoreAuthorityDbError::RetrySafe { .. }));
+
+        let receipt_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_checkpoints
+                 WHERE session_id = 'sess-v3-coverage'
+                   AND checkpoint_role = 'restore_receipt'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("receipt count query should succeed");
+        assert_eq!(receipt_count, 0);
+        let lifecycle: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT status, outcome_checkpoint_id
+                 FROM restore_attempt_lifecycle
+                 WHERE intent_checkpoint_id = ?1",
+                [intent.checkpoint_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("intent lifecycle should remain present");
+        assert_eq!(lifecycle, ("intent".to_string(), None));
+    }
+
+    #[test]
+    fn outcome_commit_rejects_an_intervening_checkpoint_and_preserves_its_authority() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-intervening-checkpoint", false);
+        let source_id = insert_checkpoint(&conn, "sess-intervening-checkpoint", 5_000, 1);
+        insert_pane_state(&conn, source_id, 7, Some("/source"), Some("bash"));
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = 5000
+             WHERE session_id = 'sess-intervening-checkpoint'",
+            [],
+        )
+        .expect("source must begin as exact latest authority");
+        let source_checkpoint = load_checkpoint_by_id(&db_path, source_id)
+            .expect("source lookup should succeed")
+            .expect("source checkpoint should exist");
+        let source = RestoreIntentSource {
+            checkpoint_id: source_checkpoint.checkpoint_id,
+            checkpoint_at: source_checkpoint.checkpoint_at,
+            checkpoint_role: source_checkpoint.checkpoint_role,
+            state_hash: source_checkpoint.state_hash,
+            pane_count: source_checkpoint.pane_count,
+        };
+        let intent =
+            persist_restore_intent_unclean(&db_path, "sess-intervening-checkpoint", &source)
+                .expect("intent should persist");
+
+        let intervening_id =
+            insert_checkpoint(&conn, "sess-intervening-checkpoint", 6_000, 1);
+        insert_pane_state(&conn, intervening_id, 8, Some("/newer"), Some("zsh"));
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = 6000
+             WHERE session_id = 'sess-intervening-checkpoint'",
+            [],
+        )
+        .expect("intervening checkpoint must become session authority");
+
+        let mut evidence = complete_test_restore_outcome_evidence(1);
+        evidence.intent = intent.clone();
+        evidence.source = source;
+        let error = persist_restore_receipt_settled(
+            &db_path,
+            "sess-intervening-checkpoint",
+            &HashMap::from([(7_u64, 70_u64)]),
+            &evidence,
+            true,
+        )
+        .expect_err("an intervening checkpoint must fence outcome settlement");
+        assert!(matches!(error, RestoreAuthorityDbError::RetrySafe { .. }));
+
+        let session_authority: (Option<i64>, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT last_checkpoint_at, shutdown_clean, clean_checkpoint_id
+                 FROM mux_sessions WHERE session_id = 'sess-intervening-checkpoint'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("session authority should remain queryable");
+        assert_eq!(session_authority, (Some(6_000), 0, None));
+        let latest_checkpoint_id: i64 = conn
+            .query_row(
+                "SELECT id FROM session_checkpoints
+                 WHERE session_id = 'sess-intervening-checkpoint'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("latest checkpoint should remain queryable");
+        assert_eq!(latest_checkpoint_id, intervening_id);
+        let lifecycle: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT status, outcome_checkpoint_id
+                 FROM restore_attempt_lifecycle
+                 WHERE intent_checkpoint_id = ?1",
+                [intent.checkpoint_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("intent lifecycle should remain unresolved");
+        assert_eq!(lifecycle, ("intent".to_string(), None));
+    }
+
+    #[test]
+    fn restore_authority_timestamps_never_precede_their_causal_source() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-future-authority", false);
+        let future_checkpoint_at = i64::MAX;
+        let source_id = insert_checkpoint(
+            &conn,
+            "sess-future-authority",
+            future_checkpoint_at,
+            1,
+        );
+        insert_pane_state(&conn, source_id, 7, Some("/future"), Some("bash"));
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = ?2 WHERE session_id = ?1",
+            params!["sess-future-authority", future_checkpoint_at],
+        )
+        .expect("future source must become exact latest authority");
+        let source_checkpoint = load_checkpoint_by_id(&db_path, source_id)
+            .expect("source lookup should succeed")
+            .expect("source checkpoint should exist");
+        let source = RestoreIntentSource {
+            checkpoint_id: source_checkpoint.checkpoint_id,
+            checkpoint_at: source_checkpoint.checkpoint_at,
+            checkpoint_role: source_checkpoint.checkpoint_role,
+            state_hash: source_checkpoint.state_hash,
+            pane_count: source_checkpoint.pane_count,
+        };
+        let intent = persist_restore_intent_unclean(&db_path, "sess-future-authority", &source)
+            .expect("intent should preserve causal timestamp ordering");
+        assert_eq!(intent.checkpoint_at, future_checkpoint_at);
+
+        let mut evidence = complete_test_restore_outcome_evidence(1);
+        evidence.intent = intent;
+        evidence.source = source;
+        let receipt = persist_restore_receipt_settled(
+            &db_path,
+            "sess-future-authority",
+            &HashMap::from([(7_u64, 70_u64)]),
+            &evidence,
+            true,
+        )
+        .expect("receipt should preserve causal timestamp ordering");
+        assert_eq!(receipt.checkpoint_at, future_checkpoint_at);
+        let session_authority: (Option<i64>, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT last_checkpoint_at, shutdown_clean, clean_checkpoint_id
+                 FROM mux_sessions WHERE session_id = 'sess-future-authority'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("resolved session authority should remain queryable");
+        assert_eq!(
+            session_authority,
+            (Some(future_checkpoint_at), 1, Some(receipt.checkpoint_id))
+        );
+    }
+
+    #[test]
+    fn duplicate_target_outcome_persists_a_loadable_reconciliation_receipt() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-v3-duplicate-receipt", false);
+        let source_id = insert_checkpoint(&conn, "sess-v3-duplicate-receipt", 5_000, 2);
+        insert_pane_state(&conn, source_id, 1, Some("/left"), Some("bash"));
+        insert_pane_state(&conn, source_id, 2, Some("/right"), Some("vim"));
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = 5000
+             WHERE session_id = 'sess-v3-duplicate-receipt'",
+            [],
+        )
+        .expect("source must be the exact latest session authority");
+
+        let source_checkpoint = load_checkpoint_by_id(&db_path, source_id)
+            .expect("source lookup should succeed")
+            .expect("source checkpoint should exist");
+        let source = RestoreIntentSource {
+            checkpoint_id: source_checkpoint.checkpoint_id,
+            checkpoint_at: source_checkpoint.checkpoint_at,
+            checkpoint_role: source_checkpoint.checkpoint_role,
+            state_hash: source_checkpoint.state_hash,
+            pane_count: source_checkpoint.pane_count,
+        };
+        let intent =
+            persist_restore_intent_unclean(&db_path, "sess-v3-duplicate-receipt", &source)
+                .expect("intent should persist before the simulated external outcome");
+
+        let expected_pane_ids = HashSet::from([1_u64, 2]);
+        let raw_pane_id_map = HashMap::from([(1_u64, 100_u64), (2, 100)]);
+        let mut duplicate_source_ids = duplicate_target_source_pane_ids(&raw_pane_id_map)
+            .into_iter()
+            .collect::<Vec<_>>();
+        duplicate_source_ids.sort_unstable();
+        assert_eq!(duplicate_source_ids, vec![1, 2]);
+        let persisted_pane_id_map = authoritative_persisted_pane_mapping(
+            &expected_pane_ids,
+            &duplicate_source_ids,
+            &raw_pane_id_map,
+        );
+        assert!(
+            persisted_pane_id_map.is_empty(),
+            "neither colliding source mapping is authoritative"
+        );
+
+        let mut evidence = complete_test_restore_outcome_evidence(2);
+        evidence.intent = intent.clone();
+        evidence.source = source;
+        evidence.mapped_panes = persisted_pane_id_map.len();
+        evidence.failed_source_pane_ids = duplicate_source_ids.clone();
+        evidence.duplicate_target_source_pane_ids = duplicate_source_ids.clone();
+        evidence.layout_complete = false;
+        evidence.process_plan_evaluated = false;
+        evidence.process_plans_total = 0;
+        evidence.process_plans_settled = 0;
+        evidence.process_manual = 0;
+        evidence.attempt_interrupted = true;
+        evidence.interruption_phase = Some(RestoreInterruptionPhase::LayoutRestoration);
+        evidence.interruption_reason = Some(RestoreInterruptionReason::IntegrityFailure);
+
+        let receipt = persist_restore_receipt_settled(
+            &db_path,
+            "sess-v3-duplicate-receipt",
+            &persisted_pane_id_map,
+            &evidence,
+            false,
+        )
+        .expect("duplicate-target evidence must settle to a durable partial receipt");
+        let loaded = load_checkpoint_by_id(&db_path, receipt.checkpoint_id)
+            .expect("partial receipt lookup should succeed")
+            .expect("partial receipt row should exist");
+        assert_eq!(loaded.checkpoint_role, CheckpointRole::RestoreReceipt);
+        assert_eq!(loaded.pane_count, 0);
+        assert!(loaded.pane_states.is_empty());
+
+        let metadata = restore_checkpoint_metadata_from_conn(
+            &conn,
+            receipt.checkpoint_id,
+            "sess-v3-duplicate-receipt",
+        )
+        .expect("partial receipt metadata must validate");
+        assert!(metadata.old_to_new.is_empty());
+        assert!(matches!(
+            metadata.restore_attempt,
+            Some(PersistedRestoreAttempt::Outcome {
+                evidence_version: RESTORE_OUTCOME_EVIDENCE_VERSION,
+                mapped_panes: 0,
+                reported_layout_failures: 0,
+                failed_source_pane_ids: Some(ref failed_source_pane_ids),
+                unexpected_mapping_count: Some(0),
+                unexpected_failure_count: Some(0),
+                duplicate_target_source_pane_ids: Some(ref duplicate_target_source_pane_ids),
+                layout_complete: false,
+                attempt_interrupted: true,
+                interruption_phase: Some(RestoreInterruptionPhase::LayoutRestoration),
+                interruption_reason: Some(RestoreInterruptionReason::IntegrityFailure),
+                ..
+            }) if failed_source_pane_ids == &[1, 2]
+                && duplicate_target_source_pane_ids == &[1, 2]
+        ));
+
+        let lifecycle: (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT status, outcome_checkpoint_id, resolved_at
+                 FROM restore_attempt_lifecycle
+                 WHERE intent_checkpoint_id = ?1",
+                [intent.checkpoint_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("settled lifecycle should remain queryable");
+        assert_eq!(
+            lifecycle,
+            (
+                "reconciliation_required".to_string(),
+                Some(receipt.checkpoint_id),
+                None,
+            )
+        );
     }
 
     #[test]
@@ -5345,6 +7181,156 @@ mod tests {
         let doctor = session_doctor(&db_path).expect("session doctor");
         assert_eq!(doctor.total_sessions, 1);
         assert_eq!(doctor.unclean_sessions, 1);
+        assert_eq!(doctor.invalid_resolved_restore_chains, 1);
+
+        let restorer = SessionRestorer::new(
+            Arc::new(db_path),
+            SessionRestoreConfig::default(),
+        );
+        assert!(matches!(
+            restorer.detect(),
+            Err(RestoreError::RestoreAttemptRequiresReconciliation {
+                status,
+                ..
+            }) if status == "invalid_resolved_chain"
+        ));
+    }
+
+    #[test]
+    fn missing_resolved_restore_outcome_never_replays_its_source_snapshot() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-missing-outcome", false);
+        let outcome_id = finalize_restore_for_test(
+            &db_path,
+            "sess-missing-outcome",
+            &HashMap::from([(1_u64, 101_u64)]),
+            true,
+        )
+        .expect("bind valid resolved restore authority");
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("disable foreign keys for historical-corruption fixture");
+        conn.execute(
+            "DELETE FROM session_checkpoints WHERE id = ?1",
+            [outcome_id],
+        )
+        .expect("remove resolved outcome without repairing lifecycle");
+
+        let doctor = session_doctor(&db_path).expect("session doctor");
+        assert_eq!(doctor.invalid_resolved_restore_chains, 1);
+
+        let restorer = SessionRestorer::new(
+            Arc::new(db_path),
+            SessionRestoreConfig::default(),
+        );
+        assert!(matches!(
+            restorer.detect(),
+            Err(RestoreError::RestoreAttemptRequiresReconciliation {
+                outcome_checkpoint_id: Some(observed_outcome_id),
+                status,
+                ..
+            }) if observed_outcome_id == outcome_id
+                && status == "invalid_resolved_chain"
+        ));
+    }
+
+    #[test]
+    fn doctor_validates_every_resolved_chain_not_only_the_newest() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-multiple-resolved", false);
+        let mapping = HashMap::from([(1_u64, 101_u64)]);
+        let older_outcome = finalize_restore_for_test(
+            &db_path,
+            "sess-multiple-resolved",
+            &mapping,
+            true,
+        )
+        .expect("bind older resolved restore authority");
+        let newer_outcome = finalize_restore_for_test(
+            &db_path,
+            "sess-multiple-resolved",
+            &mapping,
+            true,
+        )
+        .expect("bind newer resolved restore authority");
+        assert!(older_outcome < newer_outcome);
+
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("disable foreign keys for historical-corruption fixture");
+        conn.execute(
+            "DELETE FROM session_checkpoints WHERE id = ?1",
+            [older_outcome],
+        )
+        .expect("remove only the older resolved outcome");
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, metadata_json, checkpoint_role
+             ) VALUES (?1, 3000, 'startup', 'rsi2:later-unresolved',
+                       0, 0, '{}', 'restore_intent')",
+            ["sess-multiple-resolved"],
+        )
+        .expect("insert a causally later unresolved intent");
+        let later_unresolved_intent = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO restore_attempt_lifecycle (
+                 intent_checkpoint_id, session_id, source_checkpoint_id,
+                 outcome_checkpoint_id, status, created_at, resolved_at
+             ) VALUES (?1, ?2, ?3, NULL, 'intent', 3000, NULL)",
+            params![
+                later_unresolved_intent,
+                "sess-multiple-resolved",
+                newer_outcome,
+            ],
+        )
+        .expect("bind the later unresolved intent");
+
+        let doctor = session_doctor(&db_path).expect("inspect every resolved chain");
+        assert_eq!(doctor.invalid_resolved_restore_chains, 1);
+        assert_eq!(doctor.unresolved_restore_attempts, 1);
+
+        let restorer = SessionRestorer::new(
+            Arc::new(db_path.clone()),
+            SessionRestoreConfig::default(),
+        );
+        assert!(matches!(
+            restorer.detect(),
+            Err(RestoreError::RestoreAttemptRequiresReconciliation {
+                outcome_checkpoint_id: Some(observed_outcome_id),
+                status,
+                ..
+            }) if observed_outcome_id == older_outcome
+                && status == "invalid_resolved_chain"
+        ));
+        let candidates = find_unclean_sessions(&db_path)
+            .expect("invalid historical restore chain must revoke clean authority");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_id, "sess-multiple-resolved");
+    }
+
+    #[test]
+    fn doctor_counts_resolved_chain_whose_parent_session_is_missing() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-missing-resolved-parent", false);
+        finalize_restore_for_test(
+            &db_path,
+            "sess-missing-resolved-parent",
+            &HashMap::from([(1_u64, 101_u64)]),
+            true,
+        )
+        .expect("bind resolved restore authority");
+
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("disable foreign keys for historical-corruption fixture");
+        conn.execute(
+            "DELETE FROM mux_sessions WHERE session_id = 'sess-missing-resolved-parent'",
+            [],
+        )
+        .expect("remove parent session without cascading authority rows");
+
+        let doctor = session_doctor(&db_path).expect("inspect orphaned resolved authority");
+        assert_eq!(doctor.total_sessions, 0);
+        assert!(doctor.orphaned_checkpoints > 0);
+        assert_eq!(doctor.invalid_resolved_restore_chains, 1);
     }
 
     #[test]
@@ -5520,6 +7506,8 @@ mod tests {
     struct SplitFailOnceWezterm {
         inner: MockWezterm,
         split_calls: AtomicUsize,
+        reject_activation: bool,
+        cancel_after_activation_rejection: bool,
     }
 
     impl SplitFailOnceWezterm {
@@ -5527,6 +7515,26 @@ mod tests {
             Self {
                 inner: MockWezterm::new(),
                 split_calls: AtomicUsize::new(0),
+                reject_activation: false,
+                cancel_after_activation_rejection: false,
+            }
+        }
+
+        fn with_activation_rejection() -> Self {
+            Self {
+                inner: MockWezterm::new(),
+                split_calls: AtomicUsize::new(0),
+                reject_activation: true,
+                cancel_after_activation_rejection: false,
+            }
+        }
+
+        fn with_activation_rejection_then_cancel() -> Self {
+            Self {
+                inner: MockWezterm::new(),
+                split_calls: AtomicUsize::new(0),
+                reject_activation: true,
+                cancel_after_activation_rejection: true,
             }
         }
     }
@@ -5608,7 +7616,33 @@ mod tests {
         }
 
         fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
-            self.inner.activate_pane(pane_id)
+            if self.reject_activation {
+                let error: crate::Error =
+                    crate::error::WeztermError::PaneNotFound(pane_id).into();
+                Box::pin(async move { Err(error) })
+            } else {
+                self.inner.activate_pane(pane_id)
+            }
+        }
+
+        fn activate_pane_with_cx<'a>(
+            &'a self,
+            cx: &'a crate::cx::Cx,
+            pane_id: u64,
+        ) -> WeztermFuture<'a, ()> {
+            if self.reject_activation {
+                if self.cancel_after_activation_rejection {
+                    cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("session restore activation rejection test"),
+                    );
+                }
+                let error: crate::Error =
+                    crate::error::WeztermError::PaneNotFound(pane_id).into();
+                Box::pin(async move { Err(error) })
+            } else {
+                self.inner.activate_pane_with_cx(cx, pane_id)
+            }
         }
 
         fn get_pane_direction(
@@ -6367,6 +8401,116 @@ mod tests {
     }
 
     #[test]
+    fn load_checkpoint_by_id_rejects_more_rows_than_the_declared_count() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-count-overflow", false);
+        let checkpoint_id = insert_checkpoint(&conn, "sess-count-overflow", 5000, 1);
+        insert_pane_state(&conn, checkpoint_id, 7, None, None);
+        insert_pane_state(&conn, checkpoint_id, 8, None, None);
+
+        let error = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .expect_err("the bounded expected-plus-one preflight must observe the extra row");
+        assert!(matches!(error, RestoreError::CorruptCheckpoint(_)));
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_rejects_declared_pane_count_before_allocation() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-count-cap", false);
+        let checkpoint_id = insert_checkpoint(&conn, "sess-count-cap", 5000, 0);
+        conn.execute(
+            "UPDATE session_checkpoints SET pane_count = ?2 WHERE id = ?1",
+            params![
+                checkpoint_id,
+                i64::try_from(MAX_TOPOLOGY_PANES + 1).unwrap()
+            ],
+        )
+        .unwrap();
+
+        let error = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .expect_err("an over-limit declaration must fail before pane allocation");
+        assert!(matches!(
+            error,
+            RestoreError::CheckpointResourceLimit {
+                checkpoint_id: observed_checkpoint_id,
+                resource: "pane_count",
+                observed,
+                limit: MAX_TOPOLOGY_PANES,
+            } if observed_checkpoint_id == checkpoint_id && observed == MAX_TOPOLOGY_PANES + 1
+        ));
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_rejects_oversized_pane_text_before_json_decode() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-row-cap", false);
+        let checkpoint_id = insert_checkpoint(&conn, "sess-row-cap", 5000, 1);
+        insert_pane_state(&conn, checkpoint_id, 7, None, None);
+        recompute_checkpoint_total_bytes(&conn, checkpoint_id);
+        let sealed_hash = seal_checkpoint_v2(&conn, checkpoint_id);
+        assert!(sealed_hash.starts_with(SNAPSHOT_WITNESS_PREFIX));
+
+        conn.execute(
+            "UPDATE mux_pane_state SET terminal_state_json = ?2 WHERE checkpoint_id = ?1",
+            params![
+                checkpoint_id,
+                "x".repeat(MAX_PERSISTED_PANE_TEXT_BYTES + 1)
+            ],
+        )
+        .unwrap();
+
+        let error = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .expect_err("a sealed pre-cap row must fail as a resource-policy refusal");
+        assert!(matches!(
+            error,
+            RestoreError::CheckpointResourceLimit {
+                checkpoint_id: observed_checkpoint_id,
+                resource: "pane_text_row_bytes",
+                observed,
+                limit: MAX_PERSISTED_PANE_TEXT_BYTES,
+            } if observed_checkpoint_id == checkpoint_id
+                && observed == MAX_PERSISTED_PANE_TEXT_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_rejects_oversized_metadata_before_parse() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-metadata-cap", false);
+        let checkpoint_id = insert_checkpoint(&conn, "sess-metadata-cap", 5000, 0);
+        conn.execute(
+            "UPDATE session_checkpoints SET metadata_json = ?2 WHERE id = ?1",
+            params![checkpoint_id, "m".repeat(MAX_CHECKPOINT_METADATA_BYTES + 1)],
+        )
+        .unwrap();
+
+        let error = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .expect_err("oversized metadata must not cross the SQL-to-Rust boundary");
+        assert!(matches!(
+            error,
+            RestoreError::CheckpointResourceLimit {
+                checkpoint_id: observed_checkpoint_id,
+                resource: "metadata_json_bytes",
+                observed,
+                limit: MAX_CHECKPOINT_METADATA_BYTES,
+            } if observed_checkpoint_id == checkpoint_id
+                && observed == MAX_CHECKPOINT_METADATA_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_rejects_oversized_identity_text() {
+        let (db_path, conn, _dir) = setup_test_db();
+        let oversized_session_id = "s".repeat(MAX_CHECKPOINT_SESSION_ID_BYTES + 1);
+        insert_session(&conn, &oversized_session_id, false);
+        let checkpoint_id = insert_checkpoint(&conn, &oversized_session_id, 5000, 0);
+
+        let error = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .expect_err("oversized checkpoint identity must fail bounded header admission");
+        assert!(matches!(error, RestoreError::CorruptCheckpoint(_)));
+    }
+
+    #[test]
     fn load_checkpoint_by_id_rejects_duplicate_snapshot_pane_ids() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-duplicate", false);
@@ -6644,6 +8788,20 @@ mod tests {
     }
 
     #[test]
+    fn restore_mapping_rejects_over_limit_cardinality_before_serialization() {
+        let mapping = (0..=MAX_TOPOLOGY_PANES)
+            .map(|pane_id| {
+                let pane_id = u64::try_from(pane_id).expect("test pane id is representable");
+                (pane_id, pane_id)
+            })
+            .collect::<HashMap<_, _>>();
+
+        let error = prepare_restore_mapping(&mapping)
+            .expect_err("an over-limit mapping must fail before JSON construction");
+        assert!(matches!(error, RestoreError::Bookkeeping(_)));
+    }
+
+    #[test]
     fn save_restore_checkpoint_updates_session_last_checkpoint_at() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-last-cp", false);
@@ -6802,44 +8960,6 @@ mod tests {
     }
 
     #[test]
-    fn restore_banner_basic() {
-        let banner = restore_banner(42, "sess-test", 1700000000000, None);
-        assert!(banner.contains("Session restored"));
-        assert!(banner.contains("sess-test"));
-        assert!(banner.contains("42"));
-    }
-
-    #[test]
-    fn restore_banner_with_agent_context() {
-        let state = RestoredPaneState {
-            pane_id: 1,
-            cwd: Some("/home".to_string()),
-            command: Some("claude-code".to_string()),
-            terminal_state: None,
-            agent_metadata: Some(AgentMetadata {
-                agent_type: "claude_code".to_string(),
-                session_id: Some("abc123".to_string()),
-                state: Some("working".to_string()),
-            }),
-            scrollback_checkpoint_seq: None,
-            last_output_at: None,
-        };
-
-        let banner = restore_banner(1, "sess-agent", 1700000000000, Some(&state));
-        assert!(banner.contains("claude_code"));
-        assert!(banner.contains("abc123"));
-        assert!(banner.contains("working"));
-        assert!(banner.contains("claude-code")); // process name
-    }
-
-    #[test]
-    fn format_epoch_ms_produces_utc() {
-        // 2023-11-14 22:13:20 UTC = 1700000000 seconds
-        let s = format_epoch_ms(1700000000000);
-        assert_eq!(s, "22:13:20 UTC");
-    }
-
-    #[test]
     fn session_restorer_detect_empty_db() {
         let (db_path, _conn, _dir) = setup_test_db();
         let restorer = SessionRestorer::new(Arc::new(db_path), SessionRestoreConfig::default());
@@ -6859,6 +8979,50 @@ mod tests {
     }
 
     #[test]
+    fn session_restorer_reports_unclean_session_without_snapshot_as_blocked() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-unclean-no-snapshot", false);
+        let restorer = SessionRestorer::new(Arc::new(db_path), SessionRestoreConfig::default());
+
+        assert!(matches!(
+            restorer.detect(),
+            Err(RestoreError::UncleanSessionsNotRestorable {
+                session_count: 1,
+                reason: UncleanSessionBlockReason::NoSnapshotCheckpoint,
+            })
+        ));
+    }
+
+    #[test]
+    fn session_restorer_reports_empty_snapshot_as_blocked_and_changed_after_admission() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-unclean-empty-snapshot", false);
+        let checkpoint_id =
+            insert_checkpoint(&conn, "sess-unclean-empty-snapshot", 5_000, 0);
+        let restorer = SessionRestorer::new(
+            Arc::new(db_path.clone()),
+            SessionRestoreConfig::default(),
+        );
+
+        assert!(matches!(
+            restorer.detect(),
+            Err(RestoreError::UncleanSessionsNotRestorable {
+                session_count: 1,
+                reason: UncleanSessionBlockReason::EmptyOrMissingCheckpoint,
+            })
+        ));
+        let checkpoint = load_checkpoint_by_id(&db_path, checkpoint_id)
+            .expect("load empty checkpoint fixture")
+            .expect("empty checkpoint row");
+        assert!(matches!(
+            ensure_detected_checkpoint_remains_nonempty(&checkpoint),
+            Err(RestoreError::DetectedCheckpointChanged {
+                checkpoint_id: observed,
+            }) if observed == checkpoint_id
+        ));
+    }
+
+    #[test]
     fn session_restorer_detect_finds_crash() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-clean", true);
@@ -6870,6 +9034,56 @@ mod tests {
         let result = restorer.detect().unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().session_id, "sess-crash");
+    }
+
+    #[test]
+    fn session_restorer_detection_pins_the_exact_snapshot_id() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-pinned", false);
+        let selected_id = insert_checkpoint(&conn, "sess-pinned", 5000, 1);
+        insert_pane_state(&conn, selected_id, 7, Some("/selected"), Some("bash"));
+
+        let restorer = SessionRestorer::new(
+            Arc::new(db_path.clone()),
+            SessionRestoreConfig::default(),
+        );
+        let candidate = restorer.detect().unwrap().expect("bounded candidate");
+        assert_eq!(candidate.selected_checkpoint_id, Some(selected_id));
+
+        let newer_id = insert_checkpoint(&conn, "sess-pinned", 6000, 1);
+        insert_pane_state(&conn, newer_id, 8, Some("/newer"), Some("zsh"));
+        let loaded = restorer.load_checkpoint(&candidate).unwrap();
+        assert_eq!(loaded.checkpoint_id, selected_id);
+        assert_eq!(loaded.pane_states[0].pane_id, 7);
+    }
+
+    #[test]
+    fn session_restorer_detection_does_not_decode_full_pane_json() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-descriptor-only", false);
+        let checkpoint_id = insert_checkpoint(&conn, "sess-descriptor-only", 5000, 1);
+        insert_pane_state(&conn, checkpoint_id, 7, None, None);
+        conn.execute(
+            "UPDATE mux_pane_state SET terminal_state_json = 'not-json'
+             WHERE checkpoint_id = ?1",
+            [checkpoint_id],
+        )
+        .unwrap();
+        recompute_checkpoint_total_bytes(&conn, checkpoint_id);
+
+        let restorer = SessionRestorer::new(
+            Arc::new(db_path),
+            SessionRestoreConfig::default(),
+        );
+        let candidate = restorer
+            .detect()
+            .expect("descriptor detection must not decode pane JSON")
+            .expect("non-empty bounded descriptor");
+        assert_eq!(candidate.selected_checkpoint_id, Some(checkpoint_id));
+        assert!(matches!(
+            restorer.load_checkpoint(&candidate),
+            Err(RestoreError::CorruptCheckpoint(_))
+        ));
     }
 
     #[test]
@@ -6892,10 +9106,13 @@ mod tests {
                 ..SessionRestoreConfig::default()
             },
         );
-        assert!(
-            automatic.detect().unwrap().is_none(),
-            "legacy evidence may be offered manually but never auto-restored"
-        );
+        assert!(matches!(
+            automatic.detect(),
+            Err(RestoreError::UncleanSessionsNotRestorable {
+                session_count: 1,
+                reason: UncleanSessionBlockReason::LegacyUnverifiedAutoRestore,
+            })
+        ));
     }
 
     #[test]
@@ -7062,6 +9279,45 @@ mod tests {
     }
 
     #[test]
+    fn restore_admission_accepts_layout_supported_extreme_split_ratios() {
+        let leaf = |pane_id, is_active| PaneNode::Leaf {
+            pane_id,
+            rows: 24,
+            cols: 80,
+            cwd: None,
+            title: None,
+            is_active,
+        };
+        let topology = TopologySnapshot {
+            schema_version: 1,
+            captured_at: 1_000,
+            workspace_id: None,
+            windows: vec![WindowSnapshot {
+                window_id: 1,
+                title: None,
+                position: None,
+                size: None,
+                tabs: vec![TabSnapshot {
+                    tab_id: 1,
+                    title: None,
+                    active_pane_id: Some(1),
+                    pane_tree: PaneNode::VSplit {
+                        children: vec![
+                            (1.0, leaf(1, true)),
+                            (2.0, leaf(2, false)),
+                            (f64::MAX, leaf(3, false)),
+                        ],
+                    },
+                }],
+                active_tab_index: Some(0),
+            }],
+        };
+
+        validate_restore_topology(41, 3, &[1, 2, 3], &topology)
+            .expect("session admission must accept every topology supported by layout preflight");
+    }
+
+    #[test]
     fn session_restorer_restore_partial_failure_requires_explicit_reconciliation() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-partial", false);
@@ -7200,6 +9456,156 @@ mod tests {
                 && observed_outcome_checkpoint_id == outcome_checkpoint_id
                 && status == "reconciliation_required"
         ));
+    }
+
+    #[test]
+    fn mapped_activation_failure_persists_failure_only_reconciliation_receipt() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-mapped-activation-failure", false);
+        set_single_pane_topology(&conn, "sess-mapped-activation-failure", 7, "/restore");
+        let checkpoint_id = insert_checkpoint(&conn, "sess-mapped-activation-failure", 5000, 1);
+        insert_pane_state(&conn, checkpoint_id, 7, Some("/restore"), Some("bash"));
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = 5000
+             WHERE session_id = 'sess-mapped-activation-failure'",
+            [],
+        )
+        .expect("source must be the exact latest session authority");
+
+        let restorer =
+            SessionRestorer::new(Arc::new(db_path.clone()), SessionRestoreConfig::default());
+        let session = restorer.detect().unwrap().expect("restorable session");
+        let checkpoint = restorer.load_checkpoint(&session).unwrap();
+        let wezterm = Arc::new(SplitFailOnceWezterm::with_activation_rejection_then_cancel());
+
+        let error = run_async_test(restorer.restore(
+            &session,
+            &checkpoint,
+            wezterm.clone(),
+        ))
+        .expect_err("mapped activation rejection plus cancellation must return its receipt");
+        let (intent_checkpoint_id, outcome_checkpoint_id) = match error {
+            RestoreError::RestoreAttemptInterrupted {
+                intent_checkpoint_id,
+                outcome_checkpoint_id: Some(outcome_checkpoint_id),
+                phase: "post-layout checkpoint",
+                reason: RestoreInterruptionReason::Cancelled,
+                ..
+            } => (intent_checkpoint_id, outcome_checkpoint_id),
+            other => panic!("expected receipted mapped activation failure, got {other:?}"),
+        };
+        assert_eq!(
+            run_async_test(wezterm.list_panes())
+                .expect("mock pane listing should succeed")
+                .len(),
+            1,
+            "the root-pane mapping existed before activation was rejected"
+        );
+
+        let outcome = load_checkpoint_by_id(&db_path, outcome_checkpoint_id)
+            .expect("partial receipt must load")
+            .expect("partial receipt row must exist");
+        assert_eq!(outcome.checkpoint_role, CheckpointRole::RestoreReceipt);
+        assert_eq!(outcome.pane_count, 0);
+        assert!(outcome.pane_states.is_empty());
+        let metadata = restore_checkpoint_metadata_from_conn(
+            &conn,
+            outcome_checkpoint_id,
+            "sess-mapped-activation-failure",
+        )
+        .expect("mapped activation failure metadata must validate");
+        assert!(
+            metadata.old_to_new.is_empty(),
+            "a source reported failed after mapping must not remain an authoritative success"
+        );
+        assert!(matches!(
+            metadata.restore_attempt,
+            Some(PersistedRestoreAttempt::Outcome {
+                evidence_version: RESTORE_OUTCOME_EVIDENCE_VERSION,
+                mapped_panes: 0,
+                reported_layout_failures: 1,
+                failed_source_pane_ids: Some(ref failed_source_pane_ids),
+                unexpected_mapping_count: Some(0),
+                unexpected_failure_count: Some(0),
+                duplicate_target_source_pane_ids: Some(ref duplicate_target_source_pane_ids),
+                layout_complete: false,
+                attempt_interrupted: true,
+                interruption_phase: Some(RestoreInterruptionPhase::PostLayoutCheckpoint),
+                interruption_reason: Some(RestoreInterruptionReason::Cancelled),
+                ..
+            }) if failed_source_pane_ids == &[7]
+                && duplicate_target_source_pane_ids.is_empty()
+        ));
+
+        let lifecycle: (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT status, outcome_checkpoint_id, resolved_at
+                 FROM restore_attempt_lifecycle
+                 WHERE intent_checkpoint_id = ?1",
+                [intent_checkpoint_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("settled lifecycle should remain queryable");
+        assert_eq!(
+            lifecycle,
+            (
+                "reconciliation_required".to_string(),
+                Some(outcome_checkpoint_id),
+                None,
+            )
+        );
+    }
+
+    #[test]
+    fn authoritative_partial_restore_is_a_typed_error_with_durable_receipt() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-authoritative-partial", false);
+        set_single_pane_topology(&conn, "sess-authoritative-partial", 7, "/restore");
+        let checkpoint_id =
+            insert_checkpoint(&conn, "sess-authoritative-partial", 5_000, 1);
+        insert_pane_state(&conn, checkpoint_id, 7, Some("/restore"), Some("bash"));
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = 5000
+             WHERE session_id = 'sess-authoritative-partial'",
+            [],
+        )
+        .unwrap();
+
+        let restorer =
+            SessionRestorer::new(Arc::new(db_path), SessionRestoreConfig::default());
+        let session = restorer.detect().unwrap().expect("restorable session");
+        let checkpoint = restorer.load_checkpoint(&session).unwrap();
+        let error = run_async_test(restorer.restore(
+            &session,
+            &checkpoint,
+            Arc::new(SplitFailOnceWezterm::with_activation_rejection()),
+        ))
+        .expect_err("partial authority must never be represented as Result success");
+
+        let summary = error
+            .partial_restore_summary()
+            .expect("typed partial error must retain its durable receipt");
+        assert!(!summary.restore_authority_resolved);
+        assert_eq!(summary.checkpoint_id, checkpoint_id);
+        assert!(summary.intent_checkpoint_id > checkpoint_id);
+        assert!(summary.outcome_checkpoint_id > summary.intent_checkpoint_id);
+        assert_eq!(summary.layout_failed_pane_count(), 1);
+        let lifecycle: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT status, outcome_checkpoint_id
+                 FROM restore_attempt_lifecycle
+                 WHERE intent_checkpoint_id = ?1",
+                [summary.intent_checkpoint_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("partial lifecycle receipt");
+        assert_eq!(
+            lifecycle,
+            (
+                "reconciliation_required".to_string(),
+                Some(summary.outcome_checkpoint_id),
+            )
+        );
     }
 
     #[test]
@@ -7355,7 +9761,7 @@ mod tests {
             SessionRestorer::new(Arc::new(db_path.clone()), SessionRestoreConfig::default());
         let mut session = restorer.detect().unwrap().expect("restorable session");
         let checkpoint = restorer.load_checkpoint(&session).unwrap();
-        session.topology_json = "{not authoritative topology}".to_string();
+        session.selected_checkpoint_id = Some(i64::MAX);
 
         let wezterm = Arc::new(MockWezterm::new());
         let summary =
@@ -7803,7 +10209,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM session_checkpoints
                  WHERE session_id = 'sess-scrollback'
-                   AND checkpoint_role = 'restore_receipt'",
+                   AND checkpoint_role IN ('restore_intent', 'restore_receipt')",
                 [],
                 |row| row.get(0),
             )
@@ -7812,6 +10218,102 @@ mod tests {
             restore_rows, 0,
             "safety preflight must run before a durable restore intent"
         );
+    }
+
+    #[test]
+    fn session_restorer_rejects_layout_invalid_topology_before_intent_or_mux_effects() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-invalid-layout-preflight", false);
+        let topology = TopologySnapshot {
+            schema_version: 1,
+            captured_at: 5_000,
+            workspace_id: None,
+            windows: vec![
+                WindowSnapshot {
+                    window_id: 9,
+                    title: None,
+                    position: None,
+                    size: None,
+                    tabs: vec![TabSnapshot {
+                        tab_id: 10,
+                        title: None,
+                        active_pane_id: Some(1),
+                        pane_tree: PaneNode::Leaf {
+                            pane_id: 1,
+                            rows: 24,
+                            cols: 80,
+                            cwd: Some("/first".to_string()),
+                            title: None,
+                            is_active: true,
+                        },
+                    }],
+                    active_tab_index: Some(0),
+                },
+                WindowSnapshot {
+                    window_id: 9,
+                    title: None,
+                    position: None,
+                    size: None,
+                    tabs: vec![TabSnapshot {
+                        tab_id: 11,
+                        title: None,
+                        active_pane_id: Some(2),
+                        pane_tree: PaneNode::Leaf {
+                            pane_id: 2,
+                            rows: 24,
+                            cols: 80,
+                            cwd: Some("/second".to_string()),
+                            title: None,
+                            is_active: true,
+                        },
+                    }],
+                    active_tab_index: Some(0),
+                },
+            ],
+        };
+        let topology_json =
+            serde_json::to_string(&topology).expect("serialize intentionally invalid topology");
+        conn.execute(
+            "UPDATE mux_sessions
+             SET topology_json = ?2, last_checkpoint_at = 5000
+             WHERE session_id = ?1",
+            params!["sess-invalid-layout-preflight", topology_json],
+        )
+        .unwrap();
+        let checkpoint_id =
+            insert_checkpoint(&conn, "sess-invalid-layout-preflight", 5_000, 2);
+        insert_pane_state(&conn, checkpoint_id, 1, Some("/first"), Some("bash"));
+        insert_pane_state(&conn, checkpoint_id, 2, Some("/second"), Some("bash"));
+        seal_checkpoint_v2(&conn, checkpoint_id);
+
+        let restorer =
+            SessionRestorer::new(Arc::new(db_path), SessionRestoreConfig::default());
+        let session = restorer.detect().unwrap().expect("restorable session descriptor");
+        let checkpoint = restorer.load_checkpoint(&session).unwrap();
+        let wezterm = Arc::new(MockWezterm::new());
+        let error = run_async_test(restorer.restore(&session, &checkpoint, wezterm.clone()))
+            .expect_err("duplicate window authority must fail before durable intent");
+        assert!(matches!(
+            error,
+            RestoreError::CorruptCheckpoint(message)
+                if message == format!(
+                    "checkpoint {checkpoint_id} topology failed layout preflight"
+                )
+        ));
+        assert!(run_async_test(wezterm.list_panes()).unwrap().is_empty());
+        let restore_authority_rows: i64 = conn
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM session_checkpoints
+                      WHERE session_id = 'sess-invalid-layout-preflight'
+                        AND checkpoint_role IN ('restore_intent', 'restore_receipt'))
+                   + (SELECT COUNT(*) FROM restore_attempt_lifecycle
+                      WHERE session_id = 'sess-invalid-layout-preflight')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restore_authority_rows, 0);
     }
 
     #[test]
@@ -8185,6 +10687,75 @@ mod tests {
     }
 
     #[test]
+    fn list_sessions_page_bounds_rows_and_reports_exact_total() {
+        let (db_path, conn, _dir) = setup_test_db();
+        for index in 0_i64..5 {
+            let session_id = format!("sess-page-{index}");
+            insert_session(&conn, &session_id, false);
+            insert_checkpoint(&conn, &session_id, 1_000 + index, 1);
+        }
+
+        let first = list_sessions_page(&db_path, 2, 0).expect("first session page");
+        assert_eq!(first.sessions.len(), 2);
+        assert_eq!(first.total_sessions, 5);
+        assert_eq!(first.limit, 2);
+        assert_eq!(first.offset, 0);
+        assert!(first.has_more);
+        assert_eq!(first.sessions[0].session_id, "sess-page-4");
+        assert_eq!(first.sessions[1].session_id, "sess-page-3");
+
+        let last = list_sessions_page(&db_path, 2, 4).expect("last session page");
+        assert_eq!(last.sessions.len(), 1);
+        assert_eq!(last.sessions[0].session_id, "sess-page-0");
+        assert_eq!(last.total_sessions, 5);
+        assert!(!last.has_more);
+    }
+
+    #[test]
+    fn session_query_pages_reject_unbounded_windows_before_io() {
+        let dir = tempfile::tempdir().expect("create query-window test directory");
+        let missing_db = dir.path().join("must-not-be-opened.db");
+        let missing_db = missing_db.to_string_lossy().to_string();
+
+        for (limit, offset) in [
+            (0, 0),
+            (MAX_SESSION_QUERY_LIMIT + 1, 0),
+            (1, MAX_SESSION_QUERY_OFFSET + 1),
+        ] {
+            assert!(matches!(
+                list_sessions_page(&missing_db, limit, offset),
+                Err(RestoreError::InvalidQueryWindow { .. })
+            ));
+            assert!(matches!(
+                show_session_page(&missing_db, "sess-window", limit, offset),
+                Err(RestoreError::InvalidQueryWindow { .. })
+            ));
+        }
+        assert!(
+            !std::path::Path::new(&missing_db).exists(),
+            "query-window admission must precede opening storage"
+        );
+    }
+
+    #[test]
+    fn nonpaged_session_list_fails_closed_above_materialization_limit() {
+        let (db_path, conn, _dir) = setup_test_db();
+        for index in 0..=MAX_SESSION_QUERY_LIMIT {
+            insert_session(&conn, &format!("sess-bounded-{index:03}"), false);
+        }
+
+        let error = list_sessions(&db_path).expect_err("nonpaged list must fail closed");
+        assert!(matches!(
+            error,
+            RestoreError::QueryResultLimit {
+                resource: "session_summaries",
+                observed,
+                limit: MAX_SESSION_QUERY_LIMIT,
+            } if observed == MAX_SESSION_QUERY_LIMIT + 1
+        ));
+    }
+
+    #[test]
     fn list_and_show_session_break_checkpoint_timestamp_ties_by_id() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-summary-tie", false);
@@ -8196,6 +10767,63 @@ mod tests {
         let (_, checkpoints) = show_session(&db_path, "sess-summary-tie").unwrap();
         assert_eq!(checkpoints[0].id, newer_id);
         assert_eq!(checkpoints[1].id, older_id);
+    }
+
+    #[test]
+    fn list_and_show_session_use_checkpoint_time_before_higher_backdated_id() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-chronology-newest", false);
+        insert_session(&conn, "sess-chronology-middle", false);
+
+        let chronological_latest =
+            insert_checkpoint(&conn, "sess-chronology-newest", 3_000, 3);
+        let backdated_higher_id =
+            insert_checkpoint(&conn, "sess-chronology-newest", 1_000, 1);
+        insert_checkpoint(&conn, "sess-chronology-middle", 2_000, 2);
+
+        let sessions = list_sessions(&db_path).expect("list sessions chronologically");
+        assert_eq!(sessions[0].session_id, "sess-chronology-newest");
+        assert_eq!(sessions[0].last_checkpoint_at, Some(3_000));
+        assert_eq!(sessions[0].pane_count, Some(3));
+        assert_eq!(sessions[1].session_id, "sess-chronology-middle");
+
+        let (session, checkpoints) =
+            show_session(&db_path, "sess-chronology-newest").expect("show session");
+        assert_eq!(session.last_checkpoint_at, Some(3_000));
+        assert_eq!(session.selected_checkpoint_id, Some(chronological_latest));
+        assert_eq!(checkpoints[0].id, chronological_latest);
+        assert_eq!(checkpoints[1].id, backdated_higher_id);
+    }
+
+    #[test]
+    fn list_show_and_unclean_attribute_negative_latest_time_to_checkpoint_authority() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-negative-checkpoint-time", false);
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, checkpoint_role
+             ) VALUES (?1, -1, 'periodic', 'legacy:negative-time',
+                       0, 0, 'snapshot')",
+            ["sess-negative-checkpoint-time"],
+        )
+        .expect("insert negative checkpoint-time corruption fixture");
+
+        for error in [
+            list_sessions(&db_path).expect_err("list must reject negative checkpoint time"),
+            show_session(&db_path, "sess-negative-checkpoint-time")
+                .expect_err("show must reject negative checkpoint time"),
+            find_unclean_sessions(&db_path)
+                .expect_err("unclean discovery must reject negative checkpoint time"),
+        ] {
+            assert!(matches!(
+                error,
+                RestoreError::InvalidPersistedValue {
+                    field: "session_checkpoints.checkpoint_at",
+                    value: -1,
+                }
+            ));
+        }
     }
 
     #[test]
@@ -8241,6 +10869,98 @@ mod tests {
     }
 
     #[test]
+    fn list_sessions_rejects_oversized_ft_version_before_materialization() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-oversized-version", false);
+        conn.execute(
+            "UPDATE mux_sessions SET ft_version = ?2 WHERE session_id = ?1",
+            params![
+                "sess-oversized-version",
+                "v".repeat(MAX_SESSION_FT_VERSION_BYTES + 1)
+            ],
+        )
+        .unwrap();
+
+        let error = list_sessions(&db_path)
+            .expect_err("oversized ft_version must not cross the SQL-to-Rust boundary");
+        assert!(matches!(
+            error,
+            RestoreError::InvalidPersistedText {
+                field: "mux_sessions.ft_version"
+            }
+        ));
+    }
+
+    #[test]
+    fn show_session_rejects_oversized_host_id_before_materialization() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-oversized-host", false);
+        conn.execute(
+            "UPDATE mux_sessions SET host_id = ?2 WHERE session_id = ?1",
+            params![
+                "sess-oversized-host",
+                "h".repeat(MAX_SESSION_HOST_ID_BYTES + 1)
+            ],
+        )
+        .unwrap();
+
+        let error = show_session(&db_path, "sess-oversized-host")
+            .expect_err("oversized host_id must not cross the SQL-to-Rust boundary");
+        assert!(matches!(
+            error,
+            RestoreError::InvalidPersistedText {
+                field: "mux_sessions.host_id"
+            }
+        ));
+    }
+
+    #[test]
+    fn find_unclean_sessions_rejects_oversized_host_id_before_materialization() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-oversized-host-detect", false);
+        conn.execute(
+            "UPDATE mux_sessions SET host_id = ?2 WHERE session_id = ?1",
+            params![
+                "sess-oversized-host-detect",
+                "h".repeat(MAX_SESSION_HOST_ID_BYTES + 1)
+            ],
+        )
+        .unwrap();
+
+        let error = find_unclean_sessions(&db_path)
+            .expect_err("oversized host_id must not cross detection's SQL boundary");
+        assert!(matches!(
+            error,
+            RestoreError::InvalidPersistedText {
+                field: "mux_sessions.host_id"
+            }
+        ));
+    }
+
+    #[test]
+    fn session_doctor_rejects_oversized_session_id_before_materialization() {
+        let (db_path, conn, _dir) = setup_test_db();
+        let oversized_session_id = "s".repeat(MAX_CHECKPOINT_SESSION_ID_BYTES + 1);
+        let topology = r#"{"schema_version":1,"captured_at":1000,"windows":[]}"#;
+        conn.execute(
+            "INSERT INTO mux_sessions
+             (session_id, created_at, topology_json, ft_version, shutdown_clean)
+             VALUES (?1, 1000, ?2, '0.1.0', 0)",
+            params![oversized_session_id, topology],
+        )
+        .unwrap();
+
+        let error = session_doctor(&db_path)
+            .expect_err("oversized session_id must not cross the SQL-to-Rust boundary");
+        assert!(matches!(
+            error,
+            RestoreError::InvalidPersistedText {
+                field: "mux_sessions.session_id"
+            }
+        ));
+    }
+
+    #[test]
     fn session_doctor_rejects_invalid_shutdown_clean_flag() {
         let (db_path, conn, _dir) = setup_test_db();
         let topology = r#"{"schema_version":1,"captured_at":1000,"windows":[]}"#;
@@ -8269,6 +10989,43 @@ mod tests {
     }
 
     #[test]
+    fn public_session_selectors_reject_empty_and_oversized_values_before_io() {
+        let dir = tempfile::tempdir().expect("create selector test directory");
+        let missing_db = dir.path().join("must-not-be-opened.db");
+        let missing_db = missing_db.to_string_lossy().to_string();
+        let oversized = "s".repeat(MAX_CHECKPOINT_SESSION_ID_BYTES + 1);
+
+        for selector in ["", oversized.as_str()] {
+            assert!(matches!(
+                load_latest_checkpoint(&missing_db, selector),
+                Err(RestoreError::InvalidSessionSelector)
+            ));
+            assert!(matches!(
+                show_session(&missing_db, selector),
+                Err(RestoreError::InvalidSessionSelector)
+            ));
+            assert!(matches!(
+                delete_session(&missing_db, selector),
+                Err(RestoreError::InvalidSessionSelector)
+            ));
+
+            let cx = crate::cx::for_request();
+            assert!(matches!(
+                run_async_test(show_session_with_cx(&cx, &missing_db, selector)),
+                Err(RestoreError::InvalidSessionSelector)
+            ));
+            assert!(matches!(
+                run_async_test(delete_session_with_cx(&cx, &missing_db, selector)),
+                Err(RestoreError::InvalidSessionSelector)
+            ));
+        }
+        assert!(
+            !std::path::Path::new(&missing_db).exists(),
+            "selector admission must precede opening or creating storage"
+        );
+    }
+
+    #[test]
     fn show_session_with_checkpoints() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-show", false);
@@ -8285,6 +11042,63 @@ mod tests {
     }
 
     #[test]
+    fn show_session_page_bounds_checkpoints_and_reports_exact_total() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-show-page", false);
+        let mut checkpoint_ids = Vec::new();
+        for index in 0_i64..5 {
+            checkpoint_ids.push(insert_checkpoint(
+                &conn,
+                "sess-show-page",
+                1_000 + index,
+                1,
+            ));
+        }
+
+        let page = show_session_page(&db_path, "sess-show-page", 2, 1)
+            .expect("checkpoint summary page");
+        assert_eq!(page.session.session_id, "sess-show-page");
+        assert_eq!(page.checkpoints.len(), 2);
+        assert_eq!(page.total_checkpoints, 5);
+        assert_eq!(page.limit, 2);
+        assert_eq!(page.offset, 1);
+        assert!(page.has_more);
+        assert_eq!(page.checkpoints[0].id, checkpoint_ids[3]);
+        assert_eq!(page.checkpoints[1].id, checkpoint_ids[2]);
+
+        let last = show_session_page(&db_path, "sess-show-page", 2, 4)
+            .expect("last checkpoint summary page");
+        assert_eq!(last.checkpoints.len(), 1);
+        assert_eq!(last.checkpoints[0].id, checkpoint_ids[0]);
+        assert!(!last.has_more);
+    }
+
+    #[test]
+    fn nonpaged_session_show_fails_closed_above_materialization_limit() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-show-bounded", false);
+        for index in 0..=MAX_SESSION_QUERY_LIMIT {
+            insert_checkpoint(
+                &conn,
+                "sess-show-bounded",
+                1_000 + i64::try_from(index).unwrap_or(i64::MAX),
+                1,
+            );
+        }
+
+        let error = show_session(&db_path, "sess-show-bounded")
+            .expect_err("nonpaged show must fail closed");
+        assert!(matches!(
+            error,
+            RestoreError::QueryResultLimit {
+                resource: "checkpoint_summaries",
+                observed,
+                limit: MAX_SESSION_QUERY_LIMIT,
+            } if observed == MAX_SESSION_QUERY_LIMIT + 1
+        ));
+    }
+
+    #[test]
     fn session_doctor_healthy() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-d", false);
@@ -8296,7 +11110,36 @@ mod tests {
         assert_eq!(report.total_sessions, 1);
         assert_eq!(report.unclean_sessions, 0);
         assert_eq!(report.total_checkpoints, 2);
+        assert_eq!(report.orphaned_checkpoints, 0);
         assert_eq!(report.orphaned_pane_states, 0);
+        assert_eq!(report.invalid_resolved_restore_chains, 0);
+    }
+
+    #[test]
+    fn session_doctor_counts_corrupt_legacy_receipts_as_orphaned_intents() {
+        let (db_path, conn, _dir) = setup_test_db();
+        let cases = [
+            ("sess-doctor-corrupt-receipt", "{".to_string()),
+            (
+                "sess-doctor-oversized-receipt",
+                "x".repeat(MAX_CHECKPOINT_METADATA_BYTES + 1),
+            ),
+        ];
+        for (session_id, metadata_json) in cases {
+            insert_session(&conn, session_id, false);
+            conn.execute(
+                "INSERT INTO session_checkpoints (
+                     session_id, checkpoint_at, checkpoint_type, state_hash,
+                     pane_count, total_bytes, metadata_json, checkpoint_role
+                 ) VALUES (?1, 1001, 'startup', 'corrupt:legacy-receipt',
+                           0, 0, ?2, 'restore_receipt')",
+                params![session_id, metadata_json],
+            )
+            .expect("insert malformed legacy receipt fixture");
+        }
+
+        let report = session_doctor(&db_path).expect("inspect malformed legacy receipts");
+        assert_eq!(report.orphaned_restore_intents, 2);
     }
 
     #[test]
@@ -8372,10 +11215,17 @@ mod tests {
     fn session_doctor_detects_orphans() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-o", true);
+        let orphaned_checkpoint = insert_checkpoint(&conn, "sess-o", 1_000, 1);
+        insert_pane_state(&conn, orphaned_checkpoint, 1, None, None);
 
         // Simulate a historical database written by a connection that did not
         // enable foreign-key enforcement.
         conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute(
+            "DELETE FROM mux_sessions WHERE session_id = 'sess-o'",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO mux_pane_state (checkpoint_id, pane_id, terminal_state_json)
              VALUES (999, 0, '{}')",
@@ -8384,7 +11234,32 @@ mod tests {
         .unwrap();
 
         let report = session_doctor(&db_path).unwrap();
-        assert_eq!(report.orphaned_pane_states, 1);
+        assert_eq!(report.total_sessions, 0);
+        assert_eq!(report.orphaned_checkpoints, 1);
+        assert_eq!(report.orphaned_pane_states, 2);
+    }
+
+    #[test]
+    fn session_doctor_rejects_negative_bytes_even_when_sum_cancels_to_zero() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-doctor-negative-bytes", false);
+        let negative = insert_checkpoint(&conn, "sess-doctor-negative-bytes", 1_000, 0);
+        let positive = insert_checkpoint(&conn, "sess-doctor-negative-bytes", 2_000, 0);
+        conn.execute(
+            "UPDATE session_checkpoints
+             SET total_bytes = CASE id WHEN ?1 THEN -1 WHEN ?2 THEN 1 END
+             WHERE id IN (?1, ?2)",
+            params![negative, positive],
+        )
+        .expect("construct cancellation-shaped byte corruption");
+
+        assert!(matches!(
+            session_doctor(&db_path),
+            Err(RestoreError::InvalidPersistedValue {
+                field: "session_checkpoints.total_bytes",
+                value: -1,
+            })
+        ));
     }
 
     #[test]
@@ -8739,13 +11614,14 @@ mod tests {
             session_id: "sess-1".to_string(),
             created_at: 1000,
             last_checkpoint_at: Some(2000),
-            topology_json: "{}".to_string(),
+            selected_checkpoint_id: Some(17),
             ft_version: "0.1.0".to_string(),
             host_id: Some("host-a".to_string()),
         };
         let c2 = c.clone();
         assert_eq!(c2.session_id, "sess-1");
         assert_eq!(c2.last_checkpoint_at, Some(2000));
+        assert_eq!(c2.selected_checkpoint_id, Some(17));
         assert_eq!(c2.host_id, Some("host-a".to_string()));
     }
 
@@ -8755,13 +11631,13 @@ mod tests {
             session_id: "raw-session-canary".to_string(),
             created_at: 0,
             last_checkpoint_at: None,
-            topology_json: "raw-topology-canary".to_string(),
+            selected_checkpoint_id: Some(19),
             ft_version: "raw-version-canary".to_string(),
             host_id: Some("raw-host-canary".to_string()),
         };
         let dbg = format!("{:?}", c);
         assert!(dbg.contains("SessionCandidate"));
-        for canary in ["raw-session", "raw-topology", "raw-version", "raw-host"] {
+        for canary in ["raw-session", "raw-version", "raw-host"] {
             assert!(!dbg.contains(canary));
         }
     }
@@ -8776,6 +11652,7 @@ mod tests {
             checkpoint_role: CheckpointRole::Snapshot,
             verification: CheckpointVerification::LegacyUnverified,
             state_hash: "0123456789abcdef".to_string(),
+            metadata_json: Some(r#"{"test":true}"#.to_string()),
             topology_json: Some("{}".to_string()),
             restore_intent_checkpoint_id: None,
             pane_count: 3,
@@ -8785,6 +11662,7 @@ mod tests {
         let d2 = d.clone();
         assert_eq!(d2.checkpoint_id, 42);
         assert_eq!(d2.pane_count, 3);
+        assert_eq!(d2.metadata_json(), Some(r#"{"test":true}"#));
         assert!(d2.pane_states.is_empty());
     }
 
@@ -8798,6 +11676,7 @@ mod tests {
             checkpoint_role: CheckpointRole::Snapshot,
             verification: CheckpointVerification::VerifiedV2,
             state_hash: "raw-hash-canary".to_string(),
+            metadata_json: Some(r#"{"secret":"raw-metadata-canary"}"#.to_string()),
             topology_json: Some("raw-topology-canary".to_string()),
             restore_intent_checkpoint_id: None,
             pane_count: 1,
@@ -8813,7 +11692,15 @@ mod tests {
             }],
         };
         let debug = format!("{checkpoint:?}");
-        for canary in ["raw-session", "raw-type", "raw-hash", "raw-topology", "raw-cwd", "raw-command"] {
+        for canary in [
+            "raw-session",
+            "raw-type",
+            "raw-hash",
+            "raw-metadata",
+            "raw-topology",
+            "raw-cwd",
+            "raw-command",
+        ] {
             assert!(!debug.contains(canary));
         }
         assert!(debug.contains("loaded_pane_count: 1"));
@@ -8854,89 +11741,13 @@ mod tests {
     }
 
     #[test]
-    fn format_epoch_ms_midnight() {
-        // 0 = epoch = 00:00:00 UTC
-        assert_eq!(format_epoch_ms(0), "00:00:00 UTC");
-    }
-
-    #[test]
-    fn format_epoch_ms_one_hour() {
-        assert_eq!(format_epoch_ms(3_600_000), "01:00:00 UTC");
-    }
-
-    #[test]
-    fn format_epoch_ms_end_of_day() {
-        // 23:59:59 = 86399 seconds = 86_399_000 ms
-        assert_eq!(format_epoch_ms(86_399_000), "23:59:59 UTC");
-    }
-
-    #[test]
-    fn format_epoch_ms_wraps_past_24h() {
-        // 25 hours = 90_000_000 ms → 01:00:00 (wraps)
-        assert_eq!(format_epoch_ms(90_000_000), "01:00:00 UTC");
-    }
-
-    #[test]
-    fn format_epoch_ms_subsecond_ignored() {
-        // 999ms into first second → still 00:00:00
-        assert_eq!(format_epoch_ms(999), "00:00:00 UTC");
-    }
-
-    #[test]
-    fn restore_banner_no_pane_state() {
-        let banner = restore_banner(42, "sess-abc", 3_600_000, None);
-        assert!(banner.contains("01:00:00 UTC"));
-        assert!(banner.contains("sess-abc"));
-        assert!(banner.contains("--pane 42"));
-        assert!(!banner.contains("Previously running"));
-    }
-
-    #[test]
-    fn restore_banner_with_command_only() {
-        let state = RestoredPaneState {
-            pane_id: 1,
-            cwd: None,
-            command: Some("vim".to_string()),
-            terminal_state: None,
-            agent_metadata: None,
-            scrollback_checkpoint_seq: None,
-            last_output_at: None,
-        };
-        let banner = restore_banner(1, "s1", 0, Some(&state));
-        assert!(banner.contains("Process: vim"));
-        assert!(!banner.contains("Previously running"));
-    }
-
-    #[test]
-    fn restore_banner_with_agent_and_command() {
-        let state = RestoredPaneState {
-            pane_id: 2,
-            cwd: None,
-            command: Some("python agent.py".to_string()),
-            terminal_state: None,
-            agent_metadata: Some(AgentMetadata {
-                agent_type: "claude-code".to_string(),
-                session_id: Some("agent-sess".to_string()),
-                state: Some("running".to_string()),
-            }),
-            scrollback_checkpoint_seq: None,
-            last_output_at: None,
-        };
-        let banner = restore_banner(2, "s2", 0, Some(&state));
-        assert!(banner.contains("Previously running: claude-code"));
-        assert!(banner.contains("agent-sess"));
-        assert!(banner.contains("running"));
-        assert!(banner.contains("Process: python agent.py"));
-    }
-
-    #[test]
     fn session_restore_json_contract_golden() {
         #[derive(serde::Serialize)]
         struct SessionCandidateGolden<'a> {
             session_id: &'a str,
             created_at: u64,
             last_checkpoint_at: Option<u64>,
-            topology_json: &'a str,
+            selected_checkpoint_id: Option<i64>,
             ft_version: &'a str,
             host_id: Option<&'a str>,
         }
@@ -8952,7 +11763,6 @@ mod tests {
             list_sessions: Vec<SessionInfo>,
             show_session: ShowSessionGolden<'a>,
             session_doctor: SessionDoctorReport,
-            restore_banner: String,
         }
 
         let (db_path, conn, _dir) = setup_test_db();
@@ -8997,24 +11807,6 @@ mod tests {
         let list_sessions = list_sessions(&db_path).expect("list sessions");
         let (session, checkpoints) = show_session(&db_path, "sess-restore").expect("show session");
         let session_doctor = session_doctor(&db_path).expect("session doctor");
-        let restore_banner = restore_banner(
-            7,
-            "sess-restore",
-            3_000,
-            Some(&RestoredPaneState {
-                pane_id: 7,
-                cwd: Some("/agents".to_string()),
-                command: Some("codex --resume".to_string()),
-                terminal_state: None,
-                agent_metadata: Some(AgentMetadata {
-                    agent_type: "codex".to_string(),
-                    session_id: Some("agent-sess-7".to_string()),
-                    state: Some("running".to_string()),
-                }),
-                scrollback_checkpoint_seq: None,
-                last_output_at: None,
-            }),
-        );
 
         let actual = serde_json::to_string_pretty(&SessionRestoreGolden {
             list_sessions,
@@ -9023,14 +11815,13 @@ mod tests {
                     session_id: &session.session_id,
                     created_at: session.created_at,
                     last_checkpoint_at: session.last_checkpoint_at,
-                    topology_json: &session.topology_json,
+                    selected_checkpoint_id: session.selected_checkpoint_id,
                     ft_version: &session.ft_version,
                     host_id: session.host_id.as_deref(),
                 },
                 checkpoints,
             },
             session_doctor,
-            restore_banner,
         })
         .expect("serialize golden contract");
 
@@ -9062,7 +11853,7 @@ mod tests {
       "session_id": "sess-restore",
       "created_at": 1500,
       "last_checkpoint_at": 3000,
-      "topology_json": "{\"schema_version\":1,\"captured_at\":1000,\"windows\":[]}",
+      "selected_checkpoint_id": 3,
       "ft_version": "0.1.0",
       "host_id": "host-a"
     },
@@ -9089,14 +11880,15 @@ mod tests {
     "total_sessions": 2,
     "unclean_sessions": 1,
     "total_checkpoints": 3,
+    "orphaned_checkpoints": 0,
     "orphaned_pane_states": 0,
     "unresolved_restore_attempts": 0,
+    "invalid_resolved_restore_chains": 0,
     "outcome_complete_restore_attempts": 0,
     "reconciliation_required_restore_attempts": 0,
     "orphaned_restore_intents": 0,
     "total_data_bytes": 2560
-  },
-  "restore_banner": "\u001b[1;36m═══ Session restored from checkpoint at 00:00:03 UTC ═══\u001b[0m\r\n\u001b[1;33m═══ Previously running: codex (session agent-sess-7, state: running) ═══\u001b[0m\r\n\u001b[90m═══ Process: codex --resume ═══\u001b[0m\r\n\u001b[90m═══ Previous output: ft session show sess-restore --pane 7 ═══\u001b[0m\r\n"
+  }
 }"#;
 
         assert_eq!(
@@ -9146,8 +11938,10 @@ mod tests {
             total_sessions: 3,
             unclean_sessions: 1,
             total_checkpoints: 10,
+            orphaned_checkpoints: 1,
             orphaned_pane_states: 2,
             unresolved_restore_attempts: 1,
+            invalid_resolved_restore_chains: 1,
             outcome_complete_restore_attempts: 0,
             reconciliation_required_restore_attempts: 1,
             orphaned_restore_intents: 0,
@@ -9156,8 +11950,10 @@ mod tests {
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["total_sessions"], 3);
         assert_eq!(json["unclean_sessions"], 1);
+        assert_eq!(json["orphaned_checkpoints"], 1);
         assert_eq!(json["orphaned_pane_states"], 2);
         assert_eq!(json["unresolved_restore_attempts"], 1);
+        assert_eq!(json["invalid_resolved_restore_chains"], 1);
     }
 
     #[test]
@@ -9166,8 +11962,10 @@ mod tests {
             total_sessions: 1,
             unclean_sessions: 0,
             total_checkpoints: 5,
+            orphaned_checkpoints: 0,
             orphaned_pane_states: 0,
             unresolved_restore_attempts: 0,
+            invalid_resolved_restore_chains: 0,
             outcome_complete_restore_attempts: 0,
             reconciliation_required_restore_attempts: 0,
             orphaned_restore_intents: 0,

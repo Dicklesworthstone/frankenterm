@@ -18,7 +18,7 @@
 //!
 //! See `wa-29k1` bead for the full design.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -31,14 +31,20 @@ use serde_json::Value;
 use crate::agent_correlator::AgentCorrelator;
 use crate::checkpoint_witness::{
     CHECKPOINT_ROLE_SNAPSHOT, CheckpointWitnessError, PersistedPaneState,
+    MAX_CHECKPOINT_METADATA_BYTES, MAX_CHECKPOINT_ROLE_BYTES,
+    MAX_CHECKPOINT_SESSION_ID_BYTES, MAX_CHECKPOINT_STATE_HASH_BYTES,
+    MAX_PERSISTED_CHECKPOINT_TEXT_BYTES, MAX_PERSISTED_PANE_TEXT_BYTES,
     SNAPSHOT_WITNESS_PREFIX, canonical_json_string, checkpoint_witness,
+    persisted_checkpoint_text_bytes, persisted_pane_text_bytes,
     snapshot_dedup_witness,
 };
 use crate::config::{SnapshotConfig, SnapshotSchedulingMode};
 use crate::outcome::CancelKind;
 use crate::patterns::{AgentType, Detection, Severity};
-use crate::runtime_async::{LockAcquireError, Mutex, RwLock, mpsc, watch};
-use crate::session_pane_state::{PaneStateSnapshot, ScrollbackRef};
+use crate::runtime_async::{LockAcquireError, RwLock, mpsc, watch};
+use crate::session_pane_state::{
+    AgentMetadata, CapturedEnv, PaneStateSnapshot, SAFE_ENV_VARS, ScrollbackRef,
+};
 use crate::session_topology::{
     MAX_TOPOLOGY_PANES, TopologySnapshot, TopologySnapshotError,
 };
@@ -99,6 +105,12 @@ pub struct SnapshotEngineTelemetry {
     /// Historical terminal/environment/agent pane-state JSON byte estimate
     /// across successful snapshots; not total SQLite or checkpoint bytes.
     bytes_persisted: AtomicU64,
+    /// Exact admitted UTF-8 bytes across topology, metadata, and pane text
+    /// columns for successful snapshots.
+    persisted_text_bytes: AtomicU64,
+    /// Pane projections that required deterministic field truncation or
+    /// omission before persistence.
+    pane_states_truncated: AtomicU64,
 }
 
 impl SnapshotEngineTelemetry {
@@ -116,6 +128,8 @@ impl SnapshotEngineTelemetry {
             triggers_accepted: AtomicU64::new(0),
             panes_captured: AtomicU64::new(0),
             bytes_persisted: AtomicU64::new(0),
+            persisted_text_bytes: AtomicU64::new(0),
+            pane_states_truncated: AtomicU64::new(0),
         }
     }
 
@@ -139,6 +153,8 @@ impl SnapshotEngineTelemetry {
             triggers_accepted: self.triggers_accepted.load(Ordering::Relaxed),
             panes_captured: self.panes_captured.load(Ordering::Relaxed),
             bytes_persisted: self.bytes_persisted.load(Ordering::Relaxed),
+            persisted_text_bytes: self.persisted_text_bytes.load(Ordering::Relaxed),
+            pane_states_truncated: self.pane_states_truncated.load(Ordering::Relaxed),
         }
     }
 }
@@ -186,6 +202,14 @@ impl std::fmt::Debug for SnapshotEngineTelemetry {
                 "bytes_persisted",
                 &self.bytes_persisted.load(Ordering::Relaxed),
             )
+            .field(
+                "persisted_text_bytes",
+                &self.persisted_text_bytes.load(Ordering::Relaxed),
+            )
+            .field(
+                "pane_states_truncated",
+                &self.pane_states_truncated.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -215,6 +239,12 @@ pub struct SnapshotEngineTelemetrySnapshot {
     /// Historical terminal/environment/agent pane-state JSON byte estimate
     /// across successful snapshots; not total SQLite or checkpoint bytes.
     pub bytes_persisted: u64,
+    /// Exact admitted UTF-8 bytes across topology, metadata, and pane text
+    /// columns for successful snapshots.
+    pub persisted_text_bytes: u64,
+    /// Pane projections that required deterministic field truncation or
+    /// omission before persistence.
+    pub pane_states_truncated: u64,
 }
 
 // =============================================================================
@@ -271,7 +301,7 @@ impl SnapshotTrigger {
 }
 
 /// Result of a successful snapshot capture.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SnapshotResult {
     /// Time-ordered `sess-<timestamp>-<random>` session ID (UUID-v7-like).
     pub session_id: String,
@@ -286,8 +316,29 @@ pub struct SnapshotResult {
     /// Historical serialized terminal/environment/agent pane-state JSON byte
     /// estimate. This excludes topology, cwd, command, and SQLite overhead.
     pub total_bytes: usize,
+    /// Exact admitted UTF-8 bytes across topology, metadata, and every pane
+    /// text column. This excludes SQLite record/index overhead.
+    pub persisted_text_bytes: usize,
+    /// Number of pane projections whose optional text was shortened or
+    /// omitted to satisfy the durable row budget.
+    pub truncated_pane_count: usize,
     /// What triggered this snapshot.
     pub trigger: SnapshotTrigger,
+}
+
+impl std::fmt::Debug for SnapshotResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SnapshotResult")
+            .field("checkpoint_id", &self.checkpoint_id)
+            .field("checkpoint_at", &self.checkpoint_at)
+            .field("pane_count", &self.pane_count)
+            .field("total_bytes", &self.total_bytes)
+            .field("persisted_text_bytes", &self.persisted_text_bytes)
+            .field("truncated_pane_count", &self.truncated_pane_count)
+            .field("trigger", &self.trigger)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Role scope used when resolving a deletion target inside its transaction.
@@ -301,7 +352,7 @@ pub enum SnapshotCheckpointRoleScope {
 
 /// Immutable checkpoint identity used to protect an interactive confirmation
 /// from SQLite ROWID reuse between preview and deletion.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SnapshotCheckpointIdentity {
     pub checkpoint_id: i64,
     pub session_id: String,
@@ -310,17 +361,36 @@ pub struct SnapshotCheckpointIdentity {
     pub state_hash: String,
 }
 
+impl std::fmt::Debug for SnapshotCheckpointIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SnapshotCheckpointIdentity")
+            .field("checkpoint_id", &self.checkpoint_id)
+            .field("checkpoint_at", &self.checkpoint_at)
+            .finish_non_exhaustive()
+    }
+}
+
 /// In-memory periodic-dedup hint bound to the exact durable row that made the
 /// hint safe. The database identity is revalidated before every skip because
 /// another engine or process may prune that row without access to this cache.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct LastDedupCheckpoint {
     dedup_hash: String,
     identity: SnapshotCheckpointIdentity,
 }
 
+impl std::fmt::Debug for LastDedupCheckpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LastDedupCheckpoint")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Transaction-local checkpoint deletion selector.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum SnapshotDeleteTarget {
     /// Delete the row currently carrying this numeric ID.
     Id(i64),
@@ -330,8 +400,21 @@ pub enum SnapshotDeleteTarget {
     Latest(SnapshotCheckpointRoleScope),
 }
 
+impl std::fmt::Debug for SnapshotDeleteTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Id(checkpoint_id) => formatter
+                .debug_tuple("Id")
+                .field(checkpoint_id)
+                .finish(),
+            Self::Exact(identity) => formatter.debug_tuple("Exact").field(identity).finish(),
+            Self::Latest(scope) => formatter.debug_tuple("Latest").field(scope).finish(),
+        }
+    }
+}
+
 /// Receipt for one authority-serialized checkpoint deletion.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SnapshotDeleteResult {
     /// Exact identity of the row that was deleted.
     pub identity: SnapshotCheckpointIdentity,
@@ -343,15 +426,83 @@ pub struct SnapshotDeleteResult {
     pub invalidated_clean_state: bool,
 }
 
+impl std::fmt::Debug for SnapshotDeleteResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SnapshotDeleteResult")
+            .field("identity", &self.identity)
+            .field("recorded_payload_bytes", &self.recorded_payload_bytes)
+            .field("invalidated_clean_state", &self.invalidated_clean_state)
+            .finish()
+    }
+}
+
 /// Per-capture options for call sites that need snapshot behavior beyond the
 /// engine's normal periodic/event defaults.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Default)]
 pub struct SnapshotCaptureOptions {
     /// Link the checkpoint to already-captured scrollback segments.
     pub include_scrollback: bool,
     /// Optional operator/event metadata persisted atomically with the
     /// checkpoint and covered by its v2 witness.
     pub metadata: Option<Value>,
+}
+
+/// Destroy an owned JSON tree without recursive `Value::drop` calls. Public
+/// capture options accept programmatically constructed values, so their depth
+/// can exceed serde_json's parser recursion limit by an arbitrary amount.
+fn drop_json_value_iteratively(value: Value) {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Array(mut children) => pending.append(&mut children),
+            Value::Object(fields) => pending.extend(fields.into_values()),
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+}
+
+impl Drop for SnapshotCaptureOptions {
+    fn drop(&mut self) {
+        if let Some(metadata) = self.metadata.take() {
+            drop_json_value_iteratively(metadata);
+        }
+    }
+}
+
+/// Safe owner for the blocking handoff. If the executor suppresses and drops
+/// the closure before it starts, or the caller cancels while it is queued, the
+/// captured JSON still receives iterative destruction.
+struct IterativelyDroppedJsonValue(Option<Value>);
+
+impl IterativelyDroppedJsonValue {
+    fn new(value: Value) -> Self {
+        Self(Some(value))
+    }
+
+    fn value(&self) -> &Value {
+        self.0
+            .as_ref()
+            .expect("iterative JSON owner retains its value until drop")
+    }
+}
+
+impl Drop for IterativelyDroppedJsonValue {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            drop_json_value_iteratively(value);
+        }
+    }
+}
+
+impl std::fmt::Debug for SnapshotCaptureOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SnapshotCaptureOptions")
+            .field("include_scrollback", &self.include_scrollback)
+            .field("has_metadata", &self.metadata.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Finite identity for a durable snapshot-authority mutation.
@@ -431,8 +582,41 @@ impl std::fmt::Display for SnapshotAuthorityOperation {
     }
 }
 
+/// Finite, content-free resource classes for live snapshot projection limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotProjectionResource {
+    /// Canonical operator/event metadata JSON.
+    MetadataBytes,
+    /// Maximum nesting depth of operator/event metadata.
+    MetadataDepth,
+    /// Total scalar/container nodes in operator/event metadata.
+    MetadataNodes,
+    /// Canonical text-bearing columns for one pane row.
+    PaneTextBytes,
+    /// Aggregate canonical text admitted for one checkpoint.
+    CheckpointTextBytes,
+}
+
+impl SnapshotProjectionResource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MetadataBytes => "metadata_bytes",
+            Self::MetadataDepth => "metadata_depth",
+            Self::MetadataNodes => "metadata_nodes",
+            Self::PaneTextBytes => "pane_text_bytes",
+            Self::CheckpointTextBytes => "checkpoint_text_bytes",
+        }
+    }
+}
+
+impl std::fmt::Display for SnapshotProjectionResource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Error returned when a snapshot-engine operation cannot complete safely.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum SnapshotError {
     #[error("snapshot already in progress")]
     InProgress,
@@ -446,14 +630,36 @@ pub enum SnapshotError {
     NoPanes,
     #[error("no changes since last snapshot")]
     NoChanges,
-    #[error("pane listing failed: {0}")]
+    #[error("pane listing failed")]
     PaneList(String),
-    #[error("database error: {0}")]
+    #[error("snapshot database operation failed")]
     Database(String),
-    #[error("serialization error: {0}")]
+    #[error("snapshot serialization failed")]
     Serialization(String),
-    #[error("topology admission failed: {0}")]
+    #[error("topology admission failed")]
     Topology(#[from] TopologySnapshotError),
+    #[error(
+        "snapshot projection resource admission failed for {resource}: {observed} exceeds {limit}"
+    )]
+    ProjectionResourceLimit {
+        /// Finite resource class; cannot contain pane/session content.
+        resource: SnapshotProjectionResource,
+        /// Quantity observed when admission stopped. A streaming byte counter
+        /// can stop at the first over-limit chunk, so this need not be the
+        /// hypothetical fully serialized size of rejected input.
+        observed: usize,
+        /// Configured hard admission limit.
+        limit: usize,
+    },
+    #[error(
+        "snapshot topology/pane-state identity sets disagree (topology panes: {topology_panes}, pane states: {pane_states})"
+    )]
+    PaneIdentitySetMismatch {
+        /// Pane identities declared by the admitted topology.
+        topology_panes: usize,
+        /// Pane identities supplied as persisted pane rows.
+        pane_states: usize,
+    },
     /// The blocking closure was admitted, but its authoritative result was
     /// lost. The closure may still be running or may already have committed.
     #[error(
@@ -509,7 +715,7 @@ pub enum SnapshotError {
     /// A final checkpoint settled, but the clean-shutdown mark failed. Preserve
     /// the committed checkpoint receipt so callers can report partial durable
     /// progress without claiming a clean session.
-    #[error("clean-shutdown mark failed after final checkpoint settlement: {source}")]
+    #[error("clean-shutdown mark failed after final checkpoint settlement")]
     ShutdownMarkFailed {
         checkpoint: Box<SnapshotResult>,
         #[source]
@@ -523,7 +729,140 @@ pub enum SnapshotError {
     LockPolledAfterCompletion,
 }
 
+fn topology_snapshot_error_class(error: &TopologySnapshotError) -> &'static str {
+    match error {
+        TopologySnapshotError::TooLarge { .. } => "topology_too_large",
+        TopologySnapshotError::TooDeep { .. } => "topology_too_deep",
+        TopologySnapshotError::ResourceLimit { .. } => "topology_resource_limit",
+        TopologySnapshotError::InvalidStructure { .. } => "topology_invalid_structure",
+        TopologySnapshotError::Json(_) => "topology_json_invalid",
+    }
+}
+
+impl std::fmt::Debug for SnapshotError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InProgress => formatter.write_str("InProgress"),
+            Self::ShuttingDown => formatter.write_str("ShuttingDown"),
+            Self::SchedulerInProgress => formatter.write_str("SchedulerInProgress"),
+            Self::TriggerReceiverUnavailable => {
+                formatter.write_str("TriggerReceiverUnavailable")
+            }
+            Self::NoPanes => formatter.write_str("NoPanes"),
+            Self::NoChanges => formatter.write_str("NoChanges"),
+            Self::PaneList(_) => formatter.write_str("PaneList"),
+            Self::Database(_) => formatter.write_str("Database"),
+            Self::Serialization(_) => formatter.write_str("Serialization"),
+            Self::Topology(error) => formatter
+                .debug_struct("Topology")
+                .field("classification", &topology_snapshot_error_class(error))
+                .finish_non_exhaustive(),
+            Self::ProjectionResourceLimit {
+                resource,
+                observed,
+                limit,
+            } => formatter
+                .debug_struct("ProjectionResourceLimit")
+                .field("resource", resource)
+                .field("observed", observed)
+                .field("limit", limit)
+                .finish(),
+            Self::PaneIdentitySetMismatch {
+                topology_panes,
+                pane_states,
+            } => formatter
+                .debug_struct("PaneIdentitySetMismatch")
+                .field("topology_panes", topology_panes)
+                .field("pane_states", pane_states)
+                .finish(),
+            Self::IndeterminateAuthorityMutation { operation } => formatter
+                .debug_struct("IndeterminateAuthorityMutation")
+                .field("operation", operation)
+                .finish(),
+            Self::AuthorityReconciliationRequired {
+                operation,
+                first_indeterminate_operation,
+            } => formatter
+                .debug_struct("AuthorityReconciliationRequired")
+                .field("operation", operation)
+                .field(
+                    "first_indeterminate_operation",
+                    first_indeterminate_operation,
+                )
+                .finish(),
+            Self::AuthorityMutationInProgress { operation } => formatter
+                .debug_struct("AuthorityMutationInProgress")
+                .field("operation", operation)
+                .finish(),
+            Self::Cancelled => formatter.write_str("Cancelled"),
+            Self::DeadlineExceeded => formatter.write_str("DeadlineExceeded"),
+            Self::PollQuotaExhausted => formatter.write_str("PollQuotaExhausted"),
+            Self::CostBudgetExhausted => formatter.write_str("CostBudgetExhausted"),
+            Self::ContextFailure => formatter.write_str("ContextFailure"),
+            Self::BlockingRuntimeFailure => {
+                formatter.write_str("BlockingRuntimeFailure")
+            }
+            Self::ShutdownTimedOut { timeout_ms } => formatter
+                .debug_struct("ShutdownTimedOut")
+                .field("timeout_ms", timeout_ms)
+                .finish(),
+            Self::ShutdownMarkFailed { checkpoint, source } => formatter
+                .debug_struct("ShutdownMarkFailed")
+                .field("checkpoint_id", &checkpoint.checkpoint_id)
+                .field("source_class", &source.diagnostic_class())
+                .finish_non_exhaustive(),
+            Self::LockTimedOut { deadline_nanos } => formatter
+                .debug_struct("LockTimedOut")
+                .field("deadline_nanos", deadline_nanos)
+                .finish(),
+            Self::LockPoisoned => formatter.write_str("LockPoisoned"),
+            Self::LockPolledAfterCompletion => {
+                formatter.write_str("LockPolledAfterCompletion")
+            }
+        }
+    }
+}
+
 impl SnapshotError {
+    /// Finite class suitable for telemetry and logs. Unlike `Display`, this is
+    /// deliberately machine-stable and never incorporates source strings.
+    fn diagnostic_class(&self) -> &'static str {
+        match self {
+            Self::InProgress => "in_progress",
+            Self::ShuttingDown => "shutting_down",
+            Self::SchedulerInProgress => "scheduler_in_progress",
+            Self::TriggerReceiverUnavailable => "trigger_receiver_unavailable",
+            Self::NoPanes => "no_panes",
+            Self::NoChanges => "no_changes",
+            Self::PaneList(_) => "pane_list",
+            Self::Database(_) => "database",
+            Self::Serialization(_) => "serialization",
+            Self::Topology(error) => topology_snapshot_error_class(error),
+            Self::ProjectionResourceLimit { .. } => "projection_resource_limit",
+            Self::PaneIdentitySetMismatch { .. } => "pane_identity_set_mismatch",
+            Self::IndeterminateAuthorityMutation { .. } => {
+                "indeterminate_authority_mutation"
+            }
+            Self::AuthorityReconciliationRequired { .. } => {
+                "authority_reconciliation_required"
+            }
+            Self::AuthorityMutationInProgress { .. } => {
+                "authority_mutation_in_progress"
+            }
+            Self::Cancelled => "cancelled",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::PollQuotaExhausted => "poll_quota_exhausted",
+            Self::CostBudgetExhausted => "cost_budget_exhausted",
+            Self::ContextFailure => "context_failure",
+            Self::BlockingRuntimeFailure => "blocking_runtime_failure",
+            Self::ShutdownTimedOut { .. } => "shutdown_timed_out",
+            Self::ShutdownMarkFailed { .. } => "shutdown_mark_failed",
+            Self::LockTimedOut { .. } => "lock_timed_out",
+            Self::LockPoisoned => "lock_poisoned",
+            Self::LockPolledAfterCompletion => "lock_polled_after_completion",
+        }
+    }
+
     /// Whether the engine must reconcile durable state before another snapshot
     /// authority mutation can be attempted safely.
     #[must_use]
@@ -556,6 +895,21 @@ impl SnapshotError {
                 | Self::Database(_)
                 | Self::BlockingRuntimeFailure
                 | Self::LockTimedOut { .. }
+        )
+    }
+
+    /// Deterministic live-projection capacity failures retain scheduler demand
+    /// with bounded backoff. They are distinct from transient retry-safe errors
+    /// and from ordinary serialization/integrity failures.
+    fn is_capacity_admission_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Topology(
+                TopologySnapshotError::TooLarge { .. }
+                    | TopologySnapshotError::TooDeep { .. }
+                    | TopologySnapshotError::ResourceLimit { .. }
+                    | TopologySnapshotError::InvalidStructure { .. }
+            ) | Self::ProjectionResourceLimit { .. }
         )
     }
 }
@@ -669,8 +1023,8 @@ enum SchedulerCaptureDeferredReason {
     /// demand with bounded backoff instead of terminating the scheduler.
     CapacityAdmission,
     /// The attempted work settled without an indeterminate durable effect, but
-    /// a transient database, serialization, pane-list, blocking-runtime, or
-    /// lock-timeout failure prevented a checkpoint receipt.
+    /// a transient database, pane-list, blocking-runtime, or lock-timeout
+    /// failure prevented a checkpoint receipt.
     RetrySafeFailure,
 }
 
@@ -682,12 +1036,12 @@ impl SchedulerCaptureOutcome {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SchedulerCaptureRetryState {
-    consecutive_retry_safe_failures: u32,
+    consecutive_backoff_deferrals: u32,
 }
 
 impl SchedulerCaptureRetryState {
     fn record_settled(&mut self) {
-        self.consecutive_retry_safe_failures = 0;
+        self.consecutive_backoff_deferrals = 0;
     }
 
     fn retry_deadline(
@@ -701,14 +1055,14 @@ impl SchedulerCaptureRetryState {
             SchedulerCaptureDeferredReason::RetrySafeFailure
                 | SchedulerCaptureDeferredReason::CapacityAdmission
         ) {
-            self.consecutive_retry_safe_failures =
-                self.consecutive_retry_safe_failures.saturating_add(1);
+            self.consecutive_backoff_deferrals =
+                self.consecutive_backoff_deferrals.saturating_add(1);
         }
         scheduler_capture_retry_deadline(
             now,
             trigger,
             reason,
-            self.consecutive_retry_safe_failures,
+            self.consecutive_backoff_deferrals,
         )
     }
 }
@@ -716,12 +1070,12 @@ impl SchedulerCaptureRetryState {
 fn scheduler_capture_retry_delay(
     trigger: SnapshotTrigger,
     reason: SchedulerCaptureDeferredReason,
-    consecutive_retry_safe_failures: u32,
+    consecutive_backoff_deferrals: u32,
 ) -> Duration {
     match reason {
         SchedulerCaptureDeferredReason::RetrySafeFailure
         | SchedulerCaptureDeferredReason::CapacityAdmission => {
-            let exponent = consecutive_retry_safe_failures.saturating_sub(1).min(5);
+            let exponent = consecutive_backoff_deferrals.saturating_sub(1).min(5);
             let delay = SCHEDULER_RETRY_SAFE_CAPTURE_MIN_DELAY
                 .saturating_mul(1_u32 << exponent);
             delay.min(SCHEDULER_RETRY_SAFE_CAPTURE_MAX_DELAY)
@@ -739,7 +1093,7 @@ fn scheduler_capture_retry_deadline(
     now: Instant,
     trigger: SnapshotTrigger,
     reason: SchedulerCaptureDeferredReason,
-    consecutive_retry_safe_failures: u32,
+    consecutive_backoff_deferrals: u32,
 ) -> Instant {
     // Both fixed delays are tiny relative to every representable production
     // `Instant`. Falling back to `now` at the numeric ceiling preserves
@@ -747,7 +1101,7 @@ fn scheduler_capture_retry_deadline(
     now.checked_add(scheduler_capture_retry_delay(
         trigger,
         reason,
-        consecutive_retry_safe_failures,
+        consecutive_backoff_deferrals,
     ))
         .unwrap_or(now)
 }
@@ -1812,6 +2166,9 @@ pub struct SnapshotEngine {
     trigger_rx: StdMutex<Option<mpsc::Receiver<SnapshotTrigger>>>,
     /// Operational telemetry counters.
     telemetry: SnapshotEngineTelemetry,
+    /// White-box proof seam for metadata-before-auxiliary-read ordering.
+    #[cfg(test)]
+    auxiliary_projection_read_attempts: AtomicU64,
 }
 
 impl SnapshotEngine {
@@ -1842,6 +2199,8 @@ impl SnapshotEngine {
             trigger_tx,
             trigger_rx: StdMutex::new(Some(trigger_rx)),
             telemetry: SnapshotEngineTelemetry::new(),
+            #[cfg(test)]
+            auxiliary_projection_read_attempts: AtomicU64::new(0),
         }
     }
 
@@ -2143,7 +2502,7 @@ impl SnapshotEngine {
                 if error.requires_reconciliation() {
                     tracing::warn!(
                         %operation,
-                        error = %error,
+                        error_class = "indeterminate_database_authority",
                         "snapshot authority work returned an indeterminate database outcome"
                     );
                     attempt.latch_and_settle();
@@ -2376,10 +2735,38 @@ impl SnapshotEngine {
             ));
         }
 
+        let mut options = options;
+        let include_scrollback = options.include_scrollback;
+        // Operator/event metadata is part of the persisted v2 witness but not
+        // the topology/pane dedup digest. A metadata-bearing capture must
+        // therefore reach durable storage even when its panes are unchanged.
+        let periodic_dedup_allowed = options.metadata.is_none();
+        let metadata = options.metadata.take();
+        // Admit caller-supplied metadata before any auxiliary database read.
+        // The iterative shape walk, bounded byte counter, and canonicalization
+        // are CPU/allocation work, so keep them off the async worker while
+        // moving (not cloning) the caller-owned Value into the blocking pool.
+        let metadata_json = if let Some(metadata) = metadata {
+            let metadata = IterativelyDroppedJsonValue::new(metadata);
+            Some(
+                crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+                    canonical_checkpoint_metadata(metadata.value())
+                })
+                .await
+                .map_err(classify_snapshot_pure_blocking_failure)?
+                .map_err(SnapshotError::from)?,
+            )
+        } else {
+            None
+        };
+
         let now_ms = epoch_ms();
 
         // 2. Load auxiliary persisted observations without blocking an async
         // worker on SQLite.
+        #[cfg(test)]
+        self.auxiliary_projection_read_attempts
+            .fetch_add(1, Ordering::Relaxed);
         let pane_ids: Vec<u64> = panes.iter().map(|p| p.pane_id).collect();
         let detection_pane_ids = pane_ids.clone();
         let db_path_for_detections = Arc::clone(&self.db_path);
@@ -2399,16 +2786,16 @@ impl SnapshotEngine {
         .map_err(classify_snapshot_pure_blocking_failure)?
         {
             Ok(detections) => detections,
-            Err(error) => {
+            Err(_) => {
                 tracing::warn!(
-                    error = %error,
+                    error_class = "detection_projection_database",
                     "best-effort snapshot detection projection failed; continuing without detections"
                 );
                 HashMap::new()
             }
         };
 
-        let scrollback_refs = if options.include_scrollback {
+        let scrollback_refs = if include_scrollback {
             let db_path_for_scrollback = Arc::clone(&self.db_path);
             let scrollback_pane_ids = pane_ids.clone();
             crate::runtime_async::spawn_blocking_with_cx(cx, move || {
@@ -2424,23 +2811,23 @@ impl SnapshotEngine {
             std::collections::HashMap::new()
         };
 
-        // 3. Topology construction, agent correlation, pane projection,
-        // canonical JSON serialization, and hashing are all CPU/allocation
-        // heavy for large mux domains. Move the whole pure phase off the async
-        // worker. Cloning the borrowed pane slice is the only caller-thread
-        // cost retained by this compatibility API; the expensive work happens
-        // in the bounded blocking pool and has no durable side effects.
-        let owned_panes = panes.to_vec();
-        // Operator/event metadata is part of the persisted v2 witness but not
-        // the topology/pane dedup digest. A metadata-bearing capture must
-        // therefore reach durable storage even when its panes are unchanged.
-        let periodic_dedup_allowed = options.metadata.is_none();
-        let metadata = options.metadata;
+        // 3. Copy only the bounded fields consumed by topology, pane-state, and
+        // agent correlation. In particular, do not clone arbitrary backend
+        // extras or let raw oversized cwd/title/workspace strings survive in a
+        // second topology copy. The remaining JSON construction and hashing is
+        // CPU/allocation heavy and runs in the bounded blocking pool.
+        let pane_projection = project_snapshot_panes(panes)?;
         let prepared = crate::runtime_async::spawn_blocking_with_cx(cx, move || {
-            let (topology, _report) = TopologySnapshot::from_panes(&owned_panes, now_ms);
+            let SnapshotPaneProjection {
+                panes: owned_panes,
+                topology_workspace_id,
+                truncated_pane_ids,
+            } = pane_projection;
+            let (mut topology, _report) = TopologySnapshot::from_panes(&owned_panes, now_ms);
+            topology.workspace_id = topology_workspace_id;
             let mut correlator = AgentCorrelator::new();
-            for (pane_id, detections) in detections_by_pane {
-                correlator.ingest_detections(pane_id, &detections);
+            for (pane_id, detection) in detections_by_pane {
+                correlator.ingest_detections(pane_id, std::slice::from_ref(&detection));
             }
             for pane in &owned_panes {
                 correlator.update_from_pane_info(pane);
@@ -2459,7 +2846,12 @@ impl SnapshotEngine {
                     snapshot
                 })
                 .collect();
-            prepare_snapshot_persistence(&topology, &pane_states, metadata.as_ref())
+            prepare_snapshot_persistence_with_canonical_metadata(
+                &topology,
+                &pane_states,
+                metadata_json,
+                &truncated_pane_ids,
+            )
         })
         .await
         .map_err(classify_snapshot_pure_blocking_failure)?
@@ -2590,6 +2982,23 @@ impl SnapshotEngine {
             &self.telemetry.bytes_persisted,
             u64::try_from(result.total_bytes).unwrap_or(u64::MAX),
         );
+        saturating_telemetry_add(
+            &self.telemetry.persisted_text_bytes,
+            u64::try_from(result.persisted_text_bytes).unwrap_or(u64::MAX),
+        );
+        saturating_telemetry_add(
+            &self.telemetry.pane_states_truncated,
+            u64::try_from(result.truncated_pane_count).unwrap_or(u64::MAX),
+        );
+        if result.truncated_pane_count > 0 {
+            tracing::warn!(
+                checkpoint_id = result.checkpoint_id,
+                truncated_pane_count = result.truncated_pane_count,
+                pane_count,
+                pane_text_limit = MAX_PERSISTED_PANE_TEXT_BYTES,
+                "persisted snapshot after bounding oversized pane observations"
+            );
+        }
         capture_guard.complete_without_error();
 
         Ok(SnapshotResult {
@@ -2599,6 +3008,8 @@ impl SnapshotEngine {
             state_hash: result.state_hash,
             pane_count,
             total_bytes: result.total_bytes,
+            persisted_text_bytes: result.persisted_text_bytes,
+            truncated_pane_count: result.truncated_pane_count,
             trigger,
         })
     }
@@ -2759,14 +3170,14 @@ impl SnapshotEngine {
             }
             Err(error) if error.requires_reconciliation() => {
                 tracing::warn!(
-                    error = %error,
+                    error_class = error.diagnostic_class(),
                     "automatic snapshot retention cleanup requires durable-state reconciliation"
                 );
                 Err(error)
             }
             Err(error) if error.is_retry_safe_scheduler_failure() => {
                 tracing::warn!(
-                    error = %error,
+                    error_class = error.diagnostic_class(),
                     retry_delay_seconds = CHECKPOINT_CLEANUP_RETRY_DELAY.as_secs(),
                     "automatic snapshot retention cleanup failed; retry deferred"
                 );
@@ -2875,7 +3286,7 @@ impl SnapshotEngine {
                     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                     if let Err(error) = self.maybe_run_checkpoint_cleanup_with_cx(&cx).await {
                         tracing::warn!(
-                            error = %error,
+                            error_class = error.diagnostic_class(),
                             "automatic snapshot retention cleanup failed after capture"
                         );
                     }
@@ -2886,7 +3297,7 @@ impl SnapshotEngine {
                     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                     if let Err(error) = self.maybe_run_checkpoint_cleanup_with_cx(&cx).await {
                         tracing::warn!(
-                            error = %error,
+                            error_class = error.diagnostic_class(),
                             "automatic snapshot retention cleanup failed after dedup"
                         );
                     }
@@ -2905,12 +3316,20 @@ impl SnapshotEngine {
                     false
                 }
                 Err(e) => {
-                    tracing::warn!(trigger = ?trigger, error = %e, "snapshot capture failed");
+                    tracing::warn!(
+                        trigger = ?trigger,
+                        error_class = e.diagnostic_class(),
+                        "snapshot capture failed"
+                    );
                     false
                 }
             },
             Err(error) => {
-                tracing::warn!(trigger = ?trigger, error = %error, "snapshot pane listing failed");
+                tracing::warn!(
+                    trigger = ?trigger,
+                    error_class = error.diagnostic_class(),
+                    "snapshot pane listing failed"
+                );
                 false
             }
         }
@@ -3009,10 +3428,10 @@ impl SnapshotEngine {
                         SchedulerCaptureDeferredReason::Busy,
                     ))
                 }
-                Err(error @ SnapshotError::Topology(_)) => {
+                Err(error) if error.is_capacity_admission_failure() => {
                     tracing::warn!(
                         trigger = ?trigger,
-                        error = %error,
+                        error_class = error.diagnostic_class(),
                         "snapshot projection exceeded deterministic admission; scheduler will retain demand with bounded backoff"
                     );
                     Ok(SchedulerCaptureOutcome::Deferred(
@@ -3022,7 +3441,7 @@ impl SnapshotEngine {
                 Err(error) if error.is_retry_safe_scheduler_failure() => {
                     tracing::warn!(
                         trigger = ?trigger,
-                        error = %error,
+                        error_class = error.diagnostic_class(),
                         "snapshot capture failed retry-safely; scheduler will retain demand with bounded backoff"
                     );
                     Ok(SchedulerCaptureOutcome::Deferred(
@@ -3030,14 +3449,18 @@ impl SnapshotEngine {
                     ))
                 }
                 Err(e) => {
-                    tracing::warn!(trigger = ?trigger, error = %e, "snapshot capture failed");
+                    tracing::warn!(
+                        trigger = ?trigger,
+                        error_class = e.diagnostic_class(),
+                        "snapshot capture failed"
+                    );
                     Err(e)
                 }
             },
             Err(error) if error.is_retry_safe_scheduler_failure() => {
                 tracing::warn!(
                     trigger = ?trigger,
-                    error = %error,
+                    error_class = error.diagnostic_class(),
                     "snapshot pane provider failed retry-safely; scheduler will use bounded backoff"
                 );
                 Ok(SchedulerCaptureOutcome::Deferred(
@@ -3642,9 +4065,11 @@ impl SnapshotEngine {
             Ok(result) => {
                 schedule.record_authoritative_success(Instant::now());
                 let total = result.total_sessions_deleted();
-                if total > 0 || result.orphaned_checkpoints > 0 || result.orphaned_pane_states > 0 {
+                if result.any_work_done() {
                     tracing::info!(
                         sessions_deleted = total,
+                        orphaned_restore_lifecycle_rows =
+                            result.orphaned_restore_lifecycle_rows,
                         orphaned_checkpoints = result.orphaned_checkpoints,
                         orphaned_pane_states = result.orphaned_pane_states,
                         explicit_vacuum_attempted = false,
@@ -3664,7 +4089,7 @@ impl SnapshotEngine {
                 let reconciliation_latched = self.authority_reconciliation_is_required();
                 if error.requires_reconciliation() || reconciliation_latched {
                     tracing::warn!(
-                        error = %error,
+                        error_class = error.diagnostic_class(),
                         reconciliation_latched,
                         automatic_retry_suppressed = true,
                         "Session retention cleanup outcome is indeterminate; reconcile durable state before restarting cleanup"
@@ -3672,7 +4097,7 @@ impl SnapshotEngine {
                 } else {
                     schedule.defer_retry(Instant::now());
                     tracing::warn!(
-                        error = %error,
+                        error_class = error.diagnostic_class(),
                         retry_delay_seconds = SESSION_CLEANUP_RETRY_DELAY.as_secs(),
                         "Session retention cleanup failed; retry deferred"
                     );
@@ -3829,7 +4254,7 @@ impl SnapshotEngine {
                     classify_shutdown_timeout(cx, timeout)
                 };
                 tracing::warn!(
-                    error = %source,
+                    error_class = source.diagnostic_class(),
                     "Shutdown checkpoint did not settle inside its capability/time boundary"
                 );
                 if let Some(checkpoint) = checkpoint_receipt.take() {
@@ -3994,7 +4419,7 @@ where
         AuthorityBlockingOutcome::Executed(Err(error)) if error.requires_reconciliation() => {
             tracing::warn!(
                 %operation,
-                error = %error,
+                error_class = "indeterminate_database_authority",
                 "synchronous checkpoint authority work returned an indeterminate outcome"
             );
             attempt.latch_and_settle();
@@ -4024,8 +4449,15 @@ where
 }
 
 const SNAPSHOT_SQLITE_IN_LIST_CHUNK: usize = 900;
+// Snapshot correlation consumes only a stable rule ID and a small structured
+// session hint. These caps bound corrupt/legacy event rows before SQLite moves
+// their text into Rust.
+const SNAPSHOT_DETECTION_RULE_ID_BYTES: usize = 1024;
+const SNAPSHOT_DETECTION_EXTRACTED_BYTES: usize = 16 * 1024;
 
-/// Load the most recent detections per pane from storage.
+/// Load the most recent bounded, supported-agent detection per pane from
+/// storage. Mux-level and unknown-provider events are intentionally outside
+/// snapshot agent-correlation authority.
 ///
 /// This is best-effort: if the `events` table does not exist (e.g., tests using a
 /// minimal schema), it returns an empty map.
@@ -4033,7 +4465,7 @@ fn load_latest_detections_by_pane_sync(
     db_path: &str,
     pane_ids: &[u64],
     cutoff_ms: i64,
-) -> std::result::Result<std::collections::HashMap<u64, Vec<Detection>>, rusqlite::Error> {
+) -> std::result::Result<std::collections::HashMap<u64, Detection>, rusqlite::Error> {
     use std::collections::HashMap;
 
     if pane_ids.is_empty() {
@@ -4041,7 +4473,7 @@ fn load_latest_detections_by_pane_sync(
     }
 
     let conn = open_snapshot_query_conn(db_path)?;
-    let mut out: HashMap<u64, Vec<Detection>> = HashMap::new();
+    let mut out: HashMap<u64, Detection> = HashMap::with_capacity(pane_ids.len());
     for pane_chunk in pane_ids.chunks(SNAPSHOT_SQLITE_IN_LIST_CHUNK) {
         let placeholders = std::iter::repeat_n("?", pane_chunk.len())
             .collect::<Vec<_>>()
@@ -4051,17 +4483,27 @@ fn load_latest_detections_by_pane_sync(
                  SELECT pane_id,
                         rule_id,
                         agent_type,
-                        extracted,
+                        CASE
+                            WHEN extracted IS NULL THEN NULL
+                            WHEN typeof(extracted) = 'text'
+                             AND length(CAST(extracted AS BLOB)) <= {SNAPSHOT_DETECTION_EXTRACTED_BYTES}
+                            THEN extracted
+                        END AS bounded_extracted,
                         ROW_NUMBER() OVER (
                             PARTITION BY pane_id
                             ORDER BY detected_at DESC, id DESC
                         ) AS rn
                  FROM events
                  WHERE pane_id IN ({placeholders})
+                   AND typeof(pane_id) = 'integer'
+                   AND typeof(detected_at) = 'integer'
                    AND detected_at >= ?
-                   AND agent_type NOT IN ('unknown', 'wezterm')
+                   AND typeof(rule_id) = 'text'
+                   AND length(CAST(rule_id AS BLOB)) BETWEEN 1 AND {SNAPSHOT_DETECTION_RULE_ID_BYTES}
+                   AND typeof(agent_type) = 'text'
+                   AND agent_type IN ('codex', 'claude_code', 'gemini')
              )
-             SELECT pane_id, rule_id, agent_type, extracted
+             SELECT pane_id, rule_id, agent_type, bounded_extracted
              FROM ranked
              WHERE rn = 1"
         );
@@ -4095,7 +4537,7 @@ fn load_latest_detections_by_pane_sync(
                 matched_text: String::new(),
                 span: (0, 0),
             };
-            out.insert(pane_id, vec![detection]);
+            out.insert(pane_id, detection);
         }
     }
 
@@ -4113,7 +4555,7 @@ fn load_latest_scrollback_refs_sync(
     }
 
     let conn = open_snapshot_query_conn(db_path).map_err(|error| error.to_string())?;
-    let mut refs = HashMap::new();
+    let mut refs = HashMap::with_capacity(pane_ids.len());
     for pane_chunk in pane_ids.chunks(SNAPSHOT_SQLITE_IN_LIST_CHUNK) {
         let placeholders = std::iter::repeat_n("?", pane_chunk.len())
             .collect::<Vec<_>>()
@@ -4354,6 +4796,423 @@ fn generate_session_id() -> String {
     format!("sess-{ts:013x}-{rand:016x}")
 }
 
+// Bound caller-controlled strings before JSON encoding. JSON escaping can
+// expand these prefixes, so the authoritative 64 KiB check is still applied to
+// the encoded row below.
+const SNAPSHOT_TEXT_FIELD_INPUT_BYTES: usize = 8 * 1024;
+const SNAPSHOT_AGENT_FIELD_INPUT_BYTES: usize = 4 * 1024;
+const SNAPSHOT_ENV_VALUE_INPUT_BYTES: usize = 4 * 1024;
+const SNAPSHOT_METADATA_MAX_DEPTH: usize = 64;
+const SNAPSHOT_METADATA_MAX_NODES: usize = 65_536;
+// Keep this in lockstep with the restore reader's host-id admission boundary.
+const SNAPSHOT_HOST_ID_INPUT_BYTES: usize = 1024;
+const FOREGROUND_PROCESS_NAME_FIELD: &str = "foreground_process_name";
+
+struct JsonByteCounter {
+    bytes: usize,
+    max_bytes: usize,
+    overflowed: bool,
+    limit_exceeded: bool,
+}
+
+impl JsonByteCounter {
+    const fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: 0,
+            max_bytes,
+            overflowed: false,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match self.bytes.checked_add(buffer.len()) {
+            Some(bytes) => {
+                self.bytes = bytes;
+                if bytes > self.max_bytes {
+                    self.limit_exceeded = true;
+                    return Err(std::io::Error::other(
+                        "checkpoint metadata byte limit exceeded",
+                    ));
+                }
+            }
+            None => {
+                self.bytes = usize::MAX;
+                self.overflowed = true;
+                return Err(std::io::Error::other(
+                    "checkpoint metadata byte count overflowed",
+                ));
+            }
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_utf8(value: &str, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value.to_owned(), false);
+    }
+
+    const ELLIPSIS: &str = "…";
+    let mut end = max_bytes.saturating_sub(ELLIPSIS.len()).min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(end.saturating_add(ELLIPSIS.len()));
+    bounded.push_str(&value[..end]);
+    if max_bytes >= ELLIPSIS.len() {
+        bounded.push_str(ELLIPSIS);
+    }
+    (bounded, true)
+}
+
+fn bounded_optional_utf8(value: Option<&str>, max_bytes: usize) -> (Option<String>, bool) {
+    value.map_or((None, false), |value| {
+        let (bounded, truncated) = bounded_utf8(value, max_bytes);
+        (Some(bounded), truncated)
+    })
+}
+
+/// Preserve exact optional authority values or omit them. Prefix truncation is
+/// appropriate for display text, but it can manufacture a different cwd,
+/// process name, environment value, or session identity.
+fn admitted_optional_utf8(value: Option<&str>, max_bytes: usize) -> (Option<String>, bool) {
+    value.map_or((None, false), |value| {
+        if value.len() > max_bytes {
+            (None, true)
+        } else {
+            (Some(value.to_owned()), false)
+        }
+    })
+}
+
+/// Minimal, bounded pane-list projection consumed by snapshot topology,
+/// per-pane state, and agent correlation. Keeping one projection prevents the
+/// topology copy of cwd/title/workspace from retaining the raw oversized value
+/// after the pane-row copy has been shortened.
+struct SnapshotPaneProjection {
+    panes: Vec<PaneInfo>,
+    topology_workspace_id: Option<String>,
+    truncated_pane_ids: HashSet<u64>,
+}
+
+fn project_snapshot_panes(
+    panes: &[PaneInfo],
+) -> std::result::Result<SnapshotPaneProjection, SnapshotError> {
+    if panes.len() > MAX_TOPOLOGY_PANES {
+        return Err(SnapshotError::Topology(
+            TopologySnapshotError::ResourceLimit {
+                resource: "panes",
+                count: panes.len(),
+                limit: MAX_TOPOLOGY_PANES,
+            },
+        ));
+    }
+
+    let first_workspace = panes.first().and_then(|pane| pane.workspace.as_deref());
+    // Exact equality across multiple arbitrarily large workspace strings can
+    // turn this async-thread preprojection into an unbounded prefix scan. An
+    // oversized workspace is not restorable authority, so omit it instead of
+    // manufacturing a truncated identifier that can alias another workspace.
+    let oversized_workspace = panes.iter().any(|pane| {
+        pane.workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.len() > SNAPSHOT_TEXT_FIELD_INPUT_BYTES)
+    });
+    let uniform_workspace = !oversized_workspace
+        && panes
+        .iter()
+        .all(|pane| pane.workspace.as_deref() == first_workspace);
+    let topology_workspace_id = if oversized_workspace {
+        None
+    } else if uniform_workspace {
+        first_workspace.map(str::to_owned)
+    } else {
+        // Mixed workspace identity is deliberately unknown. Bounding each
+        // value first could alias two different long names onto one prefix and
+        // manufacture false single-workspace authority.
+        None
+    };
+
+    let mut projected = Vec::with_capacity(panes.len());
+    // Ordinary pane metadata is already small. Avoid reserving a second
+    // per-pane table unless at least one projection actually loses data.
+    let mut truncated_pane_ids = HashSet::new();
+    for pane in panes {
+        let (title, title_truncated) =
+            bounded_optional_utf8(pane.title.as_deref(), SNAPSHOT_TEXT_FIELD_INPUT_BYTES);
+        let (cwd, cwd_truncated) =
+            admitted_optional_utf8(pane.cwd.as_deref(), SNAPSHOT_TEXT_FIELD_INPUT_BYTES);
+
+        // AgentCorrelator consumes only this one forward-compatible extra. Do
+        // not clone arbitrary backend extras into the blocking snapshot phase.
+        // Most current mux projections do not expose a typed foreground
+        // process. Keep the empty case allocation-free across large sessions.
+        let mut extra = HashMap::new();
+        let process = pane
+            .extra
+            .get(FOREGROUND_PROCESS_NAME_FIELD)
+            .and_then(Value::as_str);
+        let process_truncated = if process
+            .is_some_and(|process| process.len() > SNAPSHOT_TEXT_FIELD_INPUT_BYTES)
+        {
+            true
+        } else if let Some(process) = process {
+            extra.insert(
+                FOREGROUND_PROCESS_NAME_FIELD.to_owned(),
+                Value::String(process.to_owned()),
+            );
+            false
+        } else {
+            false
+        };
+
+        let workspace_omitted = pane
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.len() > SNAPSHOT_TEXT_FIELD_INPUT_BYTES);
+        if workspace_omitted || title_truncated || cwd_truncated || process_truncated {
+            truncated_pane_ids.insert(pane.pane_id);
+        }
+
+        projected.push(PaneInfo {
+            pane_id: pane.pane_id,
+            tab_id: pane.tab_id,
+            window_id: pane.window_id,
+            domain_id: pane.domain_id,
+            domain_name: None,
+            // TopologySnapshot receives the one separately-projected workspace
+            // identity after construction; per-pane copies are unnecessary.
+            workspace: None,
+            size: pane.size.clone(),
+            rows: pane.rows,
+            cols: pane.cols,
+            title,
+            cwd,
+            tty_name: None,
+            cursor_x: pane.cursor_x,
+            cursor_y: pane.cursor_y,
+            cursor_visibility: pane.cursor_visibility.clone(),
+            left_col: pane.left_col,
+            top_row: pane.top_row,
+            is_active: pane.is_active,
+            is_zoomed: pane.is_zoomed,
+            extra,
+        });
+    }
+
+    Ok(SnapshotPaneProjection {
+        panes: projected,
+        topology_workspace_id,
+        truncated_pane_ids,
+    })
+}
+
+fn bounded_agent_metadata(agent: &AgentMetadata) -> (Option<AgentMetadata>, bool) {
+    if agent.agent_type.len() > SNAPSHOT_AGENT_FIELD_INPUT_BYTES {
+        return (None, true);
+    }
+    let (session_id, session_truncated) = admitted_optional_utf8(
+        agent.session_id.as_deref(),
+        SNAPSHOT_AGENT_FIELD_INPUT_BYTES,
+    );
+    let (state, state_truncated) = admitted_optional_utf8(
+        agent.state.as_deref(),
+        SNAPSHOT_AGENT_FIELD_INPUT_BYTES,
+    );
+    (
+        Some(AgentMetadata {
+            agent_type: agent.agent_type.clone(),
+            session_id,
+            state,
+        }),
+        session_truncated || state_truncated,
+    )
+}
+
+fn bounded_captured_env(env: &CapturedEnv) -> (CapturedEnv, bool) {
+    let mut vars = HashMap::with_capacity(SAFE_ENV_VARS.len().min(env.vars.len()));
+    let mut truncated = false;
+    for key in SAFE_ENV_VARS {
+        let Some(value) = env.vars.get(*key) else {
+            continue;
+        };
+        if value.len() > SNAPSHOT_ENV_VALUE_INPUT_BYTES {
+            truncated = true;
+        } else {
+            vars.insert((*key).to_owned(), value.clone());
+        }
+    }
+    // A programmatic caller can construct CapturedEnv directly. Refuse to
+    // persist names outside the capture allow-list, and make that omission
+    // visible through the same truncation evidence.
+    truncated |= vars.len() != env.vars.len();
+    (
+        CapturedEnv {
+            vars,
+            redacted_count: env.redacted_count,
+        },
+        truncated,
+    )
+}
+
+fn admit_checkpoint_metadata_child<'a>(
+    stack: &mut Vec<(&'a Value, usize)>,
+    discovered_nodes: &mut usize,
+    child: &'a Value,
+    child_depth: usize,
+) -> Result<(), SnapshotPreparationError> {
+    *discovered_nodes = discovered_nodes
+        .checked_add(1)
+        .ok_or(SnapshotPreparationError::ByteCountOverflow)?;
+    if *discovered_nodes > SNAPSHOT_METADATA_MAX_NODES {
+        return Err(SnapshotPreparationError::MetadataShapeResourceLimit {
+            resource: SnapshotProjectionResource::MetadataNodes,
+            observed: *discovered_nodes,
+            limit: SNAPSHOT_METADATA_MAX_NODES,
+        });
+    }
+    stack.push((child, child_depth));
+    Ok(())
+}
+
+fn canonical_checkpoint_metadata(
+    metadata: &Value,
+) -> Result<String, SnapshotPreparationError> {
+    // `canonical_json_string` recursively rebuilds the Value tree. Bound both
+    // recursion depth and allocation-amplifying node count iteratively before
+    // either serde or canonicalization receives programmatically-built input.
+    let mut discovered_nodes = 1_usize;
+    let mut raw_string_bytes = 0_usize;
+    let mut stack = vec![(metadata, 1_usize)];
+    while let Some((value, depth)) = stack.pop() {
+        if depth > SNAPSHOT_METADATA_MAX_DEPTH {
+            return Err(SnapshotPreparationError::MetadataShapeResourceLimit {
+                resource: SnapshotProjectionResource::MetadataDepth,
+                observed: depth,
+                limit: SNAPSHOT_METADATA_MAX_DEPTH,
+            });
+        }
+        let child_depth = depth
+            .checked_add(1)
+            .ok_or(SnapshotPreparationError::ByteCountOverflow)?;
+        match value {
+            Value::String(text) => {
+                raw_string_bytes = raw_string_bytes
+                    .checked_add(text.len())
+                    .ok_or(SnapshotPreparationError::ByteCountOverflow)?;
+            }
+            Value::Array(children) => {
+                for child in children {
+                    admit_checkpoint_metadata_child(
+                        &mut stack,
+                        &mut discovered_nodes,
+                        child,
+                        child_depth,
+                    )?;
+                }
+            }
+            Value::Object(fields) => {
+                for (key, child) in fields {
+                    raw_string_bytes = raw_string_bytes
+                        .checked_add(key.len())
+                        .ok_or(SnapshotPreparationError::ByteCountOverflow)?;
+                    if raw_string_bytes > MAX_CHECKPOINT_METADATA_BYTES {
+                        return Err(SnapshotPreparationError::MetadataResourceLimit {
+                            bytes: raw_string_bytes,
+                            limit: MAX_CHECKPOINT_METADATA_BYTES,
+                        });
+                    }
+                    admit_checkpoint_metadata_child(
+                        &mut stack,
+                        &mut discovered_nodes,
+                        child,
+                        child_depth,
+                    )?;
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+        if raw_string_bytes > MAX_CHECKPOINT_METADATA_BYTES {
+            return Err(SnapshotPreparationError::MetadataResourceLimit {
+                bytes: raw_string_bytes,
+                limit: MAX_CHECKPOINT_METADATA_BYTES,
+            });
+        }
+    }
+
+    // Canonical key ordering cannot change compact JSON's encoded length.
+    // Count through serde's writer first so an oversized Value never gets
+    // cloned into a second full tree and String merely to discover the cap.
+    let mut counter = JsonByteCounter::new(MAX_CHECKPOINT_METADATA_BYTES);
+    let serialization = serde_json::to_writer(&mut counter, metadata);
+    if counter.overflowed {
+        return Err(SnapshotPreparationError::ByteCountOverflow);
+    }
+    if counter.limit_exceeded {
+        return Err(SnapshotPreparationError::MetadataResourceLimit {
+            bytes: counter.bytes,
+            limit: MAX_CHECKPOINT_METADATA_BYTES,
+        });
+    }
+    serialization.map_err(CheckpointWitnessError::from)?;
+
+    let canonical = canonical_json_string(metadata)?;
+    debug_assert_eq!(
+        canonical.len(),
+        counter.bytes,
+        "canonical object-key ordering must preserve compact JSON byte length"
+    );
+    Ok(canonical)
+}
+
+fn reduce_persisted_pane_to_budget(
+    pane: &mut PersistedPaneState,
+) -> Result<bool, SnapshotPreparationError> {
+    let mut bytes = persisted_pane_text_bytes(pane)
+        .ok_or(SnapshotPreparationError::ByteCountOverflow)?;
+    if bytes <= MAX_PERSISTED_PANE_TEXT_BYTES {
+        return Ok(false);
+    }
+
+    // Keep the deterministic order stable: environment, agent observation,
+    // command, cwd, then title. The numeric terminal geometry and scrollback
+    // references always survive.
+    for tier in 0..5 {
+        match tier {
+            0 => pane.env_json = None,
+            1 => pane.agent_metadata_json = None,
+            2 => pane.command = None,
+            3 => pane.cwd = None,
+            4 => {
+                let mut terminal: crate::session_pane_state::TerminalState =
+                    serde_json::from_str(&pane.terminal_state_json)
+                        .map_err(CheckpointWitnessError::from)?;
+                terminal.title.clear();
+                pane.terminal_state_json = canonical_json_string(&terminal)?;
+            }
+            _ => unreachable!(),
+        }
+        bytes = persisted_pane_text_bytes(pane)
+            .ok_or(SnapshotPreparationError::ByteCountOverflow)?;
+        if bytes <= MAX_PERSISTED_PANE_TEXT_BYTES {
+            return Ok(true);
+        }
+    }
+
+    Err(SnapshotPreparationError::PaneTextResourceLimit {
+        pane_id: pane.pane_id,
+        bytes,
+        limit: MAX_PERSISTED_PANE_TEXT_BYTES,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 enum SnapshotPreparationError {
     #[error(transparent)]
@@ -4370,18 +5229,78 @@ enum SnapshotPreparationError {
     ByteCountOverflow,
     #[error("snapshot pane count exceeds SQLite integer range")]
     PaneCountOverflow,
+    #[error(
+        "snapshot topology/pane-state identity sets disagree (topology panes: {topology_panes}, pane states: {pane_states})"
+    )]
+    PaneIdentitySetMismatch {
+        topology_panes: usize,
+        pane_states: usize,
+    },
+    #[error("snapshot metadata is {bytes} bytes; limit is {limit}")]
+    MetadataResourceLimit { bytes: usize, limit: usize },
+    #[error("snapshot metadata {resource} is {observed}; limit is {limit}")]
+    MetadataShapeResourceLimit {
+        resource: SnapshotProjectionResource,
+        observed: usize,
+        limit: usize,
+    },
+    #[error("snapshot pane {pane_id} stores {bytes} text bytes; limit is {limit}")]
+    PaneTextResourceLimit {
+        pane_id: i64,
+        bytes: usize,
+        limit: usize,
+    },
+    #[error("snapshot stores {bytes} admitted text bytes; limit is {limit}")]
+    CheckpointTextResourceLimit { bytes: usize, limit: usize },
 }
 
 impl From<SnapshotPreparationError> for SnapshotError {
     fn from(error: SnapshotPreparationError) -> Self {
         match error {
             SnapshotPreparationError::Topology(source) => Self::Topology(source),
+            SnapshotPreparationError::PaneIdentitySetMismatch {
+                topology_panes,
+                pane_states,
+            } => Self::PaneIdentitySetMismatch {
+                topology_panes,
+                pane_states,
+            },
+            SnapshotPreparationError::MetadataResourceLimit { bytes, limit } => {
+                Self::ProjectionResourceLimit {
+                    resource: SnapshotProjectionResource::MetadataBytes,
+                    observed: bytes,
+                    limit,
+                }
+            }
+            SnapshotPreparationError::MetadataShapeResourceLimit {
+                resource,
+                observed,
+                limit,
+            } => Self::ProjectionResourceLimit {
+                resource,
+                observed,
+                limit,
+            },
+            SnapshotPreparationError::PaneTextResourceLimit { bytes, limit, .. } => {
+                Self::ProjectionResourceLimit {
+                    resource: SnapshotProjectionResource::PaneTextBytes,
+                    observed: bytes,
+                    limit,
+                }
+            }
+            SnapshotPreparationError::CheckpointTextResourceLimit { bytes, limit } => {
+                Self::ProjectionResourceLimit {
+                    resource: SnapshotProjectionResource::CheckpointTextBytes,
+                    observed: bytes,
+                    limit,
+                }
+            }
             other => Self::Serialization(other.to_string()),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct PreparedSnapshotPersistence {
     topology_json: String,
     metadata_json: Option<String>,
@@ -4390,30 +5309,131 @@ struct PreparedSnapshotPersistence {
     pane_count_sql: i64,
     total_bytes: usize,
     total_bytes_sql: i64,
+    persisted_text_bytes: usize,
+    truncated_pane_count: usize,
     dedup_hash: String,
+}
+
+impl std::fmt::Debug for PreparedSnapshotPersistence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedSnapshotPersistence")
+            .field("has_topology", &!self.topology_json.is_empty())
+            .field("has_metadata", &self.metadata_json.is_some())
+            .field("persisted_pane_rows", &self.panes.len())
+            .field("pane_count", &self.pane_count)
+            .field("pane_count_sql", &self.pane_count_sql)
+            .field("total_bytes", &self.total_bytes)
+            .field("total_bytes_sql", &self.total_bytes_sql)
+            .field("persisted_text_bytes", &self.persisted_text_bytes)
+            .field("truncated_pane_count", &self.truncated_pane_count)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Build once from exactly the values the SQLite transaction will insert.
 /// Non-persisted process PID/argv, shell, and scrollback segment counts are
 /// deliberately absent so they cannot manufacture redundant checkpoints.
+#[cfg(test)]
 fn prepare_snapshot_persistence(
     topology: &TopologySnapshot,
     pane_states: &[PaneStateSnapshot],
     metadata: Option<&Value>,
 ) -> std::result::Result<PreparedSnapshotPersistence, SnapshotPreparationError> {
+    prepare_snapshot_persistence_with_prebounded_panes(
+        topology,
+        pane_states,
+        metadata,
+        &HashSet::new(),
+    )
+}
+
+#[cfg(test)]
+fn prepare_snapshot_persistence_with_prebounded_panes(
+    topology: &TopologySnapshot,
+    pane_states: &[PaneStateSnapshot],
+    metadata: Option<&Value>,
+    prebounded_pane_ids: &HashSet<u64>,
+) -> std::result::Result<PreparedSnapshotPersistence, SnapshotPreparationError> {
+    let metadata_json = metadata.map(canonical_checkpoint_metadata).transpose()?;
+    prepare_snapshot_persistence_with_canonical_metadata(
+        topology,
+        pane_states,
+        metadata_json,
+        prebounded_pane_ids,
+    )
+}
+
+fn prepare_snapshot_persistence_with_canonical_metadata(
+    topology: &TopologySnapshot,
+    pane_states: &[PaneStateSnapshot],
+    metadata_json: Option<String>,
+    prebounded_pane_ids: &HashSet<u64>,
+) -> std::result::Result<PreparedSnapshotPersistence, SnapshotPreparationError> {
     let topology_json = topology.to_persistence_json()?;
-    let metadata_json = metadata.map(canonical_json_string).transpose()?;
+    let mut topology_pane_ids = topology.pane_ids();
+    topology_pane_ids.sort_unstable();
+    let mut state_pane_ids = pane_states
+        .iter()
+        .map(|pane| pane.pane_id)
+        .collect::<Vec<_>>();
+    state_pane_ids.sort_unstable();
+    if topology_pane_ids != state_pane_ids {
+        return Err(SnapshotPreparationError::PaneIdentitySetMismatch {
+            topology_panes: topology_pane_ids.len(),
+            pane_states: state_pane_ids.len(),
+        });
+    }
+    if metadata_json
+        .as_ref()
+        .is_some_and(|metadata| metadata.len() > MAX_CHECKPOINT_METADATA_BYTES)
+    {
+        return Err(SnapshotPreparationError::MetadataResourceLimit {
+            bytes: metadata_json.as_ref().map_or(0, String::len),
+            limit: MAX_CHECKPOINT_METADATA_BYTES,
+        });
+    }
     let mut panes = Vec::with_capacity(pane_states.len());
     let mut total_bytes = 0_usize;
+    let mut truncated_pane_count = 0_usize;
 
     for pane in pane_states {
-        let terminal_state_json = canonical_json_string(&pane.terminal)?;
-        let env_json = pane.env.as_ref().map(canonical_json_string).transpose()?;
-        let agent_metadata_json = pane
-            .agent
-            .as_ref()
-            .map(canonical_json_string)
-            .transpose()?;
+        let (title, title_truncated) =
+            bounded_utf8(&pane.terminal.title, SNAPSHOT_TEXT_FIELD_INPUT_BYTES);
+        // Construct the fixed-shape terminal projection directly. Cloning the
+        // source first would duplicate an unbounded caller-supplied title
+        // before the byte cap had a chance to apply.
+        let terminal = crate::session_pane_state::TerminalState {
+            rows: pane.terminal.rows,
+            cols: pane.terminal.cols,
+            cursor_row: pane.terminal.cursor_row,
+            cursor_col: pane.terminal.cursor_col,
+            is_alt_screen: pane.terminal.is_alt_screen,
+            title,
+        };
+        let terminal_state_json = canonical_json_string(&terminal)?;
+        let (cwd, cwd_truncated) =
+            admitted_optional_utf8(pane.cwd.as_deref(), SNAPSHOT_TEXT_FIELD_INPUT_BYTES);
+        let (command, command_truncated) = admitted_optional_utf8(
+            pane.foreground_process
+                .as_ref()
+                .map(|process| process.name.as_str()),
+            SNAPSHOT_TEXT_FIELD_INPUT_BYTES,
+        );
+        let (env_json, env_truncated) = match pane.env.as_ref() {
+            Some(env) => {
+                let (env, truncated) = bounded_captured_env(env);
+                (Some(canonical_json_string(&env)?), truncated)
+            }
+            None => (None, false),
+        };
+        let (agent_metadata_json, agent_truncated) = match pane.agent.as_ref() {
+            Some(agent) => {
+                let (agent, truncated) = bounded_agent_metadata(agent);
+                (agent.as_ref().map(canonical_json_string).transpose()?, truncated)
+            }
+            None => (None, false),
+        };
         let scrollback_checkpoint_seq = pane
             .scrollback_ref
             .as_ref()
@@ -4435,31 +5455,51 @@ fn prepare_snapshot_persistence(
             })
             .transpose()?;
 
-        let pane_bytes = terminal_state_json
-            .len()
-            .checked_add(env_json.as_ref().map_or(0, String::len))
-            .and_then(|bytes| {
-                bytes.checked_add(agent_metadata_json.as_ref().map_or(0, String::len))
-            })
-            .ok_or(SnapshotPreparationError::ByteCountOverflow)?;
-        total_bytes = total_bytes
-            .checked_add(pane_bytes)
-            .ok_or(SnapshotPreparationError::ByteCountOverflow)?;
-
-        panes.push(PersistedPaneState {
+        let mut persisted = PersistedPaneState {
             pane_id: i64::try_from(pane.pane_id)
                 .map_err(|_| SnapshotPreparationError::PaneIdRange(pane.pane_id))?,
-            cwd: pane.cwd.clone(),
-            command: pane
-                .foreground_process
-                .as_ref()
-                .map(|process| process.name.clone()),
+            cwd,
+            command,
             env_json,
             terminal_state_json,
             agent_metadata_json,
             scrollback_checkpoint_seq,
             last_output_at,
-        });
+        };
+        let reduced = reduce_persisted_pane_to_budget(&mut persisted)?;
+        if prebounded_pane_ids.contains(&pane.pane_id)
+            || title_truncated
+            || cwd_truncated
+            || command_truncated
+            || env_truncated
+            || agent_truncated
+            || reduced
+        {
+            truncated_pane_count = truncated_pane_count
+                .checked_add(1)
+                .ok_or(SnapshotPreparationError::PaneCountOverflow)?;
+        }
+
+        // Keep the historical database/API byte field stable for existing v2
+        // readers and witnesses. The complete admitted projection is tracked
+        // separately below.
+        let pane_bytes = persisted
+            .terminal_state_json
+            .len()
+            .checked_add(persisted.env_json.as_ref().map_or(0, String::len))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    persisted
+                        .agent_metadata_json
+                        .as_ref()
+                        .map_or(0, String::len),
+                )
+            })
+            .ok_or(SnapshotPreparationError::ByteCountOverflow)?;
+        total_bytes = total_bytes
+            .checked_add(pane_bytes)
+            .ok_or(SnapshotPreparationError::ByteCountOverflow)?;
+        panes.push(persisted);
     }
 
     panes.sort_unstable_by_key(|pane| pane.pane_id);
@@ -4468,6 +5508,18 @@ fn prepare_snapshot_persistence(
         i64::try_from(pane_count).map_err(|_| SnapshotPreparationError::PaneCountOverflow)?;
     let total_bytes_sql =
         i64::try_from(total_bytes).map_err(|_| SnapshotPreparationError::ByteCountOverflow)?;
+    let persisted_text_bytes = persisted_checkpoint_text_bytes(
+        Some(&topology_json),
+        metadata_json.as_deref(),
+        &panes,
+    )
+    .ok_or(SnapshotPreparationError::ByteCountOverflow)?;
+    if persisted_text_bytes > MAX_PERSISTED_CHECKPOINT_TEXT_BYTES {
+        return Err(SnapshotPreparationError::CheckpointTextResourceLimit {
+            bytes: persisted_text_bytes,
+            limit: MAX_PERSISTED_CHECKPOINT_TEXT_BYTES,
+        });
+    }
     let dedup_hash = snapshot_dedup_witness(&topology_json, &panes)?;
 
     Ok(PreparedSnapshotPersistence {
@@ -4478,6 +5530,8 @@ fn prepare_snapshot_persistence(
         pane_count_sql,
         total_bytes,
         total_bytes_sql,
+        persisted_text_bytes,
+        truncated_pane_count,
         dedup_hash,
     })
 }
@@ -4626,6 +5680,7 @@ fn u64_to_sqlite_integer(value: u64) -> std::result::Result<i64, rusqlite::Error
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
+#[cfg(test)]
 fn usize_to_sqlite_integer(value: usize) -> std::result::Result<i64, rusqlite::Error> {
     i64::try_from(value)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
@@ -4697,7 +5752,7 @@ fn open_conn(db_path: &str) -> std::result::Result<Connection, rusqlite::Error> 
 fn open_snapshot_query_conn(
     db_path: &str,
 ) -> std::result::Result<Connection, rusqlite::Error> {
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE;
@@ -4711,21 +5766,6 @@ fn open_snapshot_query_conn(
     let conn = Connection::open_with_flags(db_path, flags)?;
     conn.busy_timeout(Duration::from_secs(5))?;
     Ok(conn)
-}
-
-fn decode_persisted_pane_state(
-    row: &rusqlite::Row<'_>,
-) -> std::result::Result<PersistedPaneState, rusqlite::Error> {
-    Ok(PersistedPaneState {
-        pane_id: row.get(0)?,
-        cwd: row.get(1)?,
-        command: row.get(2)?,
-        env_json: row.get(3)?,
-        terminal_state_json: row.get(4)?,
-        agent_metadata_json: row.get(5)?,
-        scrollback_checkpoint_seq: row.get(6)?,
-        last_output_at: row.get(7)?,
-    })
 }
 
 /// Re-read and recompute the complete persisted v2 snapshot witness. The
@@ -4742,14 +5782,9 @@ fn exact_snapshot_checkpoint_is_verified(
         return Ok(false);
     }
     let checkpoint_at = u64_to_sqlite_integer(identity.checkpoint_at)?;
-    let checkpoint = conn
+    let checkpoint_exists = conn
         .query_row(
-            "SELECT checkpoint.checkpoint_type,
-                    checkpoint.state_hash,
-                    checkpoint.pane_count,
-                    checkpoint.total_bytes,
-                    checkpoint.metadata_json,
-                    checkpoint.topology_json
+            "SELECT 1
              FROM session_checkpoints AS checkpoint
              JOIN mux_sessions AS session
                ON session.session_id = checkpoint.session_id
@@ -4774,94 +5809,38 @@ fn exact_snapshot_checkpoint_is_verified(
                 identity.checkpoint_role.as_str(),
                 identity.state_hash.as_str(),
             ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                ))
-            },
+            |row| row.get::<_, i64>(0),
         )
-        .optional()?;
-    let Some((
-        checkpoint_type,
-        stored_state_hash,
-        pane_count,
-        total_bytes,
-        metadata_json,
-        topology_json,
-    )) = checkpoint
-    else {
-        return Ok(false);
-    };
-    if pane_count < 0
-        || total_bytes < 0
-        || !stored_state_hash.starts_with(SNAPSHOT_WITNESS_PREFIX)
-    {
-        return Ok(false);
-    }
-    let Ok(declared_pane_count) = usize::try_from(pane_count) else {
-        return Ok(false);
-    };
-    let Some(topology_json) = topology_json else {
-        return Ok(false);
-    };
-
-    let mut stmt = conn.prepare(
-        "SELECT pane_id, cwd, command, env_json, terminal_state_json,
-                agent_metadata_json, scrollback_checkpoint_seq, last_output_at
-         FROM mux_pane_state
-         WHERE checkpoint_id = ?1
-         ORDER BY pane_id ASC, id ASC",
-    )?;
-    let mut rows = stmt.query([identity.checkpoint_id])?;
-    // Avoid trusting a corrupt on-disk count as an unbounded upfront
-    // allocation request. Valid large sessions still grow normally.
-    let mut panes = Vec::with_capacity(declared_pane_count.min(4_096));
-    while let Some(row) = rows.next()? {
-        if panes.len() == declared_pane_count {
-            return Ok(false);
-        }
-        let Ok(pane) = decode_persisted_pane_state(row) else {
-            return Ok(false);
-        };
-        if pane.pane_id < 0 || panes.last().is_some_and(|prior: &PersistedPaneState| {
-            prior.pane_id == pane.pane_id
-        }) {
-            return Ok(false);
-        }
-        panes.push(pane);
-    }
-    if panes.len() != declared_pane_count {
+        .optional()?
+        .is_some();
+    if !checkpoint_exists {
         return Ok(false);
     }
 
-    let recomputed = match checkpoint_witness(
-        CHECKPOINT_ROLE_SNAPSHOT,
-        identity.session_id.as_str(),
+    match crate::session_restore::load_checkpoint_by_id_from_conn(
+        conn,
         identity.checkpoint_id,
-        checkpoint_at,
-        &checkpoint_type,
-        pane_count,
-        total_bytes,
-        metadata_json.as_deref(),
-        Some(topology_json.as_str()),
-        &panes,
     ) {
-        Ok(witness) => witness,
+        Ok(Some(checkpoint)) => Ok(
+            checkpoint.checkpoint_id == identity.checkpoint_id
+                && checkpoint.session_id.as_str() == identity.session_id.as_str()
+                && checkpoint.checkpoint_at == identity.checkpoint_at
+                && checkpoint.checkpoint_role
+                    == crate::session_restore::CheckpointRole::Snapshot
+                && checkpoint.state_hash.as_str() == identity.state_hash.as_str()
+                && checkpoint.verification
+                    == crate::session_restore::CheckpointVerification::VerifiedV2,
+        ),
+        Ok(None) => Ok(false),
         Err(error) => {
             tracing::warn!(
                 checkpoint_id = identity.checkpoint_id,
                 error = %error,
-                "snapshot checkpoint witness projection is structurally invalid"
+                "snapshot checkpoint authority failed bounded verification"
             );
-            return Ok(false);
+            Ok(false)
         }
-    };
-    Ok(recomputed == stored_state_hash)
+    }
 }
 
 fn exact_snapshot_checkpoint_exists_sync(
@@ -4869,31 +5848,69 @@ fn exact_snapshot_checkpoint_exists_sync(
     identity: &SnapshotCheckpointIdentity,
 ) -> std::result::Result<bool, rusqlite::Error> {
     let conn = open_snapshot_query_conn(db_path)?;
-    exact_snapshot_checkpoint_is_verified(&conn, identity)
+    // The identity/session-summary preflight and bounded witness loader are
+    // separate statements. Pin them to one read snapshot so another process
+    // cannot rewrite the session summary between those observations and turn
+    // a stale cache hint into an authoritative dedup skip.
+    let tx = conn.unchecked_transaction()?;
+    let verified = exact_snapshot_checkpoint_is_verified(&tx, identity)?;
+    tx.commit()?;
+    Ok(verified)
 }
 
-fn current_host_id() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("HOST"))
-        .unwrap_or_default()
+fn bounded_host_id(raw: Option<String>) -> Option<String> {
+    let raw = raw?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(bounded_utf8(trimmed, SNAPSHOT_HOST_ID_INPUT_BYTES).0)
+}
+
+fn current_host_id() -> Option<String> {
+    ["HOSTNAME", "HOST"]
+        .into_iter()
+        .find_map(|name| bounded_host_id(std::env::var(name).ok()))
 }
 
 /// Creation-only fields inserted alongside a first checkpoint. Keeping this
 /// separate from the checkpoint arguments makes it impossible for an existing
 /// session capture to accidentally rewrite creation authority.
-#[derive(Debug)]
 struct NewSessionMetadata {
     ft_version: String,
-    host_id: String,
+    host_id: Option<String>,
+}
+
+impl std::fmt::Debug for NewSessionMetadata {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewSessionMetadata")
+            .field("has_ft_version", &!self.ft_version.is_empty())
+            .field("has_host_id", &self.host_id.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Authoritative result published only after the SQLite transaction commits.
-#[derive(Debug)]
 struct CheckpointCommitReceipt {
     session_id: String,
     checkpoint_id: i64,
     state_hash: String,
     total_bytes: usize,
+    persisted_text_bytes: usize,
+    truncated_pane_count: usize,
+}
+
+impl std::fmt::Debug for CheckpointCommitReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CheckpointCommitReceipt")
+            .field("checkpoint_id", &self.checkpoint_id)
+            .field("total_bytes", &self.total_bytes)
+            .field("persisted_text_bytes", &self.persisted_text_bytes)
+            .field("truncated_pane_count", &self.truncated_pane_count)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]
@@ -4919,7 +5936,7 @@ fn create_session_sync(
             now_ms,
             topology_json,
             ft_version,
-            host_id
+            host_id.as_deref()
         ],
     )?;
     require_exactly_one_changed_row(inserted)?;
@@ -5029,7 +6046,7 @@ fn save_checkpoint_authoritatively_sync(
                     now_ms,
                     prepared.topology_json.as_str(),
                     metadata.ft_version.as_str(),
-                    metadata.host_id.as_str(),
+                    metadata.host_id.as_deref(),
                 ],
             )?;
             require_exactly_one_changed_row(inserted_session)?;
@@ -5133,6 +6150,8 @@ fn save_checkpoint_authoritatively_sync(
             checkpoint_id,
             state_hash,
             total_bytes: prepared.total_bytes,
+            persisted_text_bytes: prepared.persisted_text_bytes,
+            truncated_pane_count: prepared.truncated_pane_count,
         })
     })
 }
@@ -5268,11 +6287,27 @@ fn delete_checkpoint_authoritatively_sync(
     let conn = open_conn(db_path)?;
     run_optional_snapshot_authority_transaction(&conn, |tx| {
         crate::session_retention::ensure_session_authority_tables_have_no_unaudited_triggers(tx)?;
-        let projection = "SELECT checkpoint.id,
-                                 checkpoint.session_id,
+        let projection = format!(
+            "SELECT checkpoint.id,
+                                 CASE
+                                     WHEN typeof(checkpoint.session_id) = 'text'
+                                      AND length(CAST(checkpoint.session_id AS BLOB))
+                                          BETWEEN 1 AND {MAX_CHECKPOINT_SESSION_ID_BYTES}
+                                     THEN checkpoint.session_id
+                                 END,
                                  checkpoint.checkpoint_at,
-                                 checkpoint.checkpoint_role,
-                                 checkpoint.state_hash,
+                                 CASE
+                                     WHEN typeof(checkpoint.checkpoint_role) = 'text'
+                                      AND length(CAST(checkpoint.checkpoint_role AS BLOB))
+                                          BETWEEN 1 AND {MAX_CHECKPOINT_ROLE_BYTES}
+                                     THEN checkpoint.checkpoint_role
+                                 END,
+                                 CASE
+                                     WHEN typeof(checkpoint.state_hash) = 'text'
+                                      AND length(CAST(checkpoint.state_hash AS BLOB))
+                                          BETWEEN 1 AND {MAX_CHECKPOINT_STATE_HASH_BYTES}
+                                     THEN checkpoint.state_hash
+                                 END,
                                  checkpoint.total_bytes,
                                  COALESCE(
                                      session.shutdown_clean = 1
@@ -5304,7 +6339,8 @@ fn delete_checkpoint_authoritatively_sync(
                                  COALESCE(session.shutdown_clean = 1, 0)
                           FROM session_checkpoints AS checkpoint
                           JOIN mux_sessions AS session
-                            ON session.session_id = checkpoint.session_id";
+                            ON session.session_id = checkpoint.session_id"
+        );
         let checkpoint = match target {
             SnapshotDeleteTarget::Id(checkpoint_id) => tx
                 .query_row(
@@ -5372,6 +6408,27 @@ fn delete_checkpoint_authoritatively_sync(
         let checkpoint_at = sqlite_integer_to_u64(2, checkpoint_at)?;
         let recorded_payload_bytes = sqlite_integer_to_u64(5, recorded_payload_bytes)?;
 
+        let protects_unresolved_restore = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM restore_attempt_lifecycle
+                 WHERE source_checkpoint_id = ?1
+                   AND CASE
+                           WHEN typeof(status) = 'text' AND status = 'resolved' THEN 0
+                           ELSE 1
+                       END = 1
+             )",
+            [checkpoint_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if protects_unresolved_restore != 0 {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(
+                    "checkpoint is protected by an unresolved restore attempt",
+                ),
+            )));
+        }
+
         let deleted = tx.execute(
             "DELETE FROM session_checkpoints WHERE id = ?1",
             [checkpoint_id],
@@ -5415,9 +6472,10 @@ fn cleanup_authoritatively_sync(
     run_snapshot_authority_transaction(&conn, |tx| {
         crate::session_retention::ensure_session_authority_tables_have_no_unaudited_triggers(tx)?;
 
-        let mut affected_stmt = tx.prepare(
+        let affected_sql = format!(
             "WITH ranked AS (
-                 SELECT session_id,
+                 SELECT id,
+                        session_id,
                         checkpoint_at,
                         ROW_NUMBER() OVER (
                             PARTITION BY session_id
@@ -5426,7 +6484,12 @@ fn cleanup_authoritatively_sync(
                  FROM session_checkpoints
                  WHERE checkpoint_role = 'snapshot'
              )
-             SELECT session_id,
+             SELECT CASE
+                        WHEN typeof(session_id) = 'text'
+                         AND length(CAST(session_id AS BLOB))
+                             BETWEEN 1 AND {MAX_CHECKPOINT_SESSION_ID_BYTES}
+                        THEN session_id
+                    END,
                     MAX(
                         CASE
                             WHEN checkpoint_rank = 1
@@ -5436,9 +6499,18 @@ fn cleanup_authoritatively_sync(
                         END
                     ) AS deletes_latest_snapshot
              FROM ranked
-             WHERE checkpoint_at < ?1 OR checkpoint_rank > ?2
-             GROUP BY session_id",
-        )?;
+             WHERE (checkpoint_at < ?1 OR checkpoint_rank > ?2)
+               AND id NOT IN (
+                   SELECT source_checkpoint_id
+                   FROM restore_attempt_lifecycle
+                   WHERE CASE
+                           WHEN typeof(status) = 'text' AND status = 'resolved' THEN 0
+                           ELSE 1
+                         END = 1
+               )
+             GROUP BY session_id"
+        );
+        let mut affected_stmt = tx.prepare(&affected_sql)?;
         let affected_sessions = affected_stmt
             .query_map(rusqlite::params![cutoff_ms, retention_count], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
@@ -5449,7 +6521,16 @@ fn cleanup_authoritatively_sync(
         // Delete checkpoints older than retention_days
         let deleted_by_age: usize = tx.execute(
             "DELETE FROM session_checkpoints
-             WHERE checkpoint_role = 'snapshot' AND checkpoint_at < ?1",
+             WHERE checkpoint_role = 'snapshot'
+               AND checkpoint_at < ?1
+               AND id NOT IN (
+                   SELECT source_checkpoint_id
+                   FROM restore_attempt_lifecycle
+                   WHERE CASE
+                           WHEN typeof(status) = 'text' AND status = 'resolved' THEN 0
+                           ELSE 1
+                         END = 1
+               )",
             [cutoff_ms],
         )?;
 
@@ -5470,7 +6551,15 @@ fn cleanup_authoritatively_sync(
                      WHERE checkpoint_role = 'snapshot'
                  )
                  WHERE checkpoint_rank > ?1
-             )",
+             )
+               AND id NOT IN (
+                   SELECT source_checkpoint_id
+                   FROM restore_attempt_lifecycle
+                   WHERE CASE
+                           WHEN typeof(status) = 'text' AND status = 'resolved' THEN 0
+                           ELSE 1
+                         END = 1
+               )",
             [retention_count],
         )?;
 
@@ -5576,6 +6665,126 @@ mod tests {
     }
 
     #[test]
+    fn observation_connection_cannot_mutate_an_existing_database() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap();
+        let writer = Connection::open(db_path).unwrap();
+        writer
+            .execute_batch("CREATE TABLE observation_guard (value INTEGER NOT NULL);")
+            .unwrap();
+        drop(writer);
+
+        let reader = open_snapshot_query_conn(db_path).unwrap();
+        assert!(
+            reader
+                .execute("INSERT INTO observation_guard (value) VALUES (1)", [])
+                .is_err(),
+            "snapshot observation connections must be enforced read-only by SQLite"
+        );
+        let count: i64 = reader
+            .query_row("SELECT COUNT(*) FROM observation_guard", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn checkpoint_deletion_rejects_oversized_durable_identity_before_delete() {
+        for corrupt_field in ["session_id", "checkpoint_role", "state_hash"] {
+            let (_tmp, db_path) = setup_test_db();
+            let session_id = if corrupt_field == "session_id" {
+                "s".repeat(MAX_CHECKPOINT_SESSION_ID_BYTES + 1)
+            } else {
+                "sess-bounded-delete".to_string()
+            };
+            create_session_sync(
+                db_path.as_str(),
+                &session_id,
+                1_000,
+                r#"{"version":"initial"}"#,
+                crate::VERSION,
+            )
+            .unwrap();
+            let checkpoint_id = insert_checkpoint_fixture(
+                db_path.as_str(),
+                &session_id,
+                2_000,
+                CHECKPOINT_ROLE_SNAPSHOT,
+                "snp2:fixture",
+                Some(r#"{"version":"initial"}"#),
+                0,
+            );
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            match corrupt_field {
+                "checkpoint_role" => {
+                    conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+                        .unwrap();
+                    conn.execute(
+                        "UPDATE session_checkpoints SET checkpoint_role = ?2 WHERE id = ?1",
+                        rusqlite::params![
+                            checkpoint_id,
+                            "r".repeat(MAX_CHECKPOINT_ROLE_BYTES + 1)
+                        ],
+                    )
+                    .unwrap();
+                    conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                        .unwrap();
+                }
+                "state_hash" => {
+                    conn.execute(
+                        "UPDATE session_checkpoints SET state_hash = ?2 WHERE id = ?1",
+                        rusqlite::params![
+                            checkpoint_id,
+                            "h".repeat(MAX_CHECKPOINT_STATE_HASH_BYTES + 1)
+                        ],
+                    )
+                    .unwrap();
+                }
+                "session_id" => {}
+                _ => unreachable!("fixture field is exhaustive"),
+            }
+            drop(conn);
+
+            delete_checkpoint_authoritatively_sync(
+                db_path.as_str(),
+                &SnapshotDeleteTarget::Id(checkpoint_id),
+            )
+            .expect_err("oversized durable identity must fail before destructive DML");
+            assert_eq!(
+                checkpoint_count(db_path.as_str()),
+                1,
+                "corrupt {corrupt_field} must leave the checkpoint intact"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_rejects_oversized_session_identity_before_delete() {
+        let (_tmp, db_path) = setup_test_db();
+        let oversized_session_id = "s".repeat(MAX_CHECKPOINT_SESSION_ID_BYTES + 1);
+        create_session_sync(
+            db_path.as_str(),
+            &oversized_session_id,
+            1_000,
+            r#"{"version":"initial"}"#,
+            crate::VERSION,
+        )
+        .unwrap();
+        insert_checkpoint_fixture(
+            db_path.as_str(),
+            &oversized_session_id,
+            2_000,
+            CHECKPOINT_ROLE_SNAPSHOT,
+            "snp2:fixture",
+            Some(r#"{"version":"initial"}"#),
+            0,
+        );
+
+        cleanup_authoritatively_sync(db_path.as_str(), 0, 365)
+            .expect_err("cleanup must reject oversized affected-session identity before DML");
+        assert_eq!(checkpoint_count(db_path.as_str()), 1);
+    }
+
+    #[test]
     fn auxiliary_snapshot_queries_chunk_large_pane_sets() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let db_path = tmp.path().to_str().unwrap();
@@ -5622,11 +6831,68 @@ mod tests {
         let scrollback = load_latest_scrollback_refs_sync(db_path, &pane_ids).unwrap();
         assert_eq!(detections.len(), pane_count);
         assert_eq!(scrollback.len(), pane_count);
-        assert!(detections.values().all(|values| values.len() == 1));
         assert!(
             scrollback
                 .values()
                 .all(|reference| reference.output_segments_seq == 0)
+        );
+    }
+
+    #[test]
+    fn detection_projection_skips_oversized_identity_and_bounds_extracted_json() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap();
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (
+                 id INTEGER PRIMARY KEY,
+                 pane_id INTEGER NOT NULL,
+                 rule_id TEXT NOT NULL,
+                 agent_type TEXT NOT NULL,
+                 extracted,
+                 detected_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events
+             (pane_id, rule_id, agent_type, extracted, detected_at)
+             VALUES (1, 'codex.working', 'codex', '{\"session_id\":\"kept\"}', 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events
+             (pane_id, rule_id, agent_type, extracted, detected_at)
+             VALUES (1, ?1, 'codex', '{}', 20)",
+            rusqlite::params!["r".repeat(SNAPSHOT_DETECTION_RULE_ID_BYTES + 1)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events
+             (pane_id, rule_id, agent_type, extracted, detected_at)
+             VALUES (2, 'gemini.working', 'gemini', ?1, 30)",
+            rusqlite::params!["x".repeat(SNAPSHOT_DETECTION_EXTRACTED_BYTES + 1)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events
+             (pane_id, rule_id, agent_type, extracted, detected_at)
+             VALUES (3, 'unknown.working', 'not-a-provider', '{}', 40)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let detections =
+            load_latest_detections_by_pane_sync(db_path, &[1, 2, 3], 0).unwrap();
+        let pane_one = &detections[&1];
+        assert_eq!(pane_one.rule_id, "codex.working");
+        assert_eq!(pane_one.extracted["session_id"], "kept");
+        assert_eq!(detections[&2].extracted, Value::Null);
+        assert!(
+            !detections.contains_key(&3),
+            "unknown provider rows cannot contribute snapshot agent authority"
         );
     }
 
@@ -7059,6 +8325,8 @@ mod tests {
                 state_hash: "snp2:unpublished".to_string(),
                 pane_count: 0,
                 total_bytes: 0,
+                persisted_text_bytes: 0,
+                truncated_pane_count: 0,
                 trigger: SnapshotTrigger::Shutdown,
             };
             let shutdown_error = engine
@@ -7492,6 +8760,92 @@ mod tests {
         .is_retry_safe_scheduler_failure());
         assert!(!SnapshotError::Cancelled.is_retry_safe_scheduler_failure());
         assert!(!SnapshotError::ContextFailure.is_retry_safe_scheduler_failure());
+    }
+
+    #[test]
+    fn preparation_resource_limits_preserve_finite_capacity_classification() {
+        let cases = [
+            (
+                SnapshotPreparationError::MetadataResourceLimit {
+                    bytes: 101,
+                    limit: 100,
+                },
+                SnapshotProjectionResource::MetadataBytes,
+                101,
+                100,
+            ),
+            (
+                SnapshotPreparationError::MetadataShapeResourceLimit {
+                    resource: SnapshotProjectionResource::MetadataDepth,
+                    observed: 65,
+                    limit: 64,
+                },
+                SnapshotProjectionResource::MetadataDepth,
+                65,
+                64,
+            ),
+            (
+                SnapshotPreparationError::MetadataShapeResourceLimit {
+                    resource: SnapshotProjectionResource::MetadataNodes,
+                    observed: 65_537,
+                    limit: 65_536,
+                },
+                SnapshotProjectionResource::MetadataNodes,
+                65_537,
+                65_536,
+            ),
+            (
+                SnapshotPreparationError::PaneTextResourceLimit {
+                    pane_id: 42,
+                    bytes: 201,
+                    limit: 200,
+                },
+                SnapshotProjectionResource::PaneTextBytes,
+                201,
+                200,
+            ),
+            (
+                SnapshotPreparationError::CheckpointTextResourceLimit {
+                    bytes: 301,
+                    limit: 300,
+                },
+                SnapshotProjectionResource::CheckpointTextBytes,
+                301,
+                300,
+            ),
+        ];
+
+        for (preparation_error, expected_resource, expected_observed, expected_limit) in cases {
+            let error = SnapshotError::from(preparation_error);
+            assert!(error.is_capacity_admission_failure());
+            assert!(!error.is_retry_safe_scheduler_failure());
+            assert!(matches!(
+                error,
+                SnapshotError::ProjectionResourceLimit {
+                    resource,
+                    observed,
+                    limit,
+                } if resource == expected_resource
+                    && observed == expected_observed
+                    && limit == expected_limit
+            ));
+        }
+
+        let topology_error = SnapshotError::Topology(TopologySnapshotError::ResourceLimit {
+            resource: "panes",
+            count: 2,
+            limit: 1,
+        });
+        assert!(topology_error.is_capacity_admission_failure());
+        assert!(!topology_error.is_retry_safe_scheduler_failure());
+
+        let topology_json_error = SnapshotError::Topology(TopologySnapshotError::Json(
+            serde_json::from_str::<Value>("{").expect_err("fixture is invalid JSON"),
+        ));
+        assert!(
+            !topology_json_error.is_capacity_admission_failure(),
+            "serializer/parser failures are not live resource-pressure evidence"
+        );
     }
 
     #[test]
@@ -7995,10 +9349,52 @@ mod tests {
         topology_json: &str,
         panes: &[PaneStateSnapshot],
     ) -> PreparedSnapshotPersistence {
-        let mut prepared =
-            prepare_snapshot_persistence(&TopologySnapshot::empty(0), panes, None).unwrap();
+        let topology = if panes.is_empty() {
+            TopologySnapshot::empty(0)
+        } else {
+            let leaf = |pane: &PaneStateSnapshot| crate::session_topology::PaneNode::Leaf {
+                pane_id: pane.pane_id,
+                rows: pane.terminal.rows.max(1),
+                cols: pane.terminal.cols.max(1),
+                cwd: pane.cwd.clone(),
+                title: Some(pane.terminal.title.clone()),
+                is_active: false,
+            };
+            let pane_tree = if panes.len() == 1 {
+                leaf(&panes[0])
+            } else {
+                crate::session_topology::PaneNode::VSplit {
+                    children: panes.iter().map(|pane| (1.0, leaf(pane))).collect(),
+                }
+            };
+            TopologySnapshot {
+                schema_version: crate::session_topology::TOPOLOGY_SCHEMA_VERSION,
+                captured_at: 0,
+                workspace_id: None,
+                windows: vec![crate::session_topology::WindowSnapshot {
+                    window_id: 0,
+                    title: None,
+                    position: None,
+                    size: None,
+                    tabs: vec![crate::session_topology::TabSnapshot {
+                        tab_id: 0,
+                        title: None,
+                        pane_tree,
+                        active_pane_id: None,
+                    }],
+                    active_tab_index: None,
+                }],
+            }
+        };
+        let mut prepared = prepare_snapshot_persistence(&topology, panes, None).unwrap();
         let topology: Value = serde_json::from_str(topology_json).unwrap();
         prepared.topology_json = canonical_json_string(&topology).unwrap();
+        prepared.persisted_text_bytes = persisted_checkpoint_text_bytes(
+            Some(&prepared.topology_json),
+            prepared.metadata_json.as_deref(),
+            &prepared.panes,
+        )
+        .unwrap();
         prepared.dedup_hash =
             snapshot_dedup_witness(&prepared.topology_json, &prepared.panes).unwrap();
         prepared
@@ -8326,6 +9722,48 @@ mod tests {
     }
 
     #[test]
+    fn metadata_admission_precedes_auxiliary_database_reads() {
+        run_async_test(async {
+            // Deliberately leave this SQLite file without snapshot, event, or
+            // scrollback tables. If auxiliary reads run first, the requested
+            // scrollback projection fails with a database error instead of
+            // the deterministic metadata-admission result asserted below.
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let db_path = Arc::new(tmp.path().to_string_lossy().into_owned());
+            let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+            let metadata = Value::String("m".repeat(MAX_CHECKPOINT_METADATA_BYTES));
+
+            let error = engine
+                .capture_with_options(
+                    &[make_test_pane(1, 24, 80)],
+                    SnapshotTrigger::Manual,
+                    SnapshotCaptureOptions {
+                        include_scrollback: true,
+                        metadata: Some(metadata),
+                    },
+                )
+                .await
+                .expect_err("oversized metadata must fail before auxiliary database reads");
+
+            assert!(matches!(
+                error,
+                SnapshotError::ProjectionResourceLimit {
+                    resource: SnapshotProjectionResource::MetadataBytes,
+                    observed,
+                    limit: MAX_CHECKPOINT_METADATA_BYTES,
+                } if observed > MAX_CHECKPOINT_METADATA_BYTES
+            ));
+            assert_eq!(
+                engine
+                    .auxiliary_projection_read_attempts
+                    .load(Ordering::Relaxed),
+                0,
+                "metadata rejection must not enter the auxiliary read phase"
+            );
+        });
+    }
+
+    #[test]
     fn periodic_dedup_recomputes_persisted_pane_witness_before_skipping() {
         run_async_test(async {
             let (_tmp, db_path) = setup_test_db();
@@ -8632,15 +10070,18 @@ mod tests {
         assert_eq!(checkpoint_at, 2000);
         assert_eq!(pane_count, 1);
 
+        let corrupt_pane_info = make_test_pane(8, 24, 80);
+        let (corrupt_topology, _) =
+            TopologySnapshot::from_panes(std::slice::from_ref(&corrupt_pane_info), 3000);
         let mut corrupt_pane =
-            PaneStateSnapshot::from_pane_info(&make_test_pane(8, 24, 80), 3000, false);
+            PaneStateSnapshot::from_pane_info(&corrupt_pane_info, 3000, false);
         corrupt_pane.scrollback_ref = Some(ScrollbackRef {
             output_segments_seq: -1,
             total_segments_captured: 1,
             last_capture_at: 3000,
         });
         let error = prepare_snapshot_persistence(
-            &TopologySnapshot::empty(3000),
+            &corrupt_topology,
             &[corrupt_pane],
             None,
         )
@@ -8722,8 +10163,309 @@ mod tests {
             .unwrap();
         assert_eq!(
             checkpoint_count, 1,
-            "invalid metadata must not add a checkpoint"
+            "invalid snapshot preparation must not add a checkpoint"
         );
+    }
+
+    #[test]
+    fn actual_persistence_projection_bounds_every_pane_text_column() {
+        let mut raw_pane = make_test_pane(41, 24, 80);
+        raw_pane.workspace = Some("w".repeat(100_000));
+        raw_pane.title = Some("t".repeat(100_000));
+        raw_pane.cwd = Some("c".repeat(100_000));
+        raw_pane.extra.insert(
+            FOREGROUND_PROCESS_NAME_FIELD.to_owned(),
+            Value::String("p".repeat(100_000)),
+        );
+        raw_pane.extra.insert(
+            "unrelated_backend_field".to_owned(),
+            Value::String("u".repeat(100_000)),
+        );
+
+        let projection = project_snapshot_panes(&[raw_pane])
+            .expect("one pane is inside topology admission");
+        assert_eq!(projection.panes.len(), 1);
+        assert!(projection.truncated_pane_ids.contains(&41));
+        let projected_pane = &projection.panes[0];
+        assert!(
+            projected_pane.title.as_ref().unwrap().len() <= SNAPSHOT_TEXT_FIELD_INPUT_BYTES
+        );
+        assert!(
+            projected_pane.cwd.is_none(),
+            "an oversized cwd must be omitted rather than rewritten into a synthetic path"
+        );
+        assert!(projected_pane.workspace.is_none());
+        assert!(!projected_pane.extra.contains_key("unrelated_backend_field"));
+        assert!(
+            projected_pane.extra.is_empty(),
+            "an oversized process identity must be omitted rather than shortened"
+        );
+        assert!(
+            projection.topology_workspace_id.is_none(),
+            "an oversized workspace must be omitted instead of persisted under a synthetic prefix"
+        );
+
+        let (mut topology, _) = TopologySnapshot::from_panes(&projection.panes, 4_100);
+        topology.workspace_id.clone_from(&projection.topology_workspace_id);
+        let mut pane =
+            PaneStateSnapshot::from_pane_info(projected_pane, 4_100, false);
+        let hostile = "\u{1}".repeat(100_000);
+        pane.terminal.title = hostile.clone();
+        pane.cwd = Some(hostile.clone());
+        pane.foreground_process = Some(crate::session_pane_state::ProcessInfo {
+            name: hostile.clone(),
+            pid: Some(99),
+            argv: Some(vec![hostile.clone()]),
+        });
+        pane.env = Some(CapturedEnv {
+            vars: HashMap::from([
+                ("PATH".to_owned(), hostile.clone()),
+                ("UNSAFE_PROGRAMMATIC_NAME".to_owned(), hostile.clone()),
+            ]),
+            redacted_count: 0,
+        });
+        pane.agent = Some(AgentMetadata {
+            agent_type: hostile.clone(),
+            session_id: Some(hostile.clone()),
+            state: Some(hostile),
+        });
+
+        let prepared = prepare_snapshot_persistence_with_prebounded_panes(
+            &topology,
+            &[pane],
+            None,
+            &projection.truncated_pane_ids,
+        )
+        .expect("oversized optional observations should be bounded");
+        assert_eq!(prepared.truncated_pane_count, 1);
+        assert_eq!(prepared.panes.len(), 1);
+        assert!(
+            prepared.topology_json.len() <= crate::session_topology::MAX_SNAPSHOT_BYTES,
+            "the topology must be built from the bounded projection"
+        );
+        let row_bytes = persisted_pane_text_bytes(&prepared.panes[0]).unwrap();
+        assert!(row_bytes <= MAX_PERSISTED_PANE_TEXT_BYTES);
+        assert_eq!(
+            prepared.persisted_text_bytes,
+            persisted_checkpoint_text_bytes(
+                Some(&prepared.topology_json),
+                prepared.metadata_json.as_deref(),
+                &prepared.panes,
+            )
+            .unwrap()
+        );
+        assert!(prepared.persisted_text_bytes <= MAX_PERSISTED_CHECKPOINT_TEXT_BYTES);
+        assert!(
+            prepared.panes[0].command.is_none(),
+            "oversized process identity must be omitted"
+        );
+        assert!(
+            prepared.panes[0].cwd.is_none(),
+            "oversized cwd must not become a different restorable path"
+        );
+        let persisted_env: CapturedEnv = serde_json::from_str(
+            prepared.panes[0]
+                .env_json
+                .as_deref()
+                .expect("bounded environment envelope remains useful"),
+        )
+        .expect("bounded environment JSON decodes");
+        assert!(
+            persisted_env.vars.is_empty(),
+            "oversized and non-allow-listed environment values must be omitted"
+        );
+        assert!(
+            prepared.panes[0].agent_metadata_json.is_none(),
+            "oversized agent identity must be omitted as one semantic unit"
+        );
+    }
+
+    #[test]
+    fn persistence_projection_rejects_equal_cardinality_pane_identity_mismatch() {
+        let topology_pane = make_test_pane(41, 24, 80);
+        let (topology, _) = TopologySnapshot::from_panes(&[topology_pane], 4_150);
+        let pane_state =
+            PaneStateSnapshot::from_pane_info(&make_test_pane(42, 24, 80), 4_150, false);
+
+        let preparation_error = prepare_snapshot_persistence(&topology, &[pane_state], None)
+            .expect_err("different pane-id sets must fail before persistence");
+        match &preparation_error {
+            SnapshotPreparationError::PaneIdentitySetMismatch {
+                topology_panes,
+                pane_states,
+            } => {
+                assert_eq!(*topology_panes, 1);
+                assert_eq!(*pane_states, 1);
+            }
+            other => panic!("unexpected preparation error: {other}"),
+        }
+
+        assert!(matches!(
+            SnapshotError::from(preparation_error),
+            SnapshotError::PaneIdentitySetMismatch {
+                topology_panes: 1,
+                pane_states: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn pane_projection_rejects_over_limit_pane_count() {
+        let panes = (0..=MAX_TOPOLOGY_PANES)
+            .map(|pane_id| {
+                make_test_pane(
+                    u64::try_from(pane_id).expect("test pane id is representable"),
+                    24,
+                    80,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let error = match project_snapshot_panes(&panes) {
+            Ok(_) => panic!("over-limit pane projection must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SnapshotError::Topology(TopologySnapshotError::ResourceLimit {
+                resource: "panes",
+                count,
+                limit: MAX_TOPOLOGY_PANES,
+            }) if count == MAX_TOPOLOGY_PANES + 1
+        ));
+    }
+
+    #[test]
+    fn pane_projection_does_not_alias_distinct_long_workspaces() {
+        let shared_prefix = "w".repeat(SNAPSHOT_TEXT_FIELD_INPUT_BYTES + 1);
+        let mut first = make_test_pane(51, 24, 80);
+        first.workspace = Some(format!("{shared_prefix}-first"));
+        let mut second = make_test_pane(52, 24, 80);
+        second.workspace = Some(format!("{shared_prefix}-second"));
+        let mut ordinary = make_test_pane(53, 24, 80);
+        ordinary.workspace = Some("ordinary-workspace".to_string());
+
+        let projection = project_snapshot_panes(&[first, second, ordinary])
+            .expect("three panes are inside topology admission");
+        assert!(
+            projection.topology_workspace_id.is_none(),
+            "workspace equality must be decided before bounding common prefixes"
+        );
+        assert_eq!(
+            projection.truncated_pane_ids,
+            HashSet::from([51, 52]),
+            "global workspace omission must count only panes whose own identity was omitted"
+        );
+    }
+
+    #[test]
+    fn actual_persistence_projection_rejects_oversized_metadata() {
+        let metadata = Value::String("m".repeat(MAX_CHECKPOINT_METADATA_BYTES));
+        let error = prepare_snapshot_persistence(
+            &TopologySnapshot::empty(4_200),
+            &[],
+            Some(&metadata),
+        )
+        .expect_err("encoded metadata over the hard limit must fail closed");
+        assert!(matches!(
+            error,
+            SnapshotPreparationError::MetadataResourceLimit {
+                bytes,
+                limit: MAX_CHECKPOINT_METADATA_BYTES,
+            } if bytes > MAX_CHECKPOINT_METADATA_BYTES
+        ));
+    }
+
+    #[test]
+    fn actual_persistence_projection_accepts_exact_metadata_boundaries() {
+        let exact_bytes =
+            Value::String("m".repeat(MAX_CHECKPOINT_METADATA_BYTES.saturating_sub(2)));
+        let exact_bytes_prepared = prepare_snapshot_persistence(
+            &TopologySnapshot::empty(4_200),
+            &[],
+            Some(&exact_bytes),
+        )
+        .expect("metadata at the exact encoded-byte limit must be admitted");
+        assert_eq!(
+            exact_bytes_prepared
+                .metadata_json
+                .as_deref()
+                .map(str::len),
+            Some(MAX_CHECKPOINT_METADATA_BYTES)
+        );
+
+        let mut exact_depth = Value::Null;
+        for _ in 1..SNAPSHOT_METADATA_MAX_DEPTH {
+            exact_depth = Value::Array(vec![exact_depth]);
+        }
+        prepare_snapshot_persistence(
+            &TopologySnapshot::empty(4_200),
+            &[],
+            Some(&exact_depth),
+        )
+        .expect("metadata at the exact nesting-depth limit must be admitted");
+
+        let exact_nodes = Value::Array(
+            std::iter::repeat_n(Value::Null, SNAPSHOT_METADATA_MAX_NODES - 1).collect(),
+        );
+        prepare_snapshot_persistence(
+            &TopologySnapshot::empty(4_200),
+            &[],
+            Some(&exact_nodes),
+        )
+        .expect("metadata at the exact node-count limit must be admitted");
+    }
+
+    #[test]
+    fn snapshot_capture_options_drop_deep_metadata_iteratively() {
+        let mut metadata = Value::Null;
+        for _ in 0..100_000 {
+            metadata = Value::Array(vec![metadata]);
+        }
+        drop(SnapshotCaptureOptions {
+            include_scrollback: false,
+            metadata: Some(metadata),
+        });
+    }
+
+    #[test]
+    fn actual_persistence_projection_rejects_excessive_metadata_shape() {
+        let mut deep_metadata = Value::Null;
+        for _ in 0..SNAPSHOT_METADATA_MAX_DEPTH {
+            deep_metadata = Value::Array(vec![deep_metadata]);
+        }
+        let depth_error = prepare_snapshot_persistence(
+            &TopologySnapshot::empty(4_200),
+            &[],
+            Some(&deep_metadata),
+        )
+        .expect_err("metadata beyond the nesting limit must fail before recursive encoding");
+        assert!(matches!(
+            depth_error,
+            SnapshotPreparationError::MetadataShapeResourceLimit {
+                resource: SnapshotProjectionResource::MetadataDepth,
+                observed,
+                limit: SNAPSHOT_METADATA_MAX_DEPTH,
+            } if observed == SNAPSHOT_METADATA_MAX_DEPTH + 1
+        ));
+
+        let wide_metadata = Value::Array(
+            std::iter::repeat_n(Value::Null, SNAPSHOT_METADATA_MAX_NODES).collect(),
+        );
+        let node_error = prepare_snapshot_persistence(
+            &TopologySnapshot::empty(4_200),
+            &[],
+            Some(&wide_metadata),
+        )
+        .expect_err("metadata beyond the node limit must fail before canonicalization");
+        assert!(matches!(
+            node_error,
+            SnapshotPreparationError::MetadataShapeResourceLimit {
+                resource: SnapshotProjectionResource::MetadataNodes,
+                observed,
+                limit: SNAPSHOT_METADATA_MAX_NODES,
+            } if observed == SNAPSHOT_METADATA_MAX_NODES + 1
+        ));
     }
 
     #[test]
@@ -9420,6 +11162,97 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_restore_source_is_protected_from_cleanup_and_explicit_delete() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            create_session_sync(
+                db_path.as_str(),
+                "sess-protected-source",
+                500,
+                r#"{"version":"source"}"#,
+                crate::VERSION,
+            )
+            .unwrap();
+            let source_id = insert_checkpoint_fixture(
+                db_path.as_str(),
+                "sess-protected-source",
+                1_000,
+                CHECKPOINT_ROLE_SNAPSHOT,
+                "0000000000000011",
+                Some(r#"{"version":"source"}"#),
+                0,
+            );
+            let unprotected_id = insert_checkpoint_fixture(
+                db_path.as_str(),
+                "sess-protected-source",
+                2_000,
+                CHECKPOINT_ROLE_SNAPSHOT,
+                "0000000000000012",
+                Some(r#"{"version":"newer"}"#),
+                0,
+            );
+            let intent_id = insert_checkpoint_fixture(
+                db_path.as_str(),
+                "sess-protected-source",
+                3_000,
+                "restore_intent",
+                "restore",
+                None,
+                0,
+            );
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+            conn.execute(
+                "INSERT INTO restore_attempt_lifecycle (
+                     intent_checkpoint_id, session_id, source_checkpoint_id,
+                     outcome_checkpoint_id, status, created_at, resolved_at
+                 ) VALUES (?1, ?2, ?3, NULL, 'intent', 3000, NULL)",
+                rusqlite::params![intent_id, "sess-protected-source", source_id],
+            )
+            .unwrap();
+            drop(conn);
+
+            let config = SnapshotConfig {
+                retention_count: 0,
+                retention_days: u64::MAX,
+                ..SnapshotConfig::default()
+            };
+            let engine = SnapshotEngine::new(db_path.clone(), config);
+            assert_eq!(
+                engine.cleanup().await.unwrap(),
+                1,
+                "cleanup may delete only the unprotected snapshot"
+            );
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let remaining: Vec<i64> = conn
+                .prepare("SELECT id FROM session_checkpoints ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(remaining, vec![source_id, intent_id]);
+            assert!(!remaining.contains(&unprotected_id));
+            drop(conn);
+
+            let error = engine
+                .delete_checkpoint(SnapshotDeleteTarget::Id(source_id))
+                .await
+                .expect_err("an unresolved restore source must not be explicitly deleted");
+            assert!(matches!(
+                error,
+                SnapshotError::Database(ref message)
+                    if message.contains("protected by an unresolved restore attempt")
+            ));
+            assert_eq!(
+                checkpoint_count(db_path.as_str()),
+                2,
+                "retry-safe refusal must not mutate the protected chain"
+            );
+        });
+    }
+
+    #[test]
     fn save_checkpoint_total_bytes_matches_historical_json_contract_exactly() {
         let (_tmp, db_path) = setup_test_db();
         create_session_sync(
@@ -10095,6 +11928,24 @@ mod tests {
         let id = generate_session_id();
         assert!(id.starts_with("sess-"));
         assert!(id.len() > 20);
+    }
+
+    #[test]
+    fn host_identity_is_optional_trimmed_and_utf8_bounded() {
+        assert_eq!(bounded_host_id(None), None);
+        assert_eq!(bounded_host_id(Some(" \t\n ".to_string())), None);
+        assert_eq!(
+            bounded_host_id(Some("  trj.example  ".to_string())).as_deref(),
+            Some("trj.example")
+        );
+
+        let bounded = bounded_host_id(Some("M🦀".repeat(SNAPSHOT_HOST_ID_INPUT_BYTES)))
+            .expect("non-empty host identity should remain present");
+        assert!(bounded.len() <= SNAPSHOT_HOST_ID_INPUT_BYTES);
+        assert!(
+            bounded.ends_with('…'),
+            "oversized host identity must carry explicit truncation evidence"
+        );
     }
 
     // =========================================================================
@@ -11184,20 +13035,19 @@ mod tests {
             SnapshotError::NoChanges.to_string(),
             "no changes since last snapshot"
         );
-        assert!(
-            SnapshotError::PaneList("timeout".into())
-                .to_string()
-                .contains("timeout")
+        assert_eq!(
+            SnapshotError::PaneList("CONTENT_FREE_PANE_SOURCE".into()).to_string(),
+            "pane listing failed"
         );
-        assert!(
-            SnapshotError::Database("disk full".into())
-                .to_string()
-                .contains("disk full")
+        assert_eq!(
+            SnapshotError::Database("CONTENT_FREE_DATABASE_SOURCE".into())
+                .to_string(),
+            "snapshot database operation failed"
         );
-        assert!(
-            SnapshotError::Serialization("bad json".into())
-                .to_string()
-                .contains("bad json")
+        assert_eq!(
+            SnapshotError::Serialization("CONTENT_FREE_SERIALIZATION_SOURCE".into())
+                .to_string(),
+            "snapshot serialization failed"
         );
         assert_eq!(
             SnapshotError::IndeterminateAuthorityMutation {
@@ -11687,12 +13537,72 @@ mod tests {
             "Debug should contain variant name"
         );
 
-        let db_err = SnapshotError::Database("connection refused".into());
+        let db_err = SnapshotError::Database("CONTENT_FREE_DATABASE_SOURCE".into());
         let dbg2 = format!("{:?}", db_err);
-        assert!(
-            dbg2.contains("connection refused"),
-            "Debug should contain inner message"
-        );
+        assert!(dbg2.contains("Database"));
+        assert!(!dbg2.contains("CONTENT_FREE_DATABASE_SOURCE"));
+
+        let dedup = LastDedupCheckpoint {
+            dedup_hash: "snpd2:CONTENT_FREE_DEDUP_HASH".to_string(),
+            identity: SnapshotCheckpointIdentity {
+                checkpoint_id: 42,
+                session_id: "sess-CONTENT_FREE_SESSION".to_string(),
+                checkpoint_at: 84,
+                checkpoint_role: "CONTENT_FREE_ROLE".to_string(),
+                state_hash: "snp2:CONTENT_FREE_STATE_HASH".to_string(),
+            },
+        };
+        let dedup_debug = format!("{dedup:?}");
+        assert!(dedup_debug.contains("LastDedupCheckpoint"));
+        assert!(dedup_debug.contains("checkpoint_id: 42"));
+        for canary in [
+            "CONTENT_FREE_DEDUP_HASH",
+            "CONTENT_FREE_SESSION",
+            "CONTENT_FREE_ROLE",
+            "CONTENT_FREE_STATE_HASH",
+        ] {
+            assert!(!dedup_debug.contains(canary));
+        }
+
+        let prepared = PreparedSnapshotPersistence {
+            topology_json: "CONTENT_FREE_TOPOLOGY".to_string(),
+            metadata_json: Some("CONTENT_FREE_METADATA".to_string()),
+            panes: Vec::new(),
+            pane_count: 3,
+            pane_count_sql: 3,
+            total_bytes: 5,
+            total_bytes_sql: 5,
+            persisted_text_bytes: 7,
+            truncated_pane_count: 1,
+            dedup_hash: "snpd2:CONTENT_FREE_PREPARED_HASH".to_string(),
+        };
+        let new_session = NewSessionMetadata {
+            ft_version: "CONTENT_FREE_VERSION".to_string(),
+            host_id: Some("CONTENT_FREE_HOST".to_string()),
+        };
+        let receipt = CheckpointCommitReceipt {
+            session_id: "sess-CONTENT_FREE_RECEIPT_SESSION".to_string(),
+            checkpoint_id: 42,
+            state_hash: "snp2:CONTENT_FREE_RECEIPT_HASH".to_string(),
+            total_bytes: 5,
+            persisted_text_bytes: 7,
+            truncated_pane_count: 1,
+        };
+        let private_debug = format!("{prepared:?} {new_session:?} {receipt:?}");
+        assert!(private_debug.contains("PreparedSnapshotPersistence"));
+        assert!(private_debug.contains("has_metadata: true"));
+        assert!(private_debug.contains("CheckpointCommitReceipt"));
+        for canary in [
+            "CONTENT_FREE_TOPOLOGY",
+            "CONTENT_FREE_METADATA",
+            "CONTENT_FREE_PREPARED_HASH",
+            "CONTENT_FREE_VERSION",
+            "CONTENT_FREE_HOST",
+            "CONTENT_FREE_RECEIPT_SESSION",
+            "CONTENT_FREE_RECEIPT_HASH",
+        ] {
+            assert!(!private_debug.contains(canary));
+        }
     }
 
     #[test]
@@ -11705,6 +13615,8 @@ mod tests {
             state_hash: "snp2:test".to_string(),
             pane_count: 3,
             total_bytes: 1024,
+            persisted_text_bytes: 2048,
+            truncated_pane_count: 1,
             trigger: SnapshotTrigger::Manual,
         };
         let cloned = result.clone();
@@ -11714,6 +13626,8 @@ mod tests {
         assert_eq!(cloned.state_hash, "snp2:test");
         assert_eq!(cloned.pane_count, 3);
         assert_eq!(cloned.total_bytes, 1024);
+        assert_eq!(cloned.persisted_text_bytes, 2048);
+        assert_eq!(cloned.truncated_pane_count, 1);
         assert_eq!(cloned.trigger, SnapshotTrigger::Manual);
     }
 
@@ -11971,6 +13885,45 @@ mod tests {
     }
 
     #[test]
+    fn capture_reports_exact_truncation_and_telemetry_deltas() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
+            let before = engine.telemetry().snapshot();
+            let mut pane = make_test_pane(1, 24, 80);
+            pane.title = Some("t".repeat(SNAPSHOT_TEXT_FIELD_INPUT_BYTES + 1));
+
+            let result = engine
+                .capture(&[pane], SnapshotTrigger::Manual)
+                .await
+                .expect("oversized-but-admissible title must be bounded and persisted");
+            let after = engine.telemetry().snapshot();
+
+            assert_eq!(result.pane_count, 1);
+            assert_eq!(result.truncated_pane_count, 1);
+            assert!(result.persisted_text_bytes > 0);
+            assert_eq!(
+                after.captures_attempted - before.captures_attempted,
+                1
+            );
+            assert_eq!(
+                after.captures_succeeded - before.captures_succeeded,
+                1
+            );
+            assert_eq!(after.panes_captured - before.panes_captured, 1);
+            assert_eq!(
+                after.pane_states_truncated - before.pane_states_truncated,
+                u64::try_from(result.truncated_pane_count).unwrap()
+            );
+            assert_eq!(
+                after.persisted_text_bytes - before.persisted_text_bytes,
+                u64::try_from(result.persisted_text_bytes).unwrap()
+            );
+            assert_eq!(after.capture_errors, before.capture_errors);
+        });
+    }
+
+    #[test]
     fn shutdown_checkpoint_persists_final_receipt_when_state_is_unchanged() {
         run_async_test(async {
             let (_tmp, db_path) = setup_test_db();
@@ -12132,6 +14085,8 @@ mod tests {
         assert_eq!(snap.triggers_accepted, 0);
         assert_eq!(snap.panes_captured, 0);
         assert_eq!(snap.bytes_persisted, 0);
+        assert_eq!(snap.persisted_text_bytes, 0);
+        assert_eq!(snap.pane_states_truncated, 0);
     }
 
     #[test]

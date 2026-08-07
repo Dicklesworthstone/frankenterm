@@ -1,4 +1,4 @@
-# Performance Hot-Spot Audit (review pass)
+# Performance Hot-Spot Audit (historical static pass + current proof gaps)
 
 **Scope:** four hot paths called out by the user — (1) ingest/poll loop
 in `runtime.rs` + `ingest.rs`, (2) FTS5 query path in `storage.rs` +
@@ -8,26 +8,29 @@ in `runtime.rs` + `ingest.rs`, (2) FTS5 query path in `storage.rs` +
 allocations in tight scopes, sync calls in async contexts, lock
 contention, redundant clones), then targeted reads of the entry points
 the user named.
-**Date:** 2026-04-26
+**Original static pass:** 2026-04-26<br>
+**Truth-status refresh:** 2026-08-06
 
 ## TL;DR
 
-Two real perf opportunities filed. The hot-path code is generally
-well-engineered (Aho-Corasick + quick-reject in patterns, memchr
-SIMD + bounded overlap in delta extraction, read/write cache in
-list_panes). The two findings are foundational rather than tactical:
+The 2026-04 static pass found two structural opportunities, both subsequently
+implemented. It did not profile a live GUI/mux session and cannot establish
+keypress latency, resize/zoom responsiveness, large-session behavior, or
+target-machine qualification. In particular, there is no completed-result TTL
+cache for full `list_panes` metadata: such a cache was removed because focus,
+cursor, CWD, title, viewport, and zoom state are volatile.
 
-| # | Finding                                                     | Severity | Bead       |
-| - | ----------------------------------------------------------- | -------- | ---------- |
-| 1 | Storage read-path opens fresh SQLite `Connection` per query (78 call sites, no connection pool) | medium  | **ft-bhyxz** |
-| 2 | Codec `serialize_with_mode(Auto)` double-serializes for large PDUs | low | **ft-gbpoy** |
+| # | Historical finding | Current structural status | Bead |
+| - | - | - | - |
+| 1 | Storage read-path opened a fresh SQLite connection per query | Read-side pooling landed; live contention and tail latency remain unmeasured | **ft-bhyxz** |
+| 2 | Codec `serialize_with_mode(Auto)` serialized large PDUs twice | Serialize-once/direct-buffer compression landed; end-to-end transport gain remains unmeasured | **ft-gbpoy** |
 
-## (1) Ingest / poll loop — well-engineered
+## (1) Ingest / poll loop — bounded structure, live cost unprofiled
 
 ### `extract_delta` (`ingest.rs:1662`)
 
-The delta-extraction algorithm is the literal hot path of the watcher
-(runs once per pane per poll tick). It's well-optimized:
+The delta-extraction algorithm runs once per pane per poll tick. The original
+static review found these bounded/fast-path structures:
 
 - **Fast path for pure append** (line 1671-1678): if `current.starts_with(previous)`
   and char-boundary checks pass, returns `current[previous.len()..]` — `O(N)`
@@ -41,27 +44,28 @@ The delta-extraction algorithm is the literal hot path of the watcher
   prevent panics on multi-byte characters (Cyrillic 2B, box-drawing 3B,
   emoji 4B).
 
-**No new bead.** The single allocation per delta (`current[overlap_len..].to_string()`
-at line 1727) is unavoidable for the API shape.
+**No finding in that static pass.** The returned owned delta still allocates;
+calling that allocation unavoidable would require a current caller/API and
+allocation-profile study that this review did not perform.
 
 ### `mark_next_event_for_pane_overflow` (`ingest.rs:2659`)
 
 Linear scan over `self.buffer` (a `VecDeque<StreamEvent>`) for the
-first event matching a pane_id. Buffer is bounded by `config.capacity`
-(line 2579: `VecDeque::with_capacity(config.capacity)`). At default
-capacity (~1000), the linear scan runs in microseconds — not a finding
-unless the buffer cap goes to 100k+.
+first event matching a pane_id. Buffer work is bounded by configured capacity.
+No retained measurement in this review justifies a microsecond cost claim,
+especially at large capacity or under aged-session pressure.
 
 ### Maintenance loops (`runtime.rs:1492, 1644, 2191, 2541, 2843, 2993, 3551`)
 
 Multi-second-paced ticks (snapshot trigger bridge, maintenance, etc.).
 Not in the byte-level hot path. Skipped.
 
-## (2) FTS5 query path — connection pool gap
+## (2) FTS5 query path — historical connection-pool gap
 
 ### `search_with_results_with_cx` (`storage.rs:9480`)
 
-The Cx-first FTS search entry point:
+The Cx-first FTS search entry point at the original review revision is shown
+below. This is a pre-fix historical excerpt, not current source:
 
 ```rust
 pub async fn search_with_results_with_cx(...) -> Result<Vec<SearchResult>> {
@@ -85,46 +89,45 @@ fn open_read_storage_conn(db_path: &str) -> Result<Connection> {
 }
 ```
 
-**78 call sites of `open_read_storage_conn`** in `storage.rs` alone
-(`grep -c open_read_storage_conn → 78`). Every search, every saved-search
-fetch, every embedding read, every MCP read tool, every web `/search`
-endpoint pays the full SQLite open cost (file open + page cache
-warmup + WAL setup + busy-timeout pragma).
+The historical scan counted **78 textual call sites of
+`open_read_storage_conn`** in `storage.rs` alone
+(`grep -c open_read_storage_conn → 78`). At that revision, the reviewed search,
+saved-search, embedding, MCP-read, and web-search paths opened SQLite
+connections rather than acquiring the later pool.
 
-For a single-agent workload this is invisible. For the README's stated
-"200+ concurrent AI coding agents" with all of them potentially
-running `wa.search` / `ft robot search` simultaneously, this is
-hundreds of SQLite-open syscalls per second.
+The review hypothesized that this would amplify under concurrent search, but it
+did not measure either single-agent cost or a 200-pane workload. No throughput
+or syscall-rate number should be inferred from the textual count.
 
-**Filed:** `ft-bhyxz` (P2 perf) — introduce a read-side connection pool
+**Filed at the time:** `ft-bhyxz` (P2 perf) — introduce a read-side connection pool
 (`Mutex<Vec<Connection>>` LIFO, sized to e.g. 4-16 pre-warmed
-read-only connections; or pull in `r2d2_sqlite`). Keep
-`open_read_storage_conn` as the cold-path fallback.
+read-only connections; or pull in `r2d2_sqlite`). That structural fix later
+landed. This source scan did not measure pool wait time, WAL contention, cache
+residency, or search tail latency under a real large session.
 
 ### `search_fts_with_snippets` (`storage.rs:15638`)
 
 The actual FTS5 query construction. Not deep-audited in this pass —
-the connection-pool finding above dominates. The query path itself
-relies on rusqlite's `prepare_cached` for query plan caching (verified
-via `grep prepare_cached storage.rs → 2 hits`). A second pass should
-verify that `search_fts_with_snippets` uses `prepare_cached` and not
-`prepare`.
+the connection-pool finding above dominated that pass. A historical two-hit
+`prepare_cached` source scan did not establish which queries benefited or the
+current statement-cache hit rate; those require fresh call tracing and
+measurement.
 
 ### Embedding store (`storage.rs:9505`)
 
-Same per-query Connection::open pattern in `store_embedding_with_cx` /
-`store_embedding`. Rolled into ft-bhyxz scope.
+The original revision had the same per-query `Connection::open` pattern in
+`store_embedding_with_cx` / `store_embedding`. It was rolled into ft-bhyxz.
 
-## (3) Pattern detection — well-engineered
+## (3) Pattern detection — promising structure, workload cost unprofiled
 
-### `PatternEngine::detect` (`patterns.rs:2271`)
+### `PatternEngine::detect` (`patterns.rs:2271`) and the live contextual path
 
-Profiled hot path with proper short-circuits:
+The static review identified these short-circuits:
 
 1. **Empty-text fast exit** (line 2274).
 2. **Quick-reject pre-filter** (line 2280): cheap byte-level check
-   before the Aho-Corasick scan; skips ~80% of irrelevant chunks per
-   the existing telemetry counter (`quick_rejects`).
+   before the Aho-Corasick scan. The `quick_rejects` counter makes the
+   workload-specific rejection rate measurable; this audit retained no rate.
 3. **Aho-Corasick anchor matcher** (line 2286-2291): collects
    candidate rules in O(N) with sub-linear amortized constants.
 4. **Per-candidate regex evaluation** (line 2310+): only the regex-bearing
@@ -137,16 +140,28 @@ The single concern: line 2295 `let match_count = matcher.find_overlapping_iter(t
 runs an extra scan per detect — but it's gated by `#[cfg(test)]` and
 only fires in test builds. Acceptable.
 
-**No new bead.**
+**No new bead in the historical static pass.**
+
+That historical review did not cover the actual production call shape:
+runtime orchestration calls `PatternEngine::detect_with_context`, which adds
+tail copying/materialization, overlap filtering, agent sharding, and dedupe
+work around the core detector. No retained profile isolates those costs under
+large ongoing sessions, so the `detect` source observations do not qualify the
+live pattern hot path.
 
 ### `TriggerScanner::scan_counts` / `scan_locate` (`pattern_trigger.rs:408, 423`)
 
-Both iterate via `for_each_leftmost_match` callback — no per-byte
-allocation, results assembled into pre-allocated `HashMap`/`Vec`. Clean.
+Both iterate via `for_each_leftmost_match` callback — no per-byte allocation
+was apparent in the reviewed body, and results were assembled into
+pre-allocated `HashMap`/`Vec` values. This is a structural observation, not an
+allocation-profile result.
 
-## (4) Codec PDU encode/decode — double-serialize on Auto path
+## (4) Codec PDU encode/decode — historical double-serialize on Auto path
 
 ### `serialize_with_mode` (`frankenterm/codec/src/lib.rs:467`)
+
+This is the pre-fix historical excerpt that motivated `ft-gbpoy`, not current
+source:
 
 ```rust
 fn serialize_with_mode<T: serde::Serialize>(
@@ -177,34 +192,36 @@ time *through* the zstd encoder. The second serialize is wasteful: the
 already-encoded `uncompressed` byte buffer could be fed straight into
 `zstd::stream::encode_all(&uncompressed[..])`.
 
-For a small PDU (`<= COMPRESS_THRESH`) this is irrelevant — only one
-serialize fires. For large PDUs (mux client snapshots, render-changes,
-distributed envelopes), the cost doubles.
+For a small PDU (`<= COMPRESS_THRESH`), only one serialize fired. Above the
+threshold, serialization ran twice; this review did not measure the resulting
+end-to-end cost.
 
-**Filed:** `ft-gbpoy` (P3 perf) — replace the second serialize with
+**Filed at the time:** `ft-gbpoy` (P3 perf) — replace the second serialize with
 direct buffer compression: `zstd::bulk::compress(&uncompressed,
-zstd::DEFAULT_COMPRESSION_LEVEL)`. Same wire output, half the
-serialize work above the threshold.
+zstd::DEFAULT_COMPRESSION_LEVEL)`. The landed implementation uses direct
+buffer compression. “Half the work” was a hypothesis about the serialization
+stage, not an end-to-end latency result.
 
-Side note on `Vec::new()` (lines 471, 483): both buffers grow from
-zero capacity. A small win would be `Vec::with_capacity(64)` for
-`uncompressed` and `Vec::with_capacity(uncompressed.len() / 2)` for
-`compressed` (zstd typically halves binary data). Not its own bead;
-fold into ft-gbpoy if interesting.
+The original note also observed zero-capacity `Vec` construction. It retained
+no allocation profile or representative compression-ratio distribution, so no
+capacity recommendation or win is asserted here.
 
 ### `deserialize` (`lib.rs:506`)
 
-Clean. Bounded-read via `r.take((MAX_PDU_SIZE as u64) + 1)` prevents
-unbounded allocation on hostile input. Both compressed and uncompressed
-paths go through the same bounded-varbincode call.
+The reviewed bounded-read guard used
+`r.take((MAX_PDU_SIZE as u64) + 1)`. Both compressed and uncompressed paths
+went through the bounded-varbincode call in that revision. This is a size-bound
+observation, not a deserialization throughput or peak-RSS result.
 
 ## Architectural observations (not findings)
 
-### The mux interop boundary is subprocess-cost
+### The mux interop boundary has direct and fallback transport costs
 
-`crates/frankenterm-core/src/wezterm.rs:2140` — every CLI call
-(`run_cli` / `run_cli_with_cx`) spawns `wezterm` as a subprocess via
-`Command::new(wezterm_binary())`. Process spawn on macOS costs 5-20ms.
+`WeztermClient` prefers the existing pooled direct mux socket path. Eligible
+compatibility fallback calls spawn the configured backend CLI as a subprocess.
+This audit did not retain a transport-choice distribution, direct-socket
+latency distribution, or native spawn distribution, so it cannot identify
+which transport dominates current user-visible latency.
 For `list_panes`, completed full-metadata results are deliberately not cached
 by TTL: `PaneInfo` carries volatile focus, cursor, cwd, title, viewport, and
 zoom state, and elapsed time is not an authority revision. Concurrent CLI-only
@@ -214,19 +231,31 @@ revision/event stream. `get_text` likewise remains per-call because pane
 content varies per call.
 
 This is the documented WezTerm-fork mux boundary (per
-`docs/proposals/ft-zoxxq-mux-boundary-truth.md`). The architectural
-direction (in-process mux session API via `MuxInterface`) is the long-
-term mitigation. Not its own perf bead — the cost is intentional and
-already captured in the architecture epic.
+`docs/proposals/ft-zoxxq-mux-boundary-truth.md`). `MuxInterface` and the direct
+pooled transport already exist; they are not a future mitigation. Remaining
+work is to measure and optimize the live direct path, make fallback frequency
+observable, and prevent duplicate cross-client work using authoritative mux
+revision/event evidence.
 
 ### Pane registry and cursor RwLocks
 
 `runtime.rs` and `tailer.rs` heavily exercise `registry: Arc<RwLock<...>>`
 and `cursors: Arc<RwLock<HashMap<PaneId, PaneCursor>>>`. The
 deadlock-audit (`docs/review/deadlock-audit.md` at HEAD ed91ef1e)
-verified consistent lock ordering and properly-scoped guards. Not a
-perf concern — these are reader-heavy workloads where `RwLock` is the
-right choice.
+verified consistent lock ordering and properly-scoped guards in its scope, but
+that does not prove low contention. Reader/writer wait distributions,
+cache-line traffic, and scheduler behavior remain profiling questions.
+
+## Negative-evidence ledger
+
+| Desired conclusion | Negative evidence / missing proof | Required retry |
+|---|---|---|
+| This audit found the dominant live latency bottleneck | Static source inspection only; no Instruments, signposts, sampling profile, allocation profile, transport trace, or presented-frame timestamps | Profile the exact release build under a declared live workload and retain stacks plus stage timestamps |
+| Full-pane metadata can be cached by elapsed time | The prior TTL cache was removed because the payload is volatile and elapsed time is not an authority revision | Restrict any future coalescing to one in-flight authoritative revision across clients/transports; never reuse a completed stale payload by TTL |
+| Mac-to-LAN keypress response is fast | No end-to-end input → transport → PTY → renderer → presentation trace | Measure percentiles on the declared LAN peers with synchronized stage provenance |
+| Resize/zoom is both fast and visually correct | No retained native GUI frame-pacing plus reflow/visual-differential artifact | Couple timing, dropped frames, CPU/GPU cost, and image/reflow correctness in one run |
+| M4/M5 and Threadripper PRO 5995WX are qualified | No non-skipped end-to-end interactive qualification artifact on the named Apple generations or the 64-core/128-thread `trj` host | Run and retain the full matrix separately on each named CPU/SoC and document topology/affinity/config |
+| Large ongoing sessions remain responsive | No 4h/24h/72h aged-session soak or post-parse RSS proof | Retain bounded-load soaks with tail latency, memory attribution, cancellation, and recovery evidence |
 
 ## Caveats
 
@@ -237,20 +266,16 @@ right choice.
 - **Allocation profiling not done.** A real `dhat` / heaptrack pass
   would surface allocations the rg-based sweep misses (e.g. the
   `String::new()` growth pattern in many `format!` calls).
-- **`mcp_tools.rs` not deeply audited.** It's the largest file in the
-  workspace (8484 LOC). A targeted MCP perf audit deserves its own bead
-  — most likely under the same connection-pool finding (every MCP read
-  tool that calls `StorageHandle::*` pays the per-query Connection::open
-  cost identified in §2).
+- **`mcp_tools.rs` not deeply audited.** A targeted MCP perf audit deserves its
+  own bead; its current storage and response-building paths require fresh
+  source inspection and measurement rather than the old connection-open count.
 
 ## Conclusion
 
-Two beads filed (`ft-bhyxz`, `ft-gbpoy`); the rest of the audited
-surface is clean. The codebase shows clear evidence of perf-aware
-engineering — Aho-Corasick + quick-reject, memchr SIMD, bounded
-overlap, time-windowed CLI cache, telemetry counters everywhere — and
-the two findings are *foundational* (storage connection pool) and
-*tactical* (codec serialize-once instead of twice) rather than systemic.
-
-Anything found by a real `criterion` / `dhat` pass should grow its
-own bead.
+The two historical structural findings (`ft-bhyxz`, `ft-gbpoy`) landed, but
+this audit does not establish that the rest of the surface is clean or that the
+performance campaign is saturated. Aho-Corasick prefiltering, bounded overlap,
+read pooling, and serialize-once compression are useful substrate. They are not
+substitutes for live critical-path profiles, native target-class runs,
+resize/zoom quality evidence, or aged-session soaks. The full-pane TTL cache is
+not present; revision-aware in-flight singleflight remains future work.

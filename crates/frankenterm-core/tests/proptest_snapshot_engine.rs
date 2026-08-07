@@ -4,8 +4,8 @@
 //! 1. SnapshotTrigger serde roundtrip for all 11 variants
 //! 2. SnapshotTrigger serialized forms are snake_case strings
 //! 3. SnapshotTrigger variants are all distinct under serialization
-//! 4. SnapshotError Display messages match expected text
-//! 5. SnapshotError Debug output contains variant names
+//! 4. SnapshotError Display messages are stable and content-free
+//! 5. SnapshotError Debug output exposes finite classes, never source content
 //! 6. SnapshotResult construction and field access
 //! 7. SnapshotSchedulingMode serde roundtrip and default
 //! 8. SnapshotSchedulingConfig serde roundtrip and default values
@@ -19,8 +19,11 @@ use std::collections::HashSet;
 
 use frankenterm_core::config::{SnapshotConfig, SnapshotSchedulingConfig, SnapshotSchedulingMode};
 use frankenterm_core::snapshot_engine::{
+    SnapshotAuthorityOperation, SnapshotCaptureOptions, SnapshotCheckpointIdentity,
+    SnapshotCheckpointRoleScope, SnapshotDeleteResult, SnapshotDeleteTarget,
     SnapshotEngineTelemetrySnapshot, SnapshotError, SnapshotResult, SnapshotTrigger,
 };
+use frankenterm_core::session_topology::TopologySnapshotError;
 
 // =============================================================================
 // Constants
@@ -301,31 +304,43 @@ proptest! {
         prop_assert_eq!(&msg, "no changes since last snapshot");
     }
 
-    /// SnapshotError::PaneList contains the inner message.
+    /// SnapshotError::PaneList suppresses the untrusted inner message.
     #[test]
-    fn error_pane_list_display(inner in "[a-zA-Z0-9 ]{1,50}") {
+    fn error_pane_list_display(inner in "RAW_PANE_SECRET_[A-Z0-9]{10}") {
         let err = SnapshotError::PaneList(inner.clone());
         let msg = format!("{}", err);
-        prop_assert!(msg.contains(&inner), "PaneList display should contain inner: {}", msg);
-        prop_assert!(msg.starts_with("pane listing failed: "), "unexpected prefix: {}", msg);
+        prop_assert!(
+            !msg.contains(&inner),
+            "PaneList display leaked inner: {}",
+            msg
+        );
+        prop_assert_eq!(&msg, "pane listing failed");
     }
 
-    /// SnapshotError::Database contains the inner message.
+    /// SnapshotError::Database suppresses the untrusted inner message.
     #[test]
-    fn error_database_display(inner in "[a-zA-Z0-9 ]{1,50}") {
+    fn error_database_display(inner in "RAW_DATABASE_SECRET_[A-Z0-9]{10}") {
         let err = SnapshotError::Database(inner.clone());
         let msg = format!("{}", err);
-        prop_assert!(msg.contains(&inner), "Database display should contain inner: {}", msg);
-        prop_assert!(msg.starts_with("database error: "), "unexpected prefix: {}", msg);
+        prop_assert!(
+            !msg.contains(&inner),
+            "Database display leaked inner: {}",
+            msg
+        );
+        prop_assert_eq!(&msg, "snapshot database operation failed");
     }
 
-    /// SnapshotError::Serialization contains the inner message.
+    /// SnapshotError::Serialization suppresses the untrusted inner message.
     #[test]
-    fn error_serialization_display(inner in "[a-zA-Z0-9 ]{1,50}") {
+    fn error_serialization_display(inner in "RAW_SERIALIZATION_SECRET_[A-Z0-9]{10}") {
         let err = SnapshotError::Serialization(inner.clone());
         let msg = format!("{}", err);
-        prop_assert!(msg.contains(&inner), "Serialization display should contain inner: {}", msg);
-        prop_assert!(msg.starts_with("serialization error: "), "unexpected prefix: {}", msg);
+        prop_assert!(
+            !msg.contains(&inner),
+            "Serialization display leaked inner: {}",
+            msg
+        );
+        prop_assert_eq!(&msg, "snapshot serialization failed");
     }
 
     /// SnapshotError::Cancelled displays the fixed capability-context message.
@@ -349,53 +364,234 @@ proptest! {
     fn error_debug_in_progress(_dummy in 0..1_i32) {
         let err = SnapshotError::InProgress;
         let debug = format!("{:?}", err);
-        prop_assert!(debug.contains("InProgress"), "Debug should contain InProgress: {}", debug);
+        prop_assert!(
+            debug.contains("InProgress"),
+            "Debug should contain InProgress: {}",
+            debug
+        );
     }
 
     #[test]
     fn error_debug_no_panes(_dummy in 0..1_i32) {
         let err = SnapshotError::NoPanes;
         let debug = format!("{:?}", err);
-        prop_assert!(debug.contains("NoPanes"), "Debug should contain NoPanes: {}", debug);
+        prop_assert!(
+            debug.contains("NoPanes"),
+            "Debug should contain NoPanes: {}",
+            debug
+        );
     }
 
     #[test]
     fn error_debug_no_changes(_dummy in 0..1_i32) {
         let err = SnapshotError::NoChanges;
         let debug = format!("{:?}", err);
-        prop_assert!(debug.contains("NoChanges"), "Debug should contain NoChanges: {}", debug);
+        prop_assert!(
+            debug.contains("NoChanges"),
+            "Debug should contain NoChanges: {}",
+            debug
+        );
     }
 
     #[test]
-    fn error_debug_pane_list(inner in "[a-zA-Z0-9]{1,20}") {
+    fn error_debug_pane_list(inner in "RAW_PANE_SECRET_[A-Z0-9]{10}") {
         let err = SnapshotError::PaneList(inner.clone());
         let debug = format!("{:?}", err);
-        prop_assert!(debug.contains("PaneList"), "Debug should contain PaneList: {}", debug);
-        prop_assert!(debug.contains(&inner), "Debug should contain inner string: {}", debug);
+        prop_assert!(
+            debug.contains("PaneList"),
+            "Debug should contain PaneList: {}",
+            debug
+        );
+        prop_assert!(
+            !debug.contains(&inner),
+            "Debug leaked inner string: {}",
+            debug
+        );
     }
 
     #[test]
-    fn error_debug_database(inner in "[a-zA-Z0-9]{1,20}") {
+    fn error_debug_database(inner in "RAW_DATABASE_SECRET_[A-Z0-9]{10}") {
         let err = SnapshotError::Database(inner.clone());
         let debug = format!("{:?}", err);
-        prop_assert!(debug.contains("Database"), "Debug should contain Database: {}", debug);
-        prop_assert!(debug.contains(&inner), "Debug should contain inner string: {}", debug);
+        prop_assert!(
+            debug.contains("Database"),
+            "Debug should contain Database: {}",
+            debug
+        );
+        prop_assert!(
+            !debug.contains(&inner),
+            "Debug leaked inner string: {}",
+            debug
+        );
     }
 
     #[test]
-    fn error_debug_serialization(inner in "[a-zA-Z0-9]{1,20}") {
+    fn error_debug_serialization(inner in "RAW_SERIALIZATION_SECRET_[A-Z0-9]{10}") {
         let err = SnapshotError::Serialization(inner.clone());
         let debug = format!("{:?}", err);
-        prop_assert!(debug.contains("Serialization"), "Debug should contain Serialization: {}", debug);
-        prop_assert!(debug.contains(&inner), "Debug should contain inner string: {}", debug);
+        prop_assert!(
+            debug.contains("Serialization"),
+            "Debug should contain Serialization: {}",
+            debug
+        );
+        prop_assert!(
+            !debug.contains(&inner),
+            "Debug leaked inner string: {}",
+            debug
+        );
     }
 
     #[test]
     fn error_debug_cancelled(_dummy in 0..1_i32) {
         let err = SnapshotError::Cancelled;
         let debug = format!("{:?}", err);
-        prop_assert!(debug.contains("Cancelled"), "Debug should contain Cancelled: {}", debug);
+        prop_assert!(
+            debug.contains("Cancelled"),
+            "Debug should contain Cancelled: {}",
+            debug
+        );
     }
+}
+
+#[test]
+fn snapshot_diagnostic_projections_are_content_free() {
+    const SESSION_CANARY: &str = "sess-CONTENT_FREE_SESSION_CANARY";
+    const HASH_CANARY: &str = "snp2:CONTENT_FREE_HASH_CANARY";
+    const ROLE_CANARY: &str = "CONTENT_FREE_ROLE_CANARY";
+    const METADATA_KEY_CANARY: &str = "CONTENT_FREE_METADATA_KEY_CANARY";
+    const METADATA_VALUE_CANARY: &str = "CONTENT_FREE_METADATA_VALUE_CANARY";
+    const CONTROL_CANARY: &str = "CONTENT_FREE_CONTROL_CANARY";
+    const SOURCE_CANARY: &str = "CONTENT_FREE_SOURCE_CANARY";
+    const TOPOLOGY_CANARY: &str = "CONTENT_FREE_TOPOLOGY_CANARY";
+
+    let identity = SnapshotCheckpointIdentity {
+        checkpoint_id: 4_242,
+        session_id: SESSION_CANARY.to_string(),
+        checkpoint_at: 8_484,
+        checkpoint_role: ROLE_CANARY.to_string(),
+        state_hash: HASH_CANARY.to_string(),
+    };
+    let result = SnapshotResult {
+        session_id: SESSION_CANARY.to_string(),
+        checkpoint_id: 4_242,
+        checkpoint_at: 8_484,
+        state_hash: HASH_CANARY.to_string(),
+        pane_count: 3,
+        total_bytes: 5,
+        persisted_text_bytes: 7,
+        truncated_pane_count: 1,
+        trigger: SnapshotTrigger::Manual,
+    };
+    let options = SnapshotCaptureOptions {
+        include_scrollback: true,
+        metadata: Some(serde_json::json!({
+            METADATA_KEY_CANARY: METADATA_VALUE_CANARY,
+            "control": format!("{CONTROL_CANARY}\u{001b}[31m"),
+        })),
+    };
+    let delete_target = SnapshotDeleteTarget::Exact(identity.clone());
+    let delete_result = SnapshotDeleteResult {
+        identity: identity.clone(),
+        recorded_payload_bytes: 11,
+        invalidated_clean_state: true,
+    };
+
+    let projections = [
+        format!("{result:?}"),
+        format!("{identity:?}"),
+        format!("{options:?}"),
+        format!("{delete_target:?}"),
+        format!("{delete_result:?}"),
+    ];
+    for projection in &projections {
+        for canary in [
+            SESSION_CANARY,
+            HASH_CANARY,
+            ROLE_CANARY,
+            METADATA_KEY_CANARY,
+            METADATA_VALUE_CANARY,
+            CONTROL_CANARY,
+        ] {
+            assert!(
+                !projection.contains(canary),
+                "diagnostic projection leaked {canary}: {projection}"
+            );
+        }
+    }
+    assert!(projections[0].contains("checkpoint_id: 4242"));
+    assert!(projections[2].contains("include_scrollback: true"));
+    assert!(projections[2].contains("has_metadata: true"));
+    assert!(projections[3].contains("Exact"));
+    assert!(projections[4].contains("invalidated_clean_state: true"));
+
+    for (error, classification) in [
+        (
+            SnapshotError::PaneList(format!("{SOURCE_CANARY}\u{001b}[2J")),
+            "PaneList",
+        ),
+        (
+            SnapshotError::Database(format!("{SOURCE_CANARY}\u{001b}[2J")),
+            "Database",
+        ),
+        (
+            SnapshotError::Serialization(format!("{SOURCE_CANARY}\u{001b}[2J")),
+            "Serialization",
+        ),
+    ] {
+        let debug = format!("{error:?}");
+        let display = format!("{error}");
+        assert!(debug.contains(classification));
+        assert!(
+            !debug.contains(SOURCE_CANARY),
+            "Debug leaked source: {debug}"
+        );
+        assert!(
+            !display.contains(SOURCE_CANARY),
+            "Display leaked source: {display}"
+        );
+    }
+
+    let topology_source =
+        serde_json::from_str::<SnapshotTrigger>(&format!("\"{TOPOLOGY_CANARY}\""))
+            .expect_err("unknown trigger must produce a serde error");
+    assert!(topology_source.to_string().contains(TOPOLOGY_CANARY));
+    let topology_error =
+        SnapshotError::Topology(TopologySnapshotError::Json(topology_source));
+    assert!(std::error::Error::source(&topology_error).is_some());
+    let topology_debug = format!("{topology_error:?}");
+    let topology_display = format!("{topology_error}");
+    assert!(topology_debug.contains("topology_json_invalid"));
+    assert!(!topology_debug.contains(TOPOLOGY_CANARY));
+    assert!(!topology_display.contains(TOPOLOGY_CANARY));
+
+    let shutdown_error = SnapshotError::ShutdownMarkFailed {
+        checkpoint: Box::new(result),
+        source: Box::new(SnapshotError::Database(format!(
+            "{SOURCE_CANARY}\u{001b}[2J"
+        ))),
+    };
+    assert!(std::error::Error::source(&shutdown_error).is_some());
+    let shutdown_debug = format!("{shutdown_error:?}");
+    let shutdown_display = format!("{shutdown_error}");
+    assert!(shutdown_debug.contains("ShutdownMarkFailed"));
+    assert!(shutdown_debug.contains("source_class: \"database\""));
+    for canary in [SESSION_CANARY, HASH_CANARY, SOURCE_CANARY] {
+        assert!(!shutdown_debug.contains(canary));
+        assert!(!shutdown_display.contains(canary));
+    }
+
+    let latest = format!(
+        "{:?}",
+        SnapshotDeleteTarget::Latest(SnapshotCheckpointRoleScope::Snapshot)
+    );
+    assert!(latest.contains("Latest"));
+    assert!(latest.contains("Snapshot"));
+
+    let authority_error = SnapshotError::IndeterminateAuthorityMutation {
+        operation: SnapshotAuthorityOperation::CheckpointDelete,
+    };
+    assert!(format!("{authority_error:?}").contains("CheckpointDelete"));
+    assert!(format!("{authority_error}").contains("checkpoint_delete"));
 }
 
 // =============================================================================
@@ -413,6 +609,8 @@ proptest! {
         checkpoint_at in 0_u64..10_000_000_000,
         pane_count in 0_usize..100,
         total_bytes in 0_usize..10_000_000,
+        persisted_text_bytes in 0_usize..20_000_000,
+        truncated_pane_count in 0_usize..100,
         trigger in arb_trigger(),
     ) {
         let result = SnapshotResult {
@@ -422,6 +620,8 @@ proptest! {
             state_hash: "snp2:property".to_string(),
             pane_count,
             total_bytes,
+            persisted_text_bytes,
+            truncated_pane_count,
             trigger,
         };
 
@@ -430,6 +630,16 @@ proptest! {
         prop_assert_eq!(result.checkpoint_at, checkpoint_at, "checkpoint_at mismatch");
         prop_assert_eq!(result.pane_count, pane_count, "pane_count mismatch");
         prop_assert_eq!(result.total_bytes, total_bytes, "total_bytes mismatch");
+        prop_assert_eq!(
+            result.persisted_text_bytes,
+            persisted_text_bytes,
+            "persisted_text_bytes mismatch"
+        );
+        prop_assert_eq!(
+            result.truncated_pane_count,
+            truncated_pane_count,
+            "truncated_pane_count mismatch"
+        );
         prop_assert_eq!(result.trigger, trigger, "trigger mismatch");
     }
 
@@ -441,6 +651,8 @@ proptest! {
         checkpoint_at in 0_u64..10_000_000_000,
         pane_count in 0_usize..100,
         total_bytes in 0_usize..10_000_000,
+        persisted_text_bytes in 0_usize..20_000_000,
+        truncated_pane_count in 0_usize..100,
         trigger in arb_trigger(),
     ) {
         let result = SnapshotResult {
@@ -450,6 +662,8 @@ proptest! {
             state_hash: "snp2:property".to_string(),
             pane_count,
             total_bytes,
+            persisted_text_bytes,
+            truncated_pane_count,
             trigger,
         };
         let cloned = result.clone();
@@ -459,6 +673,16 @@ proptest! {
         prop_assert_eq!(result.checkpoint_at, cloned.checkpoint_at, "checkpoint_at clone mismatch");
         prop_assert_eq!(result.pane_count, cloned.pane_count, "pane_count clone mismatch");
         prop_assert_eq!(result.total_bytes, cloned.total_bytes, "total_bytes clone mismatch");
+        prop_assert_eq!(
+            result.persisted_text_bytes,
+            cloned.persisted_text_bytes,
+            "persisted_text_bytes clone mismatch"
+        );
+        prop_assert_eq!(
+            result.truncated_pane_count,
+            cloned.truncated_pane_count,
+            "truncated_pane_count clone mismatch"
+        );
         prop_assert_eq!(result.trigger, cloned.trigger, "trigger clone mismatch");
     }
 
@@ -470,17 +694,33 @@ proptest! {
         trigger in arb_trigger(),
     ) {
         let result = SnapshotResult {
-            session_id: "sess-test".to_string(),
+            session_id: "sess-RESULT_SESSION_SECRET_CANARY".to_string(),
             checkpoint_id,
             checkpoint_at: 1_234,
-            state_hash: "snp2:property".to_string(),
+            state_hash: "snp2:RESULT_HASH_SECRET_CANARY".to_string(),
             pane_count,
             total_bytes: 0,
+            persisted_text_bytes: 0,
+            truncated_pane_count: 0,
             trigger,
         };
         let debug = format!("{:?}", result);
         prop_assert!(!debug.is_empty(), "Debug should not be empty");
-        prop_assert!(debug.contains("SnapshotResult"), "Debug should contain SnapshotResult: {}", debug);
+        prop_assert!(
+            debug.contains("SnapshotResult"),
+            "Debug should contain SnapshotResult: {}",
+            debug
+        );
+        prop_assert!(
+            !debug.contains("RESULT_SESSION_SECRET_CANARY"),
+            "Debug leaked session ID: {}",
+            debug
+        );
+        prop_assert!(
+            !debug.contains("RESULT_HASH_SECRET_CANARY"),
+            "Debug leaked state hash: {}",
+            debug
+        );
     }
 }
 
@@ -783,6 +1023,8 @@ proptest! {
         triggers_accepted in 0_u64..10_000,
         panes in 0_u64..10_000,
         bytes in 0_u64..100_000_000,
+        persisted_text_bytes in 0_u64..200_000_000,
+        pane_states_truncated in 0_u64..10_000,
     ) {
         let snap = SnapshotEngineTelemetrySnapshot {
             captures_attempted: attempted,
@@ -795,6 +1037,8 @@ proptest! {
             triggers_accepted,
             panes_captured: panes,
             bytes_persisted: bytes,
+            persisted_text_bytes,
+            pane_states_truncated,
         };
         let json = serde_json::to_string(&snap).unwrap();
         let back: SnapshotEngineTelemetrySnapshot = serde_json::from_str(&json).unwrap();
@@ -817,6 +1061,8 @@ proptest! {
             triggers_accepted: 0,
             panes_captured: 0,
             bytes_persisted: 0,
+            persisted_text_bytes: 0,
+            pane_states_truncated: 0,
         };
         let json = serde_json::to_string(&snap).unwrap();
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -824,6 +1070,8 @@ proptest! {
         prop_assert!(obj.contains_key("captures_attempted"));
         prop_assert!(obj.contains_key("captures_succeeded"));
         prop_assert!(obj.contains_key("bytes_persisted"));
+        prop_assert!(obj.contains_key("persisted_text_bytes"));
+        prop_assert!(obj.contains_key("pane_states_truncated"));
     }
 
     #[test]
@@ -853,6 +1101,8 @@ proptest! {
             triggers_accepted,
             panes_captured: 0,
             bytes_persisted: 0,
+            persisted_text_bytes: 0,
+            pane_states_truncated: 0,
         };
         let json = serde_json::to_string(&snap).unwrap();
         let back: SnapshotEngineTelemetrySnapshot = serde_json::from_str(&json).unwrap();
@@ -905,6 +1155,8 @@ proptest! {
         triggers_accepted in 0_u64..10_000,
         panes in 0_u64..10_000,
         bytes in 0_u64..100_000_000,
+        persisted_text_bytes in 0_u64..200_000_000,
+        pane_states_truncated in 0_u64..10_000,
     ) {
         let snap = SnapshotEngineTelemetrySnapshot {
             captures_attempted: attempted,
@@ -917,6 +1169,8 @@ proptest! {
             triggers_accepted,
             panes_captured: panes,
             bytes_persisted: bytes,
+            persisted_text_bytes,
+            pane_states_truncated,
         };
         let first = serde_json::to_string(&snap).unwrap();
         let rehydrated: SnapshotEngineTelemetrySnapshot =

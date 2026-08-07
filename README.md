@@ -353,7 +353,7 @@ Honest status of every shipped surface, without migration-era hand-waving.
 | Operating envelope | **Supported** | `ft.operating_envelope.v1` planner contract + golden fixtures; fails closed on missing or critical-pressure telemetry |
 | Mission objective planner | **Supported** | Capacity-aware planner for safe swarm orchestration (ft-auy2g) |
 | Incident bundles | **Supported** | Wired to live collectors; publish-side snapshot path; beads coordination snapshot included |
-| Session persistence | **Partially supported with backend prerequisite** | Snapshots, session inspection, and `ft session doctor` are cross-platform. Unix-only live restore currently rebuilds windows, tabs, splits, local CWDs, and active-pane/tab selection. Historical scrollback, process/agent state, stable mux-domain identity, durable app-reopen tab ordering, titles, exact cell geometry, and full window appearance are not restored. |
+| Session persistence | **Capture/inspect supported; execution unavailable** | Snapshot save/list/inspect/pane-membership diff/delete and `ft session doctor` ship. `ft snapshot restore` and robot checkpoint rollback accept metadata-only `--dry-run` descriptor/status reporting, but every non-dry invocation fails closed before database resolution, process discovery, subprocess launch, or mux mutation. The layout restorer remains library/test substrate; production does not currently restore panes, processes, scrollback, mux domains, window/workspace placement, durable tab order, stable active-tab identity, or full appearance. |
 | Reality-check + attestation | **Supported** | `ft attestation verify` / `show` ship as a thin Rust wrapper over `scripts/attestation-verify.sh`. Signed bundles live in `docs/attestations/` |
 | Deferred proof queue | **Supported with fail-closed proof prerequisite** | `ft proof queue/status/replay/attach` and `ft robot proof status` expose source-landed proof intents. Replay executes only through remote-required RCH when admission is explicitly `admitted`; local Cargo is never substituted. Release-slot evidence stays under `docs/attestations/proofs/deferred-proof-replay.json`; current W8.2 remote proof remains blocked on RCH admission. |
 | Web API / SSE | **Supported behind `--features web`** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
@@ -369,7 +369,12 @@ Honest status of every shipped surface, without migration-era hand-waving.
 
 ### 1. Passive-First Architecture
 
-The observation loop (discovery, capture, pattern detection) has **no side effects**. It only reads and stores. The action loop (sending input, running workflows, mission/tx execution) is strictly separated with explicit policy gates. In practice, `ft watch` can never accidentally send input or modify agent state; it is a pure observer.
+The default observation loop does not send pane input, but it is not
+side-effect-free: `ft watch` owns persistence lifecycle work, including schema
+migration, capture writes, and retention pruning. With `--auto-handle`, matched
+events can also enter policy-gated workflow actions. Input, workflow,
+mission, and transaction effects remain separately gated and auditable; do not
+treat starting a watcher as a passive offline diagnostic.
 
 ### 2. Event-Driven, Not Time-Based
 
@@ -794,7 +799,10 @@ cargo build -p frankenterm --profile release-interactive --all-features
 ### Requirements
 
 - **Rust nightly** (Rust 2024 edition; see `rust-toolchain.toml`)
-- **WezTerm CLI + reachable mux/GUI** for pane discovery, live read/write, and snapshot restore
+- **A reachable FrankenTerm/WezTerm-fork mux endpoint** for pane discovery,
+  live read/write, and snapshot capture. The direct pooled mux protocol is the
+  preferred path; the external WezTerm CLI is an eligible compatibility
+  fallback, not a universal prerequisite.
 - **SQLite** (bundled via `rusqlite` — no system dependency)
 
 ---
@@ -1026,28 +1034,45 @@ Streaming query parameters: `pane_id` filters to one pane; `max_hz` caps deliver
 ### Session persistence
 
 ```bash
-ft snapshot save                 # capture current mux state
+ft snapshot save                 # persist a bounded mux metadata projection
 ft snapshot list                 # list recent snapshots
 ft snapshot inspect <id>         # inspect snapshot contents
-ft snapshot diff <id1> <id2>     # compare two snapshots
-ft session list                  # list saved sessions
-ft session show <session_id>     # show session + checkpoints
+ft snapshot diff <id1> <id2>     # compare pane-ID membership only
+ft snapshot restore <id> --dry-run # metadata-only descriptor/status report
+ft session list --limit 50 --offset 0              # bounded page of saved sessions
+ft session show <session_id> --limit 50 --offset 0 # bounded checkpoint page
 ft session doctor                # health check for session persistence
-ft watch                         # observe panes; startup restore prompting is not wired yet
+ft watch                         # start the persistence/observation lifecycle; may prune retained data
 ```
 
-`ft snapshot restore` is wired on Unix for a layout-only subset. Historical
-output is never written through PTY input, and shell/agent replacement remains
-a reported manual disposition until the mux exposes safe render-state and
-argv-isolated spawn channels. The `--layout-only` flag is therefore an explicit
-statement of the only supported mode, not a switch from a working scrollback
-replay mode. `ft restart` execution is deliberately unavailable: it fails
-closed before locks, capture, process discovery, signals, spawning, or mux
-mutation until one authenticated mux endpoint can be bound to an exact process
+`ft snapshot restore <id> --dry-run` reads a bounded checkpoint descriptor and
+prints a metadata-only descriptor/status report. It does not load a full restorable projection and
+is not evidence that execution would succeed. Every non-dry snapshot restore,
+on every platform, returns a finite unavailable diagnostic before database
+resolution, process discovery, subprocess launch, or mux mutation. Robot
+checkpoint rollback has the same boundary: dry-run planning only, with
+non-dry execution returning `robot.feature_not_available`.
+
+The executable layout restorer remains library/test substrate. That substrate
+can exercise a limited windows/tabs/splits/local-CWD projection and honor an
+explicit per-tab active-pane identifier when one is actually present, but the
+current pane-list-derived snapshot does not preserve durable tab order or a
+stable active-tab identity. It also does not establish mux-domain identity,
+workspace/window placement, historical scrollback, render state, process or
+agent continuity, titles, exact geometry, or full appearance.
+
+`ft restart` execution is likewise deliberately unavailable: it fails closed
+before locks, capture, process discovery, signals, spawning, or mux mutation
+until one authenticated mux endpoint can be bound to an exact process
 incarnation and verified relaunch receipt. The library can find unclean
 sessions, but the production `ft watch` startup path does not yet call that
-detector or offer a restore prompt; use the explicit snapshot/session commands
-to inspect and start a manual layout restore.
+detector or offer a restore prompt. Use snapshot/session commands for evidence
+inspection and make any recovery changes manually.
+
+The top-level `[session]` configuration table is entirely unsupported and is
+rejected, including the retired `session.restore_max_lines` key. The retired
+`[snapshots.process_relaunch]` table is also rejected; no production relaunch
+or scrollback-replay setting exists.
 
 ### Configuration
 
@@ -1096,7 +1121,7 @@ The `ft robot` subcommand provides machine-optimized output for AI agents. Alway
 | `ft robot events` | recent detection events | shipped |
 | `ft robot approve` | approve gated action | shipped |
 | `ft robot agent-mail-outbox` | retained fallback outbox entries + replay state | shipped (read-only fixture/queued-entry surface; not live delivery proof) |
-| `ft robot checkpoint` | save / list / show / delete / rollback | shipped (rollback requires `--dry-run` until robot policy approval lands) |
+| `ft robot checkpoint` | save / list / show / delete / rollback | shipped for save/list/show/delete; rollback is metadata-only with `--dry-run`, while non-dry rollback fails closed until an authenticated, incarnation-pinned mux execution contract exists |
 | `ft robot context` | status / rotate / history | shipped (native SQLite registry; rotation receipts are durable; raw context content is not stored) |
 | `ft robot work` | claim / release / complete / list / ready / assign | shipped (native SQLite `work_claims` queue) |
 | `ft robot fleet` | status / scale / rebalance / agents | shipped (live scale/rebalance plans, dry-run receipts, durable non-dry-run receipt replay, typed mutation/error receipts) |
@@ -1458,7 +1483,7 @@ frankenterm/                              # 77 workspace members (auto-stamped)
 │   │   │   ├── ingest.rs                 # Pane discovery + delta extraction
 │   │   │   ├── patterns.rs               # Pattern detection engine
 │   │   │   ├── events.rs                 # Event bus and detection fanout
-│   │   │   ├── storage/                  # SQLite + FTS5 (currently schema v35)
+│   │   │   ├── storage/                  # SQLite + FTS5 (currently schema v38)
 │   │   │   ├── policy.rs                 # Safety / access control
 │   │   │   ├── redactor.rs               # Secret redaction (T1/T2/T3 tiers)
 │   │   │   ├── plan.rs                   # Mission + Tx types
@@ -1758,29 +1783,40 @@ Several subsystems use space-efficient probabilistic data structures to avoid co
 
 ## Deep Dive: Session Persistence and Restore
 
-The session-restoration library can identify sessions that did not shut down
-cleanly (`shutdown_clean = 0`), load a checkpoint, and drive a manual restore:
+The session-restoration library/test substrate can identify sessions that did
+not shut down cleanly (`shutdown_clean = 0`), load a checkpoint, and exercise a
+restore state machine:
 
 ```
 Database → SessionCandidate → RestoreDecision → LayoutRestorer → RestoreSummary
 ```
 
-That detector is not currently wired into production `ft watch` startup, so
-FrankenTerm does not yet provide an automatic startup prompt or restore.
+That detector is not wired into production `ft watch` startup. The human
+snapshot-restore and robot-rollback commands provide bounded metadata-only
+dry-runs; all non-dry execution is unavailable.
 
-Each checkpoint records:
-- Topology snapshot (which panes existed, their tab/window arrangement)
-- Per-pane terminal state (cursor position, alt-screen flag, scrollback reference)
-- Per-pane agent metadata (agent type, session ID, CWD, process info)
-- Curated environment variables (redacted for sensitive values)
+The checkpoint schema can record:
 
-The current Unix restore path creates new panes in the current mux server and
-maps old pane IDs to new ones for the supported layout subset. It never replays
-historical output through PTY input and never restarts captured processes;
-those processes receive finite manual dispositions. A same-session durable
-intent/outcome/lifecycle chain records the mapping and keeps interrupted or
-partial attempts unclean for explicit reconciliation instead of silently
-retrying unknown external effects.
+- A deterministic topology snapshot derived from numeric window/tab/pane IDs;
+  schema v1 does not preserve user tab order or stable active-tab identity
+- Per-pane terminal metadata such as dimensions, cursor position, title, and
+  alt-screen flag, plus CWD when supplied by the bridge
+- Optional foreground-process, scrollback-reference, agent, and redacted
+  environment fields
+
+The production `PaneInfo` projection currently populates terminal metadata and
+CWD; optional process/agent/environment schema fields must not be mistaken for
+evidence that those values or their continuity were captured.
+
+The library/test layout substrate can create new panes and map old pane IDs to
+new ones for a limited projection. It does not preserve durable tab order,
+stable active-tab identity, mux domains, workspace/window placement, or full
+appearance. It never replays historical output through PTY input or restarts
+captured processes; those processes receive finite manual dispositions. Its
+same-session durable intent/outcome/lifecycle chain records mappings and keeps
+interrupted or partial attempts unclean for explicit reconciliation instead of
+silently retrying unknown external effects. No production CLI reaches this
+execution path today.
 
 Scheduled backups use the SQLite online backup API for consistent snapshots. Backup archives include the database binary, a JSON manifest with SHA-256 checksums, and optional SQL text dumps. Retention and rotation are configurable by day count and maximum backup count, with 5-field cron scheduling support.
 
@@ -2421,7 +2457,7 @@ capacity guarantees.
 
 ### Current schema version
 
-The current version is **v35**. The authoritative source is
+The current version is **v38**. The authoritative source is
 [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs);
 documentation must follow that constant rather than becoming an independent
 version authority.
@@ -2973,14 +3009,14 @@ These four words refer to four distinct mechanisms. They are often conflated; th
 
 | Concept | What it captures | Why | Restored how? | Lives where? |
 |---|---|---|---|---|
-| **Snapshot** | Mux topology + per-pane terminal state at a point in time | "What did the swarm look like?" | `ft snapshot restore <id>` (Unix) re-creates panes in the current mux | `session_checkpoints` + `mux_pane_state` tables |
-| **Session checkpoint** | Persistent session-progress markers | Diagnose and manually recover after an unclean shutdown | Inspect with `ft session`; explicitly restore a selected snapshot/checkpoint (Unix layout subset) | `session_checkpoints` table |
+| **Snapshot** | Bounded mux topology + per-pane terminal metadata at a point in time | "What did the swarm look like?" | Inspect it or compare pane membership; `ft snapshot restore <id> --dry-run` emits a metadata-only, non-executable descriptor/status report | `session_checkpoints` + `mux_pane_state` tables |
+| **Session checkpoint** | Persistent session-progress markers | Diagnose and plan manual recovery after an unclean shutdown | Inspect with `ft session`; production does not execute a checkpoint restore | `session_checkpoints` table |
 | **Recording** | Time-ordered event log of *everything* that happened | "What did the swarm *do*?" | Deterministic replay via the replay subsystem | `.ft/recorder-log/events.log` (append-log backend) |
 | **Backup** | The whole `ft.db` + manifest as a portable archive | Disaster recovery, host migration | `ft backup import` | `[backup].destination` directory (default `~/.local/share/ft/backups`) |
 
 ### When to use which
 
-- **Crashed and want my panes back?** Inspect saved sessions/checkpoints and explicitly invoke snapshot restore; `ft watch` does not yet offer this automatically.
+- **Crashed and want my panes back?** Inspect saved sessions/checkpoints, use the restore dry-run as a bounded metadata aid, and recreate the required state manually. Neither `ft watch` nor the snapshot CLI currently executes recovery.
 - **Want to debug a workflow that fired in a way you didn't expect?** Recording + replay; you can re-run with the exact inputs and step through.
 - **Moving to a new host or recovering from disk loss?** Backup. Always backup before major upgrades; the migration engine will create a safety backup automatically but explicit is better.
 - **Need a quick "what did this fleet look like 3 hours ago" answer?** Snapshot. They're cheap to take and labeled.
@@ -3104,7 +3140,11 @@ outside that guarantee.
 
 ### SIGTERM
 
-Identical to SIGINT in steady state. The shutdown deadline is configurable; if the deadline passes before flush completes, the process exits with a non-zero code and the next start will detect unclean shutdown.
+Identical to SIGINT in steady state. The shutdown deadline is configurable; if
+the deadline passes before flush completes, the process exits with a non-zero
+code and the persisted unclean authority remains available to the explicit
+session-inspection commands. Production `ft watch` startup does not currently
+run the session detector or offer a recovery prompt.
 
 ### SIGKILL
 
@@ -3113,7 +3153,7 @@ There's no clean path. The watcher is killed mid-flush. On the next start:
 - The clean-shutdown marker is absent.
 - The persisted unclean marker remains available to the session inspection
   commands. Automatic `ft watch` startup detection/prompting is not wired yet;
-  recovery is an explicit operator action.
+  inspection and any manual reconstruction are explicit operator actions.
 - The DB is opened in WAL recovery mode; SQLite reconstructs consistent state from the WAL.
 
 ### Cancel-correctness in long ops
@@ -3504,11 +3544,10 @@ Codex panes display rotating idle suggestions ("Find and fix a bug in @", "Expla
 
 ### "The watcher won't start — `watcher lock held`"
 
-```bash
-ft status                          # check existing watcher
-ft stop --force                    # force stop if needed
-rm ~/.local/share/ft/watcher.lock  # remove stale lock (after checking lsof)
-```
+Run `ft status` and identify the exact workspace and watcher owner. Do not
+force-stop a shared or unidentified process and do not manually remove its
+lock. If an explicitly owned disposable watcher is confirmed stale, coordinate
+with its operator and use that instance's normal lifecycle path.
 
 ### "Pattern detection isn't firing for a new agent version"
 
@@ -3526,7 +3565,10 @@ Follow the rule-drift workflow:
 [patterns]
 packs = ["builtin:core", "custom:my_lab_pack"]
 ```
-Then send the watcher a `SIGHUP` (the daemon hot-reloads config on `SIGHUP`); `pkill -HUP -f "ft watch"`. Restart works too. `ft rules list --verbose` confirms the active set.
+The daemon can hot-reload config on `SIGHUP`, but address only an exact,
+operator-owned watcher instance through its supervised lifecycle. Never use a
+broad process-name match on a shared host. `ft rules list --verbose` confirms
+the active set.
 
 ### "I need to debug what the operating envelope is denying"
 
@@ -3771,7 +3813,7 @@ This section catalogues the non-obvious design decisions the project has made, t
 - **SQLite is bundled** (no system dep), runs in-process (no IPC overhead), and supports FTS5 + WAL out of the box.
 - **Single-writer integrity** is a deliberate constraint: only one watcher writes, and multiple readers are fine.
 - **Backup is the SQLite online backup API**: consistent snapshots without stop-the-world.
-- **Future-proof**: schema migrations are versioned (`SCHEMA_VERSION = 35` at HEAD; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
+- **Future-proof**: schema migrations are versioned (`SCHEMA_VERSION = 38` at HEAD; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
 - **Trade-off accepted**: at fleet-of-thousands scale, write throughput would become a bottleneck. We're not there.
 
 ### Why asupersync, not tokio?
@@ -3979,6 +4021,24 @@ PTY, Metal, and display evidence; rejected hypotheses and their retry
 predicates live in
 [`docs/perf-ledger/interactive-systems-negative-results.md`](docs/perf-ledger/interactive-systems-negative-results.md).
 
+### Interactive-performance negative-evidence ledger
+
+Passing component benches is not permission to claim an interactive result.
+The following promotion gaps remain open at this source revision:
+
+| Desired claim | Evidence currently missing | Promotion condition |
+|---|---|---|
+| Responsive Mac keypress → LAN mux → remote PTY → presented frame | No retained end-to-end native trace covering the input event, transport, PTY, render queue, GPU submission, and display presentation | Reproducible percentile traces on the declared LAN topology, with the exact build/config/workload retained |
+| Smooth, visually correct resize and zoom | No retained live-GUI resize/zoom run couples frame pacing and CPU/GPU cost to image-quality/reflow checks | Signed native artifact with frame-time distributions, dropped-frame accounting, reflow correctness, and visual-differential evidence |
+| M4/M5 Apple-silicon qualification | No non-skipped end-to-end interactive qualification artifact for either generation at this source revision | Repeat the declared interactive and aged-session matrix on each named chip; do not substitute a different Apple-silicon generation |
+| Threadripper PRO 5995WX qualification | No retained end-to-end interactive `trj` result for the 64-core/128-thread host, including NUMA/scheduler/affinity evidence | Repeat the matrix on the declared high-core-count AMD host with topology, affinity, clock, and workload provenance |
+| Large ongoing-session responsiveness | Short synthetic/component lanes do not establish 4h/24h/72h behavior, post-parse RSS, or tail latency | Retained aged-session soaks with bounded workload, memory attribution, responsiveness percentiles, and failure/recovery evidence |
+| Reusing completed `list_panes` results is safe | The former elapsed-time TTL cache was removed because full `PaneInfo` contains volatile focus/cursor/CWD/title/viewport/zoom state and elapsed time is not an authority revision | Only reconsider coalescing when it is cross-client, cross-transport, in-flight-only, and bound to an authoritative mux revision/event stream |
+
+Until those conditions are met, renderer SLO documents and component benches
+are targets and diagnostic substrates, not native M4/M5/Threadripper, LAN,
+resize/zoom, or long-session proof.
+
 ---
 
 ## Testing
@@ -4018,19 +4078,18 @@ For a step-by-step operator guide (triage → why → reproduce), see [`docs/ope
 
 ### Compatibility backend returns empty pane list
 
-```bash
-wezterm start --always-new-process
-```
+Use `ft status` to verify the exact pre-existing mux endpoint and workspace.
+Do not start a new GUI instance as a diagnostic: doing so can steal focus and
+creates a different endpoint rather than explaining the empty result.
 
 ### Daemon won't start: "watcher lock held"
 
 Another `ft` watcher is already running.
 
-```bash
-ft status                                # check for existing watcher
-ft stop --force                          # force stop if stuck
-rm ~/.local/share/ft/watcher.lock        # remove stale lock
-```
+Use `ft status` to identify the exact workspace and watcher owner. Do not
+force-stop a shared or unidentified watcher and do not manually delete its
+lock. Coordinate normal shutdown only for an explicitly owned disposable
+instance.
 
 ### High memory usage
 
@@ -4107,7 +4166,7 @@ If admission is denied because telemetry is missing (rather than critical), the 
 | Multi-host federation | Distributed mode shipped with explicit limitations |
 | Semantic search | Feature-gated (requires ML embeddings) |
 | Target-class memory envelope claims | Held back pending non-skipped target-class artifact |
-| `ft restart` / `ft snapshot restore` | Currently Unix-only |
+| `ft restart` / non-dry `ft snapshot restore` | Execution unavailable on every platform; both fail closed before process or mux mutation |
 | Render-differential OSC 8 hyperlink + resize-control | Outstanding follow-ups (ft-tf6g3.54 / .55) |
 
 ---

@@ -36,6 +36,9 @@ frankenterm-core-replay = { workspace = true, default-features = false }
 frankenterm-alloc = { workspace = true, optional = true }
 frankenterm-client.workspace = true
 mux.workspace = true
+# Portable nonblocking socket-pair capture for finite doctor subprocess probes
+# (also used by the EPIPE integration-test substrate).
+filedescriptor.workspace = true
 clap.workspace = true
 chrono.workspace = true
 serde.workspace = true
@@ -123,9 +126,6 @@ redis-session = ["frankenterm-core/redis-session"]
 jemalloc = ["dep:frankenterm-alloc", "frankenterm-alloc/jemalloc"]
 
 [dev-dependencies]
-# GH#75: tests/epipe_exit_code.rs builds a pipe whose read end is closed
-# before spawn so the child's first stdout write deterministically EPIPEs.
-filedescriptor = { workspace = true }
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
 tempfile = "3.27.0"

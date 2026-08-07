@@ -47,6 +47,32 @@ struct E2ETestReport {
     pane_reports: Vec<PaneTestReport>,
 }
 
+impl E2ETestReport {
+    /// A contract result is only positive when at least one pane report exists,
+    /// every pane carries at least one exercised check, and no exercised check
+    /// failed. This deliberately rejects the vacuous truth of `all()` over an
+    /// empty pane-report collection.
+    fn all_pane_contracts_exercised_and_pass(&self) -> bool {
+        !self.pane_reports.is_empty()
+            && self
+                .pane_reports
+                .iter()
+                .all(PaneTestReport::all_exercised_checks_pass)
+    }
+
+    fn pane_contract_checks_present(&self) -> bool {
+        !self.pane_reports.is_empty()
+            && self.pane_reports.iter().all(|pane| !pane.checks.is_empty())
+    }
+
+    fn exercised_checks_present(&self) -> bool {
+        self.pane_reports
+            .iter()
+            .flat_map(|pane| pane.checks.iter())
+            .any(|check| check.status != PaneCheckStatus::NotTested)
+    }
+}
+
 const HERMETIC_NOT_TESTED_CONTRACTS: [&str; 13] = [
     "mux_stop_start",
     "authenticated_restart_execution",
@@ -83,20 +109,20 @@ impl Serialize for E2ETestReport {
             .filter(|check| check.status == PaneCheckStatus::NotTested)
             .map(|check| check.contract))
             .collect::<std::collections::BTreeSet<_>>();
-        let pane_contract_checks_present = !self.pane_reports.is_empty();
-        let exercised_contracts_passed = self.passed
-            && self
-                .pane_reports
-                .iter()
-                .all(PaneTestReport::all_exercised_checks_pass);
+        let pane_contract_checks_present = self.pane_contract_checks_present();
+        let exercised_checks_present = self.exercised_checks_present();
+        let exercised_contracts_passed =
+            self.passed && self.all_pane_contracts_exercised_and_pass();
 
-        let mut state = serializer.serialize_struct("E2ETestReport", 11)?;
+        let mut state = serializer.serialize_struct("E2ETestReport", 13)?;
         state.serialize_field("test_name", &self.test_name)?;
         state.serialize_field("scope", "hermetic_sqlite_mock_mux")?;
         state.serialize_field("phases", &self.phases)?;
         state.serialize_field("total_duration_ms", &self.total_duration_ms)?;
+        state.serialize_field("test_assertions_passed", &self.passed)?;
         state.serialize_field("exercised_contracts_passed", &exercised_contracts_passed)?;
         state.serialize_field("pane_contract_checks_present", &pane_contract_checks_present)?;
+        state.serialize_field("exercised_checks_present", &exercised_checks_present)?;
         state.serialize_field("exercised_checks_passed", &exercised_checks_passed)?;
         state.serialize_field("not_tested_contracts", &not_tested_contracts)?;
         state.serialize_field("not_tested_contract_count", &not_tested_contracts.len())?;
@@ -149,6 +175,41 @@ fn not_tested_only_pane_report_never_passes() {
 }
 
 #[test]
+fn one_failed_check_overrides_a_passed_check_in_pane_and_e2e_reports() {
+    let pane_report = PaneTestReport {
+        pane_id: 1,
+        source_artifact_hash: "source".to_string(),
+        observed_artifact_hash: "observed".to_string(),
+        checks: vec![
+            PaneContractCheck::exercised("checkpoint_shape", true),
+            PaneContractCheck::exercised("checkpoint_content", false),
+        ],
+    };
+    assert!(!pane_report.all_exercised_checks_pass());
+
+    let report = E2ETestReport {
+        test_name: "passed-and-failed-negative-control".to_string(),
+        phases: Vec::new(),
+        total_duration_ms: 0,
+        passed: true,
+        failure_reason: None,
+        pane_reports: vec![pane_report],
+    };
+    assert!(!report.all_pane_contracts_exercised_and_pass());
+
+    let serialized = serde_json::to_value(report).expect("serialize negative control");
+    assert_eq!(
+        serialized["exercised_contracts_passed"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(serialized["exercised_checks_passed"].as_u64(), Some(1));
+    assert_eq!(
+        serialized["exercised_checks_present"].as_bool(),
+        Some(true)
+    );
+}
+
+#[test]
 fn one_unexercised_pane_prevents_a_passing_serialized_report() {
     let report = E2ETestReport {
         test_name: "mixed-contract-proof".to_string(),
@@ -196,15 +257,47 @@ fn passing_phase_only_report_does_not_fabricate_missing_pane_checks() {
     };
 
     let serialized = serde_json::to_value(report).expect("serialize phase-only report");
+    assert_eq!(serialized["test_assertions_passed"].as_bool(), Some(true));
     assert_eq!(
         serialized["exercised_contracts_passed"].as_bool(),
-        Some(true)
+        Some(false)
     );
     assert_eq!(
         serialized["pane_contract_checks_present"].as_bool(),
         Some(false)
     );
     assert_eq!(serialized["exercised_checks_passed"].as_u64(), Some(0));
+    assert_eq!(
+        serialized["exercised_checks_present"].as_bool(),
+        Some(false)
+    );
+}
+
+#[test]
+fn empty_check_vector_is_reported_as_absent_and_cannot_pass() {
+    let report = E2ETestReport {
+        test_name: "empty-check-contract-proof".to_string(),
+        phases: Vec::new(),
+        total_duration_ms: 0,
+        passed: true,
+        failure_reason: None,
+        pane_reports: vec![PaneTestReport {
+            pane_id: 1,
+            source_artifact_hash: "source".to_string(),
+            observed_artifact_hash: "observed".to_string(),
+            checks: Vec::new(),
+        }],
+    };
+
+    let serialized = serde_json::to_value(report).expect("serialize empty-check report");
+    assert_eq!(
+        serialized["pane_contract_checks_present"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        serialized["exercised_contracts_passed"].as_bool(),
+        Some(false)
+    );
 }
 
 #[derive(Debug, Serialize)]
@@ -661,10 +754,7 @@ fn e2e_snapshot_roundtrip_single_pane_report() {
         };
         report.pane_reports.push(pane_report);
 
-        let success = report
-            .pane_reports
-            .iter()
-            .all(PaneTestReport::all_exercised_checks_pass);
+        let success = report.all_pane_contracts_exercised_and_pass();
         let passed_panes = report
             .pane_reports
             .iter()
@@ -808,7 +898,7 @@ fn e2e_targeted_checkpoint_load_distinguishes_versions() {
             ],
         });
 
-        let success = checkpoint_versions_distinct && new_has_extra_pane && latest_matches_new;
+        let success = report.all_pane_contracts_exercised_and_pass();
         add_phase(
             &mut report,
             "compare_versions",
@@ -1139,10 +1229,7 @@ fn e2e_restore_bookkeeping_preserves_manual_restore_checkpoint() {
             ],
         });
 
-        let success = report
-            .pane_reports
-            .iter()
-            .all(PaneTestReport::all_exercised_checks_pass)
+        let success = report.all_pane_contracts_exercised_and_pass()
             && summary.layout_settled_pane_count() == 1
             && summary.layout_failed_pane_count() == 0;
 
@@ -1459,10 +1546,7 @@ fn e2e_fixture_complex_layout_executes_session_restorer_flow() {
             && unique_tabs.len() == 2
             && mapped_new_ids.len() == fixture_panes.len()
             && active_new_pane.is_active
-            && report
-                .pane_reports
-                .iter()
-                .all(PaneTestReport::all_exercised_checks_pass);
+            && report.all_pane_contracts_exercised_and_pass();
 
         add_phase(
             &mut report,
@@ -1617,11 +1701,6 @@ fn e2e_restore_rejects_unsafe_scrollback_before_mux_or_authority_effects() {
         let remains_restore_candidate = redetected
             .as_ref()
             .is_some_and(|candidate| candidate.session_id == snapshot.session_id);
-        let success = safe_rejection
-            && no_mux_effects
-            && no_authority_effects
-            && remains_restore_candidate;
-
         report.pane_reports.push(PaneTestReport {
             pane_id: pane.pane_id,
             source_artifact_hash: hash_text("first line\nsecond line\n"),
@@ -1635,6 +1714,11 @@ fn e2e_restore_rejects_unsafe_scrollback_before_mux_or_authority_effects() {
                 PaneContractCheck::not_tested("process_continuity"),
             ],
         });
+        let success = safe_rejection
+            && no_mux_effects
+            && no_authority_effects
+            && remains_restore_candidate
+            && report.all_pane_contracts_exercised_and_pass();
 
         add_phase(
             &mut report,
@@ -1901,10 +1985,7 @@ fn e2e_persisted_session_identity_survives_engine_rebuild_and_manual_layout_rest
             && cwds_match
             && restore_ok
             && detect_cleared
-            && report
-                .pane_reports
-                .iter()
-                .all(PaneTestReport::all_exercised_checks_pass);
+            && report.all_pane_contracts_exercised_and_pass();
         report.total_duration_ms = run_start.elapsed().as_millis() as u64;
         report.passed = success;
         report.failure_reason = if success {
@@ -2142,16 +2223,6 @@ fn e2e_persisted_scrollback_bytes_survive_engine_rebuild_but_replay_is_rejected(
         let remains_restore_candidate = redetected
             .as_ref()
             .is_some_and(|session| session.session_id == captured_session_id);
-        let success = safe_rejection
-            && persisted_metadata_matches
-            && checkpoint_boundary_matches
-            && persisted_bytes_match
-            && candidate.session_id == captured_session_id
-            && checkpoint.checkpoint_id == captured_checkpoint_id
-            && no_mux_effects
-            && no_authority_effects
-            && remains_restore_candidate;
-
         report.pane_reports.push(PaneTestReport {
             pane_id: pane.pane_id,
             source_artifact_hash: expected_bytes_hash.clone(),
@@ -2168,6 +2239,16 @@ fn e2e_persisted_scrollback_bytes_survive_engine_rebuild_but_replay_is_rejected(
                 PaneContractCheck::not_tested("process_continuity"),
             ],
         });
+        let success = safe_rejection
+            && persisted_metadata_matches
+            && checkpoint_boundary_matches
+            && persisted_bytes_match
+            && candidate.session_id == captured_session_id
+            && checkpoint.checkpoint_id == captured_checkpoint_id
+            && no_mux_effects
+            && no_authority_effects
+            && remains_restore_candidate
+            && report.all_pane_contracts_exercised_and_pass();
         add_phase(
             &mut report,
             "verify_persistence_and_no_restore_side_effects",

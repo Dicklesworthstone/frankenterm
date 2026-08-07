@@ -4116,6 +4116,7 @@ dependencies = [
  "sha2 0.11.0",
  "shared_library",
  "shlex",
+ "socket2",
  "tabout",
  "tempfile",
  "terminfo",

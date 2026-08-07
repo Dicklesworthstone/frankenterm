@@ -34,7 +34,7 @@ pub use asupersync::types::Time as RuntimeTime;
 /// wildcard re-export of Asupersync's HTTP implementation.
 pub mod http {
     pub use asupersync::http::h1::http_client::ClientError;
-    pub use asupersync::http::h1::{HttpClient, Method};
+    pub use asupersync::http::h1::{HttpClient, Method, Response};
 }
 
 /// Narrow async-stream trait surface used by first-party streaming APIs.
@@ -3346,6 +3346,9 @@ pub mod process {
 
             std::process::Command::new(unix_kill_command())
                 .args(["-s", signal, &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status()
         }
 
@@ -3358,6 +3361,9 @@ pub mod process {
 
             std::process::Command::new(unix_kill_command())
                 .args(["-s", signal, &format!("-{process_group_id}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status()
         }
     }
@@ -3448,10 +3454,18 @@ pub mod process {
         if force {
             cmd.arg("/F");
         }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         cmd.status()
     }
 
-    pub(crate) fn configure_process_group(cmd: &mut std::process::Command) -> std::io::Result<()> {
+    /// Configure a freshly built command so its subprocess tree can be
+    /// terminated through [`send_signal_to_process_group`].
+    ///
+    /// Call this before `spawn`; the child PID is then the process-group/tree
+    /// identifier accepted by the signaling helpers below.
+    pub fn configure_process_group(cmd: &mut std::process::Command) -> std::io::Result<()> {
         PlatformProcessControl::configure_process_group(cmd)
     }
 
@@ -3919,7 +3933,9 @@ pub mod process {
 /// Re-exports the extension traits needed for TCP stream I/O.
 /// For Unix-specific I/O (BufReader, lines, etc.) see the `unix` module.
 pub mod io {
-    pub use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+    pub use asupersync::io::{
+        AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf,
+    };
 
     /// Read some bytes from an async reader into `buf`, returning how many
     /// bytes were read. Polyfill for tokio's `AsyncReadExt::read` which
@@ -3942,10 +3958,6 @@ pub mod io {
     }
 }
 
-/// Async I/O traits for the active runtime.
-///
-/// Re-exports the extension traits needed for TCP stream I/O.
-/// For Unix-specific I/O (BufReader, lines, etc.) see the `unix` module.
 /// Async networking primitives for the active runtime.
 ///
 /// For Unix sockets, see the `unix` module.
@@ -3953,9 +3965,15 @@ pub mod net {
     pub use asupersync::net::{TcpListener, TcpStream};
 }
 
-/// Async networking primitives for the active runtime.
+/// Canonical distributed TLS transport surface.
 ///
-/// For Unix sockets, see the `unix` module.
+/// Keeping these constructors behind the project-owned async module prevents
+/// first-party callers from coupling directly to asupersync's module layout.
+#[cfg(feature = "distributed")]
+pub mod tls {
+    pub use asupersync::tls::{TlsAcceptor, TlsConnector};
+}
+
 /// Signal handling primitives for graceful shutdown.
 ///
 /// Wraps `asupersync::signal` for the asupersync runtime.

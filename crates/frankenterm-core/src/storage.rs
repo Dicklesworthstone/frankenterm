@@ -50,8 +50,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{EventDeliveryLeaseBatchError, Result, StorageError};
 use crate::checkpoint_witness::{
-    CHECKPOINT_ROLE_SNAPSHOT, PersistedPaneState,
+    CHECKPOINT_ROLE_SNAPSHOT, MAX_CHECKPOINT_METADATA_BYTES,
+    MAX_CHECKPOINT_SESSION_ID_BYTES, MAX_CHECKPOINT_TYPE_BYTES,
+    MAX_PERSISTED_CHECKPOINT_TEXT_BYTES, MAX_PERSISTED_PANE_TEXT_BYTES,
+    MAX_SESSION_FT_VERSION_BYTES, MAX_SESSION_HOST_ID_BYTES, PersistedPaneState,
     canonical_json_string as canonical_checkpoint_json_string, checkpoint_witness,
+    persisted_pane_text_bytes,
 };
 use crate::capture_authority::CapturePersistenceHold;
 use crate::config::{
@@ -79,6 +83,7 @@ use crate::storage_backend_trait::with_test_storage_backend;
 use crate::storage_backend_trait::{
     BackendError, RusqliteBackend, SqlCell, StorageBackend, ToSqlValue,
 };
+use crate::session_topology::{MAX_SNAPSHOT_BYTES, MAX_TOPOLOGY_PANES};
 use crate::storage_pane_id_set::{PaneIdSet, PaneIdTempTablePlan};
 use crate::storage_telemetry::StoragePipelineSnapshot;
 #[cfg(test)]
@@ -1302,10 +1307,11 @@ enum WriteCommand {
         value: String,
         respond: oneshot::Sender<Result<()>>,
     },
-    /// Insert a new mux session record
+    /// Insert a new mux session record whose topology has already been parsed,
+    /// structurally validated, and canonicalized off the writer thread.
     InsertMuxSession {
         session_id: String,
-        topology_json: String,
+        prepared: PreparedMuxSession,
         ft_version: String,
         host_id: Option<String>,
         respond: oneshot::Sender<Result<()>>,
@@ -7436,6 +7442,10 @@ impl StorageHandle {
     // =========================================================================
 
     /// Insert a new mux session record.
+    ///
+    /// Identity fields and raw topology bytes are admitted synchronously. JSON
+    /// parsing/canonicalization then runs on the blocking pool before the
+    /// prepared projection can enter the serialized writer queue.
     pub async fn insert_mux_session(
         &self,
         session_id: String,
@@ -7459,13 +7469,26 @@ impl StorageHandle {
         host_id: Option<String>,
     ) -> Result<()> {
         Self::checkpoint_storage_operation(cx, "insert_mux_session")?;
+        validate_mux_session_admission(
+            &session_id,
+            topology_json.len(),
+            &ft_version,
+            host_id.as_deref(),
+        )
+        .map_err(session_persistence_admission_error)?;
+        let prepared = Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Mux session topology preparation failed",
+            move || prepare_mux_session(topology_json),
+        )
+        .await?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
                 cx,
                 WriteCommand::InsertMuxSession {
                     session_id,
-                    topology_json,
+                    prepared,
                     ft_version,
                     host_id,
                     respond: tx,
@@ -7478,6 +7501,8 @@ impl StorageHandle {
 
     /// Insert a snapshot checkpoint with row-local topology and per-pane state.
     /// Returns an exact commit receipt suitable for clean-shutdown admission.
+    /// Raw identity, row-count, row-local text, metadata, and aggregate byte
+    /// limits are enforced before any JSON parse or projection clone.
     pub async fn insert_session_checkpoint(
         &self,
         session_id: String,
@@ -7510,16 +7535,14 @@ impl StorageHandle {
         pane_states: Vec<SessionPaneStateRow>,
     ) -> Result<SessionCheckpointReceipt> {
         Self::checkpoint_storage_operation(cx, "insert_session_checkpoint")?;
+        validate_checkpoint_identity_admission(&session_id, &checkpoint_type)
+            .map_err(session_persistence_admission_error)?;
+        let admitted = admit_raw_session_checkpoint(topology_json, metadata_json, pane_states)
+            .map_err(session_persistence_admission_error)?;
         let prepared = Self::spawn_blocking_storage_with_cx_with_join_error(
             cx,
             "Session checkpoint preparation failed",
-            move || {
-                prepare_session_checkpoint(
-                    topology_json.as_str(),
-                    metadata_json.as_deref(),
-                    &pane_states,
-                )
-            },
+            move || prepare_session_checkpoint(admitted),
         )
         .await?;
         let (tx, rx) = oneshot::channel();
@@ -17381,7 +17404,7 @@ fn dispatch_write_command_raw(
         }
         WriteCommand::InsertMuxSession {
             session_id,
-            topology_json,
+            prepared,
             ft_version,
             host_id,
             respond,
@@ -17393,7 +17416,7 @@ fn dispatch_write_command_raw(
             let result = insert_mux_session_backend(
                 backend,
                 &session_id,
-                &topology_json,
+                &prepared,
                 &ft_version,
                 host_id.as_deref(),
             );
@@ -21946,21 +21969,28 @@ fn agent_profile_from_backend_cells(
 /// Insert a new mux_sessions row (writer-thread, backend-trait path).
 ///
 /// br-ft-l1jgo writer-thread migration: replaces the legacy direct-rusqlite
-/// mux-session insert helper. Routes the INSERT through the trait surface using
-/// `execute_typed`. Same shape as the
-/// `prune_session_checkpoints_backend` (c72156eb4),
+/// mux-session insert helper. The caller supplies a topology projection already
+/// parsed and canonicalized off the writer thread; this function performs only
+/// bounded field revalidation and the INSERT through `execute_typed`. Same
+/// shape as the `prune_session_checkpoints_backend` (c72156eb4),
 /// `upsert_action_undo_backend` (81589276c), and
 /// `insert_prepared_plan_backend` (1c3e5e433) slices. Called from
 /// the writer-thread dispatcher.
 fn insert_mux_session_backend(
     backend: &dyn StorageBackend,
     session_id: &str,
-    topology_json: &str,
+    prepared: &PreparedMuxSession,
     ft_version: &str,
     host_id: Option<&str>,
 ) -> Result<()> {
+    validate_mux_session_admission(
+        session_id,
+        prepared.topology_json.len(),
+        ft_version,
+        host_id,
+    )
+    .map_err(session_persistence_admission_error)?;
     let now = now_ms();
-    let (_, topology_json) = prepare_checkpoint_topology(topology_json)?;
     let host_id_value = match host_id {
         Some(s) => ToSqlValue::Text(s),
         None => ToSqlValue::Null,
@@ -21972,13 +22002,234 @@ fn insert_mux_session_backend(
         &[
             ToSqlValue::Text(session_id),
             ToSqlValue::Integer(now),
-            ToSqlValue::Text(topology_json.as_str()),
+            ToSqlValue::Text(prepared.topology_json.as_str()),
             ToSqlValue::Text(ft_version),
             host_id_value,
         ],
     )
     .map_err(|err| storage_backend_error("Failed to insert mux session", err))?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum SessionPersistenceAdmissionError {
+    #[error("session persistence field {field} must not be empty")]
+    EmptyRequiredField { field: &'static str },
+    #[error(
+        "session persistence resource limit exceeded for {resource}: observed {observed}, limit {limit}"
+    )]
+    ResourceLimit {
+        resource: &'static str,
+        observed: usize,
+        limit: usize,
+    },
+    #[error("session persistence byte count overflow for {resource}")]
+    ByteCountOverflow { resource: &'static str },
+}
+
+fn session_persistence_admission_error(
+    error: SessionPersistenceAdmissionError,
+) -> crate::error::Error {
+    StorageError::Database(error.to_string()).into()
+}
+
+fn require_session_persistence_limit(
+    resource: &'static str,
+    observed: usize,
+    limit: usize,
+) -> std::result::Result<(), SessionPersistenceAdmissionError> {
+    if observed > limit {
+        return Err(SessionPersistenceAdmissionError::ResourceLimit {
+            resource,
+            observed,
+            limit,
+        });
+    }
+    Ok(())
+}
+
+fn validate_required_session_persistence_text(
+    field: &'static str,
+    value: &str,
+    limit: usize,
+) -> std::result::Result<(), SessionPersistenceAdmissionError> {
+    if value.is_empty() {
+        return Err(SessionPersistenceAdmissionError::EmptyRequiredField { field });
+    }
+    require_session_persistence_limit(field, value.len(), limit)
+}
+
+fn validate_mux_session_admission(
+    session_id: &str,
+    topology_bytes: usize,
+    ft_version: &str,
+    host_id: Option<&str>,
+) -> std::result::Result<(), SessionPersistenceAdmissionError> {
+    validate_required_session_persistence_text(
+        "session_id",
+        session_id,
+        MAX_CHECKPOINT_SESSION_ID_BYTES,
+    )?;
+    require_session_persistence_limit("topology_json", topology_bytes, MAX_SNAPSHOT_BYTES)?;
+    validate_required_session_persistence_text(
+        "ft_version",
+        ft_version,
+        MAX_SESSION_FT_VERSION_BYTES,
+    )?;
+    if let Some(host_id) = host_id {
+        require_session_persistence_limit(
+            "host_id",
+            host_id.len(),
+            MAX_SESSION_HOST_ID_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_identity_admission(
+    session_id: &str,
+    checkpoint_type: &str,
+) -> std::result::Result<(), SessionPersistenceAdmissionError> {
+    validate_required_session_persistence_text(
+        "session_id",
+        session_id,
+        MAX_CHECKPOINT_SESSION_ID_BYTES,
+    )?;
+    validate_required_session_persistence_text(
+        "checkpoint_type",
+        checkpoint_type,
+        MAX_CHECKPOINT_TYPE_BYTES,
+    )
+}
+
+fn checkpoint_projection_bytes<I>(
+    topology_bytes: usize,
+    metadata_bytes: usize,
+    pane_rows: usize,
+    pane_text_bytes: I,
+) -> std::result::Result<usize, SessionPersistenceAdmissionError>
+where
+    I: IntoIterator<Item = std::result::Result<usize, SessionPersistenceAdmissionError>>,
+{
+    require_session_persistence_limit("topology_json", topology_bytes, MAX_SNAPSHOT_BYTES)?;
+    require_session_persistence_limit(
+        "checkpoint metadata bytes",
+        metadata_bytes,
+        MAX_CHECKPOINT_METADATA_BYTES,
+    )?;
+    require_session_persistence_limit("checkpoint pane rows", pane_rows, MAX_TOPOLOGY_PANES)?;
+
+    let mut total = topology_bytes.checked_add(metadata_bytes).ok_or(
+        SessionPersistenceAdmissionError::ByteCountOverflow {
+            resource: "checkpoint text bytes",
+        },
+    )?;
+    require_session_persistence_limit(
+        "checkpoint text bytes",
+        total,
+        MAX_PERSISTED_CHECKPOINT_TEXT_BYTES,
+    )?;
+
+    for pane_bytes in pane_text_bytes {
+        let pane_bytes = pane_bytes?;
+        require_session_persistence_limit(
+            "pane text bytes",
+            pane_bytes,
+            MAX_PERSISTED_PANE_TEXT_BYTES,
+        )?;
+        total = total.checked_add(pane_bytes).ok_or(
+            SessionPersistenceAdmissionError::ByteCountOverflow {
+                resource: "checkpoint text bytes",
+            },
+        )?;
+        require_session_persistence_limit(
+            "checkpoint text bytes",
+            total,
+            MAX_PERSISTED_CHECKPOINT_TEXT_BYTES,
+        )?;
+    }
+    Ok(total)
+}
+
+fn raw_session_pane_text_bytes(
+    pane: &SessionPaneStateRow,
+) -> std::result::Result<usize, SessionPersistenceAdmissionError> {
+    [
+        pane.cwd.as_ref().map_or(0, String::len),
+        pane.command.as_ref().map_or(0, String::len),
+        pane.env_json.as_ref().map_or(0, String::len),
+        pane.terminal_state_json.len(),
+        pane.agent_metadata_json.as_ref().map_or(0, String::len),
+    ]
+    .into_iter()
+    .try_fold(0usize, |total, bytes| {
+        total.checked_add(bytes).ok_or(
+            SessionPersistenceAdmissionError::ByteCountOverflow {
+                resource: "pane text bytes",
+            },
+        )
+    })
+}
+
+fn validate_raw_session_checkpoint_projection(
+    topology_json: &str,
+    metadata_json: Option<&str>,
+    pane_states: &[SessionPaneStateRow],
+) -> std::result::Result<usize, SessionPersistenceAdmissionError> {
+    checkpoint_projection_bytes(
+        topology_json.len(),
+        metadata_json.map_or(0, str::len),
+        pane_states.len(),
+        pane_states.iter().map(raw_session_pane_text_bytes),
+    )
+}
+
+fn validate_prepared_session_checkpoint_projection(
+    topology_json: &str,
+    metadata_json: Option<&str>,
+    panes: &[PersistedPaneState],
+) -> std::result::Result<usize, SessionPersistenceAdmissionError> {
+    checkpoint_projection_bytes(
+        topology_json.len(),
+        metadata_json.map_or(0, str::len),
+        panes.len(),
+        panes.iter().map(|pane| {
+            persisted_pane_text_bytes(pane).ok_or(
+                SessionPersistenceAdmissionError::ByteCountOverflow {
+                    resource: "pane text bytes",
+                },
+            )
+        }),
+    )
+}
+
+#[derive(Debug)]
+struct AdmittedRawSessionCheckpoint {
+    topology_json: String,
+    metadata_json: Option<String>,
+    pane_states: Vec<SessionPaneStateRow>,
+}
+
+fn admit_raw_session_checkpoint(
+    topology_json: String,
+    metadata_json: Option<String>,
+    pane_states: Vec<SessionPaneStateRow>,
+) -> std::result::Result<AdmittedRawSessionCheckpoint, SessionPersistenceAdmissionError> {
+    validate_raw_session_checkpoint_projection(
+        &topology_json,
+        metadata_json.as_deref(),
+        &pane_states,
+    )?;
+    Ok(AdmittedRawSessionCheckpoint {
+        topology_json,
+        metadata_json,
+        pane_states,
+    })
+}
+
+#[derive(Debug)]
+struct PreparedMuxSession {
+    topology_json: String,
 }
 
 #[derive(Debug)]
@@ -22034,47 +22285,72 @@ fn prepare_checkpoint_topology(
     Ok((topology, canonical))
 }
 
+fn prepare_mux_session(topology_json: String) -> Result<PreparedMuxSession> {
+    require_session_persistence_limit(
+        "topology_json",
+        topology_json.len(),
+        MAX_SNAPSHOT_BYTES,
+    )
+    .map_err(session_persistence_admission_error)?;
+    let (_, topology_json) = prepare_checkpoint_topology(&topology_json)?;
+    require_session_persistence_limit(
+        "topology_json",
+        topology_json.len(),
+        MAX_SNAPSHOT_BYTES,
+    )
+    .map_err(session_persistence_admission_error)?;
+    Ok(PreparedMuxSession { topology_json })
+}
+
 fn prepare_session_checkpoint(
-    topology_json: &str,
-    metadata_json: Option<&str>,
-    pane_states: &[SessionPaneStateRow],
+    admitted: AdmittedRawSessionCheckpoint,
 ) -> Result<PreparedSessionCheckpoint> {
-    let (topology, topology_json) = prepare_checkpoint_topology(topology_json)?;
+    let AdmittedRawSessionCheckpoint {
+        topology_json,
+        metadata_json,
+        pane_states,
+    } = admitted;
+    let (topology, topology_json) = prepare_checkpoint_topology(&topology_json)?;
     let metadata_json = metadata_json
-        .map(|json| canonicalize_checkpoint_json_text("metadata", json))
+        .map(|json| canonicalize_checkpoint_json_text("metadata", &json))
         .transpose()?;
     let mut panes = Vec::with_capacity(pane_states.len());
     let mut total_bytes = 0_usize;
 
     for pane in pane_states {
-        if pane
-            .scrollback_checkpoint_seq
-            .is_some_and(|sequence| sequence < 0)
-        {
+        let SessionPaneStateRow {
+            pane_id,
+            cwd,
+            command,
+            env_json: raw_env_json,
+            terminal_state_json: raw_terminal_state_json,
+            agent_metadata_json: raw_agent_metadata_json,
+            scrollback_checkpoint_seq,
+            last_output_at,
+        } = pane;
+        if scrollback_checkpoint_seq.is_some_and(|sequence| sequence < 0) {
             return Err(StorageError::Database(format!(
                 "Invalid negative scrollback sequence for pane {}",
-                pane.pane_id
+                pane_id
             ))
             .into());
         }
-        if pane.last_output_at.is_some_and(|timestamp| timestamp < 0) {
+        if last_output_at.is_some_and(|timestamp| timestamp < 0) {
             return Err(StorageError::Database(format!(
                 "Invalid negative last-output timestamp for pane {}",
-                pane.pane_id
+                pane_id
             ))
             .into());
         }
 
-        let env_json = pane
-            .env_json
+        let env_json = raw_env_json
             .as_deref()
             .map(|json| canonicalize_checkpoint_json_text("pane environment", json))
             .transpose()?;
         let terminal_state_json = canonicalize_typed_checkpoint_json::<
             crate::session_pane_state::TerminalState,
-        >("pane terminal state", &pane.terminal_state_json)?;
-        let agent_metadata_json = pane
-            .agent_metadata_json
+        >("pane terminal state", &raw_terminal_state_json)?;
+        let agent_metadata_json = raw_agent_metadata_json
             .as_deref()
             .map(|json| {
                 canonicalize_typed_checkpoint_json::<crate::session_pane_state::AgentMetadata>(
@@ -22097,14 +22373,14 @@ fn prepare_session_checkpoint(
         })?;
 
         panes.push(PersistedPaneState {
-            pane_id: u64_to_i64(pane.pane_id, "mux_pane_state.pane_id")?,
-            cwd: pane.cwd.clone(),
-            command: pane.command.clone(),
+            pane_id: u64_to_i64(pane_id, "mux_pane_state.pane_id")?,
+            cwd,
+            command,
             env_json,
             terminal_state_json,
             agent_metadata_json,
-            scrollback_checkpoint_seq: pane.scrollback_checkpoint_seq,
-            last_output_at: pane.last_output_at,
+            scrollback_checkpoint_seq,
+            last_output_at,
         });
     }
 
@@ -22141,6 +22417,13 @@ fn prepare_session_checkpoint(
         .into());
     }
 
+    validate_prepared_session_checkpoint_projection(
+        &topology_json,
+        metadata_json.as_deref(),
+        &panes,
+    )
+    .map_err(session_persistence_admission_error)?;
+
     Ok(PreparedSessionCheckpoint {
         topology_json,
         metadata_json,
@@ -22162,6 +22445,8 @@ fn insert_session_checkpoint_backend(
     checkpoint_type: &str,
     prepared: &PreparedSessionCheckpoint,
 ) -> Result<SessionCheckpointReceipt> {
+    validate_checkpoint_identity_admission(session_id, checkpoint_type)
+        .map_err(session_persistence_admission_error)?;
     let now = now_ms();
 
     run_writer_transaction(
@@ -41384,6 +41669,252 @@ mod pool_telemetry_tests {
                 .await
                 .expect("shutdown mock-backed handle");
         });
+    }
+}
+
+#[cfg(test)]
+mod session_persistence_admission_tests {
+    use super::*;
+
+    const EMPTY_TOPOLOGY: &str =
+        "{\"captured_at\":0,\"schema_version\":1,\"windows\":[],\"workspace_id\":null}";
+
+    fn pane_with_terminal_json(terminal_state_json: String) -> SessionPaneStateRow {
+        SessionPaneStateRow {
+            pane_id: 1,
+            cwd: None,
+            command: None,
+            env_json: None,
+            terminal_state_json,
+            agent_metadata_json: None,
+            scrollback_checkpoint_seq: None,
+            last_output_at: None,
+        }
+    }
+
+    #[test]
+    fn malformed_oversized_metadata_hits_resource_admission_before_json_parse() {
+        let malformed_metadata = "{".repeat(MAX_CHECKPOINT_METADATA_BYTES + 1);
+        let admission = admit_raw_session_checkpoint(
+            EMPTY_TOPOLOGY.to_owned(),
+            Some(malformed_metadata),
+            Vec::new(),
+        )
+        .expect_err("oversized malformed metadata must fail before preparation");
+        assert!(matches!(
+            admission,
+            SessionPersistenceAdmissionError::ResourceLimit {
+                resource: "checkpoint metadata bytes",
+                observed,
+                limit: MAX_CHECKPOINT_METADATA_BYTES,
+            } if observed == MAX_CHECKPOINT_METADATA_BYTES + 1
+        ));
+
+        let message = session_persistence_admission_error(admission).to_string();
+        assert!(message.contains("resource limit exceeded for checkpoint metadata bytes"));
+        assert!(!message.contains("Invalid metadata JSON"));
+    }
+
+    #[test]
+    fn malformed_oversized_pane_json_hits_resource_admission_before_json_parse() {
+        let malformed_terminal = "{".repeat(MAX_PERSISTED_PANE_TEXT_BYTES + 1);
+        let pane = pane_with_terminal_json(malformed_terminal);
+        let admission = admit_raw_session_checkpoint(
+            EMPTY_TOPOLOGY.to_owned(),
+            None,
+            vec![pane],
+        )
+        .expect_err("oversized malformed pane JSON must fail before preparation");
+        assert!(matches!(
+            admission,
+            SessionPersistenceAdmissionError::ResourceLimit {
+                resource: "pane text bytes",
+                observed,
+                limit: MAX_PERSISTED_PANE_TEXT_BYTES,
+            } if observed == MAX_PERSISTED_PANE_TEXT_BYTES + 1
+        ));
+
+        let message = session_persistence_admission_error(admission).to_string();
+        assert!(message.contains("resource limit exceeded for pane text bytes"));
+        assert!(!message.contains("Invalid pane terminal state JSON"));
+    }
+
+    #[test]
+    fn raw_checkpoint_admission_rejects_excess_rows_without_visiting_payloads() {
+        let panes = (0..=MAX_TOPOLOGY_PANES)
+            .map(|pane_id| SessionPaneStateRow {
+                pane_id: u64::try_from(pane_id).unwrap(),
+                ..pane_with_terminal_json("{}".to_owned())
+            })
+            .collect::<Vec<_>>();
+        let error = validate_raw_session_checkpoint_projection(
+            EMPTY_TOPOLOGY,
+            None,
+            &panes,
+        )
+        .expect_err("excess pane rows must fail raw admission");
+        assert!(matches!(
+            error,
+            SessionPersistenceAdmissionError::ResourceLimit {
+                resource: "checkpoint pane rows",
+                observed,
+                limit: MAX_TOPOLOGY_PANES,
+            } if observed == MAX_TOPOLOGY_PANES + 1
+        ));
+    }
+
+    #[test]
+    fn aggregate_checkpoint_budget_is_enforced_without_large_allocations() {
+        let pane_rows = MAX_PERSISTED_CHECKPOINT_TEXT_BYTES
+            .div_ceil(MAX_PERSISTED_PANE_TEXT_BYTES)
+            + 1;
+        let error = checkpoint_projection_bytes(
+            0,
+            0,
+            pane_rows,
+            (0..pane_rows).map(|_| {
+                Ok::<usize, SessionPersistenceAdmissionError>(
+                    MAX_PERSISTED_PANE_TEXT_BYTES,
+                )
+            }),
+        )
+        .expect_err("aggregate checkpoint text must be bounded");
+        assert!(matches!(
+            error,
+            SessionPersistenceAdmissionError::ResourceLimit {
+                resource: "checkpoint text bytes",
+                observed,
+                limit: MAX_PERSISTED_CHECKPOINT_TEXT_BYTES,
+            } if observed > MAX_PERSISTED_CHECKPOINT_TEXT_BYTES
+        ));
+    }
+
+    #[test]
+    fn canonical_projection_is_rechecked_after_preparation() {
+        let pane = PersistedPaneState {
+            pane_id: 1,
+            cwd: None,
+            command: None,
+            env_json: None,
+            terminal_state_json: "x".repeat(MAX_PERSISTED_PANE_TEXT_BYTES + 1),
+            agent_metadata_json: None,
+            scrollback_checkpoint_seq: None,
+            last_output_at: None,
+        };
+        let error = validate_prepared_session_checkpoint_projection(
+            EMPTY_TOPOLOGY,
+            None,
+            &[pane],
+        )
+        .expect_err("canonical pane projection must be re-admitted");
+        assert!(matches!(
+            error,
+            SessionPersistenceAdmissionError::ResourceLimit {
+                resource: "pane text bytes",
+                observed,
+                limit: MAX_PERSISTED_PANE_TEXT_BYTES,
+            } if observed == MAX_PERSISTED_PANE_TEXT_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn identity_and_mux_metadata_admission_match_restore_reader_bounds() {
+        assert!(matches!(
+            validate_checkpoint_identity_admission("", "periodic"),
+            Err(SessionPersistenceAdmissionError::EmptyRequiredField {
+                field: "session_id"
+            })
+        ));
+        assert!(matches!(
+            validate_checkpoint_identity_admission("session", ""),
+            Err(SessionPersistenceAdmissionError::EmptyRequiredField {
+                field: "checkpoint_type"
+            })
+        ));
+        assert!(matches!(
+            validate_checkpoint_identity_admission(
+                &"s".repeat(MAX_CHECKPOINT_SESSION_ID_BYTES + 1),
+                "periodic",
+            ),
+            Err(SessionPersistenceAdmissionError::ResourceLimit {
+                resource: "session_id",
+                observed,
+                limit: MAX_CHECKPOINT_SESSION_ID_BYTES,
+            }) if observed == MAX_CHECKPOINT_SESSION_ID_BYTES + 1
+        ));
+        assert!(matches!(
+            validate_checkpoint_identity_admission(
+                "session",
+                &"t".repeat(MAX_CHECKPOINT_TYPE_BYTES + 1),
+            ),
+            Err(SessionPersistenceAdmissionError::ResourceLimit {
+                resource: "checkpoint_type",
+                observed,
+                limit: MAX_CHECKPOINT_TYPE_BYTES,
+            }) if observed == MAX_CHECKPOINT_TYPE_BYTES + 1
+        ));
+        assert!(matches!(
+            validate_mux_session_admission("session", EMPTY_TOPOLOGY.len(), "", None),
+            Err(SessionPersistenceAdmissionError::EmptyRequiredField {
+                field: "ft_version"
+            })
+        ));
+        assert!(matches!(
+            validate_mux_session_admission(
+                "session",
+                EMPTY_TOPOLOGY.len(),
+                &"v".repeat(MAX_SESSION_FT_VERSION_BYTES + 1),
+                None,
+            ),
+            Err(SessionPersistenceAdmissionError::ResourceLimit {
+                resource: "ft_version",
+                observed,
+                limit: MAX_SESSION_FT_VERSION_BYTES,
+            }) if observed == MAX_SESSION_FT_VERSION_BYTES + 1
+        ));
+        assert!(
+            validate_mux_session_admission(
+                "session",
+                EMPTY_TOPOLOGY.len(),
+                "version",
+                Some(""),
+            )
+            .is_ok(),
+            "an optional empty host identity remains reader-compatible"
+        );
+        assert!(matches!(
+            validate_mux_session_admission(
+                "session",
+                EMPTY_TOPOLOGY.len(),
+                "version",
+                Some(&"h".repeat(MAX_SESSION_HOST_ID_BYTES + 1)),
+            ),
+            Err(SessionPersistenceAdmissionError::ResourceLimit {
+                resource: "host_id",
+                observed,
+                limit: MAX_SESSION_HOST_ID_BYTES,
+            }) if observed == MAX_SESSION_HOST_ID_BYTES + 1
+        ));
+        assert!(matches!(
+            validate_mux_session_admission(
+                "session",
+                MAX_SNAPSHOT_BYTES + 1,
+                "version",
+                None,
+            ),
+            Err(SessionPersistenceAdmissionError::ResourceLimit {
+                resource: "topology_json",
+                observed,
+                limit: MAX_SNAPSHOT_BYTES,
+            }) if observed == MAX_SNAPSHOT_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn mux_session_preparation_canonicalizes_before_writer_handoff() {
+        let prepared = prepare_mux_session(format!("  {EMPTY_TOPOLOGY}  "))
+            .expect("bounded mux topology should prepare");
+        assert_eq!(prepared.topology_json, EMPTY_TOPOLOGY);
     }
 }
 
