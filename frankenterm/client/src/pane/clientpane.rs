@@ -1465,16 +1465,24 @@ impl Pane for ClientPane {
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
+        let input_serial = InputSerial::now();
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
         let data = text.to_owned();
         let request = client.client.send_paste(SendPaste {
             pane_id: remote_pane_id,
             data,
+            input_serial,
         });
-        dispatch_interactive_rpc(request, "send_paste")?;
+        // Serialize exact transport admission with speculative publication.
+        // The first poll is bounded to validation + try_send, so holding this
+        // authority cannot park the GUI thread; it prevents a fast dispatch
+        // acknowledgement from reconciling before the matching prediction is
+        // visible in the pane ledger.
         let renderable = self.renderable.lock();
         let mut inner = renderable.inner.borrow_mut();
+        dispatch_interactive_rpc(request, "send_paste")?;
+        inner.input_serial = input_serial;
         inner.predict_from_paste(text);
         inner.update_last_send();
         Ok(())
@@ -1577,9 +1585,12 @@ impl Pane for ClientPane {
             },
             input_serial,
         });
-        dispatch_interactive_rpc(request, "key_down")?;
+        // Keep the same pane authority across bounded admission and prediction
+        // publication. A response handler needs this lock before it can record
+        // the dispatch fence, so it cannot overtake the new prediction.
         let renderable = self.renderable.lock();
         let mut inner = renderable.inner.borrow_mut();
+        dispatch_interactive_rpc(request, "key_down")?;
         inner.input_serial = input_serial;
         inner.predict_from_key_event(key, mods);
         inner.update_last_send();
@@ -1869,7 +1880,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_interactive_input_does_not_publish_local_prediction_authority() {
+    fn rejected_interactive_inputs_do_not_publish_local_prediction_authority() {
         let inner = test_client_inner(17);
         let pane = test_client_pane(&inner, 40, 29);
         let before = pane.renderable.lock().inner.borrow().input_serial;
@@ -1879,6 +1890,15 @@ mod tests {
 
         let after = pane.renderable.lock().inner.borrow().input_serial;
         assert_eq!(after, before, "rejected input must not advance prediction authority");
+
+        pane.send_paste("paste")
+            .expect_err("closed test transport must reject paste during exact admission");
+
+        let after_paste = pane.renderable.lock().inner.borrow().input_serial;
+        assert_eq!(
+            after_paste, before,
+            "rejected paste must not advance prediction authority"
+        );
     }
 
     fn test_render_application_update(

@@ -57,7 +57,7 @@ static NEXT_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
 /// each nonzero value unique even under concurrent allocation.
 fn allocate_monotonic_nonzero(counter: &AtomicU64) -> Option<u64> {
     counter
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             (current != 0).then_some(current.wrapping_add(1))
         })
         .ok()

@@ -60,10 +60,10 @@ const PREDICT_SUPPRESS_SCORE: i32 = -4;
 const PREDICT_SUPPRESS_COOLDOWN: Duration = Duration::from_secs(2);
 /// Hard memory/work bound for speculative cell overlays on one pane.
 ///
-/// A paste is not serial-correlated on the wire and an input stream can outrun
-/// acknowledgement under disconnect or extreme latency. Refuse further
-/// prediction instead of allowing pane-local speculative state to grow without
-/// bound.
+/// Paste and key predictions are serial-correlated with a dispatch fence, but
+/// an input stream can still outrun acknowledgement under disconnect or
+/// extreme latency. Refuse further prediction instead of allowing pane-local
+/// speculative state to grow without bound.
 const MAX_PENDING_PREDICTIONS: usize = 4096;
 
 /// Best-effort heuristic: does this line look like a secret prompt (password /
@@ -583,6 +583,11 @@ impl RenderableInner {
         }
     }
 
+    fn suppress_prediction_after_local_failure(&mut self) {
+        self.prediction_score = PREDICT_SUPPRESS_SCORE;
+        self.last_prediction_miss = Instant::now();
+    }
+
     /// Compute a "prediction" and apply it to the line data that we
     /// have available, marking it as dirty so that it gets rendered.
     /// The prediction is basically just local echo.
@@ -602,6 +607,21 @@ impl RenderableInner {
         col: usize,
         predicted: Cell,
     ) -> bool {
+        let Some(end_col) = col.checked_add(predicted.width()) else {
+            self.suppress_prediction_after_local_failure();
+            return false;
+        };
+        if predicted.width() == 0
+            || col >= self.dimensions.cols
+            || end_col > self.dimensions.cols
+        {
+            // A prediction is eventually painted with `Line::set_cell`, which
+            // can materialize storage up to the requested column. Never let a
+            // malformed cursor or a wide glyph past the right edge turn local
+            // echo into an out-of-bounds allocation or an incorrect wrap.
+            self.suppress_prediction_after_local_failure();
+            return false;
+        }
         let now = Instant::now();
         let admitted = push_bounded_prediction(&mut self.predictions, Prediction {
             row,
@@ -702,17 +722,33 @@ impl RenderableInner {
 
         match c {
             KeyCode::Enter => {
+                let Some(next_row) = self.cursor_position.y.checked_add(1) else {
+                    self.suppress_prediction_after_local_failure();
+                    return;
+                };
                 self.cursor_position.x = 0;
-                self.cursor_position.y += 1;
+                self.cursor_position.y = next_row;
             }
             KeyCode::UpArrow => {
                 self.cursor_position.y = self.cursor_position.y.saturating_sub(1);
             }
             KeyCode::DownArrow => {
-                self.cursor_position.y += 1;
+                let Some(next_row) = self.cursor_position.y.checked_add(1) else {
+                    self.suppress_prediction_after_local_failure();
+                    return;
+                };
+                self.cursor_position.y = next_row;
             }
             KeyCode::RightArrow => {
-                self.cursor_position.x += 1;
+                let Some(next_col) = self.cursor_position.x.checked_add(1) else {
+                    self.suppress_prediction_after_local_failure();
+                    return;
+                };
+                if next_col >= self.dimensions.cols {
+                    self.suppress_prediction_after_local_failure();
+                    return;
+                }
+                self.cursor_position.x = next_col;
             }
             KeyCode::LeftArrow => {
                 self.cursor_position.x = self.cursor_position.x.saturating_sub(1);
@@ -735,11 +771,31 @@ impl RenderableInner {
                 // render time only while confidence is low (glitchless, 3d).
                 let cell = Cell::new(c, CellAttributes::default());
                 let width = cell.width();
+                // A control scalar or zero-width scalar is stateful: it may move the
+                // cursor, alter terminal state, or combine with an adjacent glyph.
+                // This overlay owns none of that context, so publishing it as a
+                // standalone cell would be visibly wrong.
+                if c.is_control() || width == 0 {
+                    self.suppress_prediction_after_local_failure();
+                    return;
+                }
                 let row = self.cursor_position.y;
                 let col = self.cursor_position.x;
+                let Some(next_col) = col.checked_add(width) else {
+                    self.suppress_prediction_after_local_failure();
+                    return;
+                };
+                // Reaching the final column sets terminal pending-wrap state,
+                // which this overlay does not represent. Leave that edge case
+                // to the authoritative stream rather than moving the synthetic
+                // cursor one column beyond the viewport.
+                if next_col >= self.dimensions.cols {
+                    self.suppress_prediction_after_local_failure();
+                    return;
+                }
                 if self.record_prediction(row, col, cell) {
                     // Adjust the cursor to reflect the width of this new cell
-                    self.cursor_position.x += width;
+                    self.cursor_position.x = next_col;
                 }
             }
             _ => {}
@@ -784,32 +840,42 @@ impl RenderableInner {
         }
     }
 
-    fn apply_paste_prediction(&mut self, paste_idx: usize, text: &str) -> bool {
-        // Plain glyphs; the underline cue is applied at render time (3d).
-        let attrs = CellAttributes::default();
-        let text_line = Line::from_text(text, &attrs, SEQ_ZERO, None);
-        let target_row = self.cursor_position.y + paste_idx as StableRowIndex;
-
-        if paste_idx == 0 {
-            // First pasted line is appended at the cursor.
-            for cell in text_line.visible_cells() {
-                let col = self.cursor_position.x;
-                if !self.record_prediction(target_row, col, cell.as_cell()) {
-                    return false;
-                }
-                self.cursor_position.x += cell.width();
-            }
-        } else {
-            // Subsequent pasted lines replace the row content from column 0.
-            let mut col = 0;
-            for cell in text_line.visible_cells() {
-                if !self.record_prediction(target_row, col, cell.as_cell()) {
-                    return false;
-                }
-                col += cell.width();
-            }
-            self.cursor_position.x = col;
+    fn apply_paste_prediction(
+        &mut self,
+        row: StableRowIndex,
+        starting_col: usize,
+        text_line: &Line,
+    ) -> bool {
+        let Some(final_col) = text_line
+            .visible_cells()
+            .try_fold(starting_col, |col, cell| col.checked_add(cell.width()))
+        else {
+            self.suppress_prediction_after_local_failure();
+            return false;
+        };
+        if final_col > self.dimensions.cols {
+            self.suppress_prediction_after_local_failure();
+            return false;
         }
+        let original_prediction_len = self.predictions.len();
+
+        let mut col = starting_col;
+        for cell in text_line.visible_cells() {
+            if !self.record_prediction(row, col, cell.as_cell()) {
+                self.predictions.truncate(original_prediction_len);
+                return false;
+            }
+            let Some(next_col) = col.checked_add(cell.width()) else {
+                // The preflight above makes this unreachable unless cell width
+                // semantics change between the two bounded iterations. Keep
+                // the transaction fail-closed rather than relying on a panic.
+                self.predictions.truncate(original_prediction_len);
+                self.suppress_prediction_after_local_failure();
+                return false;
+            };
+            col = next_col;
+        }
+        self.cursor_position.x = final_col;
         true
     }
 
@@ -828,33 +894,85 @@ impl RenderableInner {
             return;
         }
 
-        // Preflight before `textwrap::fill` duplicates or traverses an arbitrarily
-        // large paste. A Unicode scalar can produce at most one terminal cell here,
-        // so fitting the scalar count into the remaining cell budget guarantees
+        // Preflight before allocating line models or traversing an arbitrarily large
+        // paste. A Unicode scalar can produce at most one prediction record
+        // here, so fitting the scalar count into the remaining record budget guarantees
         // all-or-nothing admission. `take(remaining + 1)` keeps refusal work bounded
         // by the pane-local prediction ceiling rather than by the paste size.
         if !paste_fits_prediction_budget(self.predictions.len(), text) {
-            let now = Instant::now();
-            self.prediction_score = PREDICT_SUPPRESS_SCORE;
-            self.last_prediction_miss = now;
+            self.suppress_prediction_after_local_failure();
+            return;
+        }
+        // Tabs, carriage returns, and other controls depend on terminal/application
+        // state that this speculative overlay does not own. Rendering them as glyphs
+        // would be visibly wrong, so leave those pastes to the authoritative stream.
+        if text.chars().any(|c| c != '\n' && c.is_control()) {
+            self.suppress_prediction_after_local_failure();
             return;
         }
 
-        let text = textwrap::fill(text, self.dimensions.cols);
-        let lines: Vec<&str> = text.split("\n").collect();
+        // Preserve explicit line boundaries exactly. `textwrap::fill` performs word
+        // wrapping, whereas a terminal hard-wraps by cell at the right margin; the
+        // former can move spaces and words to different rows. Until the speculative
+        // state carries the terminal's exact wrap mode, reject implicit wrapping
+        // rather than painting a plausible-but-wrong layout.
+        let attrs = CellAttributes::default();
+        let lines: Vec<Line> = text
+            .split('\n')
+            .map(|line| Line::from_text(line, &attrs, SEQ_ZERO, None))
+            .collect();
+        let Some(final_cursor_row) = StableRowIndex::try_from(lines.len().saturating_sub(1))
+            .ok()
+            .and_then(|additional_rows| self.cursor_position.y.checked_add(additional_rows))
+        else {
+            self.suppress_prediction_after_local_failure();
+            return;
+        };
 
-        for (idx, paste_line) in lines.iter().enumerate() {
-            let row = self.cursor_position.y + idx as StableRowIndex;
+        let original_cursor = self.cursor_position;
+        let original_prediction_len = self.predictions.len();
+        let mut final_columns = Vec::with_capacity(lines.len());
+        for (idx, line) in lines.iter().enumerate() {
+            let starting_col = if idx == 0 { original_cursor.x } else { 0 };
+            if line.visible_cells().any(|cell| cell.width() == 0) {
+                // A leading/non-composed combining cell depends on neighboring
+                // terminal state. Do not advance the synthetic cursor while
+                // omitting a cell that this overlay cannot represent exactly.
+                self.suppress_prediction_after_local_failure();
+                return;
+            }
+            let Some(final_col) = line
+                .visible_cells()
+                .try_fold(starting_col, |col, cell| col.checked_add(cell.width()))
+            else {
+                self.suppress_prediction_after_local_failure();
+                return;
+            };
+            if line.visible_cells().next().is_some() && final_col >= self.dimensions.cols {
+                self.suppress_prediction_after_local_failure();
+                return;
+            }
+            final_columns.push(final_col);
+        }
+
+        for (idx, (row, paste_line)) in (original_cursor.y..=final_cursor_row)
+            .zip(lines.iter())
+            .enumerate()
+        {
             // Only predict for rows we already have cached; recorded as an overlay.
             let cached = matches!(
                 self.lines.peek(&row),
                 Some(LineEntry::Line(_) | LineEntry::Stale(_) | LineEntry::LineAndFetching(..))
             );
-            if cached && !self.apply_paste_prediction(idx, paste_line) {
+            let starting_col = if idx == 0 { original_cursor.x } else { 0 };
+            if cached && !self.apply_paste_prediction(row, starting_col, paste_line) {
+                self.predictions.truncate(original_prediction_len);
+                self.cursor_position = original_cursor;
                 return;
             }
         }
-        self.cursor_position.y += lines.len().saturating_sub(1) as StableRowIndex;
+        self.cursor_position.y = final_cursor_row;
+        self.cursor_position.x = final_columns.last().copied().unwrap_or(original_cursor.x);
     }
 
     pub fn update_last_send(&mut self) {
@@ -1720,6 +1838,24 @@ impl ImageLru {
         }
     }
 
+    fn recompute_retained_bytes(&mut self) {
+        self.retained_bytes = self
+            .cache
+            .iter()
+            .try_fold(0usize, |total, (_, image)| {
+                total.checked_add(image.decoded_bytes)
+            })
+            .unwrap_or(usize::MAX);
+    }
+
+    fn forget_retained_bytes(&mut self, bytes: usize) {
+        if let Some(retained) = self.retained_bytes.checked_sub(bytes) {
+            self.retained_bytes = retained;
+        } else {
+            self.recompute_retained_bytes();
+        }
+    }
+
     #[cfg(test)]
     fn get(
         &mut self,
@@ -1734,9 +1870,7 @@ impl ImageLru {
             .is_some_and(|validated| validated.data.current_content_hash() == *hash);
         if !is_current {
             if let Some(stale) = self.cache.pop(&key) {
-                self.retained_bytes = self
-                    .retained_bytes
-                    .saturating_sub(stale.decoded_bytes);
+                self.forget_retained_bytes(stale.decoded_bytes);
             }
             return None;
         }
@@ -1766,9 +1900,7 @@ impl ImageLru {
         });
         if is_same {
             if let Some(stale) = self.cache.pop(&key) {
-                self.retained_bytes = self
-                    .retained_bytes
-                    .saturating_sub(stale.decoded_bytes);
+                self.forget_retained_bytes(stale.decoded_bytes);
             }
         }
     }
@@ -1798,20 +1930,24 @@ impl ImageLru {
             return;
         }
         let key = (connection, pane_id, validated.source_revision);
-        self.failures.pop(&key);
+        let _ = self.failures.pop(&key);
         if let Some(old) = self.cache.pop(&key) {
-            self.retained_bytes = self
-                .retained_bytes
-                .saturating_sub(old.decoded_bytes);
+            self.forget_retained_bytes(old.decoded_bytes);
         }
 
         let decoded_bytes = validated.decoded_bytes;
-        if let Some((_, old)) = self.cache.push(key, validated) {
-            self.retained_bytes = self
-                .retained_bytes
-                .saturating_sub(old.decoded_bytes);
+        let retained_with_new = self.retained_bytes.checked_add(decoded_bytes);
+        let evicted = self.cache.push(key, validated);
+        if let Some(retained_with_new) = retained_with_new {
+            self.retained_bytes = retained_with_new;
+            if let Some((_, evicted)) = evicted {
+                self.forget_retained_bytes(evicted.decoded_bytes);
+            }
+        } else {
+            // The cache already contains the new entry at this point, so this
+            // repair observes exactly the authoritative post-insert contents.
+            self.recompute_retained_bytes();
         }
-        self.retained_bytes = self.retained_bytes.saturating_add(decoded_bytes);
         self.enforce_byte_budget();
     }
 
@@ -1848,13 +1984,11 @@ impl ImageLru {
 
     fn enforce_byte_budget(&mut self) {
         while self.retained_bytes > self.max_bytes {
-            let Some((_, old)) = self.cache.pop_lru() else {
-                self.retained_bytes = 0;
+            let Some((_, evicted)) = self.cache.pop_lru() else {
+                self.recompute_retained_bytes();
                 break;
             };
-            self.retained_bytes = self
-                .retained_bytes
-                .saturating_sub(old.decoded_bytes);
+            self.forget_retained_bytes(evicted.decoded_bytes);
         }
     }
 
@@ -2003,6 +2137,41 @@ fn put_cached_validated_image(
     true
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrdinaryImageBatchAdmission {
+    Accepted { next_decoded_bytes: usize },
+    BatchDecodedByteLimit,
+    DecodedByteOverflow,
+    RevisionChangedBeforeCachePublish,
+}
+
+/// Publish an individually valid image before deciding whether this particular
+/// line batch still has room to attach it. The global cache has its own strict
+/// entry and decoded-byte bounds, while the batch limit governs only the set
+/// retained by this hydration result. Keeping those authorities separate
+/// avoids fetching and decoding the same valid overflow-tail revision on every
+/// retry of an oversized aggregate.
+fn cache_and_admit_ordinary_image(
+    connection: Option<RenderConnectionIdentity>,
+    pane_id: PaneId,
+    accepted_decoded_bytes: usize,
+    validated: &ValidatedImageData,
+) -> OrdinaryImageBatchAdmission {
+    if connection.is_some_and(|identity| {
+        !put_cached_validated_image(identity, pane_id, validated.clone())
+    }) {
+        return OrdinaryImageBatchAdmission::RevisionChangedBeforeCachePublish;
+    }
+    let Some(next_decoded_bytes) = accepted_decoded_bytes.checked_add(validated.decoded_bytes)
+    else {
+        return OrdinaryImageBatchAdmission::DecodedByteOverflow;
+    };
+    if next_decoded_bytes > MAX_ORDINARY_IMAGE_BATCH_BYTES {
+        return OrdinaryImageBatchAdmission::BatchDecodedByteLimit;
+    }
+    OrdinaryImageBatchAdmission::Accepted { next_decoded_bytes }
+}
+
 fn record_image_hydration_rejection(reason: &'static str) {
     metrics::counter!(
         "mux.client.image_hydration.rejected.total",
@@ -2115,15 +2284,25 @@ async fn validate_image_off_main_thread(
                 Some(replacement) => Arc::new(replacement),
                 None => {
                     // A response payload is expected to be uniquely owned at
-                    // this trust boundary. Rewrap the payload after validation
-                    // so no external Arc can mutate it between validation,
-                    // cache publication, and row attachment.
+                    // this trust boundary. Rewrap the same validated ImageData
+                    // after proving uniqueness so its local, non-serializable
+                    // revision authority survives into the renderer; rebuilding
+                    // it from `into_data()` would discard that proof and force a
+                    // second full-buffer hash pass on the GUI thread.
                     let owned = Arc::try_unwrap(data).map_err(|_| {
                         ImageDataValidationError::SharedMutablePayload
                     })?;
-                    Arc::new(ImageData::with_data(owned.into_data()))
+                    Arc::new(owned)
                 }
             };
+            debug_assert_eq!(
+                immutable_data.validated_summary_for_content_revision(
+                    expected_revision,
+                    limits
+                ),
+                Some(normalized.summary),
+                "validated image rewrap must preserve local renderer authority"
+            );
             Ok(ValidatedImageData {
                 data: immutable_data,
                 decoded_bytes: normalized.summary.decoded_bytes,
@@ -2293,7 +2472,7 @@ pub(crate) async fn hydrate_lines(
         .iter()
         .map(|(hash, _)| *hash)
         .collect::<HashSet<_>>();
-    let hydration = stream::iter(requests.into_iter())
+    let hydration = stream::iter(requests)
         .map(|(expected_hash, locators)| async move {
             for request in locators {
                 let Some(_byte_permit) = acquire_image_hydration_bytes_until(deadline).await else {
@@ -2401,17 +2580,24 @@ pub(crate) async fn hydrate_lines(
                 continue;
             }
         };
-        let Some(next_bytes) = accepted_decoded_bytes.checked_add(validated.decoded_bytes) else {
-            record_image_hydration_rejection("decoded_byte_overflow");
-            break;
-        };
-        if next_bytes > MAX_ORDINARY_IMAGE_BATCH_BYTES {
-            record_image_hydration_rejection("batch_decoded_byte_limit");
-            break;
-        }
-        accepted_decoded_bytes = next_bytes;
-        if let Some(identity) = connection_identity {
-            if !put_cached_validated_image(identity, pane_id, validated.clone()) {
+        match cache_and_admit_ordinary_image(
+            connection_identity,
+            pane_id,
+            accepted_decoded_bytes,
+            &validated,
+        ) {
+            OrdinaryImageBatchAdmission::Accepted { next_decoded_bytes } => {
+                accepted_decoded_bytes = next_decoded_bytes;
+            }
+            OrdinaryImageBatchAdmission::BatchDecodedByteLimit => {
+                record_image_hydration_rejection("batch_decoded_byte_limit");
+                break;
+            }
+            OrdinaryImageBatchAdmission::DecodedByteOverflow => {
+                record_image_hydration_rejection("decoded_byte_overflow");
+                break;
+            }
+            OrdinaryImageBatchAdmission::RevisionChangedBeforeCachePublish => {
                 record_image_hydration_rejection("revision_changed_before_cache_publish");
                 continue;
             }
@@ -2664,7 +2850,7 @@ pub(crate) async fn hydrate_render_application_lines(
         .iter()
         .map(|(hash, _)| *hash)
         .collect::<HashSet<_>>();
-    let hydration = stream::iter(requests.into_iter())
+    let hydration = stream::iter(requests)
         .map(|(hash, locators)| async move {
             let result = async {
                 for request in locators {
@@ -3030,7 +3216,14 @@ impl RenderableState {
             let confident = inner.prediction_score >= PREDICT_CONFIDENT_SCORE;
             for p in &inner.predictions {
                 if p.row >= start && p.row < end {
-                    if let Some(line) = result.get_mut((p.row - start) as usize) {
+                    let Some(offset) = p
+                        .row
+                        .checked_sub(start)
+                        .and_then(|offset| usize::try_from(offset).ok())
+                    else {
+                        continue;
+                    };
+                    if let Some(line) = result.get_mut(offset) {
                         let mut cell = p.predicted.clone();
                         if !confident {
                             cell.attrs_mut().set_underline(Underline::Double);
@@ -3051,7 +3244,13 @@ impl RenderableState {
         // cached) costs nothing and never steals fetch budget from on-screen updates.
         // Off-screen rows join `to_fetch` but never `result` (they are not displayed).
         // [prefetch]
-        let span = (lines.end - lines.start).max(1);
+        let viewport_span = StableRowIndex::try_from(inner.dimensions.viewport_rows)
+            .unwrap_or(StableRowIndex::MAX)
+            .max(1);
+        let span = lines
+            .end
+            .saturating_sub(lines.start)
+            .clamp(1, viewport_span);
         let lo = lines.start.saturating_sub(span);
         let hi = lines.end.saturating_add(span);
         let needs_prefetch =
@@ -3227,31 +3426,43 @@ mod tests {
     use crate::client::TEST_RENDER_CONNECTION_IDENTITY;
     use super::{
         apply_prediction_reconciliation_to_score, base_poll_interval, expire_predictions,
-        initial_last_poll, mark_predictions_dispatched, rebuild_cache_as_stale,
-        paste_fits_prediction_budget, push_bounded_prediction,
+        cache_and_admit_ordinary_image, get_cached_validated_image, initial_last_poll,
+        mark_predictions_dispatched, paste_fits_prediction_budget, push_bounded_prediction,
+        push_image_locator, rebuild_cache_as_stale,
         reconcile_predictions_after_cached_terminal_change,
         reconcile_predictions_after_terminal_change, render_line_cache_capacity_for_values,
-        reset_prediction_state, should_apply_unilateral_delta, CachedImageFailure, FetchToken,
-        ImageLru, LineEntry, Prediction, PredictionReconciliation, ValidatedImageData,
+        reset_prediction_state, rows_requiring_image_retry, should_apply_unilateral_delta,
+        CachedImageFailure, FetchToken, ImageLru, LineEntry, OrdinaryImageBatchAdmission,
+        Prediction, PredictionReconciliation, ValidatedImageData,
+        IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES,
+        MAX_GLOBAL_IMAGE_HYDRATION_WORKING_SET_BYTES,
+        MAX_IMAGE_LOCATOR_ATTEMPTS_PER_REVISION, MAX_ORDINARY_IMAGE_BATCH_BYTES,
         MAX_PENDING_PREDICTIONS, PREDICT_CONFIDENT_SCORE,
     };
     use crate::client::Client;
     use crate::domain::{ClientDomainConfig, ClientInner};
     use crate::pane::ClientPane;
-    use codec::{InputSerial, RenderConnectionIdentity, TopologyStreamId};
+    use codec::{
+        GetImageCell, InputSerial, RenderConnectionIdentity, TopologyStreamId,
+        MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES, MAX_IMAGE_HYDRATION_DECODED_BYTES,
+    };
     use config::UnixDomain;
     use lru::LruCache;
     use mux::MuxSessionIncarnation;
+    use std::collections::{HashMap, HashSet};
     use std::num::NonZeroUsize;
     use std::sync::Arc;
-    use std::time::{Duration, Instant, UNIX_EPOCH};
+    use std::time::{Duration, Instant};
     use termwiz::cell::{Cell, CellAttributes};
     use termwiz::hyperlink::Rule;
     use termwiz::image::{ImageData, ImageDataType};
+    use wezterm_term::{KeyCode, KeyModifiers};
     use termwiz::surface::{SequenceNo, SEQ_ZERO};
     use wezterm_term::Line;
 
-    fn test_renderable_state() -> Arc<parking_lot::Mutex<super::RenderableState>> {
+    fn test_renderable_state_with_echo_threshold(
+        local_echo_threshold_ms: Option<u64>,
+    ) -> Arc<parking_lot::Mutex<super::RenderableState>> {
         let domain_id = 731;
         let unix = UnixDomain {
             name: "renderable-hyperlink-test".to_string(),
@@ -3264,7 +3475,7 @@ mod tests {
                 ClientDomainConfig::Unix(unix),
             ),
             None,
-            None,
+            local_echo_threshold_ms,
             false,
         ));
         let pane = ClientPane::new(
@@ -3285,6 +3496,10 @@ mod tests {
         Arc::clone(&pane.renderable)
     }
 
+    fn test_renderable_state() -> Arc<parking_lot::Mutex<super::RenderableState>> {
+        test_renderable_state_with_echo_threshold(None)
+    }
+
     fn test_image(width: u32, height: u32, fill: u8) -> Arc<ImageData> {
         Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
             width,
@@ -3303,7 +3518,7 @@ mod tests {
     }
 
     fn input_serial(millis: u64) -> InputSerial {
-        (UNIX_EPOCH + Duration::from_millis(millis)).into()
+        InputSerial::from_millis_since_epoch(millis)
     }
 
     fn prediction(
@@ -3329,6 +3544,216 @@ mod tests {
         let initial = initial_last_poll(now);
 
         assert!(now.duration_since(initial) >= base_poll_interval());
+    }
+
+    #[test]
+    fn paste_prediction_rejects_row_domain_overflow_before_mutation() {
+        let renderable = test_renderable_state_with_echo_threshold(Some(0));
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        inner.last_input_rtt = 1;
+        inner.cursor_position.y = wezterm_term::StableRowIndex::MAX;
+
+        inner.predict_from_paste("x\nx");
+
+        assert!(inner.predictions.is_empty());
+        assert_eq!(inner.cursor_position.y, wezterm_term::StableRowIndex::MAX);
+        assert_eq!(inner.prediction_score, super::PREDICT_SUPPRESS_SCORE);
+    }
+
+    #[test]
+    fn key_prediction_rejects_cursor_domain_overflow_before_mutation() {
+        let renderable = test_renderable_state_with_echo_threshold(Some(0));
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        inner.last_input_rtt = 1;
+        inner.cursor_position.x = 7;
+        inner.cursor_position.y = wezterm_term::StableRowIndex::MAX;
+        inner.lines.put(
+            wezterm_term::StableRowIndex::MAX,
+            LineEntry::Line(Line::from("ordinary prompt")),
+        );
+
+        inner.predict_from_key_event(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(inner.predictions.is_empty());
+        assert_eq!(inner.cursor_position.x, 7);
+        assert_eq!(inner.cursor_position.y, wezterm_term::StableRowIndex::MAX);
+        assert_eq!(inner.prediction_score, super::PREDICT_SUPPRESS_SCORE);
+    }
+
+    #[test]
+    fn typed_key_prediction_rejects_column_domain_overflow_before_recording() {
+        let renderable = test_renderable_state_with_echo_threshold(Some(0));
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        inner.last_input_rtt = 1;
+        inner.cursor_position.x = usize::MAX;
+        inner.cursor_position.y = 0;
+        inner
+            .lines
+            .put(0, LineEntry::Line(Line::from("ordinary prompt")));
+
+        inner.predict_from_key_event(KeyCode::Char('x'), KeyModifiers::NONE);
+
+        assert!(inner.predictions.is_empty());
+        assert_eq!(inner.cursor_position.x, usize::MAX);
+        assert_eq!(inner.cursor_position.y, 0);
+        assert_eq!(inner.prediction_score, super::PREDICT_SUPPRESS_SCORE);
+    }
+
+    #[test]
+    fn typed_key_prediction_rejects_unrepresentable_pending_wrap_at_right_margin() {
+        let renderable = test_renderable_state_with_echo_threshold(Some(0));
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        inner.last_input_rtt = 1;
+        inner.cursor_position.x = inner.dimensions.cols.saturating_sub(1);
+        inner.cursor_position.y = 0;
+        let original_cursor = inner.cursor_position;
+        inner
+            .lines
+            .put(0, LineEntry::Line(Line::from("ordinary prompt")));
+
+        inner.predict_from_key_event(KeyCode::Char('x'), KeyModifiers::NONE);
+
+        assert!(inner.predictions.is_empty());
+        assert_eq!(inner.cursor_position, original_cursor);
+        assert_eq!(inner.prediction_score, super::PREDICT_SUPPRESS_SCORE);
+    }
+
+    #[test]
+    fn typed_key_prediction_rejects_stateful_zero_width_scalar() {
+        let renderable = test_renderable_state_with_echo_threshold(Some(0));
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        inner.last_input_rtt = 1;
+        inner.cursor_position.x = 1;
+        inner.cursor_position.y = 0;
+        let original_cursor = inner.cursor_position;
+        inner
+            .lines
+            .put(0, LineEntry::Line(Line::from("ordinary prompt")));
+
+        inner.predict_from_key_event(KeyCode::Char('\u{0301}'), KeyModifiers::NONE);
+
+        assert!(inner.predictions.is_empty());
+        assert_eq!(inner.cursor_position, original_cursor);
+        assert_eq!(inner.prediction_score, super::PREDICT_SUPPRESS_SCORE);
+    }
+
+    #[test]
+    fn paste_prediction_rejects_column_domain_overflow_transactionally() {
+        let renderable = test_renderable_state_with_echo_threshold(Some(0));
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        inner.last_input_rtt = 1;
+        inner.cursor_position.x = usize::MAX;
+        inner.cursor_position.y = 0;
+        inner
+            .lines
+            .put(0, LineEntry::Line(Line::from("ordinary prompt")));
+
+        inner.predict_from_paste("x");
+
+        assert!(inner.predictions.is_empty());
+        assert_eq!(inner.cursor_position.x, usize::MAX);
+        assert_eq!(inner.cursor_position.y, 0);
+        assert_eq!(inner.prediction_score, super::PREDICT_SUPPRESS_SCORE);
+    }
+
+    #[test]
+    fn paste_prediction_preserves_explicit_rows_and_tracks_uncached_final_column() {
+        let renderable = test_renderable_state_with_echo_threshold(Some(0));
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        inner.last_input_rtt = 1;
+        inner
+            .lines
+            .put(0, LineEntry::Line(Line::from("ordinary prompt")));
+
+        inner.predict_from_paste("a\nbc");
+
+        assert_eq!(inner.predictions.len(), 1);
+        assert_eq!(inner.predictions[0].row, 0);
+        assert_eq!(inner.predictions[0].predicted.str(), "a");
+        assert_eq!(inner.cursor_position.x, 2);
+        assert_eq!(inner.cursor_position.y, 1);
+    }
+
+    #[test]
+    fn paste_prediction_rejects_implicit_word_wrap_instead_of_reflowing_text() {
+        let renderable = test_renderable_state_with_echo_threshold(Some(0));
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        inner.last_input_rtt = 1;
+        inner.cursor_position.x = inner.dimensions.cols.saturating_sub(2);
+        let original_cursor = inner.cursor_position;
+        inner
+            .lines
+            .put(0, LineEntry::Line(Line::from("ordinary prompt")));
+
+        inner.predict_from_paste("a b");
+
+        assert!(inner.predictions.is_empty());
+        assert_eq!(inner.cursor_position, original_cursor);
+        assert_eq!(inner.prediction_score, super::PREDICT_SUPPRESS_SCORE);
+    }
+
+    #[test]
+    fn paste_prediction_rejects_unrepresentable_pending_wrap_at_right_margin() {
+        let renderable = test_renderable_state_with_echo_threshold(Some(0));
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        inner.last_input_rtt = 1;
+        inner.cursor_position.x = inner.dimensions.cols.saturating_sub(1);
+        let original_cursor = inner.cursor_position;
+        inner
+            .lines
+            .put(0, LineEntry::Line(Line::from("ordinary prompt")));
+
+        inner.predict_from_paste("x");
+
+        assert!(inner.predictions.is_empty());
+        assert_eq!(inner.cursor_position, original_cursor);
+        assert_eq!(inner.prediction_score, super::PREDICT_SUPPRESS_SCORE);
+    }
+
+    #[test]
+    fn paste_prediction_rejects_stateful_control_characters() {
+        let renderable = test_renderable_state_with_echo_threshold(Some(0));
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        inner.last_input_rtt = 1;
+        inner
+            .lines
+            .put(0, LineEntry::Line(Line::from("ordinary prompt")));
+
+        inner.predict_from_paste("left\tright");
+
+        assert!(inner.predictions.is_empty());
+        assert_eq!(inner.cursor_position.x, 0);
+        assert_eq!(inner.cursor_position.y, 0);
+        assert_eq!(inner.prediction_score, super::PREDICT_SUPPRESS_SCORE);
+    }
+
+    #[test]
+    fn paste_prediction_rejects_unattached_zero_width_cell() {
+        let renderable = test_renderable_state_with_echo_threshold(Some(0));
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        inner.last_input_rtt = 1;
+        inner.cursor_position.x = 1;
+        let original_cursor = inner.cursor_position;
+        inner
+            .lines
+            .put(0, LineEntry::Line(Line::from("ordinary prompt")));
+
+        inner.predict_from_paste("\u{0301}");
+
+        assert!(inner.predictions.is_empty());
+        assert_eq!(inner.cursor_position, original_cursor);
+        assert_eq!(inner.prediction_score, super::PREDICT_SUPPRESS_SCORE);
     }
 
     #[test]
@@ -3503,7 +3928,10 @@ mod tests {
 
             for stable_row in 0..2 {
                 let Some(LineEntry::Line(line)) = inner.lines.get_mut(&stable_row) else {
-                    panic!("complete logical group row {stable_row} must be fresh");
+                    panic!(
+                        "complete logical group row {} must be fresh",
+                        stable_row
+                    );
                 };
                 assert!(line.has_hyperlink());
                 line.set_appdata(Arc::clone(&cached_shape));
@@ -3627,6 +4055,47 @@ mod tests {
         assert_eq!(reconciliation, PredictionReconciliation::default());
         assert_eq!(predictions.len(), 1);
         assert_eq!(predictions[0].dispatch_seqno, Some(10));
+    }
+
+    #[test]
+    fn paste_only_prediction_receives_dispatch_fence_and_reconciles_after_echo() {
+        let renderable = test_renderable_state_with_echo_threshold(Some(0));
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        let serial = input_serial(100);
+        inner.last_input_rtt = 1;
+        inner.input_serial = serial;
+        inner
+            .lines
+            .put(0, LineEntry::Line(Line::from("ordinary prompt")));
+
+        inner.predict_from_paste("x");
+
+        assert_eq!(inner.predictions.len(), 1);
+        assert_eq!(inner.predictions[0].input_serial, serial);
+        assert_eq!(inner.predictions[0].dispatch_seqno, None);
+
+        mark_predictions_dispatched(&mut inner.predictions, serial, 10);
+        assert_eq!(inner.predictions[0].dispatch_seqno, Some(10));
+
+        let authoritative_echo = vec![(
+            0,
+            Line::from_text("x", &CellAttributes::default(), 11, None),
+        )];
+        let reconciliation = reconcile_predictions_after_terminal_change(
+            &mut inner.predictions,
+            11,
+            &authoritative_echo,
+        );
+
+        assert_eq!(
+            reconciliation,
+            PredictionReconciliation {
+                confirmed: 1,
+                rejected: 0,
+            }
+        );
+        assert!(inner.predictions.is_empty());
     }
 
     #[test]
@@ -4155,6 +4624,35 @@ mod tests {
                 )
                 .is_none(),
             "expired transient failures must permit a retry"
+        );
+    }
+
+    #[test]
+    fn valid_overflow_tail_is_cached_without_joining_the_oversized_batch() {
+        let pane_id = 0x5eed;
+        let connection = RenderConnectionIdentity::new(
+            TopologyStreamId::from_bytes([0xd7; 16]),
+            MuxSessionIncarnation::from_bytes([0xe8; 16]),
+        );
+        let validated = validated_test_image(2, 2, 0x6a);
+        let revision = validated.source_revision;
+        let accepted_decoded_bytes = MAX_ORDINARY_IMAGE_BATCH_BYTES
+            .checked_sub(validated.decoded_bytes)
+            .expect("ordinary image limit must admit one tiny image")
+            .saturating_add(1);
+
+        assert_eq!(
+            cache_and_admit_ordinary_image(
+                Some(connection),
+                pane_id,
+                accepted_decoded_bytes,
+                &validated,
+            ),
+            OrdinaryImageBatchAdmission::BatchDecodedByteLimit,
+        );
+        assert!(
+            get_cached_validated_image(connection, pane_id, &revision).is_some(),
+            "an individually valid overflow-tail revision must be reusable without another RPC or decode"
         );
     }
 

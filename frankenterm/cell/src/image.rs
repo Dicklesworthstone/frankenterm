@@ -47,6 +47,12 @@ pub const IMAGE_WIRE_BYTES_V1_NEWTYPE: &str = "frankenterm.image.WireBytesV1";
 /// every serde format, not only the mux codec's varbincode reader, so JSON and
 /// lease-backed serialization cannot bypass the remote-render memory bound.
 pub const MAX_IMAGE_WIRE_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum decoded bytes accepted from a locally prepared image after it has
+/// published revision-bound validation authority. This is deliberately larger
+/// than the wire ceiling: local high-resolution backgrounds and generated
+/// gradients never traverse the mux wire, but still need an explicit renderer
+/// memory bound.
+pub const MAX_TRUSTED_LOCAL_IMAGE_DECODED_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_IMAGE_WIRE_FRAMES: usize = 4_096;
 
 #[cfg(feature = "use_serde")]
@@ -905,6 +911,19 @@ pub struct ImageDataValidationSummary {
     pub decoded_bytes: usize,
     /// Number of independently timed frames (one for a static image).
     pub frame_count: usize,
+}
+
+/// Local, non-serializable proof that one exact decoded payload revision has
+/// completed full structural and per-buffer hash validation.
+///
+/// This authority is deliberately private and revision-bound: peers cannot
+/// assert it on the wire, and every mutable access clears it before exposing
+/// the payload. Consumers may reuse the summary only while holding the image
+/// payload lock and confirming the exact current revision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ImageDataValidationAuthority {
+    revision: [u8; 32],
+    summary: ImageDataValidationSummary,
 }
 
 /// Result of admitting one image revision at a remote-render trust boundary.
@@ -1972,6 +1991,8 @@ pub struct ImageData {
     hash: [u8; 32],
     #[cfg_attr(feature = "use_serde", serde(skip, default))]
     current_revision: Mutex<Option<[u8; 32]>>,
+    #[cfg_attr(feature = "use_serde", serde(skip, default))]
+    validation_authority: Mutex<Option<ImageDataValidationAuthority>>,
 }
 
 /// Read-only image payload guard. Mutations must use [`ImageData::data_mut`]
@@ -2104,6 +2125,7 @@ impl ImageData {
             data: Mutex::new(data),
             hash,
             current_revision: Mutex::new(Some(current_revision)),
+            validation_authority: Mutex::new(None),
         }
     }
 
@@ -2121,12 +2143,43 @@ impl ImageData {
     fn with_validated_source_revision(
         data: ImageDataType,
         source_revision: [u8; 32],
+        summary: ImageDataValidationSummary,
     ) -> Self {
         Self {
             data: Mutex::new(data),
             hash: source_revision,
             current_revision: Mutex::new(Some(source_revision)),
+            validation_authority: Mutex::new(Some(ImageDataValidationAuthority {
+                revision: source_revision,
+                summary,
+            })),
         }
+    }
+
+    fn publish_validation_authority(
+        &self,
+        revision: [u8; 32],
+        summary: ImageDataValidationSummary,
+    ) {
+        let mut authority = self
+            .validation_authority
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                self.validation_authority.clear_poison();
+                poisoned.into_inner()
+            });
+        *authority = Some(ImageDataValidationAuthority { revision, summary });
+    }
+
+    fn clear_validation_authority(&self) {
+        let mut authority = self
+            .validation_authority
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                self.validation_authority.clear_poison();
+                poisoned.into_inner()
+            });
+        *authority = None;
     }
 
     fn revision_for_locked_data(&self, data: &ImageDataType) -> [u8; 32] {
@@ -2149,6 +2202,7 @@ impl ImageData {
             data: Mutex::new(data),
             hash,
             current_revision: Mutex::new(Some(hash)),
+            validation_authority: Mutex::new(None),
         }
     }
 
@@ -2184,6 +2238,24 @@ impl ImageData {
         });
         *cached = Some(revision);
         revision
+    }
+
+    /// Check an already-published revision without acquiring the payload lock
+    /// or deriving a missing revision.
+    ///
+    /// This fail-closed probe is for consumers that render an independently
+    /// owned immutable snapshot, such as decoded blob frames. Mutable access
+    /// clears the cached revision before waiting for the payload lock and
+    /// republishes it only after the edit completes, so `false` means that the
+    /// caller must not use its snapshot. Consumers reading the payload itself
+    /// must use [`Self::data_for_content_revision`] instead.
+    #[must_use]
+    pub fn cached_content_revision_is(&self, expected_revision: [u8; 32]) -> bool {
+        let cached = self.current_revision.lock().unwrap_or_else(|poisoned| {
+            self.current_revision.clear_poison();
+            poisoned.into_inner()
+        });
+        *cached == Some(expected_revision)
     }
 
     /// Validate a requested content revision and, when necessary, produce a
@@ -2282,6 +2354,10 @@ impl ImageData {
                         limits,
                         is_cancelled,
                     )?;
+                // `data` remains locked here, so no mutable writer can change
+                // the payload between full validation and publication of the
+                // local revision-bound authority.
+                self.publish_validation_authority(expected_revision, summary);
                 return Ok(ImageDataRevisionValidation {
                     summary,
                     // The client cache is explicitly keyed by the requested
@@ -2297,7 +2373,8 @@ impl ImageData {
             limits,
             is_cancelled,
         )?;
-        let replacement = Self::with_validated_source_revision(normalized, expected_revision);
+        let replacement =
+            Self::with_validated_source_revision(normalized, expected_revision, summary);
         debug_assert_eq!(replacement.hash(), expected_revision);
         debug_assert_eq!(replacement.current_content_hash(), expected_revision);
         Ok(ImageDataRevisionValidation {
@@ -2353,6 +2430,60 @@ impl ImageData {
         }))
     }
 
+    /// Acquire the payload only if it still belongs to `expected_revision`.
+    ///
+    /// The payload lock remains held by the returned guard, so a successful
+    /// check and every subsequent read through that guard are atomic with
+    /// respect to [`Self::data_mut`]. This follows the established
+    /// data-then-revision lock order used when a mutable guard republishes its
+    /// revision. It avoids rehashing decoded pixels on renderer cache hits:
+    /// the cached revision is authoritative while the payload cannot mutate.
+    pub fn data_for_content_revision(
+        &self,
+        expected_revision: [u8; 32],
+    ) -> Option<ImageDataReadGuard<'_>> {
+        let data = self.data();
+        (self.revision_for_locked_data(&data) == expected_revision).then_some(data)
+    }
+
+    /// Reuse a local full-validation proof for one exact decoded revision.
+    ///
+    /// Validation authority is never deserialized and is cleared before every
+    /// mutable access. This method holds the payload lock while it confirms the
+    /// current revision, proof revision, and caller limits, so a successful
+    /// result cannot race a mutation. `None` means that the caller must perform
+    /// full validation; it is never permission to trust the payload.
+    pub fn validated_summary_for_content_revision(
+        &self,
+        expected_revision: [u8; 32],
+        limits: ImageDataValidationLimits,
+    ) -> Option<ImageDataValidationSummary> {
+        let data = self.data();
+        if self.revision_for_locked_data(&data) != expected_revision {
+            return None;
+        }
+        let authority = self
+            .validation_authority
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                self.validation_authority.clear_poison();
+                poisoned.into_inner()
+            });
+        let authority = authority.as_ref()?;
+        if authority.revision != expected_revision
+            || authority.summary.decoded_bytes > limits.max_decoded_bytes
+            || authority.summary.frame_count > limits.max_frame_count
+        {
+            return None;
+        }
+        let (width, height) = match &*data {
+            ImageDataType::Rgba8 { width, height, .. }
+            | ImageDataType::AnimRgba8 { width, height, .. } => (*width, *height),
+            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => return None,
+        };
+        (width <= limits.max_width && height <= limits.max_height).then_some(authority.summary)
+    }
+
     /// Mutably access image pixels or animation metadata while maintaining the
     /// O(1) content-revision cache used by remote hydration and shape caching.
     pub fn data_mut(&self) -> ImageDataMutGuard<'_> {
@@ -2363,6 +2494,7 @@ impl ImageData {
             });
             *cached = None;
         }
+        self.clear_validation_authority();
         let data = self.data.lock().unwrap_or_else(|poisoned| {
             #[cfg(feature = "use_image")]
             log::warn!(
@@ -2382,6 +2514,7 @@ impl ImageData {
             });
             *cached = None;
         }
+        self.clear_validation_authority();
         ImageDataMutGuard {
             data,
             current_revision: &self.current_revision,
@@ -3192,6 +3325,63 @@ mod tests {
     }
 
     #[test]
+    fn revision_validated_read_guard_rejects_stale_key_and_accepts_current_payload() {
+        let image = ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![1, 2, 3, 4],
+        ));
+        let stale_revision = image.current_content_hash();
+
+        {
+            let mut payload = image.data_mut();
+            *payload = ImageDataType::new_single_frame(1, 1, vec![9, 8, 7, 6]);
+        }
+
+        let current_revision = image.current_content_hash();
+        assert_ne!(current_revision, stale_revision);
+        assert!(
+            image.data_for_content_revision(stale_revision).is_none(),
+            "a stale renderer key must not acquire the mutated payload"
+        );
+
+        let payload = image
+            .data_for_content_revision(current_revision)
+            .expect("the current renderer key acquires a stable payload guard");
+        let ImageDataType::Rgba8 { data, .. } = &*payload else {
+            panic!("expected RGBA payload");
+        };
+        assert_eq!(data, &[9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn cached_revision_probe_fails_closed_during_mutation_and_rebinds_after_drop() {
+        let image = ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![1, 2, 3, 4],
+        ));
+        let old_revision = image.current_content_hash();
+        assert!(image.cached_content_revision_is(old_revision));
+
+        let mut payload = image.data_mut();
+        assert!(
+            !image.cached_content_revision_is(old_revision),
+            "a snapshot must stop being authoritative before mutable payload access begins"
+        );
+        let ImageDataType::Rgba8 { data, .. } = &mut *payload else {
+            panic!("expected RGBA payload");
+        };
+        data[0] = 9;
+        drop(payload);
+
+        let new_revision = image.current_content_hash();
+        assert_ne!(new_revision, old_revision);
+        assert!(!image.cached_content_revision_is(old_revision));
+        assert!(image.cached_content_revision_is(new_revision));
+    }
+
+    #[test]
     fn mutable_image_guard_repairs_every_animation_frame_hash() {
         let first = vec![1, 2, 3, 4];
         let second = vec![5, 6, 7, 8];
@@ -3250,6 +3440,39 @@ mod tests {
             "decoded mutable objects must not clone their complete pixel buffers"
         );
         assert_eq!(normalized.summary.decoded_bytes, 4);
+        let limits = ImageDataValidationLimits {
+            max_decoded_bytes: 4,
+            max_frame_count: 1,
+            ..ImageDataValidationLimits::UNBOUNDED
+        };
+        assert_eq!(
+            image.validated_summary_for_content_revision(decoded_revision, limits),
+            Some(normalized.summary),
+            "full normalization publishes reusable local authority"
+        );
+        assert!(
+            image
+                .validated_summary_for_content_revision(
+                    decoded_revision,
+                    ImageDataValidationLimits {
+                        max_decoded_bytes: 3,
+                        ..limits
+                    }
+                )
+                .is_none(),
+            "a proof cannot bypass a stricter consumer byte limit"
+        );
+
+        // Even a no-op mutable access is a new authority generation. The
+        // resulting content revision may be identical, but it must be fully
+        // revalidated before any consumer can reuse a proof.
+        drop(image.data_mut());
+        assert_eq!(image.current_content_hash(), decoded_revision);
+        assert!(
+            image
+                .validated_summary_for_content_revision(decoded_revision, limits)
+                .is_none()
+        );
     }
 
     #[test]
@@ -3277,6 +3500,16 @@ mod tests {
         assert_eq!(decoded.hash(), source_revision);
         assert_eq!(decoded.current_content_hash(), source_revision);
         assert!(matches!(&*decoded.data(), ImageDataType::Rgba8 { .. }));
+        let renderer_limits = ImageDataValidationLimits {
+            max_decoded_bytes: 4,
+            max_frame_count: 1,
+            ..ImageDataValidationLimits::UNBOUNDED
+        };
+        assert_eq!(
+            decoded.validated_summary_for_content_revision(source_revision, renderer_limits),
+            Some(normalized.summary),
+            "a canonical decoded replacement carries local validation authority"
+        );
 
         let renormalized = decoded
             .normalize_for_content_revision_with_limits(
@@ -3311,6 +3544,12 @@ mod tests {
             decoded.current_content_hash(),
             source_revision,
             "a local edit must invalidate the preserved source revision"
+        );
+        assert!(
+            decoded
+                .validated_summary_for_content_revision(source_revision, renderer_limits)
+                .is_none(),
+            "mutable access clears the exact-revision validation authority"
         );
     }
 
@@ -3516,6 +3755,41 @@ mod tests {
         let decoded: ImageData = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.hash(), id.hash());
         assert_eq!(&*decoded.data(), &*id.data());
+    }
+
+    #[cfg(all(feature = "use_serde", feature = "use_image"))]
+    #[test]
+    fn image_data_validation_authority_never_crosses_serde_boundary() {
+        let image = ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![1, 2, 3, 4],
+        ));
+        let revision = image.current_content_hash();
+        let limits = ImageDataValidationLimits {
+            max_decoded_bytes: 4,
+            max_frame_count: 1,
+            max_width: 1,
+            max_height: 1,
+        };
+        let validation = image
+            .normalize_for_content_revision_with_limits(revision, 0, limits, &|| false)
+            .expect("local decoded image validates");
+        assert_eq!(
+            image.validated_summary_for_content_revision(revision, limits),
+            Some(validation.summary)
+        );
+
+        let encoded = serde_json::to_string(&image).expect("serialize validated image");
+        let decoded: ImageData =
+            serde_json::from_str(&encoded).expect("deserialize validated image payload");
+        assert_eq!(decoded.current_content_hash(), revision);
+        assert!(
+            decoded
+                .validated_summary_for_content_revision(revision, limits)
+                .is_none(),
+            "a peer must never be able to serialize local validation authority"
+        );
     }
 
     #[test]

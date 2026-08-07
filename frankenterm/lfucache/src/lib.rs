@@ -194,6 +194,43 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         self.len == 0
     }
 
+    /// Return the resident value for `k` without changing its recency,
+    /// frequency, metrics, or S3-FIFO segment. This is intentionally distinct
+    /// from [`Self::get`], which records an access and may promote an entry.
+    pub fn peek<Q>(&self, k: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Debug + Hash + Eq,
+    {
+        let bucket = self.bucket_for_key(k);
+        self.buckets.get(bucket).and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.key.borrow() == k)
+                .map(|entry| &entry.value)
+        })
+    }
+
+    /// Return whether `k` is currently resident without changing cache state.
+    pub fn contains_key<Q>(&self, k: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Debug + Hash + Eq,
+    {
+        self.peek(k).is_some()
+    }
+
+    /// Visit each resident entry exactly once without changing its recency,
+    /// frequency, metrics, or S3-FIFO segment.
+    pub fn for_each_resident<F>(&self, mut visitor: F)
+    where
+        F: FnMut(&K, &V),
+    {
+        for entry in self.recency_index.iter() {
+            visitor(&entry.key, &entry.value);
+        }
+    }
+
     /// Grow the hash buckets in the pursuit of reducing potential
     /// key collisions in any given bucket
     fn grow_hash(&mut self) {
@@ -1239,7 +1276,48 @@ mod test {
 
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());
+        assert!(!cache.contains_key(&1));
         assert!(cache.get(&1).is_none());
+    }
+
+    #[test]
+    fn contains_key_does_not_promote_or_record_an_access() {
+        let mut cache = LfuCacheU64::<&'static str>::with_capacity(2);
+        cache.put(1, "one");
+        cache.put(2, "two");
+
+        assert!(cache.contains_key(&1));
+        assert!(!cache.contains_key(&3));
+        assert_eq!(cache.peek(&1), Some(&"one"));
+        assert_eq!(cache.peek(&3), None);
+        let mut residents = Vec::new();
+        cache.for_each_resident(|key, value| residents.push((*key, *value)));
+        residents.sort_unstable();
+        assert_eq!(residents, vec![(1, "one"), (2, "two")]);
+
+        let evicted = cache.put_capturing_evictions(3, "three");
+        assert_eq!(evicted, vec![(1, "one")]);
+        assert!(!cache.contains_key(&1));
+        assert!(cache.contains_key(&2));
+        assert!(cache.contains_key(&3));
+    }
+
+    #[test]
+    fn s3fifo_rejected_scan_candidate_is_not_reported_resident() {
+        let mut cache =
+            LfuCacheU64::<&'static str>::with_capacity_and_policy(2, CacheEvictionPolicy::S3Fifo);
+        cache.put(1, "one");
+        cache.put(2, "two");
+        assert!(cache.get(&1).is_some());
+        assert!(cache.get(&2).is_some());
+
+        let evicted = cache.put_capturing_evictions(3, "scan-candidate");
+
+        assert!(evicted.is_empty(), "S3 rejection is not an eviction");
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_key(&1));
+        assert!(cache.contains_key(&2));
+        assert!(!cache.contains_key(&3));
     }
 
     #[test]

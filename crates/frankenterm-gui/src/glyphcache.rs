@@ -14,20 +14,21 @@ use frankenterm_font::units::*;
 use frankenterm_font::{FontConfiguration, GlyphInfo, LoadedFont, LoadedFontId};
 use lfucache::LfuCache;
 use ordered_float::NotNan;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 use termwiz::color::RgbColor;
 use termwiz::image::{
-    ImageData, ImageDataType, ImageDataValidationLimits, MAX_IMAGE_WIRE_BYTES,
-    MAX_IMAGE_WIRE_FRAMES,
+    ImageData, ImageDataType, ImageDataValidationError, ImageDataValidationLimits,
+    ImageDataValidationSummary, MAX_IMAGE_WIRE_BYTES, MAX_IMAGE_WIRE_FRAMES,
+    MAX_TRUSTED_LOCAL_IMAGE_DECODED_BYTES,
 };
 use termwiz::surface::CursorShape;
 use wezterm_bidi::Direction;
-use wezterm_blob_leases::{BlobLease, BlobManager};
 use wezterm_term::Underline;
 use window::bitmaps::atlas::{Atlas, OutOfTextureSpace, Sprite};
 use window::bitmaps::{BitmapImage, Image, ImageTexture, Texture2d};
@@ -287,6 +288,19 @@ struct BlankFrameKey {
     scale_down: Option<usize>,
 }
 
+/// Atlas allocation is a function of both the decoded pixels and their
+/// requested geometry. Pixel-only hashes are intentionally reusable across
+/// independent image objects, but must never alias sprites with different
+/// dimensions, padding, or scale-down policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FrameSpriteKey {
+    hash: [u8; 32],
+    width: usize,
+    height: usize,
+    padding: Option<usize>,
+    scale_down: Option<usize>,
+}
+
 /// A helper struct to implement BitmapImage for ImageDataType while
 /// holding the mutex for the sake of safety.
 struct DecodedImageHandle<'a> {
@@ -294,31 +308,17 @@ struct DecodedImageHandle<'a> {
     h: termwiz::image::ImageDataReadGuard<'a>,
 }
 
-// br-ft-82pp1: DecodedImageHandle is the read-only adapter that
-// glyphcache hands to the atlas allocator (see
-// `cached_image_inner` at line ~1247: `atlas.allocate_with_padding(
-// &handle, ...)` borrows the handle immutably — only `pixel_data`
-// + `image_dimensions` are reachable). The `BitmapImage` trait
-// (vendored, in `frankenterm/window/src/bitmaps/mod.rs`) still
-// requires `pixel_data_mut` to compile, so the impl exists but
-// must never be called on this handle. The panic at line 300 was
-// the original guard; this commit:
-// 1. Converts `panic!` → `unreachable!` to match the idiom used
-//    by the sibling `pixel_data` arm at line 295.
-// 2. Adds explanatory messages to all three `unreachable!` calls
-//    so a hypothetical reach gets an actionable backtrace
-//    instead of "internal error: entered unreachable code".
-// 3. Documents the immutability contract on the impl block so
-//    future trait callers don't reach for `pixels_mut` /
-//    `pixel_mut` (defaulted methods that route through
-//    `pixel_data_mut`).
+// `DecodedImageHandle` is the read-only adapter that glyphcache hands to
+// the atlas allocator from `cached_image_impl`.
+// `atlas.allocate_with_padding(&handle, ...)` borrows it immutably, so only
+// `pixel_data` and `image_dimensions` are reachable. The vendored
+// `BitmapImage` trait still requires `pixel_data_mut`; that method exists to
+// satisfy the trait but must remain unreachable for this adapter.
 //
-// The `EncodedLease` / `EncodedFile` arms are also unreachable
-// because `decoded.image.data()` (the source of `self.h`) only
-// ever yields decoded variants — encoded variants are leased out
-// for streaming, not held by the cache. If a code path ever
-// surfaces an encoded image to the atlas, the message in the
-// `unreachable!` will surface where to look.
+// `self.h` can contain an encoded source while its decoded frames are
+// arriving from the worker. `cached_image_impl` handles that match arm
+// separately and never passes this adapter to the atlas in that state, so
+// the `EncodedLease` / `EncodedFile` BitmapImage arms remain unreachable.
 impl<'a> BitmapImage for DecodedImageHandle<'a> {
     unsafe fn pixel_data(&self) -> *const u8 {
         match &*self.h {
@@ -367,10 +367,34 @@ impl<'a> BitmapImage for DecodedImageHandle<'a> {
 
 #[derive(Clone)]
 struct DecodedFrame {
-    lease: BlobLease,
+    /// Immutable worker-produced pixels retained in memory under the decoded
+    /// image cache's exact byte ledger. Keeping them here avoids synchronous
+    /// temp-file reads and full-frame copies on the GUI render path.
+    pixels: Arc<Vec<u8>>,
+    hash: [u8; 32],
     duration: Duration,
     width: usize,
     height: usize,
+}
+
+struct DecodedFrameHandle<'a>(&'a DecodedFrame);
+
+impl BitmapImage for DecodedFrameHandle<'_> {
+    unsafe fn pixel_data(&self) -> *const u8 {
+        self.0.pixels.as_ptr()
+    }
+
+    unsafe fn pixel_data_mut(&mut self) -> *mut u8 {
+        unreachable!("decoded worker frames are immutable renderer snapshots")
+    }
+
+    fn is_mutable(&self) -> bool {
+        false
+    }
+
+    fn image_dimensions(&self) -> (usize, usize) {
+        (self.0.width, self.0.height)
+    }
 }
 
 fn checked_decoded_frame_bytes(width: usize, height: usize) -> Option<usize> {
@@ -380,10 +404,6 @@ fn checked_decoded_frame_bytes(width: usize, height: usize) -> Option<usize> {
 }
 
 impl DecodedFrame {
-    fn decoded_bytes(&self) -> usize {
-        self.width.saturating_mul(self.height).saturating_mul(4)
-    }
-
     fn checked_decoded_bytes(&self) -> Option<usize> {
         checked_decoded_frame_bytes(self.width, self.height)
     }
@@ -397,6 +417,30 @@ const MAX_FRAME_DECODER_DECODED_BYTES: usize = MAX_IMAGE_WIRE_BYTES;
 const MAX_FRAME_DECODER_AXIS: u32 = 16_384;
 const MAX_QUEUED_FRAME_DECODER_BYTES: usize = MAX_IMAGE_WIRE_BYTES * 2;
 
+fn decoded_image_validation_limits() -> ImageDataValidationLimits {
+    ImageDataValidationLimits {
+        max_decoded_bytes: MAX_FRAME_DECODER_DECODED_BYTES,
+        max_frame_count: MAX_IMAGE_WIRE_FRAMES,
+        max_width: MAX_FRAME_DECODER_AXIS,
+        max_height: MAX_FRAME_DECODER_AXIS,
+    }
+}
+
+/// Limits for reusing validation authority that was already published by a
+/// bounded local producer (background decode, gradient generation, or a remote
+/// hydration worker). The larger byte ceiling does not weaken the 64 MiB wire
+/// and fallback validator boundary: unattested decoded payloads still enter
+/// `decoded_image_validation_limits`, while this path can only reuse private,
+/// non-serialized, revision-bound authority.
+fn trusted_decoded_image_authority_limits() -> ImageDataValidationLimits {
+    ImageDataValidationLimits {
+        max_decoded_bytes: MAX_TRUSTED_LOCAL_IMAGE_DECODED_BYTES,
+        max_frame_count: MAX_IMAGE_WIRE_FRAMES,
+        max_width: MAX_FRAME_DECODER_AXIS,
+        max_height: MAX_FRAME_DECODER_AXIS,
+    }
+}
+
 static FRAME_DECODER_JOBS: AtomicUsize = AtomicUsize::new(0);
 static FRAME_DECODER_QUEUED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static FRAME_DECODER_POOL: LazyLock<Result<rayon::ThreadPool, String>> = LazyLock::new(|| {
@@ -407,26 +451,33 @@ static FRAME_DECODER_POOL: LazyLock<Result<rayon::ThreadPool, String>> = LazyLoc
         .map_err(|error| error.to_string())
 });
 
-struct FrameDecoderJobPermit;
+struct FrameDecoderJobPermit<'a> {
+    jobs: &'a AtomicUsize,
+}
 
-impl FrameDecoderJobPermit {
+impl FrameDecoderJobPermit<'static> {
     fn try_acquire() -> Option<Self> {
-        FRAME_DECODER_JOBS
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_PENDING_FRAME_DECODERS).then_some(active + 1)
-            })
-            .ok()
-            .map(|_| Self)
+        Self::try_acquire_from(&FRAME_DECODER_JOBS, MAX_PENDING_FRAME_DECODERS)
     }
 }
 
-impl Drop for FrameDecoderJobPermit {
+impl<'a> FrameDecoderJobPermit<'a> {
+    fn try_acquire_from(jobs: &'a AtomicUsize, limit: usize) -> Option<Self> {
+        jobs
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < limit).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| Self { jobs })
+    }
+}
+
+impl Drop for FrameDecoderJobPermit<'_> {
     fn drop(&mut self) {
-        let released = FRAME_DECODER_JOBS.try_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |active| active.checked_sub(1),
-        );
+        let released =
+            self.jobs.try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_sub(1)
+            });
         debug_assert!(released.is_ok());
     }
 }
@@ -438,15 +489,91 @@ struct FrameDecoderReceiver {
 
 impl FrameDecoderReceiver {
     fn try_recv(&self) -> Result<DecodedFrame, TryRecvError> {
-        self.receiver
-            .try_recv()
-            .map(QueuedDecodedFrame::into_frame)
+        self.receiver.try_recv().map(QueuedDecodedFrame::into_frame)
     }
 }
 
 impl Drop for FrameDecoderReceiver {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct DecodedImageValidationReceiver {
+    receiver: Receiver<Result<ImageDataValidationSummary, ImageDataValidationError>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl DecodedImageValidationReceiver {
+    fn try_recv(
+        &self,
+    ) -> Result<Result<ImageDataValidationSummary, ImageDataValidationError>, TryRecvError> {
+        self.receiver.try_recv()
+    }
+}
+
+impl Drop for DecodedImageValidationReceiver {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+struct DecodedImageValidator;
+
+impl DecodedImageValidator {
+    fn start(
+        image_data: Arc<ImageData>,
+        expected_revision: [u8; 32],
+    ) -> anyhow::Result<DecodedImageValidationReceiver> {
+        Self::start_with_hook(image_data, expected_revision, || {})
+    }
+
+    fn start_with_hook<BeforeValidation>(
+        image_data: Arc<ImageData>,
+        expected_revision: [u8; 32],
+        before_validation: BeforeValidation,
+    ) -> anyhow::Result<DecodedImageValidationReceiver>
+    where
+        BeforeValidation: FnOnce() + Send + 'static,
+    {
+        let (tx, rx) = channel();
+        let permit = FrameDecoderJobPermit::try_acquire()
+            .context("bounded decoded-image validation queue is full")?;
+        let pool = FRAME_DECODER_POOL.as_ref().map_err(|error| {
+            anyhow::anyhow!("decoded-image validation pool is unavailable: {error}")
+        })?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        pool.spawn(move || {
+            let _permit = permit;
+            before_validation();
+            let result = image_data
+                .normalize_for_content_revision_with_limits(
+                    expected_revision,
+                    MAX_IMAGE_WIRE_BYTES,
+                    decoded_image_validation_limits(),
+                    &|| worker_cancelled.load(Ordering::Acquire),
+                )
+                .and_then(|normalized| {
+                    if normalized.replacement.is_some() {
+                        // This lane is selected only while an exact decoded
+                        // revision guard is held. A replacement means that the
+                        // object changed variants before the worker acquired
+                        // it; retry under a newly bound revision.
+                        Err(ImageDataValidationError::ContentRevisionMismatch)
+                    } else {
+                        Ok(normalized.summary)
+                    }
+                });
+            if !worker_cancelled.load(Ordering::Acquire) {
+                let _ = tx.send(result);
+            }
+        });
+        Ok(DecodedImageValidationReceiver {
+            receiver: rx,
+            cancelled,
+        })
     }
 }
 
@@ -481,11 +608,10 @@ impl QueuedFrameBudget {
 impl Drop for QueuedFrameBudget {
     fn drop(&mut self) {
         let bytes = self.bytes;
-        let released = FRAME_DECODER_QUEUED_BYTES.try_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |queued| queued.checked_sub(bytes),
-        );
+        let released =
+            FRAME_DECODER_QUEUED_BYTES.try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                queued.checked_sub(bytes)
+            });
         debug_assert!(released.is_ok());
     }
 }
@@ -504,7 +630,10 @@ impl QueuedDecodedFrame {
 }
 
 impl FrameDecoder {
-    pub fn start(image_data: Arc<ImageData>) -> anyhow::Result<FrameDecoderReceiver> {
+    pub fn start(
+        image_data: Arc<ImageData>,
+        expected_revision: [u8; 32],
+    ) -> anyhow::Result<FrameDecoderReceiver> {
         let (tx, rx) = channel();
         let permit = FrameDecoderJobPermit::try_acquire()
             .context("bounded image frame-decoder queue is full")?;
@@ -515,7 +644,9 @@ impl FrameDecoder {
         let worker_cancelled = Arc::clone(&cancelled);
         pool.spawn(move || {
             let _permit = permit;
-            if let Err(err) = Self::run_decoder(image_data, tx, &worker_cancelled) {
+            if let Err(err) =
+                Self::run_decoder(image_data, expected_revision, tx, &worker_cancelled)
+            {
                 if !worker_cancelled.load(Ordering::Acquire)
                     && err
                         .downcast_ref::<std::sync::mpsc::SendError<QueuedDecodedFrame>>()
@@ -534,14 +665,14 @@ impl FrameDecoder {
 
     fn run_decoder(
         image_data: Arc<ImageData>,
+        expected_revision: [u8; 32],
         tx: Sender<QueuedDecodedFrame>,
         cancelled: &AtomicBool,
     ) -> anyhow::Result<()> {
         let start = Instant::now();
-        let revision = image_data.hash();
         let normalized = image_data
             .normalize_for_content_revision_with_limits(
-                revision,
+                expected_revision,
                 MAX_IMAGE_WIRE_BYTES,
                 ImageDataValidationLimits {
                     max_decoded_bytes: MAX_FRAME_DECODER_DECODED_BYTES,
@@ -560,7 +691,13 @@ impl FrameDecoder {
             .into_data();
         let mut frame_count = 0usize;
         let mut decoded_bytes = 0usize;
-        let mut send_frame = |data: Vec<u8>, duration: Duration, width: u32, height: u32| {
+        let mut send_frame = |
+            data: Vec<u8>,
+            hash: [u8; 32],
+            duration: Duration,
+            width: u32,
+            height: u32,
+        | {
             if cancelled.load(Ordering::Acquire) {
                 anyhow::bail!("image frame decode was cancelled");
             }
@@ -580,17 +717,15 @@ impl FrameDecoder {
                 .context("decoded-frame count overflow")?;
             let bytes = data.len();
             let frame = DecodedFrame {
-                lease: BlobManager::store(&data).context("BlobManager::store decoded frame")?,
+                pixels: Arc::new(data),
+                hash,
                 duration,
                 width: width as usize,
                 height: height as usize,
             };
             let budget = queued_budget.split(bytes)?;
-            tx.send(QueuedDecodedFrame {
-                frame,
-                budget,
-            })
-            .context("sending decoded frame")?;
+            tx.send(QueuedDecodedFrame { frame, budget })
+                .context("sending decoded frame")?;
             Ok::<(), anyhow::Error>(())
         };
 
@@ -599,14 +734,14 @@ impl FrameDecoder {
                 width,
                 height,
                 data,
-                ..
-            } => send_frame(data, Duration::from_secs(86_400), width, height)?,
+                hash,
+            } => send_frame(data, hash, Duration::from_secs(86_400), width, height)?,
             ImageDataType::AnimRgba8 {
                 width,
                 height,
                 durations,
                 frames,
-                ..
+                hashes,
             } => {
                 if frames.is_empty() {
                     anyhow::bail!("bounded frame decode produced no animation frames");
@@ -618,8 +753,8 @@ impl FrameDecoder {
                         durations.len()
                     );
                 }
-                for (data, duration) in frames.into_iter().zip(durations) {
-                    send_frame(data, duration, width, height)?;
+                for ((data, duration), hash) in frames.into_iter().zip(durations).zip(hashes) {
+                    send_frame(data, hash, duration, width, height)?;
                 }
             }
             ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
@@ -648,29 +783,33 @@ struct FrameState {
     source: FrameSource,
     current_frame: DecodedFrame,
     frames: Vec<DecodedFrame>,
+    /// Exact decoded-frame bytes retained by `frames`, or the transparent
+    /// placeholder while no decoded frame has arrived. `usize::MAX` is the
+    /// fail-closed overflow sentinel.
+    retained_frame_bytes: usize,
     load_state: LoadState,
 }
 
 impl FrameState {
     fn new(rx: FrameDecoderReceiver) -> Self {
         const TRANSPARENT_SIZE: usize = 1;
-        static TRANSPARENT: LazyLock<BlobLease> = LazyLock::new(|| {
-            let mut data = vec![];
-            for _ in 0..TRANSPARENT_SIZE * TRANSPARENT_SIZE {
-                data.extend_from_slice(&[0, 0, 0, 0x00]);
-            }
-            BlobManager::store(&data).unwrap()
-        });
+        static TRANSPARENT: LazyLock<Arc<Vec<u8>>> =
+            LazyLock::new(|| Arc::new(vec![0, 0, 0, 0x00]));
+
+        let current_frame = DecodedFrame {
+            pixels: Arc::clone(&TRANSPARENT),
+            hash: ImageDataType::hash_bytes(&TRANSPARENT),
+            width: TRANSPARENT_SIZE,
+            height: TRANSPARENT_SIZE,
+            duration: Duration::from_millis(0),
+        };
+        let retained_frame_bytes = current_frame.checked_decoded_bytes().unwrap_or(usize::MAX);
 
         Self {
             source: FrameSource::Decoder(rx),
             frames: vec![],
-            current_frame: DecodedFrame {
-                lease: TRANSPARENT.clone(),
-                width: TRANSPARENT_SIZE,
-                height: TRANSPARENT_SIZE,
-                duration: Duration::from_millis(0),
-            },
+            current_frame,
+            retained_frame_bytes,
             load_state: LoadState::Loading,
         }
     }
@@ -679,6 +818,16 @@ impl FrameState {
         match &mut self.source {
             FrameSource::Decoder(rx) => match rx.try_recv() {
                 Ok(frame) => {
+                    let frame_bytes = frame.checked_decoded_bytes().unwrap_or(usize::MAX);
+                    self.retained_frame_bytes = if self.frames.is_empty() {
+                        // The first real frame replaces the transparent
+                        // placeholder; it must not be counted in addition to it.
+                        frame_bytes
+                    } else {
+                        self.retained_frame_bytes
+                            .checked_add(frame_bytes)
+                            .unwrap_or(usize::MAX)
+                    };
                     self.frames.push(frame.clone());
                     self.current_frame = frame;
                     self.load_state = LoadState::Loaded;
@@ -735,7 +884,7 @@ impl FrameState {
     }
 
     fn frame_hash(&self) -> [u8; 32] {
-        self.current_frame.lease.content_id().as_hash_bytes()
+        self.current_frame.hash
     }
 
     fn next_frame_due(&self, due: Instant) -> Option<Instant> {
@@ -748,14 +897,7 @@ impl FrameState {
     }
 
     fn retained_bytes(&self) -> usize {
-        let frames_bytes = self.frames.iter().fold(0usize, |acc, frame| {
-            acc.saturating_add(frame.decoded_bytes())
-        });
-        if frames_bytes == 0 {
-            self.current_frame.decoded_bytes()
-        } else {
-            frames_bytes
-        }
+        self.retained_frame_bytes
     }
 }
 
@@ -770,81 +912,188 @@ pub struct DecodedImage {
     frame_start: RefCell<Instant>,
     current_frame: RefCell<usize>,
     image: Arc<ImageData>,
+    /// Revision that this decoded entry and its object-scoped cache key own.
+    expected_revision: [u8; 32],
+    /// Source-image bytes for this content revision, computed once at cache
+    /// construction so animation hits do not rescan every source frame.
+    source_retained_bytes: Cell<usize>,
+    /// Unattested local decoded payloads are validated on the bounded image
+    /// worker pool. Until this receiver completes, the renderer presents a
+    /// nonblocking placeholder and never exposes the pixels to the atlas.
+    decoded_validation: RefCell<Option<DecodedImageValidationReceiver>>,
     frames: RefCell<Option<FrameState>>,
-    load_state: LoadState,
+    load_state: Cell<LoadState>,
 }
 
-impl DecodedImage {
-    fn failed() -> Self {
-        let image = ImageData::with_data(ImageDataType::new_single_frame(1, 1, vec![0, 0, 0, 0]));
+#[derive(Debug, thiserror::Error)]
+#[error("decoded image content revision changed during cache admission")]
+struct DecodedImageRevisionMismatch;
+
+#[derive(Debug, thiserror::Error)]
+#[error("decoded image validation rejected the bound revision")]
+struct DecodedImageValidationRejected {
+    #[source]
+    source: ImageDataValidationError,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("decoded image validation worker became unavailable")]
+struct DecodedImageValidationUnavailable;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ImageObjectKey(*const ImageData);
+
+impl ImageObjectKey {
+    fn of(image: &Arc<ImageData>) -> Self {
+        Self(Arc::as_ptr(image))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ImageCacheKey {
+    object: ImageObjectKey,
+    revision: [u8; 32],
+}
+
+impl ImageCacheKey {
+    fn new(image: &Arc<ImageData>, revision: [u8; 32]) -> Self {
         Self {
-            frame_start: RefCell::new(Instant::now()),
-            current_frame: RefCell::new(0),
-            image: Arc::new(image),
-            frames: RefCell::new(None),
-            load_state: LoadState::Failed,
+            object: ImageObjectKey::of(image),
+            revision,
         }
     }
+}
 
-    fn start_frame_decoder(image_data: &Arc<ImageData>) -> anyhow::Result<Self> {
-        let rx = FrameDecoder::start(Arc::clone(image_data))?;
+#[derive(Debug)]
+struct ImageRevisionOwner {
+    image: Weak<ImageData>,
+    revision: [u8; 32],
+    validation_rejected: bool,
+}
+
+const IMAGE_REVISION_OWNER_PRUNE_INTERVAL: usize = 64;
+const MAX_REJECTED_IMAGE_REVISIONS: usize = 256;
+
+impl DecodedImage {
+    fn start_frame_decoder(
+        image_data: &Arc<ImageData>,
+        expected_revision: [u8; 32],
+        source_retained_bytes: usize,
+    ) -> anyhow::Result<Self> {
+        let rx = FrameDecoder::start(Arc::clone(image_data), expected_revision)?;
         Ok(Self {
             frame_start: RefCell::new(Instant::now()),
             current_frame: RefCell::new(0),
             image: Arc::clone(image_data),
+            expected_revision,
+            source_retained_bytes: Cell::new(source_retained_bytes),
+            decoded_validation: RefCell::new(None),
             frames: RefCell::new(Some(FrameState::new(rx))),
-            load_state: LoadState::Loading,
+            load_state: Cell::new(LoadState::Loading),
+        })
+    }
+
+    fn start_decoded_validator(
+        image_data: &Arc<ImageData>,
+        expected_revision: [u8; 32],
+    ) -> anyhow::Result<Self> {
+        let validation = DecodedImageValidator::start(Arc::clone(image_data), expected_revision)?;
+        Ok(Self {
+            frame_start: RefCell::new(Instant::now()),
+            current_frame: RefCell::new(0),
+            image: Arc::clone(image_data),
+            expected_revision,
+            // Reserve the complete accepted decoded-image ceiling while the
+            // worker hashes the payload. The exact validated total replaces
+            // this reservation before any pixels are uploaded.
+            source_retained_bytes: Cell::new(MAX_FRAME_DECODER_DECODED_BYTES),
+            decoded_validation: RefCell::new(Some(validation)),
+            frames: RefCell::new(None),
+            load_state: Cell::new(LoadState::Loading),
+        })
+    }
+
+    fn loaded_decoded(
+        image_data: &Arc<ImageData>,
+        expected_revision: [u8; 32],
+        source_retained_bytes: usize,
+    ) -> anyhow::Result<Self> {
+        let data = image_data
+            .data_for_content_revision(expected_revision)
+            .ok_or(DecodedImageRevisionMismatch)?;
+        let current_frame = match &*data {
+            ImageDataType::AnimRgba8 { durations, .. }
+                if durations.len() > 1 && durations[0].is_zero() =>
+            {
+                1
+            }
+            ImageDataType::AnimRgba8 { .. } | ImageDataType::Rgba8 { .. } => 0,
+            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
+                return Err(DecodedImageRevisionMismatch.into());
+            }
+        };
+        drop(data);
+        Ok(Self {
+            frame_start: RefCell::new(Instant::now()),
+            current_frame: RefCell::new(current_frame),
+            image: Arc::clone(image_data),
+            expected_revision,
+            source_retained_bytes: Cell::new(source_retained_bytes),
+            decoded_validation: RefCell::new(None),
+            frames: RefCell::new(None),
+            load_state: Cell::new(LoadState::Loaded),
         })
     }
 
     fn load(image_data: &Arc<ImageData>) -> anyhow::Result<Self> {
-        let is_encoded = matches!(
-            &*image_data.data(),
-            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_)
-        );
-        if is_encoded {
-            return Self::start_frame_decoder(image_data);
+        Self::load_for_revision(image_data, image_data.current_content_hash())
+    }
+
+    fn load_for_revision(
+        image_data: &Arc<ImageData>,
+        expected_revision: [u8; 32],
+    ) -> anyhow::Result<Self> {
+        if let Some(summary) = image_data.validated_summary_for_content_revision(
+            expected_revision,
+            trusted_decoded_image_authority_limits(),
+        ) {
+            return Self::loaded_decoded(
+                image_data,
+                expected_revision,
+                summary.decoded_bytes,
+            );
         }
 
-        Ok(match &*image_data.data() {
-            ImageDataType::AnimRgba8 { durations, .. } => {
-                let current_frame = if durations.len() > 1 && durations[0].as_millis() == 0 {
-                    // Skip possible 0-duration root frame
-                    1
-                } else {
-                    0
-                };
-                Self {
-                    frame_start: RefCell::new(Instant::now()),
-                    current_frame: RefCell::new(current_frame),
-                    image: Arc::clone(image_data),
-                    frames: RefCell::new(None),
-                    load_state: LoadState::Loaded,
-                }
-            }
-
-            ImageDataType::Rgba8 { .. } => Self {
-                frame_start: RefCell::new(Instant::now()),
-                current_frame: RefCell::new(0),
-                image: Arc::clone(image_data),
-                frames: RefCell::new(None),
-                load_state: LoadState::Loaded,
-            },
-            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => unreachable!(
-                "encoded images return through the bounded frame decoder above"
+        let data = image_data
+            .data_for_content_revision(expected_revision)
+            .ok_or(DecodedImageRevisionMismatch)?;
+        let encoded_source_retained_bytes = match &*data {
+            ImageDataType::EncodedFile(encoded) => Some(encoded.len()),
+            ImageDataType::EncodedLease(_) => Some(0),
+            ImageDataType::Rgba8 { .. } | ImageDataType::AnimRgba8 { .. } => None,
+        };
+        drop(data);
+        match encoded_source_retained_bytes {
+            Some(source_retained_bytes) => Self::start_frame_decoder(
+                image_data,
+                expected_revision,
+                source_retained_bytes,
             ),
-        })
+            None => Self::start_decoded_validator(image_data, expected_revision),
+        }
     }
 
     fn retained_bytes(&self) -> usize {
-        let image_bytes = self.image.len();
         let frame_bytes = self
             .frames
             .borrow()
             .as_ref()
             .map(FrameState::retained_bytes)
             .unwrap_or(0);
-        image_bytes.saturating_add(frame_bytes)
+        self.source_retained_bytes
+            .get()
+            .checked_add(frame_bytes)
+            .unwrap_or(usize::MAX)
     }
 }
 
@@ -854,10 +1103,20 @@ pub struct GlyphCache {
     glyph_cache: AHashMap<GlyphKey, Rc<CachedGlyph>>,
     pub atlas: Atlas,
     pub fonts: Rc<FontConfiguration>,
-    pub image_cache: LfuCache<[u8; 32], DecodedImage>,
+    image_cache: LfuCache<ImageCacheKey, DecodedImage>,
     image_cache_retained_bytes: usize,
-    image_cache_entry_bytes: AHashMap<[u8; 32], usize>,
-    frame_cache: AHashMap<[u8; 32], Sprite>,
+    image_cache_entry_bytes: AHashMap<ImageCacheKey, usize>,
+    /// Binds a mutable `ImageData` allocation to the one content revision
+    /// currently admitted on its behalf. The pointer is only an index; the
+    /// retained `Weak` owns the allocation identity and prevents address reuse
+    /// from conflating two different image objects.
+    image_revision_owners: AHashMap<ImageObjectKey, ImageRevisionOwner>,
+    /// FIFO authority for deterministic validation failures. Entries name the
+    /// rejected revision through `image_revision_owners`; no strong image Arc
+    /// is retained, and the hard cap bounds hostile malformed-image churn.
+    image_validation_rejection_order: VecDeque<ImageCacheKey>,
+    image_revision_owner_registrations_since_prune: usize,
+    frame_cache: AHashMap<FrameSpriteKey, Sprite>,
     blank_frame_cache: AHashMap<BlankFrameKey, Sprite>,
     line_glyphs: AHashMap<LineKey, Sprite>,
     pub block_glyphs: AHashMap<SizedBlockKey, Sprite>,
@@ -890,6 +1149,9 @@ impl GlyphCache {
             ),
             image_cache_retained_bytes: 0,
             image_cache_entry_bytes: AHashMap::new(),
+            image_revision_owners: AHashMap::new(),
+            image_validation_rejection_order: VecDeque::new(),
+            image_revision_owner_registrations_since_prune: 0,
             frame_cache: AHashMap::new(),
             blank_frame_cache: AHashMap::new(),
             atlas,
@@ -923,6 +1185,9 @@ impl GlyphCache {
             ),
             image_cache_retained_bytes: 0,
             image_cache_entry_bytes: AHashMap::new(),
+            image_revision_owners: AHashMap::new(),
+            image_validation_rejection_order: VecDeque::new(),
+            image_revision_owner_registrations_since_prune: 0,
             frame_cache: AHashMap::new(),
             blank_frame_cache: AHashMap::new(),
             atlas,
@@ -949,71 +1214,350 @@ impl GlyphCache {
             .unwrap_or(usize::MAX)
     }
 
-    fn forget_decoded_image_bytes(&mut self, hash: &[u8; 32], decoded: &DecodedImage) {
-        let bytes = self
-            .image_cache_entry_bytes
-            .remove(hash)
-            .unwrap_or_else(|| decoded.retained_bytes());
-        self.image_cache_retained_bytes = self.image_cache_retained_bytes.saturating_sub(bytes);
+    /// Move the complete decoded-image cache authority as one unit.
+    ///
+    /// Atlas recreation intentionally preserves decoded images so animations
+    /// do not restart. The LFU residents, exact byte ledger, object-revision
+    /// owners, and bounded rejection authority are one invariant: moving only
+    /// the LFU loses accounting and makes later mutable-image revisions unable
+    /// to retire or safely retry their prior entry.
+    pub(crate) fn swap_decoded_image_cache_state(&mut self, other: &mut Self) {
+        std::mem::swap(&mut self.image_cache, &mut other.image_cache);
+        std::mem::swap(
+            &mut self.image_cache_retained_bytes,
+            &mut other.image_cache_retained_bytes,
+        );
+        std::mem::swap(
+            &mut self.image_cache_entry_bytes,
+            &mut other.image_cache_entry_bytes,
+        );
+        std::mem::swap(
+            &mut self.image_revision_owners,
+            &mut other.image_revision_owners,
+        );
+        std::mem::swap(
+            &mut self.image_validation_rejection_order,
+            &mut other.image_validation_rejection_order,
+        );
+        std::mem::swap(
+            &mut self.image_revision_owner_registrations_since_prune,
+            &mut other.image_revision_owner_registrations_since_prune,
+        );
     }
 
-    fn apply_image_cache_evictions(&mut self, evicted: Vec<([u8; 32], DecodedImage)>) {
-        for (hash, decoded) in evicted {
-            self.forget_decoded_image_bytes(&hash, &decoded);
+    fn prune_stale_image_revision_owners(&mut self) {
+        self.image_revision_owners
+            .retain(|_, owner| owner.image.strong_count() != 0);
+        let owners = &self.image_revision_owners;
+        self.image_validation_rejection_order.retain(|key| {
+            owners.get(&key.object).is_some_and(|owner| {
+                owner.image.as_ptr() == key.object.0
+                    && owner.revision == key.revision
+                    && owner.validation_rejected
+            })
+        });
+    }
+
+    fn image_revision_is_rejected(
+        &self,
+        key: &ImageCacheKey,
+        image: &Arc<ImageData>,
+    ) -> bool {
+        key.object == ImageObjectKey::of(image)
+            && self
+                .image_revision_owners
+                .get(&key.object)
+                .is_some_and(|owner| {
+                    owner.image.as_ptr() == Arc::as_ptr(image)
+                        && owner.revision == key.revision
+                        && owner.validation_rejected
+                })
+    }
+
+    fn record_image_validation_rejection(
+        &mut self,
+        key: ImageCacheKey,
+        image: &Arc<ImageData>,
+    ) {
+        let should_record = self
+            .image_revision_owners
+            .get_mut(&key.object)
+            .filter(|owner| {
+                owner.image.as_ptr() == Arc::as_ptr(image) && owner.revision == key.revision
+            })
+            .is_some_and(|owner| {
+                if owner.validation_rejected {
+                    false
+                } else {
+                    owner.validation_rejected = true;
+                    true
+                }
+            });
+        if !should_record {
+            return;
+        }
+
+        self.image_validation_rejection_order.push_back(key);
+        while self.image_validation_rejection_order.len() > MAX_REJECTED_IMAGE_REVISIONS {
+            let Some(expired) = self.image_validation_rejection_order.pop_front() else {
+                break;
+            };
+            let matches_expired = self
+                .image_revision_owners
+                .get(&expired.object)
+                .is_some_and(|owner| {
+                    owner.image.as_ptr() == expired.object.0
+                        && owner.revision == expired.revision
+                        && owner.validation_rejected
+                });
+            if matches_expired {
+                if self.image_cache.contains_key(&expired) {
+                    if let Some(owner) = self.image_revision_owners.get_mut(&expired.object) {
+                        owner.validation_rejected = false;
+                    }
+                } else {
+                    self.image_revision_owners.remove(&expired.object);
+                }
+            }
         }
     }
 
-    fn cache_decoded_image(&mut self, hash: [u8; 32], decoded: DecodedImage) {
+    fn note_image_revision_owner_registration(&mut self) {
+        self.image_revision_owner_registrations_since_prune = self
+            .image_revision_owner_registrations_since_prune
+            .checked_add(1)
+            .unwrap_or(IMAGE_REVISION_OWNER_PRUNE_INTERVAL);
+        if self.image_revision_owner_registrations_since_prune
+            >= IMAGE_REVISION_OWNER_PRUNE_INTERVAL
+        {
+            self.prune_stale_image_revision_owners();
+            self.image_revision_owner_registrations_since_prune = 0;
+        }
+    }
+
+    /// Bind the current revision to this exact `Arc` allocation before cache
+    /// lookup. If the same mutable object advanced to another revision, retire
+    /// its prior object-scoped entry without disturbing equal-content objects.
+    fn bind_image_revision(&mut self, image: &Arc<ImageData>, revision: [u8; 32]) -> ImageCacheKey {
+        let key = ImageObjectKey::of(image);
+        let mut prior_cache_key = None;
+        let mut prior_rejection_key = None;
+        let needs_new_owner = match self.image_revision_owners.get_mut(&key) {
+            Some(owner) if owner.image.as_ptr() == key.0 => {
+                if owner.revision != revision {
+                    let prior_key = ImageCacheKey {
+                        object: key,
+                        revision: owner.revision,
+                    };
+                    prior_cache_key = Some(prior_key);
+                    if owner.validation_rejected {
+                        prior_rejection_key = Some(prior_key);
+                    }
+                    owner.revision = revision;
+                    owner.validation_rejected = false;
+                }
+                false
+            }
+            // A retained Weak prevents real allocator reuse at this address.
+            // Treat a mismatched Weak as a stale/corrupt identity slot and
+            // replace it without touching the unrelated revision it names.
+            Some(_) | None => true,
+        };
+
+        if needs_new_owner {
+            self.image_revision_owners.insert(
+                key,
+                ImageRevisionOwner {
+                    image: Arc::downgrade(image),
+                    revision,
+                    validation_rejected: false,
+                },
+            );
+            self.note_image_revision_owner_registration();
+        }
+
+        if let Some(prior_cache_key) = prior_cache_key {
+            self.remove_cached_image_key(&prior_cache_key);
+        }
+        if let Some(prior_rejection_key) = prior_rejection_key {
+            self.image_validation_rejection_order
+                .retain(|rejected| *rejected != prior_rejection_key);
+        }
+
+        ImageCacheKey {
+            object: key,
+            revision,
+        }
+    }
+
+    fn forget_image_revision_owner(&mut self, key: &ImageCacheKey, image: &Arc<ImageData>) {
+        if key.object == ImageObjectKey::of(image) {
+            self.forget_image_revision_owner_by_key(key);
+        }
+    }
+
+    fn forget_image_revision_owner_by_key(&mut self, key: &ImageCacheKey) {
+        let (matches_removed_entry, was_rejected) = self
+            .image_revision_owners
+            .get(&key.object)
+            .map_or((false, false), |owner| {
+                let matches =
+                    owner.image.as_ptr() == key.object.0 && owner.revision == key.revision;
+                (matches, matches && owner.validation_rejected)
+            });
+        if matches_removed_entry {
+            self.image_revision_owners.remove(&key.object);
+        }
+        if was_rejected {
+            self.image_validation_rejection_order
+                .retain(|rejected| rejected != key);
+        }
+    }
+
+    fn remove_cached_image_key(&mut self, key: &ImageCacheKey) {
+        if let Some((removed_key, decoded)) = self.image_cache.remove(key) {
+            self.forget_decoded_image_bytes(&removed_key, &decoded);
+        }
+    }
+
+    fn remove_cached_image_key_preserving_owner(&mut self, key: &ImageCacheKey) {
+        if let Some((removed_key, _decoded)) = self.image_cache.remove(key) {
+            self.forget_decoded_image_accounting(&removed_key);
+        }
+    }
+
+    fn recompute_image_cache_retained_bytes(&mut self) {
+        let mut entry_bytes = AHashMap::with_capacity(self.image_cache.len());
+        let mut retained_bytes = 0usize;
+        self.image_cache.for_each_resident(|key, decoded| {
+            let bytes = decoded.retained_bytes();
+            let replaced = entry_bytes.insert(*key, bytes);
+            debug_assert!(replaced.is_none());
+            retained_bytes = retained_bytes.checked_add(bytes).unwrap_or(usize::MAX);
+        });
+        self.image_cache_entry_bytes = entry_bytes;
+        self.image_cache_retained_bytes = retained_bytes;
+    }
+
+    fn record_decoded_image_bytes(&mut self, key: ImageCacheKey, bytes: usize) {
+        let prior = self.image_cache_entry_bytes.insert(key, bytes).unwrap_or(0);
+        let updated = self
+            .image_cache_retained_bytes
+            .checked_sub(prior)
+            .and_then(|retained| retained.checked_add(bytes));
+        if let Some(updated) = updated {
+            self.image_cache_retained_bytes = updated;
+        } else {
+            self.recompute_image_cache_retained_bytes();
+        }
+    }
+
+    fn forget_decoded_image_bytes(&mut self, key: &ImageCacheKey, decoded: &DecodedImage) {
+        if let Some(resident) = self.image_cache.peek(key) {
+            // Same-revision replacement: retain the new binding when the
+            // displaced and resident values share the exact Arc allocation;
+            // otherwise retire only the displaced object's binding.
+            if !Arc::ptr_eq(&resident.image, &decoded.image) {
+                self.forget_image_revision_owner(key, &decoded.image);
+            }
+        } else {
+            self.forget_image_revision_owner(key, &decoded.image);
+        }
+        self.forget_decoded_image_accounting(key);
+    }
+
+    fn forget_decoded_image_accounting(&mut self, key: &ImageCacheKey) {
+        let Some(bytes) = self.image_cache_entry_bytes.remove(key) else {
+            self.recompute_image_cache_retained_bytes();
+            return;
+        };
+        if let Some(retained) = self.image_cache_retained_bytes.checked_sub(bytes) {
+            self.image_cache_retained_bytes = retained;
+        } else {
+            self.recompute_image_cache_retained_bytes();
+        }
+    }
+
+    fn apply_image_cache_evictions(&mut self, evicted: Vec<(ImageCacheKey, DecodedImage)>) {
+        for (key, decoded) in evicted {
+            self.forget_decoded_image_bytes(&key, &decoded);
+        }
+    }
+
+    fn cache_decoded_image(&mut self, key: ImageCacheKey, decoded: DecodedImage) {
         let bytes = decoded.retained_bytes();
-        self.cache_decoded_image_with_bytes(hash, decoded, bytes);
+        self.cache_decoded_image_with_bytes(key, decoded, bytes);
     }
 
     fn cache_decoded_image_with_bytes(
         &mut self,
-        hash: [u8; 32],
+        key: ImageCacheKey,
         decoded: DecodedImage,
         bytes: usize,
     ) {
+        if key.object != ImageObjectKey::of(&decoded.image)
+            || key.revision != decoded.expected_revision
+        {
+            log::error!("refusing decoded image whose cache authority does not match its payload");
+            self.forget_image_revision_owner_by_key(&key);
+            return;
+        }
         let max_bytes = Self::image_cache_max_bytes();
-        if bytes > max_bytes {
+        if bytes == usize::MAX || bytes > max_bytes {
+            self.forget_image_revision_owner_by_key(&key);
             return;
         }
 
-        let evicted = self.image_cache.put_capturing_evictions(hash, decoded);
+        let evicted = self.image_cache.put_capturing_evictions(key, decoded);
         self.apply_image_cache_evictions(evicted);
-        self.image_cache_entry_bytes.insert(hash, bytes);
-        self.image_cache_retained_bytes = self.image_cache_retained_bytes.saturating_add(bytes);
+        if self.image_cache.contains_key(&key) {
+            self.record_decoded_image_bytes(key, bytes);
+        } else if self.image_cache_entry_bytes.remove(&key).is_some() {
+            self.recompute_image_cache_retained_bytes();
+            self.forget_image_revision_owner_by_key(&key);
+        } else {
+            self.forget_image_revision_owner_by_key(&key);
+        }
         self.enforce_image_cache_byte_budget();
     }
 
-    fn refresh_cached_image_bytes(&mut self, hash: [u8; 32], bytes: usize) {
-        if bytes > Self::image_cache_max_bytes() {
-            if let Some((removed_hash, decoded)) = self.image_cache.remove(&hash) {
-                self.forget_decoded_image_bytes(&removed_hash, &decoded);
+    fn refresh_cached_image_bytes(&mut self, key: ImageCacheKey, bytes: usize) {
+        if bytes == usize::MAX || bytes > Self::image_cache_max_bytes() {
+            if let Some((removed_key, decoded)) = self.image_cache.remove(&key) {
+                self.forget_decoded_image_bytes(&removed_key, &decoded);
             }
             return;
         }
 
-        let old = self
-            .image_cache_entry_bytes
-            .insert(hash, bytes)
-            .unwrap_or(0);
-        self.image_cache_retained_bytes = self
-            .image_cache_retained_bytes
-            .saturating_sub(old)
-            .saturating_add(bytes);
+        if self.image_cache_retained_bytes == usize::MAX
+            || !self.image_cache_entry_bytes.contains_key(&key)
+            || self.image_cache_entry_bytes.len() != self.image_cache.len()
+        {
+            self.recompute_image_cache_retained_bytes();
+        }
+        self.record_decoded_image_bytes(key, bytes);
         self.enforce_image_cache_byte_budget();
     }
 
     fn enforce_image_cache_byte_budget(&mut self) {
+        if self.image_cache_entry_bytes.len() != self.image_cache.len() {
+            self.recompute_image_cache_retained_bytes();
+        }
         let max_bytes = Self::image_cache_max_bytes();
         while self.image_cache_retained_bytes > max_bytes {
-            let Some((hash, decoded)) = self.image_cache.evict_lfu() else {
+            let Some((key, decoded)) = self.image_cache.evict_lfu() else {
+                // A positive retained total without an evictable resident is
+                // an internal-index/accounting inconsistency. Drop the cache
+                // fail-closed rather than leave unbudgeted decoded images or
+                // dangling object-revision owners live.
+                self.image_cache.clear();
                 self.image_cache_retained_bytes = 0;
                 self.image_cache_entry_bytes.clear();
+                self.image_revision_owners.clear();
+                self.image_validation_rejection_order.clear();
                 break;
             };
-            self.forget_decoded_image_bytes(&hash, &decoded);
+            self.forget_decoded_image_bytes(&key, &decoded);
         }
     }
 
@@ -1557,7 +2101,7 @@ impl GlyphCache {
     }
 
     fn cached_image_impl(
-        frame_cache: &mut AHashMap<[u8; 32], Sprite>,
+        frame_cache: &mut AHashMap<FrameSpriteKey, Sprite>,
         blank_frame_cache: &mut AHashMap<BlankFrameKey, Sprite>,
         atlas: &mut Atlas,
         decoded: &DecodedImage,
@@ -1565,32 +2109,118 @@ impl GlyphCache {
         min_frame_duration: Duration,
         allow_image: AllowImage,
     ) -> anyhow::Result<(Sprite, Option<Instant>, LoadState)> {
-        let mut handle = DecodedImageHandle {
-            h: decoded.image.data(),
-            current_frame: *decoded.current_frame.borrow(),
-        };
-
         let scale_down = match allow_image {
             AllowImage::Scale(n) => Some(n),
             _ => None,
         };
 
+        let validation_result = decoded
+            .decoded_validation
+            .borrow()
+            .as_ref()
+            .map(DecodedImageValidationReceiver::try_recv);
+        if let Some(validation_result) = validation_result {
+            match validation_result {
+                Ok(Ok(summary)) => {
+                    let _ = decoded.decoded_validation.borrow_mut().take();
+                    decoded.source_retained_bytes.set(summary.decoded_bytes);
+                    decoded.load_state.set(LoadState::Loaded);
+                }
+                Ok(Err(ImageDataValidationError::ContentRevisionMismatch)) => {
+                    let _ = decoded.decoded_validation.borrow_mut().take();
+                    return Err(DecodedImageRevisionMismatch.into());
+                }
+                Ok(Err(ImageDataValidationError::DecodeCancelled))
+                | Err(TryRecvError::Disconnected) => {
+                    let _ = decoded.decoded_validation.borrow_mut().take();
+                    return Err(DecodedImageValidationUnavailable.into());
+                }
+                Ok(Err(source)) => {
+                    let _ = decoded.decoded_validation.borrow_mut().take();
+                    return Err(DecodedImageValidationRejected { source }.into());
+                }
+                Err(TryRecvError::Empty) => {
+                    let sprite = Self::cached_blank_frame_sprite(
+                        blank_frame_cache,
+                        atlas,
+                        1,
+                        1,
+                        padding,
+                        scale_down,
+                    )?;
+                    let retry_delay = min_frame_duration.max(Duration::from_millis(1));
+                    return Ok(match Instant::now().checked_add(retry_delay) {
+                        Some(next_due) => (sprite, Some(next_due), LoadState::Loading),
+                        None => (sprite, None, LoadState::Failed),
+                    });
+                }
+            }
+        }
+
+        // Encoded sources are decoded into independently owned immutable blob
+        // frames. The decoder can hold the source ImageData payload mutex while
+        // hashing and decoding up to the bounded wire ceiling, so the render
+        // thread must not queue behind that mutex merely to present a ready
+        // frame (or its placeholder). The cached revision probe is fail-closed:
+        // mutable access clears it before exposing the source payload and the
+        // frame snapshot is retired on the next cache admission attempt.
+        if decoded.frames.borrow().is_some() {
+            return Self::cached_encoded_frame_for_revision(
+                frame_cache,
+                blank_frame_cache,
+                atlas,
+                decoded,
+                padding,
+                min_frame_duration,
+                scale_down,
+                || {},
+            );
+        }
+
+        // Poll pending worker state before acquiring the potentially large
+        // payload mutex. If the validator won that lock, the GUI must render a
+        // placeholder rather than wait behind a full-buffer hash pass. A ready
+        // result is still accepted only after this exact-revision guard.
+        let image_data = decoded
+            .image
+            .data_for_content_revision(decoded.expected_revision)
+            .ok_or(DecodedImageRevisionMismatch)?;
+
+        let mut handle = DecodedImageHandle {
+            h: image_data,
+            current_frame: *decoded.current_frame.borrow(),
+        };
+
         match &*handle.h {
-            ImageDataType::Rgba8 { hash, .. } => {
-                if let Some(sprite) = frame_cache.get(hash) {
-                    return Ok((sprite.clone(), None, decoded.load_state));
+            ImageDataType::Rgba8 {
+                hash,
+                width,
+                height,
+                ..
+            } => {
+                let key = FrameSpriteKey {
+                    hash: *hash,
+                    width: *width as usize,
+                    height: *height as usize,
+                    padding,
+                    scale_down,
+                };
+                if let Some(sprite) = frame_cache.get(&key) {
+                    return Ok((sprite.clone(), None, decoded.load_state.get()));
                 }
                 let sprite = atlas
                     .allocate_with_padding(&handle, padding, scale_down)
                     .context("atlas.allocate_with_padding")?;
-                frame_cache.insert(*hash, sprite.clone());
+                frame_cache.insert(key, sprite.clone());
 
-                return Ok((sprite, None, decoded.load_state));
+                return Ok((sprite, None, decoded.load_state.get()));
             }
             ImageDataType::AnimRgba8 {
                 hashes,
                 frames,
                 durations,
+                width,
+                height,
                 ..
             } => {
                 let mut next = None;
@@ -1609,9 +2239,10 @@ impl GlyphCache {
                     // its neighbor while we are rendering the entire terminal
                     // frame, so we want to avoid that.
                     // <https://github.com/wezterm/wezterm/issues/3260>
-                    let mut next_due = *decoded_frame_start
-                        + durations[*decoded_current_frame].max(min_frame_duration);
-                    if now >= next_due {
+                    let mut next_due = decoded_frame_start.checked_add(
+                        durations[*decoded_current_frame].max(min_frame_duration),
+                    );
+                    if next_due.is_some_and(|due| now >= due) {
                         // Advance to next frame
                         *decoded_current_frame = *decoded_current_frame + 1;
                         if *decoded_current_frame >= frames.len() {
@@ -1622,161 +2253,214 @@ impl GlyphCache {
                             }
                         }
                         *decoded_frame_start = now;
-                        next_due = *decoded_frame_start
-                            + durations[*decoded_current_frame].max(min_frame_duration);
+                        next_due = decoded_frame_start.checked_add(
+                            durations[*decoded_current_frame].max(min_frame_duration),
+                        );
                         handle.current_frame = *decoded_current_frame;
                     }
 
-                    next.replace(next_due);
+                    next = next_due;
                 }
 
-                let hash = hashes[*decoded_current_frame];
+                let load_state = if frames.len() > 1 && next.is_none() {
+                    LoadState::Failed
+                } else {
+                    decoded.load_state.get()
+                };
 
-                if let Some(sprite) = frame_cache.get(&hash) {
-                    return Ok((sprite.clone(), next, decoded.load_state));
+                let key = FrameSpriteKey {
+                    hash: hashes[*decoded_current_frame],
+                    width: *width as usize,
+                    height: *height as usize,
+                    padding,
+                    scale_down,
+                };
+
+                if let Some(sprite) = frame_cache.get(&key) {
+                    return Ok((sprite.clone(), next, load_state));
                 }
 
                 let sprite = atlas
                     .allocate_with_padding(&handle, padding, scale_down)
                     .context("atlas.allocate_with_padding")?;
 
-                frame_cache.insert(hash, sprite.clone());
+                frame_cache.insert(key, sprite.clone());
 
-                return Ok((
-                    sprite,
-                    Some(
-                        *decoded_frame_start
-                            + durations[*decoded_current_frame].max(min_frame_duration),
-                    ),
-                    decoded.load_state,
-                ));
+                return Ok((sprite, next, load_state));
             }
             ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
-                let mut frames = decoded.frames.borrow_mut();
-                let frames = frames.as_mut().expect("to have frames");
-
-                let mut decoded_frame_start = decoded.frame_start.borrow_mut();
-                let mut decoded_current_frame = decoded.current_frame.borrow_mut();
-
-                // This function runs on the GUI render path. Decoding and blob
-                // I/O happen in the bounded worker pool, and presentation must
-                // only poll their result; waiting here (the historical code
-                // waited for as long as 125 ms) directly turns an image miss
-                // into visible input and resize latency. The transparent frame
-                // below is a non-blocking placeholder and `next_due` schedules
-                // another poll at the renderer's bounded frame cadence.
-
-                let now = Instant::now();
-                // We round up the frame duration to at least the minimum
-                // frame duration that wezterm can use when rendering.
-                // There's no point trying to deal with smaller intervals
-                // because we simply cannot render them without dropping
-                // frames.
-                // In addition, with a 1ms frame delay, there's a good chance
-                // that any given cell may switch to a different frame from
-                // its neighbor while we are rendering the entire terminal
-                // frame, so we want to avoid that.
-                // <https://github.com/wezterm/wezterm/issues/3260>
-                let mut next_due =
-                    *decoded_frame_start + frames.frame_duration().max(min_frame_duration);
-                if now >= next_due {
-                    // Advance to next frame
-                    if frames.load_next_frame() {
-                        *decoded_current_frame = (*decoded_current_frame).wrapping_add(1);
-                        *decoded_frame_start = now;
-                        next_due =
-                            *decoded_frame_start + frames.frame_duration().max(min_frame_duration);
-                        handle.current_frame = *decoded_current_frame;
-                    }
-                }
-
-                let hash = frames.frame_hash();
-
-                if let Some(sprite) = frame_cache.get(&hash) {
-                    return Ok((
-                        sprite.clone(),
-                        frames.next_frame_due(next_due),
-                        frames.load_state,
-                    ));
-                }
-
-                let Some(expected_byte_size) = frames.current_frame.checked_decoded_bytes() else {
-                    report_frame_error(format!(
-                        "frame data dimensions overflow: {}x{}",
-                        frames.current_frame.width, frames.current_frame.height
-                    ));
-                    frames.load_state = LoadState::Failed;
-                    let sprite = Self::cached_blank_frame_sprite(
-                        blank_frame_cache,
-                        atlas,
-                        1,
-                        1,
-                        padding,
-                        scale_down,
-                    )?;
-                    return Ok((
-                        sprite,
-                        frames.next_frame_due(next_due),
-                        frames.load_state,
-                    ));
-                };
-
-                let frame_data = match frames.current_frame.lease.get_data() {
-                    Ok(data) => {
-                        // If the size isn't right, ignore this frame and replace
-                        // it with a blank one instead. This might happen if
-                        // some process is truncating the files, or perhaps if
-                        // the disk is full.
-                        // We need to check for this because the consequence of
-                        // a mismatched size is a panic in a layer where we
-                        // cannot handle the error case.
-                        if data.len() != expected_byte_size {
-                            report_frame_error(format!(
-                                "frame data is corrupted: expected size {expected_byte_size} but have {}",
-                                data.len()
-                            ));
-                            frames.load_state = LoadState::Failed;
-                            None
-                        } else {
-                            Some(data)
-                        }
-                    }
-                    Err(err) => {
-                        report_frame_error(format!("frame data error: {err:#}"));
-                        frames.load_state = LoadState::Failed;
-                        None
-                    }
-                };
-
-                let sprite = if let Some(frame_data) = frame_data {
-                    let frame = Image::from_raw(
-                        frames.current_frame.width,
-                        frames.current_frame.height,
-                        frame_data,
-                    );
-                    let sprite = atlas.allocate_with_padding(&frame, padding, scale_down)?;
-                    frame_cache.insert(hash, sprite.clone());
-                    sprite
-                } else {
-                    Self::cached_blank_frame_sprite(
-                        blank_frame_cache,
-                        atlas,
-                        frames.current_frame.width,
-                        frames.current_frame.height,
-                        padding,
-                        scale_down,
-                    )?
-                };
-
-                Ok((
-                    sprite,
-                    frames.next_frame_due(
-                        *decoded_frame_start + frames.frame_duration().max(min_frame_duration),
-                    ),
-                    frames.load_state,
-                ))
+                // `frames.is_some()` permanently identifies the encoded-source
+                // lane and returned above. Reaching an encoded payload here
+                // means a direct decoded object changed variants between cache
+                // admission attempts, so fail closed and rebind its revision.
+                Err(DecodedImageRevisionMismatch.into())
             }
         }
+    }
+
+    fn cached_encoded_frame_for_revision<AfterRender>(
+        frame_cache: &mut AHashMap<FrameSpriteKey, Sprite>,
+        blank_frame_cache: &mut AHashMap<BlankFrameKey, Sprite>,
+        atlas: &mut Atlas,
+        decoded: &DecodedImage,
+        padding: Option<usize>,
+        min_frame_duration: Duration,
+        scale_down: Option<usize>,
+        after_render: AfterRender,
+    ) -> anyhow::Result<(Sprite, Option<Instant>, LoadState)>
+    where
+        AfterRender: FnOnce(),
+    {
+        if !decoded
+            .image
+            .cached_content_revision_is(decoded.expected_revision)
+        {
+            return Err(DecodedImageRevisionMismatch.into());
+        }
+        let rendered = Self::cached_encoded_frame_impl(
+            frame_cache,
+            blank_frame_cache,
+            atlas,
+            decoded,
+            padding,
+            min_frame_duration,
+            scale_down,
+        )?;
+        after_render();
+        // Blob reads and atlas allocation do not hold the source payload lock.
+        // Rebind after those operations so a mutation that began after the
+        // first probe cannot publish an obsolete snapshot.
+        if !decoded
+            .image
+            .cached_content_revision_is(decoded.expected_revision)
+        {
+            return Err(DecodedImageRevisionMismatch.into());
+        }
+        Ok(rendered)
+    }
+
+    fn cached_encoded_frame_impl(
+        frame_cache: &mut AHashMap<FrameSpriteKey, Sprite>,
+        blank_frame_cache: &mut AHashMap<BlankFrameKey, Sprite>,
+        atlas: &mut Atlas,
+        decoded: &DecodedImage,
+        padding: Option<usize>,
+        min_frame_duration: Duration,
+        scale_down: Option<usize>,
+    ) -> anyhow::Result<(Sprite, Option<Instant>, LoadState)> {
+        let mut frames = decoded.frames.borrow_mut();
+        let frames = frames.as_mut().expect("to have frames");
+
+        let mut decoded_frame_start = decoded.frame_start.borrow_mut();
+        let mut decoded_current_frame = decoded.current_frame.borrow_mut();
+
+        // This function runs on the GUI render path. Decoding and blob I/O
+        // happen in the bounded worker pool, and presentation must only poll
+        // their result; waiting here (the historical code waited for as long
+        // as 125 ms) directly turns an image miss into visible input and resize
+        // latency. The transparent frame below is a non-blocking placeholder
+        // and `next_due` schedules another poll at the bounded frame cadence.
+
+        let now = Instant::now();
+        // We round up the frame duration to at least the minimum frame duration
+        // that FrankenTerm can use when rendering. There's no point trying to
+        // deal with smaller intervals because we cannot render them without
+        // dropping frames. With a 1 ms delay, neighboring cells may also switch
+        // frames while the terminal frame is being rendered.
+        // <https://github.com/wezterm/wezterm/issues/3260>
+        let Some(mut next_due) = decoded_frame_start
+            .checked_add(frames.frame_duration().max(min_frame_duration))
+        else {
+            frames.load_state = LoadState::Failed;
+            let sprite = Self::cached_blank_frame_sprite(
+                blank_frame_cache,
+                atlas,
+                1,
+                1,
+                padding,
+                scale_down,
+            )?;
+            return Ok((sprite, None, LoadState::Failed));
+        };
+        if now >= next_due && frames.load_next_frame() {
+            *decoded_current_frame = (*decoded_current_frame).wrapping_add(1);
+            *decoded_frame_start = now;
+            let Some(updated_due) = decoded_frame_start
+                .checked_add(frames.frame_duration().max(min_frame_duration))
+            else {
+                frames.load_state = LoadState::Failed;
+                let sprite = Self::cached_blank_frame_sprite(
+                    blank_frame_cache,
+                    atlas,
+                    1,
+                    1,
+                    padding,
+                    scale_down,
+                )?;
+                return Ok((sprite, None, LoadState::Failed));
+            };
+            next_due = updated_due;
+        }
+
+        let key = FrameSpriteKey {
+            hash: frames.frame_hash(),
+            width: frames.current_frame.width,
+            height: frames.current_frame.height,
+            padding,
+            scale_down,
+        };
+
+        if let Some(sprite) = frame_cache.get(&key) {
+            return Ok((
+                sprite.clone(),
+                frames.next_frame_due(next_due),
+                frames.load_state,
+            ));
+        }
+
+        let Some(expected_byte_size) = frames.current_frame.checked_decoded_bytes() else {
+            report_frame_error(format!(
+                "frame data dimensions overflow: {}x{}",
+                frames.current_frame.width, frames.current_frame.height
+            ));
+            frames.load_state = LoadState::Failed;
+            let sprite = Self::cached_blank_frame_sprite(
+                blank_frame_cache,
+                atlas,
+                1,
+                1,
+                padding,
+                scale_down,
+            )?;
+            return Ok((sprite, frames.next_frame_due(next_due), frames.load_state));
+        };
+
+        let sprite = if frames.current_frame.pixels.len() == expected_byte_size {
+            let frame = DecodedFrameHandle(&frames.current_frame);
+            let sprite = atlas.allocate_with_padding(&frame, padding, scale_down)?;
+            frame_cache.insert(key, sprite.clone());
+            sprite
+        } else {
+            report_frame_error(format!(
+                "frame data is corrupted: expected size {expected_byte_size} but have {}",
+                frames.current_frame.pixels.len()
+            ));
+            frames.load_state = LoadState::Failed;
+            Self::cached_blank_frame_sprite(
+                blank_frame_cache,
+                atlas,
+                frames.current_frame.width,
+                frames.current_frame.height,
+                padding,
+                scale_down,
+            )?
+        };
+
+        Ok((
+            sprite,
+            frames.next_frame_due(next_due),
+            frames.load_state,
+        ))
     }
 
     fn cached_blank_frame_sprite(
@@ -1809,14 +2493,87 @@ impl GlyphCache {
         padding: Option<usize>,
         allow_image: AllowImage,
     ) -> anyhow::Result<(Sprite, Option<Instant>, LoadState)> {
-        // `ImageData::hash` is stable object/source identity. Kitty edits can
-        // mutate decoded pixels in place, so renderer cache authority must use
-        // the mutation-maintained current revision or it will return a sprite
-        // uploaded for the prior pixels indefinitely.
-        let hash = image_data.current_content_hash();
+        self.cached_image_with_revision_observers(
+            image_data,
+            padding,
+            allow_image,
+            |_| {},
+            |_| {},
+            |_| {},
+        )
+    }
+
+    fn cached_image_with_revision_observers<AfterKey, BeforeLoad, AfterLoad>(
+        &mut self,
+        image_data: &Arc<ImageData>,
+        padding: Option<usize>,
+        allow_image: AllowImage,
+        mut after_key_bound: AfterKey,
+        mut before_load: BeforeLoad,
+        mut after_load: AfterLoad,
+    ) -> anyhow::Result<(Sprite, Option<Instant>, LoadState)>
+    where
+        AfterKey: FnMut(usize),
+        BeforeLoad: FnMut(usize),
+        AfterLoad: FnMut(usize),
+    {
+        const MAX_REVISION_ADMISSION_ATTEMPTS: usize = 2;
+
+        for attempt in 0..MAX_REVISION_ADMISSION_ATTEMPTS {
+            match self.cached_image_once(
+                image_data,
+                padding,
+                allow_image,
+                attempt,
+                &mut after_key_bound,
+                &mut before_load,
+                &mut after_load,
+            ) {
+                Err(error)
+                    if error
+                        .downcast_ref::<DecodedImageRevisionMismatch>()
+                        .is_some() =>
+                {
+                    if attempt + 1 < MAX_REVISION_ADMISSION_ATTEMPTS {
+                        continue;
+                    }
+                    log::debug!(
+                        "image content kept changing during bounded cache admission; deferring"
+                    );
+                    return self.image_loading_placeholder(padding, allow_image);
+                }
+                result => return result,
+            }
+        }
+
+        unreachable!("bounded image revision admission loop always returns")
+    }
+
+    fn cached_image_once<AfterKey, BeforeLoad, AfterLoad>(
+        &mut self,
+        image_data: &Arc<ImageData>,
+        padding: Option<usize>,
+        allow_image: AllowImage,
+        attempt: usize,
+        after_key_bound: &mut AfterKey,
+        before_load: &mut BeforeLoad,
+        after_load: &mut AfterLoad,
+    ) -> anyhow::Result<(Sprite, Option<Instant>, LoadState)>
+    where
+        AfterKey: FnMut(usize),
+        BeforeLoad: FnMut(usize),
+        AfterLoad: FnMut(usize),
+    {
+        // Kitty edits mutate decoded pixels in place. Cache authority therefore
+        // combines exact Arc allocation identity with the mutation-maintained
+        // content revision: two equal-content objects cannot alias a mutable
+        // DecodedImage, while frame hashes can still share uploaded sprites.
+        let revision = image_data.current_content_hash();
+        let cache_key = self.bind_image_revision(image_data, revision);
+        after_key_bound(attempt);
 
         let cached = {
-            self.image_cache.get(&hash).map(|decoded| {
+            self.image_cache.get(&cache_key).map(|decoded| {
                 let result = Self::cached_image_impl(
                     &mut self.frame_cache,
                     &mut self.blank_frame_cache,
@@ -1830,36 +2587,87 @@ impl GlyphCache {
             })
         };
         if let Some((result, retained_bytes)) = cached {
-            self.refresh_cached_image_bytes(hash, retained_bytes);
+            if let Err(error) = &result {
+                if error
+                    .downcast_ref::<DecodedImageRevisionMismatch>()
+                    .is_some()
+                {
+                    self.remove_cached_image_key(&cache_key);
+                    return result;
+                }
+                if error
+                    .downcast_ref::<DecodedImageValidationUnavailable>()
+                    .is_some()
+                {
+                    self.remove_cached_image_key(&cache_key);
+                    log::debug!("decoded image validation deferred: {error:#}");
+                    return self.image_loading_placeholder(padding, allow_image);
+                }
+                if error
+                    .downcast_ref::<DecodedImageValidationRejected>()
+                    .is_some()
+                {
+                    if image_data
+                        .data_for_content_revision(cache_key.revision)
+                        .is_none()
+                    {
+                        self.remove_cached_image_key(&cache_key);
+                        return Err(DecodedImageRevisionMismatch.into());
+                    }
+                    self.remove_cached_image_key_preserving_owner(&cache_key);
+                    log::warn!("rejecting malformed decoded image: {error:#}");
+                    self.record_image_validation_rejection(cache_key, image_data);
+                    return self.image_failed_placeholder(padding, allow_image);
+                }
+            }
+            self.refresh_cached_image_bytes(cache_key, retained_bytes);
             return result;
         }
 
-        let decoded = match DecodedImage::load(image_data) {
+        if self.image_revision_is_rejected(&cache_key, image_data) {
+            if image_data
+                .data_for_content_revision(cache_key.revision)
+                .is_some()
+            {
+                return self.image_failed_placeholder(padding, allow_image);
+            }
+            self.forget_image_revision_owner(&cache_key, image_data);
+            return Err(DecodedImageRevisionMismatch.into());
+        }
+
+        before_load(attempt);
+        let decoded = match DecodedImage::load_for_revision(image_data, cache_key.revision) {
             Ok(decoded) => decoded,
             Err(error) => {
+                if error
+                    .downcast_ref::<DecodedImageRevisionMismatch>()
+                    .is_some()
+                {
+                    self.forget_image_revision_owner(&cache_key, image_data);
+                    return Err(error);
+                }
+                if error.downcast_ref::<ImageDataValidationError>().is_some() {
+                    if image_data
+                        .data_for_content_revision(cache_key.revision)
+                        .is_none()
+                    {
+                        self.forget_image_revision_owner(&cache_key, image_data);
+                        return Err(DecodedImageRevisionMismatch.into());
+                    }
+                    log::warn!("rejecting malformed decoded image: {error:#}");
+                    self.record_image_validation_rejection(cache_key, image_data);
+                    return self.image_failed_placeholder(padding, allow_image);
+                }
                 // Queue/pool admission failures are transient resource
                 // pressure. Render a placeholder for this attempt but do not
                 // poison the cache; a later frame may retry admission.
+                self.forget_image_revision_owner(&cache_key, image_data);
                 log::debug!("image decoder admission deferred: {error:#}");
-                let failed = DecodedImage::failed();
-                let (sprite, _, _) = Self::cached_image_impl(
-                    &mut self.frame_cache,
-                    &mut self.blank_frame_cache,
-                    &mut self.atlas,
-                    &failed,
-                    padding,
-                    self.min_frame_duration,
-                    allow_image,
-                )?;
-                let retry_delay = self.min_frame_duration.max(Duration::from_millis(1));
-                return Ok((
-                    sprite,
-                    Some(Instant::now() + retry_delay),
-                    LoadState::Loading,
-                ));
+                return self.image_loading_placeholder(padding, allow_image);
             }
         };
-        let res = Self::cached_image_impl(
+        after_load(attempt);
+        let res = match Self::cached_image_impl(
             &mut self.frame_cache,
             &mut self.blank_frame_cache,
             &mut self.atlas,
@@ -1867,9 +2675,89 @@ impl GlyphCache {
             padding,
             self.min_frame_duration,
             allow_image,
-        )?;
-        self.cache_decoded_image(hash, decoded);
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                if error
+                    .downcast_ref::<DecodedImageRevisionMismatch>()
+                    .is_some()
+                {
+                    self.forget_image_revision_owner(&cache_key, image_data);
+                    return Err(error);
+                }
+                if error
+                    .downcast_ref::<DecodedImageValidationUnavailable>()
+                    .is_some()
+                {
+                    self.forget_image_revision_owner(&cache_key, image_data);
+                    log::debug!("decoded image validation deferred: {error:#}");
+                    return self.image_loading_placeholder(padding, allow_image);
+                }
+                if error
+                    .downcast_ref::<DecodedImageValidationRejected>()
+                    .is_some()
+                {
+                    if image_data
+                        .data_for_content_revision(cache_key.revision)
+                        .is_none()
+                    {
+                        self.forget_image_revision_owner(&cache_key, image_data);
+                        return Err(DecodedImageRevisionMismatch.into());
+                    }
+                    log::warn!("rejecting malformed decoded image: {error:#}");
+                    self.record_image_validation_rejection(cache_key, image_data);
+                    return self.image_failed_placeholder(padding, allow_image);
+                }
+                self.forget_image_revision_owner(&cache_key, image_data);
+                return Err(error);
+            }
+        };
+        self.cache_decoded_image(cache_key, decoded);
         Ok(res)
+    }
+
+    fn image_loading_placeholder(
+        &mut self,
+        padding: Option<usize>,
+        allow_image: AllowImage,
+    ) -> anyhow::Result<(Sprite, Option<Instant>, LoadState)> {
+        let scale_down = match allow_image {
+            AllowImage::Scale(n) => Some(n),
+            _ => None,
+        };
+        let sprite = Self::cached_blank_frame_sprite(
+            &mut self.blank_frame_cache,
+            &mut self.atlas,
+            1,
+            1,
+            padding,
+            scale_down,
+        )?;
+        let retry_delay = self.min_frame_duration.max(Duration::from_millis(1));
+        let Some(next_due) = Instant::now().checked_add(retry_delay) else {
+            return Ok((sprite, None, LoadState::Failed));
+        };
+        Ok((sprite, Some(next_due), LoadState::Loading))
+    }
+
+    fn image_failed_placeholder(
+        &mut self,
+        padding: Option<usize>,
+        allow_image: AllowImage,
+    ) -> anyhow::Result<(Sprite, Option<Instant>, LoadState)> {
+        let scale_down = match allow_image {
+            AllowImage::Scale(n) => Some(n),
+            _ => None,
+        };
+        let sprite = Self::cached_blank_frame_sprite(
+            &mut self.blank_frame_cache,
+            &mut self.atlas,
+            1,
+            1,
+            padding,
+            scale_down,
+        )?;
+        Ok((sprite, None, LoadState::Failed))
     }
 
     pub fn cached_color(&mut self, color: RgbColor, alpha: f32) -> anyhow::Result<Sprite> {
@@ -2931,9 +3819,10 @@ mod tests {
     }
 
     fn decoder_test_frame(pixel: u8, duration: Duration) -> DecodedFrame {
+        let pixels = vec![pixel, pixel, pixel, 0xff];
         DecodedFrame {
-            lease: BlobManager::store(&[pixel, pixel, pixel, 0xff])
-                .expect("store decoder test frame"),
+            hash: ImageDataType::hash_bytes(&pixels),
+            pixels: Arc::new(pixels),
             duration,
             width: 1,
             height: 1,
@@ -2944,6 +3833,12 @@ mod tests {
         let (tx, receiver) = channel();
         drop(tx);
         let current_frame = frames.last().expect("at least one test frame").clone();
+        let retained_frame_bytes = frames
+            .iter()
+            .try_fold(0usize, |total, frame| {
+                total.checked_add(frame.checked_decoded_bytes()?)
+            })
+            .unwrap_or(usize::MAX);
         FrameState {
             source: FrameSource::Decoder(FrameDecoderReceiver {
                 receiver,
@@ -2951,33 +3846,271 @@ mod tests {
             }),
             current_frame,
             frames,
+            retained_frame_bytes,
             load_state: LoadState::Loaded,
         }
+    }
+
+    fn queued_frame_state() -> (Sender<QueuedDecodedFrame>, FrameState) {
+        let (sender, receiver) = channel();
+        let state = FrameState::new(FrameDecoderReceiver {
+            receiver,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        (sender, state)
+    }
+
+    fn send_test_frame(sender: &Sender<QueuedDecodedFrame>, frame: DecodedFrame) {
+        sender
+            .send(QueuedDecodedFrame {
+                frame,
+                budget: QueuedFrameBudget { bytes: 0 },
+            })
+            .expect("queue decoder test frame");
+    }
+
+    #[test]
+    fn frame_retained_bytes_replace_placeholder_then_append_exactly_once() {
+        let (sender, mut state) = queued_frame_state();
+        assert_eq!(state.retained_bytes(), 4, "transparent placeholder bytes");
+
+        send_test_frame(&sender, decoder_test_frame(0x11, Duration::from_millis(10)));
+        assert!(state.load_next_frame());
+        assert_eq!(
+            state.retained_bytes(),
+            4,
+            "first decoded frame replaces rather than adds to the placeholder"
+        );
+
+        send_test_frame(&sender, decoder_test_frame(0x22, Duration::from_millis(20)));
+        assert!(state.load_next_frame());
+        assert_eq!(state.retained_bytes(), 8, "second frame is counted once");
+    }
+
+    #[test]
+    fn frame_retained_bytes_fail_closed_on_dimension_overflow() {
+        let (sender, mut state) = queued_frame_state();
+        let pixels = vec![0, 0, 0, 0];
+        let frame = DecodedFrame {
+            hash: ImageDataType::hash_bytes(&pixels),
+            pixels: Arc::new(pixels),
+            duration: Duration::from_millis(10),
+            width: usize::MAX,
+            height: 2,
+        };
+        send_test_frame(&sender, frame);
+
+        assert!(state.load_next_frame());
+        assert_eq!(state.retained_bytes(), usize::MAX);
+    }
+
+    #[test]
+    fn decoder_failure_retains_one_placeholder_without_double_counting() {
+        let (sender, mut state) = queued_frame_state();
+        drop(sender);
+
+        assert!(!state.load_next_frame());
+        assert_eq!(state.load_state, LoadState::Failed);
+        assert_eq!(state.frames.len(), 1);
+        assert_eq!(state.retained_bytes(), 4);
+    }
+
+    #[test]
+    fn decoder_termination_keeps_stable_total_and_cache_eviction_subtracts_it_once() {
+        let first = decoder_test_frame(0x11, Duration::from_millis(10));
+        let second = decoder_test_frame(0x22, Duration::from_millis(20));
+        let mut state = disconnected_frame_state(vec![first, second]);
+
+        assert_eq!(state.retained_bytes(), 8);
+        assert!(state.load_next_frame());
+        assert!(matches!(&state.source, FrameSource::FrameIndex(_)));
+        assert_eq!(state.retained_bytes(), 8);
+
+        let source = Arc::new(ImageData::with_data(ImageDataType::EncodedLease(
+            wezterm_blob_leases::BlobManager::store(&[0xaa])
+                .expect("store encoded source lease"),
+        )));
+        let decoded = DecodedImage {
+            frame_start: RefCell::new(Instant::now()),
+            current_frame: RefCell::new(0),
+            expected_revision: source.current_content_hash(),
+            image: source,
+            source_retained_bytes: Cell::new(0),
+            decoded_validation: RefCell::new(None),
+            frames: RefCell::new(Some(state)),
+            load_state: Cell::new(LoadState::Loaded),
+        };
+        assert_eq!(decoded.retained_bytes(), 8);
+
+        let (mut cache, _) = test_glyph_cache();
+        let key = decoded_image_cache_key(&decoded);
+        cache.cache_decoded_image(key, decoded);
+        assert_eq!(cache.image_cache_retained_bytes, 8);
+        let (removed_key, removed) = cache
+            .image_cache
+            .remove(&key)
+            .expect("decoded image remains resident before explicit eviction");
+        cache.forget_decoded_image_bytes(&removed_key, &removed);
+        assert_eq!(cache.image_cache_retained_bytes, 0);
+        assert!(cache.image_cache_entry_bytes.is_empty());
+    }
+
+    #[test]
+    fn encoded_snapshot_render_avoids_source_payload_lock_and_rebinds_after_render() {
+        let source = Arc::new(ImageData::with_data(ImageDataType::EncodedFile(vec![
+            0xaa, 0xbb, 0xcc,
+        ])));
+        let expected_revision = source.current_content_hash();
+        let frame = decoder_test_frame(0x31, Duration::from_secs(86_400));
+        let decoded = DecodedImage {
+            frame_start: RefCell::new(Instant::now()),
+            current_frame: RefCell::new(0),
+            image: Arc::clone(&source),
+            expected_revision,
+            source_retained_bytes: Cell::new(3),
+            decoded_validation: RefCell::new(None),
+            frames: RefCell::new(Some(FrameState {
+                source: FrameSource::FrameIndex(0),
+                current_frame: frame.clone(),
+                frames: vec![frame],
+                retained_frame_bytes: 4,
+                load_state: LoadState::Loaded,
+            })),
+            load_state: Cell::new(LoadState::Loaded),
+        };
+        let (mut cache, _) = test_glyph_cache();
+
+        // Holding the encoded source lock here is intentional. Rendering uses
+        // only the independent decoded BlobLease snapshot and must therefore
+        // complete without recursively waiting on this payload mutex.
+        let source_guard = source.data();
+        let (_, _, state) = GlyphCache::cached_image_impl(
+            &mut cache.frame_cache,
+            &mut cache.blank_frame_cache,
+            &mut cache.atlas,
+            &decoded,
+            None,
+            cache.min_frame_duration,
+            AllowImage::Yes,
+        )
+        .expect("encoded snapshot rendering does not acquire the source payload lock");
+        assert_eq!(state, LoadState::Loaded);
+        drop(source_guard);
+
+        let error = GlyphCache::cached_encoded_frame_for_revision(
+            &mut cache.frame_cache,
+            &mut cache.blank_frame_cache,
+            &mut cache.atlas,
+            &decoded,
+            None,
+            cache.min_frame_duration,
+            None,
+            || {
+                *source.data_mut() = ImageDataType::EncodedFile(vec![0x11, 0x22, 0x33]);
+            },
+        )
+        .expect_err("a mutation after blob rendering invalidates the old snapshot");
+        assert!(
+            error.downcast_ref::<DecodedImageRevisionMismatch>().is_some(),
+            "the post-render revision probe must fail closed"
+        );
+        assert!(!source.cached_content_revision_is(expected_revision));
+    }
+
+    #[test]
+    fn decoded_animation_source_bytes_are_aggregated_once_at_construction() {
+        let first = vec![0x11; 4];
+        let second = vec![0x22; 4];
+        let image = Arc::new(ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![Duration::from_millis(10), Duration::from_millis(20)],
+            hashes: vec![
+                ImageDataType::hash_bytes(&first),
+                ImageDataType::hash_bytes(&second),
+            ],
+            frames: vec![first, second],
+        }));
+        attest_decoded_image(&image);
+
+        let decoded = DecodedImage::load(&image).expect("attested animation loads synchronously");
+
+        assert_eq!(decoded.source_retained_bytes.get(), 8);
+        assert!(decoded.decoded_validation.borrow().is_none());
+        assert_eq!(decoded.retained_bytes(), 8);
+        assert_eq!(decoded.retained_bytes(), 8);
+    }
+
+    #[test]
+    fn image_cache_regression_rejects_direct_empty_animation_before_render_indexing() {
+        let image = Arc::new(ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![],
+            frames: vec![],
+            hashes: vec![],
+        }));
+
+        let (mut cache, _) = test_glyph_cache();
+        let (_, next_due, load_state) = wait_for_image_to_settle(&mut cache, &image);
+        assert_eq!(load_state, LoadState::Failed);
+        assert!(next_due.is_none());
+        assert!(cache.image_cache.is_empty());
+        assert!(cache.image_cache_entry_bytes.is_empty());
+        let rejected_key = image_cache_key(&image);
+        assert!(cache.image_revision_is_rejected(&rejected_key, &image));
+        assert_eq!(cache.image_validation_rejection_order.len(), 1);
+    }
+
+    #[test]
+    fn image_cache_regression_rejects_mutated_animation_cardinality_before_render_indexing() {
+        let first = vec![0x11; 4];
+        let second = vec![0x22; 4];
+        let image = Arc::new(ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![Duration::from_millis(10), Duration::from_millis(20)],
+            hashes: vec![
+                ImageDataType::hash_bytes(&first),
+                ImageDataType::hash_bytes(&second),
+            ],
+            frames: vec![first, second],
+        }));
+        if let ImageDataType::AnimRgba8 { durations, .. } = &mut *image.data_mut() {
+            let _ = durations.pop();
+        }
+
+        let (mut cache, _) = test_glyph_cache();
+        let (_, next_due, load_state) = wait_for_image_to_settle(&mut cache, &image);
+        assert_eq!(load_state, LoadState::Failed);
+        assert!(next_due.is_none());
+        let rejected_key = image_cache_key(&image);
+        assert!(cache.image_revision_is_rejected(&rejected_key, &image));
     }
 
     #[test]
     fn decoder_disconnect_wraps_from_last_frame_to_first_without_skipping_it() {
         let first = decoder_test_frame(0x11, Duration::from_millis(10));
-        let first_hash = first.lease.content_id();
+        let first_hash = first.hash;
         let second = decoder_test_frame(0x22, Duration::from_millis(20));
         let mut state = disconnected_frame_state(vec![first, second]);
 
         assert!(state.load_next_frame());
         assert!(matches!(&state.source, FrameSource::FrameIndex(0)));
-        assert_eq!(state.current_frame.lease.content_id(), first_hash);
+        assert_eq!(state.current_frame.hash, first_hash);
     }
 
     #[test]
     fn decoder_disconnect_skips_zero_duration_animation_root_on_wrap() {
         let root = decoder_test_frame(0x11, Duration::ZERO);
         let first_visible = decoder_test_frame(0x22, Duration::from_millis(20));
-        let first_visible_hash = first_visible.lease.content_id();
+        let first_visible_hash = first_visible.hash;
         let last = decoder_test_frame(0x33, Duration::from_millis(30));
         let mut state = disconnected_frame_state(vec![root, first_visible, last]);
 
         assert!(state.load_next_frame());
         assert!(matches!(&state.source, FrameSource::FrameIndex(1)));
-        assert_eq!(state.current_frame.lease.content_id(), first_visible_hash);
+        assert_eq!(state.current_frame.hash, first_visible_hash);
     }
 
     #[test]
@@ -2991,25 +4124,626 @@ mod tests {
         assert_eq!(state.current_frame.duration, state.frames[0].duration);
     }
 
+    fn one_pixel_image(pixel: [u8; 4]) -> Arc<ImageData> {
+        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            pixel.to_vec(),
+        )));
+        attest_decoded_image(&image);
+        image
+    }
+
+    fn replace_one_pixel(image: &Arc<ImageData>, pixel: [u8; 4]) {
+        *image.data_mut() = ImageDataType::new_single_frame(1, 1, pixel.to_vec());
+        attest_decoded_image(image);
+    }
+
+    fn replace_one_pixel_unattested(image: &Arc<ImageData>, pixel: [u8; 4]) {
+        *image.data_mut() = ImageDataType::new_single_frame(1, 1, pixel.to_vec());
+    }
+
+    fn attest_decoded_image(image: &Arc<ImageData>) {
+        let revision = image.current_content_hash();
+        let normalized = image
+            .normalize_for_content_revision_with_limits(
+                revision,
+                MAX_IMAGE_WIRE_BYTES,
+                decoded_image_validation_limits(),
+                &|| false,
+            )
+            .expect("test decoded image validates");
+        assert!(normalized.replacement.is_none());
+    }
+
+    fn wait_for_image_to_settle(
+        cache: &mut GlyphCache,
+        image: &Arc<ImageData>,
+    ) -> (Sprite, Option<Instant>, LoadState) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = cache
+                .cached_image(image, None, AllowImage::Yes)
+                .expect("bounded image validation returns a renderable placeholder");
+            if result.2 != LoadState::Loading {
+                return result;
+            }
+            assert!(
+                result.1.is_some(),
+                "an in-flight validation must schedule a bounded repaint"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "decoded-image validation did not settle before its test deadline"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    static IMAGE_PIPELINE_GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn wait_for_frame_decoder_job_count(expected: usize) {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(2))
+            .expect("short test deadline is representable");
+        while FRAME_DECODER_JOBS.load(Ordering::Acquire) != expected {
+            assert!(
+                Instant::now() < deadline,
+                "frame-decoder job count did not settle at {expected}; current={}",
+                FRAME_DECODER_JOBS.load(Ordering::Acquire)
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
-    fn glyph_image_cache_keys_mutable_images_by_current_content_revision() {
-        let (mut cache, _) = test_glyph_cache();
+    fn trusted_local_authority_above_wire_limit_bypasses_fallback_validator() {
+        let _serial = IMAGE_PIPELINE_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        wait_for_frame_decoder_job_count(0);
+
+        // 4096 * 4097 * 4 = 64 MiB + 16 KiB: just above the remote/fallback
+        // boundary and far below the 256 MiB trusted-local ceiling.
+        let width = 4_096u32;
+        let height = 4_097u32;
+        let decoded_bytes = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .expect("test dimensions fit usize");
+        assert!(decoded_bytes > MAX_IMAGE_WIRE_BYTES);
+        assert!(decoded_bytes <= MAX_TRUSTED_LOCAL_IMAGE_DECODED_BYTES);
+
+        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            width,
+            height,
+            vec![0x5a; decoded_bytes],
+        )));
+        let revision = image.current_content_hash();
+        let validation = image
+            .normalize_for_content_revision_with_limits(
+                revision,
+                0,
+                trusted_decoded_image_authority_limits(),
+                &|| false,
+            )
+            .expect("bounded local producer publishes trusted authority");
+        assert_eq!(validation.summary.decoded_bytes, decoded_bytes);
+        assert!(validation.replacement.is_none());
+        assert!(
+            image
+                .validated_summary_for_content_revision(
+                    revision,
+                    decoded_image_validation_limits()
+                )
+                .is_none(),
+            "the 64 MiB fallback validator must remain fail-closed"
+        );
+
+        let decoded = DecodedImage::load_for_revision(&image, revision)
+            .expect("trusted local authority admits the larger bounded image");
+        assert_eq!(decoded.load_state.get(), LoadState::Loaded);
+        assert!(decoded.decoded_validation.borrow().is_none());
+        assert!(decoded.frames.borrow().is_none());
+        assert_eq!(decoded.source_retained_bytes.get(), decoded_bytes);
+        assert_eq!(FRAME_DECODER_JOBS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn transient_validation_queue_saturation_retries_without_negative_cache_poison() {
+        let _serial = IMAGE_PIPELINE_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        wait_for_frame_decoder_job_count(0);
+
+        let mut permits = (0..MAX_PENDING_FRAME_DECODERS)
+            .map(|_| {
+                FrameDecoderJobPermit::try_acquire()
+                    .expect("test owns every bounded validation queue slot")
+            })
+            .collect::<Vec<_>>();
+        assert!(FrameDecoderJobPermit::try_acquire().is_none());
+
         let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
             1,
             1,
             vec![0x11, 0x22, 0x33, 0xff],
         )));
+        let key = image_cache_key(&image);
+        let (mut cache, _) = test_glyph_cache();
+        let retry_delay = cache.min_frame_duration.max(Duration::from_millis(1));
+        let requested_at = Instant::now();
+        let (_, next_due, state) = cache
+            .cached_image(&image, None, AllowImage::Yes)
+            .expect("queue pressure returns a renderable placeholder");
+
+        assert_eq!(state, LoadState::Loading);
+        let next_due = next_due.expect("transient pressure schedules a retry");
+        assert!(
+            next_due
+                >= requested_at
+                    .checked_add(retry_delay)
+                    .expect("short retry delay is representable")
+        );
+        assert!(
+            next_due
+                <= Instant::now()
+                    .checked_add(retry_delay)
+                    .expect("short retry delay is representable"),
+            "retry must stay at the renderer's bounded frame cadence"
+        );
+        assert!(!cache.image_revision_is_rejected(&key, &image));
+        assert!(cache.image_validation_rejection_order.is_empty());
+        assert!(cache.image_cache.is_empty());
+
+        drop(permits.pop());
+        let retry = cache
+            .cached_image(&image, None, AllowImage::Yes)
+            .expect("freeing one queue slot retries normal admission");
+        let (_, _, settled) = if retry.2 == LoadState::Loading {
+            wait_for_image_to_settle(&mut cache, &image)
+        } else {
+            retry
+        };
+        assert_eq!(settled, LoadState::Loaded);
+        assert!(!cache.image_revision_is_rejected(&key, &image));
+        assert!(cache.image_validation_rejection_order.is_empty());
+        assert!(cache.image_cache.contains_key(&key));
+
+        drop(permits);
+        wait_for_frame_decoder_job_count(0);
+    }
+
+    #[test]
+    fn dropping_validation_receiver_cancels_worker_and_releases_shared_permit() {
+        let _serial = IMAGE_PIPELINE_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        wait_for_frame_decoder_job_count(0);
+
+        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![0x44, 0x55, 0x66, 0xff],
+        )));
+        let revision = image.current_content_hash();
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let receiver = DecodedImageValidator::start_with_hook(image, revision, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        })
+        .expect("validation worker is admitted");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("validation worker reaches deterministic test gate");
+        assert_eq!(FRAME_DECODER_JOBS.load(Ordering::Acquire), 1);
+
+        let cancelled = Arc::clone(&receiver.cancelled);
+        drop(receiver);
+        assert!(cancelled.load(Ordering::Acquire));
+        release_tx.send(()).expect("release cancelled worker gate");
+        wait_for_frame_decoder_job_count(0);
+    }
+
+    #[test]
+    fn unattested_decoded_load_returns_before_full_validation_and_publishes_authority() {
+        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![0x11, 0x22, 0x33, 0xff],
+        )));
+        let revision = image.current_content_hash();
+        assert!(
+            image
+                .validated_summary_for_content_revision(
+                    revision,
+                    decoded_image_validation_limits()
+                )
+                .is_none()
+        );
+
+        let decoded = DecodedImage::load(&image)
+            .expect("unattested decoded image is admitted to the bounded validator");
+        assert_eq!(decoded.load_state.get(), LoadState::Loading);
+        assert!(decoded.decoded_validation.borrow().is_some());
+        assert_eq!(
+            decoded.source_retained_bytes.get(),
+            MAX_FRAME_DECODER_DECODED_BYTES,
+            "pending validation reserves the complete accepted byte ceiling"
+        );
+
+        let (mut cache, _) = test_glyph_cache();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = GlyphCache::cached_image_impl(
+                &mut cache.frame_cache,
+                &mut cache.blank_frame_cache,
+                &mut cache.atlas,
+                &decoded,
+                None,
+                cache.min_frame_duration,
+                AllowImage::Yes,
+            )
+            .expect("validation polling remains renderable");
+            if result.2 != LoadState::Loading {
+                assert_eq!(result.2, LoadState::Loaded);
+                break;
+            }
+            assert!(result.1.is_some());
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(decoded.decoded_validation.borrow().is_none());
+        assert_eq!(decoded.source_retained_bytes.get(), 4);
+        assert_eq!(
+            image.validated_summary_for_content_revision(
+                revision,
+                decoded_image_validation_limits()
+            ),
+            Some(ImageDataValidationSummary {
+                decoded_bytes: 4,
+                frame_count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn pending_decoded_validation_uses_bounded_repaint_placeholder_without_uploading_pixels() {
+        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![0x44, 0x55, 0x66, 0xff],
+        )));
+        let expected_revision = image.current_content_hash();
+        let (sender, receiver) = channel();
+        let decoded = DecodedImage {
+            frame_start: RefCell::new(Instant::now()),
+            current_frame: RefCell::new(0),
+            image,
+            expected_revision,
+            source_retained_bytes: Cell::new(MAX_FRAME_DECODER_DECODED_BYTES),
+            decoded_validation: RefCell::new(Some(DecodedImageValidationReceiver {
+                receiver,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            })),
+            frames: RefCell::new(None),
+            load_state: Cell::new(LoadState::Loading),
+        };
+        let (mut cache, _) = test_glyph_cache();
+
+        let (_, next_due, state) = GlyphCache::cached_image_impl(
+            &mut cache.frame_cache,
+            &mut cache.blank_frame_cache,
+            &mut cache.atlas,
+            &decoded,
+            None,
+            cache.min_frame_duration,
+            AllowImage::Yes,
+        )
+        .expect("pending validation renders a transparent placeholder");
+
+        assert_eq!(state, LoadState::Loading);
+        assert!(next_due.is_some(), "pending work must schedule a repaint");
+        assert!(cache.frame_cache.is_empty(), "source pixels were not uploaded");
+        assert_eq!(cache.blank_frame_cache.len(), 1);
+        drop(sender);
+    }
+
+    #[test]
+    fn mutation_clears_authority_and_reenters_nonblocking_validation_lane() {
+        let (mut cache, _) = test_glyph_cache();
+        let image = one_pixel_image([0x11, 0x22, 0x33, 0xff]);
+        let old_key = image_cache_key(&image);
+        let (_, _, first_state) = cache
+            .cached_image(&image, None, AllowImage::Yes)
+            .expect("attested revision uploads immediately");
+        assert_eq!(first_state, LoadState::Loaded);
+
+        replace_one_pixel_unattested(&image, [0xaa, 0xbb, 0xcc, 0xff]);
+        let current_key = image_cache_key(&image);
+        assert!(
+            image
+                .validated_summary_for_content_revision(
+                    current_key.revision,
+                    decoded_image_validation_limits()
+                )
+                .is_none(),
+            "mutable access clears prior validation authority"
+        );
+
+        let first_retry = cache
+            .cached_image(&image, None, AllowImage::Yes)
+            .expect("unattested mutation enters bounded validation");
+        assert!(matches!(first_retry.2, LoadState::Loading | LoadState::Loaded));
+        let (_, _, settled_state) = if first_retry.2 == LoadState::Loading {
+            wait_for_image_to_settle(&mut cache, &image)
+        } else {
+            first_retry
+        };
+        assert_eq!(settled_state, LoadState::Loaded);
+        assert!(!cache.image_cache.contains_key(&old_key));
+        assert!(cache.image_cache.contains_key(&current_key));
+        assert_eq!(cache.image_cache_retained_bytes, 4);
+        assert!(
+            image
+                .validated_summary_for_content_revision(
+                    current_key.revision,
+                    decoded_image_validation_limits()
+                )
+                .is_some(),
+            "worker success republishes authority for the exact new revision"
+        );
+    }
+
+    fn image_cache_key(image: &Arc<ImageData>) -> ImageCacheKey {
+        ImageCacheKey::new(image, image.current_content_hash())
+    }
+
+    fn decoded_image_cache_key(decoded: &DecodedImage) -> ImageCacheKey {
+        image_cache_key(&decoded.image)
+    }
+
+    #[test]
+    fn image_cache_regression_frame_sprite_key_covers_exact_atlas_geometry() {
+        let (mut cache, _) = test_glyph_cache();
+        let pixels = vec![0x5a; 16];
+        let one_by_four = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            4,
+            pixels.clone(),
+        )));
+        let two_by_two = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            2, 2, pixels,
+        )));
+        attest_decoded_image(&one_by_four);
+        attest_decoded_image(&two_by_two);
+
+        let (base, _, _) = cache
+            .cached_image(&one_by_four, None, AllowImage::Yes)
+            .expect("base geometry uploads");
+        assert_eq!(cache.frame_cache.len(), 1);
+
+        let (same, _, _) = cache
+            .cached_image(&one_by_four, None, AllowImage::Yes)
+            .expect("identical geometry hits the frame sprite cache");
+        assert_eq!(same.coords, base.coords);
+        assert_eq!(cache.frame_cache.len(), 1);
+
+        let (padded, _, _) = cache
+            .cached_image(&one_by_four, Some(1), AllowImage::Yes)
+            .expect("different padding uploads independently");
+        assert_ne!(padded.coords, base.coords);
+        assert_eq!(cache.frame_cache.len(), 2);
+
+        let (scaled, _, _) = cache
+            .cached_image(&one_by_four, None, AllowImage::Scale(2))
+            .expect("different scale-down policy uploads independently");
+        assert_ne!(scaled.coords, base.coords);
+        assert_eq!(cache.frame_cache.len(), 3);
+
+        let (reshaped, _, _) = cache
+            .cached_image(&two_by_two, None, AllowImage::Yes)
+            .expect("equal pixel bytes with different dimensions upload independently");
+        assert_ne!(reshaped.coords, base.coords);
+        assert_eq!(cache.frame_cache.len(), 4);
+    }
+
+    #[test]
+    fn image_cache_regression_atlas_recreation_moves_complete_decoded_state() {
+        let (mut old_cache, _) = test_glyph_cache();
+        let (mut replacement_cache, _) = test_glyph_cache();
+        let image = one_pixel_image([0x11, 0x22, 0x33, 0xff]);
+        let old_key = image_cache_key(&image);
+
+        old_cache
+            .cached_image(&image, None, AllowImage::Yes)
+            .expect("decoded image primes the old atlas cache");
+        let prior_registration_count =
+            old_cache.image_revision_owner_registrations_since_prune;
+        assert!(old_cache.image_cache.contains_key(&old_key));
+        assert_eq!(old_cache.image_cache_entry_bytes.get(&old_key), Some(&4));
+        assert_eq!(old_cache.image_cache_retained_bytes, 4);
+        assert_eq!(old_cache.image_revision_owners.len(), 1);
+
+        old_cache.swap_decoded_image_cache_state(&mut replacement_cache);
+
+        assert!(old_cache.image_cache.is_empty());
+        assert!(old_cache.image_cache_entry_bytes.is_empty());
+        assert_eq!(old_cache.image_cache_retained_bytes, 0);
+        assert!(old_cache.image_revision_owners.is_empty());
+        assert_eq!(
+            old_cache.image_revision_owner_registrations_since_prune,
+            0
+        );
+        assert!(replacement_cache.image_cache.contains_key(&old_key));
+        assert_eq!(
+            replacement_cache.image_cache_entry_bytes.get(&old_key),
+            Some(&4)
+        );
+        assert_eq!(replacement_cache.image_cache_retained_bytes, 4);
+        assert_eq!(replacement_cache.image_revision_owners.len(), 1);
+        assert_eq!(
+            replacement_cache.image_revision_owner_registrations_since_prune,
+            prior_registration_count
+        );
+
+        replace_one_pixel(&image, [0xaa, 0xbb, 0xcc, 0xff]);
+        let current_key = image_cache_key(&image);
+        replacement_cache
+            .cached_image(&image, None, AllowImage::Yes)
+            .expect("retained owner retires the pre-recreation revision after mutation");
+        assert!(!replacement_cache.image_cache.contains_key(&old_key));
+        assert!(replacement_cache.image_cache.contains_key(&current_key));
+        assert_eq!(replacement_cache.image_cache.len(), 1);
+        assert_eq!(replacement_cache.image_cache_retained_bytes, 4);
+        assert_eq!(replacement_cache.image_cache_entry_bytes.len(), 1);
+        assert_eq!(replacement_cache.image_revision_owners.len(), 1);
+    }
+
+    #[test]
+    fn image_cache_regression_rejection_survives_atlas_recreation_and_retries_new_revision() {
+        let (mut old_cache, _) = test_glyph_cache();
+        let (mut replacement_cache, _) = test_glyph_cache();
+        let image = Arc::new(ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![],
+            frames: vec![],
+            hashes: vec![],
+        }));
+        let rejected_key = image_cache_key(&image);
+        let mut load_attempts = 0usize;
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (_, first_due, first_state) = loop {
+            let result = old_cache
+                .cached_image_with_revision_observers(
+                    &image,
+                    None,
+                    AllowImage::Yes,
+                    |_| {},
+                    |_| load_attempts += 1,
+                    |_| {},
+                )
+                .expect("first malformed revision yields a bounded placeholder");
+            if result.2 != LoadState::Loading {
+                break result;
+            }
+            assert!(result.1.is_some());
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(first_state, LoadState::Failed);
+        assert!(first_due.is_none());
+        assert_eq!(load_attempts, 1);
+        assert!(old_cache.image_revision_is_rejected(&rejected_key, &image));
+        assert_eq!(
+            old_cache.image_validation_rejection_order.front(),
+            Some(&rejected_key)
+        );
+
+        old_cache.swap_decoded_image_cache_state(&mut replacement_cache);
+
+        assert!(old_cache.image_revision_owners.is_empty());
+        assert!(old_cache.image_validation_rejection_order.is_empty());
+        assert!(replacement_cache.image_revision_is_rejected(&rejected_key, &image));
+
+        let (_, repeated_due, repeated_state) = replacement_cache
+            .cached_image_with_revision_observers(
+                &image,
+                None,
+                AllowImage::Yes,
+                |_| {},
+                |_| load_attempts += 1,
+                |_| {},
+            )
+            .expect("same malformed revision hits bounded negative authority");
+        assert_eq!(repeated_state, LoadState::Failed);
+        assert!(repeated_due.is_none());
+        assert_eq!(
+            load_attempts, 1,
+            "the same object revision must not be revalidated after rejection"
+        );
+
+        let image_for_hook = Arc::clone(&image);
+        let (_, _, valid_state) = replacement_cache
+            .cached_image_with_revision_observers(
+                &image,
+                None,
+                AllowImage::Yes,
+                move |attempt| {
+                    if attempt == 0 {
+                        replace_one_pixel(&image_for_hook, [0xaa, 0xbb, 0xcc, 0xff]);
+                    }
+                },
+                |_| load_attempts += 1,
+                |_| {},
+            )
+            .expect("a later valid content revision retries normal admission");
+        let valid_key = image_cache_key(&image);
+        assert_eq!(valid_state, LoadState::Loaded);
+        assert_eq!(load_attempts, 2);
+        assert!(!replacement_cache.image_cache.contains_key(&rejected_key));
+        assert!(replacement_cache.image_cache.contains_key(&valid_key));
+        assert!(replacement_cache.image_validation_rejection_order.is_empty());
+        assert!(!replacement_cache.image_revision_is_rejected(&valid_key, &image));
+    }
+
+    #[test]
+    fn image_cache_regression_rejection_authority_is_weak_and_hard_bounded() {
+        let (mut cache, _) = test_glyph_cache();
+        let mut images = Vec::with_capacity(MAX_REJECTED_IMAGE_REVISIONS + 1);
+
+        for _ in 0..=MAX_REJECTED_IMAGE_REVISIONS {
+            let image = Arc::new(ImageData::with_data(ImageDataType::AnimRgba8 {
+                width: 1,
+                height: 1,
+                durations: vec![],
+                frames: vec![],
+                hashes: vec![],
+            }));
+            let key = cache.bind_image_revision(&image, image.current_content_hash());
+            cache.record_image_validation_rejection(key, &image);
+            images.push(image);
+        }
+
+        assert_eq!(
+            cache.image_validation_rejection_order.len(),
+            MAX_REJECTED_IMAGE_REVISIONS
+        );
+        assert_eq!(
+            cache.image_revision_owners.len(),
+            MAX_REJECTED_IMAGE_REVISIONS
+        );
+        assert!(
+            images.iter().all(|image| Arc::strong_count(image) == 1),
+            "negative authority must retain Weak identities only"
+        );
+        let newest = images.last().expect("one bounded rejection remains");
+        let newest_key = image_cache_key(newest);
+        assert!(cache.image_revision_is_rejected(&newest_key, newest));
+
+        drop(images);
+        cache.prune_stale_image_revision_owners();
+        assert!(cache.image_revision_owners.is_empty());
+        assert!(cache.image_validation_rejection_order.is_empty());
+    }
+
+    #[test]
+    fn glyph_image_cache_keys_mutable_images_by_current_content_revision() {
+        let (mut cache, _) = test_glyph_cache();
+        let image = one_pixel_image([0x11, 0x22, 0x33, 0xff]);
         let first_revision = image.current_content_hash();
+        let first_key = ImageCacheKey::new(&image, first_revision);
         let (first_sprite, _, _) = cache
             .cached_image(&image, None, AllowImage::Yes)
             .expect("first revision should upload");
 
-        *image.data_mut() = ImageDataType::new_single_frame(
-            1,
-            1,
-            vec![0xaa, 0xbb, 0xcc, 0xff],
-        );
+        replace_one_pixel(&image, [0xaa, 0xbb, 0xcc, 0xff]);
         let second_revision = image.current_content_hash();
+        let second_key = ImageCacheKey::new(&image, second_revision);
         assert_ne!(first_revision, second_revision);
 
         let (second_sprite, _, _) = cache
@@ -3020,44 +4754,314 @@ mod tests {
             first_sprite.coords, second_sprite.coords,
             "a Kitty-style in-place edit must not reuse the prior revision's atlas sprite"
         );
-        assert!(cache.image_cache.get(&first_revision).is_some());
-        assert!(cache.image_cache.get(&second_revision).is_some());
+        assert!(!cache.image_cache.contains_key(&first_key));
+        assert!(cache.image_cache.contains_key(&second_key));
+        assert_eq!(cache.image_cache_retained_bytes, 4);
+        assert_eq!(cache.image_cache_entry_bytes.len(), 1);
+        assert_eq!(cache.image_revision_owners.len(), 1);
+    }
+
+    #[test]
+    fn cached_image_retries_mutation_after_key_capture_on_cache_hit() {
+        let (mut cache, _) = test_glyph_cache();
+        let image = one_pixel_image([0x11, 0x22, 0x33, 0xff]);
+        let stale_key = image_cache_key(&image);
+        let (old_sprite, _, _) = cache
+            .cached_image(&image, None, AllowImage::Yes)
+            .expect("prime the old revision cache hit");
+        let image_for_hook = Arc::clone(&image);
+
+        let (new_sprite, _, load_state) = cache
+            .cached_image_with_revision_observers(
+                &image,
+                None,
+                AllowImage::Yes,
+                move |attempt| {
+                    if attempt == 0 {
+                        replace_one_pixel(&image_for_hook, [0xaa, 0xbb, 0xcc, 0xff]);
+                    }
+                },
+                |_| {},
+                |_| {},
+            )
+            .expect("one bounded rebind renders the new revision");
+
+        let current_key = image_cache_key(&image);
+        assert_eq!(load_state, LoadState::Loaded);
+        assert_ne!(old_sprite.coords, new_sprite.coords);
+        assert!(!cache.image_cache.contains_key(&stale_key));
+        assert!(cache.image_cache.contains_key(&current_key));
+        assert_eq!(cache.image_cache.len(), 1);
+        assert_eq!(cache.image_revision_owners.len(), 1);
+    }
+
+    #[test]
+    fn cached_image_retries_mutation_between_load_and_first_payload_read() {
+        let (mut cache, _) = test_glyph_cache();
+        let image = one_pixel_image([0x11, 0x22, 0x33, 0xff]);
+        let stale_key = image_cache_key(&image);
+        let image_for_hook = Arc::clone(&image);
+
+        let (_, _, load_state) = cache
+            .cached_image_with_revision_observers(
+                &image,
+                None,
+                AllowImage::Yes,
+                |_| {},
+                |_| {},
+                move |attempt| {
+                    if attempt == 0 {
+                        replace_one_pixel(&image_for_hook, [0xaa, 0xbb, 0xcc, 0xff]);
+                    }
+                },
+            )
+            .expect("one bounded reload renders the post-load revision");
+
+        let current_key = image_cache_key(&image);
+        assert_eq!(load_state, LoadState::Loaded);
+        assert!(!cache.image_cache.contains_key(&stale_key));
+        assert!(cache.image_cache.contains_key(&current_key));
+        assert_eq!(cache.image_cache.len(), 1);
+        assert_eq!(cache.frame_cache.len(), 1);
+        assert_eq!(cache.image_revision_owners.len(), 1);
+    }
+
+    #[test]
+    fn repeated_revision_churn_returns_loading_placeholder_after_bounded_attempts() {
+        let (mut cache, _) = test_glyph_cache();
+        let image = one_pixel_image([0x11, 0x22, 0x33, 0xff]);
+        let image_for_hook = Arc::clone(&image);
+
+        let (_, next_due, load_state) = cache
+            .cached_image_with_revision_observers(
+                &image,
+                None,
+                AllowImage::Yes,
+                move |attempt| {
+                    let value = u8::try_from(attempt + 1).expect("bounded attempt fits u8");
+                    replace_one_pixel(&image_for_hook, [value, value, value, 0xff]);
+                },
+                |_| {},
+                |_| {},
+            )
+            .expect("repeated revision churn degrades to a retryable placeholder");
+
+        assert_eq!(load_state, LoadState::Loading);
+        assert!(next_due.is_some());
+        assert!(cache.image_cache.is_empty());
+        assert!(cache.image_cache_entry_bytes.is_empty());
+        assert!(cache.image_revision_owners.is_empty());
+    }
+
+    #[test]
+    fn object_scoped_key_prevents_old_content_collision_before_mutation_is_observed() {
+        let (mut cache, _) = test_glyph_cache();
+        let original_pixel = [0x11, 0x22, 0x33, 0xff];
+        let mutable = one_pixel_image(original_pixel);
+        let original_revision = mutable.current_content_hash();
+        let mutable_original_key = ImageCacheKey::new(&mutable, original_revision);
+        let (original_sprite, _, _) = cache
+            .cached_image(&mutable, None, AllowImage::Yes)
+            .expect("cache original mutable image");
+
+        // Mutate the cached Arc, but deliberately do not render that object
+        // yet. An independent object with the old pixels must not hit the
+        // mutable object's now-stale DecodedImage.
+        replace_one_pixel(&mutable, [0xaa, 0xbb, 0xcc, 0xff]);
+        let changed_revision = mutable.current_content_hash();
+        let mutable_changed_key = ImageCacheKey::new(&mutable, changed_revision);
+
+        let same_as_original = one_pixel_image(original_pixel);
+        assert_eq!(same_as_original.current_content_hash(), original_revision);
+        let independent_original_key = image_cache_key(&same_as_original);
+        let (original_again, _, _) = cache
+            .cached_image(&same_as_original, None, AllowImage::Yes)
+            .expect("old content must not hit the mutable object's changed payload");
+
+        assert_eq!(original_again.coords, original_sprite.coords);
+        assert!(cache.image_cache.contains_key(&mutable_original_key));
+        assert!(cache.image_cache.contains_key(&independent_original_key));
+
+        let (changed_sprite, _, _) = cache
+            .cached_image(&mutable, None, AllowImage::Yes)
+            .expect("cache changed mutable image");
+
+        assert_ne!(original_again.coords, changed_sprite.coords);
+        assert!(!cache.image_cache.contains_key(&mutable_original_key));
+        assert!(cache.image_cache.contains_key(&independent_original_key));
+        assert!(cache.image_cache.contains_key(&mutable_changed_key));
+        assert_eq!(cache.image_cache_retained_bytes, 8);
+        assert_eq!(cache.image_cache_entry_bytes.len(), 2);
+    }
+
+    #[test]
+    fn equal_content_objects_keep_independent_revision_ownership() {
+        let (mut cache, _) = test_glyph_cache();
+        let first = one_pixel_image([0x10, 0x20, 0x30, 0xff]);
+        let second = one_pixel_image([0x10, 0x20, 0x30, 0xff]);
+        let shared_revision = first.current_content_hash();
+        assert_eq!(second.current_content_hash(), shared_revision);
+        let first_shared_key = ImageCacheKey::new(&first, shared_revision);
+        let second_shared_key = ImageCacheKey::new(&second, shared_revision);
+
+        let (first_sprite, _, _) = cache
+            .cached_image(&first, None, AllowImage::Yes)
+            .expect("cache first equal-content owner");
+        let (second_sprite, _, _) = cache
+            .cached_image(&second, None, AllowImage::Yes)
+            .expect("cache second equal-content owner");
+        assert_eq!(first_sprite.coords, second_sprite.coords);
+        assert_eq!(cache.image_cache.len(), 2);
+        assert_eq!(cache.image_cache_retained_bytes, 8);
+        assert_eq!(cache.image_revision_owners.len(), 2);
+
+        replace_one_pixel(&first, [0x40, 0x50, 0x60, 0xff]);
+        let first_changed_revision = first.current_content_hash();
+        let first_changed_key = ImageCacheKey::new(&first, first_changed_revision);
+        cache
+            .cached_image(&first, None, AllowImage::Yes)
+            .expect("cache first owner's changed revision");
+        assert!(!cache.image_cache.contains_key(&first_shared_key));
+        assert!(cache.image_cache.contains_key(&second_shared_key));
+        assert!(cache.image_cache.contains_key(&first_changed_key));
+        assert_eq!(cache.image_revision_owners.len(), 2);
+
+        cache
+            .cached_image(&second, None, AllowImage::Yes)
+            .expect("unchanged second owner retains its decoded entry");
+        assert!(cache.image_cache.contains_key(&second_shared_key));
+        assert_eq!(cache.image_revision_owners.len(), 2);
+
+        replace_one_pixel(&second, [0x70, 0x80, 0x90, 0xff]);
+        let second_changed_revision = second.current_content_hash();
+        let second_changed_key = ImageCacheKey::new(&second, second_changed_revision);
+        cache
+            .cached_image(&second, None, AllowImage::Yes)
+            .expect("cache second owner's changed revision");
+
+        assert!(cache.image_cache.contains_key(&first_changed_key));
+        assert!(cache.image_cache.contains_key(&second_changed_key));
+        assert!(!cache.image_cache.contains_key(&second_shared_key));
+        assert_eq!(cache.image_revision_owners.len(), 2);
+        assert_eq!(cache.image_cache_retained_bytes, 8);
+        assert_eq!(cache.image_cache_entry_bytes.len(), 2);
+    }
+
+    #[test]
+    fn stale_weak_owner_cleanup_and_pointer_slot_reuse_are_fail_closed() {
+        let (mut cache, _) = test_glyph_cache();
+
+        for value in 0..IMAGE_REVISION_OWNER_PRUNE_INTERVAL {
+            let value = u8::try_from(value).expect("prune interval values fit in one byte");
+            let image = one_pixel_image([value, 0, 0, 0xff]);
+            let revision = image.current_content_hash();
+            let _ = cache.bind_image_revision(&image, revision);
+        }
+        assert!(
+            cache.image_revision_owners.len() <= 1,
+            "periodic pruning bounds dead Weak identities"
+        );
+        cache.prune_stale_image_revision_owners();
+        assert!(cache.image_revision_owners.is_empty());
+
+        let stale = one_pixel_image([0x11, 0x11, 0x11, 0xff]);
+        let stale_weak = Arc::downgrade(&stale);
+        let stale_revision = stale.current_content_hash();
+        drop(stale);
+        assert_eq!(stale_weak.strong_count(), 0);
+
+        let current = one_pixel_image([0x22, 0x22, 0x22, 0xff]);
+        let current_key = ImageObjectKey::of(&current);
+        let current_revision = current.current_content_hash();
+        cache.image_revision_owners.insert(
+            current_key,
+            ImageRevisionOwner {
+                image: stale_weak,
+                revision: stale_revision,
+                validation_rejected: false,
+            },
+        );
+
+        let rebound_key = cache.bind_image_revision(&current, current_revision);
+
+        let owner = cache
+            .image_revision_owners
+            .get(&current_key)
+            .expect("current pointer slot is rebound");
+        assert_eq!(owner.image.as_ptr(), Arc::as_ptr(&current));
+        assert_eq!(owner.revision, current_revision);
+        assert_eq!(rebound_key, ImageCacheKey::new(&current, current_revision));
+    }
+
+    #[test]
+    fn mutable_revision_churn_keeps_one_entry_and_one_exact_byte_total() {
+        let (mut cache, _) = test_glyph_cache();
+        let image = one_pixel_image([0, 0, 0, 0xff]);
+        let mut prior_key = None;
+
+        for value in 0..32u8 {
+            replace_one_pixel(&image, [value, value.wrapping_mul(3), 0, 0xff]);
+            let revision = image.current_content_hash();
+            let key = ImageCacheKey::new(&image, revision);
+            cache
+                .cached_image(&image, None, AllowImage::Yes)
+                .expect("cache churned mutable revision");
+
+            if let Some(prior_key) = prior_key {
+                assert!(!cache.image_cache.contains_key(&prior_key));
+                assert!(!cache.image_cache_entry_bytes.contains_key(&prior_key));
+            }
+            assert!(cache.image_cache.contains_key(&key));
+            assert_eq!(cache.image_cache.len(), 1);
+            assert_eq!(cache.image_cache_retained_bytes, 4);
+            assert_eq!(cache.image_cache_entry_bytes.get(&key), Some(&4));
+            assert_eq!(cache.image_revision_owners.len(), 1);
+            prior_key = Some(key);
+        }
     }
 
     fn small_decoded_image() -> DecodedImage {
-        DecodedImage::load(&Arc::new(ImageData::with_data(
-            ImageDataType::new_single_frame(1, 1, vec![0, 0, 0, 0]),
-        )))
-        .expect("decoded image does not need worker admission")
+        let image = one_pixel_image([0, 0, 0, 0]);
+        DecodedImage::load(&image).expect("attested decoded image does not need worker admission")
     }
 
     #[test]
     fn glyph_image_cache_refuses_single_decoded_image_over_host_budget() {
         let (mut cache, _) = test_glyph_cache();
         let decoded = small_decoded_image();
+        let key = cache.bind_image_revision(&decoded.image, decoded.expected_revision);
+        assert_eq!(cache.image_revision_owners.len(), 1);
 
         cache.cache_decoded_image_with_bytes(
-            [7; 32],
+            key,
             decoded,
-            GlyphCache::image_cache_max_bytes() + 1,
+            GlyphCache::image_cache_max_bytes()
+                .checked_add(1)
+                .unwrap_or(usize::MAX),
         );
 
         assert_eq!(cache.image_cache.len(), 0);
         assert_eq!(cache.image_cache_retained_bytes, 0);
         assert!(cache.image_cache_entry_bytes.is_empty());
+        assert!(cache.image_revision_owners.is_empty());
     }
 
     #[test]
     fn glyph_image_cache_removes_entry_that_grows_over_host_budget() {
         let (mut cache, _) = test_glyph_cache();
-        let hash = [9; 32];
         let decoded = small_decoded_image();
+        let key = decoded_image_cache_key(&decoded);
 
-        cache.cache_decoded_image(hash, decoded);
+        cache.cache_decoded_image(key, decoded);
         assert_eq!(cache.image_cache.len(), 1);
         assert!(cache.image_cache_retained_bytes > 0);
 
-        cache.refresh_cached_image_bytes(hash, GlyphCache::image_cache_max_bytes() + 1);
+        cache.refresh_cached_image_bytes(
+            key,
+            GlyphCache::image_cache_max_bytes()
+                .checked_add(1)
+                .unwrap_or(usize::MAX),
+        );
 
         assert_eq!(cache.image_cache.len(), 0);
         assert_eq!(cache.image_cache_retained_bytes, 0);
@@ -3067,19 +5071,22 @@ mod tests {
     #[test]
     fn glyph_image_cache_evicts_cumulative_decoded_bytes_by_lfu() {
         let (mut cache, _) = test_glyph_cache();
-        let hot_hash = [1; 32];
-        let cold_hash = [2; 32];
-        let newest_hash = [3; 32];
+        let hot = small_decoded_image();
+        let hot_key = decoded_image_cache_key(&hot);
+        let cold = small_decoded_image();
+        let cold_key = decoded_image_cache_key(&cold);
+        let newest = small_decoded_image();
+        let newest_key = decoded_image_cache_key(&newest);
 
-        cache.cache_decoded_image(hot_hash, small_decoded_image());
-        cache.cache_decoded_image(cold_hash, small_decoded_image());
-        cache.cache_decoded_image(newest_hash, small_decoded_image());
+        cache.cache_decoded_image(hot_key, hot);
+        cache.cache_decoded_image(cold_key, cold);
+        cache.cache_decoded_image(newest_key, newest);
 
-        assert!(cache.image_cache.get(&hot_hash).is_some());
+        assert!(cache.image_cache.get(&hot_key).is_some());
 
         let half_budget = GlyphCache::image_cache_max_bytes() / 2;
-        for hash in [hot_hash, cold_hash, newest_hash] {
-            cache.image_cache_entry_bytes.insert(hash, half_budget);
+        for key in [hot_key, cold_key, newest_key] {
+            let _ = cache.image_cache_entry_bytes.insert(key, half_budget);
         }
         cache.image_cache_retained_bytes = half_budget * 3;
 
@@ -3088,9 +5095,61 @@ mod tests {
         assert_eq!(cache.image_cache.len(), 2);
         assert_eq!(cache.image_cache_retained_bytes, half_budget * 2);
         assert!(
-            cache.image_cache.get(&hot_hash).is_some(),
+            cache.image_cache.get(&hot_key).is_some(),
             "frequently-used decoded image should survive cumulative byte pressure"
         );
         assert_eq!(cache.image_cache_entry_bytes.len(), 2);
+    }
+
+    #[test]
+    fn glyph_image_cache_repairs_counter_drift_from_authoritative_entries() {
+        let (mut cache, _) = test_glyph_cache();
+        let decoded = small_decoded_image();
+        let key = decoded_image_cache_key(&decoded);
+        cache.cache_decoded_image_with_bytes(key, decoded, 4);
+        cache.image_cache_retained_bytes = usize::MAX;
+
+        cache.refresh_cached_image_bytes(key, 4);
+
+        assert_eq!(cache.image_cache_retained_bytes, 4);
+        assert_eq!(cache.image_cache_entry_bytes.get(&key), Some(&4));
+    }
+
+    #[test]
+    fn glyph_image_cache_repairs_missing_metadata_from_authoritative_residents() {
+        let (mut cache, _) = test_glyph_cache();
+        let decoded = small_decoded_image();
+        let key = decoded_image_cache_key(&decoded);
+        cache.cache_decoded_image_with_bytes(key, decoded, 4);
+        assert_eq!(cache.image_cache_entry_bytes.remove(&key), Some(4));
+
+        cache.refresh_cached_image_bytes(key, 4);
+
+        assert_eq!(cache.image_cache.len(), 1);
+        assert_eq!(cache.image_cache_retained_bytes, 4);
+        assert_eq!(cache.image_cache_entry_bytes.get(&key), Some(&4));
+    }
+
+    #[test]
+    fn same_object_same_revision_replacement_preserves_current_owner_and_counts_once() {
+        let (mut cache, _) = test_glyph_cache();
+        let image = one_pixel_image([0x11, 0x22, 0x33, 0xff]);
+        let revision = image.current_content_hash();
+        let key = cache.bind_image_revision(&image, revision);
+        let first = DecodedImage::load(&image).expect("load first decoded value");
+        cache.cache_decoded_image_with_bytes(key, first, 4);
+
+        let replacement = DecodedImage::load(&image).expect("load replacement decoded value");
+        cache.cache_decoded_image_with_bytes(key, replacement, 4);
+
+        assert_eq!(cache.image_cache.len(), 1);
+        assert_eq!(cache.image_cache_retained_bytes, 4);
+        assert_eq!(cache.image_cache_entry_bytes.get(&key), Some(&4));
+        let owner = cache
+            .image_revision_owners
+            .get(&key.object)
+            .expect("same-object replacement retains current owner binding");
+        assert_eq!(owner.image.as_ptr(), Arc::as_ptr(&image));
+        assert_eq!(owner.revision, revision);
     }
 }

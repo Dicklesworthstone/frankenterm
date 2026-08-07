@@ -22,7 +22,7 @@ use crate::runtime_async::{io, mpsc, mpsc_try_reserve_send, watch};
 use codec::{
     AdjustPaneSize, CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompatDecision, CompressionMode,
     CreateFloatingPane, CycleStack, DecodedPdu, GetCodecVersion, GetCodecVersionResponse,
-    GetLines, GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
+    GetLines, GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse, InputSerial,
     GetSemanticZones, GetSemanticZonesResponse, ListPanes, ListPanesResponse, MoveFloatingPane,
     Pdu, PduCapabilityUse, PduProducer, PduWireRole, RemoveFloatingPane, Resize, SelectStackPane,
     SendPaste, SetClientId, SetFloatingPaneZ, SetLayoutCycle, SpawnResponse, SpawnV2, SplitPane,
@@ -2320,6 +2320,7 @@ impl DirectMuxClient {
                 Pdu::SendPaste(SendPaste {
                     pane_id: pane_id as usize,
                     data,
+                    input_serial: InputSerial::now(),
                 }),
             )
             .await?;

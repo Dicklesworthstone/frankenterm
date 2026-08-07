@@ -1088,6 +1088,9 @@ impl TeenyString {
             return false;
         }
 
+        #[cfg(not(feature = "std"))]
+        let _ = unicode_version;
+
         true
     }
 

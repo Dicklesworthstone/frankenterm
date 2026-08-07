@@ -31,7 +31,6 @@ rangeset.workspace = true
 ratelim.workspace = true
 rayon.workspace = true
 termwiz.workspace = true
-textwrap.workspace = true
 thiserror.workspace = true
 umask.workspace = true
 url.workspace = true

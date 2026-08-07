@@ -3220,8 +3220,8 @@ impl CurrentClientDispatch {
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 #[error(
     "Codec version mismatch: local={} (frankenterm {}), remote={} (frankenterm {}). \
-     Until ft-kuxho/B's CODEC_VERSION_MIN_SUPPORTED window lands, every \
-     CODEC_VERSION bump is an atomic-redeploy event — see \
+     The peers' advertised codec compatibility windows do not overlap; \
+     this version transition requires an atomic redeploy. See \
      docs/codec-atomic-redeploy.md for the operator runbook (server-first \
      deploy order, expected connection drops, rollback procedure).",
     CODEC_VERSION,
@@ -9030,16 +9030,16 @@ mod tests {
     }
 
     #[test]
-    fn codec_authority_negotiation_covers_overlap_legacy_and_invalid_windows() {
+    fn codec_authority_negotiation_covers_current_legacy_and_invalid_windows() {
         let generation = NonZeroU64::new(7).expect("test generation is nonzero");
         let previous = CODEC_VERSION - 1;
-        let previous_peer = RpcCodecAuthority::negotiate(
+        let current_peer = RpcCodecAuthority::negotiate(
             generation,
-            previous,
+            CODEC_VERSION,
             codec::CODEC_VERSION_MIN_SUPPORTED,
         )
-        .expect("current client must overlap the previous peer");
-        assert_eq!(previous_peer.agreed, previous);
+        .expect("current client must overlap the current peer");
+        assert_eq!(current_peer.agreed, CODEC_VERSION);
 
         let next_peer = RpcCodecAuthority::negotiate(
             generation,
@@ -9049,11 +9049,12 @@ mod tests {
         .expect("current client must overlap a current-plus-one peer");
         assert_eq!(next_peer.agreed, CODEC_VERSION);
 
-        let legacy = RpcCodecAuthority::negotiate(generation, previous, 0)
+        let legacy = RpcCodecAuthority::negotiate(generation, CODEC_VERSION, 0)
             .expect("legacy min zero must conservatively mean remote max only");
-        assert_eq!(legacy.remote_min, previous);
-        assert_eq!(legacy.agreed, previous);
+        assert_eq!(legacy.remote_min, CODEC_VERSION);
+        assert_eq!(legacy.agreed, CODEC_VERSION);
 
+        assert!(RpcCodecAuthority::negotiate(generation, previous, previous).is_err());
         assert!(RpcCodecAuthority::negotiate(generation, previous, CODEC_VERSION).is_err());
         assert!(
             RpcCodecAuthority::negotiate(
@@ -9067,7 +9068,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ambient_real_handshake_covers_previous_legacy_and_disjoint_codec_windows() {
+    fn ambient_real_handshake_covers_current_legacy_and_disjoint_codec_windows() {
         let previous = CODEC_VERSION - 1;
         for (advertised_min, retained_min, label) in [
             (
@@ -9075,7 +9076,7 @@ mod tests {
                 codec::CODEC_VERSION_MIN_SUPPORTED,
                 "explicit-overlap",
             ),
-            (0, previous, "legacy-min-zero"),
+            (0, CODEC_VERSION, "legacy-min-zero"),
         ] {
             let RealHandshakeProbe {
                 result,
@@ -9084,17 +9085,17 @@ mod tests {
                 phase,
                 ready_generation,
                 connection_generation,
-            } = run_real_socket_pair_handshake(previous, advertised_min, true);
+            } = run_real_socket_pair_handshake(CODEC_VERSION, advertised_min, true);
             let info = result.unwrap_or_else(|error| {
                 panic!("{} real handshake failed unexpectedly: {:#}", label, error)
             });
-            assert_eq!(info.codec_vers, previous, "{label}");
+            assert_eq!(info.codec_vers, CODEC_VERSION, "{label}");
             assert_eq!(info.min_supported, advertised_min, "{label}");
             assert_eq!(transcript, ["GetCodecVersion", "SetClientId"], "{label}");
             let codec = codec.unwrap_or_else(|| panic!("{} lost codec authority", label));
-            assert_eq!(codec.remote_max, previous, "{label}");
+            assert_eq!(codec.remote_max, CODEC_VERSION, "{label}");
             assert_eq!(codec.remote_min, retained_min, "{label}");
-            assert_eq!(codec.agreed, previous, "{label}");
+            assert_eq!(codec.agreed, CODEC_VERSION, "{label}");
             assert_eq!(phase, Some(RpcProtocolPhase::Established), "{label}");
             assert_eq!(ready_generation, INITIAL_CONNECTION_GENERATION, "{label}");
             assert_eq!(
@@ -9104,6 +9105,7 @@ mod tests {
         }
 
         for (remote_max, remote_min, label) in [
+            (previous, previous, "breaking-previous-window"),
             (previous, CODEC_VERSION, "impossible-window"),
             (
                 CODEC_VERSION + 1,
@@ -9161,7 +9163,7 @@ mod tests {
             .expect("first generation admits its codec request");
         let first_codec = RpcCodecAuthority::negotiate(
             first_generation,
-            CODEC_VERSION - 1,
+            CODEC_VERSION,
             codec::CODEC_VERSION_MIN_SUPPORTED,
         )
         .expect("first peer overlaps locally");
@@ -10964,8 +10966,10 @@ mod tests {
         let request = client.ping();
         drop(receiver);
 
-        let error = admit_interactive_rpc_now(request)
-            .expect_err("closed reader queue must reject interactive input immediately");
+        let error = match admit_interactive_rpc_now(request) {
+            Err(error) => error,
+            Ok(_) => panic!("closed reader queue must reject interactive input immediately"),
+        };
         assert!(matches!(
             error.downcast_ref::<RpcTransportError>(),
             Some(RpcTransportError::Retired {
@@ -13350,8 +13354,9 @@ mod tests {
 
     /// ft-7f2om: the IncompatibleVersionError Display impl must surface
     /// both the local and remote codec versions plus a pointer to the
-    /// atomic-redeploy operator runbook so on-call sees the runbook
-    /// path the moment a handshake fails. The pre-ft-7f2om message
+    /// compatibility-window diagnosis and atomic-redeploy operator runbook so
+    /// on-call sees the runbook path the moment a handshake fails. The
+    /// pre-ft-7f2om message
     /// said "install the same version of wezterm" — outdated framing
     /// (we retired the wezterm-as-identity framing in ft-zoxxq.3) and
     /// gave operators no pointer to the new ft-kuxho docs trio.
@@ -13397,6 +13402,11 @@ mod tests {
         assert!(
             rendered.contains("docs/codec-atomic-redeploy.md"),
             "rendered error missing docs/codec-atomic-redeploy.md link: {}",
+            rendered
+        );
+        assert!(
+            rendered.contains("compatibility windows do not overlap"),
+            "rendered error must explain the negotiated-window failure: {}",
             rendered
         );
 
