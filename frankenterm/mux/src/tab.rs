@@ -7807,7 +7807,8 @@ mod test {
                 assert!(
                     *configured_callback != callback
                         || !armed.load(std::sync::atomic::Ordering::Acquire),
-                    "injected ordered pane observation panic for {callback:?}"
+                    "injected ordered pane observation panic for {:?}",
+                    callback
                 );
             }
         }
