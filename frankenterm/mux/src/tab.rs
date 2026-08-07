@@ -4160,7 +4160,23 @@ impl TabInner {
         self.zoomed = zoomed;
         self.size = size;
 
-        let callbacks = self.prepare_resize_for_reflow(size);
+        // The replacement tree was prepared from one validated remote
+        // snapshot and already carries its authoritative split geometry.
+        // Recomputing constraints here would both distort that snapshot and
+        // invoke arbitrary Pane observations while `Tab::inner` is locked.
+        // Freeze only the callbacks implied by the prepared geometry; execute
+        // them after the outer synchronization boundary releases this lock.
+        let mut callbacks = DeferredTabCallbacks {
+            changed: true,
+            ..DeferredTabCallbacks::default()
+        };
+        if size.rows != 0 && size.cols != 0 {
+            if let Some(zoomed) = self.zoomed.as_ref() {
+                callbacks.resize_work.push((Arc::clone(zoomed), size));
+            } else if let Some(tree) = self.pane.as_ref() {
+                collect_pane_resize_work(tree, &size, &mut callbacks.resize_work);
+            }
+        }
 
         log::debug!(
             "sync tab: {:#?} zoomed: {}",
@@ -6841,7 +6857,18 @@ impl TabInner {
 
     fn swap_active_with_index(&mut self, pane_index: usize, keep_focus: bool) -> Option<()> {
         let active_idx = self.get_active_idx();
-        let mut pane = self.get_active_pane()?;
+        // Validate both structural indices before taking the tree apart. The
+        // old implementation performed its first swap before discovering an
+        // invalid active index, which could drop the displaced pane and leave
+        // a partially mutated tree. Resolve the exact tree pane rather than a
+        // zoomed/floating focus overlay; this operation is explicitly about
+        // swapping tree positions.
+        let mut leaves = Vec::new();
+        collect_raw_tree_leaves(self.pane.as_ref()?, &mut leaves);
+        let mut pane = Arc::clone(leaves.get(active_idx)?);
+        if pane_index >= leaves.len() {
+            return None;
+        }
         log::trace!(
             "swap_active_with_index: pane_index {} active {}",
             pane_index,
@@ -8502,6 +8529,7 @@ mod test {
         tab.assign_pane(&FakePane::new(1, size));
         tab.split_and_insert(0, SplitRequest::default(), FakePane::new(2, size))
             .expect("split should succeed");
+        tab.set_active_idx(0);
 
         let before = tab
             .iter_panes()
@@ -8526,6 +8554,22 @@ mod test {
                 .map(|positioned| positioned.pane.pane_id())
                 .collect::<Vec<_>>(),
             unchanged,
+        );
+
+        let before_invalid_active = tab
+            .iter_panes()
+            .into_iter()
+            .map(|positioned| positioned.pane.pane_id())
+            .collect::<Vec<_>>();
+        tab.inner.lock().active = usize::MAX;
+        assert_eq!(tab.swap_active_with_index(0, true), None);
+        assert_eq!(
+            tab.iter_panes()
+                .into_iter()
+                .map(|positioned| positioned.pane.pane_id())
+                .collect::<Vec<_>>(),
+            before_invalid_active,
+            "invalid active state must not partially mutate the tree",
         );
     }
 

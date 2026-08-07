@@ -609,7 +609,7 @@ impl OneBased {
             CsiParam::Integer(v) if *v == 0 => Ok(Self {
                 value: num_traits::one(),
             }),
-            CsiParam::Integer(v) if *v > 0 && *v <= i64::from(u32::max_value()) => {
+            CsiParam::Integer(v) if *v > 0 && *v <= i64::from(u32::MAX) => {
                 Ok(Self { value: *v as u32 })
             }
             _ => Err(()),
@@ -621,9 +621,9 @@ impl OneBased {
     pub fn from_esc_param_with_big_default(v: &CsiParam) -> core::result::Result<Self, ()> {
         match v {
             CsiParam::Integer(v) if *v == 0 => Ok(Self {
-                value: u32::max_value(),
+                value: u32::MAX,
             }),
-            CsiParam::Integer(v) if *v > 0 && *v <= i64::from(u32::max_value()) => {
+            CsiParam::Integer(v) if *v > 0 && *v <= i64::from(u32::MAX) => {
                 Ok(Self { value: *v as u32 })
             }
             _ => Err(()),
