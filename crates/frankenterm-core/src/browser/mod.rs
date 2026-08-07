@@ -33,6 +33,7 @@
 //! - Profile paths are logged, but not their contents.
 //! - All browser operations are behind the `browser` feature flag.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,76 @@ impl Default for BrowserConfig {
 // =============================================================================
 // Profile Management
 // =============================================================================
+
+/// Maximum admitted size of `.wa_profile.json` metadata.
+///
+/// Profile metadata is a small fixed-schema document. The generous 64 KiB cap
+/// bounds allocation and parse work while leaving ample room for future
+/// fields. Reads retain one extra byte so growth after the metadata check is
+/// still detected rather than silently truncating a valid-looking prefix.
+pub const PROFILE_METADATA_MAX_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileMetadataReadFailure {
+    MetadataUnavailable,
+    NotRegularFile,
+    Oversized,
+    ReadUnavailable,
+    InvalidSchema,
+    IdentityMismatch,
+    InvalidTimestamp,
+}
+
+impl ProfileMetadataReadFailure {
+    const fn detail(self) -> &'static str {
+        match self {
+            Self::MetadataUnavailable => {
+                "Browser profile metadata attributes could not be inspected"
+            }
+            Self::NotRegularFile => "Browser profile metadata is not a regular file",
+            Self::Oversized => "Browser profile metadata exceeds the 64 KiB safety limit",
+            Self::ReadUnavailable => "Browser profile metadata could not be read safely",
+            Self::InvalidSchema => "Browser profile metadata does not match the required schema",
+            Self::IdentityMismatch => {
+                "Browser profile metadata identity does not match its profile"
+            }
+            Self::InvalidTimestamp => {
+                "Browser profile metadata contains an invalid timestamp"
+            }
+        }
+    }
+
+    fn into_storage_error(self) -> StorageError {
+        StorageError::Database(self.detail().to_string())
+    }
+}
+
+fn admit_profile_metadata_shape_and_size(
+    is_file: bool,
+    byte_len: u64,
+) -> std::result::Result<(), ProfileMetadataReadFailure> {
+    if !is_file {
+        return Err(ProfileMetadataReadFailure::NotRegularFile);
+    }
+    if byte_len > PROFILE_METADATA_MAX_BYTES {
+        return Err(ProfileMetadataReadFailure::Oversized);
+    }
+    Ok(())
+}
+
+fn read_profile_metadata_bounded(
+    reader: impl Read,
+) -> std::result::Result<Vec<u8>, ProfileMetadataReadFailure> {
+    let mut bytes = Vec::new();
+    reader
+        .take(PROFILE_METADATA_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| ProfileMetadataReadFailure::ReadUnavailable)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > PROFILE_METADATA_MAX_BYTES {
+        return Err(ProfileMetadataReadFailure::Oversized);
+    }
+    Ok(bytes)
+}
 
 /// Resolved browser profile directory for a service+account pair.
 #[derive(Debug, Clone)]
@@ -202,21 +273,37 @@ impl BrowserProfile {
 
     /// Read profile metadata from disk.
     ///
-    /// Returns `None` if the metadata file does not exist.
+    /// Returns `None` if the metadata file does not exist. Existing metadata
+    /// must be a regular file within [`PROFILE_METADATA_MAX_BYTES`], remain
+    /// within that cap across the open/read race, match the fixed
+    /// [`ProfileMetadata`] schema, and identify this exact profile. Failure
+    /// details are content-free and never echo paths, OS errors, or file data.
     pub fn read_metadata(&self) -> Result<Option<ProfileMetadata>> {
         let path = self.metadata_path();
-        if !path.is_file() {
-            return Ok(None);
-        }
-        let data = std::fs::read_to_string(&path).map_err(|e| {
-            StorageError::Database(format!(
-                "Failed to read profile metadata from {}: {e}",
-                path.display()
-            ))
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => {
+                return Err(ProfileMetadataReadFailure::MetadataUnavailable
+                    .into_storage_error()
+                    .into());
+            }
+        };
+        admit_profile_metadata_shape_and_size(metadata.file_type().is_file(), metadata.len())
+            .map_err(ProfileMetadataReadFailure::into_storage_error)?;
+
+        let file = std::fs::File::open(&path).map_err(|_| {
+            ProfileMetadataReadFailure::ReadUnavailable.into_storage_error()
         })?;
-        let meta: ProfileMetadata = serde_json::from_str(&data).map_err(|e| {
-            StorageError::Database(format!("Failed to parse profile metadata: {e}"))
+        let opened_metadata = file.metadata().map_err(|_| {
+            ProfileMetadataReadFailure::MetadataUnavailable.into_storage_error()
         })?;
+        admit_profile_metadata_shape_and_size(opened_metadata.is_file(), opened_metadata.len())
+            .map_err(ProfileMetadataReadFailure::into_storage_error)?;
+        let data = read_profile_metadata_bounded(file)
+            .map_err(ProfileMetadataReadFailure::into_storage_error)?;
+        let meta = parse_profile_metadata_bytes(&data, &self.service, &self.account)
+            .map_err(ProfileMetadataReadFailure::into_storage_error)?;
         Ok(Some(meta))
     }
 
@@ -273,7 +360,8 @@ impl BrowserProfile {
 /// Metadata about a browser profile's bootstrap and usage history.
 ///
 /// Stored as `.wa_profile.json` inside the profile directory.
-/// This file is safe to inspect — it contains no secrets.
+/// The schema is not intended to contain secrets, but persisted bytes are
+/// treated as untrusted until bounded parsing and identity validation succeed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileMetadata {
     /// Service this profile is for (e.g., "openai", "anthropic").
@@ -292,6 +380,29 @@ pub struct ProfileMetadata {
     /// Number of successful automated uses since last bootstrap.
     #[serde(default)]
     pub automated_use_count: u64,
+}
+
+fn parse_profile_metadata_bytes(
+    bytes: &[u8],
+    expected_service: &str,
+    expected_account: &str,
+) -> std::result::Result<ProfileMetadata, ProfileMetadataReadFailure> {
+    let metadata: ProfileMetadata = serde_json::from_slice(bytes)
+        .map_err(|_| ProfileMetadataReadFailure::InvalidSchema)?;
+    if metadata.service != expected_service || metadata.account != expected_account {
+        return Err(ProfileMetadataReadFailure::IdentityMismatch);
+    }
+    for timestamp in [
+        metadata.bootstrapped_at.as_deref(),
+        metadata.last_used_at.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .map_err(|_| ProfileMetadataReadFailure::InvalidTimestamp)?;
+    }
+    Ok(metadata)
 }
 
 impl ProfileMetadata {
@@ -854,6 +965,108 @@ mod tests {
         assert!(!json.contains("bootstrapped_at"));
         assert!(!json.contains("bootstrap_method"));
         assert!(!json.contains("last_used_at"));
+    }
+
+    #[test]
+    fn profile_metadata_reader_enforces_exact_finite_boundary() {
+        assert_eq!(
+            admit_profile_metadata_shape_and_size(true, PROFILE_METADATA_MAX_BYTES),
+            Ok(())
+        );
+        assert_eq!(
+            admit_profile_metadata_shape_and_size(
+                true,
+                PROFILE_METADATA_MAX_BYTES.saturating_add(1)
+            ),
+            Err(ProfileMetadataReadFailure::Oversized)
+        );
+        assert_eq!(
+            admit_profile_metadata_shape_and_size(false, 0),
+            Err(ProfileMetadataReadFailure::NotRegularFile)
+        );
+
+        let max_bytes = usize::try_from(PROFILE_METADATA_MAX_BYTES)
+            .expect("profile metadata cap must fit usize");
+        let exact = vec![b'x'; max_bytes];
+        assert_eq!(
+            read_profile_metadata_bounded(std::io::Cursor::new(exact))
+                .expect("exact-cap metadata must be retained")
+                .len(),
+            max_bytes
+        );
+        let oversized = vec![b'x'; max_bytes.saturating_add(1)];
+        assert_eq!(
+            read_profile_metadata_bounded(std::io::Cursor::new(oversized)),
+            Err(ProfileMetadataReadFailure::Oversized)
+        );
+    }
+
+    #[test]
+    fn profile_metadata_parser_is_schema_identity_and_timestamp_specific() {
+        let valid = br#"{
+            "service":"openai",
+            "account":"test",
+            "bootstrapped_at":"2026-08-06T12:34:56Z",
+            "bootstrap_method":"interactive",
+            "last_used_at":"2026-08-06T12:35:00+00:00",
+            "automated_use_count":3
+        }"#;
+        let parsed = parse_profile_metadata_bytes(valid, "openai", "test")
+            .expect("valid typed metadata must parse");
+        assert_eq!(parsed.service, "openai");
+        assert_eq!(parsed.account, "test");
+        assert!(parsed.bootstrapped_at.is_some());
+
+        assert_eq!(
+            parse_profile_metadata_bytes(valid, "anthropic", "test").unwrap_err(),
+            ProfileMetadataReadFailure::IdentityMismatch
+        );
+        assert_eq!(
+            parse_profile_metadata_bytes(
+                br#"{"service":"openai","account":"test","bootstrapped_at":"bad"}"#,
+                "openai",
+                "test"
+            )
+            .unwrap_err(),
+            ProfileMetadataReadFailure::InvalidTimestamp
+        );
+        assert_eq!(
+            parse_profile_metadata_bytes(
+                br#"{"service":"openai","account":"test","automated_use_count":"many"}"#,
+                "openai",
+                "test"
+            )
+            .unwrap_err(),
+            ProfileMetadataReadFailure::InvalidSchema
+        );
+    }
+
+    #[test]
+    fn profile_metadata_failures_are_content_free() {
+        for failure in [
+            ProfileMetadataReadFailure::MetadataUnavailable,
+            ProfileMetadataReadFailure::NotRegularFile,
+            ProfileMetadataReadFailure::Oversized,
+            ProfileMetadataReadFailure::ReadUnavailable,
+            ProfileMetadataReadFailure::InvalidSchema,
+            ProfileMetadataReadFailure::IdentityMismatch,
+            ProfileMetadataReadFailure::InvalidTimestamp,
+        ] {
+            let detail = failure.detail();
+            let rendered = failure.into_storage_error().to_string();
+            assert!(!detail.contains("AKIAIOSFODNN7EXAMPLE"));
+            assert!(!detail.contains('/'));
+            assert!(!detail.contains('\\'));
+            assert!(!detail.contains('\n'));
+            assert!(!detail.contains('\u{202e}'));
+            assert!(detail.len() <= 96);
+            assert!(!rendered.contains("AKIAIOSFODNN7EXAMPLE"));
+            assert!(!rendered.contains('/'));
+            assert!(!rendered.contains('\\'));
+            assert!(!rendered.contains('\n'));
+            assert!(!rendered.contains('\u{202e}'));
+            assert!(rendered.len() <= 128);
+        }
     }
 
     #[test]

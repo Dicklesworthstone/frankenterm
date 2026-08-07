@@ -59790,14 +59790,22 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         if let Ok((lines, path)) = check_wezterm_scrollback() {
                             if lines >= RECOMMENDED_SCROLLBACK_LINES {
                                 println!("✓ Your WezTerm scrollback is already configured!");
-                                println!("  Current: {} lines in {}", lines, path.display());
+                                println!(
+                                    "  Current: {} lines in {}",
+                                    lines,
+                                    wezterm_config_path_for_output(&path)
+                                );
                                 println!(
                                     "  Recommended minimum: {RECOMMENDED_SCROLLBACK_LINES} lines"
                                 );
                                 println!("\nNo changes needed.");
                             } else {
                                 println!("⚠ Your WezTerm scrollback is below recommended minimum.");
-                                println!("  Current: {} lines in {}", lines, path.display());
+                                println!(
+                                    "  Current: {} lines in {}",
+                                    lines,
+                                    wezterm_config_path_for_output(&path)
+                                );
                                 println!("  Recommended: {RECOMMENDED_SCROLLBACK_LINES} lines\n");
                                 println!("Add this line to your wezterm.lua:");
                                 println!(
@@ -71905,7 +71913,7 @@ async fn handle_session_command(
                     );
                 } else {
                     println!(
-                        "Additional sessions exist beyond the supported offset window; no valid offset continuation is available."
+                        "Additional sessions exist beyond the supported offset window; no non-overlapping continuation is available."
                     );
                 }
             }
@@ -72050,7 +72058,7 @@ async fn handle_session_command(
                     );
                 } else {
                     println!(
-                        "Additional checkpoints exist beyond the supported offset window; no valid offset continuation is available."
+                        "Additional checkpoints exist beyond the supported offset window; no non-overlapping continuation is available."
                     );
                 }
             }
@@ -73766,62 +73774,128 @@ fn run_setup_font_command(
     Ok(())
 }
 
-/// Check WezTerm scrollback configuration
-///
-/// Returns (scrollback_lines, config_path) if found, or an error message.
-fn check_wezterm_scrollback() -> Result<(u64, std::path::PathBuf), String> {
-    // Check common WezTerm config locations
-    let config_paths: Vec<std::path::PathBuf> = vec![
-        dirs::config_dir()
-            .map(|p| p.join("wezterm/wezterm.lua"))
-            .unwrap_or_default(),
-        dirs::home_dir()
-            .map(|p| p.join(".wezterm.lua"))
-            .unwrap_or_default(),
-        dirs::home_dir()
-            .map(|p| p.join(".config/wezterm/wezterm.lua"))
-            .unwrap_or_default(),
-    ];
+const WEZTERM_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
 
-    for config_path in config_paths {
-        if config_path.exists() {
-            match std::fs::read_to_string(&config_path) {
-                Ok(content) => {
-                    // Parse scrollback_lines from Lua config
-                    // Patterns: config.scrollback_lines = N or scrollback_lines = N
-                    for line in content.lines() {
-                        let line = line.trim();
-                        // Skip comments
-                        if line.starts_with("--") {
-                            continue;
-                        }
-                        // Match: config.scrollback_lines = 50000 or scrollback_lines = 50000
-                        if line.contains("scrollback_lines") && line.contains('=') {
-                            // Extract the number after '='
-                            if let Some(value_part) = line.split('=').nth(1) {
-                                let value_str = value_part.trim().trim_end_matches(',');
-                                if let Ok(lines) = value_str.parse::<u64>() {
-                                    return Ok((lines, config_path));
-                                }
-                            }
-                        }
-                    }
-                    return Err(format!(
-                        "scrollback_lines not set in {}",
-                        config_path.display()
-                    ));
-                }
-                Err(e) => {
-                    return Err(format!("Failed to read {}: {}", config_path.display(), e));
-                }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WeztermScrollbackCheckFailure {
+    MetadataUnavailable,
+    NotRegularFile,
+    Oversized,
+    ReadUnavailable,
+    InvalidEncoding,
+    SettingMissing,
+    ConfigMissing,
+}
+
+impl WeztermScrollbackCheckFailure {
+    const fn diagnostic_detail(self) -> &'static str {
+        match self {
+            Self::MetadataUnavailable => {
+                "WezTerm config metadata could not be inspected safely"
             }
+            Self::NotRegularFile => "WezTerm config path is not a regular file",
+            Self::Oversized => "WezTerm config exceeds the 1 MiB diagnostic safety limit",
+            Self::ReadUnavailable => "WezTerm config could not be read safely",
+            Self::InvalidEncoding => "WezTerm config is not valid UTF-8 text",
+            Self::SettingMissing => "scrollback_lines is not set in the active WezTerm config",
+            Self::ConfigMissing => "No WezTerm config file was found in supported locations",
         }
     }
+}
 
-    Err(
-        "No WezTerm config file found (~/.config/wezterm/wezterm.lua or ~/.wezterm.lua)"
-            .to_string(),
-    )
+impl std::fmt::Display for WeztermScrollbackCheckFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.diagnostic_detail())
+    }
+}
+
+fn admit_wezterm_config_shape_and_size(
+    is_file: bool,
+    byte_len: u64,
+) -> Result<(), WeztermScrollbackCheckFailure> {
+    if !is_file {
+        return Err(WeztermScrollbackCheckFailure::NotRegularFile);
+    }
+    if byte_len > WEZTERM_CONFIG_MAX_BYTES {
+        return Err(WeztermScrollbackCheckFailure::Oversized);
+    }
+    Ok(())
+}
+
+fn read_wezterm_config_bounded(
+    reader: impl Read,
+) -> Result<Vec<u8>, WeztermScrollbackCheckFailure> {
+    let mut bytes = Vec::new();
+    reader
+        .take(WEZTERM_CONFIG_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| WeztermScrollbackCheckFailure::ReadUnavailable)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > WEZTERM_CONFIG_MAX_BYTES {
+        return Err(WeztermScrollbackCheckFailure::Oversized);
+    }
+    Ok(bytes)
+}
+
+fn parse_wezterm_scrollback_lines(content: &str) -> Option<u64> {
+    content.lines().find_map(|line| {
+        let code = line.split_once("--").map_or(line, |(code, _)| code).trim();
+        let (name, value) = code.split_once('=')?;
+        let name = name.trim();
+        if name != "scrollback_lines" && !name.ends_with(".scrollback_lines") {
+            return None;
+        }
+        value.trim().trim_end_matches(',').trim().parse().ok()
+    })
+}
+
+fn parse_wezterm_config_bytes(
+    bytes: &[u8],
+) -> Result<u64, WeztermScrollbackCheckFailure> {
+    let content = std::str::from_utf8(bytes)
+        .map_err(|_| WeztermScrollbackCheckFailure::InvalidEncoding)?;
+    parse_wezterm_scrollback_lines(content)
+        .ok_or(WeztermScrollbackCheckFailure::SettingMissing)
+}
+
+fn diagnostic_path_for_output(path: &Path) -> String {
+    bounded_terminal_diagnostic(&path.to_string_lossy(), 256, 1_024)
+}
+
+fn wezterm_config_path_for_output(path: &Path) -> String {
+    diagnostic_path_for_output(path)
+}
+
+/// Check WezTerm scrollback configuration.
+///
+/// Returns `(scrollback_lines, config_path)` after admitting a finite regular
+/// UTF-8 config file, or a content-free failure classification.
+fn check_wezterm_scrollback() -> Result<(u64, PathBuf), WeztermScrollbackCheckFailure> {
+    // Check common WezTerm config locations
+    let config_paths: Vec<PathBuf> = [
+        dirs::config_dir().map(|path| path.join("wezterm/wezterm.lua")),
+        dirs::home_dir().map(|path| path.join(".wezterm.lua")),
+        dirs::home_dir().map(|path| path.join(".config/wezterm/wezterm.lua")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    for config_path in config_paths {
+        let metadata = match std::fs::metadata(&config_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(WeztermScrollbackCheckFailure::MetadataUnavailable),
+        };
+        admit_wezterm_config_shape_and_size(metadata.is_file(), metadata.len())?;
+
+        let file = std::fs::File::open(&config_path)
+            .map_err(|_| WeztermScrollbackCheckFailure::ReadUnavailable)?;
+        let bytes = read_wezterm_config_bounded(file)?;
+        let lines = parse_wezterm_config_bytes(&bytes)?;
+        return Ok((lines, config_path));
+    }
+
+    Err(WeztermScrollbackCheckFailure::ConfigMissing)
 }
 
 fn format_backup_hint(path: &Path) -> String {
@@ -73865,7 +73939,10 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
     match check_wezterm_scrollback() {
         Ok((lines, path)) => {
             if verbose > 0 {
-                println!("  WezTerm config: {}", path.display());
+                println!(
+                    "  WezTerm config: {}",
+                    wezterm_config_path_for_output(&path)
+                );
             }
             if lines >= RECOMMENDED_SCROLLBACK_LINES {
                 println!("  ✓ scrollback_lines = {} (ok)", lines);
@@ -75956,6 +76033,18 @@ fn tuning_diagnostic_check(config: &frankenterm_core::config::Config) -> Diagnos
     }
 }
 
+fn permission_warning_recommendation(
+    warning: &frankenterm_core::config::PermissionWarning,
+) -> String {
+    // `warning.path` may originate in user configuration and can contain
+    // private or terminal-hostile content. The numeric mode provides enough
+    // remediation context without echoing the path or any adjacent label.
+    format!(
+        "Restrict the affected configured path permissions to mode {:o}",
+        warning.expected_mode
+    )
+}
+
 /// Resolve the wezterm binary, respecting `FT_WEZTERM_CLI` env var.
 fn wezterm_binary() -> String {
     std::env::var("FT_WEZTERM_CLI").unwrap_or_else(|_| "wezterm".to_string())
@@ -75981,6 +76070,180 @@ const DIAGNOSTIC_COMMAND_LEADER_REAP_TIMEOUT: std::time::Duration =
 const DIAGNOSTIC_COMMAND_CAPTURE_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(5);
 const DIAGNOSTIC_COMMAND_DRAIN_SLICE_BYTES: usize = 1024 * 1024;
+const WEZTERM_VERSION_STDERR_OVERSIZED_DETAIL: &str =
+    "wezterm --version diagnostic output exceeded the safety limit";
+const LOGS_DIRECTORY_NOT_DIRECTORY_DETAIL: &str =
+    "shape check failed: configured logs path is not a directory";
+const LOGS_DIRECTORY_READ_ONLY_DETAIL: &str =
+    "basic permission metadata reports a read-only logs directory";
+const LOGS_DIRECTORY_INSPECTED_DETAIL: &str =
+    "shape/basic permission metadata inspected; writability was not tested";
+const LOGS_DIRECTORY_METADATA_ERROR_DETAIL: &str =
+    "shape/basic permission metadata could not be inspected";
+const LOGS_DIRECTORY_MISSING_DETAIL: &str =
+    "shape check: configured logs directory does not exist";
+
+#[cfg(feature = "browser")]
+const BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE: usize = 4_096;
+
+#[cfg(feature = "browser")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BrowserProfileDiagnosticCounts {
+    entries_examined: usize,
+    profiles_observed: usize,
+    bootstrapped: usize,
+    known_unbootstrapped: usize,
+    metadata_unknown: usize,
+    entries_unclassified: usize,
+    truncated: bool,
+}
+
+#[cfg(feature = "browser")]
+impl BrowserProfileDiagnosticCounts {
+    fn detail(self) -> String {
+        let scan = if self.truncated {
+            format!(
+                "truncated_at_{}_entries; omitted_entries=unknown",
+                BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE
+            )
+        } else {
+            "complete".to_string()
+        };
+        format!(
+            "entries_examined={}; profiles_observed={}; bootstrapped={}; \
+             known_unbootstrapped={}; metadata_unknown={}; \
+             entries_unclassified={}; scan={scan}",
+            self.entries_examined,
+            self.profiles_observed,
+            self.bootstrapped,
+            self.known_unbootstrapped,
+            self.metadata_unknown,
+            self.entries_unclassified,
+        )
+    }
+
+    const fn has_incomplete_evidence(self) -> bool {
+        self.truncated || self.metadata_unknown > 0 || self.entries_unclassified > 0
+    }
+}
+
+#[cfg(feature = "browser")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserProfileDiagnosticScan {
+    DirectoryMissing,
+    DirectoryUnavailable,
+    Observed(BrowserProfileDiagnosticCounts),
+}
+
+#[cfg(feature = "browser")]
+fn scan_browser_profiles_for_diagnostics(
+    profiles_root: &Path,
+    service: &str,
+) -> BrowserProfileDiagnosticScan {
+    let service_dir = profiles_root.join(service);
+    let entries = match std::fs::read_dir(&service_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return BrowserProfileDiagnosticScan::DirectoryMissing;
+        }
+        Err(_) => return BrowserProfileDiagnosticScan::DirectoryUnavailable,
+    };
+
+    let mut counts = BrowserProfileDiagnosticCounts::default();
+    for entry_result in entries {
+        if counts.entries_examined >= BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE {
+            counts.truncated = true;
+            break;
+        }
+        counts.entries_examined = counts.entries_examined.saturating_add(1);
+
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(_) => {
+                counts.entries_unclassified = counts.entries_unclassified.saturating_add(1);
+                continue;
+            }
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => {
+                counts.entries_unclassified = counts.entries_unclassified.saturating_add(1);
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        counts.profiles_observed = counts.profiles_observed.saturating_add(1);
+        let account_name = entry.file_name();
+        let Some(account) = account_name.to_str() else {
+            counts.metadata_unknown = counts.metadata_unknown.saturating_add(1);
+            continue;
+        };
+        let profile = frankenterm_core::browser::BrowserProfile::new(
+            profiles_root,
+            service,
+            account,
+        );
+        if profile.path() != entry.path() {
+            counts.metadata_unknown = counts.metadata_unknown.saturating_add(1);
+            continue;
+        }
+
+        match profile.read_metadata() {
+            Ok(Some(metadata)) if metadata.bootstrapped_at.is_some() => {
+                counts.bootstrapped = counts.bootstrapped.saturating_add(1);
+            }
+            Ok(Some(_)) => {
+                counts.known_unbootstrapped =
+                    counts.known_unbootstrapped.saturating_add(1);
+            }
+            Ok(None) | Err(_) => {
+                counts.metadata_unknown = counts.metadata_unknown.saturating_add(1);
+            }
+        }
+    }
+
+    BrowserProfileDiagnosticScan::Observed(counts)
+}
+
+#[cfg(feature = "browser")]
+fn browser_profile_diagnostic_check(
+    check_name: &'static str,
+    scan: BrowserProfileDiagnosticScan,
+) -> DiagnosticCheck {
+    match scan {
+        BrowserProfileDiagnosticScan::DirectoryMissing => DiagnosticCheck::ok_with_detail(
+            check_name,
+            "profile directory absent; profiles_observed=0; scan=complete",
+        ),
+        BrowserProfileDiagnosticScan::DirectoryUnavailable => DiagnosticCheck::warning(
+            check_name,
+            "profile directory could not be inspected safely",
+            "Review the configured browser profile directory permissions",
+        ),
+        BrowserProfileDiagnosticScan::Observed(counts) => {
+            let detail = counts.detail();
+            if counts.has_incomplete_evidence() {
+                let recommendation = if counts.truncated {
+                    "Reduce profile-directory entries or inspect profiles in bounded batches"
+                } else {
+                    "Inspect missing, invalid, or unreadable browser profile metadata"
+                };
+                DiagnosticCheck::warning(check_name, detail, recommendation)
+            } else if counts.known_unbootstrapped > 0 {
+                DiagnosticCheck::warning(
+                    check_name,
+                    detail,
+                    "Run interactive bootstrap for profiles that are not bootstrapped",
+                )
+            } else {
+                DiagnosticCheck::ok_with_detail(check_name, detail)
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 struct BoundedCommandStream {
@@ -76386,93 +76649,136 @@ fn run_diagnostics(
     // Check 2: Workspace resolution
     checks.push(DiagnosticCheck::ok_with_detail(
         "workspace root",
-        layout.root.display().to_string(),
+        diagnostic_path_for_output(&layout.root),
     ));
 
     // Check 3: .ft directory
-    if layout.ft_dir.exists() {
-        checks.push(DiagnosticCheck::ok_with_detail(
-            ".ft directory",
-            layout.ft_dir.display().to_string(),
-        ));
-    } else {
-        checks.push(DiagnosticCheck::warning(
-            ".ft directory",
-            format!("{} does not exist", layout.ft_dir.display()),
-            "Will be created on first daemon start",
-        ));
+    match std::fs::metadata(&layout.ft_dir) {
+        Ok(metadata) if metadata.is_dir() => {
+            checks.push(DiagnosticCheck::ok_with_detail(
+                ".ft directory",
+                diagnostic_path_for_output(&layout.ft_dir),
+            ));
+        }
+        Ok(_) => {
+            checks.push(DiagnosticCheck::error(
+                ".ft directory",
+                "configured .ft path is not a directory",
+                "Move the conflicting path before starting the daemon",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            checks.push(DiagnosticCheck::warning(
+                ".ft directory",
+                format!(
+                    "{} does not exist",
+                    diagnostic_path_for_output(&layout.ft_dir)
+                ),
+                "Will be created on first daemon start",
+            ));
+        }
+        Err(_) => {
+            checks.push(DiagnosticCheck::error(
+                ".ft directory",
+                "configured .ft directory metadata could not be inspected",
+                "Review the configured workspace directory permissions",
+            ));
+        }
     }
 
     // Check 4: Database path and status
-    if layout.db_path.exists() {
-        // Try to open and check DB
-        match rusqlite::Connection::open_with_flags(
-            &layout.db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        ) {
-            Ok(conn) => {
-                // Check schema version
-                match conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0)) {
-                    Ok(version) => {
-                        let target = frankenterm_core::storage::SCHEMA_VERSION;
-                        match version.cmp(&target) {
-                            std::cmp::Ordering::Equal => {
-                                // Check WAL mode
-                                let wal_mode: String = conn
-                                    .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-                                    .unwrap_or_else(|_| "unknown".to_string());
-                                checks.push(DiagnosticCheck::ok_with_detail(
-                                    "database",
-                                    format!(
-                                        "schema v{}, journal={} ({})",
-                                        version,
-                                        wal_mode,
-                                        layout.db_path.display()
-                                    ),
-                                ));
-                            }
-                            std::cmp::Ordering::Less => {
-                                checks.push(DiagnosticCheck::warning(
-                                    "database",
-                                    format!("schema v{} (needs migration to v{})", version, target),
-                                    "Run 'ft daemon start' to auto-migrate",
-                                ));
-                            }
-                            std::cmp::Ordering::Greater => {
-                                checks.push(DiagnosticCheck::error(
-                                    "database",
-                                    format!(
-                                        "schema v{} is newer than FrankenTerm supports (v{})",
-                                        version, target
-                                    ),
-                                    "Update FrankenTerm to a newer version",
-                                ));
+    match std::fs::metadata(&layout.db_path) {
+        Ok(metadata) if metadata.is_file() => {
+            // Try to open and check DB
+            match rusqlite::Connection::open_with_flags(
+                &layout.db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) {
+                Ok(conn) => {
+                    // Check schema version
+                    match conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0)) {
+                        Ok(version) => {
+                            let target = frankenterm_core::storage::SCHEMA_VERSION;
+                            match version.cmp(&target) {
+                                std::cmp::Ordering::Equal => {
+                                    // Check WAL mode
+                                    let wal_mode: String = conn
+                                        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                                        .unwrap_or_else(|_| "unknown".to_string());
+                                    checks.push(DiagnosticCheck::ok_with_detail(
+                                        "database",
+                                        format!(
+                                            "schema v{}, journal={} ({})",
+                                            version,
+                                            wal_mode,
+                                            diagnostic_path_for_output(&layout.db_path)
+                                        ),
+                                    ));
+                                }
+                                std::cmp::Ordering::Less => {
+                                    checks.push(DiagnosticCheck::warning(
+                                        "database",
+                                        format!(
+                                            "schema v{} (needs migration to v{})",
+                                            version, target
+                                        ),
+                                        "Run 'ft daemon start' to auto-migrate",
+                                    ));
+                                }
+                                std::cmp::Ordering::Greater => {
+                                    checks.push(DiagnosticCheck::error(
+                                        "database",
+                                        format!(
+                                            "schema v{} is newer than FrankenTerm supports (v{})",
+                                            version, target
+                                        ),
+                                        "Update FrankenTerm to a newer version",
+                                    ));
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        checks.push(DiagnosticCheck::warning(
-                            "database",
-                            format!("could not read schema version: {}", e),
-                            "Database may be corrupt or locked",
-                        ));
+                        Err(_) => {
+                            checks.push(DiagnosticCheck::warning(
+                                "database",
+                                "could not read schema version",
+                                "Database may be corrupt or locked",
+                            ));
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                checks.push(DiagnosticCheck::error(
-                    "database",
-                    format!("could not open: {}", e),
-                    "Check file permissions or if another process has locked it",
-                ));
+                Err(_) => {
+                    checks.push(DiagnosticCheck::error(
+                        "database",
+                        "database could not be opened read-only",
+                        "Check file permissions or if another process has locked it",
+                    ));
+                }
             }
         }
-    } else {
-        checks.push(DiagnosticCheck::warning(
-            "database",
-            format!("{} does not exist", layout.db_path.display()),
-            "Will be created on first daemon start",
-        ));
+        Ok(_) => {
+            checks.push(DiagnosticCheck::error(
+                "database",
+                "configured database path is not a regular file",
+                "Move the conflicting path before starting the daemon",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            checks.push(DiagnosticCheck::warning(
+                "database",
+                format!(
+                    "{} does not exist",
+                    diagnostic_path_for_output(&layout.db_path)
+                ),
+                "Will be created on first daemon start",
+            ));
+        }
+        Err(_) => {
+            checks.push(DiagnosticCheck::error(
+                "database",
+                "configured database metadata could not be inspected",
+                "Review the configured database and parent directory permissions",
+            ));
+        }
     }
 
     // Check 5: Lock file (watcher status)
@@ -76481,56 +76787,75 @@ fn run_diagnostics(
             "daemon status",
             format!("running (PID {})", meta.pid),
         ));
-    } else if layout.lock_path.exists() {
-        checks.push(DiagnosticCheck::warning(
-            "daemon status",
-            "stale lock (process not running)",
-            format!("Remove lock: rm {}", layout.lock_path.display()),
-        ));
     } else {
-        checks.push(DiagnosticCheck::ok_with_detail(
-            "daemon status",
-            "not running",
-        ));
-    }
-
-    // Check 6: Logs directory writability
-    if layout.logs_dir.exists() {
-        match std::fs::metadata(&layout.logs_dir) {
-            Ok(metadata) if !metadata.is_dir() => {
-                checks.push(DiagnosticCheck::error(
-                    "logs directory",
-                    "configured logs path is not a directory",
-                    "Move the conflicting path and create a logs directory",
-                ));
-            }
-            Ok(metadata) if metadata.permissions().readonly() => {
-                checks.push(DiagnosticCheck::error(
-                    "logs directory",
-                    "directory permissions are read-only",
-                    format!("Check permissions: chmod 755 {}", layout.logs_dir.display()),
+        match std::fs::metadata(&layout.lock_path) {
+            Ok(metadata) if metadata.is_file() => {
+                checks.push(DiagnosticCheck::warning(
+                    "daemon status",
+                    "stale lock (process not running)",
+                    "Remove the configured stale lock file after confirming the daemon is stopped",
                 ));
             }
             Ok(_) => {
+                checks.push(DiagnosticCheck::error(
+                    "daemon status",
+                    "configured lock path is not a regular file",
+                    "Move the conflicting path before starting the daemon",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 checks.push(DiagnosticCheck::ok_with_detail(
-                    "logs directory",
-                    layout.logs_dir.display().to_string(),
+                    "daemon status",
+                    "not running",
                 ));
             }
             Err(_) => {
-                checks.push(DiagnosticCheck::error(
-                    "logs directory",
-                    "directory metadata could not be inspected",
-                    format!("Check permissions: chmod 755 {}", layout.logs_dir.display()),
+                checks.push(DiagnosticCheck::warning(
+                    "daemon status",
+                    "configured lock metadata could not be inspected",
+                    "Review the configured lock and parent directory permissions",
                 ));
             }
         }
-    } else {
-        checks.push(DiagnosticCheck::warning(
-            "logs directory",
-            format!("{} does not exist", layout.logs_dir.display()),
-            "Will be created on first daemon start",
-        ));
+    }
+
+    // Check 6: Logs directory shape and basic permission metadata. This probe
+    // deliberately performs no write, so it must not claim actual writability.
+    match std::fs::metadata(&layout.logs_dir) {
+        Ok(metadata) if !metadata.is_dir() => {
+            checks.push(DiagnosticCheck::error(
+                "logs directory",
+                LOGS_DIRECTORY_NOT_DIRECTORY_DETAIL,
+                "Move the conflicting path and create the configured logs directory",
+            ));
+        }
+        Ok(metadata) if metadata.permissions().readonly() => {
+            checks.push(DiagnosticCheck::error(
+                "logs directory",
+                LOGS_DIRECTORY_READ_ONLY_DETAIL,
+                "Review the configured logs directory permissions",
+            ));
+        }
+        Ok(_) => {
+            checks.push(DiagnosticCheck::ok_with_detail(
+                "logs directory",
+                LOGS_DIRECTORY_INSPECTED_DETAIL,
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            checks.push(DiagnosticCheck::warning(
+                "logs directory",
+                LOGS_DIRECTORY_MISSING_DETAIL,
+                "Will be created on first daemon start",
+            ));
+        }
+        Err(_) => {
+            checks.push(DiagnosticCheck::error(
+                "logs directory",
+                LOGS_DIRECTORY_METADATA_ERROR_DETAIL,
+                "Review the configured logs directory and its parent permissions",
+            ));
+        }
     }
 
     // Check 7: Feature flags
@@ -76561,7 +76886,11 @@ fn run_diagnostics(
     let config_source = if config.general.log_level.is_empty() {
         "defaults".to_string()
     } else {
-        format!("log_level={}", config.general.log_level)
+        bounded_terminal_diagnostic(
+            &format!("log_level={}", config.general.log_level),
+            128,
+            256,
+        )
     };
     checks.push(DiagnosticCheck::ok_with_detail("config", config_source));
     checks.push(tuning_diagnostic_check(config));
@@ -76602,7 +76931,7 @@ fn run_diagnostics(
         Ok(output) if output.stderr.overflowed => {
             checks.push(DiagnosticCheck::error(
                 "WezTerm CLI",
-                "wezterm --version diagnostic output exceeded the safety limit",
+                WEZTERM_VERSION_STDERR_OVERSIZED_DETAIL,
                 "Ensure the active backend bridge returns bounded diagnostics",
             ));
         }
@@ -76729,7 +77058,11 @@ fn run_diagnostics(
             if lines >= RECOMMENDED_SCROLLBACK_LINES {
                 checks.push(DiagnosticCheck::ok_with_detail(
                     "WezTerm scrollback",
-                    format!("{} lines ({})", lines, path.display()),
+                    format!(
+                        "{} lines ({})",
+                        lines,
+                        wezterm_config_path_for_output(&path)
+                    ),
                 ));
             } else {
                 checks.push(DiagnosticCheck::warning(
@@ -76743,10 +77076,10 @@ fn run_diagnostics(
                 ));
             }
         }
-        Err(msg) => {
+        Err(failure) => {
             checks.push(DiagnosticCheck::warning(
                 "WezTerm scrollback",
-                msg,
+                failure.diagnostic_detail(),
                 format!(
                     "Add to wezterm.lua: config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}"
                 ),
@@ -76765,11 +77098,7 @@ fn run_diagnostics(
                     "{} permissions too open ({:o})",
                     warning.label, warning.actual_mode
                 ),
-                format!(
-                    "chmod {:o} {}",
-                    warning.expected_mode,
-                    warning.path.display()
-                ),
+                permission_warning_recommendation(warning),
             ));
         }
     }
@@ -76922,80 +77251,16 @@ fn run_diagnostics(
         }
 
         // Check browser profiles for each service
-        let data_dir = layout.ft_dir.join("browser_profiles");
+        let profiles_root = layout.ft_dir.join("browser_profiles");
         for service in &["openai", "anthropic", "google"] {
-            let service_dir = data_dir.join(service);
-            if service_dir.exists() {
-                // Count account profiles
-                let profile_count = std::fs::read_dir(&service_dir)
-                    .map(|rd| {
-                        rd.filter(|e| e.as_ref().is_ok_and(|e| e.path().is_dir()))
-                            .count()
-                    })
-                    .unwrap_or(0);
-
-                if profile_count > 0 {
-                    // Check if any profile has been bootstrapped
-                    let mut bootstrapped = 0u32;
-                    if let Ok(entries) = std::fs::read_dir(&service_dir) {
-                        for entry in entries.flatten() {
-                            let meta_path = entry.path().join(".wa_profile.json");
-                            if meta_path.exists() {
-                                if let Ok(content) = std::fs::read_to_string(&meta_path) {
-                                    if let Ok(meta) =
-                                        serde_json::from_str::<serde_json::Value>(&content)
-                                    {
-                                        if meta
-                                            .get("bootstrapped_at")
-                                            .and_then(|v| v.as_str())
-                                            .is_some()
-                                        {
-                                            bootstrapped += 1;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let check_name: &'static str = match *service {
-                        "openai" => "Browser: OpenAI",
-                        "anthropic" => "Browser: Anthropic",
-                        "google" => "Browser: Google",
-                        _ => "Browser: unknown",
-                    };
-
-                    if bootstrapped > 0 {
-                        checks.push(DiagnosticCheck::ok_with_detail(
-                            check_name,
-                            format!(
-                                "{} profile(s), {} bootstrapped → Automated",
-                                profile_count, bootstrapped
-                            ),
-                        ));
-                    } else {
-                        checks.push(DiagnosticCheck::warning(
-                            check_name,
-                            format!(
-                                "{} profile(s), none bootstrapped → NeedsHuman",
-                                profile_count
-                            ),
-                            "Run interactive bootstrap to authenticate",
-                        ));
-                    }
-                } else {
-                    let check_name: &'static str = match *service {
-                        "openai" => "Browser: OpenAI",
-                        "anthropic" => "Browser: Anthropic",
-                        "google" => "Browser: Google",
-                        _ => "Browser: unknown",
-                    };
-                    checks.push(DiagnosticCheck::ok_with_detail(
-                        check_name,
-                        "no profiles (not yet configured)",
-                    ));
-                }
-            }
+            let check_name: &'static str = match *service {
+                "openai" => "Browser: OpenAI",
+                "anthropic" => "Browser: Anthropic",
+                "google" => "Browser: Google",
+                _ => "Browser: unknown",
+            };
+            let scan = scan_browser_profiles_for_diagnostics(&profiles_root, service);
+            checks.push(browser_profile_diagnostic_check(check_name, scan));
         }
     }
 
@@ -78887,10 +79152,24 @@ mod tests {
         )
         .expect("insert newer startup checkpoint");
 
-        let (selected_session, _) =
-            frankenterm_core::session_restore::show_session(&db_path, "sess-shadowed")
-                .expect("select session checkpoint before concurrent capture");
-        assert_eq!(selected_session.selected_checkpoint_id, Some(capture_cp));
+        let selected_page = frankenterm_core::session_restore::show_session_page(
+            &db_path,
+            "sess-shadowed",
+            1,
+            0,
+        )
+        .expect("select paged session checkpoint before concurrent capture");
+        assert_eq!(selected_page.total_checkpoints, 2);
+        assert_eq!(selected_page.checkpoints.len(), 1);
+        assert!(selected_page.has_more);
+        assert_eq!(
+            selected_page.checkpoints[0].checkpoint_role,
+            frankenterm_core::session_restore::CheckpointRole::RestoreReceipt
+        );
+        assert_eq!(
+            selected_page.session.selected_checkpoint_id,
+            Some(capture_cp)
+        );
         let concurrent_cp =
             insert_checkpoint_for_session_show_test(&conn, "sess-shadowed", 3000, 1);
         insert_pane_state_for_session_show_test(
@@ -78903,8 +79182,8 @@ mod tests {
 
         let lookup = load_session_show_pane_lookup(
             &db_path,
-            &selected_session.session_id,
-            selected_session.selected_checkpoint_id,
+            &selected_page.session.session_id,
+            selected_page.session.selected_checkpoint_id,
             42,
         )
         .expect("load pane data");
@@ -101411,6 +101690,128 @@ A  docs/new-proof.md\n";
     }
 
     #[test]
+    fn diagnostic_logs_directory_metadata_wording_is_content_free_and_read_only() {
+        for detail in [
+            LOGS_DIRECTORY_NOT_DIRECTORY_DETAIL,
+            LOGS_DIRECTORY_READ_ONLY_DETAIL,
+            LOGS_DIRECTORY_INSPECTED_DETAIL,
+            LOGS_DIRECTORY_METADATA_ERROR_DETAIL,
+            LOGS_DIRECTORY_MISSING_DETAIL,
+        ] {
+            assert!(!detail.contains("AKIAIOSFODNN7EXAMPLE"));
+            assert!(!detail.contains('/'));
+            assert!(!detail.contains('\\'));
+            assert!(!detail.contains('\n'));
+            assert!(!detail.contains('\u{202e}'));
+            assert!(detail.len() <= 96);
+        }
+        assert!(LOGS_DIRECTORY_INSPECTED_DETAIL.contains("writability was not tested"));
+    }
+
+    #[test]
+    fn diagnostic_permission_recommendation_never_echoes_the_configured_path() {
+        let warning = frankenterm_core::config::PermissionWarning {
+            label: "config file",
+            path: PathBuf::from("/private/AKIAIOSFODNN7EXAMPLE\n\u{202e}/ft.toml"),
+            expected_mode: 0o600,
+            actual_mode: 0o644,
+        };
+        let recommendation = permission_warning_recommendation(&warning);
+        assert_eq!(
+            recommendation,
+            "Restrict the affected configured path permissions to mode 600"
+        );
+        assert!(!recommendation.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!recommendation.contains('\n'));
+        assert!(!recommendation.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn wezterm_scrollback_parser_and_admission_are_bounded_and_fail_closed() {
+        assert_eq!(
+            parse_wezterm_scrollback_lines(
+                "-- config.scrollback_lines = 1\nconfig.scrollback_lines = 50000, -- retained"
+            ),
+            Some(50_000)
+        );
+        assert_eq!(
+            parse_wezterm_scrollback_lines("scrollback_lines = 12345"),
+            Some(12_345)
+        );
+        assert_eq!(
+            parse_wezterm_scrollback_lines("not_scrollback_lines = 99999"),
+            None
+        );
+
+        assert_eq!(
+            admit_wezterm_config_shape_and_size(true, WEZTERM_CONFIG_MAX_BYTES),
+            Ok(())
+        );
+        assert_eq!(
+            admit_wezterm_config_shape_and_size(
+                true,
+                WEZTERM_CONFIG_MAX_BYTES.saturating_add(1)
+            ),
+            Err(WeztermScrollbackCheckFailure::Oversized)
+        );
+        assert_eq!(
+            admit_wezterm_config_shape_and_size(false, 0),
+            Err(WeztermScrollbackCheckFailure::NotRegularFile)
+        );
+
+        let max_bytes = usize::try_from(WEZTERM_CONFIG_MAX_BYTES)
+            .expect("WezTerm config cap must fit usize");
+        let exact = vec![b'x'; max_bytes];
+        assert_eq!(
+            read_wezterm_config_bounded(Cursor::new(exact))
+                .expect("exact-cap config must be admitted")
+                .len(),
+            max_bytes
+        );
+        let over = vec![b'x'; max_bytes.saturating_add(1)];
+        assert_eq!(
+            read_wezterm_config_bounded(Cursor::new(over)),
+            Err(WeztermScrollbackCheckFailure::Oversized)
+        );
+        assert_eq!(
+            parse_wezterm_config_bytes(&[0xff]),
+            Err(WeztermScrollbackCheckFailure::InvalidEncoding)
+        );
+        assert_eq!(
+            parse_wezterm_config_bytes(b"return config"),
+            Err(WeztermScrollbackCheckFailure::SettingMissing)
+        );
+    }
+
+    #[test]
+    fn wezterm_scrollback_diagnostics_are_content_free_and_path_safe() {
+        for failure in [
+            WeztermScrollbackCheckFailure::MetadataUnavailable,
+            WeztermScrollbackCheckFailure::NotRegularFile,
+            WeztermScrollbackCheckFailure::Oversized,
+            WeztermScrollbackCheckFailure::ReadUnavailable,
+            WeztermScrollbackCheckFailure::InvalidEncoding,
+            WeztermScrollbackCheckFailure::SettingMissing,
+            WeztermScrollbackCheckFailure::ConfigMissing,
+        ] {
+            let detail = failure.diagnostic_detail();
+            assert!(!detail.contains('/'));
+            assert!(!detail.contains('\\'));
+            assert!(!detail.contains('\n'));
+            assert!(!detail.contains('\u{202e}'));
+            assert!(detail.len() <= 96);
+        }
+
+        let hostile_path = Path::new("/private/AKIAIOSFODNN7EXAMPLE\n\u{202e}/wezterm.lua");
+        let public_path = wezterm_config_path_for_output(hostile_path);
+        assert_eq!(public_path, diagnostic_path_for_output(hostile_path));
+        assert!(!public_path.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!public_path.contains('\n'));
+        assert!(!public_path.contains('\u{202e}'));
+        assert!(public_path.len() <= 1_024);
+    }
+
+    #[test]
     fn diagnostic_wezterm_version_admission_fails_closed() {
         let admitted = BoundedCommandStream {
             bytes: b"wezterm 20260806-120000-deadbeef\n".to_vec(),
@@ -101475,8 +101876,10 @@ A  docs/new-proof.md\n";
         let injected_secret = "AKIAIOSFODNN7EXAMPLE\n\u{202e}forged";
         let injected_io_error = std::io::Error::other(injected_secret);
         for detail in [
+            WEZTERM_VERSION_STDERR_OVERSIZED_DETAIL,
             WeztermListProbeFailure::NonSuccess.diagnostic_detail(),
             WeztermListProbeFailure::Oversized.diagnostic_detail(),
+            WeztermListProbeFailure::StderrOversized.diagnostic_detail(),
             WeztermListProbeFailure::from_io_error(&injected_io_error).diagnostic_detail(),
         ] {
             assert!(!detail.contains("AKIAIOSFODNN7EXAMPLE"));
@@ -101532,13 +101935,112 @@ A  docs/new-proof.md\n";
 
         let injected_io_error =
             std::io::Error::other("AKIAIOSFODNN7EXAMPLE\n\u{202e}forged");
-        let detail = PlaywrightProbeFailure::from_io_error(&injected_io_error)
-            .diagnostic_detail();
-        assert!(!detail.contains("AKIAIOSFODNN7EXAMPLE"));
-        assert!(!detail.contains("forged"));
+        for detail in [
+            PlaywrightProbeFailure::NonSuccess.diagnostic_detail(),
+            PlaywrightProbeFailure::StderrOversized.diagnostic_detail(),
+            PlaywrightProbeFailure::from_io_error(&injected_io_error).diagnostic_detail(),
+        ] {
+            assert!(!detail.contains("AKIAIOSFODNN7EXAMPLE"));
+            assert!(!detail.contains("forged"));
+            assert!(!detail.contains('\n'));
+            assert!(!detail.contains('\u{202e}'));
+            assert!(detail.len() <= 80);
+        }
+    }
+
+    #[cfg(feature = "browser")]
+    #[test]
+    fn diagnostic_browser_profile_counts_are_truthful_and_status_sensitive() {
+        let fully_bootstrapped = BrowserProfileDiagnosticCounts {
+            entries_examined: 2,
+            profiles_observed: 2,
+            bootstrapped: 2,
+            ..BrowserProfileDiagnosticCounts::default()
+        };
+        let check = browser_profile_diagnostic_check(
+            "Browser: OpenAI",
+            BrowserProfileDiagnosticScan::Observed(fully_bootstrapped),
+        );
+        assert_eq!(check.status, DiagnosticStatus::Ok);
+        let detail = check.detail.expect("complete scan detail");
+        assert!(detail.contains("profiles_observed=2"));
+        assert!(detail.contains("bootstrapped=2"));
+        assert!(detail.contains("metadata_unknown=0"));
+        assert!(detail.contains("scan=complete"));
+
+        let needs_bootstrap = BrowserProfileDiagnosticCounts {
+            entries_examined: 2,
+            profiles_observed: 2,
+            bootstrapped: 1,
+            known_unbootstrapped: 1,
+            ..BrowserProfileDiagnosticCounts::default()
+        };
+        let check = browser_profile_diagnostic_check(
+            "Browser: OpenAI",
+            BrowserProfileDiagnosticScan::Observed(needs_bootstrap),
+        );
+        assert_eq!(check.status, DiagnosticStatus::Warning);
+        assert!(
+            check
+                .recommendation
+                .as_deref()
+                .is_some_and(|value| value.contains("interactive bootstrap"))
+        );
+    }
+
+    #[cfg(feature = "browser")]
+    #[test]
+    fn diagnostic_browser_profile_incomplete_counts_never_claim_completeness() {
+        let incomplete = BrowserProfileDiagnosticCounts {
+            entries_examined: BROWSER_DIAGNOSTIC_MAX_ENTRIES_PER_SERVICE,
+            profiles_observed: 4_000,
+            bootstrapped: 3_000,
+            known_unbootstrapped: 500,
+            metadata_unknown: 500,
+            entries_unclassified: 3,
+            truncated: true,
+        };
+        let check = browser_profile_diagnostic_check(
+            "Browser: Anthropic",
+            BrowserProfileDiagnosticScan::Observed(incomplete),
+        );
+        assert_eq!(check.status, DiagnosticStatus::Warning);
+        let detail = check.detail.expect("truncated scan detail");
+        assert!(detail.contains("entries_examined=4096"));
+        assert!(detail.contains("profiles_observed=4000"));
+        assert!(detail.contains("metadata_unknown=500"));
+        assert!(detail.contains("entries_unclassified=3"));
+        assert!(detail.contains("scan=truncated_at_4096_entries"));
+        assert!(detail.contains("omitted_entries=unknown"));
+        assert!(!detail.contains('/'));
+        assert!(!detail.contains('\\'));
         assert!(!detail.contains('\n'));
         assert!(!detail.contains('\u{202e}'));
-        assert!(detail.len() <= 80);
+        assert!(detail.len() <= 256);
+    }
+
+    #[cfg(feature = "browser")]
+    #[test]
+    fn diagnostic_browser_profile_directory_failures_are_content_free() {
+        let missing = browser_profile_diagnostic_check(
+            "Browser: Google",
+            BrowserProfileDiagnosticScan::DirectoryMissing,
+        );
+        assert_eq!(missing.status, DiagnosticStatus::Ok);
+        assert_eq!(
+            missing.detail.as_deref(),
+            Some("profile directory absent; profiles_observed=0; scan=complete")
+        );
+
+        let unavailable = browser_profile_diagnostic_check(
+            "Browser: Google",
+            BrowserProfileDiagnosticScan::DirectoryUnavailable,
+        );
+        assert_eq!(unavailable.status, DiagnosticStatus::Warning);
+        let rendered = serde_json::to_string(&unavailable.to_json_value())
+            .expect("content-free diagnostic serializes");
+        assert!(!rendered.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!rendered.contains("\\u202e"));
     }
 
     // --- JSON output shape stability ---

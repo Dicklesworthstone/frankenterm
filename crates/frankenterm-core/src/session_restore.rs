@@ -10709,6 +10709,17 @@ mod tests {
         assert_eq!(last.sessions[0].session_id, "sess-page-0");
         assert_eq!(last.total_sessions, 5);
         assert!(!last.has_more);
+
+        let exact = list_sessions_page(&db_path, 5, 0).expect("exact session page");
+        assert_eq!(exact.sessions.len(), 5);
+        assert_eq!(exact.total_sessions, 5);
+        assert!(!exact.has_more);
+
+        let empty = list_sessions_page(&db_path, 2, 5).expect("empty session page");
+        assert!(empty.sessions.is_empty());
+        assert_eq!(empty.total_sessions, 5);
+        assert_eq!(empty.offset, 5);
+        assert!(!empty.has_more);
     }
 
     #[test]
@@ -11071,6 +11082,19 @@ mod tests {
         assert_eq!(last.checkpoints.len(), 1);
         assert_eq!(last.checkpoints[0].id, checkpoint_ids[0]);
         assert!(!last.has_more);
+
+        let exact = show_session_page(&db_path, "sess-show-page", 5, 0)
+            .expect("exact checkpoint summary page");
+        assert_eq!(exact.checkpoints.len(), 5);
+        assert_eq!(exact.total_checkpoints, 5);
+        assert!(!exact.has_more);
+
+        let empty = show_session_page(&db_path, "sess-show-page", 2, 5)
+            .expect("empty checkpoint summary page");
+        assert!(empty.checkpoints.is_empty());
+        assert_eq!(empty.total_checkpoints, 5);
+        assert_eq!(empty.offset, 5);
+        assert!(!empty.has_more);
     }
 
     #[test]

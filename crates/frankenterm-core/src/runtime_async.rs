@@ -3265,22 +3265,174 @@ pub mod unix {
 /// without depending on any backend-native process layer directly.
 pub mod process {
     use std::ffi::OsStr;
+    use std::io::Read as _;
     use std::process::{ExitStatus, Output, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    use filedescriptor::{
+        poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN,
+    };
 
     const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+    const PROCESS_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+    const PROCESS_TERMINATION_SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
+    const PROCESS_CAPTURE_READ_CHUNK_BYTES: usize = 16 * 1024;
+    const PROCESS_CAPTURE_READ_BYTES_PER_TURN: usize = 256 * 1024;
+    /// Default maximum stdout bytes retained by one [`Command::output`] call.
+    /// Callers with a narrower or deliberately wider contract should set it
+    /// explicitly with [`Command::stdout_limit`].
+    pub const DEFAULT_COMMAND_STDOUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+    /// Default maximum stderr bytes retained by one [`Command::output`] call.
+    pub const DEFAULT_COMMAND_STDERR_LIMIT_BYTES: usize = 256 * 1024;
     #[cfg(unix)]
     const UNIX_KILL_COMMANDS: &[&str] = &["/bin/kill", "/usr/bin/kill"];
+
+    /// Output stream whose capture budget was exhausted.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CommandOutputStream {
+        Stdout,
+        Stderr,
+    }
+
+    impl std::fmt::Display for CommandOutputStream {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(match self {
+                Self::Stdout => "stdout",
+                Self::Stderr => "stderr",
+            })
+        }
+    }
+
+    /// Stable, content-free detail attached to the `io::Error` returned when
+    /// a child crosses one of [`Command`]'s output capture limits.
+    ///
+    /// `observed` is the minimum byte count known when capture stopped; the
+    /// child is terminated immediately, so it is intentionally not a claim
+    /// about the complete output the child might otherwise have produced.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CommandOutputLimitExceeded {
+        stream: CommandOutputStream,
+        observed: usize,
+        limit: usize,
+    }
+
+    impl CommandOutputLimitExceeded {
+        #[must_use]
+        pub const fn new(stream: CommandOutputStream, observed: usize, limit: usize) -> Self {
+            Self {
+                stream,
+                observed,
+                limit,
+            }
+        }
+
+        #[must_use]
+        pub const fn stream(&self) -> CommandOutputStream {
+            self.stream
+        }
+
+        #[must_use]
+        pub const fn observed(&self) -> usize {
+            self.observed
+        }
+
+        #[must_use]
+        pub const fn limit(&self) -> usize {
+            self.limit
+        }
+
+        /// Recover the stable detail from a command-capture `io::Error`.
+        #[must_use]
+        pub fn from_io_error(error: &std::io::Error) -> Option<&Self> {
+            error.get_ref()?.downcast_ref::<Self>()
+        }
+
+        #[must_use]
+        pub fn into_io_error(self) -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, self)
+        }
+    }
+
+    impl std::fmt::Display for CommandOutputLimitExceeded {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "process command {} capture limit exceeded: observed at least {} bytes, limit {}",
+                self.stream, self.observed, self.limit
+            )
+        }
+    }
+
+    impl std::error::Error for CommandOutputLimitExceeded {}
+
+    /// Stable, content-free failure returned when the child leader exited but
+    /// inherited output descriptors did not reach EOF within the bounded drain
+    /// window. Returning a partial `Output` as complete would let callers parse
+    /// or persist truncated data, so this condition fails closed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CommandOutputCaptureIncomplete {
+        stdout_open: bool,
+        stderr_open: bool,
+        drain_timeout_ms: u64,
+    }
+
+    impl CommandOutputCaptureIncomplete {
+        #[must_use]
+        pub const fn stdout_open(&self) -> bool {
+            self.stdout_open
+        }
+
+        #[must_use]
+        pub const fn stderr_open(&self) -> bool {
+            self.stderr_open
+        }
+
+        #[must_use]
+        pub const fn drain_timeout_ms(&self) -> u64 {
+            self.drain_timeout_ms
+        }
+
+        #[must_use]
+        pub fn from_io_error(error: &std::io::Error) -> Option<&Self> {
+            error.get_ref()?.downcast_ref::<Self>()
+        }
+
+        #[must_use]
+        fn into_io_error(self) -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, self)
+        }
+    }
+
+    impl std::fmt::Display for CommandOutputCaptureIncomplete {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "process command output capture incomplete after {} ms (stdout_open={}, stderr_open={})",
+                self.drain_timeout_ms, self.stdout_open, self.stderr_open
+            )
+        }
+    }
+
+    impl std::error::Error for CommandOutputCaptureIncomplete {}
+
+    #[derive(Debug, Clone, Copy)]
+    struct OutputCaptureLimits {
+        stdout: usize,
+        stderr: usize,
+    }
 
     /// Async-compatible process command wrapper backed by `std::process::Command`.
     ///
     /// Mirrors the subset of the legacy compat command surface used by callers:
-    /// `new`, `args`, `arg`, `env`, `kill_on_drop`, and async `output`.
+    /// command/env construction, kill-on-drop, bounded output configuration,
+    /// and async output collection.
     pub struct Command {
         inner: std::process::Command,
         kill_on_drop: bool,
+        stdout_limit: usize,
+        stderr_limit: usize,
     }
 
     struct KillOnDropGuard {
@@ -3545,6 +3697,8 @@ pub mod process {
             Self {
                 inner: std::process::Command::new(program),
                 kill_on_drop: false,
+                stdout_limit: DEFAULT_COMMAND_STDOUT_LIMIT_BYTES,
+                stderr_limit: DEFAULT_COMMAND_STDERR_LIMIT_BYTES,
             }
         }
 
@@ -3578,6 +3732,23 @@ pub mod process {
             self
         }
 
+        /// Set the maximum number of stdout bytes retained by [`Self::output`]
+        /// and [`Self::output_with_cx`]. A zero limit permits only empty
+        /// stdout. Crossing the limit terminates the child and returns an
+        /// `io::Error` carrying [`CommandOutputLimitExceeded`].
+        pub fn stdout_limit(&mut self, limit: usize) -> &mut Self {
+            self.stdout_limit = limit;
+            self
+        }
+
+        /// Set the maximum number of stderr bytes retained by [`Self::output`]
+        /// and [`Self::output_with_cx`]. A zero limit permits only empty
+        /// stderr.
+        pub fn stderr_limit(&mut self, limit: usize) -> &mut Self {
+            self.stderr_limit = limit;
+            self
+        }
+
         /// Executes the command and collects its output, running the blocking
         /// I/O on the runtime's blocking thread pool.
         pub async fn output(&mut self) -> std::io::Result<Output> {
@@ -3586,13 +3757,18 @@ pub mod process {
             let program = self.get_program();
             let args = self.get_args();
             let envs = self.get_envs();
+            let limits = OutputCaptureLimits {
+                stdout: self.stdout_limit,
+                stderr: self.stderr_limit,
+            };
             let cancel = Arc::new(AtomicBool::new(false));
             let mut kill_guard = KillOnDropGuard::new(Arc::clone(&cancel), self.kill_on_drop);
 
-            let result =
-                super::spawn_blocking(move || run_output_command(program, args, envs, cancel))
-                    .await
-                    .map_err(std::io::Error::other)?;
+            let result = super::spawn_blocking(move || {
+                run_output_command(program, args, envs, limits, cancel)
+            })
+            .await
+            .map_err(std::io::Error::other)?;
 
             kill_guard.disarm();
             result
@@ -3628,6 +3804,10 @@ pub mod process {
             let program = self.get_program();
             let args = self.get_args();
             let envs = self.get_envs();
+            let limits = OutputCaptureLimits {
+                stdout: self.stdout_limit,
+                stderr: self.stderr_limit,
+            };
             let cancel = Arc::new(AtomicBool::new(false));
             let mut kill_guard = KillOnDropGuard::new(Arc::clone(&cancel), self.kill_on_drop);
 
@@ -3676,10 +3856,11 @@ pub mod process {
             // long-lived cxs.
             let _watcher_done_guard = WatcherDoneGuard::new(Arc::clone(&watcher_done));
 
-            let result =
-                super::spawn_blocking(move || run_output_command(program, args, envs, cancel))
-                    .await
-                    .map_err(std::io::Error::other)?;
+            let result = super::spawn_blocking(move || {
+                run_output_command(program, args, envs, limits, cancel)
+            })
+            .await
+            .map_err(std::io::Error::other)?;
 
             // Drain the watcher on the normal path so it exits
             // before this function returns. The guard above already
@@ -3719,13 +3900,31 @@ pub mod process {
         program: std::ffi::OsString,
         args: Vec<std::ffi::OsString>,
         envs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+        limits: OutputCaptureLimits,
         cancel: Arc<AtomicBool>,
     ) -> std::io::Result<Output> {
+        let (mut stdout_read, stdout_write) = process_capture_socketpair("stdout")?;
+        let (mut stderr_read, stderr_write) = process_capture_socketpair("stderr")?;
+        stdout_read
+            .set_non_blocking(true)
+            .map_err(|error| process_capture_setup_error("stdout nonblocking mode", error))?;
+        stderr_read
+            .set_non_blocking(true)
+            .map_err(|error| process_capture_setup_error("stderr nonblocking mode", error))?;
+
         let mut cmd = std::process::Command::new(program);
         cmd.args(args);
         cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        cmd.stdout(
+            stdout_write
+                .as_stdio()
+                .map_err(|error| process_capture_setup_error("stdout child handle", error))?,
+        );
+        cmd.stderr(
+            stderr_write
+                .as_stdio()
+                .map_err(|error| process_capture_setup_error("stderr child handle", error))?,
+        );
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -3733,98 +3932,499 @@ pub mod process {
         configure_process_group(&mut cmd)?;
 
         let mut child = cmd.spawn()?;
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                terminate_child_process(&mut child);
-                return Err(std::io::Error::other(
-                    "process::Command::output stdout pipe was unavailable",
-                ));
-            }
-        };
-        let stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => {
-                terminate_child_process(&mut child);
-                return Err(std::io::Error::other(
-                    "process::Command::output stderr pipe was unavailable",
-                ));
-            }
-        };
+        // `Command` retains custom Stdio handles for possible reuse. Drop it
+        // and our original write endpoints immediately so only the child (or
+        // descendants that deliberately inherit them) can keep either stream
+        // open. This is essential for reliable EOF detection.
+        drop(cmd);
+        drop(stdout_write);
+        drop(stderr_write);
 
-        let stdout_handle = match spawn_process_pipe_reader("ft-process-stdout", stdout) {
-            Ok(handle) => handle,
-            Err(err) => {
-                terminate_child_process(&mut child);
-                return Err(err);
-            }
-        };
-        let stderr_handle = match spawn_process_pipe_reader("ft-process-stderr", stderr) {
-            Ok(handle) => handle,
-            Err(err) => {
-                terminate_child_process(&mut child);
-                let _ = stdout_handle.join();
-                return Err(err);
-            }
-        };
+        let mut stdout_reader = Some(stdout_read);
+        let mut stderr_reader = Some(stderr_read);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut status = None;
+        let mut post_exit_deadline = None;
 
         loop {
             if cancel.load(Ordering::SeqCst) {
-                if child.try_wait()?.is_none() {
+                let already_reaped = matches!(child.try_wait(), Ok(Some(_)));
+                if !already_reaped {
                     terminate_child_process(&mut child);
-                    let _ = child.wait();
                 }
-                let _ = stdout_handle.join();
-                let _ = stderr_handle.join();
+                settle_output_command(
+                    &mut child,
+                    already_reaped,
+                    &mut stdout_reader,
+                    &mut stderr_reader,
+                    &mut stdout,
+                    &mut stderr,
+                    limits,
+                );
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
                     "process command cancelled",
                 ));
             }
 
-            match child.try_wait()? {
-                Some(status) => {
-                    let stdout = stdout_handle.join().unwrap_or_default();
-                    let stderr = stderr_handle.join().unwrap_or_default();
+            if let Err(error) = drain_capture_reader(
+                &mut stdout_reader,
+                &mut stdout,
+                limits.stdout,
+                CommandOutputStream::Stdout,
+            ) {
+                if status.is_none() {
+                    terminate_child_process(&mut child);
+                }
+                settle_output_command(
+                    &mut child,
+                    status.is_some(),
+                    &mut stdout_reader,
+                    &mut stderr_reader,
+                    &mut stdout,
+                    &mut stderr,
+                    limits,
+                );
+                return Err(error);
+            }
+            if let Err(error) = drain_capture_reader(
+                &mut stderr_reader,
+                &mut stderr,
+                limits.stderr,
+                CommandOutputStream::Stderr,
+            ) {
+                if status.is_none() {
+                    terminate_child_process(&mut child);
+                }
+                settle_output_command(
+                    &mut child,
+                    status.is_some(),
+                    &mut stdout_reader,
+                    &mut stderr_reader,
+                    &mut stdout,
+                    &mut stderr,
+                    limits,
+                );
+                return Err(error);
+            }
+
+            if status.is_none() {
+                match child.try_wait() {
+                    Ok(Some(exit_status)) => {
+                        status = Some(exit_status);
+                        post_exit_deadline = Some(process_deadline_after(
+                            PROCESS_POST_EXIT_DRAIN_TIMEOUT,
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        terminate_child_process(&mut child);
+                        settle_output_command(
+                            &mut child,
+                            false,
+                            &mut stdout_reader,
+                            &mut stderr_reader,
+                            &mut stdout,
+                            &mut stderr,
+                            limits,
+                        );
+                        return Err(error);
+                    }
+                }
+            }
+
+            if let Some(exit_status) = status {
+                if stdout_reader.is_none() && stderr_reader.is_none() {
                     return Ok(Output {
-                        status,
+                        status: exit_status,
                         stdout,
                         stderr,
                     });
                 }
-                None => std::thread::sleep(PROCESS_POLL_INTERVAL),
+                let deadline = *post_exit_deadline.get_or_insert_with(|| {
+                    process_deadline_after(PROCESS_POST_EXIT_DRAIN_TIMEOUT)
+                });
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    let incomplete = CommandOutputCaptureIncomplete {
+                        stdout_open: stdout_reader.is_some(),
+                        stderr_open: stderr_reader.is_some(),
+                        drain_timeout_ms: u64::try_from(
+                            PROCESS_POST_EXIT_DRAIN_TIMEOUT.as_millis(),
+                        )
+                        .unwrap_or(u64::MAX),
+                    };
+                    // The leader has already been reaped by `try_wait`, so its
+                    // PID/process-group identifier may be reusable and is no
+                    // longer safe to signal. Closing our read endpoints is the
+                    // only race-free action; inherited writers then observe a
+                    // closed peer, while the caller receives a finite failure.
+                    stdout_reader.take();
+                    stderr_reader.take();
+                    return Err(incomplete.into_io_error());
+                }
+                if let Err(error) = poll_capture_readers(
+                    stdout_reader.as_ref(),
+                    stderr_reader.as_ref(),
+                    remaining.min(PROCESS_POLL_INTERVAL),
+                ) {
+                    settle_output_command(
+                        &mut child,
+                        true,
+                        &mut stdout_reader,
+                        &mut stderr_reader,
+                        &mut stdout,
+                        &mut stderr,
+                        limits,
+                    );
+                    return Err(error);
+                }
+            } else if let Err(error) = poll_capture_readers(
+                stdout_reader.as_ref(),
+                stderr_reader.as_ref(),
+                PROCESS_POLL_INTERVAL,
+            ) {
+                terminate_child_process(&mut child);
+                settle_output_command(
+                    &mut child,
+                    false,
+                    &mut stdout_reader,
+                    &mut stderr_reader,
+                    &mut stdout,
+                    &mut stderr,
+                    limits,
+                );
+                return Err(error);
             }
         }
     }
 
-    fn spawn_process_pipe_reader<R>(
-        name: &'static str,
-        reader: R,
-    ) -> std::io::Result<std::thread::JoinHandle<Vec<u8>>>
-    where
-        R: std::io::Read + Send + 'static,
-    {
-        std::thread::Builder::new()
-            .name(name.to_string())
-            .spawn(move || read_pipe_to_end(reader))
-            .map_err(|err| {
-                let kind = err.kind();
-                std::io::Error::new(
-                    kind,
-                    format!("failed to spawn {name} pipe reader thread: {err}"),
-                )
-            })
+    fn process_capture_socketpair(
+        stream: &'static str,
+    ) -> std::io::Result<(FileDescriptor, FileDescriptor)> {
+        socketpair().map_err(|error| process_capture_setup_error(stream, error))
     }
 
-    fn read_pipe_to_end<R: std::io::Read>(mut reader: R) -> Vec<u8> {
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        buf
+    fn process_capture_setup_error(
+        phase: &'static str,
+        error: filedescriptor::Error,
+    ) -> std::io::Error {
+        std::io::Error::other(format!("process output capture {phase} failed: {error}"))
+    }
+
+    fn append_captured_bytes(
+        output: &mut Vec<u8>,
+        bytes: &[u8],
+        limit: usize,
+        stream: CommandOutputStream,
+    ) -> std::io::Result<()> {
+        let observed = output.len().saturating_add(bytes.len());
+        if observed > limit {
+            return Err(CommandOutputLimitExceeded::new(stream, observed, limit).into_io_error());
+        }
+        output.try_reserve_exact(bytes.len()).map_err(|_| {
+            std::io::Error::other("process command output capture allocation failed")
+        })?;
+        output.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Drain a fair, bounded quantum so a continuously writing child cannot
+    /// starve cancellation, status checks, or the sibling output stream.
+    fn drain_process_capture(
+        reader: &mut FileDescriptor,
+        output: &mut Vec<u8>,
+        limit: usize,
+        stream: CommandOutputStream,
+    ) -> std::io::Result<bool> {
+        let mut drained = 0_usize;
+        let mut chunk = [0_u8; PROCESS_CAPTURE_READ_CHUNK_BYTES];
+        while drained < PROCESS_CAPTURE_READ_BYTES_PER_TURN {
+            let remaining = PROCESS_CAPTURE_READ_BYTES_PER_TURN - drained;
+            let chunk_len = remaining.min(chunk.len());
+            match reader.read(&mut chunk[..chunk_len]) {
+                Ok(0) => return Ok(true),
+                Ok(read) => {
+                    append_captured_bytes(output, &chunk[..read], limit, stream)?;
+                    drained += read;
+                }
+                // Return to the outer cancellation/status/deadline loop after
+                // an interrupted syscall; an unbounded local retry could make
+                // repeated signals defeat the settlement deadline.
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    return Ok(false);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    }
+
+    fn drain_capture_reader(
+        reader: &mut Option<FileDescriptor>,
+        output: &mut Vec<u8>,
+        limit: usize,
+        stream: CommandOutputStream,
+    ) -> std::io::Result<()> {
+        let Some(active_reader) = reader.as_mut() else {
+            return Ok(());
+        };
+        if drain_process_capture(active_reader, output, limit, stream)? {
+            reader.take();
+        }
+        Ok(())
+    }
+
+    fn poll_capture_readers(
+        stdout: Option<&FileDescriptor>,
+        stderr: Option<&FileDescriptor>,
+        wait: Duration,
+    ) -> std::io::Result<()> {
+        if wait.is_zero() {
+            return Ok(());
+        }
+        let stdout_pollfd = stdout.map(|stdout| pollfd {
+            fd: stdout.as_socket_descriptor(),
+            events: POLLIN,
+            revents: 0,
+        });
+        let stderr_pollfd = stderr.map(|stderr| pollfd {
+            fd: stderr.as_socket_descriptor(),
+            events: POLLIN,
+            revents: 0,
+        });
+        match (stdout_pollfd, stderr_pollfd) {
+            (Some(stdout), Some(stderr)) => {
+                poll_capture_descriptors(&mut [stdout, stderr], wait)
+            }
+            (Some(descriptor), None) | (None, Some(descriptor)) => {
+                poll_capture_descriptors(&mut [descriptor], wait)
+            }
+            (None, None) => {
+                std::thread::sleep(wait);
+                Ok(())
+            }
+        }
+    }
+
+    fn poll_capture_descriptors(
+        readiness: &mut [pollfd],
+        wait: Duration,
+    ) -> std::io::Result<()> {
+        match poll(readiness, Some(wait)) {
+            Ok(_) => Ok(()),
+            // filedescriptor implements poll with select(2) on macOS, where
+            // high-numbered descriptors exceed FD_SETSIZE. Large sessions can
+            // legitimately reach that state, so retain bounded nonblocking
+            // reads and timer polling instead of failing the command.
+            #[cfg(target_os = "macos")]
+            Err(filedescriptor::Error::FdValueOutsideFdSetSize(_)) => {
+                std::thread::sleep(wait);
+                Ok(())
+            }
+            Err(error) if filedescriptor_error_is_interrupted(&error) => Ok(()),
+            Err(error) => Err(std::io::Error::other(error)),
+        }
+    }
+
+    fn filedescriptor_error_is_interrupted(error: &filedescriptor::Error) -> bool {
+        let mut source: &(dyn std::error::Error + 'static) = error;
+        loop {
+            if source
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::Interrupted)
+            {
+                return true;
+            }
+            let Some(next) = source.source() else {
+                return false;
+            };
+            source = next;
+        }
+    }
+
+    fn process_deadline_after(duration: Duration) -> Instant {
+        Instant::now()
+            .checked_add(duration)
+            .unwrap_or_else(Instant::now)
+    }
+
+    /// Best-effort bounded drain and reap after cancellation or capture
+    /// failure. It never calls `Child::wait` and never waits for inherited
+    /// descriptors past the fixed settlement deadline.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_output_command(
+        child: &mut std::process::Child,
+        mut reaped: bool,
+        stdout_reader: &mut Option<FileDescriptor>,
+        stderr_reader: &mut Option<FileDescriptor>,
+        stdout: &mut Vec<u8>,
+        stderr: &mut Vec<u8>,
+        limits: OutputCaptureLimits,
+    ) {
+        let deadline = process_deadline_after(PROCESS_TERMINATION_SETTLE_TIMEOUT);
+        loop {
+            if drain_capture_reader(
+                stdout_reader,
+                stdout,
+                limits.stdout,
+                CommandOutputStream::Stdout,
+            )
+            .is_err()
+            {
+                stdout_reader.take();
+            }
+            if drain_capture_reader(
+                stderr_reader,
+                stderr,
+                limits.stderr,
+                CommandOutputStream::Stderr,
+            )
+            .is_err()
+            {
+                stderr_reader.take();
+            }
+
+            if !reaped {
+                match child.try_wait() {
+                    Ok(Some(_)) => reaped = true,
+                    Ok(None) => {}
+                    Err(_) => return,
+                }
+            }
+            if reaped && stdout_reader.is_none() && stderr_reader.is_none() {
+                return;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            let wait = remaining.min(PROCESS_POLL_INTERVAL);
+            if poll_capture_readers(
+                stdout_reader.as_ref(),
+                stderr_reader.as_ref(),
+                wait,
+            )
+            .is_err()
+            {
+                std::thread::sleep(wait);
+            }
+        }
     }
 
     fn terminate_child_process(child: &mut std::process::Child) {
         let _ = send_signal_to_process_group(child.id(), "KILL");
         let _ = child.kill();
+    }
+
+    #[cfg(test)]
+    mod output_capture_unit_tests {
+        use super::*;
+
+        #[test]
+        fn command_capture_defaults_are_finite_and_setters_are_exact() {
+            assert!(DEFAULT_COMMAND_STDOUT_LIMIT_BYTES > 0);
+            assert!(DEFAULT_COMMAND_STDOUT_LIMIT_BYTES < usize::MAX);
+            assert!(DEFAULT_COMMAND_STDERR_LIMIT_BYTES > 0);
+            assert!(DEFAULT_COMMAND_STDERR_LIMIT_BYTES < usize::MAX);
+
+            let mut command = Command::new("not-executed");
+            assert_eq!(command.stdout_limit, DEFAULT_COMMAND_STDOUT_LIMIT_BYTES);
+            assert_eq!(command.stderr_limit, DEFAULT_COMMAND_STDERR_LIMIT_BYTES);
+            command.stdout_limit(17).stderr_limit(9);
+            assert_eq!(command.stdout_limit, 17);
+            assert_eq!(command.stderr_limit, 9);
+        }
+
+        #[test]
+        fn capture_accepts_exact_limit_and_rejects_first_excess_chunk() {
+            let mut output = vec![1_u8, 2];
+            append_captured_bytes(&mut output, &[3, 4], 4, CommandOutputStream::Stdout)
+                .expect("exact capture limit must be accepted");
+            assert_eq!(output, vec![1, 2, 3, 4]);
+
+            let error = append_captured_bytes(
+                &mut output,
+                b"secret-output-must-not-enter-error",
+                4,
+                CommandOutputStream::Stdout,
+            )
+            .expect_err("first byte beyond the limit must fail closed");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            let exceeded = CommandOutputLimitExceeded::from_io_error(&error)
+                .expect("capture overflow must retain its stable typed class");
+            assert_eq!(exceeded.stream(), CommandOutputStream::Stdout);
+            assert_eq!(exceeded.limit(), 4);
+            assert!(exceeded.observed() > exceeded.limit());
+            assert!(!error.to_string().contains("secret-output"));
+            assert_eq!(output, vec![1, 2, 3, 4]);
+        }
+
+        #[test]
+        fn zero_capture_limit_allows_empty_output_only() {
+            let mut output = Vec::new();
+            append_captured_bytes(&mut output, &[], 0, CommandOutputStream::Stderr)
+                .expect("empty output is valid under a zero-byte cap");
+            let error = append_captured_bytes(
+                &mut output,
+                b"x",
+                0,
+                CommandOutputStream::Stderr,
+            )
+            .expect_err("non-empty output must exceed a zero-byte cap");
+            let exceeded = CommandOutputLimitExceeded::from_io_error(&error)
+                .expect("stderr overflow must retain typed detail");
+            assert_eq!(exceeded.stream(), CommandOutputStream::Stderr);
+            assert_eq!(exceeded.observed(), 1);
+            assert_eq!(exceeded.limit(), 0);
+        }
+
+        #[test]
+        fn incomplete_capture_error_is_typed_content_free_and_timed_out() {
+            let error = CommandOutputCaptureIncomplete {
+                stdout_open: true,
+                stderr_open: false,
+                drain_timeout_ms: 100,
+            }
+            .into_io_error();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            let incomplete = CommandOutputCaptureIncomplete::from_io_error(&error)
+                .expect("incomplete capture must retain stable typed detail");
+            assert!(incomplete.stdout_open());
+            assert!(!incomplete.stderr_open());
+            assert_eq!(incomplete.drain_timeout_ms(), 100);
+            assert_eq!(
+                error.to_string(),
+                "process command output capture incomplete after 100 ms (stdout_open=true, stderr_open=false)"
+            );
+        }
+
+        #[test]
+        fn production_capture_has_no_unbounded_reader_or_reap_primitive() {
+            let source = include_str!("runtime_async.rs");
+            let start = source
+                .find("    fn run_output_command(")
+                .expect("capture implementation marker");
+            let end = source[start..]
+                .find("    #[cfg(test)]\n    mod output_capture_unit_tests")
+                .map(|offset| start + offset)
+                .expect("capture unit-test marker");
+            let implementation = &source[start..end];
+            for forbidden in [
+                "read_to_end",
+                "std::thread::Builder",
+                ".join()",
+                "child.wait()",
+            ] {
+                assert!(
+                    !implementation.contains(forbidden),
+                    "production capture must not contain {forbidden}"
+                );
+            }
+        }
     }
 
     #[cfg(all(test, windows))]

@@ -1015,9 +1015,53 @@ const DEFAULT_RETRY_DELAY_MS: u64 = crate::tuning_config::WeztermTuning::DEFAULT
 /// Sized generously: a single `cli list` row is well under 2 KiB, so 8 MiB
 /// accommodates thousands of panes — far beyond any realistic fleet — while
 /// still rejecting pathological multi-hundred-MB output. Bulk-content paths
-/// (`get-text`) are intentionally **not** bounded by this cap; large scrollback
-/// is legitimate (see ft-9nmmh).
+/// (`get-text`) are intentionally **not** bounded by this metadata cap; large
+/// scrollback is legitimate and receives a separate, larger transport bound
+/// (see ft-9nmmh).
 const MAX_CLI_METADATA_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+/// Finite transport cap for legitimate bulk pane text. This prevents a buggy
+/// subprocess from exhausting memory while remaining much larger than the
+/// parsed-metadata contract.
+const MAX_CLI_BULK_OUTPUT_BYTES: usize = 128 * 1024 * 1024;
+/// stderr was historically truncated at the last character boundary within
+/// an 8 KiB byte prefix. Enforce that exact byte budget during capture.
+const MAX_CLI_ERROR_OUTPUT_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CliCaptureContract {
+    stdout_limit: usize,
+    output_too_large_command: Option<&'static str>,
+}
+
+impl CliCaptureContract {
+    fn for_args(args: &[&str]) -> Self {
+        use crate::runtime_async::process::DEFAULT_COMMAND_STDOUT_LIMIT_BYTES;
+
+        if matches!(
+            args,
+            ["cli", "list", "--format", "json"]
+                | ["cli", "--no-auto-start", "list", "--format", "json"]
+        ) {
+            return Self {
+                stdout_limit: MAX_CLI_METADATA_OUTPUT_BYTES,
+                output_too_large_command: Some("cli list"),
+            };
+        }
+        if matches!(
+            args,
+            ["cli", "get-text", ..] | ["cli", "--no-auto-start", "get-text", ..]
+        ) {
+            return Self {
+                stdout_limit: MAX_CLI_BULK_OUTPUT_BYTES,
+                output_too_large_command: Some("cli get-text"),
+            };
+        }
+        Self {
+            stdout_limit: DEFAULT_COMMAND_STDOUT_LIMIT_BYTES,
+            output_too_large_command: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliEffect {
@@ -2469,6 +2513,7 @@ impl WeztermClient {
                 CliMutationCircuitEvidence::Ignore,
             );
         }
+        let capture_contract = CliCaptureContract::for_args(args);
         let guarded_args = match no_auto_start_cli_args(args) {
             Ok(args) => args,
             Err(error) => {
@@ -2495,6 +2540,8 @@ impl WeztermClient {
         // top-level flag; insert it immediately after `cli` (ft-dvgzi.1.1).
         cmd.args(guarded_args);
         cmd.kill_on_drop(true);
+        cmd.stdout_limit(capture_contract.stdout_limit);
+        cmd.stderr_limit(MAX_CLI_ERROR_OUTPUT_BYTES);
 
         if let Some(ref socket) = self.socket_path {
             cmd.env("WEZTERM_UNIX_SOCKET", socket);
@@ -2551,7 +2598,7 @@ impl WeztermClient {
                 }
                 return Self::cli_effect_result(
                     effect,
-                    Err(Self::categorize_io_error(&error).into()),
+                    Err(Self::categorize_cli_capture_error(&error, capture_contract).into()),
                     CliMutationCircuitEvidence::Ignore,
                 );
             }
@@ -2646,11 +2693,10 @@ impl WeztermClient {
     /// strings to structured variants.
     fn finalize_cli_output(output: std::process::Output) -> Result<String> {
         if !output.status.success() {
-            const MAX_ERROR_CHARS: usize = 8 * 1024;
             let stderr_full = String::from_utf8_lossy(&output.stderr);
-            let stderr_str = if stderr_full.len() > MAX_ERROR_CHARS {
+            let stderr_str = if stderr_full.len() > MAX_CLI_ERROR_OUTPUT_BYTES {
                 // Truncate at a char boundary to avoid splitting multi-byte characters
-                let mut end = MAX_ERROR_CHARS;
+                let mut end = MAX_CLI_ERROR_OUTPUT_BYTES;
                 while !stderr_full.is_char_boundary(end) && end > 0 {
                     end -= 1;
                 }
@@ -2776,6 +2822,27 @@ impl WeztermClient {
             }
             _ => WeztermError::CommandFailed(e.to_string()),
         }
+    }
+
+    fn categorize_cli_capture_error(
+        error: &std::io::Error,
+        contract: CliCaptureContract,
+    ) -> WeztermError {
+        use crate::runtime_async::process::{
+            CommandOutputLimitExceeded, CommandOutputStream,
+        };
+
+        if let Some(exceeded) = CommandOutputLimitExceeded::from_io_error(error)
+            && exceeded.stream() == CommandOutputStream::Stdout
+            && let Some(command) = contract.output_too_large_command
+        {
+            return WeztermError::OutputTooLarge {
+                command: command.to_string(),
+                len: exceeded.observed(),
+                cap: exceeded.limit(),
+            };
+        }
+        Self::categorize_io_error(error)
     }
 
     fn circuit_guard(&self) -> Result<()> {
@@ -6085,6 +6152,77 @@ mod tests {
         // and the constant itself is a sane positive bound.
         assert!(WeztermClient::guard_metadata_output_size("cli list", "").is_ok());
         assert!(MAX_CLI_METADATA_OUTPUT_BYTES >= 1024 * 1024);
+    }
+
+    #[test]
+    fn cli_capture_contracts_bound_metadata_bulk_and_stderr_separately() {
+        use crate::runtime_async::process::DEFAULT_COMMAND_STDOUT_LIMIT_BYTES;
+
+        let metadata = CliCaptureContract::for_args(&["cli", "list", "--format", "json"]);
+        assert_eq!(metadata.stdout_limit, MAX_CLI_METADATA_OUTPUT_BYTES);
+        assert_eq!(metadata.output_too_large_command, Some("cli list"));
+        assert_eq!(
+            CliCaptureContract::for_args(&[
+                "cli",
+                "--no-auto-start",
+                "list",
+                "--format",
+                "json"
+            ]),
+            metadata
+        );
+
+        let bulk = CliCaptureContract::for_args(&["cli", "get-text", "--pane-id", "7"]);
+        assert_eq!(bulk.stdout_limit, MAX_CLI_BULK_OUTPUT_BYTES);
+        assert_eq!(bulk.output_too_large_command, Some("cli get-text"));
+        assert!(bulk.stdout_limit > metadata.stdout_limit);
+
+        let mutation = CliCaptureContract::for_args(&["cli", "send-text", "hello"]);
+        assert_eq!(
+            mutation.stdout_limit,
+            DEFAULT_COMMAND_STDOUT_LIMIT_BYTES
+        );
+        assert_eq!(mutation.output_too_large_command, None);
+        assert!(MAX_CLI_ERROR_OUTPUT_BYTES > 0);
+        assert!(MAX_CLI_ERROR_OUTPUT_BYTES < usize::MAX);
+    }
+
+    #[test]
+    fn metadata_capture_overflow_preserves_output_too_large_variant() {
+        use crate::runtime_async::process::{
+            CommandOutputLimitExceeded, CommandOutputStream,
+        };
+
+        let contract = CliCaptureContract::for_args(&["cli", "list", "--format", "json"]);
+        let io_error = CommandOutputLimitExceeded::new(
+            CommandOutputStream::Stdout,
+            MAX_CLI_METADATA_OUTPUT_BYTES + 1,
+            MAX_CLI_METADATA_OUTPUT_BYTES,
+        )
+        .into_io_error();
+        assert!(matches!(
+            WeztermClient::categorize_cli_capture_error(&io_error, contract),
+            WeztermError::OutputTooLarge {
+                command,
+                len,
+                cap
+            } if command == "cli list"
+                && len == MAX_CLI_METADATA_OUTPUT_BYTES + 1
+                && cap == MAX_CLI_METADATA_OUTPUT_BYTES
+        ));
+
+        let stderr_error = CommandOutputLimitExceeded::new(
+            CommandOutputStream::Stderr,
+            MAX_CLI_ERROR_OUTPUT_BYTES + 1,
+            MAX_CLI_ERROR_OUTPUT_BYTES,
+        )
+        .into_io_error();
+        assert!(matches!(
+            WeztermClient::categorize_cli_capture_error(&stderr_error, contract),
+            WeztermError::CommandFailed(message)
+                if message.contains("stderr capture limit exceeded")
+                    && !message.contains("raw-child-output")
+        ));
     }
 
     #[test]

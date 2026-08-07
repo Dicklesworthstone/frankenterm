@@ -33,6 +33,7 @@ tracing-subscriber.workspace = true
 futures.workspace = true
 finl_unicode.workspace = true
 termwiz.workspace = true
+filedescriptor.workspace = true
 frankenterm-alloc.workspace = true
 frankenterm-sigpipe.workspace = true
 frankenterm-core-resource-types = { path = "../frankenterm-core-resource-types" }

@@ -9,7 +9,7 @@
 use crate::agent_provider::AgentProvider;
 use crate::error::Remediation;
 use crate::policy::Redactor;
-use crate::runtime_async::process::Command;
+use crate::runtime_async::process::{Command, CommandOutputLimitExceeded};
 use crate::suggestions::Platform;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -238,6 +238,8 @@ impl CautClient {
         let mut cmd = Command::new(&self.binary);
         cmd.args(args);
         cmd.kill_on_drop(true);
+        cmd.stdout_limit(self.max_output_bytes);
+        cmd.stderr_limit(self.max_error_bytes);
 
         let output =
             match crate::runtime_async::timeout_with_cx(cx, self.timeout, cmd.output()).await {
@@ -284,6 +286,12 @@ impl CautClient {
 }
 
 fn categorize_io_error(err: &std::io::Error) -> CautError {
+    if let Some(exceeded) = CommandOutputLimitExceeded::from_io_error(err) {
+        return CautError::OutputTooLarge {
+            bytes: exceeded.observed(),
+            max_bytes: exceeded.limit(),
+        };
+    }
     match err.kind() {
         std::io::ErrorKind::NotFound => CautError::NotInstalled,
         _ => CautError::Io {
@@ -1276,6 +1284,23 @@ mod tests {
         match caut_err {
             CautError::Io { message } => assert!(message.contains("denied")),
             other => panic!("Expected Io, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn categorize_either_capture_stream_as_output_too_large() {
+        use crate::runtime_async::process::CommandOutputStream;
+
+        for stream in [CommandOutputStream::Stdout, CommandOutputStream::Stderr] {
+            let io_error = CommandOutputLimitExceeded::new(stream, 129, 128).into_io_error();
+            assert!(matches!(
+                categorize_io_error(&io_error),
+                CautError::OutputTooLarge {
+                    bytes: 129,
+                    max_bytes: 128
+                }
+            ));
+            assert!(!io_error.to_string().contains("caut"));
         }
     }
 
