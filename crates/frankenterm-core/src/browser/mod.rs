@@ -299,17 +299,9 @@ impl BrowserProfile {
     /// The metadata file tracks when the profile was bootstrapped,
     /// the method used, and when it was last used.
     pub fn write_metadata(&self, metadata: &ProfileMetadata) -> Result<()> {
-        validate_profile_metadata(metadata, &self.service, &self.account)
-            .map_err(ProfileMetadataReadFailure::into_storage_error)?;
         let path = self.metadata_path();
-        let json = serde_json::to_string_pretty(metadata).map_err(|_| {
-            ProfileMetadataReadFailure::InvalidSchema.into_storage_error()
-        })?;
-        if u64::try_from(json.len()).unwrap_or(u64::MAX) > PROFILE_METADATA_MAX_BYTES {
-            return Err(ProfileMetadataReadFailure::Oversized
-                .into_storage_error()
-                .into());
-        }
+        let json = serialize_profile_metadata_bounded(metadata, &self.service, &self.account)
+            .map_err(ProfileMetadataReadFailure::into_storage_error)?;
         std::fs::write(&path, json.as_bytes()).map_err(|_| {
             StorageError::Database("Browser profile metadata could not be written".to_string())
         })?;
@@ -501,6 +493,20 @@ fn validate_profile_metadata(
             .map_err(|_| ProfileMetadataReadFailure::InvalidTimestamp)?;
     }
     Ok(())
+}
+
+fn serialize_profile_metadata_bounded(
+    metadata: &ProfileMetadata,
+    expected_service: &str,
+    expected_account: &str,
+) -> std::result::Result<String, ProfileMetadataReadFailure> {
+    validate_profile_metadata(metadata, expected_service, expected_account)?;
+    let json = serde_json::to_string_pretty(metadata)
+        .map_err(|_| ProfileMetadataReadFailure::InvalidSchema)?;
+    if u64::try_from(json.len()).unwrap_or(u64::MAX) > PROFILE_METADATA_MAX_BYTES {
+        return Err(ProfileMetadataReadFailure::Oversized);
+    }
+    Ok(json)
 }
 
 impl ProfileMetadata {

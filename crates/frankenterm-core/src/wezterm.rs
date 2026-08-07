@@ -6190,7 +6190,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_capture_overflow_preserves_output_too_large_variant() {
+    fn metadata_and_bulk_capture_overflow_preserve_output_too_large_variant() {
         use crate::runtime_async::process::{
             CommandOutputLimitExceeded, CommandOutputStream,
         };
@@ -6211,6 +6211,25 @@ mod tests {
             } if command == "cli list"
                 && len == MAX_CLI_METADATA_OUTPUT_BYTES + 1
                 && cap == MAX_CLI_METADATA_OUTPUT_BYTES
+        ));
+
+        let bulk_contract =
+            CliCaptureContract::for_args(&["cli", "get-text", "--pane-id", "7"]);
+        let bulk_error = CommandOutputLimitExceeded::new(
+            CommandOutputStream::Stdout,
+            MAX_CLI_BULK_OUTPUT_BYTES + 1,
+            MAX_CLI_BULK_OUTPUT_BYTES,
+        )
+        .into_io_error();
+        assert!(matches!(
+            WeztermClient::categorize_cli_capture_error(&bulk_error, bulk_contract),
+            WeztermError::OutputTooLarge {
+                command,
+                len,
+                cap
+            } if command == "cli get-text"
+                && len == MAX_CLI_BULK_OUTPUT_BYTES + 1
+                && cap == MAX_CLI_BULK_OUTPUT_BYTES
         ));
 
         let stderr_error = CommandOutputLimitExceeded::new(
