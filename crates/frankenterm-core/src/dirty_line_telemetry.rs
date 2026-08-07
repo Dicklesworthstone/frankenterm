@@ -8,9 +8,9 @@
 //!
 //! ## What this module ships
 //!
-//! - `DirtyEventSource` — bead-cited 8-variant enum
+//! - `DirtyEventSource` — 9-variant enum
 //!   (`Pty / CursorMove / SelectionChange / ThemeSwap / FontSwap
-//!   / StatusTileUpdate / FocusChange / Resize`) +
+//!   / StatusTileUpdate / FocusChange / Resize / Viewport`) +
 //!   `is_whole_screen` predicate distinguishing per-line marks
 //!   from full-screen invalidations.
 //! - `DirtyMark` per-event payload `{ pane_id, source, lines }`
@@ -34,19 +34,19 @@
 //!   frame-end `bitmap.clear()` (off when a coarse
 //!   invalidation force-marks the next frame).
 //!
-//! ## What is deferred to ft-5ykn9 follow-up
+//! ## Current integration boundary
 //!
 //! - Replacing full visible-row iteration with `iter_dirty()`
 //!   in `crates/frankenterm-gui/src/termwindow/render/
 //!   pane.rs` and `screen_line.rs`.
-//! - Frame-end `bitmap.clear()` in `paint_impl` after Present.
-//! - Wiring all 8 event sources into `mark_dirty_line` /
-//!   `mark_range`.
 //! - `quad_generation` lower-bound migration on top of per-line
 //!   dirty (most `+= 1` sites drop in favour of per-line marks).
-//! - Per-pane `forget_dirty_lines_for_pane` hook on pane close.
 //! - Benches at `crates/frankenterm-core/benches/
 //!   dirty_tracking_typing.rs` (200-pane, 1 cell/frame).
+//!
+//! The GUI now wires the event sources, exact presented-generation settlement,
+//! and pane-close cleanup. The campaign call-graph audit remains authoritative
+//! about which of those signals affect the production renderer.
 
 #![allow(dead_code)]
 
@@ -54,7 +54,12 @@
 // Dirty-event source taxonomy
 // ============================================================================
 
-/// The bead's 8-variant event source taxonomy. Per the bead:
+/// The render integration's 9-variant event source taxonomy. The original
+/// eight sources came from the dirty-line foundation bead; viewport movement
+/// is distinct from PTY output because it changes every displayed row without
+/// mutating terminal content.
+///
+/// Per the foundation bead:
 /// "Six remaining dirty-event sources from ft-mpc9b.1.2 body
 /// (PTY writes, cursor moves, selection changes, theme/font
 /// swap, status-tile updates) plus the existing two
@@ -81,6 +86,9 @@ pub enum DirtyEventSource {
     FocusChange,
     /// Resize — coarse-invalidates affected panes.
     Resize,
+    /// Viewport movement — coarse-invalidates the affected pane because the
+    /// same visible row indices now refer to different stable rows.
+    Viewport,
 }
 
 impl DirtyEventSource {
@@ -92,7 +100,11 @@ impl DirtyEventSource {
     pub const fn is_whole_screen(self) -> bool {
         matches!(
             self,
-            Self::ThemeSwap | Self::FontSwap | Self::FocusChange | Self::Resize
+            Self::ThemeSwap
+                | Self::FontSwap
+                | Self::FocusChange
+                | Self::Resize
+                | Self::Viewport
         )
     }
 
@@ -108,6 +120,7 @@ impl DirtyEventSource {
             Self::StatusTileUpdate => "status_tile_update",
             Self::FocusChange => "focus_change",
             Self::Resize => "resize",
+            Self::Viewport => "viewport",
         }
     }
 }
@@ -358,7 +371,7 @@ impl FramePaintLatencyHistogram {
 /// `bitmap.clear()` at frame end?
 ///
 /// Per the bead: most frames yes; coarse-invalidation frames
-/// (theme/font/resize/focus) leave the bitmap dirty so the next
+/// (theme/font/resize/focus/viewport) leave the bitmap dirty so the next
 /// frame still observes the marks.
 #[must_use]
 pub fn should_clear_at_frame_end(
@@ -402,6 +415,7 @@ pub struct MarksBySource {
     pub status_tile_update: u64,
     pub focus_change: u64,
     pub resize: u64,
+    pub viewport: u64,
 }
 
 impl MarksBySource {
@@ -415,6 +429,7 @@ impl MarksBySource {
             DirtyEventSource::StatusTileUpdate => &mut self.status_tile_update,
             DirtyEventSource::FocusChange => &mut self.focus_change,
             DirtyEventSource::Resize => &mut self.resize,
+            DirtyEventSource::Viewport => &mut self.viewport,
         };
         *slot = slot.saturating_add(1);
     }
@@ -481,6 +496,7 @@ mod tests {
         assert!(DirtyEventSource::FontSwap.is_whole_screen());
         assert!(DirtyEventSource::FocusChange.is_whole_screen());
         assert!(DirtyEventSource::Resize.is_whole_screen());
+        assert!(DirtyEventSource::Viewport.is_whole_screen());
         assert!(!DirtyEventSource::Pty.is_whole_screen());
         assert!(!DirtyEventSource::CursorMove.is_whole_screen());
         assert!(!DirtyEventSource::SelectionChange.is_whole_screen());
@@ -493,6 +509,7 @@ mod tests {
         assert_eq!(DirtyEventSource::CursorMove.label(), "cursor_move");
         assert_eq!(DirtyEventSource::ThemeSwap.label(), "theme_swap");
         assert_eq!(DirtyEventSource::Resize.label(), "resize");
+        assert_eq!(DirtyEventSource::Viewport.label(), "viewport");
     }
 
     // ----------------------------------------------------------------
@@ -699,6 +716,7 @@ mod tests {
         m.record(DirtyEventSource::StatusTileUpdate);
         m.record(DirtyEventSource::FocusChange);
         m.record(DirtyEventSource::Resize);
+        m.record(DirtyEventSource::Viewport);
         assert_eq!(m.pty, 1);
         assert_eq!(m.cursor_move, 1);
         assert_eq!(m.selection_change, 1);
@@ -707,6 +725,7 @@ mod tests {
         assert_eq!(m.status_tile_update, 1);
         assert_eq!(m.focus_change, 1);
         assert_eq!(m.resize, 1);
+        assert_eq!(m.viewport, 1);
     }
 
     // ----------------------------------------------------------------

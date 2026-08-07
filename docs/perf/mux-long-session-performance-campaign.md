@@ -222,6 +222,105 @@ The full-grid triple-buffer and true asynchronous viewport-first architectures
 described elsewhere in the docs are not wired into this live paint/reflow path
 today. They remain candidate designs, not current performance facts.
 
+### 2.2.1 Live snapshot and damage reconciliation (2026-08-07)
+
+This is the retained source reconciliation for
+`ft-interactive-systems-performance-4tenz.6.1`. It is a call-graph audit, not a
+native performance result or a renderer cutover. No M4/M5, `trj`, LAN, visual,
+or latency claim follows from it.
+
+The current local producer-to-present path is:
+
+```text
+Terminal mutation
+  -> TerminalState sequence + per-Line sequence
+  -> PaneOutput/window invalidation
+  -> paint_pane
+  -> publish_terminal_state_for_pane (metadata mirror only)
+  -> get_changed_since(renderer sequence fence)
+  -> DirtyLineBitmap marks
+  -> apply_hyperlinks(visible stable range)
+  -> LocalPane::with_lines_mut(visible stable range)
+  -> shape hash + LFU line-quad lookup
+  -> on miss: shaping + glyph/atlas + quad construction
+  -> draw/submit/present
+  -> exact DamageGeneration settlement
+```
+
+`LocalPane::get_changed_since`, `apply_hyperlinks`, and `with_lines_mut` each
+take the terminal mutex separately. The important long critical section is
+`LocalPane::with_lines_mut`: `terminal_with_lines_mut` invokes the GUI's
+`LineRender` callback while the terminal guard is still alive, and that
+callback performs line hashing, cache-key construction, shaping, glyph and
+atlas work, and quad construction. The parser needs the same terminal mutex.
+The hyperlink pass is an additional terminal-locked visible-range traversal
+before that render pass.
+
+The current remote path is:
+
+```text
+server PerPane::prepare_surface_changes
+  -> get_changed_since(full viewport range, legacy baseline)
+  -> get_lines(full viewport range)
+  -> filter cloned lines to dirty rows
+  -> fetch/compress/deduplicate cursor row best-effort
+  -> codec/connection delivery
+  -> client RenderablePane cache/prediction apply
+  -> ClientPane::with_lines_mut
+  -> impl_with_lines_via_get_lines (clone range + allocate ref vector)
+  -> same GUI line loop, caches, draw, submit, and present
+```
+
+The transactional `PaneRenderBeginSnapshot` and delivery-coordinator state
+machines in `sessionhandler.rs` are compiled and tested but explicitly
+`dead_code` pending live ownership transfer. The production legacy
+`PerPane::compute_changes` path still advances its baseline without an
+application acknowledgement. It is therefore incorrect to describe the
+transactional path as the live server authority.
+
+| Substrate or claim | Live classification | Production effect | Exact gap |
+|---|---|---|---|
+| terminal `SequenceNo` plus `Pane::get_changed_since` | wired, authoritative but single-baseline | discovers changed stable rows for local GUI and server | no bounded multi-consumer journal, overflow epoch, acknowledgement, or resync identity |
+| GUI `DirtyLineBitmap` and source counters | wired, partial | marks row damage and gates clean-row LFU cache reuse/accounting | paint still visits every visible line and hashes/builds its cache key; it is not a sparse line iterator |
+| `DamageGeneration` and presented-frame settlement | wired, authoritative for GUI damage clearing | retains damage on failed/stale presentation and clears only an exact successful generation | not a coherent terminal-content generation and not shared with server/client deltas |
+| LFU `line_quad_cache` | wired | valid cache hits reapply retained layers and avoid shaping/glyph/quad reconstruction | global generations still invalidate broadly; cache is not the proposed row-indexed ownership model |
+| `render::per_row_quad_cache` | test-only foundation | pure invalidation-plan tests | no live paint consumer and no owned per-row quad vectors |
+| GUI `TerminalStateTripleBufferRegistry` | mirror-only, health-wired | publishes rows, columns, cursor, alternate-screen bit, and title; status tick polls watchdog health | payload contains no lines, attributes, images, hyperlinks, selection, IME, or render geometry; live renderer never acquires it |
+| `DifferentialCellStream` GPU delta | compiled test-only/dormant | unit tests exercise CPU diff and ring policy | types and implementation are `allow(dead_code)` and WebGPU paint has no consumer |
+| server transactional render attempt/coordinator | partial/dormant | model and unit tests cover preparation/settlement identities | legacy `compute_changes` remains live; no application-ACK-owned commit path |
+| server legacy render delta | wired, coarse | produces correct dirty-line payloads under its current baseline contract | clones the complete viewport before filtering and separately materializes cursor work |
+| client `RenderablePane` and `ClientPane` adapter | wired, partial | caches received rows, reconciles prediction, and serves GUI lines | GUI adapter clones the requested line range and allocates a mutable-reference vector on every render pass |
+
+The audit also found that GUI renderer damage discovery had reused
+`Selection::seqno` as its render watermark. With no active selection that
+watermark can remain at zero or at the last selection operation, causing old
+PTY rows to be rediscovered, re-marked, and assigned new damage generations on
+later paints. The corrective tranche gives renderer discovery a distinct
+per-pane fence, captures the source sequence before the dirty query so races
+can repeat but never skip changes, retains the selection fence only while a
+selection exists, checks stable-row range arithmetic, gives viewport movement
+its own full-pane invalidation source, and drops GUI pane state on pane removal.
+Those corrections remain unshipped until their required remote proof passes.
+
+The non-duplicative implementation map is:
+
+| Bead | Extend or replace | Do not mistake for the solution |
+|---|---|---|
+| `.6.2` | define one immutable `RenderSnapshot` payload and generation contract spanning terminal-visible state, local render, and remote delta needs | the persistence-oriented six-field `session_pane_state::TerminalState` mirror |
+| `.6.3` | add a short-lock local snapshot producer and cut `LineRender` over atomically, using the existing triple-buffer mechanics only if the measured ownership/bounds fit | merely publishing richer metadata while `LocalPane::with_lines_mut` remains the live consumer |
+| `.6.4` | make terminal/mux damage a bounded, multi-consumer correctness protocol with overflow-to-full-resync and sequence-exhaustion semantics | GUI `DirtyLineBitmap`, which is a frame-local render hint |
+| `.6.5` | make server production gather coalesced dirty ranges from the canonical snapshot/journal and deduplicate cursor materialization | filtering after `get_lines` cloned the full viewport |
+| `.6.6` | commit a minimal ordered input acknowledgement independently from later echo damage where traces prove duplicate material work | acknowledging PTY/application delivery or echo before it happened |
+| `.6.7` | apply sparse rows and their hyperlink/image/cache metadata directly in the client and remove full-range GUI materialization on the admitted path | retaining stale line references across snapshot or connection generations |
+| `.6.8` | prove the combined state pipeline with model, property, fuzz, failure, and native visual/IME/a11y evidence | unit tests or a static call graph alone |
+| `.6.9` | adjudicate every lever independently and then the retained combination on real workloads | bundling losing or unmeasured levers behind an aggregate improvement |
+
+Sequence-number saturation remains fail-closed work for `.6.4`: terminal
+sequence numbers currently saturate at `usize::MAX`, after which ordinary
+`changed_since` ordering cannot identify later mutations. No campaign result
+may call sparse damage complete until exhaustion has an explicit bounded
+resync/reconstruction transition.
+
 ### 2.3 Long-session risk model
 
 Long sessions change the workload:

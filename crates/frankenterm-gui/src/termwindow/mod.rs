@@ -89,7 +89,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use termwiz::hyperlink::Hyperlink;
-use termwiz::surface::SequenceNo;
+use termwiz::surface::{SEQ_ZERO, SequenceNo};
 use wezterm_dynamic::Value;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
@@ -277,6 +277,11 @@ pub struct PaneState {
     /// Otherwise, the viewport is at the bottom of the
     /// scrollback.
     viewport: Option<StableRowIndex>,
+    /// Terminal sequence fence consumed by render damage discovery. This is
+    /// deliberately independent from `selection.seqno`: a selection's fence
+    /// must remain fixed for its lifetime, while the renderer must advance
+    /// after every successful dirty query.
+    render_dirty_seqno: SequenceNo,
     selection: Selection,
     /// If is_some(), rather than display the actual tab
     /// contents, we're overlaying a little internal application
@@ -285,6 +290,22 @@ pub struct PaneState {
 
     bell_start: Option<Instant>,
     pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
+}
+
+impl PaneState {
+    /// Return the renderer query fence, failing closed if a pane implementation
+    /// replaced its underlying sequence domain and moved backwards.
+    fn render_dirty_baseline(&self, source_end: SequenceNo) -> SequenceNo {
+        if source_end < self.render_dirty_seqno {
+            SEQ_ZERO
+        } else {
+            self.render_dirty_seqno
+        }
+    }
+
+    fn advance_render_dirty_seqno(&mut self, source_end: SequenceNo) {
+        self.render_dirty_seqno = source_end;
+    }
 }
 
 /// Data used when synchronously formatting pane and window titles
@@ -997,7 +1018,7 @@ pub struct TermWindow {
     /// per render operation or per frame.
     frame_budget_reduce_motion_state: frame_budget_a11y::ReduceMotionState,
     /// Per-source dirty-mark counters (ft-i6k6u / ft-jvj78 slice).
-    /// Substrate's `MarksBySource` aggregator: 8 lifetime counts
+    /// Substrate's `MarksBySource` aggregator: 9 lifetime counts
     /// (one per `DirtyEventSource` variant). Bumped by the
     /// `record_dirty_event` helper at every mark-call site.
     /// Surfaced into `DirtyLineTelemetrySnapshot.marks_by_source`
@@ -4013,6 +4034,21 @@ impl TermWindow {
                     // here.
                     self.forget_terminal_state_buffer_for_pane(terminal_pane_id_to_u64(pane_id));
                     self.forget_sync_output_state_for_pane(pane_id);
+                    self.semantic_zones.remove(&pane_id);
+                    self.agent_pane_states.remove(&pane_id);
+                    let overlay_to_remove = self
+                        .pane_state
+                        .borrow_mut()
+                        .remove(&pane_id)
+                        .and_then(|state| state.overlay)
+                        .map(|overlay| overlay.pane.pane_id())
+                        .filter(|overlay_id| *overlay_id != pane_id);
+                    if let Some(overlay_id) = overlay_to_remove {
+                        self.remove_overlay_pane_from_mux(overlay_id);
+                    }
+                    if self.active_selection_drag_pane == Some(pane_id) {
+                        self.active_selection_drag_pane = None;
+                    }
                 }
                 MuxNotification::PaneAdded(_)
                 | MuxNotification::WorkspaceRenamed { .. }
@@ -4490,16 +4526,33 @@ impl TermWindow {
 
     fn check_for_dirty_lines_and_invalidate_selection(&mut self, pane: &Arc<dyn Pane>) {
         let dims = pane.get_dimensions();
-        let viewport = self
-            .get_viewport(pane.pane_id())
-            .unwrap_or(dims.physical_top);
-        let visible_range = viewport..viewport + dims.viewport_rows as StableRowIndex;
-        let seqno = self.selection(pane.pane_id()).seqno;
-        let dirty = pane.get_changed_since(visible_range, seqno);
-
-        if dirty.is_empty() {
+        let pane_id = pane.pane_id();
+        let viewport = self.get_viewport(pane_id).unwrap_or(dims.physical_top);
+        let Some(visible_range) =
+            frankenterm_gui::checked_stable_row_range_from_top(viewport, dims.viewport_rows)
+        else {
+            metrics::counter!(
+                "gui.render.dirty_range_overflow",
+                "operation" => "dirty_query"
+            )
+            .increment(1);
+            log::error!(
+                "cannot query dirty lines for pane {pane_id}: viewport {viewport} + {} rows overflows StableRowIndex",
+                dims.viewport_rows
+            );
             return;
-        }
+        };
+
+        // Fence the source before querying it. A local terminal may mutate
+        // between these two calls, while ClientPane::get_changed_since may
+        // itself poll and apply a remote delta. Advancing only to this
+        // pre-query fence means such concurrent changes can be observed twice,
+        // but can never be skipped.
+        let source_end = pane.get_current_seqno();
+        let render_seqno = self.pane_state(pane_id).render_dirty_baseline(source_end);
+        let dirty = pane.get_changed_since(visible_range.clone(), render_seqno);
+        self.pane_state(pane_id)
+            .advance_render_dirty_seqno(source_end);
 
         // Per ft-camu6 (cont of ft-jvj78): wire PTY-write dirty
         // marks into the per-pane DirtyLineBitmap. The term layer's
@@ -4508,16 +4561,17 @@ impl TermWindow {
         // it dirty in the bitmap. Out-of-bounds rows (e.g., scrolled
         // past the viewport) are silently dropped by
         // DirtyLineBitmap::mark per its existing contract.
-        let pane_id = pane.pane_id();
         let viewport_rows = dims.viewport_rows;
-        let bitmap = self.dirty_lines_for_pane(pane_id, viewport_rows);
-        mark_stable_row_ranges_dirty(bitmap, viewport, dirty.iter().cloned());
-        // Per ft-i6k6u: tag the mark with its source so the
-        // substrate's per-source aggregator attributes
-        // PTY-driven seqno bumps separately from selection /
-        // theme / font / focus events. The actual translation
-        // already happened above; here we just bump the counter.
-        self.record_dirty_event(frankenterm_core::dirty_line_telemetry::DirtyEventSource::Pty);
+        if !dirty.is_empty() {
+            let bitmap = self.dirty_lines_for_pane(pane_id, viewport_rows);
+            mark_stable_row_ranges_dirty(bitmap, viewport, dirty.iter().cloned());
+            // Per ft-i6k6u: tag the mark with its source so the
+            // substrate's per-source aggregator attributes
+            // PTY-driven seqno bumps separately from selection /
+            // theme / font / focus events. The actual translation
+            // already happened above; here we just bump the counter.
+            self.record_dirty_event(frankenterm_core::dirty_line_telemetry::DirtyEventSource::Pty);
+        }
 
         if pane.downcast_ref::<CopyOverlay>().is_none()
             && pane.downcast_ref::<QuickSelectOverlay>().is_none()
@@ -4529,24 +4583,28 @@ impl TermWindow {
             // highlighting purpose but also manipulates the selection
             // and we want to allow it to retain the selection it made!
 
-            let (clear_selection, cleared_rows) =
-                if let Some(selection_range) = self.selection(pane.pane_id()).range.as_ref() {
-                    let selection_rows = selection_range.rows();
-                    let intersects = selection_rows
-                        .clone()
-                        .into_iter()
-                        .any(|row| dirty.contains(row));
-                    (
-                        intersects,
-                        if intersects {
-                            Some(selection_rows)
-                        } else {
-                            None
-                        },
-                    )
-                } else {
-                    (false, None)
-                };
+            let (selection_range, selection_seqno) = {
+                let selection = self.selection(pane_id);
+                (selection.range, selection.seqno)
+            };
+            let (clear_selection, cleared_rows) = if let Some(selection_range) = selection_range {
+                let selection_rows = selection_range.rows();
+                let selection_dirty = pane.get_changed_since(visible_range, selection_seqno);
+                let intersects = selection_rows
+                    .clone()
+                    .into_iter()
+                    .any(|row| selection_dirty.contains(row));
+                (
+                    intersects,
+                    if intersects {
+                        Some(selection_rows)
+                    } else {
+                        None
+                    },
+                )
+            } else {
+                (false, None)
+            };
 
             if clear_selection
                 && !should_preserve_selection_during_dirty_line_update(
@@ -7118,18 +7176,46 @@ impl TermWindow {
             None => None,
         };
 
-        let mut state = self.pane_state(pane_id);
-        if pos != state.viewport {
-            state.viewport = pos;
+        let viewport_changed = {
+            let mut state = self.pane_state(pane_id);
+            if pos != state.viewport {
+                state.viewport = pos;
 
-            // This is a bit gross.  If we add other overlays that need this information,
-            // this should get extracted out into a trait
-            if let Some(overlay) = state.overlay.as_ref() {
-                if let Some(copy) = overlay.pane.downcast_ref::<CopyOverlay>() {
-                    copy.viewport_changed(pos);
-                } else if let Some(qs) = overlay.pane.downcast_ref::<QuickSelectOverlay>() {
-                    qs.viewport_changed(pos);
+                // This is a bit gross.  If we add other overlays that need this information,
+                // this should get extracted out into a trait
+                if let Some(overlay) = state.overlay.as_ref() {
+                    if let Some(copy) = overlay.pane.downcast_ref::<CopyOverlay>() {
+                        copy.viewport_changed(pos);
+                    } else if let Some(qs) = overlay.pane.downcast_ref::<QuickSelectOverlay>() {
+                        qs.viewport_changed(pos);
+                    }
                 }
+                true
+            } else {
+                false
+            }
+        };
+        if viewport_changed {
+            let viewport = pos.unwrap_or(dims.physical_top);
+            if frankenterm_gui::checked_stable_row_range_from_top(viewport, dims.viewport_rows)
+                .is_some()
+            {
+                self.dirty_lines_for_pane(pane_id, dims.viewport_rows)
+                    .mark_all();
+                self.last_dirty_event_was_whole_screen = true;
+                self.record_dirty_event(
+                    frankenterm_core::dirty_line_telemetry::DirtyEventSource::Viewport,
+                );
+            } else {
+                metrics::counter!(
+                    "gui.render.dirty_range_overflow",
+                    "operation" => "viewport_invalidation"
+                )
+                .increment(1);
+                log::error!(
+                    "cannot invalidate viewport for pane {pane_id}: viewport {viewport} + {} rows overflows StableRowIndex",
+                    dims.viewport_rows
+                );
             }
         }
         if let Some(window) = self.window.as_ref() {
@@ -7149,7 +7235,7 @@ impl TermWindow {
     }
 
     fn scroll_to_bottom(&mut self, pane: &Arc<dyn Pane>) {
-        self.pane_state(pane.pane_id()).viewport = None;
+        self.set_viewport(pane.pane_id(), None, pane.get_dimensions());
     }
 
     fn get_active_pane_no_overlay(&self) -> Option<Arc<dyn Pane>> {
@@ -7634,6 +7720,7 @@ mod tests {
         m.record(DirtyEventSource::StatusTileUpdate);
         m.record(DirtyEventSource::FocusChange);
         m.record(DirtyEventSource::Resize);
+        m.record(DirtyEventSource::Viewport);
         assert_eq!(m.pty, 2);
         assert_eq!(m.cursor_move, 1);
         assert_eq!(m.selection_change, 1);
@@ -7642,6 +7729,7 @@ mod tests {
         assert_eq!(m.status_tile_update, 1);
         assert_eq!(m.focus_change, 1);
         assert_eq!(m.resize, 1);
+        assert_eq!(m.viewport, 1);
     }
 
     /// ft-gso6n: aggregate_fleet_health on an empty snapshot
@@ -8033,7 +8121,7 @@ mod tests {
     /// ft-i6k6u: the substrate's whole-screen classification is
     /// what mark_all_panes_dirty_with_source relies on for the
     /// frame-end clear suppression. Pin the predicate here so the
-    /// 4 whole-screen variants stay aligned with the wiring sites.
+    /// whole-screen variants stay aligned with the wiring sites.
     #[test]
     fn dirty_event_source_whole_screen_classification_matches_wiring() {
         use frankenterm_core::dirty_line_telemetry::DirtyEventSource;
@@ -8048,6 +8136,25 @@ mod tests {
         assert!(DirtyEventSource::FontSwap.is_whole_screen());
         assert!(DirtyEventSource::FocusChange.is_whole_screen());
         assert!(DirtyEventSource::Resize.is_whole_screen());
+        assert!(DirtyEventSource::Viewport.is_whole_screen());
+    }
+
+    #[test]
+    fn pane_state_render_dirty_fence_advances_independently() {
+        let mut state = PaneState::default();
+        assert_eq!(state.render_dirty_baseline(41), SEQ_ZERO);
+        state.advance_render_dirty_seqno(41);
+        assert_eq!(state.render_dirty_baseline(42), 41);
+        assert_eq!(state.selection.seqno, SEQ_ZERO);
+    }
+
+    #[test]
+    fn pane_state_render_dirty_fence_fails_closed_on_sequence_regression() {
+        let mut state = PaneState::default();
+        state.advance_render_dirty_seqno(99);
+        assert_eq!(state.render_dirty_baseline(3), SEQ_ZERO);
+        state.advance_render_dirty_seqno(3);
+        assert_eq!(state.render_dirty_baseline(4), 3);
     }
     use std::collections::HashMap;
 
