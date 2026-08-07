@@ -6,16 +6,16 @@
 //!
 //!   PRE-RESUME    plan.preflight_validate(...)
 //!     → integrity check + destination-compatibility validation
-//!     → returns Allowed sections (indices) + Skipped sections
+//!     → consumes the unvalidated plan and returns validated authority
 //!     → on integrity mismatch / version mismatch → bail BEFORE any
 //!       casr subprocess runs (no side effects from a tampered or
 //!       incompatible capsule)
 //!
-//!   RESUME         plan.invoke_resume(&SessionResumer)
+//!   RESUME         validated.invoke_resume(&SessionResumer)
 //!     → delegates to SessionResumer::resume_session
 //!     → runs the casr subprocess
 //!
-//!   POST-RESUME   plan.apply_to_resumed_session(resume_output)
+//!   POST-RESUME   validated.apply_to_resumed_session(resume_output)
 //!     → produces an AppliedHandoffSummary recording which Allowed
 //!       sections were applied, with per-section apply outcomes
 //!       (Applied / SkippedByPolicy / Errored)
@@ -30,6 +30,7 @@
 //! capability passport before paying the resume cost.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use crate::capability_passport::CapabilityPassport;
 use crate::casr_types::CasrResumeOutput;
@@ -43,16 +44,15 @@ use crate::session_topology::LifecycleEntityKind;
 ///
 /// Construct from a capsule + destination passport + resume target;
 /// call [`HandoffAwareResumePlan::preflight_validate`] to check
-/// compatibility BEFORE the casr subprocess fires; call
-/// [`HandoffAwareResumePlan::invoke_resume`] to run the resume; call
-/// [`HandoffAwareResumePlan::apply_to_resumed_session`] to record
-/// which sections were applied.
+/// compatibility BEFORE the casr subprocess fires. Only the returned
+/// [`ValidatedHandoffResumePlan`] can invoke the resume or record apply
+/// outcomes, so callers cannot bypass preflight accidentally.
 #[derive(Debug)]
 pub struct HandoffAwareResumePlan<'a> {
-    pub capsule: &'a HandoffCapsule,
-    pub destination_passport: Option<&'a CapabilityPassport>,
-    pub session_id: String,
-    pub target_provider: AgentProvider,
+    capsule: &'a HandoffCapsule,
+    destination_passport: Option<&'a CapabilityPassport>,
+    session_id: String,
+    target_provider: AgentProvider,
 }
 
 impl<'a> HandoffAwareResumePlan<'a> {
@@ -72,24 +72,62 @@ impl<'a> HandoffAwareResumePlan<'a> {
     }
 
     /// Phase 1 — preflight validation. Runs BEFORE any resume work.
-    /// Returns `Ok(ValidationOutcome)` describing which capsule
-    /// sections are eligible to apply post-resume; returns
+    /// Consumes the unvalidated plan and returns the sole authority capable of
+    /// invoking resume. The authority carries the exact accepted/skipped
+    /// section decision used by post-resume accounting. Returns
     /// `Err(CapsuleValidationError)` on integrity or version
-    /// mismatch (in which case the caller MUST NOT proceed to
-    /// `invoke_resume` — the capsule is tampered or incompatible).
-    pub fn preflight_validate(&self) -> Result<ValidationOutcome, CapsuleValidationError> {
-        self.capsule
-            .validate_for_destination(self.destination_passport)
+    /// mismatch without exposing any invocation method.
+    pub fn preflight_validate(
+        self,
+    ) -> Result<ValidatedHandoffResumePlan<'a>, CapsuleValidationError> {
+        let validation = self
+            .capsule
+            .validate_for_destination(self.destination_passport)?;
+        Ok(ValidatedHandoffResumePlan {
+            capsule: self.capsule,
+            session_id: self.session_id,
+            target_provider: self.target_provider,
+            validation,
+        })
+    }
+}
+
+/// Preflight-validated authority for the mutating resume and its post-resume
+/// accounting. This type cannot be constructed outside this module.
+#[derive(Debug)]
+pub struct ValidatedHandoffResumePlan<'a> {
+    capsule: &'a HandoffCapsule,
+    session_id: String,
+    target_provider: AgentProvider,
+    validation: ValidationOutcome,
+}
+
+impl ValidatedHandoffResumePlan<'_> {
+    /// Exact preflight decision carried by this authority.
+    #[must_use]
+    pub fn validation(&self) -> &ValidationOutcome {
+        &self.validation
     }
 
-    /// Phase 2 — invoke the underlying SessionResumer. Pure
-    /// delegation; the capsule is NOT applied here. Run only after
-    /// `preflight_validate` succeeded.
+    /// Phase 2 — invoke the underlying SessionResumer. The type system proves
+    /// that capsule integrity and destination compatibility were checked.
     pub fn invoke_resume(
         &self,
         resumer: &SessionResumer,
     ) -> Result<CasrResumeOutput, SessionResumeError> {
         resumer.resume_session(&self.session_id, &self.target_provider)
+    }
+
+    /// Cx-first Phase 2. Caller cancellation reaches the bounded subprocess
+    /// supervisor through [`SessionResumer::resume_session_with_cx`].
+    pub async fn invoke_resume_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        resumer: &SessionResumer,
+    ) -> Result<CasrResumeOutput, SessionResumeError> {
+        resumer
+            .resume_session_with_cx(cx, &self.session_id, &self.target_provider)
+            .await
     }
 
     /// Phase 3 — record per-section apply outcomes. Pure-function:
@@ -99,24 +137,115 @@ impl<'a> HandoffAwareResumePlan<'a> {
     /// for actually applying each accepted section to whatever store
     /// receives the inheritance (passport store, pending-approval
     /// queue, etc). The summary records the operator-supplied apply
-    /// outcomes per section.
-    #[must_use]
+    /// outcomes per section. The exact accepted-index set and canonical section
+    /// labels are enforced; duplicates, omissions, and unaccepted outcomes are
+    /// rejected rather than producing a misleading clean summary.
     pub fn apply_to_resumed_session(
         &self,
         resume_output: &CasrResumeOutput,
-        validation: &ValidationOutcome,
         per_section_outcomes: Vec<SectionApplyOutcome>,
-    ) -> AppliedHandoffSummary {
-        AppliedHandoffSummary {
+    ) -> Result<AppliedHandoffSummary, HandoffApplySummaryError> {
+        validate_apply_outcomes(self.capsule, &self.validation, &per_section_outcomes)?;
+        Ok(AppliedHandoffSummary {
             session_id: self.session_id.clone(),
             target_provider_slug: self.target_provider.slug().to_string(),
             resumed_session_id: resume_output.target_session_id.clone().unwrap_or_default(),
             capsule_version: self.capsule.version,
-            accepted_indices: validation.accepted.clone(),
-            skipped_count: validation.skipped.len(),
+            accepted_indices: self.validation.accepted.clone(),
+            skipped_count: self.validation.skipped.len(),
             applied: per_section_outcomes,
+        })
+    }
+}
+
+/// Structural rejection from post-resume apply accounting. These errors carry
+/// only finite indices/counts, never capsule content or operator error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffApplySummaryError {
+    InvalidAcceptedSectionIndex { section_index: usize },
+    DuplicateAcceptedSectionIndex { section_index: usize },
+    DuplicateSectionOutcome { section_index: usize },
+    UnacceptedSectionOutcome { section_index: usize },
+    MissingAcceptedSectionOutcome { section_index: usize },
+    SectionLabelMismatch { section_index: usize },
+}
+
+impl std::fmt::Display for HandoffApplySummaryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (kind, section_index) = match self {
+            Self::InvalidAcceptedSectionIndex { section_index } => {
+                ("invalid_accepted_index", section_index)
+            }
+            Self::DuplicateAcceptedSectionIndex { section_index } => {
+                ("duplicate_accepted_index", section_index)
+            }
+            Self::DuplicateSectionOutcome { section_index } => {
+                ("duplicate_outcome", section_index)
+            }
+            Self::UnacceptedSectionOutcome { section_index } => {
+                ("unaccepted_outcome", section_index)
+            }
+            Self::MissingAcceptedSectionOutcome { section_index } => {
+                ("missing_outcome", section_index)
+            }
+            Self::SectionLabelMismatch { section_index } => {
+                ("section_label_mismatch", section_index)
+            }
+        };
+        write!(
+            formatter,
+            "invalid handoff apply summary (kind={kind}, section_index={section_index})"
+        )
+    }
+}
+
+impl std::error::Error for HandoffApplySummaryError {}
+
+fn validate_apply_outcomes(
+    capsule: &HandoffCapsule,
+    validation: &ValidationOutcome,
+    outcomes: &[SectionApplyOutcome],
+) -> Result<(), HandoffApplySummaryError> {
+    let mut accepted = HashSet::with_capacity(validation.accepted.len());
+    for &section_index in &validation.accepted {
+        if section_index >= capsule.sections.len() {
+            return Err(HandoffApplySummaryError::InvalidAcceptedSectionIndex {
+                section_index,
+            });
+        }
+        if !accepted.insert(section_index) {
+            return Err(HandoffApplySummaryError::DuplicateAcceptedSectionIndex {
+                section_index,
+            });
         }
     }
+
+    let mut observed = HashSet::with_capacity(outcomes.len());
+    for outcome in outcomes {
+        if !observed.insert(outcome.section_index) {
+            return Err(HandoffApplySummaryError::DuplicateSectionOutcome {
+                section_index: outcome.section_index,
+            });
+        }
+        if !accepted.contains(&outcome.section_index) {
+            return Err(HandoffApplySummaryError::UnacceptedSectionOutcome {
+                section_index: outcome.section_index,
+            });
+        }
+        if capsule.sections[outcome.section_index].label() != outcome.section_label.as_str() {
+            return Err(HandoffApplySummaryError::SectionLabelMismatch {
+                section_index: outcome.section_index,
+            });
+        }
+    }
+    for &section_index in &validation.accepted {
+        if !observed.contains(&section_index) {
+            return Err(HandoffApplySummaryError::MissingAcceptedSectionOutcome {
+                section_index,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Recorded outcome for one capsule section's post-resume apply.
@@ -167,9 +296,29 @@ impl AppliedHandoffSummary {
     /// that want a single "did the handoff land cleanly" boolean.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.applied
+        self.has_complete_outcome_coverage()
+            && self
+                .applied
+                .iter()
+                .all(|o| !matches!(o.disposition, SectionDisposition::Errored { .. }))
+    }
+
+    /// True when serialized or manually assembled summaries still contain one
+    /// and only one outcome for every accepted section and no others.
+    #[must_use]
+    pub fn has_complete_outcome_coverage(&self) -> bool {
+        if self.applied.len() != self.accepted_indices.len() {
+            return false;
+        }
+        let accepted = self.accepted_indices.iter().copied().collect::<HashSet<_>>();
+        let observed = self
+            .applied
             .iter()
-            .all(|o| !matches!(o.disposition, SectionDisposition::Errored { .. }))
+            .map(|outcome| outcome.section_index)
+            .collect::<HashSet<_>>();
+        accepted.len() == self.accepted_indices.len()
+            && observed.len() == self.applied.len()
+            && observed == accepted
     }
 
     /// Count of sections that landed at each disposition.

@@ -53,6 +53,7 @@ fn arb_config() -> impl Strategy<Value = NetworkObserverConfig> {
             yellow_latency_ms: yellow,
             red_latency_ms: yellow.max(red), // Ensure red >= yellow
             timeout_secs: timeout,
+            ..NetworkObserverConfig::default()
         }
     })
 }
@@ -137,6 +138,8 @@ proptest! {
         prop_assert!((config.yellow_latency_ms - rt.yellow_latency_ms).abs() < 0.001);
         prop_assert!((config.red_latency_ms - rt.red_latency_ms).abs() < 0.001);
         prop_assert_eq!(config.timeout_secs, rt.timeout_secs);
+        prop_assert_eq!(config.max_stdout_bytes, rt.max_stdout_bytes);
+        prop_assert_eq!(config.max_stderr_bytes, rt.max_stderr_bytes);
     }
 
     // 10. NetworkObserverConfig default values
@@ -226,6 +229,7 @@ proptest! {
             yellow_latency_ms: yellow,
             red_latency_ms: red,
             timeout_secs: 10,
+            ..NetworkObserverConfig::default()
         });
         let below_yellow = NetworkAttribution {
             provider: "t".into(),
@@ -325,26 +329,26 @@ proptest! {
 
     // 24. NetworkObserverError Display is non-empty
     #[test]
-    fn error_display_non_empty(msg in "[a-z ]{1,20}") {
-        let e = NetworkObserverError::BinaryNotFound(msg);
+    fn error_display_non_empty(_dummy in 0..1u8) {
+        let e = NetworkObserverError::BinaryNotFound;
         prop_assert!(!e.to_string().is_empty());
     }
 
-    // 25. NetworkObserverError::SubprocessFailed includes stderr
+    // 25. NetworkObserverError::SubprocessFailed is content-free
     #[test]
-    fn error_subprocess_includes_stderr(stderr in "[a-z ]{1,20}") {
+    fn error_subprocess_is_content_free(code in 1..256i32) {
         let e = NetworkObserverError::SubprocessFailed {
-            code: Some(1),
-            stderr: stderr.clone(),
+            code,
         };
-        prop_assert!(e.to_string().contains(&stderr));
+        prop_assert!(e.to_string().contains(&code.to_string()));
+        prop_assert!(!e.to_string().contains("secret-child-stderr-sentinel"));
     }
 
-    // 26. NetworkObserverError::ParseFailed includes message
+    // 26. NetworkObserverError::ParseFailed is content-free
     #[test]
-    fn error_parse_includes_message(msg in "[a-z ]{1,20}") {
-        let e = NetworkObserverError::ParseFailed(msg.clone());
-        prop_assert!(e.to_string().contains(&msg));
+    fn error_parse_is_content_free(_dummy in 0..1u8) {
+        let e = NetworkObserverError::ParseFailed;
+        prop_assert!(!e.to_string().contains("secret-output-sentinel"));
     }
 
     // 27. Observer config() returns what was provided
