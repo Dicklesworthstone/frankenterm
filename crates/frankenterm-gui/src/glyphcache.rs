@@ -753,6 +753,13 @@ impl FrameDecoder {
                         durations.len()
                     );
                 }
+                if frames.len() != hashes.len() {
+                    anyhow::bail!(
+                        "bounded frame decode produced {} frames but {} hashes",
+                        frames.len(),
+                        hashes.len()
+                    );
+                }
                 for ((data, duration), hash) in frames.into_iter().zip(durations).zip(hashes) {
                     send_frame(data, hash, duration, width, height)?;
                 }
@@ -2157,7 +2164,7 @@ impl GlyphCache {
             }
         }
 
-        // Encoded sources are decoded into independently owned immutable blob
+        // Encoded sources are decoded into independently owned immutable pixel
         // frames. The decoder can hold the source ImageData payload mutex while
         // hashing and decoding up to the bounded wire ceiling, so the render
         // thread must not queue behind that mutex merely to present a ready
@@ -2327,7 +2334,7 @@ impl GlyphCache {
             scale_down,
         )?;
         after_render();
-        // Blob reads and atlas allocation do not hold the source payload lock.
+        // Snapshot reads and atlas allocation do not hold the source payload lock.
         // Rebind after those operations so a mutation that began after the
         // first probe cannot publish an obsolete snapshot.
         if !decoded
@@ -2354,12 +2361,12 @@ impl GlyphCache {
         let mut decoded_frame_start = decoded.frame_start.borrow_mut();
         let mut decoded_current_frame = decoded.current_frame.borrow_mut();
 
-        // This function runs on the GUI render path. Decoding and blob I/O
-        // happen in the bounded worker pool, and presentation must only poll
-        // their result; waiting here (the historical code waited for as long
-        // as 125 ms) directly turns an image miss into visible input and resize
-        // latency. The transparent frame below is a non-blocking placeholder
-        // and `next_due` schedules another poll at the bounded frame cadence.
+        // This function runs on the GUI render path. Decoding and frame
+        // construction happen in the bounded worker pool, and presentation
+        // only borrows its immutable in-memory result; waiting here (the
+        // historical code waited for as long as 125 ms) directly turns an image
+        // miss into visible input and resize latency. The transparent frame is
+        // a non-blocking placeholder and `next_due` schedules another poll.
 
         let now = Instant::now();
         // We round up the frame duration to at least the minimum frame duration
@@ -4026,7 +4033,7 @@ mod tests {
                 *source.data_mut() = ImageDataType::EncodedFile(vec![0x11, 0x22, 0x33]);
             },
         )
-        .expect_err("a mutation after blob rendering invalidates the old snapshot");
+        .expect_err("a mutation after snapshot rendering invalidates the old revision");
         assert!(
             error.downcast_ref::<DecodedImageRevisionMismatch>().is_some(),
             "the post-render revision probe must fail closed"

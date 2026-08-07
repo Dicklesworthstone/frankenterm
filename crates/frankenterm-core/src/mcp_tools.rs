@@ -5993,7 +5993,7 @@ fn run_mcp_await_event_delivery_completion_worker(
                 .fetch_add(1, Ordering::Relaxed);
             #[cfg(test)]
             let synthetic_failure = synthetic_storage_init_failures
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok();
@@ -6135,7 +6135,7 @@ fn run_mcp_await_event_delivery_completion_worker(
                 let completion_stall = synthetic_completion_stall.clone();
                 #[cfg(test)]
                 let synthetic_epoch_failure = synthetic_storage_epoch_failures
-                    .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok();
