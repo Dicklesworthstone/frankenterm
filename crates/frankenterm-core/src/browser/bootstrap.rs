@@ -253,8 +253,9 @@ impl InteractiveBootstrap {
         }
 
         let login_url = service_url.unwrap_or(&self.config.login_url);
+        let profile_path = profile.path();
         let script = match self.build_bootstrap_script_with_browser_config(
-            profile.path(),
+            &profile_path,
             login_url,
             ctx.config(),
         ) {

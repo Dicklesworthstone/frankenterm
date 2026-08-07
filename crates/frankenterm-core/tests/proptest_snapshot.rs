@@ -1018,7 +1018,8 @@ proptest! {
                     ProcessDispositionReason::CapturedShellRequiresManualRecovery,
                 ),
             );
-            prop_assert!(!format!("{:?}", plans[0]).contains("raw-"));
+            let plan_debug = format!("{:?}", plans[0]);
+            prop_assert!(!plan_debug.contains("raw-"));
             Ok(())
         })?;
     }

@@ -302,9 +302,9 @@
       "exempt": 0,
       "independent_adapter": 0,
       "required_ambient_wrapper": 0,
-      "total": 2,
+      "total": 1,
       "uncovered": 0,
-      "wrapper_exempt": 1
+      "wrapper_exempt": 0
     },
     "restore_scrollback.rs": {
       "covered": 2,
@@ -401,9 +401,9 @@
       "exempt": 0,
       "independent_adapter": 0,
       "required_ambient_wrapper": 0,
-      "total": 2,
+      "total": 1,
       "uncovered": 0,
-      "wrapper_exempt": 1
+      "wrapper_exempt": 0
     },
     "sharding.rs": {
       "covered": 4,
@@ -428,9 +428,9 @@
       "exempt": 0,
       "independent_adapter": 0,
       "required_ambient_wrapper": 0,
-      "total": 12,
+      "total": 11,
       "uncovered": 0,
-      "wrapper_exempt": 6
+      "wrapper_exempt": 5
     },
     "spsc_ring_buffer.rs": {
       "covered": 4,
@@ -6095,15 +6095,6 @@
     },
     {
       "category": "wrapper_exempt",
-      "cfg_sha256": "0e232b4afbf52b568ab69737a741cc2216d1c10cc5e5c9a1bf15863e222d26cb",
-      "file": "session_retention.rs",
-      "name": "cleanup_sessions_async",
-      "occurrences": 1,
-      "scope_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-      "signature_sha256": "0d5eec9874a2a73e9146f3946045ba5b96017bf35f64f322ea5dfb4aa4e7d871"
-    },
-    {
-      "category": "wrapper_exempt",
       "cfg_sha256": "155805d32e3b136f0b807b0d83436cb23d20bed9b5c3aad4926fa98f82e45572",
       "file": "ipc.rs",
       "name": "bind",
@@ -6506,15 +6497,6 @@
       "occurrences": 1,
       "scope_sha256": "e4bd0d4818fe1c35d6fb4eb9333cef6fdf93db4c93ac7cbec7e991541fa8f55d",
       "signature_sha256": "4605c72946b45c9a38c0bb7b8f9189ea6bdeaccd82be4c617335155b50a4d8e1"
-    },
-    {
-      "category": "wrapper_exempt",
-      "cfg_sha256": "4299f47f04f0ef63379059f9a4431460a09dcf80d612fdb33c55da1118933eb5",
-      "file": "snapshot_engine.rs",
-      "name": "mark_shutdown",
-      "occurrences": 1,
-      "scope_sha256": "e4bd0d4818fe1c35d6fb4eb9333cef6fdf93db4c93ac7cbec7e991541fa8f55d",
-      "signature_sha256": "2631166ab28dc193d1d1b023c2732f1e8360e7f8cb3b5be67fae2c5ea6ca434a"
     },
     {
       "category": "wrapper_exempt",
@@ -9101,15 +9083,6 @@
     },
     {
       "category": "wrapper_exempt",
-      "cfg_sha256": "bfdee4faeec65ab554953eed589d9c9ce049d24dc0bdde7ae6ddc38e70afdde4",
-      "file": "restore_process.rs",
-      "name": "execute",
-      "occurrences": 1,
-      "scope_sha256": "6c92fc4260588f492143b8248671d3ddb91336c3822685d49bb083be732f81c7",
-      "signature_sha256": "2f2c7279656b53aaf698cbe1b354e8004fc550f62211ad040a9c82fc870b4045"
-    },
-    {
-      "category": "wrapper_exempt",
       "cfg_sha256": "c267869c8945614ff0cbae9640088121693b05b952b89f663d2dc36cbb2e1a76",
       "file": "robot_sdk_contracts.rs",
       "name": "call",
@@ -9533,7 +9506,7 @@
     }
   ],
   "site_identity_algorithm": "ft.runtime_proof_site_identity.v2;record=file,name,category,scope_sha256,signature_sha256,cfg_sha256;digest=sha256(utf8(canonical-json(sort-keys,compact-separators,ensure-ascii-false)));scope=outer-to-inner-list<rust-token-list>;signature=rust-token-list;cfg={module_paths:sorted-list<root-to-leaf-list<tagged-context-token-list>>,local:outer-to-inner-list<cfg-attribute-token-list>};cfg-context-tags=@file-inner-cfg|@external-mod|@external-mod-cfg|@unresolved-module-ancestry;rust-tokens=comments-and-whitespace-elided,literals-preserved,crlf-normalized;aggregation=identical-record-occurrence-count",
-  "total_sites": 982,
+  "total_sites": 979,
   "uncovered_sites": 0,
-  "wrapper_exempt_sites": 437
+  "wrapper_exempt_sites": 434
 }

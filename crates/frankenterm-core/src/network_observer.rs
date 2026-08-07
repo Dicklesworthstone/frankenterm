@@ -3,6 +3,9 @@
 //! Provides network connection attribution (provider, region, latency)
 //! and connectivity checks via the `rano` subprocess. Maps high latency
 //! or unreachable state to backpressure tier signals.
+//!
+//! This subprocess-backed integration is available with the
+//! `subprocess-bridge` Cargo feature.
 
 use std::path::Path;
 use std::time::Duration;
@@ -228,10 +231,9 @@ impl std::fmt::Display for NetworkObserverError {
         match self {
             Self::BinaryNotFound => f.write_str("rano command unavailable"),
             Self::InvalidBinary => f.write_str("invalid rano executable configuration"),
-            Self::InvalidRemoteAddress { input_bytes } => write!(
-                f,
-                "invalid remote address (input_bytes={input_bytes})"
-            ),
+            Self::InvalidRemoteAddress { input_bytes } => {
+                write!(f, "invalid remote address (input_bytes={input_bytes})")
+            }
             Self::SubprocessFailed { code } => write!(f, "rano failed (exit {code})"),
             Self::Timeout { timeout_secs } => {
                 write!(f, "rano timed out after {timeout_secs}s")
@@ -377,10 +379,8 @@ impl NetworkObserver {
             "attributing connection"
         );
 
-        let attr: NetworkAttribution = self.invoke_rano(
-            &["attribute", remote_addr, "--json"],
-            cancellation,
-        )?;
+        let attr: NetworkAttribution =
+            self.invoke_rano(&["attribute", remote_addr, "--json"], cancellation)?;
         validate_attribution_response(&attr, remote_addr)?;
 
         debug!(
@@ -416,10 +416,7 @@ impl NetworkObserver {
         &self,
         cancellation: &CommandCancellation,
     ) -> Result<ConnectivityStatus, NetworkObserverError> {
-        let probe = self.invoke_rano::<ConnectivityProbe>(
-            &["check", "--json"],
-            cancellation,
-        )?;
+        let probe = self.invoke_rano::<ConnectivityProbe>(&["check", "--json"], cancellation)?;
         let status = match probe.status.as_str() {
             "connected" => ConnectivityStatus::Connected,
             "degraded" => ConnectivityStatus::Degraded,
@@ -588,9 +585,9 @@ fn validate_remote_address(remote_addr: &str) -> Result<(), NetworkObserverError
     let invalid = remote_addr.is_empty()
         || remote_addr.len() > MAX_NETWORK_OBSERVER_REMOTE_ADDRESS_BYTES
         || remote_addr.starts_with('-')
-        || remote_addr.chars().any(|character| {
-            character.is_control() || character.is_whitespace()
-        });
+        || remote_addr
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace());
     if invalid {
         return Err(NetworkObserverError::InvalidRemoteAddress {
             input_bytes: remote_addr.len(),
@@ -625,10 +622,7 @@ fn validate_attribution_response(
     Ok(())
 }
 
-fn validate_response_label(
-    field: &'static str,
-    label: &str,
-) -> Result<(), NetworkObserverError> {
+fn validate_response_label(field: &'static str, label: &str) -> Result<(), NetworkObserverError> {
     if label.is_empty()
         || label.len() > MAX_NETWORK_OBSERVER_LABEL_BYTES
         || label.trim() != label
@@ -1041,10 +1035,8 @@ mod tests {
 
     #[test]
     fn connectivity_cancellation_is_typed_and_precedes_binary_resolution() {
-        let observer = NetworkObserver::with_binary(
-            "not-a-rano-binary",
-            NetworkObserverConfig::default(),
-        );
+        let observer =
+            NetworkObserver::with_binary("not-a-rano-binary", NetworkObserverConfig::default());
         let cancellation = CommandCancellation::new();
         cancellation.cancel();
         assert_eq!(

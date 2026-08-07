@@ -499,8 +499,7 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     # ft-ow8np: search/recorder cluster (35 sites). Files at 0
     # uncovered after this batch: cass.rs, recorder_migration.rs,
     # snapshot_engine.rs, recording.rs, sharding.rs, search_bridge.rs,
-    # session_correlation.rs, session_restore.rs, session_retention.rs,
-    # search_explain.rs.
+    # session_correlation.rs, session_restore.rs, search_explain.rs.
     # cass.rs: CASS search + session-store query surface.
     ("cass.rs", "export_sessions"),
     ("cass.rs", "export_content"),
@@ -523,7 +522,6 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("snapshot_engine.rs", "cleanup"),
     ("snapshot_engine.rs", "run_periodic"),
     ("snapshot_engine.rs", "shutdown_checkpoint"),
-    ("snapshot_engine.rs", "mark_shutdown"),
     # recording.rs: pane-recording lifecycle.
     ("recording.rs", "start_recording"),
     ("recording.rs", "stop_recording"),
@@ -544,8 +542,7 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     # session_restore.rs: layout/session restore on startup.
     ("session_restore.rs", "restore"),
     ("session_restore.rs", "detect_and_restore"),
-    # session_retention.rs / search_explain.rs: single-fn files.
-    ("session_retention.rs", "cleanup_sessions_async"),
+    # search_explain.rs: single-function ambient wrapper.
     ("search_explain.rs", "build_explain_context"),
     # ft-039ky: misc 1–3-site long tail. Each ambient wrapper awaits its
     # exact `_with_cx`/`_cx` sibling.
@@ -577,7 +574,6 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("replay.rs", "play_simple"),
     ("reports.rs", "generate_session_report"),
     ("restore_layout.rs", "restore"),
-    ("restore_process.rs", "execute"),
     ("restore_scrollback.rs", "inject"),
     ("storage_telemetry.rs", "append_batch_instrumented"),
     ("workflows/builtin_workflows.rs", "record_limit_window_for_trigger"),

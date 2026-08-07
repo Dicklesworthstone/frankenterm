@@ -975,7 +975,8 @@ mod tests {
             })
             .expect("spawn virtual timeout wait task");
         runtime.scheduler.lock().schedule(task_id, 0);
-        let report = runtime.run_with_auto_advance();
+        let _ = runtime.run_with_auto_advance();
+        let report = runtime.run_until_quiescent_with_report();
 
         assert!(
             report.oracle_report.all_passed(),
@@ -1031,7 +1032,8 @@ mod tests {
             })
             .expect("spawn cancellation wait task");
         runtime.scheduler.lock().schedule(task_id, 0);
-        let report = runtime.run_with_auto_advance();
+        let _ = runtime.run_with_auto_advance();
+        let report = runtime.run_until_quiescent_with_report();
 
         assert!(completed.load(Ordering::SeqCst));
         assert!(

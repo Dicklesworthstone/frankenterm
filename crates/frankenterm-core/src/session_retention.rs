@@ -663,25 +663,6 @@ fn cleanup_orphaned_data(conn: &Connection) -> Result<OrphanCleanupOutcome, rusq
     })
 }
 
-/// Run cleanup asynchronously via spawn_blocking.
-///
-/// Test-only convenience wrapper for exercising the finite blocking-handoff
-/// contract. Production path-owned cleanup must enter through
-/// `SnapshotEngine`, which owns the shared database authority.
-///
-/// # Errors
-///
-/// Returns the finite [`SessionCleanupError`] contract from
-/// [`cleanup_sessions_async_cx`].
-#[cfg(test)]
-pub(crate) async fn cleanup_sessions_async(
-    db_path: Arc<String>,
-    config: SessionRetentionConfig,
-) -> Result<CleanupResult, SessionCleanupError> {
-    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-    cleanup_sessions_async_cx(&cx, db_path, config).await
-}
-
 /// Test-only cleanup under an explicit `&Cx` (ft-xbnl0.2.2).
 ///
 /// Cx-first entry point: caller-supplied cancellation is honored before the

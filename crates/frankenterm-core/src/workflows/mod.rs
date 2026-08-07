@@ -11512,13 +11512,19 @@ You've hit your usage limit. Try again at 5:00 PM.";
     #[test]
     fn build_verification_refs_empty_for_continue() {
         let result = StepResult::cont();
-        assert!(build_verification_refs(&result, None).is_none());
+        assert!(
+            build_verification_refs(&result, None)
+                .expect("verification refs should serialize")
+                .is_none()
+        );
     }
 
     #[test]
     fn build_verification_refs_populated_for_wait_for() {
         let result = StepResult::wait_for_with_timeout(WaitCondition::external("signal"), 5000);
-        let refs = build_verification_refs(&result, None).unwrap();
+        let refs = build_verification_refs(&result, None)
+            .expect("verification refs should serialize")
+            .expect("wait-for result should produce verification refs");
         assert!(refs.contains("wait_for"));
         assert!(refs.contains("5000"));
     }
@@ -11526,7 +11532,9 @@ You've hit your usage limit. Try again at 5:00 PM.";
     #[test]
     fn build_verification_refs_populated_for_send_text_wait() {
         let result = StepResult::send_text_and_wait("hello", WaitCondition::pane_idle(1000), 3000);
-        let refs = build_verification_refs(&result, None).unwrap();
+        let refs = build_verification_refs(&result, None)
+            .expect("verification refs should serialize")
+            .expect("send-and-wait result should produce verification refs");
         assert!(refs.contains("post_send_wait"));
     }
 

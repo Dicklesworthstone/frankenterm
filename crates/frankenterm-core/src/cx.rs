@@ -760,7 +760,7 @@ mod tests {
         let handle = runtime.handle();
 
         let result = runtime.block_on(async {
-            let join = spawn_with_cx(&handle, &cx, |child_cx| async move {
+            let join = spawn_with_cx(&handle, &cx, move |child_cx| async move {
                 let active_before = Cx::current().expect("explicit cx installed for child poll");
                 assert_eq!(active_before.region_id(), expected_region);
                 assert_eq!(active_before.task_id(), expected_task);
@@ -814,7 +814,7 @@ mod tests {
             assert_eq!(effective_capability_bits(&restricted), expected);
 
             let observed = runtime.block_on(async {
-                spawn_with_cx(&handle, &restricted, |child_cx| async move {
+                spawn_with_cx(&handle, &restricted, move |child_cx| async move {
                     assert_eq!(effective_capability_bits(&child_cx), expected);
                     let before = effective_capability_bits(
                         &Cx::current().expect("installed restricted cx"),

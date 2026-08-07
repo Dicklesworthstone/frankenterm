@@ -156,7 +156,6 @@ pub mod capability_preflight;
 pub mod capability_probe;
 pub mod capacity_governor;
 pub mod capture_authority;
-mod checkpoint_witness;
 #[cfg(feature = "session-resume")]
 pub mod casr_types;
 pub mod cass;
@@ -166,6 +165,7 @@ pub mod caut;
 pub mod cell_consistency_crc;
 pub mod chaos;
 pub mod chaos_scale_harness;
+mod checkpoint_witness;
 pub mod circuit_breaker;
 pub mod cleanup;
 pub mod clock_anomaly;
@@ -401,6 +401,9 @@ pub mod mission_twin_snapshot;
 pub mod mux_client;
 pub mod namespace_isolation;
 pub mod network_calculus_bound;
+// `NetworkObserver` delegates child lifecycle and bounded capture to the
+// canonical subprocess bridge, so the public module follows that feature.
+#[cfg(feature = "subprocess-bridge")]
 pub mod network_observer;
 pub mod network_reliability;
 pub mod notifications;

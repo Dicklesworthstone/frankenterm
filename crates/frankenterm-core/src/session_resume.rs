@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use cap_std::fs::FollowSymlinks;
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 
 use crate::casr_types::{
     CanonicalMessage, CanonicalSession, CasrListEntry, CasrProviderStatus, CasrResumeOutput,
@@ -1853,6 +1853,7 @@ fn discover_antigravity_conversations_in_open_dir_with_checkpoint(
         let started_at = metadata
             .modified()
             .ok()
+            .map(cap_std::time::SystemTime::into_std)
             .and_then(system_time_to_epoch_millis);
         let resume_plan = antigravity_native_resume_plan(&session_id)?;
         let mut extra = std::collections::HashMap::new();

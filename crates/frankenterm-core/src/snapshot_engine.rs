@@ -12417,6 +12417,7 @@ mod tests {
             trigger_tx,
             trigger_rx: StdMutex::new(None),
             telemetry: SnapshotEngineTelemetry::new(),
+            auxiliary_projection_read_attempts: AtomicU64::new(0),
         };
 
         assert!(engine.emit_trigger(SnapshotTrigger::WorkCompleted));

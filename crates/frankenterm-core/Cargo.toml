@@ -757,6 +757,11 @@ path = "tests/proptest_disk_pressure.rs"
 required-features = ["disk-pressure"]
 
 [[test]]
+name = "proptest_network_observer"
+path = "tests/proptest_network_observer.rs"
+required-features = ["subprocess-bridge"]
+
+[[test]]
 name = "proptest_recorder_lexical_ingest"
 path = "tests/proptest_recorder_lexical_ingest.rs"
 required-features = ["recorder-lexical"]
@@ -987,7 +992,8 @@ redis-session = [
 session-resume = []
 # Placeholder feature gate for test files referencing unimplemented types (journal, tx, etc.)
 __journal_types_placeholder = []
-# Feature gate for generic subprocess bridge foundation.
+# Feature gate for the generic subprocess bridge foundation and integrations,
+# including the subprocess-backed network observer.
 subprocess-bridge = []
 # Feature gate for mcp_agent_mail_rust coordination bridge.
 agent-mail = ["subprocess-bridge"]

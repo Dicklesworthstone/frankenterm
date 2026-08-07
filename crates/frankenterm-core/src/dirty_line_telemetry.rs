@@ -30,9 +30,9 @@
 //!   structured-logging schema (`dirty_marks_total`,
 //!   `frames_cleared_total`, `clean_lines_skipped`,
 //!   `frames_over_budget_p99`).
-//! - `should_clear_at_frame_end` — pure predicate gating the
-//!   frame-end `bitmap.clear()` (off when a coarse
-//!   invalidation force-marks the next frame).
+//! - `should_clear_at_frame_end` — retained pure foundation predicate. The live
+//!   GUI now uses exact damage-generation settlement instead: any exact
+//!   successful frame clears, while failure/staleness/exhaustion retains.
 //!
 //! ## Current integration boundary
 //!
@@ -44,9 +44,11 @@
 //! - Benches at `crates/frankenterm-core/benches/
 //!   dirty_tracking_typing.rs` (200-pane, 1 cell/frame).
 //!
-//! The GUI now wires the event sources, exact presented-generation settlement,
-//! and pane-close cleanup. The campaign call-graph audit remains authoritative
-//! about which of those signals affect the production renderer.
+//! The GUI currently wires eight sources, exact presented-generation
+//! settlement, and pane-close cleanup. `StatusTileUpdate` remains taxonomy-only
+//! until the status-tile renderer is integrated with `TermWindow`; it has no
+//! live mark site. The campaign call-graph audit remains authoritative about
+//! which signals affect the production renderer.
 
 #![allow(dead_code)]
 
@@ -94,8 +96,7 @@ pub enum DirtyEventSource {
 impl DirtyEventSource {
     /// Whether this event triggers a whole-screen invalidation
     /// rather than per-line marks. Substrate uses this to
-    /// classify the mark + decide if `should_clear_at_frame_end`
-    /// should defer.
+    /// classify the mark for attribution and future sparse scheduling.
     #[must_use]
     pub const fn is_whole_screen(self) -> bool {
         matches!(
@@ -284,9 +285,9 @@ pub struct DirtyTelemetryConfig {
     /// Per-frame paint p99 budget in microseconds. RQ-S1/RQ-S8
     /// target: 100 µs (= 0.1 ms) when 1 cell changes per frame.
     pub p99_budget_us: u32,
-    /// When true, frame-end `bitmap.clear()` is allowed. The
-    /// integration sets this false during a coarse invalidation
-    /// to keep the bitmap force-marked across the boundary.
+    /// Foundation switch for `should_clear_at_frame_end`. The production GUI
+    /// no longer consumes this switch; exact generation settlement supersedes
+    /// the older two-frame coarse-invalidation policy.
     pub clear_allowed_at_frame_end: bool,
 }
 

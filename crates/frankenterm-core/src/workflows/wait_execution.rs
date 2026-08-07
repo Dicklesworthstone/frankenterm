@@ -1247,7 +1247,10 @@ mod tests {
             _escapes: bool,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>,
-        > {
+        >
+        where
+            Self: 'a + Sync,
+        {
             let delay = self.delay;
             let text = self.text.clone();
             Box::pin(async move {

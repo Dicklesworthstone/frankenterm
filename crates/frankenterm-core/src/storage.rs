@@ -13718,10 +13718,11 @@ mod writer_epoch_transaction_tests {
             let terminal_admission_gate = Arc::clone(&sender.terminal_admission_gate);
             let queued_depth = Arc::clone(&sender.queued_depth);
             let terminal_drain_wakeup = Arc::clone(&sender.terminal_drain_wakeup);
+            let cx = crate::cx::for_testing();
 
             let (first_tx, first_rx) = oneshot::channel();
             sender
-                .send(WriteCommand::FinalizeEventDeliveriesBulk {
+                .send_with_cx(&cx, WriteCommand::FinalizeEventDeliveriesBulk {
                     leases: vec![(17, "lease-token-17".to_string())],
                     handled_at_ms: 1,
                     workflow_id: None,
@@ -13735,14 +13736,14 @@ mod writer_epoch_transaction_tests {
             for _ in 0..(WRITER_BATCH_CAP + 8) {
                 let (respond, receive) = oneshot::channel();
                 sender
-                    .send(WriteCommand::Vacuum { respond })
+                    .send_with_cx(&cx, WriteCommand::Vacuum { respond })
                     .await
                     .expect("queue writer tail");
                 tail_receivers.push(receive);
             }
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             sender
-                .send(WriteCommand::Shutdown {
+                .send_with_cx(&cx, WriteCommand::Shutdown {
                     respond: shutdown_tx,
                 })
                 .await
@@ -13789,7 +13790,7 @@ mod writer_epoch_transaction_tests {
             );
 
             let poisoned_send = sender
-                .send(WriteCommand::Shutdown {
+                .send_with_cx(&cx, WriteCommand::Shutdown {
                     respond: oneshot::channel().0,
                 })
                 .await;
@@ -13811,10 +13812,11 @@ mod writer_epoch_transaction_tests {
             let terminal_admission_gate = Arc::clone(&sender.terminal_admission_gate);
             let queued_depth = Arc::clone(&sender.queued_depth);
             let terminal_drain_wakeup = Arc::clone(&sender.terminal_drain_wakeup);
+            let cx = crate::cx::for_testing();
 
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             sender
-                .send(WriteCommand::Shutdown {
+                .send_with_cx(&cx, WriteCommand::Shutdown {
                     respond: shutdown_tx,
                 })
                 .await
@@ -13823,7 +13825,7 @@ mod writer_epoch_transaction_tests {
             for _ in 0..(WRITER_BATCH_CAP + 8) {
                 let (respond, receive) = oneshot::channel();
                 sender
-                    .send(WriteCommand::Vacuum { respond })
+                    .send_with_cx(&cx, WriteCommand::Vacuum { respond })
                     .await
                     .expect("queue post-shutdown tail");
                 tail_receivers.push(receive);
@@ -13863,7 +13865,7 @@ mod writer_epoch_transaction_tests {
             assert!(backend.calls().is_empty(), "no post-shutdown backend calls");
             assert!(matches!(
                 sender
-                    .send(WriteCommand::Shutdown {
+                    .send_with_cx(&cx, WriteCommand::Shutdown {
                         respond: oneshot::channel().0,
                     })
                     .await,
@@ -13934,13 +13936,13 @@ mod writer_epoch_transaction_tests {
             let start = storage_writer_waker_panics_total();
             let (raw_tx, mut rx) = mpsc::channel::<WriteCommand>(1);
             let sender = WriteCommandSender::new(raw_tx, 1);
+            let cx = crate::cx::for_request();
             let (queued_tx, _queued_rx) = oneshot::channel();
             sender
-                .send(WriteCommand::Shutdown { respond: queued_tx })
+                .send_with_cx(&cx, WriteCommand::Shutdown { respond: queued_tx })
                 .await
                 .expect("fill writer queue");
 
-            let cx = crate::cx::for_request();
             let (hostile_tx, _hostile_rx) = oneshot::channel();
             let (later_tx, _later_rx) = oneshot::channel();
             let (drop_tx, _drop_rx) = oneshot::channel();
@@ -14026,13 +14028,13 @@ mod writer_epoch_transaction_tests {
         run_storage_async_test(async {
             let (raw_tx, mut rx) = mpsc::channel::<WriteCommand>(1);
             let sender = WriteCommandSender::new(raw_tx, 1);
+            let cx = crate::cx::for_request();
             let (queued_tx, _queued_rx) = oneshot::channel();
             sender
-                .send(WriteCommand::Shutdown { respond: queued_tx })
+                .send_with_cx(&cx, WriteCommand::Shutdown { respond: queued_tx })
                 .await
                 .expect("fill writer queue");
 
-            let cx = crate::cx::for_request();
             let (waiting_tx, _waiting_rx) = oneshot::channel();
             let mut waiting_send = Box::pin(sender.send_with_cx(
                 &cx,
@@ -14067,13 +14069,13 @@ mod writer_epoch_transaction_tests {
         run_storage_async_test(async {
             let (raw_tx, mut rx) = mpsc::channel::<WriteCommand>(1);
             let sender = WriteCommandSender::new(raw_tx, 1);
+            let cx = crate::cx::for_request();
             let (queued_tx, _queued_rx) = oneshot::channel();
             sender
-                .send(WriteCommand::Shutdown { respond: queued_tx })
+                .send_with_cx(&cx, WriteCommand::Shutdown { respond: queued_tx })
                 .await
                 .expect("fill writer queue");
 
-            let cx = crate::cx::for_request();
             let (waiting_tx, _waiting_rx) = oneshot::channel();
             let mut waiting_send = Box::pin(sender.send_with_cx(
                 &cx,
@@ -15298,12 +15300,13 @@ mod writer_io_scheduler_tests {
             let terminal_admission_gate = Arc::clone(&sender.terminal_admission_gate);
             let queued_depth = Arc::clone(&sender.queued_depth);
             let terminal_drain_wakeup = Arc::clone(&sender.terminal_drain_wakeup);
+            let cx = crate::cx::for_testing();
             let (mutation_tx, mutation_rx) = oneshot::channel();
             let (tail_tx, tail_rx) = oneshot::channel();
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
             sender
-                .send(WriteCommand::MarkEventHandled {
+                .send_with_cx(&cx, WriteCommand::MarkEventHandled {
                     event_id: 42,
                     workflow_id: None,
                     status: "handled".to_string(),
@@ -15312,11 +15315,11 @@ mod writer_io_scheduler_tests {
                 .await
                 .expect("queue raw mutation panic");
             sender
-                .send(WriteCommand::Vacuum { respond: tail_tx })
+                .send_with_cx(&cx, WriteCommand::Vacuum { respond: tail_tx })
                 .await
                 .expect("queue later backend command");
             sender
-                .send(WriteCommand::Shutdown {
+                .send_with_cx(&cx, WriteCommand::Shutdown {
                     respond: shutdown_tx,
                 })
                 .await
@@ -39588,6 +39591,7 @@ fn writer_join_authority_timeout_after_transfer_retains_terminal_receipt() {
 
 #[test]
 fn writer_join_authority_drop_before_blocking_start_retains_pending_handle() {
+    use crate::runtime_async::CompatRuntime as _;
     use std::future::Future as _;
     use std::task::Poll;
 
@@ -39840,17 +39844,17 @@ fn storage_shutdown_surfaces_raw_shutdown_panic_after_unit_ack_and_join() {
         let db_path = directory.path().join("shutdown-raw-panic.sqlite3");
         let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
         let (panic_tx, panic_rx) = oneshot::channel();
+        let cx = crate::cx::for_testing();
 
         storage
             .write_tx
-            .send(WriteCommand::ShutdownPanicForTest { respond: panic_tx })
+            .send_with_cx(&cx, WriteCommand::ShutdownPanicForTest { respond: panic_tx })
             .await
             .expect("queue raw shutdown panic command");
         crate::runtime_async::oneshot_recv(panic_rx)
             .await
             .expect("shutdown unwind guard deliberately acknowledges unit response");
 
-        let cx = crate::cx::for_testing();
         let error = storage
             .shutdown_with_cx(&cx)
             .await
@@ -40844,8 +40848,9 @@ mod write_command_sender_tests {
             assert_eq!(sender.max_capacity() - sender.capacity(), 0);
 
             let (respond, _respond_rx) = oneshot::channel();
+            let cx = crate::cx::for_testing();
             sender
-                .send(WriteCommand::Shutdown { respond })
+                .send_with_cx(&cx, WriteCommand::Shutdown { respond })
                 .await
                 .expect("queue shutdown command");
 

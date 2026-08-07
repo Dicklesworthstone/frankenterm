@@ -195,9 +195,10 @@ impl AnthropicAuthFlow {
                 };
             }
         };
+        let profile_path = profile.path();
         if self
             .build_playwright_script_with_browser_config(
-                profile.path(),
+                &profile_path,
                 target_url,
                 email,
                 None,

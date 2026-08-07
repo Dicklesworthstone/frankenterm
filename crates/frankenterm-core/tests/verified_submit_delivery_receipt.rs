@@ -325,30 +325,30 @@ fn submit_receipt_evidence_rule_ids_merge_sorted_and_deduped() {
 #[test]
 fn idempotency_replay_returns_the_original_receipt() {
     let ft_dir = tempfile::tempdir().expect("temp ft dir");
-    let binding = binding(7, "original prompt", "retry-1");
-    assert!(is_valid_submit_key(binding.key()));
+    let original_binding = binding(7, "original prompt", "retry-1");
+    assert!(is_valid_submit_key(original_binding.key()));
 
     // Unrecorded key -> None.
-    assert_eq!(lookup(ft_dir.path(), &binding).expect("lookup"), None);
+    assert_eq!(lookup(ft_dir.path(), &original_binding).expect("lookup"), None);
 
     // Claim and complete a submitted receipt, then replay -> the original is
     // returned verbatim without granting a second owner.
     let mut original = receipt_with_state(SubmitReceiptState::Submitted);
     original.idempotency_key = "retry-1".to_string();
     original.evidence_rule_ids = vec!["send.allow".to_string()];
-    let token = match claim(ft_dir.path(), &binding).expect("claim") {
+    let token = match claim(ft_dir.path(), &original_binding).expect("claim") {
         ClaimOutcome::Claimed(token) => token,
         other => panic!("expected fresh claim, got {other:?}"),
     };
-    mark_effect_applied_receipt_pending(ft_dir.path(), &binding, token)
+    mark_effect_applied_receipt_pending(ft_dir.path(), &original_binding, token)
         .expect("mark effect applied");
-    complete(ft_dir.path(), &binding, token, &original).expect("complete");
+    complete(ft_dir.path(), &original_binding, token, &original).expect("complete");
     assert_eq!(
-        lookup(ft_dir.path(), &binding).expect("lookup"),
+        lookup(ft_dir.path(), &original_binding).expect("lookup"),
         Some(StoredSubmitState::Completed(original.clone()))
     );
     assert_eq!(
-        claim(ft_dir.path(), &binding).expect("replay"),
+        claim(ft_dir.path(), &original_binding).expect("replay"),
         ClaimOutcome::Completed(original.clone())
     );
 

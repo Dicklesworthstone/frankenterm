@@ -3059,6 +3059,9 @@ pub mod task {
     }
 }
 
+/// Yield execution back to the canonical runtime.
+pub use task::yield_now;
+
 /// Re-export `join!` macro for concurrent future evaluation.
 pub use futures::join;
 
@@ -4369,6 +4372,7 @@ pub mod process {
         /// Configure bounded retry delays for transient `ETXTBSY` spawn
         /// failures. This is crate-internal because only integrations that can
         /// be replaced in place need the write-then-exec race workaround.
+        #[cfg(any(feature = "subprocess-bridge", test))]
         pub(crate) fn exec_busy_retry_delays(&mut self, delays: &[Duration]) -> &mut Self {
             self.exec_busy_retry_delays.clear();
             self.exec_busy_retry_delays.extend_from_slice(delays);
@@ -5520,7 +5524,6 @@ pub mod process {
     #[cfg(test)]
     mod output_capture_unit_tests {
         use super::*;
-        use std::io::Read as _;
 
         #[test]
         fn command_capture_defaults_are_finite_and_setters_are_exact() {
@@ -10301,7 +10304,7 @@ mod tests {
         let expected_region = cx.region_id();
         let expected_task = cx.task_id();
         rt.block_on(async move {
-            let handle = task::spawn_with_cx(&cx, |child_cx| async move {
+            let handle = task::spawn_with_cx(&cx, move |child_cx| async move {
                 let active_before = crate::cx::Cx::current().expect("installed child cx");
                 assert_eq!(active_before.region_id(), expected_region);
                 assert_eq!(active_before.task_id(), expected_task);
@@ -10334,7 +10337,7 @@ mod tests {
         let expected_task = cx.task_id();
         rt.block_on(async move {
             let mut set = task::JoinSet::new();
-            set.spawn_with_cx(&cx, |child_cx| async move {
+            set.spawn_with_cx(&cx, move |child_cx| async move {
                 let active = crate::cx::Cx::current().expect("installed child cx");
                 assert_eq!(active.region_id(), expected_region);
                 assert_eq!(active.task_id(), expected_task);
@@ -10393,7 +10396,7 @@ mod tests {
             assert_eq!(crate::cx::effective_capability_bits(&restricted), expected);
 
             rt.block_on(async move {
-                let handle = task::spawn_with_cx(&restricted, |child_cx| async move {
+                let handle = task::spawn_with_cx(&restricted, move |child_cx| async move {
                     assert_eq!(crate::cx::effective_capability_bits(&child_cx), expected);
                     let before = crate::cx::effective_capability_bits(
                         &crate::cx::Cx::current().expect("installed restricted cx"),
@@ -10428,7 +10431,7 @@ mod tests {
             );
 
             rt.block_on(async move {
-                let handle = task::try_spawn_with_cx(&explicit, |child_cx| async move {
+                let handle = task::try_spawn_with_cx(&explicit, move |child_cx| async move {
                     let before = crate::cx::Cx::current().expect("installed try-spawn cx");
                     assert_eq!(before.region_id(), expected_region);
                     assert_eq!(before.task_id(), expected_task);
@@ -13556,21 +13559,25 @@ mod tests {
                     .lock_with_cx(&owner_cx)
                     .await
                     .expect("owner must acquire mutex");
-                let waiter_cx = crate::cx::for_testing();
-                let mut waiter = Box::pin(mutex.lock_with_cx(&waiter_cx));
-                let waker = futures::task::noop_waker();
-                let mut task_cx = std::task::Context::from_waker(&waker);
+                {
+                    let waiter_cx = crate::cx::for_testing();
+                    let mut waiter = Box::pin(mutex.lock_with_cx(&waiter_cx));
+                    let waker = futures::task::noop_waker();
+                    let mut task_cx = std::task::Context::from_waker(&waker);
 
-                assert!(matches!(waiter.as_mut().poll(&mut task_cx), Poll::Pending));
-                waiter_cx.cancel_with(
-                    crate::outcome::CancelKind::User,
-                    Some("cancel queued mutex waiter"),
-                );
-                assert!(matches!(
-                    waiter.as_mut().poll(&mut task_cx),
-                    Poll::Ready(Err(LockAcquireError::Cancelled))
-                ));
-                drop(waiter);
+                    assert!(matches!(
+                        waiter.as_mut().poll(&mut task_cx),
+                        Poll::Pending
+                    ));
+                    waiter_cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("cancel queued mutex waiter"),
+                    );
+                    assert!(matches!(
+                        waiter.as_mut().poll(&mut task_cx),
+                        Poll::Ready(Err(LockAcquireError::Cancelled))
+                    ));
+                }
                 assert_eq!(*owner, 41, "cancelled waiter must not acquire or mutate");
                 drop(owner);
 
@@ -13631,21 +13638,25 @@ mod tests {
                     .write_with_cx(&owner_cx)
                     .await
                     .expect("owner must acquire write guard");
-                let waiter_cx = crate::cx::for_testing();
-                let mut waiter = Box::pin(rwlock.read_with_cx(&waiter_cx));
-                let waker = futures::task::noop_waker();
-                let mut task_cx = std::task::Context::from_waker(&waker);
+                {
+                    let waiter_cx = crate::cx::for_testing();
+                    let mut waiter = Box::pin(rwlock.read_with_cx(&waiter_cx));
+                    let waker = futures::task::noop_waker();
+                    let mut task_cx = std::task::Context::from_waker(&waker);
 
-                assert!(matches!(waiter.as_mut().poll(&mut task_cx), Poll::Pending));
-                waiter_cx.cancel_with(
-                    crate::outcome::CancelKind::User,
-                    Some("cancel queued rwlock reader"),
-                );
-                assert!(matches!(
-                    waiter.as_mut().poll(&mut task_cx),
-                    Poll::Ready(Err(LockAcquireError::Cancelled))
-                ));
-                drop(waiter);
+                    assert!(matches!(
+                        waiter.as_mut().poll(&mut task_cx),
+                        Poll::Pending
+                    ));
+                    waiter_cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("cancel queued rwlock reader"),
+                    );
+                    assert!(matches!(
+                        waiter.as_mut().poll(&mut task_cx),
+                        Poll::Ready(Err(LockAcquireError::Cancelled))
+                    ));
+                }
                 assert_eq!(*owner, 7, "cancelled reader must not acquire");
                 drop(owner);
 
@@ -13715,21 +13726,25 @@ mod tests {
                     .read_with_cx(&owner_cx)
                     .await
                     .expect("owner must acquire read guard");
-                let waiter_cx = crate::cx::for_testing();
-                let mut waiter = Box::pin(rwlock.write_with_cx(&waiter_cx));
-                let waker = futures::task::noop_waker();
-                let mut task_cx = std::task::Context::from_waker(&waker);
+                {
+                    let waiter_cx = crate::cx::for_testing();
+                    let mut waiter = Box::pin(rwlock.write_with_cx(&waiter_cx));
+                    let waker = futures::task::noop_waker();
+                    let mut task_cx = std::task::Context::from_waker(&waker);
 
-                assert!(matches!(waiter.as_mut().poll(&mut task_cx), Poll::Pending));
-                waiter_cx.cancel_with(
-                    crate::outcome::CancelKind::User,
-                    Some("cancel queued rwlock writer"),
-                );
-                assert!(matches!(
-                    waiter.as_mut().poll(&mut task_cx),
-                    Poll::Ready(Err(LockAcquireError::Cancelled))
-                ));
-                drop(waiter);
+                    assert!(matches!(
+                        waiter.as_mut().poll(&mut task_cx),
+                        Poll::Pending
+                    ));
+                    waiter_cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("cancel queued rwlock writer"),
+                    );
+                    assert!(matches!(
+                        waiter.as_mut().poll(&mut task_cx),
+                        Poll::Ready(Err(LockAcquireError::Cancelled))
+                    ));
+                }
                 assert_eq!(*owner, 1, "cancelled writer must not acquire or mutate");
                 drop(owner);
 
