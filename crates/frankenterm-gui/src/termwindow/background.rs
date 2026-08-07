@@ -11,7 +11,7 @@ use config::{
     BackgroundSource, BackgroundVerticalAlignment, ConfigHandle, DimensionContext, Gradient,
     GradientOrientation,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -202,9 +202,10 @@ fn background_image_validation_limits(max_decoded_bytes: usize) -> ImageDataVali
 struct ActiveBackgroundByteBudget {
     limit: usize,
     retained_bytes: usize,
-    // Pointer identity is valid for this ledger because every admitted source
-    // is immediately retained by the result Vec for the rest of the pass.
-    sources: HashSet<*const ImageData>,
+    // Own each admitted allocation for the lifetime of the ledger. That makes
+    // pointer identity immune to drop/address-reuse ABA and keeps exact
+    // de-duplication self-contained rather than relying on caller ordering.
+    sources: HashMap<*const ImageData, (Arc<ImageData>, usize)>,
 }
 
 impl ActiveBackgroundByteBudget {
@@ -212,14 +213,14 @@ impl ActiveBackgroundByteBudget {
         Self {
             limit,
             retained_bytes: 0,
-            sources: HashSet::new(),
+            sources: HashMap::new(),
         }
     }
 
     fn try_admit(&mut self, source: &Arc<ImageData>, retained_bytes: usize) -> bool {
         let identity = Arc::as_ptr(source);
-        if self.sources.contains(&identity) {
-            return true;
+        if let Some((admitted, admitted_bytes)) = self.sources.get(&identity) {
+            return Arc::ptr_eq(admitted, source) && *admitted_bytes == retained_bytes;
         }
         let Some(total) = self.retained_bytes.checked_add(retained_bytes) else {
             return false;
@@ -227,7 +228,8 @@ impl ActiveBackgroundByteBudget {
         if total > self.limit {
             return false;
         }
-        self.sources.insert(identity);
+        self.sources
+            .insert(identity, (Arc::clone(source), retained_bytes));
         self.retained_bytes = total;
         true
     }
@@ -1793,6 +1795,29 @@ mod tests {
         assert_eq!(budget.retained_bytes, 8);
         assert!(!budget.try_admit(&overflow, 4));
         assert_eq!(budget.retained_bytes, 8, "a rejected Arc changes no authority");
+    }
+
+    #[test]
+    fn active_background_byte_budget_owns_identity_and_rejects_inconsistent_accounting() {
+        let source = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![0, 0, 0, 0xff],
+        )));
+        let weak = Arc::downgrade(&source);
+        let mut budget = ActiveBackgroundByteBudget::new(4);
+
+        assert!(budget.try_admit(&source, 4));
+        assert!(
+            !budget.try_admit(&source, 3),
+            "one allocation cannot carry two exact retained-byte authorities"
+        );
+        drop(source);
+        assert!(
+            weak.upgrade().is_some(),
+            "the ledger must retain admitted identity until the pass ends"
+        );
+        assert_eq!(budget.retained_bytes, 4);
     }
 
     #[test]
