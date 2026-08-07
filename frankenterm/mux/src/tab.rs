@@ -4135,7 +4135,7 @@ impl TabInner {
             let mut index = 0;
             loop {
                 if let Some(pane) = cursor.leaf_mut() {
-                    if active.pane_id() == pane.pane_id() {
+                    if Arc::ptr_eq(&active, pane) {
                         // Found it
                         self.active = index;
                         self.recency.tag(index);
@@ -5882,7 +5882,7 @@ impl TabInner {
         }
 
         let active_idx = self.active;
-        let zoomed_id = self.zoomed.as_ref().map(|p| p.pane_id());
+        let zoomed = self.zoomed.as_ref().map(Arc::clone);
         let root_size = self.size;
         let mut cursor = self.pane.take().unwrap().cursor();
 
@@ -5914,7 +5914,9 @@ impl TabInner {
                 panes.push(PositionedPane {
                     index,
                     is_active: index == active_idx,
-                    is_zoomed: zoomed_id == Some(pane.pane_id()),
+                    is_zoomed: zoomed
+                        .as_ref()
+                        .is_some_and(|zoomed| Arc::ptr_eq(zoomed, &pane)),
                     left,
                     top,
                     width: dims.cols as _,
@@ -6889,7 +6891,7 @@ impl TabInner {
         } else {
             self.advise_focus_change(Some(pane));
         }
-        None
+        Some(())
     }
 
     fn compute_split_size(
@@ -8481,6 +8483,50 @@ mod test {
 
         tab.set_active_idx(0);
         assert_eq!(tab.get_active_idx(), 0);
+    }
+
+    #[test]
+    fn swap_active_with_index_reports_success_only_after_structural_swap() {
+        let _mux_guard = crate::MUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Mux::shutdown();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        tab.split_and_insert(0, SplitRequest::default(), FakePane::new(2, size))
+            .expect("split should succeed");
+
+        let before = tab
+            .iter_panes()
+            .into_iter()
+            .map(|positioned| positioned.pane.pane_id())
+            .collect::<Vec<_>>();
+        assert_eq!(before, vec![1, 2]);
+        assert_eq!(tab.swap_active_with_index(1, true), Some(()));
+        let after = tab
+            .iter_panes()
+            .into_iter()
+            .map(|positioned| positioned.pane.pane_id())
+            .collect::<Vec<_>>();
+        assert_eq!(after, vec![2, 1]);
+        assert_eq!(tab.get_active_idx(), 1);
+
+        let unchanged = after;
+        assert_eq!(tab.swap_active_with_index(usize::MAX, true), None);
+        assert_eq!(
+            tab.iter_panes()
+                .into_iter()
+                .map(|positioned| positioned.pane.pane_id())
+                .collect::<Vec<_>>(),
+            unchanged,
+        );
     }
 
     #[test]
@@ -11135,6 +11181,37 @@ mod test {
             "the public active-pane view deliberately resolves the zoomed pane first"
         );
         assert_eq!(tab.get_zoomed_pane().map(|pane| pane.pane_id()), Some(42));
+    }
+
+    #[test]
+    fn prepared_tree_install_resolves_active_exact_identity_without_pane_callback() {
+        let _mux_guard = crate::MUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Mux::shutdown();
+        let size = TerminalSize::default();
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pane = FakePane::new_with_ordered_observation_panic(
+            43,
+            size,
+            OrderedObservationCallback::PaneId,
+            Arc::clone(&armed),
+        );
+        let prepared = PreparedPaneTree {
+            tree: Tree::Leaf(Arc::clone(&pane)),
+            active: Some(Arc::clone(&pane)),
+            zoomed: None,
+        };
+        armed.store(true, std::sync::atomic::Ordering::Release);
+
+        let tab = Tab::new(&size);
+        tab.sync_with_prepared_pane_tree(size, prepared);
+
+        assert_eq!(tab.get_active_idx(), 0);
+        let active = tab
+            .get_active_pane_callback_free()
+            .expect("prepared active pane must be installed");
+        assert!(Arc::ptr_eq(&active, &pane));
     }
 
     #[test]
