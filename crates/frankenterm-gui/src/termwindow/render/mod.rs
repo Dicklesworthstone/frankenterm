@@ -194,6 +194,61 @@ pub struct RenderScreenLineParams<'a> {
     pub password_input: bool,
 }
 
+#[inline]
+fn image_padding_fits_cell(
+    (left, top, right, bottom): (u16, u16, u16, u16),
+    cell_width: isize,
+    cell_height: isize,
+) -> bool {
+    cell_width > 0
+        && cell_height > 0
+        && isize::from(left) + isize::from(right) < cell_width
+        && isize::from(top) + isize::from(bottom) < cell_height
+}
+
+#[inline]
+fn image_cache_padding_for_cell(cell_width: isize, cell_height: isize) -> Option<usize> {
+    if cell_width <= 0 || cell_height <= 0 {
+        return None;
+    }
+    let extent = usize::try_from(cell_width.max(cell_height)).ok()?;
+    extent.checked_next_power_of_two()
+}
+
+#[inline]
+fn canonical_image_texture_region(
+    top_left: termwiz::image::TextureCoordinate,
+    bottom_right: termwiz::image::TextureCoordinate,
+) -> Option<(f32, f32, f32, f32)> {
+    let left = top_left.x.into_inner();
+    let top = top_left.y.into_inner();
+    let right = bottom_right.x.into_inner();
+    let bottom = bottom_right.y.into_inner();
+    const WIRE_TOLERANCE: f32 = f32::EPSILON * 8.0;
+
+    if !left.is_finite()
+        || !top.is_finite()
+        || !right.is_finite()
+        || !bottom.is_finite()
+        || left < -WIRE_TOLERANCE
+        || top < -WIRE_TOLERANCE
+        || right > 1.0 + WIRE_TOLERANCE
+        || bottom > 1.0 + WIRE_TOLERANCE
+        || left >= right
+        || top >= bottom
+    {
+        return None;
+    }
+
+    let canonical = (
+        left.clamp(0.0, 1.0),
+        top.clamp(0.0, 1.0),
+        right.clamp(0.0, 1.0),
+        bottom.clamp(0.0, 1.0),
+    );
+    (canonical.0 < canonical.2 && canonical.1 < canonical.3).then_some(canonical)
+}
+
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct CursorProperties {
     pub position: StableCursorPosition,
@@ -490,15 +545,48 @@ impl crate::TermWindow {
             return Ok(());
         }
 
-        let padding = self
-            .render_metrics
-            .cell_size
-            .height
-            .max(params.render_metrics.cell_size.width) as usize;
-        let padding = if padding.is_power_of_two() {
-            padding
-        } else {
-            padding.next_power_of_two()
+        let Some((texture_left, texture_top, texture_right, texture_bottom)) =
+            canonical_image_texture_region(image.top_left(), image.bottom_right())
+        else {
+            // ImageCell is directly serde-capable, and NotNan deliberately
+            // permits infinities. Keep malformed peer geometry away from both
+            // decoded-image admission and atlas/shader coordinate arithmetic.
+            metrics::counter!(
+                "gui.render.image_cell_rejected.total",
+                "reason" => "invalid_texture_region",
+            )
+            .increment(1);
+            return Ok(());
+        };
+
+        let image_padding = image.padding();
+        if !image_padding_fits_cell(
+            image_padding,
+            params.render_metrics.cell_size.width,
+            params.render_metrics.cell_size.height,
+        ) {
+            // Padding is transported over the mux wire and can originate from
+            // a different cell geometry. Reject it before decoded-image cache
+            // admission or quad allocation, so an invalid remote cell cannot
+            // trigger image work or inflate the next frame's GPU buffers.
+            metrics::counter!(
+                "gui.render.image_cell_rejected.total",
+                "reason" => "invalid_padding",
+            )
+            .increment(1);
+            return Ok(());
+        }
+
+        let Some(padding) = image_cache_padding_for_cell(
+            params.render_metrics.cell_size.width,
+            params.render_metrics.cell_size.height,
+        ) else {
+            metrics::counter!(
+                "gui.render.image_cell_rejected.total",
+                "reason" => "invalid_cell_geometry",
+            )
+            .increment(1);
+            return Ok(());
         };
 
         let (sprite, next_due, load_state) = gl_state
@@ -513,9 +601,6 @@ impl crate::TermWindow {
         let width = sprite.coords.size.width;
         let height = sprite.coords.size.height;
 
-        let top_left = image.top_left();
-        let bottom_right = image.bottom_right();
-
         // We *could* call sprite.texture.to_texture_coords() here,
         // but since that takes integer pixel coordinates, we'd
         // lose precision and end up with visual artifacts.
@@ -524,13 +609,13 @@ impl crate::TermWindow {
         let texture_width = sprite.texture.width() as f32;
         let texture_height = sprite.texture.height() as f32;
         let origin = TextureCoord::new(
-            (sprite.coords.origin.x as f32 + (*top_left.x * width as f32)) / texture_width,
-            (sprite.coords.origin.y as f32 + (*top_left.y * height as f32)) / texture_height,
+            (sprite.coords.origin.x as f32 + (texture_left * width as f32)) / texture_width,
+            (sprite.coords.origin.y as f32 + (texture_top * height as f32)) / texture_height,
         );
 
         let size = TextureSize::new(
-            (*bottom_right.x - *top_left.x) * width as f32 / texture_width,
-            (*bottom_right.y - *top_left.y) * height as f32 / texture_height,
+            (texture_right - texture_left) * width as f32 / texture_width,
+            (texture_bottom - texture_top) * height as f32 / texture_height,
         );
 
         let texture_rect = TextureRect::new(origin, size);
@@ -544,17 +629,7 @@ impl crate::TermWindow {
             + params.left_pixel_x
             + (cell_idx as f32 * cell_width);
 
-        let (padding_left, padding_top, padding_right, padding_bottom) = image.padding();
-        if usize::from(padding_left).saturating_add(usize::from(padding_right))
-            >= params.render_metrics.cell_size.width
-            || usize::from(padding_top).saturating_add(usize::from(padding_bottom))
-                >= params.render_metrics.cell_size.height
-        {
-            // Padding is transported over the mux wire and can originate from
-            // a different cell geometry. Never emit an inverted or empty quad
-            // when a remote sender's padding does not fit this renderer.
-            return Ok(());
-        }
+        let (padding_left, padding_top, padding_right, padding_bottom) = image_padding;
 
         quad.set_position(
             pos_x + padding_left as f32,
@@ -1145,9 +1220,10 @@ fn rebase_glyph_clusters(
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedLineState, LineStateCacheOwner, rebase_glyph_clusters, resolve_fg_color_attr,
-        same_hyperlink, same_hyperlink_or_both_none, should_use_reverse_video_cursor,
-        update_next_frame_time,
+        CachedLineState, LineStateCacheOwner, canonical_image_texture_region,
+        image_cache_padding_for_cell, image_padding_fits_cell, rebase_glyph_clusters,
+        resolve_fg_color_attr, same_hyperlink, same_hyperlink_or_both_none,
+        should_use_reverse_video_cursor, update_next_frame_time,
     };
     use config::{BoldBrightening, ConfigHandle, TextStyle};
     use frankenterm_font::GlyphInfo;
@@ -1155,6 +1231,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use termwiz::hyperlink::Hyperlink;
+    use termwiz::image::TextureCoordinate;
     use wezterm_term::color::{ColorAttribute, ColorPalette};
     use wezterm_term::{CellAttributes, Intensity};
     use window::color::LinearRgba;
@@ -1173,6 +1250,69 @@ mod tests {
             x_offset: PixelLength::new(0.0),
             y_offset: PixelLength::new(0.0),
         }
+    }
+
+    #[test]
+    fn image_padding_accepts_the_largest_non_empty_cell_interior() {
+        assert!(image_padding_fits_cell((4, 3, 5, 6), 10, 10));
+        assert!(image_padding_fits_cell((0, 0, 0, 0), 1, 1));
+    }
+
+    #[test]
+    fn image_padding_rejects_each_empty_or_inverted_axis_boundary() {
+        assert!(!image_padding_fits_cell((10, 0, 0, 0), 10, 10));
+        assert!(!image_padding_fits_cell((0, 0, 10, 0), 10, 10));
+        assert!(!image_padding_fits_cell((4, 0, 6, 0), 10, 10));
+        assert!(!image_padding_fits_cell((0, 10, 0, 0), 10, 10));
+        assert!(!image_padding_fits_cell((0, 0, 0, 10), 10, 10));
+        assert!(!image_padding_fits_cell((0, 4, 0, 6), 10, 10));
+        assert!(!image_padding_fits_cell((0, 0, 0, 0), 0, 10));
+        assert!(!image_padding_fits_cell((0, 0, 0, 0), 10, 0));
+    }
+
+    #[test]
+    fn image_cache_padding_uses_one_consistent_checked_cell_extent() {
+        assert_eq!(image_cache_padding_for_cell(1, 1), Some(1));
+        assert_eq!(image_cache_padding_for_cell(9, 16), Some(16));
+        assert_eq!(image_cache_padding_for_cell(17, 2), Some(32));
+        assert_eq!(image_cache_padding_for_cell(0, 10), None);
+        assert_eq!(image_cache_padding_for_cell(10, 0), None);
+        assert_eq!(image_cache_padding_for_cell(-1, -1), None);
+        assert_eq!(
+            image_cache_padding_for_cell(isize::MAX, 1),
+            Some(1usize << (usize::BITS - 1)),
+        );
+    }
+
+    #[test]
+    fn image_texture_region_accepts_and_canonicalizes_wire_tolerance() {
+        let tolerance = f32::EPSILON * 8.0;
+        assert_eq!(
+            canonical_image_texture_region(
+                TextureCoordinate::new_f32(-tolerance, -tolerance),
+                TextureCoordinate::new_f32(1.0 + tolerance, 1.0 + tolerance),
+            ),
+            Some((0.0, 0.0, 1.0, 1.0)),
+        );
+    }
+
+    #[test]
+    fn image_texture_region_rejects_non_finite_reversed_empty_and_out_of_range() {
+        let coordinate = |left, top, right, bottom| {
+            canonical_image_texture_region(
+                TextureCoordinate::new_f32(left, top),
+                TextureCoordinate::new_f32(right, bottom),
+            )
+        };
+        assert_eq!(coordinate(f32::INFINITY, 0.0, 1.0, 1.0), None);
+        assert_eq!(coordinate(0.0, 0.0, f32::INFINITY, 1.0), None);
+        assert_eq!(coordinate(0.75, 0.0, 0.25, 1.0), None);
+        assert_eq!(coordinate(0.25, 0.0, 0.25, 1.0), None);
+        assert_eq!(coordinate(0.0, 0.75, 1.0, 0.25), None);
+        assert_eq!(coordinate(0.0, 0.25, 1.0, 0.25), None);
+        let beyond_tolerance = f32::EPSILON * 16.0;
+        assert_eq!(coordinate(-beyond_tolerance, 0.0, 1.0, 1.0), None);
+        assert_eq!(coordinate(0.0, 0.0, 1.0 + beyond_tolerance, 1.0), None);
     }
 
     #[test]

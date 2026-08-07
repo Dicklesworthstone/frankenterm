@@ -23,10 +23,7 @@ use wezterm_dynamic::ToDynamic;
 use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
 use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
-fn checked_mouse_stable_row(
-    viewport: StableRowIndex,
-    row: i64,
-) -> Option<StableRowIndex> {
+fn checked_mouse_stable_row(viewport: StableRowIndex, row: i64) -> Option<StableRowIndex> {
     let offset = StableRowIndex::try_from(row).ok()?;
     if offset < 0 {
         return None;
@@ -825,7 +822,7 @@ impl super::TermWindow {
         let stable_row = checked_mouse_stable_row(viewport, row);
 
         {
-            let pane_state = self.pane_state(pane.pane_id());
+            let mut pane_state = self.pane_state(pane.pane_id());
             if let Some(stable_row) = stable_row {
                 pane_state.mouse_terminal_coords.replace((
                     ClickPosition {
@@ -1129,9 +1126,6 @@ mod tests {
     fn mouse_stable_row_conversion_fails_closed_at_domain_boundaries() {
         assert_eq!(checked_mouse_stable_row(10, 3), Some(13));
         assert_eq!(checked_mouse_stable_row(10, -1), None);
-        assert_eq!(
-            checked_mouse_stable_row(StableRowIndex::MAX, 1),
-            None,
-        );
+        assert_eq!(checked_mouse_stable_row(StableRowIndex::MAX, 1), None);
     }
 }

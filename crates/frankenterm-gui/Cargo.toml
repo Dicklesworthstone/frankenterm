@@ -36,6 +36,16 @@ path = "../../tests/input_to_photon_bound.rs"
 name = "native_bridge"
 path = "src/native_bridge.rs"
 
+# `glyphcache` is binary-owned while the production binary intentionally keeps
+# `test = false`. This opt-in harness compiles the same `src/main.rs` module
+# graph under Rust's test runner; the generated harness replaces the application
+# entry point, so it neither calls `main` nor creates a GUI window. Keep it
+# feature-gated so ordinary workspace tests retain their existing target graph.
+[[test]]
+name = "glyphcache_unit"
+path = "src/main.rs"
+required-features = ["internal-glyphcache-test-harness"]
+
 [[test]]
 name = "ssim_parity"
 path = "tests/ssim_parity.rs"
@@ -72,6 +82,8 @@ fail-on-cell-mismatch = ["debug-cell-crc", "debug-cell-diff"]
 # Keep the SSIM corpus proof available through the lib test harness on workers
 # that intentionally lack XCB/xkb runtime development packages.
 gui-system-libs = []
+# Empty opt-in gate for the nonlaunching binary-owned unit-test harness above.
+internal-glyphcache-test-harness = []
 
 [build-dependencies]
 anyhow.workspace = true

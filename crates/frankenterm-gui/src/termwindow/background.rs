@@ -11,14 +11,14 @@ use config::{
     BackgroundSource, BackgroundVerticalAlignment, ConfigHandle, DimensionContext, Gradient,
     GradientOrientation,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 use termwiz::image::{
     ImageData, ImageDataType, ImageDataValidationLimits, MAX_IMAGE_WIRE_BYTES,
-    MAX_IMAGE_WIRE_FRAMES,
+    MAX_IMAGE_WIRE_FRAMES, MAX_TRUSTED_LOCAL_IMAGE_DECODED_BYTES,
 };
 use wezterm_term::StableRowIndex;
 
@@ -41,12 +41,27 @@ lazy_static::lazy_static! {
     };
 }
 
-const MAX_BACKGROUND_DECODED_BYTES: usize = 256 * 1024 * 1024;
-const MAX_BACKGROUND_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_BACKGROUND_DECODED_BYTES: usize = MAX_TRUSTED_LOCAL_IMAGE_DECODED_BYTES;
+const MAX_BACKGROUND_CACHE_BYTES: usize = MAX_BACKGROUND_DECODED_BYTES;
 const MAX_BACKGROUND_CACHE_ENTRIES: usize = 32;
+// Background z-indices occupy the negative i8 range -127..=-1. Keep both
+// preparation and rendering inside those slots so background content can
+// never spill into the z=0 text layer.
+const MAX_ACTIVE_BACKGROUND_LAYERS: usize = 127;
+// Cached entries can be evicted while their Arc remains active in a window.
+// Bound that active decoded footprint independently of the process caches.
+const MAX_ACTIVE_BACKGROUND_DECODED_BYTES: usize = MAX_BACKGROUND_CACHE_BYTES;
 const BACKGROUND_IO_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_BACKGROUND_TILES_PER_LAYER: usize = 16_384;
+const BACKGROUND_IMAGE_VALIDATION_LIMITS: ImageDataValidationLimits = ImageDataValidationLimits {
+    max_decoded_bytes: MAX_BACKGROUND_DECODED_BYTES,
+    max_frame_count: MAX_IMAGE_WIRE_FRAMES,
+    max_width: 16_384,
+    max_height: 16_384,
+};
 static BACKGROUND_POOL_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
+static BACKGROUND_LAYER_LIMIT_REPORTED: AtomicBool = AtomicBool::new(false);
+static BACKGROUND_BYTE_LIMIT_REPORTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
 struct BackgroundImageCache {
@@ -56,6 +71,16 @@ struct BackgroundImageCache {
 }
 
 impl BackgroundImageCache {
+    fn recompute_retained_bytes(&mut self) {
+        self.retained_bytes = self
+            .entries
+            .values()
+            .try_fold(0usize, |total, entry| {
+                total.checked_add(entry.retained_bytes)
+            })
+            .unwrap_or(usize::MAX);
+    }
+
     fn next_access(&mut self) -> u64 {
         if self.access_clock == u64::MAX {
             for entry in self.entries.values_mut() {
@@ -73,12 +98,8 @@ impl BackgroundImageCache {
     }
 
     fn insert(&mut self, path: String, image: CachedImage) {
-        if let Some(replaced) = self.entries.insert(path.clone(), image) {
-            self.retained_bytes = self.retained_bytes.saturating_sub(replaced.retained_bytes);
-        }
-        self.retained_bytes = self
-            .retained_bytes
-            .saturating_add(self.entries[&path].retained_bytes);
+        self.entries.insert(path, image);
+        self.recompute_retained_bytes();
         while self.entries.len() > MAX_BACKGROUND_CACHE_ENTRIES
             || self.retained_bytes > MAX_BACKGROUND_CACHE_BYTES
         {
@@ -90,10 +111,10 @@ impl BackgroundImageCache {
             else {
                 break;
             };
-            let Some(evicted) = self.entries.remove(&eviction_key) else {
+            if self.entries.remove(&eviction_key).is_none() {
                 break;
-            };
-            self.retained_bytes = self.retained_bytes.saturating_sub(evicted.retained_bytes);
+            }
+            self.recompute_retained_bytes();
             log::trace!("evicted background image {eviction_key} from the decoded cache");
         }
     }
@@ -107,6 +128,16 @@ struct BackgroundGradientCache {
 }
 
 impl BackgroundGradientCache {
+    fn recompute_retained_bytes(&mut self) {
+        self.retained_bytes = self
+            .entries
+            .iter()
+            .try_fold(0usize, |total, entry| {
+                total.checked_add(entry.retained_bytes)
+            })
+            .unwrap_or(usize::MAX);
+    }
+
     fn next_access(&mut self) -> u64 {
         if self.access_clock == u64::MAX {
             for entry in &mut self.entries {
@@ -124,8 +155,8 @@ impl BackgroundGradientCache {
     }
 
     fn insert(&mut self, gradient: CachedGradient) {
-        self.retained_bytes = self.retained_bytes.saturating_add(gradient.retained_bytes);
         self.entries.push(gradient);
+        self.recompute_retained_bytes();
         while self.entries.len() > MAX_BACKGROUND_CACHE_ENTRIES
             || self.retained_bytes > MAX_BACKGROUND_CACHE_BYTES
         {
@@ -137,8 +168,8 @@ impl BackgroundGradientCache {
             else {
                 break;
             };
-            let evicted = self.entries.swap_remove(index);
-            self.retained_bytes = self.retained_bytes.saturating_sub(evicted.retained_bytes);
+            self.entries.swap_remove(index);
+            self.recompute_retained_bytes();
         }
     }
 }
@@ -155,6 +186,82 @@ fn checked_background_pixel_bytes(width: u32, height: u32) -> anyhow::Result<usi
         "background retains {pixel_bytes} bytes, exceeding the {MAX_BACKGROUND_DECODED_BYTES}-byte limit"
     );
     Ok(pixel_bytes)
+}
+
+fn bounded_active_background_layer_count(requested: usize) -> usize {
+    requested.min(MAX_ACTIVE_BACKGROUND_LAYERS)
+}
+
+fn background_image_validation_limits(max_decoded_bytes: usize) -> ImageDataValidationLimits {
+    ImageDataValidationLimits {
+        max_decoded_bytes: max_decoded_bytes.min(MAX_BACKGROUND_DECODED_BYTES),
+        ..BACKGROUND_IMAGE_VALIDATION_LIMITS
+    }
+}
+
+struct ActiveBackgroundByteBudget {
+    limit: usize,
+    retained_bytes: usize,
+    // Pointer identity is valid for this ledger because every admitted source
+    // is immediately retained by the result Vec for the rest of the pass.
+    sources: HashSet<*const ImageData>,
+}
+
+impl ActiveBackgroundByteBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            retained_bytes: 0,
+            sources: HashSet::new(),
+        }
+    }
+
+    fn try_admit(&mut self, source: &Arc<ImageData>, retained_bytes: usize) -> bool {
+        let identity = Arc::as_ptr(source);
+        if self.sources.contains(&identity) {
+            return true;
+        }
+        let Some(total) = self.retained_bytes.checked_add(retained_bytes) else {
+            return false;
+        };
+        if total > self.limit {
+            return false;
+        }
+        self.sources.insert(identity);
+        self.retained_bytes = total;
+        true
+    }
+}
+
+/// Publish local validation authority for the exact decoded revision that the
+/// renderer will receive. Background preparation already runs on the bounded
+/// worker pool, so completing this validation here avoids making the GUI
+/// thread present a placeholder while it schedules the same pixel scan again.
+fn publish_decoded_background_authority(
+    image: ImageData,
+    is_cancelled: &dyn Fn() -> bool,
+) -> anyhow::Result<(Arc<ImageData>, usize)> {
+    let revision = image.current_content_hash();
+    let validation = image
+        .normalize_for_content_revision_with_limits(
+            revision,
+            0,
+            BACKGROUND_IMAGE_VALIDATION_LIMITS,
+            is_cancelled,
+        )
+        .context("validating decoded background image")?;
+    anyhow::ensure!(
+        validation.replacement.is_none(),
+        "decoded background validation unexpectedly produced a replacement"
+    );
+    debug_assert_eq!(
+        image.validated_summary_for_content_revision(
+            revision,
+            BACKGROUND_IMAGE_VALIDATION_LIMITS,
+        ),
+        Some(validation.summary)
+    );
+    Ok((Arc::new(image), validation.summary.decoded_bytes))
 }
 
 fn checked_background_repeat_count(
@@ -448,9 +555,13 @@ impl CachedGradient {
         }
 
         let data = imgbuf.into_vec();
-        let image = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
-            width, height, data,
-        )));
+        let image = ImageData::with_data(ImageDataType::new_single_frame(width, height, data));
+        let (image, retained_bytes) =
+            publish_decoded_background_authority(image, is_cancelled)?;
+        debug_assert_eq!(
+            retained_bytes,
+            checked_background_pixel_bytes(width, height)?
+        );
 
         Ok(image)
     }
@@ -459,9 +570,15 @@ impl CachedGradient {
         g: &Gradient,
         width: u32,
         height: u32,
+        max_decoded_bytes: usize,
         is_cancelled: &dyn Fn() -> bool,
     ) -> anyhow::Result<Arc<ImageData>> {
         anyhow::ensure!(!is_cancelled(), "background gradient load was superseded");
+        let retained_bytes = checked_background_pixel_bytes(width, height)?;
+        anyhow::ensure!(
+            retained_bytes <= max_decoded_bytes,
+            "background gradient retains {retained_bytes} bytes, exceeding the {max_decoded_bytes}-byte active-layer remainder"
+        );
         {
             let mut cache = lock_cache(&GRADIENT_CACHE, "gradient");
             let access = cache.next_access();
@@ -479,7 +596,6 @@ impl CachedGradient {
         // Never hold the process-wide cache lock while doing that work.
         let image = Self::compute(g, width, height, is_cancelled)?;
         anyhow::ensure!(!is_cancelled(), "background gradient load was superseded");
-        let retained_bytes = checked_background_pixel_bytes(width, height)?;
 
         let mut cache = lock_cache(&GRADIENT_CACHE, "gradient");
         let access = cache.next_access();
@@ -503,9 +619,52 @@ impl CachedGradient {
     }
 }
 
-struct CachedImage {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BackgroundFileStamp {
     modified: SystemTime,
     file_len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    status_change_seconds: i64,
+    #[cfg(unix)]
+    status_change_nanoseconds: i64,
+    #[cfg(not(unix))]
+    created: Option<SystemTime>,
+}
+
+impl BackgroundFileStamp {
+    fn from_metadata(path: &str, metadata: &std::fs::Metadata) -> anyhow::Result<Self> {
+        let modified = metadata
+            .modified()
+            .with_context(|| format!("getting modification time for {path}"))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Self {
+                modified,
+                file_len: metadata.len(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                status_change_seconds: metadata.ctime(),
+                status_change_nanoseconds: metadata.ctime_nsec(),
+            })
+        }
+
+        #[cfg(not(unix))]
+        Ok(Self {
+            modified,
+            file_len: metadata.len(),
+            created: metadata.created().ok(),
+        })
+    }
+}
+
+struct CachedImage {
+    stamp: BackgroundFileStamp,
     image: Arc<ImageData>,
     retained_bytes: usize,
     last_access: u64,
@@ -516,6 +675,7 @@ impl CachedImage {
     fn load(
         path: &str,
         speed: f32,
+        max_decoded_bytes: usize,
         is_cancelled: &dyn Fn() -> bool,
     ) -> anyhow::Result<Arc<ImageData>> {
         anyhow::ensure!(!is_cancelled(), "background image load was superseded");
@@ -528,10 +688,8 @@ impl CachedImage {
             metadata.file_type().is_file(),
             "background image {path} must be a regular file"
         );
-        let modified = metadata
-            .modified()
-            .with_context(|| format!("getting modification time for {}", path))?;
-        let file_len = metadata.len();
+        let stamp = BackgroundFileStamp::from_metadata(path, &metadata)?;
+        let file_len = stamp.file_len;
         if file_len > u64::try_from(MAX_IMAGE_WIRE_BYTES).unwrap_or(u64::MAX) {
             anyhow::bail!(
                 "background image {path} retains {file_len} encoded bytes, exceeding the {MAX_IMAGE_WIRE_BYTES}-byte limit"
@@ -541,10 +699,12 @@ impl CachedImage {
             let mut cache = lock_cache(&IMAGE_CACHE, "image");
             let access = cache.next_access();
             if let Some(cached) = cache.entries.get_mut(path) {
-                if cached.modified == modified
-                    && cached.file_len == file_len
-                    && cached.speed == speed
-                {
+                if cached.stamp == stamp && cached.speed == speed {
+                    anyhow::ensure!(
+                        cached.retained_bytes <= max_decoded_bytes,
+                        "background image {path} retains {} decoded bytes, exceeding the {max_decoded_bytes}-byte active-layer remainder",
+                        cached.retained_bytes,
+                    );
                     cached.last_access = access;
                     return Ok(Arc::clone(&cached.image));
                 }
@@ -554,6 +714,18 @@ impl CachedImage {
         // Keep filesystem IO and image decoding outside the global cache lock.
         let mut reader = std::fs::File::open(path)
             .with_context(|| format!("opening window_background_image {path}"))?;
+        let opened_metadata = reader
+            .metadata()
+            .with_context(|| format!("getting opened-file metadata for {path}"))?;
+        anyhow::ensure!(
+            opened_metadata.file_type().is_file(),
+            "background image {path} stopped being a regular file before it was opened"
+        );
+        let opened_stamp = BackgroundFileStamp::from_metadata(path, &opened_metadata)?;
+        anyhow::ensure!(
+            opened_stamp == stamp,
+            "background image {path} changed before it could be opened"
+        );
         let mut encoded = Vec::new();
         encoded
             .try_reserve_exact(usize::try_from(file_len).unwrap_or(MAX_IMAGE_WIRE_BYTES))
@@ -592,48 +764,68 @@ impl CachedImage {
             .normalize_for_content_revision_with_limits(
                 source_revision,
                 MAX_IMAGE_WIRE_BYTES,
-                ImageDataValidationLimits {
-                    max_decoded_bytes: MAX_BACKGROUND_DECODED_BYTES,
-                    max_frame_count: MAX_IMAGE_WIRE_FRAMES,
-                    max_width: 16_384,
-                    max_height: 16_384,
-                },
+                background_image_validation_limits(max_decoded_bytes),
                 is_cancelled,
             )
             .with_context(|| format!("decoding window_background_image {path}"))?;
-        let retained_bytes = normalized.summary.decoded_bytes;
-        let mut decoded = normalized
+        let decoded = normalized
             .replacement
-            .context("encoded background normalization did not return decoded data")?
-            .into_data();
-        decoded
-            .adjust_speed(speed)
-            .with_context(|| format!("applying background image speed for {path}"))?;
-        let image = Arc::new(ImageData::with_data(decoded));
+            .context("encoded background normalization did not return decoded data")?;
+        {
+            let mut data = decoded.data_mut();
+            data.adjust_speed(speed)
+                .with_context(|| format!("applying background image speed for {path}"))?;
+        }
+        // Speed adjustment is a real content mutation for animations, so it
+        // correctly clears the decode-time authority. Revalidate the final
+        // revision here on the background worker instead of rewrapping the
+        // payload and forcing the GUI fallback validator on first paint.
+        let (image, retained_bytes) =
+            publish_decoded_background_authority(decoded, is_cancelled)?;
+        anyhow::ensure!(
+            retained_bytes <= max_decoded_bytes,
+            "background image {path} retains {retained_bytes} decoded bytes, exceeding the {max_decoded_bytes}-byte active-layer remainder"
+        );
         anyhow::ensure!(!is_cancelled(), "background image load was superseded");
 
-        // File metadata is the cache authority. A decode can be expensive, so
+        // Bind the decoded bytes to the same opened file generation as the
+        // path-level cache stamp. Checking both the still-open descriptor and
+        // the path closes replacement-during-open and mutation-during-read
+        // races before the pixels become cache authority.
+        let decoded_file_stamp = BackgroundFileStamp::from_metadata(
+            path,
+            &reader
+                .metadata()
+                .with_context(|| format!("rechecking opened-file metadata for {path}"))?,
+        )?;
+        anyhow::ensure!(
+            decoded_file_stamp == stamp,
+            "background image {path} changed while it was being read"
+        );
+
+        // A strong metadata generation stamp is the cache authority. On Unix
+        // it includes device/inode and status-change time in addition to mtime
+        // and length, so same-sized atomic replacement and in-place rewrites
+        // cannot silently retain the old pixels. A decode can be expensive, so
         // another reload may win while this thread is outside the lock. Never
-        // let the older decode overwrite a cache entry for a newer file
-        // generation.
+        // let the older decode overwrite a newer file generation.
         let current_metadata = std::fs::metadata(path)
             .with_context(|| format!("rechecking metadata for {path}"))?;
         anyhow::ensure!(
             current_metadata.file_type().is_file(),
             "background image {path} stopped being a regular file while decoding"
         );
-        let current_modified = current_metadata
-            .modified()
-            .with_context(|| format!("rechecking modification time for {path}"))?;
-        let current_file_len = current_metadata.len();
-        if current_modified != modified || current_file_len != file_len {
+        let current_stamp = BackgroundFileStamp::from_metadata(path, &current_metadata)?;
+        if current_stamp != stamp {
             let mut cache = lock_cache(&IMAGE_CACHE, "image");
             let access = cache.next_access();
             if let Some(cached) = cache.entries.get_mut(path) {
-                if cached.modified == current_modified
-                    && cached.file_len == current_file_len
-                    && cached.speed == speed
-                {
+                if cached.stamp == current_stamp && cached.speed == speed {
+                    anyhow::ensure!(
+                        cached.retained_bytes <= max_decoded_bytes,
+                        "background image {path} retains {} decoded bytes, exceeding the {max_decoded_bytes}-byte active-layer remainder",
+                        cached.retained_bytes,
+                    );
                     cached.last_access = access;
                     return Ok(Arc::clone(&cached.image));
                 }
@@ -645,10 +837,12 @@ impl CachedImage {
         let mut cache = lock_cache(&IMAGE_CACHE, "image");
         let access = cache.next_access();
         if let Some(cached) = cache.entries.get_mut(path) {
-            if cached.modified == modified
-                && cached.file_len == file_len
-                && cached.speed == speed
-            {
+            if cached.stamp == stamp && cached.speed == speed {
+                anyhow::ensure!(
+                    cached.retained_bytes <= max_decoded_bytes,
+                    "background image {path} retains {} decoded bytes, exceeding the {max_decoded_bytes}-byte active-layer remainder",
+                    cached.retained_bytes,
+                );
                 cached.last_access = access;
                 return Ok(Arc::clone(&cached.image));
             }
@@ -656,8 +850,7 @@ impl CachedImage {
         cache.insert(
             path.to_string(),
             Self {
-                modified,
-                file_len,
+                stamp,
                 image: Arc::clone(&image),
                 retained_bytes,
                 last_access: access,
@@ -673,6 +866,7 @@ impl CachedImage {
 pub struct LoadedBackgroundLayer {
     pub source: Arc<ImageData>,
     pub def: BackgroundLayer,
+    retained_bytes: usize,
 }
 
 fn resolve_generated_background_axis(size: BackgroundSize, context: DimensionContext) -> u32 {
@@ -707,6 +901,7 @@ fn load_background_layer(
     layer: &BackgroundLayer,
     dimensions: &Dimensions,
     render_metrics: &RenderMetrics,
+    max_decoded_bytes: usize,
     is_cancelled: &dyn Fn() -> bool,
 ) -> anyhow::Result<LoadedBackgroundLayer> {
     anyhow::ensure!(!is_cancelled(), "background layer load was superseded");
@@ -731,7 +926,7 @@ fn load_background_layer(
                 matches!(g.orientation, GradientOrientation::Radial { .. }),
             );
 
-            CachedGradient::load(g, width, height, is_cancelled)?
+            CachedGradient::load(g, width, height, max_decoded_bytes, is_cancelled)?
         }
         BackgroundSource::Color(color) => {
             // In theory we could just make a 1x1 texture and allow
@@ -751,6 +946,10 @@ fn load_background_layer(
             let size = width.min(height);
             let pixel_bytes = checked_background_pixel_bytes(size, size)
                 .context("validating solid-color background dimensions")?;
+            anyhow::ensure!(
+                pixel_bytes <= max_decoded_bytes,
+                "solid-color background retains {pixel_bytes} bytes, exceeding the {max_decoded_bytes}-byte active-layer remainder"
+            );
             let src_pixel = {
                 let (r, g, b, a) = color.to_srgb_u8();
                 [r, g, b, a]
@@ -765,18 +964,33 @@ fn load_background_layer(
                 }
                 pixel.copy_from_slice(&src_pixel);
             }
-            Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
-                size, size, data,
-            )))
+            let image = ImageData::with_data(ImageDataType::new_single_frame(size, size, data));
+            publish_decoded_background_authority(image, is_cancelled)?.0
         }
         BackgroundSource::File(source) => {
-            CachedImage::load(&source.path, source.speed, is_cancelled)?
+            CachedImage::load(
+                &source.path,
+                source.speed,
+                max_decoded_bytes,
+                is_cancelled,
+            )?
         }
     };
+
+    let revision = data.current_content_hash();
+    let retained_bytes = data
+        .validated_summary_for_content_revision(revision, BACKGROUND_IMAGE_VALIDATION_LIMITS)
+        .context("loaded background did not retain exact decoded validation authority")?
+        .decoded_bytes;
+    anyhow::ensure!(
+        retained_bytes <= max_decoded_bytes,
+        "background layer retains {retained_bytes} bytes, exceeding the {max_decoded_bytes}-byte active-layer remainder"
+    );
 
     Ok(LoadedBackgroundLayer {
         source: data,
         def: layer.clone(),
+        retained_bytes,
     })
 }
 
@@ -792,21 +1006,43 @@ fn reload_background_image(
     // animation state can be preserved across the reload.
     let map: HashMap<_, _> = existing
         .iter()
-        .map(|layer| (layer.source.hash(), &layer.source))
+        .map(|layer| (layer.source.current_content_hash(), &layer.source))
         .collect();
 
-    let mut result = Vec::with_capacity(config.background.len());
-    for (index, definition) in config.background.iter().enumerate() {
+    let layer_count = bounded_active_background_layer_count(config.background.len());
+    if layer_count < config.background.len() {
+        let dropped = config.background.len() - layer_count;
+        metrics::counter!("gui.background.layers_rejected.total", "reason" => "layer_limit")
+            .increment(u64::try_from(dropped).unwrap_or(u64::MAX));
+        if !BACKGROUND_LAYER_LIMIT_REPORTED.swap(true, Ordering::AcqRel) {
+            log::error!(
+                "background configuration requested {} layers; only the first {MAX_ACTIVE_BACKGROUND_LAYERS} fit the renderer's negative z-index range",
+                config.background.len(),
+            );
+        }
+    }
+
+    let mut result = Vec::with_capacity(layer_count);
+    let mut active_budget =
+        ActiveBackgroundByteBudget::new(MAX_ACTIVE_BACKGROUND_DECODED_BYTES);
+    for (index, definition) in config.background.iter().take(layer_count).enumerate() {
         if is_cancelled() {
             return existing.to_vec();
         }
-        match load_background_layer(definition, dimensions, render_metrics, is_cancelled) {
+
+        let candidate = match load_background_layer(
+            definition,
+            dimensions,
+            render_metrics,
+            MAX_BACKGROUND_DECODED_BYTES,
+            is_cancelled,
+        ) {
             Ok(mut layer) => {
-                let hash = layer.source.hash();
+                let hash = layer.source.current_content_hash();
                 if let Some(existing) = map.get(&hash) {
                     layer.source = Arc::clone(existing);
                 }
-                result.push(layer);
+                Some(layer)
             }
             Err(err) => {
                 // Background reload is a prepare/commit operation. A transient
@@ -820,15 +1056,35 @@ fn reload_background_image(
                     log::error!(
                         "Failed to replace background layer {index}; retaining pixels from the matching prior source: {err:#}"
                     );
-                    result.push(LoadedBackgroundLayer {
+                    Some(LoadedBackgroundLayer {
                         source: Arc::clone(&previous.source),
                         def: definition.clone(),
-                    });
+                        retained_bytes: previous.retained_bytes,
+                    })
                 } else {
                     log::error!("Failed to load background layer {index}: {err:#}");
+                    None
                 }
             }
+        };
+
+        let Some(layer) = candidate else {
+            continue;
+        };
+        if !active_budget.try_admit(&layer.source, layer.retained_bytes) {
+            metrics::counter!(
+                "gui.background.layers_rejected.total",
+                "reason" => "active_decoded_byte_limit",
+            )
+            .increment(1);
+            if !BACKGROUND_BYTE_LIMIT_REPORTED.swap(true, Ordering::AcqRel) {
+                log::error!(
+                    "background layer {index} would exceed the {MAX_ACTIVE_BACKGROUND_DECODED_BYTES}-byte active decoded-image budget; it and remaining layers were not retained"
+                );
+            }
+            break;
         }
+        result.push(layer);
     }
 
     result
@@ -1129,7 +1385,11 @@ impl crate::TermWindow {
             .context("render state is not initialized")?;
         let mut layer_idx = -127;
         let mut loaded_any = false;
-        for layer in self.window_background.iter() {
+        for layer in self
+            .window_background
+            .iter()
+            .take(MAX_ACTIVE_BACKGROUND_LAYERS)
+        {
             if self.render_background(gl_state, bg_color, layer, layer_idx, top)? {
                 loaded_any = true;
                 layer_idx = layer_idx.saturating_add(1);
@@ -1403,10 +1663,10 @@ impl crate::TermWindow {
 
             for x_step in 0..x_count {
                 let offset_x = x_step as f32 * repeat_x;
-                if offset_x >= pixel_width {
+                let origin_x = origin_x + offset_x;
+                if origin_x >= right_pixel {
                     break;
                 }
-                let origin_x = origin_x + offset_x;
                 let mut quad = layer0.allocate()?;
                 emitted = true;
                 // log::info!("quad {origin_x},{origin_y} {width}x{height}");
@@ -1443,11 +1703,24 @@ impl crate::TermWindow {
 mod tests {
     use super::*;
     use config::Dimension;
+    use std::time::Duration;
 
     fn cached_image(last_access: u64, retained_bytes: usize) -> CachedImage {
         CachedImage {
-            modified: SystemTime::UNIX_EPOCH,
-            file_len: 4,
+            stamp: BackgroundFileStamp {
+                modified: SystemTime::UNIX_EPOCH,
+                file_len: 4,
+                #[cfg(unix)]
+                device: 0,
+                #[cfg(unix)]
+                inode: 0,
+                #[cfg(unix)]
+                status_change_seconds: 0,
+                #[cfg(unix)]
+                status_change_nanoseconds: 0,
+                #[cfg(not(unix))]
+                created: None,
+            },
             image: Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
                 1,
                 1,
@@ -1473,6 +1746,131 @@ mod tests {
         assert!(checked_background_pixel_bytes(1, 0).is_err());
         assert_eq!(checked_background_pixel_bytes(1, 1).unwrap(), 4);
         assert!(checked_background_pixel_bytes(16_384, 16_384).is_err());
+    }
+
+    #[test]
+    fn active_background_layer_count_stays_inside_negative_z_slots() {
+        assert_eq!(bounded_active_background_layer_count(0), 0);
+        assert_eq!(
+            bounded_active_background_layer_count(MAX_ACTIVE_BACKGROUND_LAYERS),
+            MAX_ACTIVE_BACKGROUND_LAYERS,
+        );
+        assert_eq!(
+            bounded_active_background_layer_count(MAX_ACTIVE_BACKGROUND_LAYERS + 1),
+            MAX_ACTIVE_BACKGROUND_LAYERS,
+        );
+        assert_eq!(
+            -127_i16 + (MAX_ACTIVE_BACKGROUND_LAYERS as i16 - 1),
+            -1,
+            "the last admitted background must remain below the z=0 text layer",
+        );
+    }
+
+    #[test]
+    fn active_background_byte_budget_counts_shared_arcs_once_and_distinct_arcs_exactly() {
+        let shared = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![0, 0, 0, 0xff],
+        )));
+        let distinct = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![1, 1, 1, 0xff],
+        )));
+        let overflow = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![2, 2, 2, 0xff],
+        )));
+        let mut budget = ActiveBackgroundByteBudget::new(8);
+        let shared_alias = Arc::clone(&shared);
+
+        assert!(budget.try_admit(&shared, 4));
+        assert!(budget.try_admit(&shared_alias, 4));
+        assert_eq!(budget.retained_bytes, 4, "a cloned Arc is not new pixel memory");
+        assert!(budget.try_admit(&distinct, 4));
+        assert_eq!(budget.retained_bytes, 8);
+        assert!(!budget.try_admit(&overflow, 4));
+        assert_eq!(budget.retained_bytes, 8, "a rejected Arc changes no authority");
+    }
+
+    #[test]
+    fn decoded_background_publication_carries_exact_renderer_authority() {
+        let image = ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![0x11, 0x22, 0x33, 0xff],
+        ));
+        let revision = image.current_content_hash();
+        assert!(
+            image
+                .validated_summary_for_content_revision(
+                    revision,
+                    BACKGROUND_IMAGE_VALIDATION_LIMITS,
+                )
+                .is_none(),
+            "an unvalidated decoded image must not start with renderer authority"
+        );
+
+        let (image, retained_bytes) =
+            publish_decoded_background_authority(image, &|| false).unwrap();
+        assert_eq!(retained_bytes, 4);
+        assert_eq!(
+            image.validated_summary_for_content_revision(
+                image.current_content_hash(),
+                BACKGROUND_IMAGE_VALIDATION_LIMITS,
+            ),
+            Some(termwiz::image::ImageDataValidationSummary {
+                decoded_bytes: 4,
+                frame_count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn animation_speed_mutation_is_revalidated_before_background_publication() {
+        let first = vec![0x10, 0x20, 0x30, 0xff];
+        let second = vec![0x40, 0x50, 0x60, 0xff];
+        let image = ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            hashes: vec![
+                ImageDataType::hash_bytes(&first),
+                ImageDataType::hash_bytes(&second),
+            ],
+            frames: vec![first, second],
+            durations: vec![Duration::from_millis(100), Duration::from_millis(200)],
+        });
+        {
+            let mut data = image.data_mut();
+            data.adjust_speed(2.0).unwrap();
+        }
+        let adjusted_revision = image.current_content_hash();
+        assert!(
+            image
+                .validated_summary_for_content_revision(
+                    adjusted_revision,
+                    BACKGROUND_IMAGE_VALIDATION_LIMITS,
+                )
+                .is_none(),
+            "mutable speed adjustment must clear the prior validation authority"
+        );
+
+        let (image, retained_bytes) =
+            publish_decoded_background_authority(image, &|| false).unwrap();
+        assert_eq!(retained_bytes, 8);
+        assert_eq!(image.current_content_hash(), adjusted_revision);
+        assert_eq!(
+            image.validated_summary_for_content_revision(
+                adjusted_revision,
+                BACKGROUND_IMAGE_VALIDATION_LIMITS,
+            ),
+            Some(termwiz::image::ImageDataValidationSummary {
+                decoded_bytes: 8,
+                frame_count: 2,
+            })
+        );
     }
 
     #[test]
@@ -1524,6 +1922,37 @@ mod tests {
         .unwrap();
         assert_eq!(scrolled_origin, -580.0);
         assert!(scrolled_mirrored);
+    }
+
+    #[test]
+    fn backward_extended_repeat_still_covers_the_trailing_viewport_edge() {
+        let viewport_left = 0.0;
+        let viewport_right = 500.0;
+        let step = 100.0;
+        let (origin, _) = prepare_background_repeat_axis(
+            20.0,
+            viewport_left,
+            step,
+            BackgroundRepeat::Repeat,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(origin, -80.0);
+
+        let count = checked_background_repeat_count(
+            viewport_right - origin,
+            step,
+            BackgroundRepeat::Repeat,
+        )
+        .unwrap();
+        let last_origin = (0..count)
+            .map(|index| origin + index as f32 * step)
+            .take_while(|tile_origin| *tile_origin < viewport_right)
+            .last()
+            .expect("the repeated background must emit at least one tile");
+
+        assert_eq!(last_origin, 420.0);
+        assert!(last_origin + step >= viewport_right);
     }
 
     #[test]

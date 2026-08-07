@@ -59,34 +59,11 @@ pub fn confirm_close_window(
         &mut term,
     )? {
         promise::spawn::spawn_into_main_thread(async move {
-            let Some(operation) = witness.operation_guard(&mux) else {
+            if !mux.kill_window_if_contains_exact_tab(mux_window_id, &tab, &witness) {
                 log::warn!(
-                    "cannot close window {mux_window_id}: exact pane generation is no longer active"
+                    "cannot close window {mux_window_id}: exact originating tab generation is no longer attached"
                 );
-                return;
-            };
-            if !tab
-                .iter_all_panes()
-                .iter()
-                .any(|pane| operation.is_same_pane(pane))
-            {
-                log::warn!(
-                    "cannot close window {mux_window_id}: witness pane left the originating tab"
-                );
-                return;
             }
-            let tab_is_still_attached = mux.get_window(mux_window_id).is_some_and(|window| {
-                window
-                    .iter()
-                    .any(|candidate| Arc::ptr_eq(candidate, &tab))
-            });
-            if !tab_is_still_attached {
-                log::warn!(
-                    "cannot close window {mux_window_id}: exact originating tab is no longer attached"
-                );
-                return;
-            }
-            mux.kill_window(mux_window_id);
         })
         .detach();
     }

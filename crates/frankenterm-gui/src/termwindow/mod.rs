@@ -7832,7 +7832,6 @@ impl TermWindow {
         overlay_pane_id: PaneId,
         ticket: OverlayCancellationTicket,
     ) {
-        ticket.request_cancellation();
         if ticket.slot != OverlaySlot::Tab(tab_id) || ticket.overlay_pane_id != overlay_pane_id {
             metrics::counter!("gui.overlay.cancel.invalid_origin_ticket", "slot" => "tab")
                 .increment(1);
@@ -7843,6 +7842,7 @@ impl TermWindow {
             );
             return;
         }
+        ticket.request_cancellation();
         window.notify(TermWindowNotif::CancelOverlayForTab {
             tab_id,
             overlay_pane_id,
@@ -7910,7 +7910,6 @@ impl TermWindow {
         pane_id: PaneId,
         ticket: OverlayCancellationTicket,
     ) {
-        ticket.request_cancellation();
         if ticket.slot != OverlaySlot::Pane(pane_id) {
             metrics::counter!("gui.overlay.cancel.invalid_origin_ticket", "slot" => "pane")
                 .increment(1);
@@ -7920,6 +7919,7 @@ impl TermWindow {
             );
             return;
         }
+        ticket.request_cancellation();
         window.notify(TermWindowNotif::CancelOverlayForPane { pane_id, ticket });
     }
 

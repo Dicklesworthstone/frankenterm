@@ -143,7 +143,7 @@ fn enqueue_bridge_event(
     match tx.try_send(event) {
         Ok(()) => BridgeQueueOutcome::Queued,
         Err(std_mpsc::TrySendError::Full(_)) => {
-            let previous = match BRIDGE_QUEUE_FULL_DROPS.fetch_update(
+            let previous = match BRIDGE_QUEUE_FULL_DROPS.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |count| Some(count.saturating_add(1)),
@@ -185,7 +185,7 @@ fn bridge_text_field_allowed(
         return true;
     }
 
-    let previous = match BRIDGE_OVERSIZED_FIELD_DROPS.fetch_update(
+    let previous = match BRIDGE_OVERSIZED_FIELD_DROPS.try_update(
         Ordering::Relaxed,
         Ordering::Relaxed,
         |count| Some(count.saturating_add(1)),

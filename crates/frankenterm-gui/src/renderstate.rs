@@ -989,12 +989,10 @@ impl RenderState {
 
         let mut glyph_cache = self.glyph_cache.borrow_mut();
 
-        // Steal the decoded image cache; without this, any animating gifs
-        // would reset back to frame 0 each time we filled the texture
-        std::mem::swap(
-            &mut glyph_cache.image_cache,
-            &mut new_glyph_cache.image_cache,
-        );
+        // Steal the complete decoded-image cache authority; without this,
+        // animations reset and mutable-image ownership/accounting is lost
+        // each time we fill the texture.
+        glyph_cache.swap_decoded_image_cache_state(&mut new_glyph_cache);
 
         *glyph_cache = new_glyph_cache;
         Ok(())

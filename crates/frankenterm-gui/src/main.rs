@@ -1185,6 +1185,11 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
     terminate_with_error_message(&err_text)
 }
 
+// The opt-in `glyphcache_unit` target compiles this production module graph
+// under Rust's generated test harness. Excluding the application entry point at
+// compile time is the hard fence that prevents those tests from initializing a
+// frontend, creating a window, or stealing desktop focus.
+#[cfg(not(test))]
 fn main() {
     // Install the privacy-bounded terminal hook before profiler or runtime
     // initialization. The GUI notifier wraps this chain below; reversing the
@@ -1207,6 +1212,14 @@ fn main() {
     }
     Mux::shutdown();
     frontend::shutdown();
+}
+
+#[cfg(test)]
+#[test]
+fn internal_glyphcache_harness_excludes_application_entrypoint() {
+    // Reaching this generated-harness test proves the mutually exclusive
+    // `#[cfg(not(test))] fn main` above was not compiled into this executable.
+    assert!(cfg!(test));
 }
 
 fn log_renderer_rollout_env_overrides() {

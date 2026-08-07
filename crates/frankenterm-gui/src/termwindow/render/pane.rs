@@ -546,6 +546,12 @@ impl crate::TermWindow {
             let stable_range =
                 frankenterm_gui::checked_stable_row_range_from_top(stable_top, dims.viewport_rows)
                     .context("stable row range overflow")?;
+            // Retain the immutable config allocation independently from the
+            // mutable TermWindow borrow held by `LineRender`. Cloning the
+            // handle is one Arc increment; cloning the compiled hyperlink
+            // rule vector on every pane render would be substantially more
+            // expensive.
+            let render_config = self.config.clone();
 
             struct LineRender<'a, 'b> {
                 term_window: &'a mut crate::TermWindow,
@@ -829,7 +835,7 @@ impl crate::TermWindow {
 
             pos.pane.with_lines_mut_and_apply_hyperlinks(
                 stable_range.clone(),
-                &self.config.hyperlink_rules,
+                &render_config.hyperlink_rules,
                 &mut render,
             );
             if let Some(error) = render.error.take() {
