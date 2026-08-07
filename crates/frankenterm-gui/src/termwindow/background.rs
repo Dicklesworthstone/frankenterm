@@ -2,8 +2,9 @@ use crate::Dimensions;
 use crate::color::LinearRgba;
 use crate::glyphcache::LoadState;
 use crate::quad::{QuadAllocator, QuadTrait};
-use crate::termwindow::RenderState;
+use crate::termwindow::{RenderState, TermWindowNotif};
 use crate::utilsprites::RenderMetrics;
+use ::window::WindowOps;
 use anyhow::Context;
 use config::{
     BackgroundHorizontalAlignment, BackgroundLayer, BackgroundRepeat, BackgroundSize,
@@ -11,14 +12,205 @@ use config::{
     GradientOrientation,
 };
 use std::collections::HashMap;
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
-use termwiz::image::{ImageData, ImageDataType};
+use termwiz::image::{
+    ImageData, ImageDataType, ImageDataValidationLimits, MAX_IMAGE_WIRE_BYTES,
+    MAX_IMAGE_WIRE_FRAMES,
+};
 use wezterm_term::StableRowIndex;
 
 lazy_static::lazy_static! {
-    static ref IMAGE_CACHE: Mutex<HashMap<String, CachedImage>> = Mutex::new(HashMap::new());
-    static ref GRADIENT_CACHE: Mutex<Vec<CachedGradient>> = Mutex::new(vec![]);
+    static ref IMAGE_CACHE: Mutex<BackgroundImageCache> = Mutex::new(BackgroundImageCache::default());
+    static ref GRADIENT_CACHE: Mutex<BackgroundGradientCache> = Mutex::new(BackgroundGradientCache::default());
+    static ref BACKGROUND_WORK_POOL: Result<rayon::ThreadPool, String> = {
+        // Keep decode traffic off the GUI thread without allowing it to occupy
+        // multiple performance cores on typical Apple Silicon machines. Very
+        // high-core-count workstations can safely prepare two windows at once.
+        let available = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        let workers = if available >= 32 { 2 } else { 1 };
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|index| format!("background-image-{index}"))
+            .build()
+            .map_err(|error| error.to_string())
+    };
+}
+
+const MAX_BACKGROUND_DECODED_BYTES: usize = 256 * 1024 * 1024;
+const MAX_BACKGROUND_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_BACKGROUND_CACHE_ENTRIES: usize = 32;
+const BACKGROUND_IO_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_BACKGROUND_TILES_PER_LAYER: usize = 16_384;
+static BACKGROUND_POOL_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Default)]
+struct BackgroundImageCache {
+    entries: HashMap<String, CachedImage>,
+    retained_bytes: usize,
+    access_clock: u64,
+}
+
+impl BackgroundImageCache {
+    fn next_access(&mut self) -> u64 {
+        if self.access_clock == u64::MAX {
+            for entry in self.entries.values_mut() {
+                entry.last_access /= 2;
+            }
+            self.access_clock = self
+                .entries
+                .values()
+                .map(|entry| entry.last_access)
+                .max()
+                .unwrap_or(0);
+        }
+        self.access_clock += 1;
+        self.access_clock
+    }
+
+    fn insert(&mut self, path: String, image: CachedImage) {
+        if let Some(replaced) = self.entries.insert(path.clone(), image) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(replaced.retained_bytes);
+        }
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(self.entries[&path].retained_bytes);
+        while self.entries.len() > MAX_BACKGROUND_CACHE_ENTRIES
+            || self.retained_bytes > MAX_BACKGROUND_CACHE_BYTES
+        {
+            let Some(eviction_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            let Some(evicted) = self.entries.remove(&eviction_key) else {
+                break;
+            };
+            self.retained_bytes = self.retained_bytes.saturating_sub(evicted.retained_bytes);
+            log::trace!("evicted background image {eviction_key} from the decoded cache");
+        }
+    }
+}
+
+#[derive(Default)]
+struct BackgroundGradientCache {
+    entries: Vec<CachedGradient>,
+    retained_bytes: usize,
+    access_clock: u64,
+}
+
+impl BackgroundGradientCache {
+    fn next_access(&mut self) -> u64 {
+        if self.access_clock == u64::MAX {
+            for entry in &mut self.entries {
+                entry.last_access /= 2;
+            }
+            self.access_clock = self
+                .entries
+                .iter()
+                .map(|entry| entry.last_access)
+                .max()
+                .unwrap_or(0);
+        }
+        self.access_clock += 1;
+        self.access_clock
+    }
+
+    fn insert(&mut self, gradient: CachedGradient) {
+        self.retained_bytes = self.retained_bytes.saturating_add(gradient.retained_bytes);
+        self.entries.push(gradient);
+        while self.entries.len() > MAX_BACKGROUND_CACHE_ENTRIES
+            || self.retained_bytes > MAX_BACKGROUND_CACHE_BYTES
+        {
+            let Some((index, _)) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_access)
+            else {
+                break;
+            };
+            let evicted = self.entries.swap_remove(index);
+            self.retained_bytes = self.retained_bytes.saturating_sub(evicted.retained_bytes);
+        }
+    }
+}
+
+fn checked_background_pixel_bytes(width: u32, height: u32) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        width > 0 && height > 0,
+        "background dimensions must be non-zero"
+    );
+    let pixel_bytes = usize::try_from(u128::from(width) * u128::from(height) * 4)
+        .context("background dimensions exceed addressable memory")?;
+    anyhow::ensure!(
+        pixel_bytes <= MAX_BACKGROUND_DECODED_BYTES,
+        "background retains {pixel_bytes} bytes, exceeding the {MAX_BACKGROUND_DECODED_BYTES}-byte limit"
+    );
+    Ok(pixel_bytes)
+}
+
+fn checked_background_repeat_count(
+    span: f32,
+    step: f32,
+    repeat: BackgroundRepeat,
+) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        span.is_finite() && span >= 0.0,
+        "background repeat span must be finite and non-negative"
+    );
+    anyhow::ensure!(
+        step.is_finite() && step > 0.0,
+        "background repeat step must be finite and greater than zero"
+    );
+    if repeat == BackgroundRepeat::NoRepeat {
+        return Ok(usize::from(span > 0.0));
+    }
+    if span == 0.0 {
+        return Ok(0);
+    }
+    let count = (span / step).ceil();
+    anyhow::ensure!(
+        count.is_finite() && count <= MAX_BACKGROUND_TILES_PER_LAYER as f32,
+        "background repeat count {count} exceeds the per-layer tile limit"
+    );
+    Ok(count as usize)
+}
+
+fn linear_gradient_projection_half_extent(
+    width: f64,
+    height: f64,
+    angle: f64,
+) -> anyhow::Result<f64> {
+    anyhow::ensure!(
+        width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0,
+        "linear-gradient dimensions must be finite and greater than zero"
+    );
+    anyhow::ensure!(angle.is_finite(), "background gradient angle must be finite");
+    let extent = (width * angle.cos().abs() + height * angle.sin().abs()) / 2.0;
+    anyhow::ensure!(
+        extent.is_finite() && extent > 0.0,
+        "linear-gradient projection must be finite and greater than zero"
+    );
+    Ok(extent)
+}
+
+fn background_sources_match(left: &BackgroundSource, right: &BackgroundSource) -> bool {
+    match (left, right) {
+        (BackgroundSource::Gradient(left), BackgroundSource::Gradient(right)) => left == right,
+        (BackgroundSource::Color(left), BackgroundSource::Color(right)) => left == right,
+        (BackgroundSource::File(left), BackgroundSource::File(right)) => {
+            left.path == right.path && left.speed == right.speed
+        }
+        _ => false,
+    }
 }
 
 fn lock_cache<'a, T>(cache: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
@@ -26,6 +218,7 @@ fn lock_cache<'a, T>(cache: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
         Ok(guard) => guard,
         Err(poisoned) => {
             log::warn!("recovering poisoned {label} cache");
+            cache.clear_poison();
             poisoned.into_inner()
         }
     }
@@ -36,16 +229,31 @@ struct CachedGradient {
     width: u32,
     height: u32,
     image: Arc<ImageData>,
-    marked: bool,
+    retained_bytes: usize,
+    last_access: u64,
 }
 
 impl CachedGradient {
-    fn compute(g: &Gradient, width: u32, height: u32) -> anyhow::Result<Arc<ImageData>> {
+    fn compute(
+        g: &Gradient,
+        width: u32,
+        height: u32,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> anyhow::Result<Arc<ImageData>> {
+        anyhow::ensure!(!is_cancelled(), "background gradient load was superseded");
+        let pixel_bytes = checked_background_pixel_bytes(width, height)
+            .context("validating background gradient dimensions")?;
         let grad = g
             .build()
             .with_context(|| format!("building gradient {:?}", g))?;
 
-        let mut imgbuf = image::RgbaImage::new(width, height);
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(pixel_bytes)
+            .context("reserving background gradient pixels")?;
+        pixels.resize(pixel_bytes, 0);
+        let mut imgbuf = image::RgbaImage::from_raw(width, height, pixels)
+            .context("constructing bounded background gradient image")?;
         let fw = width as f64;
         let fh = height as f64;
 
@@ -59,6 +267,10 @@ impl CachedGradient {
         }
 
         let (dmin, dmax) = grad.domain();
+        anyhow::ensure!(
+            dmin.is_finite() && dmax.is_finite() && dmax > dmin,
+            "background gradient domain must be finite and increasing"
+        );
 
         let mut rng = fastrand::Rng::new();
 
@@ -85,7 +297,10 @@ impl CachedGradient {
 
         match g.orientation {
             GradientOrientation::Horizontal => {
-                for (x, _, pixel) in imgbuf.enumerate_pixels_mut() {
+                for (index, (x, _, pixel)) in imgbuf.enumerate_pixels_mut().enumerate() {
+                    if index.is_multiple_of(4_096) && is_cancelled() {
+                        anyhow::bail!("background gradient load was superseded");
+                    }
                     *pixel = to_pixel(grad.at(remap(
                         x as f64 + noise(&mut rng, noise_amount),
                         0.0,
@@ -96,7 +311,10 @@ impl CachedGradient {
                 }
             }
             GradientOrientation::Vertical => {
-                for (_, y, pixel) in imgbuf.enumerate_pixels_mut() {
+                for (index, (_, y, pixel)) in imgbuf.enumerate_pixels_mut().enumerate() {
+                    if index.is_multiple_of(4_096) && is_cancelled() {
+                        anyhow::bail!("background gradient load was superseded");
+                    }
                     *pixel = to_pixel(grad.at(remap(
                         y as f64 + noise(&mut rng, noise_amount),
                         0.0,
@@ -108,14 +326,18 @@ impl CachedGradient {
             }
             GradientOrientation::Linear { angle } => {
                 let angle = angle.unwrap_or(0.0).to_radians();
-                for (x, y, pixel) in imgbuf.enumerate_pixels_mut() {
+                let half_extent = linear_gradient_projection_half_extent(fw, fh, angle)?;
+                for (index, (x, y, pixel)) in imgbuf.enumerate_pixels_mut().enumerate() {
+                    if index.is_multiple_of(4_096) && is_cancelled() {
+                        anyhow::bail!("background gradient load was superseded");
+                    }
                     let (x, y) = (x as f64, y as f64);
                     let (x, y) = (x - fw / 2., y - fh / 2.);
                     let t = x * f64::cos(angle) - y * f64::sin(angle);
                     *pixel = to_pixel(grad.at(remap(
                         t + noise(&mut rng, noise_amount),
-                        -fw / 2.,
-                        fw / 2.,
+                        -half_extent,
+                        half_extent,
                         dmin,
                         dmax,
                     )));
@@ -125,8 +347,19 @@ impl CachedGradient {
                 let radius = fw * radius.unwrap_or(0.5);
                 let cx = fw * cx.unwrap_or(0.5);
                 let cy = fh * cy.unwrap_or(0.5);
+                anyhow::ensure!(
+                    radius.is_finite() && radius > 0.0,
+                    "background radial gradient radius must be finite and greater than zero"
+                );
+                anyhow::ensure!(
+                    cx.is_finite() && cy.is_finite(),
+                    "background radial gradient center must be finite"
+                );
 
-                for (x, y, pixel) in imgbuf.enumerate_pixels_mut() {
+                for (index, (x, y, pixel)) in imgbuf.enumerate_pixels_mut().enumerate() {
+                    if index.is_multiple_of(4_096) && is_cancelled() {
+                        anyhow::bail!("background gradient load was superseded");
+                    }
                     let x = x as f64;
                     let y = y as f64;
 
@@ -158,100 +391,221 @@ impl CachedGradient {
         Ok(image)
     }
 
-    fn load(g: &Gradient, width: u32, height: u32) -> anyhow::Result<Arc<ImageData>> {
-        let mut cache = lock_cache(&GRADIENT_CACHE, "gradient");
+    fn load(
+        g: &Gradient,
+        width: u32,
+        height: u32,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> anyhow::Result<Arc<ImageData>> {
+        anyhow::ensure!(!is_cancelled(), "background gradient load was superseded");
+        {
+            let mut cache = lock_cache(&GRADIENT_CACHE, "gradient");
+            let access = cache.next_access();
+            if let Some(entry) = cache
+                .entries
+                .iter_mut()
+                .find(|entry| entry.g == *g && entry.width == width && entry.height == height)
+            {
+                entry.last_access = access;
+                return Ok(Arc::clone(&entry.image));
+            }
+        }
 
+        // Gradient construction is proportional to the target pixel count.
+        // Never hold the process-wide cache lock while doing that work.
+        let image = Self::compute(g, width, height, is_cancelled)?;
+        anyhow::ensure!(!is_cancelled(), "background gradient load was superseded");
+        let retained_bytes = checked_background_pixel_bytes(width, height)?;
+
+        let mut cache = lock_cache(&GRADIENT_CACHE, "gradient");
+        let access = cache.next_access();
         if let Some(entry) = cache
+            .entries
             .iter_mut()
             .find(|entry| entry.g == *g && entry.width == width && entry.height == height)
         {
-            entry.marked = false;
+            entry.last_access = access;
             return Ok(Arc::clone(&entry.image));
         }
-
-        let image = Self::compute(g, width, height)?;
-
-        cache.push(Self {
+        cache.insert(Self {
             g: g.clone(),
             width,
             height,
             image: Arc::clone(&image),
-            marked: false,
+            retained_bytes,
+            last_access: access,
         });
         Ok(image)
-    }
-
-    fn mark() {
-        let mut cache = lock_cache(&GRADIENT_CACHE, "gradient");
-        for entry in cache.iter_mut() {
-            entry.marked = true;
-        }
-    }
-
-    fn sweep() {
-        let mut cache = lock_cache(&GRADIENT_CACHE, "gradient");
-        cache.retain(|entry| !entry.marked);
     }
 }
 
 struct CachedImage {
     modified: SystemTime,
+    file_len: u64,
     image: Arc<ImageData>,
-    marked: bool,
+    retained_bytes: usize,
+    last_access: u64,
     speed: f32,
 }
 
 impl CachedImage {
-    fn load(path: &str, speed: f32) -> anyhow::Result<Arc<ImageData>> {
-        let modified = std::fs::metadata(path)
-            .and_then(|m| m.modified())
+    fn load(
+        path: &str,
+        speed: f32,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> anyhow::Result<Arc<ImageData>> {
+        anyhow::ensure!(!is_cancelled(), "background image load was superseded");
+        if !speed.is_finite() || speed <= 0.0 {
+            anyhow::bail!("background image speed must be finite and greater than zero");
+        }
+        let metadata = std::fs::metadata(path)
             .with_context(|| format!("getting metadata for {}", path))?;
-        let mut cache = lock_cache(&IMAGE_CACHE, "image");
-        if let Some(cached) = cache.get_mut(path) {
-            if cached.modified == modified && cached.speed == speed {
-                cached.marked = false;
-                return Ok(Arc::clone(&cached.image));
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "background image {path} must be a regular file"
+        );
+        let modified = metadata
+            .modified()
+            .with_context(|| format!("getting modification time for {}", path))?;
+        let file_len = metadata.len();
+        if file_len > u64::try_from(MAX_IMAGE_WIRE_BYTES).unwrap_or(u64::MAX) {
+            anyhow::bail!(
+                "background image {path} retains {file_len} encoded bytes, exceeding the {MAX_IMAGE_WIRE_BYTES}-byte limit"
+            );
+        }
+        {
+            let mut cache = lock_cache(&IMAGE_CACHE, "image");
+            let access = cache.next_access();
+            if let Some(cached) = cache.entries.get_mut(path) {
+                if cached.modified == modified
+                    && cached.file_len == file_len
+                    && cached.speed == speed
+                {
+                    cached.last_access = access;
+                    return Ok(Arc::clone(&cached.image));
+                }
             }
         }
 
-        let data = std::fs::read(path)
-            .with_context(|| format!("Failed to load window_background_image {}", path))?;
+        // Keep filesystem IO and image decoding outside the global cache lock.
+        let mut reader = std::fs::File::open(path)
+            .with_context(|| format!("opening window_background_image {path}"))?;
+        let mut encoded = Vec::new();
+        encoded
+            .try_reserve_exact(usize::try_from(file_len).unwrap_or(MAX_IMAGE_WIRE_BYTES))
+            .with_context(|| format!("reserving window_background_image bytes for {path}"))?;
+        let mut chunk = [0_u8; BACKGROUND_IO_CHUNK_BYTES];
+        loop {
+            anyhow::ensure!(!is_cancelled(), "background image load was superseded");
+            let read = reader
+                .read(&mut chunk)
+                .with_context(|| format!("reading window_background_image {path}"))?;
+            if read == 0 {
+                break;
+            }
+            let next_len = encoded
+                .len()
+                .checked_add(read)
+                .context("background encoded byte count overflowed")?;
+            if next_len > MAX_IMAGE_WIRE_BYTES {
+                anyhow::bail!(
+                    "background image {path} exceeded the {MAX_IMAGE_WIRE_BYTES}-byte limit while reading"
+                );
+            }
+            if next_len > encoded.capacity() {
+                encoded
+                    .try_reserve(next_len.saturating_sub(encoded.len()))
+                    .with_context(|| {
+                        format!("growing window_background_image buffer for {path}")
+                    })?;
+            }
+            encoded.extend_from_slice(&chunk[..read]);
+        }
         log::trace!("loaded {}", path);
-        let mut data = ImageDataType::EncodedFile(data);
-        data.adjust_speed(speed);
-        let image = Arc::new(ImageData::with_data(data));
+        let source_revision = ImageDataType::hash_bytes(&encoded);
+        let source = ImageData::with_data(ImageDataType::EncodedFile(encoded));
+        let normalized = source
+            .normalize_for_content_revision_with_limits(
+                source_revision,
+                MAX_IMAGE_WIRE_BYTES,
+                ImageDataValidationLimits {
+                    max_decoded_bytes: MAX_BACKGROUND_DECODED_BYTES,
+                    max_frame_count: MAX_IMAGE_WIRE_FRAMES,
+                    max_width: 16_384,
+                    max_height: 16_384,
+                },
+                is_cancelled,
+            )
+            .with_context(|| format!("decoding window_background_image {path}"))?;
+        let retained_bytes = normalized.summary.decoded_bytes;
+        let mut decoded = normalized
+            .replacement
+            .context("encoded background normalization did not return decoded data")?
+            .into_data();
+        decoded
+            .adjust_speed(speed)
+            .with_context(|| format!("applying background image speed for {path}"))?;
+        let image = Arc::new(ImageData::with_data(decoded));
+        anyhow::ensure!(!is_cancelled(), "background image load was superseded");
 
+        // File metadata is the cache authority. A decode can be expensive, so
+        // another reload may win while this thread is outside the lock. Never
+        // let the older decode overwrite a cache entry for a newer file
+        // generation.
+        let current_metadata = std::fs::metadata(path)
+            .with_context(|| format!("rechecking metadata for {path}"))?;
+        anyhow::ensure!(
+            current_metadata.file_type().is_file(),
+            "background image {path} stopped being a regular file while decoding"
+        );
+        let current_modified = current_metadata
+            .modified()
+            .with_context(|| format!("rechecking modification time for {path}"))?;
+        let current_file_len = current_metadata.len();
+        if current_modified != modified || current_file_len != file_len {
+            let mut cache = lock_cache(&IMAGE_CACHE, "image");
+            let access = cache.next_access();
+            if let Some(cached) = cache.entries.get_mut(path) {
+                if cached.modified == current_modified
+                    && cached.file_len == current_file_len
+                    && cached.speed == speed
+                {
+                    cached.last_access = access;
+                    return Ok(Arc::clone(&cached.image));
+                }
+            }
+            anyhow::bail!("background image {path} changed while it was being decoded");
+        }
+
+        anyhow::ensure!(!is_cancelled(), "background image load was superseded");
+        let mut cache = lock_cache(&IMAGE_CACHE, "image");
+        let access = cache.next_access();
+        if let Some(cached) = cache.entries.get_mut(path) {
+            if cached.modified == modified
+                && cached.file_len == file_len
+                && cached.speed == speed
+            {
+                cached.last_access = access;
+                return Ok(Arc::clone(&cached.image));
+            }
+        }
         cache.insert(
             path.to_string(),
             Self {
                 modified,
+                file_len,
                 image: Arc::clone(&image),
-                marked: false,
+                retained_bytes,
+                last_access: access,
                 speed,
             },
         );
 
         Ok(image)
     }
-
-    fn mark() {
-        let mut cache = lock_cache(&IMAGE_CACHE, "image");
-        for entry in cache.values_mut() {
-            entry.marked = true;
-        }
-    }
-
-    fn sweep() {
-        let mut cache = lock_cache(&IMAGE_CACHE, "image");
-        cache.retain(|k, entry| {
-            if entry.marked {
-                log::trace!("Unloading {} from cache", k);
-            }
-            !entry.marked
-        });
-    }
 }
 
+#[derive(Clone)]
 pub struct LoadedBackgroundLayer {
     pub source: Arc<ImageData>,
     pub def: BackgroundLayer,
@@ -289,7 +643,9 @@ fn load_background_layer(
     layer: &BackgroundLayer,
     dimensions: &Dimensions,
     render_metrics: &RenderMetrics,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> anyhow::Result<LoadedBackgroundLayer> {
+    anyhow::ensure!(!is_cancelled(), "background layer load was superseded");
     let h_context = DimensionContext {
         dpi: dimensions.dpi as f32,
         pixel_max: dimensions.pixel_width as f32,
@@ -311,7 +667,7 @@ fn load_background_layer(
                 matches!(g.orientation, GradientOrientation::Radial { .. }),
             );
 
-            CachedGradient::load(g, width, height)?
+            CachedGradient::load(g, width, height, is_cancelled)?
         }
         BackgroundSource::Color(color) => {
             // In theory we could just make a 1x1 texture and allow
@@ -329,21 +685,29 @@ fn load_background_layer(
             );
 
             let size = width.min(height);
-
-            let mut imgbuf = image::RgbaImage::new(size, size);
+            let pixel_bytes = checked_background_pixel_bytes(size, size)
+                .context("validating solid-color background dimensions")?;
             let src_pixel = {
                 let (r, g, b, a) = color.to_srgb_u8();
-                image::Rgba([r, g, b, a])
+                [r, g, b, a]
             };
-            for (_x, _y, pixel) in imgbuf.enumerate_pixels_mut() {
-                *pixel = src_pixel;
+            let mut data = Vec::new();
+            data.try_reserve_exact(pixel_bytes)
+                .context("reserving solid-color background pixels")?;
+            data.resize(pixel_bytes, 0);
+            for (index, pixel) in data.chunks_exact_mut(4).enumerate() {
+                if index.is_multiple_of(4_096) && is_cancelled() {
+                    anyhow::bail!("background solid-color load was superseded");
+                }
+                pixel.copy_from_slice(&src_pixel);
             }
-            let data = imgbuf.into_vec();
             Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
                 size, size, data,
             )))
         }
-        BackgroundSource::File(source) => CachedImage::load(&source.path, source.speed)?,
+        BackgroundSource::File(source) => {
+            CachedImage::load(&source.path, source.speed, is_cancelled)?
+        }
     };
 
     Ok(LoadedBackgroundLayer {
@@ -352,32 +716,12 @@ fn load_background_layer(
     })
 }
 
-pub fn load_background_image(
-    config: &ConfigHandle,
-    dimensions: &Dimensions,
-    render_metrics: &RenderMetrics,
-) -> Vec<LoadedBackgroundLayer> {
-    let mut layers = vec![];
-    for layer in &config.background {
-        let load_start = std::time::Instant::now();
-        match load_background_layer(layer, dimensions, render_metrics) {
-            Ok(layer) => {
-                log::trace!("loaded layer in {:?}", load_start.elapsed());
-                layers.push(layer);
-            }
-            Err(err) => {
-                log::error!("Failed to load background: {:#}", err);
-            }
-        }
-    }
-    layers
-}
-
-pub fn reload_background_image(
+fn reload_background_image(
     config: &ConfigHandle,
     existing: &[LoadedBackgroundLayer],
     dimensions: &Dimensions,
     render_metrics: &RenderMetrics,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Vec<LoadedBackgroundLayer> {
     // We want to reuse the existing version of the image where possible
     // so that the textures we may have cached can be re-used and so that
@@ -387,29 +731,329 @@ pub fn reload_background_image(
         .map(|layer| (layer.source.hash(), &layer.source))
         .collect();
 
-    CachedImage::mark();
-    CachedGradient::mark();
-
-    let result = load_background_image(config, dimensions, render_metrics)
-        .into_iter()
-        .map(|mut layer| {
-            let hash = layer.source.hash();
-
-            if let Some(existing) = map.get(&hash) {
-                layer.source = Arc::clone(existing);
+    let mut result = Vec::with_capacity(config.background.len());
+    for (index, definition) in config.background.iter().enumerate() {
+        if is_cancelled() {
+            return existing.to_vec();
+        }
+        match load_background_layer(definition, dimensions, render_metrics, is_cancelled) {
+            Ok(mut layer) => {
+                let hash = layer.source.hash();
+                if let Some(existing) = map.get(&hash) {
+                    layer.source = Arc::clone(existing);
+                }
+                result.push(layer);
             }
-
-            layer
-        })
-        .collect();
-
-    CachedImage::sweep();
-    CachedGradient::sweep();
+            Err(err) => {
+                // Background reload is a prepare/commit operation. A transient
+                // file race, decode failure, or allocation failure must not
+                // blank a layer that is already on screen.
+                if is_cancelled() {
+                    return existing.to_vec();
+                } else if let Some(previous) = existing.iter().find(|previous| {
+                    background_sources_match(&previous.def.source, &definition.source)
+                }) {
+                    log::error!(
+                        "Failed to replace background layer {index}; retaining pixels from the matching prior source: {err:#}"
+                    );
+                    result.push(LoadedBackgroundLayer {
+                        source: Arc::clone(&previous.source),
+                        def: definition.clone(),
+                    });
+                } else {
+                    log::error!("Failed to load background layer {index}: {err:#}");
+                }
+            }
+        }
+    }
 
     result
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct BackgroundLoadCoordinator {
+    state: Arc<Mutex<BackgroundLoadState>>,
+}
+
+#[derive(Default)]
+struct BackgroundLoadState {
+    current: Option<Arc<AtomicBool>>,
+    active: Option<Arc<AtomicBool>>,
+    pending: Option<BackgroundLoadRequest>,
+    ready: Option<BackgroundLoadCompletion>,
+    worker_running: bool,
+}
+
+struct BackgroundLoadRequest {
+    cancellation: Arc<AtomicBool>,
+    config: ConfigHandle,
+    existing: Vec<LoadedBackgroundLayer>,
+    dimensions: Dimensions,
+    render_metrics: RenderMetrics,
+    window: ::window::Window,
+}
+
+struct BackgroundLoadCompletion {
+    cancellation: Arc<AtomicBool>,
+    layers: Vec<LoadedBackgroundLayer>,
+}
+
+struct BackgroundWorkerLease {
+    coordinator: BackgroundLoadCoordinator,
+    armed: bool,
+}
+
+impl Drop for BackgroundWorkerLease {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let restart = {
+            let mut state = lock_cache(
+                &self.coordinator.state,
+                "background load coordinator after worker failure",
+            );
+            if let Some(active) = state.active.take() {
+                active.store(true, Ordering::Release);
+                if state
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &active))
+                {
+                    state.current = None;
+                }
+                if state
+                    .ready
+                    .as_ref()
+                    .is_some_and(|ready| Arc::ptr_eq(&ready.cancellation, &active))
+                {
+                    state.ready = None;
+                }
+            }
+            state.worker_running = state.pending.is_some();
+            state.worker_running
+        };
+        metrics::counter!("gui.background.worker_aborted.total").increment(1);
+        if restart {
+            if let Ok(pool) = &*BACKGROUND_WORK_POOL {
+                let coordinator = self.coordinator.clone();
+                pool.spawn(move || coordinator.run_worker());
+            } else {
+                lock_cache(
+                    &self.coordinator.state,
+                    "background load coordinator after restart failure",
+                )
+                .worker_running = false;
+            }
+        }
+    }
+}
+
+impl BackgroundLoadCoordinator {
+    pub(crate) fn request(
+        &self,
+        config: ConfigHandle,
+        existing: Vec<LoadedBackgroundLayer>,
+        dimensions: Dimensions,
+        render_metrics: RenderMetrics,
+        window: ::window::Window,
+    ) {
+        let pool = match &*BACKGROUND_WORK_POOL {
+            Ok(pool) => pool,
+            Err(error) => {
+                metrics::counter!("gui.background.worker_pool_unavailable.total").increment(1);
+                if !BACKGROUND_POOL_ERROR_REPORTED.swap(true, Ordering::AcqRel) {
+                    log::error!(
+                        "background worker pool is unavailable; retaining prior layers: {error}"
+                    );
+                }
+                return;
+            }
+        };
+
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let request = BackgroundLoadRequest {
+            cancellation: Arc::clone(&cancellation),
+            config,
+            existing,
+            dimensions,
+            render_metrics,
+            window,
+        };
+        let start_worker = {
+            let mut state = lock_cache(&self.state, "background load coordinator");
+            if let Some(current) = state.current.replace(Arc::clone(&cancellation)) {
+                current.store(true, Ordering::Release);
+                metrics::counter!("gui.background.load_superseded.total").increment(1);
+            }
+            if let Some(ready) = state.ready.take() {
+                ready.cancellation.store(true, Ordering::Release);
+            }
+            if let Some(pending) = state.pending.replace(request) {
+                pending.cancellation.store(true, Ordering::Release);
+            }
+            if let Some(active) = &state.active {
+                active.store(true, Ordering::Release);
+            }
+            if state.worker_running {
+                false
+            } else {
+                state.worker_running = true;
+                true
+            }
+        };
+
+        metrics::counter!("gui.background.load_requested.total").increment(1);
+        if start_worker {
+            let coordinator = self.clone();
+            pool.spawn(move || coordinator.run_worker());
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        let mut state = lock_cache(&self.state, "background load coordinator");
+        if let Some(current) = state.current.take() {
+            current.store(true, Ordering::Release);
+        }
+        if let Some(active) = state.active.take() {
+            active.store(true, Ordering::Release);
+        }
+        if let Some(pending) = state.pending.take() {
+            pending.cancellation.store(true, Ordering::Release);
+        }
+        if let Some(ready) = state.ready.take() {
+            ready.cancellation.store(true, Ordering::Release);
+        }
+    }
+
+    fn run_worker(&self) {
+        let mut worker_lease = BackgroundWorkerLease {
+            coordinator: self.clone(),
+            armed: true,
+        };
+        loop {
+            let request = {
+                let mut state = lock_cache(&self.state, "background load coordinator");
+                let Some(request) = state.pending.take() else {
+                    state.active = None;
+                    state.worker_running = false;
+                    break;
+                };
+                state.active = Some(Arc::clone(&request.cancellation));
+                request
+            };
+
+            if !request.cancellation.load(Ordering::Acquire) {
+                let started = std::time::Instant::now();
+                let layers = reload_background_image(
+                    &request.config,
+                    &request.existing,
+                    &request.dimensions,
+                    &request.render_metrics,
+                    &|| request.cancellation.load(Ordering::Acquire),
+                );
+                metrics::histogram!("gui.background.load_duration").record(started.elapsed());
+
+                if !request.cancellation.load(Ordering::Acquire) {
+                    let coordinator = self.clone();
+                    let cancellation = Arc::clone(&request.cancellation);
+                    let should_notify = {
+                        let mut state =
+                            lock_cache(&self.state, "background load coordinator completion");
+                        if request.cancellation.load(Ordering::Acquire)
+                            || !state
+                                .current
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, &cancellation))
+                        {
+                            false
+                        } else {
+                            if let Some(stale) = state.ready.replace(BackgroundLoadCompletion {
+                                cancellation: Arc::clone(&cancellation),
+                                layers,
+                            }) {
+                                stale.cancellation.store(true, Ordering::Release);
+                            }
+                            true
+                        }
+                    };
+                    if should_notify {
+                        request.window.notify(TermWindowNotif::Apply(Box::new(
+                            move |term_window| {
+                                let Some(layers) =
+                                    coordinator.take_ready_if_current(&cancellation)
+                                else {
+                                    metrics::counter!("gui.background.stale_completion.total")
+                                        .increment(1);
+                                    return;
+                                };
+                                term_window.window_background = layers;
+                                if let Some(window) = term_window.window.as_ref() {
+                                    window.invalidate();
+                                }
+                                metrics::counter!("gui.background.load_committed.total")
+                                    .increment(1);
+                            },
+                        )));
+                    } else {
+                        metrics::counter!("gui.background.stale_completion.total").increment(1);
+                    }
+                }
+            }
+
+            let mut state = lock_cache(&self.state, "background load coordinator");
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &request.cancellation))
+            {
+                state.active = None;
+            }
+            if state.pending.is_none() {
+                state.worker_running = false;
+                break;
+            }
+        }
+        worker_lease.armed = false;
+    }
+
+    fn take_ready_if_current(
+        &self,
+        cancellation: &Arc<AtomicBool>,
+    ) -> Option<Vec<LoadedBackgroundLayer>> {
+        let mut state = lock_cache(&self.state, "background load coordinator");
+        if cancellation.load(Ordering::Acquire)
+            || !state
+                .current
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, cancellation))
+        {
+            return None;
+        }
+        let ready = state.ready.take()?;
+        if !Arc::ptr_eq(&ready.cancellation, cancellation) {
+            state.ready = Some(ready);
+            return None;
+        }
+        state.current = None;
+        Some(ready.layers)
+    }
+}
+
 impl crate::TermWindow {
+    pub(crate) fn schedule_background_reload(&mut self) {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        self.background_load.request(
+            self.config.clone(),
+            self.window_background.clone(),
+            self.dimensions,
+            self.render_metrics,
+            window,
+        );
+    }
+
     pub fn render_backgrounds(
         &self,
         bg_color: LinearRgba,
@@ -470,6 +1114,22 @@ impl crate::TermWindow {
         let pixel_height = self.dimensions.pixel_height as f32;
         let tex_width = sprite.coords.width() as f32;
         let tex_height = sprite.coords.height() as f32;
+        if !pixel_width.is_finite()
+            || !pixel_height.is_finite()
+            || !tex_width.is_finite()
+            || !tex_height.is_finite()
+            || pixel_width <= 0.0
+            || pixel_height <= 0.0
+            || tex_width <= 0.0
+            || tex_height <= 0.0
+        {
+            metrics::counter!(
+                "gui.background.layer_rejected.total",
+                "reason" => "invalid_surface_geometry",
+            )
+            .increment(1);
+            return Ok(false);
+        }
 
         let scale_width = pixel_width / tex_width as f32;
         let scale_height = pixel_height / tex_height as f32;
@@ -509,6 +1169,14 @@ impl crate::TermWindow {
             BackgroundSize::Cover => max_aspect_height as f32,
             BackgroundSize::Dimension(n) => n.evaluate_as_pixels(v_context),
         };
+        if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+            metrics::counter!(
+                "gui.background.layer_rejected.total",
+                "reason" => "invalid_layer_geometry",
+            )
+            .increment(1);
+            return Ok(false);
+        }
 
         let mut origin_x = pixel_width / -2.;
         let top_pixel = pixel_height / -2.;
@@ -545,6 +1213,14 @@ impl crate::TermWindow {
             .horizontal_offset
             .map(|d| d.evaluate_as_pixels(h_context))
             .unwrap_or(0.);
+        if !vertical_offset.is_finite() || !horizontal_offset.is_finite() {
+            metrics::counter!(
+                "gui.background.layer_rejected.total",
+                "reason" => "invalid_offset",
+            )
+            .increment(1);
+            return Ok(false);
+        }
         origin_x += horizontal_offset;
 
         let repeat_x = layer
@@ -564,28 +1240,74 @@ impl crate::TermWindow {
         if let Some(factor) = layer.def.attachment.scroll_factor() {
             let distance = top as f32 * self.render_metrics.cell_size.height as f32 * factor;
             let num_tiles = distance / repeat_y;
+            if !factor.is_finite() || !num_tiles.is_finite() {
+                metrics::counter!(
+                    "gui.background.layer_rejected.total",
+                    "reason" => "invalid_scroll_factor",
+                )
+                .increment(1);
+                return Ok(false);
+            }
             origin_y -= (num_tiles.fract() * repeat_y).floor();
             start_tile = num_tiles.floor() as usize;
         }
 
         let limit_y = top_pixel + pixel_height;
+        let x_count = match checked_background_repeat_count(
+            pixel_width,
+            repeat_x,
+            layer.def.repeat_x,
+        ) {
+            Ok(count) => count,
+            Err(_) => {
+                metrics::counter!(
+                    "gui.background.layer_rejected.total",
+                    "reason" => "invalid_horizontal_repeat",
+                )
+                .increment(1);
+                return Ok(false);
+            }
+        };
+        let y_count = match checked_background_repeat_count(
+            (limit_y - origin_y).max(0.0),
+            repeat_y,
+            layer.def.repeat_y,
+        ) {
+            Ok(count) => count,
+            Err(_) => {
+                metrics::counter!(
+                    "gui.background.layer_rejected.total",
+                    "reason" => "invalid_vertical_repeat",
+                )
+                .increment(1);
+                return Ok(false);
+            }
+        };
+        if x_count
+            .checked_mul(y_count)
+            .is_none_or(|tiles| tiles > MAX_BACKGROUND_TILES_PER_LAYER)
+        {
+            metrics::counter!(
+                "gui.background.layer_rejected.total",
+                "reason" => "tile_budget",
+            )
+            .increment(1);
+            return Ok(false);
+        }
 
         let mut emitted = false;
 
-        for y_step in start_tile.. {
-            let offset_y = (y_step - start_tile) as f32 * repeat_y;
+        for y_offset in 0..y_count {
+            let y_step = start_tile.saturating_add(y_offset);
+            let offset_y = y_offset as f32 * repeat_y;
             let origin_y = origin_y + offset_y;
-            if origin_y >= limit_y
-                || (y_step > start_tile && layer.def.repeat_y == BackgroundRepeat::NoRepeat)
-            {
+            if origin_y >= limit_y {
                 break;
             }
 
-            for x_step in 0.. {
+            for x_step in 0..x_count {
                 let offset_x = x_step as f32 * repeat_x;
-                if offset_x >= pixel_width
-                    || (x_step > 0 && layer.def.repeat_x == BackgroundRepeat::NoRepeat)
-                {
+                if offset_x >= pixel_width {
                     break;
                 }
                 let origin_x = origin_x + offset_x;
@@ -622,12 +1344,149 @@ mod tests {
     use super::*;
     use config::Dimension;
 
+    fn cached_image(last_access: u64, retained_bytes: usize) -> CachedImage {
+        CachedImage {
+            modified: SystemTime::UNIX_EPOCH,
+            file_len: 4,
+            image: Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+                1,
+                1,
+                vec![0, 0, 0, 255],
+            ))),
+            retained_bytes,
+            last_access,
+            speed: 1.0,
+        }
+    }
+
     fn context(pixel_max: f32, pixel_cell: f32) -> DimensionContext {
         DimensionContext {
             dpi: 96.0,
             pixel_max,
             pixel_cell,
         }
+    }
+
+    #[test]
+    fn generated_background_pixel_budget_rejects_zero_and_oversized_dimensions() {
+        assert!(checked_background_pixel_bytes(0, 1).is_err());
+        assert!(checked_background_pixel_bytes(1, 0).is_err());
+        assert_eq!(checked_background_pixel_bytes(1, 1).unwrap(), 4);
+        assert!(checked_background_pixel_bytes(16_384, 16_384).is_err());
+    }
+
+    #[test]
+    fn background_repeat_count_rejects_zero_nan_and_pathological_tile_counts() {
+        assert!(
+            checked_background_repeat_count(100.0, 0.0, BackgroundRepeat::Repeat).is_err()
+        );
+        assert!(
+            checked_background_repeat_count(f32::NAN, 1.0, BackgroundRepeat::Repeat).is_err()
+        );
+        assert!(
+            checked_background_repeat_count(
+                MAX_BACKGROUND_TILES_PER_LAYER as f32 + 1.0,
+                1.0,
+                BackgroundRepeat::Mirror,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            checked_background_repeat_count(100.0, 30.0, BackgroundRepeat::Repeat).unwrap(),
+            4
+        );
+        assert_eq!(
+            checked_background_repeat_count(100.0, 30.0, BackgroundRepeat::NoRepeat).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn linear_gradient_projection_uses_both_window_axes() {
+        let horizontal = linear_gradient_projection_half_extent(640.0, 480.0, 0.0).unwrap();
+        let vertical =
+            linear_gradient_projection_half_extent(640.0, 480.0, std::f64::consts::FRAC_PI_2)
+                .unwrap();
+        let diagonal =
+            linear_gradient_projection_half_extent(640.0, 480.0, std::f64::consts::FRAC_PI_4)
+                .unwrap();
+
+        assert!((horizontal - 320.0).abs() < f64::EPSILON);
+        assert!((vertical - 240.0).abs() < 1.0e-10);
+        assert!(diagonal > horizontal);
+        assert!(linear_gradient_projection_half_extent(f64::NAN, 480.0, 0.0).is_err());
+    }
+
+    #[test]
+    fn decoded_background_cache_evicts_oldest_entries_at_its_count_limit() {
+        let mut cache = BackgroundImageCache::default();
+        for index in 0..=MAX_BACKGROUND_CACHE_ENTRIES {
+            cache.insert(
+                format!("image-{index}"),
+                cached_image(index as u64, 4),
+            );
+        }
+
+        assert_eq!(cache.entries.len(), MAX_BACKGROUND_CACHE_ENTRIES);
+        assert!(!cache.entries.contains_key("image-0"));
+        assert_eq!(cache.retained_bytes, MAX_BACKGROUND_CACHE_ENTRIES * 4);
+    }
+
+    #[test]
+    fn decoded_background_cache_rejects_an_entry_beyond_its_byte_budget() {
+        let mut cache = BackgroundImageCache::default();
+        cache.insert(
+            "oversized".to_string(),
+            cached_image(1, MAX_BACKGROUND_CACHE_BYTES + 1),
+        );
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.retained_bytes, 0);
+    }
+
+    #[test]
+    fn background_completion_authority_is_exact_and_one_shot() {
+        let coordinator = BackgroundLoadCoordinator::default();
+        let current = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = lock_cache(&coordinator.state, "test coordinator");
+            state.current = Some(Arc::clone(&current));
+            state.ready = Some(BackgroundLoadCompletion {
+                cancellation: Arc::clone(&current),
+                layers: Vec::new(),
+            });
+        }
+
+        assert!(coordinator.take_ready_if_current(&current).is_some());
+        assert!(coordinator.take_ready_if_current(&current).is_none());
+
+        let cancelled = Arc::new(AtomicBool::new(true));
+        {
+            let mut state = lock_cache(&coordinator.state, "test coordinator");
+            state.current = Some(Arc::clone(&cancelled));
+            state.ready = Some(BackgroundLoadCompletion {
+                cancellation: Arc::clone(&cancelled),
+                layers: Vec::new(),
+            });
+        }
+        assert!(coordinator.take_ready_if_current(&cancelled).is_none());
+    }
+
+    #[test]
+    fn background_completion_slot_preserves_newer_authority_from_a_stale_callback() {
+        let coordinator = BackgroundLoadCoordinator::default();
+        let stale = Arc::new(AtomicBool::new(true));
+        let current = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = lock_cache(&coordinator.state, "test coordinator");
+            state.current = Some(Arc::clone(&current));
+            state.ready = Some(BackgroundLoadCompletion {
+                cancellation: Arc::clone(&current),
+                layers: Vec::new(),
+            });
+        }
+
+        assert!(coordinator.take_ready_if_current(&stale).is_none());
+        assert!(coordinator.take_ready_if_current(&current).is_some());
     }
 
     #[test]

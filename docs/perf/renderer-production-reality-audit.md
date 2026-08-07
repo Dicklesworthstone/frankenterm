@@ -8,6 +8,15 @@
 
 **Evidence class:** static source, Git, and Beads inspection only
 
+> Historical-snapshot notice: this document is authoritative only for the
+> source SHA above. The 2026-08-07 reconciliation in
+> `docs/perf/mux-long-session-performance-campaign.md` supersedes its current
+> call-graph claims. In particular, exact damage-generation settlement now
+> propagates draw/present failure, whole-screen damage no longer forces a
+> second successful frame, and the no-reader terminal-state triple-buffer
+> producer is intentionally absent from the paint hot path. None of those
+> source changes is native target proof.
+
 ## Purpose and proof boundary
 
 This audit identifies the renderer, invalidation, pacing, presentation, and

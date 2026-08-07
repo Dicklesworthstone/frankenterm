@@ -1,8 +1,10 @@
 //! Per-pane render-side dirty-line bitmap.
 //!
-//! Replaces the coarse `quad_generation` whole-screen invalidation
-//! with a per-line bitmap so the render pass can iterate only over
-//! lines that actually changed (rio sugarloaf pattern, ft-mpc9b.1.2).
+//! Supplements coarse `quad_generation` whole-screen invalidation with
+//! per-line damage attribution (rio sugarloaf pattern, ft-mpc9b.1.2).
+//! The current renderer still visits every visible line to resolve its cache
+//! key; this bitmap can prove which clean rows reused valid cached quads, but
+//! it is not yet a sparse render-work iterator.
 //!
 //! ## Why a render-side bitmap?
 //!
@@ -15,7 +17,8 @@
 //! - it folds in dirty events that the term layer has no visibility
 //!   into: selection changes, focus borders, theme/font swap,
 //!   status-tile updates
-//! - it is reset at frame end, regardless of seqno semantics
+//! - exact-generation settlement clears it only after the corresponding
+//!   synchronous present succeeds; failed or superseded frames retain damage
 //!
 //! ## What this module ships (foundation, ft-mpc9b.1.2)
 //!
@@ -35,8 +38,10 @@
 //! reused cached quads for that row; rows without a valid cache entry
 //! still rebuild.
 //!
-//! Remaining follow-up work is the row-indexed quad-cache model and
-//! benches: 200-pane fleet @ 1 cell/frame, font-swap O(N) rebuild.
+//! Remaining follow-up work is the row-indexed quad-cache/snapshot ownership
+//! model and native benches: 200-pane fleet @ 1 cell/frame, font-swap O(N)
+//! rebuild. No sparse-iteration or key-to-photon claim follows from this
+//! foundation alone.
 
 use std::iter::FusedIterator;
 

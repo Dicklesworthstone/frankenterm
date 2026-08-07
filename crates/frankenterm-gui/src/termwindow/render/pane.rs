@@ -234,9 +234,7 @@ impl crate::TermWindow {
         pos: &PositionedPane,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
-        self.publish_terminal_state_for_pane(pos);
-
-        self.check_for_dirty_lines_and_invalidate_selection(&pos.pane);
+        self.check_for_dirty_lines_and_invalidate_selection(&pos.pane)?;
         /*
         let zone = {
             let dims = pos.pane.get_dimensions();
@@ -549,9 +547,6 @@ impl crate::TermWindow {
                 frankenterm_gui::checked_stable_row_range_from_top(stable_top, dims.viewport_rows)
                     .context("stable row range overflow")?;
 
-            pos.pane
-                .apply_hyperlinks(stable_range.clone(), &self.config.hyperlink_rules);
-
             struct LineRender<'a, 'b> {
                 term_window: &'a mut crate::TermWindow,
                 selrange: Option<SelectionRange>,
@@ -666,7 +661,7 @@ impl crate::TermWindow {
                         (None, None, false)
                     };
 
-                    let shape_hash = self.term_window.shape_hash_for_line(line);
+                    let shape_hash = self.term_window.shape_hash_for_line(self.pane_id, line);
 
                     let quad_key = LineQuadCacheKey {
                         pane_id: self.pane_id,
@@ -692,7 +687,7 @@ impl crate::TermWindow {
 
                     let clean_line_can_reuse_cached_quads =
                         self.term_window.iter_dirty_render_gate_enabled()
-                            && crate::termwindow::should_skip_clean_line(
+                            && crate::termwindow::is_clean_line_for_cache_hit_accounting(
                                 true,
                                 self.term_window.peek_dirty_lines(self.pane_id),
                                 line_idx,
@@ -832,9 +827,14 @@ impl crate::TermWindow {
                 }
             }
 
-            pos.pane.with_lines_mut(stable_range.clone(), &mut render);
+            pos.pane.with_lines_mut_and_apply_hyperlinks(
+                stable_range.clone(),
+                &self.config.hyperlink_rules,
+                &mut render,
+            );
             if let Some(error) = render.error.take() {
-                return Err(error).context("error while calling with_lines_mut");
+                return Err(error)
+                    .context("error while calling with_lines_mut_and_apply_hyperlinks");
             }
         }
 

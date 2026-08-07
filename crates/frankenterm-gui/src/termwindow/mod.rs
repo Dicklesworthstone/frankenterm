@@ -15,9 +15,7 @@ use crate::scrollbar::*;
 use crate::selection::Selection;
 use crate::shapecache::*;
 use crate::tabbar::{TabBarItem, TabBarState};
-use crate::termwindow::background::{
-    LoadedBackgroundLayer, load_background_image, reload_background_image,
-};
+use crate::termwindow::background::{BackgroundLoadCoordinator, LoadedBackgroundLayer};
 use crate::termwindow::keyevent::{KeyTableArgs, KeyTableState};
 use crate::termwindow::modal::Modal;
 use crate::termwindow::render::draw::{DrawFailure, DrawFailureStage};
@@ -55,11 +53,9 @@ use frankenterm_gui::floating_panes::{
     mux_pane_id_to_floating_pane_id,
 };
 use frankenterm_gui::triple_buffer_gui::{
-    TerminalStateTripleBufferRegistry, poll_terminal_state_buffer_health_snapshots,
+    TerminalStateTripleBufferRegistry,
 };
-use frankenterm_gui::{
-    terminal_pane_id_to_u64, terminal_u16_from_stable_delta, terminal_u16_from_usize,
-};
+use frankenterm_gui::terminal_pane_id_to_u64;
 use futures::future::{AbortHandle, AbortRegistration, Abortable};
 use frankenterm_toast_notification::persistent_toast_notification;
 use lfucache::*;
@@ -76,18 +72,19 @@ use mux::tab::{
 use mux::unify::{MergePlan, TabIdentity, TabSnapshot, WindowSnapshot, plan_unify_domain};
 use mux::window::WindowId as MuxWindowId;
 use mux::{
-    Mux, MuxNotification, SynchronizedOutputAdmissionDecision, SynchronizedOutputDepthOutcome,
+    Mux, MuxNotification, PaneRegistrationHandle, PaneRemovalCleanupLease,
+    SynchronizedOutputAdmissionDecision, SynchronizedOutputDepthOutcome,
     SynchronizedOutputDrainCause, SynchronizedOutputEvent,
 };
 use mux_lua::MuxPane;
 use promise::spawn::sleep;
-use std::cell::{RefCell, RefMut};
-use std::collections::{BTreeSet, HashMap, LinkedList};
+use std::cell::{Cell, RefCell, RefMut};
+use std::collections::{BTreeSet, HashMap, HashSet, LinkedList};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::SequenceNo;
 use wezterm_dynamic::Value;
@@ -127,6 +124,7 @@ pub const ICON_DATA: &[u8] = include_bytes!("../../../../assets/icon/terminal.pn
 fn lock_termwindow_mutex<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
         log::warn!("recovering poisoned {name} lock");
+        mutex.clear_poison();
         poisoned.into_inner()
     })
 }
@@ -172,12 +170,24 @@ pub enum TermWindowNotif {
     },
     GetConfigOverrides(Sender<wezterm_dynamic::Value>),
     SetConfigOverrides(wezterm_dynamic::Value),
-    CancelOverlayForPane(PaneId),
+    CancelOverlayForPane {
+        pane_id: PaneId,
+        ticket: OverlayCancellationTicket,
+    },
     CancelOverlayForTab {
         tab_id: TabId,
-        pane_id: Option<PaneId>,
+        overlay_pane_id: PaneId,
+        ticket: OverlayCancellationTicket,
     },
-    MuxNotification(MuxNotification),
+    MuxNotification {
+        notification: MuxNotification,
+        /// Exact mux instance that emitted this notification. Numeric window
+        /// and pane IDs can be reused after a process-global mux replacement.
+        mux_owner: std::sync::Weak<Mux>,
+        /// Exact mux removal-generation authority retained until this window
+        /// has finished cleaning its numeric pane-keyed state.
+        pane_removal_cleanup: Option<PaneRemovalCleanupLease>,
+    },
     EmitStatusUpdate,
     Apply(Box<dyn FnOnce(&mut TermWindow) + Send + Sync>),
     SwitchToMuxWindow(MuxWindowId),
@@ -269,6 +279,98 @@ pub struct SemanticZoneCache {
 pub struct OverlayState {
     pub pane: Arc<dyn Pane>,
     pub key_table_state: KeyTableState,
+    /// Exact mux registration captured at assignment. `None` is intentional
+    /// for GUI-only overlays such as `CopyOverlay`; those must never remove a
+    /// same-numbered mux pane.
+    registration: Option<PaneRegistrationHandle>,
+    cancellation_ticket: OverlayCancellationTicket,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverlaySlot {
+    Pane(PaneId),
+    Tab(TabId),
+}
+
+#[derive(Clone)]
+struct OverlayInstanceAuthority(Arc<OverlayInstanceState>);
+
+struct OverlayInstanceState {
+    cancellation_requested: AtomicBool,
+}
+
+impl OverlayInstanceAuthority {
+    fn new() -> Self {
+        Self(Arc::new(OverlayInstanceState {
+            cancellation_requested: AtomicBool::new(false),
+        }))
+    }
+
+    fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    fn request_cancellation(&self) {
+        self.0.cancellation_requested.store(true, Ordering::Release);
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.0.cancellation_requested.load(Ordering::Acquire)
+    }
+}
+
+/// Exact authority carried from a worker's cancellation request to the GUI
+/// event loop. Numeric pane/tab IDs are reusable slots and are not sufficient
+/// to cancel an overlay after queueing delay.
+#[derive(Clone)]
+pub struct OverlayCancellationTicket {
+    mux_owner: Weak<Mux>,
+    slot: OverlaySlot,
+    overlay_pane_id: PaneId,
+    instance: OverlayInstanceAuthority,
+    /// Exact mux registration for a TermWiz worker overlay. GUI-only overlays
+    /// deliberately carry `None` and can be cancelled only synchronously by
+    /// their owning `TermWindow`.
+    registration: Option<PaneRegistrationHandle>,
+}
+
+impl OverlayCancellationTicket {
+    fn new(
+        mux_owner: Weak<Mux>,
+        slot: OverlaySlot,
+        overlay_pane_id: PaneId,
+        registration: Option<PaneRegistrationHandle>,
+    ) -> Self {
+        Self {
+            mux_owner,
+            slot,
+            overlay_pane_id,
+            instance: OverlayInstanceAuthority::new(),
+            registration,
+        }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        if self.slot != other.slot
+            || self.overlay_pane_id != other.overlay_pane_id
+            || !Weak::ptr_eq(&self.mux_owner, &other.mux_owner)
+        {
+            return false;
+        }
+        match (&self.registration, &other.registration) {
+            (Some(current), Some(expected)) => current.same_registration(expected),
+            (None, None) => self.instance.same_instance(&other.instance),
+            _ => false,
+        }
+    }
+
+    fn request_cancellation(&self) {
+        self.instance.request_cancellation();
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.instance.cancellation_requested()
+    }
 }
 
 #[derive(Default)]
@@ -805,12 +907,10 @@ fn record_sync_output_drain(
     }
 }
 
-/// Convert a live `WatchdogedTripleBuffer` health view into the per-pane
-/// snapshot shape that `TermWindow` stores for `ft doctor --triple-buffer`.
-///
-/// The renderer migration owns when to call this; keeping the translation here
-/// gives that migration a single GUI-side bridge instead of re-encoding the
-/// substrate counters at every frame-timer poll site.
+/// Convert an explicit `WatchdogedTripleBuffer` health view into the per-pane
+/// snapshot shape retained by the dormant doctor foundation. Production has no
+/// live terminal-state buffer consumer today; tests and a future bounded
+/// integration use this single translation point.
 #[must_use]
 pub fn pane_health_snapshot_from_watchdoged_health(
     pane_id: u64,
@@ -827,13 +927,6 @@ pub fn pane_health_snapshot_from_watchdoged_health(
         last_force_recycle_ts_ms,
         watchdog_active: health.watchdog_active(),
     }
-}
-
-fn unix_epoch_ms_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
 }
 
 /// Snapshot of the workspace-wide ElasticBuffer policy state. Read
@@ -912,6 +1005,7 @@ pub struct TermWindow {
     semantic_zones: HashMap<PaneId, SemanticZoneCache>,
 
     window_background: Vec<LoadedBackgroundLayer>,
+    background_load: BackgroundLoadCoordinator,
 
     current_modifier_and_leds: (Modifiers, KeyboardLedStatus),
     current_mouse_buttons: Vec<MousePress>,
@@ -930,9 +1024,10 @@ pub struct TermWindow {
     shape_generation: usize,
     /// Per-pane render-side dirty-line bitmap (ft-tfzhy / ft-mpc9b.1.2).
     ///
-    /// The TermWindow keeps one `DirtyLineBitmap` per `PaneId` so the
-    /// render pass can distinguish rows that changed since the last
-    /// frame from rows eligible for cached-quad reuse. Coarse
+    /// The TermWindow keeps one `DirtyLineBitmap` per `PaneId` to retain
+    /// changed-row attribution through exact presentation settlement. The
+    /// current render pass uses it to classify clean cached-quad hits for
+    /// telemetry; it does not yet skip hashing or cache lookup. Coarse
     /// whole-screen events (resize, focus change, font/theme swap)
     /// call `mark_all` on every entry; live PTY dirty ranges, cursor
     /// moves, and selection changes mark row-level damage.
@@ -946,17 +1041,6 @@ pub struct TermWindow {
     /// immediately before draw and may settle damage only if presentation
     /// succeeds with the same non-exhausted generation.
     damage_generation: DamageGeneration,
-    /// Tracks whether the last dirty-marking event observed by this
-    /// TermWindow was a coarse whole-screen invalidation (font swap,
-    /// theme change, resize, focus change). Per the
-    /// `frankenterm_core::dirty_line_telemetry::should_clear_at_frame_end`
-    /// predicate, frame-end `bitmap.clear()` is suppressed on those
-    /// frames so the next frame still observes the marks. Defaults
-    /// to true so the very first paint pass leaves the bitmaps
-    /// marked-all rather than silently clearing them. Per ft-jvj78
-    /// (cont of ft-5ykn9). Each whole-screen event source flips this
-    /// flag; per-cell sources leave it false.
-    last_dirty_event_was_whole_screen: bool,
     /// Admission/circuit state for renderer recovery.  Dirty state continues
     /// to accumulate while a retry is cooling down, but expensive geometry is
     /// admitted only by a healthy renderer or an exact retry ticket.
@@ -1003,21 +1087,21 @@ pub struct TermWindow {
     frame_budget_reduce_motion_state: frame_budget_a11y::ReduceMotionState,
     /// Per-source dirty-mark counters (ft-i6k6u / ft-jvj78 slice).
     /// Substrate's `MarksBySource` aggregator: 9 lifetime counts
-    /// (one per `DirtyEventSource` variant). Bumped by the
-    /// `record_dirty_event` helper at every mark-call site.
+    /// (one per `DirtyEventSource` variant). Bumped by
+    /// `record_dirty_event` or the source-tagged whole-screen helper.
     /// Surfaced into `DirtyLineTelemetrySnapshot.marks_by_source`
     /// for ft-doctor's lines-redrawn-by-source breakdown.
     dirty_marks_by_source: frankenterm_core::dirty_line_telemetry::MarksBySource,
-    /// Per-pane `TerminalState` triple-buffer owners. The render
-    /// path publishes the current visible pane state here; the status
-    /// tick polls these live owners into doctor-facing health snapshots
-    /// without inventing a second registry.
+    /// Retained per-pane `TerminalState` triple-buffer foundation. There is no
+    /// production reader, so the hot render path intentionally does not
+    /// publish into this registry. A future integration must add a bounded
+    /// consumer before re-enabling a producer.
     triple_buffer_panes: TerminalStateTripleBufferRegistry,
     /// Per-pane WatchdogedTripleBuffer health snapshots
     /// (ft-gso6n / ft-l0oe3 slice). `triple_buffer_telemetry()`
-    /// aggregates these into the substrate's FleetHealthAggregate. The
-    /// status-tick poll refreshes this map from `triple_buffer_panes`
-    /// and prunes snapshots for panes that no longer have live owners.
+    /// aggregates these into the substrate's FleetHealthAggregate. With the
+    /// mirror producer/consumer dormant, production leaves this map
+    /// empty; explicit bridge tests exercise its aggregation helpers.
     triple_buffer_pane_health:
         HashMap<u64, frankenterm_core::triple_buffer_fleet_health::PaneHealthSnapshot>,
     /// DEC 2026 Begin-Synchronized-Update watchdog telemetry
@@ -1072,10 +1156,19 @@ pub struct TermWindow {
     shape_cache: RefCell<LfuCache<ShapeCacheKey, anyhow::Result<Rc<CachedShape>>>>,
     line_to_ele_shape_cache: RefCell<LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>>,
 
+    /// Unforgeable identity for this window's line-state LFU. Numeric entry
+    /// IDs are monotonic only within one `TermWindow`; renderer appdata can be
+    /// carried by shared pane lines into another window.
+    line_state_cache_owner: Arc<render::LineStateCacheOwner>,
     line_state_cache: RefCell<LfuCacheU64<Arc<CachedLineState>>>,
     next_line_state_id: u64,
 
     line_quad_cache: RefCell<LfuCache<LineQuadCacheKey, LineQuadCacheValue>>,
+
+    /// Last mux window-order revision reconciled against `tab_state`. This
+    /// keeps closed-tab state bounded without rescanning all tabs on ordinary
+    /// same-revision invalidations.
+    last_tab_state_prune_revision: Cell<Option<mux::window::WindowOrderRevision>>,
 
     last_status_call: Instant,
     cursor_blink_state: RefCell<ColorEase>,
@@ -1115,20 +1208,15 @@ pub struct TermWindow {
     dashboard: crate::dashboard::DashboardPanel,
 }
 
-/// Per ft-8pcwy: pure predicate the GUI render loop calls per
-/// (pane_id, line_idx) to decide whether a row is clean enough to
-/// reuse cached quads. Free function so the truth table is
-/// unit-testable without standing up a TermWindow.
+/// Pure predicate used only to classify a successful cached-quad hit as clean
+/// for accounting. Cache lookup, hash/key construction, and reuse remain
+/// independent of this bitmap today.
 ///
 /// Semantics:
-/// - gate disabled → never skip (legacy iterate-all-lines).
-/// - gate enabled, no bitmap registered → never skip (no per-cell
-///   event source has touched this pane yet; safer to render).
-/// - gate enabled, bitmap empty → never skip (bitmap was cleared
-///   at frame end and no event has marked anything since).
-/// - gate enabled, bitmap non-empty → cache-reuse candidate iff
-///   the row index is not in the dirty set.
-pub(crate) fn should_skip_clean_line(
+/// - gate disabled → do not count the cache hit as a clean hit.
+/// - no bitmap or an empty bitmap → do not infer per-row cleanliness.
+/// - non-empty bitmap → classify the row as clean iff it is not dirty.
+pub(crate) fn is_clean_line_for_cache_hit_accounting(
     gate_enabled: bool,
     bitmap: Option<&render::dirty_lines::DirtyLineBitmap>,
     line_idx: usize,
@@ -1227,21 +1315,6 @@ pub(crate) fn mark_cursor_rows_dirty(
     current: StableCursorPosition,
 ) {
     mark_stable_rows_dirty(bitmap, viewport, [previous.y, current.y]);
-}
-
-#[must_use]
-pub(crate) fn terminal_state_from_rendered_pane(pane: &dyn Pane) -> TerminalState {
-    let cursor = pane.get_cursor_position();
-    let dims = pane.get_dimensions();
-
-    TerminalState {
-        rows: terminal_u16_from_usize(dims.viewport_rows),
-        cols: terminal_u16_from_usize(dims.cols),
-        cursor_row: terminal_u16_from_stable_delta(cursor.y.saturating_sub(dims.physical_top)),
-        cursor_col: terminal_u16_from_usize(cursor.x),
-        is_alt_screen: pane.is_alt_screen_active(),
-        title: pane.get_title(),
-    }
 }
 
 /// Per ft-d6nrd slice 1: pure predicate the redraw decision
@@ -1439,28 +1512,16 @@ impl DamageGeneration {
 /// so the predicate wiring is unit-testable without needing to
 /// stand up a full `TermWindow`. Per ft-jvj78.
 ///
-/// Consults the substrate's `should_clear_at_frame_end` predicate
-/// against the supplied `last_was_whole_screen` flag and the default
-/// `DirtyTelemetryConfig`. When the predicate fires, every bitmap is
-/// cleared. Either way, the flag is reset to false so the next
-/// whole-screen event has to set it explicitly.
+/// Exact successful presentation clears every bitmap. Failed attempts, stale
+/// generations, and exhausted epochs never call this helper, so their damage
+/// remains retained without forcing an unconditional second successful frame
+/// after every whole-screen event.
 fn run_clear_dirty_lines_after_frame(
     bitmaps: &mut HashMap<PaneId, render::dirty_lines::DirtyLineBitmap>,
-    last_was_whole_screen: &mut bool,
 ) {
-    let config = frankenterm_core::dirty_line_telemetry::DirtyTelemetryConfig::default();
-    let should_clear = frankenterm_core::dirty_line_telemetry::should_clear_at_frame_end(
-        *last_was_whole_screen,
-        config,
-    );
-    if should_clear {
-        for bitmap in bitmaps.values_mut() {
-            bitmap.clear();
-        }
+    for bitmap in bitmaps.values_mut() {
+        bitmap.clear();
     }
-    // Always reset — the next whole-screen event must set the flag
-    // explicitly via `mark_all_panes_dirty`.
-    *last_was_whole_screen = false;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1601,7 +1662,6 @@ enum FrameCompletion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DamageCommitOutcome {
     Cleared,
-    RetainedWholeScreen,
     RetainedStale,
     RetainedFailure,
     RetainedEpochExhausted,
@@ -1611,7 +1671,6 @@ impl DamageCommitOutcome {
     const fn label(self) -> &'static str {
         match self {
             Self::Cleared => "cleared",
-            Self::RetainedWholeScreen => "retained_whole_screen",
             Self::RetainedStale => "retained_stale",
             Self::RetainedFailure => "retained_failure",
             Self::RetainedEpochExhausted => "retained_epoch_exhausted",
@@ -1619,13 +1678,12 @@ impl DamageCommitOutcome {
     }
 
     const fn needs_follow_up_paint(self) -> bool {
-        matches!(self, Self::RetainedWholeScreen | Self::RetainedStale)
+        matches!(self, Self::RetainedStale)
     }
 }
 
 fn settle_frame_damage(
     bitmaps: &mut HashMap<PaneId, render::dirty_lines::DirtyLineBitmap>,
-    last_was_whole_screen: &mut bool,
     current_generation: DamageGeneration,
     completion: FrameCompletion,
 ) -> DamageCommitOutcome {
@@ -1638,13 +1696,8 @@ fn settle_frame_damage(
             DamageCommitOutcome::RetainedStale
         }
         FrameCompletion::Presented(_) => {
-            let retained_whole_screen = *last_was_whole_screen;
-            run_clear_dirty_lines_after_frame(bitmaps, last_was_whole_screen);
-            if retained_whole_screen {
-                DamageCommitOutcome::RetainedWholeScreen
-            } else {
-                DamageCommitOutcome::Cleared
-            }
+            run_clear_dirty_lines_after_frame(bitmaps);
+            DamageCommitOutcome::Cleared
         }
     }
 }
@@ -1730,17 +1783,31 @@ impl TermWindow {
                     }
                     return;
                 }
-                let window = window.clone();
-                let (overlay, future) = match start_overlay(self, &tab, move |tab_id, term| {
-                    confirm_close_window(term, mux_window_id, window, tab_id)
-                }) {
-                    Ok(overlay) => overlay,
-                    Err(err) => {
-                        log::error!("failed to start close-window overlay: {err:#}");
-                        return;
-                    }
+                let Some(witness_pane) = tab.get_active_pane() else {
+                    log::warn!(
+                        "cannot prompt to close window {mux_window_id}: active tab has no pane"
+                    );
+                    return;
                 };
-                self.assign_overlay(tab.tab_id(), overlay);
+                let Some(witness) = mux.capture_pane_registration(&witness_pane) else {
+                    log::warn!(
+                        "cannot prompt to close window {mux_window_id}: exact pane registration is no longer active"
+                    );
+                    return;
+                };
+                let close_mux = Arc::clone(&mux);
+                let close_tab = Arc::clone(&tab);
+                let (overlay, ticket, future) =
+                    match start_overlay(self, &tab, move |_tab_id, term| {
+                        confirm_close_window(term, close_mux, mux_window_id, close_tab, witness)
+                    }) {
+                        Ok(overlay) => overlay,
+                        Err(err) => {
+                            log::error!("failed to start close-window overlay: {err:#}");
+                            return;
+                        }
+                    };
+                self.assign_overlay_with_ticket(tab.tab_id(), overlay, ticket);
                 promise::spawn::spawn(future).detach();
 
                 // Don't close right now; let the close happen from
@@ -1757,19 +1824,16 @@ impl TermWindow {
     /// `mark_stable_row_ranges_dirty` / `mark_cursor_rows_dirty`
     /// instead.
     ///
-    /// Bitmaps that have never been registered (capacity 0) absorb
-    /// the call as a no-op — the next read by the render path will
-    /// resize them to match the pane's visible rows.
-    /// Mark every registered pane bitmap dirty (whole-screen event:
-    /// font/theme swap, focus change, resize). Per ft-jvj78 (cont
-    /// of ft-5ykn9): also flips `last_dirty_event_was_whole_screen`
-    /// so the next frame-end clear is suppressed and the marks
-    /// survive into the upcoming paint pass.
+    /// Bitmaps that have never been registered absorb the call as a no-op; the
+    /// next read by the render path creates one at the pane's visible height.
+    /// This marks every registered pane bitmap for a whole-screen event such
+    /// as a font/theme swap, focus change, resize, or viewport move.
+    /// Exact generation settlement retains these marks on failure or a stale
+    /// present and clears them on the first exact successful presentation.
     pub fn mark_all_panes_dirty(&mut self) {
         for bitmap in self.dirty_lines.values_mut() {
             bitmap.mark_all();
         }
-        self.last_dirty_event_was_whole_screen = true;
         self.advance_damage_generation();
     }
 
@@ -1785,7 +1849,6 @@ impl TermWindow {
             for bitmap in self.dirty_lines.values_mut() {
                 bitmap.mark_all();
             }
-            self.last_dirty_event_was_whole_screen = true;
             metrics::counter!("gui.render.damage_epoch_exhausted").increment(1);
             log::error!(
                 "render damage generation exhausted; retaining full damage until reconstruction"
@@ -1830,7 +1893,6 @@ impl TermWindow {
     fn complete_presented_frame(&mut self, outcome: PaintOutcome) {
         let settlement = apply_presented_render_attempt(
             &mut self.dirty_lines,
-            &mut self.last_dirty_event_was_whole_screen,
             self.damage_generation,
             &mut self.render_recovery_state,
             outcome.damage_generation,
@@ -1961,7 +2023,6 @@ impl TermWindow {
         let stage = failure.stage();
         let (settlement, directive) = apply_failed_render_attempt(
             &mut self.dirty_lines,
-            &mut self.last_dirty_event_was_whole_screen,
             self.damage_generation,
             &mut self.render_recovery_state,
             stage,
@@ -2041,7 +2102,12 @@ impl TermWindow {
     ///
     /// Used by:
     /// - check_for_dirty_lines_and_invalidate_selection (Pty + SelectionChange)
+    /// - paint_pane (CursorMove)
+    /// - set_viewport (Viewport)
     /// - mark_all_panes_dirty_with_source (FocusChange / ThemeSwap / FontSwap / Resize)
+    ///
+    /// `StatusTileUpdate` has no live call site yet; do not count its taxonomy
+    /// variant as production integration.
     pub fn record_dirty_event(
         &mut self,
         source: frankenterm_core::dirty_line_telemetry::DirtyEventSource,
@@ -2073,19 +2139,8 @@ impl TermWindow {
         self.triple_buffer_panes.publish(pane_id, state)
     }
 
-    fn publish_terminal_state_for_pane(
-        &mut self,
-        pos: &PositionedPane,
-    ) -> frankenterm_core::triple_buffer::PublishOutcome {
-        self.publish_terminal_state_snapshot(
-            terminal_pane_id_to_u64(pos.pane.pane_id()),
-            terminal_state_from_rendered_pane(&*pos.pane),
-        )
-    }
-
-    /// Per ft-kyail: drop the live triple-buffer owner for a closed pane and
-    /// clear the last retained health snapshot for the same pane. This keeps
-    /// ownership and doctor telemetry lifetimes aligned.
+    /// Drop any explicitly published triple-buffer foundation state and
+    /// retained health snapshot for a closed pane.
     pub fn forget_terminal_state_buffer_for_pane(&mut self, pane_id: u64) {
         self.triple_buffer_panes.remove(pane_id);
         self.forget_pane_health_snapshot(pane_id);
@@ -2096,12 +2151,9 @@ impl TermWindow {
         self.triple_buffer_panes.len()
     }
 
-    /// Per ft-gso6n / ft-l0oe3 slice: store the most-recent
-    /// per-pane health snapshot from the WatchdogedTripleBuffer.
-    /// Called by the integration's frame-timer poll each tick.
-    ///
-    /// Pane removal: the dirty_lines forget hook also clears the
-    /// triple-buffer owner and snapshot for the same pane.
+    /// Store an explicitly supplied per-pane health snapshot. This remains a
+    /// test/future-integration API while the producer and consumer are dormant.
+    /// Pane removal still clears any retained foundation state.
     pub fn record_pane_health_snapshot(
         &mut self,
         pane_id: u64,
@@ -2110,10 +2162,8 @@ impl TermWindow {
         self.triple_buffer_pane_health.insert(pane_id, snapshot);
     }
 
-    /// Per ft-71v6n: record a live `WatchdogedTripleBuffer`
-    /// health view from the renderer poll path. This keeps the
-    /// frame-timer integration from having to know the exact
-    /// `PaneHealthSnapshot` field mapping.
+    /// Translate and retain an explicitly supplied watchdog health view. No
+    /// production renderer/status-tick caller is wired today.
     pub fn record_pane_watchdoged_health(
         &mut self,
         pane_id: u64,
@@ -2160,26 +2210,6 @@ impl TermWindow {
             .collect();
         out.sort_unstable();
         out
-    }
-
-    fn poll_terminal_state_buffer_health(&mut self) {
-        let reports = poll_terminal_state_buffer_health_snapshots(
-            &mut self.triple_buffer_panes,
-            &mut self.triple_buffer_pane_health,
-            Instant::now(),
-            unix_epoch_ms_now(),
-            frankenterm_core::triple_buffer_fleet_health::ConsecutiveRecyclePolicy::default(),
-        );
-        for report in reports {
-            if report.alert
-                == frankenterm_core::triple_buffer_fleet_health::RecycleAlertDecision::FireAlert
-            {
-                log::warn!(
-                    "pane {} triple-buffer watchdog force-recycled repeatedly; renderer suspected stuck",
-                    report.pane_id
-                );
-            }
-        }
     }
 
     /// Per ft-a9eu1 / ft-1dq8h slice 1: combined doctor surface
@@ -2237,9 +2267,7 @@ impl TermWindow {
     }
 
     /// Per ft-8pcwy: read-only access to a pane's bitmap. Returns
-    /// `None` when no bitmap has been registered for the pane (the
-    /// render loop falls back to legacy iterate-all-lines in that
-    /// case via `should_skip_clean_line`).
+    /// `None` when no bitmap has been registered for the pane.
     pub fn peek_dirty_lines(
         &self,
         pane_id: PaneId,
@@ -2248,8 +2276,8 @@ impl TermWindow {
     }
 
     /// Per ft-8pcwy: bump the per-pane clean-line skip counter.
-    /// Called by the render loop when `should_skip_clean_line`
-    /// returned true and a render_line call was elided.
+    /// Called after a cached-quad hit when the dirty bitmap classifies that row
+    /// as clean. It does not mean line hashing or cache lookup was elided.
     pub fn record_clean_line_skipped(&mut self, pane_id: PaneId) {
         if let Some(bitmap) = self.dirty_lines.get_mut(&pane_id) {
             bitmap.record_clean_line_skipped();
@@ -2765,14 +2793,12 @@ enum RenderRecoveryDirective {
 /// test-side approximation of the production transition.
 fn apply_failed_render_attempt(
     bitmaps: &mut HashMap<PaneId, render::dirty_lines::DirtyLineBitmap>,
-    last_was_whole_screen: &mut bool,
     current_generation: DamageGeneration,
     recovery: &mut RenderRecoveryState,
     stage: RenderFailureStage,
 ) -> (DamageCommitOutcome, RenderRecoveryDirective) {
     let damage = settle_frame_damage(
         bitmaps,
-        last_was_whole_screen,
         current_generation,
         FrameCompletion::Failed(stage),
     );
@@ -2783,14 +2809,12 @@ fn apply_failed_render_attempt(
 /// Apply the state transition for a synchronously presented frame.
 fn apply_presented_render_attempt(
     bitmaps: &mut HashMap<PaneId, render::dirty_lines::DirtyLineBitmap>,
-    last_was_whole_screen: &mut bool,
     current_generation: DamageGeneration,
     recovery: &mut RenderRecoveryState,
     captured_generation: DamageGeneration,
 ) -> DamageCommitOutcome {
     let damage = settle_frame_damage(
         bitmaps,
-        last_was_whole_screen,
         current_generation,
         FrameCompletion::Presented(captured_generation),
     );
@@ -3155,7 +3179,10 @@ impl TermWindow {
         dimensions.pixel_height += (border.top + border.bottom).get() as usize;
         dimensions.pixel_width += (border.left + border.right).get() as usize;
 
-        let window_background = load_background_image(&config, &dimensions, &render_metrics);
+        // File IO, decoding, gradients and large solid-color buffers are loaded
+        // after the native window exists on the bounded background pool.  The
+        // first frame therefore never waits on user-controlled image work.
+        let window_background = Vec::new();
 
         log::trace!(
             "TermWindow::new_window called with mux_window_id {} {:?} {:?}",
@@ -3183,6 +3210,7 @@ impl TermWindow {
             webgpu: None,
             window: None,
             window_background,
+            background_load: BackgroundLoadCoordinator::default(),
             config: config.clone(),
             config_overrides: wezterm_dynamic::Value::Object(Default::default()),
             palette: None,
@@ -3225,10 +3253,6 @@ impl TermWindow {
             shape_generation: 0,
             dirty_lines: HashMap::new(),
             damage_generation: DamageGeneration::default(),
-            // Per ft-jvj78: first paint is treated as a whole-screen
-            // event so the dirty bitmap is not silently cleared
-            // before any pane has had a chance to populate it.
-            last_dirty_event_was_whole_screen: true,
             render_recovery_state: RenderRecoveryState::default(),
             render_wake_state: RenderWakeState::default(),
             // Per ft-gwzrm: live dirty sources are wired, and the
@@ -3265,6 +3289,7 @@ impl TermWindow {
                 |config| config.shape_cache_size,
                 &config,
             )),
+            line_state_cache_owner: Arc::new(render::LineStateCacheOwner::default()),
             line_state_cache: RefCell::new(LfuCacheU64::new(
                 "line_state_cache.hit.rate",
                 "line_state_cache.miss.rate",
@@ -3278,6 +3303,7 @@ impl TermWindow {
                 |config| config.line_quad_cache_size,
                 &config,
             )),
+            last_tab_state_prune_revision: Cell::new(None),
             line_to_ele_shape_cache: RefCell::new(LfuCache::new(
                 "line_to_ele_shape_cache.hit.rate",
                 "line_to_ele_shape_cache.miss.rate",
@@ -3415,6 +3441,7 @@ impl TermWindow {
                 myself.created(RenderContext::WebGpu(Rc::clone(&webgpu)))?;
             }
             myself.load_os_parameters();
+            myself.schedule_background_reload();
             myself
                 .subscribe_to_pane_updates()
                 .context("subscribing new GUI window to mux pane updates")?;
@@ -3474,6 +3501,7 @@ impl TermWindow {
                 // the window is gone and we'll linger forever.
                 // <https://github.com/wezterm/wezterm/issues/3522>
                 self.clear_all_overlays();
+                self.background_load.cancel();
                 self.release_render_resources_before_window();
                 Ok(false)
             }
@@ -3849,13 +3877,32 @@ impl TermWindow {
                     self.config_was_reloaded();
                 }
             }
-            TermWindowNotif::CancelOverlayForPane(pane_id) => {
-                self.cancel_overlay_for_pane(pane_id);
+            TermWindowNotif::CancelOverlayForPane { pane_id, ticket } => {
+                self.cancel_overlay_for_pane_if_current(pane_id, &ticket);
             }
-            TermWindowNotif::CancelOverlayForTab { tab_id, pane_id } => {
-                self.cancel_overlay_for_tab(tab_id, pane_id);
+            TermWindowNotif::CancelOverlayForTab {
+                tab_id,
+                overlay_pane_id,
+                ticket,
+            } => {
+                self.cancel_overlay_for_tab_if_current(tab_id, Some(overlay_pane_id), &ticket);
             }
-            TermWindowNotif::MuxNotification(n) => match n {
+            TermWindowNotif::MuxNotification {
+                notification: n,
+                mux_owner,
+                pane_removal_cleanup,
+            } => {
+                let Some(notification_owner) = mux_owner.upgrade() else {
+                    return Ok(());
+                };
+                if !Mux::try_get()
+                    .is_some_and(|current| Arc::ptr_eq(&current, &notification_owner))
+                {
+                    // A queued notification from a replaced mux must never act
+                    // on same-numbered panes or windows in the new mux.
+                    return Ok(());
+                }
+                match n {
                 MuxNotification::Alert {
                     alert: Alert::SetUserVar { name, value },
                     pane_id,
@@ -3943,12 +3990,8 @@ impl TermWindow {
                     window_id: _,
                     tab_id,
                 } => {
-                    let Some(mux) = Mux::try_get() else {
-                        log::warn!("cannot size added tab {tab_id}: mux is no longer active");
-                        return Ok(());
-                    };
                     let mut size = self.terminal_size;
-                    if let Some(tab) = mux.get_tab(tab_id) {
+                    if let Some(tab) = notification_owner.get_tab(tab_id) {
                         // If we attached to a remote domain and loaded in
                         // a tab async, we need to fixup its size, either
                         // by resizing it or resizes ourselves.
@@ -3981,6 +4024,7 @@ impl TermWindow {
                 }
                 MuxNotification::WindowInvalidated(_)
                 | MuxNotification::WindowOrderChanged { .. } => {
+                    self.prune_tab_state_to_live_window();
                     self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
                     window.invalidate();
                     self.update_title_post_status();
@@ -4006,6 +4050,12 @@ impl TermWindow {
                     self.update_title_post_status();
                 }
                 MuxNotification::PaneRemoved(pane_id) => {
+                    if notification_owner.get_pane(pane_id).is_some() {
+                        log::error!(
+                            "refusing PaneRemoved GUI cleanup for live pane {pane_id}; removal fence authority was violated"
+                        );
+                        return Ok(());
+                    }
                     // ft-mpc9b.1.2: drop the pane's dirty-line
                     // bitmap. Without this the HashMap leaks an
                     // entry per closed pane over the session
@@ -4020,18 +4070,71 @@ impl TermWindow {
                     self.forget_sync_output_state_for_pane(pane_id);
                     self.semantic_zones.remove(&pane_id);
                     self.agent_pane_states.remove(&pane_id);
+                    self.line_quad_cache
+                        .borrow_mut()
+                        .remove_keys_where(|key| key.pane_id == pane_id);
+                    self.line_state_cache
+                        .borrow_mut()
+                        .remove_where(|_, state| state.pane_id == pane_id);
                     let overlay_to_remove = self
                         .pane_state
                         .borrow_mut()
                         .remove(&pane_id)
-                        .and_then(|state| state.overlay)
-                        .map(|overlay| overlay.pane.pane_id())
-                        .filter(|overlay_id| *overlay_id != pane_id);
-                    if let Some(overlay_id) = overlay_to_remove {
-                        self.remove_overlay_pane_from_mux(overlay_id);
+                        .and_then(|state| state.overlay);
+                    if let Some(overlay) = overlay_to_remove {
+                        Self::retire_overlay_registration(OverlaySlot::Pane(pane_id), overlay);
                     }
-                    if self.active_selection_drag_pane == Some(pane_id) {
+                    let detached_retired_overlays = {
+                        let mut detached = Vec::new();
+                        for (owner_pane_id, state) in self.pane_state.borrow_mut().iter_mut() {
+                            if state
+                                .overlay
+                                .as_ref()
+                                .is_some_and(|overlay| overlay.pane.pane_id() == pane_id)
+                            {
+                                if let Some(overlay) = state.overlay.take() {
+                                    detached.push((OverlaySlot::Pane(*owner_pane_id), overlay));
+                                }
+                            }
+                        }
+                        for (tab_id, state) in self.tab_state.borrow_mut().iter_mut() {
+                            if state
+                                .overlay
+                                .as_ref()
+                                .is_some_and(|overlay| overlay.pane.pane_id() == pane_id)
+                            {
+                                if let Some(overlay) = state.overlay.take() {
+                                    detached.push((OverlaySlot::Tab(*tab_id), overlay));
+                                }
+                            }
+                        }
+                        detached
+                    };
+                    let detached_retired_overlay = !detached_retired_overlays.is_empty();
+                    for (slot, overlay) in detached_retired_overlays {
+                        Self::retire_overlay_registration(slot, overlay);
+                    }
+                    let captured_pane_id = match self.current_mouse_capture.as_ref() {
+                        Some(MouseCapture::TerminalPane(captured_pane_id)) => {
+                            Some(*captured_pane_id)
+                        }
+                        Some(MouseCapture::UI) | None => None,
+                    };
+                    let mouse_cleanup = frankenterm_gui::removed_pane_mouse_cleanup(
+                        captured_pane_id,
+                        self.active_selection_drag_pane,
+                        pane_id,
+                    );
+                    if mouse_cleanup.clear_terminal_capture {
+                        self.current_mouse_capture = None;
+                        self.current_mouse_buttons.clear();
+                    }
+                    if mouse_cleanup.clear_selection_drag {
                         self.active_selection_drag_pane = None;
+                    }
+                    self.prune_tab_state_to_live_window();
+                    if detached_retired_overlay {
+                        window.invalidate();
                     }
                 }
                 MuxNotification::PaneAdded(_)
@@ -4040,10 +4143,13 @@ impl TermWindow {
                 | MuxNotification::ActiveWorkspaceChanged(_)
                 | MuxNotification::Empty
                 | MuxNotification::WindowCreated(_) => {}
-            },
+                }
+                if let Some(cleanup) = pane_removal_cleanup {
+                    cleanup.complete();
+                }
+            }
             TermWindowNotif::EmitStatusUpdate => {
                 let _ = self.poll_idle_scheduler();
-                self.poll_terminal_state_buffer_health();
                 self.emit_status_event();
                 // ft-kciew: drive the quad-buffer policy's idle
                 // shrink consideration on the same cadence as the
@@ -4110,7 +4216,7 @@ impl TermWindow {
             .pane_state
             .borrow()
             .iter()
-            .filter_map(|(_, state)| state.overlay.as_ref().map(|overlay| overlay.pane.pane_id()))
+            .filter_map(|(owner_pane_id, state)| state.overlay.as_ref().map(|_| *owner_pane_id))
             .collect::<Vec<_>>();
 
         for pane_id in overlay_panes_to_cancel {
@@ -4130,6 +4236,45 @@ impl TermWindow {
 
         self.pane_state.borrow_mut().clear();
         self.tab_state.borrow_mut().clear();
+        self.last_tab_state_prune_revision.set(None);
+    }
+
+    /// Reconcile GUI-only tab state with the exact mux window-order revision.
+    /// Stale overlay panes are removed only after the tab-state borrow is
+    /// released, because mux removal can synchronously enqueue notifications.
+    fn prune_tab_state_to_live_window(&mut self) {
+        let Some(mux) = Mux::try_get() else {
+            return;
+        };
+        let Some(mux_window) = mux.get_window(self.mux_window_id) else {
+            return;
+        };
+        let revision = mux_window.order_revision();
+        if self.last_tab_state_prune_revision.get() == Some(revision) {
+            return;
+        }
+        let live_tab_ids = mux_window
+            .iter()
+            .map(|tab| tab.tab_id())
+            .collect::<HashSet<_>>();
+        drop(mux_window);
+        self.last_tab_state_prune_revision.set(Some(revision));
+
+        let mut stale_overlays = Vec::new();
+        self.tab_state.borrow_mut().retain(|tab_id, state| {
+            if live_tab_ids.contains(tab_id) {
+                true
+            } else {
+                if let Some(overlay) = state.overlay.take() {
+                    stale_overlays.push((OverlaySlot::Tab(*tab_id), overlay));
+                }
+                false
+            }
+        });
+
+        for (slot, overlay) in stale_overlays {
+            Self::retire_overlay_registration(slot, overlay);
+        }
     }
 
     fn apply_icon(window: &Window) -> anyhow::Result<()> {
@@ -4201,14 +4346,33 @@ impl TermWindow {
         self.sync_output_buffered_bytes_by_pane.remove(&pane_id);
     }
 
+    fn mux_notification_has_deferred_cleanup_authority(
+        notification: &MuxNotification,
+        has_cleanup_lease: bool,
+    ) -> bool {
+        !matches!(notification, MuxNotification::PaneRemoved(_)) || has_cleanup_lease
+    }
+
     fn mux_pane_output_event_callback(
         n: MuxNotification,
         window: &Window,
         mux_window_id: MuxWindowId,
         dead: &Arc<AtomicBool>,
+        mux_owner: &Weak<Mux>,
+        pane_removal_cleanup: Option<PaneRemovalCleanupLease>,
     ) -> bool {
         if dead.load(Ordering::Relaxed) {
             // Subscription cancelled asynchronously
+            return false;
+        }
+        let Some(mux) = mux_owner.upgrade() else {
+            log::debug!("mux notification owner no longer exists; cancel mux subscription");
+            return false;
+        };
+        if !Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &mux)) {
+            log::debug!(
+                "discarding notification from a replaced mux instance; cancel mux subscription"
+            );
             return false;
         }
 
@@ -4244,10 +4408,6 @@ impl TermWindow {
                 // signal for that case, so we just check window validity
                 // here and propagate to the window event handler that
                 // will then do the check with full context.
-                let Some(mux) = Mux::try_get() else {
-                    log::debug!("PaneOutput: mux no longer active, cancel mux subscription");
-                    return false;
-                };
                 if mux.get_window(mux_window_id).is_none() {
                     // Something inconsistent: cancel subscription
                     log::debug!(
@@ -4262,9 +4422,7 @@ impl TermWindow {
             MuxNotification::PaneAdded(_pane_id) => {
                 // If some other client spawns a pane inside this window, this
                 // gives us an opportunity to attach it to the clipboard.
-                return Mux::try_get()
-                    .map(|mux| mux.get_window(mux_window_id).is_some())
-                    .unwrap_or(false);
+                return mux.get_window(mux_window_id).is_some();
             }
             MuxNotification::TabAddedToWindow { window_id, .. }
             | MuxNotification::WindowTitleChanged { window_id, .. }
@@ -4288,9 +4446,7 @@ impl TermWindow {
             }
             MuxNotification::TabResized(tab_id)
             | MuxNotification::TabTitleChanged { tab_id, .. } => {
-                if Mux::try_get().and_then(|mux| mux.window_containing_tab(tab_id))
-                    == Some(mux_window_id)
-                {
+                if mux.window_containing_tab(tab_id) == Some(mux_window_id) {
                     // fall through
                 } else {
                     return true;
@@ -4315,7 +4471,11 @@ impl TermWindow {
             }
         }
 
-        window.notify(TermWindowNotif::MuxNotification(n));
+        window.notify(TermWindowNotif::MuxNotification {
+            notification: n,
+            mux_owner: Arc::downgrade(&mux),
+            pane_removal_cleanup,
+        });
 
         true
     }
@@ -4335,7 +4495,7 @@ impl TermWindow {
         let callback_unsubscribe_requested = Arc::clone(&unsubscribe_requested);
         let callback_mux = Arc::downgrade(&mux);
         let allocated_subscription_id = mux
-            .subscribe(move |n| {
+            .subscribe_with_pane_removal_cleanup(move |n, pane_removal_cleanup| {
                 if dead.load(Ordering::Relaxed) {
                     return false;
                 }
@@ -4362,8 +4522,24 @@ impl TermWindow {
                 let subscription_id = Arc::clone(&callback_subscription_id);
                 let unsubscribe_requested = Arc::clone(&callback_unsubscribe_requested);
                 let mux = callback_mux.clone();
+                if !Self::mux_notification_has_deferred_cleanup_authority(
+                    &n,
+                    pane_removal_cleanup.is_some(),
+                ) {
+                    log::error!(
+                        "PaneRemoved arrived without an authoritative deferred-cleanup fence; GUI cleanup will fail closed"
+                    );
+                    return true;
+                }
                 promise::spawn::spawn_into_main_thread(async move {
-                    if !Self::mux_pane_output_event_callback(n, &window, mux_window_id, &dead) {
+                    if !Self::mux_pane_output_event_callback(
+                        n,
+                        &window,
+                        mux_window_id,
+                        &dead,
+                        &mux,
+                        pane_removal_cleanup,
+                    ) {
                         dead.store(true, Ordering::Release);
                         unsubscribe_requested.store(true, Ordering::Release);
                         let sub_id = subscription_id.swap(usize::MAX, Ordering::AcqRel);
@@ -4508,7 +4684,10 @@ impl TermWindow {
         }
     }
 
-    fn check_for_dirty_lines_and_invalidate_selection(&mut self, pane: &Arc<dyn Pane>) {
+    fn check_for_dirty_lines_and_invalidate_selection(
+        &mut self,
+        pane: &Arc<dyn Pane>,
+    ) -> anyhow::Result<()> {
         let dims = pane.get_dimensions();
         let pane_id = pane.pane_id();
         let viewport = self.get_viewport(pane_id).unwrap_or(dims.physical_top);
@@ -4524,20 +4703,27 @@ impl TermWindow {
                 "cannot query dirty lines for pane {pane_id}: viewport {viewport} + {} rows overflows StableRowIndex",
                 dims.viewport_rows
             );
-            return;
+            return Err(anyhow!(
+                "dirty-line viewport range overflow for pane {pane_id}: {viewport} + {} rows",
+                dims.viewport_rows
+            ));
         };
 
-        // Fence the source before querying it. A local terminal may mutate
-        // between these two calls, while ClientPane::get_changed_since may
-        // itself poll and apply a remote delta. Advancing only to this
-        // pre-query fence means such concurrent changes can be observed twice,
-        // but can never be skipped.
-        let source_end = pane.get_current_seqno();
-        let render_seqno = self
+        // Capture the source fence and scan under one backend lock. LocalPane
+        // holds the terminal lock across both operations; ClientPane polls,
+        // captures the post-poll fence, and scans under one renderable borrow.
+        // Every production backend whose sequence can change between calls
+        // overrides this method. The split trait fallback is admissible only
+        // for a stable monotonic source; a resetting or polling backend must
+        // provide an atomic/delegating override.
+        let last_observed_source_end = self
             .pane_state(pane_id)
             .render_dirty
-            .query_baseline(source_end);
-        let dirty = pane.get_changed_since(visible_range.clone(), render_seqno);
+            .last_observed_source_end();
+        let (source_end, dirty) = pane.get_changed_since_with_source_fence(
+            visible_range.clone(),
+            last_observed_source_end,
+        );
         self.pane_state(pane_id)
             .render_dirty
             .advance_after_query(source_end);
@@ -4577,7 +4763,14 @@ impl TermWindow {
             };
             let (clear_selection, cleared_rows) = if let Some(selection_range) = selection_range {
                 let selection_rows = selection_range.rows();
-                let selection_dirty = pane.get_changed_since(visible_range, selection_seqno);
+                // Selection creation has its own sequence baseline. Query it
+                // through the same atomic source fence as render damage so a
+                // reset/regression or saturated source cannot make an old high
+                // selection seqno suppress unrelated replacement content.
+                let (_, selection_dirty) = pane.get_changed_since_with_source_fence(
+                    visible_range,
+                    selection_seqno,
+                );
                 let intersects = selection_rows
                     .clone()
                     .into_iter()
@@ -4621,6 +4814,7 @@ impl TermWindow {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -4748,14 +4942,10 @@ impl TermWindow {
             window.invalidate();
         }
 
-        // Do this after we've potentially adjusted scaling based on config/padding
-        // and window size
-        self.window_background = reload_background_image(
-            &config,
-            &self.window_background,
-            &self.dimensions,
-            &self.render_metrics,
-        );
+        // Do this after we've potentially adjusted scaling based on
+        // config/padding and window size. The current layers stay on screen
+        // until the newest bounded background job commits.
+        self.schedule_background_reload();
 
         self.invalidate_modal();
         self.emit_window_event("window-config-reloaded", None);
@@ -5286,7 +5476,7 @@ impl TermWindow {
         };
         let pane = MuxPane(pane.pane_id());
 
-        let (overlay, future) = match start_overlay(self, &tab, move |_tab_id, term| {
+        let (overlay, ticket, future) = match start_overlay(self, &tab, move |_tab_id, term| {
             crate::overlay::selector::selector(term, args, gui_win, pane)
         }) {
             Ok(overlay) => overlay,
@@ -5295,7 +5485,7 @@ impl TermWindow {
                 return;
             }
         };
-        self.assign_overlay(tab.tab_id(), overlay);
+        self.assign_overlay_with_ticket(tab.tab_id(), overlay, ticket);
         promise::spawn::spawn(future).detach();
     }
 
@@ -5324,7 +5514,7 @@ impl TermWindow {
         };
         let pane = MuxPane(pane.pane_id());
 
-        let (overlay, future) = match start_overlay(self, &tab, move |_tab_id, term| {
+        let (overlay, ticket, future) = match start_overlay(self, &tab, move |_tab_id, term| {
             crate::overlay::prompt::show_line_prompt_overlay(term, args, gui_win, pane)
         }) {
             Ok(overlay) => overlay,
@@ -5333,7 +5523,7 @@ impl TermWindow {
                 return;
             }
         };
-        self.assign_overlay(tab.tab_id(), overlay);
+        self.assign_overlay_with_ticket(tab.tab_id(), overlay, ticket);
         promise::spawn::spawn(future).detach();
     }
 
@@ -5541,7 +5731,7 @@ impl TermWindow {
             None => return,
         };
 
-        let (overlay, future) = match start_overlay(self, &tab, move |_tab_id, mut term| {
+        let (overlay, ticket, future) = match start_overlay(self, &tab, move |_tab_id, mut term| {
             if crate::overlay::confirm::run_confirmation(&message, &mut term)? {
                 promise::spawn::spawn_into_main_thread(async move {
                     Self::apply_window_unify_plan(plan);
@@ -5557,7 +5747,7 @@ impl TermWindow {
                 return;
             }
         };
-        self.assign_overlay(tab.tab_id(), overlay);
+        self.assign_overlay_with_ticket(tab.tab_id(), overlay, ticket);
         promise::spawn::spawn(future).detach();
     }
 
@@ -5582,7 +5772,7 @@ impl TermWindow {
         };
         let pane = MuxPane(pane.pane_id());
 
-        let (overlay, future) = match start_overlay(self, &tab, move |_tab_id, term| {
+        let (overlay, ticket, future) = match start_overlay(self, &tab, move |_tab_id, term| {
             crate::overlay::confirm::show_confirmation_overlay(term, args, gui_win, pane)
         }) {
             Ok(overlay) => overlay,
@@ -5591,7 +5781,7 @@ impl TermWindow {
                 return;
             }
         };
-        self.assign_overlay(tab.tab_id(), overlay);
+        self.assign_overlay_with_ticket(tab.tab_id(), overlay, ticket);
         promise::spawn::spawn(future).detach();
     }
 
@@ -5611,7 +5801,7 @@ impl TermWindow {
         let opengl_info = self.opengl_info.as_deref().unwrap_or("Unknown").to_string();
         let connection_info = self.connection_name.clone();
 
-        let (overlay, future) = match start_overlay(self, &tab, move |_tab_id, term| {
+        let (overlay, ticket, future) = match start_overlay(self, &tab, move |_tab_id, term| {
             crate::overlay::show_debug_overlay(term, gui_win, opengl_info, connection_info)
         }) {
             Ok(overlay) => overlay,
@@ -5620,7 +5810,7 @@ impl TermWindow {
                 return;
             }
         };
-        self.assign_overlay(tab.tab_id(), overlay);
+        self.assign_overlay_with_ticket(tab.tab_id(), overlay, ticket);
         promise::spawn::spawn(future).detach();
     }
 
@@ -5732,7 +5922,7 @@ impl TermWindow {
                 };
                 if let Some(tab) = mux.get_tab(tab_id) {
                     let window = window.clone();
-                    let (overlay, future) =
+                    let (overlay, ticket, future) =
                         match start_overlay(term_window, &tab, move |_tab_id, term| {
                             launcher(args, term, window, initial_choice_idx)
                         }) {
@@ -5743,7 +5933,7 @@ impl TermWindow {
                             }
                         };
 
-                    term_window.assign_overlay(tab_id, overlay);
+                    term_window.assign_overlay_with_ticket(tab_id, overlay, ticket);
                     promise::spawn::spawn(future).detach();
                 }
             })));
@@ -6301,13 +6491,11 @@ impl TermWindow {
                             None => anyhow::bail!("no active tab!?"),
                         };
 
-                        let window = self.window.clone().ok_or_else(|| {
-                            anyhow::anyhow!("cannot start quit confirmation without a GUI window")
-                        })?;
-                        let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
-                            confirm_quit_program(term, window, tab_id)
-                        })?;
-                        self.assign_overlay(tab.tab_id(), overlay);
+                        let (overlay, ticket, future) =
+                            start_overlay(self, &tab, move |_tab_id, term| {
+                                confirm_quit_program(term)
+                            })?;
+                        self.assign_overlay_with_ticket(tab.tab_id(), overlay, ticket);
                         promise::spawn::spawn(future).detach();
                     }
                 }
@@ -7005,20 +7193,24 @@ impl TermWindow {
 
         let pane_id = pane.pane_id();
         if confirm && !pane.can_close_without_prompting(CloseReason::Pane) {
-            let window = match self.gui_window_or_log("start close-pane overlay") {
-                Some(window) => window,
-                None => return,
+            let Some(registration) = mux.capture_pane_registration(&pane) else {
+                log::warn!(
+                    "cannot prompt to close pane {pane_id}: exact registration is no longer active"
+                );
+                return;
             };
-            let (overlay, future) = match start_overlay_pane(self, &pane, move |pane_id, term| {
-                confirm_close_pane(pane_id, term, mux_window_id, window)
-            }) {
-                Ok(overlay) => overlay,
-                Err(err) => {
-                    log::error!("failed to start close-pane overlay: {err:#}");
-                    return;
-                }
-            };
-            self.assign_overlay_for_pane(pane_id, overlay);
+            let close_tab = Arc::clone(&tab);
+            let (overlay, ticket, future) =
+                match start_overlay_pane(self, &pane, move |_pane_id, term| {
+                    confirm_close_pane(term, registration, close_tab)
+                }) {
+                    Ok(overlay) => overlay,
+                    Err(err) => {
+                        log::error!("failed to start close-pane overlay: {err:#}");
+                        return;
+                    }
+                };
+            self.assign_overlay_for_pane_with_ticket(pane_id, overlay, ticket);
             promise::spawn::spawn(future).detach();
         } else {
             mux.remove_pane(pane_id);
@@ -7047,12 +7239,20 @@ impl TermWindow {
                 return;
             }
 
-            let window = match self.gui_window_or_log("start close-tab overlay") {
-                Some(window) => window,
-                None => return,
+            let Some(witness_pane) = tab.get_active_pane() else {
+                log::warn!("cannot prompt to close tab {tab_id}: tab has no active pane");
+                return;
             };
-            let (overlay, future) = match start_overlay(self, &tab, move |tab_id, term| {
-                confirm_close_tab(tab_id, term, mux_window_id, window)
+            let Some(witness) = mux.capture_pane_registration(&witness_pane) else {
+                log::warn!(
+                    "cannot prompt to close tab {tab_id}: exact pane registration is no longer active"
+                );
+                return;
+            };
+            let close_mux = Arc::clone(&mux);
+            let close_tab = Arc::clone(&tab);
+            let (overlay, ticket, future) = match start_overlay(self, &tab, move |_tab_id, term| {
+                confirm_close_tab(term, close_mux, close_tab, witness)
             }) {
                 Ok(overlay) => overlay,
                 Err(err) => {
@@ -7060,7 +7260,7 @@ impl TermWindow {
                     return;
                 }
             };
-            self.assign_overlay(tab_id, overlay);
+            self.assign_overlay_with_ticket(tab_id, overlay, ticket);
             promise::spawn::spawn(future).detach();
         } else {
             mux.remove_tab(tab_id);
@@ -7076,14 +7276,21 @@ impl TermWindow {
             None => return,
         };
         let tab_id = tab.tab_id();
-        let mux_window_id = self.mux_window_id;
         if confirm && !tab.can_close_without_prompting(CloseReason::Tab) {
-            let window = match self.gui_window_or_log("start close-current-tab overlay") {
-                Some(window) => window,
-                None => return,
+            let Some(witness_pane) = tab.get_active_pane() else {
+                log::warn!("cannot prompt to close tab {tab_id}: tab has no active pane");
+                return;
             };
-            let (overlay, future) = match start_overlay(self, &tab, move |tab_id, term| {
-                confirm_close_tab(tab_id, term, mux_window_id, window)
+            let Some(witness) = mux.capture_pane_registration(&witness_pane) else {
+                log::warn!(
+                    "cannot prompt to close tab {tab_id}: exact pane registration is no longer active"
+                );
+                return;
+            };
+            let close_mux = Arc::clone(&mux);
+            let close_tab = Arc::clone(&tab);
+            let (overlay, ticket, future) = match start_overlay(self, &tab, move |_tab_id, term| {
+                confirm_close_tab(term, close_mux, close_tab, witness)
             }) {
                 Ok(overlay) => overlay,
                 Err(err) => {
@@ -7091,7 +7298,7 @@ impl TermWindow {
                     return;
                 }
             };
-            self.assign_overlay(tab_id, overlay);
+            self.assign_overlay_with_ticket(tab_id, overlay, ticket);
             promise::spawn::spawn(future).detach();
         } else {
             mux.remove_tab(tab_id);
@@ -7105,7 +7312,13 @@ impl TermWindow {
     }
 
     pub fn tab_state(&self, tab_id: TabId) -> RefMut<'_, TabState> {
-        RefMut::map(self.tab_state.borrow_mut(), |state| {
+        let state = self.tab_state.borrow_mut();
+        if !state.contains_key(&tab_id) {
+            // A delayed task can insert after a topology reconciliation. Force
+            // the next same-revision prune to validate that insertion.
+            self.last_tab_state_prune_revision.set(None);
+        }
+        RefMut::map(state, |state| {
             state.entry(tab_id).or_insert_with(TabState::default)
         })
     }
@@ -7190,7 +7403,6 @@ impl TermWindow {
             {
                 self.dirty_lines_for_pane(pane_id, dims.viewport_rows)
                     .mark_all();
-                self.last_dirty_event_was_whole_screen = true;
                 self.record_dirty_event(
                     frankenterm_core::dirty_line_telemetry::DirtyEventSource::Viewport,
                 );
@@ -7206,8 +7418,10 @@ impl TermWindow {
                 );
             }
         }
-        if let Some(window) = self.window.as_ref() {
-            window.invalidate();
+        if viewport_changed {
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
         }
     }
 
@@ -7223,7 +7437,11 @@ impl TermWindow {
     }
 
     fn scroll_to_bottom(&mut self, pane: &Arc<dyn Pane>) {
-        self.set_viewport(pane.pane_id(), None, pane.get_dimensions());
+        let pane_id = pane.pane_id();
+        if self.get_viewport(pane_id).is_none() {
+            return;
+        }
+        self.set_viewport(pane_id, None, pane.get_dimensions());
     }
 
     fn get_active_pane_no_overlay(&self) -> Option<Arc<dyn Pane>> {
@@ -7412,72 +7630,374 @@ impl TermWindow {
         self.get_pos_panes_for_tab(&tab)
     }
 
-    /// if pane_id.is_none(), removes any overlay for the specified tab.
-    /// Otherwise: if the overlay is the specified pane for that tab, remove it.
-    fn remove_overlay_pane_from_mux(&self, pane_id: PaneId) {
-        match Mux::try_get() {
-            Some(mux) => mux.remove_pane(pane_id),
-            None => log::warn!("cannot remove overlay pane {pane_id}: mux is no longer active"),
+    fn prepare_overlay_state(slot: OverlaySlot, pane: Arc<dyn Pane>) -> OverlayState {
+        let pane_id = pane.pane_id();
+        let (registration, cancellation_ticket) = match Mux::try_get() {
+            Some(mux) => {
+                let registration = mux.capture_pane_registration(&pane);
+                let cancellation_ticket = OverlayCancellationTicket::new(
+                    Arc::downgrade(&mux),
+                    slot,
+                    pane_id,
+                    registration.clone(),
+                );
+                (registration, cancellation_ticket)
+            }
+            None => (
+                None,
+                OverlayCancellationTicket::new(Weak::new(), slot, pane_id, None),
+            ),
+        };
+        OverlayState {
+            pane,
+            key_table_state: KeyTableState::default(),
+            registration,
+            cancellation_ticket,
         }
     }
 
-    fn cancel_overlay_for_tab(&mut self, tab_id: TabId, pane_id: Option<PaneId>) {
-        if pane_id.is_some() {
-            let current = self
-                .tab_state(tab_id)
-                .overlay
-                .as_ref()
-                .map(|o| o.pane.pane_id());
-            if current != pane_id {
-                return;
+    fn mint_origin_overlay_cancellation_ticket(
+        slot: OverlaySlot,
+        pane: &Arc<dyn Pane>,
+    ) -> anyhow::Result<OverlayCancellationTicket> {
+        let mux = Mux::try_get()
+            .context("cannot mint overlay cancellation authority without an active mux")?;
+        let registration = mux.capture_pane_registration(pane).ok_or_else(|| {
+            anyhow!(
+                "cannot mint overlay cancellation authority for unregistered pane {}",
+                pane.pane_id()
+            )
+        })?;
+        Ok(OverlayCancellationTicket::new(
+            Arc::downgrade(&mux),
+            slot,
+            pane.pane_id(),
+            Some(registration),
+        ))
+    }
+
+    pub(crate) fn mint_tab_overlay_cancellation_ticket(
+        tab_id: TabId,
+        pane: &Arc<dyn Pane>,
+    ) -> anyhow::Result<OverlayCancellationTicket> {
+        Self::mint_origin_overlay_cancellation_ticket(OverlaySlot::Tab(tab_id), pane)
+    }
+
+    pub(crate) fn mint_pane_overlay_cancellation_ticket(
+        pane_id: PaneId,
+        overlay: &Arc<dyn Pane>,
+    ) -> anyhow::Result<OverlayCancellationTicket> {
+        Self::mint_origin_overlay_cancellation_ticket(OverlaySlot::Pane(pane_id), overlay)
+    }
+
+    fn prepare_origin_overlay_state(
+        slot: OverlaySlot,
+        pane: Arc<dyn Pane>,
+        ticket: OverlayCancellationTicket,
+    ) -> anyhow::Result<OverlayState> {
+        ensure!(
+            ticket.slot == slot,
+            "overlay cancellation ticket targets {:?}, not {:?}",
+            ticket.slot,
+            slot,
+        );
+        ensure!(
+            ticket.overlay_pane_id == pane.pane_id(),
+            "overlay cancellation ticket pane {} does not match assigned pane {}",
+            ticket.overlay_pane_id,
+            pane.pane_id(),
+        );
+        let owner = ticket
+            .mux_owner
+            .upgrade()
+            .context("originating mux was destroyed before overlay assignment")?;
+        let current = owner.capture_pane_registration(&pane).ok_or_else(|| {
+            anyhow!(
+                "overlay pane {} is no longer the exact originating mux registration",
+                pane.pane_id()
+            )
+        })?;
+        let expected = ticket
+            .registration
+            .as_ref()
+            .context("worker overlay cancellation ticket lacks exact registration authority")?;
+        ensure!(
+            current.same_registration(expected),
+            "overlay pane {} registration changed before assignment",
+            pane.pane_id(),
+        );
+
+        Ok(OverlayState {
+            pane,
+            key_table_state: KeyTableState::default(),
+            registration: Some(current),
+            cancellation_ticket: ticket,
+        })
+    }
+
+    /// Retire only the exact overlay registration captured at assignment.
+    ///
+    /// Never re-resolve by numeric pane ID here. A delayed cancellation can
+    /// run after either the pane slot or the process-global mux has been
+    /// replaced. GUI-only overlays intentionally carry no registration and
+    /// therefore cannot kill the underlying same-numbered pane.
+    fn retire_overlay_registration(_slot: OverlaySlot, overlay: OverlayState) {
+        let pane_id = overlay.pane.pane_id();
+        match overlay.registration {
+            Some(registration) => {
+                if !registration.retire_if_current() {
+                    metrics::counter!("gui.overlay.cleanup.stale_registration").increment(1);
+                    log::debug!(
+                        "overlay pane {pane_id} registration was already retired or replaced; preserving the current slot"
+                    );
+                }
+            }
+            None => {
+                metrics::counter!("gui.overlay.cleanup.gui_only").increment(1);
             }
         }
-        if let Some(overlay) = self.tab_state(tab_id).overlay.take() {
-            self.remove_overlay_pane_from_mux(overlay.pane.pane_id());
+    }
+
+    /// If `pane_id` is `None`, remove the current overlay for the specified
+    /// tab. Otherwise remove it only when its pane ID also matches.
+    fn cancel_overlay_for_tab(&mut self, tab_id: TabId, pane_id: Option<PaneId>) {
+        self.cancel_overlay_for_tab_matching(tab_id, pane_id, None);
+    }
+
+    fn cancel_overlay_for_tab_if_current(
+        &mut self,
+        tab_id: TabId,
+        pane_id: Option<PaneId>,
+        ticket: &OverlayCancellationTicket,
+    ) {
+        self.cancel_overlay_for_tab_matching(tab_id, pane_id, Some(ticket));
+    }
+
+    fn cancel_overlay_for_tab_matching(
+        &mut self,
+        tab_id: TabId,
+        pane_id: Option<PaneId>,
+        expected: Option<&OverlayCancellationTicket>,
+    ) {
+        let mut rejected_expected = false;
+        let mut pane_mismatch = false;
+        let overlay = {
+            let mut states = self.tab_state.borrow_mut();
+            match states.get_mut(&tab_id) {
+                Some(state)
+                    if pane_id.is_some()
+                        && state.overlay.as_ref().map(|o| o.pane.pane_id()) != pane_id =>
+                {
+                    pane_mismatch = true;
+                    rejected_expected = expected.is_some();
+                    None
+                }
+                Some(state)
+                    if expected.is_some_and(|ticket| {
+                        state
+                            .overlay
+                            .as_ref()
+                            .is_none_or(|overlay| !overlay.cancellation_ticket.matches(ticket))
+                    }) =>
+                {
+                    rejected_expected = true;
+                    None
+                }
+                Some(state) => state.overlay.take(),
+                None => {
+                    rejected_expected = expected.is_some();
+                    None
+                }
+            }
+        };
+        if rejected_expected {
+            metrics::counter!("gui.overlay.cancel.stale_ticket_rejected", "slot" => "tab")
+                .increment(1);
+            return;
+        }
+        if pane_mismatch {
+            return;
+        }
+        if let Some(overlay) = overlay {
+            Self::retire_overlay_registration(OverlaySlot::Tab(tab_id), overlay);
         }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
     }
 
-    pub fn schedule_cancel_overlay(window: Window, tab_id: TabId, pane_id: Option<PaneId>) {
-        window.notify(TermWindowNotif::CancelOverlayForTab { tab_id, pane_id });
+    pub(crate) fn schedule_cancel_overlay(
+        window: Window,
+        tab_id: TabId,
+        overlay_pane_id: PaneId,
+        ticket: OverlayCancellationTicket,
+    ) {
+        ticket.request_cancellation();
+        if ticket.slot != OverlaySlot::Tab(tab_id) || ticket.overlay_pane_id != overlay_pane_id {
+            metrics::counter!("gui.overlay.cancel.invalid_origin_ticket", "slot" => "tab")
+                .increment(1);
+            log::error!(
+                "refusing mismatched tab overlay cancellation ticket: requested tab {tab_id}, pane {overlay_pane_id}; ticket targets {:?}, pane {}",
+                ticket.slot,
+                ticket.overlay_pane_id,
+            );
+            return;
+        }
+        window.notify(TermWindowNotif::CancelOverlayForTab {
+            tab_id,
+            overlay_pane_id,
+            ticket,
+        });
     }
 
     fn cancel_overlay_for_pane(&mut self, pane_id: PaneId) {
-        if let Some(overlay) = self.pane_state(pane_id).overlay.take() {
-            // Ungh, when I built the CopyOverlay, its pane doesn't get
-            // added to the mux and instead it reports the overlaid
-            // pane id.  Take care to avoid killing ourselves off
-            // when closing the CopyOverlay
-            if pane_id != overlay.pane.pane_id() {
-                self.remove_overlay_pane_from_mux(overlay.pane.pane_id());
+        self.cancel_overlay_for_pane_matching(pane_id, None);
+    }
+
+    fn cancel_overlay_for_pane_if_current(
+        &mut self,
+        pane_id: PaneId,
+        ticket: &OverlayCancellationTicket,
+    ) {
+        self.cancel_overlay_for_pane_matching(pane_id, Some(ticket));
+    }
+
+    fn cancel_overlay_for_pane_matching(
+        &mut self,
+        pane_id: PaneId,
+        expected: Option<&OverlayCancellationTicket>,
+    ) {
+        let mut rejected_expected = false;
+        let overlay = {
+            let mut states = self.pane_state.borrow_mut();
+            match states.get_mut(&pane_id) {
+                Some(state)
+                    if expected.is_some_and(|ticket| {
+                        state
+                            .overlay
+                            .as_ref()
+                            .is_none_or(|overlay| !overlay.cancellation_ticket.matches(ticket))
+                    }) =>
+                {
+                    rejected_expected = true;
+                    None
+                }
+                Some(state) => state.overlay.take(),
+                None => {
+                    rejected_expected = expected.is_some();
+                    None
+                }
             }
+        };
+        if rejected_expected {
+            metrics::counter!(
+                "gui.overlay.cancel.stale_ticket_rejected",
+                "slot" => "pane"
+            )
+            .increment(1);
+            return;
+        }
+        if let Some(overlay) = overlay {
+            Self::retire_overlay_registration(OverlaySlot::Pane(pane_id), overlay);
         }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
     }
 
-    pub fn schedule_cancel_overlay_for_pane(window: Window, pane_id: PaneId) {
-        window.notify(TermWindowNotif::CancelOverlayForPane(pane_id));
+    pub(crate) fn schedule_cancel_overlay_for_pane(
+        window: Window,
+        pane_id: PaneId,
+        ticket: OverlayCancellationTicket,
+    ) {
+        ticket.request_cancellation();
+        if ticket.slot != OverlaySlot::Pane(pane_id) {
+            metrics::counter!("gui.overlay.cancel.invalid_origin_ticket", "slot" => "pane")
+                .increment(1);
+            log::error!(
+                "refusing mismatched pane overlay cancellation ticket: requested owner pane {pane_id}; ticket targets {:?}",
+                ticket.slot,
+            );
+            return;
+        }
+        window.notify(TermWindowNotif::CancelOverlayForPane { pane_id, ticket });
+    }
+
+    fn retire_unassigned_origin_ticket(ticket: &OverlayCancellationTicket) {
+        if let Some(registration) = &ticket.registration {
+            let _ = registration.retire_if_current();
+        }
+    }
+
+    pub(crate) fn assign_overlay_for_pane_with_ticket(
+        &mut self,
+        pane_id: PaneId,
+        pane: Arc<dyn Pane>,
+        ticket: OverlayCancellationTicket,
+    ) {
+        let cleanup_ticket = ticket.clone();
+        let overlay =
+            match Self::prepare_origin_overlay_state(OverlaySlot::Pane(pane_id), pane, ticket) {
+                Ok(overlay) => overlay,
+                Err(err) => {
+                    Self::retire_unassigned_origin_ticket(&cleanup_ticket);
+                    log::error!("refusing pane overlay without exact origin authority: {err:#}");
+                    return;
+                }
+            };
+        if overlay.cancellation_ticket.cancellation_requested() {
+            metrics::counter!("gui.overlay.cancel.completed_before_assignment", "slot" => "pane")
+                .increment(1);
+            Self::retire_overlay_registration(OverlaySlot::Pane(pane_id), overlay);
+            return;
+        }
+        self.cancel_overlay_for_pane(pane_id);
+        let replaced = self.pane_state(pane_id).overlay.replace(overlay);
+        debug_assert!(replaced.is_none(), "old pane overlay must be retired first");
+        self.update_title();
+    }
+
+    pub(crate) fn assign_overlay_with_ticket(
+        &mut self,
+        tab_id: TabId,
+        pane: Arc<dyn Pane>,
+        ticket: OverlayCancellationTicket,
+    ) {
+        let cleanup_ticket = ticket.clone();
+        let overlay =
+            match Self::prepare_origin_overlay_state(OverlaySlot::Tab(tab_id), pane, ticket) {
+                Ok(overlay) => overlay,
+                Err(err) => {
+                    Self::retire_unassigned_origin_ticket(&cleanup_ticket);
+                    log::error!("refusing tab overlay without exact origin authority: {err:#}");
+                    return;
+                }
+            };
+        if overlay.cancellation_ticket.cancellation_requested() {
+            metrics::counter!("gui.overlay.cancel.completed_before_assignment", "slot" => "tab")
+                .increment(1);
+            Self::retire_overlay_registration(OverlaySlot::Tab(tab_id), overlay);
+            return;
+        }
+        self.cancel_overlay_for_tab(tab_id, None);
+        let replaced = self.tab_state(tab_id).overlay.replace(overlay);
+        debug_assert!(replaced.is_none(), "old tab overlay must be retired first");
+        self.update_title();
     }
 
     pub fn assign_overlay_for_pane(&mut self, pane_id: PaneId, pane: Arc<dyn Pane>) {
         self.cancel_overlay_for_pane(pane_id);
-        self.pane_state(pane_id).overlay.replace(OverlayState {
-            pane,
-            key_table_state: KeyTableState::default(),
-        });
+        let overlay = Self::prepare_overlay_state(OverlaySlot::Pane(pane_id), pane);
+        let replaced = self.pane_state(pane_id).overlay.replace(overlay);
+        debug_assert!(replaced.is_none(), "old pane overlay must be retired first");
         self.update_title();
     }
 
     pub fn assign_overlay(&mut self, tab_id: TabId, overlay: Arc<dyn Pane>) {
         self.cancel_overlay_for_tab(tab_id, None);
-        self.tab_state(tab_id).overlay.replace(OverlayState {
-            pane: overlay,
-            key_table_state: KeyTableState::default(),
-        });
+        let overlay = Self::prepare_overlay_state(OverlaySlot::Tab(tab_id), overlay);
+        let replaced = self.tab_state(tab_id).overlay.replace(overlay);
+        debug_assert!(replaced.is_none(), "old tab overlay must be retired first");
         self.update_title();
     }
 
@@ -7502,6 +8022,7 @@ impl TermWindow {
 impl Drop for TermWindow {
     fn drop(&mut self) {
         self.clear_all_overlays();
+        self.background_load.cancel();
         self.release_render_resources_before_window();
         if let Some(window) = self.window.take() {
             if let Some(fe) = try_front_end() {
@@ -7529,10 +8050,143 @@ mod tests {
         record_frame_budget_execution_outstanding, record_sync_output_mux_event,
         reduce_motion_state_from_preference, render, render_recovery_directive,
         run_clear_dirty_lines_after_frame, settle_frame_damage, should_force_paint_for_frame_budget,
-        should_run_frame_budget_decision, should_skip_clean_line, webgpu,
+        is_clean_line_for_cache_hit_accounting, should_run_frame_budget_decision, webgpu,
         webgpu_repair_failure_stage,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn pane_removed_gui_cleanup_fails_closed_without_exact_deferred_authority() {
+        assert!(!super::TermWindow::mux_notification_has_deferred_cleanup_authority(
+            &mux::MuxNotification::PaneRemoved(7),
+            false,
+        ));
+        assert!(super::TermWindow::mux_notification_has_deferred_cleanup_authority(
+            &mux::MuxNotification::PaneRemoved(7),
+            true,
+        ));
+        assert!(super::TermWindow::mux_notification_has_deferred_cleanup_authority(
+            &mux::MuxNotification::PaneOutput(7),
+            false,
+        ));
+    }
+
+    #[test]
+    fn queued_tab_overlay_ticket_cannot_cancel_same_slot_replacement() {
+        let owner = std::sync::Arc::new(mux::Mux::new(None));
+        let slot = super::OverlaySlot::Tab(usize::MAX - 101);
+        let overlay_pane_id = usize::MAX - 201;
+        let old_ticket = super::OverlayCancellationTicket::new(
+            std::sync::Arc::downgrade(&owner),
+            slot,
+            overlay_pane_id,
+            None,
+        );
+        let queued = old_ticket.clone();
+        let replacement_ticket = super::OverlayCancellationTicket::new(
+            std::sync::Arc::downgrade(&owner),
+            slot,
+            usize::MAX - 202,
+            None,
+        );
+
+        assert!(
+            !replacement_ticket.matches(&queued),
+            "a queued tab ticket must remain bound to the replaced overlay instance",
+        );
+    }
+
+    #[test]
+    fn queued_pane_overlay_ticket_cannot_cancel_same_slot_replacement() {
+        let owner = std::sync::Arc::new(mux::Mux::new(None));
+        let slot = super::OverlaySlot::Pane(usize::MAX - 103);
+        let old_ticket = super::OverlayCancellationTicket::new(
+            std::sync::Arc::downgrade(&owner),
+            slot,
+            usize::MAX - 203,
+            None,
+        );
+        let replacement_ticket = super::OverlayCancellationTicket::new(
+            std::sync::Arc::downgrade(&owner),
+            slot,
+            usize::MAX - 204,
+            None,
+        );
+
+        assert!(
+            !replacement_ticket.matches(&old_ticket),
+            "a queued pane ticket must remain bound to the replaced overlay instance",
+        );
+    }
+
+    #[test]
+    fn reused_numeric_overlay_pane_id_does_not_retarget_old_ticket() {
+        let owner = std::sync::Arc::new(mux::Mux::new(None));
+        let slot = super::OverlaySlot::Tab(usize::MAX - 104);
+        let reused_overlay_pane_id = usize::MAX - 205;
+        let old_ticket = super::OverlayCancellationTicket::new(
+            std::sync::Arc::downgrade(&owner),
+            slot,
+            reused_overlay_pane_id,
+            None,
+        );
+        let replacement_ticket = super::OverlayCancellationTicket::new(
+            std::sync::Arc::downgrade(&owner),
+            slot,
+            reused_overlay_pane_id,
+            None,
+        );
+
+        assert!(
+            !replacement_ticket.matches(&old_ticket),
+            "numeric pane-ID reuse must not confer cancellation authority over the replacement",
+        );
+    }
+
+    #[test]
+    fn overlay_ticket_separates_same_numeric_ids_across_mux_owners() {
+        let old_owner = std::sync::Arc::new(mux::Mux::new(None));
+        let new_owner = std::sync::Arc::new(mux::Mux::new(None));
+        let slot = super::OverlaySlot::Pane(usize::MAX - 102);
+        let overlay_pane_id = usize::MAX - 206;
+        let old_ticket = super::OverlayCancellationTicket::new(
+            std::sync::Arc::downgrade(&old_owner),
+            slot,
+            overlay_pane_id,
+            None,
+        );
+        let new_ticket = super::OverlayCancellationTicket::new(
+            std::sync::Arc::downgrade(&new_owner),
+            slot,
+            overlay_pane_id,
+            None,
+        );
+
+        assert!(
+            !new_ticket.matches(&old_ticket),
+            "a replacement mux must not inherit cancellation authority from the old owner",
+        );
+    }
+
+    #[test]
+    fn overlay_completion_before_assignment_is_observed_by_assignment_clone() {
+        let owner = std::sync::Arc::new(mux::Mux::new(None));
+        let ticket = super::OverlayCancellationTicket::new(
+            std::sync::Arc::downgrade(&owner),
+            super::OverlaySlot::Pane(usize::MAX - 105),
+            usize::MAX - 207,
+            None,
+        );
+        let assignment_ticket = ticket.clone();
+
+        ticket.request_cancellation();
+
+        assert!(
+            assignment_ticket.cancellation_requested(),
+            "the assignment-side clone must observe completion published by the worker-side clone",
+        );
+        assert!(assignment_ticket.matches(&ticket));
+    }
 
     #[test]
     fn ui_item_hit_test_uses_half_open_extents() {
@@ -8416,9 +9070,9 @@ mod tests {
         let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
         bm.mark(5);
         // gate=false: never skip.
-        assert!(!should_skip_clean_line(false, Some(&bm), 0));
-        assert!(!should_skip_clean_line(false, Some(&bm), 5));
-        assert!(!should_skip_clean_line(false, None, 0));
+        assert!(!is_clean_line_for_cache_hit_accounting(false, Some(&bm), 0));
+        assert!(!is_clean_line_for_cache_hit_accounting(false, Some(&bm), 5));
+        assert!(!is_clean_line_for_cache_hit_accounting(false, None, 0));
     }
 
     /// ft-8pcwy: gate enabled but no bitmap registered → never
@@ -8426,8 +9080,8 @@ mod tests {
     /// safer to render than to leave a hole.
     #[test]
     fn skip_predicate_off_when_no_bitmap_registered() {
-        assert!(!should_skip_clean_line(true, None, 0));
-        assert!(!should_skip_clean_line(true, None, 23));
+        assert!(!is_clean_line_for_cache_hit_accounting(true, None, 0));
+        assert!(!is_clean_line_for_cache_hit_accounting(true, None, 23));
     }
 
     /// ft-8pcwy: gate enabled but bitmap is empty → never skip.
@@ -8439,7 +9093,7 @@ mod tests {
         assert!(bm.is_empty());
         for idx in 0..24 {
             assert!(
-                !should_skip_clean_line(true, Some(&bm), idx),
+                !is_clean_line_for_cache_hit_accounting(true, Some(&bm), idx),
                 "empty bitmap must never skip (idx={idx})",
             );
         }
@@ -8455,7 +9109,7 @@ mod tests {
         bm.mark(7);
         bm.mark(20);
         for idx in 0..24 {
-            let should_skip = should_skip_clean_line(true, Some(&bm), idx);
+            let should_skip = is_clean_line_for_cache_hit_accounting(true, Some(&bm), idx);
             let is_dirty = idx == 5 || idx == 7 || idx == 20;
             assert_eq!(
                 should_skip, !is_dirty,
@@ -8472,19 +9126,21 @@ mod tests {
         let mut bm = render::dirty_lines::DirtyLineBitmap::new(8);
         bm.mark(7);
         // idx within capacity, dirty.
-        assert!(!should_skip_clean_line(true, Some(&bm), 7));
+        assert!(!is_clean_line_for_cache_hit_accounting(true, Some(&bm), 7));
         // idx within capacity, clean.
-        assert!(should_skip_clean_line(true, Some(&bm), 6));
+        assert!(is_clean_line_for_cache_hit_accounting(true, Some(&bm), 6));
         // idx past capacity → contains() returns false → skip.
         // (Out-of-range rows shouldn't be passed in by the render
         //  loop, but the predicate is still well-defined.)
-        assert!(should_skip_clean_line(true, Some(&bm), 8));
-        assert!(should_skip_clean_line(true, Some(&bm), usize::MAX));
+        assert!(is_clean_line_for_cache_hit_accounting(true, Some(&bm), 8));
+        assert!(is_clean_line_for_cache_hit_accounting(
+            true,
+            Some(&bm),
+            usize::MAX
+        ));
     }
 
-    /// ft-jvj78: when no whole-screen event has happened, the
-    /// frame-end clear runs on every pane bitmap and the flag is
-    /// idle.
+    /// Exact success clears per-cell damage immediately.
     #[test]
     fn frame_end_clear_runs_on_per_cell_frames() {
         let mut bitmaps: HashMap<usize, render::dirty_lines::DirtyLineBitmap> = HashMap::new();
@@ -8492,9 +9148,7 @@ mod tests {
         bm.mark(5);
         bm.mark(7);
         bitmaps.insert(1, bm);
-        let mut flag = false;
-
-        run_clear_dirty_lines_after_frame(&mut bitmaps, &mut flag);
+        run_clear_dirty_lines_after_frame(&mut bitmaps);
 
         let cleared = bitmaps.get(&1).expect("pane 1 bitmap retained");
         assert_eq!(cleared.count(), 0, "frame-end must clear marks");
@@ -8503,39 +9157,25 @@ mod tests {
             1,
             "lifetime clear counter must increment exactly once",
         );
-        assert!(!flag, "flag must remain false after a clean frame");
     }
 
-    /// ft-jvj78: a whole-screen event suppresses the next frame-end
-    /// clear so the marks survive into the upcoming paint pass. The
-    /// flag is consumed (reset to false) so a single event only
-    /// suppresses one clear.
+    /// Exact success also clears whole-screen damage immediately; generation
+    /// mismatch and failure already protect damage that was not presented.
     #[test]
-    fn whole_screen_event_suppresses_next_clear_then_resets() {
+    fn whole_screen_event_clears_on_first_exact_success() {
         let mut bitmaps: HashMap<usize, render::dirty_lines::DirtyLineBitmap> = HashMap::new();
         let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
         bm.mark_all();
         bitmaps.insert(1, bm);
-        let mut flag = true;
+        run_clear_dirty_lines_after_frame(&mut bitmaps);
 
-        run_clear_dirty_lines_after_frame(&mut bitmaps, &mut flag);
-
-        // Whole-screen event suppressed the clear.
-        let kept = bitmaps.get(&1).expect("pane 1 bitmap retained");
-        assert_eq!(kept.count(), 24, "whole-screen frame must keep marks");
-        assert_eq!(
-            kept.frames_cleared_total(),
-            0,
-            "no clear means lifetime counter stays at 0",
-        );
-        // But the flag is consumed.
-        assert!(!flag, "flag must be reset after consumption");
-
-        // Now the next call (no new whole-screen event) does clear.
-        run_clear_dirty_lines_after_frame(&mut bitmaps, &mut flag);
         let cleared = bitmaps.get(&1).expect("pane 1 bitmap retained");
         assert_eq!(cleared.count(), 0);
-        assert_eq!(cleared.frames_cleared_total(), 1);
+        assert_eq!(
+            cleared.frames_cleared_total(),
+            1,
+            "one exact success must settle whole-screen damage once",
+        );
     }
 
     /// ft-jvj78: every registered pane bitmap is cleared, not just
@@ -8548,9 +9188,7 @@ mod tests {
             bm.mark(pane_id);
             bitmaps.insert(pane_id, bm);
         }
-        let mut flag = false;
-
-        run_clear_dirty_lines_after_frame(&mut bitmaps, &mut flag);
+        run_clear_dirty_lines_after_frame(&mut bitmaps);
 
         for pane_id in 1..=4 {
             let bm = bitmaps.get(&pane_id).expect("bitmap retained");
@@ -8587,7 +9225,6 @@ mod tests {
         bitmap.mark(19);
         bitmaps.insert(7, bitmap);
         let before = bitmaps.clone();
-        let mut whole_screen = true;
         let mut recovery = RenderRecoveryState::default();
         let mut wakes = RenderWakeState::default();
         let now = Instant::now();
@@ -8602,14 +9239,12 @@ mod tests {
         {
             let (damage, directive) = apply_failed_render_attempt(
                 &mut bitmaps,
-                &mut whole_screen,
                 generation,
                 &mut recovery,
                 stage,
             );
             assert_eq!(damage, DamageCommitOutcome::RetainedFailure);
             assert_eq!(bitmaps, before, "attempt {attempt} changed dirty rows");
-            assert!(whole_screen, "attempt {attempt} consumed whole-screen damage");
 
             let delay = match directive {
                 RenderRecoveryDirective::RetryAfter(delay) => delay,
@@ -8655,30 +9290,18 @@ mod tests {
 
         let first_success = apply_presented_render_attempt(
             &mut bitmaps,
-            &mut whole_screen,
             generation,
             &mut recovery,
             generation,
         );
-        assert_eq!(first_success, DamageCommitOutcome::RetainedWholeScreen);
-        assert_eq!(bitmaps, before);
-        assert!(!whole_screen);
+        assert_eq!(first_success, DamageCommitOutcome::Cleared);
+        assert_eq!(bitmaps.get(&7).expect("pane retained").count(), 0);
         assert_eq!(recovery.failed_attempts_since_success, 0);
         assert_eq!(recovery.admit(), PaintAdmission::Admit);
-
-        let follow_up = apply_presented_render_attempt(
-            &mut bitmaps,
-            &mut whole_screen,
-            generation,
-            &mut recovery,
-            generation,
-        );
-        assert_eq!(follow_up, DamageCommitOutcome::Cleared);
-        assert_eq!(bitmaps.get(&7).expect("pane retained").count(), 0);
     }
 
     #[test]
-    fn failed_submission_or_present_retains_exact_damage_and_whole_screen_state() {
+    fn failed_submission_or_present_retains_exact_damage() {
         let mut original: HashMap<usize, render::dirty_lines::DirtyLineBitmap> = HashMap::new();
         let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
         bm.mark(2);
@@ -8691,19 +9314,16 @@ mod tests {
         ] {
             let mut bitmaps = original.clone();
             let before = bitmaps.clone();
-            let mut whole_screen = true;
             let generation = DamageGeneration::default();
 
             let outcome = settle_frame_damage(
                 &mut bitmaps,
-                &mut whole_screen,
                 generation,
                 FrameCompletion::Failed(stage),
             );
 
             assert_eq!(outcome, DamageCommitOutcome::RetainedFailure);
             assert_eq!(bitmaps, before, "{stage:?} changed dirty rows");
-            assert!(whole_screen, "{stage:?} consumed whole-screen state");
         }
     }
 
@@ -8717,18 +9337,14 @@ mod tests {
         bm.mark(11);
         bitmaps.insert(3, bm);
         let before = bitmaps.clone();
-        let mut whole_screen = false;
-
         let outcome = settle_frame_damage(
             &mut bitmaps,
-            &mut whole_screen,
             current,
             FrameCompletion::Presented(captured),
         );
 
         assert_eq!(outcome, DamageCommitOutcome::RetainedStale);
         assert_eq!(bitmaps, before);
-        assert!(!whole_screen);
     }
 
     #[test]
@@ -8739,11 +9355,8 @@ mod tests {
         let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
         bm.mark(4);
         bitmaps.insert(5, bm);
-        let mut whole_screen = false;
-
         let outcome = settle_frame_damage(
             &mut bitmaps,
-            &mut whole_screen,
             generation,
             FrameCompletion::Presented(generation),
         );
@@ -8770,17 +9383,14 @@ mod tests {
         bm.mark_all();
         bitmaps.insert(1, bm);
         let before = bitmaps.clone();
-        let mut whole_screen = true;
         let outcome = settle_frame_damage(
             &mut bitmaps,
-            &mut whole_screen,
             generation,
             FrameCompletion::Presented(captured),
         );
 
         assert_eq!(outcome, DamageCommitOutcome::RetainedEpochExhausted);
         assert_eq!(bitmaps, before);
-        assert!(whole_screen);
     }
 
     #[test]

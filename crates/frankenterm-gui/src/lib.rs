@@ -184,6 +184,30 @@ pub fn should_preserve_dirty_selection_during_mouse_drag(
         && captured_pane_id == Some(pane_id)
 }
 
+/// Mouse state that must be cancelled when a mux pane disappears.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RemovedPaneMouseCleanup {
+    /// The OS-level terminal capture belongs to the removed pane. Its pressed
+    /// button set must be cleared with the capture so later motion cannot be
+    /// routed as a continuation of the dead gesture.
+    pub clear_terminal_capture: bool,
+    /// The selection drag owner is the removed pane.
+    pub clear_selection_drag: bool,
+}
+
+/// Determine which pane-owned mouse state becomes invalid on pane removal.
+#[must_use]
+pub fn removed_pane_mouse_cleanup(
+    captured_pane_id: Option<usize>,
+    active_selection_drag_pane_id: Option<usize>,
+    removed_pane_id: usize,
+) -> RemovedPaneMouseCleanup {
+    RemovedPaneMouseCleanup {
+        clear_terminal_capture: captured_pane_id == Some(removed_pane_id),
+        clear_selection_drag: active_selection_drag_pane_id == Some(removed_pane_id),
+    }
+}
+
 /// Build an exclusive stable-row range from a top row and visible row count.
 ///
 /// Binary-owned render code uses this to avoid wrapping stable-row arithmetic
@@ -208,20 +232,50 @@ pub struct RenderDirtySequenceFence {
     last_observed: termwiz::surface::SequenceNo,
 }
 
+/// A cached line shape hash is reusable only while its source sequence remains
+/// both equal and capable of proving a mutation boundary. `SEQ_ZERO` is the
+/// terminal model's always-changed sentinel, while at `SequenceNo::MAX` later
+/// mutations retain the same sequence number. Equality at either sentinel is
+/// therefore not a freshness proof.
+#[must_use]
+pub fn cached_line_shape_hash_is_fresh(
+    cached: termwiz::surface::SequenceNo,
+    current: termwiz::surface::SequenceNo,
+) -> bool {
+    current != termwiz::surface::SEQ_ZERO
+        && current != termwiz::surface::SequenceNo::MAX
+        && cached == current
+}
+
+/// Allocate a cache identity without wrapping or reusing the terminal sentinel
+/// value. Returning `None` is sticky because `next` remains `u64::MAX`; callers
+/// must bypass insertion rather than collide with an older long-session ID.
+#[must_use]
+pub fn take_monotonic_cache_id(next: &mut u64) -> Option<u64> {
+    let successor = next.checked_add(1)?;
+    let allocated = *next;
+    *next = successor;
+    Some(allocated)
+}
+
 impl RenderDirtySequenceFence {
+    /// Last source fence committed after a completed query.
+    #[must_use]
+    pub const fn last_observed_source_end(self) -> termwiz::surface::SequenceNo {
+        self.last_observed
+    }
+
     /// Sequence from which the next dirty query must start. A source sequence
     /// regression means the pane changed sequence domains, so fail closed to a
-    /// full query from `SEQ_ZERO`.
+    /// full query from `SEQ_ZERO`. Saturation also forces `SEQ_ZERO`: once the
+    /// source can no longer advance, an ordinary `changed_since(MAX)` query
+    /// cannot distinguish later mutations.
     #[must_use]
     pub fn query_baseline(
         self,
         source_end: termwiz::surface::SequenceNo,
     ) -> termwiz::surface::SequenceNo {
-        if source_end < self.last_observed {
-            termwiz::surface::SEQ_ZERO
-        } else {
-            self.last_observed
-        }
+        mux::pane::changed_since_query_baseline(self.last_observed, source_end)
     }
 
     /// Commit the pre-query source fence after the dirty query returned.
@@ -921,7 +975,8 @@ pub mod owner_last_guard {
 #[cfg(test)]
 mod selection_lifecycle_tests {
     use super::{
-        RenderDirtySequenceFence, checked_stable_row_range_from_top,
+        RenderDirtySequenceFence, RemovedPaneMouseCleanup, cached_line_shape_hash_is_fresh,
+        checked_stable_row_range_from_top, removed_pane_mouse_cleanup, take_monotonic_cache_id,
         should_preserve_dirty_selection_during_mouse_drag,
     };
     use wezterm_term::StableRowIndex;
@@ -977,6 +1032,28 @@ mod selection_lifecycle_tests {
     }
 
     #[test]
+    fn pane_removal_cancels_only_mouse_state_owned_by_that_pane() {
+        assert_eq!(
+            removed_pane_mouse_cleanup(Some(7), Some(7), 7),
+            RemovedPaneMouseCleanup {
+                clear_terminal_capture: true,
+                clear_selection_drag: true,
+            }
+        );
+        assert_eq!(
+            removed_pane_mouse_cleanup(Some(8), Some(7), 7),
+            RemovedPaneMouseCleanup {
+                clear_terminal_capture: false,
+                clear_selection_drag: true,
+            }
+        );
+        assert_eq!(
+            removed_pane_mouse_cleanup(Some(8), Some(8), 7),
+            RemovedPaneMouseCleanup::default()
+        );
+    }
+
+    #[test]
     fn render_dirty_sequence_fence_advances_independently() {
         let mut fence = RenderDirtySequenceFence::default();
         assert_eq!(fence.query_baseline(41), termwiz::surface::SEQ_ZERO);
@@ -991,6 +1068,45 @@ mod selection_lifecycle_tests {
         assert_eq!(fence.query_baseline(3), termwiz::surface::SEQ_ZERO);
         fence.advance_after_query(3);
         assert_eq!(fence.query_baseline(4), 3);
+    }
+
+    #[test]
+    fn render_dirty_sequence_fence_fails_closed_at_source_saturation() {
+        let mut fence = RenderDirtySequenceFence::default();
+        fence.advance_after_query(termwiz::surface::SequenceNo::MAX - 1);
+        assert_eq!(
+            fence.query_baseline(termwiz::surface::SequenceNo::MAX),
+            termwiz::surface::SEQ_ZERO
+        );
+        fence.advance_after_query(termwiz::surface::SequenceNo::MAX);
+        assert_eq!(
+            fence.query_baseline(termwiz::surface::SequenceNo::MAX),
+            termwiz::surface::SEQ_ZERO
+        );
+    }
+
+    #[test]
+    fn cached_shape_hash_requires_a_nonsentinel_sequence() {
+        assert!(cached_line_shape_hash_is_fresh(41, 41));
+        assert!(!cached_line_shape_hash_is_fresh(40, 41));
+        assert!(!cached_line_shape_hash_is_fresh(
+            termwiz::surface::SEQ_ZERO,
+            termwiz::surface::SEQ_ZERO,
+        ));
+        assert!(!cached_line_shape_hash_is_fresh(
+            termwiz::surface::SequenceNo::MAX,
+            termwiz::surface::SequenceNo::MAX,
+        ));
+    }
+
+    #[test]
+    fn cache_identity_allocation_is_sticky_at_exhaustion() {
+        let mut next = u64::MAX - 1;
+        assert_eq!(take_monotonic_cache_id(&mut next), Some(u64::MAX - 1));
+        assert_eq!(next, u64::MAX);
+        assert_eq!(take_monotonic_cache_id(&mut next), None);
+        assert_eq!(take_monotonic_cache_id(&mut next), None);
+        assert_eq!(next, u64::MAX);
     }
 }
 

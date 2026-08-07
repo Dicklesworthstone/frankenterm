@@ -5,6 +5,8 @@ use config::keyassignment::{
     ClipboardCopyDestination, CopyModeAssignment, KeyAssignment, KeyTable, KeyTableEntry,
     ScrollbackEraseMode, SelectionMode,
 };
+use futures::channel::oneshot;
+use futures::future::{AbortHandle, Abortable};
 use mux::domain::DomainId;
 use mux::pane::{
     CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern, PatternType,
@@ -15,10 +17,12 @@ use mux::tab::TabId;
 use ordered_float::NotNan;
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use promise::spawn::sleep;
+use rayon::prelude::*;
 use rangeset::RangeSet;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use termwiz::cell::{Cell, CellAttributes};
 use termwiz::color::AnsiColor;
@@ -38,11 +42,47 @@ lazy_static::lazy_static! {
 }
 
 const SEARCH_CHUNK_SIZE: StableRowIndex = 1000;
+const SEARCH_RESULT_REQUEST_LIMIT_PER_CHUNK: u32 = 100_000;
+const MAX_SEARCH_RESULTS_PER_CHUNK: usize = 100_000;
+const MAX_EXPANDED_SEARCH_ROWS_PER_CHUNK: usize = 200_000;
+const MAX_TOTAL_SEARCH_RESULTS: usize = 100_000;
+const MAX_TOTAL_EXPANDED_SEARCH_ROWS: usize = 200_000;
+const PARALLEL_SORT_MIN_RESULTS: usize = 4096;
+const SEARCH_RETRY_BASE_MILLIS: u64 = 50;
+const SEARCH_RETRY_MAX_MILLIS: u64 = 1000;
 
 pub struct CopyOverlay {
     delegate: Arc<dyn Pane>,
     render: Arc<Mutex<CopyRenderable>>,
     writer: Mutex<SearchOverlayPatternWriter>,
+}
+
+fn close_copy_overlay_if_current(
+    term_window: &TermWindow,
+    pane_id: PaneId,
+    instance_token: &Arc<()>,
+) {
+    let removed = {
+        let mut state = term_window.pane_state(pane_id);
+        let is_current = state
+            .overlay
+            .as_ref()
+            .and_then(|overlay| overlay.pane.downcast_ref::<CopyOverlay>())
+            .is_some_and(|copy_overlay| {
+                Arc::ptr_eq(&copy_overlay.render.lock().instance_token, instance_token)
+            });
+        if is_current {
+            state.overlay.take();
+            true
+        } else {
+            false
+        }
+    };
+    if removed {
+        if let Some(window) = term_window.window.as_ref() {
+            window.invalidate();
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -59,6 +99,10 @@ struct Jump {
 }
 
 struct CopyRenderable {
+    /// Exact, allocation-backed identity for this overlay instance. Numeric
+    /// pane ids and per-instance run counters can both be reused; pointer
+    /// identity cannot be forged by a later overlay occupying the same pane.
+    instance_token: Arc<()>,
     cursor: StableCursorPosition,
     delegate: Arc<dyn Pane>,
     start: Option<SelectionCoordinate>,
@@ -72,6 +116,14 @@ struct CopyRenderable {
     search_line: LineEditBuffer,
     /// The most recently queried set of matches
     results: Vec<SearchResult>,
+    /// Source endpoint that authorized the corresponding entry in `results`.
+    /// Copy-mode searches scrollback in chunks, so a single global endpoint
+    /// cannot prove that every accumulated match is still current.
+    result_source_ends: Vec<SequenceNo>,
+    /// Exact searched chunk that authorized each corresponding result. Match
+    /// validity can depend on multiline/regex context outside its own span.
+    result_source_ranges: Vec<Range<StableRowIndex>>,
+    expanded_result_rows: usize,
     by_line: HashMap<StableRowIndex, Vec<MatchResult>>,
     last_result_seqno: SequenceNo,
     last_bar_pos: Option<StableRowIndex>,
@@ -84,12 +136,53 @@ struct CopyRenderable {
     /// Used to debounce queries while the user is typing
     typing_cookie: usize,
     searching: Option<Searching>,
+    next_search_run_id: usize,
+    search_abort: Option<AbortHandle>,
+    search_preparation_cancel: Option<Arc<AtomicBool>>,
+    search_preparation_gate: Arc<Mutex<()>>,
+    debounce_abort: Option<AbortHandle>,
+    debounce_token: Option<Arc<()>>,
+    retry_abort: Option<AbortHandle>,
+    retry_token: Option<Arc<()>>,
+    desired_result: Option<SearchResultAnchor>,
+    desired_result_ordinal: Option<usize>,
     pending_jump: Option<PendingJump>,
     last_jump: Option<Jump>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Searching {
     remain: StableRowIndex,
+    run: SearchRunIdentity,
+    range: Range<StableRowIndex>,
+    retry_attempt: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SearchResultAnchor {
+    start_x: usize,
+    start_y: StableRowIndex,
+    end_x: usize,
+    end_y: StableRowIndex,
+    match_id: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SearchRunIdentity {
+    id: usize,
+    source_seqno: SequenceNo,
+    cols: usize,
+    viewport_rows: usize,
+    scrollback_rows: usize,
+    physical_top: StableRowIndex,
+    scrollback_top: StableRowIndex,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchCompletionStatus {
+    Accepted,
+    Superseded,
+    SourceChanged,
 }
 
 #[derive(Debug)]
@@ -98,10 +191,761 @@ struct MatchResult {
     result_index: usize,
 }
 
+struct PreparedCopyChunk {
+    results: Vec<SearchResult>,
+    by_line: HashMap<StableRowIndex, Vec<MatchResult>>,
+    dirty_rows: RangeSet<StableRowIndex>,
+    expanded_rows: usize,
+}
+
 struct Dimensions {
     vertical_gap: isize,
     dims: RenderableDimensions,
     top: StableRowIndex,
+}
+
+fn merge_dirty_results(
+    lines: Range<StableRowIndex>,
+    mut delegate_dirty: RangeSet<StableRowIndex>,
+    overlay_dirty: &RangeSet<StableRowIndex>,
+) -> RangeSet<StableRowIndex> {
+    delegate_dirty.add_set(overlay_dirty);
+    delegate_dirty.intersection_with_range(lines)
+}
+
+/// Transfer overlay damage to the renderer only at the exact source-fence
+/// discovery boundary. Ordinary line reads are deliberately non-destructive:
+/// they are used by selection, automation, and accessibility consumers and
+/// are not evidence that a frame will be presented.
+///
+/// This is the narrowest DamageGeneration handoff available through `Pane`.
+/// It is still a single-consumer handoff rather than a per-window GPU-present
+/// acknowledgement; callers that need independent damage generations require
+/// a wider renderer API.
+fn take_dirty_results(
+    lines: Range<StableRowIndex>,
+    mut delegate_dirty: RangeSet<StableRowIndex>,
+    overlay_dirty: &mut RangeSet<StableRowIndex>,
+) -> RangeSet<StableRowIndex> {
+    let claimed = overlay_dirty.intersection_with_range(lines.clone());
+    delegate_dirty.add_set(&claimed);
+
+    let mut retained = RangeSet::default();
+    for range in overlay_dirty.iter() {
+        if range.start < lines.start {
+            retained.add_range(range.start..range.end.min(lines.start));
+        }
+        if range.end > lines.end {
+            retained.add_range(range.start.max(lines.end)..range.end);
+        }
+    }
+    *overlay_dirty = retained;
+    delegate_dirty.intersection_with_range(lines)
+}
+
+fn prune_dirty_results(
+    dirty: &mut RangeSet<StableRowIndex>,
+    retained: Option<Range<StableRowIndex>>,
+) {
+    *dirty = retained
+        .map(|range| dirty.intersection_with_range(range))
+        .unwrap_or_default();
+}
+
+fn retained_row_range(dims: RenderableDimensions) -> Option<Range<StableRowIndex>> {
+    checked_stable_row_end(dims.scrollback_top, dims.scrollback_rows)
+        .map(|end| dims.scrollback_top..end)
+}
+
+fn compute_search_row_from_viewport(
+    viewport: Option<StableRowIndex>,
+    dims: RenderableDimensions,
+) -> StableRowIndex {
+    // `RangeSet::add(row)` represents a scalar as `row..row + 1`, so MAX is
+    // not a representable dirty row even though it is a valid scalar.
+    let max_dirty_row = StableRowIndex::MAX.saturating_sub(1);
+    let top = viewport.unwrap_or(dims.physical_top).min(max_dirty_row);
+    let Some(last_row_offset) = dims
+        .viewport_rows
+        .checked_sub(1)
+        .and_then(|offset| StableRowIndex::try_from(offset).ok())
+    else {
+        // A zero-height or unrepresentably tall viewport has no trustworthy
+        // bottom row. Keep the overlay anchored at the known-representable
+        // top instead of wrapping or inventing a row outside the viewport.
+        return top;
+    };
+
+    top.checked_add(last_row_offset)
+        .filter(|row| *row <= max_dirty_row)
+        .unwrap_or(top)
+}
+
+fn checked_stable_row_end(
+    top: StableRowIndex,
+    row_count: usize,
+) -> Option<StableRowIndex> {
+    let row_count = StableRowIndex::try_from(row_count).ok()?;
+    top.checked_add(row_count)
+}
+
+fn checked_last_stable_row(
+    top: StableRowIndex,
+    row_count: usize,
+) -> Option<StableRowIndex> {
+    let last_offset = row_count.checked_sub(1)?;
+    let last_offset = StableRowIndex::try_from(last_offset).ok()?;
+    top.checked_add(last_offset)
+}
+
+fn checked_page_up_boundary(
+    top: StableRowIndex,
+    viewport_rows: usize,
+) -> Option<StableRowIndex> {
+    let viewport_rows = StableRowIndex::try_from(viewport_rows).ok()?;
+    top.checked_sub(viewport_rows)
+}
+
+fn checked_page_down_boundary(
+    top: StableRowIndex,
+    viewport_rows: usize,
+) -> Option<StableRowIndex> {
+    checked_stable_row_end(top, viewport_rows)
+}
+
+fn one_line_range(row: StableRowIndex) -> Option<Range<StableRowIndex>> {
+    row.checked_add(1).map(|end| row..end)
+}
+
+fn checked_fractional_row_delta(viewport_rows: usize, amount: f64) -> Option<StableRowIndex> {
+    let viewport_rows = StableRowIndex::try_from(viewport_rows).ok()?;
+    let scaled = viewport_rows as f64 * amount;
+    let min_inclusive = StableRowIndex::MIN as f64;
+    let max_exclusive = -min_inclusive;
+    if !scaled.is_finite() || scaled < min_inclusive || scaled >= max_exclusive {
+        return None;
+    }
+    Some(scaled.trunc() as StableRowIndex)
+}
+
+fn allocate_search_run_id(next: &mut usize) -> Option<usize> {
+    let id = *next;
+    *next = id.checked_add(1)?;
+    Some(id)
+}
+
+fn search_retry_delay(attempt: u8) -> Duration {
+    let shift = u32::from(attempt.min(10));
+    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    Duration::from_millis(
+        SEARCH_RETRY_BASE_MILLIS
+            .saturating_mul(multiplier)
+            .min(SEARCH_RETRY_MAX_MILLIS),
+    )
+}
+
+fn search_result_anchor(result: &SearchResult) -> SearchResultAnchor {
+    SearchResultAnchor {
+        start_x: result.start_x,
+        start_y: result.start_y,
+        end_x: result.end_x,
+        end_y: result.end_y,
+        match_id: result.match_id,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValidatedSearchGeometry {
+    start_x: usize,
+    start_y: StableRowIndex,
+    end_x: usize,
+    end_y: StableRowIndex,
+    row_span: usize,
+}
+
+fn validate_search_geometry(
+    start_x: usize,
+    start_y: StableRowIndex,
+    end_x: usize,
+    end_y: StableRowIndex,
+    searched: &Range<StableRowIndex>,
+    cols: usize,
+) -> Option<ValidatedSearchGeometry> {
+    if cols == 0
+        || searched.start >= searched.end
+        || start_y > end_y
+        || start_y < searched.start
+        || end_x > cols
+        || start_x > cols
+    {
+        return None;
+    }
+    let searched_last = searched.end.checked_sub(1)?;
+    if end_y > searched_last {
+        return None;
+    }
+
+    let row_span = end_y
+        .checked_sub(start_y)?
+        .checked_add(1)
+        .and_then(|span| usize::try_from(span).ok())?;
+    if (start_y == end_y && start_x >= end_x)
+        || (row_span == 2 && start_x == cols && end_x == 0)
+    {
+        return None;
+    }
+
+    Some(ValidatedSearchGeometry {
+        start_x,
+        start_y,
+        end_x,
+        end_y,
+        row_span,
+    })
+}
+
+fn inclusive_search_result_end(
+    result: &SearchResult,
+    cols: usize,
+) -> Option<(usize, StableRowIndex)> {
+    if result.end_x > 0 {
+        Some((result.end_x.checked_sub(1)?, result.end_y))
+    } else if result.end_y > result.start_y && cols > 0 {
+        Some((cols.checked_sub(1)?, result.end_y.checked_sub(1)?))
+    } else {
+        None
+    }
+}
+
+fn sanitize_search_results(
+    results: Vec<SearchResult>,
+    searched: &Range<StableRowIndex>,
+    cols: usize,
+    cancel: &AtomicBool,
+) -> Option<Vec<SearchResult>> {
+    let mut sanitized = Vec::with_capacity(results.len().min(MAX_SEARCH_RESULTS_PER_CHUNK));
+    let mut expanded_rows = 0usize;
+    for (index, mut result) in results
+        .into_iter()
+        .take(MAX_SEARCH_RESULTS_PER_CHUNK)
+        .enumerate()
+    {
+        if index.is_multiple_of(256) && cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Some(geometry) = validate_search_geometry(
+            result.start_x,
+            result.start_y,
+            result.end_x,
+            result.end_y,
+            searched,
+            cols,
+        ) else {
+            continue;
+        };
+        let Some(next_expanded_rows) = expanded_rows.checked_add(geometry.row_span) else {
+            break;
+        };
+        if next_expanded_rows > MAX_EXPANDED_SEARCH_ROWS_PER_CHUNK {
+            break;
+        }
+        expanded_rows = next_expanded_rows;
+        result.start_x = geometry.start_x;
+        result.start_y = geometry.start_y;
+        result.end_x = geometry.end_x;
+        result.end_y = geometry.end_y;
+        sanitized.push(result);
+    }
+    (!cancel.load(Ordering::Relaxed)).then_some(sanitized)
+}
+
+/// Perform all sorting, geometry validation, and per-row expansion before
+/// entering the window `Apply` callback. Installing this prepared chunk only moves bounded
+/// collections and merges at most one entry per searched row while the UI
+/// renderer lock is held.
+fn prepare_copy_search_chunk(
+    results: Vec<SearchResult>,
+    searched: &Range<StableRowIndex>,
+    cols: usize,
+    result_base: usize,
+    result_capacity: usize,
+    expanded_row_capacity: usize,
+    cancel: &AtomicBool,
+) -> Option<PreparedCopyChunk> {
+    let mut results = sanitize_search_results(results, searched, cols, cancel)?;
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    if results.len() >= PARALLEL_SORT_MIN_RESULTS {
+        results.par_sort_unstable();
+    } else {
+        results.sort_unstable();
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    results.reverse();
+
+    let mut prepared_results = Vec::with_capacity(results.len().min(result_capacity));
+    let mut by_line: HashMap<StableRowIndex, Vec<MatchResult>> = HashMap::new();
+    let mut dirty_rows = RangeSet::default();
+    let mut expanded_rows = 0usize;
+
+    for (index, result) in results.into_iter().take(result_capacity).enumerate() {
+        if index.is_multiple_of(256) && cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Some(row_span) = result
+            .end_y
+            .checked_sub(result.start_y)
+            .and_then(|span| span.checked_add(1))
+            .and_then(|span| usize::try_from(span).ok())
+        else {
+            continue;
+        };
+        let Some(next_expanded_rows) = expanded_rows.checked_add(row_span) else {
+            break;
+        };
+        if next_expanded_rows > expanded_row_capacity {
+            break;
+        }
+        let Some(result_index) = result_base.checked_add(prepared_results.len()) else {
+            break;
+        };
+
+        for (row_offset, row) in (result.start_y..=result.end_y).enumerate() {
+            if row_offset.is_multiple_of(256) && cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let range = if row == result.start_y && row == result.end_y {
+                result.start_x..result.end_x
+            } else if row == result.end_y {
+                0..result.end_x
+            } else if row == result.start_y {
+                result.start_x..cols
+            } else {
+                0..cols
+            };
+            if range.start >= range.end {
+                continue;
+            }
+            by_line
+                .entry(row)
+                .or_default()
+                .push(MatchResult { range, result_index });
+            dirty_rows.add(row);
+        }
+
+        expanded_rows = next_expanded_rows;
+        prepared_results.push(result);
+    }
+
+    Some(PreparedCopyChunk {
+        results: prepared_results,
+        by_line,
+        dirty_rows,
+        expanded_rows,
+    })
+}
+
+async fn prepare_copy_search_chunk_off_thread(
+    results: Vec<SearchResult>,
+    searched: Range<StableRowIndex>,
+    cols: usize,
+    result_base: usize,
+    result_capacity: usize,
+    expanded_row_capacity: usize,
+    cancel: Arc<AtomicBool>,
+    gate: Arc<Mutex<()>>,
+) -> Result<PreparedCopyChunk, String> {
+    let (sender, receiver) = oneshot::channel();
+    rayon::spawn(move || {
+        let Some(_gate_guard) = gate.try_lock() else {
+            let _ = sender.send(Err("copy search preparation lane busy".to_string()));
+            return;
+        };
+        let prepared = prepare_copy_search_chunk(
+            results,
+            &searched,
+            cols,
+            result_base,
+            result_capacity,
+            expanded_row_capacity,
+            &cancel,
+        );
+        if let Some(prepared) = prepared {
+            let _ = sender.send(Ok(prepared));
+        } else {
+            let _ = sender.send(Err("copy search preparation cancelled".to_string()));
+        }
+    });
+    receiver
+        .await
+        .map_err(|_| "copy search result preparation worker stopped".to_string())?
+}
+
+fn search_run_identity(
+    id: usize,
+    source_seqno: SequenceNo,
+    dims: RenderableDimensions,
+) -> SearchRunIdentity {
+    SearchRunIdentity {
+        id,
+        source_seqno,
+        cols: dims.cols,
+        viewport_rows: dims.viewport_rows,
+        scrollback_rows: dims.scrollback_rows,
+        physical_top: dims.physical_top,
+        scrollback_top: dims.scrollback_top,
+    }
+}
+
+fn classify_search_completion(
+    pending: Option<&Searching>,
+    run: SearchRunIdentity,
+    range: &Range<StableRowIndex>,
+    current_source: SearchRunIdentity,
+    source_range_changed: bool,
+) -> SearchCompletionStatus {
+    let Some(pending) = pending else {
+        return SearchCompletionStatus::Superseded;
+    };
+    if pending.run != run || pending.range != *range {
+        return SearchCompletionStatus::Superseded;
+    }
+    let current_retained_end = checked_stable_row_end(
+        current_source.scrollback_top,
+        current_source.scrollback_rows,
+    );
+    if run.cols != current_source.cols
+        || current_source.scrollback_top > range.start
+        || current_retained_end.is_none_or(|end| range.end > end)
+        || source_range_changed
+    {
+        return SearchCompletionStatus::SourceChanged;
+    }
+    SearchCompletionStatus::Accepted
+}
+
+fn previous_row_within_scrollback(
+    row: StableRowIndex,
+    scrollback_top: StableRowIndex,
+) -> Option<StableRowIndex> {
+    if row > scrollback_top {
+        row.checked_sub(1)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod dirty_tracking_tests {
+    use super::*;
+
+    fn make_dirty_ranges(
+        ranges: impl IntoIterator<Item = Range<StableRowIndex>>,
+    ) -> RangeSet<StableRowIndex> {
+        let mut dirty = RangeSet::default();
+        for range in ranges {
+            dirty.add_range(range);
+        }
+        dirty
+    }
+
+    fn collect_ranges(set: &RangeSet<StableRowIndex>) -> Vec<Range<StableRowIndex>> {
+        set.iter().cloned().collect()
+    }
+
+    fn dimensions(physical_top: StableRowIndex, viewport_rows: usize) -> RenderableDimensions {
+        RenderableDimensions {
+            cols: 80,
+            viewport_rows,
+            scrollback_rows: 100,
+            physical_top,
+            scrollback_top: 0,
+            dpi: 96,
+            pixel_width: 640,
+            pixel_height: 80,
+            reverse_video: false,
+        }
+    }
+
+    #[test]
+    fn copy_overlay_dirty_rows_are_reported_without_delegate_damage() {
+        let overlay_dirty = make_dirty_ranges([12..14]);
+
+        let merged = merge_dirty_results(10..20, RangeSet::default(), &overlay_dirty);
+
+        assert_eq!(collect_ranges(&merged), vec![12..14]);
+    }
+
+    #[test]
+    fn copy_overlay_dirty_rows_are_clipped_to_requested_range() {
+        let delegate_dirty = make_dirty_ranges([5..8, 12..14]);
+        let overlay_dirty = make_dirty_ranges([18..22]);
+
+        let merged = merge_dirty_results(10..20, delegate_dirty, &overlay_dirty);
+
+        assert_eq!(collect_ranges(&merged), vec![12..14, 18..20]);
+    }
+
+    #[test]
+    fn copy_search_row_tracks_viewport_bottom_edge() {
+        let dims = dimensions(40, 5);
+
+        assert_eq!(compute_search_row_from_viewport(None, dims), 44);
+        assert_eq!(compute_search_row_from_viewport(Some(12), dims), 16);
+    }
+
+    #[test]
+    fn copy_search_row_fails_closed_when_bottom_would_overflow() {
+        let dims = dimensions(StableRowIndex::MAX, 2);
+
+        let row = compute_search_row_from_viewport(Some(StableRowIndex::MAX), dims);
+        assert_eq!(row, StableRowIndex::MAX.saturating_sub(1));
+        let mut dirty = RangeSet::default();
+        dirty.add(row);
+        assert_eq!(collect_ranges(&dirty), vec![row..StableRowIndex::MAX]);
+    }
+
+    #[test]
+    fn copy_search_row_fails_closed_for_oversized_or_empty_viewport() {
+        assert_eq!(
+            compute_search_row_from_viewport(Some(17), dimensions(0, usize::MAX)),
+            17
+        );
+        assert_eq!(
+            compute_search_row_from_viewport(Some(17), dimensions(0, 0)),
+            17
+        );
+    }
+
+    #[test]
+    fn copy_page_boundaries_fail_closed_at_stable_row_limits() {
+        assert_eq!(checked_page_up_boundary(StableRowIndex::MIN, 1), None);
+        assert_eq!(
+            checked_page_down_boundary(StableRowIndex::MAX, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn copy_page_boundaries_reject_oversized_viewports() {
+        assert_eq!(checked_page_up_boundary(17, usize::MAX), None);
+        assert_eq!(checked_page_down_boundary(17, usize::MAX), None);
+    }
+
+    #[test]
+    fn copy_extent_helpers_cover_empty_and_limit_boundaries() {
+        assert_eq!(checked_stable_row_end(7, 0), Some(7));
+        assert_eq!(checked_last_stable_row(7, 0), None);
+        assert_eq!(checked_stable_row_end(StableRowIndex::MAX, 1), None);
+        assert_eq!(
+            checked_last_stable_row(StableRowIndex::MAX, 2),
+            None
+        );
+        assert_eq!(one_line_range(StableRowIndex::MAX), None);
+    }
+
+    #[test]
+    fn fractional_page_delta_rejects_oversized_or_non_finite_inputs() {
+        assert_eq!(checked_fractional_row_delta(5, 0.5), Some(2));
+        assert_eq!(checked_fractional_row_delta(usize::MAX, 1.0), None);
+        assert_eq!(checked_fractional_row_delta(5, f64::INFINITY), None);
+    }
+
+    fn search_identity(id: usize, seqno: SequenceNo, cols: usize) -> SearchRunIdentity {
+        let mut dims = dimensions(0, 5);
+        dims.cols = cols;
+        search_run_identity(id, seqno, dims)
+    }
+
+    fn pending(run: SearchRunIdentity, range: Range<StableRowIndex>) -> Searching {
+        Searching {
+            remain: 0,
+            run,
+            range,
+            retry_attempt: 0,
+        }
+    }
+
+    #[test]
+    fn copy_search_completion_rejects_same_pattern_from_superseded_run() {
+        let old = search_identity(1, 10, 80);
+        let current = search_identity(2, 10, 80);
+        let pending = pending(current, 0..10);
+
+        assert_eq!(
+            classify_search_completion(Some(&pending), old, &(0..10), current, false),
+            SearchCompletionStatus::Superseded
+        );
+    }
+
+    #[test]
+    fn copy_search_completion_accepts_only_exact_run_range_and_source() {
+        let run = search_identity(2, 10, 80);
+        let pending = pending(run, 0..10);
+
+        assert_eq!(
+            classify_search_completion(Some(&pending), run, &(0..10), run, false),
+            SearchCompletionStatus::Accepted
+        );
+    }
+
+    #[test]
+    fn copy_search_completion_rejects_out_of_order_chunk_range() {
+        let run = search_identity(2, 10, 80);
+        let pending = pending(run, 0..10);
+
+        assert_eq!(
+            classify_search_completion(Some(&pending), run, &(10..20), run, false),
+            SearchCompletionStatus::Superseded
+        );
+    }
+
+    #[test]
+    fn copy_search_completion_ignores_unrelated_source_change_but_rejects_dirty_range_or_resize() {
+        let run = search_identity(2, 10, 80);
+        let pending = pending(run, 0..10);
+        let changed_source = search_identity(99, 11, 80);
+        let resized = search_identity(99, 10, 120);
+
+        assert_eq!(
+            classify_search_completion(Some(&pending), run, &(0..10), changed_source, false),
+            SearchCompletionStatus::Accepted
+        );
+        assert_eq!(
+            classify_search_completion(Some(&pending), run, &(0..10), changed_source, true),
+            SearchCompletionStatus::SourceChanged
+        );
+        assert_eq!(
+            classify_search_completion(Some(&pending), run, &(0..10), resized, false),
+            SearchCompletionStatus::SourceChanged
+        );
+    }
+
+    #[test]
+    fn copy_search_run_id_exhaustion_never_wraps_or_reuses_an_id() {
+        let mut next = usize::MAX;
+        assert_eq!(allocate_search_run_id(&mut next), None);
+        assert_eq!(next, usize::MAX);
+    }
+
+    #[test]
+    fn previous_word_navigation_respects_negative_scrollback_top() {
+        assert_eq!(previous_row_within_scrollback(-5, -10), Some(-6));
+        assert_eq!(previous_row_within_scrollback(-10, -10), None);
+        assert_eq!(
+            previous_row_within_scrollback(StableRowIndex::MIN, StableRowIndex::MIN),
+            None
+        );
+    }
+
+    #[test]
+    fn copy_overlay_instance_tokens_do_not_alias_across_reopen() {
+        let first = Arc::new(());
+        let reopened = Arc::new(());
+        assert!(!Arc::ptr_eq(&first, &reopened));
+        assert!(Arc::ptr_eq(&first, &Arc::clone(&first)));
+    }
+
+    #[test]
+    fn copy_damage_transfer_splits_claimed_range_and_preserves_other_consumers() {
+        let mut overlay = make_dirty_ranges([1..4, 8..12]);
+        let claimed = take_dirty_results(2..10, RangeSet::default(), &mut overlay);
+        assert_eq!(collect_ranges(&claimed), vec![2..4, 8..10]);
+        assert_eq!(collect_ranges(&overlay), vec![1..2, 10..12]);
+    }
+
+    #[test]
+    fn copy_damage_pruning_handles_negative_scrollback_and_drops_retired_rows() {
+        let mut dirty = make_dirty_ranges([-20..-10, -5..3, 8..12]);
+        prune_dirty_results(&mut dirty, Some(-10..10));
+        assert_eq!(collect_ranges(&dirty), vec![-5..3, 8..10]);
+    }
+
+    #[test]
+    fn copy_search_geometry_is_strictly_validated_and_cardinality_is_checked() {
+        assert_eq!(validate_search_geometry(7, -20, 90, 20, &(-5..6), 80), None);
+        assert_eq!(validate_search_geometry(9, 2, 9, 2, &(0..4), 80), None);
+        assert_eq!(validate_search_geometry(0, 9, 1, 2, &(0..10), 80), None);
+        assert_eq!(
+            validate_search_geometry(7, -5, 80, 5, &(-5..6), 80),
+            Some(ValidatedSearchGeometry {
+                start_x: 7,
+                start_y: -5,
+                end_x: 80,
+                end_y: 5,
+                row_span: 11,
+            })
+        );
+    }
+
+    #[test]
+    fn copy_multiline_exclusive_zero_end_selects_previous_row() {
+        let result = SearchResult {
+            start_y: 2,
+            start_x: 7,
+            end_y: 3,
+            end_x: 0,
+            match_id: 1,
+        };
+        assert_eq!(inclusive_search_result_end(&result, 80), Some((79, 2)));
+    }
+
+    #[test]
+    fn copy_search_preparation_applies_global_cap_and_stable_indexes() {
+        let results = vec![
+            SearchResult {
+                start_y: 2,
+                start_x: 1,
+                end_y: 2,
+                end_x: 3,
+                match_id: 1,
+            },
+            SearchResult {
+                start_y: 3,
+                start_x: 4,
+                end_y: 3,
+                end_x: 6,
+                match_id: 2,
+            },
+        ];
+        let cancel = AtomicBool::new(false);
+        let prepared = prepare_copy_search_chunk(results, &(0..10), 80, 7, 1, 1, &cancel)
+            .expect("uncancelled preparation completes");
+
+        assert_eq!(prepared.results.len(), 1);
+        assert_eq!(prepared.expanded_rows, 1);
+        let only_match = prepared
+            .by_line
+            .values()
+            .next()
+            .and_then(|matches| matches.first())
+            .expect("one prepared row match");
+        assert_eq!(only_match.result_index, 7);
+    }
+
+    #[test]
+    fn copy_search_preparation_honors_latest_wins_cancellation() {
+        let cancel = AtomicBool::new(true);
+        assert!(
+            prepare_copy_search_chunk(Vec::new(), &(0..10), 80, 0, 1, 1, &cancel).is_none()
+        );
+    }
+
+    #[test]
+    fn copy_search_preparation_gate_rejects_overlap_without_queueing() {
+        let gate = Mutex::new(());
+        let _running = gate.lock();
+        assert!(gate.try_lock().is_none());
+    }
+
+    #[test]
+    fn copy_search_retry_delay_is_bounded() {
+        assert_eq!(search_retry_delay(0), Duration::from_millis(50));
+        assert_eq!(search_retry_delay(u8::MAX), Duration::from_millis(1000));
+    }
 }
 
 #[derive(Debug)]
@@ -143,12 +987,16 @@ impl CopyOverlay {
         let search_line = LineEditBuffer::new(&pattern, pattern.len());
 
         let mut render = CopyRenderable {
+            instance_token: Arc::new(()),
             cursor,
             window,
             delegate: Arc::clone(pane),
             start: None,
             viewport: term_window.get_viewport(pane.pane_id()),
             results: vec![],
+            result_source_ends: vec![],
+            result_source_ranges: vec![],
+            expanded_result_rows: 0,
             by_line: HashMap::new(),
             dirty_results: RangeSet::default(),
             width: dims.cols,
@@ -163,6 +1011,16 @@ impl CopyOverlay {
             selection_mode: SelectionMode::Cell,
             typing_cookie: 0,
             searching: None,
+            next_search_run_id: 0,
+            search_abort: None,
+            search_preparation_cancel: None,
+            search_preparation_gate: Arc::new(Mutex::new(())),
+            debounce_abort: None,
+            debounce_token: None,
+            retry_abort: None,
+            retry_token: None,
+            desired_result: None,
+            desired_result_ordinal: None,
             pending_jump: None,
             last_jump: None,
         };
@@ -201,8 +1059,7 @@ impl CopyOverlay {
                 .set_line_and_cursor(&params.pattern, params.pattern.len());
             render.schedule_update_search();
         }
-        let search_row = render.compute_search_row();
-        render.dirty_results.add(search_row);
+        render.mark_search_ui_dirty();
     }
 
     pub fn viewport_changed(&self, viewport: Option<StableRowIndex>) {
@@ -211,86 +1068,164 @@ impl CopyOverlay {
             if let Some(last) = render.last_bar_pos.take() {
                 render.dirty_results.add(last);
             }
-            if let Some(pos) = viewport.as_ref() {
-                render.dirty_results.add(*pos);
-            }
             render.viewport = viewport;
+            render.mark_search_ui_dirty();
+        }
+    }
+}
+
+impl Drop for CopyRenderable {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.search_preparation_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(abort) = self.search_abort.take() {
+            abort.abort();
+        }
+        if let Some(abort) = self.debounce_abort.take() {
+            abort.abort();
+        }
+        if let Some(abort) = self.retry_abort.take() {
+            abort.abort();
         }
     }
 }
 
 impl CopyRenderable {
     fn compute_search_row(&self) -> StableRowIndex {
-        let dims = self.delegate.get_dimensions();
-        let top = self.viewport.unwrap_or_else(|| dims.physical_top);
-        let bottom = (top + dims.viewport_rows as StableRowIndex).saturating_sub(1);
-        bottom
+        compute_search_row_from_viewport(self.viewport, self.delegate.get_dimensions())
     }
 
-    fn check_for_resize(&mut self) {
+    fn update_dimensions(&mut self) -> bool {
         let dims = self.delegate.get_dimensions();
         if dims.cols == self.width && dims.viewport_rows == self.height {
-            return;
+            return false;
         }
 
         self.width = dims.cols;
         self.height = dims.viewport_rows;
-
-        let pos = self.result_pos;
-        self.update_search();
-        self.result_pos = pos;
+        true
     }
 
-    fn incrementally_recompute_results(&mut self, mut results: Vec<SearchResult>) {
-        results.sort();
-        results.reverse();
-        for (result_index, res) in results.iter().enumerate() {
-            let result_index = self.results.len() + result_index;
-            for idx in res.start_y..=res.end_y {
-                let range = if idx == res.start_y && idx == res.end_y {
-                    // Range on same line
-                    res.start_x..res.end_x
-                } else if idx == res.end_y {
-                    // final line of multi-line
-                    0..res.end_x
-                } else if idx == res.start_y {
-                    // first line of multi-line
-                    res.start_x..self.width
-                } else {
-                    // a middle line
-                    0..self.width
-                };
-
-                let result = MatchResult {
-                    range,
-                    result_index,
-                };
-
-                let matches = self.by_line.entry(idx).or_insert_with(|| vec![]);
-                matches.push(result);
-
-                self.dirty_results.add(idx);
-            }
+    fn mark_search_ui_dirty(&mut self) {
+        if let Some(last) = self.last_bar_pos {
+            self.dirty_results.add(last);
         }
-        self.results.append(&mut results);
+        self.dirty_results.add(self.compute_search_row());
+        let retained = retained_row_range(self.delegate.get_dimensions());
+        prune_dirty_results(&mut self.dirty_results, retained);
+        self.window.invalidate();
+    }
+
+    fn cancel_search_task(&mut self) {
+        if let Some(cancel) = self.search_preparation_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(abort) = self.search_abort.take() {
+            abort.abort();
+        }
+    }
+
+    fn cancel_debounce(&mut self) {
+        if let Some(abort) = self.debounce_abort.take() {
+            abort.abort();
+        }
+        self.debounce_token.take();
+    }
+
+    fn cancel_retry(&mut self) {
+        if let Some(abort) = self.retry_abort.take() {
+            abort.abort();
+        }
+        self.retry_token.take();
+    }
+
+    fn prepare_for_render(&mut self, lines: Range<StableRowIndex>) {
+        let resized = self.update_dimensions();
+        let source_changed = if resized || self.searching.is_some() || self.get_pattern().is_empty()
+        {
+            false
+        } else {
+            let (source_end, dirty) = self
+                .delegate
+                .get_changed_since_with_source_fence(lines, self.last_result_seqno);
+            source_end < self.last_result_seqno || dirty.iter().next().is_some()
+        };
+        if resized || source_changed {
+            self.restart_search(true, 0);
+        }
+    }
+
+    fn install_prepared_search_chunk(
+        &mut self,
+        mut prepared: PreparedCopyChunk,
+        source_end: SequenceNo,
+        source_range: Range<StableRowIndex>,
+    ) {
+        let result_count = prepared.results.len();
+        // Search chunks are clipped to disjoint row ranges, so their row maps
+        // can transfer ownership wholesale without copying every match under
+        // the renderer lock.
+        self.by_line.extend(prepared.by_line);
+        self.dirty_results.add_set(&prepared.dirty_rows);
+        self.expanded_result_rows = self
+            .expanded_result_rows
+            .saturating_add(prepared.expanded_rows)
+            .min(MAX_TOTAL_EXPANDED_SEARCH_ROWS);
+        self.result_source_ends
+            .extend(std::iter::repeat(source_end).take(result_count));
+        self.result_source_ranges.extend(
+            std::iter::repeat_with(|| source_range.clone()).take(result_count),
+        );
+        self.results.append(&mut prepared.results);
     }
 
     fn schedule_update_search(&mut self) {
-        self.typing_cookie += 1;
+        self.mark_search_ui_dirty();
+        // The debounce delays only the replacement query; obsolete search and
+        // CPU-preparation work should stop as soon as the pattern changes.
+        self.cancel_search_task();
+        self.searching.take();
+        self.cancel_debounce();
+        self.cancel_retry();
+        let Some(next_cookie) = self.typing_cookie.checked_add(1) else {
+            // Exhaustion is sticky. The exact instance token still prevents a
+            // cross-overlay ABA; run synchronously rather than reusing a cookie.
+            self.restart_search(false, 0);
+            return;
+        };
+        self.typing_cookie = next_cookie;
         let cookie = self.typing_cookie;
 
         let window = self.window.clone();
         let pane_id = self.delegate.pane_id();
+        let instance_token = Arc::clone(&self.instance_token);
+        let debounce_token = Arc::new(());
+        self.debounce_token = Some(Arc::clone(&debounce_token));
+        let (abort, registration) = AbortHandle::new_pair();
+        self.debounce_abort = Some(abort);
 
         promise::spawn::spawn(async move {
-            sleep(Duration::from_millis(350)).await;
+            if Abortable::new(sleep(Duration::from_millis(350)), registration)
+                .await
+                .is_err()
+            {
+                return anyhow::Result::<()>::Ok(());
+            }
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 let state = term_window.pane_state(pane_id);
                 if let Some(overlay) = state.overlay.as_ref() {
                     if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
                         let mut r = copy_overlay.render.lock();
-                        if cookie == r.typing_cookie {
-                            r.update_search();
+                        if Arc::ptr_eq(&r.instance_token, &instance_token)
+                            && cookie == r.typing_cookie
+                            && r.debounce_token
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, &debounce_token))
+                        {
+                            r.debounce_abort.take();
+                            r.debounce_token.take();
+                            r.restart_search(false, 0);
                         }
                     }
                 }
@@ -301,6 +1236,25 @@ impl CopyRenderable {
     }
 
     fn update_search(&mut self) {
+        self.restart_search(false, 0);
+    }
+
+    fn restart_search(&mut self, preserve_result: bool, retry_attempt: u8) {
+        self.cancel_search_task();
+        self.cancel_debounce();
+        self.cancel_retry();
+        self.searching.take();
+
+        if preserve_result && self.desired_result.is_none() {
+            self.desired_result_ordinal = self.result_pos;
+            self.desired_result = self
+                .result_pos
+                .and_then(|position| self.results.get(position))
+                .map(search_result_anchor);
+        } else if !preserve_result {
+            self.desired_result.take();
+            self.desired_result_ordinal.take();
+        }
         for idx in self.by_line.keys() {
             self.dirty_results.add(*idx);
         }
@@ -309,88 +1263,312 @@ impl CopyRenderable {
         }
 
         self.results.clear();
+        self.result_source_ends.clear();
+        self.result_source_ranges.clear();
+        self.expanded_result_rows = 0;
         self.by_line.clear();
         self.result_pos.take();
 
         SAVED_PATTERN.lock().insert(self.tab_id, self.get_pattern());
 
+        let dims = self.delegate.get_dimensions();
+        self.width = dims.cols;
+        self.height = dims.viewport_rows;
         let bar_pos = self.compute_search_row();
         self.dirty_results.add(bar_pos);
-        self.last_result_seqno = self.delegate.get_current_seqno();
+        let retained = retained_row_range(dims);
+        prune_dirty_results(&mut self.dirty_results, retained);
+        let Some(run_id) = allocate_search_run_id(&mut self.next_search_run_id) else {
+            self.last_result_seqno = self.delegate.get_current_seqno();
+            self.searching.take();
+            self.clear_selection();
+            self.window.invalidate();
+            return;
+        };
 
         let pattern = self.get_pattern();
         if !pattern.is_empty() {
             let pane: Arc<dyn Pane> = self.delegate.clone();
             let window = self.window.clone();
-            let dims = pane.get_dimensions();
+            let source_seqno = pane.get_current_seqno();
+            let run = search_run_identity(run_id, source_seqno, dims);
+            self.last_result_seqno = source_seqno;
 
-            let end = dims.scrollback_top + dims.scrollback_rows as StableRowIndex;
+            let Some(end) = checked_stable_row_end(dims.scrollback_top, dims.scrollback_rows)
+            else {
+                self.searching.take();
+                self.clear_selection();
+                self.window.invalidate();
+                return;
+            };
             let range = end
                 .saturating_sub(SEARCH_CHUNK_SIZE)
                 .max(dims.scrollback_top)..end;
 
             self.searching.replace(Searching {
-                remain: range.start - dims.scrollback_top,
+                remain: range.start.saturating_sub(dims.scrollback_top),
+                run,
+                range: range.clone(),
+                retry_attempt,
             });
-
-            promise::spawn::spawn(async move {
-                let limit = None;
-                log::trace!("Searching for {pattern:?} in {range:?}");
-                let results = pane.search(pattern.clone(), range.clone(), limit).await?;
-
-                let pane_id = pane.pane_id();
-                let mut results = Some(results);
-                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    let state = term_window.pane_state(pane_id);
-                    if let Some(overlay) = state.overlay.as_ref() {
-                        if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
-                            let mut r = copy_overlay.render.lock();
-                            let Some(search_results) = results.take() else {
-                                log::warn!(
-                                    "copy overlay search results already consumed for pane {pane_id}"
-                                );
-                                return;
-                            };
-                            r.processed_search_chunk(pattern, search_results, range);
-                        }
-                    }
-                })));
-
-                anyhow::Result::<()>::Ok(())
-            })
-            .detach();
+            self.spawn_search_chunk(pane, window, run, pattern, range);
         } else {
+            self.last_result_seqno = self.delegate.get_current_seqno();
             self.searching.take();
             self.clear_selection();
         }
         self.window.invalidate();
     }
 
-    fn processed_search_chunk(
+    fn spawn_search_chunk(
         &mut self,
+        pane: Arc<dyn Pane>,
+        window: ::window::Window,
+        run: SearchRunIdentity,
         pattern: Pattern,
-        results: Vec<SearchResult>,
         range: Range<StableRowIndex>,
     ) {
-        self.window.invalidate();
+        self.cancel_search_task();
+        let instance_token = Arc::clone(&self.instance_token);
+        let result_base = self.results.len();
+        let result_capacity = MAX_TOTAL_SEARCH_RESULTS.saturating_sub(result_base);
+        let expanded_row_capacity =
+            MAX_TOTAL_EXPANDED_SEARCH_ROWS.saturating_sub(self.expanded_result_rows);
+        let preparation_cancel = Arc::new(AtomicBool::new(false));
+        self.search_preparation_cancel = Some(Arc::clone(&preparation_cancel));
+        let preparation_gate = Arc::clone(&self.search_preparation_gate);
+        let (abort, registration) = AbortHandle::new_pair();
+        self.search_abort = Some(abort);
+        promise::spawn::spawn(async move {
+            let limit = Some(SEARCH_RESULT_REQUEST_LIMIT_PER_CHUNK);
+            log::trace!("Searching for {pattern:?} in {range:?}");
+            let preparation_range = range.clone();
+            let completion = Abortable::new(
+                async {
+                    let results = pane
+                        .search(pattern.clone(), range.clone(), limit)
+                        .await
+                        .map_err(|err| format!("{err:#}"))?;
+                    prepare_copy_search_chunk_off_thread(
+                        results,
+                        preparation_range,
+                        run.cols,
+                        result_base,
+                        result_capacity,
+                        expanded_row_capacity,
+                        preparation_cancel,
+                        preparation_gate,
+                    )
+                    .await
+                },
+                registration,
+            )
+            .await;
+            let outcome = match completion {
+                Err(_) => return anyhow::Result::<()>::Ok(()),
+                Ok(outcome) => outcome,
+            };
+
+            let pane_id = pane.pane_id();
+            let mut outcome = Some(outcome);
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let state = term_window.pane_state(pane_id);
+                if let Some(overlay) = state.overlay.as_ref() {
+                    if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
+                        let mut renderer = copy_overlay.render.lock();
+                        if !Arc::ptr_eq(&renderer.instance_token, &instance_token) {
+                            return;
+                        }
+                        let Some(outcome) = outcome.take() else {
+                            log::warn!(
+                                "copy overlay search completion already consumed for pane {pane_id}"
+                            );
+                            return;
+                        };
+                        match outcome {
+                            Ok(prepared) => renderer.processed_search_chunk(
+                                run,
+                                pattern,
+                                prepared,
+                                range,
+                            ),
+                            Err(error) => {
+                                renderer.processed_search_error(run, range, error);
+                            }
+                        }
+                    }
+                }
+            })));
+            anyhow::Result::<()>::Ok(())
+        })
+        .detach();
+    }
+
+    fn schedule_search_retry(&mut self, run: SearchRunIdentity, retry_attempt: u8) {
+        self.cancel_search_task();
+        self.cancel_retry();
+        let delay = search_retry_delay(retry_attempt);
+        let next_attempt = retry_attempt.saturating_add(1);
+        let pane_id = self.delegate.pane_id();
+        let window = self.window.clone();
+        let instance_token = Arc::clone(&self.instance_token);
+        let retry_token = Arc::new(());
+        self.retry_token = Some(Arc::clone(&retry_token));
+        let (abort, registration) = AbortHandle::new_pair();
+        self.retry_abort = Some(abort);
+        self.mark_search_ui_dirty();
+        promise::spawn::spawn(async move {
+            if Abortable::new(sleep(delay), registration).await.is_err() {
+                return anyhow::Result::<()>::Ok(());
+            }
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let state = term_window.pane_state(pane_id);
+                if let Some(overlay) = state.overlay.as_ref() {
+                    if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
+                        let mut renderer = copy_overlay.render.lock();
+                        if Arc::ptr_eq(&renderer.instance_token, &instance_token)
+                            && renderer.searching.as_ref().is_some_and(|pending| pending.run == run)
+                            && renderer.retry_token
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, &retry_token))
+                        {
+                            renderer.retry_abort.take();
+                            renderer.retry_token.take();
+                            renderer.restart_search(true, next_attempt);
+                        }
+                    }
+                }
+            })));
+            anyhow::Result::<()>::Ok(())
+        })
+        .detach();
+    }
+
+    fn processed_search_error(
+        &mut self,
+        run: SearchRunIdentity,
+        range: Range<StableRowIndex>,
+        error: String,
+    ) {
+        let Some(pending) = self.searching.as_ref() else {
+            return;
+        };
+        if pending.run != run || pending.range != range {
+            return;
+        }
+        let retry_attempt = pending.retry_attempt;
+        self.search_abort.take();
+        self.search_preparation_cancel.take();
+        if error.starts_with("copy search preparation ") {
+            log::debug!("copy overlay search preparation deferred for {range:?}: {error}");
+        } else {
+            log::warn!("copy overlay search failed for {range:?}: {error}");
+        }
+        self.schedule_search_retry(run, retry_attempt);
+    }
+
+    fn processed_search_chunk(
+        &mut self,
+        run: SearchRunIdentity,
+        pattern: Pattern,
+        prepared: PreparedCopyChunk,
+        range: Range<StableRowIndex>,
+    ) {
+        let dims = self.delegate.get_dimensions();
+        // Validate only the chunk that the backend searched. Re-fencing the
+        // growing union here would make live output in the newest chunk starve
+        // every older chunk and can turn a large search into quadratic work.
+        // Per-result chunk receipts below keep actions fail-closed; an atomic
+        // whole-scrollback snapshot requires a mux search-snapshot API.
+        let (source_end, source_dirty) = self
+            .delegate
+            .get_changed_since_with_source_fence(range.clone(), run.source_seqno);
+        let current_source = search_run_identity(
+            run.id,
+            source_end,
+            dims,
+        );
+        match classify_search_completion(
+            self.searching.as_ref(),
+            run,
+            &range,
+            current_source,
+            source_end < run.source_seqno || source_dirty.iter().next().is_some(),
+        ) {
+            SearchCompletionStatus::Accepted => {}
+            SearchCompletionStatus::Superseded => return,
+            SearchCompletionStatus::SourceChanged => {
+                let retry_attempt = self
+                    .searching
+                    .as_ref()
+                    .map(|pending| pending.retry_attempt)
+                    .unwrap_or_default();
+                self.schedule_search_retry(run, retry_attempt);
+                return;
+            }
+        }
+        self.search_abort.take();
+        self.search_preparation_cancel.take();
         if pattern != self.get_pattern() {
             return;
         }
-        let is_first = self.results.is_empty();
-        self.incrementally_recompute_results(results);
+        self.window.invalidate();
+        let had_no_results = self.results.is_empty();
+        self.install_prepared_search_chunk(prepared, source_end, range.clone());
 
-        if is_first {
-            if !self.results.is_empty() {
-                self.activate_match_number(0);
+        if let Some(desired) = self.desired_result {
+            if let Some(position) = self
+                .results
+                .iter()
+                .position(|result| search_result_anchor(result) == desired)
+            {
+                self.desired_result.take();
+                self.desired_result_ordinal.take();
+                self.activate_match_number_unchecked(position);
+            }
+        } else if had_no_results && !self.results.is_empty() {
+            self.activate_match_number_unchecked(0);
+        }
+
+        if self.results.len() >= MAX_TOTAL_SEARCH_RESULTS
+            || self.expanded_result_rows >= MAX_TOTAL_EXPANDED_SEARCH_ROWS
+        {
+            // The retained prefix is deterministic. Do not keep walking a
+            // huge scrollback after the overlay's explicit memory/cardinality
+            // envelope has been filled.
+            self.searching.take();
+            self.desired_result.take();
+            if self.result_pos.is_none() && !self.results.is_empty() {
+                let fallback = self
+                    .desired_result_ordinal
+                    .take()
+                    .unwrap_or_default()
+                    .min(self.results.len().saturating_sub(1));
+                self.activate_match_number_unchecked(fallback);
             } else {
+                self.desired_result_ordinal.take();
+            }
+            self.mark_search_ui_dirty();
+            return;
+        }
+
+        if range.start == dims.scrollback_top {
+            self.searching.take();
+            if self.desired_result.take().is_some() && !self.results.is_empty() {
+                let fallback = self
+                    .desired_result_ordinal
+                    .take()
+                    .unwrap_or_default()
+                    .min(self.results.len().saturating_sub(1));
+                self.activate_match_number_unchecked(fallback);
+            } else {
+                self.desired_result_ordinal.take();
+            }
+            if self.results.is_empty() {
                 self.set_viewport(None);
                 self.clear_selection();
             }
-        }
-
-        let dims = self.delegate.get_dimensions();
-        if range.start == dims.scrollback_top {
-            self.searching.take();
+            self.mark_search_ui_dirty();
             return;
         }
 
@@ -402,36 +1580,20 @@ impl CopyRenderable {
             .saturating_sub(SEARCH_CHUNK_SIZE)
             .max(dims.scrollback_top)..end;
 
+        let next_run = search_run_identity(run.id, source_end, dims);
+        let retry_attempt = self
+            .searching
+            .as_ref()
+            .map(|pending| pending.retry_attempt)
+            .unwrap_or_default();
         self.searching.replace(Searching {
-            remain: range.start - dims.scrollback_top,
+            remain: range.start.saturating_sub(dims.scrollback_top),
+            run: next_run,
+            range: range.clone(),
+            retry_attempt,
         });
-
-        promise::spawn::spawn(async move {
-            let limit = None;
-            log::trace!("Searching for {pattern:?} in {range:?}");
-            let results = pane.search(pattern.clone(), range.clone(), limit).await?;
-
-            let pane_id = pane.pane_id();
-            let mut results = Some(results);
-            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                let state = term_window.pane_state(pane_id);
-                if let Some(overlay) = state.overlay.as_ref() {
-                    if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
-                        let mut r = copy_overlay.render.lock();
-                        let Some(search_results) = results.take() else {
-                            log::warn!(
-                                "copy overlay search results already consumed for pane {pane_id}"
-                            );
-                            return;
-                        };
-                        r.processed_search_chunk(pattern, search_results, range);
-                    }
-                }
-            })));
-
-            anyhow::Result::<()>::Ok(())
-        })
-        .detach();
+        self.spawn_search_chunk(pane, window, next_run, pattern, range);
+        self.mark_search_ui_dirty();
     }
 
     fn clear_selection(&mut self) {
@@ -442,32 +1604,87 @@ impl CopyRenderable {
             })));
     }
 
+    /// Revalidate the exact chunk fence immediately before a user action uses
+    /// one of its coordinates. Rendering validates visible rows separately;
+    /// this closes the off-screen acceptance-to-navigation gap for a long,
+    /// incrementally searched scrollback.
+    fn result_is_current(&mut self, n: usize) -> bool {
+        let Some(result) = self.results.get(n).cloned() else {
+            return false;
+        };
+        let Some(source_end) = self.result_source_ends.get(n).copied() else {
+            return false;
+        };
+        let Some(source_range) = self.result_source_ranges.get(n).cloned() else {
+            return false;
+        };
+        let dims = self.delegate.get_dimensions();
+        let retained = retained_row_range(dims);
+        let chunk_is_retained = retained.as_ref().is_some_and(|retained| {
+            retained.start <= source_range.start && source_range.end <= retained.end
+        });
+        if dims.cols != self.width || dims.viewport_rows != self.height || !chunk_is_retained {
+            self.desired_result = Some(search_result_anchor(&result));
+            self.desired_result_ordinal = Some(n);
+            self.restart_search(true, 0);
+            return false;
+        }
+        let (next_source_end, dirty) = self
+            .delegate
+            .get_changed_since_with_source_fence(source_range, source_end);
+        if next_source_end < source_end || dirty.iter().next().is_some() {
+            self.desired_result = Some(search_result_anchor(&result));
+            self.desired_result_ordinal = Some(n);
+            self.restart_search(true, 0);
+            return false;
+        }
+        self.result_source_ends[n] = next_source_end;
+        true
+    }
+
     fn activate_match_number(&mut self, n: usize) {
+        if self.result_is_current(n) {
+            self.activate_match_number_unchecked(n);
+        }
+    }
+
+    fn activate_match_number_unchecked(&mut self, n: usize) {
         let Some(result) = self.results.get(n).cloned() else {
             return;
         };
+        let Some((inclusive_end_x, inclusive_end_y)) =
+            inclusive_search_result_end(&result, self.width)
+        else {
+            return;
+        };
         self.result_pos.replace(n);
-        self.cursor.y = result.end_y;
-        self.cursor.x = result.end_x.saturating_sub(1);
+        self.cursor.y = inclusive_end_y;
+        self.cursor.x = inclusive_end_x;
 
         let start = SelectionCoordinate::x_y(result.start_x, result.start_y);
-        let end = SelectionCoordinate::x_y(result.end_x.saturating_sub(1), result.end_y);
+        let end = SelectionCoordinate::x_y(inclusive_end_x, inclusive_end_y);
         self.start.replace(start);
         self.adjust_selection(start, SelectionRange { start, end });
     }
 
     fn clamp_cursor_to_scrollback(&mut self) {
         let dims = self.delegate.get_dimensions();
-        if self.cursor.x >= dims.cols {
-            self.cursor.x = dims.cols - 1;
+        if dims.cols == 0 {
+            self.cursor.x = 0;
+        } else if self.cursor.x >= dims.cols {
+            self.cursor.x = dims.cols.saturating_sub(1);
         }
         if self.cursor.y < dims.scrollback_top {
             self.cursor.y = dims.scrollback_top;
         }
 
-        let max_row = dims.scrollback_top + dims.scrollback_rows as isize;
-        if self.cursor.y >= max_row {
-            self.cursor.y = max_row - 1;
+        let Some(last_row) = checked_last_stable_row(dims.scrollback_top, dims.scrollback_rows)
+        else {
+            self.cursor.y = dims.scrollback_top;
+            return;
+        };
+        if self.cursor.y > last_row {
+            self.cursor.y = last_row;
         }
     }
 
@@ -562,16 +1779,25 @@ impl CopyRenderable {
             return;
         }
 
-        let top_gap = self.cursor.y - dims.top;
+        let top_gap = self.cursor.y.checked_sub(dims.top).unwrap_or(StableRowIndex::MAX);
         if top_gap < dims.vertical_gap {
             // Increase the gap so we can "look ahead"
             self.set_viewport(Some(self.cursor.y.saturating_sub(dims.vertical_gap)));
             return;
         }
 
-        let bottom_gap = (dims.dims.viewport_rows as isize).saturating_sub(top_gap);
+        let Some(viewport_rows) = StableRowIndex::try_from(dims.dims.viewport_rows).ok() else {
+            return;
+        };
+        let bottom_gap = viewport_rows.saturating_sub(top_gap);
         if bottom_gap < dims.vertical_gap {
-            self.set_viewport(Some(dims.top + dims.vertical_gap - bottom_gap));
+            let Some(adjustment) = dims.vertical_gap.checked_sub(bottom_gap) else {
+                return;
+            };
+            let Some(next_top) = dims.top.checked_add(adjustment) else {
+                return;
+            };
+            self.set_viewport(Some(next_top));
         }
     }
 
@@ -585,13 +1811,23 @@ impl CopyRenderable {
     }
 
     fn close(&self) {
-        TermWindow::schedule_cancel_overlay_for_pane(self.window.clone(), self.delegate.pane_id());
+        let pane_id = self.delegate.pane_id();
+        let instance_token = Arc::clone(&self.instance_token);
+        self.window
+            .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                close_copy_overlay_if_current(term_window, pane_id, &instance_token);
+            })));
     }
 
     fn move_by_page(&mut self, amount: f64) {
         let dims = self.dimensions();
-        let rows = (dims.dims.viewport_rows as f64 * amount) as isize;
-        self.cursor.y += rows;
+        let Some(rows) = checked_fractional_row_delta(dims.dims.viewport_rows, amount) else {
+            return;
+        };
+        let Some(next_row) = self.cursor.y.checked_add(rows) else {
+            return;
+        };
+        self.cursor.y = next_row;
         self.select_to_cursor_pos();
     }
 
@@ -599,7 +1835,7 @@ impl CopyRenderable {
     fn next_match(&mut self) {
         if let Some(cur) = self.result_pos.as_ref() {
             let prior = if *cur > 0 {
-                cur - 1
+                cur.saturating_sub(1)
             } else {
                 self.results.len().saturating_sub(1)
             };
@@ -610,10 +1846,13 @@ impl CopyRenderable {
     /// Move to prior match
     fn prior_match(&mut self) {
         if let Some(cur) = self.result_pos.as_ref() {
-            let next = if *cur + 1 >= self.results.len() {
+            let next = if cur
+                .checked_add(1)
+                .is_none_or(|next| next >= self.results.len())
+            {
                 0
             } else {
-                *cur + 1
+                cur.saturating_add(1)
             };
             self.activate_match_number(next);
         }
@@ -625,7 +1864,9 @@ impl CopyRenderable {
         let dims = self.delegate.get_dimensions();
         if let Some(cur) = self.result_pos {
             let top = self.viewport.unwrap_or(dims.physical_top);
-            let prior = top - dims.viewport_rows as isize;
+            let Some(prior) = checked_page_up_boundary(top, dims.viewport_rows) else {
+                return;
+            };
             if let Some(pos) = self
                 .results
                 .iter()
@@ -644,7 +1885,9 @@ impl CopyRenderable {
         let dims = self.delegate.get_dimensions();
         if let Some(cur) = self.result_pos {
             let top = self.viewport.unwrap_or(dims.physical_top);
-            let bottom = top + dims.viewport_rows as isize;
+            let Some(bottom) = checked_page_down_boundary(top, dims.viewport_rows) else {
+                return;
+            };
             if let Some(pos) = self.results.iter().position(|res| res.start_y >= bottom) {
                 self.activate_match_number(pos);
             } else {
@@ -670,11 +1913,13 @@ impl CopyRenderable {
 
     fn edit_pattern(&mut self) {
         self.editing_search = true;
+        self.mark_search_ui_dirty();
         self.update_key_table();
     }
 
     fn accept_pattern(&mut self) {
         self.editing_search = false;
+        self.mark_search_ui_dirty();
         self.update_key_table();
     }
 
@@ -717,19 +1962,37 @@ impl CopyRenderable {
 
     fn move_to_viewport_middle(&mut self) {
         let dims = self.dimensions();
-        self.cursor.y = dims.top + (dims.dims.viewport_rows as isize) / 2;
+        let Some(viewport_rows) = StableRowIndex::try_from(dims.dims.viewport_rows).ok() else {
+            return;
+        };
+        let Some(row) = dims.top.checked_add(viewport_rows / 2) else {
+            return;
+        };
+        self.cursor.y = row;
         self.select_to_cursor_pos();
     }
 
     fn move_to_viewport_top(&mut self) {
         let dims = self.dimensions();
-        self.cursor.y = dims.top + dims.vertical_gap;
+        let Some(row) = dims.top.checked_add(dims.vertical_gap) else {
+            return;
+        };
+        self.cursor.y = row;
         self.select_to_cursor_pos();
     }
 
     fn move_to_viewport_bottom(&mut self) {
         let dims = self.dimensions();
-        self.cursor.y = dims.top + (dims.dims.viewport_rows as isize) - dims.vertical_gap;
+        let Some(viewport_rows) = StableRowIndex::try_from(dims.dims.viewport_rows).ok() else {
+            return;
+        };
+        let Some(offset) = viewport_rows.checked_sub(dims.vertical_gap) else {
+            return;
+        };
+        let Some(row) = dims.top.checked_add(offset) else {
+            return;
+        };
+        self.cursor.y = row;
         self.select_to_cursor_pos();
     }
 
@@ -739,7 +2002,7 @@ impl CopyRenderable {
     }
 
     fn move_right_single_cell(&mut self) {
-        self.cursor.x += 1;
+        self.cursor.x = self.cursor.x.saturating_add(1);
         self.select_to_cursor_pos();
     }
 
@@ -749,7 +2012,7 @@ impl CopyRenderable {
     }
 
     fn move_down_single_row(&mut self) {
-        self.cursor.y += 1;
+        self.cursor.y = self.cursor.y.saturating_add(1);
         self.select_to_cursor_pos();
     }
     fn move_to_start_of_line(&mut self) {
@@ -759,13 +2022,12 @@ impl CopyRenderable {
 
     fn move_to_start_of_next_line(&mut self) {
         self.cursor.x = 0;
-        self.cursor.y += 1;
+        self.cursor.y = self.cursor.y.saturating_add(1);
         self.select_to_cursor_pos();
     }
 
     fn move_to_top(&mut self) {
-        // This will get fixed up by clamp_cursor_to_scrollback
-        self.cursor.y = 0;
+        self.cursor.y = self.delegate.get_dimensions().scrollback_top;
         self.select_to_cursor_pos();
     }
 
@@ -777,7 +2039,11 @@ impl CopyRenderable {
 
     fn move_to_end_of_line_content(&mut self) {
         let y = self.cursor.y;
-        let (top, lines) = self.delegate.get_lines(y..y + 1);
+        let Some(line_range) = one_line_range(y) else {
+            self.select_to_cursor_pos();
+            return;
+        };
+        let (top, lines) = self.delegate.get_lines(line_range);
         if let Some(line) = lines.get(0) {
             self.cursor.y = top;
             self.cursor.x = 0;
@@ -792,7 +2058,11 @@ impl CopyRenderable {
 
     fn move_to_start_of_line_content(&mut self) {
         let y = self.cursor.y;
-        let (top, lines) = self.delegate.get_lines(y..y + 1);
+        let Some(line_range) = one_line_range(y) else {
+            self.select_to_cursor_pos();
+            return;
+        };
+        let (top, lines) = self.delegate.get_lines(line_range);
         if let Some(line) = lines.get(0) {
             self.cursor.y = top;
             self.cursor.x = 0;
@@ -837,14 +2107,25 @@ impl CopyRenderable {
     }
 
     fn move_backward_one_word(&mut self) {
-        let y = if self.cursor.x == 0 && self.cursor.y > 0 {
-            self.cursor.x = usize::max_value();
-            self.cursor.y.saturating_sub(1)
+        let scrollback_top = self.delegate.get_dimensions().scrollback_top;
+        let y = if self.cursor.x == 0 {
+            if let Some(previous_row) =
+                previous_row_within_scrollback(self.cursor.y, scrollback_top)
+            {
+                self.cursor.x = usize::max_value();
+                previous_row
+            } else {
+                self.cursor.y
+            }
         } else {
             self.cursor.y
         };
 
-        let (top, lines) = self.delegate.get_lines(y..y + 1);
+        let Some(line_range) = one_line_range(y) else {
+            self.select_to_cursor_pos();
+            return;
+        };
+        let (top, lines) = self.delegate.get_lines(line_range);
         if let Some(line) = lines.get(0) {
             self.cursor.y = top;
             if self.cursor.x == usize::max_value() {
@@ -881,11 +2162,15 @@ impl CopyRenderable {
                 break;
             }
 
-            if last_was_whitespace && self.cursor.y > 0 {
+            if last_was_whitespace {
                 // The line begins with whitespace
-                self.cursor.x = usize::max_value();
-                self.cursor.y -= 1;
-                return self.move_backward_one_word();
+                if let Some(previous_row) =
+                    previous_row_within_scrollback(self.cursor.y, scrollback_top)
+                {
+                    self.cursor.x = usize::max_value();
+                    self.cursor.y = previous_row;
+                    return self.move_backward_one_word();
+                }
             }
         }
         self.select_to_cursor_pos();
@@ -893,19 +2178,29 @@ impl CopyRenderable {
 
     fn move_forward_one_word(&mut self) {
         let y = self.cursor.y;
-        let (top, lines) = self.delegate.get_lines(y..y + 1);
+        let Some(line_range) = one_line_range(y) else {
+            self.select_to_cursor_pos();
+            return;
+        };
+        let (top, lines) = self.delegate.get_lines(line_range);
         if let Some(line) = lines.get(0) {
             self.cursor.y = top;
             let width = line.len();
-            let s = line.columns_as_str(self.cursor.x..width + 1);
+            let s = line.columns_as_str(self.cursor.x..width.saturating_add(1));
             let mut words = s.split_word_bounds();
 
             if let Some(word) = words.next() {
-                self.cursor.x += unicode_column_width(word, None);
+                self.cursor.x = self
+                    .cursor
+                    .x
+                    .saturating_add(unicode_column_width(word, None));
                 if !is_whitespace_word(word) {
                     if let Some(word) = words.next() {
                         if is_whitespace_word(word) {
-                            self.cursor.x += unicode_column_width(word, None);
+                            self.cursor.x = self
+                                .cursor
+                                .x
+                                .saturating_add(unicode_column_width(word, None));
                         }
                     }
                 }
@@ -913,10 +2208,13 @@ impl CopyRenderable {
 
             if self.cursor.x >= width {
                 let dims = self.delegate.get_dimensions();
-                let max_row = dims.scrollback_top + dims.scrollback_rows as isize;
-                if self.cursor.y + 1 < max_row {
-                    self.cursor.y += 1;
-                    return self.move_to_start_of_line_content();
+                let next_row = self.cursor.y.checked_add(1);
+                let max_row = checked_stable_row_end(dims.scrollback_top, dims.scrollback_rows);
+                if let (Some(next_row), Some(max_row)) = (next_row, max_row) {
+                    if next_row < max_row {
+                        self.cursor.y = next_row;
+                        return self.move_to_start_of_line_content();
+                    }
                 }
             }
         }
@@ -925,29 +2223,40 @@ impl CopyRenderable {
 
     fn move_to_end_of_word(&mut self) {
         let y = self.cursor.y;
-        let (top, lines) = self.delegate.get_lines(y..y + 1);
+        let Some(line_range) = one_line_range(y) else {
+            self.select_to_cursor_pos();
+            return;
+        };
+        let (top, lines) = self.delegate.get_lines(line_range);
         if let Some(line) = lines.get(0) {
             self.cursor.y = top;
             let width = line.len();
-            let s = line.columns_as_str(self.cursor.x..width + 1);
+            let s = line.columns_as_str(self.cursor.x..width.saturating_add(1));
             let mut words = s.split_word_bounds();
 
-            if self.cursor.x >= width - 1 {
+            if self.cursor.x >= width.saturating_sub(1) {
                 let dims = self.delegate.get_dimensions();
-                let max_row = dims.scrollback_top + dims.scrollback_rows as isize;
-                if self.cursor.y + 1 < max_row {
-                    self.cursor.y += 1;
-                    self.cursor.x = 0;
-                    return self.move_to_end_of_word();
+                let next_row = self.cursor.y.checked_add(1);
+                let max_row = checked_stable_row_end(dims.scrollback_top, dims.scrollback_rows);
+                if let (Some(next_row), Some(max_row)) = (next_row, max_row) {
+                    if next_row < max_row {
+                        self.cursor.y = next_row;
+                        self.cursor.x = 0;
+                        return self.move_to_end_of_word();
+                    }
                 }
             }
 
             if let Some(word) = words.next() {
-                let mut word_end = self.cursor.x + unicode_column_width(word, None);
+                let mut word_end = self
+                    .cursor
+                    .x
+                    .saturating_add(unicode_column_width(word, None));
                 if !is_whitespace_word(word) {
-                    if self.cursor.x == word_end - 1 {
+                    if self.cursor.x == word_end.saturating_sub(1) {
                         while let Some(next_word) = words.next() {
-                            word_end += unicode_column_width(next_word, None);
+                            word_end =
+                                word_end.saturating_add(unicode_column_width(next_word, None));
                             if !is_whitespace_word(next_word) {
                                 break;
                             }
@@ -956,12 +2265,12 @@ impl CopyRenderable {
                 }
                 while let Some(next_word) = words.next() {
                     if !is_whitespace_word(next_word) {
-                        word_end += unicode_column_width(next_word, None);
+                        word_end = word_end.saturating_add(unicode_column_width(next_word, None));
                     } else {
                         break;
                     }
                 }
-                self.cursor.x = word_end - 1;
+                self.cursor.x = word_end.saturating_sub(1);
             }
         }
         self.select_to_cursor_pos();
@@ -1021,7 +2330,10 @@ impl CopyRenderable {
 
     fn perform_jump(&mut self, jump: Jump, repeat: bool) {
         let y = self.cursor.y;
-        let (_top, lines) = self.delegate.get_lines(y..y + 1);
+        let Some(line_range) = one_line_range(y) else {
+            return;
+        };
+        let (_top, lines) = self.delegate.get_lines(line_range);
         let target_str = jump.target.to_string();
         if let Some(line) = lines.get(0) {
             // Find the indices of cells with a matching target
@@ -1111,6 +2423,146 @@ impl CopyRenderable {
     fn clear_selection_mode(&mut self) {
         self.start.take();
         self.clear_selection();
+    }
+}
+
+impl CopyOverlay {
+    fn with_decorated_lines(
+        &self,
+        lines: Range<StableRowIndex>,
+        hyperlink_rules: Option<&[termwiz::hyperlink::Rule]>,
+        with_lines: &mut dyn WithPaneLines,
+    ) {
+        // Take care to access delegate methods before entering its callback;
+        // the overlay renderer lock is intentionally held while applying the
+        // copy-mode decorations to one coherent delegate snapshot.
+        let mut renderer = self.render.lock();
+        renderer.prepare_for_render(lines.clone());
+        let dims = self.get_dimensions();
+        let search_row = renderer.compute_search_row();
+
+        struct OverlayLines<'a> {
+            with_lines: &'a mut dyn WithPaneLines,
+            dims: RenderableDimensions,
+            search_row: StableRowIndex,
+            renderer: &'a mut CopyRenderable,
+        }
+
+        impl WithPaneLines for OverlayLines<'_> {
+            fn with_lines_mut(&mut self, first_row: StableRowIndex, lines: &mut [&mut Line]) {
+                let mut overlay_lines = vec![];
+                let config = config::configuration();
+                let colors = &config.resolved_palette;
+
+                for (idx, line) in lines.iter_mut().enumerate() {
+                    let mut line: Line = line.clone();
+
+                    let Some(stable_idx) = StableRowIndex::try_from(idx)
+                        .ok()
+                        .and_then(|offset| first_row.checked_add(offset))
+                    else {
+                        break;
+                    };
+                    let pattern = self.renderer.get_pattern();
+                    if stable_idx == self.search_row
+                        && (self.renderer.editing_search || !pattern.is_empty())
+                    {
+                        // Replace with search UI
+                        let rev = CellAttributes::default().set_reverse(true).clone();
+                        line.fill_range(0..self.dims.cols, &Cell::new(' ', rev.clone()), SEQ_ZERO);
+                        let mode = &match pattern {
+                            Pattern::CaseSensitiveString(_) => "case-sensitive",
+                            Pattern::CaseInSensitiveString(_) => "ignore-case",
+                            Pattern::Regex(_) => "regex",
+                        };
+
+                        let remain = match &self.renderer.searching {
+                            Some(Searching { remain, .. }) => {
+                                format!(" searching {remain} lines")
+                            }
+                            None => String::new(),
+                        };
+
+                        line.overlay_text_with_attribute(
+                            0,
+                            &format!(
+                                "Search: {} ({}/{} matches. {}{remain})",
+                                *pattern,
+                                self.renderer
+                                    .result_pos
+                                    .map(|x| x.saturating_add(1))
+                                    .unwrap_or(0),
+                                self.renderer.results.len(),
+                                mode
+                            ),
+                            rev,
+                            SEQ_ZERO,
+                        );
+                        self.renderer.last_bar_pos = Some(self.search_row);
+                        line.clear_appdata();
+                    } else if let Some(matches) = self.renderer.by_line.get(&stable_idx) {
+                        for m in matches {
+                            for cell_idx in m.range.clone() {
+                                if let Some(cell) =
+                                    line.cells_mut_for_attr_changes_only().get_mut(cell_idx)
+                                {
+                                    if Some(m.result_index) == self.renderer.result_pos {
+                                        cell.attrs_mut()
+                                            .set_background(
+                                                colors
+                                                    .copy_mode_active_highlight_bg
+                                                    .unwrap_or(AnsiColor::Yellow.into()),
+                                            )
+                                            .set_foreground(
+                                                colors
+                                                    .copy_mode_active_highlight_fg
+                                                    .unwrap_or(AnsiColor::Black.into()),
+                                            )
+                                            .set_reverse(false);
+                                    } else {
+                                        cell.attrs_mut()
+                                            .set_background(
+                                                colors
+                                                    .copy_mode_inactive_highlight_bg
+                                                    .unwrap_or(AnsiColor::Fuchsia.into()),
+                                            )
+                                            .set_foreground(
+                                                colors
+                                                    .copy_mode_inactive_highlight_fg
+                                                    .unwrap_or(AnsiColor::Black.into()),
+                                            )
+                                            .set_reverse(false);
+                                    }
+                                }
+                            }
+                        }
+                        line.clear_appdata();
+                    }
+                    overlay_lines.push(line);
+                }
+
+                // Decorated clones must not write their renderer appdata back
+                // to the authoritative delegate lines: their cells differ.
+                // Persisting shape caches across overlay reads therefore needs
+                // an overlay-owned, revision-keyed cache rather than appdata
+                // propagation through this copy-backed Pane API.
+                let mut overlay_refs: Vec<&mut Line> = overlay_lines.iter_mut().collect();
+                self.with_lines.with_lines_mut(first_row, &mut overlay_refs);
+            }
+        }
+
+        let mut overlay = OverlayLines {
+            with_lines,
+            dims,
+            search_row,
+            renderer: &mut renderer,
+        };
+        if let Some(rules) = hyperlink_rules {
+            self.delegate
+                .with_lines_mut_and_apply_hyperlinks(lines, rules, &mut overlay);
+        } else {
+            self.delegate.with_lines_mut(lines, &mut overlay);
+        }
     }
 }
 
@@ -1251,6 +2703,7 @@ impl Pane for CopyOverlay {
                 }
                 _ => {}
             }
+            render.mark_search_ui_dirty();
         }
 
         Ok(())
@@ -1366,7 +2819,7 @@ impl Pane for CopyOverlay {
                 None,
             );
             StableCursorPosition {
-                x: SEARCH_CURSOR_PADDING + cursor,
+                x: SEARCH_CURSOR_PADDING.saturating_add(cursor),
                 y: renderer.compute_search_row(),
                 shape: termwiz::surface::CursorShape::SteadyBlock,
                 visibility: termwiz::surface::CursorVisibility::Visible,
@@ -1385,7 +2838,32 @@ impl Pane for CopyOverlay {
         lines: Range<StableRowIndex>,
         seqno: SequenceNo,
     ) -> RangeSet<StableRowIndex> {
-        self.delegate.get_changed_since(lines, seqno)
+        let dirty = self.delegate.get_changed_since(lines.clone(), seqno);
+        merge_dirty_results(lines, dirty, &self.render.lock().dirty_results)
+    }
+
+    fn get_changed_since_with_source_fence(
+        &self,
+        lines: Range<StableRowIndex>,
+        last_observed_source_end: SequenceNo,
+    ) -> (SequenceNo, RangeSet<StableRowIndex>) {
+        // Preserve the delegate's atomic post-poll fence. Falling back to the
+        // Pane default would sample current-seq before ClientPane polls and then
+        // perform a second, separately locked changed-row query.
+        let (source_end, dirty) = self.delegate.get_changed_since_with_source_fence(
+            lines.clone(),
+            last_observed_source_end,
+        );
+        let mut renderer = self.render.lock();
+        let retained = retained_row_range(renderer.delegate.get_dimensions());
+        prune_dirty_results(
+            &mut renderer.dirty_results,
+            retained,
+        );
+        (
+            source_end,
+            take_dirty_results(lines, dirty, &mut renderer.dirty_results),
+        )
     }
 
     fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
@@ -1402,134 +2880,21 @@ impl Pane for CopyOverlay {
     }
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines) {
-        // Take care to access self.delegate methods here before we get into
-        // calling into its own with_lines_mut to avoid a runtime
-        // lock erro!
-        let mut renderer = self.render.lock();
-        if self.delegate.get_current_seqno() > renderer.last_result_seqno {
-            renderer.update_search();
-        }
-        renderer.check_for_resize();
-        let dims = self.get_dimensions();
-        let search_row = renderer.compute_search_row();
+        self.with_decorated_lines(lines, None, with_lines);
+    }
 
-        struct OverlayLines<'a> {
-            with_lines: &'a mut dyn WithPaneLines,
-            dims: RenderableDimensions,
-            search_row: StableRowIndex,
-            renderer: &'a mut CopyRenderable,
-        }
-
-        self.delegate.with_lines_mut(
-            lines,
-            &mut OverlayLines {
-                with_lines,
-                dims,
-                search_row,
-                renderer: &mut *renderer,
-            },
-        );
-
-        impl<'a> WithPaneLines for OverlayLines<'a> {
-            fn with_lines_mut(&mut self, first_row: StableRowIndex, lines: &mut [&mut Line]) {
-                let mut overlay_lines = vec![];
-                let config = config::configuration();
-                let colors = &config.resolved_palette;
-
-                for (idx, line) in lines.iter_mut().enumerate() {
-                    let mut line: Line = line.clone();
-
-                    let stable_idx = idx as StableRowIndex + first_row;
-                    self.renderer.dirty_results.remove(stable_idx);
-                    let pattern = self.renderer.get_pattern();
-                    if stable_idx == self.search_row
-                        && (self.renderer.editing_search || !pattern.is_empty())
-                    {
-                        // Replace with search UI
-                        let rev = CellAttributes::default().set_reverse(true).clone();
-                        line.fill_range(0..self.dims.cols, &Cell::new(' ', rev.clone()), SEQ_ZERO);
-                        let mode = &match pattern {
-                            Pattern::CaseSensitiveString(_) => "case-sensitive",
-                            Pattern::CaseInSensitiveString(_) => "ignore-case",
-                            Pattern::Regex(_) => "regex",
-                        };
-
-                        let remain = match &self.renderer.searching {
-                            Some(Searching { remain, .. }) => {
-                                format!(" searching {remain} lines")
-                            }
-                            None => String::new(),
-                        };
-
-                        line.overlay_text_with_attribute(
-                            0,
-                            &format!(
-                                "Search: {} ({}/{} matches. {}{remain})",
-                                *pattern,
-                                self.renderer.result_pos.map(|x| x + 1).unwrap_or(0),
-                                self.renderer.results.len(),
-                                mode
-                            ),
-                            rev,
-                            SEQ_ZERO,
-                        );
-                        self.renderer.last_bar_pos = Some(self.search_row);
-                        line.clear_appdata();
-                    } else if let Some(matches) = self.renderer.by_line.get(&stable_idx) {
-                        for m in matches {
-                            // highlight
-                            for cell_idx in m.range.clone() {
-                                if let Some(cell) =
-                                    line.cells_mut_for_attr_changes_only().get_mut(cell_idx)
-                                {
-                                    if Some(m.result_index) == self.renderer.result_pos {
-                                        cell.attrs_mut()
-                                            .set_background(
-                                                colors
-                                                    .copy_mode_active_highlight_bg
-                                                    .unwrap_or(AnsiColor::Yellow.into()),
-                                            )
-                                            .set_foreground(
-                                                colors
-                                                    .copy_mode_active_highlight_fg
-                                                    .unwrap_or(AnsiColor::Black.into()),
-                                            )
-                                            .set_reverse(false);
-                                    } else {
-                                        cell.attrs_mut()
-                                            .set_background(
-                                                colors
-                                                    .copy_mode_inactive_highlight_bg
-                                                    .unwrap_or(AnsiColor::Fuchsia.into()),
-                                            )
-                                            .set_foreground(
-                                                colors
-                                                    .copy_mode_inactive_highlight_fg
-                                                    .unwrap_or(AnsiColor::Black.into()),
-                                            )
-                                            .set_reverse(false);
-                                    }
-                                }
-                            }
-                        }
-                        line.clear_appdata();
-                    }
-                    overlay_lines.push(line);
-                }
-
-                let mut overlay_refs: Vec<&mut Line> = overlay_lines.iter_mut().collect();
-                self.with_lines.with_lines_mut(first_row, &mut overlay_refs);
-            }
-        }
+    fn with_lines_mut_and_apply_hyperlinks(
+        &self,
+        lines: Range<StableRowIndex>,
+        rules: &[termwiz::hyperlink::Rule],
+        with_lines: &mut dyn WithPaneLines,
+    ) {
+        self.with_decorated_lines(lines, Some(rules), with_lines);
     }
 
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
         let mut renderer = self.render.lock();
-        if self.delegate.get_current_seqno() > renderer.last_result_seqno {
-            renderer.update_search();
-        }
-
-        renderer.check_for_resize();
+        renderer.prepare_for_render(lines.clone());
         let dims = self.get_dimensions();
 
         let (top, mut lines) = self.delegate.get_lines(lines);
@@ -1542,8 +2907,12 @@ impl Pane for CopyOverlay {
         // For rows with search results, we want to highlight the matching ranges
         let search_row = renderer.compute_search_row();
         for (idx, line) in lines.iter_mut().enumerate() {
-            let stable_idx = idx as StableRowIndex + top;
-            renderer.dirty_results.remove(stable_idx);
+            let Some(stable_idx) = StableRowIndex::try_from(idx)
+                .ok()
+                .and_then(|offset| top.checked_add(offset))
+            else {
+                break;
+            };
             let pattern = renderer.get_pattern();
             if stable_idx == search_row && (renderer.editing_search || !pattern.is_empty()) {
                 // Replace with search UI
@@ -1559,7 +2928,10 @@ impl Pane for CopyOverlay {
                     &format!(
                         "Search: {} ({}/{} matches. {})",
                         *pattern,
-                        renderer.result_pos.map(|x| x + 1).unwrap_or(0),
+                        renderer
+                            .result_pos
+                            .map(|x| x.saturating_add(1))
+                            .unwrap_or(0),
                         renderer.results.len(),
                         mode
                     ),

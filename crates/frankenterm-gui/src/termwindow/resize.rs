@@ -141,6 +141,10 @@ impl super::TermWindow {
         } else {
             self.scaling_changed(dimensions, self.fonts.get_font_scale(), window);
         }
+        // Generated gradients/colors depend on the current pixel geometry.
+        // The coordinator coalesces resize storms to one newest pending job,
+        // cancels obsolete work, and never performs decode/raster work here.
+        self.schedule_background_reload();
         if let Some(modal) = self.get_modal() {
             modal.reconfigure(self);
         }
@@ -607,6 +611,7 @@ impl super::TermWindow {
             // Now revise the pty size to fit the window
             self.apply_dimensions(&dimensions, None, window);
         }
+        self.schedule_background_reload();
     }
 
     pub fn decrease_font_size(&mut self) {

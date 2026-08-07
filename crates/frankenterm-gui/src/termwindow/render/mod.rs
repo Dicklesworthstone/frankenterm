@@ -51,12 +51,30 @@ pub mod split;
 pub mod tab_bar;
 pub mod window_buttons;
 
-/// The data that we associate with a line; we use this to cache it shape hash
+/// Identity token for one `TermWindow`'s line-state cache.
+///
+/// The pointee has no numeric identity that can wrap or collide. A cached line
+/// state is reusable only when its retained `Arc` is pointer-equal to the
+/// current window's owner token.
+#[derive(Debug, Default)]
+pub(super) struct LineStateCacheOwner;
+
+/// The data that we associate with a line; we use this to cache its shape hash.
 #[derive(Debug)]
 pub struct CachedLineState {
     pub id: u64,
+    owner: Arc<LineStateCacheOwner>,
+    /// Owning pane. This lets pane retirement purge hot LFU entries instead of
+    /// allowing closed-pane history to crowd out long-lived active panes.
+    pub pane_id: PaneId,
     pub seqno: SequenceNo,
     pub shape_hash: [u8; 16],
+}
+
+impl CachedLineState {
+    fn belongs_to(&self, owner: &Arc<LineStateCacheOwner>, pane_id: PaneId) -> bool {
+        Arc::ptr_eq(&self.owner, owner) && self.pane_id == pane_id
+    }
 }
 
 #[derive(Debug, Hash, Clone, PartialEq, Eq)]
@@ -527,12 +545,22 @@ impl crate::TermWindow {
             + (cell_idx as f32 * cell_width);
 
         let (padding_left, padding_top, padding_right, padding_bottom) = image.padding();
+        if usize::from(padding_left).saturating_add(usize::from(padding_right))
+            >= params.render_metrics.cell_size.width
+            || usize::from(padding_top).saturating_add(usize::from(padding_bottom))
+                >= params.render_metrics.cell_size.height
+        {
+            // Padding is transported over the mux wire and can originate from
+            // a different cell geometry. Never emit an inverted or empty quad
+            // when a remote sender's padding does not fit this renderer.
+            return Ok(());
+        }
 
         quad.set_position(
             pos_x + padding_left as f32,
             pos_y + padding_top as f32,
-            pos_x + cell_width + padding_left as f32 - padding_right as f32,
-            pos_y + cell_height + padding_top as f32 - padding_bottom as f32,
+            pos_x + cell_width - padding_right as f32,
+            pos_y + cell_height - padding_bottom as f32,
         );
         quad.set_hsv(hsv);
         quad.set_fg_color(glyph_color);
@@ -963,30 +991,44 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    fn shape_hash_for_line(&mut self, line: &Line) -> [u8; 16] {
+    fn shape_hash_for_line(&mut self, pane_id: PaneId, line: &Line) -> [u8; 16] {
         let seqno = line.current_seqno();
         let mut id = None;
         if let Some(cached_arc) = line.get_appdata() {
             if let Some(line_state) = cached_arc.downcast_ref::<CachedLineState>() {
-                if line_state.seqno == seqno {
+                if line_state.belongs_to(&self.line_state_cache_owner, pane_id)
+                    && frankenterm_gui::cached_line_shape_hash_is_fresh(line_state.seqno, seqno)
+                {
                     // Touch the LRU
                     self.line_state_cache.borrow_mut().get(&line_state.id);
                     return line_state.shape_hash;
                 }
-                id.replace(line_state.id);
+                if line_state.belongs_to(&self.line_state_cache_owner, pane_id) {
+                    id.replace(line_state.id);
+                }
             }
         }
 
-        let id = id.unwrap_or_else(|| {
-            let id = self.next_line_state_id;
-            self.next_line_state_id += 1;
-            id
-        });
+        let id = match id {
+            Some(id) => id,
+            None => {
+                let Some(id) = frankenterm_gui::take_monotonic_cache_id(
+                    &mut self.next_line_state_id,
+                ) else {
+                    // Cache identity can no longer advance. Compute directly
+                    // instead of wrapping into a live entry's identity.
+                    return line.compute_shape_hash();
+                };
+                id
+            }
+        };
 
         let shape_hash = line.compute_shape_hash();
 
         let state = Arc::new(CachedLineState {
             id,
+            owner: Arc::clone(&self.line_state_cache_owner),
+            pane_id,
             seqno,
             shape_hash,
         });
@@ -1103,8 +1145,9 @@ fn rebase_glyph_clusters(
 #[cfg(test)]
 mod tests {
     use super::{
-        rebase_glyph_clusters, resolve_fg_color_attr, same_hyperlink, same_hyperlink_or_both_none,
-        should_use_reverse_video_cursor, update_next_frame_time,
+        CachedLineState, LineStateCacheOwner, rebase_glyph_clusters, resolve_fg_color_attr,
+        same_hyperlink, same_hyperlink_or_both_none, should_use_reverse_video_cursor,
+        update_next_frame_time,
     };
     use config::{BoldBrightening, ConfigHandle, TextStyle};
     use frankenterm_font::GlyphInfo;
@@ -1130,6 +1173,30 @@ mod tests {
             x_offset: PixelLength::new(0.0),
             y_offset: PixelLength::new(0.0),
         }
+    }
+
+    #[test]
+    fn cached_line_state_requires_exact_termwindow_cache_owner() {
+        let owner = Arc::new(LineStateCacheOwner);
+        let same_owner = Arc::clone(&owner);
+        let foreign_owner = Arc::new(LineStateCacheOwner);
+        let state = CachedLineState {
+            id: 0,
+            owner,
+            pane_id: 41,
+            seqno: 7,
+            shape_hash: [0x5a; 16],
+        };
+
+        assert!(state.belongs_to(&same_owner, 41));
+        assert!(
+            !state.belongs_to(&foreign_owner, 41),
+            "equal pane and numeric cache IDs from another TermWindow must not be accepted",
+        );
+        assert!(
+            !state.belongs_to(&same_owner, 42),
+            "one cache owner must still keep pane identities isolated",
+        );
     }
 
     /// ft-5qph8: missing acceptance-criterion coverage from ft-6scm7.

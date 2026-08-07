@@ -1,95 +1,99 @@
 use super::confirm;
-use crate::TermWindow;
-use mux::Mux;
-use mux::pane::PaneId;
-use mux::tab::TabId;
+use mux::tab::Tab;
 use mux::termwiztermtab::TermWizTerminal;
 use mux::window::WindowId;
+use mux::{Mux, PaneRegistrationHandle};
+use std::sync::Arc;
 
 pub fn confirm_close_pane(
-    pane_id: PaneId,
     mut term: TermWizTerminal,
-    mux_window_id: WindowId,
-    window: ::window::Window,
+    registration: PaneRegistrationHandle,
+    tab: Arc<Tab>,
 ) -> anyhow::Result<()> {
-    let close_target = Mux::try_get().and_then(|mux| {
-        let registration = mux.capture_current_pane(pane_id)?;
-        let (_domain_id, window_id, tab_id) = mux.resolve_pane_id(pane_id)?;
-        if window_id != mux_window_id {
-            return None;
-        }
-        let tab = mux.get_tab(tab_id)?;
-        Some((registration, tab))
-    });
-
     if confirm::run_confirmation("🛑 Really kill this pane?", &mut term)? {
         promise::spawn::spawn_into_main_thread(async move {
-            let Some((registration, tab)) = close_target else {
-                log::warn!("cannot close pane {pane_id}: exact registration is no longer active");
-                return;
-            };
-            let _ = tab.kill_pane_registration(&registration);
+            if !tab.kill_pane_registration(&registration) {
+                log::warn!(
+                    "cannot close pane {}: exact registration is no longer active",
+                    registration.pane_id(),
+                );
+            }
         })
         .detach();
     }
-    TermWindow::schedule_cancel_overlay_for_pane(window, pane_id);
-
     Ok(())
 }
 
 pub fn confirm_close_tab(
-    tab_id: TabId,
     mut term: TermWizTerminal,
-    _mux_window_id: WindowId,
-    window: ::window::Window,
+    mux: Arc<Mux>,
+    tab: Arc<Tab>,
+    witness: PaneRegistrationHandle,
 ) -> anyhow::Result<()> {
     if confirm::run_confirmation(
         "🛑 Really kill this tab and all contained panes?",
         &mut term,
     )? {
         promise::spawn::spawn_into_main_thread(async move {
-            let Some(mux) = Mux::try_get() else {
-                log::warn!("cannot close tab {tab_id}: mux is no longer active");
-                return;
-            };
-            mux.remove_tab(tab_id);
+            if !mux.remove_tab_if_same(&tab, &witness) {
+                log::warn!(
+                    "cannot close tab {}: exact tab generation is no longer active",
+                    tab.tab_id(),
+                );
+            }
         })
         .detach();
     }
-    TermWindow::schedule_cancel_overlay(window, tab_id, None);
-
     Ok(())
 }
 
 pub fn confirm_close_window(
     mut term: TermWizTerminal,
+    mux: Arc<Mux>,
     mux_window_id: WindowId,
-    window: ::window::Window,
-    tab_id: TabId,
+    tab: Arc<Tab>,
+    witness: PaneRegistrationHandle,
 ) -> anyhow::Result<()> {
     if confirm::run_confirmation(
         "🛑 Really kill this window and all contained tabs and panes?",
         &mut term,
     )? {
         promise::spawn::spawn_into_main_thread(async move {
-            let Some(mux) = Mux::try_get() else {
-                log::warn!("cannot close window {mux_window_id}: mux is no longer active");
+            let Some(operation) = witness.operation_guard(&mux) else {
+                log::warn!(
+                    "cannot close window {mux_window_id}: exact pane generation is no longer active"
+                );
                 return;
             };
+            if !tab
+                .iter_all_panes()
+                .iter()
+                .any(|pane| operation.is_same_pane(pane))
+            {
+                log::warn!(
+                    "cannot close window {mux_window_id}: witness pane left the originating tab"
+                );
+                return;
+            }
+            let tab_is_still_attached = mux.get_window(mux_window_id).is_some_and(|window| {
+                window
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, &tab))
+            });
+            if !tab_is_still_attached {
+                log::warn!(
+                    "cannot close window {mux_window_id}: exact originating tab is no longer attached"
+                );
+                return;
+            }
             mux.kill_window(mux_window_id);
         })
         .detach();
     }
-    TermWindow::schedule_cancel_overlay(window, tab_id, None);
-
     Ok(())
 }
 
-pub fn confirm_quit_program(
-    mut term: TermWizTerminal,
-    window: ::window::Window,
-    tab_id: TabId,
-) -> anyhow::Result<()> {
+pub fn confirm_quit_program(mut term: TermWizTerminal) -> anyhow::Result<()> {
     if confirm::run_confirmation("🛑 Really Quit FrankenTerm?", &mut term)? {
         promise::spawn::spawn_into_main_thread(async move {
             use ::window::{Connection, ConnectionOps};
@@ -100,7 +104,5 @@ pub fn confirm_quit_program(
         })
         .detach();
     }
-    TermWindow::schedule_cancel_overlay(window, tab_id, None);
-
     Ok(())
 }

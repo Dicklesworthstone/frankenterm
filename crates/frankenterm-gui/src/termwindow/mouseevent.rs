@@ -23,6 +23,17 @@ use wezterm_dynamic::ToDynamic;
 use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
 use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
+fn checked_mouse_stable_row(
+    viewport: StableRowIndex,
+    row: i64,
+) -> Option<StableRowIndex> {
+    let offset = StableRowIndex::try_from(row).ok()?;
+    if offset < 0 {
+        return None;
+    }
+    viewport.checked_add(offset)
+}
+
 impl super::TermWindow {
     fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
         let x = event.coords.x;
@@ -808,24 +819,30 @@ impl super::TermWindow {
         );
 
         let dims = pane.get_dimensions();
-        let stable_row = self
+        let viewport = self
             .get_viewport(pane.pane_id())
-            .unwrap_or(dims.physical_top)
-            + row as StableRowIndex;
+            .unwrap_or(dims.physical_top);
+        let stable_row = checked_mouse_stable_row(viewport, row);
 
-        self.pane_state(pane.pane_id())
-            .mouse_terminal_coords
-            .replace((
-                ClickPosition {
-                    column,
-                    row,
-                    x_pixel_offset,
-                    y_pixel_offset,
-                },
-                stable_row,
-            ));
-
-        pane.apply_hyperlinks(stable_row..stable_row + 1, &self.config.hyperlink_rules);
+        {
+            let pane_state = self.pane_state(pane.pane_id());
+            if let Some(stable_row) = stable_row {
+                pane_state.mouse_terminal_coords.replace((
+                    ClickPosition {
+                        column,
+                        row,
+                        x_pixel_offset,
+                        y_pixel_offset,
+                    },
+                    stable_row,
+                ));
+            } else {
+                // A coordinate outside the stable-row domain cannot safely be
+                // retained for a later click. Continue routing the mouse event
+                // itself, but fail closed for hyperlink hit testing.
+                pane_state.mouse_terminal_coords.take();
+            }
+        }
 
         struct FindCurrentLink {
             current: Option<Arc<Hyperlink>>,
@@ -845,13 +862,24 @@ impl super::TermWindow {
             }
         }
 
-        let mut find_link = FindCurrentLink {
-            current: None,
-            stable_row,
-            column,
-        };
-        pane.with_lines_mut(stable_row..stable_row + 1, &mut find_link);
-        let new_highlight = find_link.current;
+        let new_highlight = stable_row
+            .and_then(|stable_row| {
+                frankenterm_gui::checked_stable_row_range_from_top(stable_row, 1)
+                    .map(|stable_range| (stable_row, stable_range))
+            })
+            .and_then(|(stable_row, stable_range)| {
+                let mut find_link = FindCurrentLink {
+                    current: None,
+                    stable_row,
+                    column,
+                };
+                pane.with_lines_mut_and_apply_hyperlinks(
+                    stable_range,
+                    &self.config.hyperlink_rules,
+                    &mut find_link,
+                );
+                find_link.current
+            });
 
         match (self.current_highlight.as_ref(), new_highlight) {
             (Some(old_link), Some(new_link)) if Arc::ptr_eq(&old_link, &new_link) => {
@@ -1089,5 +1117,21 @@ fn mouse_press_to_tmb(press: &MousePress) -> TMB {
         MousePress::Left => TMB::Left,
         MousePress::Right => TMB::Right,
         MousePress::Middle => TMB::Middle,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checked_mouse_stable_row;
+    use wezterm_term::StableRowIndex;
+
+    #[test]
+    fn mouse_stable_row_conversion_fails_closed_at_domain_boundaries() {
+        assert_eq!(checked_mouse_stable_row(10, 3), Some(13));
+        assert_eq!(checked_mouse_stable_row(10, -1), None);
+        assert_eq!(
+            checked_mouse_stable_row(StableRowIndex::MAX, 1),
+            None,
+        );
     }
 }
