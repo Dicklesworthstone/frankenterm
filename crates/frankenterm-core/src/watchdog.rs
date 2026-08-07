@@ -562,7 +562,6 @@ impl Drop for WatchdogHandle {
 /// * `heartbeats` – shared heartbeat registry updated by runtime tasks.
 /// * `config` – staleness thresholds and check interval.
 /// * `shutdown_flag` – external shutdown signal (e.g. from `ObservationRuntime`).
-#[must_use]
 pub fn spawn_watchdog(
     cx: &crate::cx::Cx,
     heartbeats: Arc<HeartbeatRegistry>,
@@ -1012,7 +1011,6 @@ impl MuxWatchdog {
 
 /// Spawn the mux watchdog as a background task under the caller's explicit
 /// capability context.
-#[must_use]
 pub fn spawn_mux_watchdog(
     cx: &crate::cx::Cx,
     config: MuxWatchdogConfig,

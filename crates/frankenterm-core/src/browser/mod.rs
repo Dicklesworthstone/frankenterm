@@ -304,7 +304,7 @@ fn parse_secure_browser_auth_url(
         .strip_prefix("https://")
         .ok_or(BrowserNodeCommandFailure::InvalidConfiguration)?;
     let authority_end = rest
-        .find(|character: char| matches!(character, '/' | '?' | '#'))
+        .find(['/', '?', '#'])
         .unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     if authority.is_empty() || authority.contains(':') || authority.contains('@') {
@@ -2561,6 +2561,7 @@ fn discover_browser_profiles_for_service_with_limits(
     Ok(discovery)
 }
 
+#[cfg(test)]
 fn discover_browser_profiles_with_budget(
     profiles_root: &Path,
     max_entries: usize,

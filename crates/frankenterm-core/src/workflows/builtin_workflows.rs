@@ -1422,7 +1422,7 @@ impl HandleUsageLimits {
                 };
                 let tail = crate::wezterm::tail_text(&text, 200);
 
-                match parse_codex_session_summary(&tail) {
+                match parse_codex_session_summary(tail) {
                     Ok(parsed) => {
                         let persist_result =
                             persist_codex_session_summary_with_cx(cx, &storage, pane_id, &parsed)

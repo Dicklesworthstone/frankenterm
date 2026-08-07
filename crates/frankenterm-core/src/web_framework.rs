@@ -205,7 +205,7 @@ fn web_server_failure_code(error: &ServerError) -> &'static str {
     }
 }
 
-fn web_server_join_failure_code(error: &JoinError) -> &'static str {
+fn web_server_join_failure_code(error: JoinError) -> &'static str {
     match error.kind() {
         JoinErrorKind::Aborted => "web_server_task_aborted",
         JoinErrorKind::ContextCancelled => "web_server_task_context_cancelled",
@@ -559,14 +559,14 @@ impl FrameworkWebRuntime {
         result: FrameworkServerJoinResult,
     ) -> Result<()> {
         let deferred_join_error = match result {
-            Ok(Ok(())) | Ok(Err(ServerError::Shutdown)) => None,
+            Ok(Ok(()) | Err(ServerError::Shutdown)) => None,
             Ok(Err(err)) => Some(Error::runtime_backend(
                 "web server",
                 web_server_failure_code(&err),
             )),
             Err(err) => Some(Error::runtime_backend(
                 "web server task",
-                web_server_join_failure_code(&err),
+                web_server_join_failure_code(err),
             )),
         };
 

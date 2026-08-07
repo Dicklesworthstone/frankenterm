@@ -579,7 +579,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             let tail = tail_text(&text, self.options.tail_lines);
 
             // Run pattern detection
-            let detections = self.pattern_engine.detect(&tail);
+            let detections = self.pattern_engine.detect(tail);
             wait_checkpoint(cx, "pattern wait after detection")?;
             let observed_at = wait_clock_now(cx);
             if wait_timed_out(deadline, observed_at) {

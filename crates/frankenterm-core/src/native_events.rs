@@ -739,12 +739,12 @@ fn native_peer_effective_uid<F: AsFd>(stream: &F) -> Result<u32, NativeEventErro
         target_os = "dragonfly"
     ))]
     {
-        return nix::sys::socket::getsockopt(
+        nix::sys::socket::getsockopt(
             stream,
             nix::sys::socket::sockopt::LocalPeerCred,
         )
         .map(|credentials| credentials.uid())
-        .map_err(|_| NativeEventSecurityError::PeerCredentialsUnavailable.into());
+        .map_err(|_| NativeEventSecurityError::PeerCredentialsUnavailable.into())
     }
 
     #[cfg(any(target_os = "android", target_os = "linux"))]

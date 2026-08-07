@@ -741,7 +741,7 @@ impl<'a> PaneGeometry<'a> {
         }
     }
 
-    fn to_leaf(&self) -> PaneNode {
+    fn to_leaf(self) -> PaneNode {
         PaneNode::Leaf {
             pane_id: self.pane.pane_id,
             rows: self.rows,

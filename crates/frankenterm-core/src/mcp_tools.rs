@@ -463,7 +463,7 @@ fn validate_mcp_submit_idempotency_key_bytes(
     if idempotency_key.is_empty() {
         let envelope = McpEnvelope::<()>::error(
             MCP_ERR_INVALID_ARGS,
-            "idempotency_key must not be empty".to_string(),
+            "idempotency_key must not be empty",
             Some(format!(
                 "{tool_name} requires a non-empty caller replay nonce when idempotency_key is present."
             )),
@@ -2095,7 +2095,7 @@ impl ToolHandler for WaCassSearchTool {
         if params.query.trim().is_empty() {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
-                "query cannot be empty".to_string(),
+                "query cannot be empty",
                 Some("Provide a non-empty search query string".to_string()),
                 elapsed_ms(start),
             );
@@ -2254,7 +2254,7 @@ impl ToolHandler for WaCassViewTool {
         if params.source_path.trim().is_empty() {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
-                "source_path cannot be empty".to_string(),
+                "source_path cannot be empty",
                 Some("Provide a valid source_path returned by cass search".to_string()),
                 elapsed_ms(start),
             );
@@ -2315,7 +2315,7 @@ impl ToolHandler for WaCassViewTool {
             Ok(None) => {
                 let envelope = McpEnvelope::<()>::error(
                     MCP_ERR_INVALID_ARGS,
-                    "source_path is not an indexed cass session".to_string(),
+                    "source_path is not an indexed cass session",
                     Some(
                         "wa.cass_view reads only files cass has indexed. Use wa.cass_search and \
                          pass back a source_path from its results."
@@ -4404,7 +4404,7 @@ impl Drop for McpAwaitEventRequestAdmissionGuard {
     fn drop(&mut self) {
         if self
             .admissions
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
                 admitted.checked_sub(1)
             })
             .is_err()
@@ -4455,8 +4455,10 @@ fn deliver_mcp_await_event_request_reply(
     }
     match reply.try_send(output) {
         Ok(()) => None,
-        Err(crossbeam::channel::TrySendError::Full(output))
-        | Err(crossbeam::channel::TrySendError::Disconnected(output)) => Some(output),
+        Err(
+            crossbeam::channel::TrySendError::Full(output)
+            | crossbeam::channel::TrySendError::Disconnected(output),
+        ) => Some(output),
     }
 }
 
@@ -5284,7 +5286,7 @@ impl McpAwaitEventDeliveryCompletionExecutor {
 
         if self
             .request_admissions
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
                 (admitted < MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY)
                     .then(|| admitted.saturating_add(1))
             })
@@ -6110,8 +6112,10 @@ fn run_mcp_await_event_delivery_completion_worker(
                             deferred_job = Some(next_job);
                             break;
                         }
-                        Err(crossbeam::channel::TryRecvError::Empty)
-                        | Err(crossbeam::channel::TryRecvError::Disconnected) => break,
+                        Err(
+                            crossbeam::channel::TryRecvError::Empty
+                            | crossbeam::channel::TryRecvError::Disconnected,
+                        ) => break,
                     }
                 }
 
@@ -7592,7 +7596,7 @@ impl ToolHandler for WaEventsTool {
         if params.since.is_some_and(|since| since < 0) {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
-                "since must be a non-negative epoch-millisecond timestamp".to_string(),
+                "since must be a non-negative epoch-millisecond timestamp",
                 Some("Use since=0 for the beginning of the Unix epoch, or omit the filter.".to_string()),
                 elapsed_ms(start),
             );
@@ -7945,7 +7949,7 @@ impl ToolHandler for WaAwaitEventTool {
         if params.any.is_empty() && params.all.is_empty() {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
-                "wa.await_event requires at least one any/all condition".to_string(),
+                "wa.await_event requires at least one any/all condition",
                 Some("Example: {\"all\":[\"rule:codex.*\"],\"timeout_secs\":30}".to_string()),
                 elapsed_ms(start),
             );
@@ -8013,7 +8017,7 @@ impl ToolHandler for WaAwaitEventTool {
         if params.cursor.is_some_and(|cursor| cursor < 0) {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
-                "cursor must be non-negative".to_string(),
+                "cursor must be non-negative",
                 None,
                 elapsed_ms(start),
             );
@@ -8038,8 +8042,7 @@ impl ToolHandler for WaAwaitEventTool {
         if params.checkpoint_only && (params.cursor.is_some() || params.claim) {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
-                "checkpoint_only requires a fresh request without cursor/token and with claim=false"
-                    .to_string(),
+                "checkpoint_only requires a fresh request without cursor/token and with claim=false",
                 Some(
                     "Remove cursor, cursor_epoch, cursor_scope, and claim; keep the intended any/all, pane, and unhandled scope."
                         .to_string(),
@@ -8099,8 +8102,7 @@ impl ToolHandler for WaAwaitEventTool {
         if params.claim && self.response_delivery.is_none() {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_CONFIG,
-                "wa.await_event claim requires a sender-side completion-aware MCP response transport"
-                    .to_string(),
+                "wa.await_event claim requires a sender-side completion-aware MCP response transport",
                 Some(
                     "Run wa.await_event through the FrankenTerm MCP server transport; direct handler dispatch cannot safely claim events"
                         .to_string(),
@@ -8888,8 +8890,7 @@ impl ToolHandler for WaAwaitEventTool {
                     );
                     let envelope = McpEnvelope::<()>::error(
                         MCP_ERR_CONFIG,
-                        "wa.await_event claim response has no sender-side completion-aware transport"
-                            .to_string(),
+                        "wa.await_event claim response has no sender-side completion-aware transport",
                         None,
                         elapsed_ms(start),
                     );
@@ -8909,8 +8910,7 @@ impl ToolHandler for WaAwaitEventTool {
                     response_delivery.fail_all();
                     let envelope = McpEnvelope::<()>::error(
                         MCP_ERR_CONFIG,
-                        "wa.await_event claim response collided with an in-flight delivery"
-                            .to_string(),
+                        "wa.await_event claim response collided with an in-flight delivery",
                         Some(
                             "The MCP response transport must remain sequential and single-flight"
                                 .to_string(),
@@ -10299,7 +10299,7 @@ impl ToolHandler for WaWorkflowRunTool {
                 } else if status == "policy_denied" {
                     let envelope = McpEnvelope::<()>::error(
                         MCP_ERR_POLICY,
-                        "Workflow denied by policy".to_string(),
+                        "Workflow denied by policy",
                         Some("Review safety configuration or use dry_run.".to_string()),
                         elapsed_ms(start),
                     );
@@ -10508,7 +10508,7 @@ impl ToolHandler for WaWorkflowStatusTool {
         if workflow_status_missing_filter(&params) {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
-                "Must provide execution_id, pane_id, or active=true".to_string(),
+                "Must provide execution_id, pane_id, or active=true",
                 Some(
                     "Specify an execution_id, pane_id, or active=true to bound the workflow status query."
                         .to_string(),
@@ -10522,7 +10522,7 @@ impl ToolHandler for WaWorkflowStatusTool {
         if !(1..=500).contains(&limit) {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
-                "limit must be between 1 and 500".to_string(),
+                "limit must be between 1 and 500",
                 Some("Use a positive limit no larger than 500.".to_string()),
                 elapsed_ms(start),
             );
@@ -13151,7 +13151,7 @@ impl ToolHandler for WaMissionPauseTool {
             _ => {
                 let envelope = McpEnvelope::<()>::error(
                     MCP_ERR_INVALID_ARGS,
-                    "reason is required and must not be empty".to_string(),
+                    "reason is required and must not be empty",
                     Some("Provide a reason code for the pause.".to_string()),
                     elapsed_ms(start),
                 );
@@ -13439,7 +13439,7 @@ impl ToolHandler for WaMissionAbortTool {
             _ => {
                 let envelope = McpEnvelope::<()>::error(
                     MCP_ERR_INVALID_ARGS,
-                    "reason is required and must not be empty".to_string(),
+                    "reason is required and must not be empty",
                     Some("Provide a reason code for the abort.".to_string()),
                     elapsed_ms(start),
                 );
@@ -13593,7 +13593,7 @@ impl ToolHandler for WaEventsAnnotateTool {
         if params.clear == params.note.is_some() {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
-                "Invalid params: specify exactly one of note or clear".to_string(),
+                "Invalid params: specify exactly one of note or clear",
                 Some("Example: {\"event_id\":123,\"note\":\"Investigating\"}".to_string()),
                 elapsed_ms(start),
             );
@@ -13825,7 +13825,7 @@ impl ToolHandler for WaEventsTriageTool {
         if params.clear == params.state.is_some() {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
-                "Invalid params: specify exactly one of state or clear".to_string(),
+                "Invalid params: specify exactly one of state or clear",
                 Some("Example: {\"event_id\":123,\"state\":\"investigating\"}".to_string()),
                 elapsed_ms(start),
             );
@@ -14056,7 +14056,7 @@ impl ToolHandler for WaEventsLabelTool {
         if ops != 1 {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
-                "Invalid params: specify exactly one of add/remove/list".to_string(),
+                "Invalid params: specify exactly one of add/remove/list",
                 Some("Example: {\"event_id\":123,\"add\":\"urgent\"}".to_string()),
                 elapsed_ms(start),
             );

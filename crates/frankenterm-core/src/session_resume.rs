@@ -853,7 +853,6 @@ impl SessionResumer {
 
     /// Override subprocess capture limits for unusually large CASR datasets or
     /// stricter embedding contexts.
-    #[must_use]
     pub fn with_output_limits(
         mut self,
         stdout_limit: usize,
@@ -1288,10 +1287,10 @@ impl SessionResumer {
         let output = match cancellation {
             Some(cancellation) => cmd
                 .output_blocking_with_cancellation(timeout, cancellation)
-                .map_err(|error| self.map_command_error(&error))?,
+                .map_err(|error| Self::map_command_error(&error))?,
             None => cmd
                 .output_blocking(timeout)
-                .map_err(|error| self.map_command_error(&error))?,
+                .map_err(|error| Self::map_command_error(&error))?,
         };
 
         if !output.status.success() {
@@ -1409,7 +1408,7 @@ impl SessionResumer {
         }
         let output = worker_result
             .map_err(|_| SessionResumeError::AsyncInfrastructureFailure)?
-            .map_err(|error| self.map_command_error(&error))?;
+            .map_err(|error| Self::map_command_error(&error))?;
         if cancellation_won {
             return Err(SessionResumeError::Cancelled);
         }
@@ -1450,7 +1449,7 @@ impl SessionResumer {
         Ok(cmd)
     }
 
-    fn map_command_error(&self, err: &std::io::Error) -> SessionResumeError {
+    fn map_command_error(err: &std::io::Error) -> SessionResumeError {
         if err.kind() == std::io::ErrorKind::NotFound {
             return SessionResumeError::CasrNotFound;
         }

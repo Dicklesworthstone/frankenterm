@@ -107,6 +107,7 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("ipc.rs", "set_pane_priority"),
     ("ipc.rs", "clear_pane_priority"),
     ("ipc.rs", "call_rpc"),
+    ("ipc.rs", "watcher_control"),
     # ft-dit9w: workflows cluster ergonomic wrappers. Each entry below
     # constructs an ambient Cx and awaits its exact `_with_cx`/`_cx` sibling.
     ("workflows/context.rs", "send_text"),
@@ -520,6 +521,8 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("snapshot_engine.rs", "capture"),
     ("snapshot_engine.rs", "capture_with_options"),
     ("snapshot_engine.rs", "cleanup"),
+    ("snapshot_engine.rs", "close_after_checkpoint"),
+    ("snapshot_engine.rs", "delete_checkpoint"),
     ("snapshot_engine.rs", "run_periodic"),
     ("snapshot_engine.rs", "shutdown_checkpoint"),
     # recording.rs: pane-recording lifecycle.

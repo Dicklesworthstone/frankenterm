@@ -106,7 +106,7 @@ type WorkflowChildDrainResult = Result<
 
 enum WorkflowRunnerWake {
     Shutdown,
-    Event(Result<crate::events::Event, crate::events::RecvError>),
+    Event(Box<Result<crate::events::Event, crate::events::RecvError>>),
     Child(WorkflowChildDrainResult),
 }
 
@@ -129,10 +129,10 @@ async fn wait_for_workflow_runner_activity(
             let event_wait = std::pin::pin!(subscriber.recv_cx(cx));
             return match select(shutdown_wait, event_wait).await {
                 Either::Left(((), _)) => WorkflowRunnerWake::Shutdown,
-                Either::Right((event, _)) => WorkflowRunnerWake::Event(event),
+                Either::Right((event, _)) => WorkflowRunnerWake::Event(Box::new(event)),
             };
         }
-        return WorkflowRunnerWake::Event(subscriber.recv_cx(cx).await);
+        return WorkflowRunnerWake::Event(Box::new(subscriber.recv_cx(cx).await));
     }
 
     if let Some((shutdown_flag, shutdown_notify)) = shutdown {
@@ -143,7 +143,7 @@ async fn wait_for_workflow_runner_activity(
             let event_wait = std::pin::pin!(subscriber.recv_cx(cx));
             let child_wait = std::pin::pin!(child_tasks.drain_next_with_cx(cx));
             match select(event_wait, child_wait).await {
-                Either::Left((event, _)) => WorkflowRunnerWake::Event(event),
+                Either::Left((event, _)) => WorkflowRunnerWake::Event(Box::new(event)),
                 Either::Right((child, _)) => WorkflowRunnerWake::Child(child),
             }
         });
@@ -156,7 +156,7 @@ async fn wait_for_workflow_runner_activity(
     let event_wait = std::pin::pin!(subscriber.recv_cx(cx));
     let child_wait = std::pin::pin!(child_tasks.drain_next_with_cx(cx));
     match select(event_wait, child_wait).await {
-        Either::Left((event, _)) => WorkflowRunnerWake::Event(event),
+        Either::Left((event, _)) => WorkflowRunnerWake::Event(Box::new(event)),
         Either::Right((child, _)) => WorkflowRunnerWake::Child(child),
     }
 }
@@ -3160,7 +3160,7 @@ impl WorkflowRunner {
                     );
                     break;
                 }
-                WorkflowRunnerWake::Event(event) => event,
+                WorkflowRunnerWake::Event(event) => *event,
                 WorkflowRunnerWake::Child(Ok(Some(Ok(())))) => continue,
                 WorkflowRunnerWake::Child(Ok(Some(Err(error)))) => {
                     tracing::warn!(
@@ -3937,6 +3937,7 @@ impl WorkflowRunner {
     /// # Arguments
     /// * `execution_id` - The workflow execution ID
     /// * `status` - The handling status ("completed", "failed", "aborted", "denied")
+    ///
     /// Routes get_workflow + mark_event_handled through one explicit Cx.
     async fn mark_trigger_event_handled_with_cx(
         &self,

@@ -573,7 +573,7 @@ static RUNTIME_WAIT_FAILURES_TOTAL: std::sync::atomic::AtomicU64 =
 
 fn increment_saturating_atomic(counter: &std::sync::atomic::AtomicU64) -> u64 {
     counter
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(1))
         })
         .unwrap_or_else(|current| current)
@@ -939,10 +939,10 @@ impl StreamingTasks {
 
     fn remove_for_settlement(
         &mut self,
-        pane_id: &u64,
+        pane_id: u64,
         abort: bool,
     ) -> Option<RetiredStreamingTask> {
-        let task = self.tasks.remove(pane_id)?;
+        let task = self.tasks.remove(&pane_id)?;
         let StreamingTask {
             identity,
             lease,
@@ -3917,7 +3917,7 @@ impl ObservationRuntime {
                     "capability checkpoint failed before runtime startup",
                 )
             })?;
-        self.start_impl().await
+        self.start_impl()
     }
 
     #[instrument(skip(self))]
@@ -3926,7 +3926,7 @@ impl ObservationRuntime {
         self.start_with_cx(&cx).await
     }
 
-    async fn start_impl(&mut self) -> Result<RuntimeHandle> {
+    fn start_impl(&self) -> Result<RuntimeHandle> {
         info!("Starting observation runtime");
 
         // Stage 1 ingress: multi-producer capture tasks write into bounded MPSC.
@@ -4244,16 +4244,14 @@ impl ObservationRuntime {
                         }
                         Err(RuntimeTimeoutFailure::Elapsed) => {}
                     }
-                } else {
-                    if let Err(failure) = runtime_sleep(
+                } else if let Err(failure) = runtime_sleep(
                         &loop_cx,
                         Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
                     )
                     .await
-                    {
-                        record_runtime_wait_failure("snapshot_trigger_bridge", failure);
-                        break;
-                    }
+                {
+                    record_runtime_wait_failure("snapshot_trigger_bridge", failure);
+                    break;
                 }
 
                 if shutdown_flag.load(Ordering::SeqCst) {
@@ -4533,15 +4531,14 @@ impl ObservationRuntime {
                 // Check for config updates
                 if config_update_pending(&config_rx) {
                     let new_config = config_take_update(&mut config_rx);
-                    let mut retention_changed = false;
-                    if new_config.retention_days != retention_days {
+                    let mut retention_changed = new_config.retention_days != retention_days;
+                    if retention_changed {
                         info!(
                             old = retention_days,
                             new = new_config.retention_days,
                             "Retention policy updated"
                         );
                         retention_days = new_config.retention_days;
-                        retention_changed = true;
                     }
                     if new_config.retention_policy.as_ref() != retention_policy.as_ref() {
                         info!(
@@ -6050,7 +6047,7 @@ impl ObservationRuntime {
                     }
 
                     let task = streaming_tasks
-                        .remove_for_settlement(&pane_id, false)
+                        .remove_for_settlement(pane_id, false)
                         .expect("current streaming exit has an active task");
                     let task_stamp = task.lease.stamp();
                     let binding_identity = capture_bindings.get(&pane_id).and_then(|binding| {
@@ -6395,7 +6392,7 @@ impl ObservationRuntime {
 
                     #[cfg(all(feature = "vendored", unix))]
                     for pane_id in &obsolete_bindings {
-                        let _ = streaming_tasks.remove_for_settlement(pane_id, true);
+                        let _ = streaming_tasks.remove_for_settlement(*pane_id, true);
                     }
 
                     // Stop polling admission before revoking an obsolete pane.
@@ -6861,7 +6858,7 @@ impl ObservationRuntime {
                             .collect();
                         for (pane_id, has_replacement) in obsolete_streams {
                             if let Some(task) =
-                                streaming_tasks.remove_for_settlement(&pane_id, true)
+                                streaming_tasks.remove_for_settlement(pane_id, true)
                             {
                                 let task_stamp = task.lease.stamp();
                                 let binding_identity = capture_bindings.get(&pane_id).and_then(
@@ -7289,7 +7286,7 @@ impl ObservationRuntime {
                         // The bounded wait expiring is the normal scheduler
                         // wakeup: keep the in-flight poll futures owned and
                         // let the next loop iteration run sync/spawn work.
-                        Err(RuntimeTimeoutFailure::Elapsed) => continue,
+                        Err(RuntimeTimeoutFailure::Elapsed) => {}
                     }
                 } else if let Err(failure) = runtime_sleep(&loop_cx, wait_duration).await {
                     record_runtime_wait_failure("capture_scheduler_wait", failure);
@@ -7715,8 +7712,9 @@ impl ObservationRuntime {
                     Ok(RecvEvent::Closed) => {
                         // Producer completion is a clean terminal boundary;
                         // preserve already-coalesced bytes before exit.
+                        let producer_closed = shutdown_drain_state.mark_producer_closed();
                         debug_assert_eq!(
-                            shutdown_drain_state.mark_producer_closed(),
+                            producer_closed,
                             NativeEventShutdownDrainAction::ProducerClosed,
                         );
                         drain_pending_output_on_shutdown = true;

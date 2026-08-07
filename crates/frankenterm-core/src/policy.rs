@@ -2526,7 +2526,7 @@ static POLICY_AUDIT_WRITE_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn increment_policy_failure_counter(counter: &AtomicU64) -> u64 {
     counter
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(1))
         })
         .unwrap_or_else(|current| current)

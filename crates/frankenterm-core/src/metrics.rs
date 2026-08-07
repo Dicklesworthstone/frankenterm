@@ -960,13 +960,13 @@ impl MetricsServer {
                                 let _connection_test_guard =
                                     task_test_probe.map(|probe| probe.task_started());
                                 if let Err(err) =
-                                    handle_connection_with_cx(
+                                    Box::pin(handle_connection_with_cx(
                                         &conn_cx,
                                         socket,
                                         &prefix,
                                         collector,
                                         connection_io_timeout,
-                                    )
+                                    ))
                                     .await
                                 {
                                     debug!(error = %err, peer = %peer, "Metrics connection failed");
@@ -1126,7 +1126,7 @@ async fn handle_connection_with_cx(
     io_timeout: Duration,
 ) -> Result<()> {
     metrics_connection_checkpoint(cx, "metrics handle_connection")?;
-    metrics_connection_io_with_cx(
+    Box::pin(metrics_connection_io_with_cx(
         cx,
         "metrics connection I/O",
         io_timeout,
@@ -1140,7 +1140,7 @@ async fn handle_connection_with_cx(
             let request_bytes = buf[..read_len].to_vec();
             handle_connection_impl(socket, prefix, collector, request_bytes).await
         },
-    )
+    ))
     .await?
 }
 

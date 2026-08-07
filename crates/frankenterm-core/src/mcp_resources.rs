@@ -1273,7 +1273,7 @@ impl ResourceHandler for WaSwarmScentResource {
                 SWARM_SCENT_RESOURCE_URI,
                 McpEnvelope::<serde_json::Value>::error(
                     error.code(),
-                    error.message().to_string(),
+                    error.message(),
                     Some(error.hint().to_string()),
                     elapsed_ms(start),
                 ),

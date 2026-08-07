@@ -1856,7 +1856,7 @@ fn snapshot_authority_file_identity(db_path: &str) -> Option<String> {
             // to one authority key; every other memdb spelling is private.
             let shared = cache.as_deref() == Some(b"shared")
                 || (uri_path.len() > 1
-                    && matches!(uri_path.first(), Some(b'/') | Some(b'\\')));
+                    && matches!(uri_path.first(), Some(b'/' | b'\\')));
             return shared.then(|| {
                 format!(
                     "sqlite-memdb-vfs:{}",
@@ -4699,7 +4699,7 @@ fn checkpoint_cleanup_wait_duration(
     if let Some(deferred_at) = cadence.retry_deferred_at {
         let elapsed = now.saturating_duration_since(deferred_at);
         if elapsed < CHECKPOINT_CLEANUP_RETRY_DELAY {
-            return CHECKPOINT_CLEANUP_RETRY_DELAY - elapsed;
+            return CHECKPOINT_CLEANUP_RETRY_DELAY.saturating_sub(elapsed);
         }
     }
     cadence.last_authoritative_success.map_or(Duration::ZERO, |completed_at| {
@@ -4751,7 +4751,7 @@ fn session_cleanup_wait_duration(
     if let Some(deferred_at) = schedule.retry_deferred_at {
         let elapsed = now.saturating_duration_since(deferred_at);
         if elapsed < SESSION_CLEANUP_RETRY_DELAY {
-            return Some(SESSION_CLEANUP_RETRY_DELAY - elapsed);
+            return Some(SESSION_CLEANUP_RETRY_DELAY.saturating_sub(elapsed));
         }
     }
 
@@ -4998,7 +4998,7 @@ fn project_snapshot_panes(
             tty_name: None,
             cursor_x: pane.cursor_x,
             cursor_y: pane.cursor_y,
-            cursor_visibility: pane.cursor_visibility.clone(),
+            cursor_visibility: pane.cursor_visibility,
             left_col: pane.left_col,
             top_row: pane.top_row,
             is_active: pane.is_active,
@@ -5572,7 +5572,7 @@ enum SnapshotAuthorityDbError {
     #[error("mutation failed ({source}) and rollback acknowledgement failed ({rollback})")]
     IndeterminateRollback {
         source: rusqlite::Error,
-        rollback: rusqlite::Error,
+        rollback: Box<rusqlite::Error>,
     },
 }
 
@@ -5634,7 +5634,7 @@ where
             Ok(()) => Err(SnapshotAuthorityDbError::retry_safe(source)),
             Err(rollback) => Err(SnapshotAuthorityDbError::IndeterminateRollback {
                 source,
-                rollback,
+                rollback: Box::new(rollback),
             }),
         },
     }
@@ -5669,7 +5669,7 @@ where
             Ok(()) => Err(SnapshotAuthorityDbError::retry_safe(source)),
             Err(rollback) => Err(SnapshotAuthorityDbError::IndeterminateRollback {
                 source,
-                rollback,
+                rollback: Box::new(rollback),
             }),
         },
     }
@@ -7486,7 +7486,7 @@ mod tests {
                 },
                 SnapshotAuthorityDbError::IndeterminateRollback {
                     source: rusqlite::Error::InvalidQuery,
-                    rollback: rusqlite::Error::ExecuteReturnedResults,
+                    rollback: Box::new(rusqlite::Error::ExecuteReturnedResults),
                 },
             ] {
                 let (_tmp, db_path) = setup_test_db();

@@ -1173,7 +1173,7 @@ fn validate_pane_tree(
                     prefix_scale = *ratio;
                     scaled_prefix_sum = 1.0;
                 } else if *ratio > prefix_scale {
-                    scaled_prefix_sum = scaled_prefix_sum * (prefix_scale / *ratio) + 1.0;
+                    scaled_prefix_sum = scaled_prefix_sum.mul_add(prefix_scale / *ratio, 1.0);
                     prefix_scale = *ratio;
                 } else {
                     scaled_prefix_sum += *ratio / prefix_scale;

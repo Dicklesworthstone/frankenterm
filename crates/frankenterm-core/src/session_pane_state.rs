@@ -182,7 +182,7 @@ where
     S: Serializer,
 {
     let mut entries: Vec<_> = vars.iter().collect();
-    entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    entries.sort_unstable_by_key(|(key, _)| *key);
 
     let mut map = serializer.serialize_map(Some(entries.len()))?;
     for (key, value) in entries {

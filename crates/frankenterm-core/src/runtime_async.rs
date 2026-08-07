@@ -1374,7 +1374,7 @@ pub mod mpsc {
                 retained_waker,
             } = this;
             super::poll_with_contained_channel_waker(
-                &mut **retained_waker,
+                retained_waker,
                 caller_cx,
                 |proxy_cx| Pin::new(&mut *inner).poll(proxy_cx),
                 new_waker_boundary,
@@ -1412,7 +1412,7 @@ pub mod mpsc {
                 retained_waker,
             } = this;
             super::poll_with_contained_channel_waker(
-                &mut **retained_waker,
+                retained_waker,
                 caller_cx,
                 |proxy_cx| Pin::new(&mut *inner).poll(proxy_cx),
                 new_waker_boundary,
@@ -1698,7 +1698,7 @@ pub mod watch {
                 retained_waker,
             } = this;
             super::poll_with_durable_probe_contained_channel_waker(
-                &mut **retained_waker,
+                retained_waker,
                 caller_cx,
                 |proxy_cx| Pin::new(&mut *inner).poll(proxy_cx),
                 new_waker_boundary,
@@ -1970,7 +1970,7 @@ pub mod broadcast {
                 retained_waker,
             } = this;
             super::poll_with_durable_probe_contained_channel_waker(
-                &mut **retained_waker,
+                retained_waker,
                 caller_cx,
                 |proxy_cx| std::pin::Pin::new(&mut *inner).poll(proxy_cx),
                 new_waker_boundary,
@@ -2717,7 +2717,6 @@ pub mod task {
                     if result.is_some() {
                         return Ok(result);
                     }
-                    continue;
                 }
             }
         }
@@ -4870,9 +4869,8 @@ pub mod process {
                     )?;
                     return Err(error);
                 }
-            } else if io_quantum_exhausted {
-                continue;
-            } else if let Err(error) = poll_process_io(
+            } else if !io_quantum_exhausted
+                && let Err(error) = poll_process_io(
                 stdin_state.as_ref().map(|input| &input.writer),
                 stdout_reader.as_ref(),
                 stderr_reader.as_ref(),
@@ -5007,9 +5005,9 @@ pub mod process {
         limit: usize,
         stream: CommandOutputStream,
     ) -> std::io::Result<()> {
-        let observed = output.len().checked_add(bytes.len()).ok_or(
-            CommandOutputLimitExceeded::new(stream, usize::MAX, limit).into_io_error(),
-        )?;
+        let observed = output.len().checked_add(bytes.len()).ok_or_else(|| {
+            CommandOutputLimitExceeded::new(stream, usize::MAX, limit).into_io_error()
+        })?;
         if observed > limit {
             return Err(CommandOutputLimitExceeded::new(stream, observed, limit).into_io_error());
         }
@@ -5356,8 +5354,8 @@ pub mod process {
                             reaped,
                             signal_helper_settled,
                             process_tree_signalled,
-                            stdout_reader,
-                            stderr_reader,
+                            stdout_reader.as_ref(),
+                            stderr_reader.as_ref(),
                         );
                     }
                 }
@@ -5367,8 +5365,8 @@ pub mod process {
                     reaped,
                     signal_helper_settled,
                     process_tree_signalled,
-                    stdout_reader,
-                    stderr_reader,
+                    stdout_reader.as_ref(),
+                    stderr_reader.as_ref(),
                 );
             }
 
@@ -5378,8 +5376,8 @@ pub mod process {
                     reaped,
                     signal_helper_settled,
                     process_tree_signalled,
-                    stdout_reader,
-                    stderr_reader,
+                    stdout_reader.as_ref(),
+                    stderr_reader.as_ref(),
                 );
             }
             if stdout_quantum_exhausted || stderr_quantum_exhausted {
@@ -5403,8 +5401,8 @@ pub mod process {
         leader_reaped: bool,
         signal_helper_settled: bool,
         process_tree_signalled: bool,
-        stdout_reader: &Option<FileDescriptor>,
-        stderr_reader: &Option<FileDescriptor>,
+        stdout_reader: Option<&FileDescriptor>,
+        stderr_reader: Option<&FileDescriptor>,
     ) -> OutputCleanupState {
         OutputCleanupState {
             leader_reaped,

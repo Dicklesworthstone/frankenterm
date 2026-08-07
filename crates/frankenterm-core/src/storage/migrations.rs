@@ -2916,10 +2916,12 @@ fn checkpoint_v38_table_has_identity_surface(conn: &Connection) -> Result<bool> 
         )?)
 }
 
+type CheckpointForeignKey = (String, String, String, String, String, String);
+
 fn checkpoint_foreign_keys(
     conn: &Connection,
     table: &str,
-) -> Result<Vec<(String, String, String, String, String, String)>> {
+) -> Result<Vec<CheckpointForeignKey>> {
     let mut statement = conn
         .prepare(&format!("PRAGMA foreign_key_list({table})"))
         .map_err(|error| StorageError::Database(error.to_string()))?;

@@ -218,13 +218,19 @@ fn record_crash_bundle_parse_drop(
 /// count into a false clean state. `update` also keeps this correct under
 /// concurrent crash-directory refreshes.
 fn increment_saturating_crash_bundle_counter(counter: &std::sync::atomic::AtomicU64) -> u64 {
-    counter
-        .update(
+    let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(1);
+        match counter.compare_exchange_weak(
+            current,
+            next,
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
-            |current| current.saturating_add(1),
-        )
-        .saturating_add(1)
+        ) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 /// Claim one of a finite number of process-lifetime warning slots.
@@ -241,7 +247,7 @@ fn claim_bounded_crash_bundle_log_slot(
 ) -> Option<u64> {
     let terminal = warning_limit.saturating_add(1);
     counter
-        .try_update(
+        .fetch_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |current| (current < terminal).then(|| current.saturating_add(1)),
@@ -2264,7 +2270,7 @@ pub fn write_crash_bundle(
 
         match create_result {
             Ok(()) => break (candidate_tmp, candidate_final),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     };
@@ -2709,9 +2715,9 @@ fn crash_bundle_candidate_modified(
     }
 }
 
-fn crash_bundle_name_key(
-    path: &Path,
-) -> Option<(String, CrashBundleChronologicalKey, Option<(u32, u64)>)> {
+type CrashBundleNameKey = (String, CrashBundleChronologicalKey, Option<(u32, u64)>);
+
+fn crash_bundle_name_key(path: &Path) -> Option<CrashBundleNameKey> {
     let name = path.file_name()?.to_str()?;
     let suffix = name.strip_prefix("ft_crash_")?;
     let timestamp = suffix.get(..15)?;
@@ -2733,8 +2739,7 @@ fn crash_bundle_name_key(
     if year == 0 {
         return None;
     }
-    let leap_year =
-        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let days_in_month = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,

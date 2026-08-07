@@ -42,6 +42,9 @@ use std::time::Duration;
 /// All sections are optional with sensible defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
+// This private field is a serde rejection sentinel for an unsupported input
+// table, not a manual attempt to make the public type non-exhaustive.
+#[allow(clippy::manual_non_exhaustive)]
 pub struct Config {
     /// General settings (log level, data directory)
     pub general: GeneralConfig,
@@ -2000,8 +2003,8 @@ fn append_compiled_retention_tier_predicate(
     bind_values: &mut Vec<String>,
     tier: &RetentionTier,
 ) {
-    let mut needs_and = false;
-    if !tier.severities.is_empty() {
+    let needs_and = !tier.severities.is_empty();
+    if needs_and {
         sql.push('(');
         for (index, severity) in tier.severities.iter().enumerate() {
             if index > 0 {
@@ -2018,7 +2021,6 @@ fn append_compiled_retention_tier_predicate(
             bind_values.push(severity.clone());
         }
         sql.push(')');
-        needs_and = true;
     }
     if !tier.event_types.is_empty() {
         if needs_and {

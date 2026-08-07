@@ -12,38 +12,38 @@ use sha2::{Digest, Sha256};
 
 use crate::session_topology::{MAX_SNAPSHOT_BYTES, MAX_TOPOLOGY_PANES};
 
-pub(crate) const SNAPSHOT_DEDUP_PREFIX: &str = "snpd2:";
-pub(crate) const SNAPSHOT_WITNESS_PREFIX: &str = "snp2:";
-pub(crate) const RESTORE_INTENT_WITNESS_PREFIX: &str = "rsi2:";
-pub(crate) const RESTORE_RECEIPT_WITNESS_PREFIX: &str = "rst2:";
-pub(crate) const CHECKPOINT_ROLE_SNAPSHOT: &str = "snapshot";
-pub(crate) const CHECKPOINT_ROLE_RESTORE_INTENT: &str = "restore_intent";
-pub(crate) const CHECKPOINT_ROLE_RESTORE_RECEIPT: &str = "restore_receipt";
+pub const SNAPSHOT_DEDUP_PREFIX: &str = "snpd2:";
+pub const SNAPSHOT_WITNESS_PREFIX: &str = "snp2:";
+pub const RESTORE_INTENT_WITNESS_PREFIX: &str = "rsi2:";
+pub const RESTORE_RECEIPT_WITNESS_PREFIX: &str = "rst2:";
+pub const CHECKPOINT_ROLE_SNAPSHOT: &str = "snapshot";
+pub const CHECKPOINT_ROLE_RESTORE_INTENT: &str = "restore_intent";
+pub const CHECKPOINT_ROLE_RESTORE_RECEIPT: &str = "restore_receipt";
 
 /// Maximum UTF-8 bytes stored across the text columns of one
 /// `mux_pane_state` row. Scrollback content is stored elsewhere and is not
 /// part of this projection.
-pub(crate) const MAX_PERSISTED_PANE_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_PERSISTED_PANE_TEXT_BYTES: usize = 64 * 1024;
 /// Maximum UTF-8 bytes admitted for one checkpoint's topology, metadata, and
 /// pane-row text. This is an admission bound, not a claim about SQLite/Rust
 /// peak RSS while parsing an already admitted checkpoint.
-pub(crate) const MAX_PERSISTED_CHECKPOINT_TEXT_BYTES: usize = 128 * 1024 * 1024;
+pub const MAX_PERSISTED_CHECKPOINT_TEXT_BYTES: usize = 128 * 1024 * 1024;
 /// Operator/event metadata is intentionally much smaller than the topology or
 /// pane projection. Restore outcome metadata for the maximum pane count fits
 /// comfortably within this bound.
-pub(crate) const MAX_CHECKPOINT_METADATA_BYTES: usize = 1024 * 1024;
-pub(crate) const MAX_CHECKPOINT_SESSION_ID_BYTES: usize = 256;
-pub(crate) const MAX_CHECKPOINT_TYPE_BYTES: usize = 64;
+pub const MAX_CHECKPOINT_METADATA_BYTES: usize = 1024 * 1024;
+pub const MAX_CHECKPOINT_SESSION_ID_BYTES: usize = 256;
+pub const MAX_CHECKPOINT_TYPE_BYTES: usize = 64;
 /// Maximum stored mux-session build/version identity. Kept with the other
 /// persistence projection limits so writers and restore readers share it.
-pub(crate) const MAX_SESSION_FT_VERSION_BYTES: usize = 256;
+pub const MAX_SESSION_FT_VERSION_BYTES: usize = 256;
 /// Maximum stored optional mux-session host identity.
-pub(crate) const MAX_SESSION_HOST_ID_BYTES: usize = 1024;
-pub(crate) const MAX_CHECKPOINT_ROLE_BYTES: usize = 32;
-pub(crate) const MAX_CHECKPOINT_STATE_HASH_BYTES: usize = 256;
+pub const MAX_SESSION_HOST_ID_BYTES: usize = 1024;
+pub const MAX_CHECKPOINT_ROLE_BYTES: usize = 32;
+pub const MAX_CHECKPOINT_STATE_HASH_BYTES: usize = 256;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum CheckpointWitnessError {
+pub enum CheckpointWitnessError {
     #[error("checkpoint witness JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("checkpoint witness field is too large: {0}")]
@@ -72,20 +72,20 @@ pub(crate) enum CheckpointWitnessError {
 /// the bytes that are actually stored, so whitespace/key-order rewrites of a
 /// v2 row do not silently preserve its witness.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PersistedPaneState {
-    pub(crate) pane_id: i64,
-    pub(crate) cwd: Option<String>,
-    pub(crate) command: Option<String>,
-    pub(crate) env_json: Option<String>,
-    pub(crate) terminal_state_json: String,
-    pub(crate) agent_metadata_json: Option<String>,
-    pub(crate) scrollback_checkpoint_seq: Option<i64>,
-    pub(crate) last_output_at: Option<i64>,
+pub struct PersistedPaneState {
+    pub pane_id: i64,
+    pub cwd: Option<String>,
+    pub command: Option<String>,
+    pub env_json: Option<String>,
+    pub terminal_state_json: String,
+    pub agent_metadata_json: Option<String>,
+    pub scrollback_checkpoint_seq: Option<i64>,
+    pub last_output_at: Option<i64>,
 }
 
 /// Exact UTF-8 payload bytes held by the text columns of one persisted pane
 /// row. Returns `None` on integer overflow so callers can fail closed.
-pub(crate) fn persisted_pane_text_bytes(pane: &PersistedPaneState) -> Option<usize> {
+pub fn persisted_pane_text_bytes(pane: &PersistedPaneState) -> Option<usize> {
     pane.cwd
         .as_ref()
         .map_or(0, String::len)
@@ -100,7 +100,7 @@ pub(crate) fn persisted_pane_text_bytes(pane: &PersistedPaneState) -> Option<usi
 }
 
 /// Exact admitted text bytes for a complete checkpoint projection.
-pub(crate) fn persisted_checkpoint_text_bytes(
+pub fn persisted_checkpoint_text_bytes(
     topology_json: Option<&str>,
     metadata_json: Option<&str>,
     panes: &[PersistedPaneState],
@@ -209,7 +209,7 @@ fn canonicalize_json_value(value: Value) -> Value {
     }
 }
 
-pub(crate) fn canonical_json_string<T: Serialize>(
+pub fn canonical_json_string<T: Serialize>(
     value: &T,
 ) -> Result<String, CheckpointWitnessError> {
     let value = serde_json::to_value(value)?;
@@ -383,7 +383,7 @@ fn frame_pane(
 /// The topology capture clock is excluded. Every other input is an exact
 /// column that the checkpoint transaction persists; process PID/argv, shell,
 /// and scrollback total-segment counters therefore do not participate.
-pub(crate) fn snapshot_dedup_witness(
+pub fn snapshot_dedup_witness(
     topology_json: &str,
     panes: &[PersistedPaneState],
 ) -> Result<String, CheckpointWitnessError> {
@@ -403,7 +403,7 @@ pub(crate) fn snapshot_dedup_witness(
 /// Stable persisted checkpoint witness for a snapshot, restore intent, or
 /// restore outcome receipt.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn checkpoint_witness(
+pub fn checkpoint_witness(
     role: &str,
     session_id: &str,
     checkpoint_id: i64,

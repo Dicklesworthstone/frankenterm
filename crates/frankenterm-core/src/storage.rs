@@ -3020,7 +3020,9 @@ impl StorageHandle {
     }
 
     #[cfg(not(test))]
-    #[inline(always)]
+    // Keep the method receiver aligned with the cfg(test) implementation,
+    // which reads the per-handle deterministic cancellation hook.
+    #[allow(clippy::unused_self)]
     fn maybe_cancel_after_committed_batch_for_test(
         &self,
         _cx: &crate::cx::Cx,
@@ -3297,9 +3299,7 @@ impl StorageHandle {
                 if cx.checkpoint().is_err() {
                     return Ok(());
                 }
-                if let Err(error) = sleep_result {
-                    return Err(error);
-                }
+                sleep_result?;
             }
         });
         match select(ack, cancel_watcher).await {
@@ -9166,9 +9166,13 @@ impl StorageHandle {
     /// Health probe routed through a cx seam so a cancelled context surfaces
     /// before the channel state is inspected. The channel-state observation
     /// itself is infallible; only the capability checkpoint can fail.
-    pub async fn is_writable_with_cx(&self, cx: &crate::cx::Cx) -> Result<bool> {
-        Self::checkpoint_storage_operation(cx, "is_writable")?;
-        Ok(!self.write_tx.is_closed())
+    pub fn is_writable_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> impl std::future::Future<Output = Result<bool>> {
+        let result = Self::checkpoint_storage_operation(cx, "is_writable")
+            .map(|()| !self.write_tx.is_closed());
+        std::future::ready(result)
     }
 
     // =========================================================================
@@ -17548,7 +17552,6 @@ fn maybe_fail_singleton_append_after_redaction_for_test() -> Result<()> {
 }
 
 #[cfg(not(test))]
-#[inline(always)]
 fn maybe_fail_singleton_append_after_redaction_for_test() -> Result<()> {
     Ok(())
 }
@@ -17572,7 +17575,6 @@ fn maybe_fail_group_append_after_redaction_for_test(write_index: usize) -> Resul
 }
 
 #[cfg(not(test))]
-#[inline(always)]
 fn maybe_fail_group_append_after_redaction_for_test(_write_index: usize) -> Result<()> {
     Ok(())
 }
@@ -24226,11 +24228,11 @@ fn count_events_by_retention_rule_backend(
     count_query_row_to_usize(&row, "Ordered event retention count row")
 }
 
-fn compiled_retention_query_params<'a>(
+fn compiled_retention_query_params(
     before_ts: i64,
-    policy: &'a CompiledRetentionPolicy,
+    policy: &CompiledRetentionPolicy,
     branch_index: usize,
-) -> Result<Vec<ToSqlValue<'a>>> {
+) -> Result<Vec<ToSqlValue<'_>>> {
     policy
         .validate_branch_index(branch_index)
         .map_err(retention_policy_compile_error)?;
@@ -27309,7 +27311,6 @@ fn fts_startup_pane_fault_for_test() -> Option<crate::Error> {
 }
 
 #[cfg(not(test))]
-#[inline(always)]
 fn fts_startup_pane_fault_for_test() -> Option<crate::Error> {
     None
 }
@@ -27816,14 +27817,14 @@ fn insert_fts_entries_select_batch_backend(
         .i64(1)
         .and_then(|value| backend_i64_to_u64(value, "set-based FTS indexed_count"))
         .map_err(|err| storage_backend_error("Failed to parse set-based FTS indexed_count", err))?;
-    let limit_u64 = u64::try_from(limit_i64).map_err(|_| {
+    let max_fetched_count = u64::try_from(limit_i64).map_err(|_| {
         StorageError::Database(format!(
             "set-based FTS limit {limit_i64} exceeds u64 range"
         ))
     })?;
-    if fetched_count_u64 > limit_u64 || indexed_count > fetched_count_u64 {
+    if fetched_count_u64 > max_fetched_count || indexed_count > fetched_count_u64 {
         return Err(StorageError::Database(format!(
-            "set-based FTS batch violated its bounds: fetched={fetched_count_u64}, indexed={indexed_count}, limit={limit_u64}"
+            "set-based FTS batch violated its bounds: fetched={fetched_count_u64}, indexed={indexed_count}, limit={max_fetched_count}"
         ))
         .into());
     }
@@ -28021,9 +28022,7 @@ fn sync_fts_for_pane_backend_impl(
             let mut batch_bytes = 0usize;
             let mut indexed_this_batch = 0usize;
             for segment in &segments {
-                let next_batch_bytes = batch_bytes
-                    .checked_add(segment.content_len)
-                    .unwrap_or(usize::MAX);
+                let next_batch_bytes = batch_bytes.saturating_add(segment.content_len);
                 if batch_bytes > 0 && next_batch_bytes > config.max_batch_bytes {
                     break;
                 }

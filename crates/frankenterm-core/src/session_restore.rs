@@ -653,7 +653,7 @@ enum RestoreAuthorityDbError {
     )]
     IndeterminateRollback {
         source: RestoreError,
-        rollback: RestoreError,
+        rollback: Box<RestoreError>,
     },
 }
 
@@ -1220,6 +1220,8 @@ fn with_query_snapshot<T>(
 }
 
 type RestoreAmbiguity = (i64, Option<i64>, String);
+type RestoreLifecycleAuthorityRow = (i64, Option<i64>, Option<String>, i64, Option<i64>);
+type RestoreSessionAuthorityRow = (i64, Option<i64>, Option<i64>, Option<i64>);
 
 /// Return the causal-first restore attempt that makes a new restore unsafe.
 ///
@@ -3415,7 +3417,7 @@ fn validate_restore_authority_chain(
         )));
     }
 
-    let lifecycle: Option<(i64, Option<i64>, Option<String>, i64, Option<i64>)> = conn
+    let lifecycle: Option<RestoreLifecycleAuthorityRow> = conn
         .query_row(
             "SELECT source_checkpoint_id, outcome_checkpoint_id,
                     CASE
@@ -3743,7 +3745,7 @@ where
             Ok(()) => Err(RestoreAuthorityDbError::RetrySafe { source }),
             Err(rollback) => Err(RestoreAuthorityDbError::IndeterminateRollback {
                 source,
-                rollback: rollback.into(),
+                rollback: Box::new(rollback.into()),
             }),
         },
     }
@@ -3777,7 +3779,7 @@ where
             Ok(()) => Err(RestoreAuthorityDbError::RetrySafe { source }),
             Err(rollback) => Err(RestoreAuthorityDbError::IndeterminateRollback {
                 source,
-                rollback: rollback.into(),
+                rollback: Box::new(rollback.into()),
             }),
         },
     }
@@ -3841,7 +3843,7 @@ fn persist_restore_receipt_settled(
             .copied()
             .chain(failed_source_pane_ids.iter().copied())
             .collect::<HashSet<_>>();
-        let session_authority: Option<(i64, Option<i64>, Option<i64>, Option<i64>)> = tx
+        let session_authority: Option<RestoreSessionAuthorityRow> = tx
             .query_row(
                 "SELECT session.shutdown_clean,
                         session.clean_checkpoint_id,
@@ -4002,7 +4004,7 @@ fn persist_restore_receipt_settled(
                 evidence.intent.checkpoint_id, receipt.checkpoint_id
             )));
         }
-        let clean_flag = if resolve_clean { 1_i64 } else { 0_i64 };
+        let clean_flag = i64::from(resolve_clean);
         let updated = tx.execute(
             "UPDATE mux_sessions
              SET last_checkpoint_at = ?2,
@@ -4108,7 +4110,7 @@ fn persist_restore_intent_unclean(
                 source.checkpoint_id
             )));
         }
-        let session_authority: Option<(i64, Option<i64>, Option<i64>, Option<i64>)> = tx
+        let session_authority: Option<RestoreSessionAuthorityRow> = tx
             .query_row(
                 "SELECT session.shutdown_clean,
                         session.clean_checkpoint_id,

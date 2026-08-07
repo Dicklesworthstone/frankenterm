@@ -483,9 +483,7 @@ pub fn strip_ansi(s: &str) -> String {
                 _ => State::Osc,
             },
             State::OscEscape => {
-                if c == '\\' {
-                    State::Ground
-                } else if matches!(c, '\x18' | '\x1a') {
+                if matches!(c, '\\' | '\x18' | '\x1a') {
                     State::Ground
                 } else if c == '\x1b' {
                     State::OscEscape
@@ -500,9 +498,7 @@ pub fn strip_ansi(s: &str) -> String {
                 _ => State::ControlString,
             },
             State::ControlStringEscape => {
-                if c == '\\' {
-                    State::Ground
-                } else if matches!(c, '\x18' | '\x1a') {
+                if matches!(c, '\\' | '\x18' | '\x1a') {
                     State::Ground
                 } else if c == '\x1b' {
                     State::ControlStringEscape
