@@ -51,6 +51,11 @@ def load_python_lists() -> tuple[set[str], set[tuple[str, str]]]:
         )
         sys.exit(2)
     mod = importlib.util.module_from_spec(spec)
+    # `dataclasses` resolves postponed annotations through
+    # `sys.modules[cls.__module__]` while the module is executing. Register
+    # the dynamic import before `exec_module`, just as normal import machinery
+    # does, so this guard remains valid on Python 3.14+.
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     exempt_files = set(mod.EXEMPT_FILES)
     wrapper_exemptions = set(mod.WRAPPER_EXEMPTIONS)

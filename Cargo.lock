@@ -3585,7 +3585,6 @@ dependencies = [
  "ratelim",
  "rayon",
  "termwiz 0.24.0",
- "textwrap",
  "thiserror 2.0.18",
  "umask",
  "url",
