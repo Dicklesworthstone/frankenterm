@@ -310,6 +310,7 @@ fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
                 orphaned_restore_lifecycle_rows: orphan_lifecycle,
                 orphaned_checkpoints: orphan_cp,
                 orphaned_pane_states: orphan_ps,
+                ..CleanupResult::default()
             },
         )
 }

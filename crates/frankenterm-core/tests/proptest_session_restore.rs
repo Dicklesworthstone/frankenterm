@@ -661,6 +661,7 @@ fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
                     orphaned_restore_lifecycle_rows,
                     orphaned_checkpoints,
                     orphaned_pane_states,
+                    ..CleanupResult::default()
                 }
             },
         )
