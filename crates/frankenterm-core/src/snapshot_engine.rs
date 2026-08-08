@@ -11246,7 +11246,7 @@ mod tests {
         .unwrap();
 
         let conn = Connection::open(db_path.as_str()).unwrap();
-        conn.execute_batch("DROP TRIGGER session_retained_size_checkpoint_ai;")
+        conn.execute_batch("DROP TRIGGER session_checkpoints_retained_size_ai;")
             .unwrap();
         drop(conn);
 
