@@ -1305,6 +1305,41 @@ AFTER UPDATE ON mux_sessions BEGIN
     SELECT CASE WHEN NOT EXISTS (
         SELECT 1 FROM session_retained_size WHERE session_id = old.session_id
     ) THEN RAISE(ABORT, 'missing session retained-size authority during session update') END;
+    SELECT CASE WHEN session_row_bytes != (
+        length(CAST(old.session_id AS BLOB))
+            + 8
+            + CASE WHEN old.last_checkpoint_at IS NULL THEN 0 ELSE 8 END
+            + 8
+            + length(CAST(old.topology_json AS BLOB))
+            + COALESCE(length(CAST(old.window_metadata_json AS BLOB)), 0)
+            + length(CAST(old.ft_version AS BLOB))
+            + COALESCE(length(CAST(old.host_id AS BLOB)), 0)
+            + CASE WHEN old.clean_checkpoint_id IS NULL THEN 0 ELSE 8 END
+    ) THEN RAISE(ABORT, 'session retained-size authority drift during session update') END
+    FROM session_retained_size WHERE session_id = old.session_id;
+    SELECT CASE WHEN (
+        length(CAST(new.session_id AS BLOB))
+            + 8
+            + CASE WHEN new.last_checkpoint_at IS NULL THEN 0 ELSE 8 END
+            + 8
+            + length(CAST(new.topology_json AS BLOB))
+            + COALESCE(length(CAST(new.window_metadata_json AS BLOB)), 0)
+            + length(CAST(new.ft_version AS BLOB))
+            + COALESCE(length(CAST(new.host_id AS BLOB)), 0)
+            + CASE WHEN new.clean_checkpoint_id IS NULL THEN 0 ELSE 8 END
+    ) > session_row_bytes AND retained_bytes > 9223372036854775807 - ((
+        length(CAST(new.session_id AS BLOB))
+            + 8
+            + CASE WHEN new.last_checkpoint_at IS NULL THEN 0 ELSE 8 END
+            + 8
+            + length(CAST(new.topology_json AS BLOB))
+            + COALESCE(length(CAST(new.window_metadata_json AS BLOB)), 0)
+            + length(CAST(new.ft_version AS BLOB))
+            + COALESCE(length(CAST(new.host_id AS BLOB)), 0)
+            + CASE WHEN new.clean_checkpoint_id IS NULL THEN 0 ELSE 8 END
+    ) - session_row_bytes)
+    THEN RAISE(ABORT, 'session retained-size overflow during session update') END
+    FROM session_retained_size WHERE session_id = old.session_id;
     UPDATE session_retained_size
     SET session_row_bytes =
         length(CAST(new.session_id AS BLOB))
@@ -1332,6 +1367,20 @@ AFTER INSERT ON session_checkpoints BEGIN
     SELECT CASE WHEN NOT EXISTS (
         SELECT 1 FROM session_retained_size WHERE session_id = new.session_id
     ) THEN RAISE(ABORT, 'missing session retained-size authority during checkpoint insert') END;
+    SELECT CASE WHEN retained_bytes > 9223372036854775807 - (
+        8
+        + length(CAST(new.session_id AS BLOB))
+        + 8
+        + length(CAST(new.checkpoint_type AS BLOB))
+        + length(CAST(new.state_hash AS BLOB))
+        + 8
+        + 8
+        + COALESCE(length(CAST(new.metadata_json AS BLOB)), 0)
+        + length(CAST(new.checkpoint_role AS BLOB))
+        + COALESCE(length(CAST(new.topology_json AS BLOB)), 0)
+        + CASE WHEN new.restore_intent_checkpoint_id IS NULL THEN 0 ELSE 8 END
+    ) THEN RAISE(ABORT, 'session retained-size overflow during checkpoint insert') END
+    FROM session_retained_size WHERE session_id = new.session_id;
     UPDATE session_retained_size
     SET checkpoint_row_bytes = checkpoint_row_bytes
         + 8
@@ -1356,21 +1405,72 @@ AFTER UPDATE ON session_checkpoints BEGIN
     SELECT CASE WHEN NOT EXISTS (
         SELECT 1 FROM session_retained_size WHERE session_id = old.session_id
     ) THEN RAISE(ABORT, 'missing session retained-size authority during checkpoint update') END;
+    SELECT CASE WHEN checkpoint_row_bytes < (
+        8
+        + length(CAST(old.session_id AS BLOB))
+        + 8
+        + length(CAST(old.checkpoint_type AS BLOB))
+        + length(CAST(old.state_hash AS BLOB))
+        + 8
+        + 8
+        + COALESCE(length(CAST(old.metadata_json AS BLOB)), 0)
+        + length(CAST(old.checkpoint_role AS BLOB))
+        + COALESCE(length(CAST(old.topology_json AS BLOB)), 0)
+        + CASE WHEN old.restore_intent_checkpoint_id IS NULL THEN 0 ELSE 8 END
+    ) THEN RAISE(ABORT, 'session retained-size underflow during checkpoint update') END
+    FROM session_retained_size WHERE session_id = old.session_id;
+    SELECT CASE WHEN (
+        8
+        + length(CAST(new.session_id AS BLOB))
+        + 8
+        + length(CAST(new.checkpoint_type AS BLOB))
+        + length(CAST(new.state_hash AS BLOB))
+        + 8
+        + 8
+        + COALESCE(length(CAST(new.metadata_json AS BLOB)), 0)
+        + length(CAST(new.checkpoint_role AS BLOB))
+        + COALESCE(length(CAST(new.topology_json AS BLOB)), 0)
+        + CASE WHEN new.restore_intent_checkpoint_id IS NULL THEN 0 ELSE 8 END
+    ) > (
+        8
+        + length(CAST(old.session_id AS BLOB))
+        + 8
+        + length(CAST(old.checkpoint_type AS BLOB))
+        + length(CAST(old.state_hash AS BLOB))
+        + 8
+        + 8
+        + COALESCE(length(CAST(old.metadata_json AS BLOB)), 0)
+        + length(CAST(old.checkpoint_role AS BLOB))
+        + COALESCE(length(CAST(old.topology_json AS BLOB)), 0)
+        + CASE WHEN old.restore_intent_checkpoint_id IS NULL THEN 0 ELSE 8 END
+    ) AND retained_bytes > 9223372036854775807 - ((
+        8
+        + length(CAST(new.session_id AS BLOB))
+        + 8
+        + length(CAST(new.checkpoint_type AS BLOB))
+        + length(CAST(new.state_hash AS BLOB))
+        + 8
+        + 8
+        + COALESCE(length(CAST(new.metadata_json AS BLOB)), 0)
+        + length(CAST(new.checkpoint_role AS BLOB))
+        + COALESCE(length(CAST(new.topology_json AS BLOB)), 0)
+        + CASE WHEN new.restore_intent_checkpoint_id IS NULL THEN 0 ELSE 8 END
+    ) - (
+        8
+        + length(CAST(old.session_id AS BLOB))
+        + 8
+        + length(CAST(old.checkpoint_type AS BLOB))
+        + length(CAST(old.state_hash AS BLOB))
+        + 8
+        + 8
+        + COALESCE(length(CAST(old.metadata_json AS BLOB)), 0)
+        + length(CAST(old.checkpoint_role AS BLOB))
+        + COALESCE(length(CAST(old.topology_json AS BLOB)), 0)
+        + CASE WHEN old.restore_intent_checkpoint_id IS NULL THEN 0 ELSE 8 END
+    )) THEN RAISE(ABORT, 'session retained-size overflow during checkpoint update') END
+    FROM session_retained_size WHERE session_id = old.session_id;
     UPDATE session_retained_size
     SET checkpoint_row_bytes = checkpoint_row_bytes
-        + (
-            8
-            + length(CAST(new.session_id AS BLOB))
-            + 8
-            + length(CAST(new.checkpoint_type AS BLOB))
-            + length(CAST(new.state_hash AS BLOB))
-            + 8
-            + 8
-            + COALESCE(length(CAST(new.metadata_json AS BLOB)), 0)
-            + length(CAST(new.checkpoint_role AS BLOB))
-            + COALESCE(length(CAST(new.topology_json AS BLOB)), 0)
-            + CASE WHEN new.restore_intent_checkpoint_id IS NULL THEN 0 ELSE 8 END
-        )
         - (
             8
             + length(CAST(old.session_id AS BLOB))
@@ -1384,6 +1484,19 @@ AFTER UPDATE ON session_checkpoints BEGIN
             + COALESCE(length(CAST(old.topology_json AS BLOB)), 0)
             + CASE WHEN old.restore_intent_checkpoint_id IS NULL THEN 0 ELSE 8 END
         )
+        + (
+            8
+            + length(CAST(new.session_id AS BLOB))
+            + 8
+            + length(CAST(new.checkpoint_type AS BLOB))
+            + length(CAST(new.state_hash AS BLOB))
+            + 8
+            + 8
+            + COALESCE(length(CAST(new.metadata_json AS BLOB)), 0)
+            + length(CAST(new.checkpoint_role AS BLOB))
+            + COALESCE(length(CAST(new.topology_json AS BLOB)), 0)
+            + CASE WHEN new.restore_intent_checkpoint_id IS NULL THEN 0 ELSE 8 END
+        )
     WHERE session_id = old.session_id;
 END;
 
@@ -1394,6 +1507,35 @@ BEFORE DELETE ON session_checkpoints BEGIN
     ) AND NOT EXISTS (
         SELECT 1 FROM session_retained_size WHERE session_id = old.session_id
     ) THEN RAISE(ABORT, 'missing session retained-size authority during checkpoint delete') END;
+    SELECT CASE WHEN checkpoint_row_bytes < (
+        8
+        + length(CAST(old.session_id AS BLOB))
+        + 8
+        + length(CAST(old.checkpoint_type AS BLOB))
+        + length(CAST(old.state_hash AS BLOB))
+        + 8
+        + 8
+        + COALESCE(length(CAST(old.metadata_json AS BLOB)), 0)
+        + length(CAST(old.checkpoint_role AS BLOB))
+        + COALESCE(length(CAST(old.topology_json AS BLOB)), 0)
+        + CASE WHEN old.restore_intent_checkpoint_id IS NULL THEN 0 ELSE 8 END
+    ) THEN RAISE(ABORT, 'session retained-size underflow during checkpoint delete') END
+    FROM session_retained_size WHERE session_id = old.session_id;
+    SELECT CASE WHEN pane_state_row_bytes < COALESCE((
+        SELECT SUM(
+            8 + 8 + 8
+            + COALESCE(length(CAST(p.cwd AS BLOB)), 0)
+            + COALESCE(length(CAST(p.command AS BLOB)), 0)
+            + COALESCE(length(CAST(p.env_json AS BLOB)), 0)
+            + length(CAST(p.terminal_state_json AS BLOB))
+            + COALESCE(length(CAST(p.agent_metadata_json AS BLOB)), 0)
+            + CASE WHEN p.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN p.last_output_at IS NULL THEN 0 ELSE 8 END
+        )
+        FROM mux_pane_state p
+        WHERE p.checkpoint_id = old.id
+    ), 0) THEN RAISE(ABORT, 'session retained-size underflow during checkpoint pane cascade') END
+    FROM session_retained_size WHERE session_id = old.session_id;
     UPDATE session_retained_size
     SET checkpoint_row_bytes = checkpoint_row_bytes - (
             8
@@ -1433,6 +1575,19 @@ AFTER INSERT ON mux_pane_state BEGIN
         INNER JOIN session_retained_size z ON z.session_id = c.session_id
         WHERE c.id = new.checkpoint_id
     ) THEN RAISE(ABORT, 'missing session retained-size authority during pane-state insert') END;
+    SELECT CASE WHEN z.retained_bytes > 9223372036854775807 - (
+        8 + 8 + 8
+        + COALESCE(length(CAST(new.cwd AS BLOB)), 0)
+        + COALESCE(length(CAST(new.command AS BLOB)), 0)
+        + COALESCE(length(CAST(new.env_json AS BLOB)), 0)
+        + length(CAST(new.terminal_state_json AS BLOB))
+        + COALESCE(length(CAST(new.agent_metadata_json AS BLOB)), 0)
+        + CASE WHEN new.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
+        + CASE WHEN new.last_output_at IS NULL THEN 0 ELSE 8 END
+    ) THEN RAISE(ABORT, 'session retained-size overflow during pane-state insert') END
+    FROM session_checkpoints c
+    INNER JOIN session_retained_size z ON z.session_id = c.session_id
+    WHERE c.id = new.checkpoint_id;
     UPDATE session_retained_size
     SET pane_state_row_bytes = pane_state_row_bytes
         + 8 + 8 + 8
@@ -1459,18 +1614,61 @@ AFTER UPDATE ON mux_pane_state BEGIN
         INNER JOIN session_retained_size z ON z.session_id = c.session_id
         WHERE c.id = old.checkpoint_id
     ) THEN RAISE(ABORT, 'missing session retained-size authority during pane-state update') END;
+    SELECT CASE WHEN z.pane_state_row_bytes < (
+        8 + 8 + 8
+        + COALESCE(length(CAST(old.cwd AS BLOB)), 0)
+        + COALESCE(length(CAST(old.command AS BLOB)), 0)
+        + COALESCE(length(CAST(old.env_json AS BLOB)), 0)
+        + length(CAST(old.terminal_state_json AS BLOB))
+        + COALESCE(length(CAST(old.agent_metadata_json AS BLOB)), 0)
+        + CASE WHEN old.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
+        + CASE WHEN old.last_output_at IS NULL THEN 0 ELSE 8 END
+    ) THEN RAISE(ABORT, 'session retained-size underflow during pane-state update') END
+    FROM session_checkpoints c
+    INNER JOIN session_retained_size z ON z.session_id = c.session_id
+    WHERE c.id = old.checkpoint_id;
+    SELECT CASE WHEN (
+        8 + 8 + 8
+        + COALESCE(length(CAST(new.cwd AS BLOB)), 0)
+        + COALESCE(length(CAST(new.command AS BLOB)), 0)
+        + COALESCE(length(CAST(new.env_json AS BLOB)), 0)
+        + length(CAST(new.terminal_state_json AS BLOB))
+        + COALESCE(length(CAST(new.agent_metadata_json AS BLOB)), 0)
+        + CASE WHEN new.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
+        + CASE WHEN new.last_output_at IS NULL THEN 0 ELSE 8 END
+    ) > (
+        8 + 8 + 8
+        + COALESCE(length(CAST(old.cwd AS BLOB)), 0)
+        + COALESCE(length(CAST(old.command AS BLOB)), 0)
+        + COALESCE(length(CAST(old.env_json AS BLOB)), 0)
+        + length(CAST(old.terminal_state_json AS BLOB))
+        + COALESCE(length(CAST(old.agent_metadata_json AS BLOB)), 0)
+        + CASE WHEN old.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
+        + CASE WHEN old.last_output_at IS NULL THEN 0 ELSE 8 END
+    ) AND z.retained_bytes > 9223372036854775807 - ((
+        8 + 8 + 8
+        + COALESCE(length(CAST(new.cwd AS BLOB)), 0)
+        + COALESCE(length(CAST(new.command AS BLOB)), 0)
+        + COALESCE(length(CAST(new.env_json AS BLOB)), 0)
+        + length(CAST(new.terminal_state_json AS BLOB))
+        + COALESCE(length(CAST(new.agent_metadata_json AS BLOB)), 0)
+        + CASE WHEN new.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
+        + CASE WHEN new.last_output_at IS NULL THEN 0 ELSE 8 END
+    ) - (
+        8 + 8 + 8
+        + COALESCE(length(CAST(old.cwd AS BLOB)), 0)
+        + COALESCE(length(CAST(old.command AS BLOB)), 0)
+        + COALESCE(length(CAST(old.env_json AS BLOB)), 0)
+        + length(CAST(old.terminal_state_json AS BLOB))
+        + COALESCE(length(CAST(old.agent_metadata_json AS BLOB)), 0)
+        + CASE WHEN old.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
+        + CASE WHEN old.last_output_at IS NULL THEN 0 ELSE 8 END
+    )) THEN RAISE(ABORT, 'session retained-size overflow during pane-state update') END
+    FROM session_checkpoints c
+    INNER JOIN session_retained_size z ON z.session_id = c.session_id
+    WHERE c.id = old.checkpoint_id;
     UPDATE session_retained_size
     SET pane_state_row_bytes = pane_state_row_bytes
-        + (
-            8 + 8 + 8
-            + COALESCE(length(CAST(new.cwd AS BLOB)), 0)
-            + COALESCE(length(CAST(new.command AS BLOB)), 0)
-            + COALESCE(length(CAST(new.env_json AS BLOB)), 0)
-            + length(CAST(new.terminal_state_json AS BLOB))
-            + COALESCE(length(CAST(new.agent_metadata_json AS BLOB)), 0)
-            + CASE WHEN new.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
-            + CASE WHEN new.last_output_at IS NULL THEN 0 ELSE 8 END
-        )
         - (
             8 + 8 + 8
             + COALESCE(length(CAST(old.cwd AS BLOB)), 0)
@@ -1480,6 +1678,16 @@ AFTER UPDATE ON mux_pane_state BEGIN
             + COALESCE(length(CAST(old.agent_metadata_json AS BLOB)), 0)
             + CASE WHEN old.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
             + CASE WHEN old.last_output_at IS NULL THEN 0 ELSE 8 END
+        )
+        + (
+            8 + 8 + 8
+            + COALESCE(length(CAST(new.cwd AS BLOB)), 0)
+            + COALESCE(length(CAST(new.command AS BLOB)), 0)
+            + COALESCE(length(CAST(new.env_json AS BLOB)), 0)
+            + length(CAST(new.terminal_state_json AS BLOB))
+            + COALESCE(length(CAST(new.agent_metadata_json AS BLOB)), 0)
+            + CASE WHEN new.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN new.last_output_at IS NULL THEN 0 ELSE 8 END
         )
     WHERE session_id = (
         SELECT session_id FROM session_checkpoints WHERE id = old.checkpoint_id
@@ -1496,6 +1704,19 @@ AFTER DELETE ON mux_pane_state BEGIN
         INNER JOIN session_retained_size z ON z.session_id = c.session_id
         WHERE c.id = old.checkpoint_id
     ) THEN RAISE(ABORT, 'missing session retained-size authority during pane-state delete') END;
+    SELECT CASE WHEN z.pane_state_row_bytes < (
+        8 + 8 + 8
+        + COALESCE(length(CAST(old.cwd AS BLOB)), 0)
+        + COALESCE(length(CAST(old.command AS BLOB)), 0)
+        + COALESCE(length(CAST(old.env_json AS BLOB)), 0)
+        + length(CAST(old.terminal_state_json AS BLOB))
+        + COALESCE(length(CAST(old.agent_metadata_json AS BLOB)), 0)
+        + CASE WHEN old.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
+        + CASE WHEN old.last_output_at IS NULL THEN 0 ELSE 8 END
+    ) THEN RAISE(ABORT, 'session retained-size underflow during pane-state delete') END
+    FROM session_checkpoints c
+    INNER JOIN session_retained_size z ON z.session_id = c.session_id
+    WHERE c.id = old.checkpoint_id;
     UPDATE session_retained_size
     SET pane_state_row_bytes = pane_state_row_bytes - (
             8 + 8 + 8
@@ -1517,6 +1738,16 @@ AFTER INSERT ON restore_attempt_lifecycle BEGIN
     SELECT CASE WHEN NOT EXISTS (
         SELECT 1 FROM session_retained_size WHERE session_id = new.session_id
     ) THEN RAISE(ABORT, 'missing session retained-size authority during lifecycle insert') END;
+    SELECT CASE WHEN retained_bytes > 9223372036854775807 - (
+        8
+        + length(CAST(new.session_id AS BLOB))
+        + 8
+        + CASE WHEN new.outcome_checkpoint_id IS NULL THEN 0 ELSE 8 END
+        + length(CAST(new.status AS BLOB))
+        + 8
+        + CASE WHEN new.resolved_at IS NULL THEN 0 ELSE 8 END
+    ) THEN RAISE(ABORT, 'session retained-size overflow during lifecycle insert') END
+    FROM session_retained_size WHERE session_id = new.session_id;
     UPDATE session_retained_size
     SET restore_lifecycle_row_bytes = restore_lifecycle_row_bytes
         + 8
@@ -1538,17 +1769,52 @@ AFTER UPDATE ON restore_attempt_lifecycle BEGIN
     SELECT CASE WHEN NOT EXISTS (
         SELECT 1 FROM session_retained_size WHERE session_id = old.session_id
     ) THEN RAISE(ABORT, 'missing session retained-size authority during lifecycle update') END;
+    SELECT CASE WHEN restore_lifecycle_row_bytes < (
+        8
+        + length(CAST(old.session_id AS BLOB))
+        + 8
+        + CASE WHEN old.outcome_checkpoint_id IS NULL THEN 0 ELSE 8 END
+        + length(CAST(old.status AS BLOB))
+        + 8
+        + CASE WHEN old.resolved_at IS NULL THEN 0 ELSE 8 END
+    ) THEN RAISE(ABORT, 'session retained-size underflow during lifecycle update') END
+    FROM session_retained_size WHERE session_id = old.session_id;
+    SELECT CASE WHEN (
+        8
+        + length(CAST(new.session_id AS BLOB))
+        + 8
+        + CASE WHEN new.outcome_checkpoint_id IS NULL THEN 0 ELSE 8 END
+        + length(CAST(new.status AS BLOB))
+        + 8
+        + CASE WHEN new.resolved_at IS NULL THEN 0 ELSE 8 END
+    ) > (
+        8
+        + length(CAST(old.session_id AS BLOB))
+        + 8
+        + CASE WHEN old.outcome_checkpoint_id IS NULL THEN 0 ELSE 8 END
+        + length(CAST(old.status AS BLOB))
+        + 8
+        + CASE WHEN old.resolved_at IS NULL THEN 0 ELSE 8 END
+    ) AND retained_bytes > 9223372036854775807 - ((
+        8
+        + length(CAST(new.session_id AS BLOB))
+        + 8
+        + CASE WHEN new.outcome_checkpoint_id IS NULL THEN 0 ELSE 8 END
+        + length(CAST(new.status AS BLOB))
+        + 8
+        + CASE WHEN new.resolved_at IS NULL THEN 0 ELSE 8 END
+    ) - (
+        8
+        + length(CAST(old.session_id AS BLOB))
+        + 8
+        + CASE WHEN old.outcome_checkpoint_id IS NULL THEN 0 ELSE 8 END
+        + length(CAST(old.status AS BLOB))
+        + 8
+        + CASE WHEN old.resolved_at IS NULL THEN 0 ELSE 8 END
+    )) THEN RAISE(ABORT, 'session retained-size overflow during lifecycle update') END
+    FROM session_retained_size WHERE session_id = old.session_id;
     UPDATE session_retained_size
     SET restore_lifecycle_row_bytes = restore_lifecycle_row_bytes
-        + (
-            8
-            + length(CAST(new.session_id AS BLOB))
-            + 8
-            + CASE WHEN new.outcome_checkpoint_id IS NULL THEN 0 ELSE 8 END
-            + length(CAST(new.status AS BLOB))
-            + 8
-            + CASE WHEN new.resolved_at IS NULL THEN 0 ELSE 8 END
-        )
         - (
             8
             + length(CAST(old.session_id AS BLOB))
@@ -1557,6 +1823,15 @@ AFTER UPDATE ON restore_attempt_lifecycle BEGIN
             + length(CAST(old.status AS BLOB))
             + 8
             + CASE WHEN old.resolved_at IS NULL THEN 0 ELSE 8 END
+        )
+        + (
+            8
+            + length(CAST(new.session_id AS BLOB))
+            + 8
+            + CASE WHEN new.outcome_checkpoint_id IS NULL THEN 0 ELSE 8 END
+            + length(CAST(new.status AS BLOB))
+            + 8
+            + CASE WHEN new.resolved_at IS NULL THEN 0 ELSE 8 END
         )
     WHERE session_id = old.session_id;
 END;
@@ -1568,6 +1843,16 @@ AFTER DELETE ON restore_attempt_lifecycle BEGIN
     ) AND NOT EXISTS (
         SELECT 1 FROM session_retained_size WHERE session_id = old.session_id
     ) THEN RAISE(ABORT, 'missing session retained-size authority during lifecycle delete') END;
+    SELECT CASE WHEN restore_lifecycle_row_bytes < (
+        8
+        + length(CAST(old.session_id AS BLOB))
+        + 8
+        + CASE WHEN old.outcome_checkpoint_id IS NULL THEN 0 ELSE 8 END
+        + length(CAST(old.status AS BLOB))
+        + 8
+        + CASE WHEN old.resolved_at IS NULL THEN 0 ELSE 8 END
+    ) THEN RAISE(ABORT, 'session retained-size underflow during lifecycle delete') END
+    FROM session_retained_size WHERE session_id = old.session_id;
     UPDATE session_retained_size
     SET restore_lifecycle_row_bytes = restore_lifecycle_row_bytes - (
             8

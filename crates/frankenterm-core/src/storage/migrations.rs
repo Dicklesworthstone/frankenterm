@@ -2438,6 +2438,21 @@ const SESSION_RETAINED_SIZE_V40_BEGIN: &str = "-- FT_SESSION_RETAINED_SIZE_V40_B
 const SESSION_RETAINED_SIZE_V40_END: &str = "-- FT_SESSION_RETAINED_SIZE_V40_END";
 
 fn session_retained_size_schema_sql() -> Result<&'static str> {
+    if SCHEMA_SQL
+        .match_indices(SESSION_RETAINED_SIZE_V40_BEGIN)
+        .count()
+        != 1
+        || SCHEMA_SQL
+            .match_indices(SESSION_RETAINED_SIZE_V40_END)
+            .count()
+            != 1
+    {
+        return Err(StorageError::Corruption {
+            details: "SCHEMA_SQL must contain exactly one v40 retained-size marker pair"
+                .to_string(),
+        }
+        .into());
+    }
     let start = SCHEMA_SQL
         .find(SESSION_RETAINED_SIZE_V40_BEGIN)
         .ok_or_else(|| StorageError::Corruption {
@@ -2461,6 +2476,43 @@ fn session_retained_size_schema_sql() -> Result<&'static str> {
     Ok(&SCHEMA_SQL[start..end])
 }
 
+fn canonical_session_retained_size_object_sql(
+    declaration_kind: &'static str,
+    object_name: &'static str,
+) -> Result<&'static str> {
+    let schema_sql = session_retained_size_schema_sql()?;
+    let declaration = format!("CREATE {declaration_kind} IF NOT EXISTS {object_name}");
+    let mut matches = schema_sql.match_indices(&declaration);
+    let Some((start, _)) = matches.next() else {
+        return Err(StorageError::Corruption {
+            details: format!("SCHEMA_SQL v40 is missing canonical object {object_name}"),
+        }
+        .into());
+    };
+    if matches.next().is_some() {
+        return Err(StorageError::Corruption {
+            details: format!(
+                "SCHEMA_SQL v40 declares canonical object {object_name} more than once"
+            ),
+        }
+        .into());
+    }
+
+    let tail = &schema_sql[start..];
+    let terminator = if declaration_kind == "TRIGGER" {
+        "\nEND;"
+    } else {
+        ";"
+    };
+    let end = tail
+        .find(terminator)
+        .and_then(|offset| offset.checked_add(terminator.len()))
+        .ok_or_else(|| StorageError::Corruption {
+            details: format!("SCHEMA_SQL v40 canonical object {object_name} is unterminated"),
+        })?;
+    Ok(&tail[..end])
+}
+
 fn ensure_session_retained_size_schema(conn: &Connection) -> Result<()> {
     let sql = session_retained_size_schema_sql()?;
     conn.execute_batch(sql).map_err(|error| {
@@ -2476,6 +2528,53 @@ fn ensure_session_retained_size_schema(conn: &Connection) -> Result<()> {
 /// infrequent cleanup transaction, where a mismatch fails closed before any
 /// retention deletion.
 fn validate_session_retained_size_schema(conn: &Connection) -> Result<()> {
+    for (object_type, declaration_kind, object_name) in [
+        ("view", "VIEW", "session_retained_size_recomputed"),
+        ("table", "TABLE", "session_retained_size"),
+        ("trigger", "TRIGGER", "session_retained_size_bi"),
+        ("trigger", "TRIGGER", "session_retained_size_bd"),
+        ("trigger", "TRIGGER", "session_retained_size_session_id_bu"),
+        ("trigger", "TRIGGER", "mux_sessions_retained_size_ai"),
+        ("trigger", "TRIGGER", "mux_sessions_retained_size_au"),
+        ("trigger", "TRIGGER", "mux_sessions_retained_size_ad"),
+        ("trigger", "TRIGGER", "session_checkpoints_retained_size_ai"),
+        ("trigger", "TRIGGER", "session_checkpoints_retained_size_au"),
+        ("trigger", "TRIGGER", "session_checkpoints_retained_size_bd"),
+        ("trigger", "TRIGGER", "mux_pane_state_retained_size_ai"),
+        ("trigger", "TRIGGER", "mux_pane_state_retained_size_au"),
+        ("trigger", "TRIGGER", "mux_pane_state_retained_size_ad"),
+        (
+            "trigger",
+            "TRIGGER",
+            "restore_attempt_lifecycle_retained_size_ai",
+        ),
+        (
+            "trigger",
+            "TRIGGER",
+            "restore_attempt_lifecycle_retained_size_au",
+        ),
+        (
+            "trigger",
+            "TRIGGER",
+            "restore_attempt_lifecycle_retained_size_ad",
+        ),
+    ] {
+        let actual = load_schema_object_sql(conn, object_type, object_name)?.ok_or_else(|| {
+            StorageError::Corruption {
+                details: format!("schema v40 is missing required {object_type} {object_name}"),
+            }
+        })?;
+        let canonical = canonical_session_retained_size_object_sql(declaration_kind, object_name)?;
+        if compact_schema_sql(&actual) != compact_schema_sql(canonical) {
+            return Err(StorageError::Corruption {
+                details: format!(
+                    "schema v40 {object_type} {object_name} differs from its canonical definition"
+                ),
+            }
+            .into());
+        }
+    }
+
     let view_sql = load_schema_object_sql(conn, "view", "session_retained_size_recomputed")?
         .ok_or_else(|| StorageError::Corruption {
             details: "schema v40 is missing session_retained_size_recomputed".to_string(),
@@ -2501,11 +2600,12 @@ fn validate_session_retained_size_schema(conn: &Connection) -> Result<()> {
         }
     }
 
-    let table_sql = load_schema_object_sql(conn, "table", "session_retained_size")?.ok_or_else(
-        || StorageError::Corruption {
-            details: "schema v40 is missing session_retained_size".to_string(),
-        },
-    )?;
+    let table_sql =
+        load_schema_object_sql(conn, "table", "session_retained_size")?.ok_or_else(|| {
+            StorageError::Corruption {
+                details: "schema v40 is missing session_retained_size".to_string(),
+            }
+        })?;
     let compact_table_sql = compact_schema_sql(&table_sql);
     for required in [
         "session_id TEXT PRIMARY KEY",
@@ -2519,7 +2619,9 @@ fn validate_session_retained_size_schema(conn: &Connection) -> Result<()> {
     ] {
         if !compact_table_sql.contains(&compact_schema_sql(required)) {
             return Err(StorageError::Corruption {
-                details: format!("schema v40 session_retained_size is missing invariant {required}"),
+                details: format!(
+                    "schema v40 session_retained_size is missing invariant {required}"
+                ),
             }
             .into());
         }
@@ -2558,10 +2660,7 @@ fn validate_session_retained_size_schema(conn: &Connection) -> Result<()> {
             "mux_sessions_retained_size_ai",
             "INSERT INTO session_retained_size",
         ),
-        (
-            "mux_sessions_retained_size_au",
-            "SET session_row_bytes =",
-        ),
+        ("mux_sessions_retained_size_au", "SET session_row_bytes ="),
         (
             "mux_sessions_retained_size_ad",
             "DELETE FROM session_retained_size",
@@ -2875,6 +2974,15 @@ fn compact_schema_sql(sql: &str) -> String {
     }
     if let Some(suffix) = compact.strip_prefix("createindexifnotexists") {
         return format!("createindex{suffix}");
+    }
+    if let Some(suffix) = compact.strip_prefix("createtableifnotexists") {
+        return format!("createtable{suffix}");
+    }
+    if let Some(suffix) = compact.strip_prefix("createviewifnotexists") {
+        return format!("createview{suffix}");
+    }
+    if let Some(suffix) = compact.strip_prefix("createtriggerifnotexists") {
+        return format!("createtrigger{suffix}");
     }
     compact
 }
@@ -5926,6 +6034,26 @@ mod tests {
             compact_schema_sql("CREATE UNIQUE INDEX idx_unique ON example(value)"),
             "sqlite_schema also omits IF NOT EXISTS from unique indexes"
         );
+        for (canonical, sqlite_schema) in [
+            (
+                "CREATE TABLE IF NOT EXISTS example (id INTEGER);",
+                "CREATE TABLE example (id INTEGER)",
+            ),
+            (
+                "CREATE VIEW IF NOT EXISTS example_view AS SELECT 1;",
+                "CREATE VIEW example_view AS SELECT 1",
+            ),
+            (
+                "CREATE TRIGGER IF NOT EXISTS example_trigger AFTER INSERT ON example BEGIN SELECT 1; END;",
+                "CREATE TRIGGER example_trigger AFTER INSERT ON example BEGIN SELECT 1; END",
+            ),
+        ] {
+            assert_eq!(
+                compact_schema_sql(canonical),
+                compact_schema_sql(sqlite_schema),
+                "sqlite_schema omits IF NOT EXISTS from persisted schema objects"
+            );
+        }
         assert!(
             compact_schema_sql(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_literal ON example(value) \
@@ -5970,6 +6098,20 @@ mod tests {
 
         validate_checkpoint_identity_v38_schema(&conn)
             .expect("head DDL must satisfy the v38 checkpoint authority contract");
+    }
+
+    #[test]
+    fn v0_schema_body_defers_v40_until_legacy_session_columns_exist() {
+        let (_, schema_body) = split_schema_sql_pragmas();
+        assert!(!schema_body.contains(SESSION_RETAINED_SIZE_V40_BEGIN));
+        assert!(!schema_body.contains("CREATE TABLE IF NOT EXISTS session_retained_size"));
+        assert!(!schema_body.contains("session_checkpoints_retained_size_ai"));
+
+        let conn = Connection::open_in_memory().expect("open current-schema fixture");
+        initialize_schema(&conn).expect("v0 migration sequence installs current schema");
+        validate_session_retained_size_schema(&conn)
+            .expect("v40 must be installed after all legacy session columns exist");
+        assert_eq!(get_user_version(&conn).unwrap(), 40);
     }
 
     fn create_v35_checkpoint_fixture(conn: &Connection) {
@@ -8209,8 +8351,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_and_scrollback_authority_v36_through_v39_are_forward_only() {
-        for version in [36, 37, 38, 39] {
+    fn checkpoint_scrollback_and_size_authority_v36_through_v40_are_forward_only() {
+        for version in [36, 37, 38, 39, 40] {
             let migration = MIGRATIONS
                 .iter()
                 .find(|migration| migration.version == version)
@@ -8227,6 +8369,8 @@ mod tests {
         assert!(build_migration_plan(38, 35).is_err());
         assert!(build_migration_plan(39, 38).is_err());
         assert!(build_migration_plan(39, 35).is_err());
+        assert!(build_migration_plan(40, 39).is_err());
+        assert!(build_migration_plan(40, 35).is_err());
     }
 
     #[test]
@@ -8833,6 +8977,367 @@ mod tests {
             .unwrap();
         assert_eq!(history_count, 128);
         assert_eq!(summary, (128, 0, 127, 1_000, 2_063));
+    }
+
+    #[test]
+    fn session_retained_size_v40_upgrade_backfills_exact_bytes_and_tracks_mutations() {
+        use rusqlite::{Connection, params};
+
+        type Components = (i64, i64, i64, i64, i64);
+
+        fn load_components(conn: &Connection, relation: &str, session_id: &str) -> Components {
+            let sql = format!(
+                "SELECT session_row_bytes, checkpoint_row_bytes,
+                        pane_state_row_bytes, restore_lifecycle_row_bytes,
+                        retained_bytes
+                 FROM {relation} WHERE session_id = ?1"
+            );
+            conn.query_row(&sql, [session_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+        }
+
+        fn assert_authority_matches_recomputation(conn: &Connection, session_id: &str) {
+            let stored = load_components(conn, "session_retained_size", session_id);
+            let recomputed_four: (i64, i64, i64, i64) = conn
+                .query_row(
+                    "SELECT session_row_bytes, checkpoint_row_bytes,
+                            pane_state_row_bytes, restore_lifecycle_row_bytes
+                     FROM session_retained_size_recomputed WHERE session_id = ?1",
+                    [session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!((stored.0, stored.1, stored.2, stored.3), recomputed_four);
+            assert_eq!(stored.4, stored.0 + stored.1 + stored.2 + stored.3);
+        }
+
+        let file = tempfile::NamedTempFile::new().expect("temporary pre-v40 database");
+        let path = file.path().to_path_buf();
+        let conn = Connection::open(&path).expect("open pre-v40 database");
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE schema_version (
+                 version INTEGER NOT NULL,
+                 applied_at INTEGER NOT NULL,
+                 description TEXT
+             );
+             CREATE TABLE mux_sessions (
+                 session_id TEXT PRIMARY KEY,
+                 created_at INTEGER NOT NULL,
+                 last_checkpoint_at INTEGER,
+                 shutdown_clean INTEGER NOT NULL DEFAULT 0,
+                 topology_json TEXT NOT NULL,
+                 window_metadata_json TEXT,
+                 ft_version TEXT NOT NULL,
+                 host_id TEXT,
+                 clean_checkpoint_id INTEGER
+                     REFERENCES session_checkpoints(id) ON DELETE SET NULL
+             );
+             CREATE TABLE session_checkpoints (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id TEXT NOT NULL
+                     REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
+                 checkpoint_at INTEGER NOT NULL,
+                 checkpoint_type TEXT NOT NULL,
+                 state_hash TEXT NOT NULL,
+                 pane_count INTEGER NOT NULL,
+                 total_bytes INTEGER NOT NULL,
+                 metadata_json TEXT,
+                 checkpoint_role TEXT NOT NULL DEFAULT 'snapshot',
+                 topology_json TEXT,
+                 restore_intent_checkpoint_id INTEGER
+                     REFERENCES session_checkpoints(id) ON DELETE CASCADE
+             );
+             CREATE TABLE restore_attempt_lifecycle (
+                 intent_checkpoint_id INTEGER PRIMARY KEY
+                     REFERENCES session_checkpoints(id)
+                     ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
+                 session_id TEXT NOT NULL
+                     REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
+                 source_checkpoint_id INTEGER NOT NULL,
+                 outcome_checkpoint_id INTEGER
+                     REFERENCES session_checkpoints(id) ON DELETE SET NULL,
+                 status TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 resolved_at INTEGER
+             );
+             CREATE TABLE mux_pane_state (
+                 id INTEGER PRIMARY KEY,
+                 checkpoint_id INTEGER NOT NULL
+                     REFERENCES session_checkpoints(id) ON DELETE CASCADE,
+                 pane_id INTEGER NOT NULL,
+                 cwd TEXT,
+                 command TEXT,
+                 env_json TEXT,
+                 terminal_state_json TEXT NOT NULL,
+                 agent_metadata_json TEXT,
+                 scrollback_checkpoint_seq INTEGER,
+                 last_output_at INTEGER
+             );
+             PRAGMA user_version = 39;",
+        )
+        .expect("create pre-v40 session schema");
+
+        let session_id = "session-λ";
+        let session_topology = r#"{"tabs":["α"]}"#;
+        let host_id = "host-值";
+        conn.execute(
+            "INSERT INTO mux_sessions (
+                 session_id, created_at, last_checkpoint_at, shutdown_clean,
+                 topology_json, window_metadata_json, ft_version, host_id
+             ) VALUES (?1, 11, NULL, 0, ?2, NULL, '0.40.0', ?3)",
+            params![session_id, session_topology, host_id],
+        )
+        .unwrap();
+
+        let metadata_one = r#"{"m":"é"}"#;
+        let checkpoint_topology = r#"{"tab":"β"}"#;
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, metadata_json, checkpoint_role,
+                 topology_json
+             ) VALUES (?1, 12, 'periodic', 'hash-α', 2, 99, ?2,
+                       'snapshot', ?3)",
+            params![session_id, metadata_one, checkpoint_topology],
+        )
+        .unwrap();
+        let snapshot_id = conn.last_insert_rowid();
+        let intent_metadata = r#"{"restore_attempt":{"phase":"intent"}}"#;
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, metadata_json, checkpoint_role
+             ) VALUES (?1, 13, 'startup', 'intent-hash', 0, 0, ?2,
+                       'restore_intent')",
+            params![session_id, intent_metadata],
+        )
+        .unwrap();
+        let intent_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO mux_pane_state (
+                 checkpoint_id, pane_id, cwd, command, env_json,
+                 terminal_state_json, agent_metadata_json,
+                 scrollback_checkpoint_seq, last_output_at
+             ) VALUES (?1, 7, '/tmp/λ', 'cargo', '{\"K\":\"值\"}',
+                       '{\"cursor\":\"é\"}', NULL, 4, 14)",
+            [snapshot_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mux_pane_state (
+                 checkpoint_id, pane_id, terminal_state_json
+             ) VALUES (?1, 8, '{}')",
+            [snapshot_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO restore_attempt_lifecycle (
+                 intent_checkpoint_id, session_id, source_checkpoint_id,
+                 status, created_at
+             ) VALUES (?1, ?2, ?3, 'intent', 15)",
+            params![intent_id, session_id, snapshot_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mux_sessions
+             SET shutdown_clean = 1, last_checkpoint_at = 13,
+                 clean_checkpoint_id = ?2
+             WHERE session_id = ?1",
+            params![session_id, snapshot_id],
+        )
+        .unwrap();
+
+        let step = build_migration_plan(39, 40)
+            .expect("build v40 migration plan")
+            .steps
+            .into_iter()
+            .next()
+            .expect("v40 migration step");
+        apply_migration_step(&conn, &step).expect("apply v40 retained-size migration");
+        assert_eq!(get_user_version(&conn).unwrap(), 40);
+        assert_authority_matches_recomputation(&conn, session_id);
+
+        let text_bytes = |value: &str| i64::try_from(value.len()).unwrap();
+        let expected_session = text_bytes(session_id)
+            + 8
+            + 8
+            + 8
+            + text_bytes(session_topology)
+            + text_bytes("0.40.0")
+            + text_bytes(host_id)
+            + 8;
+        let checkpoint_bytes = |checkpoint_type: &str,
+                                state_hash: &str,
+                                metadata: Option<&str>,
+                                role: &str,
+                                topology: Option<&str>| {
+            8 + text_bytes(session_id)
+                + 8
+                + text_bytes(checkpoint_type)
+                + text_bytes(state_hash)
+                + 8
+                + 8
+                + metadata.map_or(0, text_bytes)
+                + text_bytes(role)
+                + topology.map_or(0, text_bytes)
+        };
+        let expected_checkpoints = checkpoint_bytes(
+            "periodic",
+            "hash-α",
+            Some(metadata_one),
+            "snapshot",
+            Some(checkpoint_topology),
+        ) + checkpoint_bytes(
+            "startup",
+            "intent-hash",
+            Some(intent_metadata),
+            "restore_intent",
+            None,
+        );
+        let expected_panes = 8
+            + 8
+            + 8
+            + text_bytes("/tmp/λ")
+            + text_bytes("cargo")
+            + text_bytes(r#"{"K":"值"}"#)
+            + text_bytes(r#"{"cursor":"é"}"#)
+            + 8
+            + 8
+            + 8
+            + 8
+            + 8
+            + text_bytes("{}");
+        let expected_lifecycle = 8 + text_bytes(session_id) + 8 + text_bytes("intent") + 8;
+        let stored = load_components(&conn, "session_retained_size", session_id);
+        assert_eq!(
+            stored,
+            (
+                expected_session,
+                expected_checkpoints,
+                expected_panes,
+                expected_lifecycle,
+                expected_session + expected_checkpoints + expected_panes + expected_lifecycle,
+            )
+        );
+
+        let maximum_metadata = format!(
+            "\"{}\"",
+            "x".repeat(crate::checkpoint_witness::MAX_CHECKPOINT_METADATA_BYTES - 2)
+        );
+        conn.execute(
+            "UPDATE session_checkpoints SET metadata_json = ?1 WHERE id = ?2",
+            params![maximum_metadata, snapshot_id],
+        )
+        .expect("replace metadata with maximum supported payload");
+        assert_authority_matches_recomputation(&conn, session_id);
+        conn.execute(
+            "UPDATE session_checkpoints SET metadata_json = NULL WHERE id = ?1",
+            [snapshot_id],
+        )
+        .expect("exercise NULL payload accounting");
+        conn.execute(
+            "UPDATE mux_sessions
+             SET topology_json = '{\"tabs\":[\"値\",\"値\"]}',
+                 window_metadata_json = '{\"columns\":240}', host_id = NULL
+             WHERE session_id = ?1",
+            [session_id],
+        )
+        .expect("replace session-level topology without multiplying it");
+        assert_authority_matches_recomputation(&conn, session_id);
+
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, checkpoint_role
+             ) VALUES (?1, 16, 'event', 'third', 1, 1, 'snapshot')",
+            [session_id],
+        )
+        .unwrap();
+        let third_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO mux_pane_state (
+                 checkpoint_id, pane_id, terminal_state_json
+             ) VALUES (?1, 9, '{\"wide\":\"界\"}')",
+            [third_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE restore_attempt_lifecycle
+             SET outcome_checkpoint_id = ?2, status = 'outcome_complete'
+             WHERE intent_checkpoint_id = ?1",
+            params![intent_id, third_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE restore_attempt_lifecycle
+             SET status = 'resolved', resolved_at = 17
+             WHERE intent_checkpoint_id = ?1",
+            [intent_id],
+        )
+        .unwrap();
+        assert_authority_matches_recomputation(&conn, session_id);
+        conn.execute(
+            "DELETE FROM restore_attempt_lifecycle WHERE intent_checkpoint_id = ?1",
+            [intent_id],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM session_checkpoints WHERE id = ?1", [third_id])
+            .expect("checkpoint cascade subtracts each pane exactly once");
+        assert_authority_matches_recomputation(&conn, session_id);
+
+        drop(conn);
+        let reopened = Connection::open(&path).expect("reopen migrated v40 database");
+        reopened.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        validate_session_retained_size_schema(&reopened)
+            .expect("v40 schema and authority survive restart");
+        assert_authority_matches_recomputation(&reopened, session_id);
+        reopened
+            .execute(
+                "DELETE FROM session_checkpoints WHERE id = ?1",
+                [snapshot_id],
+            )
+            .expect("clean-checkpoint and pane cascades remain exact after restart");
+        assert_authority_matches_recomputation(&reopened, session_id);
+        reopened
+            .execute(
+                "DELETE FROM mux_sessions WHERE session_id = ?1",
+                [session_id],
+            )
+            .expect("session cascade removes retained-size authority");
+        let retained_size_rows: i64 = reopened
+            .query_row("SELECT count(*) FROM session_retained_size", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(retained_size_rows, 0);
+    }
+
+    #[test]
+    fn current_schema_reopen_fails_closed_when_retained_size_trigger_drifts() {
+        let conn = Connection::open_in_memory().expect("open database");
+        initialize_schema(&conn).expect("initialize current schema");
+        conn.execute_batch(
+            "DROP TRIGGER mux_sessions_retained_size_ai;
+             CREATE TRIGGER mux_sessions_retained_size_ai
+             AFTER INSERT ON mux_sessions BEGIN SELECT 1; END;",
+        )
+        .expect("inject same-name trigger drift");
+
+        let error = initialize_schema(&conn)
+            .expect_err("an up-to-date version stamp must not mask trigger-body drift");
+        assert!(
+            error.to_string().contains("mux_sessions_retained_size_ai"),
+            "drifted trigger identity must be explicit: {error}"
+        );
     }
 
     #[test]
