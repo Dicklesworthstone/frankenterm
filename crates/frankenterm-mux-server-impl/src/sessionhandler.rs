@@ -649,6 +649,13 @@ impl PduSender {
         (self.func)(pdu, PduDeliveryClass::Bulk)
     }
 
+    /// Construct an enqueue boundary.
+    ///
+    /// `Ok(())` means the PDU was admitted. `Err` must guarantee that it was
+    /// not admitted and ownership remained local; the render code may retry
+    /// after an explicit error. A panic is treated as indeterminate because a
+    /// callback can unwind after publication, and therefore retires any
+    /// affected legacy render/notification authority instead of retrying.
     pub fn new<T>(f: T) -> Self
     where
         T: Fn(DecodedPdu, PduDeliveryClass) -> anyhow::Result<()> + Send + Sync + 'static,
@@ -926,17 +933,20 @@ fn pane_alert_text_bytes(alert: &Alert) -> Option<usize> {
 }
 
 fn pane_alerts_coalesce(existing: &Alert, incoming: &Alert) -> bool {
-    match (existing, incoming) {
+    matches!(
+        (existing, incoming),
         (Alert::CurrentWorkingDirectoryChanged, Alert::CurrentWorkingDirectoryChanged)
-        | (Alert::PaletteChanged, Alert::PaletteChanged)
-        | (Alert::OutputSinceFocusLost, Alert::OutputSinceFocusLost)
-        | (Alert::Progress(_), Alert::Progress(_))
-        | (Alert::IconTitleChanged(_), Alert::IconTitleChanged(_))
-        | (Alert::WindowTitleChanged(_), Alert::WindowTitleChanged(_))
-        | (Alert::TabTitleChanged(_), Alert::TabTitleChanged(_))
-        | (Alert::MouseShapeRequested { .. }, Alert::MouseShapeRequested { .. }) => true,
-        _ => false,
-    }
+            | (Alert::PaletteChanged, Alert::PaletteChanged)
+            | (Alert::OutputSinceFocusLost, Alert::OutputSinceFocusLost)
+            | (Alert::Progress(_), Alert::Progress(_))
+            | (Alert::IconTitleChanged(_), Alert::IconTitleChanged(_))
+            | (Alert::WindowTitleChanged(_), Alert::WindowTitleChanged(_))
+            | (Alert::TabTitleChanged(_), Alert::TabTitleChanged(_))
+            | (
+                Alert::MouseShapeRequested { .. },
+                Alert::MouseShapeRequested { .. }
+            )
+    )
 }
 
 fn pane_alert_is_exact_event(alert: &Alert) -> bool {
@@ -1230,6 +1240,19 @@ enum PaneRenderTransactionPhase {
     Closed,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum LegacyRenderEnqueuePhase {
+    #[default]
+    Idle,
+    /// A speculative surface baseline owns this exact revision until enqueue
+    /// admission is acknowledged or rolled back.
+    InFlight { installed_revision: u64 },
+    /// A protected alert prefix owns delivery until every admitted element is
+    /// acknowledged or the undelivered suffix is released.
+    NotificationsInFlight,
+    Closed,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PaneRenderSettlement {
     AcknowledgedClean,
@@ -1253,6 +1276,7 @@ enum PaneRenderPreparationError {
     StableRowRangeUnrepresentable,
     LegacyBaselineSuperseded,
     LegacyAttemptIdentityExhausted,
+    LegacyDeliveryAuthorityChanged,
     StaleAttempt,
     NotificationPrefixChanged,
     NotificationBacklogInvalid,
@@ -1284,6 +1308,9 @@ impl std::fmt::Display for PaneRenderPreparationError {
             Self::LegacyAttemptIdentityExhausted => {
                 "pane legacy render attempt identity exhausted before wrap or reuse"
             }
+            Self::LegacyDeliveryAuthorityChanged => {
+                "pane legacy delivery ownership changed before settlement"
+            }
             Self::StaleAttempt => "pane render attempt no longer owns the transaction",
             Self::NotificationPrefixChanged => {
                 "pane notification prefix changed during transaction preparation"
@@ -1314,6 +1341,11 @@ pub(crate) struct PerPane {
     next_render_attempt: Option<u64>,
     next_input_epoch: Option<u64>,
     baseline_revision: u64,
+    legacy_enqueue_phase: LegacyRenderEnqueuePhase,
+    #[cfg(test)]
+    panic_next_legacy_enqueue_ack: bool,
+    #[cfg(test)]
+    panic_next_legacy_enqueue_recovery: bool,
     pub(crate) notifications: PendingPaneAlerts,
 }
 
@@ -1327,6 +1359,11 @@ impl Default for PerPane {
             next_render_attempt: Some(1),
             next_input_epoch: Some(1),
             baseline_revision: 0,
+            legacy_enqueue_phase: LegacyRenderEnqueuePhase::Idle,
+            #[cfg(test)]
+            panic_next_legacy_enqueue_ack: false,
+            #[cfg(test)]
+            panic_next_legacy_enqueue_recovery: false,
             notifications: PendingPaneAlerts::default(),
         }
     }
@@ -1582,9 +1619,10 @@ fn prepare_legacy_render_enqueue(
 > {
     let pane_id = pane.pane_id();
     let (prior_baseline, prior_revision) = {
-        let mut state = per_pane
-            .lock()
-            .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
+        let mut state = lock_per_pane_or_retire(
+            per_pane,
+            "preparing the legacy render baseline",
+        )?;
         state.ensure_legacy_transport_idle()?;
         (state.baseline.clone(), state.baseline_revision)
     };
@@ -1594,13 +1632,41 @@ fn prepare_legacy_render_enqueue(
         false,
     );
 
-    let mut state = per_pane
-        .lock()
-        .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
+    let mut state = lock_per_pane_or_retire(
+        per_pane,
+        "publishing the legacy render baseline",
+    )?;
     state.ensure_legacy_transport_idle()?;
     if state.baseline != prior_baseline || state.baseline_revision != prior_revision {
         state.mark_transactional_dirty();
         return Err(PaneRenderPreparationError::LegacyBaselineSuperseded.into());
+    }
+
+    let source_fence = match &surface {
+        SurfacePreparation::NoChange {
+            source_start,
+            source_query,
+            source_end,
+        } => Some((*source_start, *source_query, *source_end)),
+        SurfacePreparation::Changes(prepared) => Some((
+            prepared.source_start,
+            prepared.source_query,
+            prepared.source_end,
+        )),
+        SurfacePreparation::StableRowRangeUnrepresentable => None,
+    };
+    if let Some((source_start, source_query, source_end)) = source_fence {
+        if source_start == SequenceNo::MAX
+            || source_query == SequenceNo::MAX
+            || source_end == SequenceNo::MAX
+        {
+            state.retire_render_authority();
+            return Err(PaneRenderPreparationError::TerminalSequenceExhausted.into());
+        }
+        if source_start != source_query || source_query != source_end {
+            state.mark_transactional_dirty();
+            return Err(PaneRenderPreparationError::SourceChanged.into());
+        }
     }
 
     match surface {
@@ -1611,7 +1677,7 @@ fn prepare_legacy_render_enqueue(
         SurfacePreparation::NoChange { source_query, .. } => {
             if state.baseline.seqno != source_query {
                 let Some(next_revision) = prior_revision.checked_add(1) else {
-                    state.mark_transactional_dirty();
+                    state.retire_render_authority();
                     return Err(
                         PaneRenderPreparationError::LegacyAttemptIdentityExhausted.into(),
                     );
@@ -1626,11 +1692,14 @@ fn prepare_legacy_render_enqueue(
                 response, baseline, ..
             } = *prepared;
             let Some(installed_revision) = prior_revision.checked_add(1) else {
-                state.mark_transactional_dirty();
+                state.retire_render_authority();
                 return Err(PaneRenderPreparationError::LegacyAttemptIdentityExhausted.into());
             };
             state.baseline = baseline;
             state.baseline_revision = installed_revision;
+            state.legacy_enqueue_phase = LegacyRenderEnqueuePhase::InFlight {
+                installed_revision,
+            };
             drop(state);
             let rollback = LegacyRenderEnqueueGuard::new(
                 Arc::clone(per_pane),
@@ -1661,6 +1730,17 @@ struct PaneRenderBeginSnapshot {
 )]
 impl PerPane {
     fn ensure_legacy_transport_idle(&mut self) -> Result<(), PaneRenderPreparationError> {
+        match self.legacy_enqueue_phase {
+            LegacyRenderEnqueuePhase::Idle => {}
+            LegacyRenderEnqueuePhase::InFlight { .. }
+            | LegacyRenderEnqueuePhase::NotificationsInFlight => {
+                self.mark_transactional_dirty();
+                return Err(PaneRenderPreparationError::Busy);
+            }
+            LegacyRenderEnqueuePhase::Closed => {
+                return Err(PaneRenderPreparationError::Closed);
+            }
+        }
         match self.transaction_phase {
             PaneRenderTransactionPhase::Idle => {
                 if self.notifications.protected_prefix_len == 0 {
@@ -1695,6 +1775,17 @@ impl PerPane {
         }
     }
 
+    /// Permanently retire every render-settlement authority for this exact
+    /// pane registration. Once delivery may have happened but local settlement
+    /// is unknown, neither the speculative baseline nor retained alerts may be
+    /// exposed to a successor attempt without risking omission or duplication.
+    pub(crate) fn retire_render_authority(&mut self) {
+        self.transaction_phase = PaneRenderTransactionPhase::Closed;
+        self.legacy_enqueue_phase = LegacyRenderEnqueuePhase::Closed;
+        self.notifications.clear_protection();
+        self.transactional_dirty = true;
+    }
+
     pub(crate) fn push_notification(
         &mut self,
         alert: Alert,
@@ -1709,6 +1800,17 @@ impl PerPane {
         pane_id: PaneId,
         force_with_input_dispatch_serial: Option<InputSerial>,
     ) -> Result<PaneRenderBeginSnapshot, PaneRenderPreparationError> {
+        match self.legacy_enqueue_phase {
+            LegacyRenderEnqueuePhase::Idle => {}
+            LegacyRenderEnqueuePhase::InFlight { .. }
+            | LegacyRenderEnqueuePhase::NotificationsInFlight => {
+                self.mark_transactional_dirty();
+                return Err(PaneRenderPreparationError::Busy);
+            }
+            LegacyRenderEnqueuePhase::Closed => {
+                return Err(PaneRenderPreparationError::Closed);
+            }
+        }
         match self.transaction_phase {
             PaneRenderTransactionPhase::Idle => {}
             PaneRenderTransactionPhase::Preparing { .. }
@@ -1729,8 +1831,7 @@ impl PerPane {
             .next_render_attempt
             .and_then(|attempt| attempt.checked_add(1).map(|next| (attempt, next)));
         let Some((attempt, next_attempt)) = attempt else {
-            self.transaction_phase = PaneRenderTransactionPhase::Closed;
-            self.transactional_dirty = true;
+            self.close_transaction();
             return Err(PaneRenderPreparationError::AttemptIdentityExhausted);
         };
 
@@ -1739,8 +1840,7 @@ impl PerPane {
                 .next_input_epoch
                 .and_then(|epoch| epoch.checked_add(1).map(|next| (epoch, next)));
             let Some((epoch, next_epoch)) = next else {
-                self.transaction_phase = PaneRenderTransactionPhase::Closed;
-                self.transactional_dirty = true;
+                self.close_transaction();
                 return Err(PaneRenderPreparationError::InputIdentityExhausted);
             };
             self.next_input_epoch = Some(next_epoch);
@@ -1828,9 +1928,7 @@ impl PerPane {
                 PaneRenderSettlement::StaleOrDuplicate
             };
         }
-        self.transaction_phase = PaneRenderTransactionPhase::Closed;
-        self.notifications.clear_protection();
-        self.transactional_dirty = true;
+        self.close_transaction();
         PaneRenderSettlement::Closed
     }
 
@@ -1897,9 +1995,7 @@ impl PerPane {
             .get(..snapshot.covered_notifications.len())
             != Some(snapshot.covered_notifications.as_slice())
         {
-            self.transaction_phase = PaneRenderTransactionPhase::Closed;
-            self.notifications.clear_protection();
-            self.transactional_dirty = true;
+            self.close_transaction();
             return Err(PaneRenderPreparationError::NotificationPrefixChanged);
         }
 
@@ -1950,9 +2046,7 @@ impl PerPane {
             .get(..pending.covered_notifications.len())
             != Some(pending.covered_notifications.as_slice())
         {
-            self.transaction_phase = PaneRenderTransactionPhase::Closed;
-            self.notifications.clear_protection();
-            self.transactional_dirty = true;
+            self.close_transaction();
             return PaneRenderSettlement::FailedClosed;
         }
 
@@ -1962,9 +2056,7 @@ impl PerPane {
             ..
         } = *pending;
         let Some(next_baseline_revision) = self.baseline_revision.checked_add(1) else {
-            self.transaction_phase = PaneRenderTransactionPhase::Closed;
-            self.notifications.clear_protection();
-            self.transactional_dirty = true;
+            self.close_transaction();
             return PaneRenderSettlement::FailedClosed;
         };
         if self
@@ -1972,9 +2064,7 @@ impl PerPane {
             .drain_prefix(covered_notifications.len())
             .is_err()
         {
-            self.transaction_phase = PaneRenderTransactionPhase::Closed;
-            self.notifications.clear_protection();
-            self.transactional_dirty = true;
+            self.close_transaction();
             return PaneRenderSettlement::FailedClosed;
         }
         self.notifications.clear_protection();
@@ -2008,9 +2098,7 @@ impl PerPane {
     }
 
     fn close_transaction(&mut self) {
-        self.transaction_phase = PaneRenderTransactionPhase::Closed;
-        self.notifications.clear_protection();
-        self.transactional_dirty = true;
+        self.retire_render_authority();
     }
 }
 
@@ -2108,10 +2196,18 @@ fn begin_transactional_pane_render(
     pane_id: PaneId,
     force_with_input_dispatch_serial: Option<InputSerial>,
 ) -> Result<PaneRenderPreparation, PaneRenderPreparationError> {
-    let snapshot = state
-        .lock()
-        .map_err(|_| PaneRenderPreparationError::StateLockPoisoned)?
-        .begin_transactional_preparation(pane_id, force_with_input_dispatch_serial)?;
+    let snapshot = match state.lock() {
+        Ok(mut per_pane) => {
+            per_pane.begin_transactional_preparation(
+                pane_id,
+                force_with_input_dispatch_serial,
+            )?
+        }
+        Err(poison) => {
+            retire_poisoned_pane_render(&state, poison);
+            return Err(PaneRenderPreparationError::StateLockPoisoned);
+        }
+    };
     Ok(PaneRenderPreparation {
         state,
         snapshot,
@@ -2173,11 +2269,14 @@ impl PaneRenderPreparation {
             || source_query == SequenceNo::MAX
             || source_end == SequenceNo::MAX
         {
-            let outcome = self
-                .state
-                .lock()
-                .map_err(|_| PaneRenderPreparationError::StateLockPoisoned)?
-                .close_exhausted_preparation(self.snapshot.token);
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poison) => {
+                    retire_poisoned_pane_render(&self.state, poison);
+                    return Err(PaneRenderPreparationError::StateLockPoisoned);
+                }
+            };
+            let outcome = state.close_exhausted_preparation(self.snapshot.token);
             self.armed = false;
             debug_assert!(matches!(
                 outcome,
@@ -2190,11 +2289,14 @@ impl PaneRenderPreparation {
         }
 
         let SurfacePreparation::Changes(mut surface) = surface else {
-            let outcome = self
-                .state
-                .lock()
-                .map_err(|_| PaneRenderPreparationError::StateLockPoisoned)?
-                .settle_no_change(self.snapshot.token);
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poison) => {
+                    retire_poisoned_pane_render(&self.state, poison);
+                    return Err(PaneRenderPreparationError::StateLockPoisoned);
+                }
+            };
+            let outcome = state.settle_no_change(self.snapshot.token);
             self.armed = false;
             return Ok(PaneRenderPreparationOutcome::NoChange(outcome));
         };
@@ -2233,14 +2335,18 @@ impl PaneRenderPreparation {
         let PreparedSurfaceChanges {
             response, baseline, ..
         } = *surface;
-        self.state
-            .lock()
-            .map_err(|_| PaneRenderPreparationError::StateLockPoisoned)?
-            .install_prepared(
+        let install_result = match self.state.lock() {
+            Ok(mut state) => state.install_prepared(
                 &self.snapshot,
                 baseline,
                 redirtied_after_snapshot,
-            )?;
+            ),
+            Err(poison) => {
+                retire_poisoned_pane_render(&self.state, poison);
+                return Err(PaneRenderPreparationError::StateLockPoisoned);
+            }
+        };
+        install_result?;
         self.armed = false;
         Ok(PaneRenderPreparationOutcome::Prepared(
             Box::new(PreparedPaneRender {
@@ -2266,9 +2372,12 @@ impl Drop for PaneRenderPreparation {
                 let _ = state.cancel_preparation(self.snapshot.token);
             }
             Err(err) => {
-                log::error!(
-                    "failed to recover cancelled pane render preparation after lock poison: {err}"
-                );
+                if !std::thread::panicking() {
+                    log::error!(
+                        "failed to recover cancelled pane render preparation after lock poison: {err}"
+                    );
+                }
+                retire_poisoned_pane_render(&self.state, err);
             }
         }
     }
@@ -2286,7 +2395,13 @@ impl PreparedPaneRender {
     fn acknowledge(mut self) -> PaneRenderSettlement {
         let outcome = match self.state.lock() {
             Ok(mut state) => state.acknowledge_prepared(self.token),
-            Err(_) => PaneRenderSettlement::FailedClosed,
+            Err(err) => {
+                log::error!(
+                    "failed to acknowledge pane render application after lock poison: {err}"
+                );
+                retire_poisoned_pane_render(&self.state, err);
+                PaneRenderSettlement::FailedClosed
+            }
         };
         self.armed = false;
         outcome
@@ -2295,7 +2410,13 @@ impl PreparedPaneRender {
     fn nack(mut self) -> PaneRenderSettlement {
         let outcome = match self.state.lock() {
             Ok(mut state) => state.retry_prepared(self.token),
-            Err(_) => PaneRenderSettlement::FailedClosed,
+            Err(err) => {
+                log::error!(
+                    "failed to retry pane render application after lock poison: {err}"
+                );
+                retire_poisoned_pane_render(&self.state, err);
+                PaneRenderSettlement::FailedClosed
+            }
         };
         self.armed = false;
         outcome
@@ -2307,14 +2428,25 @@ impl Drop for PreparedPaneRender {
         if !self.armed {
             return;
         }
+        if std::thread::panicking() {
+            // Once a prepared application is handed to a delivery
+            // coordinator, an unwind may happen after queue admission but
+            // before local settlement. Retrying that indeterminate candidate
+            // without an application ACK could duplicate exact effects.
+            retire_pane_render_after_settlement_failure(&self.state);
+            return;
+        }
         match self.state.lock() {
             Ok(mut state) => {
                 let _ = state.retry_prepared(self.token);
             }
             Err(err) => {
-                log::error!(
-                    "failed to recover abandoned pane render application after lock poison: {err}"
-                );
+                if !std::thread::panicking() {
+                    log::error!(
+                        "failed to recover abandoned pane render application after lock poison: {err}"
+                    );
+                }
+                retire_poisoned_pane_render(&self.state, err);
             }
         }
     }
@@ -2344,8 +2476,28 @@ impl LegacyRenderEnqueueGuard {
         }
     }
 
-    fn acknowledge(mut self) {
+    fn acknowledge(mut self) -> anyhow::Result<()> {
+        let result = match catch_recoverable(
+            RecoverablePanicSite::MuxPaneCallback,
+            AssertUnwindSafe(|| {
+                acknowledge_legacy_render_enqueue(
+                    &self.per_pane,
+                    self.pane_id,
+                    self.installed_revision,
+                )
+            }),
+        ) {
+            Ok(result) => result,
+            Err(err) => Err(anyhow!(
+                "legacy render enqueue acknowledgement panicked for pane {}: {err}",
+                self.pane_id
+            )),
+        };
+        if result.is_err() {
+            retire_pane_render_after_settlement_failure(&self.per_pane);
+        }
         self.armed = false;
+        result
     }
 
     fn recover(&self) -> anyhow::Result<()> {
@@ -2354,7 +2506,6 @@ impl LegacyRenderEnqueueGuard {
             AssertUnwindSafe(|| {
                 retain_legacy_render_after_enqueue_failure(
                     &self.per_pane,
-                    self.pane_id,
                     &self.prior_baseline,
                     self.installed_revision,
                 )
@@ -2370,8 +2521,16 @@ impl LegacyRenderEnqueueGuard {
 
     fn rollback(mut self) -> anyhow::Result<()> {
         let result = self.recover();
+        if result.is_err() {
+            retire_pane_render_after_settlement_failure(&self.per_pane);
+        }
         self.armed = false;
         result
+    }
+
+    fn retire(mut self) {
+        retire_pane_render_after_settlement_failure(&self.per_pane);
+        self.armed = false;
     }
 }
 
@@ -2381,7 +2540,14 @@ impl Drop for LegacyRenderEnqueueGuard {
             return;
         }
         self.armed = false;
+        if std::thread::panicking() {
+            // A callback may panic after admitting the PDU. Its delivery state
+            // is unknowable, so rollback-and-retry could duplicate effects.
+            retire_pane_render_after_settlement_failure(&self.per_pane);
+            return;
+        }
         if let Err(err) = self.recover() {
+            retire_pane_render_after_settlement_failure(&self.per_pane);
             log::error!(
                 "failed to recover abandoned legacy render enqueue for pane {}: {err:#}",
                 self.pane_id
@@ -2416,13 +2582,24 @@ impl UnsentNotificationsGuard {
             .notifications
             .get(self.next_unsent)
             .ok_or_else(|| anyhow!("no protected pane notification remains to acknowledge"))?;
-        let mut state = self.per_pane.lock().map_err(|err| {
-            anyhow!("per-pane state lock poisoned during notification commit: {err}")
-        })?;
-        state
-            .notifications
-            .acknowledge_protected_front(expected)
-            .map_err(anyhow::Error::from)?;
+        let mut state = lock_per_pane_or_retire(
+            &self.per_pane,
+            "committing a legacy pane notification",
+        )?;
+        if !matches!(
+            state.legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::NotificationsInFlight
+        ) || !matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Idle
+        ) {
+            state.retire_render_authority();
+            return Err(PaneRenderPreparationError::LegacyDeliveryAuthorityChanged.into());
+        }
+        if let Err(error) = state.notifications.acknowledge_protected_front(expected) {
+            state.retire_render_authority();
+            return Err(error.into());
+        }
         drop(state);
         self.next_unsent = self
             .next_unsent
@@ -2431,7 +2608,41 @@ impl UnsentNotificationsGuard {
         Ok(())
     }
 
-    fn acknowledge_all(mut self) {
+    fn settle_completed(&self) -> anyhow::Result<()> {
+        if self.next_unsent != self.notifications.len() {
+            anyhow::bail!("pane notification batch is not completely acknowledged");
+        }
+        let mut state = lock_per_pane_or_retire(
+            &self.per_pane,
+            "settling a legacy pane notification batch",
+        )?;
+        if !matches!(
+            state.legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::NotificationsInFlight
+        ) || state.notifications.protected_prefix_len != 0
+            || !matches!(
+                state.transaction_phase,
+                PaneRenderTransactionPhase::Idle
+            )
+        {
+            state.retire_render_authority();
+            return Err(PaneRenderPreparationError::LegacyDeliveryAuthorityChanged.into());
+        }
+        state.legacy_enqueue_phase = LegacyRenderEnqueuePhase::Idle;
+        Ok(())
+    }
+
+    fn acknowledge_all(mut self) -> anyhow::Result<()> {
+        let result = self.settle_completed();
+        if result.is_err() {
+            retire_pane_render_after_settlement_failure(&self.per_pane);
+        }
+        self.armed = false;
+        result
+    }
+
+    fn retire(mut self) {
+        retire_pane_render_after_settlement_failure(&self.per_pane);
         self.armed = false;
     }
 
@@ -2442,15 +2653,27 @@ impl UnsentNotificationsGuard {
                 let unsent = self.notifications.get(self.next_unsent..).ok_or_else(|| {
                     anyhow!("pane notification recovery index exceeded its protected batch")
                 })?;
-                let mut state = self.per_pane.lock().map_err(|err| {
-                    anyhow!(
-                        "per-pane state lock poisoned during notification recovery: {err}"
-                    )
-                })?;
-                state
-                    .notifications
-                    .release_protected_prefix(unsent)
-                    .map_err(anyhow::Error::from)?;
+                let mut state = lock_per_pane_or_retire(
+                    &self.per_pane,
+                    "recovering a legacy pane notification batch",
+                )?;
+                if !matches!(
+                    state.legacy_enqueue_phase,
+                    LegacyRenderEnqueuePhase::NotificationsInFlight
+                ) || !matches!(
+                    state.transaction_phase,
+                    PaneRenderTransactionPhase::Idle
+                ) {
+                    state.retire_render_authority();
+                    return Err(
+                        PaneRenderPreparationError::LegacyDeliveryAuthorityChanged.into(),
+                    );
+                }
+                if let Err(error) = state.notifications.release_protected_prefix(unsent) {
+                    state.retire_render_authority();
+                    return Err(error.into());
+                }
+                state.legacy_enqueue_phase = LegacyRenderEnqueuePhase::Idle;
                 state.mark_transactional_dirty();
                 Ok(())
             }),
@@ -2462,6 +2685,9 @@ impl UnsentNotificationsGuard {
 
     fn rollback(mut self) -> anyhow::Result<()> {
         let result = self.recover();
+        if result.is_err() {
+            retire_pane_render_after_settlement_failure(&self.per_pane);
+        }
         self.armed = false;
         result
     }
@@ -2469,40 +2695,132 @@ impl UnsentNotificationsGuard {
 
 impl Drop for UnsentNotificationsGuard {
     fn drop(&mut self) {
-        if !self.armed || self.next_unsent >= self.notifications.len() {
+        if !self.armed {
             return;
         }
         self.armed = false;
-        if let Err(err) = self.recover() {
-            log::error!("failed to retain abandoned pane notifications: {err:#}");
+        if std::thread::panicking() {
+            // As with surface delivery, a panicking sender may already have
+            // admitted the alert. Never retry an indeterminate exact event.
+            retire_pane_render_after_settlement_failure(&self.per_pane);
+            return;
+        }
+        let result = if self.next_unsent >= self.notifications.len() {
+            self.settle_completed()
+        } else {
+            self.recover()
+        };
+        if let Err(err) = result {
+            retire_pane_render_after_settlement_failure(&self.per_pane);
+            log::error!("failed to settle abandoned pane notifications: {err:#}");
         }
     }
 }
 
 fn retain_legacy_render_after_enqueue_failure(
     per_pane: &Arc<Mutex<PerPane>>,
-    pane_id: PaneId,
     prior_baseline: &PaneRenderBaseline,
     installed_revision: u64,
 ) -> anyhow::Result<()> {
-    let mut state = per_pane
-        .lock()
-        .map_err(|err| anyhow!("per-pane state lock poisoned during render recovery: {err}"))?;
-    if state.baseline_revision == installed_revision {
-        let current_config_generation = state.baseline.config_generation;
-        let current_sent_initial_palette = state.baseline.sent_initial_palette;
-        state.baseline.clone_from(prior_baseline);
-        // Palette/config bookkeeping is committed independently after the
-        // surface enqueue. Preserve a newer metadata update while rolling back
-        // only the speculative surface baseline owned by this exact revision.
-        state.baseline.config_generation = current_config_generation;
-        state.baseline.sent_initial_palette = current_sent_initial_palette;
-    } else {
-        log::error!(
-            "cannot roll back failed legacy render enqueue for pane {pane_id}: the baseline was superseded"
-        );
+    let mut state = lock_per_pane_or_retire(per_pane, "recovering a legacy pane render")?;
+    #[cfg(test)]
+    assert!(
+        !std::mem::take(&mut state.panic_next_legacy_enqueue_recovery),
+        "synthetic legacy render recovery panic"
+    );
+    let owns_enqueue = matches!(
+        state.legacy_enqueue_phase,
+        LegacyRenderEnqueuePhase::InFlight {
+            installed_revision: active,
+        } if active == installed_revision
+    );
+    if !owns_enqueue || state.baseline_revision != installed_revision {
+        state.retire_render_authority();
+        return Err(PaneRenderPreparationError::LegacyDeliveryAuthorityChanged.into());
     }
+
+    let current_config_generation = state.baseline.config_generation;
+    let current_sent_initial_palette = state.baseline.sent_initial_palette;
+    state.baseline.clone_from(prior_baseline);
+    // Palette/config bookkeeping is committed independently after the
+    // surface enqueue. Preserve a newer metadata update while rolling back
+    // only the speculative surface baseline owned by this exact revision.
+    state.baseline.config_generation = current_config_generation;
+    state.baseline.sent_initial_palette = current_sent_initial_palette;
+    state.legacy_enqueue_phase = LegacyRenderEnqueuePhase::Idle;
     state.mark_transactional_dirty();
+    Ok(())
+}
+
+/// Retire a pane after acknowledgement/recovery could not prove a unique
+/// terminal state. This path deliberately recovers a poisoned mutex: closing
+/// both render protocols and releasing any local alert-prefix marker restores
+/// the fail-closed invariant before the poison marker is cleared. A baseline
+/// or alert may represent delivered or undelivered bytes, so neither may be
+/// exposed to another render attempt.
+fn retire_pane_render_after_settlement_failure(per_pane: &Arc<Mutex<PerPane>>) {
+    match per_pane.lock() {
+        Ok(mut state) => state.retire_render_authority(),
+        Err(poison) => retire_poisoned_pane_render(per_pane, poison),
+    }
+}
+
+/// Repair a poisoned render state while retaining the original recovered
+/// mutex guard. No observer can acquire the mutex between recovery and the
+/// installation of the closed/dirty invariant, and poison is cleared only
+/// while that repaired state is still exclusively held.
+pub(crate) fn retire_poisoned_pane_render<'a>(
+    per_pane: &'a Arc<Mutex<PerPane>>,
+    poison: std::sync::PoisonError<std::sync::MutexGuard<'a, PerPane>>,
+) {
+    let mut state = poison.into_inner();
+    state.retire_render_authority();
+    per_pane.clear_poison();
+}
+
+/// Acquire per-pane render state or turn mutex poison into an explicit closed
+/// protocol state. A panic while holding this mutex leaves every field suspect;
+/// returning a bare poison error would strand the registration without proving
+/// whether either delivery protocol still owned a baseline or alert prefix.
+fn lock_per_pane_or_retire<'a>(
+    per_pane: &'a Arc<Mutex<PerPane>>,
+    operation: &'static str,
+) -> anyhow::Result<std::sync::MutexGuard<'a, PerPane>> {
+    match per_pane.lock() {
+        Ok(state) => Ok(state),
+        Err(poison) => {
+            retire_poisoned_pane_render(per_pane, poison);
+            Err(anyhow!("per-pane state lock poisoned while {operation}"))
+        }
+    }
+}
+
+fn acknowledge_legacy_render_enqueue(
+    per_pane: &Arc<Mutex<PerPane>>,
+    pane_id: PaneId,
+    installed_revision: u64,
+) -> anyhow::Result<()> {
+    let mut state =
+        lock_per_pane_or_retire(per_pane, "acknowledging a legacy pane render")?;
+    #[cfg(test)]
+    assert!(
+        !std::mem::take(&mut state.panic_next_legacy_enqueue_ack),
+        "synthetic legacy render acknowledgement panic"
+    );
+    let owns_enqueue = matches!(
+        state.legacy_enqueue_phase,
+        LegacyRenderEnqueuePhase::InFlight {
+            installed_revision: active,
+        } if active == installed_revision
+    );
+    if !owns_enqueue || state.baseline_revision != installed_revision {
+        state.retire_render_authority();
+        return Err(anyhow!(
+            "cannot acknowledge legacy render enqueue for pane {pane_id}: {}",
+            PaneRenderPreparationError::LegacyDeliveryAuthorityChanged
+        ));
+    }
+    state.legacy_enqueue_phase = LegacyRenderEnqueuePhase::Idle;
     Ok(())
 }
 
@@ -2519,7 +2837,7 @@ fn maybe_push_pane_changes(
             serial: 0,
         });
         match send_result {
-            Ok(()) => rollback_guard.acknowledge(),
+            Ok(()) => rollback_guard.acknowledge()?,
             Err(send_err) => {
                 if let Err(recovery_err) = rollback_guard.rollback() {
                     return Err(anyhow!(
@@ -2533,9 +2851,10 @@ fn maybe_push_pane_changes(
 
     let config_generation = config::configuration().generation();
     let (mut notifications_remaining, first_notification_batch) = {
-        let mut per_pane = per_pane
-            .lock()
-            .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
+        let mut per_pane = lock_per_pane_or_retire(
+            &per_pane,
+            "preparing legacy pane notifications",
+        )?;
         per_pane.ensure_legacy_transport_idle()?;
         if per_pane.baseline.config_generation != config_generation {
             // If the config changed, it may have changed colors
@@ -2562,6 +2881,10 @@ fn maybe_push_pane_changes(
             .notifications
             .protected_batch_up_to(notifications_remaining)
             .map_err(anyhow::Error::from)?;
+        if notifications_remaining != 0 {
+            per_pane.legacy_enqueue_phase =
+                LegacyRenderEnqueuePhase::NotificationsInFlight;
+        }
         (notifications_remaining, batch)
     };
 
@@ -2596,13 +2919,13 @@ fn maybe_push_pane_changes(
             match send_result {
                 Ok(()) => {
                     if let Err(commit_err) = notifications.acknowledge_current() {
-                        if let Err(recovery_err) = notifications.rollback() {
-                            return Err(anyhow!(
-                                "notification enqueue committed but local settlement failed: {commit_err:#}; protection recovery also failed: {recovery_err:#}"
-                            ));
-                        }
+                        // The client accepted the notification, but local
+                        // state could not prove which exact event was drained.
+                        // Retrying can duplicate bells and other edge-triggered
+                        // effects, so this registration is terminal.
+                        notifications.retire();
                         return Err(anyhow!(
-                            "notification enqueue committed but local settlement failed: {commit_err:#}"
+                            "notification enqueue committed but local settlement failed; pane render authority retired: {commit_err:#}"
                         ));
                     }
                 }
@@ -2616,20 +2939,26 @@ fn maybe_push_pane_changes(
                 }
             }
         }
-        notifications.acknowledge_all();
+        notifications
+            .acknowledge_all()
+            .context("settling committed legacy pane-notification batch")?;
         notifications_remaining = notifications_remaining
             .checked_sub(batch_len)
             .ok_or_else(|| anyhow!("pane notification batch accounting underflowed"))?;
         if notifications_remaining != 0 {
             let batch = {
-                let mut state = per_pane
-                    .lock()
-                    .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
+                let mut state = lock_per_pane_or_retire(
+                    &per_pane,
+                    "preparing the next legacy pane-notification batch",
+                )?;
                 state.ensure_legacy_transport_idle()?;
-                state
+                let batch = state
                     .notifications
                     .protected_batch_up_to(notifications_remaining)
-                    .map_err(anyhow::Error::from)?
+                    .map_err(anyhow::Error::from)?;
+                state.legacy_enqueue_phase =
+                    LegacyRenderEnqueuePhase::NotificationsInFlight;
+                batch
             };
             next_notification_batch = Some(batch);
         }
@@ -2674,7 +3003,7 @@ fn mark_post_input_render_dirty(
     pane_id: PaneId,
     operation: &'static str,
 ) {
-    match per_pane.lock() {
+    match lock_per_pane_or_retire(per_pane, "marking a committed input render dirty") {
         Ok(mut state) => state.mark_transactional_dirty(),
         Err(err) => log::error!(
             "render state lock poisoned while recovering committed {operation} for pane {pane_id}: {err}"
@@ -2729,7 +3058,14 @@ fn push_input_dispatch_changes_after_committed_input(
             })
         }),
     ) {
-        Ok(Ok(())) => rollback.acknowledge(),
+        Ok(Ok(())) => {
+            if let Err(err) = rollback.acknowledge() {
+                mark_post_input_render_dirty(&per_pane, pane_id, operation);
+                log::error!(
+                    "render enqueue acknowledgement failed after committed {operation} for pane {pane_id}; preserving the input acknowledgment: {err:#}"
+                );
+            }
+        }
         Ok(Err(err)) => {
             if let Err(recovery_err) = rollback.rollback() {
                 log::error!(
@@ -2741,8 +3077,11 @@ fn push_input_dispatch_changes_after_committed_input(
             );
         }
         Err(err) => {
-            // The armed guard restores the exact baseline before returning.
-            drop(rollback);
+            // The sender panic was caught before the guard could observe an
+            // active unwind. Admission may already have occurred, so an
+            // explicit terminal settlement is required here; rolling back and
+            // retrying could duplicate this input-correlated surface PDU.
+            rollback.retire();
             log::error!(
                 "render enqueue panicked after committed {operation} for pane {pane_id}; preserving the input acknowledgment: {err}"
             );
@@ -3569,17 +3908,23 @@ impl SessionHandler {
         per_pane: Arc<Mutex<PerPane>>,
     ) {
         spawn_into_main_thread(async move {
-            authority.try_run(|| {
+            let pane_id = registration.pane_id();
+            let result = authority.try_run(|| {
                 registration
                     .try_with_current(|pane| maybe_push_pane_changes(&pane, sender, per_pane))
                     .ok_or_else(|| {
                         anyhow!(
                             "pane registration {} is no longer current",
-                            registration.pane_id()
+                            pane_id
                         )
                     })?
-            })??;
-            Ok::<(), anyhow::Error>(())
+            });
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) | Err(err) => {
+                    log::error!("scheduled pane {pane_id} render push failed: {err:#}");
+                }
+            }
         })
         .detach();
     }
@@ -5458,6 +5803,19 @@ mod tests {
         }
     }
 
+    fn poison_per_pane_lock(state: &Arc<Mutex<PerPane>>) {
+        let state = Arc::clone(state);
+        assert!(
+            std::thread::spawn(move || {
+                let _held = state.lock().expect("test state starts unpoisoned");
+                panic!("synthetic per-pane lock poison");
+            })
+            .join()
+            .is_err(),
+            "synthetic poison thread must panic"
+        );
+    }
+
     /// Extract the single response PDU from the captured list.
     fn take_response(captured: &Arc<Mutex<Vec<DecodedPdu>>>) -> DecodedPdu {
         let mut v = captured.lock().unwrap();
@@ -5960,6 +6318,57 @@ mod tests {
             replacement_state.lock().unwrap().baseline,
             PaneRenderBaseline::default(),
             "an old registration ACK must not mutate same-numeric-id replacement state"
+        );
+    }
+
+    #[test]
+    fn old_registration_legacy_enqueue_ack_cannot_mutate_replacement_state() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let mux = Arc::new(Mux::new(None));
+        let pane_id = 7_003;
+        let original: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
+        mux.add_pane(&original).expect("register original pane");
+        let (sender, _captured) = capturing_sender();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+        let original_registration = handler
+            .owner
+            .authority()
+            .capture_current_pane(pane_id)
+            .expect("capture original registration");
+        let original_state = handler.per_pane_for_registration(&original_registration);
+        let (_, enqueue_guard) = original_registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &original_state, None)
+            })
+            .expect("original registration remains current")
+            .expect("prepare original legacy enqueue")
+            .expect("original pane state produces a render");
+
+        assert!(original_registration.retire_if_current());
+        let replacement: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
+        mux.add_pane(&replacement)
+            .expect("register replacement pane");
+        let replacement_registration = handler
+            .owner
+            .authority()
+            .capture_current_pane(pane_id)
+            .expect("capture replacement registration");
+        let replacement_state = handler.per_pane_for_registration(&replacement_registration);
+
+        assert!(!Arc::ptr_eq(&original_state, &replacement_state));
+        enqueue_guard
+            .acknowledge()
+            .expect("the original enqueue settles only its exact state");
+        assert_eq!(
+            original_state.lock().unwrap().legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::Idle
+        );
+        let replacement_state = replacement_state.lock().unwrap();
+        assert_eq!(replacement_state.baseline, PaneRenderBaseline::default());
+        assert_eq!(
+            replacement_state.legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::Idle
         );
     }
 
@@ -10175,7 +10584,65 @@ mod tests {
             .expect("lock-free legacy render preparation should send");
 
         assert_eq!(callback_count.load(Ordering::Relaxed), 1);
-        assert_eq!(per_pane.lock().unwrap().baseline.seqno, 11);
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.baseline.seqno, 11);
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Idle);
+    }
+
+    #[test]
+    fn legacy_render_rejects_a_source_that_changes_during_snapshot() {
+        let mut fake = FakePane::new(None);
+        fake.seqno_on_dimensions = Some(12);
+        let pane: Arc<dyn Pane> = Arc::new(fake);
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+
+        let result = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a mixed-source legacy snapshot must not be published"),
+        };
+        assert!(error.to_string().contains("source changed"));
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.baseline, PaneRenderBaseline::default());
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Idle);
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Idle
+        ));
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn legacy_render_terminal_sequence_retires_both_protocols() {
+        let pane = Arc::new(FakePane::new(None));
+        pane.state.lock().unwrap().seqno = SequenceNo::MAX;
+        let pane_dyn: Arc<dyn Pane> = pane;
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+
+        let result = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("terminal legacy sequence identity must fail closed"),
+        };
+        assert!(error.to_string().contains("terminal sequence"));
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
     }
 
     #[test]
@@ -10212,6 +10679,83 @@ mod tests {
         assert_eq!(send_count.load(Ordering::Relaxed), 0);
         let state = per_pane.lock().unwrap();
         assert_eq!(state.baseline.title, "newer-baseline");
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn legacy_changed_render_identity_exhaustion_retires_both_protocols() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        per_pane.lock().unwrap().baseline_revision = u64::MAX;
+
+        let result = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("an exhausted legacy change identity must fail closed"),
+        };
+        assert!(error.to_string().contains("attempt identity exhausted"));
+
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.baseline, PaneRenderBaseline::default());
+        assert_eq!(state.baseline_revision, u64::MAX);
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn legacy_no_change_identity_exhaustion_retires_both_protocols() {
+        let pane = Arc::new(FakePane::new(None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let (_, first) = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current")
+            .expect("initial legacy render preparation succeeds")
+            .expect("initial pane state produces a render");
+        first
+            .acknowledge()
+            .expect("initial legacy baseline becomes authoritative");
+        pane.clear_changed_lines();
+        {
+            let mut state = per_pane.lock().unwrap();
+            state.baseline.seqno = 10;
+            state.baseline_revision = u64::MAX;
+            state.transactional_dirty = false;
+        }
+
+        let result = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("an exhausted legacy no-change identity must fail closed"),
+        };
+        assert!(error.to_string().contains("attempt identity exhausted"));
+
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.baseline.seqno, 10);
+        assert_eq!(state.baseline_revision, u64::MAX);
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(state.notifications.protected_prefix_len, 0);
         assert!(state.transactional_dirty);
     }
 
@@ -10270,50 +10814,80 @@ mod tests {
             state.transactional_dirty,
             "failed enqueue must retain an explicit retry obligation"
         );
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Idle);
     }
 
     #[test]
-    fn stale_legacy_enqueue_failure_cannot_roll_back_a_newer_render_revision() {
+    fn reentrant_legacy_prepare_cannot_inherit_an_undelivered_baseline() {
         let pane = Arc::new(FakePane::new(None));
         let pane_dyn: Arc<dyn Pane> = pane.clone();
         let (_mux, registration) = register_test_pane(&pane_dyn);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
         per_pane.lock().unwrap().transactional_dirty = false;
+        let nested_rejected = Arc::new(AtomicBool::new(false));
         let sender = PduSender::new({
             let pane = Arc::clone(&pane);
             let registration = registration.clone();
             let per_pane = Arc::clone(&per_pane);
+            let nested_rejected = Arc::clone(&nested_rejected);
             move |_, _| {
                 {
                     let mut pane_state = pane.state.lock().unwrap();
                     pane_state.title = "newer-render".to_string();
                     pane_state.seqno = 12;
                 }
-                let nested = registration
+                let nested_result = registration
                     .try_with_current(|current| {
                         prepare_legacy_render_enqueue(&current, &per_pane, None)
                     })
-                    .expect("nested registration remains exact")
-                    .expect("newer render preparation succeeds")
-                    .expect("newer pane state produces a render");
-                assert_eq!(nested.0.title, "newer-render");
-                nested.1.acknowledge();
-                Err(anyhow!("outer enqueue failed after nested render committed"))
+                    .expect("nested registration remains exact");
+                let nested_error = match nested_result {
+                    Err(error) => error,
+                    Ok(_) => panic!(
+                        "an undelivered baseline must retain exclusive enqueue authority"
+                    ),
+                };
+                assert!(nested_error.to_string().contains("already active"));
+                nested_rejected.store(true, Ordering::Relaxed);
+                Err(anyhow!("outer enqueue failed after nested render was rejected"))
             }
         });
 
-        registration
+        let error = registration
             .try_with_current(|current| {
                 maybe_push_pane_changes(&current, sender, Arc::clone(&per_pane))
             })
             .expect("test pane registration remains current")
             .expect_err("the outer synthetic enqueue must fail");
+        assert!(error.to_string().contains("outer enqueue failed"));
+        assert!(nested_rejected.load(Ordering::Relaxed));
 
+        {
+            let state = per_pane.lock().unwrap();
+            assert_eq!(state.baseline, PaneRenderBaseline::default());
+            assert_eq!(state.baseline_revision, 1);
+            assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Idle);
+            assert!(state.transactional_dirty);
+        }
+
+        let (retry_sender, captured) = capturing_sender();
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, retry_sender, Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect("the exact rollback must release authority for a complete retry");
+        let responses = captured.lock().unwrap();
+        assert!(responses.iter().any(|decoded| matches!(
+            &decoded.pdu,
+            Pdu::GetPaneRenderChangesResponse(response)
+                if response.title == "newer-render" && response.seqno == 12
+        )));
         let state = per_pane.lock().unwrap();
         assert_eq!(state.baseline.title, "newer-render");
         assert_eq!(state.baseline.seqno, 12);
         assert_eq!(state.baseline_revision, 2);
-        assert!(state.transactional_dirty);
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Idle);
     }
 
     #[test]
@@ -10346,10 +10920,288 @@ mod tests {
         };
         assert_eq!(state.baseline, expected);
         assert!(state.transactional_dirty);
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Idle);
     }
 
     #[test]
-    fn panicked_legacy_render_enqueue_restores_baseline_and_preserves_input_ack_path() {
+    fn abandoned_legacy_enqueue_guard_rolls_back_and_releases_authority() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let (_, guard) = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current")
+            .expect("initial render preparation succeeds")
+            .expect("initial pane state produces a render");
+        assert!(matches!(
+            per_pane.lock().unwrap().legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::InFlight { .. }
+        ));
+
+        // Model a connection/task being retired after preparation but before
+        // queue admission. The armed guard must restore the baseline and make
+        // a later exact-registration retry possible.
+        drop(guard);
+
+        {
+            let state = per_pane.lock().unwrap();
+            assert_eq!(state.baseline, PaneRenderBaseline::default());
+            assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Idle);
+            assert!(state.transactional_dirty);
+        }
+        let (_, retry_guard) = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current")
+            .expect("abandoned authority must permit an exact retry")
+            .expect("rolled-back surface must be prepared again");
+        retry_guard
+            .rollback()
+            .expect("retry guard cleanup restores idle authority");
+    }
+
+    #[test]
+    fn legacy_preparation_retires_and_clears_a_poisoned_state_lock() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        poison_per_pane_lock(&per_pane);
+
+        let result = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("poisoned legacy state must fail closed"),
+        };
+        assert!(error.to_string().contains("state lock poisoned"));
+
+        let state = per_pane
+            .lock()
+            .expect("legacy terminal recovery must clear the mutex poison");
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn legacy_enqueue_recovery_mismatch_retires_under_the_recovery_guard() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let (_, guard) = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current")
+            .expect("initial render preparation succeeds")
+            .expect("initial pane state produces a render");
+        per_pane.lock().unwrap().baseline_revision = 2;
+
+        let error = guard
+            .recover()
+            .expect_err("mismatched baseline ownership must fail closed");
+        assert!(error.to_string().contains("ownership changed"));
+        {
+            let state = per_pane.lock().unwrap();
+            assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+            assert!(matches!(
+                state.transaction_phase,
+                PaneRenderTransactionPhase::Closed
+            ));
+            assert_eq!(state.baseline.seqno, 11);
+            assert!(state.transactional_dirty);
+        }
+        guard.retire();
+    }
+
+    #[test]
+    fn legacy_enqueue_ack_mismatch_retires_under_the_ack_guard() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let (_, guard) = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current")
+            .expect("initial render preparation succeeds")
+            .expect("initial pane state produces a render");
+        per_pane.lock().unwrap().baseline_revision = 2;
+
+        let error = acknowledge_legacy_render_enqueue(
+            &per_pane,
+            pane.pane_id(),
+            guard.installed_revision,
+        )
+        .expect_err("mismatched enqueue acknowledgement must fail closed");
+        assert!(error.to_string().contains("ownership changed"));
+        {
+            let state = per_pane.lock().unwrap();
+            assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+            assert!(matches!(
+                state.transaction_phase,
+                PaneRenderTransactionPhase::Closed
+            ));
+            assert_eq!(state.baseline.seqno, 11);
+            assert!(state.transactional_dirty);
+        }
+        guard.retire();
+    }
+
+    #[test]
+    fn legacy_enqueue_ack_retires_poison_under_the_recovered_guard() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let (_, guard) = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current")
+            .expect("initial render preparation succeeds")
+            .expect("initial pane state produces a render");
+        poison_per_pane_lock(&per_pane);
+
+        let error = guard
+            .acknowledge()
+            .expect_err("poisoned acknowledgement must fail closed");
+        assert!(error.to_string().contains("state lock poisoned"));
+        let state = per_pane
+            .lock()
+            .expect("acknowledgement poison repair must clear the mutex poison");
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn legacy_enqueue_rollback_retires_poison_under_the_recovered_guard() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let (_, guard) = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current")
+            .expect("initial render preparation succeeds")
+            .expect("initial pane state produces a render");
+        poison_per_pane_lock(&per_pane);
+
+        let error = guard
+            .rollback()
+            .expect_err("poisoned rollback must fail closed");
+        assert!(error.to_string().contains("state lock poisoned"));
+        let state = per_pane
+            .lock()
+            .expect("rollback poison repair must clear the mutex poison");
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn panicked_legacy_enqueue_ack_retires_and_clears_lock_poison() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let (_, guard) = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current")
+            .expect("initial render preparation succeeds")
+            .expect("initial pane state produces a render");
+        per_pane.lock().unwrap().panic_next_legacy_enqueue_ack = true;
+
+        let error = guard
+            .acknowledge()
+            .expect_err("a recovered acknowledgement panic must fail closed");
+        assert!(error.to_string().contains("acknowledgement panicked"));
+        let state = per_pane
+            .lock()
+            .expect("terminal retirement must clear the recovered lock poison");
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert_eq!(state.baseline.seqno, 11);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn panicked_legacy_enqueue_rollback_retires_and_clears_lock_poison() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let (_, guard) = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current")
+            .expect("initial render preparation succeeds")
+            .expect("initial pane state produces a render");
+        per_pane
+            .lock()
+            .unwrap()
+            .panic_next_legacy_enqueue_recovery = true;
+
+        let error = guard
+            .rollback()
+            .expect_err("a recovered rollback panic must fail closed");
+        assert!(error.to_string().contains("recovery panicked"));
+        let state = per_pane
+            .lock()
+            .expect("terminal retirement must clear the recovered lock poison");
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert_eq!(state.baseline.seqno, 11);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn panicked_abandoned_legacy_enqueue_recovery_cannot_linger_in_flight() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let (_, guard) = registration
+            .try_with_current(|current| {
+                prepare_legacy_render_enqueue(&current, &per_pane, None)
+            })
+            .expect("test pane registration remains current")
+            .expect("initial render preparation succeeds")
+            .expect("initial pane state produces a render");
+        per_pane
+            .lock()
+            .unwrap()
+            .panic_next_legacy_enqueue_recovery = true;
+
+        drop(guard);
+
+        let state = per_pane
+            .lock()
+            .expect("drop-time terminal retirement must clear lock poison");
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert_eq!(state.baseline.seqno, 11);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn panicked_legacy_render_enqueue_retires_indeterminate_delivery() {
         let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
@@ -10371,14 +11223,40 @@ mod tests {
 
         let state = per_pane.lock().unwrap();
         assert_eq!(
-            state.baseline,
-            PaneRenderBaseline::default(),
-            "an enqueue panic cannot publish the speculative baseline"
+            state.baseline.seqno, 11,
+            "the speculative baseline is retained only inside terminal state"
         );
         assert!(
             state.transactional_dirty,
-            "an enqueue panic must retain a render retry obligation"
+            "an enqueue panic must preserve explicit terminal dirtiness"
         );
+        assert_eq!(
+            state.legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::Closed
+        );
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+    }
+
+    #[test]
+    fn committed_input_dirty_mark_retires_and_clears_a_poisoned_state_lock() {
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        poison_per_pane_lock(&per_pane);
+
+        mark_post_input_render_dirty(&per_pane, 17, "test committed input");
+
+        let state = per_pane
+            .lock()
+            .expect("post-input terminal recovery must clear the mutex poison");
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
     }
 
     #[test]
@@ -10421,7 +11299,7 @@ mod tests {
     }
 
     #[test]
-    fn panicked_notification_enqueue_retains_unsent_suffix() {
+    fn panicked_notification_enqueue_retires_indeterminate_exact_event() {
         let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
@@ -10452,6 +11330,256 @@ mod tests {
         let state = per_pane.lock().unwrap();
         assert_eq!(state.baseline.seqno, 11);
         assert_eq!(state.notifications, vec![Alert::PaletteChanged]);
+        assert!(state.transactional_dirty);
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert_eq!(
+            state.legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::Closed
+        );
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+    }
+
+    #[test]
+    fn committed_notification_with_failed_local_settlement_retires_authority() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let enqueue_count = Arc::new(AtomicUsize::new(0));
+        let sender = PduSender::new({
+            let enqueue_count = Arc::clone(&enqueue_count);
+            let per_pane = Arc::clone(&per_pane);
+            move |_, _| {
+                if enqueue_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    return Ok(());
+                }
+                // Model queue admission followed by contradictory local
+                // settlement authority. The accepted notification must never
+                // be retried as though delivery had definitely failed.
+                per_pane
+                    .try_lock()
+                    .expect("notification callback runs outside the pane-state lock")
+                    .notifications
+                    .clear_protection();
+                Ok(())
+            }
+        });
+
+        let error = registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender, Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect_err("committed notification without exact settlement must fail closed");
+        assert!(error.to_string().contains("authority retired"));
+
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.baseline.seqno, 11);
+        assert_eq!(state.notifications, vec![Alert::PaletteChanged]);
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
+        assert_eq!(
+            state.legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::Closed
+        );
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+    }
+
+    #[test]
+    fn notification_ack_mismatch_retires_under_the_settlement_guard() {
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let batch = {
+            let mut state = per_pane.lock().unwrap();
+            state.push_notification(Alert::Bell).unwrap();
+            let batch = state.notifications.protected_batch_up_to(1).unwrap();
+            state.legacy_enqueue_phase = LegacyRenderEnqueuePhase::NotificationsInFlight;
+            state.notifications.clear_protection();
+            batch
+        };
+        let mut guard = UnsentNotificationsGuard::new(Arc::clone(&per_pane), batch);
+
+        assert!(guard.acknowledge_current().is_err());
+        {
+            let state = per_pane.lock().unwrap();
+            assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+            assert!(matches!(
+                state.transaction_phase,
+                PaneRenderTransactionPhase::Closed
+            ));
+            assert!(state.transactional_dirty);
+        }
+        guard.retire();
+    }
+
+    #[test]
+    fn notification_recovery_mismatch_retires_under_the_recovery_guard() {
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let batch = {
+            let mut state = per_pane.lock().unwrap();
+            state.push_notification(Alert::Bell).unwrap();
+            let batch = state.notifications.protected_batch_up_to(1).unwrap();
+            state.legacy_enqueue_phase = LegacyRenderEnqueuePhase::Idle;
+            batch
+        };
+        let guard = UnsentNotificationsGuard::new(Arc::clone(&per_pane), batch);
+
+        assert!(guard.recover().is_err());
+        {
+            let state = per_pane.lock().unwrap();
+            assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+            assert!(matches!(
+                state.transaction_phase,
+                PaneRenderTransactionPhase::Closed
+            ));
+            assert_eq!(state.notifications.protected_prefix_len, 0);
+            assert!(state.transactional_dirty);
+        }
+        guard.retire();
+    }
+
+    #[test]
+    fn notification_completion_mismatch_retires_under_the_settlement_guard() {
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let batch = {
+            let mut state = per_pane.lock().unwrap();
+            state.push_notification(Alert::Bell).unwrap();
+            let batch = state.notifications.protected_batch_up_to(1).unwrap();
+            state.legacy_enqueue_phase = LegacyRenderEnqueuePhase::NotificationsInFlight;
+            batch
+        };
+        let mut guard = UnsentNotificationsGuard::new(Arc::clone(&per_pane), batch);
+        guard.acknowledge_current().unwrap();
+        per_pane.lock().unwrap().legacy_enqueue_phase = LegacyRenderEnqueuePhase::Idle;
+
+        assert!(guard.settle_completed().is_err());
+        {
+            let state = per_pane.lock().unwrap();
+            assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+            assert!(matches!(
+                state.transaction_phase,
+                PaneRenderTransactionPhase::Closed
+            ));
+            assert!(state.transactional_dirty);
+        }
+        guard.retire();
+    }
+
+    #[test]
+    fn notification_rollback_retires_and_clears_a_poisoned_state_lock() {
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let batch = {
+            let mut state = per_pane.lock().unwrap();
+            state
+                .push_notification(Alert::Bell)
+                .expect("retain exact event");
+            let batch = state
+                .notifications
+                .protected_batch_up_to(1)
+                .expect("protect exact notification batch");
+            state.legacy_enqueue_phase =
+                LegacyRenderEnqueuePhase::NotificationsInFlight;
+            batch
+        };
+        let guard = UnsentNotificationsGuard::new(Arc::clone(&per_pane), batch);
+        poison_per_pane_lock(&per_pane);
+
+        assert!(guard.rollback().is_err());
+        let state = per_pane
+            .lock()
+            .expect("notification terminal recovery must clear mutex poison");
+        assert_eq!(state.notifications, vec![Alert::Bell]);
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
+        assert_eq!(
+            state.legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::Closed
+        );
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+    }
+
+    #[test]
+    fn notification_ack_retires_poison_under_the_recovered_guard() {
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let batch = {
+            let mut state = per_pane.lock().unwrap();
+            state
+                .push_notification(Alert::Bell)
+                .expect("retain exact event");
+            let batch = state
+                .notifications
+                .protected_batch_up_to(1)
+                .expect("protect exact notification batch");
+            state.legacy_enqueue_phase =
+                LegacyRenderEnqueuePhase::NotificationsInFlight;
+            batch
+        };
+        let mut guard = UnsentNotificationsGuard::new(Arc::clone(&per_pane), batch);
+        poison_per_pane_lock(&per_pane);
+
+        let error = guard
+            .acknowledge_current()
+            .expect_err("poisoned notification acknowledgement must fail closed");
+        assert!(error.to_string().contains("state lock poisoned"));
+        {
+            let state = per_pane
+                .lock()
+                .expect("notification acknowledgement must clear mutex poison before return");
+            assert_eq!(state.notifications, vec![Alert::Bell]);
+            assert_eq!(state.notifications.protected_prefix_len, 0);
+            assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+            assert!(matches!(
+                state.transaction_phase,
+                PaneRenderTransactionPhase::Closed
+            ));
+            assert!(state.transactional_dirty);
+        }
+        guard.retire();
+    }
+
+    #[test]
+    fn notification_settlement_retires_poison_under_the_recovered_guard() {
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let batch = {
+            let mut state = per_pane.lock().unwrap();
+            state
+                .push_notification(Alert::Bell)
+                .expect("retain exact event");
+            let batch = state
+                .notifications
+                .protected_batch_up_to(1)
+                .expect("protect exact notification batch");
+            state.legacy_enqueue_phase =
+                LegacyRenderEnqueuePhase::NotificationsInFlight;
+            batch
+        };
+        let mut guard = UnsentNotificationsGuard::new(Arc::clone(&per_pane), batch);
+        guard
+            .acknowledge_current()
+            .expect("exact notification acknowledgement succeeds");
+        poison_per_pane_lock(&per_pane);
+
+        let error = guard
+            .acknowledge_all()
+            .expect_err("poisoned notification settlement must fail closed");
+        assert!(error.to_string().contains("state lock poisoned"));
+        let state = per_pane
+            .lock()
+            .expect("notification settlement poison repair must clear the mutex poison");
+        assert!(state.notifications.is_empty());
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
         assert!(state.transactional_dirty);
     }
 
@@ -10493,6 +11621,7 @@ mod tests {
         );
         assert_eq!(state.notifications.protected_prefix_len, 0);
         assert!(state.transactional_dirty);
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Idle);
     }
 
     #[test]
@@ -10613,7 +11742,76 @@ mod tests {
     }
 
     #[test]
-    fn panicked_key_down_render_enqueue_restores_baseline_without_escaping() {
+    fn reentrant_notification_push_cannot_revoke_the_active_batch_owner() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let (bootstrap_sender, _) = capturing_sender();
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(
+                    &current,
+                    bootstrap_sender,
+                    Arc::clone(&per_pane),
+                )
+            })
+            .expect("test pane registration remains current")
+            .expect("bootstrap render and palette settle");
+        per_pane
+            .lock()
+            .unwrap()
+            .push_notification(Alert::Bell)
+            .expect("retain exact event for reentrant delivery test");
+
+        let (nested_sender, nested_captured) = capturing_sender();
+        let nested_rejected = Arc::new(AtomicBool::new(false));
+        let sender = PduSender::new({
+            let registration = registration.clone();
+            let per_pane = Arc::clone(&per_pane);
+            let nested_rejected = Arc::clone(&nested_rejected);
+            move |decoded, _| {
+                if matches!(&decoded.pdu, Pdu::NotifyAlert(_))
+                    && !nested_rejected.swap(true, Ordering::Relaxed)
+                {
+                    let nested = registration
+                        .try_with_current(|current| {
+                            maybe_push_pane_changes(
+                                &current,
+                                nested_sender.clone(),
+                                Arc::clone(&per_pane),
+                            )
+                        })
+                        .expect("nested pane registration remains current");
+                    let error = nested
+                        .expect_err("the active notification batch must retain authority");
+                    assert!(error.to_string().contains("already active"));
+                }
+                Ok(())
+            }
+        });
+
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender, Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect("the active notification owner must settle after reentrant rejection");
+
+        assert!(nested_rejected.load(Ordering::Relaxed));
+        assert!(nested_captured.lock().unwrap().is_empty());
+        let state = per_pane.lock().unwrap();
+        assert!(state.notifications.is_empty());
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Idle);
+        assert!(!matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+    }
+
+    #[test]
+    fn panicked_key_down_render_enqueue_retires_indeterminate_delivery() {
         let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
@@ -10635,8 +11833,13 @@ mod tests {
             .expect("test pane registration remains current");
 
         let state = per_pane.lock().unwrap();
-        assert_eq!(state.baseline, PaneRenderBaseline::default());
+        assert_eq!(state.baseline.seqno, 11);
         assert!(state.transactional_dirty);
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
     }
 
     #[test]
@@ -10778,6 +11981,41 @@ mod tests {
     }
 
     #[test]
+    fn prepared_render_dropped_during_unwind_retires_indeterminate_delivery() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let prepared = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                None,
+            )
+            .expect("prepare transactional render"),
+        );
+
+        let result = catch_recoverable(
+            RecoverablePanicSite::MuxPaneCallback,
+            AssertUnwindSafe(move || {
+                let _prepared = prepared;
+                panic!("synthetic panic after transactional render handoff");
+            }),
+        );
+        assert!(result.is_err(), "the synthetic unwind must be recovered");
+
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.baseline, PaneRenderBaseline::default());
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
     fn transactional_ack_advances_shared_baseline_revision_and_exhaustion_fails_closed() {
         let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
@@ -10820,6 +12058,7 @@ mod tests {
             state.transaction_phase,
             PaneRenderTransactionPhase::Closed
         ));
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
         assert_eq!(state.baseline_revision, u64::MAX);
         assert!(state.transactional_dirty);
     }
@@ -10869,6 +12108,300 @@ mod tests {
             PaneRenderTransactionPhase::Idle
         ));
         assert_eq!(state.notifications.protected_prefix_len, 0);
+    }
+
+    #[test]
+    fn transactional_begin_retires_and_clears_a_poisoned_state_lock() {
+        let state = Arc::new(Mutex::new(PerPane::default()));
+        poison_per_pane_lock(&state);
+
+        assert!(matches!(
+            begin_transactional_pane_render(Arc::clone(&state), 81, None),
+            Err(PaneRenderPreparationError::StateLockPoisoned)
+        ));
+        let state = state
+            .lock()
+            .expect("terminal recovery must clear the mutex poison");
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(
+            state.legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::Closed
+        );
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn poisoned_state_repair_is_visible_before_the_first_waiter_can_enter() {
+        let state = Arc::new(Mutex::new(PerPane::default()));
+        poison_per_pane_lock(&state);
+        let poison = state
+            .lock()
+            .expect_err("synthetic panic must leave the state lock poisoned");
+        let waiter_started = Arc::new(std::sync::Barrier::new(2));
+        let waiter = {
+            let state = Arc::clone(&state);
+            let waiter_started = Arc::clone(&waiter_started);
+            std::thread::spawn(move || {
+                waiter_started.wait();
+                let observed = state
+                    .lock()
+                    .expect("atomic poison repair must clear poison before releasing the lock");
+                (
+                    matches!(
+                        observed.transaction_phase,
+                        PaneRenderTransactionPhase::Closed
+                    ),
+                    observed.legacy_enqueue_phase,
+                    observed.notifications.protected_prefix_len,
+                    observed.transactional_dirty,
+                )
+            })
+        };
+        waiter_started.wait();
+
+        retire_poisoned_pane_render(&state, poison);
+
+        let (transaction_closed, legacy_phase, protected_prefix_len, dirty) = waiter
+            .join()
+            .expect("observer of repaired state must not panic");
+        assert!(transaction_closed);
+        assert_eq!(legacy_phase, LegacyRenderEnqueuePhase::Closed);
+        assert_eq!(protected_prefix_len, 0);
+        assert!(dirty);
+    }
+
+    #[test]
+    fn terminal_sequence_settlement_retires_poison_under_the_recovered_guard() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane = Arc::new(FakePane::new(None));
+        pane.state.lock().unwrap().seqno = SequenceNo::MAX;
+        let pane_dyn: Arc<dyn Pane> = pane;
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let state = Arc::new(Mutex::new(PerPane::default()));
+        let preparation = begin_transactional_pane_render(
+            Arc::clone(&state),
+            registration.pane_id(),
+            None,
+        )
+        .expect("transactional preparation owns the state");
+        poison_per_pane_lock(&state);
+
+        let result = registration
+            .try_with_current(move |pane| preparation.prepare(&pane))
+            .expect("test pane registration remains current");
+        assert_eq!(result.unwrap_err(), PaneRenderPreparationError::StateLockPoisoned);
+
+        let state = state
+            .lock()
+            .expect("terminal-sequence poison repair must clear the mutex poison");
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn no_change_settlement_retires_poison_under_the_recovered_guard() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane = Arc::new(FakePane::new(None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let state = Arc::new(Mutex::new(PerPane::default()));
+        let initial = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&state),
+                &registration,
+                None,
+            )
+            .expect("prepare initial transactional render"),
+        );
+        assert_eq!(
+            initial.acknowledge(),
+            PaneRenderSettlement::AcknowledgedClean
+        );
+        pane.state.lock().unwrap().seqno = 12;
+        state.lock().unwrap().mark_transactional_dirty();
+        let preparation = begin_transactional_pane_render(
+            Arc::clone(&state),
+            registration.pane_id(),
+            None,
+        )
+        .expect("transactional preparation owns the state");
+        poison_per_pane_lock(&state);
+
+        let result = registration
+            .try_with_current(move |pane| preparation.prepare(&pane))
+            .expect("test pane registration remains current");
+        assert_eq!(result.unwrap_err(), PaneRenderPreparationError::StateLockPoisoned);
+
+        let state = state
+            .lock()
+            .expect("no-change poison repair must clear the mutex poison");
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert_eq!(state.baseline.seqno, 11);
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn prepared_install_retires_poison_under_the_recovered_guard() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let state = Arc::new(Mutex::new(PerPane::default()));
+        let preparation = begin_transactional_pane_render(
+            Arc::clone(&state),
+            registration.pane_id(),
+            None,
+        )
+        .expect("transactional preparation owns the state");
+        poison_per_pane_lock(&state);
+
+        let result = registration
+            .try_with_current(move |pane| preparation.prepare(&pane))
+            .expect("test pane registration remains current");
+        assert_eq!(result.unwrap_err(), PaneRenderPreparationError::StateLockPoisoned);
+
+        let state = state
+            .lock()
+            .expect("prepared-install poison repair must clear the mutex poison");
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
+        assert_eq!(state.baseline, PaneRenderBaseline::default());
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn abandoned_transactional_preparation_retires_a_poisoned_state_lock() {
+        let state = Arc::new(Mutex::new(PerPane::default()));
+        let preparation = begin_transactional_pane_render(Arc::clone(&state), 82, None)
+            .expect("transactional preparation owns the state");
+        poison_per_pane_lock(&state);
+
+        drop(preparation);
+
+        let state = state
+            .lock()
+            .expect("drop-time terminal recovery must clear the mutex poison");
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(
+            state.legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::Closed
+        );
+        assert_eq!(state.notifications.protected_prefix_len, 0);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn transactional_ack_retires_a_poisoned_inflight_state() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let state = Arc::new(Mutex::new(PerPane::default()));
+        let prepared = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&state),
+                &registration,
+                None,
+            )
+            .expect("prepare transactional render"),
+        );
+        poison_per_pane_lock(&state);
+
+        assert_eq!(prepared.acknowledge(), PaneRenderSettlement::FailedClosed);
+        let state = state
+            .lock()
+            .expect("ack terminal recovery must clear the mutex poison");
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(
+            state.legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::Closed
+        );
+        assert_eq!(state.baseline, PaneRenderBaseline::default());
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn transactional_nack_retires_a_poisoned_inflight_state() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let state = Arc::new(Mutex::new(PerPane::default()));
+        let prepared = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&state),
+                &registration,
+                None,
+            )
+            .expect("prepare transactional render"),
+        );
+        poison_per_pane_lock(&state);
+
+        assert_eq!(prepared.nack(), PaneRenderSettlement::FailedClosed);
+        let state = state
+            .lock()
+            .expect("nack terminal recovery must clear the mutex poison");
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(
+            state.legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::Closed
+        );
+        assert_eq!(state.baseline, PaneRenderBaseline::default());
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn abandoned_prepared_render_retires_a_poisoned_inflight_state() {
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let state = Arc::new(Mutex::new(PerPane::default()));
+        let prepared = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&state),
+                &registration,
+                None,
+            )
+            .expect("prepare transactional render"),
+        );
+        poison_per_pane_lock(&state);
+
+        drop(prepared);
+
+        let state = state
+            .lock()
+            .expect("drop-time terminal recovery must clear the mutex poison");
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(
+            state.legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::Closed
+        );
+        assert_eq!(state.baseline, PaneRenderBaseline::default());
+        assert!(state.transactional_dirty);
     }
 
     #[test]
@@ -11420,6 +12953,10 @@ mod tests {
             attempt_exhausted.transaction_phase,
             PaneRenderTransactionPhase::Closed
         ));
+        assert_eq!(
+            attempt_exhausted.legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::Closed
+        );
 
         let mut input_exhausted = PerPane {
             next_input_epoch: Some(u64::MAX),
@@ -11436,6 +12973,10 @@ mod tests {
             input_exhausted.transaction_phase,
             PaneRenderTransactionPhase::Closed
         ));
+        assert_eq!(
+            input_exhausted.legacy_enqueue_phase,
+            LegacyRenderEnqueuePhase::Closed
+        );
 
         let state = Arc::new(Mutex::new(PerPane::default()));
         let first = begin_transactional_pane_render(Arc::clone(&state), 1, None)

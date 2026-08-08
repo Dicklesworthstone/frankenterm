@@ -4181,7 +4181,7 @@ impl Tab {
 impl TabInner {
     fn new(size: &TerminalSize) -> Self {
         Self {
-            id: crate::next_saturating_usize_id(&TAB_ID),
+            id: crate::next_unique_usize_id(&TAB_ID, "mux tab"),
             pane: Some(Tree::new()),
             floating_panes: vec![],
             floating_focus: None,

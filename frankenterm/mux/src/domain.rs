@@ -39,7 +39,7 @@ pub enum DomainState {
 }
 
 pub fn alloc_domain_id() -> DomainId {
-    crate::next_saturating_usize_id(&DOMAIN_ID)
+    crate::next_unique_usize_id(&DOMAIN_ID, "mux domain")
 }
 
 #[derive(Debug, Clone, PartialEq)]

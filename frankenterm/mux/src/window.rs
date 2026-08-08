@@ -212,7 +212,7 @@ impl Window {
                 .unwrap_or_else(|| DEFAULT_WORKSPACE.to_string())
         });
         Self {
-            id: crate::next_saturating_usize_id(&WIN_ID),
+            id: crate::next_unique_usize_id(&WIN_ID, "mux window"),
             owner,
             tabs: vec![],
             active: 0,

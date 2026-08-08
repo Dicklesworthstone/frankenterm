@@ -16,7 +16,7 @@ use crate::protocol_recovery::{
 #[cfg(test)]
 use crate::runtime_async::mpsc_reserve_send;
 #[cfg(test)]
-use crate::runtime_async::task;
+use crate::runtime_async::{task, timeout};
 use crate::runtime_async::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
 use crate::runtime_async::{io, mpsc, mpsc_try_reserve_send, watch};
 use codec::{

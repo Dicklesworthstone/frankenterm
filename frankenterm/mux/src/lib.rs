@@ -863,19 +863,65 @@ pub(crate) fn try_reserve_usize_ids(
     }
 }
 
-/// Legacy allocator retained only for the domain, tab, window, and client
-/// namespaces pending their fallible-constructor migrations.
+/// Allocate one process-local identifier without ever reusing the terminal
+/// value after exhaustion.
 ///
-/// Its terminal-value duplication is deliberately covered as negative
-/// evidence below. New identifier namespaces must use
-/// `try_reserve_usize_ids`.
-pub(crate) fn next_saturating_usize_id(counter: &AtomicUsize) -> usize {
+/// The remaining infallible domain, tab, window, and client constructors
+/// cannot propagate [`IdAllocationError`]. Exhaustion is therefore an
+/// invariant failure: panicking before publication is strictly safer than
+/// returning `usize::MAX` repeatedly and aliasing live mux objects.
+#[track_caller]
+pub(crate) fn next_unique_usize_id(
+    counter: &AtomicUsize,
+    namespace: &'static str,
+) -> usize {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
-        let next = current.saturating_add(1);
+        let Some(next) = current.checked_add(1) else {
+            panic!(
+                "{} identifier space exhausted; refusing to reuse an identifier",
+                namespace
+            );
+        };
         match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return current,
             Err(actual) => current = actual,
+        }
+    }
+}
+
+fn try_increment_atomic_count(counter: &AtomicUsize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(1) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn try_decrement_atomic_count(counter: &AtomicUsize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_sub(1) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
         }
     }
 }
@@ -1024,13 +1070,9 @@ impl Drop for PaneRemovalCleanupLease {
         let release = self.token.release();
         if release.is_some() {
             if let Some(owner) = &owner {
-                if owner
-                    .pane_removal_cleanup_outstanding_leases
-                    .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                        count.checked_sub(1)
-                    })
-                    .is_err()
-                {
+                if !try_decrement_atomic_count(
+                    &owner.pane_removal_cleanup_outstanding_leases,
+                ) {
                     log::error!(
                         "PaneRemoved global cleanup observability count underflow for pane {}; exact token release remains authoritative",
                         self.pane_id
@@ -5429,13 +5471,7 @@ impl Mux {
             );
             return None;
         }
-        if self
-            .pane_removal_cleanup_outstanding_leases
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                count.checked_add(1)
-            })
-            .is_err()
-        {
+        if !try_increment_atomic_count(&self.pane_removal_cleanup_outstanding_leases) {
             let released = token.release();
             debug_assert_eq!(released, Some(false));
             log::error!(
@@ -14156,12 +14192,36 @@ mod tests {
     }
 
     #[test]
-    fn legacy_saturating_allocator_repeats_the_terminal_value() {
-        let counter = AtomicUsize::new(usize::MAX);
+    fn infallible_allocator_issues_the_last_unreserved_identifier_once() {
+        let counter = AtomicUsize::new(usize::MAX - 1);
 
-        assert_eq!(next_saturating_usize_id(&counter), usize::MAX);
-        assert_eq!(next_saturating_usize_id(&counter), usize::MAX);
+        assert_eq!(next_unique_usize_id(&counter, "test"), usize::MAX - 1);
         assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "test identifier space exhausted; refusing to reuse an identifier")]
+    fn infallible_allocator_fails_closed_at_exhaustion() {
+        let counter = AtomicUsize::new(usize::MAX);
+        let _ = next_unique_usize_id(&counter, "test");
+    }
+
+    #[test]
+    fn checked_atomic_count_updates_preserve_zero_and_maximum_bounds() {
+        let counter = AtomicUsize::new(0);
+
+        assert!(!try_decrement_atomic_count(&counter));
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+        assert!(try_increment_atomic_count(&counter));
+        assert_eq!(counter.load(Ordering::Acquire), 1);
+        assert!(try_decrement_atomic_count(&counter));
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+
+        counter.store(usize::MAX - 1, Ordering::Release);
+        assert!(try_increment_atomic_count(&counter));
+        assert_eq!(counter.load(Ordering::Acquire), usize::MAX);
+        assert!(!try_increment_atomic_count(&counter));
+        assert_eq!(counter.load(Ordering::Acquire), usize::MAX);
     }
 
     #[test]

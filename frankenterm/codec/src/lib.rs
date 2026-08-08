@@ -9708,7 +9708,8 @@ pub struct SendKeyUp {
 /// estimate dispatch round-trip time, but [`InputSerial::now`] also enforces
 /// process-local monotonicity. Before terminal `u64` exhaustion, wall-clock
 /// rollback and multiple keystrokes in one millisecond therefore cannot reverse
-/// or alias the ordering relation.
+/// or alias the ordering relation. The terminal value can be issued once;
+/// subsequent local allocation fails closed rather than reusing that identity.
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, PartialOrd, Ord)]
 pub struct InputSerial(u64);
 
@@ -9731,27 +9732,37 @@ impl InputSerial {
     }
 
     pub fn now() -> Self {
-        use std::sync::atomic::Ordering;
-
         let wall_clock = input_serial_from_system_time(std::time::SystemTime::now()).0;
-        let mut observed = LAST_INPUT_SERIAL.load(Ordering::Relaxed);
-        loop {
-            let candidate = wall_clock.max(observed.saturating_add(1));
-            match LAST_INPUT_SERIAL.compare_exchange_weak(
-                observed,
-                candidate,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Self(candidate),
-                Err(current) => observed = current,
-            }
-        }
+        let serial = next_input_serial(&LAST_INPUT_SERIAL, wall_clock).unwrap_or_else(|| {
+            panic!("process-local input serial space exhausted; refusing to reuse an identity")
+        });
+        Self(serial)
     }
 
     pub fn elapsed_millis(&self) -> u64 {
         let now = input_serial_from_system_time(std::time::SystemTime::now());
         now.0.saturating_sub(self.0)
+    }
+}
+
+fn next_input_serial(
+    counter: &std::sync::atomic::AtomicU64,
+    wall_clock: u64,
+) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+
+    let mut observed = counter.load(Ordering::Relaxed);
+    loop {
+        let candidate = wall_clock.max(observed.checked_add(1)?);
+        match counter.compare_exchange_weak(
+            observed,
+            candidate,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(candidate),
+            Err(current) => observed = current,
+        }
     }
 }
 
@@ -12063,6 +12074,25 @@ mod test {
         let first = InputSerial::now();
         let second = InputSerial::now();
         assert!(second > first);
+    }
+
+    #[test]
+    fn input_serial_allocator_preserves_wall_clock_floor_and_monotonicity() {
+        let counter = std::sync::atomic::AtomicU64::new(41);
+
+        assert_eq!(next_input_serial(&counter, 100), Some(100));
+        assert_eq!(next_input_serial(&counter, 1), Some(101));
+    }
+
+    #[test]
+    fn input_serial_allocator_issues_terminal_value_once_then_fails_closed() {
+        use std::sync::atomic::Ordering;
+
+        let counter = std::sync::atomic::AtomicU64::new(u64::MAX - 1);
+
+        assert_eq!(next_input_serial(&counter, 0), Some(u64::MAX));
+        assert_eq!(next_input_serial(&counter, 0), None);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]

@@ -2,7 +2,8 @@
 #![allow(clippy::type_repetition_in_bounds)]
 use crate::sessionhandler::{
     PduDeliveryClass, PduSender, PerPane, SessionAuthority, SessionHandler, SessionOwner,
-    frozen_window_order_to_codec, validate_ordered_snapshot_projection,
+    frozen_window_order_to_codec, retire_poisoned_pane_render,
+    validate_ordered_snapshot_projection,
 };
 use anyhow::Context;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -2346,6 +2347,8 @@ struct TopologyStreamCoordinator {
     after_ordered_snapshot_validation: ParkingMutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     after_ordered_snapshot_publish: ParkingMutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    after_unilateral_render_publish: ParkingMutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl TopologyStreamCoordinator {
@@ -2381,6 +2384,8 @@ impl TopologyStreamCoordinator {
             after_ordered_snapshot_validation: ParkingMutex::new(None),
             #[cfg(test)]
             after_ordered_snapshot_publish: ParkingMutex::new(None),
+            #[cfg(test)]
+            after_unilateral_render_publish: ParkingMutex::new(None),
         }
     }
 
@@ -2409,6 +2414,14 @@ impl TopologyStreamCoordinator {
     }
 
     #[cfg(test)]
+    fn set_after_unilateral_render_publish_hook(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        *self.after_unilateral_render_publish.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
     fn run_before_ordered_snapshot_publish_hook(&self) {
         let hook = self.before_ordered_snapshot_publish.lock().take();
         if let Some(hook) = hook {
@@ -2427,6 +2440,14 @@ impl TopologyStreamCoordinator {
     #[cfg(test)]
     fn run_after_ordered_snapshot_publish_hook(&self) {
         let hook = self.after_ordered_snapshot_publish.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn run_after_unilateral_render_publish_hook(&self) {
+        let hook = self.after_unilateral_render_publish.lock().take();
         if let Some(hook) = hook {
             hook();
         }
@@ -2753,7 +2774,69 @@ impl TopologyStreamCoordinator {
         decoded: DecodedPdu,
         delivery_class: PduDeliveryClass,
     ) -> anyhow::Result<()> {
-        self.with_live_result(|| self.queue_response_admitted(decoded, delivery_class))
+        // FIFO admission is the linearization point for every PduSender. Once
+        // publication succeeds, a later terminal transition must not rewrite
+        // that fact into `Err`; callers use an error as proof that ownership
+        // remained local. Operations that lose the terminal race before
+        // publication still fail inside `queue_response_admitted`.
+        if self.terminal.is_tripped() {
+            self.discard_retained_state();
+            anyhow::bail!("mux dispatch connection is already terminal");
+        }
+        let result = self.queue_response_admitted(decoded, delivery_class);
+        if self.terminal.is_tripped() {
+            self.discard_retained_state();
+        }
+        result
+    }
+
+    /// Queue one unilateral legacy render effect with an exact admission
+    /// result. Unlike the general topology response wrapper, this path must
+    /// never turn a successful FIFO publication into `Err` merely because the
+    /// connection becomes terminal immediately afterwards: legacy render
+    /// rollback interprets `Err` as proof that publication did not occur.
+    fn queue_unilateral_render_response(
+        &self,
+        decoded: DecodedPdu,
+        delivery_class: PduDeliveryClass,
+    ) -> anyhow::Result<()> {
+        let DecodedPdu { pdu, serial } = decoded;
+        let valid_class = matches!(
+            (&pdu, delivery_class),
+            (
+                Pdu::GetPaneRenderChangesResponse(_),
+                PduDeliveryClass::Control | PduDeliveryClass::Bulk,
+            )
+            | (
+                Pdu::SetPalette(_) | Pdu::NotifyAlert(_),
+                PduDeliveryClass::Bulk,
+            )
+        );
+        if serial != 0 || !valid_class {
+            self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+            self.discard_retained_state();
+            anyhow::bail!(
+                "invalid PDU or delivery class reached unilateral render admission"
+            );
+        }
+        let result = queue_response_pdu(
+            &self.item_tx,
+            &self.terminal,
+            &self.outbound_budget,
+            pdu,
+            serial,
+            delivery_class,
+        );
+        if result.is_err() && self.terminal.is_tripped() {
+            self.discard_retained_state();
+        }
+        result?;
+        #[cfg(test)]
+        self.run_after_unilateral_render_publish_hook();
+        if self.terminal.is_tripped() {
+            self.discard_retained_state();
+        }
+        Ok(())
     }
 
     fn queue_response_admitted(
@@ -2810,6 +2893,7 @@ impl TopologyStreamCoordinator {
                 }
                 let phase =
                     std::mem::replace(&mut state.phase, TopologyStreamPhase::Exhausted);
+                let mut response_was_published = false;
                 let result = (|| {
                     match phase {
                         TopologyStreamPhase::Fencing(in_flight)
@@ -2827,6 +2911,7 @@ impl TopologyStreamCoordinator {
                                 serial,
                                 delivery_class,
                             )?;
+                            response_was_published = true;
                             state.phase = self.restore_prior(in_flight)?;
                         }
                         phase => {
@@ -2839,11 +2924,19 @@ impl TopologyStreamCoordinator {
                                 serial,
                                 delivery_class,
                             )?;
+                            response_was_published = true;
                         }
                     }
                     Ok(())
                 })();
-                result.inspect_err(|_| self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE))
+                if response_was_published {
+                    if result.is_err() {
+                        self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                    }
+                    Ok(())
+                } else {
+                    result.inspect_err(|_| self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE))
+                }
             }
         }
     }
@@ -2956,10 +3049,26 @@ impl TopologyStreamCoordinator {
                 &mut prepared,
             )
         };
+        let response_was_published =
+            matches!(prepared.frame, OrderedSnapshotFrameOwner::Published);
         // Revalidation and queue failures deliberately return ownership here;
         // a maximum-size frame must never be deallocated under `state`.
         prepared.release_after_unlock();
-        result
+        if response_was_published {
+            if let Err(err) = result {
+                // PDU87 publication is the response linearization point. A
+                // later buffered-event failure terminates this connection,
+                // but returning Err would falsely tell PduSender callers that
+                // the response remained local and could be retried.
+                self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                log::error!(
+                    "ordered mux snapshot response was published before terminal topology settlement failed: {err:#}"
+                );
+            }
+            Ok(())
+        } else {
+            result
+        }
     }
 
     fn complete_fence_response(
@@ -2967,6 +3076,36 @@ impl TopologyStreamCoordinator {
         state: &mut TopologyStreamState,
         serial: u64,
         response: ListPanesCoherentResponse,
+    ) -> anyhow::Result<()> {
+        let mut response_was_published = false;
+        let result = self.complete_fence_response_with_admission_witness(
+            state,
+            serial,
+            response,
+            &mut response_was_published,
+        );
+        if response_was_published {
+            if result.is_err() {
+                // As for PDU87, the coherent response has already crossed the
+                // FIFO boundary. Retire the stream, retain Ok as the exact
+                // admission result, and never invite a duplicate response.
+                // This function runs under the coordinator mutex; terminal
+                // reason telemetry is deliberately used instead of logging
+                // while holding that hot lock.
+                self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+            }
+            Ok(())
+        } else {
+            result
+        }
+    }
+
+    fn complete_fence_response_with_admission_witness(
+        &self,
+        state: &mut TopologyStreamState,
+        serial: u64,
+        response: ListPanesCoherentResponse,
+        response_was_published: &mut bool,
     ) -> anyhow::Result<()> {
         if response.stream_id != self.stream_id {
             state.phase = TopologyStreamPhase::Exhausted;
@@ -3066,6 +3205,7 @@ impl TopologyStreamCoordinator {
                     serial,
                     PduDeliveryClass::Control,
                 )?;
+                *response_was_published = true;
 
                 let mut established = EstablishedTopologyStream {
                     snapshot_revision,
@@ -3104,6 +3244,7 @@ impl TopologyStreamCoordinator {
                     serial,
                     PduDeliveryClass::Control,
                 )?;
+                *response_was_published = true;
                 state.phase = self.restore_prior(in_flight)?;
             }
             FenceOutcomeAuthority::RevisionExhausted => {
@@ -3115,6 +3256,7 @@ impl TopologyStreamCoordinator {
                     serial,
                     PduDeliveryClass::Control,
                 )?;
+                *response_was_published = true;
                 state.phase = TopologyStreamPhase::Exhausted;
                 self.terminal.trip(TOPOLOGY_REVISION_EXHAUSTED);
             }
@@ -6056,7 +6198,18 @@ fn pdu_sender_for_topology(topology: &Arc<TopologyStreamCoordinator>) -> PduSend
         let topology = topology
             .upgrade()
             .context("mux dispatch connection is retired")?;
-        topology.queue_response(pdu, delivery_class)
+        let is_unilateral_render = pdu.serial == 0
+            && matches!(
+                &pdu.pdu,
+                Pdu::GetPaneRenderChangesResponse(_)
+                    | Pdu::SetPalette(_)
+                    | Pdu::NotifyAlert(_)
+            );
+        if is_unilateral_render {
+            topology.queue_unilateral_render_response(pdu, delivery_class)
+        } else {
+            topology.queue_response(pdu, delivery_class)
+        }
     })
 }
 
@@ -6114,10 +6267,20 @@ fn retain_pane_alert_or_trip(
     alert: wezterm_term::Alert,
 ) -> anyhow::Result<()> {
     let retention = match per_pane.lock() {
-        Ok(mut state) => state.push_notification(alert),
-        Err(err) => {
+        Ok(mut state) => match state.push_notification(alert) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // Losing an exact alert makes this registration terminal.
+                // Close its render authorities under the same mutex guard so
+                // no scheduled push can enter between rejection and repair.
+                state.retire_render_authority();
+                Err(err)
+            }
+        },
+        Err(poison) => {
+            retire_poisoned_pane_render(per_pane, poison);
             terminal.trip(PANE_ALERT_BACKLOG_FAILURE);
-            anyhow::bail!("per-pane lock poisoned while retaining alert for pane {pane_id}: {err}");
+            anyhow::bail!("per-pane lock poisoned while retaining alert for pane {pane_id}");
         }
     };
     if let Err(err) = retention {
@@ -6762,6 +6925,37 @@ mod tests {
             codec::MAX_RENDER_APPLICATION_ALERTS * 2,
             "rejection must not mutate the exact retained prefix"
         );
+    }
+
+    #[test]
+    fn poisoned_pane_alert_retention_repairs_state_before_returning() {
+        let per_pane = Arc::new(std::sync::Mutex::new(PerPane::default()));
+        let poison_target = Arc::clone(&per_pane);
+        assert!(
+            std::thread::spawn(move || {
+                let _held = poison_target
+                    .lock()
+                    .expect("test pane state starts unpoisoned");
+                panic!("synthetic pane-alert state poison");
+            })
+            .join()
+            .is_err()
+        );
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+
+        let error = retain_pane_alert_or_trip(&per_pane, &terminal, 92, Alert::Bell)
+            .expect_err("poisoned alert retention must fail the connection closed");
+
+        assert!(error.to_string().contains("per-pane lock poisoned"));
+        let repaired = per_pane
+            .lock()
+            .expect("poison repair must complete before retention returns");
+        assert!(repaired.notifications.is_empty());
+        assert_eq!(
+            terminal_rx.try_recv().expect("terminal reason"),
+            PANE_ALERT_BACKLOG_FAILURE
+        );
+        assert!(terminal_rx.is_empty(), "terminal reason must publish exactly once");
     }
 
     fn bound_topology_coordinator() -> (
@@ -7640,6 +7834,223 @@ mod tests {
             1,
             MuxNotification::PaneAdded(1),
         )));
+    }
+
+    #[test]
+    fn unilateral_render_sender_preserves_success_after_post_publish_terminal_trip() {
+        let (coordinator, item_rx, terminal_rx, _, _) = bound_topology_coordinator();
+        let coordinator = Arc::new(coordinator);
+        coordinator.set_after_unilateral_render_publish_hook({
+            let terminal = coordinator.terminal.clone();
+            move || terminal.trip(TOPOLOGY_PROTOCOL_FAILURE)
+        });
+        let sender = pdu_sender_for_topology(&coordinator);
+
+        sender
+            .send_bulk(DecodedPdu {
+                pdu: Pdu::NotifyAlert(codec::NotifyAlert {
+                    pane_id: 91,
+                    alert: Alert::Bell,
+                }),
+                serial: 0,
+            })
+            .expect(
+                "publication is authoritative even when the connection becomes terminal immediately afterwards",
+            );
+
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("the post-publication hook must trip the connection"),
+            TOPOLOGY_PROTOCOL_FAILURE
+        );
+        let queued = take_written_pdu(&item_rx);
+        assert_eq!(queued.serial, 0);
+        assert!(matches!(
+            queued.pdu,
+            Pdu::NotifyAlert(codec::NotifyAlert {
+                pane_id: 91,
+                alert: Alert::Bell,
+            })
+        ));
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn unilateral_alert_rejects_control_class_before_publication() {
+        let (coordinator, item_rx, terminal_rx, _, _) = bound_topology_coordinator();
+        let coordinator = Arc::new(coordinator);
+        let sender = pdu_sender_for_topology(&coordinator);
+
+        let error = sender
+            .send_control(DecodedPdu {
+                pdu: Pdu::NotifyAlert(codec::NotifyAlert {
+                    pane_id: 91,
+                    alert: Alert::Bell,
+                }),
+                serial: 0,
+            })
+            .expect_err("unilateral alerts must use the bounded bulk class");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid PDU or delivery class")
+        );
+        assert!(item_rx.is_empty(), "an invalid class must not publish");
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("invalid unilateral admission must trip the connection"),
+            TOPOLOGY_PROTOCOL_FAILURE
+        );
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn ordered_response_preserves_success_after_post_publish_terminal_trip() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        coordinator
+            .begin_ordered_fence_with_server_capabilities(
+                198,
+                &request,
+                ordered_window_capabilities(true),
+            )
+            .expect("begin future-enabled ordered topology fence");
+        coordinator.set_after_ordered_snapshot_publish_hook({
+            let terminal = coordinator.terminal.clone();
+            move || terminal.trip(TOPOLOGY_PROTOCOL_FAILURE)
+        });
+
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    pdu: Pdu::ListPanesOrderedV1Response(ordered_snapshot_response(
+                        &request,
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                    serial: 198,
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect(
+                "ordered publication is authoritative even when the connection becomes terminal immediately afterwards",
+            );
+
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("the post-publication hook must trip the connection"),
+            TOPOLOGY_PROTOCOL_FAILURE
+        );
+        let queued = take_written_pdu(&item_rx);
+        assert_eq!(queued.serial, 198);
+        assert!(matches!(
+            queued.pdu,
+            Pdu::ListPanesOrderedV1Response(_)
+        ));
+        assert!(matches!(
+            &coordinator.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn coherent_response_preserves_success_after_buffered_event_queue_loss() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator_with_item_capacity(1);
+        coordinator
+            .begin_fence(199, &fenced_snapshot_request())
+            .expect("begin coherent topology fence");
+        let mux = Mux::new(None);
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(1, MuxNotification::PaneAdded(1)),
+        ));
+
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                    serial: 199,
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect(
+                "published PDU86 must remain admitted when its buffered event cannot queue",
+            );
+
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("buffered event queue loss must terminate the connection"),
+            NOTIFICATION_QUEUE_OVERFLOW
+        );
+        assert!(terminal_rx.is_empty(), "terminal reason must publish exactly once");
+        let queued = take_written_pdu(&item_rx);
+        assert_eq!(queued.serial, 199);
+        assert!(matches!(
+            queued.pdu,
+            Pdu::ListPanesCoherentResponse(_)
+        ));
+        assert!(item_rx.is_empty(), "failed topology event must not publish");
+        assert!(matches!(
+            &coordinator.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn generic_response_preserves_success_after_fence_restore_queue_loss() {
+        let (coordinator, item_rx, terminal_rx, _, _) =
+            bound_topology_coordinator_with_item_capacity(1);
+        coordinator
+            .begin_fence(200, &fenced_snapshot_request())
+            .expect("begin coherent topology fence");
+        let mux = Mux::new(None);
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(1, MuxNotification::PaneAdded(1)),
+        ));
+
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    pdu: Pdu::Pong(Pong {}),
+                    serial: 200,
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect(
+                "published generic response must remain admitted when fence restore cannot queue",
+            );
+
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("fence-restore queue loss must terminate the connection"),
+            NOTIFICATION_QUEUE_OVERFLOW
+        );
+        assert!(terminal_rx.is_empty(), "terminal reason must publish exactly once");
+        let queued = take_written_pdu(&item_rx);
+        assert_eq!(queued.serial, 200);
+        assert!(matches!(queued.pdu, Pdu::Pong(Pong {})));
+        assert!(item_rx.is_empty(), "failed restored event must not publish");
+        assert!(matches!(
+            &coordinator.state.lock().phase,
+            TopologyStreamPhase::Exhausted
+        ));
+        assert_outbound_live_counters_zero(&coordinator);
     }
 
     #[test]
@@ -9327,7 +9738,7 @@ mod tests {
     }
 
     #[test]
-    fn first_ordered_event_queue_loss_is_terminal_and_preserves_only_queued_pdu87() {
+    fn first_ordered_event_queue_loss_preserves_success_for_queued_pdu87() {
         let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
             bound_topology_coordinator_with_item_capacity(1);
         let request = ordered_snapshot_request(true);
@@ -9365,7 +9776,7 @@ mod tests {
             ),
         ));
 
-        let error = coordinator
+        coordinator
             .queue_response(
                 DecodedPdu {
                     serial: 190,
@@ -9378,11 +9789,9 @@ mod tests {
                 },
                 PduDeliveryClass::Control,
             )
-            .expect_err("the first PDU90 must not disappear behind a full one-slot queue");
-        assert!(
-            format!("{error:#}").contains("topology queue is full"),
-            "unexpected first-PDU90 queue failure: {error:#}"
-        );
+            .expect(
+                "published PDU87 must remain admitted when the following PDU90 cannot queue",
+            );
         assert_eq!(
             terminal_rx
                 .try_recv()
@@ -9411,7 +9820,7 @@ mod tests {
     }
 
     #[test]
-    fn first_ordered_event_queue_close_after_pdu87_is_sticky_terminal() {
+    fn first_ordered_event_queue_close_preserves_success_for_published_pdu87() {
         let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
             bound_topology_coordinator();
         let request = ordered_snapshot_request(true);
@@ -9469,7 +9878,7 @@ mod tests {
                 .expect("PDU90 admission must wait for deterministic queue closure");
         });
 
-        let error = coordinator
+        coordinator
             .queue_response(
                 DecodedPdu {
                     serial: 197,
@@ -9482,12 +9891,10 @@ mod tests {
                 },
                 PduDeliveryClass::Control,
             )
-            .expect_err("the first PDU90 must fail when its FIFO closes after PDU87");
+            .expect(
+                "published PDU87 must remain admitted when its FIFO closes before PDU90",
+            );
         closer.join().expect("queue closer thread must finish");
-        assert!(
-            format!("{error:#}").contains("topology queue is closed"),
-            "unexpected first-PDU90 close: {error:#}"
-        );
         assert_eq!(
             terminal_rx
                 .try_recv()

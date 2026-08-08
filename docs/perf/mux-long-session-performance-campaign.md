@@ -1525,16 +1525,98 @@ substrate, but the user-level result promised above has not yet been proved:
   evidence prove that the legacy path is no longer serving supported sessions.
 - The current source candidate adds atomic dirty source fences, exact damage
   settlement, one-lock local hyperlink/render traversal, generation-safe
-  overlay search publication, authenticated decoded-image admission, bounded
-  off-main image validation, safe remote shape-appdata retention, and checked
-  server rollback/range behavior. These are bounded correctness/performance
-  improvements, not proof of improved native key-to-photon or resize latency.
+  overlay search publication, revision-bound decoded-image validation, bounded
+  off-main image validation, generation-bound remote shape-appdata retention,
+  and checked server rollback/range behavior. These are structural correctness,
+  resource-bound, and hot-path-work candidates, not proof of improved native
+  key-to-photon or resize latency.
+- The current mux snapshot producer performs callback-free bounded preflight
+  before pane callbacks or arena mutation. The audited pane/tab/window cleanup
+  paths use exact registration witnesses, the server alert backlog has exact
+  entry/byte limits with protected terminal outcomes, and key/paste dispatch
+  carries process-local causal input serials whose terminal identity can be
+  issued once before later allocation fails closed. The legacy render path now
+  gives one exact per-pane baseline revision exclusive enqueue authority
+  through queue admission, with exact acknowledge/rollback/drop settlement and
+  visible detached-task errors. This still is not a client application ACK:
+  transport admission cannot prove that a peer applied the delta, and remote
+  Cargo proof cannot establish LAN input-to-present latency.
+- Decoded-image trust in the current source is private, revision-bound
+  authority: untrusted wire content retains the 64 MiB ceiling while explicitly
+  trusted local decoded content has a separate 256 MiB ceiling. Validation,
+  cache identity, and worker publication bind the exact content revision.
+  Worker-decoded animation frames retain immutable shared pixels, so ordinary
+  paint does not reopen their temporary blob or clone a full frame. Invalid
+  `ImageCell` texture regions, padding, and cell geometry are rejected before
+  decoded-cache or quad admission; decoded source dimensions are bounded by the
+  separate image-validation contract.
+- Background publication uses three distinct authorities rather than one vague
+  "generation": an exact request token fences GUI completion, a strong file
+  metadata stamp fences path-cache replacement, and a content revision fences
+  decoded-image validation. Pixel-preserving animation-speed edits may retain
+  validation authority only after the transformed durations satisfy the same
+  renderer timing contract. A window admits at most 127 negative-z layers and
+  256 MiB of unique validated decoded-pixel lengths. That is a logical payload
+  admission bound, not an RSS, allocator-capacity, metadata, cache, in-flight,
+  or GPU-residency bound. While an encoded zero-duration animation root is
+  awaiting a timed worker frame, the current frame remains transparent; a
+  queued timed frame can publish in the same paint, while decoder completion
+  without one makes the root visible rather than leaving a permanent blank.
+- Long-scroll repeat/mirror phase in the current source uses exact
+  binary-rational quotient/remainder reduction rather than assuming an f64
+  quotient below 2^53 preserves its fractional phase. It derives the only
+  consumed whole-tile property, odd/even parity, directly from the aligned
+  numerator modulo twice the denominator and carries the signed exact
+  remainder into origin normalization. Positive exponent deltas use fast
+  modular exponentiation, so neither u64 nor u128 becomes an arbitrary
+  whole-tile ceiling; the bounded negative-delta alignment is materialized
+  with checked arithmetic. Row-pixel/f32-factor products are admitted by their
+  actual combined odd-significand width, avoiding a false fixed 2^29
+  long-session cutoff while still rejecting a genuinely rounded 54-bit
+  product. Radial-gradient noise is applied as an axis offset before both
+  squared-distance terms. These are structural appearance/correctness fixes,
+  not visual-corpus or frame-time qualification.
+- Surface's batched width-one fill remains the hot path, but width-two cells use
+  the established sequential invalidation semantics. Cap-adjacent rejected
+  ranges return before iteration, printable-ASCII append rejects control-byte
+  graphemes, and both vector and clustered trailing-blank pruning preserve or
+  remove the full width of a wide cell. Single changes, complete batches, and
+  actual dimension changes now preflight sequence exhaustion and fail before
+  mutation rather than publishing later content under an aliased `usize::MAX`
+  token. Batch-mutated rows carry the final committed frontier, so line-level
+  `changed_since` cannot miss them under the pre-batch token. A dimension change
+  advances identity and forces a full repaint even when the journal was already
+  empty, while a same-dimension resize is a true no-op that preserves clustered
+  rows and line identity. A real resize drops discarded rows before changing
+  retained widths and constructs only genuinely added rows at final geometry,
+  avoiding an eagerly allocated throwaway line and duplicate new-row resizing.
+  These corrections invalidate the old assumption that the closed `ft-3xrmq`
+  batch optimization was equivalence-proven; its retained benchmark claim
+  remains unqualified.
+- Three intentional eager settled-future APIs preserve call-time cancellation,
+  preflight, and completed-outcome telemetry even when the returned ready
+  future is never polled. The runtime-proof census now models that contract as a
+  distinct fail-closed category instead of requiring a semantic change to
+  `async fn`. This is proof-doctrine hardening, not runtime performance proof.
 - Remote images still use coordinate lookup rather than a snapshot-owned batch,
   and there is no global cross-request singleflight or unified decoded/GPU/
   in-flight budget. `.6.7.1` remains open for that replacement architecture.
-- Binary-owned `TermWindow` renderer behavior remains excluded by the GUI
-  target's normal `test = false` topology. Library/pure tests do not substitute
-  for `.6.8.1` making the production modules executable under ordinary gates.
+- The feature-gated opt-in `glyphcache_unit` harness compiles the binary-owned
+  renderer module graph through a distinct crate-root wrapper under Rust's
+  generated test runner and provides an explicit target that does not rely on
+  the prior zero-test `--lib` command. Cfg-disabling `main` prevents automatic
+  application startup; it does not prove that an arbitrary test body in the
+  included graph cannot call a frontend or window constructor. Only exact
+  statically audited test filters qualify as nonlaunching evidence. The GUI
+  binary still has `test = false`, so this opt-in harness is not yet ordinary
+  workspace test authority and does not substitute for `.6.8.1` or native
+  proof.
+- Atlas-capacity recovery still reaches `AllowImage::Scale(n)`, where
+  `allocate_with_padding` constructs and copies a full-resolution 4WH staging
+  image and performs a high-quality resize synchronously on the paint thread.
+  Open Bead `ft-interactive-systems-performance-4tenz.8.8.1` owns the coherent
+  direct/fallible scaling, accounting, oracle, and target A/B fix; off-main
+  decode alone does not make this fallback nonblocking.
 - Same-numeric-pane-ID reconnect/ABA protection and delivery application ACK
   remain separate open P0/P1 work; generation-aware cleanup and cache tokens do
   not by themselves establish end-to-end successor safety.
@@ -1542,6 +1624,54 @@ substrate, but the user-level result promised above has not yet been proved:
   `skipped_not_proven`; there is no admissible native M4/M5/Threadripper
   key-to-photon, continuous-resize, visual-quality, or long-session result for
   the current source candidate.
+- The frozen Surface source (`src/lib.rs` SHA-256
+  `a10c44d0680bd316afdbaa6e5e0e6c92f1344e86a996f44170f5d6d864f55b41`;
+  `tests/proptest_core_serde.rs`
+  `e4454be7823df1d3dfe4bdc4fd178b7c625bd0601e42829ceb583bafcf7b2943`)
+  has exact strict-remote package proof against RCH source snapshot
+  `80236bf736b56008`: Clippy with `-D warnings` passed on `ovh-b` as job
+  `j-29966029874528646`, and 369 unit plus 27 integration/property tests passed
+  with zero failures on `vmi1153651` as job `j-29966029874528647`.
+- The frozen Termwiz candidates (`widgets/mod.rs` SHA-256
+  `d5e7810470bb9f0cf5f0d31d69f4a08d492997368d3d1596a0e25a4d3b04427e`;
+  `render/terminfo.rs`
+  `76ab2cc63dfbde745eb8d58ed1c530c23a4e7b62bafc8e82d70ff8caba282cd5`)
+  have strict remote package proof against the same source snapshot. Clippy
+  with `-D warnings` passed on `vmi1149989` as job
+  `j-29966029874528654`; 348 unit, 1 golden, 7 escape-property, 5 Kitty
+  property, 2 serde, 1 succinct, and 3 doc tests passed with zero failures on
+  `vmi1153651` as job `j-29966029874528653`. An earlier Clippy attempt on
+  `ovh-b` failed closed with active-project exclusion (exit 103); it was not
+  counted as proof and did not fall back locally.
+- The frozen mux allocator/topology candidates have final SHA-256 values
+  `9bd0590b6990fd58ffad4ce62f3c9e1da90efba3c402e39098d0d515dccad68b`
+  (`lib.rs`),
+  `10d9ac205516bb88bc301666b610abc1247dbfdc364d3da4db2cb7ffdbc21914`
+  (`domain.rs`),
+  `9580abba12c919bf6fd96b711a4c02abdc4964d00028aa8920f535804a6329ce`
+  (`window.rs`),
+  `d6094e68cb6482871c3b907acd42419eeecc73851bc0f3d8ba9722a8fc60e693`
+  (`tab.rs`), and
+  `9131f9848b7c1d2813d438c2e20cb19faadafb268e2e53fa0f26275d068b5fd3`
+  (`client.rs`). Strict remote library Clippy with `-D warnings` passed on
+  `vmi1149989` as job `j-29966029874528657`; all 771 mux library tests passed
+  there as job `j-29966029874528661`. A separately retained exact allocator
+  filter ran both terminal-boundary tests successfully (2 passed, 769 filtered)
+  as job `j-29966029874528667`.
+- The frozen codec source SHA-256 is
+  `d3cac9f580e64b37689fb7db028b5416a0499fa39a5cf639134fcd96dd1b928c`.
+  On exact strict remote source snapshot `80236bf736b56008`, all 263 codec
+  library tests passed with zero failures on `ovh-a` as job
+  `j-29966029874528668`, and library/test Clippy with `-D warnings` passed on
+  `ovh-b` as job `j-29966029874528669`. Both jobs reported remote execution;
+  neither had a failed or local-fallback attempt.
+- These are package/static source proofs only. They are not GUI, native visual,
+  key-to-photon, resize/zoom latency, target-class resource, soak, or release
+  qualification. Final strict remote proof and hash reconciliation for the
+  shared-tree GUI harness, session-handler, runtime-proof, and related
+  image candidates remains pending at this checkpoint. Earlier passing jobs or
+  a passing job against another source snapshot do not qualify a later
+  candidate.
 - A separate risk-weighted closure audit sampled 15 campaign-relevant closed
   Beads. It verified three, found six substantially complete, two partial, and
   four false-closed at varying severity. Precise completion-debt Beads now

@@ -25,7 +25,7 @@ pub struct ClientId {
 
 impl ClientId {
     pub fn new() -> Self {
-        let id = crate::next_saturating_usize_id(&CLIENT_ID);
+        let id = crate::next_unique_usize_id(&CLIENT_ID, "mux client");
         Self {
             hostname: hostname::get()
                 .map(|s| s.to_string_lossy().to_string())
