@@ -1160,11 +1160,7 @@ impl TelemetryCollector {
     /// should stop. Cx cancellation ends the loop; an executor/runtime failure
     /// is an ordinary failed sample and collection retries after the normal
     /// sampling interval.
-    fn handle_blocking_probe_error(
-        &self,
-        pid: u32,
-        error: &SpawnBlockingWithCxError,
-    ) -> bool {
+    fn handle_blocking_probe_error(&self, pid: u32, error: &SpawnBlockingWithCxError) -> bool {
         match error {
             SpawnBlockingWithCxError::CancelledBeforeSpawn { .. }
             | SpawnBlockingWithCxError::CancelledMidFlight { .. } => {
@@ -2850,10 +2846,7 @@ mod tests {
             runtime_metrics.counter_value("telemetry.collector.cancelled"),
             0
         );
-        assert_eq!(
-            runtime_metrics.counter_value("telemetry.sample_failure"),
-            1
-        );
+        assert_eq!(runtime_metrics.counter_value("telemetry.sample_failure"), 1);
         assert_eq!(
             runtime_metrics.counter_value("telemetry.resource_probe.runtime_failure"),
             1

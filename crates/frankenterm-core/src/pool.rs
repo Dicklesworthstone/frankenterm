@@ -20,9 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::cx::{self, Cx};
-use crate::runtime_async::{
-    LockAcquireError, Mutex, RuntimeTime, Semaphore, TryAcquireError,
-};
+use crate::runtime_async::{LockAcquireError, Mutex, RuntimeTime, Semaphore, TryAcquireError};
 use serde::{Deserialize, Serialize};
 
 /// Add to a telemetry counter without allowing an ancient/high-volume process
@@ -32,12 +30,7 @@ fn saturating_atomic_add(counter: &AtomicU64, delta: u64) -> u64 {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
         let next = current.saturating_add(delta);
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return next,
             Err(observed) => current = observed,
         }
@@ -178,9 +171,7 @@ impl From<LockAcquireError> for PoolError {
             LockAcquireError::PollQuotaExhausted => Self::PollQuotaExhausted,
             LockAcquireError::CostBudgetExhausted => Self::CostBudgetExhausted,
             LockAcquireError::ContextFailure => Self::ContextFailure,
-            LockAcquireError::TimedOut { deadline_nanos } => {
-                Self::LockTimedOut { deadline_nanos }
-            }
+            LockAcquireError::TimedOut { deadline_nanos } => Self::LockTimedOut { deadline_nanos },
             LockAcquireError::Poisoned | LockAcquireError::PolledAfterCompletion => {
                 Self::LockAcquire(error)
             }
@@ -230,10 +221,7 @@ impl<C: Send + 'static> Pool<C> {
         error.into()
     }
 
-    fn classify_acquire_failure(
-        cx: &Cx,
-        error: crate::runtime_async::AcquireError,
-    ) -> PoolError {
+    fn classify_acquire_failure(cx: &Cx, error: crate::runtime_async::AcquireError) -> PoolError {
         match error {
             crate::runtime_async::AcquireError::Closed => PoolError::Closed,
             crate::runtime_async::AcquireError::Cancelled => Self::classify_cx_failure(cx),
@@ -306,10 +294,7 @@ impl<C: Send + 'static> Pool<C> {
                     #[cfg(test)]
                     self.fire_after_idle_lock_acquired();
                     Self::checkpoint_explicit_cx(cx)?;
-                    self.evict_expired(
-                        &mut idle,
-                        crate::runtime_async::timer_now_with_cx(cx),
-                    );
+                    self.evict_expired(&mut idle, crate::runtime_async::timer_now_with_cx(cx));
                     idle.pop_front().map(|e| e.conn)
                 };
                 saturating_atomic_add(&self.stats_acquired, 1);
@@ -378,10 +363,7 @@ impl<C: Send + 'static> Pool<C> {
             #[cfg(test)]
             self.fire_after_idle_lock_acquired();
             Self::checkpoint_explicit_cx(cx)?;
-            self.evict_expired(
-                &mut idle,
-                crate::runtime_async::timer_now_with_cx(cx),
-            );
+            self.evict_expired(&mut idle, crate::runtime_async::timer_now_with_cx(cx));
             idle.pop_front().map(|e| e.conn)
         };
         saturating_atomic_add(&self.stats_acquired, 1);
@@ -449,10 +431,7 @@ impl<C: Send + 'static> Pool<C> {
         #[cfg(test)]
         self.fire_after_idle_lock_acquired();
         Self::checkpoint_explicit_cx(cx)?;
-        Ok(self.evict_expired(
-            &mut idle,
-            crate::runtime_async::timer_now_with_cx(cx),
-        ))
+        Ok(self.evict_expired(&mut idle, crate::runtime_async::timer_now_with_cx(cx)))
     }
 
     /// Get current pool statistics under an explicit `&Cx`.
@@ -510,11 +489,7 @@ impl<C: Send + 'static> Pool<C> {
     }
 
     /// Internal: remove expired entries from the idle queue.
-    fn evict_expired(
-        &self,
-        idle: &mut VecDeque<PooledEntry<C>>,
-        now: RuntimeTime,
-    ) -> usize {
+    fn evict_expired(&self, idle: &mut VecDeque<PooledEntry<C>>, now: RuntimeTime) -> usize {
         let mut evicted = 0;
         while let Some(front) = idle.front() {
             if idle_age_exceeds_timeout(front.returned_at, now, self.config.idle_timeout) {
@@ -1096,10 +1071,7 @@ mod tests {
                 LockAcquireError::CostBudgetExhausted,
                 PoolError::CostBudgetExhausted,
             ),
-            (
-                LockAcquireError::ContextFailure,
-                PoolError::ContextFailure,
-            ),
+            (LockAcquireError::ContextFailure, PoolError::ContextFailure),
             (
                 LockAcquireError::TimedOut { deadline_nanos: 23 },
                 PoolError::LockTimedOut { deadline_nanos: 23 },
@@ -1131,15 +1103,11 @@ mod tests {
                     PoolError::DeadlineExceeded,
                 ),
                 (
-                    Cx::for_testing_with_budget(
-                        crate::cx::Budget::new().with_poll_quota(0),
-                    ),
+                    Cx::for_testing_with_budget(crate::cx::Budget::new().with_poll_quota(0)),
                     PoolError::PollQuotaExhausted,
                 ),
                 (
-                    Cx::for_testing_with_budget(
-                        crate::cx::Budget::new().with_cost_quota(0),
-                    ),
+                    Cx::for_testing_with_budget(crate::cx::Budget::new().with_cost_quota(0)),
                     PoolError::CostBudgetExhausted,
                 ),
             ];

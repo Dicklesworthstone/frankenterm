@@ -293,12 +293,7 @@ fn next_unique_arena_id(counter: &AtomicU32) -> ArenaId {
         let Some(next) = current.checked_add(1) else {
             panic!("pane arena id space exhausted; refusing to reuse an arena identity");
         };
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return ArenaId(current),
             Err(observed) => current = observed,
         }
@@ -555,17 +550,12 @@ mod tests {
     fn arena_id_allocator_uses_the_last_unreserved_identity_once() {
         let counter = AtomicU32::new(u32::MAX - 1);
 
-        assert_eq!(
-            next_unique_arena_id(&counter),
-            ArenaId(u32::MAX - 1)
-        );
+        assert_eq!(next_unique_arena_id(&counter), ArenaId(u32::MAX - 1));
         assert_eq!(counter.load(Ordering::Relaxed), u32::MAX);
     }
 
     #[test]
-    #[should_panic(
-        expected = "pane arena id space exhausted; refusing to reuse an arena identity"
-    )]
+    #[should_panic(expected = "pane arena id space exhausted; refusing to reuse an arena identity")]
     fn arena_id_allocator_fails_closed_at_exhaustion() {
         let counter = AtomicU32::new(u32::MAX);
         let _ = next_unique_arena_id(&counter);

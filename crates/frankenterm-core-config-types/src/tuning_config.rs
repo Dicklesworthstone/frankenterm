@@ -1108,9 +1108,7 @@ impl TuningConfig {
             .aggregate_request_buffer_bytes()
             .is_none_or(|bytes| bytes > IpcTuning::MAX_AGGREGATE_REQUEST_BUFFER_BYTES)
         {
-            errors.push(
-                "tuning.ipc aggregate request buffer envelope must be <= 512MB".into(),
-            );
+            errors.push("tuning.ipc aggregate request buffer envelope must be <= 512MB".into());
         }
 
         errors
@@ -1342,15 +1340,17 @@ default_port = 9000
                 .all(|error| !error.contains("ipc.max_message_size"))
         );
         cfg.ipc.max_message_size = IpcTuning::MIN_MAX_MESSAGE_SIZE - 1;
-        assert!(cfg
-            .validate()
-            .iter()
-            .any(|error| error == "tuning.ipc.max_message_size must be >= 16KB"));
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|error| error == "tuning.ipc.max_message_size must be >= 16KB")
+        );
         cfg.ipc.max_message_size = IpcTuning::MAX_MAX_MESSAGE_SIZE + 1;
-        assert!(cfg
-            .validate()
-            .iter()
-            .any(|error| error == "tuning.ipc.max_message_size must be <= 64MB"));
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|error| error == "tuning.ipc.max_message_size must be <= 64MB")
+        );
 
         cfg = TuningConfig::default();
         cfg.ipc.accept_poll_interval_ms = IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS;
@@ -1366,15 +1366,17 @@ default_port = 9000
                 .all(|error| !error.contains("accept_poll_interval_ms"))
         );
         cfg.ipc.accept_poll_interval_ms = IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS - 1;
-        assert!(cfg
-            .validate()
-            .iter()
-            .any(|error| error == "tuning.ipc.accept_poll_interval_ms must be >= 10"));
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|error| error == "tuning.ipc.accept_poll_interval_ms must be >= 10")
+        );
         cfg.ipc.accept_poll_interval_ms = IpcTuning::MAX_ACCEPT_POLL_INTERVAL_MS + 1;
-        assert!(cfg
-            .validate()
-            .iter()
-            .any(|error| error == "tuning.ipc.accept_poll_interval_ms must be <= 1000"));
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|error| error == "tuning.ipc.accept_poll_interval_ms must be <= 1000")
+        );
 
         cfg = TuningConfig::default();
         cfg.ipc.max_concurrent_connections = IpcTuning::MIN_MAX_CONCURRENT_CONNECTIONS;
@@ -1390,15 +1392,17 @@ default_port = 9000
                 .all(|error| !error.contains("max_concurrent_connections"))
         );
         cfg.ipc.max_concurrent_connections = IpcTuning::MIN_MAX_CONCURRENT_CONNECTIONS - 1;
-        assert!(cfg
-            .validate()
-            .iter()
-            .any(|error| error == "tuning.ipc.max_concurrent_connections must be >= 1"));
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|error| error == "tuning.ipc.max_concurrent_connections must be >= 1")
+        );
         cfg.ipc.max_concurrent_connections = IpcTuning::MAX_MAX_CONCURRENT_CONNECTIONS + 1;
-        assert!(cfg
-            .validate()
-            .iter()
-            .any(|error| error == "tuning.ipc.max_concurrent_connections must be <= 16384"));
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|error| error == "tuning.ipc.max_concurrent_connections must be <= 16384")
+        );
 
         cfg = TuningConfig::default();
         cfg.ipc.initial_request_timeout_ms = IpcTuning::MIN_INITIAL_REQUEST_TIMEOUT_MS;
@@ -1414,15 +1418,17 @@ default_port = 9000
                 .all(|error| !error.contains("initial_request_timeout_ms"))
         );
         cfg.ipc.initial_request_timeout_ms = IpcTuning::MIN_INITIAL_REQUEST_TIMEOUT_MS - 1;
-        assert!(cfg
-            .validate()
-            .iter()
-            .any(|error| error == "tuning.ipc.initial_request_timeout_ms must be >= 100"));
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|error| error == "tuning.ipc.initial_request_timeout_ms must be >= 100")
+        );
         cfg.ipc.initial_request_timeout_ms = IpcTuning::MAX_INITIAL_REQUEST_TIMEOUT_MS + 1;
-        assert!(cfg
-            .validate()
-            .iter()
-            .any(|error| error == "tuning.ipc.initial_request_timeout_ms must be <= 60000"));
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|error| error == "tuning.ipc.initial_request_timeout_ms must be <= 60000")
+        );
 
         cfg = TuningConfig::default();
         cfg.ipc.io_timeout_ms = IpcTuning::MIN_IO_TIMEOUT_MS;
@@ -1438,15 +1444,17 @@ default_port = 9000
                 .all(|error| !error.contains("io_timeout_ms"))
         );
         cfg.ipc.io_timeout_ms = IpcTuning::MIN_IO_TIMEOUT_MS - 1;
-        assert!(cfg
-            .validate()
-            .iter()
-            .any(|error| error == "tuning.ipc.io_timeout_ms must be >= 100"));
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|error| error == "tuning.ipc.io_timeout_ms must be >= 100")
+        );
         cfg.ipc.io_timeout_ms = IpcTuning::MAX_IO_TIMEOUT_MS + 1;
-        assert!(cfg
-            .validate()
-            .iter()
-            .any(|error| error == "tuning.ipc.io_timeout_ms must be <= 300000"));
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|error| error == "tuning.ipc.io_timeout_ms must be <= 300000")
+        );
 
         cfg = TuningConfig::default();
         assert_eq!(

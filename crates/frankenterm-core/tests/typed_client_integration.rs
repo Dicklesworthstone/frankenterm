@@ -1173,8 +1173,7 @@ fn required_fields_coverage_events() {
 #[test]
 fn events_cursor_triple_serializes_as_one_authority_token() {
     let epoch = "0123456789abcdef0123456789abcdef".to_string();
-    let scope =
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+    let scope = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
     let data = EventsData {
         events: vec![],
         total_count: 0,
@@ -1239,13 +1238,11 @@ fn event_optional_fields_are_omitted_instead_of_serialized_as_null() {
         }),
     };
     let value = serde_json::to_value(item).expect("serialize event item");
-    for field in [
-        "extracted",
-        "annotations",
-        "handled_at",
-        "workflow_id",
-    ] {
-        assert!(value.get(field).is_none(), "optional field {field} leaked null");
+    for field in ["extracted", "annotations", "handled_at", "workflow_id"] {
+        assert!(
+            value.get(field).is_none(),
+            "optional field {field} leaked null"
+        );
     }
     let preview = value["would_handle_with"]
         .as_object()

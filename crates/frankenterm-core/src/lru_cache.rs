@@ -57,17 +57,17 @@ pub struct CacheStats {
 impl CacheStats {
     /// Hit rate as a fraction [0.0, 1.0]. Returns 0.0 if no lookups.
     pub fn hit_rate(&self) -> f64 {
-        let total = self.hits + self.misses;
-        if total == 0 {
+        let total = self.hits as f64 + self.misses as f64;
+        if total == 0.0 {
             0.0
         } else {
-            self.hits as f64 / total as f64
+            self.hits as f64 / total
         }
     }
 
     /// Total number of get() calls (hits + misses).
     pub fn total_lookups(&self) -> u64 {
-        self.hits + self.misses
+        self.hits.saturating_add(self.misses)
     }
 }
 
@@ -155,10 +155,10 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
     pub fn get(&mut self, key: &K) -> Option<&V> {
         if let Some(&idx) = self.map.get(key) {
             self.move_to_head(idx);
-            self.stats.hits += 1;
+            self.stats.hits = self.stats.hits.saturating_add(1);
             self.arena[idx].value.as_ref()
         } else {
-            self.stats.misses += 1;
+            self.stats.misses = self.stats.misses.saturating_add(1);
             None
         }
     }
@@ -167,10 +167,10 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         if let Some(&idx) = self.map.get(key) {
             self.move_to_head(idx);
-            self.stats.hits += 1;
+            self.stats.hits = self.stats.hits.saturating_add(1);
             self.arena[idx].value.as_mut()
         } else {
-            self.stats.misses += 1;
+            self.stats.misses = self.stats.misses.saturating_add(1);
             None
         }
     }
@@ -196,7 +196,7 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
             // Update existing entry
             self.arena[idx].value = Some(value);
             self.move_to_head(idx);
-            self.stats.updates += 1;
+            self.stats.updates = self.stats.updates.saturating_add(1);
             return None;
         }
 
@@ -213,7 +213,7 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
         // Link at head
         self.push_head(idx);
         self.map.insert(key, idx);
-        self.stats.insertions += 1;
+        self.stats.insertions = self.stats.insertions.saturating_add(1);
 
         evicted
     }
@@ -226,7 +226,7 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
             // Add to free list
             self.arena[idx].next = self.free_head;
             self.free_head = idx;
-            self.stats.removals += 1;
+            self.stats.removals = self.stats.removals.saturating_add(1);
             value
         } else {
             None
@@ -408,7 +408,7 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
         self.arena[idx].next = self.free_head;
         self.free_head = idx;
 
-        self.stats.evictions += 1;
+        self.stats.evictions = self.stats.evictions.saturating_add(1);
 
         value.map(|v| (key, v))
     }
@@ -704,6 +704,17 @@ mod tests {
     fn hit_rate_zero_lookups() {
         let stats = CacheStats::default();
         assert!(stats.hit_rate().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn saturated_lookup_counters_keep_ratio_and_total_well_defined() {
+        let stats = CacheStats {
+            hits: u64::MAX,
+            misses: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(stats.hit_rate(), 0.5);
+        assert_eq!(stats.total_lookups(), u64::MAX);
     }
 
     #[test]

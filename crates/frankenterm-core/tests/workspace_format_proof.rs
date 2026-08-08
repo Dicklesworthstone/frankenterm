@@ -111,20 +111,8 @@ fn format_proof_context() -> FormatProofContext {
     let cargo = OsStr::new(env!("CARGO"));
     let rustfmt = env::var_os("RUSTFMT").unwrap_or_else(|| OsString::from("rustfmt"));
     print_version(&repo_root, "cargo", cargo, ["--version"], "cargo ");
-    print_version(
-        &repo_root,
-        "rustc",
-        OsStr::new("rustc"),
-        ["-Vv"],
-        "rustc ",
-    );
-    print_version(
-        &repo_root,
-        "rustfmt",
-        &rustfmt,
-        ["--version"],
-        "rustfmt ",
-    );
+    print_version(&repo_root, "rustc", OsStr::new("rustc"), ["-Vv"], "rustc ");
+    print_version(&repo_root, "rustfmt", &rustfmt, ["--version"], "rustfmt ");
 
     assert_accepted_rustfmt_stdin(
         &repo_root,
@@ -165,7 +153,10 @@ fn scoped_format_paths(repo_root: &Path) -> Vec<PathBuf> {
         .canonicalize()
         .unwrap_or_else(|err| panic!("canonicalize repository root: {err}"));
     for entry in raw.split(',') {
-        assert!(!entry.is_empty(), "{SCOPED_PATHS_ENV} contains an empty path");
+        assert!(
+            !entry.is_empty(),
+            "{SCOPED_PATHS_ENV} contains an empty path"
+        );
         let path = Path::new(entry);
         assert!(
             !path.is_absolute()
@@ -220,8 +211,7 @@ fn print_version<I, S>(
     program: &OsStr,
     args: I,
     expected_prefix: &str,
-)
-where
+) where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
@@ -234,7 +224,10 @@ where
     let stdout = String::from_utf8(output.stdout)
         .unwrap_or_else(|err| panic!("{label} version output must be UTF-8: {err}"));
     let version = stdout.trim();
-    assert!(!version.is_empty(), "{label} version output must not be empty");
+    assert!(
+        !version.is_empty(),
+        "{label} version output must not be empty"
+    );
     assert!(
         version.starts_with(expected_prefix),
         "{label} version output must start with {expected_prefix:?}, got {version:?}"
@@ -242,12 +235,7 @@ where
     println!("{label}: {version}");
 }
 
-fn assert_accepted_rustfmt_stdin(
-    repo_root: &Path,
-    rustfmt: &OsStr,
-    source: &str,
-    label: &str,
-) {
+fn assert_accepted_rustfmt_stdin(repo_root: &Path, rustfmt: &OsStr, source: &str, label: &str) {
     let output = rustfmt_stdin_output(repo_root, rustfmt, source, label);
     assert!(
         output.status.success(),
@@ -316,12 +304,7 @@ fn assert_malformed_rustfmt_stdin_fails(
     );
 }
 
-fn rustfmt_stdin_output(
-    repo_root: &Path,
-    rustfmt: &OsStr,
-    source: &str,
-    label: &str,
-) -> Output {
+fn rustfmt_stdin_output(repo_root: &Path, rustfmt: &OsStr, source: &str, label: &str) -> Output {
     let mut child = Command::new(rustfmt)
         .current_dir(repo_root)
         .args(["--edition", "2024", "--emit", "stdout"])

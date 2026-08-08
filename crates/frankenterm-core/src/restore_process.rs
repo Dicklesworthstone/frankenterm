@@ -78,7 +78,9 @@ mod tests {
     }
 
     fn mapped(count: u64) -> HashMap<u64, u64> {
-        (0..count).map(|id| (id, id.saturating_add(10_000))).collect()
+        (0..count)
+            .map(|id| (id, id.saturating_add(10_000)))
+            .collect()
     }
 
     #[test]
@@ -109,15 +111,11 @@ mod tests {
         assert_eq!(plans.len(), 5);
         assert_eq!(
             plans[0].action,
-            LaunchAction::Manual(
-                ProcessDispositionReason::CapturedAgentRequiresManualRecovery
-            )
+            LaunchAction::Manual(ProcessDispositionReason::CapturedAgentRequiresManualRecovery)
         );
         assert_eq!(
             plans[1].action,
-            LaunchAction::Manual(
-                ProcessDispositionReason::CapturedShellRequiresManualRecovery
-            )
+            LaunchAction::Manual(ProcessDispositionReason::CapturedShellRequiresManualRecovery)
         );
         assert_eq!(
             plans[2].action,
@@ -151,9 +149,7 @@ mod tests {
         let plans = ProcessLauncher::plan(&mapped(1), &[state]);
         assert_eq!(
             plans[0].action,
-            LaunchAction::Manual(
-                ProcessDispositionReason::CapturedShellRequiresManualRecovery
-            )
+            LaunchAction::Manual(ProcessDispositionReason::CapturedShellRequiresManualRecovery)
         );
     }
 
@@ -195,7 +191,9 @@ mod tests {
 
     #[test]
     fn large_report_has_exact_totals_and_bounded_deterministic_sample() {
-        let count = LAUNCH_RESULT_SAMPLE_CAP.saturating_mul(100).saturating_add(7);
+        let count = LAUNCH_RESULT_SAMPLE_CAP
+            .saturating_mul(100)
+            .saturating_add(7);
         let plans = (0..count)
             .map(|index| ProcessPlan {
                 old_pane_id: u64::try_from(index).expect("test index fits u64"),
@@ -282,7 +280,10 @@ mod tests {
         ] {
             let cx = crate::cx::Cx::for_testing_with_budget(budget);
             let report = ProcessLauncher::execute_cx(&cx, &plans);
-            assert_eq!(report.interruption().map(|value| value.reason), Some(expected));
+            assert_eq!(
+                report.interruption().map(|value| value.reason),
+                Some(expected)
+            );
             assert_eq!(report.plans_settled(), 0);
         }
     }
@@ -491,25 +492,23 @@ fn launch_interruption_reason(
         ContextErrorKind::PollQuotaExhausted => LaunchInterruptionReason::PollQuotaExhausted,
         ContextErrorKind::CostQuotaExhausted => LaunchInterruptionReason::CostQuotaExhausted,
         ContextErrorKind::CancelTimeout => LaunchInterruptionReason::CancellationCleanupTimedOut,
-        ContextErrorKind::Cancelled => {
-            match cx.root_cancel_cause().map(|reason| reason.kind) {
-                Some(CancelKind::Deadline | CancelKind::Timeout) => {
-                    LaunchInterruptionReason::DeadlineExceeded
-                }
-                Some(CancelKind::PollQuota) => LaunchInterruptionReason::PollQuotaExhausted,
-                Some(CancelKind::CostBudget) => LaunchInterruptionReason::CostQuotaExhausted,
-                Some(
-                    CancelKind::User
-                    | CancelKind::FailFast
-                    | CancelKind::RaceLost
-                    | CancelKind::ParentCancelled
-                    | CancelKind::ResourceUnavailable
-                    | CancelKind::Shutdown
-                    | CancelKind::LinkedExit,
-                )
-                | None => LaunchInterruptionReason::Cancelled,
+        ContextErrorKind::Cancelled => match cx.root_cancel_cause().map(|reason| reason.kind) {
+            Some(CancelKind::Deadline | CancelKind::Timeout) => {
+                LaunchInterruptionReason::DeadlineExceeded
             }
-        }
+            Some(CancelKind::PollQuota) => LaunchInterruptionReason::PollQuotaExhausted,
+            Some(CancelKind::CostBudget) => LaunchInterruptionReason::CostQuotaExhausted,
+            Some(
+                CancelKind::User
+                | CancelKind::FailFast
+                | CancelKind::RaceLost
+                | CancelKind::ParentCancelled
+                | CancelKind::ResourceUnavailable
+                | CancelKind::Shutdown
+                | CancelKind::LinkedExit,
+            )
+            | None => LaunchInterruptionReason::Cancelled,
+        },
         _ => LaunchInterruptionReason::ContextFailure,
     }
 }
@@ -547,10 +546,7 @@ impl ProcessLauncher {
 
     /// Plan directly from borrowed finite capture fields without cloning
     /// terminal state, cwd, command, or agent metadata.
-    pub fn plan_inputs<'a, I>(
-        pane_id_map: &HashMap<u64, u64>,
-        pane_states: I,
-    ) -> Vec<ProcessPlan>
+    pub fn plan_inputs<'a, I>(pane_id_map: &HashMap<u64, u64>, pane_states: I) -> Vec<ProcessPlan>
     where
         I: IntoIterator<Item = ProcessDispositionInput<'a>>,
         I::IntoIter: ExactSizeIterator,

@@ -244,10 +244,11 @@ pub(crate) fn map_mcp_error(error: &Error) -> (&'static str, Option<String>) {
 mod tests {
     use super::{
         MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_CURSOR_DISCONTINUITY,
-        MCP_ERR_FTS_QUERY, MCP_ERR_INDETERMINATE_EFFECT, MCP_ERR_INTERNAL, MCP_ERR_INVALID_ARGS, MCP_ERR_NOT_IMPLEMENTED,
-        MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
-        MCP_ERR_RESERVATION_CONFLICT, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM,
-        MCP_ERR_WORKFLOW, McpToolError, map_cass_error, map_caut_error, map_mcp_error,
+        MCP_ERR_FTS_QUERY, MCP_ERR_INDETERMINATE_EFFECT, MCP_ERR_INTERNAL, MCP_ERR_INVALID_ARGS,
+        MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY,
+        MCP_ERR_REMOTE_TEXT_UNAVAILABLE, MCP_ERR_RESERVATION_CONFLICT, MCP_ERR_STORAGE,
+        MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError, map_cass_error,
+        map_caut_error, map_mcp_error,
     };
     use crate::cass::CassError;
     use crate::caut::CautError;
@@ -409,9 +410,8 @@ mod tests {
         assert!(!io_err.message.contains("id_rsa"));
 
         let secret = format!("backend-secret-{}", "x".repeat(128 * 1024));
-        let wezterm = McpToolError::from_error(Error::Wezterm(
-            WeztermError::CommandFailed(secret.clone()),
-        ));
+        let wezterm =
+            McpToolError::from_error(Error::Wezterm(WeztermError::CommandFailed(secret.clone())));
         assert_eq!(wezterm.code, MCP_ERR_WEZTERM);
         assert_eq!(wezterm.message, "Backend bridge request failed");
         assert!(!wezterm.message.contains("backend-secret"));
@@ -481,9 +481,7 @@ mod tests {
     #[test]
     fn indeterminate_effects_have_a_dedicated_no_retry_mcp_contract() {
         for error in [
-            Error::Wezterm(WeztermError::IndeterminateMutation {
-                operation: "spawn",
-            }),
+            Error::Wezterm(WeztermError::IndeterminateMutation { operation: "spawn" }),
             Error::Storage(StorageError::IndeterminateMutation {
                 operation: "store_embedding",
             }),

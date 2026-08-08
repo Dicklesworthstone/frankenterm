@@ -84,9 +84,8 @@ fn arb_wezterm_error() -> impl Strategy<Value = WeztermError> {
             operation: "property_mutation",
         }),
         arb_nonempty_string().prop_map(WeztermError::ParseError),
-        (arb_nonempty_string(), 0usize..1_000_000, 1usize..1_000_001).prop_map(
-            |(command, len, cap)| WeztermError::OutputTooLarge { command, len, cap },
-        ),
+        (arb_nonempty_string(), 0usize..1_000_000, 1usize..1_000_001)
+            .prop_map(|(command, len, cap)| WeztermError::OutputTooLarge { command, len, cap },),
         arb_u64().prop_map(WeztermError::Timeout),
         arb_u64().prop_map(|ms| WeztermError::CircuitOpen { retry_after_ms: ms }),
     ]
@@ -115,9 +114,7 @@ fn arb_storage_error() -> impl Strategy<Value = StorageError> {
             }
         }),
         (0..1u8).prop_map(|_| {
-            StorageError::InvalidEventDeliveryLeaseBatch(
-                EventDeliveryLeaseBatchError::EmptyToken,
-            )
+            StorageError::InvalidEventDeliveryLeaseBatch(EventDeliveryLeaseBatchError::EmptyToken)
         }),
         any::<i64>().prop_map(|event_id| StorageError::LeaseTokenConflict { event_id }),
         (any::<usize>(), any::<usize>()).prop_map(|(updated, expected)| {

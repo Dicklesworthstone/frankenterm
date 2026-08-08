@@ -14,16 +14,16 @@ use std::time::{Duration, Instant};
 use crate::runtime_async::mpsc;
 use crate::runtime_async::timeout;
 use crate::runtime_async::{RwLock, Semaphore};
-use futures::{FutureExt, Stream, StreamExt};
 use futures::stream::FuturesUnordered;
+use futures::{FutureExt, Stream, StreamExt};
 use tracing::{debug, trace, warn};
 
-use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, get_or_register_circuit};
 use crate::capture_authority::CaptureAuthority;
 use crate::capture_authority::{
     ActivePaneIdentity, CaptureAuthorityError, CaptureLease, CaptureProducerGuard,
     CaptureSourceKind, CaptureStamp,
 };
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, get_or_register_circuit};
 use crate::config::CaptureBudgetConfig;
 use crate::ingest::{CapturedSegment, PaneCursor, PaneRegistry};
 use crate::wezterm::{PaneInfo, PaneTextSource};
@@ -1915,16 +1915,14 @@ where
                         permit
                     );
 
-                    let producer_guard = match capture_lease.try_acquire_producer(
-                        capture_lease.stamp(),
-                        pane_id,
-                    ) {
-                        Ok(guard) => guard,
-                        Err(error) => {
-                            drop(permit);
-                            return (pane_id, PollOutcome::AuthorityRejected(error));
-                        }
-                    };
+                    let producer_guard =
+                        match capture_lease.try_acquire_producer(capture_lease.stamp(), pane_id) {
+                            Ok(guard) => guard,
+                            Err(error) => {
+                                drop(permit);
+                                return (pane_id, PollOutcome::AuthorityRejected(error));
+                            }
+                        };
 
                     let gap_segment = {
                         let mut cursors = cursors.write().await;
@@ -1966,15 +1964,13 @@ where
                     return (pane_id, PollOutcome::NoCursor);
                 }
 
-                let producer_guard = match capture_lease.try_acquire_producer(
-                    capture_lease.stamp(),
-                    pane_id,
-                ) {
-                    Ok(guard) => guard,
-                    Err(error) => {
-                        return (pane_id, PollOutcome::AuthorityRejected(error));
-                    }
-                };
+                let producer_guard =
+                    match capture_lease.try_acquire_producer(capture_lease.stamp(), pane_id) {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            return (pane_id, PollOutcome::AuthorityRejected(error));
+                        }
+                    };
 
                 let retry_after_ms = {
                     let mut guard = match capture_circuit_breaker.lock() {
@@ -2753,9 +2749,7 @@ mod tests {
         assert!(ready.is_empty());
 
         let mut pending = TailerPollTaskSet::new();
-        pending.spawn_poll_task(async {
-            std::future::pending::<(u64, PollOutcome)>().await
-        });
+        pending.spawn_poll_task(async { std::future::pending::<(u64, PollOutcome)>().await });
         assert!(pending.try_join_next().is_none());
         assert_eq!(pending.len(), 1, "pending work remains owned by the set");
     }
@@ -6234,8 +6228,7 @@ mod tests {
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let source = Arc::new(StaticSource);
-        let mut supervisor =
-            TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
         let mut panes = HashMap::new();
         panes.insert(1, make_pane(1));
@@ -6267,8 +6260,7 @@ mod tests {
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let source = Arc::new(StaticSource);
-        let mut supervisor =
-            TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
         let mut panes = HashMap::new();
         panes.insert(1, make_pane(1));

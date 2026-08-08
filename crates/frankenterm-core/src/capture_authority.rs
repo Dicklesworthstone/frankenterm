@@ -450,12 +450,7 @@ fn try_increment_inflight(
         let next = current
             .checked_add(1)
             .ok_or(CaptureAuthorityError::InflightCounterExhausted { stage })?;
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => return Ok(()),
             Err(actual) => current = actual,
         }
@@ -469,12 +464,7 @@ fn decrement_inflight_exactly_once(counter: &AtomicUsize) -> usize {
             .checked_sub(1)
             .ok_or(current)
             .expect("capture in-flight guard released exactly once");
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(previous) => return previous,
             Err(actual) => current = actual,
         }
@@ -550,9 +540,7 @@ impl CapturePersistenceGuard {
     /// the storage writer handoff, whose queued command can outlive the async
     /// caller that submitted it.  The child keeps pane/source revocation
     /// blocked until that detached command has committed or failed.
-    pub(crate) fn delegate_storage(
-        &self,
-    ) -> Result<CapturePersistenceHold, CaptureAuthorityError> {
+    pub(crate) fn delegate_storage(&self) -> Result<CapturePersistenceHold, CaptureAuthorityError> {
         let counter = &self.0.inner.persistence_inflight;
         try_increment_inflight(counter, CaptureGuardStage::Persistence)?;
 
@@ -633,9 +621,7 @@ impl Drop for CaptureDrainWaiter {
     }
 }
 
-fn capture_drain_capability_failure(
-    cx: &crate::cx::Cx,
-) -> Option<CaptureAuthorityError> {
+fn capture_drain_capability_failure(cx: &crate::cx::Cx) -> Option<CaptureAuthorityError> {
     use crate::outcome::CancelKind;
 
     if let Some(reason) = cx.root_cancel_cause() {
@@ -675,17 +661,12 @@ fn capture_drain_context_failure(
 ) -> CaptureAuthorityError {
     match error.kind() {
         ContextErrorKind::DeadlineExceeded => CaptureAuthorityError::DrainTimedOut,
-        ContextErrorKind::CancelTimeout => {
-            CaptureAuthorityError::DrainCancellationCleanupTimedOut
+        ContextErrorKind::CancelTimeout => CaptureAuthorityError::DrainCancellationCleanupTimedOut,
+        ContextErrorKind::PollQuotaExhausted => CaptureAuthorityError::DrainPollBudgetExhausted,
+        ContextErrorKind::CostQuotaExhausted => CaptureAuthorityError::DrainCostBudgetExhausted,
+        ContextErrorKind::Cancelled => {
+            capture_drain_capability_failure(cx).unwrap_or(CaptureAuthorityError::DrainCancelled)
         }
-        ContextErrorKind::PollQuotaExhausted => {
-            CaptureAuthorityError::DrainPollBudgetExhausted
-        }
-        ContextErrorKind::CostQuotaExhausted => {
-            CaptureAuthorityError::DrainCostBudgetExhausted
-        }
-        ContextErrorKind::Cancelled => capture_drain_capability_failure(cx)
-            .unwrap_or(CaptureAuthorityError::DrainCancelled),
         _ => CaptureAuthorityError::DrainContextFailure,
     }
 }
@@ -733,14 +714,12 @@ where
         Either::Left((Err(_), _)) => match checkpoint_capture_drain(cx) {
             Ok(()) => Err(CaptureAuthorityError::DrainTimedOut),
             Err(error) => Err(error),
-        }
+        },
         Either::Right((error, _)) => Err(error),
     }
 }
 
-fn checkpoint_after_capture_drain(
-    cx: &crate::cx::Cx,
-) -> Result<(), CaptureAuthorityError> {
+fn checkpoint_after_capture_drain(cx: &crate::cx::Cx) -> Result<(), CaptureAuthorityError> {
     checkpoint_capture_drain(cx)
 }
 
@@ -869,12 +848,9 @@ impl CaptureAuthority {
             });
         }
         for (pane_id, pane) in &mut state.panes {
-            if pane
-                .discovery_revision
-                .is_some_and(|active_revision| {
-                    desired.get(pane_id).copied() == Some(active_revision)
-                })
-            {
+            if pane.discovery_revision.is_some_and(|active_revision| {
+                desired.get(pane_id).copied() == Some(active_revision)
+            }) {
                 continue;
             }
             pane.accepting_sources = false;
@@ -905,12 +881,11 @@ impl CaptureAuthority {
         source_kind: CaptureSourceKind,
     ) -> Result<CaptureLease, CaptureAuthorityError> {
         let mut state = self.lock_state()?;
-        let pane = state
-            .panes
-            .get(&identity.global_pane_id)
-            .ok_or(CaptureAuthorityError::PaneNotActive {
+        let pane = state.panes.get(&identity.global_pane_id).ok_or(
+            CaptureAuthorityError::PaneNotActive {
                 global_pane_id: identity.global_pane_id,
-            })?;
+            },
+        )?;
         if pane.identity != identity {
             return Err(CaptureAuthorityError::StalePaneIncarnation {
                 global_pane_id: identity.global_pane_id,
@@ -927,9 +902,8 @@ impl CaptureAuthority {
             .last_source_epoch
             .checked_add(1)
             .ok_or(CaptureAuthorityError::SourceEpochExhausted)?;
-        let source_epoch = SourceEpoch(
-            NonZeroU64::new(next).ok_or(CaptureAuthorityError::SourceEpochExhausted)?,
-        );
+        let source_epoch =
+            SourceEpoch(NonZeroU64::new(next).ok_or(CaptureAuthorityError::SourceEpochExhausted)?);
         state.last_source_epoch = next;
         let lease = CaptureLease::new(CaptureStamp {
             global_pane_id: identity.global_pane_id,
@@ -966,12 +940,11 @@ impl CaptureAuthority {
 
         let lease = {
             let state = self.lock_state()?;
-            let pane = state
-                .panes
-                .get(&stamp.global_pane_id())
-                .ok_or_else(|| CaptureAuthorityError::PaneNotActive {
+            let pane = state.panes.get(&stamp.global_pane_id()).ok_or_else(|| {
+                CaptureAuthorityError::PaneNotActive {
                     global_pane_id: stamp.global_pane_id(),
-                })?;
+                }
+            })?;
             if pane.identity.pane_incarnation() != stamp.pane_incarnation() {
                 return Err(CaptureAuthorityError::StalePaneIncarnation {
                     global_pane_id: stamp.global_pane_id(),
@@ -1110,12 +1083,11 @@ impl CaptureAuthority {
         state: &CaptureAuthorityState,
         identity: ActivePaneIdentity,
     ) -> Result<&PaneAuthorityState, CaptureAuthorityError> {
-        let pane = state
-            .panes
-            .get(&identity.global_pane_id)
-            .ok_or(CaptureAuthorityError::PaneNotActive {
+        let pane = state.panes.get(&identity.global_pane_id).ok_or(
+            CaptureAuthorityError::PaneNotActive {
                 global_pane_id: identity.global_pane_id,
-            })?;
+            },
+        )?;
         if pane.identity != identity {
             return Err(CaptureAuthorityError::StalePaneIncarnation {
                 global_pane_id: identity.global_pane_id,
@@ -1128,12 +1100,11 @@ impl CaptureAuthority {
         state: &mut CaptureAuthorityState,
         identity: ActivePaneIdentity,
     ) -> Result<&mut PaneAuthorityState, CaptureAuthorityError> {
-        let pane = state
-            .panes
-            .get_mut(&identity.global_pane_id)
-            .ok_or(CaptureAuthorityError::PaneNotActive {
+        let pane = state.panes.get_mut(&identity.global_pane_id).ok_or(
+            CaptureAuthorityError::PaneNotActive {
                 global_pane_id: identity.global_pane_id,
-            })?;
+            },
+        )?;
         if pane.identity != identity {
             return Err(CaptureAuthorityError::StalePaneIncarnation {
                 global_pane_id: identity.global_pane_id,
@@ -1142,9 +1113,7 @@ impl CaptureAuthority {
         Ok(pane)
     }
 
-    fn lock_state(
-        &self,
-    ) -> Result<MutexGuard<'_, CaptureAuthorityState>, CaptureAuthorityError> {
+    fn lock_state(&self) -> Result<MutexGuard<'_, CaptureAuthorityState>, CaptureAuthorityError> {
         self.inner
             .state
             .lock()
@@ -1295,10 +1264,7 @@ mod tests {
         let revision_three = CaptureRevision::new(3).expect("revision three");
         let desired_one = HashMap::from([(7, revision_one), (8, revision_one)]);
         authority
-            .install_desired_revisions(
-                CaptureViewEpoch::new(1).expect("view one"),
-                &desired_one,
-            )
+            .install_desired_revisions(CaptureViewEpoch::new(1).expect("view one"), &desired_one)
             .expect("install first desired view");
         let predecessor_seven = authority
             .activate_pane_for_revision(7, revision_one)
@@ -1379,10 +1345,7 @@ mod tests {
 
         let desired_four = HashMap::from([(7, revision_three), (8, revision_two)]);
         authority
-            .install_desired_revisions(
-                CaptureViewEpoch::new(4).expect("view four"),
-                &desired_four,
-            )
+            .install_desired_revisions(CaptureViewEpoch::new(4).expect("view four"), &desired_four)
             .expect("supersede between activation and source exposure");
         assert_eq!(
             authority
@@ -1398,17 +1361,11 @@ mod tests {
 
         let desired_five = HashMap::from([(9, revision_three)]);
         authority
-            .install_desired_revisions(
-                CaptureViewEpoch::new(5).expect("view five"),
-                &desired_five,
-            )
+            .install_desired_revisions(CaptureViewEpoch::new(5).expect("view five"), &desired_five)
             .expect("install pane nine desired view");
         let desired_six = HashMap::from([(9, revision_two)]);
         authority
-            .install_desired_revisions(
-                CaptureViewEpoch::new(6).expect("view six"),
-                &desired_six,
-            )
+            .install_desired_revisions(CaptureViewEpoch::new(6).expect("view six"), &desired_six)
             .expect("supersede pane nine before activation");
         assert_eq!(
             authority
@@ -1507,10 +1464,7 @@ mod tests {
                 .begin_source_revocation(first, first_lease.stamp())
                 .expect("begin source revocation");
             source_revocation
-                .wait_with_cx(
-                    &crate::cx::for_testing(),
-                    Duration::from_millis(50),
-                )
+                .wait_with_cx(&crate::cx::for_testing(), Duration::from_millis(50))
                 .await
                 .expect("drain first source");
             let second_lease = authority
@@ -1525,10 +1479,7 @@ mod tests {
                 .begin_pane_revocation(first)
                 .expect("begin pane revocation");
             pane_revocation
-                .wait_with_cx(
-                    &crate::cx::for_testing(),
-                    Duration::from_millis(50),
-                )
+                .wait_with_cx(&crate::cx::for_testing(), Duration::from_millis(50))
                 .await
                 .expect("drain first pane");
             let second = authority.activate_pane(7).expect("second incarnation");
@@ -1548,9 +1499,11 @@ mod tests {
             .try_acquire_producer(predecessor_stamp, 8)
             .expect("held predecessor producer");
 
-        assert!(!authority
-            .retire_pane_if_drained(predecessor_pane)
-            .expect("begin synchronous retirement"));
+        assert!(
+            !authority
+                .retire_pane_if_drained(predecessor_pane)
+                .expect("begin synchronous retirement")
+        );
         assert_eq!(
             predecessor
                 .try_acquire_producer(predecessor_stamp, 8)
@@ -1561,9 +1514,11 @@ mod tests {
         );
 
         drop(held);
-        assert!(authority
-            .retire_pane_if_drained(predecessor_pane)
-            .expect("finish synchronous retirement"));
+        assert!(
+            authority
+                .retire_pane_if_drained(predecessor_pane)
+                .expect("finish synchronous retirement")
+        );
         let successor_pane = authority.activate_pane(8).expect("successor pane");
         let successor = authority
             .issue_source(successor_pane, CaptureSourceKind::Polling)
@@ -1611,10 +1566,7 @@ mod tests {
             assert_eq!(lease.inflight_counts(), (0, 0));
             assert_eq!(
                 revocation
-                    .wait_with_cx(
-                        &crate::cx::for_testing(),
-                        Duration::from_millis(50),
-                    )
+                    .wait_with_cx(&crate::cx::for_testing(), Duration::from_millis(50),)
                     .await
                     .expect("retry drain"),
                 stamp
@@ -1650,10 +1602,7 @@ mod tests {
             drop(held);
             assert_eq!(lease.drain_notification_count(), 1);
             revocation
-                .wait_with_cx(
-                    &crate::cx::for_testing(),
-                    Duration::from_millis(50),
-                )
+                .wait_with_cx(&crate::cx::for_testing(), Duration::from_millis(50))
                 .await
                 .expect("drain after final guard");
         });
@@ -1733,10 +1682,7 @@ mod tests {
             .expect("streaming source");
         assert_eq!(
             polling
-                .try_acquire_persistence(
-                    streaming.stamp(),
-                    streaming.stamp().global_pane_id(),
-                )
+                .try_acquire_persistence(streaming.stamp(), streaming.stamp().global_pane_id(),)
                 .unwrap_err(),
             CaptureAuthorityError::StampMismatch
         );
@@ -1754,10 +1700,7 @@ mod tests {
             authority
                 .begin_source_revocation(pane, stale_stamp)
                 .expect("predecessor revocation")
-                .wait_with_cx(
-                    &crate::cx::for_testing(),
-                    Duration::from_millis(50),
-                )
+                .wait_with_cx(&crate::cx::for_testing(), Duration::from_millis(50))
                 .await
                 .expect("predecessor drain");
 
@@ -1777,10 +1720,7 @@ mod tests {
             let successor_stamp = successor.stamp();
             drop(
                 successor
-                    .try_acquire_producer(
-                        successor_stamp,
-                        successor_stamp.global_pane_id(),
-                    )
+                    .try_acquire_producer(successor_stamp, successor_stamp.global_pane_id())
                     .expect("successor remains admitting"),
             );
         });
@@ -1821,10 +1761,7 @@ mod tests {
             authority
                 .begin_source_revocation(predecessor_pane, predecessor_stamp)
                 .expect("predecessor source revocation")
-                .wait_with_cx(
-                    &crate::cx::for_testing(),
-                    Duration::from_millis(50),
-                )
+                .wait_with_cx(&crate::cx::for_testing(), Duration::from_millis(50))
                 .await
                 .expect("predecessor source drain");
             let successor_source = authority
@@ -1842,10 +1779,7 @@ mod tests {
             authority
                 .begin_pane_revocation(predecessor_pane)
                 .expect("predecessor pane revocation")
-                .wait_with_cx(
-                    &crate::cx::for_testing(),
-                    Duration::from_millis(50),
-                )
+                .wait_with_cx(&crate::cx::for_testing(), Duration::from_millis(50))
                 .await
                 .expect("predecessor pane drain");
             drop(successor_source);
@@ -1882,10 +1816,7 @@ mod tests {
                 .expect("source revocation");
             assert_eq!(
                 revocation
-                    .wait_with_cx(
-                        &crate::cx::for_testing(),
-                        Duration::from_millis(1),
-                    )
+                    .wait_with_cx(&crate::cx::for_testing(), Duration::from_millis(1),)
                     .await
                     .unwrap_err(),
                 CaptureAuthorityError::DrainTimedOut
@@ -1893,10 +1824,7 @@ mod tests {
             drop(storage_hold);
             assert_eq!(
                 revocation
-                    .wait_with_cx(
-                        &crate::cx::for_testing(),
-                        Duration::from_millis(50),
-                    )
+                    .wait_with_cx(&crate::cx::for_testing(), Duration::from_millis(50),)
                     .await
                     .expect("drain after storage completion"),
                 stamp
@@ -1925,10 +1853,7 @@ mod tests {
                 stage: CaptureGuardStage::Persistence,
             }
         );
-        lease
-            .inner
-            .persistence_inflight
-            .store(1, Ordering::SeqCst);
+        lease.inner.persistence_inflight.store(1, Ordering::SeqCst);
         drop(parent);
         assert_eq!(lease.inflight_counts(), (0, 0));
     }
@@ -1964,10 +1889,7 @@ mod tests {
             drop(held);
             assert_eq!(
                 resumed
-                    .wait_with_cx(
-                        &crate::cx::for_testing(),
-                        Duration::from_millis(50),
-                    )
+                    .wait_with_cx(&crate::cx::for_testing(), Duration::from_millis(50),)
                     .await
                     .expect("resumed drain"),
                 stamp
@@ -2004,10 +1926,7 @@ mod tests {
             drop(held);
             assert_eq!(
                 resumed
-                    .wait_with_cx(
-                        &crate::cx::for_testing(),
-                        Duration::from_millis(50),
-                    )
+                    .wait_with_cx(&crate::cx::for_testing(), Duration::from_millis(50),)
                     .await
                     .expect("resumed pane drain"),
                 pane
@@ -2035,10 +1954,7 @@ mod tests {
                 .expect("pane revocation resumes source drain");
             assert_eq!(
                 pane_revocation
-                    .wait_with_cx(
-                        &crate::cx::for_testing(),
-                        Duration::from_millis(50),
-                    )
+                    .wait_with_cx(&crate::cx::for_testing(), Duration::from_millis(50),)
                     .await
                     .expect("pane drain"),
                 pane
@@ -2100,17 +2016,11 @@ mod tests {
                 revocation.wait_with_cx(&cx, Duration::from_secs(1)),
                 cancel
             );
-            assert_eq!(
-                result.unwrap_err(),
-                CaptureAuthorityError::DrainCancelled
-            );
+            assert_eq!(result.unwrap_err(), CaptureAuthorityError::DrainCancelled);
 
             drop(held);
             revocation
-                .wait_with_cx(
-                    &crate::cx::for_testing(),
-                    Duration::from_millis(50),
-                )
+                .wait_with_cx(&crate::cx::for_testing(), Duration::from_millis(50))
                 .await
                 .expect("resume after cancellation");
         });
@@ -2193,10 +2103,7 @@ mod tests {
 
             drop(held);
             revocation
-                .wait_with_cx(
-                    &crate::cx::for_testing(),
-                    Duration::from_millis(50),
-                )
+                .wait_with_cx(&crate::cx::for_testing(), Duration::from_millis(50))
                 .await
                 .expect("resume after budget exhaustion");
         });
@@ -2229,10 +2136,7 @@ mod tests {
             );
             drop(held);
             revocation
-                .wait_with_cx(
-                    &crate::cx::for_testing(),
-                    Duration::from_millis(50),
-                )
+                .wait_with_cx(&crate::cx::for_testing(), Duration::from_millis(50))
                 .await
                 .expect("resume after budget expiry");
         });
@@ -2295,10 +2199,7 @@ mod tests {
             lease.inner.persistence_inflight.load(Ordering::SeqCst),
             usize::MAX
         );
-        lease
-            .inner
-            .persistence_inflight
-            .store(0, Ordering::SeqCst);
+        lease.inner.persistence_inflight.store(0, Ordering::SeqCst);
     }
 
     #[test]

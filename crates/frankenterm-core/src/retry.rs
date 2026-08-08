@@ -550,17 +550,17 @@ pub fn is_retryable(error: &Error) -> bool {
         Error::Io(_) => true,
         // WezTerm CLI errors - some are retryable
         Error::Wezterm(e) => match e {
-            WeztermError::NotRunning => true,             // Might start up
-            WeztermError::Timeout(_) => true,             // Temporary slowdown
-            WeztermError::CommandFailed(_) => true,       // Might be transient
-            WeztermError::CircuitOpen { .. } => false,    // Already rate-limited
-            WeztermError::CliNotFound => false,           // Need installation
-            WeztermError::PaneNotFound(_) => false,       // Won't magically appear
-            WeztermError::SocketNotFound(_) => true,      // Might be initializing
+            WeztermError::NotRunning => true,          // Might start up
+            WeztermError::Timeout(_) => true,          // Temporary slowdown
+            WeztermError::CommandFailed(_) => true,    // Might be transient
+            WeztermError::CircuitOpen { .. } => false, // Already rate-limited
+            WeztermError::CliNotFound => false,        // Need installation
+            WeztermError::PaneNotFound(_) => false,    // Won't magically appear
+            WeztermError::SocketNotFound(_) => true,   // Might be initializing
             // The command may already have committed. Reconciliation, not
             // replay, is the only safe next action.
             WeztermError::IndeterminateMutation { .. } => false,
-            WeztermError::ParseError(_) => false,         // Structural issue
+            WeztermError::ParseError(_) => false, // Structural issue
             WeztermError::OutputTooLarge { .. } => false, // Output won't shrink on retry
         },
         // Storage errors - only generic database errors are retryable (lock conflicts)
@@ -577,15 +577,15 @@ pub fn is_retryable(error: &Error) -> bool {
             StorageError::SubmitIdempotency(error) => error.is_retryable(),
             StorageError::InvalidEventDeliveryLeaseBatch(_) => false, // Caller must rebuild input
             StorageError::ReservationConflict { .. } => false, // Another owner must release first
-            StorageError::LeaseTokenConflict { .. } => false, // Input authority is contradictory
+            StorageError::LeaseTokenConflict { .. } => false,  // Input authority is contradictory
             StorageError::LeaseOwnershipConflict { .. } => false, // Must reacquire exact authority
             StorageError::SequenceDiscontinuity { .. } => false, // Logic error
-            StorageError::MigrationFailed(_) => false, // Persistent issue
-            StorageError::SchemaTooNew { .. } => false, // Version mismatch
-            StorageError::WaTooOld { .. } => false, // Version mismatch
-            StorageError::FtsQueryError(_) => false, // Query syntax issue
-            StorageError::Corruption { .. } => false, // Serious issue
-            StorageError::NotFound(_) => false, // Item doesn't exist
+            StorageError::MigrationFailed(_) => false,         // Persistent issue
+            StorageError::SchemaTooNew { .. } => false,        // Version mismatch
+            StorageError::WaTooOld { .. } => false,            // Version mismatch
+            StorageError::FtsQueryError(_) => false,           // Query syntax issue
+            StorageError::Corruption { .. } => false,          // Serious issue
+            StorageError::NotFound(_) => false,                // Item doesn't exist
         },
         // Pattern errors are not retryable (invalid regex, etc.)
         Error::Pattern(_) => false,
@@ -1717,9 +1717,7 @@ mod tests {
         use crate::error::{StorageError, WeztermError};
 
         for error in [
-            Error::Wezterm(WeztermError::IndeterminateMutation {
-                operation: "spawn",
-            }),
+            Error::Wezterm(WeztermError::IndeterminateMutation { operation: "spawn" }),
             Error::Storage(StorageError::IndeterminateMutation {
                 operation: "store_embedding",
             }),
@@ -1940,9 +1938,7 @@ mod tests {
     fn not_retryable_invalid_event_delivery_lease_batch() {
         use crate::error::{EventDeliveryLeaseBatchError, StorageError};
         assert!(!is_retryable(&Error::Storage(
-            StorageError::InvalidEventDeliveryLeaseBatch(
-                EventDeliveryLeaseBatchError::EmptyToken,
-            )
+            StorageError::InvalidEventDeliveryLeaseBatch(EventDeliveryLeaseBatchError::EmptyToken,)
         )));
     }
 

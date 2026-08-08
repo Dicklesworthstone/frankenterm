@@ -64,9 +64,7 @@ async fn recv_event(
         .expect(label)
 }
 
-async fn assert_listener_shutdown(
-    handle: task::JoinHandle<Result<(), NativeEventError>>,
-) {
+async fn assert_listener_shutdown(handle: task::JoinHandle<Result<(), NativeEventError>>) {
     runtime_async::timeout(Duration::from_secs(2), handle)
         .await
         .expect("listener shutdown timed out")
@@ -335,10 +333,10 @@ fn listener_enforces_private_directory_socket_and_owner_contracts() {
             .await
             .expect("bind secure native event listener");
 
-        let parent_metadata = std::fs::symlink_metadata(&secure_parent)
-            .expect("read native event parent metadata");
-        let socket_metadata = std::fs::symlink_metadata(&socket_path)
-            .expect("read native event socket metadata");
+        let parent_metadata =
+            std::fs::symlink_metadata(&secure_parent).expect("read native event parent metadata");
+        let socket_metadata =
+            std::fs::symlink_metadata(&socket_path).expect("read native event socket metadata");
         assert_eq!(parent_metadata.permissions().mode() & 0o7777, 0o700);
         assert_eq!(socket_metadata.permissions().mode() & 0o7777, 0o600);
         assert_eq!(parent_metadata.uid(), socket_metadata.uid());
@@ -385,8 +383,7 @@ fn listener_rejects_symlinked_socket_parent() {
         std::fs::set_permissions(&real_parent, std::fs::Permissions::from_mode(0o700))
             .expect("secure real parent");
         let symlink_parent = root.path().join("linked-parent");
-        std::os::unix::fs::symlink(&real_parent, &symlink_parent)
-            .expect("create parent symlink");
+        std::os::unix::fs::symlink(&real_parent, &symlink_parent).expect("create parent symlink");
 
         let result = NativeEventListener::bind(symlink_parent.join("events.sock")).await;
         assert!(matches!(
@@ -413,8 +410,8 @@ fn listener_drop_preserves_replacement_socket_identity() {
             .expect("bind original native event listener");
 
         std::fs::rename(&socket_path, &displaced_path).expect("displace original socket path");
-        let replacement = std::os::unix::net::UnixListener::bind(&socket_path)
-            .expect("bind replacement socket");
+        let replacement =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind replacement socket");
         drop(listener);
 
         assert!(

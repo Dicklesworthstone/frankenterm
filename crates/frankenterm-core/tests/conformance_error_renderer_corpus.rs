@@ -28,11 +28,11 @@
 //! New variants without a golden flip this test red — caught at
 //! development time, not in production.
 
+use frankenterm_core::capture_authority::CaptureAuthorityError;
 use frankenterm_core::error::{
     ConfigError, Error, PaneOperationSource, PatternError, RuntimeOperationSource, StorageError,
     WatchdogWarningSource, WeztermError, WorkflowError,
 };
-use frankenterm_core::capture_authority::CaptureAuthorityError;
 use frankenterm_core::output::{ErrorRenderer, OutputFormat};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};

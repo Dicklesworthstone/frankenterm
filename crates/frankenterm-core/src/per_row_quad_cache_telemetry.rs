@@ -195,11 +195,11 @@ pub fn fold_event(health: &mut PerRowQuadCacheHealth, event: RowCacheEvent) {
             health.rows_referenced_total = health
                 .rows_referenced_total
                 .saturating_add(u64::from(rows_referenced));
-            let denom = health.frame_hits + health.frame_misses;
-            health.last_frame_hit_rate = if denom == 0 {
+            let denom = health.frame_hits as f64 + health.frame_misses as f64;
+            health.last_frame_hit_rate = if denom == 0.0 {
                 1.0
             } else {
-                health.frame_hits as f64 / denom as f64
+                health.frame_hits as f64 / denom
             };
             health.frame_hits = 0;
             health.frame_misses = 0;
@@ -487,6 +487,19 @@ mod tests {
         let mut h = PerRowQuadCacheHealth::baseline();
         fold_event(&mut h, RowCacheEvent::FrameBoundary { rows_referenced: 0 });
         assert!((h.last_frame_hit_rate - 1.0).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn fold_frame_boundary_handles_saturated_frame_counters() {
+        let mut h = PerRowQuadCacheHealth::baseline();
+        h.frame_hits = u32::MAX;
+        h.frame_misses = u32::MAX;
+
+        fold_event(&mut h, RowCacheEvent::FrameBoundary { rows_referenced: 0 });
+
+        assert_eq!(h.last_frame_hit_rate, 0.5);
+        assert_eq!(h.frame_hits, 0);
+        assert_eq!(h.frame_misses, 0);
     }
 
     // ------------------------------------------------------------------------

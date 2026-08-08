@@ -35,16 +35,16 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::backpressure::{
     BackpressureConfig, BackpressureManager, BackpressureMetrics, QueueDepths,
 };
-use crate::config::{
-    CaptureBudgetConfig, CompiledRetentionPolicy, HotReloadableConfig, PaneFilterConfig,
-    PanePriorityConfig, PatternsConfig, SnapshotConfig, SnapshotSchedulingMode, StorageConfig,
-};
+#[cfg(feature = "native-wezterm")]
+use crate::capture_authority::CaptureProducerGuard;
 use crate::capture_authority::{
     ActivePaneIdentity, CaptureAuthority, CaptureLease, CapturePersistenceGuard, CaptureRevision,
     CaptureSourceKind, CaptureViewEpoch, PaneIncarnation,
 };
-#[cfg(feature = "native-wezterm")]
-use crate::capture_authority::CaptureProducerGuard;
+use crate::config::{
+    CaptureBudgetConfig, CompiledRetentionPolicy, HotReloadableConfig, PaneFilterConfig,
+    PanePriorityConfig, PatternsConfig, SnapshotConfig, SnapshotSchedulingMode, StorageConfig,
+};
 use crate::connector_inbound_bridge::{
     BridgeRouteResult, ConnectorBridgeError, ConnectorInboundBridge, ConnectorInboundBridgeConfig,
     ConnectorSignal,
@@ -80,8 +80,8 @@ use crate::patterns::{AgentType, Detection, DetectionContext, PatternEngine, Sev
 use crate::policy::Redactor;
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
-use crate::runtime_async::{RuntimeTime, RwLock, mpsc, task::JoinHandle, watch};
 use crate::runtime_async::task::{JoinErrorKind, JoinSet, JoinSetSettlement};
+use crate::runtime_async::{RuntimeTime, RwLock, mpsc, task::JoinHandle, watch};
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
 use crate::sharding::{ShardId, try_decode_sharded_pane_id};
@@ -106,11 +106,7 @@ use crate::wezterm::{
     wezterm_handle_with_timeout,
 };
 
-fn runtime_cx_error(
-    operation: &'static str,
-    cx: &crate::cx::Cx,
-    fallback: &'static str,
-) -> Error {
+fn runtime_cx_error(operation: &'static str, cx: &crate::cx::Cx, fallback: &'static str) -> Error {
     use crate::outcome::CancelKind;
 
     match cx.root_cancel_cause().map(|reason| reason.kind) {
@@ -209,8 +205,7 @@ fn append_bounded_watchdog_warnings(target: &mut Vec<String>, source: Vec<String
     };
 
     target.extend(source.into_iter().take(retained).map(|warning| {
-        let bounded_input =
-            utf8_prefix_at_most(&warning, MAX_RUNTIME_WATCHDOG_WARNING_INPUT_BYTES);
+        let bounded_input = utf8_prefix_at_most(&warning, MAX_RUNTIME_WATCHDOG_WARNING_INPUT_BYTES);
         crate::output::sanitize_redact_truncate_bounded(
             bounded_input,
             MAX_RUNTIME_WATCHDOG_WARNING_WIDTH,
@@ -254,8 +249,7 @@ impl RetentionMaintenanceSchedule {
     fn should_attempt(&self, now: Instant) -> bool {
         if self.due {
             return self.last_attempt.is_none_or(|last_attempt| {
-                now.saturating_duration_since(last_attempt)
-                    >= RETENTION_MAINTENANCE_RETRY_DELAY
+                now.saturating_duration_since(last_attempt) >= RETENTION_MAINTENANCE_RETRY_DELAY
             });
         }
         now.saturating_duration_since(self.last_success) >= RETENTION_MAINTENANCE_CADENCE
@@ -287,8 +281,7 @@ impl CompletionTimedSchedule {
     }
 
     fn should_run(self, now: Instant, interval: Duration) -> bool {
-        !interval.is_zero()
-            && now.saturating_duration_since(self.last_completion) >= interval
+        !interval.is_zero() && now.saturating_duration_since(self.last_completion) >= interval
     }
 
     fn finish(&mut self, completion: Instant) {
@@ -318,10 +311,7 @@ fn fleet_coordinator_maintenance_is_noteworthy(
     bytes_reclaimed: u64,
     targets_applied: usize,
 ) -> bool {
-    previous != Some(current)
-        || pages_evicted > 0
-        || bytes_reclaimed > 0
-        || targets_applied > 0
+    previous != Some(current) || pages_evicted > 0 || bytes_reclaimed > 0 || targets_applied > 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,10 +367,7 @@ async fn record_size_retention_receipt(
 ) -> Result<i64> {
     let receipt_cx = crate::cx::Cx::for_request_with_budget(crate::cx::Budget::MINIMAL);
     storage
-        .record_maintenance_with_cx(
-            &receipt_cx,
-            size_retention_receipt_record(pending),
-        )
+        .record_maintenance_with_cx(&receipt_cx, size_retention_receipt_record(pending))
         .await
 }
 
@@ -575,12 +562,7 @@ fn increment_saturating_atomic(counter: &std::sync::atomic::AtomicU64) -> u64 {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
         let next = current.saturating_add(1);
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return next,
             Err(observed) => current = observed,
         }
@@ -650,9 +632,7 @@ fn runtime_context_error_kind(
     }
 }
 
-fn runtime_checkpoint_failure(
-    runtime_cx: &RuntimeLoopCx,
-) -> Option<RuntimeWaitFailureKind> {
+fn runtime_checkpoint_failure(runtime_cx: &RuntimeLoopCx) -> Option<RuntimeWaitFailureKind> {
     match runtime_cx.checkpoint() {
         Err(error) => Some(runtime_context_error_kind(runtime_cx, &error)),
         Ok(()) => runtime_cancel_or_budget_failure_kind(runtime_cx),
@@ -679,8 +659,7 @@ async fn runtime_sleep(
         .is_err()
     {
         return Err(
-            runtime_checkpoint_failure(runtime_cx)
-                .unwrap_or(RuntimeWaitFailureKind::TimerFailure),
+            runtime_checkpoint_failure(runtime_cx).unwrap_or(RuntimeWaitFailureKind::TimerFailure)
         );
     }
     runtime_checkpoint_failure(runtime_cx).map_or(Ok(()), Err)
@@ -688,11 +667,7 @@ async fn runtime_sleep(
 
 const SHUTDOWN_AWARE_SLEEP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-fn runtime_time_elapsed_at_least(
-    now: RuntimeTime,
-    since: RuntimeTime,
-    duration: Duration,
-) -> bool {
+fn runtime_time_elapsed_at_least(now: RuntimeTime, since: RuntimeTime, duration: Duration) -> bool {
     u128::from(now.duration_since(since)) >= duration.as_nanos()
 }
 
@@ -865,10 +840,10 @@ fn classify_streaming_task_drain(
     settlement: JoinSetSettlement,
 ) -> StreamingTaskDrainOutcome {
     match settlement {
-        JoinSetSettlement::Settled => terminal_failure.map_or(
-            StreamingTaskDrainOutcome::Settled,
-            |failure| StreamingTaskDrainOutcome::SettledWithFailure { failure },
-        ),
+        JoinSetSettlement::Settled => terminal_failure
+            .map_or(StreamingTaskDrainOutcome::Settled, |failure| {
+                StreamingTaskDrainOutcome::SettledWithFailure { failure }
+            }),
         JoinSetSettlement::Incomplete {
             active_tasks,
             unacknowledged_tasks,
@@ -944,11 +919,7 @@ impl StreamingTasks {
         }
     }
 
-    fn remove_for_settlement(
-        &mut self,
-        pane_id: u64,
-        abort: bool,
-    ) -> Option<RetiredStreamingTask> {
+    fn remove_for_settlement(&mut self, pane_id: u64, abort: bool) -> Option<RetiredStreamingTask> {
         let task = self.tasks.remove(&pane_id)?;
         let StreamingTask {
             identity,
@@ -1022,30 +993,25 @@ impl StreamingTasks {
         self.settling.abort_all();
         let drain_cx = crate::cx::for_request();
         let mut terminal_failure = None;
-        let drain_result = crate::runtime_async::timeout_with_cx(
-            &drain_cx,
-            STREAMING_TASK_DRAIN_TIMEOUT,
-            async {
+        let drain_result =
+            crate::runtime_async::timeout_with_cx(&drain_cx, STREAMING_TASK_DRAIN_TIMEOUT, async {
                 loop {
                     match self.settling.drain_next_with_cx(&drain_cx).await {
                         Ok(Some(Ok(()))) => {}
-                        Ok(Some(Err(error))) => {
-                            match error.kind() {
-                                JoinErrorKind::Aborted | JoinErrorKind::ContextCancelled => {}
-                                JoinErrorKind::WakerRegistrationFailed => {
-                                    terminal_failure
-                                        .get_or_insert(JoinErrorKind::WakerRegistrationFailed);
-                                }
-                                other => terminal_failure = Some(other),
+                        Ok(Some(Err(error))) => match error.kind() {
+                            JoinErrorKind::Aborted | JoinErrorKind::ContextCancelled => {}
+                            JoinErrorKind::WakerRegistrationFailed => {
+                                terminal_failure
+                                    .get_or_insert(JoinErrorKind::WakerRegistrationFailed);
                             }
-                        }
+                            other => terminal_failure = Some(other),
+                        },
                         Ok(None) => return Ok(()),
                         Err(error) => return Err(error.kind()),
                     }
                 }
-            },
-        )
-        .await;
+            })
+            .await;
         let timed_out = drain_result.is_err();
         let drain_failure = match drain_result {
             Ok(Err(failure)) => Some(failure),
@@ -1101,12 +1067,8 @@ const NATIVE_EVENT_QUEUE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeEventShutdownDrainState {
     Running,
-    Graceful {
-        deadline: RuntimeTime,
-    },
-    Forced {
-        deadline: RuntimeTime,
-    },
+    Graceful { deadline: RuntimeTime },
+    Forced { deadline: RuntimeTime },
     ProducerClosed,
     Abandoned,
 }
@@ -1195,10 +1157,10 @@ fn classify_native_accept_task_settlement(
     settlement: JoinSetSettlement,
 ) -> NativeAcceptTaskSettlement {
     match settlement {
-        JoinSetSettlement::Settled => terminal_failure.map_or(
-            NativeAcceptTaskSettlement::Settled,
-            |failure| NativeAcceptTaskSettlement::SettledWithFailure { failure },
-        ),
+        JoinSetSettlement::Settled => terminal_failure
+            .map_or(NativeAcceptTaskSettlement::Settled, |failure| {
+                NativeAcceptTaskSettlement::SettledWithFailure { failure }
+            }),
         JoinSetSettlement::Incomplete {
             active_tasks,
             unacknowledged_tasks,
@@ -1256,16 +1218,14 @@ impl AbortOnDropNativeAcceptTask {
                 loop {
                     match self.tasks.drain_next_with_cx(&drain_cx).await {
                         Ok(Some(Ok(()))) => {}
-                        Ok(Some(Err(error))) => {
-                            match error.kind() {
-                                JoinErrorKind::Aborted | JoinErrorKind::ContextCancelled => {}
-                                JoinErrorKind::WakerRegistrationFailed => {
-                                    terminal_failure
-                                        .get_or_insert(JoinErrorKind::WakerRegistrationFailed);
-                                }
-                                other => terminal_failure = Some(other),
+                        Ok(Some(Err(error))) => match error.kind() {
+                            JoinErrorKind::Aborted | JoinErrorKind::ContextCancelled => {}
+                            JoinErrorKind::WakerRegistrationFailed => {
+                                terminal_failure
+                                    .get_or_insert(JoinErrorKind::WakerRegistrationFailed);
                             }
-                        }
+                            other => terminal_failure = Some(other),
+                        },
                         Ok(None) => return Ok(()),
                         Err(error) => return Err(error.kind()),
                     }
@@ -1392,12 +1352,11 @@ async fn forward_vendored_streaming_delta(
         Ok(delta) => delta,
         Err(reason) => return Some(reason),
     };
-    let producer_guard = match lease
-        .try_acquire_producer(identity.capture_stamp, identity.global_pane_id)
-    {
-        Ok(guard) => guard,
-        Err(error) => return Some(format!("capture authority rejected stream: {error}")),
-    };
+    let producer_guard =
+        match lease.try_acquire_producer(identity.capture_stamp, identity.global_pane_id) {
+            Ok(guard) => guard,
+            Err(error) => return Some(format!("capture authority rejected stream: {error}")),
+        };
     let exit_reason = match &delta {
         PaneDelta::Ended { reason, .. } => Some(reason.clone()),
         _ => None,
@@ -1509,8 +1468,7 @@ impl NativeOutputCoalescer {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let pending = o.get_mut();
-                let source_changed =
-                    pending.producer_guard.stamp() != producer_guard.stamp();
+                let source_changed = pending.producer_guard.stamp() != producer_guard.stamp();
 
                 if source_changed
                     || (!pending.bytes.is_empty()
@@ -1788,10 +1746,7 @@ impl Default for DiscoveryCapturePublication {
 fn conservative_capture_view_before_storage(
     previous: &HashMap<u64, ObservedCapturePane>,
     panes: &[PaneInfo],
-) -> (
-    Arc<HashMap<u64, ObservedCapturePane>>,
-    Arc<HashSet<u64>>,
-) {
+) -> (Arc<HashMap<u64, ObservedCapturePane>>, Arc<HashSet<u64>>) {
     let mut listed = HashMap::<u64, &PaneInfo>::with_capacity(panes.len());
     let mut duplicate_ids = HashSet::new();
     for pane in panes {
@@ -2061,10 +2016,7 @@ impl PendingCaptureResyncs {
         self.storage_audit.insert(pane_id);
     }
 
-    fn retain_authoritative(
-        &mut self,
-        publication: &DiscoveryCapturePublication,
-    ) {
+    fn retain_authoritative(&mut self, publication: &DiscoveryCapturePublication) {
         let retain = |pane_id: &u64| {
             publication.observed_panes.contains_key(pane_id)
                 || publication.transitioning_pane_ids.contains(pane_id)
@@ -2142,19 +2094,13 @@ fn begin_capture_checkpoint_write(
         };
     };
     let baseline = match cache.get(&pane_id) {
-        Some(CachedCaptureCheckpoint::Certain(checkpoint))
-            if checkpoint.revision == revision =>
-        {
+        Some(CachedCaptureCheckpoint::Certain(checkpoint)) if checkpoint.revision == revision => {
             Some(checkpoint.clone())
         }
-        Some(CachedCaptureCheckpoint::Certain(_)
-        | CachedCaptureCheckpoint::Uncertain { .. })
+        Some(CachedCaptureCheckpoint::Certain(_) | CachedCaptureCheckpoint::Uncertain { .. })
         | None => None,
     };
-    let _ = cache.put(
-        pane_id,
-        CachedCaptureCheckpoint::Uncertain { revision },
-    );
+    let _ = cache.put(pane_id, CachedCaptureCheckpoint::Uncertain { revision });
     CaptureCheckpointWrite { revision, baseline }
 }
 
@@ -2203,11 +2149,8 @@ fn confirm_capture_checkpoint(
     }
     let mut raw_tail = baseline.raw_tail.clone();
     raw_tail.push_str(raw_content);
-    raw_tail = crate::ingest::resume_anchor_tail(
-        &raw_tail,
-        crate::ingest::RESUME_ANCHOR_BYTES,
-    )
-    .to_string();
+    raw_tail = crate::ingest::resume_anchor_tail(&raw_tail, crate::ingest::RESUME_ANCHOR_BYTES)
+        .to_string();
     let _ = cache.put(
         pane_id,
         CachedCaptureCheckpoint::Certain(CaptureDurabilityCheckpoint {
@@ -2228,13 +2171,10 @@ fn certain_capture_checkpoint(
         return None;
     };
     match cache.get(&pane_id) {
-        Some(CachedCaptureCheckpoint::Certain(checkpoint))
-            if checkpoint.revision == revision =>
-        {
+        Some(CachedCaptureCheckpoint::Certain(checkpoint)) if checkpoint.revision == revision => {
             Some(checkpoint.clone())
         }
-        Some(CachedCaptureCheckpoint::Certain(_)
-        | CachedCaptureCheckpoint::Uncertain { .. })
+        Some(CachedCaptureCheckpoint::Certain(_) | CachedCaptureCheckpoint::Uncertain { .. })
         | None => None,
     }
 }
@@ -2350,9 +2290,7 @@ fn publish_discovery_capture_view(
             let Some(revision) = CaptureRevision::new(pane.revision.get()) else {
                 return Err(runtime_backend_error(
                     "capture.discovery.publish",
-                    format!(
-                        "{phase}: pane {pane_id} has an invalid zero capture revision"
-                    ),
+                    format!("{phase}: pane {pane_id} has an invalid zero capture revision"),
                 ));
             };
             desired_revisions.insert(*pane_id, revision);
@@ -2409,20 +2347,17 @@ async fn relay_capture_event_with_cx(
     capture_ring_tx: &SpscProducer<CaptureEvent>,
     event: CaptureEvent,
 ) -> Result<()> {
-    capture_ring_tx
-        .send_with_cx(cx, event)
-        .await
-        .map_err(|_| {
-            if cx.checkpoint().is_err() {
-                runtime_cx_error(
-                    "capture.relay",
-                    cx,
-                    "capability context failed while relaying capture",
-                )
-            } else {
-                runtime_backend_error("capture.relay", "persistence ring closed")
-            }
-        })
+    capture_ring_tx.send_with_cx(cx, event).await.map_err(|_| {
+        if cx.checkpoint().is_err() {
+            runtime_cx_error(
+                "capture.relay",
+                cx,
+                "capability context failed while relaying capture",
+            )
+        } else {
+            runtime_backend_error("capture.relay", "persistence ring closed")
+        }
+    })
 }
 
 /// Acquire the complete persistence-side admission before any semantic lookup
@@ -2460,15 +2395,12 @@ async fn admit_capture_event_for_persistence(
             .observed_panes
             .get(&event.segment.pane_id)
             .is_some_and(|pane| {
-                (
-                    pane.pane_uuid.as_str(),
-                    pane.generation,
-                    pane.revision,
-                ) == (
-                    metadata.pane_uuid.as_str(),
-                    metadata.discovery_generation,
-                    metadata.discovery_revision,
-                )
+                (pane.pane_uuid.as_str(), pane.generation, pane.revision)
+                    == (
+                        metadata.pane_uuid.as_str(),
+                        metadata.discovery_generation,
+                        metadata.discovery_revision,
+                    )
             })
     };
     if !is_current {
@@ -2510,10 +2442,7 @@ fn capture_transition_retry_delay(started_at: Instant, now: Instant) -> Duration
     }
 }
 
-fn bounded_capture_transition_retry_delay(
-    started_at: Instant,
-    now: Instant,
-) -> Option<Duration> {
+fn bounded_capture_transition_retry_delay(started_at: Instant, now: Instant) -> Option<Duration> {
     let age = now.saturating_duration_since(started_at);
     let remaining = CAPTURE_PROMPT_DRAIN_WINDOW.checked_sub(age)?;
     (!remaining.is_zero()).then(|| capture_transition_retry_delay(started_at, now).min(remaining))
@@ -2551,12 +2480,13 @@ async fn activate_capture_binding(
     capture_metadata: &Arc<RwLock<HashMap<PaneIncarnation, CapturePaneMetadata>>>,
     metadata: CapturePaneMetadata,
 ) -> Result<ActiveCaptureBinding> {
-    let capture_revision = CaptureRevision::new(metadata.discovery_revision.get()).ok_or_else(|| {
-        runtime_backend_error(
-            "capture.transition.activate",
-            format!("pane {global_pane_id} has an invalid zero discovery revision"),
-        )
-    })?;
+    let capture_revision =
+        CaptureRevision::new(metadata.discovery_revision.get()).ok_or_else(|| {
+            runtime_backend_error(
+                "capture.transition.activate",
+                format!("pane {global_pane_id} has an invalid zero discovery revision"),
+            )
+        })?;
     let identity = authority.activate_pane_for_revision(global_pane_id, capture_revision)?;
     let pane_uuid = metadata.pane_uuid.clone();
     let revision = metadata.discovery_revision;
@@ -2599,9 +2529,8 @@ fn enable_native_capture_source(
     #[cfg(feature = "native-wezterm")]
     {
         if native_enabled && binding.native_lease.is_none() {
-            binding.native_lease = Some(
-                authority.issue_source(binding.identity, CaptureSourceKind::NativePush)?,
-            );
+            binding.native_lease =
+                Some(authority.issue_source(binding.identity, CaptureSourceKind::NativePush)?);
         }
     }
     #[cfg(not(feature = "native-wezterm"))]
@@ -2638,8 +2567,7 @@ async fn retire_or_quarantine_capture_binding(
         Ok(false) => {
             debug!(
                 pane_id,
-                context,
-                "Capture binding quarantined while exact revocation drains"
+                context, "Capture binding quarantined while exact revocation drains"
             );
             let replaced = draining_bindings.insert(pane_id, binding);
             debug_assert!(replaced.is_none(), "one exact draining binding per pane");
@@ -2694,8 +2622,7 @@ async fn recover_capture_checkpoint(
     pane_id: u64,
     predecessor_revision: DiscoveryRevision,
 ) -> Result<CaptureDurabilityCheckpoint> {
-    if let Some(checkpoint) =
-        certain_capture_checkpoint(checkpoints, pane_id, predecessor_revision)
+    if let Some(checkpoint) = certain_capture_checkpoint(checkpoints, pane_id, predecessor_revision)
     {
         return Ok(checkpoint);
     }
@@ -2804,28 +2731,23 @@ async fn emit_capture_generation_resync(
     let pane_id = binding.identity.global_pane_id();
     // Reserve bounded-queue capacity before acquiring authority or mutating
     // the cursor.  Backpressure therefore cannot create a speculative hole.
-    let permit = runtime_timeout(
-        cx,
-        CAPTURE_TRANSITION_QUEUE_TIMEOUT,
-        capture_tx.reserve(cx),
-    )
-    .await
-    .map_err(|failure| match failure {
-        RuntimeTimeoutFailure::Elapsed => runtime_backend_error(
-            "capture.transition.reserve",
-            format!("pane {pane_id} capture ingress stayed full"),
-        ),
-        RuntimeTimeoutFailure::Context(_) => runtime_cx_error(
-            "capture.transition.reserve",
-            cx,
-            "capability context failed while reserving capture ingress",
-        ),
-    })?
-    .map_err(|error| runtime_backend_error("capture.transition.reserve", error))?;
-    let producer_guard = binding.polling_lease.try_acquire_producer(
-        binding.polling_lease.stamp(),
-        pane_id,
-    )?;
+    let permit = runtime_timeout(cx, CAPTURE_TRANSITION_QUEUE_TIMEOUT, capture_tx.reserve(cx))
+        .await
+        .map_err(|failure| match failure {
+            RuntimeTimeoutFailure::Elapsed => runtime_backend_error(
+                "capture.transition.reserve",
+                format!("pane {pane_id} capture ingress stayed full"),
+            ),
+            RuntimeTimeoutFailure::Context(_) => runtime_cx_error(
+                "capture.transition.reserve",
+                cx,
+                "capability context failed while reserving capture ingress",
+            ),
+        })?
+        .map_err(|error| runtime_backend_error("capture.transition.reserve", error))?;
+    let producer_guard = binding
+        .polling_lease
+        .try_acquire_producer(binding.polling_lease.stamp(), pane_id)?;
     let text = runtime_timeout(
         cx,
         Duration::from_secs(2),
@@ -3920,14 +3842,13 @@ impl ObservationRuntime {
     // artificial yield would change task-admission and cancellation ordering.
     #[allow(clippy::unused_async_trait_impl)]
     pub async fn start_with_cx(&mut self, cx: &crate::cx::Cx) -> Result<RuntimeHandle> {
-        cx.checkpoint()
-            .map_err(|_| {
-                runtime_cx_error(
-                    "runtime.start",
-                    cx,
-                    "capability checkpoint failed before runtime startup",
-                )
-            })?;
+        cx.checkpoint().map_err(|_| {
+            runtime_cx_error(
+                "runtime.start",
+                cx,
+                "capability checkpoint failed before runtime startup",
+            )
+        })?;
         self.start_impl()
     }
 
@@ -4031,17 +3952,17 @@ impl ObservationRuntime {
             snapshot_engine,
             snapshot_scheduler_status,
             snapshot_shutdown_requested,
-        ) =
-            if let Some(ref snap_config) = self.snapshot_config {
-                if snap_config.enabled {
-                    let db_path = Arc::new(self.storage.db_path().to_string());
-                    let engine = Arc::new(crate::snapshot_engine::SnapshotEngine::new(
-                        db_path,
-                        snap_config.clone(),
-                    ));
-                    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-                    let wezterm = self.wezterm_handle.clone();
-                    let snapshot_triggers = if matches!(
+        ) = if let Some(ref snap_config) = self.snapshot_config {
+            if snap_config.enabled {
+                let db_path = Arc::new(self.storage.db_path().to_string());
+                let engine = Arc::new(crate::snapshot_engine::SnapshotEngine::new(
+                    db_path,
+                    snap_config.clone(),
+                ));
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let wezterm = self.wezterm_handle.clone();
+                let snapshot_triggers =
+                    if matches!(
                         snap_config.scheduling.mode,
                         SnapshotSchedulingMode::Intelligent
                     ) {
@@ -4052,74 +3973,72 @@ impl ObservationRuntime {
                     } else {
                         None
                     };
-                    let snapshot_shutdown_clean = Arc::new(AtomicBool::new(false));
-                    let snapshot_scheduler_status =
-                        Arc::new(AtomicU8::new(SNAPSHOT_SCHEDULER_RUNNING));
-                    let task_snapshot_scheduler_status = Arc::clone(&snapshot_scheduler_status);
-                    let snapshot_shutdown_requested = Arc::new(AtomicBool::new(false));
-                    let task_snapshot_shutdown_requested =
-                        Arc::clone(&snapshot_shutdown_requested);
-                    let scheduler_engine = Arc::clone(&engine);
+                let snapshot_shutdown_clean = Arc::new(AtomicBool::new(false));
+                let snapshot_scheduler_status = Arc::new(AtomicU8::new(SNAPSHOT_SCHEDULER_RUNNING));
+                let task_snapshot_scheduler_status = Arc::clone(&snapshot_scheduler_status);
+                let snapshot_shutdown_requested = Arc::new(AtomicBool::new(false));
+                let task_snapshot_shutdown_requested = Arc::clone(&snapshot_shutdown_requested);
+                let scheduler_engine = Arc::clone(&engine);
 
-                    let loop_cx = runtime_loop_cx();
-                    let handle = spawn_runtime_task(&loop_cx, move |task_cx| async move {
-                        let pane_provider_cx = task_cx.clone();
-                        let scheduler_wezterm = wezterm.clone();
-                        let scheduler_result = scheduler_engine
-                            .run_periodic_with_cx(&task_cx, shutdown_rx, move || {
-                                let wez = scheduler_wezterm.clone();
-                                let pane_provider_cx = pane_provider_cx.clone();
-                                async move {
-                                    wez.list_panes_with_cx(&pane_provider_cx)
-                                        .await
-                                        .map_err(|error| {
-                                            crate::snapshot_engine::SnapshotError::PaneList(
-                                                error.to_string(),
-                                            )
-                                        })
-                                }
-                            })
-                            .await;
-                        let shutdown_was_requested =
-                            task_snapshot_shutdown_requested.load(Ordering::Acquire);
-                        let scheduler_status = match scheduler_result {
-                            Ok(()) if shutdown_was_requested => {
-                                info!("snapshot scheduler acknowledged runtime shutdown");
-                                SNAPSHOT_SCHEDULER_SHUTDOWN_ACKNOWLEDGED
+                let loop_cx = runtime_loop_cx();
+                let handle = spawn_runtime_task(&loop_cx, move |task_cx| async move {
+                    let pane_provider_cx = task_cx.clone();
+                    let scheduler_wezterm = wezterm.clone();
+                    let scheduler_result = scheduler_engine
+                        .run_periodic_with_cx(&task_cx, shutdown_rx, move || {
+                            let wez = scheduler_wezterm.clone();
+                            let pane_provider_cx = pane_provider_cx.clone();
+                            async move {
+                                wez.list_panes_with_cx(&pane_provider_cx)
+                                    .await
+                                    .map_err(|error| {
+                                        crate::snapshot_engine::SnapshotError::PaneList(
+                                            error.to_string(),
+                                        )
+                                    })
                             }
-                            Ok(()) => {
-                                error!(
-                                    "snapshot scheduler returned before runtime shutdown was requested"
-                                );
-                                SNAPSHOT_SCHEDULER_UNEXPECTED_RETURN
-                            }
-                            Err(error) => {
-                                error!(
-                                    error = %error,
-                                    shutdown_was_requested,
-                                    "snapshot scheduler failed before publishing a clean shutdown acknowledgement"
-                                );
-                                SNAPSHOT_SCHEDULER_FAILED
-                            }
-                        };
-                        task_snapshot_scheduler_status.store(scheduler_status, Ordering::Release);
-                    });
-                    info!("Snapshot engine started");
-                    (
-                        Some(handle),
-                        Some(shutdown_tx),
-                        snapshot_triggers,
-                        Some(snapshot_shutdown_clean),
-                        Some(engine),
-                        Some(snapshot_scheduler_status),
-                        Some(snapshot_shutdown_requested),
-                    )
-                } else {
-                    (None, None, None, None, None, None, None)
-                }
+                        })
+                        .await;
+                    let shutdown_was_requested =
+                        task_snapshot_shutdown_requested.load(Ordering::Acquire);
+                    let scheduler_status = match scheduler_result {
+                        Ok(()) if shutdown_was_requested => {
+                            info!("snapshot scheduler acknowledged runtime shutdown");
+                            SNAPSHOT_SCHEDULER_SHUTDOWN_ACKNOWLEDGED
+                        }
+                        Ok(()) => {
+                            error!(
+                                "snapshot scheduler returned before runtime shutdown was requested"
+                            );
+                            SNAPSHOT_SCHEDULER_UNEXPECTED_RETURN
+                        }
+                        Err(error) => {
+                            error!(
+                                error = %error,
+                                shutdown_was_requested,
+                                "snapshot scheduler failed before publishing a clean shutdown acknowledgement"
+                            );
+                            SNAPSHOT_SCHEDULER_FAILED
+                        }
+                    };
+                    task_snapshot_scheduler_status.store(scheduler_status, Ordering::Release);
+                });
+                info!("Snapshot engine started");
+                (
+                    Some(handle),
+                    Some(shutdown_tx),
+                    snapshot_triggers,
+                    Some(snapshot_shutdown_clean),
+                    Some(engine),
+                    Some(snapshot_scheduler_status),
+                    Some(snapshot_shutdown_requested),
+                )
             } else {
                 (None, None, None, None, None, None, None)
-            };
+            }
+        } else {
+            (None, None, None, None, None, None, None)
+        };
 
         info!("Observation runtime started");
 
@@ -4192,7 +4111,7 @@ impl ObservationRuntime {
                         Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
                         sub.recv(),
                     )
-                        .await
+                    .await
                     {
                         Ok(recv) => {
                             if shutdown_flag.load(Ordering::SeqCst) {
@@ -4247,19 +4166,16 @@ impl ObservationRuntime {
                             }
                         }
                         Err(RuntimeTimeoutFailure::Context(failure)) => {
-                            record_runtime_wait_failure(
-                                "snapshot_trigger_bridge_recv",
-                                failure,
-                            );
+                            record_runtime_wait_failure("snapshot_trigger_bridge_recv", failure);
                             break;
                         }
                         Err(RuntimeTimeoutFailure::Elapsed) => {}
                     }
                 } else if let Err(failure) = runtime_sleep(
-                        &loop_cx,
-                        Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
-                    )
-                    .await
+                    &loop_cx,
+                    Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
+                )
+                .await
                 {
                     record_runtime_wait_failure("snapshot_trigger_bridge", failure);
                     break;
@@ -4428,10 +4344,7 @@ impl ObservationRuntime {
                     }
                     Ok(Err(crate::events::RecvError::Closed)) => break,
                     Err(RuntimeTimeoutFailure::Context(failure)) => {
-                        record_runtime_wait_failure(
-                            "connector_outbound_bridge_recv",
-                            failure,
-                        );
+                        record_runtime_wait_failure("connector_outbound_bridge_recv", failure);
                         break;
                     }
                     Err(RuntimeTimeoutFailure::Elapsed) => {}
@@ -4470,8 +4383,7 @@ impl ObservationRuntime {
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(Instant::now);
             let health_interval = Duration::from_secs(30);
-            let mut health_schedule =
-                CompletionTimedSchedule::new(initial_health_completion);
+            let mut health_schedule = CompletionTimedSchedule::new(initial_health_completion);
 
             // Run maintenance every minute, but only do expensive ops when needed.
             // Keep first tick immediate to preserve prior interval behavior.
@@ -4605,16 +4517,13 @@ impl ObservationRuntime {
                     let mut retention_succeeded = true;
                     if let Some(pending) = pending_cleanup_receipt.clone() {
                         let expected_maintenance_id = pending.id;
-                        let receipt_cx = crate::cx::Cx::for_request_with_budget(
-                            crate::cx::Budget::MINIMAL,
-                        );
+                        let receipt_cx =
+                            crate::cx::Cx::for_request_with_budget(crate::cx::Budget::MINIMAL);
                         match storage
                             .record_maintenance_with_cx(&receipt_cx, pending)
                             .await
                         {
-                            Ok(maintenance_id)
-                                if maintenance_id == expected_maintenance_id =>
-                            {
+                            Ok(maintenance_id) if maintenance_id == expected_maintenance_id => {
                                 pending_cleanup_receipt = None;
                                 info!(
                                     maintenance_id,
@@ -4674,13 +4583,14 @@ impl ObservationRuntime {
                         && pending_size_retention_receipt.is_none()
                         && (retention_days > 0 || !retention_policy.tiers().is_empty())
                     {
-                        let outcome = crate::cleanup::cleanup_apply_with_compiled_retention_with_cx(
-                            &loop_cx,
-                            &storage,
-                            retention_days,
-                            Arc::clone(&retention_policy),
-                        )
-                        .await;
+                        let outcome =
+                            crate::cleanup::cleanup_apply_with_compiled_retention_with_cx(
+                                &loop_cx,
+                                &storage,
+                                retention_days,
+                                Arc::clone(&retention_policy),
+                            )
+                            .await;
                         if let crate::cleanup::CleanupAuditStatus::Failed {
                             pending_record, ..
                         } = &outcome.audit
@@ -4705,8 +4615,7 @@ impl ObservationRuntime {
                             (
                                 crate::cleanup::CleanupTermination::Completed,
                                 crate::cleanup::CleanupAuditStatus::Failed {
-                                    error: _error,
-                                    ..
+                                    error: _error, ..
                                 },
                             ) => {
                                 retention_succeeded = false;
@@ -4953,14 +4862,12 @@ impl ObservationRuntime {
                     if cache_gc_settings.log_report {
                         info!(
                             free_ratio,
-                            manual_vacuum_advised,
-                            "Database cache GC cycle completed"
+                            manual_vacuum_advised, "Database cache GC cycle completed"
                         );
                     } else {
                         debug!(
                             free_ratio,
-                            manual_vacuum_advised,
-                            "Database cache GC cycle completed"
+                            manual_vacuum_advised, "Database cache GC cycle completed"
                         );
                     }
 
@@ -5109,24 +5016,23 @@ impl ObservationRuntime {
                         reg.observed_pane_ids()
                     };
                     let observed_pane_count = observed_pane_ids.len();
-                    let tiered_scrollback_fetch =
-                        match collect_pane_tiered_scrollback_summaries(
-                            &loop_cx,
-                            &wezterm_handle,
-                            &observed_pane_ids,
-                        )
-                        .await
-                        {
-                            Ok(fetch) => fetch,
-                            Err(error) if is_runtime_cancellation(&error) => break,
-                            Err(_error) => {
-                                warn!(
-                                    error_class = "pane_summary_collection_failed",
-                                    "Failed to collect mux-side tiered scrollback telemetry"
-                                );
-                                PaneTieredScrollbackFetch::default()
-                            }
-                        };
+                    let tiered_scrollback_fetch = match collect_pane_tiered_scrollback_summaries(
+                        &loop_cx,
+                        &wezterm_handle,
+                        &observed_pane_ids,
+                    )
+                    .await
+                    {
+                        Ok(fetch) => fetch,
+                        Err(error) if is_runtime_cancellation(&error) => break,
+                        Err(_error) => {
+                            warn!(
+                                error_class = "pane_summary_collection_failed",
+                                "Failed to collect mux-side tiered scrollback telemetry"
+                            );
+                            PaneTieredScrollbackFetch::default()
+                        }
+                    };
                     if loop_cx.checkpoint().is_err() {
                         break;
                     }
@@ -5393,11 +5299,9 @@ impl ObservationRuntime {
             let mut last_publication_epoch = 0_u64;
             let mut discovery_revisions = HashMap::<u64, DiscoveryRevision>::new();
             let mut storage_resync_revisions = HashMap::<u64, DiscoveryRevision>::new();
-            let mut capture_transitions =
-                HashMap::<u64, CaptureTransitionDescriptor>::new();
+            let mut capture_transitions = HashMap::<u64, CaptureTransitionDescriptor>::new();
             let mut last_capture_view = Arc::new(HashMap::<u64, ObservedCapturePane>::new());
-            let mut unresolved_barrier_predecessors =
-                HashMap::<u64, DiscoveryRevision>::new();
+            let mut unresolved_barrier_predecessors = HashMap::<u64, DiscoveryRevision>::new();
             let mut capture_setup_pending = HashMap::<u64, &'static str>::new();
 
             'discovery: loop {
@@ -5405,8 +5309,8 @@ impl ObservationRuntime {
                     first_tick = false;
                 } else {
                     // Wait for interval, checking shutdown periodically to ensure responsiveness
-                    let deadline = crate::runtime_async::timer_now_with_cx(&loop_cx)
-                        + current_interval;
+                    let deadline =
+                        crate::runtime_async::timer_now_with_cx(&loop_cx) + current_interval;
                     loop {
                         if shutdown_flag.load(Ordering::SeqCst) {
                             break;
@@ -5417,11 +5321,8 @@ impl ObservationRuntime {
                         }
                         // Sleep in short bursts to remain responsive to shutdown signals
                         let remaining = Duration::from_nanos(deadline.duration_since(now));
-                        if let Err(failure) = runtime_sleep(
-                            &loop_cx,
-                            remaining.min(Duration::from_millis(100)),
-                        )
-                        .await
+                        if let Err(failure) =
+                            runtime_sleep(&loop_cx, remaining.min(Duration::from_millis(100))).await
                         {
                             record_runtime_wait_failure("discovery_interval", failure);
                             break 'discovery;
@@ -5541,9 +5442,8 @@ impl ObservationRuntime {
                                 let Some(stable_uuid) = stable_uuids.remove(pane_id) else {
                                     continue;
                                 };
-                                let Some(generated_uuid) = reg
-                                    .get_entry(*pane_id)
-                                    .map(|entry| entry.pane_uuid.clone())
+                                let Some(generated_uuid) =
+                                    reg.get_entry(*pane_id).map(|entry| entry.pane_uuid.clone())
                                 else {
                                     continue;
                                 };
@@ -5613,10 +5513,8 @@ impl ObservationRuntime {
                                 &mut unresolved_barrier_predecessors,
                                 &mut storage_resync_revisions,
                             );
-                            for pane_id in diff
-                                .new_generations
-                                .iter()
-                                .chain(&diff.re_observed_panes)
+                            for pane_id in
+                                diff.new_generations.iter().chain(&diff.re_observed_panes)
                             {
                                 if let Some(revision) = discovery_revisions.get(pane_id).copied() {
                                     storage_resync_revisions.insert(*pane_id, revision);
@@ -5691,10 +5589,7 @@ impl ObservationRuntime {
                                         "cwd": entry.info.cwd.clone(),
                                     }),
                                 ) {
-                                    adapter.record_sequence_error(
-                                        "runtime.pane_opened",
-                                        error,
-                                    );
+                                    adapter.record_sequence_error("runtime.pane_opened", error);
                                 }
                             }
 
@@ -5722,10 +5617,7 @@ impl ObservationRuntime {
                                     Some("pane_closed".to_string()),
                                     serde_json::json!({}),
                                 ) {
-                                    adapter.record_sequence_error(
-                                        "runtime.capture_stopped",
-                                        error,
-                                    );
+                                    adapter.record_sequence_error("runtime.capture_stopped", error);
                                 }
                                 if let Err(error) = adapter.capture_lifecycle(
                                     *pane_id,
@@ -5733,10 +5625,7 @@ impl ObservationRuntime {
                                     Some("pane_closed".to_string()),
                                     serde_json::json!({}),
                                 ) {
-                                    adapter.record_sequence_error(
-                                        "runtime.pane_closed",
-                                        error,
-                                    );
+                                    adapter.record_sequence_error("runtime.pane_closed", error);
                                 }
                             }
 
@@ -5813,10 +5702,7 @@ impl ObservationRuntime {
                                     None,
                                     serde_json::json!({ "reason": reason }),
                                 ) {
-                                    adapter.record_sequence_error(
-                                        "runtime.capture_started",
-                                        error,
-                                    );
+                                    adapter.record_sequence_error("runtime.capture_started", error);
                                 }
                             }
                         }
@@ -6008,11 +5894,9 @@ impl ObservationRuntime {
             #[cfg(all(feature = "vendored", unix))]
             let mut streaming_tasks: StreamingTasks = StreamingTasks::new();
             #[cfg(all(feature = "vendored", unix))]
-            let mut observed_panes_cache =
-                Arc::new(HashMap::<u64, ObservedCapturePane>::new());
+            let mut observed_panes_cache = Arc::new(HashMap::<u64, ObservedCapturePane>::new());
             let mut capture_bindings = HashMap::<u64, ActiveCaptureBinding>::new();
-            let mut pending_resync_bindings =
-                HashMap::<u64, PendingCaptureResyncBinding>::new();
+            let mut pending_resync_bindings = HashMap::<u64, PendingCaptureResyncBinding>::new();
             let mut draining_bindings = HashMap::<u64, ActiveCaptureBinding>::new();
             let mut draining_since = HashMap::<u64, Instant>::new();
             let mut retired_state_candidates = HashMap::<u64, Instant>::new();
@@ -6078,9 +5962,10 @@ impl ObservationRuntime {
                             {
                                 Ok(_) => {
                                     if let Some(binding) = capture_bindings.get_mut(&pane_id)
-                                        && binding.streaming_lease.as_ref().is_some_and(|lease| {
-                                            lease.stamp() == task_stamp
-                                        })
+                                        && binding
+                                            .streaming_lease
+                                            .as_ref()
+                                            .is_some_and(|lease| lease.stamp() == task_stamp)
                                     {
                                         binding.streaming_lease = None;
                                     }
@@ -6150,8 +6035,8 @@ impl ObservationRuntime {
                                 .map(|binding| (*pane_id, binding.polling_lease.clone()))
                         })
                         .collect();
-                    if let Err(error) = supervisor
-                        .sync_authorized_tailers(&polling_observed_panes, &polling_leases)
+                    if let Err(error) =
+                        supervisor.sync_authorized_tailers(&polling_observed_panes, &polling_leases)
                     {
                         error!(error = %error, "Failed to authorize polling fallback");
                     }
@@ -6214,10 +6099,7 @@ impl ObservationRuntime {
                             .get(pane_id)
                             .is_some_and(|pane| pane.revision == *revision)
                     });
-                    pending_resyncs.observe_ready_transitions(
-                        &publication,
-                        &completed_resyncs,
-                    );
+                    pending_resyncs.observe_ready_transitions(&publication, &completed_resyncs);
 
                     // A successor resync is submitted without blocking fleet
                     // reconciliation on storage.  Persistence decides the
@@ -6424,10 +6306,9 @@ impl ObservationRuntime {
                                 .map(|binding| (*pane_id, binding.polling_lease.clone()))
                         })
                         .collect::<HashMap<_, _>>();
-                    if let Err(error) = supervisor.sync_authorized_tailers(
-                        &retained_polling_panes,
-                        &retained_polling_leases,
-                    ) {
+                    if let Err(error) = supervisor
+                        .sync_authorized_tailers(&retained_polling_panes, &retained_polling_leases)
+                    {
                         error!(error = %error, "Failed to suspend obsolete polling bindings");
                     }
 
@@ -6485,8 +6366,7 @@ impl ObservationRuntime {
                         // predecessor has left both active and draining maps.
                         // A late predecessor commit therefore cannot race this
                         // successor baseline into false certainty.
-                        let capture_state_preexisted =
-                            cursors.read().await.contains_key(&pane_id);
+                        let capture_state_preexisted = cursors.read().await.contains_key(&pane_id);
                         if capture_state_preexisted {
                             // Until a current authority binding is installed,
                             // this state is provisional. Tracking it from the
@@ -6545,15 +6425,12 @@ impl ObservationRuntime {
                             }
                         };
 
-                        let resync_completed = completed_resyncs.get(&pane_id).copied()
-                            == Some(observed.revision);
+                        let resync_completed =
+                            completed_resyncs.get(&pane_id).copied() == Some(observed.revision);
                         let mut resync_requirement = if resync_completed {
                             None
                         } else {
-                            pending_resyncs.requirement(
-                                pane_id,
-                                observed.requires_storage_resync,
-                            )
+                            pending_resyncs.requirement(pane_id, observed.requires_storage_resync)
                         };
                         if !resync_completed
                             && resync_requirement.is_none()
@@ -6844,52 +6721,42 @@ impl ObservationRuntime {
                         let obsolete_streams: Vec<(u64, bool)> = streaming_tasks
                             .iter()
                             .filter_map(|(pane_id, task)| {
-                                let desired_identity = observed_panes_cache.get(pane_id).and_then(
-                                    |pane| {
+                                let desired_identity =
+                                    observed_panes_cache.get(pane_id).and_then(|pane| {
                                         capture_bindings.get(pane_id).and_then(|binding| {
                                             binding.streaming_lease.as_ref().map(|lease| {
                                                 (*pane_id, pane.generation, lease.stamp())
                                             })
                                         })
-                                    },
-                                );
+                                    });
                                 match streaming_task_reconcile_action(
                                     &task.identity,
                                     desired_identity,
                                 ) {
                                     StreamingTaskReconcileAction::Keep => None,
-                                    StreamingTaskReconcileAction::Remove => {
-                                        Some((*pane_id, false))
-                                    }
-                                    StreamingTaskReconcileAction::Replace => {
-                                        Some((*pane_id, true))
-                                    }
+                                    StreamingTaskReconcileAction::Remove => Some((*pane_id, false)),
+                                    StreamingTaskReconcileAction::Replace => Some((*pane_id, true)),
                                 }
                             })
                             .collect();
                         for (pane_id, has_replacement) in obsolete_streams {
-                            if let Some(task) =
-                                streaming_tasks.remove_for_settlement(pane_id, true)
+                            if let Some(task) = streaming_tasks.remove_for_settlement(pane_id, true)
                             {
                                 let task_stamp = task.lease.stamp();
-                                let binding_identity = capture_bindings.get(&pane_id).and_then(
-                                    |binding| {
+                                let binding_identity =
+                                    capture_bindings.get(&pane_id).and_then(|binding| {
                                         binding
                                             .streaming_lease
                                             .as_ref()
                                             .is_some_and(|lease| lease.stamp() == task_stamp)
                                             .then_some(binding.identity)
-                                    },
-                                );
+                                    });
                                 if let Some(binding_identity) = binding_identity {
                                     match capture_authority
                                         .begin_source_revocation(binding_identity, task_stamp)
                                     {
                                         Ok(revocation) => match revocation
-                                            .wait_with_cx(
-                                                &loop_cx,
-                                                CAPTURE_AUTHORITY_DRAIN_TIMEOUT,
-                                            )
+                                            .wait_with_cx(&loop_cx, CAPTURE_AUTHORITY_DRAIN_TIMEOUT)
                                             .await
                                         {
                                             Ok(_) => {
@@ -6986,17 +6853,16 @@ impl ObservationRuntime {
                                 if let Some(existing_lease) = existing_streaming_lease {
                                     let existing_stamp = existing_lease.stamp();
                                     let drained = match capture_authority
-                                        .begin_source_revocation(
-                                            binding_identity,
-                                            existing_stamp,
-                                        )
+                                        .begin_source_revocation(binding_identity, existing_stamp)
                                     {
-                                        Ok(revocation) => revocation
-                                            .wait_with_cx(
-                                                &loop_cx,
-                                                CAPTURE_AUTHORITY_DRAIN_TIMEOUT,
-                                            )
-                                            .await,
+                                        Ok(revocation) => {
+                                            revocation
+                                                .wait_with_cx(
+                                                    &loop_cx,
+                                                    CAPTURE_AUTHORITY_DRAIN_TIMEOUT,
+                                                )
+                                                .await
+                                        }
                                         Err(error) => Err(error),
                                     };
                                     match drained {
@@ -7049,20 +6915,20 @@ impl ObservationRuntime {
                                     .is_some_and(|binding| {
                                         binding.streaming_lease = Some(streaming_lease.clone());
                                         true
-                                });
+                                    });
                                 if !installed {
-                                    let cleanup = match capture_authority
-                                        .begin_source_revocation(
-                                            binding_identity,
-                                            streaming_lease.stamp(),
-                                        )
-                                    {
-                                        Ok(revocation) => revocation
-                                            .wait_with_cx(
-                                                &loop_cx,
-                                                CAPTURE_AUTHORITY_DRAIN_TIMEOUT,
-                                            )
-                                            .await,
+                                    let cleanup = match capture_authority.begin_source_revocation(
+                                        binding_identity,
+                                        streaming_lease.stamp(),
+                                    ) {
+                                        Ok(revocation) => {
+                                            revocation
+                                                .wait_with_cx(
+                                                    &loop_cx,
+                                                    CAPTURE_AUTHORITY_DRAIN_TIMEOUT,
+                                                )
+                                                .await
+                                        }
                                         Err(error) => Err(error),
                                     };
                                     if let Err(error) = cleanup {
@@ -7238,9 +7104,7 @@ impl ObservationRuntime {
                     let retry_now = Instant::now();
                     let retry_delay = pending_resync_bindings
                         .values()
-                        .map(|pending| {
-                            capture_transition_retry_delay(pending.queued_at, retry_now)
-                        })
+                        .map(|pending| capture_transition_retry_delay(pending.queued_at, retry_now))
                         .chain(draining_since.values().filter_map(|started_at| {
                             bounded_capture_transition_retry_delay(*started_at, retry_now)
                         }))
@@ -7362,9 +7226,7 @@ impl ObservationRuntime {
     ) -> &'static str {
         match error {
             crate::native_events::NativeEventError::EmptySocketPath => "empty_socket_path",
-            crate::native_events::NativeEventError::ContextUnavailable => {
-                "context_unavailable"
-            }
+            crate::native_events::NativeEventError::ContextUnavailable => "context_unavailable",
             crate::native_events::NativeEventError::SocketAlreadyExists(_) => {
                 "socket_already_exists"
             }
@@ -7399,39 +7261,38 @@ impl ObservationRuntime {
 
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
-            let listener = match NativeEventListener::bind_with_cx(&loop_cx, socket_path.clone())
-                .await
-            {
-                Ok(listener) => {
-                    if loop_cx.checkpoint().is_err() {
+            let listener =
+                match NativeEventListener::bind_with_cx(&loop_cx, socket_path.clone()).await {
+                    Ok(listener) => {
+                        if loop_cx.checkpoint().is_err() {
+                            record_runtime_wait_failure(
+                                "native_event_bind",
+                                runtime_context_failure_kind(&loop_cx),
+                            );
+                            return;
+                        }
+                        info!(
+                            path = %socket_path.display(),
+                            "Native event listener bound — waiting for GUI connections"
+                        );
+                        listener
+                    }
+                    Err(_) if loop_cx.checkpoint().is_err() => {
                         record_runtime_wait_failure(
                             "native_event_bind",
                             runtime_context_failure_kind(&loop_cx),
                         );
                         return;
                     }
-                    info!(
-                        path = %socket_path.display(),
-                        "Native event listener bound — waiting for GUI connections"
-                    );
-                    listener
-                }
-                Err(_) if loop_cx.checkpoint().is_err() => {
-                    record_runtime_wait_failure(
-                        "native_event_bind",
-                        runtime_context_failure_kind(&loop_cx),
-                    );
-                    return;
-                }
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        path = %socket_path.display(),
-                        "Failed to bind native event socket, falling back to polling only"
-                    );
-                    return;
-                }
-            };
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            path = %socket_path.display(),
+                            "Failed to bind native event socket, falling back to polling only"
+                        );
+                        return;
+                    }
+                };
 
             let (event_tx, mut event_rx) = mpsc::channel::<NativeEvent>(1024);
 
@@ -7440,11 +7301,7 @@ impl ObservationRuntime {
                 &loop_cx,
                 move |accept_cx| async move {
                     let listener_result = listener
-                        .run_with_cx(
-                            &accept_cx,
-                            event_tx,
-                            Arc::clone(&accept_shutdown_flag),
-                        )
+                        .run_with_cx(&accept_cx, event_tx, Arc::clone(&accept_shutdown_flag))
                         .await;
                     // `run_with_cx` reports observed cancellation and requested
                     // shutdown as `Ok(())`. Every error here is therefore an
@@ -7483,9 +7340,7 @@ impl ObservationRuntime {
                     break;
                 }
                 let now = crate::runtime_async::timer_now_with_cx(&loop_cx);
-                match shutdown_drain_state
-                    .advance(now, shutdown_flag.load(Ordering::SeqCst))
-                {
+                match shutdown_drain_state.advance(now, shutdown_flag.load(Ordering::SeqCst)) {
                     NativeEventShutdownDrainAction::None => {}
                     NativeEventShutdownDrainAction::BeginGraceful => {
                         // Stop admitting new work through the shared shutdown
@@ -7558,11 +7413,9 @@ impl ObservationRuntime {
                                 timestamp_ms,
                                 dropped_bytes,
                             } => {
-                                let Some(producer_guard) = acquire_native_producer(
-                                    &capture_authority,
-                                    &metrics,
-                                    pane_id,
-                                ) else {
+                                let Some(producer_guard) =
+                                    acquire_native_producer(&capture_authority, &metrics, pane_id)
+                                else {
                                     continue;
                                 };
                                 metrics.record_native_output_input(data.len());
@@ -7588,15 +7441,13 @@ impl ObservationRuntime {
                                 let now_ms = crate::runtime_async::timer_now_with_cx(&loop_cx)
                                     .duration_since(start)
                                     / 1_000_000;
-                                if let Some(item) =
-                                    coalescer.push(
-                                        pane_id,
-                                        data,
-                                        timestamp_ms,
-                                        now_ms,
-                                        producer_guard,
-                                    )
-                                {
+                                if let Some(item) = coalescer.push(
+                                    pane_id,
+                                    data,
+                                    timestamp_ms,
+                                    now_ms,
+                                    producer_guard,
+                                ) {
                                     if loop_cx.checkpoint().is_err() {
                                         break 'native_events;
                                     }
@@ -7945,31 +7796,31 @@ impl ObservationRuntime {
             while let Some(mut event) = capture_rx.recv().await {
                 let mut resync_decision = event.take_resync_decision();
                 let stamp = event.stamp();
-                let (persistence_guard, capture_pane_metadata) = match
-                    admit_capture_event_for_persistence(
+                let (persistence_guard, capture_pane_metadata) =
+                    match admit_capture_event_for_persistence(
                         &capture_authority,
                         &capture_metadata,
                         &discovery_publication_rx,
                         &event,
                     )
                     .await
-                {
-                    Ok(admission) => admission,
-                    Err(error) => {
-                        metrics.capture_authority_rejections.increment();
-                        debug!(
-                            pane_id = event.segment.pane_id,
-                            pane_incarnation = stamp.pane_incarnation().get(),
-                            source_kind = ?stamp.source_kind(),
-                            error = %error,
-                            "Rejected stale capture event before semantic side effects"
-                        );
-                        if let Some(decision) = resync_decision.as_mut() {
-                            decision.finish(Err(error.to_string()));
+                    {
+                        Ok(admission) => admission,
+                        Err(error) => {
+                            metrics.capture_authority_rejections.increment();
+                            debug!(
+                                pane_id = event.segment.pane_id,
+                                pane_incarnation = stamp.pane_incarnation().get(),
+                                source_kind = ?stamp.source_kind(),
+                                error = %error,
+                                "Rejected stale capture event before semantic side effects"
+                            );
+                            if let Some(decision) = resync_decision.as_mut() {
+                                decision.finish(Err(error.to_string()));
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                };
+                    };
                 let pane_incarnation = stamp.pane_incarnation();
                 metrics.record_capture_queue_depth(capture_rx.depth());
                 heartbeats.record_persistence();
@@ -8362,8 +8213,7 @@ async fn handle_native_event(
             timestamp_ms,
             dropped_bytes,
         } => {
-            let Some(producer_guard) =
-                acquire_native_producer(capture_authority, metrics, pane_id)
+            let Some(producer_guard) = acquire_native_producer(capture_authority, metrics, pane_id)
             else {
                 return;
             };
@@ -8393,8 +8243,7 @@ async fn handle_native_event(
             }
         }
         NativeEvent::StateChange { pane_id, state, .. } => {
-            let Some(producer_guard) =
-                acquire_native_producer(capture_authority, metrics, pane_id)
+            let Some(producer_guard) = acquire_native_producer(capture_authority, metrics, pane_id)
             else {
                 return;
             };
@@ -8680,14 +8529,14 @@ async fn run_vendored_streaming_capture(
         DirectMuxClientConfig::default().with_socket_path(identity.socket_path.clone());
     client_config.compression_mode = compression_mode;
 
-    let client =
-        match Box::pin(DirectMuxClient::connect_with_cx(&runtime_cx, client_config)).await {
-            Ok(client) => client,
-            Err(err) => {
-                bridge.record_fallback();
-                return format!("connect error: {err}");
-            }
-        };
+    let client = match Box::pin(DirectMuxClient::connect_with_cx(&runtime_cx, client_config)).await
+    {
+        Ok(client) => client,
+        Err(err) => {
+            bridge.record_fallback();
+            return format!("connect error: {err}");
+        }
+    };
 
     info!(
         pane_id = identity.global_pane_id,
@@ -9820,10 +9669,7 @@ impl RuntimeHandle {
             .await
     }
 
-    async fn shutdown_with_timeout_impl(
-        mut self,
-        shutdown_timeout: Duration,
-    ) -> ShutdownSummary {
+    async fn shutdown_with_timeout_impl(mut self, shutdown_timeout: Duration) -> ShutdownSummary {
         let elapsed_secs = self.start_time.elapsed().as_secs();
         let mut warnings = Vec::new();
         let mut clean = true;
@@ -9872,16 +9718,16 @@ impl RuntimeHandle {
         })
         .await;
 
-        let (graceful_timed_out, graceful_wait_failure, graceful_drain_failure) =
-            match join_result {
-                Ok(Ok(())) => (false, None, None),
-                Ok(Err(failure)) => (false, None, Some(failure)),
-                Err(RuntimeTimeoutFailure::Elapsed) => (true, None, None),
-                Err(RuntimeTimeoutFailure::Context(failure)) => {
-                    record_runtime_wait_failure("runtime_shutdown_graceful_join", failure);
-                    (false, Some(failure), None)
-                }
-            };
+        let (graceful_timed_out, graceful_wait_failure, graceful_drain_failure) = match join_result
+        {
+            Ok(Ok(())) => (false, None, None),
+            Ok(Err(failure)) => (false, None, Some(failure)),
+            Err(RuntimeTimeoutFailure::Elapsed) => (true, None, None),
+            Err(RuntimeTimeoutFailure::Context(failure)) => {
+                record_runtime_wait_failure("runtime_shutdown_graceful_join", failure);
+                (false, Some(failure), None)
+            }
+        };
 
         if graceful_join_failures > 0 {
             clean = false;
@@ -9929,21 +9775,16 @@ impl RuntimeHandle {
                 }
             })
             .await;
-            let (cancellation_wait_failure, cancellation_drain_failure) =
-                match cancellation_result {
-                    Ok(Ok(())) => (None, None),
-                    Ok(Err(failure)) => (None, Some(failure)),
-                    Err(RuntimeTimeoutFailure::Elapsed) => {
-                        (Some(RuntimeTimeoutFailure::Elapsed), None)
-                    }
-                    Err(RuntimeTimeoutFailure::Context(failure)) => {
-                        record_runtime_wait_failure(
-                            "runtime_shutdown_cancellation_join",
-                            failure,
-                        );
-                        (Some(RuntimeTimeoutFailure::Context(failure)), None)
-                    }
-                };
+            let (cancellation_wait_failure, cancellation_drain_failure) = match cancellation_result
+            {
+                Ok(Ok(())) => (None, None),
+                Ok(Err(failure)) => (None, Some(failure)),
+                Err(RuntimeTimeoutFailure::Elapsed) => (Some(RuntimeTimeoutFailure::Elapsed), None),
+                Err(RuntimeTimeoutFailure::Context(failure)) => {
+                    record_runtime_wait_failure("runtime_shutdown_cancellation_join", failure);
+                    (Some(RuntimeTimeoutFailure::Context(failure)), None)
+                }
+            };
             let cancellation_settled = cancellation_wait_failure.is_none()
                 && cancellation_drain_failure.is_none()
                 && task_handles.settlement() == JoinSetSettlement::Settled;
@@ -9953,16 +9794,12 @@ impl RuntimeHandle {
                     "Tasks exceeded graceful shutdown timeout; every retained top-level task acknowledged cancellation, but independently delegated nested or blocking work is not proven stopped"
                         .to_string(),
                 );
-            } else if cancellation_settled
-                && let Some(failure) = graceful_wait_failure
-            {
+            } else if cancellation_settled && let Some(failure) = graceful_wait_failure {
                 warnings.push(format!(
                     "Graceful task-join wait failed with class {}; every retained top-level task subsequently acknowledged cancellation, but independently delegated nested or blocking work is not proven stopped",
                     failure.as_str()
                 ));
-            } else if cancellation_settled
-                && let Some(failure) = graceful_drain_failure
-            {
+            } else if cancellation_settled && let Some(failure) = graceful_drain_failure {
                 warnings.push(format!(
                     "Graceful trusted drain failed with class {failure:?}; every retained top-level task subsequently acknowledged cancellation, but independently delegated nested or blocking work is not proven stopped"
                 ));
@@ -9977,8 +9814,7 @@ impl RuntimeHandle {
                 warnings.push(format!(
                     "Retained cancellation authority subsequently settled every top-level task{registration_note}, but independently delegated nested or blocking work is not proven stopped"
                 ));
-            } else if let Some(RuntimeTimeoutFailure::Context(failure)) =
-                cancellation_wait_failure
+            } else if let Some(RuntimeTimeoutFailure::Context(failure)) = cancellation_wait_failure
             {
                 warnings.push(format!(
                     "Cancellation settlement wait failed with class {}; terminal acknowledgement remained incomplete, so orphan risk remains",
@@ -10059,15 +9895,12 @@ impl RuntimeHandle {
         // Get last seq per pane
         let cursor_cx = crate::cx::for_request();
         let last_seq_by_pane = match runtime_timeout(&cursor_cx, shutdown_timeout, async {
-            self.cursors
-                .read_with_cx(&cursor_cx)
-                .await
-                .map(|cursors| {
-                    cursors
-                        .iter()
-                        .map(|(pane_id, cursor)| (*pane_id, cursor.last_seq()))
-                        .collect::<Vec<_>>()
-                })
+            self.cursors.read_with_cx(&cursor_cx).await.map(|cursors| {
+                cursors
+                    .iter()
+                    .map(|(pane_id, cursor)| (*pane_id, cursor.last_seq()))
+                    .collect::<Vec<_>>()
+            })
         })
         .await
         {
@@ -10167,11 +10000,7 @@ impl RuntimeHandle {
                     Ok(Ok(panes)) => {
                         let checkpoint_timeout = shutdown_timeout.min(Duration::from_secs(5));
                         match snapshot_engine
-                            .shutdown_checkpoint_with_cx(
-                                &snapshot_cx,
-                                &panes,
-                                checkpoint_timeout,
-                            )
+                            .shutdown_checkpoint_with_cx(&snapshot_cx, &panes, checkpoint_timeout)
                             .await
                         {
                             Ok(checkpoint) => {
@@ -10187,14 +10016,9 @@ impl RuntimeHandle {
                             }
                             Err(error) => {
                                 clean = false;
-                                if let Some(checkpoint) =
-                                    error.committed_shutdown_checkpoint()
-                                {
-                                    let session_id = checkpoint
-                                        .session_id
-                                        .chars()
-                                        .take(64)
-                                        .collect::<String>();
+                                if let Some(checkpoint) = error.committed_shutdown_checkpoint() {
+                                    let session_id =
+                                        checkpoint.session_id.chars().take(64).collect::<String>();
                                     warn!(
                                         error = %error,
                                         %session_id,
@@ -10239,10 +10063,7 @@ impl RuntimeHandle {
                     }
                     Err(RuntimeTimeoutFailure::Context(failure)) => {
                         clean = false;
-                        record_runtime_wait_failure(
-                            "runtime_shutdown_snapshot_pane_list",
-                            failure,
-                        );
+                        record_runtime_wait_failure("runtime_shutdown_snapshot_pane_list", failure);
                         warnings.push(format!(
                             "RuntimeBuilder terminal snapshot pane-list wait failed with class {}",
                             failure.as_str()
@@ -10274,10 +10095,7 @@ impl RuntimeHandle {
         // non-authoritative after any earlier unclean phase.
         let managed_queue_quiescence_proven =
             clean && final_capture_queue == 0 && final_write_queue == 0;
-        if !managed_queue_quiescence_proven
-            && final_capture_queue == 0
-            && final_write_queue == 0
-        {
+        if !managed_queue_quiescence_proven && final_capture_queue == 0 && final_write_queue == 0 {
             warnings.push(
                 "Managed queue quiescence was not proven because an earlier shutdown phase was unclean"
                     .to_string(),
@@ -11036,12 +10854,7 @@ mod tests {
     #[test]
     fn native_accept_settlement_truth_gives_terminal_authority_precedence() {
         assert_eq!(
-            classify_native_accept_task_settlement(
-                true,
-                None,
-                None,
-                JoinSetSettlement::Settled,
-            ),
+            classify_native_accept_task_settlement(true, None, None, JoinSetSettlement::Settled,),
             NativeAcceptTaskSettlement::Settled,
         );
         assert_eq!(
@@ -11081,12 +10894,7 @@ mod tests {
     #[test]
     fn streaming_task_drain_truth_gives_terminal_authority_precedence() {
         assert_eq!(
-            classify_streaming_task_drain(
-                true,
-                None,
-                None,
-                JoinSetSettlement::Settled,
-            ),
+            classify_streaming_task_drain(true, None, None, JoinSetSettlement::Settled,),
             StreamingTaskDrainOutcome::Settled,
         );
         assert_eq!(
@@ -11180,10 +10988,7 @@ mod tests {
             });
             let mut guard = AbortOnDropNativeAcceptTask::new(handle);
 
-            assert_eq!(
-                guard.settle().await,
-                NativeAcceptTaskSettlement::Settled
-            );
+            assert_eq!(guard.settle().await, NativeAcceptTaskSettlement::Settled);
             assert!(
                 completed.load(Ordering::Acquire),
                 "graceful settlement must let the listener reach its own terminal path"
@@ -11224,10 +11029,7 @@ mod tests {
                 NativeEventShutdownDrainAction::BeginGraceful,
             );
             assert_eq!(
-                drain_state.advance(
-                    start + NATIVE_ACCEPT_TASK_GRACEFUL_TIMEOUT,
-                    true,
-                ),
+                drain_state.advance(start + NATIVE_ACCEPT_TASK_GRACEFUL_TIMEOUT, true,),
                 NativeEventShutdownDrainAction::AbortProducer,
             );
             assert_eq!(
@@ -11255,9 +11057,7 @@ mod tests {
             assert!(drain_state.producer_closed());
             assert_eq!(
                 drain_state.advance(
-                    start
-                        + NATIVE_ACCEPT_TASK_GRACEFUL_TIMEOUT
-                        + NATIVE_EVENT_QUEUE_DRAIN_TIMEOUT,
+                    start + NATIVE_ACCEPT_TASK_GRACEFUL_TIMEOUT + NATIVE_EVENT_QUEUE_DRAIN_TIMEOUT,
                     true,
                 ),
                 NativeEventShutdownDrainAction::None,
@@ -11298,10 +11098,7 @@ mod tests {
             drain_state.advance(forced_deadline, true),
             NativeEventShutdownDrainAction::Abandon,
         );
-        assert_eq!(
-            drain_state,
-            NativeEventShutdownDrainState::Abandoned,
-        );
+        assert_eq!(drain_state, NativeEventShutdownDrainState::Abandoned,);
         assert_eq!(
             drain_state.mark_producer_closed(),
             NativeEventShutdownDrainAction::None,
@@ -11364,7 +11161,10 @@ mod tests {
     #[test]
     fn discovery_revision_and_publication_namespaces_never_wrap() {
         let mut revision = 0;
-        assert_eq!(allocate_discovery_revision(&mut revision).map(DiscoveryRevision::get), Some(1));
+        assert_eq!(
+            allocate_discovery_revision(&mut revision).map(DiscoveryRevision::get),
+            Some(1)
+        );
         revision = u64::MAX;
         assert_eq!(allocate_discovery_revision(&mut revision), None);
         assert_eq!(revision, u64::MAX);
@@ -11426,9 +11226,7 @@ mod tests {
 
     #[test]
     fn pending_resync_requires_a_terminal_receipt_even_when_superseded() {
-        use PendingCaptureResyncDisposition::{
-            Publish, RetireFailed, RetireSuperseded, Wait,
-        };
+        use PendingCaptureResyncDisposition::{Publish, RetireFailed, RetireSuperseded, Wait};
 
         assert_eq!(pending_capture_resync_disposition(true, None), Wait);
         assert_eq!(pending_capture_resync_disposition(false, None), Wait);
@@ -11501,8 +11299,7 @@ mod tests {
             make_pane(4, "new"),
         ];
 
-        let (view, transitioning) =
-            conservative_capture_view_before_storage(&previous, &panes);
+        let (view, transitioning) = conservative_capture_view_before_storage(&previous, &panes);
 
         assert_eq!(view.len(), 1);
         let retained = view.get(&1).expect("unchanged pane remains admissible");
@@ -11823,12 +11620,8 @@ mod tests {
                 5
             );
             assert!(
-                certain_capture_checkpoint(
-                    &checkpoints,
-                    pane_id,
-                    superseding_setup.revision,
-                )
-                .is_none(),
+                certain_capture_checkpoint(&checkpoints, pane_id, superseding_setup.revision,)
+                    .is_none(),
                 "post-drain setup must not certify over an existing coordinator-owned cursor"
             );
         });
@@ -11917,8 +11710,7 @@ mod tests {
 
             let cursors = Arc::new(RwLock::new(HashMap::from([(
                 pane_id,
-                PaneCursor::from_seq(pane_id, 8)
-                    .with_resume_anchor("shared prompt> ".to_string()),
+                PaneCursor::from_seq(pane_id, 8).with_resume_anchor("shared prompt> ".to_string()),
             )])));
             let contexts = Arc::new(RwLock::new(HashMap::from([(
                 pane_id,
@@ -11954,12 +11746,8 @@ mod tests {
                     "capture_generation_resync",
                 );
             assert_eq!(segment.content, "shared prompt> successor output");
-            let checkpoint = certain_capture_checkpoint(
-                &checkpoints,
-                pane_id,
-                successor_revision,
-            )
-            .expect("successor checkpoint");
+            let checkpoint = certain_capture_checkpoint(&checkpoints, pane_id, successor_revision)
+                .expect("successor checkpoint");
             assert!(
                 checkpoint.raw_tail.is_empty(),
                 "failed retry cannot relabel predecessor storage text as successor continuity"
@@ -12097,16 +11885,18 @@ mod tests {
             let mut draining = HashMap::new();
             let mut draining_since = HashMap::new();
 
-            assert!(!retire_or_quarantine_capture_binding(
-                &authority,
-                &metadata,
-                &backpressure,
-                &mut draining,
-                &mut draining_since,
-                first_binding,
-                "test held predecessor",
-            )
-            .await);
+            assert!(
+                !retire_or_quarantine_capture_binding(
+                    &authority,
+                    &metadata,
+                    &backpressure,
+                    &mut draining,
+                    &mut draining_since,
+                    first_binding,
+                    "test held predecessor",
+                )
+                .await
+            );
             assert!(draining.contains_key(&1));
             assert!(draining_since.contains_key(&1));
             assert_eq!(
@@ -12122,16 +11912,18 @@ mod tests {
                 "quarantined binding retains immutable metadata until exact drain"
             );
 
-            assert!(retire_or_quarantine_capture_binding(
-                &authority,
-                &metadata,
-                &backpressure,
-                &mut draining,
-                &mut draining_since,
-                second_binding,
-                "test unrelated predecessor",
-            )
-            .await);
+            assert!(
+                retire_or_quarantine_capture_binding(
+                    &authority,
+                    &metadata,
+                    &backpressure,
+                    &mut draining,
+                    &mut draining_since,
+                    second_binding,
+                    "test unrelated predecessor",
+                )
+                .await
+            );
             assert!(!draining.contains_key(&2));
             assert!(!draining_since.contains_key(&2));
             assert_eq!(backpressure.segments_dropped_for_pane(2), 0);
@@ -12145,16 +11937,18 @@ mod tests {
 
             drop(held);
             let first_binding = draining.remove(&1).expect("quarantined first binding");
-            assert!(retire_or_quarantine_capture_binding(
-                &authority,
-                &metadata,
-                &backpressure,
-                &mut draining,
-                &mut draining_since,
-                first_binding,
-                "test retry after drain",
-            )
-            .await);
+            assert!(
+                retire_or_quarantine_capture_binding(
+                    &authority,
+                    &metadata,
+                    &backpressure,
+                    &mut draining,
+                    &mut draining_since,
+                    first_binding,
+                    "test retry after drain",
+                )
+                .await
+            );
             assert!(draining.is_empty());
             assert!(draining_since.is_empty());
             assert_eq!(backpressure.segments_dropped_for_pane(1), 0);
@@ -12174,9 +11968,7 @@ mod tests {
             let predecessor_revision = DiscoveryRevision(10);
             let successor_revision = DiscoveryRevision(11);
             let authority = CaptureAuthority::new();
-            let predecessor = authority
-                .activate_pane(pane_id)
-                .expect("predecessor pane");
+            let predecessor = authority.activate_pane(pane_id).expect("predecessor pane");
             let predecessor_lease = authority
                 .issue_source(predecessor, CaptureSourceKind::Polling)
                 .expect("predecessor source");
@@ -12195,40 +11987,25 @@ mod tests {
                 revision: predecessor_revision,
                 requires_storage_resync: false,
             };
-            let (publication_tx, publication_rx) = watch::channel(
-                DiscoveryCapturePublication {
-                    epoch: 1,
-                    observed_panes: Arc::new(HashMap::from([(
-                        pane_id,
-                        predecessor_observed,
-                    )])),
-                    transitioning_pane_ids: Arc::new(HashSet::new()),
-                    transitions: Arc::new(HashMap::new()),
-                },
-            );
+            let (publication_tx, publication_rx) = watch::channel(DiscoveryCapturePublication {
+                epoch: 1,
+                observed_panes: Arc::new(HashMap::from([(pane_id, predecessor_observed)])),
+                transitioning_pane_ids: Arc::new(HashSet::new()),
+                transitions: Arc::new(HashMap::new()),
+            });
 
-            let publication_only = test_capture_event_for_lease(
-                pane_id,
-                0,
-                &predecessor_lease,
-            );
+            let publication_only = test_capture_event_for_lease(pane_id, 0, &predecessor_lease);
             let (mpsc_decision, mpsc_receipt) = CaptureResyncDecision::channel();
-            let mpsc_event = test_capture_event_for_lease(
-                pane_id,
-                1,
-                &predecessor_lease,
-            )
-            .with_resync_decision(mpsc_decision);
+            let mpsc_event = test_capture_event_for_lease(pane_id, 1, &predecessor_lease)
+                .with_resync_decision(mpsc_decision);
             let (spsc_decision, spsc_receipt) = CaptureResyncDecision::channel();
-            let spsc_event = test_capture_event_for_lease(
-                pane_id,
-                2,
-                &predecessor_lease,
-            )
-            .with_resync_decision(spsc_decision);
+            let spsc_event = test_capture_event_for_lease(pane_id, 2, &predecessor_lease)
+                .with_resync_decision(spsc_decision);
             let (ingress_tx, mut ingress_rx) = mpsc::channel(2);
             let (ring_tx, ring_rx) = spsc_channel(3);
-            ingress_tx.try_send(mpsc_event).expect("queue old MPSC event");
+            ingress_tx
+                .try_send(mpsc_event)
+                .expect("queue old MPSC event");
             ring_tx.try_send(spsc_event).expect("queue old SPSC event");
 
             let successor_observed = ObservedCapturePane {
@@ -12241,10 +12018,7 @@ mod tests {
             publication_tx
                 .send(DiscoveryCapturePublication {
                     epoch: 2,
-                    observed_panes: Arc::new(HashMap::from([(
-                        pane_id,
-                        successor_observed,
-                    )])),
+                    observed_panes: Arc::new(HashMap::from([(pane_id, successor_observed)])),
                     transitioning_pane_ids: Arc::new(HashSet::new()),
                     transitions: Arc::new(HashMap::new()),
                 })
@@ -12312,8 +12086,7 @@ mod tests {
                     .is_err()
             );
 
-            let mut relayed_ingress_event =
-                ring_rx.try_recv().expect("relayed MPSC event");
+            let mut relayed_ingress_event = ring_rx.try_recv().expect("relayed MPSC event");
             let mut relayed_ingress_decision = relayed_ingress_event
                 .take_resync_decision()
                 .expect("MPSC resync decision");
@@ -12338,8 +12111,7 @@ mod tests {
                     .is_err()
             );
 
-            let successor_event =
-                test_capture_event_for_lease(pane_id, 3, &successor_lease);
+            let successor_event = test_capture_event_for_lease(pane_id, 3, &successor_lease);
             let successor_admission = admit_capture_event_for_persistence(
                 &authority,
                 &capture_metadata,
@@ -12400,23 +12172,21 @@ mod tests {
                 },
             );
 
-            let (publication_tx, publication_rx) = watch::channel(
-                DiscoveryCapturePublication {
-                    epoch: 1,
-                    observed_panes: Arc::new(HashMap::from([(
-                        pane_id,
-                        ObservedCapturePane {
-                            info: make_pane(pane_id, "predecessor"),
-                            generation: 0,
-                            pane_uuid: "predecessor-uuid".to_string(),
-                            revision: predecessor_revision,
-                            requires_storage_resync: false,
-                        },
-                    )])),
-                    transitioning_pane_ids: Arc::new(HashSet::new()),
-                    transitions: Arc::new(HashMap::new()),
-                },
-            );
+            let (publication_tx, publication_rx) = watch::channel(DiscoveryCapturePublication {
+                epoch: 1,
+                observed_panes: Arc::new(HashMap::from([(
+                    pane_id,
+                    ObservedCapturePane {
+                        info: make_pane(pane_id, "predecessor"),
+                        generation: 0,
+                        pane_uuid: "predecessor-uuid".to_string(),
+                        revision: predecessor_revision,
+                        requires_storage_resync: false,
+                    },
+                )])),
+                transitioning_pane_ids: Arc::new(HashSet::new()),
+                transitions: Arc::new(HashMap::new()),
+            });
 
             let (mpsc_decision, mpsc_receipt) = CaptureResyncDecision::channel();
             let stale_mpsc = test_capture_event_for_lease(pane_id, 0, &predecessor_lease)
@@ -12472,17 +12242,12 @@ mod tests {
                 let cursor = cursors
                     .entry(pane_id)
                     .or_insert_with(|| PaneCursor::new(pane_id));
-                cursor.capture_generation_resync(
-                    "successor snapshot",
-                    "capture_generation_resync",
-                )
+                cursor.capture_generation_resync("successor snapshot", "capture_generation_resync")
             };
             let (successor_decision, successor_receipt) = CaptureResyncDecision::channel();
-            let successor_event = test_capture_event_from_segment_for_lease(
-                successor_segment,
-                &successor_lease,
-            )
-            .with_resync_decision(successor_decision);
+            let successor_event =
+                test_capture_event_from_segment_for_lease(successor_segment, &successor_lease)
+                    .with_resync_decision(successor_decision);
 
             let (ingress_tx, ingress_rx) = mpsc::channel(2);
             let (ring_tx, ring_rx) = spsc_channel(4);
@@ -12497,19 +12262,15 @@ mod tests {
                 .expect("queue successor resync behind predecessor");
             drop(ingress_tx);
 
-            let checkpoints: CaptureCheckpointCache =
-                Arc::new(StdMutex::new(LruCache::new(4)));
-            let _ = checkpoints
-                .lock()
-                .expect("capture checkpoint cache")
-                .put(
-                    pane_id,
-                    CachedCaptureCheckpoint::Certain(CaptureDurabilityCheckpoint {
-                        revision: successor_revision,
-                        next_seq: 0,
-                        raw_tail: String::new(),
-                    }),
-                );
+            let checkpoints: CaptureCheckpointCache = Arc::new(StdMutex::new(LruCache::new(4)));
+            let _ = checkpoints.lock().expect("capture checkpoint cache").put(
+                pane_id,
+                CachedCaptureCheckpoint::Certain(CaptureDurabilityCheckpoint {
+                    revision: successor_revision,
+                    next_seq: 0,
+                    raw_tail: String::new(),
+                }),
+            );
             let relay = runtime.spawn_capture_relay_task(ingress_rx, ring_tx);
             let persistence = runtime.spawn_persistence_task(
                 ring_rx,
@@ -12581,7 +12342,13 @@ mod tests {
             assert_eq!(runtime.metrics.capture_authority_rejections(), 2);
             assert_eq!(runtime.metrics.segments_persisted(), 1);
             assert_eq!(runtime.metrics.events_recorded(), 0);
-            assert!(runtime.detection_contexts.read().await.contains_key(&pane_id));
+            assert!(
+                runtime
+                    .detection_contexts
+                    .read()
+                    .await
+                    .contains_key(&pane_id)
+            );
 
             let mut published = Vec::new();
             while let Some(event) = event_subscriber.try_recv() {
@@ -12696,7 +12463,10 @@ mod tests {
     #[test]
     fn runtime_cancellation_classifier_covers_structured_and_legacy_errors() {
         let cx = crate::cx::for_testing();
-        cx.cancel_with(crate::outcome::CancelKind::User, Some("SECRET structured cancel"));
+        cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("SECRET structured cancel"),
+        );
         let structured = runtime_cx_error("runtime.test", &cx, "fallback");
         let legacy = Error::Cancelled("legacy cancel".to_string());
         let backend = runtime_backend_error("runtime.test", "backend failure");
@@ -12754,8 +12524,7 @@ mod tests {
     fn runtime_wait_classifier_detects_unmaterialized_budget_exhaustion() {
         let cases = [
             (
-                crate::cx::Budget::new()
-                    .with_deadline(crate::runtime_async::RuntimeTime::ZERO),
+                crate::cx::Budget::new().with_deadline(crate::runtime_async::RuntimeTime::ZERO),
                 RuntimeWaitFailureKind::DeadlineExceeded,
             ),
             (
@@ -12783,8 +12552,7 @@ mod tests {
         run_async_test(async {
             let cases = [
                 (
-                    crate::cx::Budget::new()
-                        .with_deadline(crate::runtime_async::RuntimeTime::ZERO),
+                    crate::cx::Budget::new().with_deadline(crate::runtime_async::RuntimeTime::ZERO),
                     RuntimeWaitFailureKind::DeadlineExceeded,
                 ),
                 (
@@ -12799,12 +12567,9 @@ mod tests {
 
             for (budget, expected) in cases {
                 let cx = crate::cx::Cx::for_testing_with_budget(budget);
-                let result = runtime_timeout(
-                    &cx,
-                    Duration::from_secs(1),
-                    std::future::pending::<()>(),
-                )
-                .await;
+                let result =
+                    runtime_timeout(&cx, Duration::from_secs(1), std::future::pending::<()>())
+                        .await;
                 assert_eq!(result, Err(RuntimeTimeoutFailure::Context(expected)));
             }
         });
@@ -13063,7 +12828,9 @@ mod tests {
             assert_eq!(bridge.events_processed(), 1);
             assert_eq!(bridge.ingester().active_panes(), 0);
             assert_eq!(
-                bridge.render_metadata(19).map(|metadata| metadata.title.as_str()),
+                bridge
+                    .render_metadata(19)
+                    .map(|metadata| metadata.title.as_str()),
                 Some("metadata-only")
             );
         });
@@ -13171,11 +12938,7 @@ mod tests {
         test_capture_event_for_lease(1, seq, &lease)
     }
 
-    fn test_capture_event_for_lease(
-        pane_id: u64,
-        seq: u64,
-        lease: &CaptureLease,
-    ) -> CaptureEvent {
+    fn test_capture_event_for_lease(pane_id: u64, seq: u64, lease: &CaptureLease) -> CaptureEvent {
         test_capture_event_from_segment_for_lease(
             CapturedSegment {
                 pane_id,
@@ -13890,13 +13653,10 @@ mod tests {
             let mock = crate::wezterm::MockWezterm::new();
             mock.add_default_pane(0).await;
             let wezterm_handle: WeztermHandle = Arc::new(mock);
-            let mut runtime = ObservationRuntime::new(
-                config,
-                storage,
-                Arc::new(RwLock::new(patterns)),
-            )
-            .with_wezterm_handle(wezterm_handle)
-            .with_snapshot_config(snapshot_config);
+            let mut runtime =
+                ObservationRuntime::new(config, storage, Arc::new(RwLock::new(patterns)))
+                    .with_wezterm_handle(wezterm_handle)
+                    .with_snapshot_config(snapshot_config);
 
             let handle = runtime.start().await.expect("runtime should start");
             let startup_deadline = Instant::now() + Duration::from_secs(10);
@@ -13964,13 +13724,10 @@ mod tests {
                 },
                 ..Default::default()
             };
-            let mut runtime = ObservationRuntime::new(
-                config,
-                storage,
-                Arc::new(RwLock::new(patterns)),
-            )
-            .with_wezterm_handle(Arc::new(crate::wezterm::MockWezterm::new()))
-            .with_snapshot_config(snapshot_config);
+            let mut runtime =
+                ObservationRuntime::new(config, storage, Arc::new(RwLock::new(patterns)))
+                    .with_wezterm_handle(Arc::new(crate::wezterm::MockWezterm::new()))
+                    .with_snapshot_config(snapshot_config);
 
             let handle = runtime.start().await.expect("runtime should start");
             let summary = handle.shutdown_with_summary().await;
@@ -14020,12 +13777,9 @@ mod tests {
                 channel_buffer: 64,
                 ..Default::default()
             };
-            let mut runtime = ObservationRuntime::new(
-                config,
-                storage,
-                Arc::new(RwLock::new(engine)),
-            )
-            .with_wezterm_handle(Arc::new(crate::wezterm::MockWezterm::new()));
+            let mut runtime =
+                ObservationRuntime::new(config, storage, Arc::new(RwLock::new(engine)))
+                    .with_wezterm_handle(Arc::new(crate::wezterm::MockWezterm::new()));
             let handle = runtime.start().await.expect("runtime should start");
 
             let caller_cx = crate::cx::for_testing();
@@ -14071,7 +13825,8 @@ mod tests {
                 "stubborn tasks should make shutdown summary unclean"
             );
             assert_eq!(
-                summary.final_capture_queue(), 7,
+                summary.final_capture_queue(),
+                7,
                 "shutdown summary must report the observed capture queue depth"
             );
             assert!(
@@ -14079,9 +13834,10 @@ mod tests {
                 "non-zero or unclean queue state must not claim proven quiescence"
             );
             assert!(
-                summary.warnings.iter().any(|warning| {
-                    warning.contains("7 capture queue item(s) still observed")
-                }),
+                summary
+                    .warnings
+                    .iter()
+                    .any(|warning| { warning.contains("7 capture queue item(s) still observed") }),
                 "non-zero terminal capture depth must remain operator-visible: {:?}",
                 summary.warnings
             );
@@ -14128,10 +13884,7 @@ mod tests {
                 "pre-aborted top-level task results must make shutdown unclean"
             );
             assert_eq!(
-                (
-                    summary.final_capture_queue(),
-                    summary.final_write_queue(),
-                ),
+                (summary.final_capture_queue(), summary.final_write_queue(),),
                 (0, 0),
                 "regression precondition: this path must exercise observed-zero but unclean shutdown"
             );
@@ -14622,9 +14375,7 @@ mod tests {
             let guard = lease
                 .try_acquire_producer(lease.stamp(), 1)
                 .expect("native producer guard");
-            assert!(
-                c.push(1, bytes, timestamp_ms, now_ms, guard).is_none()
-            );
+            assert!(c.push(1, bytes, timestamp_ms, now_ms, guard).is_none());
         }
 
         // Not due until >= window.
@@ -15274,13 +15025,7 @@ mod tests {
                 ),
             ])));
 
-            remove_runtime_pane_state_for_panes(
-                &[2, 3, 2],
-                &cursors,
-                &contexts,
-                &activity,
-            )
-            .await;
+            remove_runtime_pane_state_for_panes(&[2, 3, 2], &cursors, &contexts, &activity).await;
 
             assert_eq!(
                 cursors.read().await.keys().copied().collect::<Vec<_>>(),
@@ -17248,9 +16993,7 @@ mod tests {
         let mut schedule = CompletionTimedSchedule::new(start);
         assert!(!schedule.should_run(start, ten_minutes));
 
-        let operation_start = start
-            .checked_add(ten_minutes)
-            .expect("test due instant");
+        let operation_start = start.checked_add(ten_minutes).expect("test due instant");
         assert!(schedule.should_run(operation_start, ten_minutes));
         let long_completion = operation_start
             .checked_add(Duration::from_secs(7 * 60))
@@ -17265,12 +17008,14 @@ mod tests {
             ),
             "long maintenance must retain the full interval after completion"
         );
-        assert!(schedule.should_run(
-            long_completion
-                .checked_add(ten_minutes)
-                .expect("completion-based due instant"),
-            ten_minutes,
-        ));
+        assert!(
+            schedule.should_run(
+                long_completion
+                    .checked_add(ten_minutes)
+                    .expect("completion-based due instant"),
+                ten_minutes,
+            )
+        );
 
         let shorter = Duration::from_secs(60);
         assert!(
@@ -17282,12 +17027,14 @@ mod tests {
             ),
             "a shortened hot-reload interval is measured from the last completion"
         );
-        assert!(!schedule.should_run(
-            long_completion
-                .checked_add(Duration::from_secs(24 * 60 * 60))
-                .expect("disabled interval probe"),
-            Duration::ZERO,
-        ));
+        assert!(
+            !schedule.should_run(
+                long_completion
+                    .checked_add(Duration::from_secs(24 * 60 * 60))
+                    .expect("disabled interval probe"),
+                Duration::ZERO,
+            )
+        );
     }
 
     #[test]
@@ -17330,10 +17077,9 @@ mod tests {
             assert!(message.contains("17 durable segment deletions"));
             assert!(message.len() < 160, "receipt message must remain bounded");
 
-            let metadata: serde_json::Value = serde_json::from_str(
-                record.metadata.as_deref().expect("size receipt metadata"),
-            )
-            .expect("parse fixed-shape size receipt");
+            let metadata: serde_json::Value =
+                serde_json::from_str(record.metadata.as_deref().expect("size receipt metadata"))
+                    .expect("parse fixed-shape size receipt");
             assert_eq!(metadata["schema"], "size_retention_receipt.v1");
             assert_eq!(metadata["attempt_status"], expected_status);
             assert_eq!(metadata["retention_max_mb"], 4);
@@ -17392,9 +17138,8 @@ mod tests {
     fn vendored_streaming_identity_for_single_backend_uses_raw_pane_id() {
         let socket_paths = vec![PathBuf::from("/tmp/wa.sock")];
         let lease = test_capture_lease(42, CaptureSourceKind::VendoredStreaming);
-        let identity =
-            vendored_streaming_identity_for_pane(&socket_paths, 42, 3, lease.stamp())
-                .expect("single socket");
+        let identity = vendored_streaming_identity_for_pane(&socket_paths, 42, 3, lease.stamp())
+            .expect("single socket");
         assert_eq!(identity.global_pane_id, 42);
         assert_eq!(identity.local_pane_id, 42);
         assert_eq!(identity.socket_shard, ShardId(0));
@@ -17412,13 +17157,9 @@ mod tests {
         let global_pane_id =
             crate::sharding::encode_sharded_pane_id(crate::sharding::ShardId(1), 7);
         let lease = test_capture_lease(global_pane_id, CaptureSourceKind::VendoredStreaming);
-        let identity = vendored_streaming_identity_for_pane(
-            &socket_paths,
-            global_pane_id,
-            9,
-            lease.stamp(),
-        )
-        .expect("sharded socket");
+        let identity =
+            vendored_streaming_identity_for_pane(&socket_paths, global_pane_id, 9, lease.stamp())
+                .expect("sharded socket");
         assert_eq!(identity.global_pane_id, global_pane_id);
         assert_eq!(identity.local_pane_id, 7);
         assert_eq!(identity.socket_shard, ShardId(1));
@@ -17437,13 +17178,8 @@ mod tests {
             crate::sharding::encode_sharded_pane_id(crate::sharding::ShardId(3), 9);
         let lease = test_capture_lease(global_pane_id, CaptureSourceKind::VendoredStreaming);
         assert!(
-            vendored_streaming_identity_for_pane(
-                &socket_paths,
-                global_pane_id,
-                0,
-                lease.stamp(),
-            )
-            .is_none()
+            vendored_streaming_identity_for_pane(&socket_paths, global_pane_id, 0, lease.stamp(),)
+                .is_none()
         );
     }
 
@@ -17455,8 +17191,7 @@ mod tests {
             PathBuf::from("/tmp/wa-0.sock"),
             PathBuf::from("/tmp/wa-1.sock"),
         ];
-        let shard_one =
-            crate::sharding::encode_sharded_pane_id(crate::sharding::ShardId(1), 7);
+        let shard_one = crate::sharding::encode_sharded_pane_id(crate::sharding::ShardId(1), 7);
 
         assert!(vendored_streaming_route_for_pane(&one_socket, u64::MAX).is_none());
         assert!(vendored_streaming_route_for_pane(&one_socket, shard_one).is_none());
@@ -17479,30 +17214,18 @@ mod tests {
             PathBuf::from("/tmp/wa-1.sock"),
         ];
         let local_pane_id = 7;
-        let global_zero = crate::sharding::encode_sharded_pane_id(
-            crate::sharding::ShardId(0),
-            local_pane_id,
-        );
-        let global_one = crate::sharding::encode_sharded_pane_id(
-            crate::sharding::ShardId(1),
-            local_pane_id,
-        );
+        let global_zero =
+            crate::sharding::encode_sharded_pane_id(crate::sharding::ShardId(0), local_pane_id);
+        let global_one =
+            crate::sharding::encode_sharded_pane_id(crate::sharding::ShardId(1), local_pane_id);
         let lease_zero = test_capture_lease(global_zero, CaptureSourceKind::VendoredStreaming);
         let lease_one = test_capture_lease(global_one, CaptureSourceKind::VendoredStreaming);
-        let identity_zero = vendored_streaming_identity_for_pane(
-            &socket_paths,
-            global_zero,
-            2,
-            lease_zero.stamp(),
-        )
-        .expect("shard zero identity");
-        let identity_one = vendored_streaming_identity_for_pane(
-            &socket_paths,
-            global_one,
-            4,
-            lease_one.stamp(),
-        )
-        .expect("shard one identity");
+        let identity_zero =
+            vendored_streaming_identity_for_pane(&socket_paths, global_zero, 2, lease_zero.stamp())
+                .expect("shard zero identity");
+        let identity_one =
+            vendored_streaming_identity_for_pane(&socket_paths, global_one, 4, lease_one.stamp())
+                .expect("shard one identity");
 
         assert_eq!(identity_zero.local_pane_id, identity_one.local_pane_id);
         assert_ne!(identity_zero.global_pane_id, identity_one.global_pane_id);
@@ -17569,14 +17292,10 @@ mod tests {
                 PathBuf::from("/tmp/wa-1.sock"),
             ];
             let local_pane_id = 7;
-            let global_zero = crate::sharding::encode_sharded_pane_id(
-                crate::sharding::ShardId(0),
-                local_pane_id,
-            );
-            let global_one = crate::sharding::encode_sharded_pane_id(
-                crate::sharding::ShardId(1),
-                local_pane_id,
-            );
+            let global_zero =
+                crate::sharding::encode_sharded_pane_id(crate::sharding::ShardId(0), local_pane_id);
+            let global_one =
+                crate::sharding::encode_sharded_pane_id(crate::sharding::ShardId(1), local_pane_id);
             assert_ne!(global_zero, global_one);
 
             let (_dir, db_path) = temp_db_path();
@@ -17647,35 +17366,33 @@ mod tests {
                     },
                 ),
             ]);
-            let (_publication_tx, publication_rx) = watch::channel(
-                DiscoveryCapturePublication {
-                    epoch: 1,
-                    observed_panes: Arc::new(HashMap::from([
-                        (
-                            global_zero,
-                            ObservedCapturePane {
-                                info: make_pane(global_zero, "shard-zero"),
-                                generation: 2,
-                                pane_uuid: "shard-zero-uuid".to_string(),
-                                revision: revision_zero,
-                                requires_storage_resync: false,
-                            },
-                        ),
-                        (
-                            global_one,
-                            ObservedCapturePane {
-                                info: make_pane(global_one, "shard-one"),
-                                generation: 4,
-                                pane_uuid: "shard-one-uuid".to_string(),
-                                revision: revision_one,
-                                requires_storage_resync: false,
-                            },
-                        ),
-                    ])),
-                    transitioning_pane_ids: Arc::new(HashSet::new()),
-                    transitions: Arc::new(HashMap::new()),
-                },
-            );
+            let (_publication_tx, publication_rx) = watch::channel(DiscoveryCapturePublication {
+                epoch: 1,
+                observed_panes: Arc::new(HashMap::from([
+                    (
+                        global_zero,
+                        ObservedCapturePane {
+                            info: make_pane(global_zero, "shard-zero"),
+                            generation: 2,
+                            pane_uuid: "shard-zero-uuid".to_string(),
+                            revision: revision_zero,
+                            requires_storage_resync: false,
+                        },
+                    ),
+                    (
+                        global_one,
+                        ObservedCapturePane {
+                            info: make_pane(global_one, "shard-one"),
+                            generation: 4,
+                            pane_uuid: "shard-one-uuid".to_string(),
+                            revision: revision_one,
+                            requires_storage_resync: false,
+                        },
+                    ),
+                ])),
+                transitioning_pane_ids: Arc::new(HashSet::new()),
+                transitions: Arc::new(HashMap::new()),
+            });
 
             let (capture_tx, capture_rx) = mpsc::channel(4);
             let loop_cx = runtime_loop_cx();
@@ -17738,8 +17455,7 @@ mod tests {
 
             let (ring_tx, ring_rx) = spsc_channel(4);
             let relay = runtime.spawn_capture_relay_task(capture_rx, ring_tx);
-            let checkpoints: CaptureCheckpointCache =
-                Arc::new(StdMutex::new(LruCache::new(4)));
+            let checkpoints: CaptureCheckpointCache = Arc::new(StdMutex::new(LruCache::new(4)));
             let persistence = runtime.spawn_persistence_task(
                 ring_rx,
                 Arc::clone(&runtime.cursors),
@@ -17775,8 +17491,7 @@ mod tests {
     fn vendored_streaming_rejects_mismatched_local_id_before_bridge() {
         run_async_test(async {
             let global_pane_id = crate::sharding::encode_sharded_pane_id(ShardId(1), 7);
-            let lease =
-                test_capture_lease(global_pane_id, CaptureSourceKind::VendoredStreaming);
+            let lease = test_capture_lease(global_pane_id, CaptureSourceKind::VendoredStreaming);
             let identity = test_streaming_identity(global_pane_id, 7, 1, 5, &lease);
             for mismatched_delta in [
                 PaneDelta::Gap {

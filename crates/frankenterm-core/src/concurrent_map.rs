@@ -649,12 +649,7 @@ impl<V> PaneMap<V> {
         let mut guards = self
             .shards
             .iter()
-            .map(|shard| {
-                shard
-                    .map
-                    .write()
-                    .unwrap_or_else(record_poison_and_recover)
-            })
+            .map(|shard| shard.map.write().unwrap_or_else(record_poison_and_recover))
             .collect::<Vec<_>>();
         for (guard, replacement) in guards.iter_mut().zip(&mut replacements) {
             std::mem::swap(&mut **guard, replacement);

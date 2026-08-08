@@ -191,8 +191,8 @@ async fn connect_client(socket_path: &Path) -> DirectMuxClient {
     Box::pin(DirectMuxClient::connect(
         DirectMuxClientConfig::default().with_socket_path(socket_path),
     ))
-        .await
-        .expect("connect DirectMuxClient")
+    .await
+    .expect("connect DirectMuxClient")
 }
 
 fn bench_pdu_encode_write(c: &mut Criterion) {

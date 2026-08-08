@@ -43,7 +43,7 @@ use super::{
     EmbedError, Embedder, EmbedderInfo, EmbedderTier, FusedResult, HashEmbedder,
     HybridSearchService, SearchMode, TwoTierMetrics,
 };
-use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;

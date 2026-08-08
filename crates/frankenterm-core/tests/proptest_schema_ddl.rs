@@ -142,8 +142,7 @@ fn schema_ddl_required_tables_are_declared_once() {
 #[test]
 fn schema_ddl_required_indexes_target_expected_tables() {
     for &(index_name, table_name) in REQUIRED_INDEXES {
-        let declaration_start =
-            unique_declaration_start("CREATE INDEX IF NOT EXISTS ", index_name);
+        let declaration_start = unique_declaration_start("CREATE INDEX IF NOT EXISTS ", index_name);
         // Include the opening column-list delimiter so a similarly prefixed
         // table (for example `events_archive`) cannot satisfy an `events`
         // target assertion.
@@ -166,8 +165,7 @@ fn schema_ddl_required_indexes_target_expected_tables() {
 #[test]
 fn schema_ddl_output_segment_fts_triggers_keep_expected_actions() {
     for &(trigger_name, trigger_timing, fts_action) in OUTPUT_SEGMENT_TRIGGERS {
-        let trigger_start =
-            unique_declaration_start("CREATE TRIGGER IF NOT EXISTS ", trigger_name);
+        let trigger_start = unique_declaration_start("CREATE TRIGGER IF NOT EXISTS ", trigger_name);
         let trigger_tail = &SCHEMA_SQL[trigger_start..];
         let trigger_end = trigger_tail
             .find("\nEND;")

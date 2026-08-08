@@ -510,12 +510,8 @@ mod web_tests {
                 .build();
             let cx = frankenterm_core::cx::for_request();
 
-            let result = FrameworkWebRuntime::start_with_cx(
-                &cx,
-                occupied_addr.to_string(),
-                app,
-            )
-            .await;
+            let result =
+                FrameworkWebRuntime::start_with_cx(&cx, occupied_addr.to_string(), app).await;
 
             let error = result.err().expect("occupied address must fail startup");
             let error_message = error.to_string();
@@ -591,13 +587,10 @@ mod web_tests {
                 })
                 .build();
             let start_cx = frankenterm_core::cx::for_request();
-            let (addr, mut runtime) = FrameworkWebRuntime::start_with_cx(
-                &start_cx,
-                "127.0.0.1:0".to_string(),
-                app,
-            )
-            .await
-            .expect("framework server should start");
+            let (addr, mut runtime) =
+                FrameworkWebRuntime::start_with_cx(&start_cx, "127.0.0.1:0".to_string(), app)
+                    .await
+                    .expect("framework server should start");
             let response = fetch_health(addr)
                 .await
                 .expect("framework server should answer before shutdown");
@@ -654,20 +647,15 @@ mod web_tests {
                 })
                 .build();
             let cx = frankenterm_core::cx::for_request();
-            let (addr, mut runtime) = FrameworkWebRuntime::start_with_cx(
-                &cx,
-                "127.0.0.1:0".to_string(),
-                app,
-            )
-            .await
-            .expect("framework server should start");
+            let (addr, mut runtime) =
+                FrameworkWebRuntime::start_with_cx(&cx, "127.0.0.1:0".to_string(), app)
+                    .await
+                    .expect("framework server should start");
             let mut client = TcpStream::connect(addr)
                 .await
                 .expect("stuck-handler client should connect");
             client
-                .write_all(
-                    b"GET /stuck HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-                )
+                .write_all(b"GET /stuck HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
                 .await
                 .expect("stuck-handler request should write");
 

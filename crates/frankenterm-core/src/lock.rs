@@ -146,10 +146,7 @@ fn require_external_advisory_lock(
 ) -> Result<(), LockSidecarReadFailure> {
     match file.try_lock_exclusive() {
         Err(error) if is_lock_contended(&error) => Ok(()),
-        Ok(()) => Err(LockSidecarReadFailure::new(
-            phase,
-            "holder_binding_missing",
-        )),
+        Ok(()) => Err(LockSidecarReadFailure::new(phase, "holder_binding_missing")),
         Err(error) => Err(stable_io_failure(phase, &error)),
     }
 }
@@ -267,10 +264,7 @@ fn require_same_metadata_observation(
     match metadata_observations_match(left, right) {
         Some(true) => Ok(()),
         Some(false) => Err(LockSidecarReadFailure::new(phase, "metadata_changed")),
-        None => Err(LockSidecarReadFailure::new(
-            phase,
-            "timestamp_unavailable",
-        )),
+        None => Err(LockSidecarReadFailure::new(phase, "timestamp_unavailable")),
     }
 }
 
@@ -307,10 +301,9 @@ fn require_same_metadata_identity(
             phase,
             "namespace_identity_changed",
         )),
-        None if cfg!(any(unix, windows)) => Err(LockSidecarReadFailure::new(
-            phase,
-            "identity_unavailable",
-        )),
+        None if cfg!(any(unix, windows)) => {
+            Err(LockSidecarReadFailure::new(phase, "identity_unavailable"))
+        }
         None => Ok(()),
     }
 }
@@ -364,7 +357,9 @@ fn read_lock_sidecar_bytes_in_directory_admitted_with_hook(
 
     after_open();
 
-    let read_limit = u64::try_from(max_bytes).unwrap_or(u64::MAX).saturating_add(1);
+    let read_limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
     let mut raw = Vec::with_capacity(max_bytes.saturating_add(1));
     (&mut file)
         .take(read_limit)
@@ -411,11 +406,7 @@ fn read_lock_sidecar_bytes_admitted_with_hook(
     let directory = CapDir::open_ambient_dir(parent, cap_std::ambient_authority())
         .map_err(|error| stable_io_failure("parent_open", &error))?;
     read_lock_sidecar_bytes_in_directory_admitted_with_hook(
-        &directory,
-        name,
-        max_bytes,
-        false,
-        after_open,
+        &directory, name, max_bytes, false, after_open,
     )
     .map(|admitted| admitted.raw)
 }
@@ -443,11 +434,8 @@ fn read_lock_metadata_admitted_with_hook(
     meta_path: &Path,
     after_open: impl FnOnce(),
 ) -> Result<LockMetadata, LockSidecarReadFailure> {
-    let raw = read_lock_sidecar_bytes_admitted_with_hook(
-        meta_path,
-        MAX_LOCK_METADATA_BYTES,
-        after_open,
-    )?;
+    let raw =
+        read_lock_sidecar_bytes_admitted_with_hook(meta_path, MAX_LOCK_METADATA_BYTES, after_open)?;
     decode_lock_metadata(&raw)
 }
 
@@ -612,10 +600,7 @@ fn open_lock_leaf_nofollow_with_hook(
                     return Err(LockSidecarReadFailure::new("lock_open", "symlink"));
                 }
                 if !current.is_file() {
-                    return Err(LockSidecarReadFailure::new(
-                        "lock_open",
-                        "not_regular_file",
-                    ));
+                    return Err(LockSidecarReadFailure::new("lock_open", "not_regular_file"));
                 }
             }
             return Err(stable_io_failure("lock_open", &error));
@@ -1438,11 +1423,9 @@ fn probe_held_lock_metadata_with_hooks(
     // a no-op, then revalidates both the exact sidecar inode and its holder lock
     // after the main lock has been proven contended a second time.
     after_main_lock_reprobe();
-    if let Err(failure) = verify_retained_lock_metadata_authority(
-        &opened.directory,
-        &meta_name,
-        &admitted,
-    ) {
+    if let Err(failure) =
+        verify_retained_lock_metadata_authority(&opened.directory, &meta_name, &admitted)
+    {
         return reconcile_metadata_failure_with_main_lock(opened, failure);
     }
 
@@ -1483,21 +1466,19 @@ fn check_running_with_hooks(
 
     // Try to acquire lock - if it fails, something is holding it
     match opened.file.try_lock_exclusive() {
-        Ok(()) => {
-            match opened.verify_namespace() {
-                Ok(()) => LockStatus::Free,
-                Err(failure) => {
-                    tracing::warn!(
-                        target: "frankenterm::lock",
-                        event = "ft-interactive-systems-performance-4tenz.53",
-                        phase = failure.phase,
-                        kind = failure.kind,
-                        "watcher lock status probe changed during verification"
-                    );
-                    LockStatus::ProbeUnavailable
-                }
+        Ok(()) => match opened.verify_namespace() {
+            Ok(()) => LockStatus::Free,
+            Err(failure) => {
+                tracing::warn!(
+                    target: "frankenterm::lock",
+                    event = "ft-interactive-systems-performance-4tenz.53",
+                    phase = failure.phase,
+                    kind = failure.kind,
+                    "watcher lock status probe changed during verification"
+                );
+                LockStatus::ProbeUnavailable
             }
-        }
+        },
         Err(e) if is_lock_contended(&e) => {
             if let Err(failure) = opened.verify_namespace() {
                 tracing::warn!(
@@ -1826,10 +1807,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("watch.lock");
         let handoff_path = watcher_handoff_path(&lock_path);
-        let mut value = serde_json::to_value(WatcherHandoffRecord::drain_requested(
-            7, 100, 200,
-        ))
-        .unwrap();
+        let mut value =
+            serde_json::to_value(WatcherHandoffRecord::drain_requested(7, 100, 200)).unwrap();
         value
             .as_object_mut()
             .unwrap()
@@ -1879,9 +1858,7 @@ mod tests {
 
         assert!(matches!(
             read_watcher_handoff_record(&lock_path),
-            Err(LockError::HandoffRead(
-                WatcherHandoffReadError::Oversized
-            ))
+            Err(LockError::HandoffRead(WatcherHandoffReadError::Oversized))
         ));
         assert_eq!(watcher_handoff_admission_failure_count(), 1);
     }
@@ -2104,9 +2081,7 @@ mod tests {
 
         assert!(matches!(
             WatcherLock::acquire(&lock_path),
-            Err(LockError::LockPath(
-                LockPathAdmissionError::NotRegularFile
-            ))
+            Err(LockError::LockPath(LockPathAdmissionError::NotRegularFile))
         ));
         assert_eq!(check_running(&lock_path), LockStatus::ProbeUnavailable);
     }
@@ -2173,7 +2148,10 @@ mod tests {
             ),
             Err(LockError::SidecarWrite(LockSidecarWriteError::Symlink))
         ));
-        assert_eq!(fs::read_to_string(&target).unwrap(), "handoff-target-canary");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "handoff-target-canary"
+        );
     }
 
     #[cfg(unix)]
@@ -2713,7 +2691,11 @@ mod metadata_admission_tests {
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("target.meta");
         let link = tmp.path().join("link.meta");
-        fs::write(&target, serde_json::to_vec(&well_formed_metadata()).unwrap()).unwrap();
+        fs::write(
+            &target,
+            serde_json::to_vec(&well_formed_metadata()).unwrap(),
+        )
+        .unwrap();
         symlink(&target, &link).unwrap();
 
         let failure = read_lock_metadata(&link).unwrap_err();

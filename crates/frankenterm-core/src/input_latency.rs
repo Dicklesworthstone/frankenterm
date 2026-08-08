@@ -134,10 +134,7 @@ where
                 // `T`; an adversarial oversize element may itself own an
                 // allocation much larger than this container's bound.
                 if access.next_element::<de::IgnoredAny>()?.is_some() {
-                    return Err(de::Error::invalid_length(
-                        MAX.saturating_add(1),
-                        &self,
-                    ));
+                    return Err(de::Error::invalid_length(MAX.saturating_add(1), &self));
                 }
                 Ok(BoundedVec(values))
             }
@@ -405,10 +402,7 @@ impl InputLatencyMeasurement {
     /// percentile can be computed.
     #[cfg(test)]
     #[must_use]
-    fn from_stages(
-        id: u64,
-        stages: BTreeMap<InputLatencyStage, InputLatencyTimestamp>,
-    ) -> Self {
+    fn from_stages(id: u64, stages: BTreeMap<InputLatencyStage, InputLatencyTimestamp>) -> Self {
         Self {
             id,
             stages,
@@ -535,14 +529,15 @@ impl InputLatencyMeasurement {
                 to_clock_domain_id: to_timestamp.clock_domain_id,
             });
         }
-        to_timestamp.timestamp_us.checked_sub(from_timestamp.timestamp_us).ok_or(
-            InputLatencyMeasurementError::TimestampRegression {
+        to_timestamp
+            .timestamp_us
+            .checked_sub(from_timestamp.timestamp_us)
+            .ok_or(InputLatencyMeasurementError::TimestampRegression {
                 from,
                 to,
                 from_timestamp_us: from_timestamp.timestamp_us,
                 to_timestamp_us: to_timestamp.timestamp_us,
-            },
-        )
+            })
     }
 
     /// Number of stages recorded.
@@ -722,9 +717,7 @@ impl<'de> Deserialize<'de> for InputLatencyCollector {
             next_id: wire.next_id,
             id_exhausted: wire.id_exhausted,
         };
-        collector
-            .validate_structure()
-            .map_err(de::Error::custom)?;
+        collector.validate_structure().map_err(de::Error::custom)?;
         Ok(collector)
     }
 }
@@ -1005,10 +998,7 @@ pub struct InputLatencyBudget {
 
 // Serde's `serialize_with` field adapter contract requires the value as `&T`.
 #[allow(clippy::trivially_copy_pass_by_ref)]
-fn serialize_regression_threshold_bits<S>(
-    value: &f64,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
+fn serialize_regression_threshold_bits<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
@@ -1357,21 +1347,19 @@ fn validate_budget(budget: &InputLatencyBudget) -> Result<(), InputLatencyBudget
         }
     }
 
-    for &budget_us in budget
-        .aggregate
-        .values()
-        .chain(budget.stages.iter().flat_map(|stage| stage.targets.values()))
-    {
+    for &budget_us in budget.aggregate.values().chain(
+        budget
+            .stages
+            .iter()
+            .flat_map(|stage| stage.targets.values()),
+    ) {
         effective_budget_us(budget_us, budget.regression_threshold)?;
     }
 
     Ok(())
 }
 
-fn effective_budget_us(
-    budget_us: u64,
-    threshold: f64,
-) -> Result<u64, InputLatencyBudgetError> {
+fn effective_budget_us(budget_us: u64, threshold: f64) -> Result<u64, InputLatencyBudgetError> {
     if !threshold.is_finite() || threshold <= 0.0 {
         return Err(InputLatencyBudgetError::InvalidRegressionThreshold {
             value_bits: threshold.to_bits(),
@@ -1394,7 +1382,10 @@ fn effective_budget_us(
     let encoded_exponent = ((bits >> FRACTION_BITS) & 0x7ff) as i32;
     let fraction = bits & FRACTION_MASK;
     let (significand, exponent) = if encoded_exponent == 0 {
-        (u128::from(fraction), 1 - EXPONENT_BIAS - FRACTION_BITS as i32)
+        (
+            u128::from(fraction),
+            1 - EXPONENT_BIAS - FRACTION_BITS as i32,
+        )
     } else {
         (
             u128::from((1_u64 << FRACTION_BITS) | fraction),
@@ -1511,25 +1502,28 @@ pub fn evaluate_budget(
             return failed_budget_check(collector, budget, None, Some(error), reason_code);
         };
         for (&percentile, &budget_us) in &stage_budget.targets {
-            let measured_us = match collector.stage_latency_percentile(
-                from,
-                stage_budget.stage,
-                percentile,
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    let reason_code = error.reason_code();
-                    return failed_budget_check(collector, budget, Some(error), None, reason_code);
-                }
-            };
-            let effective_budget =
-                match effective_budget_us(budget_us, budget.regression_threshold) {
+            let measured_us =
+                match collector.stage_latency_percentile(from, stage_budget.stage, percentile) {
                     Ok(value) => value,
                     Err(error) => {
                         let reason_code = error.reason_code();
-                        return failed_budget_check(collector, budget, None, Some(error), reason_code);
+                        return failed_budget_check(
+                            collector,
+                            budget,
+                            Some(error),
+                            None,
+                            reason_code,
+                        );
                     }
                 };
+            let effective_budget = match effective_budget_us(budget_us, budget.regression_threshold)
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    let reason_code = error.reason_code();
+                    return failed_budget_check(collector, budget, None, Some(error), reason_code);
+                }
+            };
             let passed = measured_us <= effective_budget;
             if !passed {
                 all_passed = false;
@@ -2126,14 +2120,7 @@ mod tests {
             effective_budget_us(u64::MAX, 2.0),
             Err(InputLatencyBudgetError::EffectiveBudgetOverflow { .. })
         ));
-        for threshold in [
-            f64::NAN,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            -1.0,
-            -0.0,
-            0.0,
-        ] {
+        for threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, -0.0, 0.0] {
             assert!(matches!(
                 effective_budget_us(1, threshold),
                 Err(InputLatencyBudgetError::InvalidRegressionThreshold { value_bits })
@@ -2147,14 +2134,7 @@ mod tests {
         let mut collector = InputLatencyCollector::new(1);
         record_measurement(&mut collector, 1000, 100);
 
-        for threshold in [
-            f64::NAN,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            -1.0,
-            -0.0,
-            0.0,
-        ] {
+        for threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, -0.0, 0.0] {
             let budget = InputLatencyBudget {
                 regression_threshold: threshold,
                 ..Default::default()
@@ -2230,9 +2210,11 @@ mod tests {
         };
         let result = evaluate_budget(&collector, &budget);
         assert!(!result.passed);
-        assert!(result.details.iter().any(|detail| {
-            detail.stage == Some(InputLatencyStage::PtyWrite) && !detail.passed
-        }));
+        assert!(
+            result.details.iter().any(|detail| {
+                detail.stage == Some(InputLatencyStage::PtyWrite) && !detail.passed
+            })
+        );
     }
 
     #[test]
@@ -2292,7 +2274,10 @@ mod tests {
         assert_eq!(report.admitted_sample_count, 20);
         assert_eq!(report.schema_version, INPUT_LATENCY_REPORT_SCHEMA_VERSION);
         assert_eq!(report.evidence_class, InputLatencyEvidenceClass::ProxyOnly);
-        assert_eq!(report.evidence_status, InputLatencyEvidenceStatus::ValidProxy);
+        assert_eq!(
+            report.evidence_status,
+            InputLatencyEvidenceStatus::ValidProxy
+        );
         assert!(report.evidence_error.is_none());
         assert!(!report.percentiles.is_empty());
         assert!(!report.stage_breakdown_p50.is_empty());
@@ -2417,9 +2402,7 @@ mod tests {
             .remove("recording_faults");
         measurement_value["stages"]["key_event"]["future_clock_authority"] =
             serde_json::json!(true);
-        assert!(
-            serde_json::from_value::<InputLatencyMeasurement>(measurement_value).is_err()
-        );
+        assert!(serde_json::from_value::<InputLatencyMeasurement>(measurement_value).is_err());
 
         for label in ["producer_id", "clock_domain_id"] {
             let mut zero_label = serde_json::to_value(&measurement).unwrap();
@@ -2453,7 +2436,10 @@ mod tests {
         let json = serde_json::to_string(&collector).unwrap();
         let mut back: InputLatencyCollector = serde_json::from_str(&json).unwrap();
         assert_eq!(back.count(), 5);
-        assert_eq!(back.schema_version(), INPUT_LATENCY_COLLECTOR_SCHEMA_VERSION);
+        assert_eq!(
+            back.schema_version(),
+            INPUT_LATENCY_COLLECTOR_SCHEMA_VERSION
+        );
         assert_eq!(back.begin_measurement().unwrap().id, 6);
     }
 
@@ -2524,10 +2510,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(&json).unwrap();
             assert_eq!(
                 value["regression_threshold_bits"],
-                serde_json::json!(format!(
-                    "0x{:016x}",
-                    regression_threshold.to_bits()
-                ))
+                serde_json::json!(format!("0x{:016x}", regression_threshold.to_bits()))
             );
             assert!(value.get("regression_threshold").is_none());
             let back: InputLatencyBudget = serde_json::from_str(&json).unwrap();

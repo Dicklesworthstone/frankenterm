@@ -41,12 +41,11 @@ pub use fastmcp::{
 #[cfg(feature = "mcp")]
 #[allow(unused_imports)]
 pub use fastmcp::{
-    JsonRpcMessage as FrameworkJsonRpcMessage,
-    Prompt as FrameworkPrompt,
+    JsonRpcMessage as FrameworkJsonRpcMessage, Prompt as FrameworkPrompt,
     Resource as FrameworkResource, ResourceContent as FrameworkResourceContent,
     ResourceHandler as FrameworkResourceHandler, ResourceTemplate as FrameworkResourceTemplate,
-    ServerCapabilities as FrameworkServerCapabilities, ServerInfo as FrameworkServerInfo,
     Server as FrameworkServer, ServerBuilder as FrameworkServerBuilder,
+    ServerCapabilities as FrameworkServerCapabilities, ServerInfo as FrameworkServerInfo,
     StdioTransport as FrameworkStdioTransport, ToolHandler as FrameworkToolHandler,
     Transport as FrameworkTransport, TransportError as FrameworkTransportError,
 };
@@ -419,10 +418,11 @@ impl FrameworkDeliveryServer {
     where
         T: FrameworkDeliveryAcknowledgingTransport + Send + 'static,
     {
-        self.inner.run_transport(FrameworkDeliveryAwareTransport::new(
-            transport,
-            self.coordinator,
-        ))
+        self.inner
+            .run_transport(FrameworkDeliveryAwareTransport::new(
+                transport,
+                self.coordinator,
+            ))
     }
 
     /// Run forever on an acknowledgment-capable transport with an explicit context.

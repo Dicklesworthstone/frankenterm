@@ -340,7 +340,9 @@ pub static FT_1024: ErrorCodeDef = ErrorCodeDef {
     recovery_steps: &[
         RecoveryStep::with_command("Reconcile live pane state", "ft list"),
         RecoveryStep::with_command("Inspect machine state", "ft robot state"),
-        RecoveryStep::text("Do not blindly replay the mutation; verify its intended postcondition first"),
+        RecoveryStep::text(
+            "Do not blindly replay the mutation; verify its intended postcondition first",
+        ),
     ],
     doc_link: None,
 };
@@ -360,7 +362,9 @@ pub static FT_1030: ErrorCodeDef = ErrorCodeDef {
     recovery_steps: &[
         RecoveryStep::with_command("Check FrankenTerm status", "ft status"),
         RecoveryStep::with_command("Run diagnostics", "ft doctor"),
-        RecoveryStep::text("Wait for the reported cooldown before retrying, and repair the backend if failures continue"),
+        RecoveryStep::text(
+            "Wait for the reported cooldown before retrying, and repair the backend if failures continue",
+        ),
     ],
     doc_link: None,
 };
@@ -540,7 +544,9 @@ pub static FT_2009: ErrorCodeDef = ErrorCodeDef {
     recovery_steps: &[
         RecoveryStep::text("Reconcile the affected durable record before retrying"),
         RecoveryStep::with_command("Run diagnostics", "ft doctor"),
-        RecoveryStep::text("Retry only after proving the original mutation did not commit or after deriving an idempotent continuation"),
+        RecoveryStep::text(
+            "Retry only after proving the original mutation did not commit or after deriving an idempotent continuation",
+        ),
     ],
     doc_link: None,
 };
@@ -658,8 +664,12 @@ pub static FT_2051: ErrorCodeDef = ErrorCodeDef {
         "A lease token or finalization label exceeds its byte limit",
     ],
     recovery_steps: &[
-        RecoveryStep::text("Rebuild the request with positive event IDs and non-empty exact lease tokens"),
-        RecoveryStep::text("Page batches at the advertised maximum and keep tokens and labels within their byte limits"),
+        RecoveryStep::text(
+            "Rebuild the request with positive event IDs and non-empty exact lease tokens",
+        ),
+        RecoveryStep::text(
+            "Page batches at the advertised maximum and keep tokens and labels within their byte limits",
+        ),
         RecoveryStep::text("Do not retry the unchanged invalid request"),
     ],
     doc_link: None,
@@ -678,7 +688,9 @@ pub static FT_2052: ErrorCodeDef = ErrorCodeDef {
     ],
     recovery_steps: &[
         RecoveryStep::text("Rebuild the batch with at most one exact token for each event"),
-        RecoveryStep::text("Discard stale ownership and acquire a fresh lease when authority is uncertain"),
+        RecoveryStep::text(
+            "Discard stale ownership and acquire a fresh lease when authority is uncertain",
+        ),
         RecoveryStep::text("Do not retry the contradictory batch unchanged"),
     ],
     doc_link: None,
@@ -716,7 +728,9 @@ pub static FT_2054: ErrorCodeDef = ErrorCodeDef {
         "The store is temporarily busy or could not be opened",
     ],
     recovery_steps: &[
-        RecoveryStep::text("Correct deterministic request, schema, path, or capacity failures before retrying"),
+        RecoveryStep::text(
+            "Correct deterministic request, schema, path, or capacity failures before retrying",
+        ),
         RecoveryStep::text("Retry only a typed busy or transient open failure"),
         RecoveryStep::with_command("Run diagnostics", "ft doctor"),
     ],
@@ -737,7 +751,9 @@ pub static FT_2055: ErrorCodeDef = ErrorCodeDef {
     recovery_steps: &[
         RecoveryStep::text("Treat the command outcome as unknown and reconcile durable state"),
         RecoveryStep::with_command("Run diagnostics", "ft doctor"),
-        RecoveryStep::text("A later shutdown call may observe the retained join receipt; do not assume the writer detached"),
+        RecoveryStep::text(
+            "A later shutdown call may observe the retained join receipt; do not assume the writer detached",
+        ),
     ],
     doc_link: None,
 };
@@ -2090,7 +2106,11 @@ mod tests {
         let def = get_error_code("FT-1030").expect("circuit-open code");
         assert_eq!(def.category, ErrorCategory::Wezterm);
         assert!(def.title.to_ascii_lowercase().contains("circuit"));
-        assert!(def.description.to_ascii_lowercase().contains("not dispatched"));
+        assert!(
+            def.description
+                .to_ascii_lowercase()
+                .contains("not dispatched")
+        );
         assert!(!def.title.to_ascii_lowercase().contains("parse"));
         assert!(
             def.recovery_steps
@@ -2143,7 +2163,8 @@ mod tests {
             assert!(
                 def.recovery_steps
                     .iter()
-                    .any(|step| step.description.contains("Open") || step.description.contains("open"))
+                    .any(|step| step.description.contains("Open")
+                        || step.description.contains("open"))
             );
         }
     }

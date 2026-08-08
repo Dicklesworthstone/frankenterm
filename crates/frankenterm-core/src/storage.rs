@@ -32,10 +32,10 @@ use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::{
     collections::{HashMap, VecDeque, hash_map::DefaultHasher},
@@ -48,19 +48,16 @@ use frankenterm_core_audit_types::storage_audit::AuditFieldRedactor;
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{EventDeliveryLeaseBatchError, Result, StorageError};
+use crate::capture_authority::CapturePersistenceHold;
 use crate::checkpoint_witness::{
-    CHECKPOINT_ROLE_SNAPSHOT, MAX_CHECKPOINT_METADATA_BYTES,
-    MAX_CHECKPOINT_SESSION_ID_BYTES, MAX_CHECKPOINT_TYPE_BYTES,
-    MAX_PERSISTED_CHECKPOINT_TEXT_BYTES, MAX_PERSISTED_PANE_TEXT_BYTES,
+    CHECKPOINT_ROLE_SNAPSHOT, MAX_CHECKPOINT_METADATA_BYTES, MAX_CHECKPOINT_SESSION_ID_BYTES,
+    MAX_CHECKPOINT_TYPE_BYTES, MAX_PERSISTED_CHECKPOINT_TEXT_BYTES, MAX_PERSISTED_PANE_TEXT_BYTES,
     MAX_SESSION_FT_VERSION_BYTES, MAX_SESSION_HOST_ID_BYTES, PersistedPaneState,
     canonical_json_string as canonical_checkpoint_json_string, checkpoint_witness,
     persisted_pane_text_bytes,
 };
-use crate::capture_authority::CapturePersistenceHold;
-use crate::config::{
-    CompiledRetentionPolicy, RetentionTier, compile_retention_policy_tiers,
-};
+use crate::config::{CompiledRetentionPolicy, RetentionTier, compile_retention_policy_tiers};
+use crate::error::{EventDeliveryLeaseBatchError, Result, StorageError};
 use crate::events::event_identity_key;
 use crate::lru_cache::LruCache;
 use crate::policy::Redactor;
@@ -72,6 +69,7 @@ use crate::redactor::DEFAULT_STREAMING_REDACTOR_TAIL_BYTES;
 use crate::runtime_async::mpsc;
 use crate::runtime_telemetry::{SwarmCapacityStage, SwarmCapacityStageTimer};
 use crate::search::{FusionBackend, HybridSearchService, SearchMode};
+use crate::session_topology::{MAX_SNAPSHOT_BYTES, MAX_TOPOLOGY_PANES};
 use crate::storage::io_scheduler::{
     StorageIoAdmissionDecision, StorageIoClass, StorageIoScheduler, StorageIoSchedulerConfig,
     StorageIoWorkItem,
@@ -83,7 +81,6 @@ use crate::storage_backend_trait::with_test_storage_backend;
 use crate::storage_backend_trait::{
     BackendError, RusqliteBackend, SqlCell, StorageBackend, ToSqlValue,
 };
-use crate::session_topology::{MAX_SNAPSHOT_BYTES, MAX_TOPOLOGY_PANES};
 use crate::storage_pane_id_set::{PaneIdSet, PaneIdTempTablePlan};
 use crate::storage_telemetry::StoragePipelineSnapshot;
 #[cfg(test)]
@@ -125,8 +122,7 @@ pub const EVENT_DELIVERY_WORKFLOW_ID_MAX_BYTES: usize = 1_024;
 
 // Keep hot-path SQL in one place so execution and EXPLAIN-plan regression
 // tests cannot silently drift apart.
-const QUERY_UNHANDLED_EVENTS_NEWEST_SQL: &str =
-    r"SELECT id, pane_id, rule_id, agent_type, event_type, severity, confidence,
+const QUERY_UNHANDLED_EVENTS_NEWEST_SQL: &str = r"SELECT id, pane_id, rule_id, agent_type, event_type, severity, confidence,
      extracted, matched_text, segment_id, detected_at, dedupe_key, handled_at,
      handled_by_workflow_id, handled_status
      FROM events
@@ -134,14 +130,12 @@ const QUERY_UNHANDLED_EVENTS_NEWEST_SQL: &str =
      ORDER BY detected_at DESC, id DESC
      LIMIT ?1";
 
-const QUERY_UNHANDLED_EVENT_COUNTS_SQL: &str =
-    r"SELECT pane_id, COUNT(*) AS cnt
+const QUERY_UNHANDLED_EVENT_COUNTS_SQL: &str = r"SELECT pane_id, COUNT(*) AS cnt
       FROM events
       WHERE handled_at IS NULL
       GROUP BY pane_id";
 
-const QUERY_UNHANDLED_EVENT_COUNTS_BULK_SQL: &str =
-    r"WITH requested(pane_id) AS (
+const QUERY_UNHANDLED_EVENT_COUNTS_BULK_SQL: &str = r"WITH requested(pane_id) AS (
          SELECT CAST(requested_json.value AS INTEGER)
          FROM json_each(?1) AS requested_json
          WHERE requested_json.type = 'integer'
@@ -155,15 +149,13 @@ const QUERY_UNHANDLED_EVENT_COUNTS_BULK_SQL: &str =
             )
      FROM requested";
 
-const QUERY_PANE_LAST_OUTPUT_AT_SQL: &str =
-    r"SELECT captured_at
+const QUERY_PANE_LAST_OUTPUT_AT_SQL: &str = r"SELECT captured_at
       FROM output_segments
       WHERE pane_id = ?1
       ORDER BY captured_at DESC
       LIMIT 1";
 
-const QUERY_PANE_LAST_OUTPUT_AT_BULK_SQL: &str =
-    r"WITH requested(pane_id) AS (
+const QUERY_PANE_LAST_OUTPUT_AT_BULK_SQL: &str = r"WITH requested(pane_id) AS (
          SELECT CAST(requested_json.value AS INTEGER)
          FROM json_each(?1) AS requested_json
          WHERE requested_json.type = 'integer'
@@ -179,8 +171,7 @@ const QUERY_PANE_LAST_OUTPUT_AT_BULK_SQL: &str =
      FROM requested
      JOIN panes ON panes.pane_id = requested.pane_id";
 
-const QUERY_LAST_ACTIVITY_BY_PANE_SQL: &str =
-    r"SELECT panes.pane_id,
+const QUERY_LAST_ACTIVITY_BY_PANE_SQL: &str = r"SELECT panes.pane_id,
               (
                   SELECT output_segments.captured_at
                   FROM output_segments
@@ -191,8 +182,7 @@ const QUERY_LAST_ACTIVITY_BY_PANE_SQL: &str =
        FROM panes
        ORDER BY panes.pane_id ASC";
 
-const FINALIZE_EVENT_DELIVERY_LEASES_BULK_SQL: &str =
-    r"WITH requested(event_id, token) AS (
+const FINALIZE_EVENT_DELIVERY_LEASES_BULK_SQL: &str = r"WITH requested(event_id, token) AS (
          SELECT CAST(json_extract(lease_json.value, '$[0]') AS INTEGER),
                 json_extract(lease_json.value, '$[1]')
          FROM json_each(?1) AS lease_json
@@ -212,8 +202,7 @@ const FINALIZE_EVENT_DELIVERY_LEASES_BULK_SQL: &str =
        )
      RETURNING id";
 
-const RELEASE_EVENT_DELIVERY_LEASES_BULK_SQL: &str =
-    r"WITH requested(event_id, token) AS (
+const RELEASE_EVENT_DELIVERY_LEASES_BULK_SQL: &str = r"WITH requested(event_id, token) AS (
          SELECT CAST(json_extract(lease_json.value, '$[0]') AS INTEGER),
                 json_extract(lease_json.value, '$[1]')
          FROM json_each(?1) AS lease_json
@@ -397,14 +386,16 @@ struct CompiledRetentionDeleteBatch {
 
 impl CompiledRetentionDeleteBatch {
     fn total_deleted(&self) -> Result<usize> {
-        self.deleted_by_branch.iter().try_fold(0usize, |total, deleted| {
-            total.checked_add(*deleted).ok_or_else(|| {
-                StorageError::Database(
-                    "compiled retention batch deleted-row count overflow".to_string(),
-                )
-                .into()
+        self.deleted_by_branch
+            .iter()
+            .try_fold(0usize, |total, deleted| {
+                total.checked_add(*deleted).ok_or_else(|| {
+                    StorageError::Database(
+                        "compiled retention batch deleted-row count overflow".to_string(),
+                    )
+                    .into()
+                })
             })
-        })
     }
 }
 
@@ -2050,10 +2041,7 @@ const WRITER_TERMINAL_ADMISSION_CLOSED: usize = 1usize << (usize::BITS - 1);
 const WRITER_TERMINAL_ADMISSION_COUNT_MASK: usize = WRITER_TERMINAL_ADMISSION_CLOSED - 1;
 
 impl<'a> WriterTerminalAdmission<'a> {
-    fn try_acquire(
-        gate: &'a AtomicUsize,
-        terminal_drain_wakeup: &'a WriterWakeup,
-    ) -> Option<Self> {
+    fn try_acquire(gate: &'a AtomicUsize, terminal_drain_wakeup: &'a WriterWakeup) -> Option<Self> {
         let mut state = gate.load(AtomicOrdering::Acquire);
         loop {
             if state & WRITER_TERMINAL_ADMISSION_CLOSED != 0 {
@@ -2089,8 +2077,7 @@ impl Drop for WriterTerminalAdmission<'_> {
         let mut state = self.gate.load(AtomicOrdering::Acquire);
         loop {
             if state & WRITER_TERMINAL_ADMISSION_COUNT_MASK == 0 {
-                STORAGE_WRITER_QUEUE_ACCOUNTING_UNDERFLOWS_TOTAL
-                    .fetch_add(1, AtomicOrdering::Relaxed);
+                saturating_atomic_u64_add(&STORAGE_WRITER_QUEUE_ACCOUNTING_UNDERFLOWS_TOTAL, 1);
                 tracing::error!(
                     event = "storage_writer_terminal_admission_underflow",
                     writer_queue_accounting_underflows_total =
@@ -2117,10 +2104,7 @@ impl Drop for WriterTerminalAdmission<'_> {
     }
 }
 
-fn close_writer_terminal_admissions(
-    gate: &AtomicUsize,
-    terminal_drain_wakeup: &WriterWakeup,
-) {
+fn close_writer_terminal_admissions(gate: &AtomicUsize, terminal_drain_wakeup: &WriterWakeup) {
     let previous = gate.fetch_or(WRITER_TERMINAL_ADMISSION_CLOSED, AtomicOrdering::AcqRel);
     if previous & WRITER_TERMINAL_ADMISSION_CLOSED == 0 {
         terminal_drain_wakeup.notify();
@@ -2341,9 +2325,7 @@ impl WriterJoinAuthority {
             match self.changed.wait_timeout(state, remaining) {
                 Ok((next, timed_out)) => {
                     state = next;
-                    if timed_out.timed_out()
-                        && !matches!(&*state, WriterJoinState::Completed(_))
-                    {
+                    if timed_out.timed_out() && !matches!(&*state, WriterJoinState::Completed(_)) {
                         return WriterJoinDriveOutcome::InProgress;
                     }
                 }
@@ -2454,8 +2436,7 @@ impl WriteCommandSender {
         let mut depth = counter.load(AtomicOrdering::Acquire);
         loop {
             let Some(next) = depth.checked_sub(1) else {
-                STORAGE_WRITER_QUEUE_ACCOUNTING_UNDERFLOWS_TOTAL
-                    .fetch_add(1, AtomicOrdering::Relaxed);
+                saturating_atomic_u64_add(&STORAGE_WRITER_QUEUE_ACCOUNTING_UNDERFLOWS_TOTAL, 1);
                 tracing::error!(
                     event = "storage_writer_queue_accounting_underflow",
                     writer_queue_accounting_underflows_total =
@@ -2556,8 +2537,7 @@ impl WriteCommandSender {
                     match poll {
                         Ok(poll) => poll,
                         Err(_) => {
-                            STORAGE_WRITER_WAKER_PANICS_TOTAL
-                                .fetch_add(1, AtomicOrdering::Relaxed);
+                            saturating_atomic_u64_add(&STORAGE_WRITER_WAKER_PANICS_TOTAL, 1);
                             tracing::error!(
                                 action = "reserve_poll",
                                 writer_waker_panics_total = storage_writer_waker_panics_total(),
@@ -2994,10 +2974,7 @@ impl StorageHandle {
     }
 
     #[cfg(test)]
-    pub(crate) fn cancel_after_next_committed_batch_for_test(
-        &self,
-        operation: &'static str,
-    ) {
+    pub(crate) fn cancel_after_next_committed_batch_for_test(&self, operation: &'static str) {
         *self
             .test_cancel_after_batch
             .lock()
@@ -3059,33 +3036,20 @@ impl StorageHandle {
 
     /// Update semantic latency/cost budget configuration.
     pub fn set_semantic_budget_config(&self, config: SemanticBudgetConfig) {
-        if let Ok(mut state) = self.semantic_budget_state.lock() {
-            state.configure(config);
-        }
+        lock_semantic_budget_state(&self.semantic_budget_state).configure(config);
     }
 
     /// Return semantic budget telemetry snapshot for operator dashboards.
     #[must_use]
     pub fn semantic_budget_snapshot(&self) -> SemanticBudgetSnapshot {
-        match self.semantic_budget_state.lock() {
-            Ok(state) => state.snapshot(),
-            Err(_) => SemanticBudgetSnapshot {
-                config: SemanticBudgetConfig::default(),
-                metrics: SemanticBudgetMetrics::default(),
-                ewma_semantic_latency_ms: 0.0,
-                backoff_until_ms: None,
-                cache_entries: 0,
-            },
-        }
+        lock_semantic_budget_state(&self.semantic_budget_state).snapshot()
     }
 
     fn finish_embedding_mutation(
         semantic_budget_state: &Arc<Mutex<SemanticBudgetState>>,
         result: Result<()>,
     ) -> Result<()> {
-        if let Ok(mut state) = semantic_budget_state.lock() {
-            state.invalidate_cache();
-        }
+        lock_semantic_budget_state(semantic_budget_state).invalidate_cache();
         result
     }
 
@@ -3097,9 +3061,8 @@ impl StorageHandle {
     /// operation name in the detail while retaining the typed cancellation
     /// variant for policy and transport layers.
     fn checkpoint_storage_operation(cx: &crate::cx::Cx, operation: &str) -> Result<()> {
-        cx.checkpoint().map_err(|err| {
-            crate::Error::Cancelled(format!("{operation} cancelled: {err}"))
-        })
+        cx.checkpoint()
+            .map_err(|err| crate::Error::Cancelled(format!("{operation} cancelled: {err}")))
     }
 
     /// Classify the Cx-aware writer enqueue failure without turning a
@@ -3109,9 +3072,7 @@ impl StorageHandle {
             WriteCommandSendError::WriterBackendEpochPoisoned => {
                 StorageError::WriterBackendEpochPoisoned.into()
             }
-            WriteCommandSendError::WriterClosedCleanly => {
-                StorageError::WriterClosed.into()
-            }
+            WriteCommandSendError::WriterClosedCleanly => StorageError::WriterClosed.into(),
             WriteCommandSendError::Channel(error) => match error.as_ref() {
                 mpsc::SendError::Cancelled(_) => crate::Error::Cancelled(format!(
                     "{operation} cancelled while waiting for storage writer capacity"
@@ -3187,21 +3148,15 @@ impl StorageHandle {
                 result
             }
             Err(
-                error
-                @ (SpawnBlockingWithCxError::CancelledBeforeSpawn { .. }
+                error @ (SpawnBlockingWithCxError::CancelledBeforeSpawn { .. }
                 | SpawnBlockingWithCxError::CancelledMidFlight { .. }),
-            ) => {
-                Err(crate::Error::Cancelled(format!(
-                    "{join_error_prefix}: {error}"
-                )))
-            }
+            ) => Err(crate::Error::Cancelled(format!(
+                "{join_error_prefix}: {error}"
+            ))),
             Err(
-                error
-                @ (SpawnBlockingWithCxError::RuntimeFailure
+                error @ (SpawnBlockingWithCxError::RuntimeFailure
                 | SpawnBlockingWithCxError::CancellationWatcherTimerFailure),
-            ) => {
-                Err(StorageError::Database(format!("{join_error_prefix}: {error}")).into())
-            }
+            ) => Err(StorageError::Database(format!("{join_error_prefix}: {error}")).into()),
         }
     }
 
@@ -3235,11 +3190,9 @@ impl StorageHandle {
         error: SpawnBlockingWithCxError,
     ) -> crate::Error {
         match error {
-            SpawnBlockingWithCxError::CancelledBeforeSpawn { .. } => {
-                crate::Error::Cancelled(format!(
-                    "{operation} cancelled before storage mutation admission"
-                ))
-            }
+            SpawnBlockingWithCxError::CancelledBeforeSpawn { .. } => crate::Error::Cancelled(
+                format!("{operation} cancelled before storage mutation admission"),
+            ),
             SpawnBlockingWithCxError::CancelledMidFlight { .. }
             | SpawnBlockingWithCxError::RuntimeFailure
             | SpawnBlockingWithCxError::CancellationWatcherTimerFailure => {
@@ -3261,8 +3214,7 @@ impl StorageHandle {
         // context instead of an unrelated ambient Cx; surfacing ambient
         // cancellation here could falsely report that an admitted write did
         // not happen.
-        let response_cx =
-            crate::cx::Cx::for_request_with_budget(crate::cx::Budget::INFINITE);
+        let response_cx = crate::cx::Cx::for_request_with_budget(crate::cx::Budget::INFINITE);
         let timeout_cx = crate::cx::for_request();
         match crate::runtime_async::timeout_with_cx(
             &timeout_cx,
@@ -3295,11 +3247,9 @@ impl StorageHandle {
         let ack = std::pin::pin!(crate::runtime_async::oneshot_recv_with_cx(&ack_cx, rx));
         let cancel_watcher = std::pin::pin!(async {
             loop {
-                let sleep_result = crate::runtime_async::sleep_with_cx(
-                    cx,
-                    std::time::Duration::from_millis(50),
-                )
-                .await;
+                let sleep_result =
+                    crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(50))
+                        .await;
                 // A finite budget can make sleep return immediately without
                 // first latching `is_cancel_requested`. Check the complete Cx
                 // contract after every wake so an expired deadline cannot turn
@@ -3330,8 +3280,7 @@ impl StorageHandle {
         // cancellation that caused its caller to request teardown, and it may
         // wait for bounded writer capacity until Shutdown is either admitted
         // or the writer has already reached a terminal state.
-        let cleanup_cx =
-            crate::cx::Cx::for_request_with_budget(crate::cx::Budget::INFINITE);
+        let cleanup_cx = crate::cx::Cx::for_request_with_budget(crate::cx::Budget::INFINITE);
         let timeout_cx = crate::cx::for_request();
         match crate::runtime_async::timeout_with_cx(
             &timeout_cx,
@@ -3368,8 +3317,7 @@ impl StorageHandle {
                 Err(StorageError::WriterBackendEpochPoisoned.into())
             }
             WRITER_TERMINAL_HEALTHY => Err(StorageError::Database(
-                "storage writer completed shutdown without publishing a terminal state"
-                    .to_string(),
+                "storage writer completed shutdown without publishing a terminal state".to_string(),
             )
             .into()),
             unknown => Err(StorageError::Database(format!(
@@ -3394,10 +3342,7 @@ impl StorageHandle {
         }
     }
 
-    async fn settle_writer_join_with_timeout(
-        &self,
-        timeout: std::time::Duration,
-    ) -> Result<()> {
+    async fn settle_writer_join_with_timeout(&self, timeout: std::time::Duration) -> Result<()> {
         if let Some(outcome) = self.completed_writer_join_outcome()? {
             return self.writer_join_outcome_result(outcome);
         }
@@ -3407,8 +3352,7 @@ impl StorageHandle {
         // Cx is checked before this transfer; after the blocking closure
         // starts it owns the sole native join authority and must publish its
         // terminal receipt even if this bounded async wait expires.
-        let settlement_cx =
-            crate::cx::Cx::for_request_with_budget(crate::cx::Budget::INFINITE);
+        let settlement_cx = crate::cx::Cx::for_request_with_budget(crate::cx::Budget::INFINITE);
         let timeout_cx = crate::cx::for_request();
         let observed = crate::runtime_async::timeout_with_cx(
             &timeout_cx,
@@ -3615,8 +3559,7 @@ impl StorageHandle {
         let queued_depth_for_writer = Arc::clone(&write_tx.queued_depth);
         let terminal_drain_wakeup_for_writer = Arc::clone(&write_tx.terminal_drain_wakeup);
         let terminal_state_for_writer = Arc::clone(&write_tx.terminal_state);
-        let terminal_admission_gate_for_writer =
-            Arc::clone(&write_tx.terminal_admission_gate);
+        let terminal_admission_gate_for_writer = Arc::clone(&write_tx.terminal_admission_gate);
         let mmap_runtime_for_writer = mmap_runtime.clone();
         let writer_wakeup_for_writer = writer_wakeup;
 
@@ -4716,12 +4659,8 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        self.purge_auxiliary_history_with_cx(
-            cx,
-            before_ts,
-            AuxiliaryRetentionTable::AuditActions,
-        )
-        .await
+        self.purge_auxiliary_history_with_cx(cx, before_ts, AuxiliaryRetentionTable::AuditActions)
+            .await
     }
 
     pub(crate) async fn purge_audit_actions_before_progress_with_cx(
@@ -4775,10 +4714,7 @@ impl StorageHandle {
     /// and `size_retention`) remain durable audit evidence regardless of the
     /// cutoff. Deletion runs in bounded writer turns and yields through the
     /// FIFO tail between full batches.
-    pub async fn purge_operational_maintenance_before(
-        &self,
-        before_ts: i64,
-    ) -> Result<usize> {
+    pub async fn purge_operational_maintenance_before(&self, before_ts: i64) -> Result<usize> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.purge_operational_maintenance_before_with_cx(&cx, before_ts)
             .await
@@ -5410,11 +5346,7 @@ impl StorageHandle {
                 }
             };
             total_deleted = next_total;
-            self.maybe_cancel_after_committed_batch_for_test(
-                cx,
-                "prune_segments_before",
-                deleted,
-            );
+            self.maybe_cancel_after_committed_batch_for_test(cx, "prune_segments_before", deleted);
             if complete {
                 return DurableMutationProgress::Complete(total_deleted);
             }
@@ -5644,12 +5576,8 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        self.purge_auxiliary_history_with_cx(
-            cx,
-            before_ts,
-            AuxiliaryRetentionTable::UsageMetrics,
-        )
-        .await
+        self.purge_auxiliary_history_with_cx(cx, before_ts, AuxiliaryRetentionTable::UsageMetrics)
+            .await
     }
 
     pub(crate) async fn purge_usage_metrics_progress_with_cx(
@@ -6132,13 +6060,8 @@ impl StorageHandle {
         excluded_tiers: &[RetentionTier],
     ) -> Result<usize> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.count_events_by_retention_rule_with_cx(
-            &cx,
-            before_ts,
-            tier,
-            excluded_tiers,
-        )
-        .await
+        self.count_events_by_retention_rule_with_cx(&cx, before_ts, tier, excluded_tiers)
+            .await
     }
 
     /// Cx-first sibling of [`count_events_by_retention_rule`].
@@ -6149,15 +6072,9 @@ impl StorageHandle {
         tier: Option<&RetentionTier>,
         excluded_tiers: &[RetentionTier],
     ) -> Result<usize> {
-        let (policy, branch_index) =
-            compile_ordered_retention_policy_branch(tier, excluded_tiers)?;
-        self.count_events_by_compiled_retention_branch_with_cx(
-            cx,
-            before_ts,
-            policy,
-            branch_index,
-        )
-        .await
+        let (policy, branch_index) = compile_ordered_retention_policy_branch(tier, excluded_tiers)?;
+        self.count_events_by_compiled_retention_branch_with_cx(cx, before_ts, policy, branch_index)
+            .await
     }
 
     /// Count one branch of a precompiled first-match classifier with explicit
@@ -6209,11 +6126,7 @@ impl StorageHandle {
             "Spawn blocking failed",
             move || {
                 pooled_backend(db_path.as_str(), |backend| {
-                    count_events_by_compiled_retention_policy_backend(
-                        backend,
-                        &policy,
-                        &cutoffs,
-                    )
+                    count_events_by_compiled_retention_policy_backend(backend, &policy, &cutoffs)
                 })
             },
         )
@@ -6410,11 +6323,7 @@ impl StorageHandle {
                 }
             };
             total_deleted = next_total;
-            self.maybe_cancel_after_committed_batch_for_test(
-                cx,
-                "delete_events_before",
-                deleted,
-            );
+            self.maybe_cancel_after_committed_batch_for_test(cx, "delete_events_before", deleted);
             if complete {
                 return DurableMutationProgress::Complete(total_deleted);
             }
@@ -6465,11 +6374,7 @@ impl StorageHandle {
         }])
         .map_err(retention_policy_compile_error)?;
         self.delete_events_by_compiled_retention_branch_with_cx(
-            cx,
-            before_ts,
-            policy,
-            0,
-            batch_size,
+            cx, before_ts, policy, 0, batch_size,
         )
         .await
     }
@@ -6502,8 +6407,7 @@ impl StorageHandle {
         excluded_tiers: &[RetentionTier],
         batch_size: usize,
     ) -> Result<usize> {
-        let (policy, branch_index) =
-            compile_ordered_retention_policy_branch(tier, excluded_tiers)?;
+        let (policy, branch_index) = compile_ordered_retention_policy_branch(tier, excluded_tiers)?;
         self.delete_events_by_compiled_retention_branch_with_cx(
             cx,
             before_ts,
@@ -6580,9 +6484,7 @@ impl StorageHandle {
                     },
                 )
                 .await
-                .map_err(|error| {
-                    Self::writer_send_error("delete_events_by_retention_rule", error)
-                })
+                .map_err(|error| Self::writer_send_error("delete_events_by_retention_rule", error))
             {
                 return DurableMutationProgress::Interrupted {
                     durable: (total_deleted > 0).then_some(total_deleted),
@@ -6646,12 +6548,14 @@ impl StorageHandle {
         let branch_count = cutoffs.len();
         let mut aggregate = vec![0usize; branch_count];
         loop {
-            if let Err(error) = Self::checkpoint_storage_operation(
-                cx,
-                "delete_events_by_retention_policy",
-            ) {
+            if let Err(error) =
+                Self::checkpoint_storage_operation(cx, "delete_events_by_retention_policy")
+            {
                 return DurableMutationProgress::Interrupted {
-                    durable: aggregate.iter().any(|count| *count > 0).then_some(aggregate),
+                    durable: aggregate
+                        .iter()
+                        .any(|count| *count > 0)
+                        .then_some(aggregate),
                     error,
                 };
             }
@@ -6677,7 +6581,10 @@ impl StorageHandle {
                 })
             {
                 return DurableMutationProgress::Interrupted {
-                    durable: aggregate.iter().any(|count| *count > 0).then_some(aggregate),
+                    durable: aggregate
+                        .iter()
+                        .any(|count| *count > 0)
+                        .then_some(aggregate),
                     error,
                 };
             }
@@ -6685,14 +6592,20 @@ impl StorageHandle {
                 Ok(turn) => turn,
                 Err(error) => {
                     return DurableMutationProgress::Interrupted {
-                        durable: aggregate.iter().any(|count| *count > 0).then_some(aggregate),
+                        durable: aggregate
+                            .iter()
+                            .any(|count| *count > 0)
+                            .then_some(aggregate),
                         error,
                     };
                 }
             };
             if turn.deleted_by_branch.len() != branch_count {
                 return DurableMutationProgress::Interrupted {
-                    durable: aggregate.iter().any(|count| *count > 0).then_some(aggregate),
+                    durable: aggregate
+                        .iter()
+                        .any(|count| *count > 0)
+                        .then_some(aggregate),
                     error: StorageError::Database(format!(
                         "compiled retention writer returned {} branches; expected {branch_count}",
                         turn.deleted_by_branch.len()
@@ -6704,7 +6617,10 @@ impl StorageHandle {
                 Ok(total) => total,
                 Err(error) => {
                     return DurableMutationProgress::Interrupted {
-                        durable: aggregate.iter().any(|count| *count > 0).then_some(aggregate),
+                        durable: aggregate
+                            .iter()
+                            .any(|count| *count > 0)
+                            .then_some(aggregate),
                         error,
                     };
                 }
@@ -7612,8 +7528,7 @@ impl StorageHandle {
         receipt: SessionCheckpointReceipt,
     ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.mark_session_shutdown_clean_with_cx(&cx, receipt)
-            .await
+        self.mark_session_shutdown_clean_with_cx(&cx, receipt).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_session_shutdown_clean`].
@@ -8376,13 +8291,8 @@ impl StorageHandle {
         cursor_epoch: &str,
     ) -> Result<EventRetentionCheck> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.check_event_retention_in_epoch_with_cx(
-            &cx,
-            after_id,
-            through_id,
-            cursor_epoch,
-        )
-        .await
+        self.check_event_retention_in_epoch_with_cx(&cx, after_id, through_id, cursor_epoch)
+            .await
     }
 
     /// Cx-first sibling of [`check_event_retention_in_epoch`].
@@ -8399,12 +8309,7 @@ impl StorageHandle {
         let cursor_epoch = cursor_epoch.to_string();
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             pooled_backend(db_path.as_str(), |backend| {
-                check_event_retention_backend(
-                    backend,
-                    after_id,
-                    through_id,
-                    Some(&cursor_epoch),
-                )
+                check_event_retention_backend(backend, after_id, through_id, Some(&cursor_epoch))
             })
         })
         .await
@@ -10077,6 +9982,10 @@ pub struct SemanticBudgetMetrics {
     pub semantic_cache_misses: u64,
     /// Semantic cache entries invalidated (stale generation/ttl).
     pub semantic_cache_invalidations: u64,
+    /// Completed searches discarded because their cache epoch was superseded.
+    pub semantic_stale_completions: u64,
+    /// Semantic budget mutex poison recoveries that retired cache authority.
+    pub semantic_state_poison_recoveries: u64,
     /// Cache evictions due to bounded capacity.
     pub semantic_cache_evictions: u64,
     /// Semantic requests skipped due to active budget backoff.
@@ -10132,7 +10041,7 @@ struct SemanticQueryCacheKey {
 struct CachedSemanticHits {
     hits: Vec<SemanticSearchHit>,
     expires_at_ms: i64,
-    generation: u64,
+    generation: Arc<()>,
 }
 
 #[derive(Debug)]
@@ -10140,6 +10049,7 @@ enum SemanticBudgetDecision {
     Execute {
         key: SemanticQueryCacheKey,
         max_scan_rows: usize,
+        generation: Arc<()>,
     },
     UseCache {
         hits: Vec<SemanticSearchHit>,
@@ -10151,6 +10061,12 @@ enum SemanticBudgetDecision {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SemanticCompletionOutcome {
+    backoff_until_ms: Option<i64>,
+    epoch_current: bool,
+}
+
 #[derive(Debug)]
 struct SemanticBudgetState {
     config: SemanticBudgetConfig,
@@ -10159,7 +10075,7 @@ struct SemanticBudgetState {
     backoff_until_ms: Option<i64>,
     rate_window_started_at_ms: i64,
     rate_window_queries: u32,
-    generation: u64,
+    generation: Arc<()>,
     cache: LruCache<SemanticQueryCacheKey, CachedSemanticHits>,
 }
 
@@ -10173,7 +10089,7 @@ impl SemanticBudgetState {
             backoff_until_ms: None,
             rate_window_started_at_ms: 0,
             rate_window_queries: 0,
-            generation: 0,
+            generation: Arc::new(()),
             cache: LruCache::new(cache_capacity),
         }
     }
@@ -10189,6 +10105,10 @@ impl SemanticBudgetState {
     }
 
     fn configure(&mut self, config: SemanticBudgetConfig) {
+        // Reconfiguration is an authority boundary. Advance the epoch even if
+        // the current cache is empty so an execution admitted under the old
+        // limits cannot publish into the replacement cache after it returns.
+        self.invalidate_cache();
         self.config = config;
         self.cache = LruCache::new(self.config.cache_capacity.max(1));
         self.backoff_until_ms = None;
@@ -10200,7 +10120,9 @@ impl SemanticBudgetState {
     fn invalidate_cache(&mut self) {
         let removed = self.cache.len();
         self.cache.clear();
-        self.generation = self.generation.wrapping_add(1);
+        // Allocation identity cannot wrap or alias an older in-flight search,
+        // unlike a finite numeric generation counter.
+        self.generation = Arc::new(());
         if removed > 0 {
             self.metrics.semantic_cache_invalidations = self
                 .metrics
@@ -10263,45 +10185,54 @@ impl SemanticBudgetState {
         }
 
         let key = semantic_query_cache_key(embedder_id, options, query_vector);
-        if let Some(entry) = self.cache.get(&key).cloned() {
-            if entry.generation == self.generation && entry.expires_at_ms >= now_ms {
-                self.metrics.semantic_cache_hits =
-                    self.metrics.semantic_cache_hits.saturating_add(1);
-                self.metrics.last_semantic_cache_hit = true;
-                self.metrics.last_fallback_reason = None;
-                self.metrics.last_semantic_latency_ms = 0;
-                self.metrics.last_semantic_rows_scanned = 0;
-                return SemanticBudgetDecision::UseCache { hits: entry.hits };
-            }
+        if self.config.cache_capacity > 0 {
+            if let Some(entry) = self.cache.get(&key).cloned() {
+                if Arc::ptr_eq(&entry.generation, &self.generation) && entry.expires_at_ms >= now_ms
+                {
+                    self.metrics.semantic_cache_hits =
+                        self.metrics.semantic_cache_hits.saturating_add(1);
+                    self.metrics.last_semantic_cache_hit = true;
+                    self.metrics.last_fallback_reason = entry
+                        .hits
+                        .is_empty()
+                        .then(|| "semantic_no_hits".to_string());
+                    self.metrics.last_semantic_latency_ms = 0;
+                    self.metrics.last_semantic_rows_scanned = 0;
+                    return SemanticBudgetDecision::UseCache { hits: entry.hits };
+                }
 
-            let _ = self.cache.remove(&key);
-            self.metrics.semantic_cache_invalidations =
-                self.metrics.semantic_cache_invalidations.saturating_add(1);
+                let _ = self.cache.remove(&key);
+                self.metrics.semantic_cache_invalidations =
+                    self.metrics.semantic_cache_invalidations.saturating_add(1);
+            }
         }
 
         self.metrics.semantic_cache_misses = self.metrics.semantic_cache_misses.saturating_add(1);
         self.metrics.last_semantic_cache_hit = false;
 
-        let configured_scan = self.config.max_semantic_scan_rows.max(1);
-        let requested_limit = options.limit.unwrap_or(100).max(1);
-        let max_scan_rows = configured_scan.max(requested_limit);
+        // The scan budget is an operator-owned hard ceiling, not a hint that a
+        // caller can raise by requesting more results. A zero ceiling is a
+        // valid fail-closed configuration and produces `LIMIT 0` downstream.
+        let max_scan_rows = self.config.max_semantic_scan_rows;
 
-        SemanticBudgetDecision::Execute { key, max_scan_rows }
+        SemanticBudgetDecision::Execute {
+            key,
+            max_scan_rows,
+            generation: Arc::clone(&self.generation),
+        }
     }
 
     fn complete_semantic_lane(
         &mut self,
         now_ms: i64,
         key: SemanticQueryCacheKey,
+        admitted_generation: &Arc<()>,
         hits: &[SemanticSearchHit],
         latency_ms: u64,
         rows_scanned: usize,
-    ) -> Option<i64> {
+    ) -> SemanticCompletionOutcome {
         self.metrics.semantic_queries_executed =
             self.metrics.semantic_queries_executed.saturating_add(1);
-        self.metrics.last_semantic_latency_ms = latency_ms;
-        self.metrics.last_semantic_rows_scanned = rows_scanned;
-        self.metrics.last_fallback_reason = None;
         self.metrics.semantic_rows_scanned_total = self
             .metrics
             .semantic_rows_scanned_total
@@ -10311,6 +10242,21 @@ impl SemanticBudgetState {
             .semantic_hits_returned_total
             .saturating_add(u64::try_from(hits.len()).unwrap_or(u64::MAX));
 
+        if !Arc::ptr_eq(admitted_generation, &self.generation) {
+            // The search result may still be returned to its initiating
+            // caller, but it has no authority to populate or tune the newer
+            // cache/configuration epoch.
+            self.metrics.semantic_stale_completions =
+                self.metrics.semantic_stale_completions.saturating_add(1);
+            return SemanticCompletionOutcome {
+                backoff_until_ms: self.backoff_until_ms,
+                epoch_current: false,
+            };
+        }
+
+        self.metrics.last_semantic_latency_ms = latency_ms;
+        self.metrics.last_semantic_rows_scanned = rows_scanned;
+        self.metrics.last_fallback_reason = hits.is_empty().then(|| "semantic_no_hits".to_string());
         let alpha = self.config.latency_ewma_alpha.clamp(0.0, 1.0);
         if self.metrics.semantic_queries_executed == 1 || self.ewma_semantic_latency_ms <= 0.0 {
             self.ewma_semantic_latency_ms = latency_ms as f64;
@@ -10330,26 +10276,60 @@ impl SemanticBudgetState {
                 self.metrics.semantic_backoff_activations.saturating_add(1);
         }
 
-        let ttl_ms = self.config.cache_ttl_ms.max(1);
-        let expires_at_ms = now_ms.saturating_add(ttl_ms);
-        let evicted = self.cache.put(
-            key,
-            CachedSemanticHits {
-                hits: hits.to_vec(),
-                expires_at_ms,
-                generation: self.generation,
-            },
-        );
-        if evicted.is_some() {
-            self.metrics.semantic_cache_evictions =
-                self.metrics.semantic_cache_evictions.saturating_add(1);
+        if self.config.cache_capacity > 0 {
+            let ttl_ms = self.config.cache_ttl_ms.max(1);
+            let expires_at_ms = now_ms.saturating_add(ttl_ms);
+            let evicted = self.cache.put(
+                key,
+                CachedSemanticHits {
+                    hits: hits.to_vec(),
+                    expires_at_ms,
+                    generation: Arc::clone(&self.generation),
+                },
+            );
+            if evicted.is_some() {
+                self.metrics.semantic_cache_evictions =
+                    self.metrics.semantic_cache_evictions.saturating_add(1);
+            }
         }
 
-        self.backoff_until_ms
+        SemanticCompletionOutcome {
+            backoff_until_ms: self.backoff_until_ms,
+            epoch_current: true,
+        }
     }
 
     fn note_semantic_fallback_reason(&mut self, reason: &str) {
         self.metrics.last_fallback_reason = Some(reason.to_string());
+    }
+}
+
+fn lock_semantic_budget_state(
+    state: &Mutex<SemanticBudgetState>,
+) -> MutexGuard<'_, SemanticBudgetState> {
+    match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            // A panic may have interrupted a compound cache/budget mutation.
+            // Retire all cache authority and transient throttling state before
+            // making the mutex usable again; preserving the configured limits
+            // and aggregate counters keeps diagnosis available.
+            guard.invalidate_cache();
+            guard.backoff_until_ms = None;
+            guard.rate_window_started_at_ms = 0;
+            guard.rate_window_queries = 0;
+            guard.ewma_semantic_latency_ms = 0.0;
+            guard.metrics.semantic_state_poison_recoveries = guard
+                .metrics
+                .semantic_state_poison_recoveries
+                .saturating_add(1);
+            state.clear_poison();
+            tracing::error!(
+                "storage semantic budget recovered poisoned state; cache authority was retired"
+            );
+            guard
+        }
     }
 }
 
@@ -10899,6 +10879,39 @@ static STORAGE_WRITER_RESPONSE_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STORAGE_WRITER_WAKER_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STORAGE_WRITER_QUEUE_ACCOUNTING_UNDERFLOWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+fn saturating_atomic_u64_add(counter: &AtomicU64, delta: u64) {
+    let _ = counter.try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |value| {
+        Some(value.saturating_add(delta))
+    });
+}
+
+#[cfg(test)]
+mod saturation_counter_tests {
+    use super::*;
+
+    #[test]
+    fn storage_telemetry_atomic_add_saturates_without_wrapping() {
+        let counter = AtomicU64::new(u64::MAX);
+
+        saturating_atomic_u64_add(&counter, 1);
+
+        assert_eq!(counter.load(AtomicOrdering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn pool_telemetry_totals_saturate_without_wrapping() {
+        let snapshot = PoolTelemetrySnapshot {
+            hits: u64::MAX,
+            misses: u64::MAX,
+            returns: 0,
+            pool_lock_poisoned: 0,
+        };
+
+        assert_eq!(snapshot.total_acquires(), u64::MAX);
+        assert_eq!(snapshot.hit_rate(), 0.5);
+    }
+}
+
 std::thread_local! {
     /// Dispatch-local poison signal. Transaction helpers sit below the raw
     /// command dispatcher and return their typed error through heterogeneous
@@ -10997,7 +11010,7 @@ fn storage_writer_waker_action_recovering(action: &'static str, operation: impl 
     )
     .is_err()
     {
-        STORAGE_WRITER_WAKER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+        saturating_atomic_u64_add(&STORAGE_WRITER_WAKER_PANICS_TOTAL, 1);
         tracing::error!(
             action,
             writer_waker_panics_total = storage_writer_waker_panics_total(),
@@ -11013,7 +11026,7 @@ fn mark_writer_backend_epoch_poisoned(operation: &'static str, phase: &'static s
         !was_poisoned
     });
     if newly_poisoned {
-        STORAGE_WRITER_EPOCH_POISONS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+        saturating_atomic_u64_add(&STORAGE_WRITER_EPOCH_POISONS_TOTAL, 1);
     }
     tracing::error!(
         operation,
@@ -11134,7 +11147,7 @@ fn writer_transaction_control(
         Ok(Ok(_)) => WriterTransactionControlOutcome::Succeeded,
         Ok(Err(error)) => WriterTransactionControlOutcome::Failed(error),
         Err(_) => {
-            STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            saturating_atomic_u64_add(&STORAGE_WRITER_PANICS_TOTAL, 1);
             tracing::error!(
                 operation,
                 phase,
@@ -11147,10 +11160,7 @@ fn writer_transaction_control(
     }
 }
 
-fn rollback_writer_transaction(
-    backend: &dyn StorageBackend,
-    operation: &'static str,
-) -> bool {
+fn rollback_writer_transaction(backend: &dyn StorageBackend, operation: &'static str) -> bool {
     match writer_transaction_control(backend, "ROLLBACK", operation, "rollback") {
         WriterTransactionControlOutcome::Succeeded => true,
         WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => false,
@@ -11194,19 +11204,17 @@ where
         std::panic::AssertUnwindSafe(mutation),
     );
     match mutation_outcome {
-        Ok(Ok(value)) => {
-            match writer_transaction_control(backend, "COMMIT", operation, "commit") {
-                WriterTransactionControlOutcome::Succeeded => Ok(value),
-                WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => {
-                    backend_epoch_poisoned_error(operation, "commit")
-                }
-                WriterTransactionControlOutcome::Failed(_)
-                | WriterTransactionControlOutcome::Panicked => {
-                    let _ = rollback_writer_transaction(backend, operation);
-                    backend_epoch_poisoned_error(operation, "commit")
-                }
+        Ok(Ok(value)) => match writer_transaction_control(backend, "COMMIT", operation, "commit") {
+            WriterTransactionControlOutcome::Succeeded => Ok(value),
+            WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => {
+                backend_epoch_poisoned_error(operation, "commit")
             }
-        }
+            WriterTransactionControlOutcome::Failed(_)
+            | WriterTransactionControlOutcome::Panicked => {
+                let _ = rollback_writer_transaction(backend, operation);
+                backend_epoch_poisoned_error(operation, "commit")
+            }
+        },
         Ok(Err(error)) => {
             let nested_poison = is_backend_epoch_poisoned(&error);
             if nested_poison {
@@ -11222,7 +11230,7 @@ where
             }
         }
         Err(_) => {
-            STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            saturating_atomic_u64_add(&STORAGE_WRITER_PANICS_TOTAL, 1);
             tracing::error!(
                 operation,
                 writer_panics_total = storage_writer_panics_total(),
@@ -11247,12 +11255,7 @@ fn restore_writer_savepoint(
     savepoint: WriterSavepoint,
     operation: &'static str,
 ) -> bool {
-    match writer_transaction_control(
-        backend,
-        savepoint.rollback_sql,
-        operation,
-        "rollback",
-    ) {
+    match writer_transaction_control(backend, savepoint.rollback_sql, operation, "rollback") {
         WriterTransactionControlOutcome::Succeeded => {}
         WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => return false,
         WriterTransactionControlOutcome::Failed(_) | WriterTransactionControlOutcome::Panicked => {
@@ -11262,12 +11265,7 @@ fn restore_writer_savepoint(
             return false;
         }
     }
-    match writer_transaction_control(
-        backend,
-        savepoint.release_sql,
-        operation,
-        "release",
-    ) {
+    match writer_transaction_control(backend, savepoint.release_sql, operation, "release") {
         WriterTransactionControlOutcome::Succeeded => true,
         WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => false,
         WriterTransactionControlOutcome::Failed(_) | WriterTransactionControlOutcome::Panicked => {
@@ -11309,12 +11307,7 @@ where
         std::panic::AssertUnwindSafe(mutation),
     ) {
         Ok(Ok(value)) => {
-            match writer_transaction_control(
-                backend,
-                savepoint.release_sql,
-                operation,
-                "release",
-            ) {
+            match writer_transaction_control(backend, savepoint.release_sql, operation, "release") {
                 WriterTransactionControlOutcome::Succeeded => Ok(value),
                 WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => {
                     backend_epoch_poisoned_error(operation, "release")
@@ -11341,7 +11334,7 @@ where
             }
         }
         Err(_) => {
-            STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            saturating_atomic_u64_add(&STORAGE_WRITER_PANICS_TOTAL, 1);
             tracing::error!(
                 operation,
                 writer_panics_total = storage_writer_panics_total(),
@@ -11764,10 +11757,7 @@ fn flush_storage_io_pending_commands(
                 std::mem::take(&mut pending_event_gap),
                 &interruption.failure,
             );
-            fail_pending_storage_io_commands(
-                std::mem::take(pending_io),
-                &interruption.failure,
-            );
+            fail_pending_storage_io_commands(std::mem::take(pending_io), &interruption.failure);
             io_gate.reset_after_scheduler_loss();
             return Some(interruption);
         };
@@ -11816,10 +11806,7 @@ fn flush_storage_io_pending_commands(
                     std::mem::take(&mut pending_event_gap),
                     &interruption.failure,
                 );
-                fail_pending_storage_io_commands(
-                    std::mem::take(pending_io),
-                    &interruption.failure,
-                );
+                fail_pending_storage_io_commands(std::mem::take(pending_io), &interruption.failure);
                 io_gate.reset_after_panic();
                 return Some(interruption);
             }
@@ -11837,10 +11824,7 @@ fn flush_storage_io_pending_commands(
                     std::mem::take(&mut pending_append_segments),
                     &interruption.failure,
                 );
-                fail_pending_storage_io_commands(
-                    std::mem::take(pending_io),
-                    &interruption.failure,
-                );
+                fail_pending_storage_io_commands(std::mem::take(pending_io), &interruption.failure);
                 io_gate.reset_after_panic();
                 return Some(interruption);
             }
@@ -12089,7 +12073,7 @@ fn flush_event_gap_group_recovering(
             terminal.then(WriterDispatchInterruption::backend_epoch_poisoned)
         }
         Err(_) => {
-            STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            saturating_atomic_u64_add(&STORAGE_WRITER_PANICS_TOTAL, 1);
             let _ = take_writer_backend_epoch_poisoned_signal();
             mark_writer_backend_epoch_poisoned("event/gap group commit", "panic");
             let interruption = WriterDispatchInterruption::backend_epoch_poisoned();
@@ -12258,9 +12242,7 @@ fn dispatch_event_gap_group_commit_result(
             let failure = if is_writer_backend_epoch_poisoned(&error) {
                 WriterFailure::BackendEpochPoisoned
             } else {
-                WriterFailure::Database(format!(
-                    "storage event/gap group commit failed: {error}"
-                ))
+                WriterFailure::Database(format!("storage event/gap group commit failed: {error}"))
             };
             tracing::warn!(
                 commands = group.len(),
@@ -12388,7 +12370,7 @@ fn flush_append_segment_group_recovering(
             terminal.then(WriterDispatchInterruption::backend_epoch_poisoned)
         }
         Err(_) => {
-            STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            saturating_atomic_u64_add(&STORAGE_WRITER_PANICS_TOTAL, 1);
             let _ = take_writer_backend_epoch_poisoned_signal();
             mark_writer_backend_epoch_poisoned("append segment group commit", "panic");
             let interruption = WriterDispatchInterruption::backend_epoch_poisoned();
@@ -12471,10 +12453,7 @@ fn fail_pending_append_segments(commands: Vec<PendingAppendSegmentWrite>, failur
     }
 }
 
-fn fail_pending_storage_io_commands(
-    commands: HashMap<u64, WriteCommand>,
-    failure: &WriterFailure,
-) {
+fn fail_pending_storage_io_commands(commands: HashMap<u64, WriteCommand>, failure: &WriterFailure) {
     for (_, cmd) in commands {
         fail_undispatched_write_command(cmd, failure);
     }
@@ -12672,7 +12651,7 @@ fn dispatch_write_command_raw_recovering(
         Ok(()) => take_writer_backend_epoch_poisoned_signal()
             .then(WriterDispatchInterruption::backend_epoch_poisoned),
         Err(_) => {
-            STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            saturating_atomic_u64_add(&STORAGE_WRITER_PANICS_TOTAL, 1);
             let _ = take_writer_backend_epoch_poisoned_signal();
             mark_writer_backend_epoch_poisoned("raw writer dispatch", "panic");
             tracing::error!(
@@ -12900,7 +12879,7 @@ fn close_and_drain_writer_queue(
     )
     .is_err()
     {
-        STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+        saturating_atomic_u64_add(&STORAGE_WRITER_PANICS_TOTAL, 1);
         tracing::error!(
             writer_panics_total = storage_writer_panics_total(),
             error_code = "WA-STORAGE-WRITER-PANIC",
@@ -13149,9 +13128,7 @@ fn writer_loop(
         }
     }
 
-    if terminal_state.load(AtomicOrdering::Acquire)
-        != WRITER_TERMINAL_BACKEND_EPOCH_POISONED
-    {
+    if terminal_state.load(AtomicOrdering::Acquire) != WRITER_TERMINAL_BACKEND_EPOCH_POISONED {
         flush_segment_redactors(backend, mmap_mirror, &mut segment_redactors);
     }
 }
@@ -13197,8 +13174,7 @@ mod writer_epoch_transaction_tests {
 
         fn observe(&self, sql: &str) {
             if writer_backend_epoch_poisoned_signal_is_set() {
-                self.post_poison_calls
-                    .fetch_add(1, AtomicOrdering::Relaxed);
+                self.post_poison_calls.fetch_add(1, AtomicOrdering::Relaxed);
             }
             self.calls
                 .lock()
@@ -13219,9 +13195,7 @@ mod writer_epoch_transaction_tests {
                     "injected finite transaction-control failure".to_string(),
                 )),
                 FaultMode::Poison => Some(BackendError::TxPoisoned),
-                FaultMode::Panic => {
-                    std::panic::panic_any("INJECTED-TRANSACTION-CONTROL-PANIC")
-                }
+                FaultMode::Panic => std::panic::panic_any("INJECTED-TRANSACTION-CONTROL-PANIC"),
             }
         }
 
@@ -13257,10 +13231,7 @@ mod writer_epoch_transaction_tests {
             self.inner.set_busy_timeout(timeout)
         }
 
-        fn query_scalar(
-            &self,
-            sql: &str,
-        ) -> std::result::Result<Option<String>, BackendError> {
+        fn query_scalar(&self, sql: &str) -> std::result::Result<Option<String>, BackendError> {
             self.observe(sql);
             self.inner.query_scalar(sql)
         }
@@ -13279,10 +13250,8 @@ mod writer_epoch_transaction_tests {
 
         fn begin_transaction(
             &self,
-        ) -> std::result::Result<
-            crate::storage_backend_trait::TransactionGuard<'_>,
-            BackendError,
-        > {
+        ) -> std::result::Result<crate::storage_backend_trait::TransactionGuard<'_>, BackendError>
+        {
             self.inner.begin_transaction()
         }
 
@@ -13359,10 +13328,12 @@ mod writer_epoch_transaction_tests {
             "ordinary mutation error test",
             || Err(StorageError::Database("ordinary mutation error".to_string()).into()),
         );
-        assert!(ordinary_error
-            .expect_err("ordinary mutation must fail")
-            .to_string()
-            .contains("ordinary mutation error"));
+        assert!(
+            ordinary_error
+                .expect_err("ordinary mutation must fail")
+                .to_string()
+                .contains("ordinary mutation error")
+        );
         assert_eq!(backend.calls(), vec!["BEGIN IMMEDIATE", "ROLLBACK"]);
         assert!(!take_writer_backend_epoch_poisoned_signal());
 
@@ -13433,10 +13404,7 @@ mod writer_epoch_transaction_tests {
             },
         );
         assert_epoch_poisoned(&embedding_poison);
-        assert_eq!(
-            backend.calls(),
-            vec!["BEGIN", SEGMENT_EMBEDDING_INSERT_SQL]
-        );
+        assert_eq!(backend.calls(), vec!["BEGIN", SEGMENT_EMBEDDING_INSERT_SQL]);
         assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
         assert!(take_writer_backend_epoch_poisoned_signal());
 
@@ -13683,17 +13651,14 @@ mod writer_epoch_transaction_tests {
         assert_epoch_poisoned(&rollback_poison);
         assert_eq!(
             backend.calls(),
-            vec![
-                "SAVEPOINT test_unit",
-                "ROLLBACK TO SAVEPOINT test_unit",
-            ]
+            vec!["SAVEPOINT test_unit", "ROLLBACK TO SAVEPOINT test_unit",]
         );
         assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
         assert!(take_writer_backend_epoch_poisoned_signal());
 
         for mode in [FaultMode::Error, FaultMode::Panic] {
-            let backend = FaultBackend::new("RELEASE SAVEPOINT test_unit", mode)
-                .with_target_occurrence(0);
+            let backend =
+                FaultBackend::new("RELEASE SAVEPOINT test_unit", mode).with_target_occurrence(0);
             let result: Result<()> = run_writer_savepoint(
                 &backend,
                 fts_test_savepoint(),
@@ -13742,13 +13707,16 @@ mod writer_epoch_transaction_tests {
 
             let (first_tx, first_rx) = oneshot::channel();
             sender
-                .send_with_cx(&cx, WriteCommand::FinalizeEventDeliveriesBulk {
-                    leases: vec![(17, "lease-token-17".to_string())],
-                    handled_at_ms: 1,
-                    workflow_id: None,
-                    status: "delivered".to_string(),
-                    respond: first_tx,
-                })
+                .send_with_cx(
+                    &cx,
+                    WriteCommand::FinalizeEventDeliveriesBulk {
+                        leases: vec![(17, "lease-token-17".to_string())],
+                        handled_at_ms: 1,
+                        workflow_id: None,
+                        status: "delivered".to_string(),
+                        respond: first_tx,
+                    },
+                )
                 .await
                 .expect("queue poison-triggering transaction");
 
@@ -13763,9 +13731,12 @@ mod writer_epoch_transaction_tests {
             }
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             sender
-                .send_with_cx(&cx, WriteCommand::Shutdown {
-                    respond: shutdown_tx,
-                })
+                .send_with_cx(
+                    &cx,
+                    WriteCommand::Shutdown {
+                        respond: shutdown_tx,
+                    },
+                )
                 .await
                 .expect("queue shutdown tail");
 
@@ -13810,9 +13781,12 @@ mod writer_epoch_transaction_tests {
             );
 
             let poisoned_send = sender
-                .send_with_cx(&cx, WriteCommand::Shutdown {
-                    respond: oneshot::channel().0,
-                })
+                .send_with_cx(
+                    &cx,
+                    WriteCommand::Shutdown {
+                        respond: oneshot::channel().0,
+                    },
+                )
                 .await;
             assert!(matches!(
                 poisoned_send,
@@ -13836,9 +13810,12 @@ mod writer_epoch_transaction_tests {
 
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             sender
-                .send_with_cx(&cx, WriteCommand::Shutdown {
-                    respond: shutdown_tx,
-                })
+                .send_with_cx(
+                    &cx,
+                    WriteCommand::Shutdown {
+                        respond: shutdown_tx,
+                    },
+                )
                 .await
                 .expect("queue clean shutdown");
             let mut tail_receivers = Vec::new();
@@ -13885,9 +13862,12 @@ mod writer_epoch_transaction_tests {
             assert!(backend.calls().is_empty(), "no post-shutdown backend calls");
             assert!(matches!(
                 sender
-                    .send_with_cx(&cx, WriteCommand::Shutdown {
-                        respond: oneshot::channel().0,
-                    })
+                    .send_with_cx(
+                        &cx,
+                        WriteCommand::Shutdown {
+                            respond: oneshot::channel().0,
+                        }
+                    )
                     .await,
                 Err(WriteCommandSendError::WriterClosedCleanly)
             ));
@@ -13973,14 +13953,10 @@ mod writer_epoch_transaction_tests {
                     respond: hostile_tx,
                 },
             ));
-            let mut later_send = Box::pin(sender.send_with_cx(
-                &cx,
-                WriteCommand::Shutdown { respond: later_tx },
-            ));
-            let mut drop_send = Box::pin(sender.send_with_cx(
-                &cx,
-                WriteCommand::Shutdown { respond: drop_tx },
-            ));
+            let mut later_send =
+                Box::pin(sender.send_with_cx(&cx, WriteCommand::Shutdown { respond: later_tx }));
+            let mut drop_send =
+                Box::pin(sender.send_with_cx(&cx, WriteCommand::Shutdown { respond: drop_tx }));
             let mut cancel_drop_send = Box::pin(sender.send_with_cx(
                 &cx,
                 WriteCommand::Shutdown {
@@ -13996,9 +13972,7 @@ mod writer_epoch_transaction_tests {
             assert!(poll_writer_send(&mut hostile_send, &hostile_waker).is_pending());
             assert!(poll_writer_send(&mut later_send, &counting_waker).is_pending());
             assert!(poll_writer_send(&mut drop_send, &drop_waker).is_pending());
-            assert!(
-                poll_writer_send(&mut cancel_drop_send, &cancel_drop_waker).is_pending()
-            );
+            assert!(poll_writer_send(&mut cancel_drop_send, &cancel_drop_waker).is_pending());
             drop(cancel_drop_waker);
             let cancelled_waiter_drop = catch_recoverable(
                 RecoverablePanicSite::StorageWriter,
@@ -14016,7 +13990,10 @@ mod writer_epoch_transaction_tests {
                 RecoverablePanicSite::StorageWriter,
                 std::panic::AssertUnwindSafe(|| rx.close()),
             );
-            assert!(closed.is_ok(), "stable waiter proxies must contain wake panics");
+            assert!(
+                closed.is_ok(),
+                "stable waiter proxies must contain wake panics"
+            );
             assert!(
                 counting.wakes.load(AtomicOrdering::Relaxed) > 0,
                 "a hostile first waiter must not strand later waiters"
@@ -14072,9 +14049,7 @@ mod writer_epoch_transaction_tests {
             rx.close();
             assert!(matches!(
                 poll_writer_send(&mut waiting_send, &noop_waker),
-                std::task::Poll::Ready(Err(
-                    WriteCommandSendError::WriterBackendEpochPoisoned
-                ))
+                std::task::Poll::Ready(Err(WriteCommandSendError::WriterBackendEpochPoisoned))
             ));
 
             let queued = rx.try_recv().expect("drain command visible before close");
@@ -14170,7 +14145,10 @@ mod writer_epoch_transaction_tests {
                 );
             }),
         );
-        assert!(delivered.is_ok(), "response helper must contain hostile wake");
+        assert!(
+            delivered.is_ok(),
+            "response helper must contain hostile wake"
+        );
 
         let (drop_tx, drop_rx) = oneshot::channel::<PanicOnDrop>();
         drop(drop_rx);
@@ -14180,7 +14158,10 @@ mod writer_epoch_transaction_tests {
                 respond_oneshot_best_effort(drop_tx, PanicOnDrop);
             }),
         );
-        assert!(dropped.is_ok(), "response helper must contain returned-value Drop");
+        assert!(
+            dropped.is_ok(),
+            "response helper must contain returned-value Drop"
+        );
 
         let outer = catch_recoverable(
             RecoverablePanicSite::StorageWriter,
@@ -14194,7 +14175,10 @@ mod writer_epoch_transaction_tests {
                 std::panic::panic_any("INJECTED-OUTER-BACKEND-PANIC");
             }),
         );
-        assert!(outer.is_err(), "outer panic remains visible to its recovery boundary");
+        assert!(
+            outer.is_err(),
+            "outer panic remains visible to its recovery boundary"
+        );
         assert!(
             storage_writer_response_panics_total() >= start.saturating_add(3),
             "all three response panic surfaces must be counted"
@@ -14571,15 +14555,14 @@ mod writer_io_scheduler_tests {
                 ignore_reason: None,
                 last_decision_at: None,
             };
-            upsert_pane_backend(&backend, &pane)
-                .expect("seed append rollback pane");
+            upsert_pane_backend(&backend, &pane).expect("seed append rollback pane");
         }
         backend
     }
 
     fn sorted_segment_contents(backend: &dyn StorageBackend, pane_id: u64) -> Vec<String> {
-        let mut segments = query_segments_backend(backend, pane_id, 100)
-            .expect("query append rollback segments");
+        let mut segments =
+            query_segments_backend(backend, pane_id, 100).expect("query append rollback segments");
         segments.sort_by_key(|segment| segment.seq);
         segments
             .into_iter()
@@ -14591,15 +14574,8 @@ mod writer_io_scheduler_tests {
     fn singleton_append_failure_after_retroactive_mask_restores_database_and_redactor() {
         let backend = real_writer_backend_with_panes(&[71]);
         let mut redactors = HashMap::<u64, SegmentPersistRedactor>::new();
-        append_segment_commit_backend(
-            &backend,
-            71,
-            "prefix sk-",
-            None,
-            None,
-            &mut redactors,
-        )
-        .expect("seed split-secret prefix");
+        append_segment_commit_backend(&backend, 71, "prefix sk-", None, None, &mut redactors)
+            .expect("seed split-secret prefix");
         let redactors_before = redactors.clone();
 
         set_append_commit_fault_for_test(AppendCommitFaultForTest::SingletonAfterRedaction);
@@ -14681,11 +14657,7 @@ mod writer_io_scheduler_tests {
         ];
 
         set_append_commit_fault_for_test(AppendCommitFaultForTest::GroupAfterRedaction(1));
-        let error = match append_segment_group_commit_backend(
-            &backend,
-            &writes,
-            &mut redactors,
-        ) {
+        let error = match append_segment_group_commit_backend(&backend, &writes, &mut redactors) {
             Ok(_) => panic!("fault after the second redactor mutation must roll back the group"),
             Err(error) => error,
         };
@@ -14969,8 +14941,7 @@ mod writer_io_scheduler_tests {
 
         fn note_call(&self, label: &'static str) {
             if self.panic_started.load(AtomicOrdering::Acquire) {
-                self.post_panic_calls
-                    .fetch_add(1, AtomicOrdering::Relaxed);
+                self.post_panic_calls.fetch_add(1, AtomicOrdering::Relaxed);
             }
             self.calls
                 .lock()
@@ -15326,12 +15297,15 @@ mod writer_io_scheduler_tests {
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
             sender
-                .send_with_cx(&cx, WriteCommand::MarkEventHandled {
-                    event_id: 42,
-                    workflow_id: None,
-                    status: "handled".to_string(),
-                    respond: mutation_tx,
-                })
+                .send_with_cx(
+                    &cx,
+                    WriteCommand::MarkEventHandled {
+                        event_id: 42,
+                        workflow_id: None,
+                        status: "handled".to_string(),
+                        respond: mutation_tx,
+                    },
+                )
                 .await
                 .expect("queue raw mutation panic");
             sender
@@ -15339,9 +15313,12 @@ mod writer_io_scheduler_tests {
                 .await
                 .expect("queue later backend command");
             sender
-                .send_with_cx(&cx, WriteCommand::Shutdown {
-                    respond: shutdown_tx,
-                })
+                .send_with_cx(
+                    &cx,
+                    WriteCommand::Shutdown {
+                        respond: shutdown_tx,
+                    },
+                )
                 .await
                 .expect("queue shutdown tail");
 
@@ -15746,7 +15723,10 @@ mod writer_io_scheduler_tests {
             &mut segment_redactors,
         );
 
-        assert!(result.is_err(), "the later event mutation must fail the group");
+        assert!(
+            result.is_err(),
+            "the later event mutation must fail the group"
+        );
         assert_eq!(
             backend.executed(),
             vec!["BEGIN".to_string(), "ROLLBACK".to_string()],
@@ -16684,7 +16664,7 @@ where
     )
     .is_err()
     {
-        STORAGE_WRITER_RESPONSE_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+        saturating_atomic_u64_add(&STORAGE_WRITER_RESPONSE_PANICS_TOTAL, 1);
         tracing::error!(
             writer_response_panics_total = storage_writer_response_panics_total(),
             error_code = "WA-STORAGE-WRITER-RESPONSE-PANIC",
@@ -17475,10 +17455,7 @@ fn dispatch_write_command_raw(
             let result = prune_session_checkpoints_backend(backend, &session_id, retention);
             respond_oneshot_best_effort(respond, result);
         }
-        WriteCommand::MarkSessionShutdownClean {
-            receipt,
-            respond,
-        } => {
+        WriteCommand::MarkSessionShutdownClean { receipt, respond } => {
             let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
             // Replaces the legacy
@@ -19002,14 +18979,12 @@ fn reserve_event_delivery_backend_at(
         .is_some();
 
     if acquired {
-        return Ok(EventDeliveryReservation::Acquired(
-            EventDeliveryLease::new(
-                event_id,
-                token.to_string(),
-                acquired_at_ms,
-                expires_at_ms,
-            ),
-        ));
+        return Ok(EventDeliveryReservation::Acquired(EventDeliveryLease::new(
+            event_id,
+            token.to_string(),
+            acquired_at_ms,
+            expires_at_ms,
+        )));
     }
 
     // Classification happens immediately in the same writer dispatch. A
@@ -19059,14 +19034,7 @@ fn finalize_event_delivery_backend(
     // Timestamp at serialized writer dispatch so bounded-queue delay cannot
     // make `handled_at` predate the durable token-CAS transition.
     let handled_at_ms = now_ms_strict()?;
-    finalize_event_delivery_backend_at(
-        backend,
-        event_id,
-        token,
-        handled_at_ms,
-        workflow_id,
-        status,
-    )
+    finalize_event_delivery_backend_at(backend, event_id, token, handled_at_ms, workflow_id, status)
 }
 
 fn finalize_event_delivery_backend_at(
@@ -19193,9 +19161,7 @@ fn validate_event_delivery_finalize_fields(
     Ok(())
 }
 
-fn canonical_event_delivery_lease_pairs(
-    leases: &[(i64, String)],
-) -> Result<Vec<(i64, String)>> {
+fn canonical_event_delivery_lease_pairs(leases: &[(i64, String)]) -> Result<Vec<(i64, String)>> {
     if leases.len() > EVENT_DELIVERY_LEASE_BULK_MAX {
         return Err(StorageError::InvalidEventDeliveryLeaseBatch(
             EventDeliveryLeaseBatchError::TooManyPairs {
@@ -19212,10 +19178,7 @@ fn canonical_event_delivery_lease_pairs(
     let mut canonical = leases.to_vec();
     canonical.sort_unstable();
     canonical.dedup();
-    if let Some(conflict) = canonical
-        .windows(2)
-        .find(|pair| pair[0].0 == pair[1].0)
-    {
+    if let Some(conflict) = canonical.windows(2).find(|pair| pair[0].0 == pair[1].0) {
         return Err(StorageError::LeaseTokenConflict {
             event_id: conflict[0].0,
         }
@@ -20348,8 +20311,7 @@ fn parse_workflow_execution_column<T: serde::de::DeserializeOwned>(
     match serde_json::from_str(raw) {
         Ok(parsed) => Some(parsed),
         Err(err) => {
-            WORKFLOW_EXECUTION_ROW_PARSE_DROP_COUNT
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            saturating_atomic_u64_add(&WORKFLOW_EXECUTION_ROW_PARSE_DROP_COUNT, 1);
             tracing::warn!(
                 target: "ft.storage.workflow",
                 event = "workflow_execution_row_parse_drop",
@@ -20416,7 +20378,7 @@ fn parse_storage_json_col<T: serde::de::DeserializeOwned>(
     match serde_json::from_str(raw) {
         Ok(parsed) => Some(parsed),
         Err(err) => {
-            STORAGE_JSON_COL_PARSE_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            saturating_atomic_u64_add(&STORAGE_JSON_COL_PARSE_DROP_COUNT, 1);
             tracing::warn!(
                 target: "ft.storage.json_col",
                 event = "json_col_parse_drop",
@@ -20473,7 +20435,7 @@ fn parse_pane_bookmark_tags(raw: &str, bookmark_id: i64, pane_id: u64) -> Option
     match serde_json::from_str::<Vec<String>>(raw) {
         Ok(tags) => Some(tags),
         Err(err) => {
-            PANE_BOOKMARK_TAGS_PARSE_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            saturating_atomic_u64_add(&PANE_BOOKMARK_TAGS_PARSE_DROP_COUNT, 1);
             tracing::warn!(
                 target: "ft.storage.pane_bookmark",
                 event = "pane_bookmark_tags_parse_drop",
@@ -20728,17 +20690,17 @@ impl PoolTelemetrySnapshot {
     /// acquires have happened yet (avoids 0/0 NaN).
     #[must_use]
     pub fn hit_rate(&self) -> f64 {
-        let total = self.hits + self.misses;
-        if total == 0 {
+        let total = self.hits as f64 + self.misses as f64;
+        if total == 0.0 {
             return 0.0;
         }
-        self.hits as f64 / total as f64
+        self.hits as f64 / total
     }
 
     /// Total acquire calls (hits + misses).
     #[must_use]
     pub fn total_acquires(&self) -> u64 {
-        self.hits + self.misses
+        self.hits.saturating_add(self.misses)
     }
 }
 
@@ -20786,7 +20748,6 @@ impl PooledReadConn {
     pub(crate) fn acquire_with_capacity(db_path: &str, max_pool_size: usize) -> Result<Self> {
         let timer = SwarmCapacityStageTimer::start(SwarmCapacityStage::StorageReadPool, 0);
         let result = (|| {
-            use std::sync::atomic::Ordering;
             let recycled = {
                 // br-ft-ac4j0: recover from poison instead of cascading.
                 // Pre-fix used .expect — a panic in any thread holding
@@ -20799,7 +20760,7 @@ impl PooledReadConn {
                 // is a no-op; worst case a stale entry survives until the
                 // next return.
                 let mut pool = read_pool().lock().unwrap_or_else(|poison| {
-                    POOL_LOCK_POISONED.fetch_add(1, Ordering::Relaxed);
+                    saturating_atomic_u64_add(&POOL_LOCK_POISONED, 1);
                     poison.into_inner()
                 });
                 pool.get_mut(db_path).and_then(|v| v.pop())
@@ -20808,7 +20769,7 @@ impl PooledReadConn {
                 Some(c) => {
                     // br-ft-rvt1z: pool hit — recycled an existing
                     // pre-warmed connection.
-                    POOL_HITS.fetch_add(1, Ordering::Relaxed);
+                    saturating_atomic_u64_add(&POOL_HITS, 1);
                     c
                 }
                 None => {
@@ -20817,7 +20778,7 @@ impl PooledReadConn {
                     // open call so a failed open still counts as a miss
                     // attempt (the test invariant is hit-rate, not
                     // success-rate).
-                    POOL_MISSES.fetch_add(1, Ordering::Relaxed);
+                    saturating_atomic_u64_add(&POOL_MISSES, 1);
                     open_read_storage_backend(db_path)?
                 }
             };
@@ -20869,7 +20830,6 @@ impl PooledReadConn {
 
 impl Drop for PooledReadConn {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
         if let Some(backend) = self.backend.take() {
             // If the closure panicked or returned mid-transaction, the
             // backend has an open transaction. Returning it to the pool
@@ -20896,12 +20856,12 @@ impl Drop for PooledReadConn {
                     if entry.len() < self.max_pool_size {
                         entry.push(backend);
                         // br-ft-rvt1z: counted only on successful return.
-                        POOL_RETURNS.fetch_add(1, Ordering::Relaxed);
+                        saturating_atomic_u64_add(&POOL_RETURNS, 1);
                         return;
                     }
                 }
                 Err(_) => {
-                    POOL_LOCK_POISONED.fetch_add(1, Ordering::Relaxed);
+                    saturating_atomic_u64_add(&POOL_LOCK_POISONED, 1);
                 }
             }
             // Pool full (or lock poisoned) — let backend drop, which closes it.
@@ -21154,7 +21114,12 @@ fn parse_tiered_cleanup_receipt_metadata(metadata: &str) -> Result<serde_json::V
             != Some(TIERED_CLEANUP_RECEIPT_SCHEMA)
         || ["tables_recorded", "eligible_rows", "deleted_rows"]
             .iter()
-            .any(|key| object.get(*key).and_then(serde_json::Value::as_u64).is_none())
+            .any(|key| {
+                object
+                    .get(*key)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none()
+            })
     {
         return Err(StorageError::Database(
             "tiered cleanup receipt metadata has an invalid fixed shape".to_string(),
@@ -21169,10 +21134,8 @@ fn tiered_cleanup_receipt_status(metadata: &serde_json::Value) -> Result<&str> {
         .get("attempt_status")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
-            StorageError::Database(
-                "tiered cleanup receipt attempt status is invalid".to_string(),
-            )
-            .into()
+            StorageError::Database("tiered cleanup receipt attempt status is invalid".to_string())
+                .into()
         })
 }
 
@@ -21181,10 +21144,7 @@ fn tiered_cleanup_receipt_count(metadata: &serde_json::Value, field: &str) -> Re
         .get(field)
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| {
-            StorageError::Database(format!(
-                "tiered cleanup receipt {field} is invalid"
-            ))
-            .into()
+            StorageError::Database(format!("tiered cleanup receipt {field} is invalid")).into()
         })
 }
 
@@ -22098,11 +22058,7 @@ fn validate_mux_session_admission(
         MAX_SESSION_FT_VERSION_BYTES,
     )?;
     if let Some(host_id) = host_id {
-        require_session_persistence_limit(
-            "host_id",
-            host_id.len(),
-            MAX_SESSION_HOST_ID_BYTES,
-        )?;
+        require_session_persistence_limit("host_id", host_id.len(), MAX_SESSION_HOST_ID_BYTES)?;
     }
     Ok(())
 }
@@ -22184,11 +22140,11 @@ fn raw_session_pane_text_bytes(
     ]
     .into_iter()
     .try_fold(0usize, |total, bytes| {
-        total.checked_add(bytes).ok_or(
-            SessionPersistenceAdmissionError::ByteCountOverflow {
+        total
+            .checked_add(bytes)
+            .ok_or(SessionPersistenceAdmissionError::ByteCountOverflow {
                 resource: "pane text bytes",
-            },
-        )
+            })
     })
 }
 
@@ -22266,22 +22222,23 @@ fn checkpoint_json_error(
     field: &'static str,
     error: impl std::fmt::Display,
 ) -> crate::error::Error {
-    StorageError::Database(format!("Invalid {field} JSON for session checkpoint: {error}")).into()
+    StorageError::Database(format!(
+        "Invalid {field} JSON for session checkpoint: {error}"
+    ))
+    .into()
 }
 
 fn canonicalize_checkpoint_json_text(field: &'static str, raw: &str) -> Result<String> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|error| checkpoint_json_error(field, error))?;
-    canonical_checkpoint_json_string(&value)
-        .map_err(|error| checkpoint_json_error(field, error))
+    canonical_checkpoint_json_string(&value).map_err(|error| checkpoint_json_error(field, error))
 }
 
 fn canonicalize_typed_checkpoint_json<T>(field: &'static str, raw: &str) -> Result<String>
 where
     T: serde::de::DeserializeOwned,
 {
-    let _: T =
-        serde_json::from_str(raw).map_err(|error| checkpoint_json_error(field, error))?;
+    let _: T = serde_json::from_str(raw).map_err(|error| checkpoint_json_error(field, error))?;
     // Validate the required typed projection, but canonicalize the original
     // value. Serde deliberately ignores unknown struct fields by default;
     // serializing `T` here would silently discard forward-compatible state.
@@ -22307,19 +22264,11 @@ fn prepare_checkpoint_topology(
 }
 
 fn prepare_mux_session(topology_json: String) -> Result<PreparedMuxSession> {
-    require_session_persistence_limit(
-        "topology_json",
-        topology_json.len(),
-        MAX_SNAPSHOT_BYTES,
-    )
-    .map_err(session_persistence_admission_error)?;
+    require_session_persistence_limit("topology_json", topology_json.len(), MAX_SNAPSHOT_BYTES)
+        .map_err(session_persistence_admission_error)?;
     let (_, topology_json) = prepare_checkpoint_topology(&topology_json)?;
-    require_session_persistence_limit(
-        "topology_json",
-        topology_json.len(),
-        MAX_SNAPSHOT_BYTES,
-    )
-    .map_err(session_persistence_admission_error)?;
+    require_session_persistence_limit("topology_json", topology_json.len(), MAX_SNAPSHOT_BYTES)
+        .map_err(session_persistence_admission_error)?;
     Ok(PreparedMuxSession { topology_json })
 }
 
@@ -22880,9 +22829,9 @@ fn current_session_checkpoint_witness_matches_backend(
             cwd: pane_row
                 .optional_string(1)
                 .map_err(|error| storage_backend_error("Checkpoint witness pane cwd", error))?,
-            command: pane_row.optional_string(2).map_err(|error| {
-                storage_backend_error("Checkpoint witness pane command", error)
-            })?,
+            command: pane_row
+                .optional_string(2)
+                .map_err(|error| storage_backend_error("Checkpoint witness pane command", error))?,
             env_json: pane_row.optional_string(3).map_err(|error| {
                 storage_backend_error("Checkpoint witness pane environment", error)
             })?,
@@ -23153,8 +23102,7 @@ fn bounded_segment_retention_batch_size(requested: usize) -> usize {
     requested.min(SEGMENT_RETENTION_DELETE_BATCH_MAX)
 }
 
-const REWIND_AFFECTED_FTS_PROGRESS_SQL: &str =
-    "DELETE FROM fts_pane_progress
+const REWIND_AFFECTED_FTS_PROGRESS_SQL: &str = "DELETE FROM fts_pane_progress
      WHERE pane_id IN (SELECT pane_id FROM segment_retention_affected_panes)
        AND last_indexed_seq > COALESCE(
            (SELECT MAX(seq) FROM output_segments
@@ -23249,12 +23197,7 @@ fn prune_segments_backend(
     before_ts: i64,
     requested_batch_size: usize,
 ) -> Result<usize> {
-    prune_segments_with_cleanup_receipt_backend(
-        backend,
-        before_ts,
-        requested_batch_size,
-        None,
-    )
+    prune_segments_with_cleanup_receipt_backend(backend, before_ts, requested_batch_size, None)
 }
 
 fn prune_segments_with_cleanup_receipt_backend(
@@ -23288,13 +23231,8 @@ fn prune_segments_with_cleanup_receipt_backend(
             )
             .map_err(|err| storage_backend_error("Select segment retention batch", err))?;
             capture_segment_delete_affected_panes_backend(backend)?;
-            let selected = count_table_where(
-                backend,
-                "segment_retention_delete_batch",
-                "1=1",
-                &[],
-            )
-            .map_err(|err| storage_backend_error("Count segment retention batch", err))?;
+            let selected = count_table_where(backend, "segment_retention_delete_batch", "1=1", &[])
+                .map_err(|err| storage_backend_error("Count segment retention batch", err))?;
             let selected = count_i64_to_usize(selected, "Segment retention batch count")?;
 
             execute_typed(
@@ -23360,9 +23298,7 @@ fn rewind_stranded_fts_progress_for_affected_panes_backend(
 ) -> Result<()> {
     backend
         .query_map_typed(REWIND_AFFECTED_FTS_PROGRESS_SQL, &[])
-        .map_err(|err| {
-            storage_backend_error("Failed to rewind affected-pane FTS progress", err)
-        })?;
+        .map_err(|err| storage_backend_error("Failed to rewind affected-pane FTS progress", err))?;
     Ok(())
 }
 
@@ -23406,7 +23342,9 @@ fn oldest_segment_eviction_sample_backend(
             OLDEST_SEGMENT_EVICTION_SAMPLE_SQL,
             &[ToSqlValue::Integer(probe_limit)],
         )
-        .map_err(|error| storage_backend_error("Sample oldest segments for size eviction", error))?;
+        .map_err(|error| {
+            storage_backend_error("Sample oldest segments for size eviction", error)
+        })?;
     let contains_every_segment = rows.len() <= SIZE_EVICTION_BATCH;
     let mut sampled_rows = 0usize;
     let mut sampled_content_bytes = 0u64;
@@ -23423,13 +23361,14 @@ fn oldest_segment_eviction_sample_backend(
         sampled_rows = sampled_rows.checked_add(1).ok_or_else(|| {
             StorageError::Database("size-eviction sample row count overflow".to_string())
         })?;
-        sampled_content_bytes = sampled_content_bytes
-            .checked_add(content_len)
-            .ok_or_else(|| {
-                StorageError::Database(
-                    "size-eviction sample content-byte count overflow".to_string(),
-                )
-            })?;
+        sampled_content_bytes =
+            sampled_content_bytes
+                .checked_add(content_len)
+                .ok_or_else(|| {
+                    StorageError::Database(
+                        "size-eviction sample content-byte count overflow".to_string(),
+                    )
+                })?;
         largest_content_bytes = largest_content_bytes.max(content_len);
     }
     Ok(SegmentEvictionSample {
@@ -23467,12 +23406,11 @@ fn database_used_bytes_backend(backend: &dyn StorageBackend) -> Result<u64> {
     let live_pages = u64::try_from(stats.page_count - stats.free_pages).map_err(|_| {
         StorageError::Database("SQLite live-page count exceeds u64 range".to_string())
     })?;
-    let page_size = u64::try_from(page_size).map_err(|_| {
-        StorageError::Database("SQLite page size exceeds u64 range".to_string())
-    })?;
-    live_pages.checked_mul(page_size).ok_or_else(|| {
-        StorageError::Database("SQLite live-byte count overflow".to_string()).into()
-    })
+    let page_size = u64::try_from(page_size)
+        .map_err(|_| StorageError::Database("SQLite page size exceeds u64 range".to_string()))?;
+    live_pages
+        .checked_mul(page_size)
+        .ok_or_else(|| StorageError::Database("SQLite live-byte count overflow".to_string()).into())
 }
 
 /// Delete the `limit` oldest output segments (by `captured_at`, ties broken by
@@ -23498,13 +23436,8 @@ fn delete_oldest_segments_backend(backend: &dyn StorageBackend, limit: usize) ->
             )
             .map_err(|err| storage_backend_error("Select oldest segment delete batch", err))?;
             capture_segment_delete_affected_panes_backend(backend)?;
-            let selected = count_table_where(
-                backend,
-                "segment_retention_delete_batch",
-                "1=1",
-                &[],
-            )
-            .map_err(|err| storage_backend_error("Count size-eviction segment batch", err))?;
+            let selected = count_table_where(backend, "segment_retention_delete_batch", "1=1", &[])
+                .map_err(|err| storage_backend_error("Count size-eviction segment batch", err))?;
             let selected = count_i64_to_usize(selected, "Size-eviction segment batch count")?;
             execute_typed(
                 backend,
@@ -23602,14 +23535,11 @@ fn enforce_size_limit_backend(
     }
 
     let sampled_rows = u64::try_from(sample.sampled_rows).unwrap_or(u64::MAX);
-    let average_content_bytes = sample
-        .sampled_content_bytes
-        .div_ceil(sampled_rows)
-        .max(1);
-    let estimated_reclaim_per_segment = average_content_bytes
-        .saturating_add(SIZE_EVICTION_ESTIMATED_ROW_OVERHEAD_BYTES);
-    let needed = usize::try_from(over_bytes.div_ceil(estimated_reclaim_per_segment))
-        .unwrap_or(usize::MAX);
+    let average_content_bytes = sample.sampled_content_bytes.div_ceil(sampled_rows).max(1);
+    let estimated_reclaim_per_segment =
+        average_content_bytes.saturating_add(SIZE_EVICTION_ESTIMATED_ROW_OVERHEAD_BYTES);
+    let needed =
+        usize::try_from(over_bytes.div_ceil(estimated_reclaim_per_segment)).unwrap_or(usize::MAX);
     let batch_size = SIZE_EVICTION_BATCH.min(needed.max(1));
     let deleted_segments = delete_oldest_segments_backend(backend, batch_size)?;
     let used_after = if deleted_segments == 0 {
@@ -24165,10 +24095,7 @@ fn purge_notification_history_backend(
              RETURNING id",
             &[
                 ToSqlValue::Integer(before_ts),
-                ToSqlValue::Integer(usize_to_i64(
-                    batch_size,
-                    "notification purge batch size",
-                )?),
+                ToSqlValue::Integer(usize_to_i64(batch_size, "notification purge batch size")?),
             ],
         )
         .map_err(|err| storage_backend_error("Failed to purge notification history", err))?;
@@ -24237,9 +24164,7 @@ fn count_events_by_retention_rule_backend(
         .query_row_typed(&sql, &params)
         .map_err(|err| storage_backend_error("Count ordered event retention rule", err))?
         .ok_or_else(|| {
-            StorageError::Database(
-                "ordered event retention count returned no row".to_string(),
-            )
+            StorageError::Database("ordered event retention count returned no row".to_string())
         })?;
     count_query_row_to_usize(&row, "Ordered event retention count row")
 }
@@ -24254,7 +24179,12 @@ fn compiled_retention_query_params(
         .map_err(retention_policy_compile_error)?;
     let mut params = Vec::with_capacity(policy.bind_values().len() + 2);
     params.push(ToSqlValue::Integer(before_ts));
-    params.extend(policy.bind_values().iter().map(|value| ToSqlValue::Text(value)));
+    params.extend(
+        policy
+            .bind_values()
+            .iter()
+            .map(|value| ToSqlValue::Text(value)),
+    );
     params.push(ToSqlValue::Integer(usize_to_i64(
         branch_index,
         "retention policy branch index",
@@ -24328,9 +24258,7 @@ fn count_events_by_compiled_retention_branch_backend(
         .query_row_typed(policy.count_sql(), &params)
         .map_err(|err| storage_backend_error("Count compiled event retention branch", err))?
         .ok_or_else(|| {
-            StorageError::Database(
-                "compiled event retention count returned no row".to_string(),
-            )
+            StorageError::Database("compiled event retention count returned no row".to_string())
         })?;
     count_query_row_to_usize(&row, "Compiled event retention count row")
 }
@@ -24344,9 +24272,7 @@ fn count_events_by_compiled_retention_policy_backend(
     policy.note_sql_execution();
     let rows = backend
         .query_map_typed(policy.all_branch_count_sql(), &params)
-        .map_err(|error| {
-            storage_backend_error("Count compiled event retention policy", error)
-        })?;
+        .map_err(|error| storage_backend_error("Count compiled event retention policy", error))?;
     let mut counts = vec![0usize; cutoffs.len()];
     let mut seen = vec![false; cutoffs.len()];
     for row in &rows {
@@ -24367,9 +24293,7 @@ fn count_events_by_compiled_retention_policy_backend(
         }
         counts[branch] = count_query_row_to_usize(
             row.get(1..).ok_or_else(|| {
-                StorageError::Database(
-                    "compiled retention count row omitted its count".to_string(),
-                )
+                StorageError::Database("compiled retention count row omitted its count".to_string())
             })?,
             "Compiled retention policy count row",
         )?;
@@ -24429,9 +24353,7 @@ fn count_operational_maintenance_before_backend(
         "timestamp < ?1 AND event_type IN ('cache_gc', 'fleet_scrollback_coordinator')",
         &[ToSqlValue::Integer(before_ts)],
     )
-    .map_err(|err| {
-        storage_backend_error("Failed to count operational maintenance history", err)
-    })?;
+    .map_err(|err| storage_backend_error("Failed to count operational maintenance history", err))?;
     count_i64_to_usize(count, "Failed to count operational maintenance row")
 }
 
@@ -24475,8 +24397,7 @@ fn compile_ordered_retention_policy_branch(
     if let Some(tier) = tier {
         tiers.push(tier.clone());
     }
-    let policy =
-        compile_retention_policy_tiers(&tiers).map_err(retention_policy_compile_error)?;
+    let policy = compile_retention_policy_tiers(&tiers).map_err(retention_policy_compile_error)?;
     let branch_index = if tier.is_some() {
         branch_index
     } else {
@@ -24505,9 +24426,9 @@ fn accumulate_bounded_writer_batch(
         ))
         .into());
     }
-    let total_deleted = total_deleted.checked_add(deleted).ok_or_else(|| {
-        StorageError::Database(format!("{operation} deleted-row count overflow"))
-    })?;
+    let total_deleted = total_deleted
+        .checked_add(deleted)
+        .ok_or_else(|| StorageError::Database(format!("{operation} deleted-row count overflow")))?;
     Ok((total_deleted, deleted < batch_size))
 }
 
@@ -24558,12 +24479,8 @@ fn delete_events_by_retention_rule_backend(
     excluded_tiers: &[RetentionTier],
     batch_size: usize,
 ) -> Result<usize> {
-    let (candidate_query, params) = build_retention_rule_query(
-        "SELECT id FROM events",
-        before_ts,
-        tier,
-        excluded_tiers,
-    );
+    let (candidate_query, params) =
+        build_retention_rule_query("SELECT id FROM events", before_ts, tier, excluded_tiers);
     delete_events_with_retention_ledger_backend(
         backend,
         &candidate_query,
@@ -24729,13 +24646,11 @@ fn delete_event_retention_batch_from_query_backend(
         "event retention transaction",
         || -> Result<EventRetentionDeleteBatchResult> {
             let now = now_ms();
-            let stale_authorizations = count_table_where(
-                backend,
-                "event_retention_delete_authorizations",
-                "1=1",
-                &[],
-            )
-            .map_err(|err| storage_backend_error("Check event retention delete batch", err))?;
+            let stale_authorizations =
+                count_table_where(backend, "event_retention_delete_authorizations", "1=1", &[])
+                    .map_err(|err| {
+                        storage_backend_error("Check event retention delete batch", err)
+                    })?;
             if stale_authorizations != 0 {
                 return Err(StorageError::Database(format!(
                     "event retention delete authorization table was non-empty outside a batch: {stale_authorizations} rows"
@@ -24842,8 +24757,7 @@ fn delete_event_retention_batch_from_query_backend(
                 .into());
             }
 
-            let deleted_count =
-                usize_to_i64(candidate_ids.len(), "event retention deleted count")?;
+            let deleted_count = usize_to_i64(candidate_ids.len(), "event retention deleted count")?;
             let generation_row = backend
                 .query_row_typed(
                     "UPDATE event_retention_state
@@ -24857,15 +24771,13 @@ fn delete_event_retention_batch_from_query_backend(
                    AND generation < 9223372036854775807
                    AND deleted_event_count <= 9223372036854775807 - ?1
                  RETURNING generation, evidence_from_event_id",
-                    &[
-                        ToSqlValue::Integer(deleted_count),
-                        ToSqlValue::Integer(now),
-                    ],
+                    &[ToSqlValue::Integer(deleted_count), ToSqlValue::Integer(now)],
                 )
                 .map_err(|err| storage_backend_error("Advance event retention generation", err))?
                 .ok_or_else(|| {
                     StorageError::Database(
-                        "event retention state is missing or its counters are exhausted".to_string(),
+                        "event retention state is missing or its counters are exhausted"
+                            .to_string(),
                     )
                 })?;
             let generation = RowReader::new(&generation_row)
@@ -24886,8 +24798,8 @@ fn delete_event_retention_batch_from_query_backend(
             // those old holes in the new epoch: they cannot make a current-epoch
             // cursor less complete, and retaining them would cause needless
             // repeated rotations under sparse tier rules.
-            let authoritative_start = candidate_ids
-                .partition_point(|event_id| *event_id < evidence_from_event_id);
+            let authoritative_start =
+                candidate_ids.partition_point(|event_id| *event_id < evidence_from_event_id);
             record_event_retention_intervals_backend(
                 backend,
                 &candidate_ids[authoritative_start..],
@@ -24898,9 +24810,7 @@ fn delete_event_retention_batch_from_query_backend(
 
             backend
                 .execute("DELETE FROM event_retention_delete_authorizations")
-                .map_err(|err| {
-                    storage_backend_error("Clear committed event delete batch", err)
-                })?;
+                .map_err(|err| storage_backend_error("Clear committed event delete batch", err))?;
             if let Some(cleanup_receipt_id) = cleanup_receipt_id {
                 advance_tiered_cleanup_receipt_backend(
                     backend,
@@ -24953,9 +24863,7 @@ fn enforce_event_retention_interval_bound_backend(
         .into());
     }
     backend
-        .execute(
-            "INSERT INTO event_retention_rotation_authorizations (singleton) VALUES (1)",
-        )
+        .execute("INSERT INTO event_retention_rotation_authorizations (singleton) VALUES (1)")
         .map_err(|err| storage_backend_error("Authorize event retention epoch rotation", err))?;
     let rotated = backend
         .query_row_typed(
@@ -24976,10 +24884,7 @@ fn enforce_event_retention_interval_bound_backend(
     let rotated_epoch = RowReader::new(&rotated)
         .string(0)
         .map_err(|err| storage_backend_error("Rotated event retention cursor epoch", err))?;
-    validate_event_retention_cursor_epoch(
-        &rotated_epoch,
-        "rotated event retention cursor epoch",
-    )?;
+    validate_event_retention_cursor_epoch(&rotated_epoch, "rotated event retention cursor epoch")?;
     if rotated_epoch == snapshot.cursor_epoch {
         return Err(StorageError::Database(
             "event retention epoch rotation generated the existing cursor epoch; refusing to clear authoritative intervals"
@@ -24992,7 +24897,9 @@ fn enforce_event_retention_interval_bound_backend(
         .map_err(|err| storage_backend_error("Clear rotated event retention intervals", err))?;
     backend
         .execute("DELETE FROM event_retention_rotation_authorizations")
-        .map_err(|err| storage_backend_error("Clear event retention rotation authorization", err))?;
+        .map_err(|err| {
+            storage_backend_error("Clear event retention rotation authorization", err)
+        })?;
     let remaining = count_table_where(backend, "event_retention_intervals", "1=1", &[])
         .map_err(|err| storage_backend_error("Verify rotated retention intervals", err))?;
     if remaining != 0 {
@@ -25124,8 +25031,7 @@ fn record_event_retention_intervals_backend(
         .map_err(|err| storage_backend_error("Query adjacent retention intervals", err))?;
     if neighbor_rows.len() == neighbor_limit {
         return Err(StorageError::Database(
-            "event retention interval ledger is overlapping or otherwise non-canonical"
-                .to_string(),
+            "event retention interval ledger is overlapping or otherwise non-canonical".to_string(),
         )
         .into());
     }
@@ -25141,12 +25047,12 @@ fn record_event_retention_intervals_backend(
             end_id: reader
                 .i64(1)
                 .map_err(|err| storage_backend_error("Retention neighbor end", err))?,
-            first_generation: reader.i64(2).map_err(|err| {
-                storage_backend_error("Retention neighbor first generation", err)
-            })?,
-            last_generation: reader.i64(3).map_err(|err| {
-                storage_backend_error("Retention neighbor last generation", err)
-            })?,
+            first_generation: reader
+                .i64(2)
+                .map_err(|err| storage_backend_error("Retention neighbor first generation", err))?,
+            last_generation: reader
+                .i64(3)
+                .map_err(|err| storage_backend_error("Retention neighbor last generation", err))?,
             first_deleted_at: reader.i64(4).map_err(|err| {
                 storage_backend_error("Retention neighbor first deletion time", err)
             })?,
@@ -25260,8 +25166,7 @@ fn build_retention_rule_query(
     tier: Option<&RetentionTier>,
     excluded_tiers: &[RetentionTier],
 ) -> (String, Vec<ToSqlValue<'static>>) {
-    let mut sql =
-        format!("{select_prefix} WHERE detected_at < ? AND delivery_lease_token IS NULL");
+    let mut sql = format!("{select_prefix} WHERE detected_at < ? AND delivery_lease_token IS NULL");
     let mut params = vec![ToSqlValue::Integer(before_ts)];
     if let Some(tier) = tier {
         let predicate = retention_tier_match_predicate(tier, &mut params);
@@ -26817,10 +26722,9 @@ fn search_semantic_backend_with_scan_limit(
     // Stable base order before similarity sort.
     sql.push_str(" ORDER BY s.id ASC");
     if let Some(scan_limit) = scan_limit_rows {
-        let bounded_scan_limit = scan_limit.max(limit).max(1);
         sql.push_str(" LIMIT ?");
         params.push(ToSqlValue::Integer(usize_to_i64(
-            bounded_scan_limit,
+            scan_limit,
             "semantic scan limit",
         )?));
     }
@@ -26881,9 +26785,8 @@ fn resolve_semantic_lane_backend(
     }
 
     if query_vector.is_empty() {
-        if let Ok(mut state) = semantic_budget_state.lock() {
-            state.note_semantic_fallback_reason("semantic_query_empty");
-        }
+        lock_semantic_budget_state(semantic_budget_state)
+            .note_semantic_fallback_reason("semantic_query_empty");
         return Ok(SemanticLaneResolution {
             hits: Vec::new(),
             unavailable_reason: Some("semantic_query_empty".to_string()),
@@ -26896,9 +26799,8 @@ fn resolve_semantic_lane_backend(
     }
 
     if query_vector.iter().any(|v| !v.is_finite()) {
-        if let Ok(mut state) = semantic_budget_state.lock() {
-            state.note_semantic_fallback_reason("semantic_query_non_finite");
-        }
+        lock_semantic_budget_state(semantic_budget_state)
+            .note_semantic_fallback_reason("semantic_query_non_finite");
         return Ok(SemanticLaneResolution {
             hits: Vec::new(),
             unavailable_reason: Some("semantic_query_non_finite".to_string()),
@@ -26911,14 +26813,12 @@ fn resolve_semantic_lane_backend(
     }
 
     let now = now_ms();
-    let decision = match semantic_budget_state.lock() {
-        Ok(mut state) => state.begin_semantic_lane(now, options, embedder_id, query_vector),
-        Err(_) => SemanticBudgetDecision::Skip {
-            reason: "semantic_budget_poisoned".to_string(),
-            budget_state: "error".to_string(),
-            backoff_until_ms: None,
-        },
-    };
+    let decision = lock_semantic_budget_state(semantic_budget_state).begin_semantic_lane(
+        now,
+        options,
+        embedder_id,
+        query_vector,
+    );
 
     match decision {
         SemanticBudgetDecision::UseCache { hits } => {
@@ -26927,11 +26827,6 @@ fn resolve_semantic_lane_backend(
             } else {
                 None
             };
-            if unavailable_reason.is_some()
-                && let Ok(mut state) = semantic_budget_state.lock()
-            {
-                state.note_semantic_fallback_reason("semantic_no_hits");
-            }
             Ok(SemanticLaneResolution {
                 hits,
                 unavailable_reason,
@@ -26955,7 +26850,11 @@ fn resolve_semantic_lane_backend(
             budget_state,
             backoff_until_ms,
         }),
-        SemanticBudgetDecision::Execute { key, max_scan_rows } => {
+        SemanticBudgetDecision::Execute {
+            key,
+            max_scan_rows,
+            generation,
+        } => {
             let started = Instant::now();
             let (hits, rows_scanned) = search_semantic_backend_with_scan_limit(
                 backend,
@@ -26966,17 +26865,17 @@ fn resolve_semantic_lane_backend(
             )?;
             let elapsed_ms = started.elapsed().as_millis() as u64;
             let now_after = now_ms();
-            let backoff_until_ms = match semantic_budget_state.lock() {
-                Ok(mut state) => {
-                    state.complete_semantic_lane(now_after, key, &hits, elapsed_ms, rows_scanned)
-                }
-                Err(_) => None,
-            };
+            let completion = lock_semantic_budget_state(semantic_budget_state)
+                .complete_semantic_lane(
+                    now_after,
+                    key,
+                    &generation,
+                    &hits,
+                    elapsed_ms,
+                    rows_scanned,
+                );
 
             let unavailable_reason = if hits.is_empty() {
-                if let Ok(mut state) = semantic_budget_state.lock() {
-                    state.note_semantic_fallback_reason("semantic_no_hits");
-                }
                 Some("semantic_no_hits".to_string())
             } else {
                 None
@@ -26988,8 +26887,12 @@ fn resolve_semantic_lane_backend(
                 cache_hit: false,
                 latency_ms: elapsed_ms,
                 rows_scanned,
-                budget_state: "active".to_string(),
-                backoff_until_ms,
+                budget_state: if completion.epoch_current {
+                    "active".to_string()
+                } else {
+                    "stale_completion".to_string()
+                },
+                backoff_until_ms: completion.backoff_until_ms,
             })
         }
     }
@@ -27492,11 +27395,9 @@ const FTS_INTEGRITY_CHECK_SQL: &str =
 fn check_fts_integrity_backend(backend: &dyn StorageBackend) -> Result<bool> {
     match backend.execute_batch(FTS_INTEGRITY_CHECK_SQL) {
         Ok(()) => Ok(true),
-        Err(BackendError::TxPoisoned) => Err(storage_backend_error(
-            "FTS integrity check",
-            BackendError::TxPoisoned,
-        )
-        .into()),
+        Err(BackendError::TxPoisoned) => {
+            Err(storage_backend_error("FTS integrity check", BackendError::TxPoisoned).into())
+        }
         Err(err) => {
             let msg = err.to_string();
             if msg.contains("database disk image is malformed") || msg.contains("fts5: ") {
@@ -27834,9 +27735,7 @@ fn insert_fts_entries_select_batch_backend(
         .and_then(|value| backend_i64_to_u64(value, "set-based FTS indexed_count"))
         .map_err(|err| storage_backend_error("Failed to parse set-based FTS indexed_count", err))?;
     let max_fetched_count = u64::try_from(limit_i64).map_err(|_| {
-        StorageError::Database(format!(
-            "set-based FTS limit {limit_i64} exceeds u64 range"
-        ))
+        StorageError::Database(format!("set-based FTS limit {limit_i64} exceeds u64 range"))
     })?;
     if fetched_count_u64 > max_fetched_count || indexed_count > fetched_count_u64 {
         return Err(StorageError::Database(format!(
@@ -27844,11 +27743,9 @@ fn insert_fts_entries_select_batch_backend(
         ))
         .into());
     }
-    let min_content_bytes = reader
-        .optional_i64(3)
-        .map_err(|err| {
-            storage_backend_error("Failed to parse set-based FTS min_content_bytes", err)
-        })?;
+    let min_content_bytes = reader.optional_i64(3).map_err(|err| {
+        storage_backend_error("Failed to parse set-based FTS min_content_bytes", err)
+    })?;
     if fetched_count > 0 && min_content_bytes.is_none() {
         return Err(StorageError::Database(
             "set-based FTS batch fetched rows without a minimum content byte length".to_string(),
@@ -27976,9 +27873,7 @@ fn sync_fts_for_pane_backend_impl(
                 let next_total_indexed = total_indexed
                     .checked_add(outcome.indexed_count)
                     .ok_or_else(|| {
-                        StorageError::Database(
-                            "FTS sync total-indexed count overflow".to_string(),
-                        )
+                        StorageError::Database("FTS sync total-indexed count overflow".to_string())
                     })?;
                 let next_indexed_count = indexed_count
                     .checked_add(outcome.indexed_count)
@@ -28003,8 +27898,7 @@ fn sync_fts_for_pane_backend_impl(
             } else {
                 batch()?
             };
-            let Some((outcome, next_total_indexed, next_indexed_count)) = batch
-            else {
+            let Some((outcome, next_total_indexed, next_indexed_count)) = batch else {
                 break;
             };
             total_indexed = next_total_indexed;
@@ -28012,9 +27906,7 @@ fn sync_fts_for_pane_backend_impl(
             max_seq = outcome.max_seq;
 
             let fetched_count = u64::try_from(outcome.fetched_count).unwrap_or(u64::MAX);
-            if outcome.fetched_count < config.batch_size
-                && outcome.indexed_count == fetched_count
-            {
+            if outcome.fetched_count < config.batch_size && outcome.indexed_count == fetched_count {
                 break;
             }
             continue;
@@ -28149,8 +28041,7 @@ fn full_fts_rebuild_backend(
     validate_fts_sync_config(config)?;
     let start = Instant::now();
     let now = now_ms();
-    let created_at = get_fts_index_state_backend(backend)?
-        .map_or(now, |state| state.created_at);
+    let created_at = get_fts_index_state_backend(backend)?.map_or(now, |state| state.created_at);
 
     // Persist the fail-closed marker before any destructive index mutation.
     // The rebuild itself is one transaction: readers see the old complete
@@ -28202,9 +28093,7 @@ fn full_fts_rebuild_backend(
                             }
                         })?;
                     total_indexed = total_indexed.checked_add(indexed).ok_or_else(|| {
-                        StorageError::Database(
-                            "FTS rebuild indexed-row count overflow".to_string(),
-                        )
+                        StorageError::Database("FTS rebuild indexed-row count overflow".to_string())
                     })?;
                     panes_processed = panes_processed.checked_add(1).ok_or_else(|| {
                         StorageError::Database("FTS rebuild pane count overflow".to_string())
@@ -28244,9 +28133,7 @@ const fn fts_startup_error_class(error: &crate::Error) -> &'static str {
         crate::Error::Storage(StorageError::WriterBackendEpochPoisoned) => {
             "writer_backend_epoch_poisoned"
         }
-        crate::Error::Storage(StorageError::MigrationEpochPoisoned) => {
-            "migration_epoch_poisoned"
-        }
+        crate::Error::Storage(StorageError::MigrationEpochPoisoned) => "migration_epoch_poisoned",
         crate::Error::Storage(StorageError::WriterClosed) => "writer_closed",
         crate::Error::Storage(_) => "storage",
         crate::Error::Cancelled(_) => "cancelled",
@@ -28593,8 +28480,7 @@ fn decode_unhandled_event_count_rows(
         let pane_id_i64 = reader
             .i64(0)
             .map_err(|err| storage_backend_error("Unhandled event count pane_id", err))?;
-        if requested_pane_ids
-            .is_some_and(|pane_ids| pane_ids.binary_search(&pane_id_i64).is_err())
+        if requested_pane_ids.is_some_and(|pane_ids| pane_ids.binary_search(&pane_id_i64).is_err())
         {
             return Err(StorageError::Database(format!(
                 "unhandled event count query returned unrequested pane {pane_id_i64}"
@@ -28790,14 +28676,11 @@ fn validate_event_retention_cursor_epoch(epoch: &str, context: &str) -> Result<(
     Ok(())
 }
 
-const EVENT_STREAM_COLUMNS: &str =
-    "id, pane_id, rule_id, agent_type, event_type, severity, confidence, \
+const EVENT_STREAM_COLUMNS: &str = "id, pane_id, rule_id, agent_type, event_type, severity, confidence, \
      extracted, matched_text, segment_id, detected_at, dedupe_key, handled_at, \
      handled_by_workflow_id, handled_status";
 
-fn build_event_stream_suffix(
-    query: &EventStreamQuery,
-) -> Result<(String, Vec<ToSqlValue<'_>>)> {
+fn build_event_stream_suffix(query: &EventStreamQuery) -> Result<(String, Vec<ToSqlValue<'_>>)> {
     let mut sql = String::from(" WHERE 1=1");
     let mut params = Vec::new();
 
@@ -28916,7 +28799,9 @@ fn event_retention_snapshot_from_cells(
         || snapshot.max_event_id < snapshot.evidence_from_event_id.saturating_sub(1)
         || snapshot.deleted_event_count < 0
         || snapshot.deleted_event_count < snapshot.generation
-        || snapshot.last_deleted_at.is_some_and(|timestamp| timestamp < 0)
+        || snapshot
+            .last_deleted_at
+            .is_some_and(|timestamp| timestamp < 0)
         || !counters_consistent
         || (snapshot.legacy_history_complete && snapshot.evidence_from_event_id != 1)
     {
@@ -29132,8 +29017,7 @@ fn check_event_retention_backend(
     let status = if cursor_epoch.is_some_and(|epoch| epoch != snapshot.cursor_epoch.as_str()) {
         EventRetentionStatus::CursorEpochMismatch
     } else if !snapshot.legacy_history_complete
-        && (cursor_epoch.is_none()
-            || after_id < snapshot.evidence_from_event_id.saturating_sub(1))
+        && (cursor_epoch.is_none() || after_id < snapshot.evidence_from_event_id.saturating_sub(1))
     {
         EventRetentionStatus::LegacyHistoryUnavailable {
             evidence_from_event_id: snapshot.evidence_from_event_id,
@@ -33038,6 +32922,57 @@ fn hybrid_backend_search_returns_fused_ranked_results() {
         first.fusion_score > second.fusion_score,
         "matching lexical+semantic rank should outrank the weaker candidate"
     );
+}
+
+#[test]
+fn semantic_backend_honors_scan_ceiling_even_below_requested_result_limit() {
+    let backend = memory_backend();
+    let now_ms = 1_700_000_000_000i64;
+    seed_pane_backend(&backend, 1, now_ms);
+    let vector = encode_f32_embedding_blob(&[1.0_f32, 0.0]).unwrap();
+    for seq in 0..5 {
+        let segment_id = seed_segment_backend(
+            &backend,
+            1,
+            seq,
+            &format!("semantic candidate {seq}"),
+            now_ms + seq,
+        );
+        seed_segment_embedding_backend(
+            &backend,
+            segment_id,
+            "bounded-scan-embedder",
+            2,
+            &vector,
+            now_ms + seq,
+        );
+    }
+    let options = SearchOptions {
+        limit: Some(100),
+        ..SearchOptions::default()
+    };
+
+    let (hits, rows_scanned) = search_semantic_backend_with_scan_limit(
+        &backend,
+        "bounded-scan-embedder",
+        &[1.0, 0.0],
+        &options,
+        Some(2),
+    )
+    .unwrap();
+    assert_eq!(rows_scanned, 2);
+    assert_eq!(hits.len(), 2);
+
+    let (hits, rows_scanned) = search_semantic_backend_with_scan_limit(
+        &backend,
+        "bounded-scan-embedder",
+        &[1.0, 0.0],
+        &options,
+        Some(0),
+    )
+    .unwrap();
+    assert_eq!(rows_scanned, 0);
+    assert!(hits.is_empty());
 }
 
 #[test]
@@ -39540,7 +39475,7 @@ fn indeterminate_embedding_mutation_invalidates_semantic_cache_before_return() {
             CachedSemanticHits {
                 hits: Vec::new(),
                 expires_at_ms: i64::MAX,
-                generation: 0,
+                generation: Arc::clone(&guard.generation),
             },
         );
         assert_eq!(guard.cache.len(), 1);
@@ -39563,8 +39498,203 @@ fn indeterminate_embedding_mutation_invalidates_semantic_cache_before_return() {
 
     let guard = state.lock().expect("semantic state test lock");
     assert_eq!(guard.cache.len(), 0);
-    assert_eq!(guard.generation, 1);
     assert_eq!(guard.metrics.semantic_cache_invalidations, 1);
+}
+
+#[test]
+fn semantic_cache_epoch_replacement_clears_entries_without_identity_reuse() {
+    let mut state = SemanticBudgetState::new(SemanticBudgetConfig::default());
+    let original_generation = Arc::clone(&state.generation);
+    let key = SemanticQueryCacheKey {
+        embedder_id: "epoch-test".to_owned(),
+        pane_id: None,
+        zone_type: None,
+        since: None,
+        until: None,
+        limit: 10,
+        query_vector_hash: 11,
+        query_vector_len: 4,
+    };
+    let _ = state.cache.put(
+        key,
+        CachedSemanticHits {
+            hits: Vec::new(),
+            expires_at_ms: i64::MAX,
+            generation: Arc::clone(&original_generation),
+        },
+    );
+
+    state.invalidate_cache();
+
+    assert!(!Arc::ptr_eq(&state.generation, &original_generation));
+    assert!(state.cache.is_empty());
+    assert_eq!(state.metrics.semantic_cache_invalidations, 1);
+}
+
+#[test]
+fn semantic_completion_cannot_publish_across_a_reconfigured_cache_epoch() {
+    let mut state = SemanticBudgetState::new(SemanticBudgetConfig::default());
+    let options = SearchOptions {
+        limit: Some(10),
+        ..SearchOptions::default()
+    };
+    let (key, admitted_generation) = match state.begin_semantic_lane(
+        100,
+        &options,
+        "epoch-fenced-embedder",
+        &[1.0, 0.0],
+    ) {
+        SemanticBudgetDecision::Execute {
+            key, generation, ..
+        } => (key, generation),
+        decision => panic!("expected a cache miss execution, got {decision:?}"),
+    };
+
+    let mut replacement = SemanticBudgetConfig::default();
+    replacement.cache_capacity = 8;
+    state.configure(replacement);
+    state.note_semantic_fallback_reason("replacement-epoch-marker");
+    assert!(!Arc::ptr_eq(&state.generation, &admitted_generation));
+
+    let completion = state.complete_semantic_lane(
+        101,
+        key,
+        &admitted_generation,
+        &[SemanticSearchHit {
+            segment_id: 7,
+            score: 1.0,
+        }],
+        1,
+        1,
+    );
+
+    assert!(!completion.epoch_current);
+    assert!(state.cache.is_empty());
+    assert_eq!(state.metrics.semantic_stale_completions, 1);
+    assert_eq!(state.metrics.semantic_queries_executed, 1);
+    assert_eq!(state.metrics.semantic_rows_scanned_total, 1);
+    assert_eq!(state.metrics.last_semantic_latency_ms, 0);
+    assert_eq!(state.metrics.last_semantic_rows_scanned, 0);
+    assert_eq!(
+        state.metrics.last_fallback_reason.as_deref(),
+        Some("replacement-epoch-marker")
+    );
+    assert_eq!(state.ewma_semantic_latency_ms, 0.0);
+}
+
+#[test]
+fn semantic_zero_cache_capacity_never_reuses_or_retains_results() {
+    let mut config = SemanticBudgetConfig::default();
+    config.cache_capacity = 0;
+    let mut state = SemanticBudgetState::new(config);
+    let options = SearchOptions {
+        limit: Some(10),
+        ..SearchOptions::default()
+    };
+    let (key, admitted_generation) = match state.begin_semantic_lane(
+        100,
+        &options,
+        "cache-disabled-embedder",
+        &[1.0, 0.0],
+    ) {
+        SemanticBudgetDecision::Execute {
+            key, generation, ..
+        } => (key, generation),
+        decision => panic!("disabled cache must execute, got {decision:?}"),
+    };
+
+    let _ = state.complete_semantic_lane(
+        101,
+        key,
+        &admitted_generation,
+        &[SemanticSearchHit {
+            segment_id: 7,
+            score: 1.0,
+        }],
+        1,
+        1,
+    );
+
+    assert!(state.cache.is_empty());
+    assert!(matches!(
+        state.begin_semantic_lane(102, &options, "cache-disabled-embedder", &[1.0, 0.0]),
+        SemanticBudgetDecision::Execute { .. }
+    ));
+    assert_eq!(state.metrics.semantic_cache_hits, 0);
+    assert_eq!(state.metrics.semantic_cache_misses, 2);
+}
+
+#[test]
+fn semantic_scan_budget_is_a_hard_ceiling_below_requested_result_limit() {
+    let mut config = SemanticBudgetConfig::default();
+    config.max_semantic_scan_rows = 3;
+    let mut state = SemanticBudgetState::new(config);
+    let options = SearchOptions {
+        limit: Some(100),
+        ..SearchOptions::default()
+    };
+
+    assert!(matches!(
+        state.begin_semantic_lane(100, &options, "bounded-scan-embedder", &[1.0, 0.0]),
+        SemanticBudgetDecision::Execute {
+            max_scan_rows: 3,
+            ..
+        }
+    ));
+
+    let mut zero_scan = SemanticBudgetConfig::default();
+    zero_scan.max_semantic_scan_rows = 0;
+    state.configure(zero_scan);
+    assert!(matches!(
+        state.begin_semantic_lane(101, &options, "zero-scan-embedder", &[1.0, 0.0]),
+        SemanticBudgetDecision::Execute {
+            max_scan_rows: 0,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn semantic_budget_poison_recovery_retires_cache_authority_and_transient_state() {
+    let state = Arc::new(Mutex::new(SemanticBudgetState::new(
+        SemanticBudgetConfig::default(),
+    )));
+    let poisoned = Arc::clone(&state);
+    let join = std::thread::spawn(move || {
+        let mut guard = poisoned.lock().expect("lock semantic state");
+        guard.backoff_until_ms = Some(i64::MAX);
+        guard.rate_window_started_at_ms = 42;
+        guard.rate_window_queries = 9;
+        let _ = guard.cache.put(
+            SemanticQueryCacheKey {
+                embedder_id: "poison-test".to_owned(),
+                pane_id: None,
+                zone_type: None,
+                since: None,
+                until: None,
+                limit: 1,
+                query_vector_hash: 1,
+                query_vector_len: 1,
+            },
+            CachedSemanticHits {
+                hits: Vec::new(),
+                expires_at_ms: i64::MAX,
+                generation: Arc::clone(&guard.generation),
+            },
+        );
+        panic!("intentional semantic budget poison");
+    });
+    assert!(join.join().is_err());
+    assert!(state.is_poisoned());
+
+    let guard = lock_semantic_budget_state(&state);
+
+    assert!(!state.is_poisoned());
+    assert!(guard.cache.is_empty());
+    assert_eq!(guard.backoff_until_ms, None);
+    assert_eq!(guard.rate_window_started_at_ms, 0);
+    assert_eq!(guard.rate_window_queries, 0);
+    assert_eq!(guard.metrics.semantic_state_poison_recoveries, 1);
 }
 
 #[test]
@@ -40954,13 +41084,11 @@ mod write_command_sender_tests {
             0
         );
         assert!(
-            sender
-                .terminal_drain_wakeup
-                .wait_for_terminal_depth_change(
-                    std::time::Duration::ZERO,
-                    &sender.queued_depth,
-                    &sender.terminal_admission_gate,
-                ),
+            sender.terminal_drain_wakeup.wait_for_terminal_depth_change(
+                std::time::Duration::ZERO,
+                &sender.queued_depth,
+                &sender.terminal_admission_gate,
+            ),
             "the drain's atomic admission fence must retain zero as a stable terminal decision"
         );
     }
@@ -40984,25 +41112,21 @@ mod write_command_sender_tests {
             sender.terminal_drain_wakeup.as_ref(),
         );
         assert!(
-            !sender
-                .terminal_drain_wakeup
-                .wait_for_terminal_depth_change(
-                    std::time::Duration::ZERO,
-                    &sender.queued_depth,
-                    &sender.terminal_admission_gate,
-                ),
+            !sender.terminal_drain_wakeup.wait_for_terminal_depth_change(
+                std::time::Duration::ZERO,
+                &sender.queued_depth,
+                &sender.terminal_admission_gate,
+            ),
             "depth zero is not final while a pre-terminal sender can still increment it"
         );
 
         drop(paused_admission);
         assert!(
-            sender
-                .terminal_drain_wakeup
-                .wait_for_terminal_depth_change(
-                    std::time::Duration::ZERO,
-                    &sender.queued_depth,
-                    &sender.terminal_admission_gate,
-                ),
+            sender.terminal_drain_wakeup.wait_for_terminal_depth_change(
+                std::time::Duration::ZERO,
+                &sender.queued_depth,
+                &sender.terminal_admission_gate,
+            ),
             "once the pre-terminal registration retires, closed gate plus depth zero is stable"
         );
     }
@@ -41010,8 +41134,7 @@ mod write_command_sender_tests {
     #[test]
     fn shutdown_ack_waiter_stops_on_expired_budget_without_hot_loop() {
         run_storage_async_test(async {
-            let budget = crate::cx::Budget::new()
-                .with_deadline(asupersync::types::Time::ZERO);
+            let budget = crate::cx::Budget::new().with_deadline(asupersync::types::Time::ZERO);
             let cx = crate::cx::Cx::for_testing_with_budget(budget);
             let (_respond, receive) = oneshot::channel();
 
@@ -41084,7 +41207,7 @@ mod pool_telemetry_tests {
         // saturating math correctly.
         let snap = pool_telemetry_snapshot();
         let _ = snap.hit_rate();
-        assert_eq!(snap.total_acquires(), snap.hits + snap.misses);
+        assert_eq!(snap.total_acquires(), snap.hits.saturating_add(snap.misses));
     }
 
     #[test]
@@ -41756,12 +41879,8 @@ mod session_persistence_admission_tests {
     fn malformed_oversized_pane_json_hits_resource_admission_before_json_parse() {
         let malformed_terminal = "{".repeat(MAX_PERSISTED_PANE_TEXT_BYTES + 1);
         let pane = pane_with_terminal_json(malformed_terminal);
-        let admission = admit_raw_session_checkpoint(
-            EMPTY_TOPOLOGY.to_owned(),
-            None,
-            vec![pane],
-        )
-        .expect_err("oversized malformed pane JSON must fail before preparation");
+        let admission = admit_raw_session_checkpoint(EMPTY_TOPOLOGY.to_owned(), None, vec![pane])
+            .expect_err("oversized malformed pane JSON must fail before preparation");
         assert!(matches!(
             admission,
             SessionPersistenceAdmissionError::ResourceLimit {
@@ -41784,12 +41903,8 @@ mod session_persistence_admission_tests {
                 ..pane_with_terminal_json("{}".to_owned())
             })
             .collect::<Vec<_>>();
-        let error = validate_raw_session_checkpoint_projection(
-            EMPTY_TOPOLOGY,
-            None,
-            &panes,
-        )
-        .expect_err("excess pane rows must fail raw admission");
+        let error = validate_raw_session_checkpoint_projection(EMPTY_TOPOLOGY, None, &panes)
+            .expect_err("excess pane rows must fail raw admission");
         assert!(matches!(
             error,
             SessionPersistenceAdmissionError::ResourceLimit {
@@ -41802,17 +41917,14 @@ mod session_persistence_admission_tests {
 
     #[test]
     fn aggregate_checkpoint_budget_is_enforced_without_large_allocations() {
-        let pane_rows = MAX_PERSISTED_CHECKPOINT_TEXT_BYTES
-            .div_ceil(MAX_PERSISTED_PANE_TEXT_BYTES)
-            + 1;
+        let pane_rows =
+            MAX_PERSISTED_CHECKPOINT_TEXT_BYTES.div_ceil(MAX_PERSISTED_PANE_TEXT_BYTES) + 1;
         let error = checkpoint_projection_bytes(
             0,
             0,
             pane_rows,
             (0..pane_rows).map(|_| {
-                Ok::<usize, SessionPersistenceAdmissionError>(
-                    MAX_PERSISTED_PANE_TEXT_BYTES,
-                )
+                Ok::<usize, SessionPersistenceAdmissionError>(MAX_PERSISTED_PANE_TEXT_BYTES)
             }),
         )
         .expect_err("aggregate checkpoint text must be bounded");
@@ -41838,12 +41950,8 @@ mod session_persistence_admission_tests {
             scrollback_checkpoint_seq: None,
             last_output_at: None,
         };
-        let error = validate_prepared_session_checkpoint_projection(
-            EMPTY_TOPOLOGY,
-            None,
-            &[pane],
-        )
-        .expect_err("canonical pane projection must be re-admitted");
+        let error = validate_prepared_session_checkpoint_projection(EMPTY_TOPOLOGY, None, &[pane])
+            .expect_err("canonical pane projection must be re-admitted");
         assert!(matches!(
             error,
             SessionPersistenceAdmissionError::ResourceLimit {
@@ -41910,13 +42018,8 @@ mod session_persistence_admission_tests {
             }) if observed == MAX_SESSION_FT_VERSION_BYTES + 1
         ));
         assert!(
-            validate_mux_session_admission(
-                "session",
-                EMPTY_TOPOLOGY.len(),
-                "version",
-                Some(""),
-            )
-            .is_ok(),
+            validate_mux_session_admission("session", EMPTY_TOPOLOGY.len(), "version", Some(""),)
+                .is_ok(),
             "an optional empty host identity remains reader-compatible"
         );
         assert!(matches!(

@@ -66,8 +66,7 @@ pub const RENDERER_SCENARIO_SCHEMA_VERSION: u32 = 1;
 pub const RENDERER_SCENARIO_CATALOG_REVISION: u32 = 2;
 
 /// Bead that owns the version-1 contract.
-pub const RENDERER_SCENARIO_SOURCE_BEAD_ID: &str =
-    "ft-interactive-systems-performance-4tenz.3.1";
+pub const RENDERER_SCENARIO_SOURCE_BEAD_ID: &str = "ft-interactive-systems-performance-4tenz.3.1";
 
 /// Maximum raw JSON document accepted by the bounded decoder.
 pub const MAX_RENDERER_SCENARIO_CATALOG_BYTES: usize = 8 * 1024 * 1024;
@@ -127,15 +126,14 @@ pub const REQUIRED_RENDERER_STEADY_GESTURE_COUNT: usize =
 pub const REQUIRED_RENDERER_COVERAGE_OVERLAY_COUNT: usize = 8;
 
 /// Exact checkpoint-to-manifest binding rows: 20 live cells and 12 steady cells.
-pub const REQUIRED_RENDERER_CHECKPOINT_BINDING_COUNT: usize =
-    REQUIRED_RENDERER_LIVE_GESTURE_COUNT
+pub const REQUIRED_RENDERER_CHECKPOINT_BINDING_COUNT: usize = REQUIRED_RENDERER_LIVE_GESTURE_COUNT
+    * REQUIRED_RENDERER_FLEET_POINT_COUNT
+    * REQUIRED_RENDERER_COVERAGE_OVERLAY_COUNT
+    * 4
+    + REQUIRED_RENDERER_STEADY_GESTURE_COUNT
         * REQUIRED_RENDERER_FLEET_POINT_COUNT
         * REQUIRED_RENDERER_COVERAGE_OVERLAY_COUNT
-        * 4
-        + REQUIRED_RENDERER_STEADY_GESTURE_COUNT
-            * REQUIRED_RENDERER_FLEET_POINT_COUNT
-            * REQUIRED_RENDERER_COVERAGE_OVERLAY_COUNT
-            * 3;
+        * 3;
 
 /// Number of terminal-content features required across active corpus entries.
 pub const REQUIRED_RENDERER_TERMINAL_FEATURE_COUNT: usize = 13;
@@ -1368,8 +1366,12 @@ pub enum RendererOverlayExclusionReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "target_kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RendererOverlayQualificationTarget {
-    Requirement { requirement_id: RendererRequirementId },
-    Measurement { measurement_role: RendererMeasurementRole },
+    Requirement {
+        requirement_id: RendererRequirementId,
+    },
+    Measurement {
+        measurement_role: RendererMeasurementRole,
+    },
 }
 
 /// Typed overlay-to-measurement incompatibility; omission never implies exclusion.
@@ -2105,9 +2107,7 @@ impl RendererNegativeControlId {
             Self::AlternateScreenFlip => "alternate_screen_flip",
             Self::GridDimensionMismatch => "grid_dimension_mismatch",
             Self::DuplicateStaleFrame => "duplicate_stale_frame",
-            Self::AccessibilityGeometryDisplacement => {
-                "accessibility_geometry_displacement"
-            }
+            Self::AccessibilityGeometryDisplacement => "accessibility_geometry_displacement",
             Self::BlankFrameAfterNonblank => "blank_frame_after_nonblank",
             Self::MixedGenerationTearBand => "mixed_generation_tear_band",
         }
@@ -2294,11 +2294,7 @@ pub enum RendererPresentationTargetProfileId {
 }
 
 impl RendererPresentationTargetProfileId {
-    pub const ALL: [Self; 3] = [
-        Self::Fixed60Hz,
-        Self::Fixed120Hz,
-        Self::VariableRefreshRate,
-    ];
+    pub const ALL: [Self; 3] = [Self::Fixed60Hz, Self::Fixed120Hz, Self::VariableRefreshRate];
 }
 
 /// Availability metadata for a requested presentation target, not a verdict.
@@ -2346,11 +2342,7 @@ pub enum RendererPreconditioningProfileId {
 }
 
 impl RendererPreconditioningProfileId {
-    pub const ALL: [Self; 3] = [
-        Self::Cold,
-        Self::Warm,
-        Self::Aged,
-    ];
+    pub const ALL: [Self; 3] = [Self::Cold, Self::Warm, Self::Aged];
 }
 
 /// Cache/atlas preconditioning class.
@@ -2617,9 +2609,7 @@ impl RendererMeasurementBinding {
         match self {
             Self::FirstCorrectViewport { .. } => RendererMeasurementRole::FirstCorrectViewport,
             Self::SteadyPresentedFps { .. } => RendererMeasurementRole::SteadyPresentedFps,
-            Self::ColdReflowConvergence { .. } => {
-                RendererMeasurementRole::ColdReflowConvergence
-            }
+            Self::ColdReflowConvergence { .. } => RendererMeasurementRole::ColdReflowConvergence,
             Self::SnapBack { .. } => RendererMeasurementRole::SnapBack,
             Self::KeypressToFirstCorrectPresent { .. } => {
                 RendererMeasurementRole::KeypressToFirstCorrectPresent
@@ -2663,14 +2653,22 @@ impl RendererDriverCanaryId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RendererDriverCanaryAction {
-    FocusWindow { target_window_ordinal: u16 },
+    FocusWindow {
+        target_window_ordinal: u16,
+    },
     ActivateTab {
         target_window_ordinal: u16,
         target_tab_ordinal: u16,
     },
-    FocusPane { target_pane_ordinal: u16 },
-    SetSplitGeometry { split_geometry_ref: String },
-    SetTopologyManifest { topology_ref: String },
+    FocusPane {
+        target_pane_ordinal: u16,
+    },
+    SetSplitGeometry {
+        split_geometry_ref: String,
+    },
+    SetTopologyManifest {
+        topology_ref: String,
+    },
 }
 
 /// Root canary definition referenced by scenarios.
@@ -2966,11 +2964,7 @@ pub fn expected_renderer_scenario_id(
     gesture: RendererGesture,
     fleet_point: RendererFleetPoint,
 ) -> String {
-    format!(
-        "renderer.{}.{}",
-        gesture.as_str(),
-        fleet_point.as_str()
-    )
+    format!("renderer.{}.{}", gesture.as_str(), fleet_point.as_str())
 }
 
 /// Return the deterministic, collision-free version-1 seed for a coverage cell.
@@ -2982,9 +2976,7 @@ pub const fn expected_renderer_scenario_seed(
     gesture: RendererGesture,
     fleet_point: RendererFleetPoint,
 ) -> u64 {
-    0x4654_5253_0000_0000
-        | (gesture.seed_discriminant() << 16)
-        | fleet_point.pane_count() as u64
+    0x4654_5253_0000_0000 | (gesture.seed_discriminant() << 16) | fleet_point.pane_count() as u64
 }
 
 /// Stable bounded-decoder failure category.
@@ -3628,9 +3620,7 @@ fn validate_identifier(value: &str) -> Result<(), String> {
         return Err("identifier must start with a lowercase ASCII letter or digit".to_string());
     }
     if !bytes.all(|byte| {
-        byte.is_ascii_lowercase()
-            || byte.is_ascii_digit()
-            || matches!(byte, b'.' | b'-' | b'_')
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
     }) {
         return Err(
             "identifier may contain only lowercase ASCII letters, digits, '.', '-', and '_'"
@@ -3670,7 +3660,10 @@ fn validate_tracked_limitation(
         validator.error(
             RendererScenarioValidationCode::LimitExceeded,
             format!("{path}.reason"),
-            format!("reason is {} bytes (maximum {MAX_REASON_BYTES})", reason.len()),
+            format!(
+                "reason is {} bytes (maximum {MAX_REASON_BYTES})",
+                reason.len()
+            ),
         );
     }
     if tracking_refs.is_empty() {
@@ -3746,9 +3739,7 @@ fn validate_content_decoder(
         RendererContentEncoding::RawTerminalBytes => RendererContentDecoder::Identity,
         RendererContentEncoding::Utf8Text => RendererContentDecoder::Utf8ValidateV1,
         RendererContentEncoding::HexTranscriptV1 => RendererContentDecoder::HexDecodeV1,
-        RendererContentEncoding::GpuFixtureStateV1 => {
-            RendererContentDecoder::JsonFixtureStateV1
-        }
+        RendererContentEncoding::GpuFixtureStateV1 => RendererContentDecoder::JsonFixtureStateV1,
         RendererContentEncoding::GeneratedTerminalBytesV1 => RendererContentDecoder::GeneratorV1,
         RendererContentEncoding::GeneratedTypedStateV1 => RendererContentDecoder::GeneratorV1,
     };
@@ -3872,13 +3863,10 @@ struct CatalogIndex<'a> {
     renderer_config_profiles: BTreeMap<&'a str, &'a RendererConfigProfile>,
     layout_profiles: BTreeMap<&'a str, &'a RendererLayoutProfile>,
     surface_state_templates: BTreeMap<&'a str, &'a RendererSurfaceStateTemplate>,
-    content_distribution_profiles:
-        BTreeMap<&'a str, &'a RendererContentDistributionProfile>,
+    content_distribution_profiles: BTreeMap<&'a str, &'a RendererContentDistributionProfile>,
     phase_manifests: BTreeMap<&'a str, &'a RendererPhaseManifest>,
-    coverage_overlay_profiles:
-        BTreeMap<&'a str, &'a RendererCoverageOverlayProfile>,
-    detector_contracts:
-        BTreeMap<RendererCheckpointDetectorId, &'a RendererDetectorContract>,
+    coverage_overlay_profiles: BTreeMap<&'a str, &'a RendererCoverageOverlayProfile>,
+    detector_contracts: BTreeMap<RendererCheckpointDetectorId, &'a RendererDetectorContract>,
     presentation_profiles:
         BTreeMap<RendererPresentationTargetProfileId, &'a RendererPresentationTargetProfile>,
     preconditioning_profiles:
@@ -3979,10 +3967,8 @@ fn validate_renderer_scenario_catalog_indexed(
         &catalog.accessibility_authority_boundary,
         &mut validator,
     );
-    let content = validate_content_corpus_references(
-        &catalog.content_corpus_references,
-        &mut validator,
-    );
+    let content =
+        validate_content_corpus_references(&catalog.content_corpus_references, &mut validator);
     let evidence = validate_evidence_sources(&catalog.evidence_sources, &mut validator);
     validate_feature_evidence_bindings(
         &catalog.feature_evidence_bindings,
@@ -4023,15 +4009,10 @@ fn validate_renderer_scenario_catalog_indexed(
         &catalog.presentation_target_profiles,
         &mut validator,
     );
-    let preconditioning_profiles = validate_preconditioning_profiles(
-        &catalog.preconditioning_profiles,
-        &mut validator,
-    );
+    let preconditioning_profiles =
+        validate_preconditioning_profiles(&catalog.preconditioning_profiles, &mut validator);
     let driver_canaries = validate_driver_canaries(&catalog.driver_canaries, &mut validator);
-    validate_rq_s1_synthetic_substrate(
-        catalog.rq_s1_synthetic_substrate.as_ref(),
-        &mut validator,
-    );
+    validate_rq_s1_synthetic_substrate(catalog.rq_s1_synthetic_substrate.as_ref(), &mut validator);
     let index = CatalogIndex {
         scenarios: catalog
             .scenarios
@@ -4171,9 +4152,7 @@ fn resolve_renderer_scenario_overlay_indexed(
             .layout_profiles
             .get(manifest.layout_profile_id.as_str())
             .copied()
-            .ok_or_else(|| {
-                missing(format!("undefined layout `{}`", manifest.layout_profile_id))
-            })?;
+            .ok_or_else(|| missing(format!("undefined layout `{}`", manifest.layout_profile_id)))?;
         let distribution = index
             .content_distribution_profiles
             .get(manifest.content_distribution_profile_id.as_str())
@@ -4317,8 +4296,7 @@ fn resolve_renderer_scenario_overlay_indexed(
                 focused: pane_ordinal == manifest.focused_pane_ordinal,
                 surface_state: state.surfaces[pane_position].clone(),
                 output: state.outputs[pane_position].clone(),
-                applied_materialization_steps: state.applied_materialization_steps
-                    [pane_position]
+                applied_materialization_steps: state.applied_materialization_steps[pane_position]
                     .clone(),
             });
         }
@@ -4331,9 +4309,7 @@ fn resolve_renderer_scenario_overlay_indexed(
             expected_invariant_ids: checkpoint.expected_invariant_ids.clone(),
             layout_profile_id: layout.layout_profile_id.clone(),
             layout_stable_id_revision: layout.stable_id_revision.clone(),
-            content_distribution_profile_id: distribution
-                .content_distribution_profile_id
-                .clone(),
+            content_distribution_profile_id: distribution.content_distribution_profile_id.clone(),
             content_distribution_profile_revision: distribution.profile_revision,
             focused_window_id,
             focused_pane_id,
@@ -4467,8 +4443,14 @@ fn validate_run_observation_contracts(
         );
     }
     for (field, repository_ref) in [
-        ("observed_frame_stream_ref", &contracts.observed_frame_stream_ref),
-        ("stage_metrics_contract_ref", &contracts.stage_metrics_contract_ref),
+        (
+            "observed_frame_stream_ref",
+            &contracts.observed_frame_stream_ref,
+        ),
+        (
+            "stage_metrics_contract_ref",
+            &contracts.stage_metrics_contract_ref,
+        ),
         (
             "production_path_receipt_contract_ref",
             &contracts.production_path_receipt_contract_ref,
@@ -4584,18 +4566,16 @@ const GESTURE_SOURCE_REFLOW_FORWARD: [ExpectedGestureAuthoritySource; 1] =
 const GESTURE_SOURCE_REFLOW_REVERSE: [ExpectedGestureAuthoritySource; 1] =
     [ExpectedGestureAuthoritySource {
         evidence_source_id: "simulation_resize_single_pane_scrollback",
-        repository_ref:
-            "fixtures/simulations/resize_baseline/resize_single_pane_scrollback.yaml",
+        repository_ref: "fixtures/simulations/resize_baseline/resize_single_pane_scrollback.yaml",
         coverage_status: RendererCorpusCoverageStatus::Partial,
         tracking_refs: &TRACK_HEADLESS_NATIVE,
     }];
-const GESTURE_SOURCE_ZOOM: [ExpectedGestureAuthoritySource; 1] =
-    [ExpectedGestureAuthoritySource {
-        evidence_source_id: "simulation_font_churn_multi_pane",
-        repository_ref: "fixtures/simulations/resize_baseline/font_churn_multi_pane.yaml",
-        coverage_status: RendererCorpusCoverageStatus::Partial,
-        tracking_refs: &TRACK_HEADLESS_NATIVE,
-    }];
+const GESTURE_SOURCE_ZOOM: [ExpectedGestureAuthoritySource; 1] = [ExpectedGestureAuthoritySource {
+    evidence_source_id: "simulation_font_churn_multi_pane",
+    repository_ref: "fixtures/simulations/resize_baseline/font_churn_multi_pane.yaml",
+    coverage_status: RendererCorpusCoverageStatus::Partial,
+    tracking_refs: &TRACK_HEADLESS_NATIVE,
+}];
 const GESTURE_SOURCE_DPI_DISPLAY: [ExpectedGestureAuthoritySource; 2] = [
     ExpectedGestureAuthoritySource {
         evidence_source_id: "gpu_stress_dpi_1_00",
@@ -4610,14 +4590,14 @@ const GESTURE_SOURCE_DPI_DISPLAY: [ExpectedGestureAuthoritySource; 2] = [
         tracking_refs: &TRACK_STRESS_NATIVE,
     },
 ];
-const GESTURE_SOURCE_OUTPUT_OVERLAP: [ExpectedGestureAuthoritySource; 1] =
-    [ExpectedGestureAuthoritySource {
+const GESTURE_SOURCE_OUTPUT_OVERLAP: [ExpectedGestureAuthoritySource; 1] = [
+    ExpectedGestureAuthoritySource {
         evidence_source_id: "simulation_mixed_workload_interactive_streaming",
-        repository_ref:
-            "fixtures/simulations/resize_baseline/mixed_workload_interactive_streaming.yaml",
+        repository_ref: "fixtures/simulations/resize_baseline/mixed_workload_interactive_streaming.yaml",
         coverage_status: RendererCorpusCoverageStatus::Gap,
         tracking_refs: &TRACK_HEADLESS_NATIVE,
-    }];
+    },
+];
 
 const fn expected_gesture_authority_sources(
     gesture: RendererGesture,
@@ -4705,10 +4685,7 @@ fn validate_gesture_authority_map(
                     validator.error(
                         RendererScenarioValidationCode::InvalidGestureAuthority,
                         format!("{source_path}.coverage_status"),
-                        format!(
-                            "expected canonical status {:?}",
-                            expected.coverage_status
-                        ),
+                        format!("expected canonical status {:?}", expected.coverage_status),
                     );
                 }
                 let actual_tracking = source
@@ -4876,10 +4853,7 @@ fn validate_non_direct_status_fields(
     }
 }
 
-fn validate_legacy_mappings(
-    mappings: &[RendererLegacyScenarioMapping],
-    validator: &mut Validator,
-) {
+fn validate_legacy_mappings(mappings: &[RendererLegacyScenarioMapping], validator: &mut Validator) {
     if mappings.len() != RendererLegacyScenarioId::ALL.len() {
         validator.error(
             RendererScenarioValidationCode::InvalidLegacyMapping,
@@ -5115,10 +5089,8 @@ fn validate_content_corpus_references<'a>(
             &format!("{path}.content_corpus_id"),
             &reference.content_corpus_id,
         );
-        validator.require_repository_ref(
-            &format!("{path}.repository_ref"),
-            &reference.repository_ref,
-        );
+        validator
+            .require_repository_ref(&format!("{path}.repository_ref"), &reference.repository_ref);
         if index
             .insert(reference.content_corpus_id.as_str(), reference)
             .is_some()
@@ -5586,10 +5558,7 @@ fn validate_evidence_sources<'a>(
             &format!("{path}.evidence_source_id"),
             &source.evidence_source_id,
         );
-        validator.require_repository_ref(
-            &format!("{path}.repository_ref"),
-            &source.repository_ref,
-        );
+        validator.require_repository_ref(&format!("{path}.repository_ref"), &source.repository_ref);
         if index
             .insert(source.evidence_source_id.as_str(), source)
             .is_some()
@@ -5704,7 +5673,10 @@ fn validate_evidence_qualification(
         Some(value) if value.len() > MAX_REASON_BYTES => validator.error(
             RendererScenarioValidationCode::LimitExceeded,
             format!("{path}.limitation"),
-            format!("limitation is {} bytes (maximum {MAX_REASON_BYTES})", value.len()),
+            format!(
+                "limitation is {} bytes (maximum {MAX_REASON_BYTES})",
+                value.len()
+            ),
         ),
         Some(_) | None => validator.error(
             RendererScenarioValidationCode::InvalidCorpusReference,
@@ -5806,7 +5778,10 @@ fn validate_feature_evidence_bindings(
                 validator.error(
                     RendererScenarioValidationCode::InvalidCorpusReference,
                     format!("{source_path}.evidence_source_id"),
-                    format!("duplicate feature evidence source `{}`", source.evidence_source_id),
+                    format!(
+                        "duplicate feature evidence source `{}`",
+                        source.evidence_source_id
+                    ),
                 );
             }
             if !evidence.contains_key(source.evidence_source_id.as_str()) {
@@ -5822,7 +5797,8 @@ fn validate_feature_evidence_bindings(
                     format!("{source_path}.coverage_status"),
                     format!(
                         "feature `{}` requires status {:?}",
-                        binding.terminal_feature.as_str(), expected_status
+                        binding.terminal_feature.as_str(),
+                        expected_status
                     ),
                 );
             }
@@ -5995,12 +5971,11 @@ const FEATURE_ALTERNATE_SCREEN: [ExpectedFeatureEvidenceSource; 1] =
         repository_ref: "tests/renderer_golden/SCENARIOS.md",
         tracking_refs: &TRACK_SELECTION_ALT,
     }];
-const FEATURE_ACCESSIBILITY: [ExpectedFeatureEvidenceSource; 1] =
-    [ExpectedFeatureEvidenceSource {
-        evidence_source_id: "a11y.scenario_corpus_geometry_gap",
-        repository_ref: "docs/a11y/scenario-corpus.md",
-        tracking_refs: &TRACK_ACCESSIBILITY_GEOMETRY,
-    }];
+const FEATURE_ACCESSIBILITY: [ExpectedFeatureEvidenceSource; 1] = [ExpectedFeatureEvidenceSource {
+    evidence_source_id: "a11y.scenario_corpus_geometry_gap",
+    repository_ref: "docs/a11y/scenario-corpus.md",
+    tracking_refs: &TRACK_ACCESSIBILITY_GEOMETRY,
+}];
 
 const fn expected_feature_evidence_sources(
     feature: RendererTerminalFeature,
@@ -6207,9 +6182,7 @@ fn validate_output_stream(
         validator.error(
             RendererScenarioValidationCode::InvalidWorkload,
             format!("{path}.aggregate_bytes_per_second"),
-            format!(
-                "aggregate rate must be in 1..={MAX_RENDERER_OUTPUT_BYTES_PER_SECOND}"
-            ),
+            format!("aggregate rate must be in 1..={MAX_RENDERER_OUTPUT_BYTES_PER_SECOND}"),
         );
     }
     if pane_count == 0 {
@@ -6240,15 +6213,16 @@ fn validate_output_stream(
             rates[usize::from(ordinal)] = rate_override.bytes_per_second;
         }
     }
-    let sum = rates.iter().try_fold(0_u64, |total, rate| total.checked_add(*rate));
+    let sum = rates
+        .iter()
+        .try_fold(0_u64, |total, rate| total.checked_add(*rate));
     if sum != Some(stream.aggregate_bytes_per_second) {
         validator.error(
             RendererScenarioValidationCode::InvalidWorkload,
             format!("{path}.rate_overrides"),
             format!(
                 "expanded pane rates sum to {:?}, expected aggregate {}",
-                sum,
-                stream.aggregate_bytes_per_second
+                sum, stream.aggregate_bytes_per_second
             ),
         );
     }
@@ -6311,7 +6285,6 @@ fn validate_foreground_key_events(
         }
     }
 }
-
 
 fn validate_scenarios(
     catalog: &RendererScenarioCatalog,
@@ -6388,8 +6361,16 @@ fn validate_scenarios(
             );
         }
         for (field, actual, expected) in [
-            ("pane_count", scenario.pane_count, scenario.fleet_point.pane_count()),
-            ("tab_count", scenario.tab_count, scenario.fleet_point.tab_count()),
+            (
+                "pane_count",
+                scenario.pane_count,
+                scenario.fleet_point.pane_count(),
+            ),
+            (
+                "tab_count",
+                scenario.tab_count,
+                scenario.fleet_point.tab_count(),
+            ),
             (
                 "window_count",
                 scenario.window_count,
@@ -6508,13 +6489,9 @@ fn validate_scenarios(
         validate_detector_bindings(&path, scenario, index, validator);
         validate_requirement_crosswalk(&path, scenario, workload, &overlays, index, validator);
         validate_scenario_profile_sets(&path, scenario, index, validator);
-        validate_scenario_capabilities_and_readiness(
-            &path, scenario, &overlays, index, validator,
-        );
+        validate_scenario_capabilities_and_readiness(&path, scenario, &overlays, index, validator);
         if let (Some(workload), Some(facts)) = (workload, facts.as_ref()) {
-            validate_measurement_bindings(
-                &path, scenario, workload, facts, index, validator,
-            );
+            validate_measurement_bindings(&path, scenario, workload, facts, index, validator);
             validate_scenario_materialization(
                 &path,
                 scenario,
@@ -6527,14 +6504,12 @@ fn validate_scenarios(
             for overlay_id in RendererCoverageOverlayId::ALL {
                 if let Some(overlay) = overlays.get(&overlay_id) {
                     validate_overlay_replay(&path, scenario, workload, overlay, index, validator);
-                    validate_overlay_gesture_transition(
-                        &path, scenario, overlay, index, validator,
-                    );
+                    validate_overlay_gesture_transition(&path, scenario, overlay, index, validator);
                 }
             }
         }
-        checkpoint_binding_count = checkpoint_binding_count
-            .saturating_add(scenario.visual_checkpoints.len());
+        checkpoint_binding_count =
+            checkpoint_binding_count.saturating_add(scenario.visual_checkpoints.len());
         for checkpoint in &scenario.visual_checkpoints {
             checkpoint_manifest_order.push(checkpoint.phase_manifest_id.as_str());
             if let Some(previous_scenario) = active_phase_manifests.insert(
@@ -6642,7 +6617,10 @@ fn validate_scenarios(
             validator.error(
                 RendererScenarioValidationCode::UnreferencedDefinition,
                 format!("$.layout_profiles[{position}].layout_profile_id"),
-                format!("layout `{}` is not selected by the matrix", layout.layout_profile_id),
+                format!(
+                    "layout `{}` is not selected by the matrix",
+                    layout.layout_profile_id
+                ),
             );
         }
     }
@@ -6650,7 +6628,9 @@ fn validate_scenarios(
         if !active_distributions.contains(distribution.content_distribution_profile_id.as_str()) {
             validator.error(
                 RendererScenarioValidationCode::UnreferencedDefinition,
-                format!("$.content_distribution_profiles[{position}].content_distribution_profile_id"),
+                format!(
+                    "$.content_distribution_profiles[{position}].content_distribution_profile_id"
+                ),
                 format!(
                     "content distribution `{}` is not selected by a phase manifest",
                     distribution.content_distribution_profile_id
@@ -6675,7 +6655,10 @@ fn validate_scenarios(
             validator.error(
                 RendererScenarioValidationCode::UnreferencedDefinition,
                 format!("$.workloads[{position}].workload_id"),
-                format!("workload `{}` is not selected by a scenario", workload.workload_id),
+                format!(
+                    "workload `{}` is not selected by a scenario",
+                    workload.workload_id
+                ),
             );
         }
     }
@@ -6717,9 +6700,7 @@ fn validate_scenario_profile_sets(
             );
         }
     }
-    if scenario.preconditioning_profile_ids.as_slice()
-        != RendererPreconditioningProfileId::ALL
-    {
+    if scenario.preconditioning_profile_ids.as_slice() != RendererPreconditioningProfileId::ALL {
         validator.error(
             RendererScenarioValidationCode::InvalidState,
             format!("{scenario_path}.preconditioning_profile_ids"),
@@ -6762,9 +6743,7 @@ fn materialization_boundary_key(
         RendererContentApplicationBoundary::BeforeGesture => Ok((0, 0)),
         RendererContentApplicationBoundary::AtEvent { event_ordinal } => {
             match scenario.timeline.get(*event_ordinal as usize) {
-                Some(event) if event.event_ordinal == *event_ordinal => {
-                    Ok((*event_ordinal, 1))
-                }
+                Some(event) if event.event_ordinal == *event_ordinal => Ok((*event_ordinal, 1)),
                 _ => Err(format!(
                     "at-event boundary {event_ordinal} does not resolve to an exact timeline event"
                 )),
@@ -6774,8 +6753,7 @@ fn materialization_boundary_key(
             .visual_checkpoints
             .iter()
             .find(|checkpoint| {
-                checkpoint.overlay_id == overlay_id
-                    && checkpoint.checkpoint_id == *checkpoint_id
+                checkpoint.overlay_id == overlay_id && checkpoint.checkpoint_id == *checkpoint_id
             })
             .map(|checkpoint| (checkpoint.event_ordinal, 2))
             .ok_or_else(|| {
@@ -6823,8 +6801,7 @@ fn validate_scenario_materialization(
             let mut previous_boundary = None;
             let mut active_buffer = RendererTerminalBufferKind::Primary;
             for (step_position, step) in assignment.materialization_steps.iter().enumerate() {
-                let step_path =
-                    format!("{assignment_path}.materialization_steps[{step_position}]");
+                let step_path = format!("{assignment_path}.materialization_steps[{step_position}]");
                 let boundary_key = materialization_boundary_key(step, scenario, overlay_id);
                 match boundary_key {
                     Ok(key) => {
@@ -7044,12 +7021,15 @@ fn validate_scenario_capabilities_and_readiness(
     }
     for overlay_id in RendererCoverageOverlayId::ALL {
         let mut blocking_codes = Vec::new();
-        let profile = overlays.get(&overlay_id).map(|overlay| overlay.profile).or_else(|| {
-            index
-                .coverage_overlay_profiles
-                .get(expected_overlay_profile_id(overlay_id).as_str())
-                .copied()
-        });
+        let profile = overlays
+            .get(&overlay_id)
+            .map(|overlay| overlay.profile)
+            .or_else(|| {
+                index
+                    .coverage_overlay_profiles
+                    .get(expected_overlay_profile_id(overlay_id).as_str())
+                    .copied()
+            });
         let mut merged = base.clone();
         if let Some(profile) = profile {
             for delta in &profile.capability_deltas {
@@ -7146,9 +7126,9 @@ fn validate_scenario_capabilities_and_readiness(
                         RendererContentInputAvailability::Unavailable {
                             reason,
                             tracking_refs,
-                        } => tracking_refs.first().map(|tracking| {
-                            (reason.as_str(), tracking.as_str())
-                        }),
+                        } => tracking_refs
+                            .first()
+                            .map(|tracking| (reason.as_str(), tracking.as_str())),
                         RendererContentInputAvailability::Available => index
                             .content
                             .get(step.content_corpus_id.as_str())
@@ -7156,9 +7136,9 @@ fn validate_scenario_capabilities_and_readiness(
                                 RendererContentInputAvailability::Unavailable {
                                     reason,
                                     tracking_refs,
-                                } => tracking_refs.first().map(|tracking| {
-                                    (reason.as_str(), tracking.as_str())
-                                }),
+                                } => tracking_refs
+                                    .first()
+                                    .map(|tracking| (reason.as_str(), tracking.as_str())),
                                 RendererContentInputAvailability::Available => None,
                             }),
                     };
@@ -7191,9 +7171,7 @@ fn validate_scenario_capabilities_and_readiness(
                 &scenario.scenario_id,
                 overlay_id,
             );
-            blocking_codes.push(
-                RendererScenarioGapCode::DeterministicOutputStreamUnavailable,
-            );
+            blocking_codes.push(RendererScenarioGapCode::DeterministicOutputStreamUnavailable);
             if overlay_id == RendererCoverageOverlayId::ProductionDefault {
                 validator.overlay_gap(
                     RendererScenarioGapCode::KeyEffectOracleUnavailable,
@@ -7206,11 +7184,7 @@ fn validate_scenario_capabilities_and_readiness(
                 blocking_codes.push(RendererScenarioGapCode::KeyEffectOracleUnavailable);
             }
         }
-        validator.record_overlay_readiness(
-            &scenario.scenario_id,
-            overlay_id,
-            blocking_codes,
-        );
+        validator.record_overlay_readiness(&scenario.scenario_id, overlay_id, blocking_codes);
     }
 }
 
@@ -7232,10 +7206,8 @@ fn validate_measurement_bindings(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let mut expected_roles = vec![
-        RendererMeasurementRole::FirstCorrectViewport;
-        mutation_ordinals.len()
-    ];
+    let mut expected_roles =
+        vec![RendererMeasurementRole::FirstCorrectViewport; mutation_ordinals.len()];
     expected_roles.push(RendererMeasurementRole::SteadyPresentedFps);
     if matches!(
         scenario.gesture,
@@ -7441,10 +7413,9 @@ fn validate_measurement_bindings(
                         != Some(last_draft_checkpoint_id.as_str())
                     || snap_back.map(|checkpoint| checkpoint.checkpoint_id.as_str())
                         != Some(standard_snap_back_subject_checkpoint_id.as_str())
-                    || snap_back
-                        .and_then(|checkpoint| {
-                            checkpoint.independent_standard_oracle_ref.as_deref()
-                        }) != Some(independent_standard_oracle_ref.as_str())
+                    || snap_back.and_then(|checkpoint| {
+                        checkpoint.independent_standard_oracle_ref.as_deref()
+                    }) != Some(independent_standard_oracle_ref.as_str())
                     || *target_selection
                         != RendererObservedFrameSelection::FirstSatisfyingObservedFrame
                     || required_stage_ids.as_slice() != RendererResizeTraceStage::ALL
@@ -7495,10 +7466,8 @@ fn validate_measurement_bindings(
                     ),
                     ("stage_metrics_contract_ref", stage_metrics_contract_ref),
                 ] {
-                    validator.require_repository_ref(
-                        &format!("{binding_path}.{field}"),
-                        repository_ref,
-                    );
+                    validator
+                        .require_repository_ref(&format!("{binding_path}.{field}"), repository_ref);
                 }
             }
         }
@@ -7517,8 +7486,7 @@ fn validate_measurement_bindings(
         .iter()
         .map(|(ordinal, id)| (*ordinal, id.as_str()))
         .collect::<Vec<_>>();
-    if key_bindings != expected_keys
-        || workload.foreground_key_events.len() != expected_keys.len()
+    if key_bindings != expected_keys || workload.foreground_key_events.len() != expected_keys.len()
     {
         validator.error(
             RendererScenarioValidationCode::InvalidRequirementCrosswalk,
@@ -7530,7 +7498,10 @@ fn validate_measurement_bindings(
 
 const fn expected_negative_control_binding(
     control_id: RendererNegativeControlId,
-) -> (RendererCheckpointDetectorId, Option<RendererTerminalFeature>) {
+) -> (
+    RendererCheckpointDetectorId,
+    Option<RendererTerminalFeature>,
+) {
     match control_id {
         RendererNegativeControlId::MissingGlyph => (
             RendererCheckpointDetectorId::NoMissingGlyphs,
@@ -7567,18 +7538,16 @@ const fn expected_negative_control_binding(
         RendererNegativeControlId::GridDimensionMismatch => {
             (RendererCheckpointDetectorId::ExactRowWidth, None)
         }
-        RendererNegativeControlId::DuplicateStaleFrame => (
-            RendererCheckpointDetectorId::NoStaleOrDuplicateFrame,
-            None,
-        ),
+        RendererNegativeControlId::DuplicateStaleFrame => {
+            (RendererCheckpointDetectorId::NoStaleOrDuplicateFrame, None)
+        }
         RendererNegativeControlId::AccessibilityGeometryDisplacement => (
             RendererCheckpointDetectorId::AccessibilityGeometry,
             Some(RendererTerminalFeature::AccessibilityGeometry),
         ),
-        RendererNegativeControlId::BlankFrameAfterNonblank => (
-            RendererCheckpointDetectorId::NonblankAfterBaseline,
-            None,
-        ),
+        RendererNegativeControlId::BlankFrameAfterNonblank => {
+            (RendererCheckpointDetectorId::NonblankAfterBaseline, None)
+        }
         RendererNegativeControlId::MixedGenerationTearBand => (
             RendererCheckpointDetectorId::NoMixedGenerationTearBand,
             None,
@@ -7636,10 +7605,7 @@ fn validate_negative_controls(
                 ),
             );
         }
-        validator.require_identifier(
-            &format!("{control_path}.scenario_id"),
-            &control.scenario_id,
-        );
+        validator.require_identifier(&format!("{control_path}.scenario_id"), &control.scenario_id);
         validator.require_identifier(
             &format!("{control_path}.checkpoint_id"),
             &control.checkpoint_id,
@@ -7711,9 +7677,7 @@ fn validate_negative_controls(
     }
 }
 
-fn expected_scenario_invariant_ids(
-    scenario: &RendererScenarioDefinition,
-) -> Vec<&'static str> {
+fn expected_scenario_invariant_ids(scenario: &RendererScenarioDefinition) -> Vec<&'static str> {
     let needs_reflow_identity = matches!(
         scenario.gesture,
         RendererGesture::GridChangingDrag
@@ -7759,12 +7723,12 @@ fn expected_invariant_phases(
         phases
     };
     match invariant_id {
-        "no_blank_frame_after_nonblank" | "no_stale_full_frame_reuse" => Some(
-            with_snap_back(vec![
+        "no_blank_frame_after_nonblank" | "no_stale_full_frame_reuse" => {
+            Some(with_snap_back(vec![
                 RendererTimelinePhase::Mutation,
                 RendererTimelinePhase::Settle,
-            ]),
-        ),
+            ]))
+        }
         "coherent_grid_terminal_revision"
         | "anchors_in_bounds"
         | "alternate_screen_isolation"
@@ -7993,17 +7957,17 @@ fn validate_visual_checkpoints(
         };
         let expected_phase = match expected_role {
             RendererCheckpointRole::InitialBaseline => RendererTimelinePhase::Begin,
-            RendererCheckpointRole::LastDraftProvenance
-            | RendererCheckpointRole::Intermediate => RendererTimelinePhase::Mutation,
-            RendererCheckpointRole::StandardSnapBackSubject => {
-                RendererTimelinePhase::SnapBack
+            RendererCheckpointRole::LastDraftProvenance | RendererCheckpointRole::Intermediate => {
+                RendererTimelinePhase::Mutation
             }
+            RendererCheckpointRole::StandardSnapBackSubject => RendererTimelinePhase::SnapBack,
             RendererCheckpointRole::FinalSteadyState => RendererTimelinePhase::Settle,
         };
         let expected_event = match expected_role {
             RendererCheckpointRole::InitialBaseline => Some(0),
-            RendererCheckpointRole::LastDraftProvenance
-            | RendererCheckpointRole::Intermediate => last_mutation_ordinal,
+            RendererCheckpointRole::LastDraftProvenance | RendererCheckpointRole::Intermediate => {
+                last_mutation_ordinal
+            }
             RendererCheckpointRole::StandardSnapBackSubject => snap_back_ordinal,
             RendererCheckpointRole::FinalSteadyState => final_ordinal,
         };
@@ -8020,11 +7984,8 @@ fn validate_visual_checkpoints(
             );
         }
         let expected_content_class = match expected_role {
-            RendererCheckpointRole::InitialBaseline => {
-                RendererFrameContentClass::NonblankBaseline
-            }
-            RendererCheckpointRole::LastDraftProvenance
-            | RendererCheckpointRole::Intermediate => {
+            RendererCheckpointRole::InitialBaseline => RendererFrameContentClass::NonblankBaseline,
+            RendererCheckpointRole::LastDraftProvenance | RendererCheckpointRole::Intermediate => {
                 RendererFrameContentClass::NonblankTransient
             }
             RendererCheckpointRole::StandardSnapBackSubject => {
@@ -8051,12 +8012,12 @@ fn validate_visual_checkpoints(
         for (field, repository_ref) in [
             ("state_oracle_ref", &checkpoint.state_oracle_ref),
             ("visual_oracle_ref", &checkpoint.visual_oracle_ref),
-            ("accessibility_oracle_ref", &checkpoint.accessibility_oracle_ref),
+            (
+                "accessibility_oracle_ref",
+                &checkpoint.accessibility_oracle_ref,
+            ),
         ] {
-            validator.require_repository_ref(
-                &format!("{checkpoint_path}.{field}"),
-                repository_ref,
-            );
+            validator.require_repository_ref(&format!("{checkpoint_path}.{field}"), repository_ref);
         }
         match expected_role {
             RendererCheckpointRole::StandardSnapBackSubject => {
@@ -8087,9 +8048,7 @@ fn validate_visual_checkpoints(
             }
             RendererCheckpointRole::InitialBaseline
             | RendererCheckpointRole::Intermediate
-            | RendererCheckpointRole::FinalSteadyState => {
-                &[RQ_S13_COMPARATOR_POLICY_REF]
-            }
+            | RendererCheckpointRole::FinalSteadyState => &[RQ_S13_COMPARATOR_POLICY_REF],
         };
         let actual_policies = checkpoint
             .comparator_policy_refs
@@ -8103,13 +8062,9 @@ fn validate_visual_checkpoints(
                 format!("checkpoint requires exact comparator policies {expected_policies:?}"),
             );
         }
-        for (policy_position, policy_ref) in
-            checkpoint.comparator_policy_refs.iter().enumerate()
-        {
+        for (policy_position, policy_ref) in checkpoint.comparator_policy_refs.iter().enumerate() {
             validator.require_repository_ref(
-                &format!(
-                    "{checkpoint_path}.comparator_policy_refs[{policy_position}]"
-                ),
+                &format!("{checkpoint_path}.comparator_policy_refs[{policy_position}]"),
                 policy_ref,
             );
         }
@@ -8159,13 +8114,8 @@ fn validate_visual_checkpoints(
             && let Some(initial) = overlay.anchors.first()
             && let Some(initial_checkpoint) = overlay.checkpoints.first()
             && let Some(workload) = index.workloads.get(scenario.workload_id.as_str())
-            && let Ok(initial_state) = expand_manifest_state(
-                initial,
-                index,
-                scenario,
-                initial_checkpoint,
-                workload,
-            )
+            && let Ok(initial_state) =
+                expand_manifest_state(initial, index, scenario, initial_checkpoint, workload)
             && let Some(initial_surface) = initial_state.surfaces.first()
         {
             let effective_quality = effective_quality_at_event(
@@ -8174,17 +8124,12 @@ fn validate_visual_checkpoints(
                 checkpoint.event_ordinal,
             );
             let expected_quality = match checkpoint.role {
-                RendererCheckpointRole::LastDraftProvenance => {
-                    RendererQualityMode::Draft
+                RendererCheckpointRole::LastDraftProvenance => RendererQualityMode::Draft,
+                RendererCheckpointRole::StandardSnapBackSubject => RendererQualityMode::Standard,
+                RendererCheckpointRole::FinalSteadyState => scenario.configured_steady_quality,
+                RendererCheckpointRole::InitialBaseline | RendererCheckpointRole::Intermediate => {
+                    initial_surface.quality_mode
                 }
-                RendererCheckpointRole::StandardSnapBackSubject => {
-                    RendererQualityMode::Standard
-                }
-                RendererCheckpointRole::FinalSteadyState => {
-                    scenario.configured_steady_quality
-                }
-                RendererCheckpointRole::InitialBaseline
-                | RendererCheckpointRole::Intermediate => initial_surface.quality_mode,
             };
             if effective_quality != expected_quality {
                 validator.error(
@@ -8310,23 +8255,17 @@ fn validate_observed_frame_policies(
                 ),
             );
         }
-        for (detector_position, detector_id) in
-            policy.all_frame_detector_ids.iter().enumerate()
-        {
+        for (detector_position, detector_id) in policy.all_frame_detector_ids.iter().enumerate() {
             match index.detector_contracts.get(detector_id) {
                 Some(contract) if contract.scope == RendererDetectorScope::AllObservedFrames => {}
                 Some(_) => validator.error(
                     RendererScenarioValidationCode::InvalidCheckpoint,
-                    format!(
-                        "{policy_path}.all_frame_detector_ids[{detector_position}]"
-                    ),
+                    format!("{policy_path}.all_frame_detector_ids[{detector_position}]"),
                     "policy may contain only all-observed-frames detectors",
                 ),
                 None => validator.error(
                     RendererScenarioValidationCode::DanglingReference,
-                    format!(
-                        "{policy_path}.all_frame_detector_ids[{detector_position}]"
-                    ),
+                    format!("{policy_path}.all_frame_detector_ids[{detector_position}]"),
                     format!("undefined detector `{}`", detector_id.as_str()),
                 ),
             }
@@ -8494,8 +8433,7 @@ fn validate_detector_bindings(
             }
             RendererDetectorBinding::WholeTimeline { detector_id, .. } => {
                 if !gesture_is_live_resize(scenario.gesture)
-                    || *detector_id
-                        != RendererCheckpointDetectorId::ExactlyOneStandardSnapBack
+                    || *detector_id != RendererCheckpointDetectorId::ExactlyOneStandardSnapBack
                     || contract.scope != RendererDetectorScope::WholeTimeline
                 {
                     validator.error(
@@ -8509,9 +8447,7 @@ fn validate_detector_bindings(
     }
 }
 
-fn expected_requirement_ids(
-    scenario: &RendererScenarioDefinition,
-) -> Vec<RendererRequirementId> {
+fn expected_requirement_ids(scenario: &RendererScenarioDefinition) -> Vec<RendererRequirementId> {
     let mut expected = Vec::new();
     if scenario.gesture == RendererGesture::OutputOverlapResize
         && scenario.fleet_point == RendererFleetPoint::P050
@@ -8541,9 +8477,10 @@ fn rq_s10_pure_resize_predicate(
         .timeline
         .iter()
         .filter(|event| {
-            event.actions.iter().any(|action| {
-                matches!(action, RendererTimelineAction::SetWindowSize { .. })
-            })
+            event
+                .actions
+                .iter()
+                .any(|action| matches!(action, RendererTimelineAction::SetWindowSize { .. }))
         })
         .count();
     let no_output_or_key = workload.output_stream.is_none()
@@ -8566,26 +8503,22 @@ fn rq_s10_pure_resize_predicate(
                 overlay.checkpoints.last()?,
             ))
         })
-        .and_then(|(initial, initial_checkpoint, final_manifest, final_checkpoint)| {
-            Some((
-                expand_manifest_state(
-                    initial,
-                    index,
-                    scenario,
-                    initial_checkpoint,
-                    workload,
-                )
-                .ok()?,
-                expand_manifest_state(
-                    final_manifest,
-                    index,
-                    scenario,
-                    final_checkpoint,
-                    workload,
-                )
-                .ok()?,
-            ))
-        })
+        .and_then(
+            |(initial, initial_checkpoint, final_manifest, final_checkpoint)| {
+                Some((
+                    expand_manifest_state(initial, index, scenario, initial_checkpoint, workload)
+                        .ok()?,
+                    expand_manifest_state(
+                        final_manifest,
+                        index,
+                        scenario,
+                        final_checkpoint,
+                        workload,
+                    )
+                    .ok()?,
+                ))
+            },
+        )
         .is_some_and(|(initial, final_state)| {
             initial.surfaces.len() == final_state.surfaces.len()
                 && initial
@@ -8644,20 +8577,8 @@ fn snap_back_state_matches_last_draft(
         return false;
     };
     let (Ok(mut last_draft_state), Ok(snap_back_state)) = (
-        expand_manifest_state(
-            last_draft_manifest,
-            index,
-            scenario,
-            last_draft,
-            workload,
-        ),
-        expand_manifest_state(
-            snap_back_manifest,
-            index,
-            scenario,
-            snap_back,
-            workload,
-        ),
+        expand_manifest_state(last_draft_manifest, index, scenario, last_draft, workload),
+        expand_manifest_state(snap_back_manifest, index, scenario, snap_back, workload),
     ) else {
         return false;
     };
@@ -8747,13 +8668,9 @@ fn validate_requirement_crosswalk(
             RendererRequirementBinding::RqS6 { .. } => workload.is_some_and(|workload| {
                 scenario.gesture == RendererGesture::OutputOverlapResize
                     && scenario.fleet_point == RendererFleetPoint::P050
-                    && workload
-                        .output_stream
-                        .as_ref()
-                        .is_some_and(|stream| {
-                            stream.aggregate_bytes_per_second
-                                == OUTPUT_OVERLAP_BYTES_PER_SECOND
-                        })
+                    && workload.output_stream.as_ref().is_some_and(|stream| {
+                        stream.aggregate_bytes_per_second == OUTPUT_OVERLAP_BYTES_PER_SECOND
+                    })
                     && workload.foreground_key_events.len() == 1
             }),
             RendererRequirementBinding::RqS9 { .. } => workload.is_some_and(|workload| {
@@ -8789,11 +8706,9 @@ fn validate_requirement_crosswalk(
                         == Some(last_draft_checkpoint_id.as_str())
                     && snap_back.map(|checkpoint| checkpoint.checkpoint_id.as_str())
                         == Some(standard_snap_back_subject_checkpoint_id.as_str())
-                    && snap_back
-                        .and_then(|checkpoint| {
-                            checkpoint.independent_standard_oracle_ref.as_deref()
-                        })
-                        == Some(independent_standard_oracle_ref.as_str())
+                    && snap_back.and_then(|checkpoint| {
+                        checkpoint.independent_standard_oracle_ref.as_deref()
+                    }) == Some(independent_standard_oracle_ref.as_str())
                     && snap_back_state_matches_last_draft(scenario, index)
             }
             RendererRequirementBinding::RqS13 { .. } => true,
@@ -8811,9 +8726,7 @@ fn validate_requirement_crosswalk(
     }
 }
 
-fn content_identity_framing(
-    reference: &RendererContentCorpusReference,
-) -> RendererContentFraming {
+fn content_identity_framing(reference: &RendererContentCorpusReference) -> RendererContentFraming {
     match &reference.deterministic_identity {
         RendererContentDeterministicIdentity::Generator { output_framing, .. } => *output_framing,
         RendererContentDeterministicIdentity::Payload { framing, .. } => *framing,
@@ -8821,7 +8734,10 @@ fn content_identity_framing(
 }
 
 fn content_input_available(reference: &RendererContentCorpusReference) -> bool {
-    matches!(reference.availability, RendererContentInputAvailability::Available)
+    matches!(
+        reference.availability,
+        RendererContentInputAvailability::Available
+    )
 }
 
 fn validate_content_distribution_profiles<'a>(
@@ -8857,7 +8773,10 @@ fn validate_content_distribution_profiles<'a>(
             validator.error(
                 RendererScenarioValidationCode::DuplicateId,
                 format!("{path}.content_distribution_profile_id"),
-                format!("duplicate content distribution `{}`", profile.content_distribution_profile_id),
+                format!(
+                    "duplicate content distribution `{}`",
+                    profile.content_distribution_profile_id
+                ),
             );
         }
         let pane_count = profile.fleet_point.pane_count();
@@ -8895,7 +8814,10 @@ fn validate_content_distribution_profiles<'a>(
                         format!("expected contiguous step ordinal {step_position}"),
                     );
                 }
-                validator.require_identifier(&format!("{step_path}.content_corpus_id"), &step.content_corpus_id);
+                validator.require_identifier(
+                    &format!("{step_path}.content_corpus_id"),
+                    &step.content_corpus_id,
+                );
                 let corpus = content.get(step.content_corpus_id.as_str()).copied();
                 if corpus.is_none() {
                     validator.error(
@@ -8918,9 +8840,8 @@ fn validate_content_distribution_profiles<'a>(
                 for (checkpoint_position, checkpoint_id) in
                     step.hold_through_checkpoint_ids.iter().enumerate()
                 {
-                    let checkpoint_path = format!(
-                        "{step_path}.hold_through_checkpoint_ids[{checkpoint_position}]"
-                    );
+                    let checkpoint_path =
+                        format!("{step_path}.hold_through_checkpoint_ids[{checkpoint_position}]");
                     validator.require_identifier(&checkpoint_path, checkpoint_id);
                     if !held.insert(checkpoint_id.as_str()) {
                         validator.error(
@@ -8930,8 +8851,10 @@ fn validate_content_distribution_profiles<'a>(
                         );
                     }
                 }
-                if matches!(step.operation, RendererContentCompositionOperation::EnterAlternateBuffer)
-                    && step.hold_through_checkpoint_ids.is_empty()
+                if matches!(
+                    step.operation,
+                    RendererContentCompositionOperation::EnterAlternateBuffer
+                ) && step.hold_through_checkpoint_ids.is_empty()
                 {
                     validator.error(
                         RendererScenarioValidationCode::InvalidState,
@@ -8944,8 +8867,10 @@ fn validate_content_distribution_profiles<'a>(
                         content_identity_framing(corpus),
                         RendererContentFraming::TypedStateOverlay
                     );
-                    if matches!(step.operation, RendererContentCompositionOperation::ApplyTypedStateOverlay)
-                        != is_typed_state
+                    if matches!(
+                        step.operation,
+                        RendererContentCompositionOperation::ApplyTypedStateOverlay
+                    ) != is_typed_state
                     {
                         validator.error(
                             RendererScenarioValidationCode::InvalidState,
@@ -8982,7 +8907,10 @@ fn validate_content_distribution_profiles<'a>(
                         );
                     }
                     if !content_input_available(corpus)
-                        && matches!(step.availability, RendererContentInputAvailability::Available)
+                        && matches!(
+                            step.availability,
+                            RendererContentInputAvailability::Available
+                        )
                     {
                         validator.error(
                             RendererScenarioValidationCode::InvalidState,
@@ -9017,7 +8945,11 @@ fn validate_content_distribution_profiles<'a>(
     index
 }
 
-fn validate_pane_output_state(path: &str, output: &RendererPaneOutputState, validator: &mut Validator) {
+fn validate_pane_output_state(
+    path: &str,
+    output: &RendererPaneOutputState,
+    validator: &mut Validator,
+) {
     if let Some(stream_id) = &output.stream_id {
         validator.require_identifier(&format!("{path}.stream_id"), stream_id);
         if output.bytes_per_second == 0 {
@@ -9061,8 +8993,14 @@ fn validate_phase_manifests<'a>(
     let mut index = BTreeMap::new();
     for (position, manifest) in manifests.iter().enumerate() {
         let path = format!("$.phase_manifests[{position}]");
-        validator.require_identifier(&format!("{path}.phase_manifest_id"), &manifest.phase_manifest_id);
-        if index.insert(manifest.phase_manifest_id.as_str(), manifest).is_some() {
+        validator.require_identifier(
+            &format!("{path}.phase_manifest_id"),
+            &manifest.phase_manifest_id,
+        );
+        if index
+            .insert(manifest.phase_manifest_id.as_str(), manifest)
+            .is_some()
+        {
             validator.error(
                 RendererScenarioValidationCode::DuplicateId,
                 format!("{path}.phase_manifest_id"),
@@ -9094,7 +9032,10 @@ fn validate_phase_manifests<'a>(
             validator.error(
                 RendererScenarioValidationCode::DanglingReference,
                 format!("{path}.default_surface_state_template_id"),
-                format!("undefined surface template `{}`", manifest.default_surface_state_template_id),
+                format!(
+                    "undefined surface template `{}`",
+                    manifest.default_surface_state_template_id
+                ),
             );
         }
         let distribution = distributions
@@ -9104,7 +9045,10 @@ fn validate_phase_manifests<'a>(
             validator.error(
                 RendererScenarioValidationCode::DanglingReference,
                 format!("{path}.content_distribution_profile_id"),
-                format!("undefined content distribution `{}`", manifest.content_distribution_profile_id),
+                format!(
+                    "undefined content distribution `{}`",
+                    manifest.content_distribution_profile_id
+                ),
             );
         }
         if let (Some(layout), Some(distribution)) = (layout, distribution) {
@@ -9163,7 +9107,11 @@ fn validate_phase_manifests<'a>(
                         format!("active local tab ordinal is outside window tab count {tab_count}"),
                     );
                 }
-                validate_pixel_rect(&format!("{window_path}.window_rect"), window_state.window_rect, validator);
+                validate_pixel_rect(
+                    &format!("{window_path}.window_rect"),
+                    window_state.window_rect,
+                    validator,
+                );
                 if window_state.window_rect.x != 0 || window_state.window_rect.y != 0 {
                     validator.error(
                         RendererScenarioValidationCode::InvalidState,
@@ -9186,9 +9134,10 @@ fn validate_phase_manifests<'a>(
                     let active_global_tab = expanded
                         .tabs_by_window
                         .get(usize::from(pane_window))
-                        .and_then(|tabs| tabs
-                        .get(usize::from(window_state.active_tab_ordinal))
-                        .copied());
+                        .and_then(|tabs| {
+                            tabs.get(usize::from(window_state.active_tab_ordinal))
+                                .copied()
+                        });
                     if active_global_tab != Some(pane_tab) {
                         validator.error(
                             RendererScenarioValidationCode::InvalidState,
@@ -9205,7 +9154,10 @@ fn validate_phase_manifests<'a>(
                     validator.error(
                         RendererScenarioValidationCode::DanglingReference,
                         format!("{override_path}.surface_state_template_id"),
-                        format!("undefined surface template `{}`", pane_override.surface_state_template_id),
+                        format!(
+                            "undefined surface template `{}`",
+                            pane_override.surface_state_template_id
+                        ),
                     );
                 }
                 for ordinal in expand_pane_selector(
@@ -9222,10 +9174,18 @@ fn validate_phase_manifests<'a>(
                         );
                     }
                 }
-                validate_pane_output_state(&format!("{override_path}.output"), &pane_override.output, validator);
+                validate_pane_output_state(
+                    &format!("{override_path}.output"),
+                    &pane_override.output,
+                    validator,
+                );
             }
         }
-        validate_pane_output_state(&format!("{path}.default_output"), &manifest.default_output, validator);
+        validate_pane_output_state(
+            &format!("{path}.default_output"),
+            &manifest.default_output,
+            validator,
+        );
     }
     index
 }
@@ -9266,10 +9226,8 @@ fn validate_capability_availability_shape(
             reason,
             tracking_ref,
         } => {
-            validator.require_repository_ref(
-                &format!("{path}.target_profile_ref"),
-                target_profile_ref,
-            );
+            validator
+                .require_repository_ref(&format!("{path}.target_profile_ref"), target_profile_ref);
             validate_tracked_limitation(
                 path,
                 reason,
@@ -9291,13 +9249,19 @@ fn validate_coverage_overlay_profiles<'a>(
         validator.error(
             RendererScenarioValidationCode::MissingRequiredCoverage,
             "$.coverage_overlay_profiles",
-            format!("expected exactly {expected_count} overlay profiles, found {}", profiles.len()),
+            format!(
+                "expected exactly {expected_count} overlay profiles, found {}",
+                profiles.len()
+            ),
         );
     }
     let mut index = BTreeMap::new();
     for (position, profile) in profiles.iter().enumerate() {
         let path = format!("$.coverage_overlay_profiles[{position}]");
-        validator.require_identifier(&format!("{path}.overlay_profile_id"), &profile.overlay_profile_id);
+        validator.require_identifier(
+            &format!("{path}.overlay_profile_id"),
+            &profile.overlay_profile_id,
+        );
         validator.require_identifier(
             &format!("{path}.renderer_config_profile_id"),
             &profile.renderer_config_profile_id,
@@ -9309,7 +9273,10 @@ fn validate_coverage_overlay_profiles<'a>(
                 "overlay profile revision must be positive",
             );
         }
-        if index.insert(profile.overlay_profile_id.as_str(), profile).is_some() {
+        if index
+            .insert(profile.overlay_profile_id.as_str(), profile)
+            .is_some()
+        {
             validator.error(
                 RendererScenarioValidationCode::DuplicateId,
                 format!("{path}.overlay_profile_id"),
@@ -9347,7 +9314,10 @@ fn validate_coverage_overlay_profiles<'a>(
             validator.error(
                 RendererScenarioValidationCode::DanglingReference,
                 format!("{path}.renderer_config_profile_id"),
-                format!("undefined renderer configuration `{}`", profile.renderer_config_profile_id),
+                format!(
+                    "undefined renderer configuration `{}`",
+                    profile.renderer_config_profile_id
+                ),
             );
         }
         let expected_class = if profile.overlay_id == RendererCoverageOverlayId::ProductionDefault {
@@ -9369,7 +9339,10 @@ fn validate_coverage_overlay_profiles<'a>(
                 validator.error(
                     RendererScenarioValidationCode::InvalidCapabilityMatrix,
                     format!("{delta_path}.capability"),
-                    format!("duplicate overlay capability delta `{}`", delta.capability.as_str()),
+                    format!(
+                        "duplicate overlay capability delta `{}`",
+                        delta.capability.as_str()
+                    ),
                 );
             }
             validate_capability_availability_shape(
@@ -9379,12 +9352,8 @@ fn validate_coverage_overlay_profiles<'a>(
             );
         }
         let expected_delta = match profile.overlay_id {
-            RendererCoverageOverlayId::ImeComposing => {
-                Some(RendererCapability::ImeComposition)
-            }
-            RendererCoverageOverlayId::ImageHyperlink => {
-                Some(RendererCapability::ImageProtocol)
-            }
+            RendererCoverageOverlayId::ImeComposing => Some(RendererCapability::ImeComposition),
+            RendererCoverageOverlayId::ImageHyperlink => Some(RendererCapability::ImageProtocol),
             RendererCoverageOverlayId::LigatureEnabled => {
                 Some(RendererCapability::EnabledLigatureShaping)
             }
@@ -9461,8 +9430,7 @@ fn validate_coverage_overlay_profiles<'a>(
         let expected_exclusions = match profile.overlay_id {
             RendererCoverageOverlayId::ImeComposing => [
                 Some(RendererOverlayQualificationTarget::Measurement {
-                    measurement_role:
-                        RendererMeasurementRole::KeypressToFirstCorrectPresent,
+                    measurement_role: RendererMeasurementRole::KeypressToFirstCorrectPresent,
                 }),
                 Some(RendererOverlayQualificationTarget::Requirement {
                     requirement_id: RendererRequirementId::RqS6HeavyBurstInputLatency,
@@ -9541,7 +9509,10 @@ fn validate_detector_contracts<'a>(
         validator.error(
             RendererScenarioValidationCode::InvalidCheckpoint,
             "$.detector_contracts",
-            format!("expected exactly 20 detector contracts, found {}", contracts.len()),
+            format!(
+                "expected exactly 20 detector contracts, found {}",
+                contracts.len()
+            ),
         );
     }
     let mut index = BTreeMap::new();
@@ -9573,7 +9544,10 @@ fn validate_detector_contracts<'a>(
         match (&contract.detector_id, &contract.mechanism_status) {
             (
                 RendererCheckpointDetectorId::ChangedPixelFractionPolicy,
-                RendererDetectorMechanismStatus::KnownNonIndependent { reason, tracking_ref },
+                RendererDetectorMechanismStatus::KnownNonIndependent {
+                    reason,
+                    tracking_ref,
+                },
             ) => {
                 if tracking_ref != CHANGED_PIXEL_FRACTION_TRACKING_REF {
                     validator.error(
@@ -9634,10 +9608,8 @@ fn validate_presentation_availability(
             reason,
             tracking_ref,
         } => {
-            validator.require_repository_ref(
-                &format!("{path}.target_profile_ref"),
-                target_profile_ref,
-            );
+            validator
+                .require_repository_ref(&format!("{path}.target_profile_ref"), target_profile_ref);
             validate_tracked_limitation(
                 path,
                 reason,
@@ -9657,7 +9629,10 @@ fn validate_presentation_target_profiles<'a>(
         validator.error(
             RendererScenarioValidationCode::InvalidState,
             "$.presentation_target_profiles",
-            format!("expected exactly three cadence profiles, found {}", profiles.len()),
+            format!(
+                "expected exactly three cadence profiles, found {}",
+                profiles.len()
+            ),
         );
     }
     let mut index = BTreeMap::new();
@@ -9685,8 +9660,7 @@ fn validate_presentation_target_profiles<'a>(
                 profile.minimum_millihz == 120_000 && profile.maximum_millihz == 120_000
             }
             RendererPresentationTargetProfileId::VariableRefreshRate => {
-                profile.minimum_millihz > 0
-                    && profile.minimum_millihz < profile.maximum_millihz
+                profile.minimum_millihz > 0 && profile.minimum_millihz < profile.maximum_millihz
             }
         };
         if !cadence_valid {
@@ -9696,7 +9670,11 @@ fn validate_presentation_target_profiles<'a>(
                 "presentation cadence does not match its closed profile identity",
             );
         }
-        validate_presentation_availability(&format!("{path}.availability"), &profile.availability, validator);
+        validate_presentation_availability(
+            &format!("{path}.availability"),
+            &profile.availability,
+            validator,
+        );
     }
     index
 }
@@ -9709,7 +9687,10 @@ fn validate_preconditioning_profiles<'a>(
         validator.error(
             RendererScenarioValidationCode::InvalidState,
             "$.preconditioning_profiles",
-            format!("expected exactly cold/warm/aged profiles, found {}", profiles.len()),
+            format!(
+                "expected exactly cold/warm/aged profiles, found {}",
+                profiles.len()
+            ),
         );
     }
     let mut index = BTreeMap::new();
@@ -9772,7 +9753,10 @@ fn validate_driver_canaries<'a>(
         validator.error(
             RendererScenarioValidationCode::InvalidState,
             "$.driver_canaries",
-            format!("expected exactly five driver canaries, found {}", canaries.len()),
+            format!(
+                "expected exactly five driver canaries, found {}",
+                canaries.len()
+            ),
         );
     }
     let mut index = BTreeMap::new();
@@ -9813,11 +9797,22 @@ fn validate_driver_canaries<'a>(
         }
         let action_matches = matches!(
             (&canary.canary_id, &canary.action),
-            (RendererDriverCanaryId::FocusWindow, RendererDriverCanaryAction::FocusWindow { .. })
-                | (RendererDriverCanaryId::ActivateTab, RendererDriverCanaryAction::ActivateTab { .. })
-                | (RendererDriverCanaryId::FocusPane, RendererDriverCanaryAction::FocusPane { .. })
-                | (RendererDriverCanaryId::SplitGeometry, RendererDriverCanaryAction::SetSplitGeometry { .. })
-                | (RendererDriverCanaryId::TopologyManifest, RendererDriverCanaryAction::SetTopologyManifest { .. })
+            (
+                RendererDriverCanaryId::FocusWindow,
+                RendererDriverCanaryAction::FocusWindow { .. }
+            ) | (
+                RendererDriverCanaryId::ActivateTab,
+                RendererDriverCanaryAction::ActivateTab { .. }
+            ) | (
+                RendererDriverCanaryId::FocusPane,
+                RendererDriverCanaryAction::FocusPane { .. }
+            ) | (
+                RendererDriverCanaryId::SplitGeometry,
+                RendererDriverCanaryAction::SetSplitGeometry { .. }
+            ) | (
+                RendererDriverCanaryId::TopologyManifest,
+                RendererDriverCanaryAction::SetTopologyManifest { .. }
+            )
         );
         if !action_matches {
             validator.error(
@@ -9828,12 +9823,23 @@ fn validate_driver_canaries<'a>(
         }
         match &canary.action {
             RendererDriverCanaryAction::SetSplitGeometry { split_geometry_ref } => validator
-                .require_repository_ref(&format!("{path}.action.split_geometry_ref"), split_geometry_ref),
+                .require_repository_ref(
+                    &format!("{path}.action.split_geometry_ref"),
+                    split_geometry_ref,
+                ),
             RendererDriverCanaryAction::SetTopologyManifest { topology_ref } => validator
                 .require_repository_ref(&format!("{path}.action.topology_ref"), topology_ref),
-            RendererDriverCanaryAction::FocusWindow { target_window_ordinal } => {
-                if *target_window_ordinal == 0 || *target_window_ordinal >= canary.minimum_window_count {
-                    validator.error(RendererScenarioValidationCode::InvalidState, format!("{path}.action"), "focus-window canary must switch to a nonzero in-bounds window");
+            RendererDriverCanaryAction::FocusWindow {
+                target_window_ordinal,
+            } => {
+                if *target_window_ordinal == 0
+                    || *target_window_ordinal >= canary.minimum_window_count
+                {
+                    validator.error(
+                        RendererScenarioValidationCode::InvalidState,
+                        format!("{path}.action"),
+                        "focus-window canary must switch to a nonzero in-bounds window",
+                    );
                 }
             }
             RendererDriverCanaryAction::ActivateTab {
@@ -9844,17 +9850,28 @@ fn validate_driver_canaries<'a>(
                     || *target_tab_ordinal == 0
                     || *target_tab_ordinal >= canary.minimum_tab_count
                 {
-                    validator.error(RendererScenarioValidationCode::InvalidState, format!("{path}.action"), "activate-tab canary must switch to a nonzero in-bounds tab");
+                    validator.error(
+                        RendererScenarioValidationCode::InvalidState,
+                        format!("{path}.action"),
+                        "activate-tab canary must switch to a nonzero in-bounds tab",
+                    );
                 }
             }
-            RendererDriverCanaryAction::FocusPane { target_pane_ordinal } => {
+            RendererDriverCanaryAction::FocusPane {
+                target_pane_ordinal,
+            } => {
                 if *target_pane_ordinal == 0 || *target_pane_ordinal >= canary.minimum_pane_count {
-                    validator.error(RendererScenarioValidationCode::InvalidState, format!("{path}.action"), "focus-pane canary must switch to a nonzero in-bounds pane");
+                    validator.error(
+                        RendererScenarioValidationCode::InvalidState,
+                        format!("{path}.action"),
+                        "focus-pane canary must switch to a nonzero in-bounds pane",
+                    );
                 }
             }
         }
         let mut capabilities = BTreeSet::new();
-        for (capability_position, capability) in canary.prerequisite_capabilities.iter().enumerate() {
+        for (capability_position, capability) in canary.prerequisite_capabilities.iter().enumerate()
+        {
             if !capabilities.insert(*capability) {
                 validator.error(
                     RendererScenarioValidationCode::InvalidCapabilityMatrix,
@@ -9874,7 +9891,10 @@ fn validate_rq_s1_synthetic_substrate(
     let Some(substrate) = substrate else {
         return;
     };
-    validator.require_repository_ref("$.rq_s1_synthetic_substrate.benchmark_ref", &substrate.benchmark_ref);
+    validator.require_repository_ref(
+        "$.rq_s1_synthetic_substrate.benchmark_ref",
+        &substrate.benchmark_ref,
+    );
     if substrate.frame_count != 300
         || substrate.low_columns != 80
         || substrate.high_columns != 200
@@ -9937,8 +9957,7 @@ const CONTENT_SEM_UNICODE: [RendererContentSemanticKind; 4] = [
     RendererContentSemanticKind::CombiningMarkText,
     RendererContentSemanticKind::EmojiText,
 ];
-const CONTENT_SEM_RTL: [RendererContentSemanticKind; 1] =
-    [RendererContentSemanticKind::RtlText];
+const CONTENT_SEM_RTL: [RendererContentSemanticKind; 1] = [RendererContentSemanticKind::RtlText];
 const CONTENT_SEM_HYPERLINK: [RendererContentSemanticKind; 1] =
     [RendererContentSemanticKind::HyperlinkProtocol];
 const CONTENT_SEM_ALT: [RendererContentSemanticKind; 1] =
@@ -9948,8 +9967,7 @@ const CONTENT_SEM_IMAGE: [RendererContentSemanticKind; 1] =
 const CONTENT_SEM_LIGATURE: [RendererContentSemanticKind; 1] =
     [RendererContentSemanticKind::LigatureSequence];
 const CONTENT_SEM_STATE_ONLY: [RendererContentSemanticKind; 0] = [];
-const CONTENT_TRACK_LIGATURE: [&str; 1] =
-    ["ft-interactive-systems-performance-4tenz.3.6.2"];
+const CONTENT_TRACK_LIGATURE: [&str; 1] = ["ft-interactive-systems-performance-4tenz.3.6.2"];
 const CONTENT_TRACK_IME: [&str; 3] = [
     "ft-interactive-systems-performance-4tenz.3.6.2",
     "ft-interactive-systems-performance-4tenz.3.5",
@@ -10143,7 +10161,9 @@ fn validate_canonical_content_reference(
             },
         ) => {
             let selector_matches = match (selector, expected_selector) {
-                (RendererContentPayloadSelector::WholePayload, ExpectedContentSelector::Whole) => true,
+                (RendererContentPayloadSelector::WholePayload, ExpectedContentSelector::Whole) => {
+                    true
+                }
                 (
                     RendererContentPayloadSelector::ManifestRowSegment {
                         manifest_ref,
@@ -10157,10 +10177,12 @@ fn validate_canonical_content_reference(
                         start,
                         end,
                     },
-                ) => manifest_ref == expected_manifest
-                    && manifest_row_id == row_id
-                    && *decoded_byte_start == start
-                    && *decoded_byte_end_exclusive == end,
+                ) => {
+                    manifest_ref == expected_manifest
+                        && manifest_row_id == row_id
+                        && *decoded_byte_start == start
+                        && *decoded_byte_end_exclusive == end
+                }
                 _ => false,
             };
             if payload_ref != expected_ref
@@ -10170,7 +10192,10 @@ fn validate_canonical_content_reference(
                 || encoded_payload_sha256 != encoded_sha256
                 || decoded_payload_sha256 != decoded_sha256
                 || !selector_matches
-                || !matches!(actual.availability, RendererContentInputAvailability::Available)
+                || !matches!(
+                    actual.availability,
+                    RendererContentInputAvailability::Available
+                )
             {
                 validator.error(
                     RendererScenarioValidationCode::InvalidCorpusReference,
@@ -10199,10 +10224,9 @@ fn validate_canonical_content_reference(
             },
         ) => {
             let actual_tracking = match &actual.availability {
-                RendererContentInputAvailability::Unavailable { tracking_refs, .. } => tracking_refs
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>(),
+                RendererContentInputAvailability::Unavailable { tracking_refs, .. } => {
+                    tracking_refs.iter().map(String::as_str).collect::<Vec<_>>()
+                }
                 RendererContentInputAvailability::Available => Vec::new(),
             };
             if generator_id != expected_generator
@@ -10213,7 +10237,10 @@ fn validate_canonical_content_reference(
                 || *output_decoder != RendererContentDecoder::GeneratorV1
                 || *output_framing != framing
                 || actual_tracking.as_slice() != tracking_refs
-                || !matches!(actual.availability, RendererContentInputAvailability::Unavailable { .. })
+                || !matches!(
+                    actual.availability,
+                    RendererContentInputAvailability::Unavailable { .. }
+                )
             {
                 validator.error(
                     RendererScenarioValidationCode::InvalidCorpusReference,
@@ -10273,9 +10300,7 @@ fn semantic_feature(kind: RendererContentSemanticKind) -> RendererTerminalFeatur
         RendererContentSemanticKind::AsciiText => RendererTerminalFeature::Ascii,
         RendererContentSemanticKind::CjkText => RendererTerminalFeature::Cjk,
         RendererContentSemanticKind::RtlText => RendererTerminalFeature::Rtl,
-        RendererContentSemanticKind::CombiningMarkText => {
-            RendererTerminalFeature::CombiningMarks
-        }
+        RendererContentSemanticKind::CombiningMarkText => RendererTerminalFeature::CombiningMarks,
         RendererContentSemanticKind::EmojiText => RendererTerminalFeature::Emoji,
         RendererContentSemanticKind::LigatureSequence => RendererTerminalFeature::Ligatures,
         RendererContentSemanticKind::ImageProtocol => RendererTerminalFeature::Images,
@@ -10303,14 +10328,17 @@ fn materialization_step_applies(
     scenario: &RendererScenarioDefinition,
     checkpoint: &RendererVisualCheckpoint,
 ) -> Result<bool, String> {
-    let current_position = overlay_checkpoint_position(
-        scenario,
-        checkpoint.overlay_id,
-        &checkpoint.checkpoint_id,
-    )
-    .ok_or_else(|| format!("checkpoint `{}` is not in its overlay", checkpoint.checkpoint_id))?;
-    let (boundary_reached, minimum_hold_position, minimum_hold_event) =
-        match &step.application_boundary {
+    let current_position =
+        overlay_checkpoint_position(scenario, checkpoint.overlay_id, &checkpoint.checkpoint_id)
+            .ok_or_else(|| {
+                format!(
+                    "checkpoint `{}` is not in its overlay",
+                    checkpoint.checkpoint_id
+                )
+            })?;
+    let (boundary_reached, minimum_hold_position, minimum_hold_event) = match &step
+        .application_boundary
+    {
         RendererContentApplicationBoundary::BeforeGesture => (true, 0, 0),
         RendererContentApplicationBoundary::AtEvent { event_ordinal } => {
             let Some(event) = scenario.timeline.get(*event_ordinal as usize) else {
@@ -10354,12 +10382,8 @@ fn materialization_step_applies(
     // undo; applied operations persist until an explicit Replace or Exit.
     let mut previous_hold_position = None;
     for hold_id in &step.hold_through_checkpoint_ids {
-        let hold_position = overlay_checkpoint_position(
-            scenario,
-            checkpoint.overlay_id,
-            hold_id,
-        )
-        .ok_or_else(|| {
+        let hold_position = overlay_checkpoint_position(scenario, checkpoint.overlay_id, hold_id)
+            .ok_or_else(|| {
             format!(
                 "hold-through checkpoint `{hold_id}` is absent from overlay `{}`",
                 checkpoint.overlay_id.as_str()
@@ -10407,12 +10431,14 @@ fn resolve_pane_materialization(
     let mut alternate_content_corpus_ids = Vec::new();
     let mut applied_steps = Vec::new();
     let mut held_effects = Vec::new();
-    let current_checkpoint_position = overlay_checkpoint_position(
-        scenario,
-        checkpoint.overlay_id,
-        &checkpoint.checkpoint_id,
-    )
-    .ok_or_else(|| format!("checkpoint `{}` is not in its overlay", checkpoint.checkpoint_id))?;
+    let current_checkpoint_position =
+        overlay_checkpoint_position(scenario, checkpoint.overlay_id, &checkpoint.checkpoint_id)
+            .ok_or_else(|| {
+                format!(
+                    "checkpoint `{}` is not in its overlay",
+                    checkpoint.checkpoint_id
+                )
+            })?;
     for step in steps {
         if !materialization_step_applies(step, scenario, checkpoint)? {
             continue;
@@ -10420,9 +10446,7 @@ fn resolve_pane_materialization(
         let reference = content
             .get(step.content_corpus_id.as_str())
             .copied()
-            .ok_or_else(|| {
-                format!("undefined content corpus `{}`", step.content_corpus_id)
-            })?;
+            .ok_or_else(|| format!("undefined content corpus `{}`", step.content_corpus_id))?;
         let target_buffer = active_buffer;
         let active_content = match target_buffer {
             RendererTerminalBufferKind::Primary => &mut primary_content_corpus_ids,
@@ -10456,9 +10480,7 @@ fn resolve_pane_materialization(
                 overlay_checkpoint_position(scenario, checkpoint.overlay_id, checkpoint_id)
             })
             .max();
-        if furthest_hold_position
-            .is_some_and(|furthest| current_checkpoint_position <= furthest)
-        {
+        if furthest_hold_position.is_some_and(|furthest| current_checkpoint_position <= furthest) {
             held_effects.push((step, target_buffer));
         }
         applied_steps.push(step.clone());
@@ -10481,10 +10503,9 @@ fn resolve_pane_materialization(
                 active_buffer == RendererTerminalBufferKind::Primary
             }
             RendererContentCompositionOperation::ApplyTypedStateOverlay => {
-                reference_has_visible_semantics(content, &step.content_corpus_id)
-                    .is_none_or(|has_visible| {
-                        !has_visible || target_content.contains(&step.content_corpus_id)
-                    })
+                reference_has_visible_semantics(content, &step.content_corpus_id).is_none_or(
+                    |has_visible| !has_visible || target_content.contains(&step.content_corpus_id),
+                )
             }
         };
         if !effect_survives {
@@ -10682,13 +10703,10 @@ fn expand_manifest_state(
                 "pane {ordinal} terminal buffers contradict ordered content materialization"
             ));
         }
-        if state.terminal.primary_buffer.scrollback_lines
-            != workload.scrollback_lines_per_pane
-        {
+        if state.terminal.primary_buffer.scrollback_lines != workload.scrollback_lines_per_pane {
             return Err(format!(
                 "pane {ordinal} primary scrollback {} differs from workload {}",
-                state.terminal.primary_buffer.scrollback_lines,
-                workload.scrollback_lines_per_pane
+                state.terminal.primary_buffer.scrollback_lines, workload.scrollback_lines_per_pane
             ));
         }
         let geometry = &pane_geometry[ordinal];
@@ -10786,7 +10804,9 @@ const fn expected_overlay_features(
     }
 }
 
-fn canonical_feature_set(features: &[RendererTerminalFeature]) -> BTreeSet<RendererTerminalFeature> {
+fn canonical_feature_set(
+    features: &[RendererTerminalFeature],
+) -> BTreeSet<RendererTerminalFeature> {
     features.iter().copied().collect()
 }
 
@@ -10860,7 +10880,11 @@ fn validate_mutation_target(
     }
     let tab_ordinal = target.tab_id.as_ref().and_then(|tab_id| {
         validator.require_identifier(&format!("{path}.tab_id"), tab_id);
-        let ordinal = expanded.tab_ids.iter().position(|id| id == tab_id).map(|value| value as u16);
+        let ordinal = expanded
+            .tab_ids
+            .iter()
+            .position(|id| id == tab_id)
+            .map(|value| value as u16);
         if ordinal.is_none() {
             validator.error(
                 RendererScenarioValidationCode::InvalidTimeline,
@@ -10968,7 +10992,10 @@ fn validate_timeline(
         validator.error(
             RendererScenarioValidationCode::InvalidWorkload,
             &path,
-            format!("timeline event count must equal workload event_count {}", workload.event_count),
+            format!(
+                "timeline event count must equal workload event_count {}",
+                workload.event_count
+            ),
         );
     }
     let mut previous_at = None;
@@ -11008,7 +11035,9 @@ fn validate_timeline(
             );
         }
         previous_at = Some(event.at_us);
-        if previous_phase.is_some_and(|phase: RendererTimelinePhase| event.phase.rank() < phase.rank()) {
+        if previous_phase
+            .is_some_and(|phase: RendererTimelinePhase| event.phase.rank() < phase.rank())
+        {
             validator.error(
                 RendererScenarioValidationCode::InvalidTimeline,
                 format!("{event_path}.phase"),
@@ -11036,7 +11065,13 @@ fn validate_timeline(
                 );
             }
             if let Some(target) = timeline_action_target(action) {
-                validate_mutation_target(&format!("{action_path}.target"), target, kind, layout, validator);
+                validate_mutation_target(
+                    &format!("{action_path}.target"),
+                    target,
+                    kind,
+                    layout,
+                    validator,
+                );
                 if let Some(expected) = coherent_mutation_target {
                     if target != expected {
                         validator.error(
@@ -11051,31 +11086,62 @@ fn validate_timeline(
             }
             match action {
                 RendererTimelineAction::BeginGesture => begin_count += 1,
-                RendererTimelineAction::SetWindowSize { width_px, height_px, .. } => {
+                RendererTimelineAction::SetWindowSize {
+                    width_px,
+                    height_px,
+                    ..
+                } => {
                     if *width_px == 0
                         || *height_px == 0
                         || *width_px > MAX_VIEWPORT_DIMENSION_PX
                         || *height_px > MAX_VIEWPORT_DIMENSION_PX
                     {
-                        validator.error(RendererScenarioValidationCode::InvalidTimeline, &action_path, "window size is outside contract bounds");
+                        validator.error(
+                            RendererScenarioValidationCode::InvalidTimeline,
+                            &action_path,
+                            "window size is outside contract bounds",
+                        );
                     }
                 }
                 RendererTimelineAction::SetGrid { columns, rows, .. } => {
-                    validate_grid_state(&action_path, RendererGridState { columns: *columns, rows: *rows }, validator);
+                    validate_grid_state(
+                        &action_path,
+                        RendererGridState {
+                            columns: *columns,
+                            rows: *rows,
+                        },
+                        validator,
+                    );
                     facts.grid_event_ordinals.push(event.event_ordinal);
                 }
                 RendererTimelineAction::SetFontScale { scale_milli, .. } => {
                     if *scale_milli == 0 || *scale_milli > MAX_SCALE_FACTOR_MILLI {
-                        validator.error(RendererScenarioValidationCode::InvalidTimeline, &action_path, "font scale is outside contract bounds");
+                        validator.error(
+                            RendererScenarioValidationCode::InvalidTimeline,
+                            &action_path,
+                            "font scale is outside contract bounds",
+                        );
                     }
                     facts.font_event_ordinals.push(event.event_ordinal);
                 }
                 RendererTimelineAction::SetQualityMode { mode, .. } => {
-                    if event.phase == RendererTimelinePhase::Mutation && *mode != RendererQualityMode::Draft {
-                        validator.error(RendererScenarioValidationCode::InvalidTimeline, &action_path, "mutation-phase quality transition may only enter Draft");
+                    if event.phase == RendererTimelinePhase::Mutation
+                        && *mode != RendererQualityMode::Draft
+                    {
+                        validator.error(
+                            RendererScenarioValidationCode::InvalidTimeline,
+                            &action_path,
+                            "mutation-phase quality transition may only enter Draft",
+                        );
                     }
-                    if event.phase == RendererTimelinePhase::SnapBack && *mode != RendererQualityMode::Standard {
-                        validator.error(RendererScenarioValidationCode::InvalidTimeline, &action_path, "snap-back must transition to Standard");
+                    if event.phase == RendererTimelinePhase::SnapBack
+                        && *mode != RendererQualityMode::Standard
+                    {
+                        validator.error(
+                            RendererScenarioValidationCode::InvalidTimeline,
+                            &action_path,
+                            "snap-back must transition to Standard",
+                        );
                     }
                 }
                 RendererTimelineAction::MoveToDisplay { display, .. } => {
@@ -11092,13 +11158,24 @@ fn validate_timeline(
                 } => {
                     validator.require_identifier(&format!("{action_path}.stream_id"), stream_id);
                     if *bytes_per_second > MAX_RENDERER_OUTPUT_BYTES_PER_SECOND {
-                        validator.error(RendererScenarioValidationCode::LimitExceeded, &action_path, "output rate exceeds contract bound");
+                        validator.error(
+                            RendererScenarioValidationCode::LimitExceeded,
+                            &action_path,
+                            "output rate exceeds contract bound",
+                        );
                     }
-                    facts.output_actions.push((event.event_ordinal, stream_id.clone(), *bytes_per_second));
+                    facts.output_actions.push((
+                        event.event_ordinal,
+                        stream_id.clone(),
+                        *bytes_per_second,
+                    ));
                 }
                 RendererTimelineAction::ForegroundKey { key_event_id } => {
-                    validator.require_identifier(&format!("{action_path}.key_event_id"), key_event_id);
-                    facts.key_actions.push((event.event_ordinal, key_event_id.clone()));
+                    validator
+                        .require_identifier(&format!("{action_path}.key_event_id"), key_event_id);
+                    facts
+                        .key_actions
+                        .push((event.event_ordinal, key_event_id.clone()));
                 }
                 RendererTimelineAction::SetRevisions {
                     renderer_generation,
@@ -11107,7 +11184,11 @@ fn validate_timeline(
                     ..
                 } => {
                     if *renderer_generation == 0 || *grid_revision == 0 || *terminal_revision == 0 {
-                        validator.error(RendererScenarioValidationCode::InvalidTimeline, &action_path, "all explicit revisions must be positive");
+                        validator.error(
+                            RendererScenarioValidationCode::InvalidTimeline,
+                            &action_path,
+                            "all explicit revisions must be positive",
+                        );
                     }
                 }
                 RendererTimelineAction::EndGesture => {
@@ -11152,21 +11233,33 @@ fn validate_timeline(
                 if position != 0
                     || event.actions.as_slice() != [RendererTimelineAction::BeginGesture]
                 {
-                    validator.error(RendererScenarioValidationCode::InvalidTimeline, &event_path, "Begin must be event zero with only gesture_begin");
+                    validator.error(
+                        RendererScenarioValidationCode::InvalidTimeline,
+                        &event_path,
+                        "Begin must be event zero with only gesture_begin",
+                    );
                 }
             }
             RendererTimelinePhase::End => {
                 if event.at_us != workload.gesture_duration_us
                     || event.actions.as_slice() != [RendererTimelineAction::EndGesture]
                 {
-                    validator.error(RendererScenarioValidationCode::InvalidTimeline, &event_path, "End must occur exactly at gesture_duration_us with only gesture_end");
+                    validator.error(
+                        RendererScenarioValidationCode::InvalidTimeline,
+                        &event_path,
+                        "End must occur exactly at gesture_duration_us with only gesture_end",
+                    );
                 }
             }
             RendererTimelinePhase::SnapBack => {
                 snap_count += 1;
                 facts.snap_back_event_ordinal = Some(event.event_ordinal);
                 if !kinds.contains(&ActiveTimelineActionKind::SetQualityMode) {
-                    validator.error(RendererScenarioValidationCode::InvalidTimeline, &event_path, "SnapBack requires an explicit Standard quality action");
+                    validator.error(
+                        RendererScenarioValidationCode::InvalidTimeline,
+                        &event_path,
+                        "SnapBack requires an explicit Standard quality action",
+                    );
                 }
             }
             RendererTimelinePhase::Settle => {
@@ -11174,9 +11267,14 @@ fn validate_timeline(
                     || event.at_us != workload.total_duration_us
                     || !kinds.contains(&ActiveTimelineActionKind::Settle)
                 {
-                    validator.error(RendererScenarioValidationCode::InvalidTimeline, &event_path, "final Settle must occur exactly at total_duration_us and contain settle");
+                    validator.error(
+                        RendererScenarioValidationCode::InvalidTimeline,
+                        &event_path,
+                        "final Settle must occur exactly at total_duration_us and contain settle",
+                    );
                 }
-                let allowed_fancy = scenario.configured_steady_quality == RendererQualityMode::Fancy
+                let allowed_fancy = scenario.configured_steady_quality
+                    == RendererQualityMode::Fancy
                     && kinds.contains(&ActiveTimelineActionKind::SetQualityMode);
                 if event.actions.len() != 1 + usize::from(allowed_fancy) {
                     validator.error(RendererScenarioValidationCode::InvalidTimeline, &event_path, "Settle bundle may contain only settle and the configured Standard-to-Fancy transition");
@@ -11197,14 +11295,21 @@ fn validate_timeline(
         validator.error(
             RendererScenarioValidationCode::InvalidTimeline,
             &path,
-            format!("gesture requires {} SnapBack event(s), found {snap_count}", usize::from(live)),
+            format!(
+                "gesture requires {} SnapBack event(s), found {snap_count}",
+                usize::from(live)
+            ),
         );
     }
     if workload.resize_mutation_count != facts.resize_event_ordinals.len() as u32 {
         validator.error(
             RendererScenarioValidationCode::InvalidWorkload,
             &path,
-            format!("resize bundle count {} differs from workload {}", facts.resize_event_ordinals.len(), workload.resize_mutation_count),
+            format!(
+                "resize bundle count {} differs from workload {}",
+                facts.resize_event_ordinals.len(),
+                workload.resize_mutation_count
+            ),
         );
     }
     let expected_display_moves = usize::from(scenario.gesture == RendererGesture::DpiDisplayMove);
@@ -11243,16 +11348,20 @@ fn validate_output_and_key_schedule(
         validator.error(
             RendererScenarioValidationCode::InvalidWorkload,
             format!("{scenario_path}.timeline"),
-            format!("foreground-key actions must equal workload key definitions {expected_key_ids:?}"),
+            format!(
+                "foreground-key actions must equal workload key definitions {expected_key_ids:?}"
+            ),
         );
     }
     let focused_pane_id = scenario
         .visual_checkpoints
         .iter()
-        .find(|checkpoint| {
-            checkpoint.overlay_id == RendererCoverageOverlayId::ProductionDefault
+        .find(|checkpoint| checkpoint.overlay_id == RendererCoverageOverlayId::ProductionDefault)
+        .and_then(|checkpoint| {
+            index
+                .phase_manifests
+                .get(checkpoint.phase_manifest_id.as_str())
         })
-        .and_then(|checkpoint| index.phase_manifests.get(checkpoint.phase_manifest_id.as_str()))
         .and_then(|manifest| {
             index
                 .layout_profiles
@@ -11268,7 +11377,9 @@ fn validate_output_and_key_schedule(
         if focused_pane_id.as_deref() != Some(key_event.target_pane_id.as_str()) {
             validator.error(
                 RendererScenarioValidationCode::InvalidWorkload,
-                format!("{scenario_path}.workload_id.foreground_key_events[{position}].target_pane_id"),
+                format!(
+                    "{scenario_path}.workload_id.foreground_key_events[{position}].target_pane_id"
+                ),
                 format!(
                     "foreground key target must equal focused pane identity {:?}",
                     focused_pane_id
@@ -11339,13 +11450,21 @@ fn validate_output_and_key_schedule(
                     }
                     if *bytes_per_second == 0 {
                         if !active {
-                            validator.error(RendererScenarioValidationCode::InvalidTimeline, scenario_path, "output stop occurs while stream is inactive");
+                            validator.error(
+                                RendererScenarioValidationCode::InvalidTimeline,
+                                scenario_path,
+                                "output stop occurs while stream is inactive",
+                            );
                         }
                         active = false;
                         stopped_at = Some(event.event_ordinal);
                     } else {
                         if *bytes_per_second != OUTPUT_OVERLAP_BYTES_PER_SECOND || active {
-                            validator.error(RendererScenarioValidationCode::InvalidOutputOverlapRate, scenario_path, "output must start once at exactly one decimal MB/s");
+                            validator.error(
+                                RendererScenarioValidationCode::InvalidOutputOverlapRate,
+                                scenario_path,
+                                "output must start once at exactly one decimal MB/s",
+                            );
                         }
                         active = true;
                     }
@@ -11353,13 +11472,21 @@ fn validate_output_and_key_schedule(
                 RendererTimelineAction::SetWindowSize { .. }
                 | RendererTimelineAction::SetGrid { .. } => {
                     if stopped_at.is_some() {
-                        validator.error(RendererScenarioValidationCode::InvalidTimeline, scenario_path, "resize occurs after explicit output stop");
+                        validator.error(
+                            RendererScenarioValidationCode::InvalidTimeline,
+                            scenario_path,
+                            "resize occurs after explicit output stop",
+                        );
                     }
                     saw_resize_while_active |= active;
                 }
                 RendererTimelineAction::ForegroundKey { .. } => {
                     if stopped_at.is_some() {
-                        validator.error(RendererScenarioValidationCode::InvalidTimeline, scenario_path, "foreground key occurs after explicit output stop");
+                        validator.error(
+                            RendererScenarioValidationCode::InvalidTimeline,
+                            scenario_path,
+                            "foreground key occurs after explicit output stop",
+                        );
                     }
                     saw_key_while_active |= active;
                 }
@@ -11374,8 +11501,7 @@ fn validate_output_and_key_schedule(
             "output must start nonzero, overlap resize and foreground key, stop at zero, and remain stopped",
         );
     }
-    if scenario.fleet_point == RendererFleetPoint::P050
-        && workload.foreground_key_events.len() != 1
+    if scenario.fleet_point == RendererFleetPoint::P050 && workload.foreground_key_events.len() != 1
     {
         validator.error(
             RendererScenarioValidationCode::InvalidRequirementCrosswalk,
@@ -11384,18 +11510,21 @@ fn validate_output_and_key_schedule(
         );
     }
     match scenario.output_overlap_resize_mode {
-        Some(RendererResizeMode::SameGrid) if !facts.grid_event_ordinals.is_empty() => validator.error(
-            RendererScenarioValidationCode::InvalidGestureTransition,
-            format!("{scenario_path}.timeline"),
-            "same-grid output mode forbids grid changes",
-        ),
+        Some(RendererResizeMode::SameGrid) if !facts.grid_event_ordinals.is_empty() => validator
+            .error(
+                RendererScenarioValidationCode::InvalidGestureTransition,
+                format!("{scenario_path}.timeline"),
+                "same-grid output mode forbids grid changes",
+            ),
         Some(RendererResizeMode::GridChanging) => {
             let distinct_grids = scenario
                 .timeline
                 .iter()
                 .flat_map(|event| &event.actions)
                 .filter_map(|action| match action {
-                    RendererTimelineAction::SetGrid { columns, rows, .. } => Some((*columns, *rows)),
+                    RendererTimelineAction::SetGrid { columns, rows, .. } => {
+                        Some((*columns, *rows))
+                    }
                     _ => None,
                 })
                 .collect::<BTreeSet<_>>();
@@ -11435,9 +11564,7 @@ fn resolve_scenario_overlays<'a>(
     }
     let mut resolved = BTreeMap::new();
     let workload = index.workloads.get(scenario.workload_id.as_str()).copied();
-    for (position, overlay_profile_id) in
-        scenario.coverage_overlay_profile_ids.iter().enumerate()
-    {
+    for (position, overlay_profile_id) in scenario.coverage_overlay_profile_ids.iter().enumerate() {
         let path = format!("{scenario_path}.coverage_overlay_profile_ids[{position}]");
         validator.require_identifier(&path, overlay_profile_id);
         let Some(profile) = index
@@ -11454,9 +11581,7 @@ fn resolve_scenario_overlays<'a>(
         };
         let expected_overlay = RendererCoverageOverlayId::ALL.get(position).copied();
         if expected_overlay != Some(profile.overlay_id)
-            || expected_overlay
-                .map(expected_overlay_profile_id)
-                .as_deref()
+            || expected_overlay.map(expected_overlay_profile_id).as_deref()
                 != Some(overlay_profile_id.as_str())
         {
             validator.error(
@@ -11469,7 +11594,10 @@ fn resolve_scenario_overlays<'a>(
             validator.error(
                 RendererScenarioValidationCode::DuplicateCoverageCell,
                 &path,
-                format!("duplicate scenario overlay `{}`", profile.overlay_id.as_str()),
+                format!(
+                    "duplicate scenario overlay `{}`",
+                    profile.overlay_id.as_str()
+                ),
             );
             continue;
         }
@@ -11504,10 +11632,8 @@ fn resolve_scenario_overlays<'a>(
             let checkpoint_path =
                 format!("{scenario_path}.visual_checkpoints[{checkpoint_position}]");
             let manifest_id = checkpoint.phase_manifest_id.as_str();
-            validator.require_identifier(
-                &format!("{checkpoint_path}.phase_manifest_id"),
-                manifest_id,
-            );
+            validator
+                .require_identifier(&format!("{checkpoint_path}.phase_manifest_id"), manifest_id);
             if !anchor_ids.insert(manifest_id) {
                 validator.error(
                     RendererScenarioValidationCode::InvalidState,
@@ -11560,7 +11686,9 @@ fn resolve_scenario_overlays<'a>(
                     "anchor event ordinal is outside the scenario timeline",
                 ),
             }
-            if let Some(layout) = index.layout_profiles.get(manifest.layout_profile_id.as_str())
+            if let Some(layout) = index
+                .layout_profiles
+                .get(manifest.layout_profile_id.as_str())
                 && layout.fleet_point != scenario.fleet_point
             {
                 validator.error(
@@ -11570,13 +11698,7 @@ fn resolve_scenario_overlays<'a>(
                 );
             }
             if let Some(workload) = workload {
-                match expand_manifest_state(
-                    manifest,
-                    index,
-                    scenario,
-                    checkpoint,
-                    workload,
-                ) {
+                match expand_manifest_state(manifest, index, scenario, checkpoint, workload) {
                     Ok(expanded) => {
                         let expected =
                             canonical_feature_set(expected_overlay_features(profile.overlay_id));
@@ -11586,7 +11708,9 @@ fn resolve_scenario_overlays<'a>(
                                 &checkpoint_path,
                                 format!(
                                     "overlay `{}` derives {:?}, expected exact {:?}",
-                                    profile.overlay_id.as_str(), expanded.features, expected
+                                    profile.overlay_id.as_str(),
+                                    expanded.features,
+                                    expected
                                 ),
                             );
                         }
@@ -11762,7 +11886,9 @@ fn apply_timeline_action(
 ) {
     let kind = active_timeline_action_kind(action);
     let target_ordinals = timeline_action_target(action)
-        .map(|target| validate_mutation_target(&format!("{path}.target"), target, kind, layout, validator))
+        .map(|target| {
+            validate_mutation_target(&format!("{path}.target"), target, kind, layout, validator)
+        })
         .unwrap_or_default();
     match action {
         RendererTimelineAction::BeginGesture
@@ -11795,11 +11921,7 @@ fn apply_timeline_action(
                         rows: *rows,
                     };
                     if let Err(detail) = refresh_surface_padding_and_geometry(surface) {
-                        validator.error(
-                            RendererScenarioValidationCode::InvalidState,
-                            path,
-                            detail,
-                        );
+                        validator.error(RendererScenarioValidationCode::InvalidState, path, detail);
                     }
                 }
             }
@@ -11809,11 +11931,7 @@ fn apply_timeline_action(
                 if let Some(surface) = state.surfaces.get_mut(usize::from(ordinal)) {
                     surface.font.scale_milli = *scale_milli;
                     if let Err(detail) = refresh_surface_padding_and_geometry(surface) {
-                        validator.error(
-                            RendererScenarioValidationCode::InvalidState,
-                            path,
-                            detail,
-                        );
+                        validator.error(RendererScenarioValidationCode::InvalidState, path, detail);
                     }
                 }
             }
@@ -11825,10 +11943,7 @@ fn apply_timeline_action(
                 }
             }
         }
-        RendererTimelineAction::MoveToDisplay {
-            display,
-            ..
-        } => {
+        RendererTimelineAction::MoveToDisplay { display, .. } => {
             for ordinal in target_ordinals {
                 if let Some(surface) = state.surfaces.get_mut(usize::from(ordinal)) {
                     surface.display.display_id.clone_from(&display.display_id);
@@ -11846,11 +11961,7 @@ fn apply_timeline_action(
                     surface.display.edr_available = display.edr_available;
                     surface.display.edr_headroom_milli = display.edr_headroom_milli;
                     if let Err(detail) = refresh_surface_padding_and_geometry(surface) {
-                        validator.error(
-                            RendererScenarioValidationCode::InvalidState,
-                            path,
-                            detail,
-                        );
+                        validator.error(RendererScenarioValidationCode::InvalidState, path, detail);
                     }
                 }
             }
@@ -11945,9 +12056,7 @@ fn apply_reached_materialization_to_replay(
             validator.error(
                 RendererScenarioValidationCode::InvalidState,
                 path,
-                format!(
-                    "pane {pane_position} materialization history is not a persistent prefix"
-                ),
+                format!("pane {pane_position} materialization history is not a persistent prefix"),
             );
             continue;
         }
@@ -11962,8 +12071,7 @@ fn apply_reached_materialization_to_replay(
                     changes_buffer_content = true;
                 }
                 RendererContentCompositionOperation::ApplyTypedStateOverlay => {
-                    let Some(reference) = index.content.get(step.content_corpus_id.as_str())
-                    else {
+                    let Some(reference) = index.content.get(step.content_corpus_id.as_str()) else {
                         validator.error(
                             RendererScenarioValidationCode::DanglingReference,
                             path,
@@ -12088,8 +12196,7 @@ fn validate_overlay_replay(
                 || replayed.outputs != expected.outputs
                 || replayed.window_states != expected.window_states
                 || replayed.pane_geometry != expected.pane_geometry
-                || replayed.applied_materialization_steps
-                    != expected.applied_materialization_steps
+                || replayed.applied_materialization_steps != expected.applied_materialization_steps
                 || replayed.features != expected.features
             {
                 validator.error(
@@ -12115,7 +12222,8 @@ fn validate_overlay_gesture_transition(
     index: &CatalogIndex<'_>,
     validator: &mut Validator,
 ) {
-    let (Some(initial), Some(final_manifest)) = (overlay.anchors.first(), overlay.anchors.last()) else {
+    let (Some(initial), Some(final_manifest)) = (overlay.anchors.first(), overlay.anchors.last())
+    else {
         return;
     };
     let (Some(initial_checkpoint), Some(final_checkpoint)) =
@@ -12128,28 +12236,25 @@ fn validate_overlay_gesture_transition(
     };
     let (Ok(initial), Ok(final_state)) = (
         expand_manifest_state(initial, index, scenario, initial_checkpoint, workload),
-        expand_manifest_state(
-            final_manifest,
-            index,
-            scenario,
-            final_checkpoint,
-            workload,
-        ),
+        expand_manifest_state(final_manifest, index, scenario, final_checkpoint, workload),
     ) else {
         return;
     };
     if initial.surfaces.len() != final_state.surfaces.len() {
         return;
     }
-    let pairs = initial.surfaces.iter().zip(&final_state.surfaces).collect::<Vec<_>>();
+    let pairs = initial
+        .surfaces
+        .iter()
+        .zip(&final_state.surfaces)
+        .collect::<Vec<_>>();
     let font_identity_stable = pairs.iter().all(|(before, after)| {
         before.font.font_id == after.font.font_id
             && before.font.pinned_font_ref == after.font.pinned_font_ref
             && before.font.base_size_milli_points == after.font.base_size_milli_points
             && before.font.base_cell_width_milli_px == after.font.base_cell_width_milli_px
             && before.font.base_cell_height_milli_px == after.font.base_cell_height_milli_px
-            && before.font.metric_reference_dpi_milli
-                == after.font.metric_reference_dpi_milli
+            && before.font.metric_reference_dpi_milli == after.font.metric_reference_dpi_milli
             && before.font.metric_derivation_revision == after.font.metric_derivation_revision
     });
     let terminal_stable = pairs.iter().all(|(before, after)| {
@@ -12167,65 +12272,61 @@ fn validate_overlay_gesture_transition(
         before.display.viewport_width_px != after.display.viewport_width_px
             || before.display.viewport_height_px != after.display.viewport_height_px
     });
-    let any_grid_change = pairs.iter().any(|(before, after)| before.grid != after.grid);
+    let any_grid_change = pairs
+        .iter()
+        .any(|(before, after)| before.grid != after.grid);
     let valid = match scenario.gesture {
         RendererGesture::SameGridDrag => {
-            pairs.iter().all(|(before, after)| before.grid == after.grid) && any_viewport_change
+            pairs
+                .iter()
+                .all(|(before, after)| before.grid == after.grid)
+                && any_viewport_change
         }
         RendererGesture::GridChangingDrag => any_grid_change && any_viewport_change,
-        RendererGesture::Reflow80To200 => pairs.iter().any(|(before, after)| {
-            before.grid.columns == 80 && after.grid.columns == 200
-        }),
-        RendererGesture::Reflow200To80 => pairs.iter().any(|(before, after)| {
-            before.grid.columns == 200 && after.grid.columns == 80
-        }),
+        RendererGesture::Reflow80To200 => pairs
+            .iter()
+            .any(|(before, after)| before.grid.columns == 80 && after.grid.columns == 200),
+        RendererGesture::Reflow200To80 => pairs
+            .iter()
+            .any(|(before, after)| before.grid.columns == 200 && after.grid.columns == 80),
         RendererGesture::ZoomIn => {
             pairs.iter().all(|(before, after)| {
                 before.display.display_id == after.display.display_id
                     && before.display.dpi_milli == after.display.dpi_milli
-                    && before.display.scale_factor_milli
-                        == after.display.scale_factor_milli
+                    && before.display.scale_factor_milli == after.display.scale_factor_milli
                     && before.display.color_space_id == after.display.color_space_id
                     && before.display.color_profile_ref == after.display.color_profile_ref
-                    && before.display.dynamic_range_mode
-                        == after.display.dynamic_range_mode
-                    && before.display.viewport_width_px
-                        == after.display.viewport_width_px
-                    && before.display.viewport_height_px
-                        == after.display.viewport_height_px
-            })
-                && pairs
-                    .iter()
-                    .any(|(before, after)| after.font.scale_milli > before.font.scale_milli)
+                    && before.display.dynamic_range_mode == after.display.dynamic_range_mode
+                    && before.display.viewport_width_px == after.display.viewport_width_px
+                    && before.display.viewport_height_px == after.display.viewport_height_px
+            }) && pairs
+                .iter()
+                .any(|(before, after)| after.font.scale_milli > before.font.scale_milli)
         }
         RendererGesture::ZoomOut => {
             pairs.iter().all(|(before, after)| {
                 before.display.display_id == after.display.display_id
                     && before.display.dpi_milli == after.display.dpi_milli
-                    && before.display.scale_factor_milli
-                        == after.display.scale_factor_milli
+                    && before.display.scale_factor_milli == after.display.scale_factor_milli
                     && before.display.color_space_id == after.display.color_space_id
                     && before.display.color_profile_ref == after.display.color_profile_ref
-                    && before.display.dynamic_range_mode
-                        == after.display.dynamic_range_mode
-                    && before.display.viewport_width_px
-                        == after.display.viewport_width_px
-                    && before.display.viewport_height_px
-                        == after.display.viewport_height_px
-            })
-                && pairs
-                    .iter()
-                    .any(|(before, after)| after.font.scale_milli < before.font.scale_milli)
+                    && before.display.dynamic_range_mode == after.display.dynamic_range_mode
+                    && before.display.viewport_width_px == after.display.viewport_width_px
+                    && before.display.viewport_height_px == after.display.viewport_height_px
+            }) && pairs
+                .iter()
+                .any(|(before, after)| after.font.scale_milli < before.font.scale_milli)
         }
         RendererGesture::DpiDisplayMove => pairs.iter().any(|(before, after)| {
             before.display.display_id != after.display.display_id
                 && (before.display.dpi_milli != after.display.dpi_milli
-                    || before.display.scale_factor_milli
-                        != after.display.scale_factor_milli)
+                    || before.display.scale_factor_milli != after.display.scale_factor_milli)
         }),
         RendererGesture::OutputOverlapResize => match scenario.output_overlap_resize_mode {
             Some(RendererResizeMode::SameGrid) => {
-                pairs.iter().all(|(before, after)| before.grid == after.grid)
+                pairs
+                    .iter()
+                    .all(|(before, after)| before.grid == after.grid)
                     && any_viewport_change
             }
             Some(RendererResizeMode::GridChanging) => any_grid_change && any_viewport_change,
@@ -12236,7 +12337,10 @@ fn validate_overlay_gesture_transition(
         validator.error(
             RendererScenarioValidationCode::InvalidGestureTransition,
             scenario_path,
-            format!("overlay does not implement `{}` transition semantics", scenario.gesture.as_str()),
+            format!(
+                "overlay does not implement `{}` transition semantics",
+                scenario.gesture.as_str()
+            ),
         );
     }
 }
@@ -12315,9 +12419,7 @@ struct ExpandedPaneGeometry {
     split_path: Vec<RendererSplitTreeBranch>,
 }
 
-const fn alternate_split_direction(
-    direction: RendererSplitDirection,
-) -> RendererSplitDirection {
+const fn alternate_split_direction(direction: RendererSplitDirection) -> RendererSplitDirection {
     match direction {
         RendererSplitDirection::Horizontal => RendererSplitDirection::Vertical,
         RendererSplitDirection::Vertical => RendererSplitDirection::Horizontal,
@@ -12335,10 +12437,8 @@ fn split_rect(
             if rect.width < 2 {
                 return None;
             }
-            let first_width = u32::try_from(
-                (u64::from(rect.width) * ratio).div_ceil(1_000),
-            )
-            .ok()?;
+            let first_width =
+                u32::try_from((u64::from(rect.width) * ratio).div_ceil(1_000)).ok()?;
             if first_width == 0 || first_width >= rect.width {
                 return None;
             }
@@ -12359,10 +12459,8 @@ fn split_rect(
             if rect.height < 2 {
                 return None;
             }
-            let first_height = u32::try_from(
-                (u64::from(rect.height) * ratio).div_ceil(1_000),
-            )
-            .ok()?;
+            let first_height =
+                u32::try_from((u64::from(rect.height) * ratio).div_ceil(1_000)).ok()?;
             if first_height == 0 || first_height >= rect.height {
                 return None;
             }
@@ -12408,8 +12506,7 @@ fn expand_split_subtree(
     if first_count == 0 || first_count == pane_ordinals.len() {
         return Err("balanced split did not partition pane ordinals".to_string());
     }
-    let Some((first_rect, second_rect)) =
-        split_rect(rect, direction, profile.split_ratio_milli)
+    let Some((first_rect, second_rect)) = split_rect(rect, direction, profile.split_ratio_milli)
     else {
         return Err(format!(
             "drawable region {}x{} is too small for balanced split",
@@ -12498,7 +12595,10 @@ fn validate_renderer_config_profiles<'a>(
         validator.error(
             RendererScenarioValidationCode::InvalidState,
             "$.renderer_config_profiles",
-            format!("expected exactly two renderer configuration profiles, found {}", profiles.len()),
+            format!(
+                "expected exactly two renderer configuration profiles, found {}",
+                profiles.len()
+            ),
         );
     }
     let expected = [
@@ -12518,7 +12618,8 @@ fn validate_renderer_config_profiles<'a>(
             &format!("{path}.renderer_config_profile_id"),
             &profile.renderer_config_profile_id,
         );
-        validator.require_repository_ref(&format!("{path}.repository_ref"), &profile.repository_ref);
+        validator
+            .require_repository_ref(&format!("{path}.repository_ref"), &profile.repository_ref);
         if profile.profile_revision == 0 {
             validator.error(
                 RendererScenarioValidationCode::InvalidState,
@@ -12533,11 +12634,16 @@ fn validate_renderer_config_profiles<'a>(
             validator.error(
                 RendererScenarioValidationCode::DuplicateId,
                 format!("{path}.renderer_config_profile_id"),
-                format!("duplicate renderer configuration `{}`", profile.renderer_config_profile_id),
+                format!(
+                    "duplicate renderer configuration `{}`",
+                    profile.renderer_config_profile_id
+                ),
             );
         }
         if let Some((expected_id, expected_authority)) = expected.get(position) {
-            if profile.renderer_config_profile_id != *expected_id || profile.authority != *expected_authority {
+            if profile.renderer_config_profile_id != *expected_id
+                || profile.authority != *expected_authority
+            {
                 validator.error(
                     RendererScenarioValidationCode::InvalidState,
                     &path,
@@ -12549,10 +12655,11 @@ fn validate_renderer_config_profiles<'a>(
             && profile.ligature_features.clig_enabled
             && profile.ligature_features.liga_enabled;
         match profile.authority {
-            RendererConfigAuthority::BundledProductionDefault if all_ligatures_enabled
-                || profile.ligature_features.calt_enabled
-                || profile.ligature_features.clig_enabled
-                || profile.ligature_features.liga_enabled =>
+            RendererConfigAuthority::BundledProductionDefault
+                if all_ligatures_enabled
+                    || profile.ligature_features.calt_enabled
+                    || profile.ligature_features.clig_enabled
+                    || profile.ligature_features.liga_enabled =>
             {
                 validator.error(
                     RendererScenarioValidationCode::InvalidState,
@@ -12594,16 +12701,28 @@ fn validate_layout_profiles<'a>(
         validator.error(
             RendererScenarioValidationCode::InvalidState,
             "$.layout_profiles",
-            format!("expected exactly four layout profiles, found {}", profiles.len()),
+            format!(
+                "expected exactly four layout profiles, found {}",
+                profiles.len()
+            ),
         );
     }
     let mut index = BTreeMap::new();
     let mut fleet_points = BTreeSet::new();
     for (position, profile) in profiles.iter().enumerate() {
         let path = format!("$.layout_profiles[{position}]");
-        validator.require_identifier(&format!("{path}.layout_profile_id"), &profile.layout_profile_id);
-        validator.require_identifier(&format!("{path}.stable_id_revision"), &profile.stable_id_revision);
-        if index.insert(profile.layout_profile_id.as_str(), profile).is_some() {
+        validator.require_identifier(
+            &format!("{path}.layout_profile_id"),
+            &profile.layout_profile_id,
+        );
+        validator.require_identifier(
+            &format!("{path}.stable_id_revision"),
+            &profile.stable_id_revision,
+        );
+        if index
+            .insert(profile.layout_profile_id.as_str(), profile)
+            .is_some()
+        {
             validator.error(
                 RendererScenarioValidationCode::DuplicateId,
                 format!("{path}.layout_profile_id"),
@@ -12737,7 +12856,10 @@ fn validate_surface_state_templates<'a>(
             validator.error(
                 RendererScenarioValidationCode::DuplicateId,
                 format!("{path}.surface_state_template_id"),
-                format!("duplicate surface template `{}`", template.surface_state_template_id),
+                format!(
+                    "duplicate surface template `{}`",
+                    template.surface_state_template_id
+                ),
             );
         }
         validate_surface_state(
@@ -12773,7 +12895,10 @@ fn validate_surface_state(
         validator.error(
             RendererScenarioValidationCode::DanglingReference,
             format!("{path}.renderer_config_profile_id"),
-            format!("undefined renderer configuration `{}`", state.renderer_config_profile_id),
+            format!(
+                "undefined renderer configuration `{}`",
+                state.renderer_config_profile_id
+            ),
         );
     }
     validate_grid_state(&format!("{path}.grid"), state.grid, validator);
@@ -12791,11 +12916,9 @@ fn validate_surface_state(
         || state.font.scale_milli == 0
         || state.font.scale_milli > MAX_SCALE_FACTOR_MILLI
         || state.font.base_cell_width_milli_px == 0
-        || state.font.base_cell_width_milli_px
-            > MAX_VIEWPORT_DIMENSION_PX.saturating_mul(1_000)
+        || state.font.base_cell_width_milli_px > MAX_VIEWPORT_DIMENSION_PX.saturating_mul(1_000)
         || state.font.base_cell_height_milli_px == 0
-        || state.font.base_cell_height_milli_px
-            > MAX_VIEWPORT_DIMENSION_PX.saturating_mul(1_000)
+        || state.font.base_cell_height_milli_px > MAX_VIEWPORT_DIMENSION_PX.saturating_mul(1_000)
         || state.font.metric_reference_dpi_milli == 0
         || state.font.metric_reference_dpi_milli > MAX_DPI_MILLI
     {
@@ -12859,14 +12982,10 @@ fn validate_surface_cell_metric_layout(
         .map(|value| value / 1_000);
     let exact_width = derived_grid_width
         .and_then(|grid| grid.checked_add(u64::from(state.display.content_padding_left_px)))
-        .and_then(|value| {
-            value.checked_add(u64::from(state.display.content_padding_right_px))
-        });
+        .and_then(|value| value.checked_add(u64::from(state.display.content_padding_right_px)));
     let exact_height = derived_grid_height
         .and_then(|grid| grid.checked_add(u64::from(state.display.content_padding_top_px)))
-        .and_then(|value| {
-            value.checked_add(u64::from(state.display.content_padding_bottom_px))
-        });
+        .and_then(|value| value.checked_add(u64::from(state.display.content_padding_bottom_px)));
     if exact_width != Some(u64::from(state.display.viewport_width_px))
         || exact_height != Some(u64::from(state.display.viewport_height_px))
     {
@@ -13065,7 +13184,9 @@ fn effective_cell_extent_milli(
     let denominator = 1_000_u128
         .checked_mul(1_000)?
         .checked_mul(u128::from(reference_dpi_milli))?;
-    u64::try_from(numerator / denominator).ok().filter(|value| *value > 0)
+    u64::try_from(numerator / denominator)
+        .ok()
+        .filter(|value| *value > 0)
 }
 
 fn derive_cell_range_rect(
@@ -13100,18 +13221,14 @@ fn derive_cell_range_rect(
         display.scale_factor_milli,
         font.metric_reference_dpi_milli,
     )?;
-    let left = u64::from(display.content_padding_left_px).checked_add(
-        u64::from(start.column).checked_mul(cell_width_milli)? / 1_000,
-    )?;
-    let right = u64::from(display.content_padding_left_px).checked_add(
-        (u64::from(end.column) + 1).checked_mul(cell_width_milli)? / 1_000,
-    )?;
-    let top = u64::from(display.content_padding_top_px).checked_add(
-        u64::from(start.row).checked_mul(cell_height_milli)? / 1_000,
-    )?;
-    let bottom = u64::from(display.content_padding_top_px).checked_add(
-        (u64::from(end.row) + 1).checked_mul(cell_height_milli)? / 1_000,
-    )?;
+    let left = u64::from(display.content_padding_left_px)
+        .checked_add(u64::from(start.column).checked_mul(cell_width_milli)? / 1_000)?;
+    let right = u64::from(display.content_padding_left_px)
+        .checked_add((u64::from(end.column) + 1).checked_mul(cell_width_milli)? / 1_000)?;
+    let top = u64::from(display.content_padding_top_px)
+        .checked_add(u64::from(start.row).checked_mul(cell_height_milli)? / 1_000)?;
+    let bottom = u64::from(display.content_padding_top_px)
+        .checked_add((u64::from(end.row) + 1).checked_mul(cell_height_milli)? / 1_000)?;
     let width = right.checked_sub(left)?;
     let height = bottom.checked_sub(top)?;
     if width == 0 || height == 0 {
@@ -13130,14 +13247,9 @@ fn recompute_surface_geometry(state: &mut RendererSurfaceState) -> Result<(), St
     let font = &state.font;
     let display = &state.display;
     for image in &mut state.terminal.inline_images {
-        image.pixel_rect = derive_cell_range_rect(
-            grid,
-            font,
-            display,
-            image.cell_start,
-            image.cell_end,
-        )
-        .ok_or_else(|| format!("cannot derive image geometry `{}`", image.image_id))?;
+        image.pixel_rect =
+            derive_cell_range_rect(grid, font, display, image.cell_start, image.cell_end)
+                .ok_or_else(|| format!("cannot derive image geometry `{}`", image.image_id))?;
     }
     for hyperlink in &mut state.terminal.hyperlinks {
         hyperlink.pixel_rect = derive_cell_range_rect(
@@ -13148,7 +13260,10 @@ fn recompute_surface_geometry(state: &mut RendererSurfaceState) -> Result<(), St
             hyperlink.cell_end,
         )
         .ok_or_else(|| {
-            format!("cannot derive hyperlink geometry `{}`", hyperlink.hyperlink_id)
+            format!(
+                "cannot derive hyperlink geometry `{}`",
+                hyperlink.hyperlink_id
+            )
         })?;
     }
     if let RendererImeState::Composing {
@@ -13158,28 +13273,20 @@ fn recompute_surface_geometry(state: &mut RendererSurfaceState) -> Result<(), St
     {
         if candidate.coordinate_space != RendererPixelCoordinateSpace::VirtualDisplay {
             return Err(
-                "IME candidate popup geometry requires virtual_display coordinates"
-                    .to_string(),
+                "IME candidate popup geometry requires virtual_display coordinates".to_string(),
             );
         }
     }
     if let RendererAccessibilityGeometryState::Active {
-        nodes,
-        caret_rect,
-        ..
+        nodes, caret_rect, ..
     } = &mut state.terminal.accessibility_geometry
     {
         for node in nodes {
-            node.pixel_rect = derive_cell_range_rect(
-                grid,
-                font,
-                display,
-                node.cell_start,
-                node.cell_end,
-            )
-            .ok_or_else(|| {
-                format!("cannot derive accessibility geometry `{}`", node.node_id)
-            })?;
+            node.pixel_rect =
+                derive_cell_range_rect(grid, font, display, node.cell_start, node.cell_end)
+                    .ok_or_else(|| {
+                        format!("cannot derive accessibility geometry `{}`", node.node_id)
+                    })?;
         }
         if let Some(rect) = caret_rect {
             let cursor = RendererCellCoordinate {
@@ -13193,9 +13300,7 @@ fn recompute_surface_geometry(state: &mut RendererSurfaceState) -> Result<(), St
     Ok(())
 }
 
-fn refresh_surface_padding_and_geometry(
-    state: &mut RendererSurfaceState,
-) -> Result<(), String> {
+fn refresh_surface_padding_and_geometry(state: &mut RendererSurfaceState) -> Result<(), String> {
     let cell_width_milli = effective_cell_extent_milli(
         state.font.base_cell_width_milli_px,
         state.font.scale_milli,
@@ -13256,9 +13361,7 @@ fn terminal_without_derived_geometry(
         hyperlink.pixel_rect = zero;
     }
     if let RendererAccessibilityGeometryState::Active {
-        nodes,
-        caret_rect,
-        ..
+        nodes, caret_rect, ..
     } = &mut normalized.accessibility_geometry
     {
         for node in nodes {
@@ -13351,8 +13454,18 @@ fn validate_terminal_mode_state(
     content: &BTreeMap<&str, &RendererContentCorpusReference>,
     validator: &mut Validator,
 ) {
-    validate_terminal_buffer(&format!("{path}.primary_buffer"), &terminal.primary_buffer, content, validator);
-    validate_terminal_buffer(&format!("{path}.alternate_buffer"), &terminal.alternate_buffer, content, validator);
+    validate_terminal_buffer(
+        &format!("{path}.primary_buffer"),
+        &terminal.primary_buffer,
+        content,
+        validator,
+    );
+    validate_terminal_buffer(
+        &format!("{path}.alternate_buffer"),
+        &terminal.alternate_buffer,
+        content,
+        validator,
+    );
     if terminal.primary_buffer.buffer_id == terminal.alternate_buffer.buffer_id {
         validator.error(
             RendererScenarioValidationCode::InvalidState,
@@ -13376,8 +13489,7 @@ fn validate_terminal_mode_state(
             "primary viewport origin must remain within retained scrollback and live bottom",
         );
     }
-    if terminal.active_buffer == RendererTerminalBufferKind::Alternate
-        && terminal.viewport_top != 0
+    if terminal.active_buffer == RendererTerminalBufferKind::Alternate && terminal.viewport_top != 0
     {
         validator.error(
             RendererScenarioValidationCode::InvalidState,
@@ -13419,7 +13531,12 @@ fn validate_terminal_mode_state(
             );
         }
         validator.require_identifier(&format!("{path}.ime.input_source_id"), input_source_id);
-        validate_cell_coordinate(&format!("{path}.ime.preedit_origin"), *preedit_origin, grid, validator);
+        validate_cell_coordinate(
+            &format!("{path}.ime.preedit_origin"),
+            *preedit_origin,
+            grid,
+            validator,
+        );
         validate_cell_coordinate(&format!("{path}.ime.caret"), *caret, grid, validator);
         if composition_segments.is_empty() {
             validator.error(
@@ -13431,7 +13548,8 @@ fn validate_terminal_mode_state(
         let mut segment_ids = BTreeSet::new();
         for (position, segment) in composition_segments.iter().enumerate() {
             let segment_path = format!("{path}.ime.composition_segments[{position}]");
-            validator.require_identifier(&format!("{segment_path}.segment_id"), &segment.segment_id);
+            validator
+                .require_identifier(&format!("{segment_path}.segment_id"), &segment.segment_id);
             if !segment_ids.insert(segment.segment_id.as_str()) {
                 validator.error(
                     RendererScenarioValidationCode::DuplicateId,
@@ -13461,9 +13579,19 @@ fn validate_terminal_mode_state(
         let image_path = format!("{path}.inline_images[{position}]");
         validator.require_identifier(&format!("{image_path}.image_id"), &image.image_id);
         if !image_ids.insert(image.image_id.as_str()) {
-            validator.error(RendererScenarioValidationCode::DuplicateId, &image_path, "duplicate image identity");
+            validator.error(
+                RendererScenarioValidationCode::DuplicateId,
+                &image_path,
+                "duplicate image identity",
+            );
         }
-        validate_cell_range(&image_path, image.cell_start, image.cell_end, grid, validator);
+        validate_cell_range(
+            &image_path,
+            image.cell_start,
+            image.cell_end,
+            grid,
+            validator,
+        );
         validate_surface_pixel_rect(
             &format!("{image_path}.pixel_rect"),
             image.pixel_rect,
@@ -13490,11 +13618,24 @@ fn validate_terminal_mode_state(
     let mut hyperlink_ids = BTreeSet::new();
     for (position, hyperlink) in terminal.hyperlinks.iter().enumerate() {
         let link_path = format!("{path}.hyperlinks[{position}]");
-        validator.require_identifier(&format!("{link_path}.hyperlink_id"), &hyperlink.hyperlink_id);
+        validator.require_identifier(
+            &format!("{link_path}.hyperlink_id"),
+            &hyperlink.hyperlink_id,
+        );
         if !hyperlink_ids.insert(hyperlink.hyperlink_id.as_str()) {
-            validator.error(RendererScenarioValidationCode::DuplicateId, &link_path, "duplicate hyperlink identity");
+            validator.error(
+                RendererScenarioValidationCode::DuplicateId,
+                &link_path,
+                "duplicate hyperlink identity",
+            );
         }
-        validate_cell_range(&link_path, hyperlink.cell_start, hyperlink.cell_end, grid, validator);
+        validate_cell_range(
+            &link_path,
+            hyperlink.cell_start,
+            hyperlink.cell_end,
+            grid,
+            validator,
+        );
         if hyperlink.cell_start.row != hyperlink.cell_end.row {
             validator.error(
                 RendererScenarioValidationCode::InvalidState,
@@ -13543,7 +13684,11 @@ fn validate_terminal_mode_state(
             validator.require_identifier(&format!("{node_path}.node_id"), &node.node_id);
             validator.require_identifier(&format!("{node_path}.role_id"), &node.role_id);
             if !node_ids.insert(node.node_id.as_str()) {
-                validator.error(RendererScenarioValidationCode::DuplicateId, &node_path, "duplicate accessibility node identity");
+                validator.error(
+                    RendererScenarioValidationCode::DuplicateId,
+                    &node_path,
+                    "duplicate accessibility node identity",
+                );
             }
             focused += usize::from(node.focused);
             validate_cell_range(&node_path, node.cell_start, node.cell_end, grid, validator);
@@ -13574,7 +13719,9 @@ fn validate_terminal_mode_state(
             validator.error(
                 RendererScenarioValidationCode::InvalidState,
                 format!("{path}.accessibility_geometry.nodes"),
-                format!("active accessibility tree requires exactly one focused node, found {focused}"),
+                format!(
+                    "active accessibility tree requires exactly one focused node, found {focused}"
+                ),
             );
         }
         if let Some(rect) = caret_rect {

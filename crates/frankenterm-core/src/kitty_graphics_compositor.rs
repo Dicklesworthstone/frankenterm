@@ -404,7 +404,8 @@ impl KittyCompositorHealth {
             CompositorLayer::Cursor => "cursor",
             CompositorLayer::Overlay => "overlay",
         };
-        *self.by_placement_layer.entry(slug.to_string()).or_insert(0) += 1;
+        let by_layer = self.by_placement_layer.entry(slug.to_string()).or_insert(0);
+        *by_layer = by_layer.saturating_add(1);
     }
 
     pub fn record_rejection(&mut self) {
@@ -412,10 +413,11 @@ impl KittyCompositorHealth {
     }
 
     pub fn record_frame_budget_op(&mut self, op: KittyFrameBudgetOp) {
-        *self
+        let by_kind = self
             .frame_budget_ops_by_kind
             .entry(op.slug().to_string())
-            .or_insert(0) += 1;
+            .or_insert(0);
+        *by_kind = by_kind.saturating_add(1);
     }
 
     /// Record an op that was dispatched on the render thread.
@@ -443,11 +445,11 @@ impl KittyCompositorHealth {
         if self.misclassified_decode_async_count > 0 {
             return false;
         }
-        let total = self.admitted_total + self.rejected_total;
-        if total == 0 {
+        let total = self.admitted_total as f64 + self.rejected_total as f64;
+        if total == 0.0 {
             return true;
         }
-        let reject_ratio = self.rejected_total as f64 / total as f64;
+        let reject_ratio = self.rejected_total as f64 / total;
         reject_ratio <= 0.05
     }
 }
@@ -806,6 +808,26 @@ mod tests {
         }
         h.record_rejection(); // 10% rejection
         assert!(!h.is_safe());
+    }
+
+    #[test]
+    fn health_ratio_and_breakdown_counters_saturate_without_overflow() {
+        let mut h = KittyCompositorHealth {
+            admitted_total: u64::MAX,
+            rejected_total: u64::MAX,
+            ..Default::default()
+        };
+        h.by_placement_layer
+            .insert("background".to_string(), u64::MAX);
+        h.frame_budget_ops_by_kind
+            .insert("kitty_atlas_upload".to_string(), u64::MAX);
+
+        h.record_admission(CompositorLayer::Background);
+        h.record_frame_budget_op(KittyFrameBudgetOp::AtlasUpload);
+
+        assert!(!h.is_safe());
+        assert_eq!(h.by_placement_layer["background"], u64::MAX);
+        assert_eq!(h.frame_budget_ops_by_kind["kitty_atlas_upload"], u64::MAX);
     }
 
     #[test]

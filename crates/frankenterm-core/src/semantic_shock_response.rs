@@ -360,9 +360,7 @@ impl SemanticShockResponder {
             .unwrap_or(0) as usize;
 
         let seq = crate::try_next_unique_atomic_u64(&self.sequence).unwrap_or_else(|| {
-            panic!(
-                "semantic shock sequence space exhausted; refusing to alias an existing record"
-            )
+            panic!("semantic shock sequence space exhausted; refusing to alias an existing record")
         });
         let age_ms = u64::try_from(self.created_at.elapsed().as_millis()).unwrap_or(u64::MAX);
 

@@ -28,9 +28,9 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 
 use crate::runtime_async::mpsc;
 #[cfg(any(unix, windows))]
-use crate::runtime_async::{AcquireError, Semaphore, TryAcquireError};
-#[cfg(any(unix, windows))]
 use crate::runtime_async::task::{JoinErrorKind, JoinSet, JoinSetSettlement};
+#[cfg(any(unix, windows))]
+use crate::runtime_async::{AcquireError, Semaphore, TryAcquireError};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 #[cfg(any(unix, windows))]
@@ -157,12 +157,7 @@ fn record_native_listener_anomaly(counter: &AtomicU64) -> u64 {
             return current;
         }
         let next = current.saturating_add(1);
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return next,
             Err(observed) => current = observed,
         }
@@ -224,9 +219,7 @@ fn record_native_connection_drop_summary(
         || drops.context_ended_drops > 0
         || drops.channel_closed_drops > 0
         || drops.malformed_event_drops > 0)
-        .then(|| {
-            record_native_listener_anomaly(&listener_counters.connections_with_drops)
-        })
+        .then(|| record_native_listener_anomaly(&listener_counters.connections_with_drops))
 }
 
 #[cfg(any(unix, windows))]
@@ -311,8 +304,7 @@ fn classify_native_spawn_failure(
     retry_state: &mut NativeSpawnRetryState,
 ) -> NativeSpawnAdmissionDecision {
     let capacity_error = native_spawn_error_code_is_transient(error_code);
-    if shutdown_observed
-        && (capacity_error || native_spawn_error_may_be_shutdown_race(error_code))
+    if shutdown_observed && (capacity_error || native_spawn_error_may_be_shutdown_race(error_code))
     {
         return NativeSpawnAdmissionDecision::CleanShutdown;
     }
@@ -321,9 +313,8 @@ fn classify_native_spawn_failure(
         return NativeSpawnAdmissionDecision::Fatal;
     }
 
-    retry_state.consecutive_capacity_errors = retry_state
-        .consecutive_capacity_errors
-        .saturating_add(1);
+    retry_state.consecutive_capacity_errors =
+        retry_state.consecutive_capacity_errors.saturating_add(1);
     let retry_backoff = retry_state.backoff;
     retry_state.backoff = retry_state
         .backoff
@@ -394,20 +385,16 @@ pub enum NativeEventSecurityError {
     MissingSocketParent,
     #[error("native event socket parent is not a real directory")]
     ParentNotDirectory,
-    #[error("native event socket parent owner mismatch: expected uid {expected_uid}, got {actual_uid}")]
-    ParentOwnerMismatch {
-        expected_uid: u32,
-        actual_uid: u32,
-    },
+    #[error(
+        "native event socket parent owner mismatch: expected uid {expected_uid}, got {actual_uid}"
+    )]
+    ParentOwnerMismatch { expected_uid: u32, actual_uid: u32 },
     #[error("native event socket parent mode must be 0700, got {actual_mode:#o}")]
     ParentModeMismatch { actual_mode: u32 },
     #[error("native event endpoint is not a Unix socket")]
     EndpointNotSocket,
     #[error("native event endpoint owner mismatch: expected uid {expected_uid}, got {actual_uid}")]
-    EndpointOwnerMismatch {
-        expected_uid: u32,
-        actual_uid: u32,
-    },
+    EndpointOwnerMismatch { expected_uid: u32, actual_uid: u32 },
     #[error("native event endpoint mode must be 0600, got {actual_mode:#o}")]
     EndpointModeMismatch { actual_mode: u32 },
     #[error("native event socket identity changed before cleanup")]
@@ -415,10 +402,7 @@ pub enum NativeEventSecurityError {
     #[error("native event peer credentials are unavailable on this platform or build")]
     PeerCredentialsUnavailable,
     #[error("native event peer uid mismatch: expected {expected_uid}, got {actual_uid}")]
-    PeerUidMismatch {
-        expected_uid: u32,
-        actual_uid: u32,
-    },
+    PeerUidMismatch { expected_uid: u32, actual_uid: u32 },
 }
 
 #[cfg(unix)]
@@ -576,11 +560,9 @@ mod socket_transport {
                             return Ok((stream, ()));
                         }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                            let sleep_result = crate::runtime_async::sleep_with_cx(
-                                cx,
-                                Duration::from_millis(1),
-                            )
-                            .await;
+                            let sleep_result =
+                                crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(1))
+                                    .await;
                             cx.checkpoint().map_err(|_| {
                                 super::super::native_context_io_error("accept_wait")
                             })?;
@@ -739,22 +721,16 @@ fn native_peer_effective_uid<F: AsFd>(stream: &F) -> Result<u32, NativeEventErro
         target_os = "dragonfly"
     ))]
     {
-        nix::sys::socket::getsockopt(
-            stream,
-            nix::sys::socket::sockopt::LocalPeerCred,
-        )
-        .map(|credentials| credentials.uid())
-        .map_err(|_| NativeEventSecurityError::PeerCredentialsUnavailable.into())
+        nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerCred)
+            .map(|credentials| credentials.uid())
+            .map_err(|_| NativeEventSecurityError::PeerCredentialsUnavailable.into())
     }
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
     {
-        nix::sys::socket::getsockopt(
-            stream,
-            nix::sys::socket::sockopt::PeerCredentials,
-        )
-        .map(|credentials| credentials.uid())
-        .map_err(|_| NativeEventSecurityError::PeerCredentialsUnavailable.into())
+        nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+            .map(|credentials| credentials.uid())
+            .map_err(|_| NativeEventSecurityError::PeerCredentialsUnavailable.into())
     }
 
     #[cfg(not(any(
@@ -909,9 +885,7 @@ fn native_socket_identity(
 /// directory, endpoint type, owner, or mode violates the native-event trust
 /// contract. Filesystem lookup failures are returned as [`NativeEventError::Io`].
 #[cfg(unix)]
-pub fn validate_native_event_socket_endpoint(
-    socket_path: &Path,
-) -> Result<(), NativeEventError> {
+pub fn validate_native_event_socket_endpoint(socket_path: &Path) -> Result<(), NativeEventError> {
     #[cfg(feature = "native-wezterm")]
     let expected_uid = native_effective_uid();
     #[cfg(not(feature = "native-wezterm"))]
@@ -1208,60 +1182,53 @@ impl NativeEventListener {
             // input, so accepting first would let a same-UID reconnect storm
             // allocate an unbounded number of tasks. Contention stays in the
             // kernel backlog and wakes promptly when a task releases a permit.
-            let connection_permit =
-                match Arc::clone(&connection_permits).try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(TryAcquireError::NoPermits) => {
-                        connection_capacity_waits = connection_capacity_waits.saturating_add(1);
-                        if connection_capacity_waits.is_power_of_two() {
-                            warn!(
-                                connection_capacity_waits,
-                                max_connections = MAX_CONCURRENT_NATIVE_CONNECTIONS,
-                                "native event listener waiting for bounded connection capacity"
-                            );
-                        }
-                        match crate::runtime_async::timeout_with_cx(
-                            cx,
-                            ACCEPT_POLL_INTERVAL,
-                            Arc::clone(&connection_permits).acquire_owned_with_cx(cx),
-                        )
-                        .await
-                        {
-                            Ok(Ok(permit)) => permit,
-                            Ok(Err(AcquireError::Closed)) => {
-                                listener_error =
-                                    Some(NativeEventError::ConnectionTaskAdmissionFailed);
-                                break;
-                            }
-                            Ok(Err(_)) if cx.checkpoint().is_err() => break,
-                            Ok(Err(_)) => {
-                                listener_error =
-                                    Some(NativeEventError::ConnectionTaskAdmissionFailed);
-                                break;
-                            }
-                            Err(_) => continue,
-                        }
+            let connection_permit = match Arc::clone(&connection_permits).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(TryAcquireError::NoPermits) => {
+                    connection_capacity_waits = connection_capacity_waits.saturating_add(1);
+                    if connection_capacity_waits.is_power_of_two() {
+                        warn!(
+                            connection_capacity_waits,
+                            max_connections = MAX_CONCURRENT_NATIVE_CONNECTIONS,
+                            "native event listener waiting for bounded connection capacity"
+                        );
                     }
-                    Err(TryAcquireError::Closed) => {
-                        listener_error = Some(NativeEventError::ConnectionTaskAdmissionFailed);
-                        break;
+                    match crate::runtime_async::timeout_with_cx(
+                        cx,
+                        ACCEPT_POLL_INTERVAL,
+                        Arc::clone(&connection_permits).acquire_owned_with_cx(cx),
+                    )
+                    .await
+                    {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(AcquireError::Closed)) => {
+                            listener_error = Some(NativeEventError::ConnectionTaskAdmissionFailed);
+                            break;
+                        }
+                        Ok(Err(_)) if cx.checkpoint().is_err() => break,
+                        Ok(Err(_)) => {
+                            listener_error = Some(NativeEventError::ConnectionTaskAdmissionFailed);
+                            break;
+                        }
+                        Err(_) => continue,
                     }
-                };
+                }
+                Err(TryAcquireError::Closed) => {
+                    listener_error = Some(NativeEventError::ConnectionTaskAdmissionFailed);
+                    break;
+                }
+            };
 
-            match crate::runtime_async::timeout_with_cx(
-                cx,
-                ACCEPT_POLL_INTERVAL,
-                async {
-                    #[cfg(unix)]
-                    {
-                        self.listener.accept().await
-                    }
-                    #[cfg(windows)]
-                    {
-                        self.listener.accept_with_cx(cx).await
-                    }
-                },
-            )
+            match crate::runtime_async::timeout_with_cx(cx, ACCEPT_POLL_INTERVAL, async {
+                #[cfg(unix)]
+                {
+                    self.listener.accept().await
+                }
+                #[cfg(windows)]
+                {
+                    self.listener.accept_with_cx(cx).await
+                }
+            })
             .await
             {
                 Ok(Ok((stream, _addr))) => {
@@ -1276,9 +1243,8 @@ impl NativeEventListener {
                     }
                     #[cfg(unix)]
                     if let Err(error) = validate_native_event_peer(stream.as_std()) {
-                        let rejected_peers = record_native_listener_anomaly(
-                            &anomaly_counters.rejected_peers,
-                        );
+                        let rejected_peers =
+                            record_native_listener_anomaly(&anomaly_counters.rejected_peers);
                         if rejected_peers.is_power_of_two() {
                             warn!(
                                 failure_class = ?error,
@@ -1297,14 +1263,13 @@ impl NativeEventListener {
                         cx,
                         move |child_cx| async move {
                             let _connection_permit = connection_permit;
-                            if let Err(err) =
-                                handle_connection_with_cx(
-                                    child_cx,
-                                    stream,
-                                    tx,
-                                    &connection_anomalies,
-                                )
-                                .await
+                            if let Err(err) = handle_connection_with_cx(
+                                child_cx,
+                                stream,
+                                tx,
+                                &connection_anomalies,
+                            )
+                            .await
                             {
                                 // Split by error kind: clean client disconnects
                                 // exit the handler loop via `Ok(None)` from
@@ -1389,9 +1354,8 @@ impl NativeEventListener {
                                     // unavailable. Fail the listener loop closed;
                                     // polling remains active and a runtime restart is
                                     // required to attempt a fresh listener.
-                                    listener_error = Some(
-                                        NativeEventError::ConnectionTaskAdmissionFailed,
-                                    );
+                                    listener_error =
+                                        Some(NativeEventError::ConnectionTaskAdmissionFailed);
                                     break;
                                 }
                             }
@@ -1588,10 +1552,7 @@ impl NativeEventListener {
 }
 
 #[cfg(any(unix, windows))]
-fn native_connection_spawn_allowed(
-    cx: &crate::cx::Cx,
-    shutdown_flag: &AtomicBool,
-) -> bool {
+fn native_connection_spawn_allowed(cx: &crate::cx::Cx, shutdown_flag: &AtomicBool) -> bool {
     !shutdown_flag.load(Ordering::SeqCst) && cx.checkpoint().is_ok()
 }
 
@@ -1646,11 +1607,8 @@ fn maybe_cleanup_stale_socket(
                 std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
             ) =>
         {
-            if remove_native_socket_if_identity_matches(
-                socket_path,
-                effective_uid,
-                stale_identity,
-            )? {
+            if remove_native_socket_if_identity_matches(socket_path, effective_uid, stale_identity)?
+            {
                 debug!(
                     path = %socket_path.display(),
                     "removed identity-pinned stale native event socket before bind"
@@ -1707,12 +1665,10 @@ async fn handle_connection_with_cx(
                 None => break 'connection Ok(()),
             };
             if line.len() > MAX_EVENT_LINE_BYTES {
-                let connection_drop_count = record_native_connection_anomaly(
-                    &mut drops.oversized_line_drops,
-                );
-                let listener_drop_count = record_native_listener_anomaly(
-                    &listener_anomalies.oversized_line_drops,
-                );
+                let connection_drop_count =
+                    record_native_connection_anomaly(&mut drops.oversized_line_drops);
+                let listener_drop_count =
+                    record_native_listener_anomaly(&listener_anomalies.oversized_line_drops);
                 if listener_drop_count.is_power_of_two() {
                     warn!(
                         connection_drop_count,
@@ -1738,9 +1694,8 @@ async fn handle_connection_with_cx(
                             // to warn so the loss is at least operator-visible rather
                             // than sinking into a filtered debug line; full per-pane
                             // gap injection for this path is tracked as a follow-up.
-                            let connection_drop_count = record_native_connection_anomaly(
-                                &mut drops.backpressure_drops,
-                            );
+                            let connection_drop_count =
+                                record_native_connection_anomaly(&mut drops.backpressure_drops);
                             let listener_drop_count = record_native_listener_anomaly(
                                 &listener_anomalies.backpressure_drops,
                             );
@@ -1810,12 +1765,10 @@ async fn handle_connection_with_cx(
                     // a hostile client writing to the native-events socket)
                     // and must not sink silently into a debug-level log
                     // that operators routinely filter out.
-                    let connection_drop_count = record_native_connection_anomaly(
-                        &mut drops.malformed_event_drops,
-                    );
-                    let listener_drop_count = record_native_listener_anomaly(
-                        &listener_anomalies.malformed_event_drops,
-                    );
+                    let connection_drop_count =
+                        record_native_connection_anomaly(&mut drops.malformed_event_drops);
+                    let listener_drop_count =
+                        record_native_listener_anomaly(&listener_anomalies.malformed_event_drops);
                     if listener_drop_count.is_power_of_two() {
                         warn!(
                             connection_drop_count,
@@ -2056,10 +2009,7 @@ mod native_accept_error_classifier_tests {
             std::io::ErrorKind::BrokenPipe,
         ] {
             let error = std::io::Error::from(kind);
-            assert!(
-                native_accept_error_is_permanent(&error),
-                "kind={kind:?}"
-            );
+            assert!(native_accept_error_is_permanent(&error), "kind={kind:?}");
         }
 
         for kind in [
@@ -2069,10 +2019,7 @@ mod native_accept_error_classifier_tests {
             std::io::ErrorKind::Other,
         ] {
             let error = std::io::Error::from(kind);
-            assert!(
-                !native_accept_error_is_permanent(&error),
-                "kind={kind:?}"
-            );
+            assert!(!native_accept_error_is_permanent(&error), "kind={kind:?}");
         }
     }
 
@@ -2208,10 +2155,7 @@ mod native_accept_error_classifier_tests {
             (1, 1)
         );
         assert_eq!(drops.context_ended_drops, 1);
-        assert_eq!(
-            counters.context_ended_drops.load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(counters.context_ended_drops.load(Ordering::Relaxed), 1);
         assert_eq!(
             counters.backpressure_drops.load(Ordering::Relaxed),
             0,
@@ -2230,10 +2174,7 @@ mod native_accept_error_classifier_tests {
             Some(1),
             "a context-ended event loss must appear in the connection summary"
         );
-        assert_eq!(
-            counters.connections_with_drops.load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(counters.connections_with_drops.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -2246,20 +2187,14 @@ mod native_accept_error_classifier_tests {
             (1, 1)
         );
         assert_eq!(drops.channel_closed_drops, 1);
-        assert_eq!(
-            counters.channel_closed_drops.load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(counters.channel_closed_drops.load(Ordering::Relaxed), 1);
         assert_eq!(counters.backpressure_drops.load(Ordering::Relaxed), 0);
         assert_eq!(counters.context_ended_drops.load(Ordering::Relaxed), 0);
         assert_eq!(
             record_native_connection_drop_summary(&counters, &drops),
             Some(1)
         );
-        assert_eq!(
-            counters.connections_with_drops.load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(counters.connections_with_drops.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -2304,10 +2239,7 @@ mod native_accept_error_classifier_tests {
             // deliberately shared across reconnects, so a reconnect storm
             // cannot turn every first malformed frame into a warning.
             let mut connection_count = 0;
-            assert_eq!(
-                record_native_connection_anomaly(&mut connection_count),
-                1
-            );
+            assert_eq!(record_native_connection_anomaly(&mut connection_count), 1);
             listener_counts.push(record_native_listener_anomaly(
                 &counters.malformed_event_drops,
             ));
@@ -2322,14 +2254,8 @@ mod native_accept_error_classifier_tests {
         assert!(listener_counts[1].is_power_of_two());
         assert!(!listener_counts[2].is_power_of_two());
         assert!(listener_counts[3].is_power_of_two());
-        assert_eq!(
-            counters.malformed_event_drops.load(Ordering::Relaxed),
-            4
-        );
-        assert_eq!(
-            counters.connections_with_drops.load(Ordering::Relaxed),
-            4
-        );
+        assert_eq!(counters.malformed_event_drops.load(Ordering::Relaxed), 4);
+        assert_eq!(counters.connections_with_drops.load(Ordering::Relaxed), 4);
     }
 
     #[test]
@@ -3206,9 +3132,7 @@ mod tests {
             .expect(label)
     }
 
-    async fn assert_listener_shutdown(
-        handle: task::JoinHandle<Result<(), NativeEventError>>,
-    ) {
+    async fn assert_listener_shutdown(handle: task::JoinHandle<Result<(), NativeEventError>>) {
         crate::runtime_async::timeout(Duration::from_secs(2), handle)
             .await
             .expect("listener shutdown timed out")
@@ -3911,8 +3835,7 @@ mod tests {
                 .await
                 .expect("first send should fill the queue");
             let cx = crate::cx::Cx::for_testing_with_budget(
-                crate::cx::Budget::new()
-                    .with_deadline(crate::runtime_async::RuntimeTime::ZERO),
+                crate::cx::Budget::new().with_deadline(crate::runtime_async::RuntimeTime::ZERO),
             );
 
             let outcome = dispatch_event_with_timeout_with_cx(

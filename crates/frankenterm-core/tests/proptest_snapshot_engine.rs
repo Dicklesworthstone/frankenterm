@@ -18,12 +18,12 @@ use proptest::prelude::*;
 use std::collections::HashSet;
 
 use frankenterm_core::config::{SnapshotConfig, SnapshotSchedulingConfig, SnapshotSchedulingMode};
+use frankenterm_core::session_topology::TopologySnapshotError;
 use frankenterm_core::snapshot_engine::{
     SnapshotAuthorityOperation, SnapshotCaptureOptions, SnapshotCheckpointIdentity,
     SnapshotCheckpointRoleScope, SnapshotDeleteResult, SnapshotDeleteTarget,
     SnapshotEngineTelemetrySnapshot, SnapshotError, SnapshotResult, SnapshotTrigger,
 };
-use frankenterm_core::session_topology::TopologySnapshotError;
 
 // =============================================================================
 // Constants
@@ -555,8 +555,7 @@ fn snapshot_diagnostic_projections_are_content_free() {
         serde_json::from_str::<SnapshotTrigger>(&format!("\"{TOPOLOGY_CANARY}\""))
             .expect_err("unknown trigger must produce a serde error");
     assert!(topology_source.to_string().contains(TOPOLOGY_CANARY));
-    let topology_error =
-        SnapshotError::Topology(TopologySnapshotError::Json(topology_source));
+    let topology_error = SnapshotError::Topology(TopologySnapshotError::Json(topology_source));
     assert!(std::error::Error::source(&topology_error).is_some());
     let topology_debug = format!("{topology_error:?}");
     let topology_display = format!("{topology_error}");

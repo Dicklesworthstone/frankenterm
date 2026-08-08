@@ -740,10 +740,7 @@ mod tests {
 
         assert_eq!(report.count_by_kind(ViolationKind::ReservedSequence), 1);
         assert_eq!(report.count_by_kind(ViolationKind::SequenceGap), 0);
-        assert_eq!(
-            report.count_by_kind(ViolationKind::SequenceRegression),
-            0
-        );
+        assert_eq!(report.count_by_kind(ViolationKind::SequenceRegression), 0);
     }
 
     #[test]

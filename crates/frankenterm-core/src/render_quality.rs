@@ -269,10 +269,9 @@ impl SteadyStateQuality {
 pub struct DraftModeDriver {
     steady_state: SteadyStateQuality,
     last_resize_state: LiveResizeState,
-    /// Set when the resize state transitions away from Resizing
-    /// or ResizeBegin. Cleared after the next call to `pick` so
-    /// the snap-back fires exactly once.
-    snap_back_owed: bool,
+    /// Exact quality returned by the preceding call. Resize state alone is not
+    /// sufficient because `ResizeEnd` is Standard even when Idle is Fancy.
+    last_quality: RenderQuality,
     /// Counters.
     draft_frames_total: u64,
     standard_frames_total: u64,
@@ -285,10 +284,11 @@ impl DraftModeDriver {
     /// New driver pinned to a steady-state default.
     #[must_use]
     pub fn new(steady_state: SteadyStateQuality) -> Self {
+        let last_quality = steady_state.as_render_quality();
         Self {
             steady_state,
             last_resize_state: LiveResizeState::Idle,
-            snap_back_owed: false,
+            last_quality,
             draft_frames_total: 0,
             standard_frames_total: 0,
             fancy_frames_total: 0,
@@ -315,19 +315,17 @@ impl DraftModeDriver {
     /// machine remains in `ResizeEnd` (which is unusual but
     /// possible during the auto-clear → Idle transition).
     pub fn pick(&mut self, resize_state: LiveResizeState) -> RenderQuality {
+        let prior_resize_state = self.last_resize_state;
         let quality = match resize_state {
             LiveResizeState::ResizeBegin | LiveResizeState::Resizing => RenderQuality::Draft,
             LiveResizeState::ResizeEnd => {
-                // Snap-back: one full-quality frame, always
-                // Standard.
-                if self.snap_back_owed
-                    || matches!(
-                        self.last_resize_state,
-                        LiveResizeState::ResizeBegin | LiveResizeState::Resizing
-                    )
-                {
-                    self.snap_back_total += 1;
-                    self.snap_back_owed = false;
+                // The transition out of draft produces exactly one full-quality
+                // reference frame. Remaining in ResizeEnd does not recount it.
+                if matches!(
+                    prior_resize_state,
+                    LiveResizeState::ResizeBegin | LiveResizeState::Resizing
+                ) {
+                    self.snap_back_total = self.snap_back_total.saturating_add(1);
                 }
                 RenderQuality::Standard
             }
@@ -337,56 +335,37 @@ impl DraftModeDriver {
                 // layer skipped the ResizeEnd tick). Synthesize
                 // it: this frame becomes the snap-back.
                 if matches!(
-                    self.last_resize_state,
+                    prior_resize_state,
                     LiveResizeState::ResizeBegin | LiveResizeState::Resizing
                 ) {
-                    self.snap_back_total += 1;
-                    // Update bookkeeping so the NEXT Idle frame
-                    // returns the steady-state instead of
-                    // re-synthesizing a snap-back.
-                    self.last_resize_state = LiveResizeState::Idle;
-                    self.standard_frames_total += 1;
-                    self.quality_transitions_total += 1;
-                    return RenderQuality::Standard;
+                    self.snap_back_total = self.snap_back_total.saturating_add(1);
+                    RenderQuality::Standard
+                } else {
+                    self.steady_state.as_render_quality()
                 }
-                self.steady_state.as_render_quality()
             }
         };
 
-        if quality != self.last_picked_quality_for_counters() {
-            self.quality_transitions_total += 1;
+        if quality != self.last_quality {
+            self.quality_transitions_total = self.quality_transitions_total.saturating_add(1);
         }
 
-        // Update last-state AFTER the snap-back synthesis so the
-        // next call sees ResizeEnd having already fired.
         self.last_resize_state = resize_state;
+        self.last_quality = quality;
 
         match quality {
-            RenderQuality::Draft => self.draft_frames_total += 1,
-            RenderQuality::Standard => self.standard_frames_total += 1,
-            RenderQuality::Fancy => self.fancy_frames_total += 1,
-        }
-
-        // Mark snap-back as owed when transitioning OUT of a
-        // draft-mode state.
-        if matches!(
-            resize_state,
-            LiveResizeState::Idle | LiveResizeState::ResizeEnd
-        ) && matches!(
-            self.last_resize_state,
-            LiveResizeState::ResizeBegin | LiveResizeState::Resizing
-        ) {
-            self.snap_back_owed = true;
+            RenderQuality::Draft => {
+                self.draft_frames_total = self.draft_frames_total.saturating_add(1);
+            }
+            RenderQuality::Standard => {
+                self.standard_frames_total = self.standard_frames_total.saturating_add(1);
+            }
+            RenderQuality::Fancy => {
+                self.fancy_frames_total = self.fancy_frames_total.saturating_add(1);
+            }
         }
 
         quality
-    }
-
-    fn last_picked_quality_for_counters(&self) -> RenderQuality {
-        match self.last_resize_state {
-            LiveResizeState::ResizeBegin | LiveResizeState::Resizing => RenderQuality::Draft,
-            _ => self.steady_state.as_render_quality(),
-        }
     }
 
     /// Cumulative health snapshot.
@@ -445,11 +424,13 @@ impl RenderQualityHealth {
     /// reports 0.0; an active resize burst spikes it.
     #[must_use]
     pub fn draft_ratio(&self) -> f64 {
-        let total = self.draft_frames_total + self.standard_frames_total + self.fancy_frames_total;
-        if total == 0 {
+        let total = self.draft_frames_total as f64
+            + self.standard_frames_total as f64
+            + self.fancy_frames_total as f64;
+        if total == 0.0 {
             0.0
         } else {
-            self.draft_frames_total as f64 / total as f64
+            self.draft_frames_total as f64 / total
         }
     }
 }
@@ -952,6 +933,31 @@ mod tests {
     }
 
     #[test]
+    fn fancy_driver_counts_actual_quality_transitions_across_repeated_resize_end() {
+        let mut driver = DraftModeDriver::new(SteadyStateQuality::Fancy);
+        assert_eq!(
+            driver.pick(LiveResizeState::ResizeBegin),
+            RenderQuality::Draft
+        );
+        assert_eq!(driver.pick(LiveResizeState::Resizing), RenderQuality::Draft);
+        assert_eq!(
+            driver.pick(LiveResizeState::ResizeEnd),
+            RenderQuality::Standard
+        );
+        assert_eq!(driver.health().quality_transitions_total, 2);
+
+        assert_eq!(
+            driver.pick(LiveResizeState::ResizeEnd),
+            RenderQuality::Standard
+        );
+        assert_eq!(driver.health().quality_transitions_total, 2);
+
+        assert_eq!(driver.pick(LiveResizeState::Idle), RenderQuality::Fancy);
+        assert_eq!(driver.health().quality_transitions_total, 3);
+        assert_eq!(driver.health().snap_back_total, 1);
+    }
+
+    #[test]
     fn jsonl_event_roundtrip() {
         let events = vec![
             RenderQualityFrameEvent {
@@ -998,6 +1004,18 @@ mod tests {
         };
         // 60 / 100 = 0.6
         assert!((h.draft_ratio() - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn draft_ratio_remains_meaningful_when_frame_counters_saturate() {
+        let h = RenderQualityHealth {
+            draft_frames_total: u64::MAX,
+            standard_frames_total: u64::MAX,
+            fancy_frames_total: 0,
+            snap_back_total: 0,
+            quality_transitions_total: 0,
+        };
+        assert_eq!(h.draft_ratio(), 0.5);
     }
 
     #[test]

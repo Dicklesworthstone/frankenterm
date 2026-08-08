@@ -3,6 +3,9 @@
 //! This stays as a thin extraction-only layer to reduce `mcp.rs` size while
 //! preserving behavior and registration order.
 
+use super::mcp_tools::{
+    MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS, MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX,
+};
 use super::{
     AuditedToolHandler, Config, FormatAwareToolHandler, Result,
     WaAccountsByServiceTemplateResource, WaAccountsRefreshTool, WaAccountsResource, WaAccountsTool,
@@ -25,16 +28,13 @@ use super::{
     WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
     WaWorkflowStatusTool, WaWorkflowsResource, build_mcp_shared_rate_limiter,
 };
-use super::mcp_tools::{
-    MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS, MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX,
-};
 use crate::mcp_framework::{
     FrameworkDeliveryServer as Server, FrameworkResponseDeliveryCoordinator,
     framework_server_builder, run_framework_stdio_server,
 };
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// FastMCP's per-request budget must exceed the longest advertised
 /// `wa.await_event` poll (300s) and leave bounded time for final formatting and
@@ -631,8 +631,7 @@ mod tests {
     fn storage_backed_request_budget_exceeds_the_longest_await_and_degraded_stays_bounded() {
         assert!(
             mcp_server_request_timeout_secs(true)
-                >= MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX
-                    + MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS,
+                >= MCP_AWAIT_EVENT_TIMEOUT_SECS_MAX + MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS,
             "full MCP mode must leave response-delivery margin after the longest advertised await"
         );
         assert!(

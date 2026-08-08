@@ -97,9 +97,7 @@ impl ContainedForwardingWaker {
         (state, proxy)
     }
 
-    fn lock_downstream_recovering(
-        &self,
-    ) -> std::sync::MutexGuard<'_, Option<std::task::Waker>> {
+    fn lock_downstream_recovering(&self) -> std::sync::MutexGuard<'_, Option<std::task::Waker>> {
         self.downstream.lock().unwrap_or_else(|poison| {
             saturating_increment_counter(self.lock_poisoned_count);
             poison.into_inner()
@@ -543,10 +541,7 @@ fn map_mutex_lock_error(
     }
 }
 
-fn map_rwlock_error(
-    cx: &crate::cx::Cx,
-    error: asupersync::sync::RwLockError,
-) -> LockAcquireError {
+fn map_rwlock_error(cx: &crate::cx::Cx, error: asupersync::sync::RwLockError) -> LockAcquireError {
     match error {
         asupersync::sync::RwLockError::Poisoned => LockAcquireError::Poisoned,
         asupersync::sync::RwLockError::Cancelled => classify_lock_context_failure(cx),
@@ -1030,11 +1025,7 @@ pub mod mpsc {
         }
 
         /// Reserves and sends one value.
-        pub async fn send(
-            &self,
-            cx: &crate::cx::Cx,
-            value: T,
-        ) -> Result<(), SendError<T>> {
+        pub async fn send(&self, cx: &crate::cx::Cx, value: T) -> Result<(), SendError<T>> {
             match self.reserve(cx).await {
                 Ok(permit) => permit.try_send(value),
                 Err(SendError::Disconnected(())) => Err(SendError::Disconnected(value)),
@@ -1044,9 +1035,7 @@ pub mod mpsc {
         }
 
         pub fn try_reserve(&self) -> Result<SendPermit<'_, T>, SendError<()>> {
-            self.inner
-                .try_reserve()
-                .map(|inner| SendPermit { inner })
+            self.inner.try_reserve().map(|inner| SendPermit { inner })
         }
 
         pub fn try_send(&self, value: T) -> Result<(), SendError<T>> {
@@ -1231,10 +1220,7 @@ pub mod mpsc {
         }
 
         #[must_use]
-        pub fn recv<'a, Caps>(
-            &'a mut self,
-            cx: &'a crate::cx::Cx<Caps>,
-        ) -> Recv<'a, T, Caps> {
+        pub fn recv<'a, Caps>(&'a mut self, cx: &'a crate::cx::Cx<Caps>) -> Recv<'a, T, Caps> {
             let Self {
                 inner,
                 retained_waker,
@@ -2262,9 +2248,7 @@ pub mod task {
             use crate::outcome::CancelKind;
 
             let kind = match cx.root_cancel_cause().map(|reason| reason.kind) {
-                Some(CancelKind::Deadline | CancelKind::Timeout) => {
-                    JoinErrorKind::DeadlineExceeded
-                }
+                Some(CancelKind::Deadline | CancelKind::Timeout) => JoinErrorKind::DeadlineExceeded,
                 Some(CancelKind::PollQuota) => JoinErrorKind::PollQuotaExhausted,
                 Some(CancelKind::CostBudget) => JoinErrorKind::CostBudgetExhausted,
                 Some(
@@ -2299,9 +2283,8 @@ pub mod task {
 
     impl std::error::Error for JoinError {}
 
-    type AbortableTaskJoin<T> = asupersync::runtime::JoinHandle<
-        std::result::Result<T, futures::future::Aborted>,
-    >;
+    type AbortableTaskJoin<T> =
+        asupersync::runtime::JoinHandle<std::result::Result<T, futures::future::Aborted>>;
 
     /// Handle to a spawned task. Awaiting it yields the task's output
     /// wrapped in `Result<T, JoinError>` for API compatibility with tokio.
@@ -2336,10 +2319,7 @@ pub mod task {
             // asupersync handle sees only `completion_waker`, whose identity
             // remains stable across every poll and whose callback is contained.
             #[cfg(test)]
-            if self
-                .force_registration_failure
-                .load(Ordering::Acquire)
-            {
+            if self.force_registration_failure.load(Ordering::Acquire) {
                 self.abort_handle.abort();
                 self.forwarding.clear();
                 return Poll::Ready(Err(JoinError::waker_registration_failed()));
@@ -2484,9 +2464,7 @@ pub mod task {
         }
 
         pub fn len(&self) -> usize {
-            self.handles
-                .len()
-                .saturating_add(self.unacknowledged.len())
+            self.handles.len().saturating_add(self.unacknowledged.len())
         }
 
         pub fn is_empty(&self) -> bool {
@@ -2551,8 +2529,7 @@ pub mod task {
                     Poll::Ready(Err(error))
                         if error.kind() == JoinErrorKind::WakerRegistrationFailed =>
                     {
-                        let result =
-                            self.settle_or_quarantine_registration_failure(index, error);
+                        let result = self.settle_or_quarantine_registration_failure(index, error);
                         return Poll::Ready(Some(result));
                     }
                     Poll::Ready(result) => {
@@ -2642,9 +2619,9 @@ pub mod task {
 
             std::future::poll_fn(|cx| {
                 if caller_cx.checkpoint().is_err() {
-                    return std::task::Poll::Ready(Some(Err(
-                        JoinError::from_context_failure(caller_cx),
-                    )));
+                    return std::task::Poll::Ready(Some(Err(JoinError::from_context_failure(
+                        caller_cx,
+                    ))));
                 }
                 if let Some(result) = self.poll_finished_unacknowledged() {
                     return Poll::Ready(Some(result));
@@ -2846,8 +2823,7 @@ pub mod task {
         type Output = F::Output;
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            let _runtime_handle_guard =
-                super::install_runtime_handle_scoped(self.handle.clone());
+            let _runtime_handle_guard = super::install_runtime_handle_scoped(self.handle.clone());
             // asupersync installs a scheduler-owned Cx while polling a task,
             // but `spawn_with_cx` promises that ambient adapters inside the
             // child observe the explicitly threaded context. Install it only
@@ -2857,9 +2833,7 @@ pub mod task {
                 .task_cx
                 .as_ref()
                 .map(|task_cx| crate::cx::Cx::set_current(Some(task_cx.clone())));
-            let _task_capability_guard = self
-                .task_cap_mask
-                .map(crate::cx::Cx::push_restriction);
+            let _task_capability_guard = self.task_cap_mask.map(crate::cx::Cx::push_restriction);
             self.future.as_mut().poll(cx)
         }
     }
@@ -2885,9 +2859,7 @@ pub mod task {
         // spawn inherits cancellation, deadline, identity, and monotone
         // capability authority rather than escaping into an unrelated root.
         let task_cx = crate::cx::Cx::current();
-        let task_cap_mask = task_cx
-            .as_ref()
-            .map(crate::cx::effective_cap_mask);
+        let task_cap_mask = task_cx.as_ref().map(crate::cx::effective_cap_mask);
         let wrapped = HandleContextFuture {
             handle: handle.clone(),
             task_cx,
@@ -2895,10 +2867,7 @@ pub mod task {
             future: Box::pin(future),
         };
         let (abort_handle, abort_registration) = futures::future::AbortHandle::new_pair();
-        let inner = handle.spawn(futures::future::Abortable::new(
-            wrapped,
-            abort_registration,
-        ));
+        let inner = handle.spawn(futures::future::Abortable::new(wrapped, abort_registration));
         let (forwarding, completion_waker) = super::ContainedForwardingWaker::new(
             &JOIN_HANDLE_LOCK_POISONED_COUNT,
             &JOIN_HANDLE_WAKER_CALLBACK_PANIC_COUNT,
@@ -2936,10 +2905,7 @@ pub mod task {
             future: Box::pin(async move { task(child_cx).await }),
         };
         let (abort_handle, abort_registration) = futures::future::AbortHandle::new_pair();
-        let inner = handle.spawn(futures::future::Abortable::new(
-            wrapped,
-            abort_registration,
-        ));
+        let inner = handle.spawn(futures::future::Abortable::new(wrapped, abort_registration));
         let (forwarding, completion_waker) = super::ContainedForwardingWaker::new(
             &JOIN_HANDLE_LOCK_POISONED_COUNT,
             &JOIN_HANDLE_WAKER_CALLBACK_PANIC_COUNT,
@@ -2971,7 +2937,8 @@ pub mod task {
         Fut: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let handle = super::ASUPERSYNC_HANDLE.with(|cell| cell.borrow().as_ref().cloned())
+        let handle = super::ASUPERSYNC_HANDLE
+            .with(|cell| cell.borrow().as_ref().cloned())
             .ok_or(SpawnError::RuntimeUnavailable)?;
         let child_cx = cx.clone();
         let child_cap_mask = crate::cx::effective_cap_mask(&child_cx);
@@ -2982,10 +2949,8 @@ pub mod task {
             future: Box::pin(async move { task(child_cx).await }),
         };
         let (abort_handle, abort_registration) = futures::future::AbortHandle::new_pair();
-        let inner = handle.try_spawn(futures::future::Abortable::new(
-            wrapped,
-            abort_registration,
-        ))?;
+        let inner =
+            handle.try_spawn(futures::future::Abortable::new(wrapped, abort_registration))?;
         let (forwarding, completion_waker) = super::ContainedForwardingWaker::new(
             &JOIN_HANDLE_LOCK_POISONED_COUNT,
             &JOIN_HANDLE_WAKER_CALLBACK_PANIC_COUNT,
@@ -3028,13 +2993,9 @@ pub mod task {
         // explicit-Cx tasks: synthetic/request contexts carry no pool and the
         // raw Asupersync helper would otherwise run `f` inline on the executor.
         spawn(async move {
-            super::spawn_blocking_in_context(
-                blocking_context,
-                blocking_runtime_handle,
-                f,
-            )
-            .await
-            .unwrap_or_else(|_| panic!("blocking task failed at canonical runtime boundary"))
+            super::spawn_blocking_in_context(blocking_context, blocking_runtime_handle, f)
+                .await
+                .unwrap_or_else(|_| panic!("blocking task failed at canonical runtime boundary"))
         })
     }
 
@@ -3274,7 +3235,7 @@ pub mod process {
     use std::time::{Duration, Instant};
 
     use filedescriptor::{
-        poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT,
+        AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT, poll, pollfd, socketpair,
     };
 
     const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -4003,13 +3964,11 @@ pub mod process {
                 }
                 .into_io_error())
             }
-            SignalHelperReapOutcome::DeadlineElapsed => {
-                Err(CommandSignalHelperCleanupIncomplete {
-                    phase: CommandSignalHelperFailurePhase::PostKillDeadline,
-                    probe_error_kind: None,
-                }
-                .into_io_error())
+            SignalHelperReapOutcome::DeadlineElapsed => Err(CommandSignalHelperCleanupIncomplete {
+                phase: CommandSignalHelperFailurePhase::PostKillDeadline,
+                probe_error_kind: None,
             }
+            .into_io_error()),
         }
     }
 
@@ -4078,11 +4037,7 @@ pub mod process {
             deadline: Instant,
         ) -> std::io::Result<ExitStatus> {
             validate_windows_signal_target(i64::from(process_group_id))?;
-            run_taskkill(
-                process_group_id,
-                windows_taskkill_force(signal)?,
-                deadline,
-            )
+            run_taskkill(process_group_id, windows_taskkill_force(signal)?, deadline)
         }
     }
 
@@ -4196,11 +4151,7 @@ pub mod process {
         signal: &str,
         deadline: Instant,
     ) -> std::io::Result<ExitStatus> {
-        PlatformProcessControl::send_signal_to_process_group(
-            process_group_id,
-            signal,
-            deadline,
-        )
+        PlatformProcessControl::send_signal_to_process_group(process_group_id, signal, deadline)
     }
 
     /// Send a process-termination signal by pid. Cross-platform: on Unix it
@@ -4410,8 +4361,8 @@ pub mod process {
             let mut kill_guard = KillOnDropGuard::new(Arc::clone(&cancel), self.kill_on_drop);
 
             let result = super::spawn_blocking(move || run_output_command(spec, cancel, None))
-            .await
-            .map_err(std::io::Error::other)?;
+                .await
+                .map_err(std::io::Error::other)?;
 
             kill_guard.disarm();
             result
@@ -4490,8 +4441,8 @@ pub mod process {
             let _watcher_done_guard = WatcherDoneGuard::new(Arc::clone(&watcher_done));
 
             let result = super::spawn_blocking(move || run_output_command(spec, cancel, None))
-            .await
-            .map_err(std::io::Error::other)?;
+                .await
+                .map_err(std::io::Error::other)?;
 
             // Drain the watcher on the normal path so it exits
             // before this function returns. The guard above already
@@ -4514,7 +4465,11 @@ pub mod process {
         fn output_spec(&self) -> OutputCommandSpec {
             OutputCommandSpec {
                 program: self.inner.get_program().to_os_string(),
-                args: self.inner.get_args().map(|arg| arg.to_os_string()).collect(),
+                args: self
+                    .inner
+                    .get_args()
+                    .map(|arg| arg.to_os_string())
+                    .collect(),
                 envs: self
                     .inner
                     .get_envs()
@@ -4522,7 +4477,10 @@ pub mod process {
                         value.map(|value| (key.to_os_string(), value.to_os_string()))
                     })
                     .collect(),
-                current_dir: self.inner.get_current_dir().map(std::path::Path::to_path_buf),
+                current_dir: self
+                    .inner
+                    .get_current_dir()
+                    .map(std::path::Path::to_path_buf),
                 stdin: self.stdin.clone(),
                 stdin_configuration_error: self.stdin_configuration_error,
                 stdin_limit: self.stdin_limit,
@@ -4618,12 +4576,7 @@ pub mod process {
         // terminate that process tree promptly.
         check_output_command_abort(&cancel, deadline)?;
 
-        let mut child = spawn_output_child(
-            &mut cmd,
-            &exec_busy_retry_delays,
-            &cancel,
-            deadline,
-        )?;
+        let mut child = spawn_output_child(&mut cmd, &exec_busy_retry_delays, &cancel, deadline)?;
         // `Command` retains custom Stdio handles for possible reuse. Drop it
         // and our original write endpoints immediately so only the child (or
         // descendants that deliberately inherit them) can keep either stream
@@ -4633,11 +4586,13 @@ pub mod process {
         drop(stdout_write);
         drop(stderr_write);
 
-        let mut stdin_state = stdin.zip(stdin_write).map(|(bytes, writer)| CommandInputState {
-            writer,
-            bytes,
-            written: 0,
-        });
+        let mut stdin_state = stdin
+            .zip(stdin_write)
+            .map(|(bytes, writer)| CommandInputState {
+                writer,
+                bytes,
+                written: 0,
+            });
         let mut stdout_reader = Some(stdout_read);
         let mut stderr_reader = Some(stderr_read);
         let mut stdout = Vec::new();
@@ -4739,9 +4694,8 @@ pub mod process {
                     return Err(error);
                 }
             };
-            let io_quantum_exhausted = stdin_quantum_exhausted
-                || stdout_quantum_exhausted
-                || stderr_quantum_exhausted;
+            let io_quantum_exhausted =
+                stdin_quantum_exhausted || stdout_quantum_exhausted || stderr_quantum_exhausted;
 
             if status.is_none() {
                 match child.try_wait() {
@@ -4767,9 +4721,8 @@ pub mod process {
                             return Err(error);
                         }
                         status = Some(exit_status);
-                        post_exit_deadline = Some(process_deadline_after(
-                            PROCESS_POST_EXIT_DRAIN_TIMEOUT,
-                        ));
+                        post_exit_deadline =
+                            Some(process_deadline_after(PROCESS_POST_EXIT_DRAIN_TIMEOUT));
                     }
                     Ok(None) => {}
                     Err(error)
@@ -4817,9 +4770,8 @@ pub mod process {
                         stderr,
                     });
                 }
-                let post_exit_at = *post_exit_deadline.get_or_insert_with(|| {
-                    process_deadline_after(PROCESS_POST_EXIT_DRAIN_TIMEOUT)
-                });
+                let post_exit_at = *post_exit_deadline
+                    .get_or_insert_with(|| process_deadline_after(PROCESS_POST_EXIT_DRAIN_TIMEOUT));
                 let remaining = post_exit_at.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     let incomplete = CommandOutputCaptureIncomplete {
@@ -4851,10 +4803,7 @@ pub mod process {
                     stdin_state.as_ref().map(|input| &input.writer),
                     stdout_reader.as_ref(),
                     stderr_reader.as_ref(),
-                    bounded_output_poll_wait(
-                        remaining.min(PROCESS_POLL_INTERVAL),
-                        deadline,
-                    ),
+                    bounded_output_poll_wait(remaining.min(PROCESS_POLL_INTERVAL), deadline),
                 ) {
                     terminate_and_settle_output_command(
                         &mut child,
@@ -4871,11 +4820,12 @@ pub mod process {
                 }
             } else if !io_quantum_exhausted
                 && let Err(error) = poll_process_io(
-                stdin_state.as_ref().map(|input| &input.writer),
-                stdout_reader.as_ref(),
-                stderr_reader.as_ref(),
-                bounded_output_poll_wait(PROCESS_POLL_INTERVAL, deadline),
-            ) {
+                    stdin_state.as_ref().map(|input| &input.writer),
+                    stdout_reader.as_ref(),
+                    stderr_reader.as_ref(),
+                    bounded_output_poll_wait(PROCESS_POLL_INTERVAL, deadline),
+                )
+            {
                 terminate_and_settle_output_command(
                     &mut child,
                     false,
@@ -4898,10 +4848,7 @@ pub mod process {
         socketpair().map_err(|error| process_capture_setup_error(stream, error))
     }
 
-    fn validate_command_input(
-        stdin: Option<&[u8]>,
-        limit: usize,
-    ) -> std::io::Result<()> {
+    fn validate_command_input(stdin: Option<&[u8]>, limit: usize) -> std::io::Result<()> {
         if let Some(bytes) = stdin
             && bytes.len() > limit
         {
@@ -5036,17 +4983,13 @@ pub mod process {
             .min(limit);
         output
             .try_reserve_exact(geometric_target.saturating_sub(output.len()))
-            .map_err(|_| {
-                std::io::Error::other("process command output capture allocation failed")
-            })
+            .map_err(|_| std::io::Error::other("process command output capture allocation failed"))
     }
 
     /// Write a fair, bounded stdin quantum. Returning to the outer supervisor
     /// after `WouldBlock`/`Interrupted` keeps cancellation, deadline, status,
     /// and both output streams responsive even when the child reads slowly.
-    fn write_command_input(
-        input_state: &mut Option<CommandInputState>,
-    ) -> std::io::Result<bool> {
+    fn write_command_input(input_state: &mut Option<CommandInputState>) -> std::io::Result<bool> {
         let Some(input) = input_state.as_mut() else {
             return Ok(false);
         };
@@ -5195,9 +5138,7 @@ pub mod process {
             }
             (Some(descriptor), None, None)
             | (None, Some(descriptor), None)
-            | (None, None, Some(descriptor)) => {
-                poll_capture_descriptors(&mut [descriptor], wait)
-            }
+            | (None, None, Some(descriptor)) => poll_capture_descriptors(&mut [descriptor], wait),
             (None, None, None) => {
                 std::thread::sleep(wait);
                 Ok(())
@@ -5205,10 +5146,7 @@ pub mod process {
         }
     }
 
-    fn poll_capture_descriptors(
-        readiness: &mut [pollfd],
-        wait: Duration,
-    ) -> std::io::Result<()> {
+    fn poll_capture_descriptors(readiness: &mut [pollfd], wait: Duration) -> std::io::Result<()> {
         match poll(readiness, Some(wait)) {
             Ok(_) => Ok(()),
             // filedescriptor implements poll with select(2) on macOS, where
@@ -5280,11 +5218,7 @@ pub mod process {
         // cannot add another 200 ms after the advertised settlement budget.
         let settlement_deadline = process_deadline_after(PROCESS_TERMINATION_SETTLE_TIMEOUT);
         let (reaped, signal_helper_settled, process_tree_signalled) =
-            terminate_output_child_if_running(
-                child,
-                leader_already_reaped,
-                settlement_deadline,
-            );
+            terminate_output_child_if_running(child, leader_already_reaped, settlement_deadline);
         let cleanup = settle_output_command(
             child,
             reaped,
@@ -5384,13 +5318,7 @@ pub mod process {
                 continue;
             }
             let wait = remaining.min(PROCESS_POLL_INTERVAL);
-            if poll_process_io(
-                None,
-                stdout_reader.as_ref(),
-                stderr_reader.as_ref(),
-                wait,
-            )
-            .is_err()
+            if poll_process_io(None, stdout_reader.as_ref(), stderr_reader.as_ref(), wait).is_err()
             {
                 std::thread::sleep(wait);
             }
@@ -5439,13 +5367,11 @@ pub mod process {
         .into_io_error())
     }
 
-    fn output_cleanup_trigger_for_capture_error(
-        error: &std::io::Error,
-    ) -> CommandCleanupTrigger {
-        CommandOutputLimitExceeded::from_io_error(error).map_or(
-            CommandCleanupTrigger::CaptureRead,
-            |exceeded| CommandCleanupTrigger::CaptureLimit(exceeded.stream()),
-        )
+    fn output_cleanup_trigger_for_capture_error(error: &std::io::Error) -> CommandCleanupTrigger {
+        CommandOutputLimitExceeded::from_io_error(error)
+            .map_or(CommandCleanupTrigger::CaptureRead, |exceeded| {
+                CommandCleanupTrigger::CaptureLimit(exceeded.stream())
+            })
     }
 
     /// Probe immediately before any numeric PID/process-group signal. A
@@ -5506,10 +5432,7 @@ pub mod process {
     /// that probe and these signals, so its PID cannot be reused; on Windows,
     /// `Child::kill` retains the process handle identity. The helper makes no
     /// safety claim for arbitrary numeric process identifiers.
-    fn terminate_child_process(
-        child: &mut std::process::Child,
-        deadline: Instant,
-    ) -> (bool, bool) {
+    fn terminate_child_process(child: &mut std::process::Child, deadline: Instant) -> (bool, bool) {
         let group_result = send_signal_to_process_group_until(child.id(), "KILL", deadline);
         let signal_helper_settled = group_result.as_ref().err().is_none_or(|error| {
             CommandSignalHelperCleanupIncomplete::from_io_error(error).is_none()
@@ -5566,10 +5489,7 @@ pub mod process {
             let timed_out = CommandTimedOut::from_io_error(&error)
                 .expect("deadline error must retain stable typed detail");
             assert_eq!(timed_out.timeout_ms(), 37);
-            assert_eq!(
-                error.to_string(),
-                "process command timed out after 37 ms"
-            );
+            assert_eq!(error.to_string(), "process command timed out after 37 ms");
         }
 
         #[test]
@@ -5748,7 +5668,10 @@ pub mod process {
 
             let mut command = Command::new("not-executed");
             command.stdin_limit(2).stdin_bytes(vec![1, 2, 3]);
-            assert!(command.stdin.is_none(), "oversized input must not be retained");
+            assert!(
+                command.stdin.is_none(),
+                "oversized input must not be retained"
+            );
             let retained_error = command
                 .stdin_configuration_error
                 .expect("oversized setter input must retain only typed detail");
@@ -5874,13 +5797,8 @@ pub mod process {
             let first_pointer = output.as_ptr();
             assert!(first_capacity >= 101);
 
-            append_captured_bytes(
-                &mut output,
-                &[b'b'; 100],
-                1024,
-                CommandOutputStream::Stdout,
-            )
-            .expect("existing geometric reservation should accept the next chunk");
+            append_captured_bytes(&mut output, &[b'b'; 100], 1024, CommandOutputStream::Stdout)
+                .expect("existing geometric reservation should accept the next chunk");
             assert_eq!(output.as_ptr(), first_pointer);
             assert_eq!(output.len(), 101);
         }
@@ -5914,13 +5832,8 @@ pub mod process {
             let mut output = Vec::new();
             append_captured_bytes(&mut output, &[], 0, CommandOutputStream::Stderr)
                 .expect("empty output is valid under a zero-byte cap");
-            let error = append_captured_bytes(
-                &mut output,
-                b"x",
-                0,
-                CommandOutputStream::Stderr,
-            )
-            .expect_err("non-empty output must exceed a zero-byte cap");
+            let error = append_captured_bytes(&mut output, b"x", 0, CommandOutputStream::Stderr)
+                .expect_err("non-empty output must exceed a zero-byte cap");
             let exceeded = CommandOutputLimitExceeded::from_io_error(&error)
                 .expect("stderr overflow must retain typed detail");
             assert_eq!(exceeded.stream(), CommandOutputStream::Stderr);
@@ -6255,9 +6168,7 @@ impl CompatRuntime for Runtime {
     {
         let handle = self.inner.handle();
         let task_cx = crate::cx::Cx::current();
-        let task_cap_mask = task_cx
-            .as_ref()
-            .map(crate::cx::effective_cap_mask);
+        let task_cap_mask = task_cx.as_ref().map(crate::cx::effective_cap_mask);
         // Wrap in HandleContextFuture so that nested task::spawn() calls
         // inside the detached future can find the runtime handle in
         // thread-local storage. Preserve the ambient Cx and effective
@@ -6535,9 +6446,7 @@ where
         work()
     }
 
-    struct CancelBlockingTaskOnDrop(
-        Option<asupersync::runtime::blocking_pool::BlockingTaskHandle>,
-    );
+    struct CancelBlockingTaskOnDrop(Option<asupersync::runtime::blocking_pool::BlockingTaskHandle>);
 
     impl CancelBlockingTaskOnDrop {
         fn disarm(&mut self) {
@@ -6553,8 +6462,7 @@ where
         }
     }
 
-    const PANIC_ERROR: &str =
-        "blocking task panicked (error_code=WA-RUNTIME-BLOCKING-PANIC)";
+    const PANIC_ERROR: &str = "blocking task panicked (error_code=WA-RUNTIME-BLOCKING-PANIC)";
 
     // Pool selection must come from the installed runtime, not from the
     // explicit operation Cx. Synthetic/request contexts intentionally carry
@@ -6686,9 +6594,7 @@ fn map_spawn_blocking_runtime_result<T>(
     result.map_err(|_| SpawnBlockingWithCxError::RuntimeFailure)
 }
 
-fn spawn_blocking_root_cancel_kind(
-    cx: &crate::cx::Cx,
-) -> Option<crate::outcome::CancelKind> {
+fn spawn_blocking_root_cancel_kind(cx: &crate::cx::Cx) -> Option<crate::outcome::CancelKind> {
     cx.root_cancel_cause().map(|reason| reason.kind)
 }
 
@@ -6787,11 +6693,9 @@ where
 
     match select(join_fut, cancel_watcher).await {
         Either::Left((result, _)) => map_spawn_blocking_runtime_result(result),
-        Either::Right((Ok(()), _)) => {
-            Err(SpawnBlockingWithCxError::CancelledMidFlight {
-                kind: spawn_blocking_root_cancel_kind(cx),
-            })
-        }
+        Either::Right((Ok(()), _)) => Err(SpawnBlockingWithCxError::CancelledMidFlight {
+            kind: spawn_blocking_root_cancel_kind(cx),
+        }),
         Either::Right((Err(()), _)) => {
             Err(SpawnBlockingWithCxError::CancellationWatcherTimerFailure)
         }
@@ -7064,8 +6968,7 @@ mod tests {
         }
 
         fn count(&self) -> usize {
-            self.wake_count
-                .load(std::sync::atomic::Ordering::SeqCst)
+            self.wake_count.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn record_wake(&self) {
@@ -7120,11 +7023,9 @@ mod tests {
         std::task::Waker,
     ) {
         let drop_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let waker = std::task::Waker::from(std::sync::Arc::new(
-            RuntimeAsyncDropPanickingWake {
-                drop_count: std::sync::Arc::clone(&drop_count),
-            },
-        ));
+        let waker = std::task::Waker::from(std::sync::Arc::new(RuntimeAsyncDropPanickingWake {
+            drop_count: std::sync::Arc::clone(&drop_count),
+        }));
         (drop_count, waker)
     }
 
@@ -7254,7 +7155,9 @@ mod tests {
         );
 
         let (wake_probe, wake_waker) = probe_waker(true);
-        forwarding.register(&wake_waker).expect("register wake probe");
+        forwarding
+            .register(&wake_waker)
+            .expect("register wake probe");
         let wake_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             proxy.clone().wake();
         }));
@@ -7340,7 +7243,10 @@ mod tests {
             let _forwarding_dropped_first = forwarding;
             panic!("synthetic outer panic while dropping forwarding state");
         }));
-        assert!(outer.is_err(), "the original outer panic must remain visible");
+        assert!(
+            outer.is_err(),
+            "the original outer panic must remain visible"
+        );
         assert_eq!(
             drop_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -8083,10 +7989,12 @@ mod tests {
             std::task::Poll::Ready(Ok(permit)) => permit,
             other => panic!("uncontended reserve was not ready: {other:?}"),
         };
-        assert!(!reserve
-            .as_ref()
-            .get_ref()
-            .retained_waker_allocated_for_test());
+        assert!(
+            !reserve
+                .as_ref()
+                .get_ref()
+                .retained_waker_allocated_for_test()
+        );
         permit.abort();
 
         let (watch_tx, mut watch_rx) = watch::channel(0u8);
@@ -8313,15 +8221,15 @@ mod tests {
         let mut receive_many = Box::pin(rx.recv_many(&cx, &mut batch, 8));
         let (hostile_batch_probe, hostile_batch_waker) = probe_waker(true);
         let mut hostile_batch_cx = std::task::Context::from_waker(&hostile_batch_waker);
-        assert!(receive_many
-            .as_mut()
-            .poll(&mut hostile_batch_cx)
-            .is_pending());
+        assert!(
+            receive_many
+                .as_mut()
+                .poll(&mut hostile_batch_cx)
+                .is_pending()
+        );
         tx.try_send(12).expect("wake contained batch receiver");
         assert_eq!(hostile_batch_probe.count(), 1);
-        assert!(
-            mpsc::retained_waker_callback_panic_count() >= callback_before.saturating_add(1)
-        );
+        assert!(mpsc::retained_waker_callback_panic_count() >= callback_before.saturating_add(1));
         let (_, normal_batch_waker) = probe_waker(false);
         let mut normal_batch_cx = std::task::Context::from_waker(&normal_batch_waker);
         assert!(matches!(
@@ -8335,11 +8243,10 @@ mod tests {
         let (hostile_poll_probe, hostile_poll_waker) = probe_waker(true);
         let mut hostile_poll_cx = std::task::Context::from_waker(&hostile_poll_waker);
         assert!(rx.poll_recv(&cx, &mut hostile_poll_cx).is_pending());
-        tx.try_send(13).expect("wake contained direct poll receiver");
+        tx.try_send(13)
+            .expect("wake contained direct poll receiver");
         assert_eq!(hostile_poll_probe.count(), 1);
-        assert!(
-            mpsc::retained_waker_callback_panic_count() >= callback_before.saturating_add(1)
-        );
+        assert!(mpsc::retained_waker_callback_panic_count() >= callback_before.saturating_add(1));
         let (_, normal_poll_waker) = probe_waker(false);
         let mut normal_poll_cx = std::task::Context::from_waker(&normal_poll_waker);
         assert!(matches!(
@@ -8350,9 +8257,10 @@ mod tests {
         let mut direct_batch = Vec::new();
         let (hostile_many_probe, hostile_many_waker) = probe_waker(true);
         let mut hostile_many_cx = std::task::Context::from_waker(&hostile_many_waker);
-        assert!(rx
-            .poll_recv_many(&cx, &mut direct_batch, 4, &mut hostile_many_cx)
-            .is_pending());
+        assert!(
+            rx.poll_recv_many(&cx, &mut direct_batch, 4, &mut hostile_many_cx)
+                .is_pending()
+        );
         tx.try_send(14)
             .expect("wake contained direct batch receiver");
         assert_eq!(hostile_many_probe.count(), 1);
@@ -8376,26 +8284,25 @@ mod tests {
         let mut capacity_second = Box::pin(capacity_tx.reserve(&cx));
         let (capacity_hostile_probe, capacity_hostile_waker) = probe_waker(true);
         let (capacity_later_probe, capacity_later_waker) = probe_waker(false);
-        let mut capacity_hostile_cx =
-            std::task::Context::from_waker(&capacity_hostile_waker);
+        let mut capacity_hostile_cx = std::task::Context::from_waker(&capacity_hostile_waker);
         let mut capacity_later_cx = std::task::Context::from_waker(&capacity_later_waker);
-        assert!(capacity_first
-            .as_mut()
-            .poll(&mut capacity_hostile_cx)
-            .is_pending());
-        assert!(capacity_second
-            .as_mut()
-            .poll(&mut capacity_later_cx)
-            .is_pending());
+        assert!(
+            capacity_first
+                .as_mut()
+                .poll(&mut capacity_hostile_cx)
+                .is_pending()
+        );
+        assert!(
+            capacity_second
+                .as_mut()
+                .poll(&mut capacity_later_cx)
+                .is_pending()
+        );
         assert_eq!(capacity_rx.try_recv(), Ok(0));
         assert_eq!(capacity_hostile_probe.count(), 1);
         let (_, capacity_repoll_waker) = probe_waker(false);
-        let mut capacity_repoll_cx =
-            std::task::Context::from_waker(&capacity_repoll_waker);
-        let first_permit = match capacity_first
-            .as_mut()
-            .poll(&mut capacity_repoll_cx)
-        {
+        let mut capacity_repoll_cx = std::task::Context::from_waker(&capacity_repoll_waker);
+        let first_permit = match capacity_first.as_mut().poll(&mut capacity_repoll_cx) {
             std::task::Poll::Ready(Ok(permit)) => permit,
             other => panic!("head capacity waiter did not acquire: {other:?}"),
         };
@@ -8405,10 +8312,7 @@ mod tests {
             1,
             "releasing the first reservation must wake the later waiter"
         );
-        let second_permit = match capacity_second
-            .as_mut()
-            .poll(&mut capacity_later_cx)
-        {
+        let second_permit = match capacity_second.as_mut().poll(&mut capacity_later_cx) {
             std::task::Poll::Ready(Ok(permit)) => permit,
             other => panic!("later capacity waiter was stranded: {other:?}"),
         };
@@ -8428,12 +8332,13 @@ mod tests {
 
         let callback_before = mpsc::retained_waker_callback_panic_count();
         let close_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rx.close()));
-        assert!(close_result.is_ok(), "close must contain every waiter callback");
+        assert!(
+            close_result.is_ok(),
+            "close must contain every waiter callback"
+        );
         assert_eq!(hostile_probe.count(), 1);
         assert_eq!(normal_probe.count(), 1, "later waiter must still be woken");
-        assert!(
-            mpsc::retained_waker_callback_panic_count() >= callback_before.saturating_add(1)
-        );
+        assert!(mpsc::retained_waker_callback_panic_count() >= callback_before.saturating_add(1));
         assert!(matches!(
             first.as_mut().poll(&mut hostile_cx),
             std::task::Poll::Ready(Err(mpsc::SendError::Disconnected(())))
@@ -8457,32 +8362,27 @@ mod tests {
         let (watch_normal_probe, watch_normal_waker) = probe_waker(false);
         let mut watch_hostile_cx = std::task::Context::from_waker(&watch_hostile_waker);
         let mut watch_normal_cx = std::task::Context::from_waker(&watch_normal_waker);
-        assert!(watch_first
-            .as_mut()
-            .poll(&mut watch_hostile_cx)
-            .is_pending());
-        assert!(watch_second
-            .as_mut()
-            .poll(&mut watch_normal_cx)
-            .is_pending());
+        assert!(
+            watch_first
+                .as_mut()
+                .poll(&mut watch_hostile_cx)
+                .is_pending()
+        );
+        assert!(
+            watch_second
+                .as_mut()
+                .poll(&mut watch_normal_cx)
+                .is_pending()
+        );
         let watch_before = watch::retained_waker_callback_panic_count();
-        let watch_send = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            watch_tx.send(1)
-        }));
+        let watch_send =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| watch_tx.send(1)));
         assert!(matches!(watch_send, Ok(Ok(()))));
         assert_eq!(watch_hostile_probe.count(), 1);
         assert_eq!(watch_normal_probe.count(), 1);
-        assert!(
-            watch::retained_waker_callback_panic_count() >= watch_before.saturating_add(1)
-        );
-        assert!(watch_first
-            .as_mut()
-            .poll(&mut watch_hostile_cx)
-            .is_ready());
-        assert!(watch_second
-            .as_mut()
-            .poll(&mut watch_normal_cx)
-            .is_ready());
+        assert!(watch::retained_waker_callback_panic_count() >= watch_before.saturating_add(1));
+        assert!(watch_first.as_mut().poll(&mut watch_hostile_cx).is_ready());
+        assert!(watch_second.as_mut().poll(&mut watch_normal_cx).is_ready());
 
         let (broadcast_tx, mut broadcast_rx1) = broadcast::channel(4);
         let mut broadcast_rx2 = broadcast_tx.subscribe();
@@ -8490,18 +8390,20 @@ mod tests {
         let mut broadcast_second = Box::pin(broadcast_rx2.recv_with_cx(&cx));
         let (broadcast_hostile_probe, broadcast_hostile_waker) = probe_waker(true);
         let (broadcast_normal_probe, broadcast_normal_waker) = probe_waker(false);
-        let mut broadcast_hostile_cx =
-            std::task::Context::from_waker(&broadcast_hostile_waker);
-        let mut broadcast_normal_cx =
-            std::task::Context::from_waker(&broadcast_normal_waker);
-        assert!(broadcast_first
-            .as_mut()
-            .poll(&mut broadcast_hostile_cx)
-            .is_pending());
-        assert!(broadcast_second
-            .as_mut()
-            .poll(&mut broadcast_normal_cx)
-            .is_pending());
+        let mut broadcast_hostile_cx = std::task::Context::from_waker(&broadcast_hostile_waker);
+        let mut broadcast_normal_cx = std::task::Context::from_waker(&broadcast_normal_waker);
+        assert!(
+            broadcast_first
+                .as_mut()
+                .poll(&mut broadcast_hostile_cx)
+                .is_pending()
+        );
+        assert!(
+            broadcast_second
+                .as_mut()
+                .poll(&mut broadcast_normal_cx)
+                .is_pending()
+        );
         let broadcast_before = broadcast::retained_waker_callback_panic_count();
         let broadcast_send = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             broadcast_tx.send_with_cx(&cx, 2)
@@ -8510,19 +8412,14 @@ mod tests {
         assert_eq!(broadcast_hostile_probe.count(), 1);
         assert_eq!(broadcast_normal_probe.count(), 1);
         assert!(
-            broadcast::retained_waker_callback_panic_count()
-                >= broadcast_before.saturating_add(1)
+            broadcast::retained_waker_callback_panic_count() >= broadcast_before.saturating_add(1)
         );
         assert!(matches!(
-            broadcast_first
-                .as_mut()
-                .poll(&mut broadcast_hostile_cx),
+            broadcast_first.as_mut().poll(&mut broadcast_hostile_cx),
             std::task::Poll::Ready(Ok(2))
         ));
         assert!(matches!(
-            broadcast_second
-                .as_mut()
-                .poll(&mut broadcast_normal_cx),
+            broadcast_second.as_mut().poll(&mut broadcast_normal_cx),
             std::task::Poll::Ready(Ok(2))
         ));
     }
@@ -8563,8 +8460,7 @@ mod tests {
         assert_eq!(*watch_rx.borrow(), 83);
 
         let (broadcast_tx, mut broadcast_rx) = broadcast::channel(2);
-        let broadcast_completed =
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let broadcast_completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let broadcast_waker =
             std::task::Waker::from(std::sync::Arc::new(BroadcastReentrantDropWake {
                 sender: broadcast_tx,
@@ -8572,10 +8468,12 @@ mod tests {
             }));
         let mut broadcast_future = Box::pin(broadcast_rx.recv_with_cx(&cx));
         let mut broadcast_cx = std::task::Context::from_waker(&broadcast_waker);
-        assert!(broadcast_future
-            .as_mut()
-            .poll(&mut broadcast_cx)
-            .is_pending());
+        assert!(
+            broadcast_future
+                .as_mut()
+                .poll(&mut broadcast_cx)
+                .is_pending()
+        );
         drop(broadcast_cx);
         drop(broadcast_waker);
         drop(broadcast_future);
@@ -8593,10 +8491,7 @@ mod tests {
         let (reserve_drop_count, reserve_waker) = drop_panicking_waker();
         let mut reserve_future = Box::pin(reserve_tx.reserve(&cx));
         let mut reserve_cx = std::task::Context::from_waker(&reserve_waker);
-        assert!(reserve_future
-            .as_mut()
-            .poll(&mut reserve_cx)
-            .is_pending());
+        assert!(reserve_future.as_mut().poll(&mut reserve_cx).is_pending());
         drop(reserve_cx);
         drop(reserve_waker);
         let reserve_before = mpsc::retained_waker_callback_panic_count();
@@ -8605,9 +8500,7 @@ mod tests {
             reserve_drop_count.load(std::sync::atomic::Ordering::SeqCst),
             1
         );
-        assert!(
-            mpsc::retained_waker_callback_panic_count() >= reserve_before.saturating_add(1)
-        );
+        assert!(mpsc::retained_waker_callback_panic_count() >= reserve_before.saturating_add(1));
         assert_eq!(reserve_rx.try_recv(), Ok(1));
 
         let (_mpsc_tx, mut mpsc_rx) = mpsc::channel::<u8>(1);
@@ -8619,13 +8512,8 @@ mod tests {
         drop(mpsc_waker);
         let mpsc_before = mpsc::retained_waker_callback_panic_count();
         drop(mpsc_future);
-        assert_eq!(
-            mpsc_drop_count.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
-        assert!(
-            mpsc::retained_waker_callback_panic_count() >= mpsc_before.saturating_add(1)
-        );
+        assert_eq!(mpsc_drop_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(mpsc::retained_waker_callback_panic_count() >= mpsc_before.saturating_add(1));
 
         let (_watch_tx, mut watch_rx) = watch::channel(0u8);
         let (watch_drop_count, watch_waker) = drop_panicking_waker();
@@ -8640,18 +8528,18 @@ mod tests {
             watch_drop_count.load(std::sync::atomic::Ordering::SeqCst),
             1
         );
-        assert!(
-            watch::retained_waker_callback_panic_count() >= watch_before.saturating_add(1)
-        );
+        assert!(watch::retained_waker_callback_panic_count() >= watch_before.saturating_add(1));
 
         let (_broadcast_tx, mut broadcast_rx) = broadcast::channel::<u8>(1);
         let (broadcast_drop_count, broadcast_waker) = drop_panicking_waker();
         let mut broadcast_future = Box::pin(broadcast_rx.recv_with_cx(&cx));
         let mut broadcast_cx = std::task::Context::from_waker(&broadcast_waker);
-        assert!(broadcast_future
-            .as_mut()
-            .poll(&mut broadcast_cx)
-            .is_pending());
+        assert!(
+            broadcast_future
+                .as_mut()
+                .poll(&mut broadcast_cx)
+                .is_pending()
+        );
         drop(broadcast_cx);
         drop(broadcast_waker);
         let broadcast_before = broadcast::retained_waker_callback_panic_count();
@@ -8661,8 +8549,7 @@ mod tests {
             1
         );
         assert!(
-            broadcast::retained_waker_callback_panic_count()
-                >= broadcast_before.saturating_add(1)
+            broadcast::retained_waker_callback_panic_count() >= broadcast_before.saturating_add(1)
         );
     }
 
@@ -8681,7 +8568,10 @@ mod tests {
             let _keep_sender_live = tx;
             panic!("synthetic authoritative outer panic");
         }));
-        assert!(outer.is_err(), "the authoritative outer panic must remain visible");
+        assert!(
+            outer.is_err(),
+            "the authoritative outer panic must remain visible"
+        );
         assert_eq!(
             drop_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -9975,8 +9865,7 @@ mod tests {
 
         for (explicit_mask, expected_caps) in crate::cx::capability_mask_test_cases() {
             let explicit = {
-                let _base_guard =
-                    crate::cx::Cx::set_current(Some(crate::cx::for_request()));
+                let _base_guard = crate::cx::Cx::set_current(Some(crate::cx::for_request()));
                 let _restriction = crate::cx::Cx::push_restriction(explicit_mask);
                 crate::cx::Cx::current().expect("restricted explicit blocking cx")
             };
@@ -9986,8 +9875,7 @@ mod tests {
                 asupersync::cx::CapMask::none()
             };
             let ambient = {
-                let _base_guard =
-                    crate::cx::Cx::set_current(Some(crate::cx::for_request()));
+                let _base_guard = crate::cx::Cx::set_current(Some(crate::cx::for_request()));
                 let _restriction = crate::cx::Cx::push_restriction(ambient_mask);
                 crate::cx::Cx::current().expect("restricted mismatched ambient cx")
             };
@@ -10219,7 +10107,11 @@ mod tests {
 
             assert!(matches!(error, SpawnBlockingWithCxError::RuntimeFailure));
             assert_eq!(error.to_string(), "blocking task runtime failure");
-            assert!(!error.to_string().contains("injected blocking closure panic"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("injected blocking closure panic")
+            );
             assert!(!format!("{error:?}").contains("injected blocking closure panic"));
         });
     }
@@ -10386,8 +10278,7 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         for (mask, expected) in crate::cx::capability_mask_test_cases() {
             let restricted = {
-                let _base_guard =
-                    crate::cx::Cx::set_current(Some(crate::cx::for_testing()));
+                let _base_guard = crate::cx::Cx::set_current(Some(crate::cx::for_testing()));
                 let _restriction = crate::cx::Cx::push_restriction(mask);
                 crate::cx::Cx::current().expect("restricted explicit cx")
             };
@@ -10405,7 +10296,10 @@ mod tests {
                     );
                     (before, after)
                 });
-                assert_eq!(handle.await.expect("task should complete"), (expected, expected));
+                assert_eq!(
+                    handle.await.expect("task should complete"),
+                    (expected, expected)
+                );
             });
         }
     }
@@ -10416,8 +10310,7 @@ mod tests {
 
         for (mask, expected) in crate::cx::capability_mask_test_cases() {
             let explicit = {
-                let _base_guard =
-                    crate::cx::Cx::set_current(Some(crate::cx::for_request()));
+                let _base_guard = crate::cx::Cx::set_current(Some(crate::cx::for_request()));
                 let _restriction = crate::cx::Cx::push_restriction(mask);
                 crate::cx::Cx::current().expect("restricted explicit cx")
             };
@@ -10481,8 +10374,7 @@ mod tests {
 
         for (mask, expected) in crate::cx::capability_mask_test_cases() {
             let restricted = {
-                let _base_guard =
-                    crate::cx::Cx::set_current(Some(crate::cx::for_testing()));
+                let _base_guard = crate::cx::Cx::set_current(Some(crate::cx::for_testing()));
                 let _restriction = crate::cx::Cx::push_restriction(mask);
                 crate::cx::Cx::current().expect("restricted explicit cx")
             };
@@ -10509,8 +10401,7 @@ mod tests {
                         );
                         task::yield_now().await;
                         let after = crate::cx::effective_capability_bits(
-                            &crate::cx::Cx::current()
-                                .expect("JoinSet nested spawn cx after yield"),
+                            &crate::cx::Cx::current().expect("JoinSet nested spawn cx after yield"),
                         );
                         (before, after)
                     });
@@ -10573,8 +10464,7 @@ mod tests {
 
         for (mask, expected) in crate::cx::capability_mask_test_cases() {
             let restricted = {
-                let _base_guard =
-                    crate::cx::Cx::set_current(Some(crate::cx::for_testing()));
+                let _base_guard = crate::cx::Cx::set_current(Some(crate::cx::for_testing()));
                 let _restriction = crate::cx::Cx::push_restriction(mask);
                 crate::cx::Cx::current().expect("restricted explicit cx")
             };
@@ -10601,8 +10491,7 @@ mod tests {
         for (mask, expected) in crate::cx::capability_mask_test_cases() {
             let (tx, rx) = oneshot::channel();
             {
-                let _base_guard =
-                    crate::cx::Cx::set_current(Some(crate::cx::for_testing()));
+                let _base_guard = crate::cx::Cx::set_current(Some(crate::cx::for_testing()));
                 let _restriction = crate::cx::Cx::push_restriction(mask);
                 rt.spawn_detached(async move {
                     let before = crate::cx::effective_capability_bits(
@@ -10976,7 +10865,10 @@ mod tests {
             let _send_on_drop = SendOnDrop { sender: Some(tx) };
             panic!("synthetic outer panic");
         }));
-        assert!(outer.is_err(), "the original outer panic must remain visible");
+        assert!(
+            outer.is_err(),
+            "the original outer panic must remain visible"
+        );
         assert_eq!(probe.count(), 1);
 
         let noop = futures::task::noop_waker();
@@ -11006,7 +10898,10 @@ mod tests {
             let _receive_dropped_during_unwind = receive;
             panic!("synthetic outer panic while dropping oneshot receive");
         }));
-        assert!(outer.is_err(), "the original outer panic must remain visible");
+        assert!(
+            outer.is_err(),
+            "the original outer panic must remain visible"
+        );
         assert_eq!(
             drop_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -11370,8 +11265,7 @@ mod tests {
 
         for (mask, expected) in crate::cx::capability_mask_test_cases() {
             let explicit = {
-                let _base_guard =
-                    crate::cx::Cx::set_current(Some(crate::cx::for_request()));
+                let _base_guard = crate::cx::Cx::set_current(Some(crate::cx::for_request()));
                 let _restriction = crate::cx::Cx::push_restriction(mask);
                 crate::cx::Cx::current().expect("restricted blocking cx")
             };
@@ -11737,10 +11631,7 @@ mod tests {
                 .await
                 .expect("set contains one task")
                 .expect_err("forced registration failure must be observable");
-            assert_eq!(
-                error.kind(),
-                task::JoinErrorKind::WakerRegistrationFailed
-            );
+            assert_eq!(error.kind(), task::JoinErrorKind::WakerRegistrationFailed);
             assert_eq!(
                 set.settlement(),
                 task::JoinSetSettlement::Incomplete {
@@ -11828,21 +11719,15 @@ mod tests {
                 .await
                 .expect("set contains one task")
                 .expect_err("forced registration failure must be observable");
-            assert_eq!(
-                error.kind(),
-                task::JoinErrorKind::WakerRegistrationFailed
-            );
+            assert_eq!(error.kind(), task::JoinErrorKind::WakerRegistrationFailed);
             assert!(set.join_next_with_cx(&cx).await.is_none());
             assert_eq!(set.unacknowledged_len(), 1);
 
-            let terminal = timeout_with_cx(
-                &cx,
-                Duration::from_secs(1),
-                set.drain_next_with_cx(&cx),
-            )
-            .await
-            .expect("trusted drain must remain bounded")
-            .expect("trusted drain context must remain live");
+            let terminal =
+                timeout_with_cx(&cx, Duration::from_secs(1), set.drain_next_with_cx(&cx))
+                    .await
+                    .expect("trusted drain must remain bounded")
+                    .expect("trusted drain context must remain live");
             let error = terminal
                 .expect("trusted polling must recover terminal authority")
                 .expect_err("pending task was aborted after registration failure");
@@ -12150,13 +12035,10 @@ mod tests {
                 asupersync::types::Budget::new().with_deadline(asupersync::types::Time::ZERO);
             let cx = crate::cx::Cx::for_testing_with_budget(budget);
 
-            let error = timeout_with_cx_typed(
-                &cx,
-                Duration::from_secs(30),
-                std::future::pending::<()>(),
-            )
-            .await
-            .expect_err("expired budget must terminate the typed timeout");
+            let error =
+                timeout_with_cx_typed(&cx, Duration::from_secs(30), std::future::pending::<()>())
+                    .await
+                    .expect_err("expired budget must terminate the typed timeout");
 
             assert_eq!(error, TimeoutError::Elapsed);
         });
@@ -12268,7 +12150,11 @@ mod tests {
         use crate::outcome::CancelKind;
 
         let cases = [
-            (CancelKind::User, task::JoinErrorKind::ContextCancelled, true),
+            (
+                CancelKind::User,
+                task::JoinErrorKind::ContextCancelled,
+                true,
+            ),
             (
                 CancelKind::Timeout,
                 task::JoinErrorKind::DeadlineExceeded,
@@ -12321,7 +12207,10 @@ mod tests {
             ),
         ];
 
-        let rt = RuntimeBuilder::current_thread().enable_all().build().unwrap();
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             for (kind, expected, expected_cancelled) in cases {
                 let cx = crate::cx::Cx::for_testing();
@@ -13563,10 +13452,7 @@ mod tests {
                     let waker = futures::task::noop_waker();
                     let mut task_cx = std::task::Context::from_waker(&waker);
 
-                    assert!(matches!(
-                        waiter.as_mut().poll(&mut task_cx),
-                        Poll::Pending
-                    ));
+                    assert!(matches!(waiter.as_mut().poll(&mut task_cx), Poll::Pending));
                     waiter_cx.cancel_with(
                         crate::outcome::CancelKind::User,
                         Some("cancel queued mutex waiter"),
@@ -13642,10 +13528,7 @@ mod tests {
                     let waker = futures::task::noop_waker();
                     let mut task_cx = std::task::Context::from_waker(&waker);
 
-                    assert!(matches!(
-                        waiter.as_mut().poll(&mut task_cx),
-                        Poll::Pending
-                    ));
+                    assert!(matches!(waiter.as_mut().poll(&mut task_cx), Poll::Pending));
                     waiter_cx.cancel_with(
                         crate::outcome::CancelKind::User,
                         Some("cancel queued rwlock reader"),
@@ -13730,10 +13613,7 @@ mod tests {
                     let waker = futures::task::noop_waker();
                     let mut task_cx = std::task::Context::from_waker(&waker);
 
-                    assert!(matches!(
-                        waiter.as_mut().poll(&mut task_cx),
-                        Poll::Pending
-                    ));
+                    assert!(matches!(waiter.as_mut().poll(&mut task_cx), Poll::Pending));
                     waiter_cx.cancel_with(
                         crate::outcome::CancelKind::User,
                         Some("cancel queued rwlock writer"),
@@ -13999,10 +13879,7 @@ mod tests {
             "lock capability context failed"
         );
         assert_eq!(
-            LockAcquireError::TimedOut {
-                deadline_nanos: 42,
-            }
-            .to_string(),
+            LockAcquireError::TimedOut { deadline_nanos: 42 }.to_string(),
             "lock acquisition timed out at 42ns"
         );
         assert_eq!(
@@ -14019,10 +13896,7 @@ mod tests {
             (CancelKind::User, LockAcquireError::Cancelled),
             (CancelKind::Timeout, LockAcquireError::DeadlineExceeded),
             (CancelKind::Deadline, LockAcquireError::DeadlineExceeded),
-            (
-                CancelKind::PollQuota,
-                LockAcquireError::PollQuotaExhausted,
-            ),
+            (CancelKind::PollQuota, LockAcquireError::PollQuotaExhausted),
             (
                 CancelKind::CostBudget,
                 LockAcquireError::CostBudgetExhausted,
@@ -14030,10 +13904,7 @@ mod tests {
             (CancelKind::FailFast, LockAcquireError::Cancelled),
             (CancelKind::RaceLost, LockAcquireError::Cancelled),
             (CancelKind::ParentCancelled, LockAcquireError::Cancelled),
-            (
-                CancelKind::ResourceUnavailable,
-                LockAcquireError::Cancelled,
-            ),
+            (CancelKind::ResourceUnavailable, LockAcquireError::Cancelled),
             (CancelKind::Shutdown, LockAcquireError::Cancelled),
             (CancelKind::LinkedExit, LockAcquireError::Cancelled),
         ];

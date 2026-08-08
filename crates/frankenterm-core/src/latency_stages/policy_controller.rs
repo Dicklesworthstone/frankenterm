@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use super::HitchRiskLevel;
 
+// Four weighted loss terms plus later subtraction/hysteresis arithmetic must
+// remain finite even when configuration arrives from an untrusted serializer.
+const MAX_SAFE_LOSS: f64 = f64::MAX / 16.0;
+
 // ── D3: Expected-Loss Policy Controller ────────────────────────────
 
 /// Actions the policy controller can select.
@@ -119,6 +123,8 @@ pub struct PolicyDecision {
     pub all_losses: [f64; 4],
     /// Whether hysteresis suppressed a switch.
     pub hysteresis_applied: bool,
+    /// Whether the configured action-change rate limit suppressed a switch.
+    pub rate_limit_applied: bool,
     /// Timestamp in microseconds.
     pub timestamp_us: u64,
 }
@@ -136,6 +142,8 @@ pub struct PolicyControllerSnapshot {
     pub last_expected_loss: f64,
     /// Number of times hysteresis suppressed a switch.
     pub hysteresis_count: u64,
+    /// Number of times the action-change rate guard suppressed a switch.
+    pub rate_limit_count: u64,
 }
 
 /// The expected-loss policy controller.
@@ -156,17 +164,48 @@ pub struct PolicyController {
     last_expected_loss: f64,
     /// Count of hysteresis suppressions.
     hysteresis_count: u64,
+    /// Count of action-change rate-limit suppressions.
+    rate_limit_count: u64,
     /// Recent decisions (ring buffer).
     decisions: Vec<PolicyDecision>,
     max_decisions: usize,
     decision_head: usize,
-    /// Last decision timestamp for rate limiting.
-    last_decision_us: u64,
+    /// Timestamp of the last action change for rate limiting.
+    last_change_us: Option<u64>,
 }
 
 impl PolicyController {
     /// Create a new controller.
-    pub fn new(config: PolicyControllerConfig) -> Self {
+    pub fn new(mut config: PolicyControllerConfig) -> Self {
+        let defaults = PolicyControllerConfig::default_asymmetric();
+        if config.loss_matrix.len() != 16 {
+            config.loss_matrix = defaults.loss_matrix.clone();
+        } else {
+            for (index, loss) in config.loss_matrix.iter_mut().enumerate() {
+                if !loss.is_finite() || *loss < 0.0 {
+                    *loss = defaults.loss_matrix[index];
+                } else {
+                    *loss = loss.min(MAX_SAFE_LOSS);
+                }
+            }
+        }
+        config.critical_floor = if config.critical_floor.is_finite() {
+            config.critical_floor.clamp(0.0, 1.0)
+        } else {
+            defaults.critical_floor
+        };
+        config.max_change_rate_hz =
+            if config.max_change_rate_hz.is_finite() && config.max_change_rate_hz >= 0.0 {
+                config.max_change_rate_hz
+            } else {
+                defaults.max_change_rate_hz
+            };
+        config.hysteresis = if config.hysteresis.is_finite() {
+            config.hysteresis.max(0.0)
+        } else {
+            defaults.hysteresis
+        };
+
         Self {
             config,
             current_action: PolicyAction::Hold,
@@ -174,10 +213,11 @@ impl PolicyController {
             action_counts: [0; 4],
             last_expected_loss: 0.0,
             hysteresis_count: 0,
+            rate_limit_count: 0,
             decisions: Vec::with_capacity(64),
             max_decisions: 100,
             decision_head: 0,
-            last_decision_us: 0,
+            last_change_us: None,
         }
     }
 
@@ -191,27 +231,50 @@ impl PolicyController {
     /// `probs` = [P(Healthy), P(Drifting), P(Stressed), P(Critical)]
     /// Must sum to ~1.0 (renormalized internally).
     pub fn decide(&mut self, probs: [f64; 4], timestamp_us: u64) -> PolicyAction {
-        // Apply critical floor
-        let mut p = probs;
-        if p[3] < self.config.critical_floor {
-            let deficit = self.config.critical_floor - p[3];
-            p[3] = self.config.critical_floor;
-            // Redistribute deficit proportionally from other states
-            let other_sum: f64 = p[0] + p[1] + p[2];
-            if other_sum > 1e-12 {
-                let scale = (other_sum - deficit) / other_sum;
-                p[0] *= scale;
-                p[1] *= scale;
-                p[2] *= scale;
+        // Negative and non-finite values are not probabilities. Clamp them at
+        // the boundary so a malformed telemetry/config payload cannot inject
+        // NaNs into every expected loss or steer the minimum search by accident.
+        let mut p = probs.map(|value| {
+            if value.is_finite() {
+                value.max(0.0)
+            } else {
+                0.0
+            }
+        });
+
+        // Normalize using the largest component first. Summing several finite
+        // `f64::MAX` inputs directly would overflow to infinity and turn every
+        // normalized component into zero.
+        let largest = p.iter().copied().fold(0.0_f64, f64::max);
+        if largest == 0.0 {
+            // An entirely unusable posterior fails safe to Critical rather
+            // than making every expected loss zero and silently selecting Hold.
+            p[3] = 1.0;
+        } else {
+            for probability in &mut p {
+                *probability /= largest;
+            }
+            let scaled_total: f64 = p.iter().sum();
+            for probability in &mut p {
+                *probability /= scaled_total;
             }
         }
 
-        // Renormalize
-        let total: f64 = p.iter().sum();
-        if total > 1e-12 {
-            for pi in &mut p {
-                *pi /= total;
+        // Apply the floor after normalization so non-unit caller input cannot
+        // dilute the safety floor back below its configured minimum.
+        if p[3] < self.config.critical_floor {
+            let other_sum: f64 = p[0] + p[1] + p[2];
+            if other_sum > 1e-12 {
+                let scale = (1.0 - self.config.critical_floor) / other_sum;
+                p[0] *= scale;
+                p[1] *= scale;
+                p[2] *= scale;
+            } else {
+                p[0] = 0.0;
+                p[1] = 0.0;
+                p[2] = 0.0;
             }
+            p[3] = self.config.critical_floor;
         }
 
         // Compute expected loss for each action
@@ -253,10 +316,20 @@ impl PolicyController {
         let hysteresis_applied = best_action != self.current_action
             && improvement < self.config.hysteresis * current_loss;
 
+        let rate_limit_applied = !hysteresis_applied
+            && best_action != self.current_action
+            && self.change_rate_guard_blocks(timestamp_us);
+
         let chosen = if hysteresis_applied {
-            self.hysteresis_count += 1;
+            self.hysteresis_count = self.hysteresis_count.saturating_add(1);
+            self.current_action
+        } else if rate_limit_applied {
+            self.rate_limit_count = self.rate_limit_count.saturating_add(1);
             self.current_action
         } else {
+            if best_action != self.current_action {
+                self.last_change_us = Some(timestamp_us);
+            }
             self.current_action = best_action;
             best_action
         };
@@ -269,22 +342,22 @@ impl PolicyController {
         }];
 
         // Record
-        self.total_decisions += 1;
+        self.total_decisions = self.total_decisions.saturating_add(1);
         self.last_expected_loss = chosen_loss;
-        self.action_counts[match chosen {
+        let action_count = &mut self.action_counts[match chosen {
             PolicyAction::Hold => 0,
             PolicyAction::Tighten => 1,
             PolicyAction::Relax => 2,
             PolicyAction::Shed => 3,
-        }] += 1;
-        self.last_decision_us = timestamp_us;
-
+        }];
+        *action_count = action_count.saturating_add(1);
         let decision = PolicyDecision {
             action: chosen,
             expected_loss: chosen_loss,
             state_probs: p,
             all_losses,
             hysteresis_applied,
+            rate_limit_applied,
             timestamp_us,
         };
         if self.decisions.len() < self.max_decisions {
@@ -315,17 +388,19 @@ impl PolicyController {
             action_counts: self.action_counts,
             last_expected_loss: self.last_expected_loss,
             hysteresis_count: self.hysteresis_count,
+            rate_limit_count: self.rate_limit_count,
         }
     }
 
     /// Human-readable status line.
     pub fn status_line(&self) -> String {
         format!(
-            "policy[{}] decisions={} loss={:.3} hyst={}",
+            "policy[{}] decisions={} loss={:.3} hyst={} rate_limited={}",
             self.current_action,
             self.total_decisions,
             self.last_expected_loss,
             self.hysteresis_count,
+            self.rate_limit_count,
         )
     }
 
@@ -336,9 +411,10 @@ impl PolicyController {
         self.action_counts = [0; 4];
         self.last_expected_loss = 0.0;
         self.hysteresis_count = 0;
+        self.rate_limit_count = 0;
         self.decisions.clear();
         self.decision_head = 0;
-        self.last_decision_us = 0;
+        self.last_change_us = None;
     }
 
     /// Recent decisions.
@@ -385,6 +461,7 @@ impl PolicyController {
             action_counts: self.action_counts,
             last_expected_loss: self.last_expected_loss,
             hysteresis_count: self.hysteresis_count,
+            rate_limit_count: self.rate_limit_count,
             degradation: self.detect_degradation(),
         }
     }
@@ -410,10 +487,13 @@ impl PolicyController {
 
     /// Action distribution as fractions [hold, tighten, relax, shed].
     pub fn action_distribution(&self) -> [f64; 4] {
-        if self.total_decisions == 0 {
+        let total = self
+            .action_counts
+            .iter()
+            .fold(0.0, |sum, &count| sum + count as f64);
+        if total == 0.0 {
             return [0.0; 4];
         }
-        let total = self.total_decisions as f64;
         [
             self.action_counts[0] as f64 / total,
             self.action_counts[1] as f64 / total,
@@ -432,6 +512,11 @@ impl PolicyController {
         self.hysteresis_count
     }
 
+    /// Count of action switches suppressed by the rate guard.
+    pub fn rate_limit_count(&self) -> u64 {
+        self.rate_limit_count
+    }
+
     /// Last expected loss.
     pub fn last_expected_loss(&self) -> f64 {
         self.last_expected_loss
@@ -439,26 +524,45 @@ impl PolicyController {
 
     /// Update the hysteresis threshold.
     pub fn set_hysteresis(&mut self, h: f64) {
-        self.config.hysteresis = h;
+        if h.is_finite() {
+            self.config.hysteresis = h.max(0.0);
+        }
     }
 
     /// Update the critical floor.
     pub fn set_critical_floor(&mut self, floor: f64) {
-        self.config.critical_floor = floor;
+        if floor.is_finite() {
+            self.config.critical_floor = floor.clamp(0.0, 1.0);
+        }
     }
 
     /// Update a single loss matrix entry.
     /// `state_idx` in 0..4 (Healthy/Drifting/Stressed/Critical),
     /// `action_idx` in 0..4 (Hold/Tighten/Relax/Shed).
     pub fn set_loss(&mut self, state_idx: usize, action_idx: usize, loss: f64) {
-        if state_idx < 4 && action_idx < 4 {
-            self.config.loss_matrix[state_idx * 4 + action_idx] = loss;
+        if state_idx < 4 && action_idx < 4 && loss.is_finite() && loss >= 0.0 {
+            self.config.loss_matrix[state_idx * 4 + action_idx] = loss.min(MAX_SAFE_LOSS);
         }
     }
 
     /// Number of stored decisions.
     pub fn decision_count(&self) -> usize {
         self.decisions.len()
+    }
+
+    fn change_rate_guard_blocks(&self, timestamp_us: u64) -> bool {
+        let Some(last_change_us) = self.last_change_us else {
+            return false;
+        };
+        if self.config.max_change_rate_hz == 0.0 {
+            return true;
+        }
+        let minimum_interval_us = (1_000_000.0 / self.config.max_change_rate_hz)
+            .ceil()
+            .clamp(1.0, u64::MAX as f64) as u64;
+        timestamp_us
+            .checked_sub(last_change_us)
+            .is_none_or(|elapsed| elapsed < minimum_interval_us)
     }
 }
 
@@ -503,5 +607,122 @@ pub struct PolicyControllerLogEntry {
     pub action_counts: [u64; 4],
     pub last_expected_loss: f64,
     pub hysteresis_count: u64,
+    pub rate_limit_count: u64,
     pub degradation: PolicyDegradation,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_distribution_and_counters_handle_saturation() {
+        let mut controller = PolicyController::with_defaults();
+        controller.set_hysteresis(2.0);
+        controller.total_decisions = u64::MAX - 1;
+        controller.hysteresis_count = u64::MAX - 1;
+        controller.action_counts = [u64::MAX; 4];
+
+        let action = controller.decide([0.0, 0.0, 0.0, 1.0], 1);
+
+        assert_eq!(action, PolicyAction::Hold);
+        assert_eq!(controller.total_decisions, u64::MAX);
+        assert_eq!(controller.hysteresis_count, u64::MAX);
+        assert_eq!(controller.action_counts, [u64::MAX; 4]);
+        assert_eq!(controller.action_distribution(), [0.25; 4]);
+    }
+
+    #[test]
+    fn malformed_config_and_posterior_fail_safe_without_panicking() {
+        let mut controller = PolicyController::new(PolicyControllerConfig {
+            loss_matrix: vec![f64::NAN],
+            critical_floor: f64::INFINITY,
+            max_change_rate_hz: f64::NAN,
+            hysteresis: f64::NEG_INFINITY,
+        });
+
+        let action = controller.decide([f64::NAN, f64::NEG_INFINITY, -1.0, f64::INFINITY], 1);
+
+        assert_eq!(action, PolicyAction::Shed);
+        let decision = controller
+            .recent_decisions(1)
+            .into_iter()
+            .next()
+            .expect("the fail-safe decision is retained");
+        assert_eq!(decision.state_probs, [0.0, 0.0, 0.0, 1.0]);
+        assert!(decision.all_losses.iter().all(|loss| loss.is_finite()));
+    }
+
+    #[test]
+    fn critical_floor_survives_unnormalized_large_input() {
+        let mut controller = PolicyController::with_defaults();
+
+        let _ = controller.decide([100.0, 0.0, 0.0, 0.0], 1);
+
+        let decision = controller
+            .recent_decisions(1)
+            .into_iter()
+            .next()
+            .expect("decision is retained");
+        assert!(decision.state_probs[3] >= controller.config.critical_floor);
+        assert!((decision.state_probs.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn finite_extreme_losses_cannot_overflow_expected_loss() {
+        let mut controller = PolicyController::new(PolicyControllerConfig {
+            loss_matrix: vec![f64::MAX; 16],
+            ..PolicyControllerConfig::default_asymmetric()
+        });
+
+        let _ = controller.decide([f64::MAX; 4], 1);
+
+        let decision = controller
+            .recent_decisions(1)
+            .into_iter()
+            .next()
+            .expect("decision is retained");
+        assert!(decision.all_losses.iter().all(|loss| loss.is_finite()));
+        assert!(decision.expected_loss.is_finite());
+    }
+
+    #[test]
+    fn action_change_rate_guard_suppresses_fast_switch_and_allows_later_switch() {
+        let mut controller = PolicyController::with_defaults();
+        assert_eq!(
+            controller.decide([0.0, 0.0, 0.0, 1.0], 100),
+            PolicyAction::Shed
+        );
+        assert_eq!(
+            controller.decide([1.0, 0.0, 0.0, 0.0], 200),
+            PolicyAction::Shed
+        );
+        assert!(
+            controller
+                .recent_decisions(1)
+                .first()
+                .is_some_and(|decision| decision.rate_limit_applied)
+        );
+        assert_eq!(controller.rate_limit_count(), 1);
+
+        assert_eq!(
+            controller.decide([1.0, 0.0, 0.0, 0.0], 500_100),
+            PolicyAction::Hold
+        );
+        assert_eq!(controller.rate_limit_count(), 1);
+    }
+
+    #[test]
+    fn backwards_timestamp_cannot_bypass_action_change_rate_guard() {
+        let mut controller = PolicyController::with_defaults();
+        assert_eq!(
+            controller.decide([0.0, 0.0, 0.0, 1.0], 1_000),
+            PolicyAction::Shed
+        );
+        assert_eq!(
+            controller.decide([1.0, 0.0, 0.0, 0.0], 999),
+            PolicyAction::Shed
+        );
+        assert_eq!(controller.rate_limit_count(), 1);
+    }
 }

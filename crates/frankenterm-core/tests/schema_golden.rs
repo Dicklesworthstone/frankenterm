@@ -47,10 +47,10 @@ use frankenterm_core::runtime_telemetry::{
     SwarmResourceCockpitQueueBackpressureSummary, SwarmResourceCockpitResidencyBucket,
     SwarmResourceCockpitRunIdentity, SwarmResourceCockpitSnapshot, SwarmTailRiskStatus,
 };
+use frankenterm_core::storage::SCHEMA_VERSION;
 use frankenterm_core::storage::io_scheduler::{
     StorageIoClass, StorageIoDominantClassSummary, StorageIoOperatorSummary, StorageIoPressureTier,
 };
-use frankenterm_core::storage::SCHEMA_VERSION;
 use frankenterm_core::swarm_scheduler::{
     AdmissionAction, AdmissionDecisionCounters, AdmissionReasonCode,
     ResourceAdmissionDecisionSummary,
@@ -150,10 +150,7 @@ fn assert_schema_accepts(label: &str, validator: &Validator, value: &Value) {
             .map(|error| format!("{}: {}", error.instance_path(), error))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            false,
-            "{label} did not match schema:\n{messages}"
-        );
+        assert!(false, "{label} did not match schema:\n{messages}");
     }
 }
 
@@ -1592,9 +1589,7 @@ fn event_stream_schema_covers_every_closed_record_family() {
 
     let mut extra_field = records
         .iter()
-        .find(|record| {
-            record["type"].as_str() == Some("event") && record["id"].as_i64() == Some(7)
-        })
+        .find(|record| record["type"].as_str() == Some("event") && record["id"].as_i64() == Some(7))
         .expect("ordinary event fixture")
         .clone();
     extra_field["surprise"] = json!(true);

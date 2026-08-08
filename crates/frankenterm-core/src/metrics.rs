@@ -497,12 +497,9 @@ impl MetricsConnectionTestProbe {
     where
         F: FnMut() -> bool,
     {
-        crate::runtime_async::timeout(
-            Duration::from_secs(5),
-            self.changed.wait_until(predicate),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("timed out waiting for {description}: {error}"));
+        crate::runtime_async::timeout(Duration::from_secs(5), self.changed.wait_until(predicate))
+            .await
+            .unwrap_or_else(|error| panic!("timed out waiting for {description}: {error}"));
     }
 }
 
@@ -630,10 +627,8 @@ fn classify_metrics_connection_task_drain(
     match settlement {
         JoinSetSettlement::Settled => first_non_benign_failure.map_or(
             MetricsConnectionTaskDrainOutcome::Settled,
-            |first_non_benign_failure| {
-                MetricsConnectionTaskDrainOutcome::SettledWithFailure {
-                    first_non_benign_failure,
-                }
+            |first_non_benign_failure| MetricsConnectionTaskDrainOutcome::SettledWithFailure {
+                first_non_benign_failure,
             },
         ),
         JoinSetSettlement::Incomplete {
@@ -851,8 +846,7 @@ impl MetricsServer {
             // admission budget. Each connection also carries an I/O deadline
             // below, but the semaphore is the fail-fast bound while those
             // deadlines are pending.
-            let connection_permits =
-                Arc::new(Semaphore::new(METRICS_MAX_CONCURRENT_CONNECTIONS));
+            let connection_permits = Arc::new(Semaphore::new(METRICS_MAX_CONCURRENT_CONNECTIONS));
             let mut connection_capacity_waits = 0_u64;
             let mut accept_error_backoff = MetricsRetryBackoff::new();
             let mut spawn_capacity_backoff = MetricsRetryBackoff::new();
@@ -876,59 +870,52 @@ impl MetricsServer {
                 // loop on the runtime thread. The contended path wakes as soon
                 // as a permit is released and polls shutdown at most every
                 // accept interval.
-                let connection_permit =
-                    match Arc::clone(&connection_permits).try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(TryAcquireError::NoPermits) => {
-                            connection_capacity_waits =
-                                connection_capacity_waits.saturating_add(1);
-                            #[cfg(all(test, feature = "metrics"))]
-                            if let Some(probe) = connection_test_probe.as_ref() {
-                                probe.record_capacity_wait();
-                            }
-                            if connection_capacity_waits.is_power_of_two() {
-                                warn!(
-                                    connection_capacity_waits,
-                                    max_connections = METRICS_MAX_CONCURRENT_CONNECTIONS,
-                                    "Metrics listener waiting for bounded connection capacity"
-                                );
-                            }
-                            let shutdown_wait =
-                                std::pin::pin!(task_shutdown_notify.wait_until(|| {
-                                    shutdown_flag.load(Ordering::SeqCst)
-                                }));
-                            let capacity_wait = std::pin::pin!(
-                                crate::runtime_async::timeout_with_cx(
-                                    &accept_cx,
-                                    accept_poll_interval,
-                                    Arc::clone(&connection_permits)
-                                        .acquire_owned_with_cx(&accept_cx),
-                                )
-                            );
-                            match select(shutdown_wait, capacity_wait).await {
-                                Either::Left(((), _)) => break,
-                                Either::Right((Ok(Ok(permit)), _)) => permit,
-                                Either::Right((Ok(Err(AcquireError::Closed)), _)) => {
-                                    warn!(
-                                        "Metrics connection admission semaphore closed; stopping listener"
-                                    );
-                                    break;
-                                }
-                                Either::Right((Ok(Err(_)), _)) => break,
-                                Either::Right((Err(_), _)) => continue,
-                            }
+                let connection_permit = match Arc::clone(&connection_permits).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(TryAcquireError::NoPermits) => {
+                        connection_capacity_waits = connection_capacity_waits.saturating_add(1);
+                        #[cfg(all(test, feature = "metrics"))]
+                        if let Some(probe) = connection_test_probe.as_ref() {
+                            probe.record_capacity_wait();
                         }
-                        Err(TryAcquireError::Closed) => {
+                        if connection_capacity_waits.is_power_of_two() {
                             warn!(
-                                "Metrics connection admission semaphore closed; stopping listener"
+                                connection_capacity_waits,
+                                max_connections = METRICS_MAX_CONCURRENT_CONNECTIONS,
+                                "Metrics listener waiting for bounded connection capacity"
                             );
-                            break;
                         }
-                    };
+                        let shutdown_wait = std::pin::pin!(
+                            task_shutdown_notify
+                                .wait_until(|| { shutdown_flag.load(Ordering::SeqCst) })
+                        );
+                        let capacity_wait = std::pin::pin!(crate::runtime_async::timeout_with_cx(
+                            &accept_cx,
+                            accept_poll_interval,
+                            Arc::clone(&connection_permits).acquire_owned_with_cx(&accept_cx),
+                        ));
+                        match select(shutdown_wait, capacity_wait).await {
+                            Either::Left(((), _)) => break,
+                            Either::Right((Ok(Ok(permit)), _)) => permit,
+                            Either::Right((Ok(Err(AcquireError::Closed)), _)) => {
+                                warn!(
+                                    "Metrics connection admission semaphore closed; stopping listener"
+                                );
+                                break;
+                            }
+                            Either::Right((Ok(Err(_)), _)) => break,
+                            Either::Right((Err(_), _)) => continue,
+                        }
+                    }
+                    Err(TryAcquireError::Closed) => {
+                        warn!("Metrics connection admission semaphore closed; stopping listener");
+                        break;
+                    }
+                };
 
-                let shutdown_wait = std::pin::pin!(task_shutdown_notify.wait_until(|| {
-                    shutdown_flag.load(Ordering::SeqCst)
-                }));
+                let shutdown_wait = std::pin::pin!(
+                    task_shutdown_notify.wait_until(|| { shutdown_flag.load(Ordering::SeqCst) })
+                );
                 let accept_wait = std::pin::pin!(crate::runtime_async::timeout_with_cx(
                     &accept_cx,
                     accept_poll_interval,
@@ -942,9 +929,7 @@ impl MetricsServer {
                 match accept_result {
                     Ok(Ok((socket, peer))) => {
                         accept_error_backoff.reset();
-                        if shutdown_flag.load(Ordering::SeqCst)
-                            || accept_cx.checkpoint().is_err()
-                        {
+                        if shutdown_flag.load(Ordering::SeqCst) || accept_cx.checkpoint().is_err() {
                             drop(socket);
                             break;
                         }
@@ -959,15 +944,14 @@ impl MetricsServer {
                                 #[cfg(all(test, feature = "metrics"))]
                                 let _connection_test_guard =
                                     task_test_probe.map(|probe| probe.task_started());
-                                if let Err(err) =
-                                    Box::pin(handle_connection_with_cx(
-                                        &conn_cx,
-                                        socket,
-                                        &prefix,
-                                        collector,
-                                        connection_io_timeout,
-                                    ))
-                                    .await
+                                if let Err(err) = Box::pin(handle_connection_with_cx(
+                                    &conn_cx,
+                                    socket,
+                                    &prefix,
+                                    collector,
+                                    connection_io_timeout,
+                                ))
+                                .await
                                 {
                                     debug!(error = %err, peer = %peer, "Metrics connection failed");
                                 }
@@ -988,15 +972,13 @@ impl MetricsServer {
                                         "Metrics connection task region is at capacity; applying bounded retry backoff"
                                     );
                                 }
-                                let shutdown_wait =
-                                    std::pin::pin!(task_shutdown_notify.wait_until(|| {
-                                        shutdown_flag.load(Ordering::SeqCst)
-                                    }));
-                                let retry_wait =
-                                    std::pin::pin!(crate::runtime_async::sleep_with_cx(
-                                        &accept_cx,
-                                        retry_delay,
-                                    ));
+                                let shutdown_wait = std::pin::pin!(
+                                    task_shutdown_notify
+                                        .wait_until(|| { shutdown_flag.load(Ordering::SeqCst) })
+                                );
+                                let retry_wait = std::pin::pin!(
+                                    crate::runtime_async::sleep_with_cx(&accept_cx, retry_delay,)
+                                );
                                 match select(shutdown_wait, retry_wait).await {
                                     Either::Left(((), _)) | Either::Right((Err(_), _)) => break,
                                     Either::Right((Ok(()), _)) => {}
@@ -1034,9 +1016,10 @@ impl MetricsServer {
                                 "Metrics listener accept failed; applying bounded retry backoff"
                             );
                         }
-                        let shutdown_wait = std::pin::pin!(task_shutdown_notify.wait_until(|| {
-                            shutdown_flag.load(Ordering::SeqCst)
-                        }));
+                        let shutdown_wait = std::pin::pin!(
+                            task_shutdown_notify
+                                .wait_until(|| { shutdown_flag.load(Ordering::SeqCst) })
+                        );
                         let retry_wait = std::pin::pin!(crate::runtime_async::sleep_with_cx(
                             &accept_cx,
                             retry_delay,
@@ -1554,10 +1537,7 @@ mod pure_tests {
             std::io::ErrorKind::Other,
         ] {
             let error = std::io::Error::new(kind, "retryable accept failure");
-            assert!(
-                !metrics_accept_error_is_permanent(&error),
-                "kind={kind:?}"
-            );
+            assert!(!metrics_accept_error_is_permanent(&error), "kind={kind:?}");
         }
     }
 
@@ -1674,14 +1654,12 @@ mod pure_tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let probe = DropProbe(Arc::clone(&dropped));
         let cx = crate::cx::for_testing();
-        let spawn_result = crate::runtime_async::task::try_spawn_with_cx(
-            &cx,
-            move |_connection_cx| async move {
+        let spawn_result =
+            crate::runtime_async::task::try_spawn_with_cx(&cx, move |_connection_cx| async move {
                 let _connection_permit = connection_permit;
                 let _probe = probe;
                 std::future::pending::<()>().await;
-            },
-        );
+            });
         let rejected = matches!(
             spawn_result,
             Err(crate::runtime_async::task::SpawnError::RuntimeUnavailable)
@@ -1773,8 +1751,7 @@ mod pure_tests {
 
         let cases = [
             (
-                crate::cx::Budget::new()
-                    .with_deadline(crate::runtime_async::RuntimeTime::ZERO),
+                crate::cx::Budget::new().with_deadline(crate::runtime_async::RuntimeTime::ZERO),
                 RuntimeOperationSource::DeadlineExceeded,
             ),
             (
@@ -2638,14 +2615,10 @@ mod tests {
             let shutdown_flag = Arc::new(AtomicBool::new(false));
             let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
             let probe = Arc::new(MetricsConnectionTestProbe::new());
-            let server = MetricsServer::new(
-                "127.0.0.1:0",
-                "wa",
-                collector,
-                Arc::clone(&shutdown_flag),
-            )
-            .with_connection_test_probe(Arc::clone(&probe))
-            .with_connection_io_timeout_for_test(Duration::from_secs(30));
+            let server =
+                MetricsServer::new("127.0.0.1:0", "wa", collector, Arc::clone(&shutdown_flag))
+                    .with_connection_test_probe(Arc::clone(&probe))
+                    .with_connection_io_timeout_for_test(Duration::from_secs(30));
             let handle = server.start().await.expect("start bounded metrics server");
 
             let mut stalled_clients = Vec::with_capacity(METRICS_MAX_CONCURRENT_CONNECTIONS);
@@ -2689,9 +2662,10 @@ mod tests {
             assert!(String::from_utf8_lossy(&released_response).contains("200 OK"));
 
             probe
-                .wait_until("waiting metrics client admission after permit release", || {
-                    probe.total_admitted_tasks() == METRICS_MAX_CONCURRENT_CONNECTIONS + 1
-                })
+                .wait_until(
+                    "waiting metrics client admission after permit release",
+                    || probe.total_admitted_tasks() == METRICS_MAX_CONCURRENT_CONNECTIONS + 1,
+                )
                 .await;
             let waiting_response = read_metrics_test_response(&mut waiting_client).await;
             assert!(String::from_utf8_lossy(&waiting_response).contains("200 OK"));
@@ -2711,14 +2685,10 @@ mod tests {
             let shutdown_flag = Arc::new(AtomicBool::new(false));
             let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
             let probe = Arc::new(MetricsConnectionTestProbe::new());
-            let server = MetricsServer::new(
-                "127.0.0.1:0",
-                "wa",
-                collector,
-                Arc::clone(&shutdown_flag),
-            )
-            .with_connection_test_probe(Arc::clone(&probe))
-            .with_connection_io_timeout_for_test(Duration::from_secs(30));
+            let server =
+                MetricsServer::new("127.0.0.1:0", "wa", collector, Arc::clone(&shutdown_flag))
+                    .with_connection_test_probe(Arc::clone(&probe))
+                    .with_connection_io_timeout_for_test(Duration::from_secs(30));
             let handle = server.start().await.expect("start bounded metrics server");
 
             let mut stalled_clients = Vec::with_capacity(METRICS_MAX_CONCURRENT_CONNECTIONS);
@@ -2755,14 +2725,10 @@ mod tests {
             let shutdown_flag = Arc::new(AtomicBool::new(false));
             let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
             let probe = Arc::new(MetricsConnectionTestProbe::new());
-            let server = MetricsServer::new(
-                "127.0.0.1:0",
-                "wa",
-                collector,
-                Arc::clone(&shutdown_flag),
-            )
-            .with_connection_test_probe(Arc::clone(&probe))
-            .with_connection_io_timeout_for_test(Duration::from_millis(25));
+            let server =
+                MetricsServer::new("127.0.0.1:0", "wa", collector, Arc::clone(&shutdown_flag))
+                    .with_connection_test_probe(Arc::clone(&probe))
+                    .with_connection_io_timeout_for_test(Duration::from_millis(25));
             let handle = server.start().await.expect("start timeout metrics server");
 
             let mut silent_client = TcpStream::connect(handle.local_addr())

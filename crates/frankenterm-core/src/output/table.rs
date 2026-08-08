@@ -19,9 +19,9 @@ pub(super) const MAX_BYTES_PER_DISPLAY_CELL: usize = 256;
 // nested controls, and unterminated styling can never be re-emitted merely
 // because the visible text happened to fit its column.
 const SAFE_STYLE_PREFIXES: &[&str] = &[
-    "\x1b[1m", "\x1b[2m", "\x1b[3m", "\x1b[4m", "\x1b[31m", "\x1b[32m", "\x1b[33m",
-    "\x1b[34m", "\x1b[35m", "\x1b[36m", "\x1b[37m", "\x1b[90m", "\x1b[91m",
-    "\x1b[92m", "\x1b[93m", "\x1b[94m", "\x1b[96m",
+    "\x1b[1m", "\x1b[2m", "\x1b[3m", "\x1b[4m", "\x1b[31m", "\x1b[32m", "\x1b[33m", "\x1b[34m",
+    "\x1b[35m", "\x1b[36m", "\x1b[37m", "\x1b[90m", "\x1b[91m", "\x1b[92m", "\x1b[93m", "\x1b[94m",
+    "\x1b[96m",
 ];
 const SAFE_STYLE_RESET: &str = "\x1b[0m";
 
@@ -747,7 +747,10 @@ mod tests {
             "padding must use terminal-cell width rather than UTF-8 bytes"
         );
         assert_eq!(Table::format_cell("表ab", 3, Alignment::Left), "表a");
-        assert_eq!(visible_width(&Table::format_cell("表ab", 3, Alignment::Left)), 3);
+        assert_eq!(
+            visible_width(&Table::format_cell("表ab", 3, Alignment::Left)),
+            3
+        );
 
         let combining_spam = "\u{0301}".repeat(1_024);
         assert_eq!(
@@ -795,7 +798,11 @@ mod tests {
             "unterminated styling must not leak into following output"
         );
         assert_eq!(
-            Table::format_cell("\x1b[32msafe\x1b]8;;https://example.invalid\x07x\x1b[0m", 8, Alignment::Left),
+            Table::format_cell(
+                "\x1b[32msafe\x1b]8;;https://example.invalid\x07x\x1b[0m",
+                8,
+                Alignment::Left
+            ),
             "safex   ",
             "a safe-looking outer wrapper must not bless nested controls"
         );

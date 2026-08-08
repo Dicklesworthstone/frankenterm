@@ -329,7 +329,10 @@ fn idempotency_replay_returns_the_original_receipt() {
     assert!(is_valid_submit_key(original_binding.key()));
 
     // Unrecorded key -> None.
-    assert_eq!(lookup(ft_dir.path(), &original_binding).expect("lookup"), None);
+    assert_eq!(
+        lookup(ft_dir.path(), &original_binding).expect("lookup"),
+        None
+    );
 
     // Claim and complete a submitted receipt, then replay -> the original is
     // returned verbatim without granting a second owner.
@@ -368,7 +371,7 @@ fn idempotency_replay_returns_the_original_receipt() {
         Some(StoredSubmitState::Completed(queued))
     );
     assert_eq!(
-        lookup(ft_dir.path(), &binding).expect("lookup"),
+        lookup(ft_dir.path(), &original_binding).expect("lookup"),
         Some(StoredSubmitState::Completed(original))
     );
 }

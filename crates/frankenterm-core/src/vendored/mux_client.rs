@@ -15,16 +15,16 @@ use crate::protocol_recovery::{
 };
 #[cfg(test)]
 use crate::runtime_async::mpsc_reserve_send;
-#[cfg(test)]
-use crate::runtime_async::{task, timeout};
 use crate::runtime_async::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
 use crate::runtime_async::{io, mpsc, mpsc_try_reserve_send, watch};
+#[cfg(test)]
+use crate::runtime_async::{task, timeout};
 use codec::{
     AdjustPaneSize, CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompatDecision, CompressionMode,
-    CreateFloatingPane, CycleStack, DecodedPdu, GetCodecVersion, GetCodecVersionResponse,
-    GetLines, GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse, InputSerial,
-    GetSemanticZones, GetSemanticZonesResponse, ListPanes, ListPanesResponse, MoveFloatingPane,
-    Pdu, PduCapabilityUse, PduProducer, PduWireRole, RemoveFloatingPane, Resize, SelectStackPane,
+    CreateFloatingPane, CycleStack, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
+    GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse, GetSemanticZones,
+    GetSemanticZonesResponse, InputSerial, ListPanes, ListPanesResponse, MoveFloatingPane, Pdu,
+    PduCapabilityUse, PduProducer, PduWireRole, RemoveFloatingPane, Resize, SelectStackPane,
     SendPaste, SetClientId, SetFloatingPaneZ, SetLayoutCycle, SpawnResponse, SpawnV2, SplitPane,
     StreamingPduBuffer, SwapToLayout, ToggleFloatingPane, TopologyCapabilities, UnitResponse,
     UpdatePaneConstraints, WriteToPane,
@@ -182,9 +182,7 @@ pub enum DirectMuxError {
         max_count: usize,
         max_bytes: usize,
     },
-    #[error(
-        "response serial {serial} is not outstanding on direct mux connection {connection_id}"
-    )]
+    #[error("response serial {serial} is not outstanding on direct mux connection {connection_id}")]
     ResponseSerialNotOutstanding { connection_id: u64, serial: u64 },
     #[error(
         "retained mux state belongs to connection {got_connection_id}, not active connection \
@@ -235,9 +233,7 @@ pub enum DirectMuxError {
     },
     #[error("outbound PDU {pdu} is not client-produced")]
     OutboundPduDirectionViolation { pdu: &'static str },
-    #[error(
-        "outbound PDU {pdu} requires codec {required}, above negotiated codec {agreed}"
-    )]
+    #[error("outbound PDU {pdu} requires codec {required}, above negotiated codec {agreed}")]
     OutboundPduRequiresCodec {
         pdu: &'static str,
         agreed: usize,
@@ -343,8 +339,7 @@ impl DirectMuxError {
                 | Self::OutboundPduRequiresCodec { .. }
                 | Self::OutboundCapabilityNotNegotiated { .. }
                 | Self::ProvenPreWriteRejection(_)
-        )
-            || self.is_pre_transport_cancellation()
+        ) || self.is_pre_transport_cancellation()
     }
 
     /// Whether a typed cancellation was observed at a checkpoint that is
@@ -357,10 +352,7 @@ impl DirectMuxError {
         matches!(
             self,
             Self::Cancelled {
-                phase: "request_start"
-                    | "request_write_wait"
-                    | "batch_wait"
-                    | "render_batch_wait",
+                phase: "request_start" | "request_write_wait" | "batch_wait" | "render_batch_wait",
                 ..
             }
         )
@@ -552,11 +544,8 @@ impl RetainedRenderChange {
         payload: GetPaneRenderChangesResponse,
     ) -> Result<Self, DirectMuxError> {
         let pane_id = payload.pane_id as u64;
-        let pdu = RetainedMuxPdu::encode(
-            connection_id,
-            0,
-            Pdu::GetPaneRenderChangesResponse(payload),
-        )?;
+        let pdu =
+            RetainedMuxPdu::encode(connection_id, 0, Pdu::GetPaneRenderChangesResponse(payload))?;
         Ok(Self { pane_id, pdu })
     }
 
@@ -574,11 +563,9 @@ impl RetainedRenderChange {
             {
                 Ok(payload)
             }
-            Pdu::GetPaneRenderChangesResponse(_) => {
-                Err(DirectMuxError::RetainedStateAccounting {
-                    resource: "render-change pane identity",
-                })
-            }
+            Pdu::GetPaneRenderChangesResponse(_) => Err(DirectMuxError::RetainedStateAccounting {
+                resource: "render-change pane identity",
+            }),
             _ => Err(DirectMuxError::RetainedStateAccounting {
                 resource: "render-change retained PDU type",
             }),
@@ -769,11 +756,11 @@ impl PendingRenderChanges {
                         resource: Self::RESOURCE,
                     },
                 )?;
-                removed_bytes = removed_bytes
-                    .checked_add(retained.retained_bytes())
-                    .ok_or(DirectMuxError::RetainedStateAccounting {
+                removed_bytes = removed_bytes.checked_add(retained.retained_bytes()).ok_or(
+                    DirectMuxError::RetainedStateAccounting {
                         resource: Self::RESOURCE,
-                    })?;
+                    },
+                )?;
             }
         }
         let next = self
@@ -786,11 +773,7 @@ impl PendingRenderChanges {
         })
     }
 
-    fn commit_remove_panes(
-        &mut self,
-        pane_ids: &HashSet<u64>,
-        plan: RetainedRemovalPlan,
-    ) {
+    fn commit_remove_panes(&mut self, pane_ids: &HashSet<u64>, plan: RetainedRemovalPlan) {
         for pane_id in pane_ids {
             #[cfg(test)]
             {
@@ -931,16 +914,17 @@ impl RenderChangeSnapshots {
                     resource: Self::RESOURCE,
                 });
             }
-            removed_count = removed_count.checked_add(1).ok_or(
+            removed_count =
+                removed_count
+                    .checked_add(1)
+                    .ok_or(DirectMuxError::RetainedStateAccounting {
+                        resource: Self::RESOURCE,
+                    })?;
+            removed_bytes = removed_bytes.checked_add(retained.retained_bytes()).ok_or(
                 DirectMuxError::RetainedStateAccounting {
                     resource: Self::RESOURCE,
                 },
             )?;
-            removed_bytes = removed_bytes
-                .checked_add(retained.retained_bytes())
-                .ok_or(DirectMuxError::RetainedStateAccounting {
-                    resource: Self::RESOURCE,
-                })?;
         }
         let next = self
             .totals
@@ -952,11 +936,7 @@ impl RenderChangeSnapshots {
         })
     }
 
-    fn commit_remove_panes(
-        &mut self,
-        pane_ids: &HashSet<u64>,
-        plan: RetainedRemovalPlan,
-    ) {
+    fn commit_remove_panes(&mut self, pane_ids: &HashSet<u64>, plan: RetainedRemovalPlan) {
         for pane_id in pane_ids {
             #[cfg(test)]
             {
@@ -1211,11 +1191,13 @@ impl BatchLocalRenderSidebands {
             sideband.retained_frame_bytes,
             limit,
         )?;
-        let next_count = self.totals.count.checked_add(1).ok_or(
-            DirectMuxError::RetainedStateAccounting {
-                resource: Self::RESOURCE,
-            },
-        )?;
+        let next_count =
+            self.totals
+                .count
+                .checked_add(1)
+                .ok_or(DirectMuxError::RetainedStateAccounting {
+                    resource: Self::RESOURCE,
+                })?;
         let next_bytes = self
             .totals
             .bytes
@@ -1246,16 +1228,15 @@ impl BatchLocalRenderSidebands {
         else {
             return Ok(None);
         };
-        let (next_count, next_bytes) = self.totals.after_remove(
-            1,
-            retained_frame_bytes,
-            Self::RESOURCE,
-        )?;
-        let sideband = self.by_pane.remove(&pane_id).ok_or(
-            DirectMuxError::RetainedStateAccounting {
-                resource: Self::RESOURCE,
-            },
-        )?;
+        let (next_count, next_bytes) =
+            self.totals
+                .after_remove(1, retained_frame_bytes, Self::RESOURCE)?;
+        let sideband =
+            self.by_pane
+                .remove(&pane_id)
+                .ok_or(DirectMuxError::RetainedStateAccounting {
+                    resource: Self::RESOURCE,
+                })?;
         self.totals.set(next_count, next_bytes);
         Ok(Some(sideband))
     }
@@ -1375,16 +1356,19 @@ impl<'a> RenderBatchGuard<'a> {
     }
 
     fn record_issued(&mut self, request_idx: usize, serial: u64) -> Result<(), DirectMuxError> {
-        let next_request_idx = request_idx.checked_add(1).ok_or(
-            DirectMuxError::RetainedStateAccounting {
-                resource: "render batch request index",
-            },
-        )?;
-        let pane_id = *self.pane_ids.get(request_idx).ok_or(
-            DirectMuxError::RetainedStateAccounting {
-                resource: "render batch issued pane index",
-            },
-        )?;
+        let next_request_idx =
+            request_idx
+                .checked_add(1)
+                .ok_or(DirectMuxError::RetainedStateAccounting {
+                    resource: "render batch request index",
+                })?;
+        let pane_id =
+            *self
+                .pane_ids
+                .get(request_idx)
+                .ok_or(DirectMuxError::RetainedStateAccounting {
+                    resource: "render batch issued pane index",
+                })?;
         self.in_flight.insert(serial, request_idx)?;
         if !self.in_flight_panes.insert(pane_id) {
             let _ = self.in_flight.take(serial);
@@ -1401,11 +1385,13 @@ impl<'a> RenderBatchGuard<'a> {
             return Ok(false);
         }
         let request_idx = self.next_request_idx;
-        let pane_id = *self.pane_ids.get(request_idx).ok_or(
-            DirectMuxError::RetainedStateAccounting {
-                resource: "render batch explicit-Cx request index",
-            },
-        )?;
+        let pane_id =
+            *self
+                .pane_ids
+                .get(request_idx)
+                .ok_or(DirectMuxError::RetainedStateAccounting {
+                    resource: "render batch explicit-Cx request index",
+                })?;
         let serial = self
             .client
             .send_request_only_with_cx_tracking(
@@ -1451,12 +1437,11 @@ impl<'a> RenderBatchGuard<'a> {
         sideband: TypedRenderSideband,
     ) -> Result<(), DirectMuxError> {
         let (reserved_count, reserved_bytes) = self.local_sidebands.totals()?;
-        self.client
-            .stash_unilateral_render_change_with_reservation(
-                sideband,
-                reserved_count,
-                reserved_bytes,
-            )
+        self.client.stash_unilateral_render_change_with_reservation(
+            sideband,
+            reserved_count,
+            reserved_bytes,
+        )
     }
 
     fn handle_unilateral(
@@ -1518,8 +1503,7 @@ impl<'a> RenderBatchGuard<'a> {
                     let (local_count, local_bytes) = self.local_sidebands.totals()?;
                     let stats = &mut self.client.render_retention_codec_stats;
                     stats.batch_local_claims += 1;
-                    stats.batch_local_peak_count =
-                        stats.batch_local_peak_count.max(local_count);
+                    stats.batch_local_peak_count = stats.batch_local_peak_count.max(local_count);
                     stats.batch_local_peak_frame_bytes =
                         stats.batch_local_peak_frame_bytes.max(local_bytes);
                 }
@@ -1564,11 +1548,13 @@ impl<'a> RenderBatchGuard<'a> {
             });
         }
 
-        let pane_id = *self.pane_ids.get(response_idx).ok_or(
-            DirectMuxError::RetainedStateAccounting {
-                resource: "render batch response pane index",
-            },
-        )?;
+        let pane_id =
+            *self
+                .pane_ids
+                .get(response_idx)
+                .ok_or(DirectMuxError::RetainedStateAccounting {
+                    resource: "render batch response pane index",
+                })?;
         if !self.in_flight_panes.remove(&pane_id) {
             return Err(DirectMuxError::RetainedStateAccounting {
                 resource: "render batch in-flight pane ownership",
@@ -1576,16 +1562,15 @@ impl<'a> RenderBatchGuard<'a> {
         }
         let local_sideband = self.local_sidebands.take(pane_id)?;
         let (reserved_count, reserved_bytes) = self.local_sidebands.totals()?;
-        let resolved = DirectMuxClient::response_from_pdu(decoded.pdu)
-            .and_then(|pdu| {
-                self.client.resolve_render_change_response_with_sideband(
-                    pane_id,
-                    pdu,
-                    local_sideband,
-                    reserved_count,
-                    reserved_bytes,
-                )
-            });
+        let resolved = DirectMuxClient::response_from_pdu(decoded.pdu).and_then(|pdu| {
+            self.client.resolve_render_change_response_with_sideband(
+                pane_id,
+                pdu,
+                local_sideband,
+                reserved_count,
+                reserved_bytes,
+            )
+        });
         match resolved {
             Ok(payload) => {
                 let output = self.outputs.get_mut(response_idx).ok_or(
@@ -1606,11 +1591,12 @@ impl<'a> RenderBatchGuard<'a> {
             }
             Err(error) => return Err(error),
         }
-        self.settled_count = self.settled_count.checked_add(1).ok_or(
-            DirectMuxError::RetainedStateAccounting {
-                resource: "render batch settled response count",
-            },
-        )?;
+        self.settled_count =
+            self.settled_count
+                .checked_add(1)
+                .ok_or(DirectMuxError::RetainedStateAccounting {
+                    resource: "render batch settled response count",
+                })?;
         if self.in_flight.is_empty() {
             if !self.in_flight_panes.is_empty() || !self.local_sidebands.is_empty()? {
                 return Err(DirectMuxError::RetainedStateAccounting {
@@ -1635,10 +1621,7 @@ impl<'a> RenderBatchGuard<'a> {
                 .read_next_pdu_with_retention_metadata_with_cx(cx)
                 .await?;
             let completed_batch_request = self.handle_decoded(decoded)?;
-            if completed_batch_request
-                && self.can_admit()
-                && !self.send_next_with_cx(cx).await?
-            {
+            if completed_batch_request && self.can_admit() && !self.send_next_with_cx(cx).await? {
                 return Err(DirectMuxError::RetainedStateAccounting {
                     resource: "render batch explicit-Cx admission",
                 });
@@ -1684,9 +1667,7 @@ impl<'a> RenderBatchGuard<'a> {
                 return self.fail_finish(error, "render batch sideband accounting failure");
             }
         };
-        if !self.in_flight.is_empty()
-            || !self.in_flight_panes.is_empty()
-            || !local_sidebands_empty
+        if !self.in_flight.is_empty() || !self.in_flight_panes.is_empty() || !local_sidebands_empty
         {
             self.transport_ambiguous = true;
             return self.fail_finish(
@@ -1699,10 +1680,8 @@ impl<'a> RenderBatchGuard<'a> {
 
         if let Some(error) = self.first_error.take() {
             if let Err(cleanup_error) = self.invalidate_target_render_state() {
-                return self.fail_finish(
-                    cleanup_error,
-                    "render batch semantic-error cleanup failure",
-                );
+                return self
+                    .fail_finish(cleanup_error, "render batch semantic-error cleanup failure");
             }
             tracing::trace!(
                 connection_id = self.client.connection_id,
@@ -1716,10 +1695,7 @@ impl<'a> RenderBatchGuard<'a> {
         }
 
         let mut ordered = Vec::with_capacity(self.outputs.len());
-        for (request_idx, output) in std::mem::take(&mut self.outputs)
-            .into_iter()
-            .enumerate()
-        {
+        for (request_idx, output) in std::mem::take(&mut self.outputs).into_iter().enumerate() {
             let Some(payload) = output else {
                 self.transport_ambiguous = true;
                 return self.fail_finish(
@@ -1769,9 +1745,7 @@ impl Drop for RenderBatchGuard<'_> {
         if self.transport_ambiguous {
             self.client
                 .poison_connection("ambiguous render batch abandonment", self.explicit_cx);
-        } else if self.batch_progressed
-            && self.invalidate_target_render_state().is_err()
-        {
+        } else if self.batch_progressed && self.invalidate_target_render_state().is_err() {
             self.client.poison_connection(
                 "render batch abandonment cleanup accounting failure",
                 self.explicit_cx,
@@ -2256,8 +2230,7 @@ impl DirectMuxClient {
         layout_index: usize,
     ) -> Result<UnitResponse, DirectMuxError> {
         let cx = Cx::current().unwrap_or_else(cx::for_request);
-        self.swap_to_layout_with_cx(&cx, tab_id, layout_index)
-            .await
+        self.swap_to_layout_with_cx(&cx, tab_id, layout_index).await
     }
 
     pub async fn set_layout_cycle(
@@ -2561,9 +2534,8 @@ impl DirectMuxClient {
                     remote_min,
                     agreed,
                 };
-                self.protocol_state = DirectMuxProtocolState::AwaitingRegistration {
-                    codec: negotiated,
-                };
+                self.protocol_state =
+                    DirectMuxProtocolState::AwaitingRegistration { codec: negotiated };
                 Ok(payload)
             }
             other => self.unexpected_response("GetCodecVersionResponse", &other, true),
@@ -2658,11 +2630,7 @@ impl DirectMuxClient {
         }
         debug_assert!(validate_render_batch_panes(pane_ids).is_ok());
         let usable = self.ensure_connection_usable();
-        self.settle_transport_result(
-            usable,
-            "render batch rejected by poisoned transport",
-            true,
-        )?;
+        self.settle_transport_result(usable, "render batch rejected by poisoned transport", true)?;
         let checkpoint = checkpoint_mux_cx(cx, self.connection_id, "render_batch_wait");
         self.settle_transport_result(checkpoint, "render batch preflight cancellation", true)?;
         let depth = max_pipeline_depth.max(1).min(pane_ids.len());
@@ -3379,8 +3347,7 @@ impl DirectMuxClient {
         cx: &Cx,
         pdu: Pdu,
     ) -> Result<u64, DirectMuxError> {
-        self.send_request_only_with_cx_tracking(cx, pdu, None)
-            .await
+        self.send_request_only_with_cx_tracking(cx, pdu, None).await
     }
 
     async fn send_request_only_with_cx_tracking(
@@ -3390,11 +3357,7 @@ impl DirectMuxClient {
         write_boundary_entered: Option<&mut bool>,
     ) -> Result<u64, DirectMuxError> {
         let usable = self.ensure_connection_usable();
-        self.settle_transport_result(
-            usable,
-            "request rejected by poisoned transport",
-            true,
-        )?;
+        self.settle_transport_result(usable, "request rejected by poisoned transport", true)?;
         let authorized = self.authorize_outbound_pdu(&pdu);
         self.settle_transport_result(authorized, "outbound PDU authority rejection", true)?;
         let checkpoint = checkpoint_mux_cx(cx, self.connection_id, "request_start");
@@ -3404,11 +3367,8 @@ impl DirectMuxClient {
             .map_err(DirectMuxError::proven_pre_write_rejection);
         self.settle_transport_result(capacity, "outstanding request admission failure", true)?;
         let serial_result = next_request_serial(&mut self.serial);
-        let serial = self.settle_transport_result(
-            serial_result,
-            "request serial allocation failure",
-            true,
-        )?;
+        let serial =
+            self.settle_transport_result(serial_result, "request serial allocation failure", true)?;
         let pdu_name = pdu.pdu_name();
         let mut buf = Vec::new();
         tracing::trace!(
@@ -3503,17 +3463,10 @@ impl DirectMuxClient {
     #[cfg(test)]
     async fn await_response(&mut self, serial: u64) -> Result<Pdu, DirectMuxError> {
         let correlated = self.validate_response_serial(serial);
-        self.settle_transport_result(
-            correlated,
-            "response waiter correlation violation",
-            false,
-        )?;
+        self.settle_transport_result(correlated, "response waiter correlation violation", false)?;
         let pending = self.take_pending_response(serial);
-        let pending = self.settle_transport_result(
-            pending,
-            "pending response retention failure",
-            false,
-        )?;
+        let pending =
+            self.settle_transport_result(pending, "pending response retention failure", false)?;
         if let Some(pending) = pending {
             tracing::trace!(
                 connection_id = self.connection_id,
@@ -3536,11 +3489,7 @@ impl DirectMuxClient {
             }
             if decoded.serial == 0 {
                 let stashed = self.stash_unilateral_pdu(decoded.pdu);
-                self.settle_transport_result(
-                    stashed,
-                    "unilateral PDU retention failure",
-                    false,
-                )?;
+                self.settle_transport_result(stashed, "unilateral PDU retention failure", false)?;
                 continue;
             }
             tracing::trace!(
@@ -3565,17 +3514,10 @@ impl DirectMuxClient {
         serial: u64,
     ) -> Result<Pdu, DirectMuxError> {
         let correlated = self.validate_response_serial(serial);
-        self.settle_transport_result(
-            correlated,
-            "response waiter correlation violation",
-            true,
-        )?;
+        self.settle_transport_result(correlated, "response waiter correlation violation", true)?;
         let pending = self.take_pending_response(serial);
-        let pending = self.settle_transport_result(
-            pending,
-            "pending response retention failure",
-            true,
-        )?;
+        let pending =
+            self.settle_transport_result(pending, "pending response retention failure", true)?;
         if let Some(pending) = pending {
             tracing::trace!(
                 connection_id = self.connection_id,
@@ -3599,11 +3541,7 @@ impl DirectMuxClient {
             }
             if decoded.serial == 0 {
                 let stashed = self.stash_unilateral_pdu(decoded.pdu);
-                self.settle_transport_result(
-                    stashed,
-                    "unilateral PDU retention failure",
-                    true,
-                )?;
+                self.settle_transport_result(stashed, "unilateral PDU retention failure", true)?;
                 continue;
             }
             tracing::trace!(
@@ -3615,11 +3553,7 @@ impl DirectMuxClient {
                 "stashing out-of-order mux response"
             );
             let stashed = self.stash_pending_response(decoded.serial, decoded.pdu);
-            self.settle_transport_result(
-                stashed,
-                "out-of-order response retention failure",
-                true,
-            )?;
+            self.settle_transport_result(stashed, "out-of-order response retention failure", true)?;
         }
     }
 
@@ -3649,10 +3583,7 @@ impl DirectMuxClient {
                 Err(error)
             }
             Err(error) => {
-                self.poison_connection(
-                    "single render response settlement failure",
-                    explicit_cx,
-                );
+                self.poison_connection("single render response settlement failure", explicit_cx);
                 return Err(error);
             }
         };
@@ -3703,10 +3634,7 @@ impl DirectMuxClient {
                     self.invalidate_render_state_for_pane(pane_id)?;
                     return Err(DirectMuxError::AlignedUnexpectedResponse {
                         expected: format!("GetPaneRenderChangesResponse for pane {pane_id}"),
-                        got: format!(
-                            "GetPaneRenderChangesResponse for pane {}",
-                            payload.pane_id
-                        ),
+                        got: format!("GetPaneRenderChangesResponse for pane {}", payload.pane_id),
                     });
                 }
                 self.remember_render_change_snapshot(&payload)?;
@@ -3863,10 +3791,9 @@ impl DirectMuxClient {
             pending_limit,
         )?;
 
-        let next_pending = self.pending_render_changes.admit_insert(
-            &pending,
-            pending_limit,
-        )?;
+        let next_pending = self
+            .pending_render_changes
+            .admit_insert(&pending, pending_limit)?;
         let next_snapshot = self.render_change_snapshots.admit_insert(
             pane_id,
             &snapshot,
@@ -3944,17 +3871,13 @@ impl DirectMuxClient {
         &mut self,
         payload: &GetPaneRenderChangesResponse,
     ) -> Result<RetainedRenderChange, DirectMuxError> {
-        let retained = RetainedRenderChange::encode(
-            self.connection_id,
-            Self::idle_render_snapshot(payload),
-        )?;
+        let retained =
+            RetainedRenderChange::encode(self.connection_id, Self::idle_render_snapshot(payload))?;
         #[cfg(test)]
         {
             self.render_retention_codec_stats.snapshot_encodes += 1;
-            self.render_retention_codec_stats
-                .snapshot_frame_allocations += 1;
-            self.render_retention_codec_stats.snapshot_encoded_bytes +=
-                retained.retained_bytes();
+            self.render_retention_codec_stats.snapshot_frame_allocations += 1;
+            self.render_retention_codec_stats.snapshot_encoded_bytes += retained.retained_bytes();
             self.render_retention_codec_stats
                 .snapshot_frame_capacity_bytes += retained.pdu.frame.capacity();
         }
@@ -3972,10 +3895,7 @@ impl DirectMuxClient {
             .commit_remove_panes(&targets, snapshot_plan);
         self.pending_render_changes
             .commit_remove_panes(&targets, pending_plan);
-        Ok((
-            pending_plan.removed_count,
-            snapshot_plan.removed_count != 0,
-        ))
+        Ok((pending_plan.removed_count, snapshot_plan.removed_count != 0))
     }
 
     fn invalidate_render_state_for_panes(
@@ -4077,11 +3997,7 @@ impl DirectMuxClient {
             if let Some(decoded) = decoded_result {
                 let decoded_ref = decoded.decoded();
                 if let Err(error) = self.authorize_inbound_pdu(decoded_ref) {
-                    self.apply_error_disposition(
-                        &error,
-                        "inbound PDU authority violation",
-                        false,
-                    );
+                    self.apply_error_disposition(&error, "inbound PDU authority violation", false);
                     return Err(error);
                 }
                 let correlated = self.validate_response_serial(decoded_ref.serial);
@@ -4160,19 +4076,12 @@ impl DirectMuxClient {
                 &mut self.read_buf,
                 self.config.max_frame_bytes,
             );
-            let decoded_result = self.settle_transport_result(
-                decoded_result,
-                "inbound frame decode failure",
-                true,
-            )?;
+            let decoded_result =
+                self.settle_transport_result(decoded_result, "inbound frame decode failure", true)?;
             if let Some(decoded) = decoded_result {
                 let decoded_ref = decoded.decoded();
                 if let Err(error) = self.authorize_inbound_pdu(decoded_ref) {
-                    self.apply_error_disposition(
-                        &error,
-                        "inbound PDU authority violation",
-                        true,
-                    );
+                    self.apply_error_disposition(&error, "inbound PDU authority violation", true);
                     return Err(error);
                 }
                 let correlated = self.validate_response_serial(decoded_ref.serial);
@@ -4268,12 +4177,7 @@ fn next_connection_id_from(next: &AtomicU64) -> Result<u64, DirectMuxError> {
             return Err(DirectMuxError::ConnectionIdExhausted);
         }
 
-        match next.compare_exchange(
-            current,
-            current + 1,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match next.compare_exchange(current, current + 1, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return Ok(current),
             Err(observed) => current = observed,
         }
@@ -4350,19 +4254,16 @@ fn decode_from_buffer_with_retention_metadata(
     buffer: &mut StreamingPduBuffer,
     max_frame_bytes: usize,
 ) -> Result<Option<codec::DecodedPduWithRetentionMetadata>, DirectMuxError> {
-    codec::Pdu::stream_decode_with_retention_metadata_and_frame_limit(
-        buffer,
-        max_frame_bytes,
-    )
-    .map_err(|error| {
-        if let Some(limit) = error.downcast_ref::<codec::StreamingPduFrameLimitExceeded>() {
-            DirectMuxError::FrameTooLarge {
-                max_bytes: limit.max_frame_bytes(),
+    codec::Pdu::stream_decode_with_retention_metadata_and_frame_limit(buffer, max_frame_bytes)
+        .map_err(|error| {
+            if let Some(limit) = error.downcast_ref::<codec::StreamingPduFrameLimitExceeded>() {
+                DirectMuxError::FrameTooLarge {
+                    max_bytes: limit.max_frame_bytes(),
+                }
+            } else {
+                DirectMuxError::Codec(error.to_string())
             }
-        } else {
-            DirectMuxError::Codec(error.to_string())
-        }
-    })
+        })
 }
 
 fn resolve_socket_path(config: &DirectMuxClientConfig) -> Result<PathBuf, DirectMuxError> {
@@ -5034,11 +4935,8 @@ mod tests {
         seqno: usize,
         title: &str,
     ) {
-        let retained = RetainedRenderChange::encode(
-            41,
-            test_render_change(pane_id, seqno, title),
-        )
-        .expect("encode pending render-change fixture");
+        let retained = RetainedRenderChange::encode(41, test_render_change(pane_id, seqno, title))
+            .expect("encode pending render-change fixture");
         let next = pending
             .admit_insert(
                 &retained,
@@ -5058,11 +4956,8 @@ mod tests {
         title: &str,
     ) {
         let pane_id_u64 = u64::try_from(pane_id).expect("bounded pane id must fit u64");
-        let retained = RetainedRenderChange::encode(
-            41,
-            test_render_change(pane_id, seqno, title),
-        )
-        .expect("encode render-change snapshot fixture");
+        let retained = RetainedRenderChange::encode(41, test_render_change(pane_id, seqno, title))
+            .expect("encode render-change snapshot fixture");
         let next = snapshots
             .admit_insert(
                 pane_id_u64,
@@ -5163,8 +5058,8 @@ mod tests {
             assert!(read > 0, "direct mux client disconnected during handshake");
             read_buf.extend_from_slice(&temp[..read]);
 
-            while let Some(decoded) = codec::Pdu::stream_decode(&mut read_buf)
-                .expect("decode direct mux handshake")
+            while let Some(decoded) =
+                codec::Pdu::stream_decode(&mut read_buf).expect("decode direct mux handshake")
             {
                 match decoded.pdu {
                     Pdu::GetCodecVersion(_) => {
@@ -5187,7 +5082,10 @@ mod tests {
                     }
                     Pdu::SetClientId(_) => {
                         assert!(codec_response_sent, "registration preceded codec agreement");
-                        assert!(!registration_response_sent, "duplicate registration request");
+                        assert!(
+                            !registration_response_sent,
+                            "duplicate registration request"
+                        );
                         assert_eq!(decoded.serial, 2);
                         registration_response_sent = true;
                         write_response_pdu(
@@ -5267,7 +5165,10 @@ mod tests {
     }
 
     fn assert_cancelled_mux_error(err: &DirectMuxError) {
-        assert!(err.is_cancelled(), "typed cancellation bit must be retained");
+        assert!(
+            err.is_cancelled(),
+            "typed cancellation bit must be retained"
+        );
         let source = match err {
             DirectMuxError::InFlightScopeAbandoned(source) => source.as_ref(),
             other => other,
@@ -6243,7 +6144,10 @@ mod tests {
             assert_eq!(render.pane_id, 12);
             assert_eq!(render.seqno, 9);
             assert_eq!(render.title, "sideband-pane");
-            assert_eq!(render.dirty_lines, std::iter::once(0..1).collect::<Vec<_>>());
+            assert_eq!(
+                render.dirty_lines,
+                std::iter::once(0..1).collect::<Vec<_>>()
+            );
 
             drop(client);
             server.await.expect("server task");
@@ -6554,7 +6458,9 @@ mod tests {
             client.config.max_pending_render_changes = 1;
             client
                 .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
-                    28, 2, "queued-pane",
+                    28,
+                    2,
+                    "queued-pane",
                 )))
                 .expect("first bounded unilateral render change");
             let pending_bytes = client.pending_render_changes.retained_bytes();
@@ -6574,7 +6480,10 @@ mod tests {
                 }
             ));
             assert_eq!(client.pending_render_changes.len(), 1);
-            assert_eq!(client.pending_render_changes.retained_bytes(), pending_bytes);
+            assert_eq!(
+                client.pending_render_changes.retained_bytes(),
+                pending_bytes
+            );
             assert_eq!(
                 client.render_change_snapshots.retained_bytes(),
                 snapshot_bytes,
@@ -6634,10 +6543,7 @@ mod tests {
             ambiguous_guard.transport_ambiguous = true;
             let mid_batch_error = ambiguous_guard
                 .fail_finish::<()>(
-                    cancelled_mux_error(
-                        "request_write_wait",
-                        "later render admission cancelled",
-                    ),
+                    cancelled_mux_error("request_write_wait", "later render admission cancelled"),
                     "synthetic mid-batch pre-write cancellation",
                 )
                 .expect_err("earlier in-flight render work must override local reuse");
@@ -6940,16 +6846,13 @@ mod tests {
                                 Pdu::GetCodecVersion(_) => {
                                     write_response_pdu(
                                         &mut stream,
-                                        &Pdu::GetCodecVersionResponse(
-                                            GetCodecVersionResponse {
-                                                codec_vers: CODEC_VERSION,
-                                                version_string: "typed-sideband-test".to_string(),
-                                                executable_path: PathBuf::from("/bin/wezterm"),
-                                                config_file_path: None,
-                                                min_supported:
-                                                    codec::CODEC_VERSION_MIN_SUPPORTED,
-                                            },
-                                        ),
+                                        &Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: CODEC_VERSION,
+                                            version_string: "typed-sideband-test".to_string(),
+                                            executable_path: PathBuf::from("/bin/wezterm"),
+                                            config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                        }),
                                         decoded.serial,
                                     )
                                     .await
@@ -7014,24 +6917,14 @@ mod tests {
                     .await
                     .expect("connect");
                 let pane_ids = (1..=depth)
-                    .map(|pane_id| {
-                        u64::try_from(pane_id).expect("bounded pane id must fit u64")
-                    })
+                    .map(|pane_id| u64::try_from(pane_id).expect("bounded pane id must fit u64"))
                     .collect::<Vec<_>>();
                 let responses = client
-                    .get_pane_render_changes_batch(
-                        &pane_ids,
-                        depth,
-                        Duration::from_secs(10),
-                    )
+                    .get_pane_render_changes_batch(&pane_ids, depth, Duration::from_secs(10))
                     .await
                     .expect("typed-sideband batch");
                 let reused = client
-                    .get_pane_render_changes_batch(
-                        &pane_ids,
-                        depth,
-                        Duration::from_secs(10),
-                    )
+                    .get_pane_render_changes_batch(&pane_ids, depth, Duration::from_secs(10))
                     .await
                     .expect("typed-sideband snapshot reuse batch");
 
@@ -7084,9 +6977,16 @@ mod tests {
                         .snapshot_frame_capacity_bytes
                         >= client.render_retention_codec_stats.snapshot_encoded_bytes
                 );
-                assert!(client.render_retention_codec_stats.batch_local_peak_frame_bytes > 0);
                 assert!(
-                    client.render_retention_codec_stats.batch_local_peak_frame_bytes
+                    client
+                        .render_retention_codec_stats
+                        .batch_local_peak_frame_bytes
+                        > 0
+                );
+                assert!(
+                    client
+                        .render_retention_codec_stats
+                        .batch_local_peak_frame_bytes
                         <= client.config.max_pending_render_change_bytes
                 );
 
@@ -7128,8 +7028,7 @@ mod tests {
                                     &mut stream,
                                     &Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
                                         codec_vers: CODEC_VERSION,
-                                        version_string: "typed-sideband-duplicate-test"
-                                            .to_string(),
+                                        version_string: "typed-sideband-duplicate-test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
                                         min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
@@ -7154,13 +7053,11 @@ mod tests {
                                     for seqno in [1usize, 2] {
                                         write_response_pdu(
                                             &mut stream,
-                                            &Pdu::GetPaneRenderChangesResponse(
-                                                test_render_change(
-                                                    request.pane_id,
-                                                    seqno,
-                                                    "duplicate-sideband",
-                                                ),
-                                            ),
+                                            &Pdu::GetPaneRenderChangesResponse(test_render_change(
+                                                request.pane_id,
+                                                seqno,
+                                                "duplicate-sideband",
+                                            )),
                                             0,
                                         )
                                         .await
@@ -7207,14 +7104,22 @@ mod tests {
             assert_eq!(client.render_retention_codec_stats.batch_local_claims, 1);
             assert_eq!(client.render_retention_codec_stats.batch_local_demotions, 1);
             assert_eq!(client.render_retention_codec_stats.batch_local_returns, 0);
-            assert_eq!(client.render_retention_codec_stats.pending_payload_encodes, 2);
+            assert_eq!(
+                client.render_retention_codec_stats.pending_payload_encodes,
+                2
+            );
             assert_eq!(
                 client
                     .render_retention_codec_stats
                     .pending_payload_frame_allocations,
                 2
             );
-            assert!(client.render_retention_codec_stats.pending_payload_encoded_bytes > 0);
+            assert!(
+                client
+                    .render_retention_codec_stats
+                    .pending_payload_encoded_bytes
+                    > 0
+            );
             assert!(
                 client
                     .render_retention_codec_stats
@@ -7223,7 +7128,10 @@ mod tests {
                         .render_retention_codec_stats
                         .pending_payload_encoded_bytes
             );
-            assert_eq!(client.render_retention_codec_stats.pending_payload_decodes, 2);
+            assert_eq!(
+                client.render_retention_codec_stats.pending_payload_decodes,
+                2
+            );
             assert_eq!(client.render_retention_codec_stats.snapshot_encodes, 2);
             assert_eq!(
                 client
@@ -7293,17 +7201,14 @@ mod tests {
                                 Pdu::GetCodecVersion(_) => {
                                     write_response_pdu(
                                         &mut stream,
-                                        &Pdu::GetCodecVersionResponse(
-                                            GetCodecVersionResponse {
-                                                codec_vers: CODEC_VERSION,
-                                                version_string:
-                                                    "typed-sideband-semantic-test".to_string(),
-                                                executable_path: PathBuf::from("/bin/wezterm"),
-                                                config_file_path: None,
-                                                min_supported:
-                                                    codec::CODEC_VERSION_MIN_SUPPORTED,
-                                            },
-                                        ),
+                                        &Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: CODEC_VERSION,
+                                            version_string: "typed-sideband-semantic-test"
+                                                .to_string(),
+                                            executable_path: PathBuf::from("/bin/wezterm"),
+                                            config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                        }),
                                         decoded.serial,
                                     )
                                     .await
@@ -7318,28 +7223,21 @@ mod tests {
                                     .await
                                     .expect("write client response");
                                 }
-                                Pdu::GetPaneRenderChanges(request)
-                                    if first_render_request =>
-                                {
+                                Pdu::GetPaneRenderChanges(request) if first_render_request => {
                                     first_render_request = false;
                                     write_response_pdu(
                                         &mut stream,
-                                        &Pdu::GetPaneRenderChangesResponse(
-                                            test_render_change(
-                                                request.pane_id,
-                                                1,
-                                                "typed-before-semantic-error",
-                                            ),
-                                        ),
+                                        &Pdu::GetPaneRenderChangesResponse(test_render_change(
+                                            request.pane_id,
+                                            1,
+                                            "typed-before-semantic-error",
+                                        )),
                                         0,
                                     )
                                     .await
                                     .expect("write typed sideband before semantic error");
 
-                                    if matches!(
-                                        case,
-                                        LocalSemanticCase::RemovedBeforeLiveness
-                                    ) {
+                                    if matches!(case, LocalSemanticCase::RemovedBeforeLiveness) {
                                         write_response_pdu(
                                             &mut stream,
                                             &Pdu::PaneRemoved(codec::PaneRemoved {
@@ -7353,13 +7251,11 @@ mod tests {
 
                                     let response = match case {
                                         LocalSemanticCase::WrongLegacyPane => {
-                                            Pdu::GetPaneRenderChangesResponse(
-                                                test_render_change(
-                                                    700,
-                                                    2,
-                                                    "wrong-legacy-pane",
-                                                ),
-                                            )
+                                            Pdu::GetPaneRenderChangesResponse(test_render_change(
+                                                700,
+                                                2,
+                                                "wrong-legacy-pane",
+                                            ))
                                         }
                                         LocalSemanticCase::WrongLivenessPane => {
                                             Pdu::LivenessResponse(codec::LivenessResponse {
@@ -7384,29 +7280,22 @@ mod tests {
                                         }
                                         LocalSemanticCase::ErrorResponse => {
                                             Pdu::ErrorResponse(codec::ErrorResponse {
-                                                reason: "typed-sideband semantic error"
-                                                    .to_string(),
+                                                reason: "typed-sideband semantic error".to_string(),
                                             })
                                         }
                                     };
-                                    write_response_pdu(
-                                        &mut stream,
-                                        &response,
-                                        decoded.serial,
-                                    )
-                                    .await
-                                    .expect("write semantic response");
+                                    write_response_pdu(&mut stream, &response, decoded.serial)
+                                        .await
+                                        .expect("write semantic response");
                                 }
                                 Pdu::GetPaneRenderChanges(request) => {
                                     write_response_pdu(
                                         &mut stream,
-                                        &Pdu::GetPaneRenderChangesResponse(
-                                            test_render_change(
-                                                request.pane_id,
-                                                1,
-                                                "reuse-after-local-semantic-error",
-                                            ),
-                                        ),
+                                        &Pdu::GetPaneRenderChangesResponse(test_render_change(
+                                            request.pane_id,
+                                            1,
+                                            "reuse-after-local-semantic-error",
+                                        )),
                                         decoded.serial,
                                     )
                                     .await
@@ -7438,10 +7327,7 @@ mod tests {
                     );
                 }
 
-                let demoted = usize::from(matches!(
-                    case,
-                    LocalSemanticCase::WrongLegacyPane
-                ));
+                let demoted = usize::from(matches!(case, LocalSemanticCase::WrongLegacyPane));
                 assert_eq!(client.render_retention_codec_stats.batch_local_claims, 1);
                 assert_eq!(client.render_retention_codec_stats.batch_local_returns, 0);
                 assert_eq!(
@@ -7458,8 +7344,14 @@ mod tests {
                         .pending_payload_frame_allocations,
                     demoted
                 );
-                assert_eq!(client.render_retention_codec_stats.pending_payload_decodes, 0);
-                assert_eq!(client.render_retention_codec_stats.snapshot_encodes, demoted);
+                assert_eq!(
+                    client.render_retention_codec_stats.pending_payload_decodes,
+                    0
+                );
+                assert_eq!(
+                    client.render_retention_codec_stats.snapshot_encodes,
+                    demoted
+                );
                 assert_eq!(
                     client
                         .render_retention_codec_stats
@@ -7468,9 +7360,17 @@ mod tests {
                 );
                 assert!(client.outstanding_requests.is_empty(), "{case:?}");
                 assert!(client.pending_render_changes.is_empty(), "{case:?}");
-                assert_eq!(client.pending_render_changes.retained_bytes(), 0, "{case:?}");
+                assert_eq!(
+                    client.pending_render_changes.retained_bytes(),
+                    0,
+                    "{case:?}"
+                );
                 assert!(client.render_change_snapshots.is_empty(), "{case:?}");
-                assert_eq!(client.render_change_snapshots.retained_bytes(), 0, "{case:?}");
+                assert_eq!(
+                    client.render_change_snapshots.retained_bytes(),
+                    0,
+                    "{case:?}"
+                );
                 assert!(!client.connection_poisoned, "{case:?}");
                 assert_eq!(client.poison_transition_count, 0, "{case:?}");
 
@@ -7543,26 +7443,22 @@ mod tests {
                                 if render_requests == 1 {
                                     write_response_pdu(
                                         &mut stream,
-                                        &Pdu::GetPaneRenderChangesResponse(
-                                            test_render_change(
-                                                request.pane_id,
-                                                1,
-                                                "unilateral-before-legacy",
-                                            ),
-                                        ),
+                                        &Pdu::GetPaneRenderChangesResponse(test_render_change(
+                                            request.pane_id,
+                                            1,
+                                            "unilateral-before-legacy",
+                                        )),
                                         0,
                                     )
                                     .await
                                     .expect("write unilateral response");
                                     write_response_pdu(
                                         &mut stream,
-                                        &Pdu::GetPaneRenderChangesResponse(
-                                            test_render_change(
-                                                request.pane_id,
-                                                2,
-                                                "matching-legacy-response",
-                                            ),
-                                        ),
+                                        &Pdu::GetPaneRenderChangesResponse(test_render_change(
+                                            request.pane_id,
+                                            2,
+                                            "matching-legacy-response",
+                                        )),
                                         decoded.serial,
                                     )
                                     .await
@@ -7609,14 +7505,20 @@ mod tests {
             assert_eq!(client.render_retention_codec_stats.batch_local_claims, 1);
             assert_eq!(client.render_retention_codec_stats.batch_local_demotions, 1);
             assert_eq!(client.render_retention_codec_stats.batch_local_returns, 0);
-            assert_eq!(client.render_retention_codec_stats.pending_payload_encodes, 1);
+            assert_eq!(
+                client.render_retention_codec_stats.pending_payload_encodes,
+                1
+            );
             assert_eq!(
                 client
                     .render_retention_codec_stats
                     .pending_payload_frame_allocations,
                 1
             );
-            assert_eq!(client.render_retention_codec_stats.pending_payload_decodes, 1);
+            assert_eq!(
+                client.render_retention_codec_stats.pending_payload_decodes,
+                1
+            );
             assert_eq!(client.render_retention_codec_stats.snapshot_encodes, 2);
             assert_eq!(
                 client
@@ -7732,21 +7634,31 @@ mod tests {
             assert_eq!(owned[0].seqno, 7);
             assert_eq!(client.pending_render_changes.len(), 1);
             assert_eq!(
-                client.pending_render_changes.iter().map(|item| item.pane_id).collect::<Vec<_>>(),
+                client
+                    .pending_render_changes
+                    .iter()
+                    .map(|item| item.pane_id)
+                    .collect::<Vec<_>>(),
                 vec![999]
             );
             assert!(client.render_change_snapshots.contains_key(7));
             assert!(client.render_change_snapshots.contains_key(999));
             assert_eq!(client.render_retention_codec_stats.batch_local_claims, 1);
             assert_eq!(client.render_retention_codec_stats.batch_local_returns, 1);
-            assert_eq!(client.render_retention_codec_stats.pending_payload_encodes, 1);
+            assert_eq!(
+                client.render_retention_codec_stats.pending_payload_encodes,
+                1
+            );
             assert_eq!(
                 client
                     .render_retention_codec_stats
                     .pending_payload_frame_allocations,
                 1
             );
-            assert_eq!(client.render_retention_codec_stats.pending_payload_decodes, 0);
+            assert_eq!(
+                client.render_retention_codec_stats.pending_payload_decodes,
+                0
+            );
             assert_eq!(client.render_retention_codec_stats.snapshot_encodes, 2);
 
             let unowned = client
@@ -7763,7 +7675,10 @@ mod tests {
             assert_eq!(unowned.title, "unowned-sideband");
             assert!(client.pending_render_changes.is_empty());
             assert_eq!(client.pending_render_changes.retained_bytes(), 0);
-            assert_eq!(client.render_retention_codec_stats.pending_payload_decodes, 1);
+            assert_eq!(
+                client.render_retention_codec_stats.pending_payload_decodes,
+                1
+            );
 
             drop(client);
             server.await.expect("server task");
@@ -7806,8 +7721,8 @@ mod tests {
                         return 0usize;
                     }
                     read_buf.extend_from_slice(&temp[..read]);
-                    while let Some(decoded) = codec::Pdu::stream_decode(&mut read_buf)
-                        .expect("decode shared-cap request")
+                    while let Some(decoded) =
+                        codec::Pdu::stream_decode(&mut read_buf).expect("decode shared-cap request")
                     {
                         match decoded.pdu {
                             Pdu::GetCodecVersion(_) => {
@@ -7886,7 +7801,10 @@ mod tests {
             assert!(client.render_change_snapshots.is_empty());
             assert_eq!(client.render_change_snapshots.retained_bytes(), 0);
             assert_eq!(client.render_retention_codec_stats.batch_local_claims, 1);
-            assert_eq!(client.render_retention_codec_stats.batch_local_peak_count, 1);
+            assert_eq!(
+                client.render_retention_codec_stats.batch_local_peak_count,
+                1
+            );
             assert_eq!(
                 client
                     .render_retention_codec_stats
@@ -7955,13 +7873,12 @@ mod tests {
                                     for (idx, (_serial, pane_id)) in
                                         batch_requests.iter().rev().enumerate()
                                     {
-                                        let sideband = Pdu::GetPaneRenderChangesResponse(
-                                            test_render_change(
+                                        let sideband =
+                                            Pdu::GetPaneRenderChangesResponse(test_render_change(
                                                 *pane_id,
                                                 idx + 1,
                                                 &format!("pane-{pane_id}"),
-                                            ),
-                                        );
+                                            ));
                                         write_response_pdu(&mut stream, &sideband, 0)
                                             .await
                                             .expect("write sideband render delta");
@@ -7993,19 +7910,12 @@ mod tests {
             config.max_pending_render_changes = 2;
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
             let responses = client
-                .get_pane_render_changes_batch(
-                    &[10, 20, 30, 40, 50, 60],
-                    2,
-                    Duration::from_secs(1),
-                )
+                .get_pane_render_changes_batch(&[10, 20, 30, 40, 50, 60], 2, Duration::from_secs(1))
                 .await
                 .expect("batch request");
 
             assert_eq!(responses.len(), 6);
-            for (response, pane_id) in responses
-                .iter()
-                .zip([10usize, 20, 30, 40, 50, 60])
-            {
+            for (response, pane_id) in responses.iter().zip([10usize, 20, 30, 40, 50, 60]) {
                 assert_eq!(response.pane_id, pane_id);
                 assert_eq!(response.title, format!("pane-{pane_id}"));
             }
@@ -8074,13 +7984,12 @@ mod tests {
                                     for (idx, (serial, pane_id)) in
                                         batch_requests.iter().rev().enumerate()
                                     {
-                                        let sideband = Pdu::GetPaneRenderChangesResponse(
-                                            test_render_change(
+                                        let sideband =
+                                            Pdu::GetPaneRenderChangesResponse(test_render_change(
                                                 *pane_id,
                                                 idx + 1,
                                                 &format!("pane-{pane_id}"),
-                                            ),
-                                        );
+                                            ));
                                         write_response_pdu(&mut stream, &sideband, 0)
                                             .await
                                             .expect("write sideband render delta");
@@ -8205,9 +8114,7 @@ mod tests {
                                     .await
                                     .expect("write client response");
                                 }
-                                Pdu::GetPaneRenderChanges(request)
-                                    if !initial_batch_answered =>
-                                {
+                                Pdu::GetPaneRenderChanges(request) if !initial_batch_answered => {
                                     initial_requests.push((decoded.serial, request.pane_id));
                                     if initial_requests.len() != 3 {
                                         continue;
@@ -8406,7 +8313,10 @@ mod tests {
                     .await_response(unrelated_response_serial)
                     .await
                     .expect("unrelated pending response must survive target cleanup");
-                assert!(matches!(preserved_response, Pdu::UnitResponse(_)), "{case:?}");
+                assert!(
+                    matches!(preserved_response, Pdu::UnitResponse(_)),
+                    "{case:?}"
+                );
                 assert!(client.outstanding_requests.is_empty(), "{case:?}");
                 assert!(client.pending_responses.is_empty(), "{case:?}");
                 assert_eq!(client.pending_response_bytes, 0, "{case:?}");
@@ -8609,7 +8519,11 @@ mod tests {
                 .read_next_pdu_with_retention_metadata_with_cx(&cx)
                 .await
                 .expect("read first response");
-            assert!(guard.handle_decoded(decoded).expect("settle first response"));
+            assert!(
+                guard
+                    .handle_decoded(decoded)
+                    .expect("settle first response")
+            );
             assert!(!guard.transport_ambiguous);
             assert!(guard.in_flight.is_empty());
 
@@ -8675,13 +8589,12 @@ mod tests {
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
                             Pdu::GetPaneRenderChanges(request) => {
-                                let response = Pdu::GetPaneRenderChangesResponse(
-                                    test_render_change(
+                                let response =
+                                    Pdu::GetPaneRenderChangesResponse(test_render_change(
                                         request.pane_id,
                                         1,
                                         "must-exceed-snapshot-limit",
-                                    ),
-                                );
+                                    ));
                                 write_response_pdu(&mut stream, &response, decoded.serial)
                                     .await
                                     .expect("write render response");
@@ -8814,19 +8727,14 @@ mod tests {
                 "typed-sideband-before-caller-drop",
             );
             let targets = [11_u64];
-            let mut batch = Box::pin(client.get_pane_render_changes_batch(
-                &targets,
-                1,
-                Duration::from_secs(5),
-            ));
+            let mut batch =
+                Box::pin(client.get_pane_render_changes_batch(&targets, 1, Duration::from_secs(5)));
             std::future::poll_fn(|task_cx| {
                 match std::future::Future::poll(batch.as_mut(), task_cx) {
                     std::task::Poll::Ready(result) => {
                         panic!("stalled batch unexpectedly completed: {result:?}")
                     }
-                    std::task::Poll::Pending
-                        if request_observed.load(Ordering::SeqCst) =>
-                    {
+                    std::task::Poll::Pending if request_observed.load(Ordering::SeqCst) => {
                         std::task::Poll::Ready(())
                     }
                     std::task::Poll::Pending => {
@@ -8849,8 +8757,14 @@ mod tests {
             assert_eq!(client.render_retention_codec_stats.batch_local_claims, 1);
             assert_eq!(client.render_retention_codec_stats.batch_local_returns, 0);
             assert_eq!(client.render_retention_codec_stats.batch_local_demotions, 0);
-            assert_eq!(client.render_retention_codec_stats.pending_payload_encodes, 0);
-            assert_eq!(client.render_retention_codec_stats.pending_payload_decodes, 0);
+            assert_eq!(
+                client.render_retention_codec_stats.pending_payload_encodes,
+                0
+            );
+            assert_eq!(
+                client.render_retention_codec_stats.pending_payload_decodes,
+                0
+            );
             assert_eq!(client.render_retention_codec_stats.snapshot_encodes, 0);
             assert!(matches!(
                 client.list_panes().await,
@@ -8945,17 +8859,21 @@ mod tests {
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
             for pane_id in [11usize, 22, 999] {
                 client
-                    .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(
-                        test_render_change(pane_id, 1, "accounting-seed"),
-                    ))
+                    .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
+                        pane_id,
+                        1,
+                        "accounting-seed",
+                    )))
                     .expect("seed retained render state");
             }
             let bulk_targets = (1_000_u64..1_256).collect::<Vec<_>>();
             for pane_id in bulk_targets.iter().copied() {
                 client
-                    .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(
-                        test_render_change(pane_id as usize, 1, "bulk-accounting-seed"),
-                    ))
+                    .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
+                        pane_id as usize,
+                        1,
+                        "bulk-accounting-seed",
+                    )))
                     .expect("seed bulk retained render state");
             }
             let (pending_removed, snapshots_removed) = client
@@ -9999,8 +9917,14 @@ mod tests {
             assert_eq!(client.render_retention_codec_stats.batch_local_claims, 1);
             assert_eq!(client.render_retention_codec_stats.batch_local_returns, 0);
             assert_eq!(client.render_retention_codec_stats.batch_local_demotions, 0);
-            assert_eq!(client.render_retention_codec_stats.pending_payload_encodes, 0);
-            assert_eq!(client.render_retention_codec_stats.pending_payload_decodes, 0);
+            assert_eq!(
+                client.render_retention_codec_stats.pending_payload_encodes,
+                0
+            );
+            assert_eq!(
+                client.render_retention_codec_stats.pending_payload_decodes,
+                0
+            );
             assert_eq!(client.render_retention_codec_stats.snapshot_encodes, 0);
             let reuse_error = client
                 .list_panes()
@@ -10106,8 +10030,14 @@ mod tests {
             assert_eq!(client.render_retention_codec_stats.batch_local_claims, 1);
             assert_eq!(client.render_retention_codec_stats.batch_local_returns, 0);
             assert_eq!(client.render_retention_codec_stats.batch_local_demotions, 0);
-            assert_eq!(client.render_retention_codec_stats.pending_payload_encodes, 0);
-            assert_eq!(client.render_retention_codec_stats.pending_payload_decodes, 0);
+            assert_eq!(
+                client.render_retention_codec_stats.pending_payload_encodes,
+                0
+            );
+            assert_eq!(
+                client.render_retention_codec_stats.pending_payload_decodes,
+                0
+            );
             assert_eq!(client.render_retention_codec_stats.snapshot_encodes, 0);
             let reuse_error = client
                 .list_panes()
@@ -10221,8 +10151,14 @@ mod tests {
             assert_eq!(client.render_retention_codec_stats.batch_local_claims, 1);
             assert_eq!(client.render_retention_codec_stats.batch_local_returns, 0);
             assert_eq!(client.render_retention_codec_stats.batch_local_demotions, 0);
-            assert_eq!(client.render_retention_codec_stats.pending_payload_encodes, 0);
-            assert_eq!(client.render_retention_codec_stats.pending_payload_decodes, 0);
+            assert_eq!(
+                client.render_retention_codec_stats.pending_payload_encodes,
+                0
+            );
+            assert_eq!(
+                client.render_retention_codec_stats.pending_payload_decodes,
+                0
+            );
             assert_eq!(client.render_retention_codec_stats.snapshot_encodes, 0);
             let reuse_error = client
                 .list_panes()
@@ -10332,9 +10268,7 @@ mod tests {
             pending.reset_operation_counts();
             for pane_id in (1..=depth).rev() {
                 let retained = pending
-                    .take_for_pane(
-                        u64::try_from(pane_id).expect("bounded pane id must fit u64"),
-                    )
+                    .take_for_pane(u64::try_from(pane_id).expect("bounded pane id must fit u64"))
                     .expect("keyed sideband take must preserve accounting")
                     .expect("seeded pane must retain one sideband");
                 let decoded = retained
@@ -10541,7 +10475,11 @@ mod tests {
                 .pane_id,
             7
         );
-        assert!(sidebands.is_empty().expect("empty local accounting must validate"));
+        assert!(
+            sidebands
+                .is_empty()
+                .expect("empty local accounting must validate")
+        );
         sidebands.totals.count_check = 0;
         let empty_corruption = sidebands
             .is_empty()
@@ -10588,7 +10526,10 @@ mod tests {
                 max_bytes: 100,
             }
         ));
-        assert_eq!(byte_bounded.totals().expect("valid retained totals"), (1, 64));
+        assert_eq!(
+            byte_bounded.totals().expect("valid retained totals"),
+            (1, 64)
+        );
 
         byte_bounded.totals.set(1, 32);
         let accounting_error = byte_bounded
@@ -10609,18 +10550,16 @@ mod tests {
         for depth in [32usize, DEFAULT_MAX_OUTSTANDING_REQUESTS, 4_096] {
             let mut slots = InFlightRequestSlots::with_capacity(depth);
             for request_idx in 0..depth {
-                let serial = u64::try_from(request_idx)
-                    .expect("bounded request index must fit u64")
-                    + 1;
+                let serial =
+                    u64::try_from(request_idx).expect("bounded request index must fit u64") + 1;
                 slots
                     .insert(serial, request_idx)
                     .expect("fixture serials must be unique");
             }
 
             for request_idx in (0..depth).rev() {
-                let serial = u64::try_from(request_idx)
-                    .expect("bounded response index must fit u64")
-                    + 1;
+                let serial =
+                    u64::try_from(request_idx).expect("bounded response index must fit u64") + 1;
                 assert_eq!(
                     slots.take(serial),
                     Some(request_idx),
@@ -13046,9 +12985,7 @@ mod tests {
                     .join(format!("mux-codec-overlap-{case_idx}.sock"));
                 let listener = compat_unix::bind(&socket_path).await.expect("bind");
                 let server = task::spawn(accept_direct_mux_handshake(
-                    listener,
-                    remote_max,
-                    remote_min,
+                    listener, remote_max, remote_min,
                 ));
 
                 let config = direct_mux_client_config(socket_path);
@@ -13192,8 +13129,7 @@ mod tests {
                     .join(format!("mux-ordered-outbound-gate-{case_idx}.sock"));
                 let listener = compat_unix::bind(&socket_path).await.expect("bind");
                 let server = task::spawn(async move {
-                    let mut stream =
-                        accept_direct_mux_handshake(listener, remote_max, 46).await;
+                    let mut stream = accept_direct_mux_handshake(listener, remote_max, 46).await;
                     let mut read_buf = StreamingPduBuffer::new();
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -13321,8 +13257,7 @@ mod tests {
                     .join(format!("mux-ordered-inbound-gate-{case_idx}.sock"));
                 let listener = compat_unix::bind(&socket_path).await.expect("bind");
                 let server = task::spawn(async move {
-                    let mut stream =
-                        accept_direct_mux_handshake(listener, remote_max, 46).await;
+                    let mut stream = accept_direct_mux_handshake(listener, remote_max, 46).await;
                     let mut read_buf = StreamingPduBuffer::new();
                     loop {
                         let mut temp = vec![0u8; 4096];
@@ -15180,7 +15115,9 @@ mod tests {
 
         runtime.block_on(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
-            let socket_path = temp_dir.path().join("cancel-full-output-channel-with-cx.sock");
+            let socket_path = temp_dir
+                .path()
+                .join("cancel-full-output-channel-with-cx.sock");
             let listener = compat_unix::bind(&socket_path).await.expect("bind");
 
             let render_request_count = Arc::new(AtomicUsize::new(0));
@@ -15250,8 +15187,7 @@ mod tests {
                                             },
                                             tiered_scrollback_status: None,
                                             dirty_lines,
-                                            title: "cancel-full-output-channel-with-cx"
-                                                .to_string(),
+                                            title: "cancel-full-output-channel-with-cx".to_string(),
                                             working_dir: None,
                                             bonus_lines: Vec::new().into(),
                                             input_serial: None,

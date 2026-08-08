@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
 use codec::{
-    CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, Pdu,
-    StreamingPduBuffer, UnitResponse,
+    CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, Pdu, StreamingPduBuffer,
+    UnitResponse,
 };
 #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
 use frankenterm_core::runtime_async::unix::AsyncWriteExt;
@@ -1642,11 +1642,7 @@ fn b23h_explicit_cx_public_write_to_pane_cancellation_contract() {
             .recv_timeout(Duration::from_secs(2))
             .expect("server should complete handshake");
 
-        let err = Box::pin(client.write_to_pane_with_cx(
-            &cancelled_cx,
-            56,
-            b"hello".to_vec(),
-        ))
+        let err = Box::pin(client.write_to_pane_with_cx(&cancelled_cx, 56, b"hello".to_vec()))
             .await
             .expect_err("write_to_pane_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_error(&err);
@@ -1885,11 +1881,7 @@ fn b23j_explicit_cx_public_send_paste_cancellation_contract() {
             .recv_timeout(Duration::from_secs(2))
             .expect("server should complete handshake");
 
-        let err = Box::pin(client.send_paste_with_cx(
-            &cancelled_cx,
-            78,
-            "paste me".to_string(),
-        ))
+        let err = Box::pin(client.send_paste_with_cx(&cancelled_cx, 78, "paste me".to_string()))
             .await
             .expect_err("send_paste_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_error(&err);
@@ -2566,13 +2558,10 @@ fn b23n_explicit_cx_public_get_lines_read_timeout_contract() {
         let mut client = Box::pin(DirectMuxClient::connect_with_cx(&cx, config))
             .await
             .expect("connect_with_cx");
-        let err = Box::pin(client.get_lines_with_cx(
-            &cx,
-            88,
-            std::iter::once(0isize..1isize).collect(),
-        ))
-            .await
-            .expect_err("get_lines_with_cx should time out when the peer stalls");
+        let err =
+            Box::pin(client.get_lines_with_cx(&cx, 88, std::iter::once(0isize..1isize).collect()))
+                .await
+                .expect_err("get_lines_with_cx should time out when the peer stalls");
         assert!(
             matches!(err, DirectMuxError::ReadTimeout),
             "expected ReadTimeout, got: {err}"
@@ -3577,8 +3566,8 @@ fn b23w_explicit_cx_public_mux_pool_get_lines_cancellation_contract() {
             34,
             vec![0isize..3isize, 5isize..6isize],
         ))
-            .await
-            .expect_err("get_lines_with_cx should fail fast for a pre-cancelled context");
+        .await
+        .expect_err("get_lines_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_pool_error(&err);
 
         drop(pool);
@@ -3700,11 +3689,7 @@ fn b23x_explicit_cx_public_mux_pool_write_to_pane_cancellation_contract() {
             .await
             .expect("warmup list_panes should establish a pooled connection");
 
-        let err = Box::pin(pool.write_to_pane_with_cx(
-            &cancelled_cx,
-            56,
-            b"hello".to_vec(),
-        ))
+        let err = Box::pin(pool.write_to_pane_with_cx(&cancelled_cx, 56, b"hello".to_vec()))
             .await
             .expect_err("write_to_pane_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_pool_error(&err);
@@ -3827,11 +3812,7 @@ fn b23y_explicit_cx_public_mux_pool_send_paste_cancellation_contract() {
             .await
             .expect("warmup list_panes should establish a pooled connection");
 
-        let err = Box::pin(pool.send_paste_with_cx(
-            &cancelled_cx,
-            78,
-            "paste me".to_string(),
-        ))
+        let err = Box::pin(pool.send_paste_with_cx(&cancelled_cx, 78, "paste me".to_string()))
             .await
             .expect_err("send_paste_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_pool_error(&err);

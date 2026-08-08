@@ -1019,15 +1019,13 @@ mod tests {
                     );
                     async { WaitFor::<()>::not_ready(Some("cancelled by predicate".to_string())) }
                 });
-                let error = wait_for_cx(
-                    &cx,
-                    condition,
-                    Duration::from_secs(5),
-                    Backoff::default(),
-                )
-                .await
-                .expect_err("cancelled context must not become timeout or success");
-                assert!(matches!(error.termination, WaitTermination::Cancelled { .. }));
+                let error = wait_for_cx(&cx, condition, Duration::from_secs(5), Backoff::default())
+                    .await
+                    .expect_err("cancelled context must not become timeout or success");
+                assert!(matches!(
+                    error.termination,
+                    WaitTermination::Cancelled { .. }
+                ));
                 completed_task.store(true, Ordering::SeqCst);
             })
             .expect("spawn cancellation wait task");

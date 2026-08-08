@@ -7,8 +7,8 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use chrono::{Datelike as _, TimeZone as _, Timelike as _};
 use crate::runtime_async::{ContextError, ContextErrorKind};
+use chrono::{Datelike as _, TimeZone as _, Timelike as _};
 
 // ============================================================================
 // Built-in Workflows
@@ -1252,10 +1252,7 @@ impl HandleUsageLimits {
                 // caller's authority. An individual storage failure does not
                 // fail the workflow, but cancellation observed after the
                 // await prevents all subsequent side effects.
-                let trigger = ctx
-                    .trigger()
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
+                let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
                 let now = now_ms();
                 let agent_type = trigger
                     .get("agent_type")
@@ -1334,10 +1331,9 @@ impl HandleUsageLimits {
                         let mut tracker = match RATE_LIMIT_TRACKER.lock_with_cx(cx).await {
                             Ok(tracker) => tracker,
                             Err(_) => {
-                                if let Err(result) = usage_limit_checkpoint(
-                                    cx,
-                                    "after_rate_limit_tracker_lock",
-                                ) {
+                                if let Err(result) =
+                                    usage_limit_checkpoint(cx, "after_rate_limit_tracker_lock")
+                                {
                                     return result;
                                 }
                                 return usage_limit_failure(
@@ -1427,8 +1423,7 @@ impl HandleUsageLimits {
                         let persist_result =
                             persist_codex_session_summary_with_cx(cx, &storage, pane_id, &parsed)
                                 .await;
-                        if let Err(result) =
-                            usage_limit_checkpoint(cx, "after_summary_persistence")
+                        if let Err(result) = usage_limit_checkpoint(cx, "after_summary_persistence")
                         {
                             return result;
                         }
@@ -1451,10 +1446,7 @@ impl HandleUsageLimits {
                 StepResult::cont()
             }
             2 => {
-                let trigger = ctx
-                    .trigger()
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
+                let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
                 let rate_limit_summary = if trigger_is_rate_limit(&trigger) {
                     let tracker_agent_type = trigger_agent_type(&trigger);
                     if tracker_agent_type == crate::patterns::AgentType::Unknown {
@@ -1463,10 +1455,9 @@ impl HandleUsageLimits {
                         let mut tracker = match RATE_LIMIT_TRACKER.lock_with_cx(cx).await {
                             Ok(tracker) => tracker,
                             Err(_) => {
-                                if let Err(result) = usage_limit_checkpoint(
-                                    cx,
-                                    "after_rate_limit_tracker_lock",
-                                ) {
+                                if let Err(result) =
+                                    usage_limit_checkpoint(cx, "after_rate_limit_tracker_lock")
+                                {
                                     return result;
                                 }
                                 return usage_limit_failure(
@@ -1489,32 +1480,28 @@ impl HandleUsageLimits {
 
                 let caut_client = crate::caut::CautClient::new();
                 let config = crate::accounts::AccountSelectionConfig::default();
-                let selection = match refresh_and_select_account_with_cx(
-                    cx,
-                    &caut_client,
-                    &storage,
-                    &config,
-                )
-                .await
-                {
-                    Ok(selection) => selection,
-                    Err(_) => {
-                        if let Err(result) =
-                            usage_limit_checkpoint(cx, "after_account_selection")
-                        {
-                            return result;
+                let selection =
+                    match refresh_and_select_account_with_cx(cx, &caut_client, &storage, &config)
+                        .await
+                    {
+                        Ok(selection) => selection,
+                        Err(_) => {
+                            if let Err(result) =
+                                usage_limit_checkpoint(cx, "after_account_selection")
+                            {
+                                return result;
+                            }
+                            tracing::error!(
+                                pane_id,
+                                error_class = "account_selection_failed",
+                                "handle_usage_limits: account selection failed"
+                            );
+                            return usage_limit_failure(
+                                "account_selection",
+                                "account_selection_failed",
+                            );
                         }
-                        tracing::error!(
-                            pane_id,
-                            error_class = "account_selection_failed",
-                            "handle_usage_limits: account selection failed"
-                        );
-                        return usage_limit_failure(
-                            "account_selection",
-                            "account_selection_failed",
-                        );
-                    }
-                };
+                    };
                 if let Err(result) = usage_limit_checkpoint(cx, "after_account_selection") {
                     return result;
                 }
@@ -1572,10 +1559,7 @@ impl HandleUsageLimits {
                                     serde_json::Value::Null
                                 }
                             };
-                            object.insert(
-                                "provider_rate_limit_status".to_string(),
-                                summary_value,
-                            );
+                            object.insert("provider_rate_limit_status".to_string(), summary_value);
                         }
                     }
                     if let Err(result) = usage_limit_checkpoint(cx, "before_step_completion") {
@@ -1589,9 +1573,8 @@ impl HandleUsageLimits {
                         "handle_usage_limits: all accounts exhausted, entering fallback"
                     );
 
-                    let accounts_result = storage
-                        .get_accounts_by_service_with_cx(cx, "openai")
-                        .await;
+                    let accounts_result =
+                        storage.get_accounts_by_service_with_cx(cx, "openai").await;
                     if let Err(result) = usage_limit_checkpoint(cx, "after_account_read") {
                         return result;
                     }
@@ -1606,10 +1589,8 @@ impl HandleUsageLimits {
                             Vec::new()
                         }
                     };
-                    let exhaustion = crate::accounts::build_exhaustion_info(
-                        &accounts,
-                        selection.explanation,
-                    );
+                    let exhaustion =
+                        crate::accounts::build_exhaustion_info(&accounts, selection.explanation);
                     let tracker_retry_after_ms = rate_limit_summary
                         .as_ref()
                         .and_then(|summary| {
@@ -1674,22 +1655,23 @@ fn usage_limit_context_failure_code(cx: &crate::cx::Cx, error: &ContextError) ->
         ContextErrorKind::CancelTimeout => "usage_limit_cancellation_cleanup_timeout",
         ContextErrorKind::PollQuotaExhausted => "usage_limit_poll_budget_exhausted",
         ContextErrorKind::CostQuotaExhausted => "usage_limit_cost_budget_exhausted",
-        ContextErrorKind::Cancelled => match cx.cancel_reason().map(|reason| reason.root_cause().kind) {
-            Some(crate::outcome::CancelKind::Timeout | crate::outcome::CancelKind::Deadline) => {
-                "usage_limit_deadline_exceeded"
+        ContextErrorKind::Cancelled => {
+            match cx.cancel_reason().map(|reason| reason.root_cause().kind) {
+                Some(
+                    crate::outcome::CancelKind::Timeout | crate::outcome::CancelKind::Deadline,
+                ) => "usage_limit_deadline_exceeded",
+                Some(crate::outcome::CancelKind::PollQuota) => "usage_limit_poll_budget_exhausted",
+                Some(crate::outcome::CancelKind::CostBudget) => "usage_limit_cost_budget_exhausted",
+                _ => "usage_limit_context_cancelled",
             }
-            Some(crate::outcome::CancelKind::PollQuota) => "usage_limit_poll_budget_exhausted",
-            Some(crate::outcome::CancelKind::CostBudget) => "usage_limit_cost_budget_exhausted",
-            _ => "usage_limit_context_cancelled",
-        },
+        }
         _ => "usage_limit_context_failure",
     }
 }
 
 fn usage_limit_checkpoint(cx: &crate::cx::Cx, stage: &'static str) -> Result<(), StepResult> {
-    cx.checkpoint().map_err(|error| {
-        usage_limit_failure(stage, usage_limit_context_failure_code(cx, &error))
-    })
+    cx.checkpoint()
+        .map_err(|error| usage_limit_failure(stage, usage_limit_context_failure_code(cx, &error)))
 }
 
 fn usage_limit_failure(stage: &'static str, error_class: &'static str) -> StepResult {
@@ -1759,9 +1741,7 @@ impl Workflow for HandleUsageLimits {
     ) -> BoxFuture<'a, StepResult> {
         let cx = cx.clone();
         let ctx = ctx.clone();
-        Box::pin(async move {
-            Self::execute_step_inner(&cx, ctx, step_idx).await
-        })
+        Box::pin(async move { Self::execute_step_inner(&cx, ctx, step_idx).await })
     }
 }
 

@@ -24,13 +24,12 @@ use super::mcp_types::{
     McpReservationsData, McpReserveData, McpRuleItem, McpRuleMatchItem, McpRuleTraceInfo,
     McpRulesListData, McpRulesTestData, McpSearchData, McpSearchHit, McpSendData,
     McpSendOutputOmissions, McpTxPlanData, McpTxRollbackData, McpTxRunData, McpTxShowData,
-    McpWaitForData, McpWorkflowRunData,
-    MissionAbortParams, MissionExplainParams, MissionObjectivePlanParams, MissionPauseParams,
-    MissionResumeParams, MissionStateParams, OperatingEnvelopeParams, RehearsalScoreParams,
-    ReleaseParams, ReservationsParams, ReserveParams, RulesListParams, RulesTestParams,
-    SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams, TxRunParams,
-    TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams, apply_tail_truncation,
-    now_ms,
+    McpWaitForData, McpWorkflowRunData, MissionAbortParams, MissionExplainParams,
+    MissionObjectivePlanParams, MissionPauseParams, MissionResumeParams, MissionStateParams,
+    OperatingEnvelopeParams, RehearsalScoreParams, ReleaseParams, ReservationsParams,
+    ReserveParams, RulesListParams, RulesTestParams, SearchParams, SendParams, StateParams,
+    TxPlanParams, TxRollbackParams, TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams,
+    WorkflowStatusParams, apply_tail_truncation, now_ms,
 };
 #[allow(unused_imports)]
 use super::{
@@ -70,8 +69,8 @@ use crate::mcp_error::{MCP_ERR_CURSOR_DISCONTINUITY, MCP_ERR_REMOTE_TEXT_UNAVAIL
 #[allow(unused_imports)]
 use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
-    FrameworkMcpResult as McpResult, FrameworkTool as Tool,
-    FrameworkResponseDeliveryCoordinator, FrameworkResponseDeliveryOutcome,
+    FrameworkMcpResult as McpResult, FrameworkResponseDeliveryCoordinator,
+    FrameworkResponseDeliveryOutcome, FrameworkTool as Tool,
     FrameworkToolAnnotations as ToolAnnotations, FrameworkToolHandler as ToolHandler,
 };
 use crate::mission_objective_plan::{
@@ -454,8 +453,7 @@ fn validate_mcp_submit_idempotency_key_bytes(
     idempotency_key: &str,
     start: Instant,
 ) -> Option<McpResult<Vec<Content>>> {
-    if !idempotency_key.is_empty()
-        && idempotency_key.len() <= MAX_MCP_SUBMIT_IDEMPOTENCY_KEY_BYTES
+    if !idempotency_key.is_empty() && idempotency_key.len() <= MAX_MCP_SUBMIT_IDEMPOTENCY_KEY_BYTES
     {
         return None;
     }
@@ -793,13 +791,14 @@ fn load_mcp_tx_contract_from_guard(
             }),
         )
     })?;
-    let contract: crate::plan::MissionTxContract = serde_json::from_slice(&raw).map_err(|_error| {
-        McpToolError::new(
-            MCP_ERR_INVALID_ARGS,
-            "Invalid transaction contract JSON".to_string(),
-            Some("Ensure the file matches the MissionTxContract schema.".to_string()),
-        )
-    })?;
+    let contract: crate::plan::MissionTxContract =
+        serde_json::from_slice(&raw).map_err(|_error| {
+            McpToolError::new(
+                MCP_ERR_INVALID_ARGS,
+                "Invalid transaction contract JSON".to_string(),
+                Some("Ensure the file matches the MissionTxContract schema.".to_string()),
+            )
+        })?;
     contract.validate().map_err(|_error| {
         McpToolError::new(
             MCP_ERR_INVALID_ARGS,
@@ -2193,12 +2192,8 @@ impl ToolHandler for WaCassSearchTool {
             }
             Err(err) => {
                 let err = McpToolError::from_cass_error(err);
-                let envelope = McpEnvelope::<()>::error(
-                    err.code,
-                    err.message,
-                    err.hint,
-                    elapsed_ms(start),
-                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -2327,12 +2322,8 @@ impl ToolHandler for WaCassViewTool {
             }
             Err(err) => {
                 let err = McpToolError::from_cass_error(err);
-                let envelope = McpEnvelope::<()>::error(
-                    err.code,
-                    err.message,
-                    err.hint,
-                    elapsed_ms(start),
-                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -2412,12 +2403,8 @@ impl ToolHandler for WaCassStatusTool {
             }
             Err(err) => {
                 let err = McpToolError::from_cass_error(err);
-                let envelope = McpEnvelope::<()>::error(
-                    err.code,
-                    err.message,
-                    err.hint,
-                    elapsed_ms(start),
-                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -2559,9 +2546,7 @@ fn bounded_mcp_send_response_text(text: &str) -> String {
     )
 }
 
-fn bound_mcp_send_decision_context_output(
-    context: &mut DecisionContext,
-) -> McpSendOutputOmissions {
+fn bound_mcp_send_decision_context_output(context: &mut DecisionContext) -> McpSendOutputOmissions {
     let mut omissions = McpSendOutputOmissions::default();
     for value in [
         &mut context.domain,
@@ -2619,9 +2604,7 @@ fn bound_mcp_send_decision_context_output(
     omissions
 }
 
-fn bound_mcp_send_policy_decision_output(
-    decision: &mut PolicyDecision,
-) -> McpSendOutputOmissions {
+fn bound_mcp_send_policy_decision_output(decision: &mut PolicyDecision) -> McpSendOutputOmissions {
     let (rule_id, context) = match decision {
         PolicyDecision::Allow { rule_id, context } => (rule_id, context),
         PolicyDecision::Deny {
@@ -2658,9 +2641,7 @@ fn bound_mcp_send_policy_decision_output(
         })
 }
 
-fn bound_mcp_send_submit_receipt_output(
-    receipt: &mut crate::robot_types::SubmitReceipt,
-) -> usize {
+fn bound_mcp_send_submit_receipt_output(receipt: &mut crate::robot_types::SubmitReceipt) -> usize {
     if let Some(agent_type) = receipt.agent_type.as_mut() {
         *agent_type = bounded_mcp_send_response_text(agent_type);
     }
@@ -2894,12 +2875,8 @@ impl ToolHandler for WaStateTool {
             }
             Err(err) => {
                 let err = McpToolError::from_error(err);
-                let envelope = McpEnvelope::<()>::error(
-                    err.code,
-                    err.message,
-                    err.hint,
-                    elapsed_ms(start),
-                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -4116,9 +4093,7 @@ impl ToolHandler for WaSearchTool {
                         seq: r.segment.seq,
                         captured_at: r.segment.captured_at,
                         score: r.score,
-                        snippet: r
-                            .snippet
-                            .map(|snippet| redact_mcp_output_secrets(&snippet)),
+                        snippet: r.snippet.map(|snippet| redact_mcp_output_secrets(&snippet)),
                         content: if snippets_enabled {
                             None
                         } else {
@@ -4239,10 +4214,8 @@ const MCP_AWAIT_EVENT_BASELINE_LIMIT: usize = 0;
 const MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX: usize = MCP_AWAIT_EVENT_BATCH_LIMIT;
 const MCP_AWAIT_EVENT_CURSOR_EPOCH_HEX_LEN: usize = 32;
 const MCP_AWAIT_EVENT_CURSOR_SCOPE_HEX_LEN: usize = 64;
-const MCP_AWAIT_EVENT_CURSOR_SCOPE_DOMAIN: &[u8] =
-    b"frankenterm.wa.await_event.cursor-scope.v1";
-const MCP_AWAIT_EVENT_CURSOR_SCOPE_QUIESCENCE_MODE: &[u8] =
-    b"unsupported-db-events-only";
+const MCP_AWAIT_EVENT_CURSOR_SCOPE_DOMAIN: &[u8] = b"frankenterm.wa.await_event.cursor-scope.v1";
+const MCP_AWAIT_EVENT_CURSOR_SCOPE_QUIESCENCE_MODE: &[u8] = b"unsupported-db-events-only";
 pub const MCP_AWAIT_EVENT_DELIVERY_FINALIZE_GRACE_SECS: u64 = 30;
 const MCP_AWAIT_EVENT_CANCEL_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(50);
@@ -4271,8 +4244,7 @@ const MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY: u64 = 16;
 const MCP_AWAIT_EVENT_REQUEST_CONCURRENCY: usize = 8;
 const MCP_AWAIT_EVENT_SERVICE_RUNTIME_WORKERS: usize = 4;
 const MCP_AWAIT_EVENT_SERVICE_BLOCKING_THREADS: usize = 8;
-const MCP_AWAIT_EVENT_TASK_FINISHED_CAPACITY: usize =
-    MCP_AWAIT_EVENT_REQUEST_CONCURRENCY + 1;
+const MCP_AWAIT_EVENT_TASK_FINISHED_CAPACITY: usize = MCP_AWAIT_EVENT_REQUEST_CONCURRENCY + 1;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4406,12 +4378,7 @@ fn try_decrement_atomic(counter: &AtomicU64) -> bool {
         let Some(next) = current.checked_sub(1) else {
             return false;
         };
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return true,
             Err(observed) => current = observed,
         }
@@ -4425,12 +4392,7 @@ fn try_increment_atomic_below(counter: &AtomicU64, ceiling: u64) -> bool {
             return false;
         }
         let next = current.saturating_add(1);
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return true,
             Err(observed) => current = observed,
         }
@@ -4538,20 +4500,19 @@ enum McpAwaitEventCompletionPreflightRejection {
         token_empty: bool,
         token_too_long: bool,
     },
-    ContradictoryTokens { event_id: i64 },
+    ContradictoryTokens {
+        event_id: i64,
+    },
 }
 
 fn mcp_await_event_completion_preflight_rejection(
     leases: &[EventDeliveryLease],
 ) -> Option<McpAwaitEventCompletionPreflightRejection> {
-    if let Some(lease) = leases
-        .iter()
-        .find(|lease| {
-            lease.event_id() <= 0
-                || lease.token().is_empty()
-                || lease.token().len() > EVENT_DELIVERY_LEASE_TOKEN_MAX_BYTES
-        })
-    {
+    if let Some(lease) = leases.iter().find(|lease| {
+        lease.event_id() <= 0
+            || lease.token().is_empty()
+            || lease.token().len() > EVENT_DELIVERY_LEASE_TOKEN_MAX_BYTES
+    }) {
         return Some(McpAwaitEventCompletionPreflightRejection::InvalidLease {
             event_id: lease.event_id(),
             token_empty: lease.token().is_empty(),
@@ -4568,9 +4529,11 @@ fn mcp_await_event_completion_preflight_rejection(
     lease_pairs
         .windows(2)
         .find(|pair| pair[0].0 == pair[1].0)
-        .map(|pair| McpAwaitEventCompletionPreflightRejection::ContradictoryTokens {
-            event_id: pair[0].0,
-        })
+        .map(
+            |pair| McpAwaitEventCompletionPreflightRejection::ContradictoryTokens {
+                event_id: pair[0].0,
+            },
+        )
 }
 
 impl McpAwaitEventCompletionWorkerPhase {
@@ -4814,13 +4777,9 @@ impl McpAwaitEventDeliveryCompletionStats {
             worker_initialization_handoffs: self
                 .worker_initialization_handoffs
                 .load(Ordering::Relaxed),
-            worker_completion_handoffs: self
-                .worker_completion_handoffs
-                .load(Ordering::Relaxed),
+            worker_completion_handoffs: self.worker_completion_handoffs.load(Ordering::Relaxed),
             worker_request_handoffs: self.worker_request_handoffs.load(Ordering::Relaxed),
-            worker_shutdown_handoffs: self
-                .worker_shutdown_handoffs
-                .load(Ordering::Relaxed),
+            worker_shutdown_handoffs: self.worker_shutdown_handoffs.load(Ordering::Relaxed),
             runtime_initializations: self.runtime_initializations.load(Ordering::Relaxed),
             storage_initialization_attempts: self
                 .storage_initialization_attempts
@@ -4841,9 +4800,7 @@ impl McpAwaitEventDeliveryCompletionStats {
             reconnect_backoff_waits: self.reconnect_backoff_waits.load(Ordering::Relaxed),
             reconnect_backoff_ms_total: self.reconnect_backoff_ms_total.load(Ordering::Relaxed),
             completion_batches: self.completion_batches.load(Ordering::Relaxed),
-            completion_attempts_finished: self
-                .completion_attempts_finished
-                .load(Ordering::Acquire),
+            completion_attempts_finished: self.completion_attempts_finished.load(Ordering::Acquire),
             completion_attempts_storage_reusable: self
                 .completion_attempts_storage_reusable
                 .load(Ordering::Relaxed),
@@ -4909,9 +4866,7 @@ impl McpAwaitEventDeliveryCompletionStats {
             request_jobs_rejected_cancelled: self
                 .request_jobs_rejected_cancelled
                 .load(Ordering::Relaxed),
-            request_waiter_cancellations: self
-                .request_waiter_cancellations
-                .load(Ordering::Relaxed),
+            request_waiter_cancellations: self.request_waiter_cancellations.load(Ordering::Relaxed),
             request_reply_outputs_reclaimed: self
                 .request_reply_outputs_reclaimed
                 .load(Ordering::Relaxed),
@@ -4923,18 +4878,10 @@ impl McpAwaitEventDeliveryCompletionStats {
                 .load(Ordering::Relaxed),
             request_panics: self.request_panics.load(Ordering::Relaxed),
             active_requests: self.active_requests.load(Ordering::Acquire),
-            active_requests_high_water: self
-                .active_requests_high_water
-                .load(Ordering::Relaxed),
-            request_queue_delay_us_max: self
-                .request_queue_delay_us_max
-                .load(Ordering::Relaxed),
-            request_execution_us_total: self
-                .request_execution_us_total
-                .load(Ordering::Relaxed),
-            request_execution_us_max: self
-                .request_execution_us_max
-                .load(Ordering::Relaxed),
+            active_requests_high_water: self.active_requests_high_water.load(Ordering::Relaxed),
+            request_queue_delay_us_max: self.request_queue_delay_us_max.load(Ordering::Relaxed),
+            request_execution_us_total: self.request_execution_us_total.load(Ordering::Relaxed),
+            request_execution_us_max: self.request_execution_us_max.load(Ordering::Relaxed),
             completion_schedule_delay_ms_max: self
                 .completion_schedule_delay_ms_max
                 .load(Ordering::Relaxed),
@@ -4947,10 +4894,7 @@ struct McpAwaitEventActiveCxGuard<'a> {
 }
 
 impl<'a> McpAwaitEventActiveCxGuard<'a> {
-    fn install(
-        slot: &'a std::sync::Mutex<Option<crate::cx::Cx>>,
-        cx: &crate::cx::Cx,
-    ) -> Self {
+    fn install(slot: &'a std::sync::Mutex<Option<crate::cx::Cx>>, cx: &crate::cx::Cx) -> Self {
         *slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cx.clone());
@@ -5036,8 +4980,7 @@ impl McpAwaitEventDeliveryCompletionExecutor {
             crossbeam::channel::Sender<McpAwaitEventRequestJob>,
             crossbeam::channel::Receiver<McpAwaitEventRequestJob>,
         ) = crossbeam::channel::bounded(
-            usize::try_from(MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY)
-                .unwrap_or(usize::MAX),
+            usize::try_from(MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY).unwrap_or(usize::MAX),
         );
         let request_admissions = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -5047,14 +4990,11 @@ impl McpAwaitEventDeliveryCompletionExecutor {
         ));
         let lifecycle_gate = Arc::new(std::sync::Mutex::new(()));
         let active_completion_cx = Arc::new(std::sync::Mutex::new(None));
-        let active_request_cxs = Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        ));
+        let active_request_cxs = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let stats = Arc::new(McpAwaitEventDeliveryCompletionStats::default());
         #[cfg(test)]
-        let synthetic_storage_init_failures = Arc::new(AtomicU64::new(
-            synthetic_storage_init_failures,
-        ));
+        let synthetic_storage_init_failures =
+            Arc::new(AtomicU64::new(synthetic_storage_init_failures));
         #[cfg(test)]
         let synthetic_storage_epoch_failures =
             Arc::new(AtomicU64::new(synthetic_storage_epoch_failures));
@@ -5071,11 +5011,9 @@ impl McpAwaitEventDeliveryCompletionExecutor {
         let worker_stats = Arc::clone(&stats);
         let worker_db_path = Arc::clone(&db_path);
         #[cfg(test)]
-        let worker_synthetic_storage_init_failures =
-            Arc::clone(&synthetic_storage_init_failures);
+        let worker_synthetic_storage_init_failures = Arc::clone(&synthetic_storage_init_failures);
         #[cfg(test)]
-        let worker_synthetic_storage_epoch_failures =
-            Arc::clone(&synthetic_storage_epoch_failures);
+        let worker_synthetic_storage_epoch_failures = Arc::clone(&synthetic_storage_epoch_failures);
         #[cfg(test)]
         let worker_synthetic_storage_init_stall = synthetic_storage_init_stall;
         #[cfg(test)]
@@ -5164,8 +5102,7 @@ impl McpAwaitEventDeliveryCompletionExecutor {
             crossbeam::channel::Sender<McpAwaitEventRequestJob>,
             crossbeam::channel::Receiver<McpAwaitEventRequestJob>,
         ) = crossbeam::channel::bounded(
-            usize::try_from(MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY)
-                .unwrap_or(usize::MAX),
+            usize::try_from(MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY).unwrap_or(usize::MAX),
         );
         let request_admissions = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -5175,9 +5112,7 @@ impl McpAwaitEventDeliveryCompletionExecutor {
         ));
         let lifecycle_gate = Arc::new(std::sync::Mutex::new(()));
         let active_completion_cx = Arc::new(std::sync::Mutex::new(None));
-        let active_request_cxs = Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        ));
+        let active_request_cxs = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let stats = Arc::new(McpAwaitEventDeliveryCompletionStats::default());
         let mut workers = Vec::with_capacity(MCP_AWAIT_EVENT_COMPLETION_WORKERS);
 
@@ -5304,10 +5239,7 @@ impl McpAwaitEventDeliveryCompletionExecutor {
             self.stats
                 .request_admission_rejections_cancelled
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok((
-                Err(McpToolError::from_error(cancellation)),
-                Vec::new(),
-            ));
+            return Ok((Err(McpToolError::from_error(cancellation)), Vec::new()));
         }
         let lifecycle_guard = self
             .lifecycle_gate
@@ -5371,8 +5303,7 @@ impl McpAwaitEventDeliveryCompletionExecutor {
                             break Err(mcp_await_event_service_disconnected_error());
                         }
                         Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
-                            let Err(cancellation) = mcp_await_event_checkpoint(&response_cx)
-                            else {
+                            let Err(cancellation) = mcp_await_event_checkpoint(&response_cx) else {
                                 continue;
                             };
                             self.stats
@@ -5380,10 +5311,8 @@ impl McpAwaitEventDeliveryCompletionExecutor {
                                 .fetch_add(1, Ordering::Relaxed);
                             self.wake_workers();
                             if let Some(undelivered_output) =
-                                abandon_mcp_await_event_request_reply(
-                                    &response,
-                                    &reply_handoff,
-                                ) && reclaim_mcp_await_event_request_reply(
+                                abandon_mcp_await_event_request_reply(&response, &reply_handoff)
+                                && reclaim_mcp_await_event_request_reply(
                                     &self.sender,
                                     &self.stats,
                                     undelivered_output,
@@ -5391,10 +5320,7 @@ impl McpAwaitEventDeliveryCompletionExecutor {
                             {
                                 self.wake_workers();
                             }
-                            break Ok((
-                                Err(McpToolError::from_error(cancellation)),
-                                Vec::new(),
-                            ));
+                            break Ok((Err(McpToolError::from_error(cancellation)), Vec::new()));
                         }
                     }
                 }
@@ -5458,11 +5384,7 @@ impl McpAwaitEventDeliveryCompletionExecutor {
             );
             return false;
         }
-        let queued = try_enqueue_mcp_await_event_delivery_completion(
-            &self.sender,
-            leases,
-            outcome,
-        );
+        let queued = try_enqueue_mcp_await_event_delivery_completion(&self.sender, leases, outcome);
         drop(lifecycle_guard);
         if queued {
             self.wake_workers();
@@ -5510,10 +5432,9 @@ fn shutdown_mcp_await_event_completion_storage(
             .fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             error_class,
-            shutdown_grace_ms = u64::try_from(
-                MCP_AWAIT_EVENT_COMPLETION_STORAGE_SHUTDOWN_GRACE.as_millis()
-            )
-            .unwrap_or(u64::MAX),
+            shutdown_grace_ms =
+                u64::try_from(MCP_AWAIT_EVENT_COMPLETION_STORAGE_SHUTDOWN_GRACE.as_millis())
+                    .unwrap_or(u64::MAX),
             "Long-lived MCP event-delivery completion storage shutdown failed or timed out"
         );
     }
@@ -5535,9 +5456,8 @@ fn abandon_queued_mcp_await_event_completions(
     let mut abandoned_leases = 0_u64;
     let mut record = |job: McpAwaitEventDeliveryCompletionJob| {
         abandoned_jobs = abandoned_jobs.saturating_add(1);
-        abandoned_leases = abandoned_leases.saturating_add(
-            u64::try_from(job.leases.len()).unwrap_or(u64::MAX),
-        );
+        abandoned_leases =
+            abandoned_leases.saturating_add(u64::try_from(job.leases.len()).unwrap_or(u64::MAX));
     };
     if let Some(job) = deferred_job.take() {
         record(job);
@@ -5684,9 +5604,7 @@ fn spawn_mcp_await_event_request(
     storage_epoch: u64,
     job: McpAwaitEventRequestJob,
     active_requests: &mut std::collections::HashMap<u64, crate::cx::Cx>,
-    shared_active_requests: &std::sync::Mutex<
-        std::collections::HashMap<u64, crate::cx::Cx>,
-    >,
+    shared_active_requests: &std::sync::Mutex<std::collections::HashMap<u64, crate::cx::Cx>>,
     completion_sender: &crossbeam::channel::Sender<McpAwaitEventDeliveryCompletionJob>,
     stats: &Arc<McpAwaitEventDeliveryCompletionStats>,
     task_finished_tx: &crossbeam::channel::Sender<McpAwaitEventServiceTaskFinished>,
@@ -5773,15 +5691,10 @@ fn spawn_mcp_await_event_request(
         // immediately submit replacement work instead of observing a stale
         // saturation count while this task performs terminal bookkeeping.
         drop(_admission);
-        if let Some(undelivered_output) = deliver_mcp_await_event_request_reply(
-            &reply,
-            &reply_handoff,
-            output,
-        ) && reclaim_mcp_await_event_request_reply(
-            &completion_sender,
-            &stats,
-            undelivered_output,
-        ) {
+        if let Some(undelivered_output) =
+            deliver_mcp_await_event_request_reply(&reply, &reply_handoff, output)
+            && reclaim_mcp_await_event_request_reply(&completion_sender, &stats, undelivered_output)
+        {
             coordinator_thread.unpark();
         }
         stats.request_jobs_finished.fetch_add(1, Ordering::Release);
@@ -5811,9 +5724,7 @@ fn run_mcp_await_event_delivery_completion_worker(
     phase: Arc<AtomicU8>,
     lifecycle_gate: Arc<std::sync::Mutex<()>>,
     active_completion_cx: Arc<std::sync::Mutex<Option<crate::cx::Cx>>>,
-    active_request_cxs: Arc<
-        std::sync::Mutex<std::collections::HashMap<u64, crate::cx::Cx>>,
-    >,
+    active_request_cxs: Arc<std::sync::Mutex<std::collections::HashMap<u64, crate::cx::Cx>>>,
     stats: Arc<McpAwaitEventDeliveryCompletionStats>,
     db_path: Arc<PathBuf>,
     #[cfg(test)] synthetic_storage_init_failures: Arc<AtomicU64>,
@@ -5855,10 +5766,9 @@ fn run_mcp_await_event_delivery_completion_worker(
     // can be live, and each publishes exactly one terminal record.  Keep the
     // coordinator mailbox physically bounded by that invariant rather than
     // relying on an unbounded channel whose safety exists only in comments.
-    let (task_finished_tx, task_finished_rx) =
-        crossbeam::channel::bounded::<McpAwaitEventServiceTaskFinished>(
-            MCP_AWAIT_EVENT_TASK_FINISHED_CAPACITY,
-        );
+    let (task_finished_tx, task_finished_rx) = crossbeam::channel::bounded::<
+        McpAwaitEventServiceTaskFinished,
+    >(MCP_AWAIT_EVENT_TASK_FINISHED_CAPACITY);
     let mut active_requests = std::collections::HashMap::<u64, crate::cx::Cx>::new();
     let mut pending_requests = std::collections::VecDeque::<McpAwaitEventRequestJob>::new();
     let mut completion_in_flight = false;
@@ -5968,11 +5878,7 @@ fn run_mcp_await_event_delivery_completion_worker(
                 }
                 shutdown_cancellation_sent = true;
             }
-            abandon_queued_mcp_await_event_completions(
-                &receiver,
-                &mut deferred_job,
-                &stats,
-            );
+            abandon_queued_mcp_await_event_completions(&receiver, &mut deferred_job, &stats);
             reject_queued_mcp_await_event_requests(
                 &request_receiver,
                 &mut pending_requests,
@@ -6010,11 +5916,7 @@ fn run_mcp_await_event_delivery_completion_worker(
 
             McpAwaitEventCompletionWorkerPhase::ShuttingDownStorage.store(&phase);
             if let Some(unusable_storage) = storage.take() {
-                shutdown_mcp_await_event_completion_storage(
-                    &runtime,
-                    &stats,
-                    unusable_storage,
-                );
+                shutdown_mcp_await_event_completion_storage(&runtime, &stats, unusable_storage);
             }
             stats.record_reconnect_backoff(reconnect_backoff);
             if !wait_for_mcp_await_event_completion_reconnect(&shutdown, reconnect_backoff) {
@@ -6041,8 +5943,7 @@ fn run_mcp_await_event_delivery_completion_worker(
                 Err("synthetic_storage_initialization_failure")
             } else {
                 let cx = crate::cx::for_request();
-                let _active_cx =
-                    McpAwaitEventActiveCxGuard::install(&active_completion_cx, &cx);
+                let _active_cx = McpAwaitEventActiveCxGuard::install(&active_completion_cx, &cx);
                 runtime
                     .block_on(StorageHandle::new_with_cx(&cx, &db_path_text))
                     .map_err(|_error| "storage_open_failed")
@@ -6099,15 +6000,13 @@ fn run_mcp_await_event_delivery_completion_worker(
                         .fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
                         error_class = error,
-                        reconnect_backoff_ms = u64::try_from(reconnect_backoff.as_millis())
-                            .unwrap_or(u64::MAX),
+                        reconnect_backoff_ms =
+                            u64::try_from(reconnect_backoff.as_millis()).unwrap_or(u64::MAX),
                         "Unable to initialize shared MCP await-event storage; all await admission remains fail-closed"
                     );
                     stats.record_reconnect_backoff(reconnect_backoff);
-                    if !wait_for_mcp_await_event_completion_reconnect(
-                        &shutdown,
-                        reconnect_backoff,
-                    ) {
+                    if !wait_for_mcp_await_event_completion_reconnect(&shutdown, reconnect_backoff)
+                    {
                         continue;
                     }
                     reconnect_backoff = reconnect_backoff
@@ -6345,11 +6244,7 @@ fn run_mcp_await_event_delivery_completion_worker(
 
     if let Some(active_storage) = storage {
         McpAwaitEventCompletionWorkerPhase::ShuttingDownStorage.store(&phase);
-        shutdown_mcp_await_event_completion_storage(
-            &runtime,
-            &stats,
-            active_storage,
-        );
+        shutdown_mcp_await_event_completion_storage(&runtime, &stats, active_storage);
     }
 }
 
@@ -6398,9 +6293,7 @@ impl Drop for McpAwaitEventDeliveryCompletionExecutor {
                         Some("MCP await shared service shutdown"),
                     );
                 }
-                std::thread::park_timeout(
-                    remaining.min(MCP_AWAIT_EVENT_COMPLETION_SHUTDOWN_POLL),
-                );
+                std::thread::park_timeout(remaining.min(MCP_AWAIT_EVENT_COMPLETION_SHUTDOWN_POLL));
             }
             if worker.is_finished() {
                 if worker.join().is_err() {
@@ -6827,10 +6720,9 @@ fn complete_mcp_await_event_deliveries(
     };
     let active_cx = std::sync::Mutex::new(None);
     let cx = crate::cx::for_request();
-    let storage = match runtime.block_on(StorageHandle::new_with_cx(
-        &cx,
-        &db_path.to_string_lossy(),
-    )) {
+    let storage = match runtime
+        .block_on(StorageHandle::new_with_cx(&cx, &db_path.to_string_lossy()))
+    {
         Ok(storage) => storage,
         Err(_error) => {
             tracing::error!(
@@ -6843,10 +6735,7 @@ fn complete_mcp_await_event_deliveries(
         }
     };
     let _storage_reusable = runtime.block_on(complete_mcp_await_event_deliveries_with_storage(
-        &storage,
-        &active_cx,
-        leases,
-        outcome,
+        &storage, &active_cx, leases, outcome,
     ));
     if let Err(_error) = runtime.block_on(storage.shutdown_with_cx(&cx)) {
         tracing::warn!(
@@ -6996,10 +6885,7 @@ fn mcp_await_event_cursor_scope_is_canonical(cursor_scope: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn mcp_await_event_hash_scope_field(
-    hasher: &mut sha2::Sha256,
-    field: &[u8],
-) {
+fn mcp_await_event_hash_scope_field(hasher: &mut sha2::Sha256, field: &[u8]) {
     use sha2::Digest;
 
     let len = u64::try_from(field.len()).unwrap_or(u64::MAX);
@@ -7062,10 +6948,7 @@ fn mcp_await_event_cursor_scope(
     // mode in the v1 digest prevents a future implementation/default from
     // accidentally inheriting authority from today's DB-event-only cursors.
     mcp_await_event_hash_scope_field(&mut hasher, b"quiescence_mode");
-    mcp_await_event_hash_scope_field(
-        &mut hasher,
-        MCP_AWAIT_EVENT_CURSOR_SCOPE_QUIESCENCE_MODE,
-    );
+    mcp_await_event_hash_scope_field(&mut hasher, MCP_AWAIT_EVENT_CURSOR_SCOPE_QUIESCENCE_MODE);
     hex::encode(hasher.finalize())
 }
 
@@ -7225,19 +7108,15 @@ async fn mcp_await_event_reconcile_page(
     retention_coverage: &mut Option<McpAwaitRetentionCoverage>,
 ) -> std::result::Result<(), McpToolError> {
     let through_id = mcp_await_event_page_checked_through(page).max(committed_after_id);
-    if retention_coverage.as_ref().is_some_and(|coverage| {
-        coverage.covers(cursor_epoch, page, committed_after_id, through_id)
-    }) {
+    if retention_coverage
+        .as_ref()
+        .is_some_and(|coverage| coverage.covers(cursor_epoch, page, committed_after_id, through_id))
+    {
         return Ok(());
     }
 
     let check_result = storage
-        .check_event_retention_in_epoch_with_cx(
-            cx,
-            committed_after_id,
-            through_id,
-            cursor_epoch,
-        )
+        .check_event_retention_in_epoch_with_cx(cx, committed_after_id, through_id, cursor_epoch)
         .await;
     mcp_await_event_record_storage_call_health(storage_reusable, &check_result);
     mcp_await_event_checkpoint(cx).map_err(McpToolError::from_error)?;
@@ -7322,9 +7201,7 @@ async fn mcp_await_event_resolve_exact_event(
         .next()
         .filter(|event| event.id == event_id)
     {
-        Some(event) if event.handled_at.is_some() => {
-            Ok(Err(McpAwaitExactEventAbsence::Handled))
-        }
+        Some(event) if event.handled_at.is_some() => Ok(Err(McpAwaitExactEventAbsence::Handled)),
         Some(event) => Ok(Ok(event)),
         None => Ok(Err(
             McpAwaitExactEventAbsence::MissingWithoutRetentionEvidence,
@@ -7380,8 +7257,7 @@ fn mcp_await_event_require_claim_completion_ready(
         delivery_completion.record_unready_claim_admission();
         return Err(McpToolError::new(
             MCP_ERR_CONFIG,
-            "wa.await_event claim completion storage is initializing or reconnecting"
-                .to_string(),
+            "wa.await_event claim completion storage is initializing or reconnecting".to_string(),
             Some(
                 "Retry after the MCP server reports its durable claim-completion lane ready"
                     .to_string(),
@@ -7406,9 +7282,7 @@ fn mcp_await_event_service_saturated_error() -> McpToolError {
         format!(
             "wa.await_event shared service has reached its bounded admission limit of {MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY} requests"
         ),
-        Some(
-            "Wait for an in-flight await to finish or cancel one before retrying".to_string(),
-        ),
+        Some("Wait for an in-flight await to finish or cancel one before retrying".to_string()),
     )
 }
 
@@ -7503,9 +7377,8 @@ fn mcp_await_event_record_partial_latch_cursor(
 ) {
     if mcp_await_event_has_partial_latch(any_met, all_met) {
         let before_event = event_id.saturating_sub(1);
-        *partial_latch_cursor = Some(
-            partial_latch_cursor.map_or(before_event, |cursor| cursor.min(before_event)),
-        );
+        *partial_latch_cursor =
+            Some(partial_latch_cursor.map_or(before_event, |cursor| cursor.min(before_event)));
     }
 }
 
@@ -7640,7 +7513,10 @@ impl ToolHandler for WaEventsTool {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
                 "since must be a non-negative epoch-millisecond timestamp",
-                Some("Use since=0 for the beginning of the Unix epoch, or omit the filter.".to_string()),
+                Some(
+                    "Use since=0 for the beginning of the Unix epoch, or omit the filter."
+                        .to_string(),
+                ),
                 elapsed_ms(start),
             );
             return envelope_to_content(envelope);
@@ -7782,17 +7658,17 @@ impl WaAwaitEventTool {
         db_path: Arc<PathBuf>,
         response_delivery: Arc<FrameworkResponseDeliveryCoordinator>,
     ) -> Self {
-        let await_service =
-            match McpAwaitEventDeliveryCompletionExecutor::new(Arc::clone(&db_path)) {
-                Ok(executor) => Some(Arc::new(executor)),
-                Err(_error) => {
-                    tracing::error!(
-                        error_class = "mcp_await_event_service_start_failed",
-                        "Unable to start the shared MCP await-event service; all await requests will fail closed"
-                    );
-                    None
-                }
-            };
+        let await_service = match McpAwaitEventDeliveryCompletionExecutor::new(Arc::clone(&db_path))
+        {
+            Ok(executor) => Some(Arc::new(executor)),
+            Err(_error) => {
+                tracing::error!(
+                    error_class = "mcp_await_event_service_start_failed",
+                    "Unable to start the shared MCP await-event service; all await requests will fail closed"
+                );
+                None
+            }
+        };
         Self {
             #[cfg(test)]
             db_path,
@@ -7818,10 +7694,8 @@ impl WaAwaitEventTool {
             response_delivery: Some(response_delivery),
             request_service: None,
             delivery_completion: Some(Arc::new(
-                McpAwaitEventDeliveryCompletionExecutor::new_with_handler(
-                    completion_handler,
-                )
-                .expect("test completion lane must start"),
+                McpAwaitEventDeliveryCompletionExecutor::new_with_handler(completion_handler)
+                    .expect("test completion lane must start"),
             )),
             blocked_retry_observer: None,
             iteration_observer: None,
@@ -8016,15 +7890,11 @@ impl ToolHandler for WaAwaitEventTool {
             );
             return envelope_to_content(envelope);
         }
-        if let Err(message) =
-            validate_mcp_await_event_condition_lengths(&params.any, &params.all)
-        {
+        if let Err(message) = validate_mcp_await_event_condition_lengths(&params.any, &params.all) {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
                 message,
-                Some(
-                    "Shorten each rule condition before retrying wa.await_event.".to_string(),
-                ),
+                Some("Shorten each rule condition before retrying wa.await_event.".to_string()),
                 elapsed_ms(start),
             );
             return envelope_to_content(envelope);
@@ -8133,12 +8003,8 @@ impl ToolHandler for WaAwaitEventTool {
                     supplied_scope,
                     &canonical_cursor_scope,
                 );
-                let envelope = McpEnvelope::<()>::error(
-                    err.code,
-                    err.message,
-                    err.hint,
-                    elapsed_ms(start),
-                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 return envelope_to_content(envelope);
             }
         }
@@ -8155,16 +8021,11 @@ impl ToolHandler for WaAwaitEventTool {
             return envelope_to_content(envelope);
         }
         if params.claim
-            && let Err(err) = mcp_await_event_require_claim_completion_ready(
-                self.delivery_completion.as_ref(),
-            )
+            && let Err(err) =
+                mcp_await_event_require_claim_completion_ready(self.delivery_completion.as_ref())
         {
-            let envelope = McpEnvelope::<()>::error(
-                err.code,
-                err.message,
-                err.hint,
-                elapsed_ms(start),
-            );
+            let envelope =
+                McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
             return envelope_to_content(envelope);
         }
 
@@ -8190,28 +8051,28 @@ impl ToolHandler for WaAwaitEventTool {
                         true,
                     );
                 }
-            let redactor = crate::redactor::Redactor::new();
-            let started = Instant::now();
-            let timeout = std::time::Duration::from_secs(params.timeout_secs);
-            let poll = std::time::Duration::from_millis(params.poll_interval_ms);
-            // `scan_after_id` is a monotonic query high-watermark. Temporarily
-            // leased matching rows are retained separately and retried by ID,
-            // so one live hole neither head-of-line blocks later claimable
-            // matches nor forces the full scanned tail through SQLite again on
-            // every poll.
-            let mut scan_after_id = params.cursor;
-            let mut final_cursor = params.cursor;
-            let mut partial_latch_cursor = None;
-            let mut current_cursor_epoch = params.cursor_epoch.clone();
-            let mut retention_coverage = None;
-            let mut any_met = vec![false; any_conditions.len()];
-            let mut all_met = vec![false; all_conditions.len()];
-            let mut matched_stored_events = Vec::new();
-            let mut blocked_events =
-                Vec::<McpAwaitBlockedEvent>::with_capacity(MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX);
-            let mut blocked_retry_scratch =
-                Vec::<McpAwaitBlockedEvent>::with_capacity(MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX);
-            let mut retry_blocked_events = true;
+                let redactor = crate::redactor::Redactor::new();
+                let started = Instant::now();
+                let timeout = std::time::Duration::from_secs(params.timeout_secs);
+                let poll = std::time::Duration::from_millis(params.poll_interval_ms);
+                // `scan_after_id` is a monotonic query high-watermark. Temporarily
+                // leased matching rows are retained separately and retried by ID,
+                // so one live hole neither head-of-line blocks later claimable
+                // matches nor forces the full scanned tail through SQLite again on
+                // every poll.
+                let mut scan_after_id = params.cursor;
+                let mut final_cursor = params.cursor;
+                let mut partial_latch_cursor = None;
+                let mut current_cursor_epoch = params.cursor_epoch.clone();
+                let mut retention_coverage = None;
+                let mut any_met = vec![false; any_conditions.len()];
+                let mut all_met = vec![false; all_conditions.len()];
+                let mut matched_stored_events = Vec::new();
+                let mut blocked_events =
+                    Vec::<McpAwaitBlockedEvent>::with_capacity(MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX);
+                let mut blocked_retry_scratch =
+                    Vec::<McpAwaitBlockedEvent>::with_capacity(MCP_AWAIT_EVENT_BLOCKED_EVENT_MAX);
+                let mut retry_blocked_events = true;
 
                 let operation: std::result::Result<McpAwaitEventData, McpToolError> = async {
                 if scan_after_id.is_none() {
@@ -8829,11 +8690,7 @@ impl ToolHandler for WaAwaitEventTool {
                 }
                 .await;
                 let storage_reusable = storage_reusable.load(Ordering::Acquire);
-                McpAwaitEventRequestTaskOutput::new(
-                    operation,
-                    delivery_leases,
-                    storage_reusable,
-                )
+                McpAwaitEventRequestTaskOutput::new(operation, delivery_leases, storage_reusable)
             })
         });
 
@@ -8842,13 +8699,15 @@ impl ToolHandler for WaAwaitEventTool {
         } else {
             #[cfg(test)]
             {
-                let runtime = CompatRuntimeBuilder::current_thread().build().map_err(|error| {
-                    McpToolError::new(
-                        MCP_ERR_CONFIG,
-                        format!("MCP test runtime init failed: {error}"),
-                        None,
-                    )
-                });
+                let runtime = CompatRuntimeBuilder::current_thread()
+                    .build()
+                    .map_err(|error| {
+                        McpToolError::new(
+                            MCP_ERR_CONFIG,
+                            format!("MCP test runtime init failed: {error}"),
+                            None,
+                        )
+                    });
                 match runtime {
                     Ok(runtime) => {
                         let open_cx = crate::cx::for_request();
@@ -8858,7 +8717,9 @@ impl ToolHandler for WaAwaitEventTool {
                         )) {
                             Ok(storage) => {
                                 let output = runtime.block_on(request_operation(storage.clone()));
-                                if let Err(_error) = runtime.block_on(storage.shutdown_with_cx(&open_cx)) {
+                                if let Err(_error) =
+                                    runtime.block_on(storage.shutdown_with_cx(&open_cx))
+                                {
                                     tracing::warn!(
                                         error_class = "test_await_event_storage_shutdown_failed",
                                         "Test-only direct wa.await_event storage shutdown failed"
@@ -8866,10 +8727,7 @@ impl ToolHandler for WaAwaitEventTool {
                                 }
                                 Ok(output.response)
                             }
-                            Err(error) => Ok((
-                                Err(McpToolError::from_error(error)),
-                                Vec::new(),
-                            )),
+                            Err(error) => Ok((Err(McpToolError::from_error(error)), Vec::new())),
                         }
                     }
                     Err(error) => Err(error),
@@ -8884,21 +8742,13 @@ impl ToolHandler for WaAwaitEventTool {
         let (result, mut delivery_leases) = match request_execution {
             Ok(output) => output,
             Err(err) => {
-                let envelope = McpEnvelope::<()>::error(
-                    err.code,
-                    err.message,
-                    err.hint,
-                    elapsed_ms(start),
-                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 return envelope_to_content(envelope);
             }
         };
 
-        if result
-            .as_ref()
-            .is_ok_and(|data| !data.satisfied)
-            && !delivery_leases.is_empty()
-        {
+        if result.as_ref().is_ok_and(|data| !data.satisfied) && !delivery_leases.is_empty() {
             enqueue_mcp_await_event_deliveries(
                 delivery_completion.as_ref(),
                 std::mem::take(&mut delivery_leases),
@@ -8971,12 +8821,8 @@ impl ToolHandler for WaAwaitEventTool {
                     delivery_leases,
                     FrameworkResponseDeliveryOutcome::Failed,
                 );
-                let envelope = McpEnvelope::<()>::error(
-                    err.code,
-                    err.message,
-                    err.hint,
-                    elapsed_ms(start),
-                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -9071,8 +8917,7 @@ fn mcp_submit_idempotency_should_retry_post_effect(
     error: crate::submit_idempotency_store::SubmitIdempotencyError,
 ) -> bool {
     error.is_retryable()
-        || error
-            == crate::submit_idempotency_store::SubmitIdempotencyError::TransitionFailed
+        || error == crate::submit_idempotency_store::SubmitIdempotencyError::TransitionFailed
 }
 
 fn mcp_submit_idempotency_retry_post_effect<T, F>(
@@ -9166,9 +9011,7 @@ async fn mcp_submit_idempotency_complete(
         crate::submit_idempotency_store::SubmitIdempotencyError::TransitionFailed,
         move || {
             mcp_submit_idempotency_retry_post_effect(|| {
-                crate::submit_idempotency_store::complete(
-                    &ft_dir, &binding, token, &receipt,
-                )
+                crate::submit_idempotency_store::complete(&ft_dir, &binding, token, &receipt)
             })
         },
     )
@@ -9364,9 +9207,7 @@ async fn attach_mcp_submit_receipt_to_audit(
     receipt: &crate::robot_types::SubmitReceipt,
 ) {
     let Some(audit_action_id) = injection.audit_action_id() else {
-        tracing::debug!(
-            "wa.send submit receipt has no audit action id to attach"
-        );
+        tracing::debug!("wa.send submit receipt has no audit action id to attach");
         return;
     };
 
@@ -10018,12 +9859,8 @@ impl ToolHandler for WaSendTool {
             }
             Err(err) => {
                 let err = McpToolError::from_error(err);
-                let envelope = McpEnvelope::<()>::error(
-                    err.code,
-                    err.message,
-                    err.hint,
-                    elapsed_ms(start),
-                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -11629,12 +11466,8 @@ impl ToolHandler for WaReservationsTool {
             }
             Err(err) => {
                 let err = McpToolError::from_error(err);
-                let envelope = McpEnvelope::<()>::error(
-                    err.code,
-                    err.message,
-                    err.hint,
-                    elapsed_ms(start),
-                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -12091,12 +11924,8 @@ impl ToolHandler for WaAccountsTool {
             }
             Err(err) => {
                 let err = McpToolError::from_error(err);
-                let envelope = McpEnvelope::<()>::error(
-                    err.code,
-                    err.message,
-                    err.hint,
-                    elapsed_ms(start),
-                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -13786,12 +13615,8 @@ impl ToolHandler for WaEventsAnnotateTool {
             }
             Err(err) => {
                 let err = McpToolError::from_error(err);
-                let envelope = McpEnvelope::<()>::error(
-                    err.code,
-                    err.message,
-                    err.hint,
-                    elapsed_ms(start),
-                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -14006,12 +13831,8 @@ impl ToolHandler for WaEventsTriageTool {
             }
             Err(err) => {
                 let err = McpToolError::from_error(err);
-                let envelope = McpEnvelope::<()>::error(
-                    err.code,
-                    err.message,
-                    err.hint,
-                    elapsed_ms(start),
-                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -14292,12 +14113,8 @@ impl ToolHandler for WaEventsLabelTool {
             }
             Err(err) => {
                 let err = McpToolError::from_error(err);
-                let envelope = McpEnvelope::<()>::error(
-                    err.code,
-                    err.message,
-                    err.hint,
-                    elapsed_ms(start),
-                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -14327,26 +14144,24 @@ mod tests {
         MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES,
         MCP_STATE_FIELD_INPUT_MAX_BYTES, MCP_STATE_FIELD_MAX_BYTES, MCP_STATE_FIELD_OVERSIZE,
         McpContext, PaneCapabilities, PaneFilterConfig, PolicySurface, RecoverablePanicSite,
-        StorageHandle, Tool, ToolHandler,
-        WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool, WaAwaitEventTool, WaCassSearchTool,
-        WaCassStatusTool, WaCassViewTool, WaDomTool, WaEventsAnnotateTool, WaEventsLabelTool,
-        WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
-        WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
-        WaOperatingEnvelopeTool, WaRehearsalScoreTool, WaReleaseTool, WaReservationsTool,
-        WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool,
-        WaSteerPlanTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool,
-        WaWorkflowRunTool, WaWorkflowStatusTool, accounts_refresh_policy_input,
-        audit_mcp_policy_denial_async, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
-        build_policy_engine_with_shared_rate_limiter, catch_recoverable,
-        intent_hash_hex, mcp_event_mutation_decision_context,
+        StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool,
+        WaAwaitEventTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaDomTool,
+        WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool,
+        WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool,
+        WaMissionResumeTool, WaMissionStateTool, WaOperatingEnvelopeTool, WaRehearsalScoreTool,
+        WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool,
+        WaSearchTool, WaSendTool, WaStateTool, WaSteerPlanTool, WaTxPlanTool, WaTxRollbackTool,
+        WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
+        accounts_refresh_policy_input, audit_mcp_policy_denial_async, authorize_mcp_policy_call,
+        build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter,
+        catch_recoverable, intent_hash_hex, mcp_event_mutation_decision_context,
         mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
         mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
         mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
         merge_distributed_remote_mcp_states, redact_mcp_output_secrets,
         redact_mcp_pane_state_fields, redact_mcp_pane_text_with_escape_contract,
-        redact_mcp_wait_pattern_for_output,
-        serialize_mcp_audit_decision_context, tx_run_test_wezterm_override_slot,
-        tx_run_wezterm_handle, validate_cass_timeout_secs,
+        redact_mcp_wait_pattern_for_output, serialize_mcp_audit_decision_context,
+        tx_run_test_wezterm_override_slot, tx_run_wezterm_handle, validate_cass_timeout_secs,
     };
     use crate::mcp::mcp_types::{IpcPaneState, McpPaneState, StateParams};
     use crate::mcp::set_mcp_test_pane_state_override;
@@ -14463,12 +14278,9 @@ mod tests {
             Box::pin(async move {
                 entered.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 while gate.load(std::sync::atomic::Ordering::Acquire) {
-                    if super::mcp_await_event_wait_with_cx(
-                        &cx,
-                        std::time::Duration::from_millis(5),
-                    )
-                    .await
-                    .is_err()
+                    if super::mcp_await_event_wait_with_cx(&cx, std::time::Duration::from_millis(5))
+                        .await
+                        .is_err()
                     {
                         break;
                     }
@@ -14539,9 +14351,7 @@ mod tests {
     }
 
     impl crate::wezterm::MuxInterface for CancelOnSendWezterm {
-        fn list_panes(
-            &self,
-        ) -> crate::wezterm::WeztermFuture<'_, Vec<crate::wezterm::PaneInfo>> {
+        fn list_panes(&self) -> crate::wezterm::WeztermFuture<'_, Vec<crate::wezterm::PaneInfo>> {
             crate::wezterm::MuxInterface::list_panes(self.inner.as_ref())
         }
 
@@ -14560,11 +14370,7 @@ mod tests {
             crate::wezterm::MuxInterface::get_text(self.inner.as_ref(), pane_id, escapes)
         }
 
-        fn send_text(
-            &self,
-            _pane_id: u64,
-            _text: &str,
-        ) -> crate::wezterm::WeztermFuture<'_, ()> {
+        fn send_text(&self, _pane_id: u64, _text: &str) -> crate::wezterm::WeztermFuture<'_, ()> {
             Box::pin(async {
                 Err(crate::Error::Cancelled(
                     "test ambient send path used instead of send_text_with_cx".to_string(),
@@ -14627,11 +14433,7 @@ mod tests {
             pane_id: u64,
             control_char: &str,
         ) -> crate::wezterm::WeztermFuture<'_, ()> {
-            crate::wezterm::MuxInterface::send_control(
-                self.inner.as_ref(),
-                pane_id,
-                control_char,
-            )
+            crate::wezterm::MuxInterface::send_control(self.inner.as_ref(), pane_id, control_char)
         }
 
         fn send_ctrl_c(&self, pane_id: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
@@ -14700,11 +14502,7 @@ mod tests {
             crate::wezterm::MuxInterface::kill_pane(self.inner.as_ref(), pane_id)
         }
 
-        fn zoom_pane(
-            &self,
-            pane_id: u64,
-            zoom: bool,
-        ) -> crate::wezterm::WeztermFuture<'_, ()> {
+        fn zoom_pane(&self, pane_id: u64, zoom: bool) -> crate::wezterm::WeztermFuture<'_, ()> {
             crate::wezterm::MuxInterface::zoom_pane(self.inner.as_ref(), pane_id, zoom)
         }
 
@@ -14976,8 +14774,7 @@ mod tests {
                             extracted: None,
                             matched_text: Some(format!("event {index}")),
                             segment_id: None,
-                            detected_at: 1_700_000_000_000
-                                + i64::try_from(index).unwrap(),
+                            detected_at: 1_700_000_000_000 + i64::try_from(index).unwrap(),
                             dedupe_key: None,
                             handled_at: None,
                             handled_by_workflow_id: None,
@@ -15019,13 +14816,7 @@ mod tests {
             .iter()
             .map(|condition| super::parse_mcp_await_event_condition(condition).unwrap())
             .collect::<Vec<_>>();
-        super::mcp_await_event_cursor_scope(
-            &any,
-            &all,
-            pane,
-            unhandled || claim,
-            claim,
-        )
+        super::mcp_await_event_cursor_scope(&any, &all, pane, unhandled || claim, claim)
     }
 
     fn cursor_test_event(event_id: i64) -> crate::storage::StoredEvent {
@@ -15478,7 +15269,12 @@ mod tests {
             WaCassSearchTool.definition(),
             WaCassViewTool.definition(),
             WaCassStatusTool.definition(),
-            WaStateTool::new(Arc::new(Config::default()), PaneFilterConfig::default(), None).definition(),
+            WaStateTool::new(
+                Arc::new(Config::default()),
+                PaneFilterConfig::default(),
+                None,
+            )
+            .definition(),
             WaGetTextTool::new(Arc::clone(&cfg), Some(Arc::clone(&db))).definition(),
             WaWaitForTool::new(Arc::clone(&cfg), Some(Arc::clone(&db))).definition(),
             WaSearchTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
@@ -15684,9 +15480,7 @@ mod tests {
         );
         assert_eq!(canonical, reordered);
         assert_eq!(canonical.len(), super::MCP_AWAIT_EVENT_CURSOR_SCOPE_HEX_LEN);
-        assert!(super::mcp_await_event_cursor_scope_is_canonical(
-            &canonical
-        ));
+        assert!(super::mcp_await_event_cursor_scope_is_canonical(&canonical));
 
         assert_ne!(
             canonical,
@@ -15723,12 +15517,7 @@ mod tests {
             checked_through_id: 50,
         };
 
-        assert!(coverage.covers(
-            &first_page.retention.cursor_epoch,
-            &first_page,
-            25,
-            50,
-        ));
+        assert!(coverage.covers(&first_page.retention.cursor_epoch, &first_page, 25, 50,));
         assert!(
             !coverage.covers(
                 &extended_page.retention.cursor_epoch,
@@ -15762,13 +15551,7 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            false,
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, false);
         let tool = WaAwaitEventTool::new(db_path);
 
         let envelope = parse_json_content(
@@ -15790,7 +15573,10 @@ mod tests {
         assert_eq!(envelope["data"]["final_cursor"], event_id);
         assert_eq!(envelope["data"]["final_cursor_epoch"], cursor_epoch);
         assert_eq!(envelope["data"]["final_cursor_scope"], cursor_scope);
-        assert_eq!(envelope["data"]["candidate_cursor"], serde_json::Value::Null);
+        assert_eq!(
+            envelope["data"]["candidate_cursor"],
+            serde_json::Value::Null
+        );
         assert_eq!(envelope["data"]["pending_finalize"], false);
     }
 
@@ -15832,10 +15618,8 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let next_event_id = seed_events_with_rules(
-            db_path.as_ref().as_path(),
-            &["codex.after.checkpoint"],
-        )[0];
+        let next_event_id =
+            seed_events_with_rules(db_path.as_ref().as_path(), &["codex.after.checkpoint"])[0];
         let resumed = parse_json_content(
             tool.call(
                 &test_mcp_context(),
@@ -15859,13 +15643,7 @@ mod tests {
     fn await_event_checkpoint_only_rejects_resume_tokens_and_claims() {
         let (_dir, db_path) = temp_db_path();
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            false,
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, false);
         let tool = WaAwaitEventTool::new(db_path);
 
         for arguments in [
@@ -15934,10 +15712,8 @@ mod tests {
             "the public cursor may cross irrelevant rows but must stop before the first partial contribution"
         );
 
-        let second_event_id = seed_events_with_rules(
-            db_path.as_ref().as_path(),
-            &["codex.phase_b"],
-        )[0];
+        let second_event_id =
+            seed_events_with_rules(db_path.as_ref().as_path(), &["codex.phase_b"])[0];
         let resumed = parse_json_content(
             tool.call(
                 &test_mcp_context(),
@@ -16022,13 +15798,7 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            false,
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, false);
         let tool = WaAwaitEventTool::new(db_path);
 
         let envelope = parse_json_content(
@@ -16058,13 +15828,7 @@ mod tests {
     fn await_event_rejects_cursor_reuse_after_request_scope_changes() {
         let (_dir, db_path) = temp_db_path();
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let original_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            false,
-        );
+        let original_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, false);
         let tool = WaAwaitEventTool::new(db_path);
 
         for changed_arguments in [
@@ -16109,10 +15873,7 @@ mod tests {
                     .expect("changed cursor scope should return a typed error envelope"),
             );
             assert_eq!(envelope["ok"], false);
-            assert_eq!(
-                envelope["error_code"],
-                super::MCP_ERR_CURSOR_DISCONTINUITY
-            );
+            assert_eq!(envelope["error_code"], super::MCP_ERR_CURSOR_DISCONTINUITY);
             assert!(
                 envelope["error"]
                     .as_str()
@@ -16132,13 +15893,7 @@ mod tests {
         } else {
             "00000000000000000000000000000000"
         };
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            false,
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, false);
         let tool = WaAwaitEventTool::new(db_path);
 
         let envelope = parse_json_content(
@@ -16157,10 +15912,7 @@ mod tests {
         );
 
         assert_eq!(envelope["ok"], false);
-        assert_eq!(
-            envelope["error_code"],
-            super::MCP_ERR_CURSOR_DISCONTINUITY
-        );
+        assert_eq!(envelope["error_code"], super::MCP_ERR_CURSOR_DISCONTINUITY);
         assert!(
             envelope["error"]
                 .as_str()
@@ -16174,13 +15926,7 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            false,
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, false);
         let ahead_cursor = event_id + 1;
         let tool = WaAwaitEventTool::new(db_path);
 
@@ -16200,10 +15946,7 @@ mod tests {
         );
 
         assert_eq!(envelope["ok"], false);
-        assert_eq!(
-            envelope["error_code"],
-            super::MCP_ERR_CURSOR_DISCONTINUITY
-        );
+        assert_eq!(envelope["error_code"], super::MCP_ERR_CURSOR_DISCONTINUITY);
         assert!(
             envelope["error"]
                 .as_str()
@@ -16217,16 +15960,12 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         let _event_id = seed_event(db_path.as_ref().as_path());
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            false,
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, false);
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             assert_eq!(
                 storage
                     .delete_events_before(1_700_000_000_001, 10)
@@ -16254,10 +15993,7 @@ mod tests {
         );
 
         assert_eq!(envelope["ok"], false);
-        assert_eq!(
-            envelope["error_code"],
-            super::MCP_ERR_CURSOR_DISCONTINUITY
-        );
+        assert_eq!(envelope["error_code"], super::MCP_ERR_CURSOR_DISCONTINUITY);
         assert!(
             envelope["error"]
                 .as_str()
@@ -16271,16 +16007,12 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            true,
-            false,
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, true, false);
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             storage
                 .mark_event_handled(event_id, Some("test.workflow".to_string()), "handled")
                 .await
@@ -16392,16 +16124,8 @@ mod tests {
             &["other.filtered", "codex.claim"],
         );
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            true,
-        );
-        let response_delivery = Arc::new(
-            super::FrameworkResponseDeliveryCoordinator::default(),
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, true);
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
         let tool = WaAwaitEventTool::new_with_response_delivery(
             Arc::clone(&db_path),
             Arc::clone(&response_delivery),
@@ -16447,13 +16171,7 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            true,
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, true);
         let (worker_started_tx, worker_started_rx) = crossbeam::channel::bounded(1);
         let (release_worker_tx, release_worker_rx) = crossbeam::channel::bounded(1);
         let completion_handler: super::McpAwaitEventDeliveryCompletionHandler =
@@ -16462,9 +16180,7 @@ mod tests {
                 let _ = release_worker_rx.recv_timeout(std::time::Duration::from_secs(5));
                 drop(job);
             });
-        let response_delivery = Arc::new(
-            super::FrameworkResponseDeliveryCoordinator::default(),
-        );
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
         let tool = WaAwaitEventTool::new_with_response_delivery_and_completion_handler(
             Arc::clone(&db_path),
             Arc::clone(&response_delivery),
@@ -16490,8 +16206,7 @@ mod tests {
         assert_eq!(claimed["data"]["candidate_cursor"], event_id);
         assert!(response_delivery.activate_prepared());
 
-        let (completion_returned_tx, completion_returned_rx) =
-            crossbeam::channel::bounded(1);
+        let (completion_returned_tx, completion_returned_rx) = crossbeam::channel::bounded(1);
         let response_delivery_for_thread = Arc::clone(&response_delivery);
         let delivery_thread = std::thread::spawn(move || {
             response_delivery_for_thread.fail_all();
@@ -16502,9 +16217,7 @@ mod tests {
             .expect("completion worker did not receive the queued job");
         completion_returned_rx
             .recv_timeout(std::time::Duration::from_secs(1))
-            .expect(
-                "transport completion waited for the deliberately blocked completion handler",
-            );
+            .expect("transport completion waited for the deliberately blocked completion handler");
         delivery_thread.join().unwrap();
 
         // The completion worker is deliberately blocked above. A following
@@ -16551,14 +16264,10 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(1_100));
                 }
             });
-        let response_delivery = Arc::new(
-            super::FrameworkResponseDeliveryCoordinator::default(),
-        );
-        let tool = WaAwaitEventTool::new_with_response_delivery(
-            Arc::clone(&db_path),
-            response_delivery,
-        )
-        .with_iteration_observer(iteration_observer);
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
+        let tool =
+            WaAwaitEventTool::new_with_response_delivery(Arc::clone(&db_path), response_delivery)
+                .with_iteration_observer(iteration_observer);
         tool.wait_for_delivery_completion_ready_for_test();
 
         let envelope = parse_json_content(
@@ -16588,12 +16297,11 @@ mod tests {
 
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let reservation = storage
-                .reserve_event_delivery(
-                    second_event_id,
-                    std::time::Duration::from_secs(1),
-                )
+                .reserve_event_delivery(second_event_id, std::time::Duration::from_secs(1))
                 .await
                 .unwrap();
             let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
@@ -16662,9 +16370,10 @@ mod tests {
         assert_eq!(running.active_requests_high_water, 1);
 
         drop(tool);
-        let stopped = wait_for_completion_stats(&stats, "shared await service shutdown", |snapshot| {
-            snapshot.worker_stops == 1
-        });
+        let stopped =
+            wait_for_completion_stats(&stats, "shared await service shutdown", |snapshot| {
+                snapshot.worker_stops == 1
+            });
         assert_eq!(stopped.runtime_initializations, 1);
         assert_eq!(stopped.storage_initializations, 1);
         assert_eq!(stopped.storage_shutdowns, 1);
@@ -16726,14 +16435,11 @@ mod tests {
             .stats_for_test();
         let mut shared_us = checkpoint_latency_samples(&shared_tool, SAMPLE_COUNT);
         shared_us.sort_unstable();
-        let shared_lifecycle = wait_for_completion_stats(
-            &shared_stats,
-            "A/B shared request completion",
-            |snapshot| {
+        let shared_lifecycle =
+            wait_for_completion_stats(&shared_stats, "A/B shared request completion", |snapshot| {
                 snapshot.request_jobs_finished == u64::try_from(SAMPLE_COUNT).unwrap()
                     && snapshot.active_requests == 0
-            },
-        );
+            });
 
         let baseline_p50_us = percentile(&baseline_us, 50);
         let baseline_p95_us = percentile(&baseline_us, 95);
@@ -16783,9 +16489,8 @@ mod tests {
     #[test]
     fn await_event_service_does_not_count_disconnected_request_as_admitted() {
         let handler: super::McpAwaitEventDeliveryCompletionHandler = Arc::new(|_job| {});
-        let service =
-            super::McpAwaitEventDeliveryCompletionExecutor::new_with_handler(handler)
-                .expect("test completion-only service must start");
+        let service = super::McpAwaitEventDeliveryCompletionExecutor::new_with_handler(handler)
+            .expect("test completion-only service must start");
         let stats = service.stats_for_test();
         let operation: super::McpAwaitEventRequestOperation = Box::new(|_storage| {
             Box::pin(async {
@@ -16817,9 +16522,8 @@ mod tests {
     #[test]
     fn await_event_service_id_exhaustion_releases_admission_without_running_request() {
         let handler: super::McpAwaitEventDeliveryCompletionHandler = Arc::new(|_job| {});
-        let service =
-            super::McpAwaitEventDeliveryCompletionExecutor::new_with_handler(handler)
-                .expect("test completion-only service must start");
+        let service = super::McpAwaitEventDeliveryCompletionExecutor::new_with_handler(handler)
+            .expect("test completion-only service must start");
         service
             .request_sequence
             .store(u64::MAX, std::sync::atomic::Ordering::Release);
@@ -16864,10 +16568,7 @@ mod tests {
 
     #[test]
     fn await_event_request_reply_handoff_preserves_lease_authority_in_both_orderings() {
-        fn lease_bearing_output(
-            event_id: i64,
-            token: &str,
-        ) -> super::McpAwaitEventRequestResult {
+        fn lease_bearing_output(event_id: i64, token: &str) -> super::McpAwaitEventRequestResult {
             (
                 Err(super::McpToolError::new(
                     super::MCP_ERR_TIMEOUT,
@@ -16886,9 +16587,8 @@ mod tests {
         // If task delivery wins the serialized handoff, cancellation must
         // drain the already-enqueued output before returning.
         let (first_reply, first_response) = crossbeam::channel::bounded(1);
-        let first_handoff = std::sync::Mutex::new(
-            super::McpAwaitEventRequestReplyHandoff::default(),
-        );
+        let first_handoff =
+            std::sync::Mutex::new(super::McpAwaitEventRequestReplyHandoff::default());
         assert!(
             super::deliver_mcp_await_event_request_reply(
                 &first_reply,
@@ -16897,26 +16597,20 @@ mod tests {
             )
             .is_none()
         );
-        let first_reclaimed = super::abandon_mcp_await_event_request_reply(
-            &first_response,
-            &first_handoff,
-        )
-        .expect("abandonment must drain a reply delivered first");
+        let first_reclaimed =
+            super::abandon_mcp_await_event_request_reply(&first_response, &first_handoff)
+                .expect("abandonment must drain a reply delivered first");
         assert_eq!(first_reclaimed.1.len(), 1);
         assert_eq!(first_reclaimed.1[0].event_id(), 41);
 
         // If cancellation wins, the task must retain the output rather than
         // enqueueing it into a receiver that the caller is about to drop.
         let (second_reply, second_response) = crossbeam::channel::bounded(1);
-        let second_handoff = std::sync::Mutex::new(
-            super::McpAwaitEventRequestReplyHandoff::default(),
-        );
+        let second_handoff =
+            std::sync::Mutex::new(super::McpAwaitEventRequestReplyHandoff::default());
         assert!(
-            super::abandon_mcp_await_event_request_reply(
-                &second_response,
-                &second_handoff,
-            )
-            .is_none()
+            super::abandon_mcp_await_event_request_reply(&second_response, &second_handoff,)
+                .is_none()
         );
         let second_reclaimed = super::deliver_mcp_await_event_request_reply(
             &second_reply,
@@ -17029,11 +16723,7 @@ mod tests {
             super::FrameworkResponseDeliveryOutcome::DeliveryAcknowledged,
         ));
 
-        super::abandon_queued_mcp_await_event_completions(
-            &receiver,
-            &mut deferred_job,
-            &stats,
-        );
+        super::abandon_queued_mcp_await_event_completions(&receiver, &mut deferred_job, &stats);
 
         assert!(deferred_job.is_none());
         assert!(receiver.try_recv().is_err());
@@ -17122,16 +16812,12 @@ mod tests {
             }));
         }
 
-        let saturated = wait_for_completion_stats(
-            &stats,
-            "bounded shared await admission",
-            |snapshot| {
-                snapshot.request_admissions
-                    == super::MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY
+        let saturated =
+            wait_for_completion_stats(&stats, "bounded shared await admission", |snapshot| {
+                snapshot.request_admissions == super::MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY
                     && snapshot.active_requests
                         == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
-            },
-        );
+            });
         assert_eq!(
             saturated.active_requests_high_water,
             u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
@@ -17171,11 +16857,14 @@ mod tests {
             results.len(),
             usize::try_from(super::MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY).unwrap()
         );
-        assert!(results.iter().all(|message| message.starts_with("completed:request-")));
+        assert!(
+            results
+                .iter()
+                .all(|message| message.starts_with("completed:request-"))
+        );
 
         let drained = wait_for_completion_stats(&stats, "bounded request drain", |snapshot| {
-            snapshot.request_jobs_finished
-                == super::MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY
+            snapshot.request_jobs_finished == super::MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY
                 && snapshot.active_requests == 0
         });
         assert_eq!(drained.request_admission_rejections_saturated, 1);
@@ -17194,7 +16883,9 @@ mod tests {
         let event_id = seed_event(db_path.as_ref().as_path());
         let probe_runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         let lease = probe_runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let reservation = storage
                 .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
                 .await
@@ -17226,12 +16917,7 @@ mod tests {
                 let cx = crate::cx::for_request();
                 service.execute_request(
                     cx.clone(),
-                    gated_await_request_operation(
-                        cx,
-                        gate,
-                        entered,
-                        format!("fairness-{index}"),
-                    ),
+                    gated_await_request_operation(cx, gate, entered, format!("fairness-{index}")),
                 )
             }));
         }
@@ -17281,7 +16967,9 @@ mod tests {
         });
 
         probe_runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             assert!(
                 !storage.release_event_delivery(&lease).await.unwrap(),
                 "the prioritized completion must already have released its exact token"
@@ -17339,8 +17027,7 @@ mod tests {
         });
 
         wait_for_completion_stats(&stats, "two isolated await requests", |snapshot| {
-            snapshot.active_requests == 2
-                && entered.load(std::sync::atomic::Ordering::Acquire) == 2
+            snapshot.active_requests == 2 && entered.load(std::sync::atomic::Ordering::Acquire) == 2
         });
         first_cancel.cancel_with(
             crate::outcome::CancelKind::User,
@@ -17357,11 +17044,10 @@ mod tests {
                 .message,
             "cancelled:first"
         );
-        let one_remaining = wait_for_completion_stats(
-            &stats,
-            "uncancelled request remains active",
-            |snapshot| snapshot.active_requests == 1 && snapshot.request_jobs_finished == 1,
-        );
+        let one_remaining =
+            wait_for_completion_stats(&stats, "uncancelled request remains active", |snapshot| {
+                snapshot.active_requests == 1 && snapshot.request_jobs_finished == 1
+            });
         assert_eq!(one_remaining.request_jobs_cancelled_for_epoch, 0);
 
         gate.store(false, std::sync::atomic::Ordering::Release);
@@ -17376,9 +17062,10 @@ mod tests {
                 .message,
             "completed:second"
         );
-        let drained = wait_for_completion_stats(&stats, "isolated cancellation drain", |snapshot| {
-            snapshot.active_requests == 0 && snapshot.request_jobs_finished == 2
-        });
+        let drained =
+            wait_for_completion_stats(&stats, "isolated cancellation drain", |snapshot| {
+                snapshot.active_requests == 0 && snapshot.request_jobs_finished == 2
+            });
         assert_eq!(drained.runtime_initializations, 1);
         assert_eq!(drained.storage_initializations, 1);
         assert_eq!(drained.request_jobs_cancelled_for_epoch, 0);
@@ -17411,12 +17098,7 @@ mod tests {
                 let cx = crate::cx::for_request();
                 service.execute_request(
                     cx.clone(),
-                    gated_await_request_operation(
-                        cx,
-                        gate,
-                        entered,
-                        format!("active-{index}"),
-                    ),
+                    gated_await_request_operation(cx, gate, entered, format!("active-{index}")),
                 )
             }));
         }
@@ -17443,12 +17125,16 @@ mod tests {
                 ),
             )
         });
-        wait_for_completion_stats(&stats, "one request queued behind active slots", |snapshot| {
-            snapshot.request_admissions
-                == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY + 1).unwrap()
-                && snapshot.active_requests
-                    == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
-        });
+        wait_for_completion_stats(
+            &stats,
+            "one request queued behind active slots",
+            |snapshot| {
+                snapshot.request_admissions
+                    == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY + 1).unwrap()
+                    && snapshot.active_requests
+                        == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+            },
+        );
 
         let cancellation_started = std::time::Instant::now();
         queued_cancel.cancel_with(
@@ -17470,9 +17156,10 @@ mod tests {
             cancellation_started.elapsed() < std::time::Duration::from_secs(1),
             "queued cancellation must not wait for an occupied request slot"
         );
-        let pruned = wait_for_completion_stats(&stats, "cancelled queued request pruning", |snapshot| {
-            snapshot.request_jobs_rejected_cancelled == 1
-        });
+        let pruned =
+            wait_for_completion_stats(&stats, "cancelled queued request pruning", |snapshot| {
+                snapshot.request_jobs_rejected_cancelled == 1
+            });
         assert!(pruned.request_waiter_cancellations <= 1);
         assert_eq!(
             pruned.request_jobs_started,
@@ -17527,12 +17214,7 @@ mod tests {
                 let cx = crate::cx::for_request();
                 service.execute_request(
                     cx.clone(),
-                    gated_await_request_operation(
-                        cx,
-                        gate,
-                        entered,
-                        format!("shutdown-{index}"),
-                    ),
+                    gated_await_request_operation(cx, gate, entered, format!("shutdown-{index}")),
                 )
             }));
         }
@@ -17557,20 +17239,19 @@ mod tests {
             ),
             "completion admission must fail closed after shutdown begins"
         );
-        let post_shutdown_operation: super::McpAwaitEventRequestOperation =
-            Box::new(|_storage| {
-                Box::pin(async {
-                    super::McpAwaitEventRequestTaskOutput::new(
-                        Err(super::McpToolError::new(
-                            super::MCP_ERR_CONFIG,
-                            "must not run after shutdown".to_string(),
-                            None,
-                        )),
-                        Vec::new(),
-                        true,
-                    )
-                })
-            });
+        let post_shutdown_operation: super::McpAwaitEventRequestOperation = Box::new(|_storage| {
+            Box::pin(async {
+                super::McpAwaitEventRequestTaskOutput::new(
+                    Err(super::McpToolError::new(
+                        super::MCP_ERR_CONFIG,
+                        "must not run after shutdown".to_string(),
+                        None,
+                    )),
+                    Vec::new(),
+                    true,
+                )
+            })
+        });
         let post_shutdown_error = service
             .execute_request(crate::cx::for_request(), post_shutdown_operation)
             .expect_err("request admission must fail closed after shutdown begins");
@@ -17584,8 +17265,8 @@ mod tests {
                 .expect("shutdown-stopped request caller must not panic")
                 .expect("shutdown-stopped request must receive its isolated result");
             assert!(request_leases.is_empty());
-            let error = request_result
-                .expect_err("shutdown-stopped gated request returns a typed error");
+            let error =
+                request_result.expect_err("shutdown-stopped gated request returns a typed error");
             if error.message.starts_with("cancelled:shutdown-") {
                 cancelled_requests = cancelled_requests.saturating_add(1);
             } else {
@@ -17659,11 +17340,10 @@ mod tests {
         assert_eq!(finished.runtime_initializations, 1);
 
         drop(service);
-        let stopped = wait_for_completion_stats(
-            &stats,
-            "request-local-error service shutdown",
-            |snapshot| snapshot.worker_stops == 1,
-        );
+        let stopped =
+            wait_for_completion_stats(&stats, "request-local-error service shutdown", |snapshot| {
+                snapshot.worker_stops == 1
+            });
         assert_eq!(stopped.storage_shutdowns, 1);
         assert_eq!(stopped.storage_initializations, 1);
     }
@@ -17821,9 +17501,10 @@ mod tests {
             "shared service must be ready on its replacement epoch"
         );
         drop(service);
-        let stopped = wait_for_completion_stats(&stats, "panic-contained service shutdown", |snapshot| {
-            snapshot.worker_stops == 1
-        });
+        let stopped =
+            wait_for_completion_stats(&stats, "panic-contained service shutdown", |snapshot| {
+                snapshot.worker_stops == 1
+            });
         assert_eq!(stopped.storage_shutdowns, 2);
         assert_eq!(stopped.runtime_initializations, 1);
     }
@@ -17837,7 +17518,9 @@ mod tests {
         );
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         let leases = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let mut leases = Vec::with_capacity(event_ids.len());
             for event_id in &event_ids {
                 let reservation = storage
@@ -17909,7 +17592,9 @@ mod tests {
         assert_eq!(stopped.runtime_initializations, 1);
 
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             for event_id in event_ids {
                 assert!(matches!(
                     storage
@@ -17947,16 +17632,15 @@ mod tests {
         let handler_calls_for_worker = Arc::clone(&handler_calls);
         let completion_handler: super::McpAwaitEventDeliveryCompletionHandler =
             Arc::new(move |_job| {
-                let call_index = handler_calls_for_worker
-                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let call_index =
+                    handler_calls_for_worker.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 if call_index == 0 {
                     std::panic::panic_any(SENTINEL.to_string());
                 }
             });
-        let executor = super::McpAwaitEventDeliveryCompletionExecutor::new_with_handler(
-            completion_handler,
-        )
-        .expect("panic-containment completion lane must start");
+        let executor =
+            super::McpAwaitEventDeliveryCompletionExecutor::new_with_handler(completion_handler)
+                .expect("panic-containment completion lane must start");
         let stats = executor.stats_for_test();
 
         for event_id in [81_i64, 82_i64] {
@@ -17971,16 +17655,16 @@ mod tests {
                 super::FrameworkResponseDeliveryOutcome::Failed,
             ));
             wait_for_completion_stats(&stats, "contained completion handler panic", |snapshot| {
-                handler_calls.load(std::sync::atomic::Ordering::Acquire)
-                    >= expected_calls
+                handler_calls.load(std::sync::atomic::Ordering::Acquire) >= expected_calls
                     && (event_id != 81 || snapshot.completion_panics == 1)
             });
         }
 
         drop(executor);
-        let stopped = wait_for_completion_stats(&stats, "panic-contained worker shutdown", |snapshot| {
-            snapshot.worker_stops == 1
-        });
+        let stopped =
+            wait_for_completion_stats(&stats, "panic-contained worker shutdown", |snapshot| {
+                snapshot.worker_stops == 1
+            });
         assert_eq!(stopped.worker_starts, 1);
         assert_eq!(stopped.worker_stops, 1);
         assert_eq!(stopped.completion_panics, 1);
@@ -18039,9 +17723,11 @@ mod tests {
             )
             .expect("completion worker with synthetic init stall must start");
         let stats = executor.stats_for_test();
-        wait_for_completion_stats(&stats, "non-preemptible storage initialization", |snapshot| {
-            snapshot.storage_initialization_stalls == 1
-        });
+        wait_for_completion_stats(
+            &stats,
+            "non-preemptible storage initialization",
+            |snapshot| snapshot.storage_initialization_stalls == 1,
+        );
         let request_operation: super::McpAwaitEventRequestOperation = Box::new(|_storage| {
             Box::pin(async {
                 super::McpAwaitEventRequestTaskOutput::new(
@@ -18099,7 +17785,9 @@ mod tests {
         let event_id = seed_event(db_path.as_ref().as_path());
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         let lease = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let reservation = storage
                 .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
                 .await
@@ -18148,7 +17836,9 @@ mod tests {
         assert_eq!(handed_off.completion_attempts_finished, 0);
 
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             assert!(
                 matches!(
                     storage
@@ -18196,7 +17886,9 @@ mod tests {
         let event_id = seed_event(db_path.as_ref().as_path());
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         let lease = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let reservation = storage
                 .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
                 .await
@@ -18241,13 +17933,17 @@ mod tests {
                 )
             }));
         }
-        wait_for_completion_stats(&stats, "active and queued requests on doomed storage epoch", |snapshot| {
-            snapshot.request_admissions == u64::try_from(doomed_request_count).unwrap()
-                && snapshot.active_requests
-                    == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
-                && entered.load(std::sync::atomic::Ordering::Acquire)
-                    == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
-        });
+        wait_for_completion_stats(
+            &stats,
+            "active and queued requests on doomed storage epoch",
+            |snapshot| {
+                snapshot.request_admissions == u64::try_from(doomed_request_count).unwrap()
+                    && snapshot.active_requests
+                        == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+                    && entered.load(std::sync::atomic::Ordering::Acquire)
+                        == u64::try_from(super::MCP_AWAIT_EVENT_REQUEST_CONCURRENCY).unwrap()
+            },
+        );
         assert!(executor.try_submit(
             vec![lease.clone()],
             super::FrameworkResponseDeliveryOutcome::Failed,
@@ -18267,13 +17963,15 @@ mod tests {
                 .expect("epoch-stopped request caller must not panic")
                 .expect("epoch-stopped request must receive its isolated result");
             assert!(request_leases.is_empty());
-            let error = request_result
-                .expect_err("epoch-stopped gated request returns a typed error");
+            let error =
+                request_result.expect_err("epoch-stopped gated request returns a typed error");
             if error.message.starts_with("cancelled:invalidated-epoch-") {
                 cancelled_requests = cancelled_requests.saturating_add(1);
             } else {
                 assert!(
-                    error.message.contains("initializing, reconnecting, or shutting down"),
+                    error
+                        .message
+                        .contains("initializing, reconnecting, or shutting down"),
                     "unexpected queued-request rejection: {error:?}"
                 );
                 rejected_requests = rejected_requests.saturating_add(1);
@@ -18316,9 +18014,10 @@ mod tests {
         });
 
         drop(executor);
-        let stopped = wait_for_completion_stats(&stats, "reconnected worker shutdown", |snapshot| {
-            snapshot.worker_stops == 1
-        });
+        let stopped =
+            wait_for_completion_stats(&stats, "reconnected worker shutdown", |snapshot| {
+                snapshot.worker_stops == 1
+            });
         assert_eq!(stopped.runtime_initializations, 1);
         assert_eq!(stopped.storage_initialization_attempts, 2);
         assert_eq!(stopped.storage_initialization_failures, 0);
@@ -18351,7 +18050,9 @@ mod tests {
         assert_eq!(stopped.request_jobs_rejected_for_shutdown, 0);
 
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             assert!(
                 storage.release_event_delivery(&lease).await.unwrap(),
                 "synthetic epoch failure must leave the durable lease token untouched"
@@ -18366,7 +18067,9 @@ mod tests {
         let event_id = seed_event(db_path.as_ref().as_path());
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         let lease = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let reservation = storage
                 .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
                 .await
@@ -18384,18 +18087,17 @@ mod tests {
         let blocking_calls_for_handler = Arc::clone(&blocking_calls);
         let completion_handler: super::McpAwaitEventDeliveryCompletionHandler =
             Arc::new(move |job| {
-                let call_index = blocking_calls_for_handler
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let call_index =
+                    blocking_calls_for_handler.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if call_index < u64::try_from(super::MCP_AWAIT_EVENT_COMPLETION_WORKERS).unwrap() {
                     worker_started_tx.send(()).unwrap();
                     release_worker_rx.recv().unwrap();
                 }
                 drop(job);
             });
-        let executor = super::McpAwaitEventDeliveryCompletionExecutor::new_with_handler(
-            completion_handler,
-        )
-        .unwrap();
+        let executor =
+            super::McpAwaitEventDeliveryCompletionExecutor::new_with_handler(completion_handler)
+                .unwrap();
 
         for worker_index in 0..super::MCP_AWAIT_EVENT_COMPLETION_WORKERS {
             let fake_lease = crate::storage::EventDeliveryLease::new(
@@ -18436,7 +18138,9 @@ mod tests {
         );
 
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             assert!(
                 storage.release_event_delivery(&lease).await.unwrap(),
                 "rejected completion must leave the durable lease token untouched"
@@ -18452,28 +18156,19 @@ mod tests {
     #[test]
     fn await_event_claim_retry_stops_after_first_satisfying_expired_lease() {
         let (_dir, db_path) = temp_db_path();
-        let event_ids = seed_events_with_rules(
-            db_path.as_ref().as_path(),
-            &["codex.first", "codex.second"],
-        );
+        let event_ids =
+            seed_events_with_rules(db_path.as_ref().as_path(), &["codex.first", "codex.second"]);
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            true,
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, true);
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         let foreign_leases = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let mut leases = Vec::new();
             for event_id in &event_ids {
                 let reservation = storage
-                    .reserve_event_delivery(
-                        *event_id,
-                        std::time::Duration::from_secs(60),
-                    )
+                    .reserve_event_delivery(*event_id, std::time::Duration::from_secs(60))
                     .await
                     .unwrap();
                 let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
@@ -18511,9 +18206,7 @@ mod tests {
                 }
             });
 
-        let response_delivery = Arc::new(
-            super::FrameworkResponseDeliveryCoordinator::default(),
-        );
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
         let tool = WaAwaitEventTool::new_with_response_delivery(
             Arc::clone(&db_path),
             Arc::clone(&response_delivery),
@@ -18571,14 +18264,13 @@ mod tests {
         );
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         let foreign_leases = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let mut leases = Vec::new();
             for event_id in &event_ids {
                 let reservation = storage
-                    .reserve_event_delivery(
-                        *event_id,
-                        std::time::Duration::from_secs(60),
-                    )
+                    .reserve_event_delivery(*event_id, std::time::Duration::from_secs(60))
                     .await
                     .unwrap();
                 let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
@@ -18617,15 +18309,11 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(1_100));
                 }
             });
-        let response_delivery = Arc::new(
-            super::FrameworkResponseDeliveryCoordinator::default(),
-        );
-        let tool = WaAwaitEventTool::new_with_response_delivery(
-            Arc::clone(&db_path),
-            response_delivery,
-        )
-        .with_blocked_retry_observer(blocked_retry_observer)
-        .with_iteration_observer(iteration_observer);
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
+        let tool =
+            WaAwaitEventTool::new_with_response_delivery(Arc::clone(&db_path), response_delivery)
+                .with_blocked_retry_observer(blocked_retry_observer)
+                .with_iteration_observer(iteration_observer);
         tool.wait_for_delivery_completion_ready_for_test();
 
         let envelope = parse_json_content(
@@ -18654,12 +18342,11 @@ mod tests {
         assert_eq!(envelope["data"]["pending_finalize"], false);
 
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let reservation = storage
-                .reserve_event_delivery(
-                    second_event_id,
-                    std::time::Duration::from_secs(1),
-                )
+                .reserve_event_delivery(second_event_id, std::time::Duration::from_secs(1))
                 .await
                 .unwrap();
             let crate::storage::EventDeliveryReservation::Acquired(lease) = reservation else {
@@ -18674,16 +18361,9 @@ mod tests {
     fn await_event_claim_timeout_without_candidate_has_no_pending_finalize_state() {
         let (_dir, db_path) = temp_db_path();
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:never.matches"],
-            &[],
-            None,
-            false,
-            true,
-        );
-        let response_delivery = Arc::new(
-            super::FrameworkResponseDeliveryCoordinator::default(),
-        );
+        let cursor_scope =
+            await_event_cursor_scope(&["rule:never.matches"], &[], None, false, true);
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
         let tool = WaAwaitEventTool::new_with_response_delivery(
             Arc::clone(&db_path),
             Arc::clone(&response_delivery),
@@ -18710,7 +18390,10 @@ mod tests {
         assert_eq!(envelope["data"]["satisfied"], false);
         assert_eq!(envelope["data"]["timed_out"], true);
         assert_eq!(envelope["data"]["pending_finalize"], false);
-        assert_eq!(envelope["data"]["candidate_cursor"], serde_json::Value::Null);
+        assert_eq!(
+            envelope["data"]["candidate_cursor"],
+            serde_json::Value::Null
+        );
         assert_eq!(envelope["data"]["claim_delivery"], serde_json::Value::Null);
         response_delivery.fail_all();
     }
@@ -18718,10 +18401,8 @@ mod tests {
     #[test]
     fn await_event_partial_claim_releases_leases_and_replays_composite_rules() {
         let (_dir, db_path) = temp_db_path();
-        let first_event_id = seed_events_with_rules(
-            db_path.as_ref().as_path(),
-            &["codex.phase_a"],
-        )[0];
+        let first_event_id =
+            seed_events_with_rules(db_path.as_ref().as_path(), &["codex.phase_a"])[0];
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
         let cursor_scope = await_event_cursor_scope(
             &[],
@@ -18730,9 +18411,7 @@ mod tests {
             false,
             true,
         );
-        let response_delivery = Arc::new(
-            super::FrameworkResponseDeliveryCoordinator::default(),
-        );
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
         let tool = WaAwaitEventTool::new_with_response_delivery(
             Arc::clone(&db_path),
             Arc::clone(&response_delivery),
@@ -18766,14 +18445,13 @@ mod tests {
         // release, then prove the event is still claimable and unhandled.
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let mut probe_lease = None;
             for _ in 0..100 {
                 match storage
-                    .reserve_event_delivery(
-                        first_event_id,
-                        std::time::Duration::from_secs(1),
-                    )
+                    .reserve_event_delivery(first_event_id, std::time::Duration::from_secs(1))
                     .await
                     .unwrap()
                 {
@@ -18784,9 +18462,9 @@ mod tests {
                     crate::storage::EventDeliveryReservation::LeasedUntil { .. } => {
                         crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
                     }
-                    other => panic!(
-                        "partial claim must remain unhandled and retryable, got {other:?}"
-                    ),
+                    other => {
+                        panic!("partial claim must remain unhandled and retryable, got {other:?}")
+                    }
                 }
             }
             let probe_lease = probe_lease
@@ -18795,10 +18473,8 @@ mod tests {
             storage.shutdown().await.unwrap();
         });
 
-        let second_event_id = seed_events_with_rules(
-            db_path.as_ref().as_path(),
-            &["codex.phase_b"],
-        )[0];
+        let second_event_id =
+            seed_events_with_rules(db_path.as_ref().as_path(), &["codex.phase_b"])[0];
         let resumed = parse_json_content(
             tool.call(
                 &test_mcp_context(),
@@ -18831,7 +18507,9 @@ mod tests {
         );
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         let leases = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let mut leases = Vec::new();
             for event_id in &event_ids {
                 let reservation = storage
@@ -18872,7 +18550,9 @@ mod tests {
             "the uncontended multi-event path must use one exact bulk transaction without fallback"
         );
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             for event_id in event_ids {
                 assert!(matches!(
                     storage
@@ -18891,7 +18571,9 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         let storage = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             storage.shutdown().await.unwrap();
             storage
         });
@@ -18906,8 +18588,8 @@ mod tests {
             },
         )));
         let active_cx = std::sync::Mutex::new(None);
-        let storage_reusable = runtime.block_on(
-            super::complete_mcp_await_event_deliveries_with_storage(
+        let storage_reusable =
+            runtime.block_on(super::complete_mcp_await_event_deliveries_with_storage(
                 &storage,
                 &active_cx,
                 vec![crate::storage::EventDeliveryLease::new(
@@ -18917,8 +18599,7 @@ mod tests {
                     i64::MAX,
                 )],
                 super::FrameworkResponseDeliveryOutcome::Failed,
-            ),
-        );
+            ));
         super::set_mcp_await_event_completion_batch_observer(None);
 
         assert!(!storage_reusable);
@@ -18937,7 +18618,9 @@ mod tests {
         let event_id = seed_event(db_path.as_ref().as_path());
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         let (stale_lease, successor_lease) = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let stale_lease = match storage
                 .reserve_event_delivery(event_id, std::time::Duration::from_millis(1))
                 .await
@@ -18985,7 +18668,9 @@ mod tests {
         assert!(executor.wait_until_ready_for_test(std::time::Duration::from_secs(1)));
 
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             assert!(
                 !storage.release_event_delivery(&stale_lease).await.unwrap(),
                 "predecessor token must not displace the current owner"
@@ -19010,9 +18695,10 @@ mod tests {
         });
 
         drop(executor);
-        let stopped = wait_for_completion_stats(&stats, "contradictory-token shutdown", |snapshot| {
-            snapshot.worker_stops == 1
-        });
+        let stopped =
+            wait_for_completion_stats(&stats, "contradictory-token shutdown", |snapshot| {
+                snapshot.worker_stops == 1
+            });
         assert_eq!(stopped.storage_shutdowns, 1);
     }
 
@@ -19032,11 +18718,10 @@ mod tests {
             )],
             super::FrameworkResponseDeliveryOutcome::Failed,
         ));
-        let rejected = wait_for_completion_stats(
-            &stats,
-            "invalid-lease completion preflight",
-            |snapshot| snapshot.completion_attempts_finished == 1,
-        );
+        let rejected =
+            wait_for_completion_stats(&stats, "invalid-lease completion preflight", |snapshot| {
+                snapshot.completion_attempts_finished == 1
+            });
         assert_eq!(rejected.completion_attempts_storage_reusable, 1);
         assert_eq!(rejected.completion_attempts_storage_unusable, 0);
         assert_eq!(rejected.completion_jobs_rejected_invalid_lease, 1);
@@ -19062,24 +18747,26 @@ mod tests {
         )];
         assert_eq!(
             super::mcp_await_event_completion_preflight_rejection(&leases),
-            Some(super::McpAwaitEventCompletionPreflightRejection::InvalidLease {
-                event_id: 17,
-                token_empty: false,
-                token_too_long: true,
-            })
+            Some(
+                super::McpAwaitEventCompletionPreflightRejection::InvalidLease {
+                    event_id: 17,
+                    token_empty: false,
+                    token_too_long: true,
+                }
+            )
         );
     }
 
     #[test]
     fn await_event_bulk_finalize_conflict_falls_back_and_settles_valid_lease() {
         let (_dir, db_path) = temp_db_path();
-        let event_ids = seed_events_with_rules(
-            db_path.as_ref().as_path(),
-            &["codex.stale", "codex.valid"],
-        );
+        let event_ids =
+            seed_events_with_rules(db_path.as_ref().as_path(), &["codex.stale", "codex.valid"]);
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         let (stale_lease, valid_lease, successor_lease) = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let stale_lease = match storage
                 .reserve_event_delivery(event_ids[0], std::time::Duration::from_millis(1))
                 .await
@@ -19140,18 +18827,26 @@ mod tests {
             "one stale token must roll back the exact batch before per-lease recovery"
         );
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             assert!(
-                storage.release_event_delivery(&successor_lease).await.unwrap(),
-                "stale fallback must not disturb the successor owner"
-            );
-            assert!(matches!(
                 storage
-                    .reserve_event_delivery(event_ids[1], std::time::Duration::from_secs(60))
+                    .release_event_delivery(&successor_lease)
                     .await
                     .unwrap(),
-                crate::storage::EventDeliveryReservation::AlreadyHandledOrMissing
-            ), "the independently valid lease must still finalize after bulk rollback");
+                "stale fallback must not disturb the successor owner"
+            );
+            assert!(
+                matches!(
+                    storage
+                        .reserve_event_delivery(event_ids[1], std::time::Duration::from_secs(60))
+                        .await
+                        .unwrap(),
+                    crate::storage::EventDeliveryReservation::AlreadyHandledOrMissing
+                ),
+                "the independently valid lease must still finalize after bulk rollback"
+            );
             storage.shutdown().await.unwrap();
         });
     }
@@ -19159,13 +18854,13 @@ mod tests {
     #[test]
     fn await_event_bulk_release_conflict_falls_back_and_releases_valid_lease() {
         let (_dir, db_path) = temp_db_path();
-        let event_ids = seed_events_with_rules(
-            db_path.as_ref().as_path(),
-            &["codex.stale", "codex.valid"],
-        );
+        let event_ids =
+            seed_events_with_rules(db_path.as_ref().as_path(), &["codex.stale", "codex.valid"]);
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         let (stale_lease, valid_lease, successor_lease) = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let stale_lease = match storage
                 .reserve_event_delivery(event_ids[0], std::time::Duration::from_millis(1))
                 .await
@@ -19225,9 +18920,14 @@ mod tests {
             ]
         );
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             assert!(
-                storage.release_event_delivery(&successor_lease).await.unwrap(),
+                storage
+                    .release_event_delivery(&successor_lease)
+                    .await
+                    .unwrap(),
                 "stale release fallback must not disturb the successor owner"
             );
             assert!(
@@ -19240,7 +18940,9 @@ mod tests {
                 .unwrap()
             {
                 crate::storage::EventDeliveryReservation::Acquired(lease) => lease,
-                other => panic!("released valid event must be immediately retryable, got {other:?}"),
+                other => {
+                    panic!("released valid event must be immediately retryable, got {other:?}")
+                }
             };
             assert!(storage.release_event_delivery(&probe_lease).await.unwrap());
             storage.shutdown().await.unwrap();
@@ -19252,16 +18954,12 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            true,
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, true);
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         let (stale_lease, successor_lease) = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let stale_lease = match storage
                 .reserve_event_delivery(event_id, std::time::Duration::from_millis(1))
                 .await
@@ -19289,14 +18987,19 @@ mod tests {
             super::FrameworkResponseDeliveryOutcome::DeliveryAcknowledged,
         );
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
-            assert!(storage.release_event_delivery(&successor_lease).await.unwrap());
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
+            assert!(
+                storage
+                    .release_event_delivery(&successor_lease)
+                    .await
+                    .unwrap()
+            );
             storage.shutdown().await.unwrap();
         });
 
-        let response_delivery = Arc::new(
-            super::FrameworkResponseDeliveryCoordinator::default(),
-        );
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
         let tool = WaAwaitEventTool::new_with_response_delivery(
             Arc::clone(&db_path),
             Arc::clone(&response_delivery),
@@ -19329,16 +19032,12 @@ mod tests {
         let (dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            true,
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, true);
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         let lease = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let lease = match storage
                 .reserve_event_delivery(event_id, std::time::Duration::from_millis(1))
                 .await
@@ -19361,9 +19060,7 @@ mod tests {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
 
-        let response_delivery = Arc::new(
-            super::FrameworkResponseDeliveryCoordinator::default(),
-        );
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
         let tool = WaAwaitEventTool::new_with_response_delivery(
             Arc::clone(&db_path),
             Arc::clone(&response_delivery),
@@ -19396,13 +19093,7 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            true,
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, true);
         let tool = WaAwaitEventTool::new(Arc::clone(&db_path));
 
         let envelope = parse_json_content(
@@ -19457,13 +19148,7 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            true,
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, true);
         let completion = Arc::new(
             super::McpAwaitEventDeliveryCompletionExecutor::new_with_storage_init_failures_for_test(
                 Arc::clone(&db_path),
@@ -19518,7 +19203,9 @@ mod tests {
 
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let reservation = storage
                 .reserve_event_delivery(event_id, std::time::Duration::from_secs(1))
                 .await
@@ -19536,20 +19223,10 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            true,
-        );
-        let response_delivery = Arc::new(
-            super::FrameworkResponseDeliveryCoordinator::default(),
-        );
-        let mut tool = WaAwaitEventTool::new_with_response_delivery(
-            Arc::clone(&db_path),
-            response_delivery,
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, true);
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
+        let mut tool =
+            WaAwaitEventTool::new_with_response_delivery(Arc::clone(&db_path), response_delivery);
         tool.wait_for_delivery_completion_ready_for_test();
         let completion = Arc::clone(
             tool.delivery_completion
@@ -19563,10 +19240,8 @@ mod tests {
             Arc::new(move |phase, observed_event_id| {
                 if phase == super::McpAwaitEventIterationPhase::PageScan
                     && observed_event_id == event_id
-                    && !readiness_revoked_for_observer.swap(
-                        true,
-                        std::sync::atomic::Ordering::AcqRel,
-                    )
+                    && !readiness_revoked_for_observer
+                        .swap(true, std::sync::atomic::Ordering::AcqRel)
                 {
                     completion
                         .ready
@@ -19633,20 +19308,10 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
-        let cursor_scope = await_event_cursor_scope(
-            &["rule:codex.*"],
-            &[],
-            None,
-            false,
-            true,
-        );
-        let response_delivery = Arc::new(
-            super::FrameworkResponseDeliveryCoordinator::default(),
-        );
-        let mut tool = WaAwaitEventTool::new_with_response_delivery(
-            Arc::clone(&db_path),
-            response_delivery,
-        );
+        let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, true);
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
+        let mut tool =
+            WaAwaitEventTool::new_with_response_delivery(Arc::clone(&db_path), response_delivery);
         tool.delivery_completion = None;
 
         let envelope = parse_json_content(
@@ -19675,7 +19340,9 @@ mod tests {
 
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let reservation = storage
                 .reserve_event_delivery(event_id, std::time::Duration::from_secs(1))
                 .await
@@ -20430,11 +20097,8 @@ mod tests {
                     .is_some_and(|error| error.to_ascii_lowercase().contains("rate limit")),
                 "expected rate-limit policy decision, got {envelope:?}"
             );
-            let retryable_binding = test_submit_idempotency_binding(
-                pane_id,
-                "echo over-limit",
-                "over-limit-attempt",
-            );
+            let retryable_binding =
+                test_submit_idempotency_binding(pane_id, "echo over-limit", "over-limit-attempt");
             assert_eq!(
                 crate::submit_idempotency_store::lookup(
                     db.parent().expect("test database parent"),
@@ -20540,10 +20204,7 @@ mod tests {
                     Ok(())
                 },
             ));
-            let first_poll = std::future::poll_fn(|cx| {
-                Poll::Ready(caller.as_mut().poll(cx))
-            })
-            .await;
+            let first_poll = std::future::poll_fn(|cx| Poll::Ready(caller.as_mut().poll(cx))).await;
             assert!(
                 matches!(first_poll, Poll::Pending),
                 "the gated blocking closure cannot finish on its first poll"
@@ -20884,8 +20545,7 @@ mod tests {
             );
             assert_eq!(replay["ok"], true, "replay envelope: {replay:?}");
             assert_eq!(
-                replay["data"]["injection"]["status"],
-                "requires_approval",
+                replay["data"]["injection"]["status"], "requires_approval",
                 "current rate-limit policy must run before completed replay"
             );
             assert_eq!(
@@ -21038,7 +20698,10 @@ mod tests {
                 .await
                 .expect("mock pane should exist")
                 .content;
-            assert!(!content.contains(text), "effect-pending replay must not resend");
+            assert!(
+                !content.contains(text),
+                "effect-pending replay must not resend"
+            );
             assert_eq!(
                 crate::submit_idempotency_store::lookup(ft_dir, &binding)
                     .expect("lookup effect-pending claim"),
@@ -21246,7 +20909,10 @@ mod tests {
                 .await
                 .expect("mock pane should remain present")
                 .content;
-            assert_eq!(content, text, "unsupported profile must receive exact caller text");
+            assert_eq!(
+                content, text,
+                "unsupported profile must receive exact caller text"
+            );
             assert!(
                 !content.contains("\u{2063}ft-vs:"),
                 "unsupported profile must never receive a semantic canary"
@@ -21314,7 +20980,10 @@ mod tests {
                 .await
                 .expect("mock pane should remain present")
                 .content;
-            assert!(content.is_empty(), "profile drift must fail before pane effect");
+            assert!(
+                content.is_empty(),
+                "profile drift must fail before pane effect"
+            );
             assert_eq!(
                 crate::submit_idempotency_store::lookup(ft_dir, &supported_binding)
                     .expect("lookup original supported binding"),
@@ -24028,7 +23697,12 @@ exit 17",
 
     #[test]
     fn state_tool_schema_has_domain_and_pane_id() {
-        let def = WaStateTool::new(Arc::new(Config::default()), PaneFilterConfig::default(), None).definition();
+        let def = WaStateTool::new(
+            Arc::new(Config::default()),
+            PaneFilterConfig::default(),
+            None,
+        )
+        .definition();
         let props = def.input_schema.get("properties").unwrap();
         assert!(
             props.get("domain").is_some(),
@@ -24225,7 +23899,11 @@ exit 17",
 
     #[test]
     fn wa_state_malformed_args_redacts_serde_error_value() {
-        let tool = WaStateTool::new(Arc::new(Config::default()), PaneFilterConfig::default(), None);
+        let tool = WaStateTool::new(
+            Arc::new(Config::default()),
+            PaneFilterConfig::default(),
+            None,
+        );
         let redaction_sample = redaction_test_token();
 
         let envelope = parse_json_content(
@@ -24253,7 +23931,11 @@ exit 17",
 
     #[test]
     fn wa_state_rejects_oversized_agent_filter_without_echoing_value() {
-        let tool = WaStateTool::new(Arc::new(Config::default()), PaneFilterConfig::default(), None);
+        let tool = WaStateTool::new(
+            Arc::new(Config::default()),
+            PaneFilterConfig::default(),
+            None,
+        );
         let redaction_sample = redaction_test_token();
         let agent = format!(
             "{redaction_sample}{}",
@@ -24316,17 +23998,11 @@ exit 17",
     fn wa_events_rejects_negative_since_at_schema_and_handler_boundaries() {
         let tool = WaEventsTool::new(db_path());
         let definition = tool.definition();
-        assert_eq!(
-            definition.input_schema["properties"]["since"]["minimum"],
-            0
-        );
+        assert_eq!(definition.input_schema["properties"]["since"]["minimum"], 0);
 
         let envelope = parse_json_content(
-            tool.call(
-                &test_mcp_context(),
-                serde_json::json!({"since": -1}),
-            )
-            .expect("negative since should return an invalid-args envelope"),
+            tool.call(&test_mcp_context(), serde_json::json!({"since": -1}))
+                .expect("negative since should return an invalid-args envelope"),
         );
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
@@ -24343,7 +24019,9 @@ exit 17",
         let event_id = seed_event(db_path.as_ref().as_path());
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             assert!(
                 storage
                     .set_event_triage_state(
@@ -24798,7 +24476,10 @@ exit 17",
         assert!(redacted.contains("[REDACTED]"));
         assert!(!redacted.contains('\x1b'));
         assert!(!redacted.contains('\u{202e}'));
-        assert!(redacted.contains('\n'), "pane/search layout must be retained");
+        assert!(
+            redacted.contains('\n'),
+            "pane/search layout must be retained"
+        );
     }
 
     #[test]
@@ -24843,12 +24524,7 @@ exit 17",
         decision_context.text_summary = Some(hostile.clone());
         decision_context.workflow_id = Some(hostile.clone());
         decision_context.capabilities.reserved_by = Some(hostile.clone());
-        decision_context.record_rule(
-            hostile.clone(),
-            true,
-            Some("allow"),
-            Some(hostile.clone()),
-        );
+        decision_context.record_rule(hostile.clone(), true, Some("allow"), Some(hostile.clone()));
         decision_context.add_evidence(hostile.clone(), hostile.clone());
         decision_context.rules_evaluated = (0..super::MCP_SEND_OUTPUT_RULE_LIMIT + 7)
             .map(|_| crate::policy::RuleEvaluation {
@@ -24948,9 +24624,7 @@ exit 17",
             value["submit"]["cursor_before"].as_str(),
             value["submit"]["cursor_after"].as_str(),
         ] {
-            assert!(
-                field.is_some_and(|field| field.len() <= super::MCP_SEND_OUTPUT_MAX_BYTES)
-            );
+            assert!(field.is_some_and(|field| field.len() <= super::MCP_SEND_OUTPUT_MAX_BYTES));
         }
         assert_eq!(
             value["injection"]["decision"]["context"]["rules_evaluated"]
@@ -24979,10 +24653,7 @@ exit 17",
         assert_eq!(value["output_omissions"]["rules_evaluated"], 7);
         assert_eq!(value["output_omissions"]["decision_evidence"], 5);
         assert_eq!(value["output_omissions"]["risk_factors"], 3);
-        assert_eq!(
-            value["output_omissions"]["submit_evidence_rule_ids"],
-            11
-        );
+        assert_eq!(value["output_omissions"]["submit_evidence_rule_ids"], 11);
     }
 
     #[test]
@@ -25004,11 +24675,9 @@ exit 17",
             &secret[..split_at],
             &secret[split_at..]
         );
-        let protected = redact_mcp_pane_text_with_escape_contract(
-            &hostile,
-            true,
-            |candidate| redactor.redact(candidate),
-        );
+        let protected = redact_mcp_pane_text_with_escape_contract(&hostile, true, |candidate| {
+            redactor.redact(candidate)
+        });
         assert!(!protected.contains(&secret));
         assert!(!protected.contains('\x1b'));
         assert!(protected.contains("[REDACTED]"));

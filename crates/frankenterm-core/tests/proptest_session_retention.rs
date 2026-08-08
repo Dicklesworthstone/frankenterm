@@ -71,31 +71,15 @@ fn empty_restore_receipt_witness(
     metadata_json: &str,
 ) -> String {
     let mut hasher = Sha256::new();
-    frame_required(
-        &mut hasher,
-        "domain",
-        b"frankenterm:restore-receipt:v2",
-    );
+    frame_required(&mut hasher, "domain", b"frankenterm:restore-receipt:v2");
     frame_required(&mut hasher, "checkpoint_role", b"restore_receipt");
     frame_required(&mut hasher, "session_id", session_id.as_bytes());
-    frame_required(
-        &mut hasher,
-        "checkpoint_id",
-        &checkpoint_id.to_be_bytes(),
-    );
-    frame_required(
-        &mut hasher,
-        "checkpoint_at",
-        &checkpoint_at.to_be_bytes(),
-    );
+    frame_required(&mut hasher, "checkpoint_id", &checkpoint_id.to_be_bytes());
+    frame_required(&mut hasher, "checkpoint_at", &checkpoint_at.to_be_bytes());
     frame_required(&mut hasher, "checkpoint_type", b"startup");
     frame_required(&mut hasher, "pane_count", &0_i64.to_be_bytes());
     frame_required(&mut hasher, "total_bytes", &0_i64.to_be_bytes());
-    frame_optional(
-        &mut hasher,
-        "metadata_json",
-        Some(metadata_json.as_bytes()),
-    );
+    frame_optional(&mut hasher, "metadata_json", Some(metadata_json.as_bytes()));
     frame_optional(&mut hasher, "topology_json", None);
     frame_required(
         &mut hasher,
@@ -318,16 +302,16 @@ fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
         0..100usize,
         0..100usize,
     )
-        .prop_map(|(age, count, size, orphan_lifecycle, orphan_cp, orphan_ps)| {
-            CleanupResult {
+        .prop_map(
+            |(age, count, size, orphan_lifecycle, orphan_cp, orphan_ps)| CleanupResult {
                 deleted_by_age: age,
                 deleted_by_count: count,
                 deleted_by_size: size,
                 orphaned_restore_lifecycle_rows: orphan_lifecycle,
                 orphaned_checkpoints: orphan_cp,
                 orphaned_pane_states: orphan_ps,
-            }
-        })
+            },
+        )
 }
 
 fn arb_config() -> impl Strategy<Value = SessionRetentionConfig> {

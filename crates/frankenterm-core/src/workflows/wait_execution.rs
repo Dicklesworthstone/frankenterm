@@ -199,14 +199,16 @@ fn wait_context_failure_code(cx: &crate::cx::Cx, error: &ContextError) -> &'stat
         ContextErrorKind::CancelTimeout => "wait_cancellation_cleanup_timeout",
         ContextErrorKind::PollQuotaExhausted => "wait_poll_budget_exhausted",
         ContextErrorKind::CostQuotaExhausted => "wait_cost_budget_exhausted",
-        ContextErrorKind::Cancelled => match cx.cancel_reason().map(|reason| reason.root_cause().kind) {
-            Some(crate::outcome::CancelKind::Timeout | crate::outcome::CancelKind::Deadline) => {
-                "wait_deadline_exceeded"
+        ContextErrorKind::Cancelled => {
+            match cx.cancel_reason().map(|reason| reason.root_cause().kind) {
+                Some(
+                    crate::outcome::CancelKind::Timeout | crate::outcome::CancelKind::Deadline,
+                ) => "wait_deadline_exceeded",
+                Some(crate::outcome::CancelKind::PollQuota) => "wait_poll_budget_exhausted",
+                Some(crate::outcome::CancelKind::CostBudget) => "wait_cost_budget_exhausted",
+                _ => "wait_context_cancelled",
             }
-            Some(crate::outcome::CancelKind::PollQuota) => "wait_poll_budget_exhausted",
-            Some(crate::outcome::CancelKind::CostBudget) => "wait_cost_budget_exhausted",
-            _ => "wait_context_cancelled",
-        },
+        }
         _ => "wait_context_failure",
     }
 }
@@ -467,12 +469,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 loop {
                     wait_checkpoint(cx, "external signal wait")?;
                     let before_poll = wait_clock_now(cx);
-                    if wait_poll_forbidden(
-                        deadline,
-                        before_poll,
-                        polls,
-                        self.options.max_polls,
-                    ) {
+                    if wait_poll_forbidden(deadline, before_poll, polls, self.options.max_polls) {
                         return Ok(WaitConditionResult::TimedOut {
                             elapsed_ms: wait_elapsed_ms(start, before_poll),
                             polls,
@@ -550,12 +547,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         loop {
             wait_checkpoint(cx, "pattern wait")?;
             let before_poll = wait_clock_now(cx);
-            if wait_poll_forbidden(
-                deadline,
-                before_poll,
-                polls,
-                self.options.max_polls,
-            ) {
+            if wait_poll_forbidden(deadline, before_poll, polls, self.options.max_polls) {
                 return Ok(WaitConditionResult::TimedOut {
                     elapsed_ms: wait_elapsed_ms(start, before_poll),
                     polls,
@@ -591,15 +583,12 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             }
 
             // Check for matching rule
-            if detections.iter().any(|detection| detection.rule_id == rule_id) {
+            if detections
+                .iter()
+                .any(|detection| detection.rule_id == rule_id)
+            {
                 let elapsed_ms = wait_elapsed_ms(start, observed_at);
-                tracing::info!(
-                    pane_id,
-                    rule_id,
-                    elapsed_ms,
-                    polls,
-                    "pattern_wait matched"
-                );
+                tracing::info!(pane_id, rule_id, elapsed_ms, polls, "pattern_wait matched");
                 return Ok(WaitConditionResult::Satisfied {
                     elapsed_ms,
                     polls,
@@ -672,12 +661,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         loop {
             wait_checkpoint(cx, "pane idle wait")?;
             let before_poll = wait_clock_now(cx);
-            if wait_poll_forbidden(
-                deadline,
-                before_poll,
-                polls,
-                self.options.max_polls,
-            ) {
+            if wait_poll_forbidden(deadline, before_poll, polls, self.options.max_polls) {
                 return Ok(WaitConditionResult::TimedOut {
                     elapsed_ms: wait_elapsed_ms(start, before_poll),
                     polls,
@@ -811,12 +795,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         loop {
             wait_checkpoint(cx, "stable tail wait")?;
             let before_poll = wait_clock_now(cx);
-            if wait_poll_forbidden(
-                deadline,
-                before_poll,
-                polls,
-                self.options.max_polls,
-            ) {
+            if wait_poll_forbidden(deadline, before_poll, polls, self.options.max_polls) {
                 let last_observed = last_hash.map(|hash| {
                     format!(
                         "last_hash={:016x} tail_len={} stable_for_ms={}",
@@ -1245,9 +1224,7 @@ mod tests {
             cx: &'a crate::cx::Cx,
             _pane_id: u64,
             _escapes: bool,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>,
-        >
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>>
         where
             Self: 'a + Sync,
         {
@@ -1717,8 +1694,7 @@ mod tests {
         let source = MockPaneSource::new(vec!["ERROR\n$ ".to_string()]);
         let signals = ExternalSignalRegistry::new();
         signals.signal("already-fired");
-        let executor = WaitConditionExecutor::new(&source, &engine)
-            .with_external_signals(&signals);
+        let executor = WaitConditionExecutor::new(&source, &engine).with_external_signals(&signals);
         let conditions = [
             WaitCondition::Pattern {
                 pane_id: None,
@@ -2747,10 +2723,8 @@ mod tests {
                     vec![rule],
                 )])
                 .expect("late-match pattern pack");
-                let source = DelayedPaneSource::new(
-                    Duration::from_millis(10),
-                    "ERROR arrived too late\n$ ",
-                );
+                let source =
+                    DelayedPaneSource::new(Duration::from_millis(10), "ERROR arrived too late\n$ ");
                 let executor = WaitConditionExecutor::new(&source, &engine);
                 let conditions = [
                     WaitCondition::Pattern {
@@ -2773,12 +2747,7 @@ mod tests {
                 let mut results = Vec::with_capacity(conditions.len());
                 for condition in &conditions {
                     let result = executor
-                        .execute_with_cx(
-                            &cx,
-                            condition,
-                            1,
-                            Duration::from_millis(5),
-                        )
+                        .execute_with_cx(&cx, condition, 1, Duration::from_millis(5))
                         .await
                         .expect("late pane read should produce a timeout outcome");
                     results.push(result);
@@ -2955,12 +2924,7 @@ mod tests {
             let engine = PatternEngine::new();
             let executor = WaitConditionExecutor::new(&source, &engine);
             let error = rt
-                .block_on(executor.execute_with_cx(
-                    &cx,
-                    &condition,
-                    1,
-                    Duration::from_secs(5),
-                ))
+                .block_on(executor.execute_with_cx(&cx, &condition, 1, Duration::from_secs(5)))
                 .expect_err("post-read context failure must win over backend error");
 
             assert_finite_post_read_cancellation(&error);

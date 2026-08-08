@@ -113,12 +113,8 @@ fn record_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
 fn saturating_increment(counter: &AtomicU64) {
     let mut count = counter.load(Ordering::Relaxed);
     while count != u64::MAX {
-        match counter.compare_exchange_weak(
-            count,
-            count + 1,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(count, count + 1, Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => break,
             Err(observed) => count = observed,
         }
@@ -298,10 +294,7 @@ impl SequenceAssigner {
         let pane_sequence = previous_pane.unwrap_or(0);
         let global_sequence = frontiers.global;
 
-        match (
-            global_sequence == u64::MAX,
-            pane_sequence == u64::MAX,
-        ) {
+        match (global_sequence == u64::MAX, pane_sequence == u64::MAX) {
             (true, true) => {
                 return Err(SequenceAssignmentError::GlobalAndPaneExhausted { pane_id });
             }

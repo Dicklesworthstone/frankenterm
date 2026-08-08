@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::runtime_async::{LockAcquireError, Mutex};
-use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
@@ -1140,12 +1140,7 @@ fn saturating_atomic_increment(counter: &AtomicU64) {
         let Some(next) = observed.checked_add(1) else {
             return;
         };
-        match counter.compare_exchange_weak(
-            observed,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(observed, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return,
             Err(current) => observed = current,
         }
@@ -1228,12 +1223,8 @@ fn allocate_recording_sequence(
     let mut candidate = next.load(Ordering::Relaxed);
     loop {
         let successor = candidate.checked_add(1).ok_or(exhausted)?;
-        match next.compare_exchange_weak(
-            candidate,
-            successor,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match next.compare_exchange_weak(candidate, successor, Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => return Ok(candidate),
             Err(observed) => candidate = observed,
         }
@@ -2601,14 +2592,8 @@ mod tests {
             next: AtomicU64::new(u64::MAX - 1),
         };
         assert_eq!(seq.next(), Ok(u64::MAX - 1));
-        assert_eq!(
-            seq.next(),
-            Err(RecordingSequenceError::IngressExhausted)
-        );
-        assert_eq!(
-            seq.next(),
-            Err(RecordingSequenceError::IngressExhausted)
-        );
+        assert_eq!(seq.next(), Err(RecordingSequenceError::IngressExhausted));
+        assert_eq!(seq.next(), Err(RecordingSequenceError::IngressExhausted));
     }
 
     #[test]
@@ -2622,7 +2607,11 @@ mod tests {
             let sequence = Arc::clone(&sequence);
             workers.push(std::thread::spawn(move || {
                 (0..ALLOCATIONS_PER_THREAD)
-                    .map(|_| sequence.next().expect("sequence space must remain available"))
+                    .map(|_| {
+                        sequence
+                            .next()
+                            .expect("sequence space must remain available")
+                    })
                     .collect::<Vec<_>>()
             }));
         }

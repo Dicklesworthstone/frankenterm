@@ -3,9 +3,9 @@
 //! Provides fast, reliable detection of agent state transitions.
 #![allow(unexpected_cfgs)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(not(feature = "patterns-fingerprint-dedup"))]
 use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -31,6 +31,12 @@ pub const PATTERN_PACK_SIGNATURE_ALGORITHM: &str = "frankenterm.sha256-attestati
 pub const PATTERN_PACK_COMPATIBILITY_TARGET: &str = "frankenterm-patterns.v1";
 
 type RuleRegexResult = std::result::Result<Regex, Box<fancy_regex::Error>>;
+
+fn saturating_atomic_add(counter: &AtomicU64, delta: u64) {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(delta))
+    });
+}
 
 /// Compile a rule regex with the shared backtrack limit. All compile
 /// sites in this module MUST use this helper so the security contract
@@ -117,7 +123,7 @@ impl PatternTelemetry {
     /// Record that a rule's regex scan ended in an engine error, discarding
     /// any matches it had not yet yielded. See [`Self::regex_scan_errors`].
     fn record_regex_scan_error(&self, rule_id: &str, error: &fancy_regex::Error) {
-        self.regex_scan_errors.fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_add(&self.regex_scan_errors, 1);
         tracing::warn!(
             rule_id,
             %error,
@@ -546,7 +552,7 @@ static DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT: AtomicU64 = AtomicU64::new(0);
 #[inline]
 fn record_detect_with_context_materialization() {
     #[cfg(test)]
-    DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT.fetch_add(1, Ordering::Relaxed);
+    saturating_atomic_add(&DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT, 1);
 }
 
 #[cfg(test)]
@@ -797,11 +803,17 @@ impl DetectionContext {
         true
     }
 
-    /// Next monotonic recency generation (wraps defensively; unreachable in
-    /// practice).
+    /// Next monotonic recency generation. At terminal exhaustion, discard the
+    /// bounded dedup epoch before recycling so no stale ordering token can
+    /// alias a live entry in the new epoch.
     #[cfg(not(feature = "patterns-fingerprint-dedup"))]
     fn next_seen_generation(&mut self) -> u64 {
-        self.seen_generation = self.seen_generation.wrapping_add(1);
+        if self.seen_generation == u64::MAX {
+            self.seen_keys.clear();
+            self.seen_order.clear();
+            self.seen_generation = 0;
+        }
+        self.seen_generation += 1;
         self.seen_generation
     }
 
@@ -4356,7 +4368,7 @@ impl PatternEngine {
     /// Detect patterns in text
     #[must_use]
     pub fn detect(&self, text: &str) -> Vec<Detection> {
-        self.telemetry.scans_total.fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_add(&self.telemetry.scans_total, 1);
 
         if text.is_empty() {
             return Vec::new();
@@ -4366,7 +4378,7 @@ impl PatternEngine {
 
         if self.quick_reject_enabled && !Self::quick_reject_with_index(index, text, &self.telemetry)
         {
-            self.telemetry.quick_rejects.fetch_add(1, Ordering::Relaxed);
+            saturating_atomic_add(&self.telemetry.quick_rejects, 1);
             return Vec::new();
         }
 
@@ -4396,9 +4408,10 @@ impl PatternEngine {
 
         indices.sort_unstable();
 
-        self.telemetry
-            .candidate_rules_evaluated
-            .fetch_add(indices.len() as u64, Ordering::Relaxed);
+        saturating_atomic_add(
+            &self.telemetry.candidate_rules_evaluated,
+            u64::try_from(indices.len()).unwrap_or(u64::MAX),
+        );
 
         let mut detections = Vec::new();
         for idx in indices {
@@ -4409,9 +4422,7 @@ impl PatternEngine {
                 .unwrap_or(("", (0, 0)));
 
             if let Some(regex) = compiled.regex.as_ref() {
-                self.telemetry
-                    .regex_evaluations
-                    .fetch_add(1, Ordering::Relaxed);
+                saturating_atomic_add(&self.telemetry.regex_evaluations, 1);
                 for capture_result in regex.captures_iter(text) {
                     let captures = match capture_result {
                         Ok(captures) => captures,
@@ -4453,9 +4464,10 @@ impl PatternEngine {
             }
         }
 
-        self.telemetry
-            .matches_total
-            .fetch_add(detections.len() as u64, Ordering::Relaxed);
+        saturating_atomic_add(
+            &self.telemetry.matches_total,
+            u64::try_from(detections.len()).unwrap_or(u64::MAX),
+        );
         self.telemetry.record_rule_hits(&detections);
 
         detections
@@ -4482,7 +4494,7 @@ impl PatternEngine {
         text: &str,
         context: &mut DetectionContext,
     ) -> Vec<Detection> {
-        self.telemetry.scans_total.fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_add(&self.telemetry.scans_total, 1);
 
         if text.is_empty() {
             return Vec::new();
@@ -4513,7 +4525,7 @@ impl PatternEngine {
         if self.quick_reject_enabled
             && !Self::quick_reject_with_index(index, &input_text, &self.telemetry)
         {
-            self.telemetry.quick_rejects.fetch_add(1, Ordering::Relaxed);
+            saturating_atomic_add(&self.telemetry.quick_rejects, 1);
             return Vec::new();
         }
 
@@ -4550,9 +4562,10 @@ impl PatternEngine {
 
         indices.sort_unstable();
 
-        self.telemetry
-            .candidate_rules_evaluated
-            .fetch_add(indices.len() as u64, Ordering::Relaxed);
+        saturating_atomic_add(
+            &self.telemetry.candidate_rules_evaluated,
+            u64::try_from(indices.len()).unwrap_or(u64::MAX),
+        );
 
         let mut result = Vec::new();
         let mut emitted_matches = 0u64;
@@ -4570,9 +4583,7 @@ impl PatternEngine {
             }
 
             if let Some(regex) = compiled.regex.as_ref() {
-                self.telemetry
-                    .regex_evaluations
-                    .fetch_add(1, Ordering::Relaxed);
+                saturating_atomic_add(&self.telemetry.regex_evaluations, 1);
 
                 for capture_result in regex.captures_iter(&input_text) {
                     let captures = match capture_result {
@@ -4747,9 +4758,7 @@ impl PatternEngine {
             }
         }
 
-        self.telemetry
-            .matches_total
-            .fetch_add(emitted_matches, Ordering::Relaxed);
+        saturating_atomic_add(&self.telemetry.matches_total, emitted_matches);
         self.telemetry.record_rule_hits(&result);
 
         result
@@ -4767,7 +4776,7 @@ impl PatternEngine {
         context: &mut DetectionContext,
         opts: &TraceOptions,
     ) -> (Vec<Detection>, Vec<MatchTrace>) {
-        self.telemetry.scans_total.fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_add(&self.telemetry.scans_total, 1);
 
         if text.is_empty() {
             return (Vec::new(), Vec::new());
@@ -4806,7 +4815,7 @@ impl PatternEngine {
 
         if self.quick_reject_enabled && !Self::quick_reject_with_index(index, text, &self.telemetry)
         {
-            self.telemetry.quick_rejects.fetch_add(1, Ordering::Relaxed);
+            saturating_atomic_add(&self.telemetry.quick_rejects, 1);
             return (Vec::new(), Vec::new());
         }
 
@@ -4830,9 +4839,10 @@ impl PatternEngine {
 
         indices.sort_unstable();
 
-        self.telemetry
-            .candidate_rules_evaluated
-            .fetch_add(indices.len() as u64, Ordering::Relaxed);
+        saturating_atomic_add(
+            &self.telemetry.candidate_rules_evaluated,
+            u64::try_from(indices.len()).unwrap_or(u64::MAX),
+        );
 
         let mut detections: Vec<Detection> = Vec::new();
         let mut traces: Vec<MatchTrace> = Vec::new();
@@ -4857,9 +4867,7 @@ impl PatternEngine {
             if let Some(regex) = compiled.regex.as_ref() {
                 let mut any_capture = false;
 
-                self.telemetry
-                    .regex_evaluations
-                    .fetch_add(1, Ordering::Relaxed);
+                saturating_atomic_add(&self.telemetry.regex_evaluations, 1);
 
                 for capture_result in regex.captures_iter(text) {
                     let captures = match capture_result {
@@ -4995,9 +5003,10 @@ impl PatternEngine {
             }
         }
 
-        self.telemetry
-            .matches_total
-            .fetch_add(detections.len() as u64, Ordering::Relaxed);
+        saturating_atomic_add(
+            &self.telemetry.matches_total,
+            u64::try_from(detections.len()).unwrap_or(u64::MAX),
+        );
         self.telemetry.record_rule_hits(&detections);
 
         (detections, traces)
@@ -5604,9 +5613,9 @@ impl PatternEngine {
                             continue;
                         }
                         let window = &text[start..end];
-                        telemetry.bloom_checks.fetch_add(1, Ordering::Relaxed);
+                        saturating_atomic_add(&telemetry.bloom_checks, 1);
                         if bloom.check(window) {
-                            telemetry.bloom_positives.fetch_add(1, Ordering::Relaxed);
+                            saturating_atomic_add(&telemetry.bloom_positives, 1);
                             // Bloom says "possibly present" - need full matching.
                             return true;
                         }
@@ -5617,7 +5626,7 @@ impl PatternEngine {
                 return false;
             }
             // Bloom filter rejected all candidate substrings - definitely no match
-            telemetry.bloom_rejects.fetch_add(1, Ordering::Relaxed);
+            saturating_atomic_add(&telemetry.bloom_rejects, 1);
             return false;
         }
 
@@ -5683,6 +5692,15 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn pattern_telemetry_atomic_add_saturates_without_wrapping() {
+        let counter = AtomicU64::new(u64::MAX);
+
+        saturating_atomic_add(&counter, 1);
+
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
 
     // ── round5 EV2: agent-sharded pattern index oracle equivalence ──────
 
@@ -8220,6 +8238,22 @@ rules:
 
         assert!(ctx.mark_seen_key("codex.test:one".to_string()));
         assert_eq!(ctx.seen_count(), 1);
+        assert_eq!(ctx.seen_order.len(), 1);
+    }
+
+    #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+    #[test]
+    fn seen_generation_recycles_only_after_discarding_the_prior_dedup_epoch() {
+        let mut ctx = DetectionContext::new();
+        assert!(ctx.mark_seen_key("codex.test:old".to_string()));
+        ctx.seen_generation = u64::MAX;
+
+        assert!(ctx.mark_seen_key("codex.test:new".to_string()));
+
+        assert_eq!(ctx.seen_generation, 1);
+        assert_eq!(ctx.seen_count(), 1);
+        assert!(!ctx.seen_keys.contains_key("codex.test:old"));
+        assert!(ctx.seen_keys.contains_key("codex.test:new"));
         assert_eq!(ctx.seen_order.len(), 1);
     }
 

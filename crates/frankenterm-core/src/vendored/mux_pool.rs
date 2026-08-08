@@ -233,12 +233,7 @@ fn saturating_atomic_increment(counter: &AtomicU64) -> u64 {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
         let next = current.saturating_add(1);
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return next,
             Err(observed) => current = observed,
         }
@@ -373,10 +368,7 @@ impl MuxPool {
         attempts: &RenderAttemptState,
         decision: MuxRecoveryDecision,
     ) -> bool {
-        self.recovery.enabled
-            && attempts.has_remaining()
-            && decision.retry
-            && !decision.cancelled
+        self.recovery.enabled && attempts.has_remaining() && decision.retry && !decision.cancelled
     }
 
     fn record_permanent_failure(&self, decision: MuxRecoveryDecision) {
@@ -809,11 +801,10 @@ impl MuxPool {
                 Err(err) => {
                     let decision = mux_recovery_decision(&err);
                     if self.can_retry(attempt, decision) {
-                        let reuse_in_hand = matches!(
-                            decision.connection,
-                            MuxConnectionDisposition::Reuse
-                        ) && !client.is_connection_poisoned()
-                            && !cx.is_cancel_requested();
+                        let reuse_in_hand =
+                            matches!(decision.connection, MuxConnectionDisposition::Reuse)
+                                && !client.is_connection_poisoned()
+                                && !cx.is_cancel_requested();
                         tracing::debug!(
                             op = op_name,
                             attempt,
@@ -1006,9 +997,9 @@ impl MuxPool {
                 match self.acquire_client_with_cx(cx).await {
                     Ok(acquired) => acquired,
                     Err(MuxPoolError::Pool(error)) => {
-                        return Err(RenderExecutionError::BeforeOperation(
-                            MuxPoolError::Pool(error),
-                        ));
+                        return Err(RenderExecutionError::BeforeOperation(MuxPoolError::Pool(
+                            error,
+                        )));
                     }
                     Err(MuxPoolError::IndeterminateMutation(error)) => {
                         return Err(RenderExecutionError::BeforeOperation(
@@ -1038,9 +1029,9 @@ impl MuxPool {
                         }
 
                         self.record_permanent_failure(decision);
-                        return Err(RenderExecutionError::BeforeOperation(
-                            MuxPoolError::Mux(error),
-                        ));
+                        return Err(RenderExecutionError::BeforeOperation(MuxPoolError::Mux(
+                            error,
+                        )));
                     }
                 }
             };
@@ -1055,9 +1046,7 @@ impl MuxPool {
                 }
             };
             let result = client
-                .get_pane_render_changes_batch_with_cx_prevalidated(
-                    cx, pane_ids, depth, remaining,
-                )
+                .get_pane_render_changes_batch_with_cx_prevalidated(cx, pane_ids, depth, remaining)
                 .await;
             match result {
                 Ok(value) => {
@@ -1082,11 +1071,10 @@ impl MuxPool {
                 }
                 Err(error) => {
                     let decision = mux_recovery_decision(&error);
-                    let reuse_in_hand = matches!(
-                        decision.connection,
-                        MuxConnectionDisposition::Reuse
-                    ) && !client.is_connection_poisoned()
-                        && !cx.is_cancel_requested();
+                    let reuse_in_hand =
+                        matches!(decision.connection, MuxConnectionDisposition::Reuse)
+                            && !client.is_connection_poisoned()
+                            && !cx.is_cancel_requested();
                     let hand_off_to_fallback = depth > 1
                         && attempts.has_remaining()
                         && is_transport_failover_decision(decision);
@@ -1102,9 +1090,7 @@ impl MuxPool {
                             "pipelined render batch failed; handing next shared attempt to sequential fallback"
                         );
                         self.return_client_after_error(cx, client, decision).await;
-                        return Err(RenderExecutionError::Operation(MuxPoolError::Mux(
-                            error,
-                        )));
+                        return Err(RenderExecutionError::Operation(MuxPoolError::Mux(error)));
                     }
 
                     if self.can_retry_render(attempts, decision) {
@@ -1134,9 +1120,7 @@ impl MuxPool {
 
                     self.record_permanent_failure(decision);
                     self.return_client_after_error(cx, client, decision).await;
-                    return Err(RenderExecutionError::Operation(MuxPoolError::Mux(
-                        error,
-                    )));
+                    return Err(RenderExecutionError::Operation(MuxPoolError::Mux(error)));
                 }
             }
         }
@@ -1239,9 +1223,7 @@ impl MuxPool {
         match crate::runtime_async::timeout_with_cx(
             cx,
             outer_timeout,
-            self.get_pane_render_changes_batch_within_deadline(
-                cx, &pane_ids, depth, &deadline,
-            ),
+            self.get_pane_render_changes_batch_within_deadline(cx, &pane_ids, depth, &deadline),
         )
         .await
         {
@@ -3186,8 +3168,7 @@ mod tests {
         assert!(!mux_err.is_pool_timeout());
         assert!(mux_err.is_disconnected());
 
-        let mutation_err =
-            MuxPoolError::IndeterminateMutation(DirectMuxError::Disconnected);
+        let mutation_err = MuxPoolError::IndeterminateMutation(DirectMuxError::Disconnected);
         assert!(mutation_err.to_string().contains("indeterminate"));
         assert!(!mutation_err.is_pool_timeout());
         assert!(mutation_err.is_disconnected());
@@ -3262,7 +3243,10 @@ mod tests {
             .expect("initial deadline slice");
         let later = require_render_batch_remaining(Some(Duration::from_millis(750)), configured)
             .expect("recomputed deadline slice");
-        assert!(later < first, "later attempt must receive less remaining time");
+        assert!(
+            later < first,
+            "later attempt must receive less remaining time"
+        );
 
         for exhausted in [None, Some(Duration::ZERO)] {
             let error = require_render_batch_remaining(exhausted, configured)
@@ -4427,10 +4411,7 @@ mod tests {
                 .await
                 .expect_err("a read completed under cancellation must not publish its value");
 
-            assert!(matches!(
-                &error,
-                MuxPoolError::Pool(PoolError::Cancelled)
-            ));
+            assert!(matches!(&error, MuxPoolError::Pool(PoolError::Cancelled)));
             assert!(!error.to_string().contains(SECRET));
 
             let stats_cx = Cx::for_testing();
@@ -4466,10 +4447,7 @@ mod tests {
                 .get_pane_render_changes_batch_with_cx(&cx, vec![1, 2])
                 .await
                 .expect_err("cancelled caller must not receive a completed render batch");
-            assert!(matches!(
-                &error,
-                MuxPoolError::Pool(PoolError::Cancelled)
-            ));
+            assert!(matches!(&error, MuxPoolError::Pool(PoolError::Cancelled)));
             assert!(!error.to_string().contains(SECRET));
 
             let stats = pool
@@ -5503,7 +5481,8 @@ mod tests {
         ///    publish a backend health attempt or failure. Caller interruption
         ///    is not evidence that the mux server itself is unhealthy.
         #[test]
-        fn mux_pool_health_check_with_precancelled_cx_publishes_no_health_sample_under_labruntime() {
+        fn mux_pool_health_check_with_precancelled_cx_publishes_no_health_sample_under_labruntime()
+        {
             run_lab(904, || async move {
                 let pool = unreachable_pool(2);
                 let cx = pre_cancelled_cx("wa-2h5wv health_check cancel");

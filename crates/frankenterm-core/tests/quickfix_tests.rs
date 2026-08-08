@@ -132,9 +132,7 @@ fn every_error_variant_has_remediation() {
         Error::Wezterm(WeztermError::PaneNotFound(1)),
         Error::Wezterm(WeztermError::SocketNotFound("/tmp/wez.sock".to_string())),
         Error::Wezterm(WeztermError::CommandFailed("boom".to_string())),
-        Error::Wezterm(WeztermError::IndeterminateMutation {
-            operation: "spawn",
-        }),
+        Error::Wezterm(WeztermError::IndeterminateMutation { operation: "spawn" }),
         Error::Wezterm(WeztermError::ParseError("bad json".to_string())),
         Error::Wezterm(WeztermError::OutputTooLarge {
             command: "cli list".to_string(),
@@ -554,9 +552,7 @@ fn error_renderer_maps_all_error_variants_to_catalog() {
         Error::Wezterm(WeztermError::PaneNotFound(1)),
         Error::Wezterm(WeztermError::SocketNotFound("/tmp/s".to_string())),
         Error::Wezterm(WeztermError::CommandFailed("err".to_string())),
-        Error::Wezterm(WeztermError::IndeterminateMutation {
-            operation: "spawn",
-        }),
+        Error::Wezterm(WeztermError::IndeterminateMutation { operation: "spawn" }),
         Error::Wezterm(WeztermError::ParseError("bad".to_string())),
         Error::Wezterm(WeztermError::OutputTooLarge {
             command: "cli list".to_string(),

@@ -346,11 +346,11 @@ impl BackendStats {
     /// frames have been observed.
     #[must_use]
     pub fn present_rate_pct(&self) -> u32 {
-        let total = self.frames_presented + self.frames_skipped;
+        let total = u128::from(self.frames_presented) + u128::from(self.frames_skipped);
         if total == 0 {
             return 0;
         }
-        ((self.frames_presented * 100) / total).min(100) as u32
+        ((u128::from(self.frames_presented) * 100) / total).min(100) as u32
     }
 }
 
@@ -651,6 +651,16 @@ mod tests {
             s.record_present();
             s.record_skip();
         }
+        assert_eq!(s.present_rate_pct(), 50);
+    }
+
+    #[test]
+    fn stats_present_rate_handles_saturated_counters_without_overflow() {
+        let s = BackendStats {
+            frames_presented: u64::MAX,
+            frames_skipped: u64::MAX,
+            ..Default::default()
+        };
         assert_eq!(s.present_rate_pct(), 50);
     }
 

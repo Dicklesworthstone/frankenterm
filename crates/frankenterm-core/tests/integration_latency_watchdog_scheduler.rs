@@ -39,11 +39,9 @@ fn make_intent(pane_id: u64, seq: u64, work_units: u32, at_ms: u64) -> ResizeInt
 /// Record a full input-to-render latency measurement.
 fn record_full_measurement(collector: &mut InputLatencyCollector, base_us: u64, jitter_us: u64) {
     let producer_id = InputLatencyProducerId::new(1).expect("fixture producer ID is non-zero");
-    let clock_domain_id =
-        InputLatencyClockDomainId::new(1).expect("fixture clock ID is non-zero");
-    let timestamp = |timestamp_us| {
-        InputLatencyTimestamp::new(timestamp_us, producer_id, clock_domain_id)
-    };
+    let clock_domain_id = InputLatencyClockDomainId::new(1).expect("fixture clock ID is non-zero");
+    let timestamp =
+        |timestamp_us| InputLatencyTimestamp::new(timestamp_us, producer_id, clock_domain_id);
     let mut m = collector
         .begin_measurement()
         .expect("fixture collector has ID capacity");

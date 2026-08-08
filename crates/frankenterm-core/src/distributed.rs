@@ -989,9 +989,7 @@ impl DistributedHttpClient {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: runtime_http::HttpClient::builder()
-                .no_redirects()
-                .build(),
+            inner: runtime_http::HttpClient::builder().no_redirects().build(),
         }
     }
 
@@ -1092,12 +1090,9 @@ where
     let inner = std::pin::pin!(inner);
     let cancel_watcher = async {
         loop {
-            if crate::runtime_async::sleep_with_cx(
-                cx,
-                std::time::Duration::from_millis(50),
-            )
-            .await
-            .is_err()
+            if crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(50))
+                .await
+                .is_err()
             {
                 let error = if cx.is_cancel_requested() {
                     runtime_http::ClientError::Cancelled

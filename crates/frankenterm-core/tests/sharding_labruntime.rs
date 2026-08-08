@@ -275,10 +275,7 @@ fn sharding_circuit_status_aggregates_worst_state() {
     rt.block_on(async {
         let healthy = Arc::new(MockWezterm::new());
         let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(
-                ShardId(0),
-                healthy as WeztermHandle,
-            )],
+            vec![ShardBackend::new(ShardId(0), healthy as WeztermHandle)],
             AssignmentStrategy::RoundRobin,
         )
         .unwrap();

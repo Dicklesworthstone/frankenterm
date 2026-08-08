@@ -6,8 +6,8 @@ use super::{
 };
 use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
-    FrameworkMcpResult as McpResult, FrameworkTool as Tool, FrameworkToolHandler as ToolHandler,
-    FrameworkResponseDeliveryCoordinator,
+    FrameworkMcpResult as McpResult, FrameworkResponseDeliveryCoordinator, FrameworkTool as Tool,
+    FrameworkToolHandler as ToolHandler,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -409,8 +409,8 @@ mod tests {
         FrameworkToolHandler as ToolHandler,
     };
     use proptest::prelude::*;
-    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     // ========================================================================
     // McpOutputFormat Tests

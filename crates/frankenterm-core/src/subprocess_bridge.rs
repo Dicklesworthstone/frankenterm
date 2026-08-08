@@ -17,8 +17,8 @@ use tracing::{debug, warn};
 use crate::runtime_async::process::{
     Command, CommandCancellation, CommandCancelled, CommandCleanupTrigger,
     CommandOutputCaptureIncomplete, CommandOutputLimitExceeded, CommandOutputStream,
-    CommandProcessCleanupIncomplete, CommandTimedOut,
-    DEFAULT_COMMAND_STDERR_LIMIT_BYTES, DEFAULT_COMMAND_STDOUT_LIMIT_BYTES,
+    CommandProcessCleanupIncomplete, CommandTimedOut, DEFAULT_COMMAND_STDERR_LIMIT_BYTES,
+    DEFAULT_COMMAND_STDOUT_LIMIT_BYTES,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -344,9 +344,9 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use serde::Deserialize;
+    use serde_json::Value;
     #[cfg(unix)]
     use serde_json::json;
-    use serde_json::Value;
     #[cfg(unix)]
     use tempfile::tempdir;
 
@@ -859,9 +859,7 @@ mod tests {
         let start = std::time::Instant::now();
         // The main 'sh' process exits immediately, but the background 'sleep' process
         // inherits stdout and holds it open.
-        let err = b
-            .invoke(&["-c", "sleep 1 >&1 2>/dev/null &"])
-            .unwrap_err();
+        let err = b.invoke(&["-c", "sleep 1 >&1 2>/dev/null &"]).unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(2));
         assert!(matches!(
             err,
@@ -887,10 +885,7 @@ mod tests {
 
         let over = bridge("sh").with_stdout_limit(payload.len() - 1);
         let error = over
-            .invoke(&[
-                "-c",
-                "printf '{\"ok\":true}'; while :; do sleep 1; done",
-            ])
+            .invoke(&["-c", "printf '{\"ok\":true}'; while :; do sleep 1; done"])
             .expect_err("first byte beyond stdout cap must fail closed");
         assert!(matches!(
             error,
@@ -928,19 +923,13 @@ mod tests {
     fn invoke_accepts_exact_stderr_cap_and_rejects_one_byte_over() {
         let exact = bridge("sh").with_stderr_limit(3);
         let output = exact
-            .invoke(&[
-                "-c",
-                "printf 'abc' >&2; printf '{\"ok\":true}'",
-            ])
+            .invoke(&["-c", "printf 'abc' >&2; printf '{\"ok\":true}'"])
             .expect("exact stderr boundary must be accepted");
         assert_eq!(output, json!({"ok": true}));
 
         let over = exact.with_stderr_limit(2);
         let error = over
-            .invoke(&[
-                "-c",
-                "printf 'abc' >&2; while :; do sleep 1; done",
-            ])
+            .invoke(&["-c", "printf 'abc' >&2; while :; do sleep 1; done"])
             .expect_err("first byte beyond stderr cap must fail closed");
         assert!(matches!(
             error,

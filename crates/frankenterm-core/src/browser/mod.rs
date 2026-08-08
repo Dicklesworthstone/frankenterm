@@ -192,8 +192,7 @@ pub(super) fn encode_node_script_input(
 ) -> std::result::Result<String, BrowserNodeCommandFailure> {
     use base64::Engine as _;
 
-    let json = serde_json::to_vec(input)
-        .map_err(|_| BrowserNodeCommandFailure::ScriptOversized)?;
+    let json = serde_json::to_vec(input).map_err(|_| BrowserNodeCommandFailure::ScriptOversized)?;
     if json.len() > BROWSER_NODE_INPUT_JSON_MAX_BYTES {
         return Err(BrowserNodeCommandFailure::ScriptOversized);
     }
@@ -303,15 +302,13 @@ fn parse_secure_browser_auth_url(
     let rest = candidate
         .strip_prefix("https://")
         .ok_or(BrowserNodeCommandFailure::InvalidConfiguration)?;
-    let authority_end = rest
-        .find(['/', '?', '#'])
-        .unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     if authority.is_empty() || authority.contains(':') || authority.contains('@') {
         return Err(BrowserNodeCommandFailure::InvalidConfiguration);
     }
-    let parsed = url::Url::parse(candidate)
-        .map_err(|_| BrowserNodeCommandFailure::InvalidConfiguration)?;
+    let parsed =
+        url::Url::parse(candidate).map_err(|_| BrowserNodeCommandFailure::InvalidConfiguration)?;
     if parsed.scheme() != "https"
         || !parsed.username().is_empty()
         || parsed.password().is_some()
@@ -350,13 +347,20 @@ pub(super) fn admit_automated_auth_url(
         BrowserAuthService::Google => {
             host == "accounts.google.com"
                 && ((path == "/" && !query_present)
-                    || matches!(path, "/o/oauth2/v2/auth" | "/o/oauth2/v2/auth/"
-                        | "/o/oauth2/auth" | "/o/oauth2/auth/"))
+                    || matches!(
+                        path,
+                        "/o/oauth2/v2/auth"
+                            | "/o/oauth2/v2/auth/"
+                            | "/o/oauth2/auth"
+                            | "/o/oauth2/auth/"
+                    ))
         }
         BrowserAuthService::Anthropic => {
             host == "console.anthropic.com"
-                && matches!(path, "/login" | "/login/" | "/oauth/authorize"
-                    | "/oauth/authorize/")
+                && matches!(
+                    path,
+                    "/login" | "/login/" | "/oauth/authorize" | "/oauth/authorize/"
+                )
         }
     };
     if admitted {
@@ -378,19 +382,25 @@ pub(super) fn admit_bootstrap_login_url(
     let query_present = parsed.query().is_some();
     let admitted = match service {
         BrowserAuthService::OpenAi => {
-            host == "auth.openai.com"
-                && matches!(path, "/authorize" | "/authorize/")
+            host == "auth.openai.com" && matches!(path, "/authorize" | "/authorize/")
         }
         BrowserAuthService::Google => {
             host == "accounts.google.com"
                 && ((path == "/" && !query_present)
-                    || matches!(path, "/o/oauth2/v2/auth" | "/o/oauth2/v2/auth/"
-                        | "/o/oauth2/auth" | "/o/oauth2/auth/"))
+                    || matches!(
+                        path,
+                        "/o/oauth2/v2/auth"
+                            | "/o/oauth2/v2/auth/"
+                            | "/o/oauth2/auth"
+                            | "/o/oauth2/auth/"
+                    ))
         }
         BrowserAuthService::Anthropic => {
             host == "console.anthropic.com"
-                && matches!(path, "/login" | "/login/" | "/oauth/authorize"
-                    | "/oauth/authorize/")
+                && matches!(
+                    path,
+                    "/login" | "/login/" | "/oauth/authorize" | "/oauth/authorize/"
+                )
         }
     };
     if admitted {
@@ -572,9 +582,7 @@ impl ProfileMetadataReadFailure {
             Self::NotRegularFile => "Browser profile metadata is not a regular file",
             Self::Oversized => "Browser profile metadata exceeds the 64 KiB safety limit",
             Self::ReadUnavailable => "Browser profile metadata could not be read safely",
-            Self::ChangedDuringRead => {
-                "Browser profile metadata changed while it was being read"
-            }
+            Self::ChangedDuringRead => "Browser profile metadata changed while it was being read",
             Self::InvalidSchema => "Browser profile metadata does not match the required schema",
             Self::IdentityMismatch => {
                 "Browser profile metadata identity does not match its profile"
@@ -582,9 +590,7 @@ impl ProfileMetadataReadFailure {
             Self::LegacyIdentityUnrecoverable => {
                 "Browser profile metadata uses an unrecoverable legacy identity"
             }
-            Self::InvalidTimestamp => {
-                "Browser profile metadata contains an invalid timestamp"
-            }
+            Self::InvalidTimestamp => "Browser profile metadata contains an invalid timestamp",
         }
     }
 
@@ -618,9 +624,7 @@ enum StorageStateFailure {
 impl StorageStateFailure {
     const fn detail(self) -> &'static str {
         match self {
-            Self::MetadataUnavailable => {
-                "Browser storage-state attributes could not be inspected"
-            }
+            Self::MetadataUnavailable => "Browser storage-state attributes could not be inspected",
             Self::NotRegularFile => "Browser storage state is not a regular file",
             Self::Oversized => "Browser storage state exceeds the 16 MiB safety limit",
             Self::ReadUnavailable => "Browser storage state could not be read safely",
@@ -756,16 +760,12 @@ fn private_io_error(message: &'static str) -> std::io::Error {
     std::io::Error::other(message)
 }
 
-fn snapshot_std(
-    metadata: &std::fs::Metadata,
-) -> std::io::Result<ProfileMetadataFileSnapshot> {
+fn snapshot_std(metadata: &std::fs::Metadata) -> std::io::Result<ProfileMetadataFileSnapshot> {
     ProfileMetadataFileSnapshot::capture(metadata)
         .ok_or_else(|| private_io_error("required file version metadata is unavailable"))
 }
 
-fn snapshot_cap(
-    metadata: &cap_std::fs::Metadata,
-) -> std::io::Result<ProfileMetadataFileSnapshot> {
+fn snapshot_cap(metadata: &cap_std::fs::Metadata) -> std::io::Result<ProfileMetadataFileSnapshot> {
     ProfileMetadataFileSnapshot::capture_cap(metadata)
         .ok_or_else(|| private_io_error("required file version metadata is unavailable"))
 }
@@ -817,16 +817,15 @@ fn verify_private_directory_permissions(directory: &cap_std::fs::Dir) -> std::io
             .mode()
             & 0o777;
         if mode & 0o077 != 0 {
-            return Err(private_io_error("private directory permissions are too broad"));
+            return Err(private_io_error(
+                "private directory permissions are too broad",
+            ));
         }
     }
     Ok(())
 }
 
-fn create_private_child_directory(
-    parent: &cap_std::fs::Dir,
-    name: &Path,
-) -> std::io::Result<()> {
+fn create_private_child_directory(parent: &cap_std::fs::Dir, name: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         let mut builder = cap_std::fs::DirBuilder::new();
@@ -846,7 +845,9 @@ fn path_has_parent_component(path: &Path) -> bool {
 
 fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
     if path_has_parent_component(path) {
-        return Err(private_io_error("private directory path contains a parent component"));
+        return Err(private_io_error(
+            "private directory path contains a parent component",
+        ));
     }
     let Some(leaf) = path.file_name() else {
         let base = if path.as_os_str().is_empty() {
@@ -866,7 +867,9 @@ fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir
 
 fn ensure_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
     if path_has_parent_component(path) {
-        return Err(private_io_error("private directory path contains a parent component"));
+        return Err(private_io_error(
+            "private directory path contains a parent component",
+        ));
     }
     let Some(leaf) = path.file_name() else {
         let base = if path.as_os_str().is_empty() {
@@ -1004,7 +1007,9 @@ pub(super) fn write_private_file_create_new(
 ) -> std::io::Result<PathBuf> {
     validate_private_file_name(file_name)?;
     if bytes.len() > max_bytes {
-        return Err(private_io_error("private artifact exceeds its safety limit"));
+        return Err(private_io_error(
+            "private artifact exceeds its safety limit",
+        ));
     }
     let directory = open_profiles_root_capability(directory_path)?;
     verify_private_directory_permissions(&directory)?;
@@ -1116,8 +1121,7 @@ where
     let Ok(path_metadata_after) = directory.symlink_metadata(name) else {
         return false;
     };
-    if !cap_file_metadata_is_private(&path_metadata_after)
-        || path_metadata_after.len() > max_bytes
+    if !cap_file_metadata_is_private(&path_metadata_after) || path_metadata_after.len() > max_bytes
     {
         return false;
     }
@@ -1158,8 +1162,8 @@ fn read_private_file_bounded(
     if opened_metadata.len() > max_bytes {
         return Err(PrivateFileReadFailure::Oversized);
     }
-    let opened_snapshot = snapshot_std(&opened_metadata)
-        .map_err(|_| PrivateFileReadFailure::MetadataUnavailable)?;
+    let opened_snapshot =
+        snapshot_std(&opened_metadata).map_err(|_| PrivateFileReadFailure::MetadataUnavailable)?;
     if opened_snapshot != path_snapshot_before {
         return Err(PrivateFileReadFailure::ChangedDuringRead);
     }
@@ -1179,8 +1183,7 @@ fn read_private_file_bounded(
     let path_metadata_after = directory
         .symlink_metadata(name)
         .map_err(|_| PrivateFileReadFailure::ChangedDuringRead)?;
-    if !cap_file_metadata_is_private(&path_metadata_after)
-        || path_metadata_after.len() > max_bytes
+    if !cap_file_metadata_is_private(&path_metadata_after) || path_metadata_after.len() > max_bytes
     {
         return Err(PrivateFileReadFailure::ChangedDuringRead);
     }
@@ -1208,24 +1211,18 @@ fn read_bytes_to_finite_cap(
     Ok(bytes)
 }
 
-fn admit_storage_state_size(
-    byte_len: u64,
-) -> std::result::Result<(), StorageStateFailure> {
+fn admit_storage_state_size(byte_len: u64) -> std::result::Result<(), StorageStateFailure> {
     if byte_len > STORAGE_STATE_MAX_BYTES {
         return Err(StorageStateFailure::Oversized);
     }
     Ok(())
 }
 
-fn admit_storage_state_document(
-    bytes: &[u8],
-) -> std::result::Result<(), StorageStateFailure> {
+fn admit_storage_state_document(bytes: &[u8]) -> std::result::Result<(), StorageStateFailure> {
     admit_storage_state_size(u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| StorageStateFailure::InvalidJson)?;
-    let object = value
-        .as_object()
-        .ok_or(StorageStateFailure::InvalidShape)?;
+    let object = value.as_object().ok_or(StorageStateFailure::InvalidShape)?;
     let cookies = object
         .get("cookies")
         .and_then(serde_json::Value::as_array)
@@ -1271,13 +1268,9 @@ fn admit_storage_state_document(
             .and_then(serde_json::Value::as_array)
             .ok_or(StorageStateFailure::InvalidShape)?;
         for entry in local_storage {
-            let entry = entry
-                .as_object()
-                .ok_or(StorageStateFailure::InvalidShape)?;
+            let entry = entry.as_object().ok_or(StorageStateFailure::InvalidShape)?;
             if !entry.get("name").is_some_and(serde_json::Value::is_string)
-                || !entry
-                    .get("value")
-                    .is_some_and(serde_json::Value::is_string)
+                || !entry.get("value").is_some_and(serde_json::Value::is_string)
             {
                 return Err(StorageStateFailure::InvalidShape);
             }
@@ -1340,11 +1333,15 @@ fn write_private_file_atomically(
             let expected_len = u64::try_from(bytes.len())
                 .map_err(|_| private_io_error("private file length is not representable"))?;
             if !path_metadata.is_file() || path_metadata.len() != expected_len {
-                return Err(private_io_error("private file replacement did not remain stable"));
+                return Err(private_io_error(
+                    "private file replacement did not remain stable",
+                ));
             }
             let path_snapshot = snapshot_cap(&path_metadata)?;
             if path_snapshot != handle_snapshot {
-                return Err(private_io_error("private file replacement changed after rename"));
+                return Err(private_io_error(
+                    "private file replacement changed after rename",
+                ));
             }
             Ok(())
         })();
@@ -1417,7 +1414,9 @@ impl std::error::Error for BrowserProfileIdentityError {}
 
 impl std::fmt::Debug for BrowserProfile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("BrowserProfile").finish_non_exhaustive()
+        formatter
+            .debug_struct("BrowserProfile")
+            .finish_non_exhaustive()
     }
 }
 
@@ -1457,10 +1456,7 @@ impl BrowserProfileOperationLock {
         let Ok(handle_snapshot) = snapshot_std(&handle_metadata) else {
             return false;
         };
-        let Ok(path_metadata) = self
-            .lock_directory
-            .symlink_metadata(&self.lock_file_name)
-        else {
+        let Ok(path_metadata) = self.lock_directory.symlink_metadata(&self.lock_file_name) else {
             return false;
         };
         if !path_metadata.is_file()
@@ -1476,16 +1472,19 @@ impl BrowserProfileOperationLock {
         else {
             return false;
         };
-        let Ok(current_lock_directory_snapshot) = open_profiles_root_capability(&self.profiles_root)
-            .and_then(|root| {
-                verify_private_directory_permissions(&root)?;
-                let directory =
-                    open_child_directory_nofollow(&root, PROFILE_OPERATION_LOCKS_DIRECTORY_NAME)?;
-                verify_private_directory_permissions(&directory)?;
-                Ok(directory)
-            })
-            .and_then(|directory| directory.into_std_file().metadata())
-            .and_then(|metadata| snapshot_std(&metadata))
+        let Ok(current_lock_directory_snapshot) =
+            open_profiles_root_capability(&self.profiles_root)
+                .and_then(|root| {
+                    verify_private_directory_permissions(&root)?;
+                    let directory = open_child_directory_nofollow(
+                        &root,
+                        PROFILE_OPERATION_LOCKS_DIRECTORY_NAME,
+                    )?;
+                    verify_private_directory_permissions(&directory)?;
+                    Ok(directory)
+                })
+                .and_then(|directory| directory.into_std_file().metadata())
+                .and_then(|metadata| snapshot_std(&metadata))
         else {
             return false;
         };
@@ -1714,12 +1713,7 @@ impl BrowserProfile {
 
     fn open_operation_lock_file(
         &self,
-    ) -> std::io::Result<(
-        cap_std::fs::Dir,
-        cap_std::fs::Dir,
-        std::fs::File,
-        String,
-    )> {
+    ) -> std::io::Result<(cap_std::fs::Dir, cap_std::fs::Dir, std::fs::File, String)> {
         let directory = self.open_profile_dir_capability()?;
         let root = ensure_profiles_root_capability(&self.profiles_root)?;
         let lock_directory =
@@ -1810,13 +1804,15 @@ impl BrowserProfile {
                             "Browser profile operation lock could not be verified".to_string(),
                         )
                     })?;
-                    let path_metadata = lock_directory
-                        .symlink_metadata(&lock_file_name)
-                        .map_err(|_| {
-                            StorageError::Database(
-                                "Browser profile operation lock could not be verified".to_string(),
-                            )
-                        })?;
+                    let path_metadata =
+                        lock_directory
+                            .symlink_metadata(&lock_file_name)
+                            .map_err(|_| {
+                                StorageError::Database(
+                                    "Browser profile operation lock could not be verified"
+                                        .to_string(),
+                                )
+                            })?;
                     if !path_metadata.is_file()
                         || snapshot_cap(&path_metadata).map_err(|_| {
                             StorageError::Database(
@@ -1905,14 +1901,13 @@ impl BrowserProfile {
     /// files larger than [`STORAGE_STATE_MAX_BYTES`].
     #[must_use]
     pub fn has_storage_state(&self) -> bool {
-        self.open_profile_dir_capability()
-            .is_ok_and(|directory| {
-                private_file_is_safely_accessible(
-                    &directory,
-                    STORAGE_STATE_FILE_NAME,
-                    STORAGE_STATE_MAX_BYTES,
-                )
-            })
+        self.open_profile_dir_capability().is_ok_and(|directory| {
+            private_file_is_safely_accessible(
+                &directory,
+                STORAGE_STATE_FILE_NAME,
+                STORAGE_STATE_MAX_BYTES,
+            )
+        })
     }
 
     /// Write profile metadata to disk.
@@ -2057,16 +2052,12 @@ impl BrowserProfile {
                     .into());
             }
         };
-        let data = read_private_file_bounded(
-            &directory,
-            STORAGE_STATE_FILE_NAME,
-            STORAGE_STATE_MAX_BYTES,
-        )
-        .map_err(StorageStateFailure::from_private_file)
-        .map_err(StorageStateFailure::into_storage_error)?;
-        if let Some(bytes) = data.as_deref() {
-            admit_storage_state_document(bytes)
+        let data =
+            read_private_file_bounded(&directory, STORAGE_STATE_FILE_NAME, STORAGE_STATE_MAX_BYTES)
+                .map_err(StorageStateFailure::from_private_file)
                 .map_err(StorageStateFailure::into_storage_error)?;
+        if let Some(bytes) = data.as_deref() {
+            admit_storage_state_document(bytes).map_err(StorageStateFailure::into_storage_error)?;
         }
         Ok(data)
     }
@@ -2080,14 +2071,16 @@ impl BrowserProfile {
     pub fn validate_storage_state(&self) -> Result<StorageStateValidation> {
         match self.load_storage_state()? {
             Some(state) => {
-                let metadata = self.read_metadata()?.ok_or_else(|| {
-                    StorageStateFailure::InvalidShape.into_storage_error()
-                })?;
-                let expected_digest = metadata.storage_state_sha256.ok_or_else(|| {
-                    StorageStateFailure::InvalidShape.into_storage_error()
-                })?;
+                let metadata = self
+                    .read_metadata()?
+                    .ok_or_else(|| StorageStateFailure::InvalidShape.into_storage_error())?;
+                let expected_digest = metadata
+                    .storage_state_sha256
+                    .ok_or_else(|| StorageStateFailure::InvalidShape.into_storage_error())?;
                 if storage_state_digest(&state) != expected_digest {
-                    return Err(StorageStateFailure::InvalidShape.into_storage_error().into());
+                    return Err(StorageStateFailure::InvalidShape
+                        .into_storage_error()
+                        .into());
                 }
                 Ok(StorageStateValidation::Valid)
             }
@@ -2275,37 +2268,33 @@ fn profile_from_discovered_directory(
     }
 
     let read_limit = PROFILE_METADATA_MAX_BYTES.min(metadata_bytes_remaining);
-    let bytes = read_private_file_bounded(
-        profile_directory,
-        PROFILE_METADATA_FILE_NAME,
-        read_limit,
-    )
-    .map_err(|failure| {
-        if failure == PrivateFileReadFailure::Oversized
-            && read_limit < PROFILE_METADATA_MAX_BYTES
-        {
-            ProfileDiscoveryFailure::MetadataBudgetExhausted
-        } else {
-            ProfileDiscoveryFailure::Unsafe {
-                // The stable read may have consumed the complete admitted
-                // document before rejecting a race or schema boundary. Charge
-                // the full finite allowance so repeated hostile files cannot
-                // evade the cumulative discovery budget.
-                metadata_bytes_examined: read_limit,
-            }
-        }
-    })?
-    .ok_or(ProfileDiscoveryFailure::Unsafe {
-        metadata_bytes_examined: 0,
-    })?;
+    let bytes =
+        read_private_file_bounded(profile_directory, PROFILE_METADATA_FILE_NAME, read_limit)
+            .map_err(|failure| {
+                if failure == PrivateFileReadFailure::Oversized
+                    && read_limit < PROFILE_METADATA_MAX_BYTES
+                {
+                    ProfileDiscoveryFailure::MetadataBudgetExhausted
+                } else {
+                    ProfileDiscoveryFailure::Unsafe {
+                        // The stable read may have consumed the complete admitted
+                        // document before rejecting a race or schema boundary. Charge
+                        // the full finite allowance so repeated hostile files cannot
+                        // evade the cumulative discovery budget.
+                        metadata_bytes_examined: read_limit,
+                    }
+                }
+            })?
+            .ok_or(ProfileDiscoveryFailure::Unsafe {
+                metadata_bytes_examined: 0,
+            })?;
     let byte_len = u64::try_from(bytes.len()).map_err(|_| ProfileDiscoveryFailure::Unsafe {
         metadata_bytes_examined: read_limit,
     })?;
-    let metadata =
-        parse_profile_metadata_for_storage(&bytes, storage_service, storage_account)
-            .map_err(|_| ProfileDiscoveryFailure::Unsafe {
-                metadata_bytes_examined: byte_len,
-            })?;
+    let metadata = parse_profile_metadata_for_storage(&bytes, storage_service, storage_account)
+        .map_err(|_| ProfileDiscoveryFailure::Unsafe {
+            metadata_bytes_examined: byte_len,
+        })?;
     let profile = BrowserProfile::from_bound_metadata(
         profiles_root,
         storage_service,
@@ -2326,9 +2315,8 @@ fn admit_discovered_profile_with_metadata_budget(
     match profile_result {
         Ok((profile, byte_len)) if byte_len <= *metadata_bytes_remaining => {
             *metadata_bytes_remaining -= byte_len;
-            discovery.metadata_bytes_examined = discovery
-                .metadata_bytes_examined
-                .saturating_add(byte_len);
+            discovery.metadata_bytes_examined =
+                discovery.metadata_bytes_examined.saturating_add(byte_len);
             discovery.profiles.push(profile);
             true
         }
@@ -2498,15 +2486,13 @@ fn discover_browser_profiles_for_service_with_limits(
         let account_metadata = match service_directory.symlink_metadata(&account_name) {
             Ok(metadata) => metadata,
             Err(_) => {
-                discovery.unclassified_entries =
-                    discovery.unclassified_entries.saturating_add(1);
+                discovery.unclassified_entries = discovery.unclassified_entries.saturating_add(1);
                 continue;
             }
         };
         if !account_metadata.is_dir() {
             if account_metadata.file_type().is_symlink() {
-                discovery.unclassified_entries =
-                    discovery.unclassified_entries.saturating_add(1);
+                discovery.unclassified_entries = discovery.unclassified_entries.saturating_add(1);
             }
             continue;
         }
@@ -2611,9 +2597,7 @@ fn discover_browser_profiles_with_limits(
     let service_entries = collect_directory_entry_names_bounded(
         &root,
         max_entries,
-        Some(std::ffi::OsStr::new(
-            PROFILE_OPERATION_LOCKS_DIRECTORY_NAME,
-        )),
+        Some(std::ffi::OsStr::new(PROFILE_OPERATION_LOCKS_DIRECTORY_NAME)),
     )
     .map_err(|_| {
         StorageError::Database(
@@ -2632,15 +2616,13 @@ fn discover_browser_profiles_with_limits(
         let service_metadata = match root.symlink_metadata(&service_name) {
             Ok(metadata) => metadata,
             Err(_) => {
-                discovery.unclassified_entries =
-                    discovery.unclassified_entries.saturating_add(1);
+                discovery.unclassified_entries = discovery.unclassified_entries.saturating_add(1);
                 continue;
             }
         };
         if !service_metadata.is_dir() {
             if service_metadata.file_type().is_symlink() {
-                discovery.unclassified_entries =
-                    discovery.unclassified_entries.saturating_add(1);
+                discovery.unclassified_entries = discovery.unclassified_entries.saturating_add(1);
             }
             continue;
         }
@@ -2655,8 +2637,7 @@ fn discover_browser_profiles_with_limits(
         let service_directory = match open_child_directory_nofollow(&root, service) {
             Ok(directory) => directory,
             Err(_) => {
-                discovery.unclassified_entries =
-                    discovery.unclassified_entries.saturating_add(1);
+                discovery.unclassified_entries = discovery.unclassified_entries.saturating_add(1);
                 continue;
             }
         };
@@ -2671,8 +2652,7 @@ fn discover_browser_profiles_with_limits(
         ) {
             Ok(entries) => entries,
             Err(_) => {
-                discovery.unclassified_entries =
-                    discovery.unclassified_entries.saturating_add(1);
+                discovery.unclassified_entries = discovery.unclassified_entries.saturating_add(1);
                 continue;
             }
         };
@@ -2704,13 +2684,11 @@ fn discover_browser_profiles_with_limits(
                 continue;
             }
             let Some(account) = account_name.to_str() else {
-                discovery.unclassified_entries =
-                    discovery.unclassified_entries.saturating_add(1);
+                discovery.unclassified_entries = discovery.unclassified_entries.saturating_add(1);
                 continue;
             };
             if validate_profile_storage_component(account).is_err() {
-                discovery.unclassified_entries =
-                    discovery.unclassified_entries.saturating_add(1);
+                discovery.unclassified_entries = discovery.unclassified_entries.saturating_add(1);
                 continue;
             }
             let profile_directory = match open_child_directory_nofollow(&service_directory, account)
@@ -2723,8 +2701,7 @@ fn discover_browser_profiles_with_limits(
                 }
             };
             if verify_private_directory_permissions(&profile_directory).is_err() {
-                discovery.unclassified_entries =
-                    discovery.unclassified_entries.saturating_add(1);
+                discovery.unclassified_entries = discovery.unclassified_entries.saturating_add(1);
                 continue;
             }
             let profile = profile_from_discovered_directory(
@@ -2800,8 +2777,8 @@ fn parse_profile_metadata_bytes(
     expected_service: &str,
     expected_account: &str,
 ) -> std::result::Result<ProfileMetadata, ProfileMetadataReadFailure> {
-    let mut metadata: ProfileMetadata = serde_json::from_slice(bytes)
-        .map_err(|_| ProfileMetadataReadFailure::InvalidSchema)?;
+    let mut metadata: ProfileMetadata =
+        serde_json::from_slice(bytes).map_err(|_| ProfileMetadataReadFailure::InvalidSchema)?;
     validate_profile_metadata_timestamps(&metadata)?;
     if metadata.service == expected_service && metadata.account == expected_account {
         return Ok(metadata);
@@ -2817,8 +2794,12 @@ fn parse_profile_metadata_bytes(
     let expected_storage_account = encode_profile_path_component(expected_account);
     if metadata.service == expected_storage_service
         && metadata.account == expected_storage_account
-        && (metadata.service.starts_with(HASHED_PROFILE_COMPONENT_PREFIX)
-            || metadata.account.starts_with(HASHED_PROFILE_COMPONENT_PREFIX))
+        && (metadata
+            .service
+            .starts_with(HASHED_PROFILE_COMPONENT_PREFIX)
+            || metadata
+                .account
+                .starts_with(HASHED_PROFILE_COMPONENT_PREFIX))
     {
         metadata.service = expected_service.to_string();
         metadata.account = expected_account.to_string();
@@ -2833,8 +2814,8 @@ fn parse_profile_metadata_for_storage(
     expected_storage_service: &str,
     expected_storage_account: &str,
 ) -> std::result::Result<ProfileMetadata, ProfileMetadataReadFailure> {
-    let metadata: ProfileMetadata = serde_json::from_slice(bytes)
-        .map_err(|_| ProfileMetadataReadFailure::InvalidSchema)?;
+    let metadata: ProfileMetadata =
+        serde_json::from_slice(bytes).map_err(|_| ProfileMetadataReadFailure::InvalidSchema)?;
     validate_profile_metadata_timestamps(&metadata)?;
     if encode_profile_path_component(&metadata.service) == expected_storage_service
         && encode_profile_path_component(&metadata.account) == expected_storage_account
@@ -2854,12 +2835,16 @@ fn parse_profile_metadata_for_storage(
 fn validate_profile_metadata_timestamps(
     metadata: &ProfileMetadata,
 ) -> std::result::Result<(), ProfileMetadataReadFailure> {
-    if metadata.storage_state_sha256.as_deref().is_some_and(|digest| {
-        digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }) {
+    if metadata
+        .storage_state_sha256
+        .as_deref()
+        .is_some_and(|digest| {
+            digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
         return Err(ProfileMetadataReadFailure::InvalidSchema);
     }
     for timestamp in [
@@ -2981,13 +2966,9 @@ fn profile_component_can_be_stored_verbatim(component: &str) -> bool {
         && !matches!(component, "." | "..")
         && component != PROFILE_OPERATION_LOCKS_DIRECTORY_NAME
         && !component.starts_with(HASHED_PROFILE_COMPONENT_PREFIX)
-        && component
-            .bytes()
-            .all(|byte| {
-                byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || matches!(byte, b'-' | b'_' | b'.')
-            })
+        && component.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
 }
 
 fn validate_profile_storage_component(component: &str) -> std::io::Result<()> {
@@ -2998,7 +2979,9 @@ fn validate_profile_storage_component(component: &str) -> std::io::Result<()> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
-        return Err(private_io_error("browser profile identity is not canonical"));
+        return Err(private_io_error(
+            "browser profile identity is not canonical",
+        ));
     }
     Ok(())
 }
@@ -3032,9 +3015,17 @@ fn profile_operation_lock_file_name(service: &str, account: &str) -> String {
 
     let mut digest = sha2::Sha256::new();
     digest.update(b"frankenterm-browser-profile-lock-v1\0");
-    digest.update(u64::try_from(service.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(
+        u64::try_from(service.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
     digest.update(service.as_bytes());
-    digest.update(u64::try_from(account.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(
+        u64::try_from(account.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
     digest.update(account.as_bytes());
     let encoded = hex::encode(digest.finalize());
     format!("l-{}", &encoded[..62])
@@ -3138,7 +3129,10 @@ impl BrowserContext {
             return Err(StorageError::Database(msg).into());
         }
 
-        tracing::info!(headless = self.config.headless, "Initializing browser automation context");
+        tracing::info!(
+            headless = self.config.headless,
+            "Initializing browser automation context"
+        );
 
         // Ensure profiles root exists
         ensure_profiles_root_capability(&self.profiles_root).map_err(|_| {
@@ -3231,15 +3225,13 @@ pub fn probe_playwright_chromium_capability(
         .stdin_bytes(PROBE_SCRIPT.as_bytes().to_vec())
         .stdout_limit(PROBE_OUTPUT_LIMIT_BYTES)
         .stderr_limit(PROBE_OUTPUT_LIMIT_BYTES);
-    let output = command
-        .output_blocking(timeout)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::TimedOut {
-                PlaywrightCapabilityProbeError::TimedOut
-            } else {
-                PlaywrightCapabilityProbeError::Unavailable
-            }
-        })?;
+    let output = command.output_blocking(timeout).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            PlaywrightCapabilityProbeError::TimedOut
+        } else {
+            PlaywrightCapabilityProbeError::Unavailable
+        }
+    })?;
 
     if !output.status.success() {
         return Err(PlaywrightCapabilityProbeError::MissingCapability);
@@ -3346,10 +3338,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            admit_automated_auth_url(
-                BrowserAuthService::OpenAi,
-                "file:///tmp/login",
-            ),
+            admit_automated_auth_url(BrowserAuthService::OpenAi, "file:///tmp/login",),
             Err(BrowserNodeCommandFailure::InvalidConfiguration)
         );
         assert_eq!(
@@ -3360,8 +3349,8 @@ mod tests {
             Err(BrowserNodeCommandFailure::InvalidConfiguration)
         );
 
-        let selectors = vec!["body"; BROWSER_NODE_INPUT_MAX_LIST_ENTRIES.saturating_add(1)]
-            .join(", ");
+        let selectors =
+            vec!["body"; BROWSER_NODE_INPUT_MAX_LIST_ENTRIES.saturating_add(1)].join(", ");
         assert_eq!(
             admit_selector_group(&selectors),
             Err(BrowserNodeCommandFailure::InvalidConfiguration)
@@ -3401,14 +3390,8 @@ mod tests {
                 BrowserAuthService::OpenAi,
                 "http://auth.openai.com/codex/device",
             ),
-            (
-                BrowserAuthService::OpenAi,
-                "https://127.0.0.1/codex/device",
-            ),
-            (
-                BrowserAuthService::OpenAi,
-                "https://localhost/codex/device",
-            ),
+            (BrowserAuthService::OpenAi, "https://127.0.0.1/codex/device"),
+            (BrowserAuthService::OpenAi, "https://localhost/codex/device"),
             (
                 BrowserAuthService::OpenAi,
                 "https://auth.openai.com.evil.example/codex/device",
@@ -3437,10 +3420,7 @@ mod tests {
                 BrowserAuthService::OpenAi,
                 "https://auth.openai.com/codex/device/extra",
             ),
-            (
-                BrowserAuthService::OpenAi,
-                "https://accounts.google.com/",
-            ),
+            (BrowserAuthService::OpenAi, "https://accounts.google.com/"),
             (
                 BrowserAuthService::Google,
                 "https://accounts.google.com/evil?client_id=public",
@@ -3495,17 +3475,11 @@ mod tests {
             Err(BrowserNodeCommandFailure::InvalidConfiguration)
         );
         assert_eq!(
-            admit_bootstrap_success_url(
-                BrowserAuthService::OpenAi,
-                "https://platform.openai.com",
-            ),
+            admit_bootstrap_success_url(BrowserAuthService::OpenAi, "https://platform.openai.com",),
             Ok(())
         );
         assert_eq!(
-            admit_bootstrap_success_url(
-                BrowserAuthService::Google,
-                "https://myaccount.google.com",
-            ),
+            admit_bootstrap_success_url(BrowserAuthService::Google, "https://myaccount.google.com",),
             Ok(())
         );
         assert_eq!(
@@ -3607,24 +3581,15 @@ mod tests {
             Err(BrowserNodeCommandFailure::ScriptOversized)
         );
 
-        let remaining = "y".repeat(
-            BROWSER_NODE_INPUT_MAX_TOTAL_BYTES - BROWSER_NODE_INPUT_MAX_FIELD_BYTES,
-        );
+        let remaining =
+            "y".repeat(BROWSER_NODE_INPUT_MAX_TOTAL_BYTES - BROWSER_NODE_INPUT_MAX_FIELD_BYTES);
         assert_eq!(
-            admit_node_script_input_parts(
-                &[Some(&exact_field), Some(&remaining)],
-                &[],
-                &[],
-            ),
+            admit_node_script_input_parts(&[Some(&exact_field), Some(&remaining)], &[], &[],),
             Ok(())
         );
         let total_one_over = format!("{remaining}z");
         assert_eq!(
-            admit_node_script_input_parts(
-                &[Some(&exact_field), Some(&total_one_over)],
-                &[],
-                &[],
-            ),
+            admit_node_script_input_parts(&[Some(&exact_field), Some(&total_one_over)], &[], &[],),
             Err(BrowserNodeCommandFailure::ScriptOversized)
         );
 
@@ -3838,8 +3803,7 @@ mod tests {
                 .is_ok()
         );
         let worst_case_escaped = "\u{0001}".repeat(PROFILE_LOGICAL_IDENTITY_MAX_BYTES);
-        let worst_case_metadata =
-            ProfileMetadata::new(&worst_case_escaped, &worst_case_escaped);
+        let worst_case_metadata = ProfileMetadata::new(&worst_case_escaped, &worst_case_escaped);
         assert!(
             serialize_profile_metadata_bounded(
                 &worst_case_metadata,
@@ -3886,7 +3850,10 @@ mod tests {
         let profiles_root = PathBuf::from("/data/profiles");
         let upper = BrowserProfile::new(&profiles_root, "openai", "Work");
         let lower = BrowserProfile::new(&profiles_root, "openai", "work");
-        assert_ne!(upper.storage_account_component(), lower.storage_account_component());
+        assert_ne!(
+            upper.storage_account_component(),
+            lower.storage_account_component()
+        );
         assert_ne!(upper.path(), lower.path());
         assert!(upper.storage_account_component().starts_with("h-"));
         assert_eq!(lower.storage_account_component(), "work");
@@ -3974,10 +3941,8 @@ mod tests {
 
     #[test]
     fn profile_ensure_dir_idempotent() {
-        let temp = canonical_system_temp_dir().join(format!(
-            "wa_browser_test_idempotent_{}",
-            std::process::id()
-        ));
+        let temp = canonical_system_temp_dir()
+            .join(format!("wa_browser_test_idempotent_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "test");
@@ -4024,13 +3989,15 @@ mod tests {
         let wrong_lock = profile
             .acquire_operation_lock(1_000)
             .expect("source profile lock");
-        assert!(other
-            .record_authenticated_state_with_lock(
-                br#"{"cookies":[],"origins":[]}"#,
-                BootstrapMethod::Automated,
-                &wrong_lock,
-            )
-            .is_err());
+        assert!(
+            other
+                .record_authenticated_state_with_lock(
+                    br#"{"cookies":[],"origins":[]}"#,
+                    BootstrapMethod::Automated,
+                    &wrong_lock,
+                )
+                .is_err()
+        );
         assert!(!other.storage_state_path().exists());
     }
 
@@ -4040,14 +4007,16 @@ mod tests {
         let profile = BrowserProfile::new(temp.path().join("profiles"), "openai", "invalid");
         profile.ensure_dir().expect("profile directory");
         assert!(profile.acquire_operation_lock(0).is_err());
-        assert!(!profile
-            .profiles_root
-            .join(PROFILE_OPERATION_LOCKS_DIRECTORY_NAME)
-            .join(profile_operation_lock_file_name(
-                profile.service(),
-                profile.account(),
-            ))
-            .exists());
+        assert!(
+            !profile
+                .profiles_root
+                .join(PROFILE_OPERATION_LOCKS_DIRECTORY_NAME)
+                .join(profile_operation_lock_file_name(
+                    profile.service(),
+                    profile.account(),
+                ))
+                .exists()
+        );
     }
 
     #[test]
@@ -4065,13 +4034,15 @@ mod tests {
 
         assert!(!operation_lock.is_current_for(&profile));
         assert!(profile.acquire_operation_lock(50).is_err());
-        assert!(profile
-            .record_authenticated_state_with_lock(
-                br#"{"cookies":[],"origins":[]}"#,
-                BootstrapMethod::Automated,
-                &operation_lock,
-            )
-            .is_err());
+        assert!(
+            profile
+                .record_authenticated_state_with_lock(
+                    br#"{"cookies":[],"origins":[]}"#,
+                    BootstrapMethod::Automated,
+                    &operation_lock,
+                )
+                .is_err()
+        );
         assert!(!profile.storage_state_path().exists());
         assert!(!detached_path.join(STORAGE_STATE_FILE_NAME).exists());
     }
@@ -4105,7 +4076,9 @@ mod tests {
         assert!(symlinked.acquire_operation_lock(1_000).is_err());
 
         let hardlinked = BrowserProfile::new(&profiles_root, "openai", "hardlinked-lock");
-        hardlinked.ensure_dir().expect("hardlinked profile directory");
+        hardlinked
+            .ensure_dir()
+            .expect("hardlinked profile directory");
         let hardlinked_lock_name =
             profile_operation_lock_file_name(hardlinked.service(), hardlinked.account());
         std::fs::hard_link(
@@ -4226,8 +4199,8 @@ mod tests {
             .write_metadata(&ProfileMetadata::new(logical_service, logical_account))
             .expect("path-bound logical metadata");
 
-        let discovery = discover_browser_profiles_bounded(&profiles_root)
-            .expect("bound profile discovery");
+        let discovery =
+            discover_browser_profiles_bounded(&profiles_root).expect("bound profile discovery");
         assert!(discovery.is_complete());
         assert_eq!(discovery.profiles.len(), 1);
         let discovered = &discovery.profiles[0];
@@ -4235,20 +4208,13 @@ mod tests {
         assert_eq!(discovered.account(), logical_account);
         assert_eq!(discovered.path(), profile.path());
         assert_eq!(
-            BrowserProfile::new(
-                &profiles_root,
-                discovered.service(),
-                discovered.account(),
-            )
-            .path(),
+            BrowserProfile::new(&profiles_root, discovered.service(), discovered.account(),).path(),
             profile.path()
         );
 
-        let service_discovery = discover_browser_profiles_for_service_bounded(
-            &profiles_root,
-            logical_service,
-        )
-        .expect("service-scoped bound profile discovery");
+        let service_discovery =
+            discover_browser_profiles_for_service_bounded(&profiles_root, logical_service)
+                .expect("service-scoped bound profile discovery");
         assert!(service_discovery.is_complete());
         assert_eq!(service_discovery.profiles.len(), 1);
         assert_eq!(service_discovery.profiles[0].account(), logical_account);
@@ -4288,12 +4254,9 @@ mod tests {
                 .all(|profile| profile.account() != "unrelated")
         );
 
-        let truncated = discover_browser_profiles_for_service_with_budget(
-            &profiles_root,
-            "openai",
-            1,
-        )
-        .expect("bounded service discovery");
+        let truncated =
+            discover_browser_profiles_for_service_with_budget(&profiles_root, "openai", 1)
+                .expect("bounded service discovery");
         assert!(truncated.truncated);
         assert_eq!(truncated.entries_examined, 1);
     }
@@ -4305,8 +4268,8 @@ mod tests {
         let profile = BrowserProfile::new(&profiles_root, "openai", "person@example.com");
         profile.ensure_dir().expect("hashed profile directory");
 
-        let missing = discover_browser_profiles_bounded(&profiles_root)
-            .expect("missing-metadata discovery");
+        let missing =
+            discover_browser_profiles_bounded(&profiles_root).expect("missing-metadata discovery");
         assert!(missing.profiles.is_empty());
         assert_eq!(missing.unclassified_entries, 1);
         assert!(!missing.is_complete());
@@ -4355,8 +4318,8 @@ mod tests {
         )
         .expect("legacy metadata fixture write");
 
-        let undiscoverable = discover_browser_profiles_bounded(&profiles_root)
-            .expect("legacy profile discovery");
+        let undiscoverable =
+            discover_browser_profiles_bounded(&profiles_root).expect("legacy profile discovery");
         assert!(undiscoverable.profiles.is_empty());
         assert_eq!(undiscoverable.unclassified_entries, 1);
 
@@ -4370,8 +4333,8 @@ mod tests {
             .write_metadata(&normalized)
             .expect("normalized metadata migration");
 
-        let migrated = discover_browser_profiles_bounded(&profiles_root)
-            .expect("migrated profile discovery");
+        let migrated =
+            discover_browser_profiles_bounded(&profiles_root).expect("migrated profile discovery");
         assert!(migrated.is_complete());
         assert_eq!(migrated.profiles.len(), 1);
         assert_eq!(migrated.profiles[0].account(), logical_account);
@@ -4414,10 +4377,8 @@ mod tests {
     fn profile_dir_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = canonical_system_temp_dir().join(format!(
-            "wa_browser_test_perms_{}",
-            std::process::id()
-        ));
+        let temp = canonical_system_temp_dir()
+            .join(format!("wa_browser_test_perms_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "secure");
@@ -4669,14 +4630,12 @@ mod tests {
         let mut invalid_timestamp = ProfileMetadata::new("openai", "test");
         invalid_timestamp.bootstrapped_at = Some("not-a-timestamp".to_string());
         assert_eq!(
-            serialize_profile_metadata_bounded(&invalid_timestamp, "openai", "test")
-                .unwrap_err(),
+            serialize_profile_metadata_bounded(&invalid_timestamp, "openai", "test").unwrap_err(),
             ProfileMetadataReadFailure::InvalidTimestamp
         );
 
         let oversized_account = "a".repeat(
-            usize::try_from(PROFILE_METADATA_MAX_BYTES)
-                .expect("metadata cap must fit usize"),
+            usize::try_from(PROFILE_METADATA_MAX_BYTES).expect("metadata cap must fit usize"),
         );
         let oversized = ProfileMetadata::new("openai", &oversized_account);
         assert_eq!(
@@ -4801,8 +4760,7 @@ mod tests {
 
     #[test]
     fn profile_metadata_write_and_read() {
-        let temp =
-            canonical_system_temp_dir().join(format!("wa_meta_test_{}", std::process::id()));
+        let temp = canonical_system_temp_dir().join(format!("wa_meta_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "test-account");
@@ -4823,10 +4781,8 @@ mod tests {
 
     #[test]
     fn profile_metadata_read_missing() {
-        let temp = canonical_system_temp_dir().join(format!(
-            "wa_meta_missing_test_{}",
-            std::process::id()
-        ));
+        let temp = canonical_system_temp_dir()
+            .join(format!("wa_meta_missing_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "nonexistent");
@@ -4841,10 +4797,8 @@ mod tests {
     fn profile_metadata_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = canonical_system_temp_dir().join(format!(
-            "wa_meta_perms_test_{}",
-            std::process::id()
-        ));
+        let temp =
+            canonical_system_temp_dir().join(format!("wa_meta_perms_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "secure");
@@ -4875,7 +4829,8 @@ mod tests {
         let outside_metadata = temp_path.join("outside-metadata.json");
         let outside_metadata_bytes =
             br#"{"service":"openai","account":"safe-account","automated_use_count":0}"#;
-        std::fs::write(&outside_metadata, outside_metadata_bytes).expect("outside metadata fixture");
+        std::fs::write(&outside_metadata, outside_metadata_bytes)
+            .expect("outside metadata fixture");
         symlink(&outside_metadata, profile.metadata_path()).expect("metadata symlink fixture");
         assert!(profile.read_metadata().is_err());
 
@@ -5020,10 +4975,8 @@ mod tests {
 
     #[test]
     fn profile_no_storage_state_initially() {
-        let temp = canonical_system_temp_dir().join(format!(
-            "wa_state_test_none_{}",
-            std::process::id()
-        ));
+        let temp =
+            canonical_system_temp_dir().join(format!("wa_state_test_none_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "fresh");
@@ -5120,16 +5073,17 @@ mod tests {
     #[test]
     fn profile_storage_state_rejects_invalid_json_and_shape_on_both_boundaries() {
         let temp = tempfile::tempdir().expect("isolated storage-state root");
-        let temp_path =
-            std::fs::canonicalize(temp.path()).expect("canonical storage-state root");
+        let temp_path = std::fs::canonicalize(temp.path()).expect("canonical storage-state root");
         let profile = BrowserProfile::new(temp_path.join("profiles"), "openai", "test");
         profile.ensure_dir().expect("profile directory");
 
         assert!(profile.save_storage_state(b"not-json").is_err());
         assert!(profile.save_storage_state(br#"{"cookies":[]}"#).is_err());
-        assert!(profile
-            .save_storage_state(br#"{"cookies":[{}],"origins":[]}"#)
-            .is_err());
+        assert!(
+            profile
+                .save_storage_state(br#"{"cookies":[{}],"origins":[]}"#)
+                .is_err()
+        );
         assert!(profile
             .save_storage_state(
                 br#"{"cookies":[],"origins":[{"origin":"https://example.com","localStorage":[{}]}]}"#,
@@ -5143,8 +5097,11 @@ mod tests {
             StorageStateValidation::Missing
         );
 
-        std::fs::write(profile.storage_state_path(), br#"{"cookies":[],"origins":false}"#)
-            .expect("invalid persisted fixture");
+        std::fs::write(
+            profile.storage_state_path(),
+            br#"{"cookies":[],"origins":false}"#,
+        )
+        .expect("invalid persisted fixture");
         assert!(profile.load_storage_state().is_err());
         assert!(profile.validate_storage_state().is_err());
     }
@@ -5176,10 +5133,8 @@ mod tests {
 
     #[test]
     fn profile_load_storage_state_missing() {
-        let temp = canonical_system_temp_dir().join(format!(
-            "wa_state_missing_test_{}",
-            std::process::id()
-        ));
+        let temp = canonical_system_temp_dir()
+            .join(format!("wa_state_missing_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "no-state");
@@ -5194,10 +5149,8 @@ mod tests {
     fn profile_storage_state_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = canonical_system_temp_dir().join(format!(
-            "wa_state_perms_test_{}",
-            std::process::id()
-        ));
+        let temp =
+            canonical_system_temp_dir().join(format!("wa_state_perms_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "secure");

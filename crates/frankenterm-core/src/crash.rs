@@ -485,19 +485,18 @@ fn revalidate_crash_bundle_payloads(
     stats: &mut CrashBundlePayloadReadStats,
 ) -> bool {
     for validation in validations {
-        let (held_snapshot, held_metadata_unreadable) =
-            match validation.file.metadata() {
-                Ok(metadata) => crash_bundle_filesystem_snapshot(&metadata),
-                Err(error) => {
-                    stats.authority_unreadable = true;
-                    record_crash_bundle_parse_drop(
-                        bundle_path,
-                        "payload_revalidation_metadata_fail",
-                        &error,
-                    );
-                    return false;
-                }
-            };
+        let (held_snapshot, held_metadata_unreadable) = match validation.file.metadata() {
+            Ok(metadata) => crash_bundle_filesystem_snapshot(&metadata),
+            Err(error) => {
+                stats.authority_unreadable = true;
+                record_crash_bundle_parse_drop(
+                    bundle_path,
+                    "payload_revalidation_metadata_fail",
+                    &error,
+                );
+                return false;
+            }
+        };
         stats.metadata_unreadable |= held_metadata_unreadable;
         if !crash_bundle_candidate_snapshot_matches(validation.snapshot, held_snapshot) {
             stats.filesystem_changed = true;
@@ -544,27 +543,22 @@ fn revalidate_crash_bundle_payloads(
             .saturating_add(u64::try_from(reread.len()).unwrap_or(u64::MAX));
         if let Err(error) = read_result {
             stats.authority_unreadable = true;
-            record_crash_bundle_parse_drop(
-                bundle_path,
-                "payload_revalidation_read_fail",
-                &error,
-            );
+            record_crash_bundle_parse_drop(bundle_path, "payload_revalidation_read_fail", &error);
             return false;
         }
 
-        let (snapshot_after_reread, metadata_unreadable_after_reread) =
-            match file.metadata() {
-                Ok(metadata) => crash_bundle_filesystem_snapshot(&metadata),
-                Err(error) => {
-                    stats.authority_unreadable = true;
-                    record_crash_bundle_parse_drop(
-                        bundle_path,
-                        "payload_revalidation_metadata_fail",
-                        &error,
-                    );
-                    return false;
-                }
-            };
+        let (snapshot_after_reread, metadata_unreadable_after_reread) = match file.metadata() {
+            Ok(metadata) => crash_bundle_filesystem_snapshot(&metadata),
+            Err(error) => {
+                stats.authority_unreadable = true;
+                record_crash_bundle_parse_drop(
+                    bundle_path,
+                    "payload_revalidation_metadata_fail",
+                    &error,
+                );
+                return false;
+            }
+        };
         stats.metadata_unreadable |= metadata_unreadable_after_reread;
         if reread != validation.bytes
             || !crash_bundle_candidate_snapshot_matches(
@@ -8268,18 +8262,9 @@ mod tests {
 
     #[test]
     fn shutdown_summary_serialization() {
-        let summary = ShutdownSummary::try_new(
-            3600,
-            0,
-            0,
-            true,
-            1000,
-            50,
-            vec![(1, 500)],
-            true,
-            vec![],
-        )
-        .unwrap();
+        let summary =
+            ShutdownSummary::try_new(3600, 0, 0, true, 1000, 50, vec![(1, 500)], true, vec![])
+                .unwrap();
 
         let json = serde_json::to_string(&summary).unwrap();
         let parsed: ShutdownSummary = serde_json::from_str(&json).unwrap();

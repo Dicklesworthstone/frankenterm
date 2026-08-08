@@ -77,16 +77,24 @@ impl IngestTelemetry {
 
     /// Record a completed discovery tick and its diff results.
     fn record_discovery_tick(&mut self, diff: &DiscoveryDiff) {
-        self.discovery_ticks += 1;
-        self.panes_discovered += diff.new_panes.len() as u64;
-        self.panes_closed += diff.closed_panes.len() as u64;
-        self.generation_changes += diff.new_generations.len() as u64;
-        self.metadata_changes += diff.changed_panes.len() as u64;
+        self.discovery_ticks = self.discovery_ticks.saturating_add(1);
+        self.panes_discovered = self
+            .panes_discovered
+            .saturating_add(u64::try_from(diff.new_panes.len()).unwrap_or(u64::MAX));
+        self.panes_closed = self
+            .panes_closed
+            .saturating_add(u64::try_from(diff.closed_panes.len()).unwrap_or(u64::MAX));
+        self.generation_changes = self
+            .generation_changes
+            .saturating_add(u64::try_from(diff.new_generations.len()).unwrap_or(u64::MAX));
+        self.metadata_changes = self
+            .metadata_changes
+            .saturating_add(u64::try_from(diff.changed_panes.len()).unwrap_or(u64::MAX));
     }
 
     /// Record a pane being filtered out by observation rules.
     fn record_pane_filtered(&mut self) {
-        self.panes_filtered += 1;
+        self.panes_filtered = self.panes_filtered.saturating_add(1);
     }
 
     /// Take a serializable snapshot of current counter values.
@@ -563,6 +571,14 @@ impl DiscoveryDiff {
 
 static PANE_CURSOR_SEQ_SATURATION_COUNT: AtomicU64 = AtomicU64::new(0);
 
+fn record_pane_cursor_seq_saturation() {
+    let _ = PANE_CURSOR_SEQ_SATURATION_COUNT.try_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |count| Some(count.saturating_add(1)),
+    );
+}
+
 /// Number of times a `PaneCursor::next_seq` increment saturated at `u64::MAX`,
 /// producing a duplicate seq for the resulting capture.
 #[must_use]
@@ -723,7 +739,7 @@ impl PaneCursor {
         match self.next_seq.checked_add(1) {
             Some(next) => self.next_seq = next,
             None => {
-                PANE_CURSOR_SEQ_SATURATION_COUNT.fetch_add(1, Ordering::Relaxed);
+                record_pane_cursor_seq_saturation();
                 // self.next_seq is already u64::MAX; leaving it pinned
                 // preserves the prior saturating_add behaviour.
             }
@@ -906,7 +922,7 @@ impl PaneCursor {
         self.next_seq = match storage_seq.checked_add(1) {
             Some(next) => next,
             None => {
-                PANE_CURSOR_SEQ_SATURATION_COUNT.fetch_add(1, Ordering::Relaxed);
+                record_pane_cursor_seq_saturation();
                 u64::MAX
             }
         };
@@ -2622,7 +2638,7 @@ impl OutputCache {
         // Check per-pane state first (fast path)
         if let Some(state) = self.pane_states.get_mut(&pane_id) {
             if state.content_hash == hash && state.content_len == len {
-                self.hits += 1;
+                self.hits = self.hits.saturating_add(1);
                 state.last_updated = now;
                 return false;
             }
@@ -2632,14 +2648,14 @@ impl OutputCache {
         if self.global_hashes.contains_key(&hash) {
             self.update_pane_state(pane_id, hash, len, now);
             self.update_global_lru(hash, now);
-            self.hits += 1;
+            self.hits = self.hits.saturating_add(1);
             return false;
         }
 
         // New content
         self.update_pane_state(pane_id, hash, len, now);
         self.update_global_lru(hash, now);
-        self.misses += 1;
+        self.misses = self.misses.saturating_add(1);
         true
     }
 
@@ -2655,6 +2671,17 @@ impl OutputCache {
     }
 
     fn update_global_lru(&mut self, hash: u64, now: i64) {
+        if self.config.global_lru_capacity == 0 {
+            return;
+        }
+        if self.lru_generation == u64::MAX {
+            // The ordering token is meaningful only within this bounded cache.
+            // Discard the entire global epoch before recycling so a stale token
+            // can never alias a live entry after wraparound.
+            self.global_hashes.clear();
+            self.lru_order.clear();
+            self.lru_generation = 0;
+        }
         if let Entry::Occupied(mut entry) = self.global_hashes.entry(hash) {
             // ft-zo4hw: refresh recency on access in O(1) amortized. Stamp a
             // fresh generation and push a new ordering token to the back; the
@@ -2667,7 +2694,7 @@ impl OutputCache {
             // Inline the counter bump (a disjoint field access) so the live
             // `entry` borrow of `global_hashes` doesn't collide with a
             // whole-`self` method borrow.
-            self.lru_generation = self.lru_generation.wrapping_add(1);
+            self.lru_generation += 1;
             let generation = self.lru_generation;
             *entry.get_mut() = GlobalHashEntry {
                 last_seen: now,
@@ -2705,11 +2732,10 @@ impl OutputCache {
         self.lru_order.push_back((hash, generation));
     }
 
-    /// Next monotonic recency generation. Wraps defensively; a u64 counter is
-    /// not reachable in practice, and the lazy-token check only relies on a
-    /// hash's stored generation differing from its superseded tokens.
+    /// Next monotonic recency generation within the current cache epoch.
     fn next_lru_generation(&mut self) -> u64 {
-        self.lru_generation = self.lru_generation.wrapping_add(1);
+        debug_assert_ne!(self.lru_generation, u64::MAX);
+        self.lru_generation += 1;
         self.lru_generation
     }
 
@@ -2766,11 +2792,16 @@ impl OutputCache {
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn hit_rate(&self) -> f64 {
-        let total = self.hits + self.misses;
-        if total == 0 {
+        // Convert before adding: both operational counters saturate at
+        // `u64::MAX`, so integer addition could overflow exactly when this
+        // diagnostic is most needed. f64 has ample exponent range for the
+        // sum and preserves the meaningful 0.5 ratio when both counters are
+        // saturated.
+        let total = self.hits as f64 + self.misses as f64;
+        if total == 0.0 {
             0.0
         } else {
-            self.hits as f64 / total as f64
+            self.hits as f64 / total
         }
     }
 
@@ -2801,6 +2832,7 @@ impl OutputCache {
     pub fn clear(&mut self) {
         self.global_hashes.clear();
         self.lru_order.clear();
+        self.lru_generation = 0;
         self.pane_states.clear();
         self.hits = 0;
         self.misses = 0;
@@ -3478,7 +3510,7 @@ impl StreamChannel {
                 if let StreamEvent::OutputData { pane_id, .. } = &event {
                     self.overflow_panes.insert(*pane_id);
                 }
-                self.events_dropped += 1;
+                self.events_dropped = self.events_dropped.saturating_add(1);
                 false
             }
             OverflowPolicy::DropOldest => {
@@ -3490,7 +3522,7 @@ impl StreamChannel {
                 }
                 self.apply_pending_overflow_to_event(&mut event);
                 self.buffer.push_back(event);
-                self.events_dropped += 1;
+                self.events_dropped = self.events_dropped.saturating_add(1);
                 true
             }
         }
@@ -3708,6 +3740,50 @@ mod tests {
             2,
             "every subsequent saturating increment also bumps"
         );
+    }
+
+    #[test]
+    fn pane_cursor_seq_saturation_counter_never_wraps() {
+        let _guard = SEQ_SATURATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        PANE_CURSOR_SEQ_SATURATION_COUNT.store(u64::MAX, Ordering::Relaxed);
+
+        let mut cursor = PaneCursor::from_seq(7, u64::MAX);
+        let _ = cursor.capture_delta("still saturated".to_string(), 0);
+
+        assert_eq!(pane_cursor_seq_saturation_count(), u64::MAX);
+        reset_pane_cursor_seq_saturation_count_for_test();
+    }
+
+    #[test]
+    fn ingest_telemetry_counters_saturate_without_panicking() {
+        let mut telemetry = IngestTelemetry {
+            discovery_ticks: u64::MAX,
+            panes_discovered: u64::MAX,
+            panes_closed: u64::MAX,
+            generation_changes: u64::MAX,
+            metadata_changes: u64::MAX,
+            panes_filtered: u64::MAX,
+        };
+        let diff = DiscoveryDiff {
+            new_panes: vec![1],
+            closed_panes: vec![2],
+            changed_panes: vec![3],
+            new_generations: vec![4],
+            ..DiscoveryDiff::default()
+        };
+
+        telemetry.record_discovery_tick(&diff);
+        telemetry.record_pane_filtered();
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.discovery_ticks, u64::MAX);
+        assert_eq!(snapshot.panes_discovered, u64::MAX);
+        assert_eq!(snapshot.panes_closed, u64::MAX);
+        assert_eq!(snapshot.generation_changes, u64::MAX);
+        assert_eq!(snapshot.metadata_changes, u64::MAX);
+        assert_eq!(snapshot.panes_filtered, u64::MAX);
     }
 
     #[test]
@@ -4427,10 +4503,8 @@ mod tests {
         ));
 
         let mut absent = PaneCursor::from_seq(8, 0);
-        let absent_gap = absent.capture_generation_resync(
-            "first visible snapshot\n",
-            "capture_generation_resync",
-        );
+        let absent_gap = absent
+            .capture_generation_resync("first visible snapshot\n", "capture_generation_resync");
         assert_eq!(absent_gap.content, "first visible snapshot\n");
         assert!(matches!(
             absent_gap.kind,
@@ -4444,10 +4518,7 @@ mod tests {
         let mut replacement = PaneCursor::from_seq(9, 12);
         let successor = "successor banner\n$ common prompt\nvaluable successor output\n";
 
-        let gap = replacement.capture_generation_resync(
-            successor,
-            "capture_generation_resync",
-        );
+        let gap = replacement.capture_generation_resync(successor, "capture_generation_resync");
 
         assert_eq!(gap.content, successor);
         assert!(matches!(
@@ -6310,6 +6381,52 @@ mod tests {
     }
 
     #[test]
+    fn output_cache_lru_generation_recycles_only_after_discarding_prior_epoch() {
+        let mut cache = OutputCache::with_defaults();
+        cache.update_global_lru(11, 100);
+        cache.lru_generation = u64::MAX;
+
+        cache.update_global_lru(22, 200);
+
+        assert_eq!(cache.lru_generation, 1);
+        assert!(!cache.global_hashes.contains_key(&11));
+        assert_eq!(cache.global_hashes[&22].generation, 1);
+        assert_eq!(
+            cache.lru_order.iter().copied().collect::<Vec<_>>(),
+            [(22, 1)]
+        );
+    }
+
+    #[test]
+    fn zero_capacity_disables_cross_pane_global_cache() {
+        let config = OutputCacheConfig {
+            global_lru_capacity: 0,
+            per_pane_max_age_ms: 60_000,
+        };
+        let mut cache = OutputCache::new(config);
+
+        assert!(cache.is_new(1, "same content"));
+        assert!(cache.is_new(2, "same content"));
+        assert!(cache.global_hashes.is_empty());
+        assert!(cache.lru_order.is_empty());
+        assert_eq!(cache.lru_generation, 0);
+    }
+
+    #[test]
+    fn output_cache_telemetry_saturates_without_changing_dedup_behavior() {
+        let mut cache = OutputCache::with_defaults();
+        cache.hits = u64::MAX;
+        cache.misses = u64::MAX;
+
+        assert!(cache.is_new(1, "first"));
+        assert!(!cache.is_new(1, "first"));
+
+        assert_eq!(cache.hits, u64::MAX);
+        assert_eq!(cache.misses, u64::MAX);
+        assert_eq!(cache.hit_rate(), 0.5);
+    }
+
+    #[test]
     fn output_cache_lru_eviction() {
         // Create cache with small LRU capacity
         let config = OutputCacheConfig {
@@ -7635,6 +7752,30 @@ mod tests {
                 "first post-drop accepted event should carry the overflow marker"
             );
         }
+    }
+
+    #[test]
+    fn stream_channel_drop_telemetry_saturates_without_changing_overflow_policy() {
+        let cfg = StreamChannelConfig {
+            capacity: 1,
+            overflow_policy: OverflowPolicy::EmitGap,
+        };
+        let mut channel = StreamChannel::new(&cfg);
+        assert!(channel.send(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "first".to_string(),
+            received_at: 1,
+            overflow: false,
+        }));
+        channel.events_dropped = u64::MAX;
+
+        assert!(!channel.send(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "dropped".to_string(),
+            received_at: 2,
+            overflow: false,
+        }));
+        assert_eq!(channel.events_dropped, u64::MAX);
     }
 
     #[test]

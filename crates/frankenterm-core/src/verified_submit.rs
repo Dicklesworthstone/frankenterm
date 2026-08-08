@@ -15,10 +15,8 @@ const SUBMIT_IDEMPOTENCY_REQUEST_DOMAIN: &[u8] =
     b"frankenterm:verified-submit:semantic-request:v2\0";
 const SUBMIT_IDEMPOTENCY_EFFECT_DOMAIN: &[u8] =
     b"frankenterm:verified-submit:exact-outbound-effect:v2\0";
-const SUBMIT_IDEMPOTENCY_KEY_DOMAIN: &[u8] =
-    b"frankenterm:verified-submit:caller-claim-key:v1\0";
-const SUBMIT_IDEMPOTENCY_CANARY_DOMAIN: &[u8] =
-    b"frankenterm:verified-submit:effect-canary:v2\0";
+const SUBMIT_IDEMPOTENCY_KEY_DOMAIN: &[u8] = b"frankenterm:verified-submit:caller-claim-key:v1\0";
+const SUBMIT_IDEMPOTENCY_CANARY_DOMAIN: &[u8] = b"frankenterm:verified-submit:effect-canary:v2\0";
 
 /// Wire-stable semantic contract included in every durable submit binding.
 pub const SUBMIT_IDEMPOTENCY_SEMANTICS_VERSION: u16 = 2;
@@ -147,12 +145,19 @@ impl SubmitIdempotencyBinding {
             && self.key == submit_key_from_caller_key(self.pane_id, &self.caller_key)
             && self.verification_canary.as_deref().is_none_or(|canary| {
                 is_semantic_canary(canary)
-                    && self.outbound_text.strip_suffix(canary).is_some_and(|original| {
-                        semantic_canary_from_effect_inputs(self.pane_id, original, true) == canary
-                    })
+                    && self
+                        .outbound_text
+                        .strip_suffix(canary)
+                        .is_some_and(|original| {
+                            semantic_canary_from_effect_inputs(self.pane_id, original, true)
+                                == canary
+                        })
             })
             && self.effect_sha256
-                == hex::encode(submit_effect_digest(self.pane_id, self.outbound_text.as_ref()))
+                == hex::encode(submit_effect_digest(
+                    self.pane_id,
+                    self.outbound_text.as_ref(),
+                ))
     }
 }
 
@@ -1233,16 +1238,8 @@ mod tests {
     fn idempotency_claim_key_is_stable_for_caller_nonce_and_pane() {
         let a = idempotency_key(7, "nonce");
         assert_eq!(a, idempotency_key(7, "nonce"), "stable for same inputs");
-        assert_ne!(
-            a,
-            idempotency_key(8, "nonce"),
-            "pane namespace must matter"
-        );
-        assert_ne!(
-            a,
-            idempotency_key(7, "nonce-2"),
-            "caller key must matter"
-        );
+        assert_ne!(a, idempotency_key(8, "nonce"), "pane namespace must matter");
+        assert_ne!(a, idempotency_key(7, "nonce-2"), "caller key must matter");
         assert!(a.starts_with("idem:7:"), "key was {a}");
         assert_eq!(
             a.rsplit(':').next().map(str::len),
@@ -1351,7 +1348,10 @@ mod tests {
             caller_key: "attempt-2",
             ..base
         });
-        assert_eq!(base_binding.request_sha256(), different_nonce.request_sha256());
+        assert_eq!(
+            base_binding.request_sha256(),
+            different_nonce.request_sha256()
+        );
         assert_ne!(base_binding.key(), different_nonce.key());
     }
 
@@ -1375,7 +1375,10 @@ mod tests {
         assert_eq!(binding.key(), changed_wait.key());
         assert_ne!(binding.request_sha256(), changed_wait.request_sha256());
         assert_eq!(binding.effect_sha256(), changed_wait.effect_sha256());
-        assert_eq!(binding.verification_canary(), changed_wait.verification_canary());
+        assert_eq!(
+            binding.verification_canary(),
+            changed_wait.verification_canary()
+        );
 
         let changed_nonce = idempotency_binding(SubmitIdempotencyRequest {
             caller_key: "attempt-2",

@@ -392,11 +392,11 @@ impl DirectScanoutTelemetry {
     /// Returns 0 when no frames have been recorded.
     #[must_use]
     pub fn scanout_active_rate_pct(&self) -> u32 {
-        let total = self.frames_scanout_active + self.frames_fallback_total;
+        let total = u128::from(self.frames_scanout_active) + u128::from(self.frames_fallback_total);
         if total == 0 {
             return 0;
         }
-        ((self.frames_scanout_active * 100) / total).min(100) as u32
+        ((u128::from(self.frames_scanout_active) * 100) / total).min(100) as u32
     }
 }
 
@@ -863,6 +863,16 @@ mod tests {
         }
         assert_eq!(t.scanout_active_rate_pct(), 50);
         assert_eq!(t.latency_win_us_total, 500_000); // 500 ms total saved
+    }
+
+    #[test]
+    fn telemetry_active_rate_handles_saturated_counters_without_overflow() {
+        let t = DirectScanoutTelemetry {
+            frames_scanout_active: u64::MAX,
+            frames_fallback_total: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(t.scanout_active_rate_pct(), 50);
     }
 
     #[test]

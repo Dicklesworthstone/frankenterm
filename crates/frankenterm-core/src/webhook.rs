@@ -542,18 +542,20 @@ fn checkpoint_error_class(
         ContextErrorKind::CancelTimeout => DeliveryFailureClass::CancellationCleanupTimeout,
         ContextErrorKind::PollQuotaExhausted => DeliveryFailureClass::PollBudgetExhausted,
         ContextErrorKind::CostQuotaExhausted => DeliveryFailureClass::CostBudgetExhausted,
-        ContextErrorKind::Cancelled => match cx.cancel_reason().map(|reason| reason.root_cause().kind) {
-            Some(crate::outcome::CancelKind::Timeout | crate::outcome::CancelKind::Deadline) => {
-                DeliveryFailureClass::DeadlineExceeded
+        ContextErrorKind::Cancelled => {
+            match cx.cancel_reason().map(|reason| reason.root_cause().kind) {
+                Some(
+                    crate::outcome::CancelKind::Timeout | crate::outcome::CancelKind::Deadline,
+                ) => DeliveryFailureClass::DeadlineExceeded,
+                Some(crate::outcome::CancelKind::PollQuota) => {
+                    DeliveryFailureClass::PollBudgetExhausted
+                }
+                Some(crate::outcome::CancelKind::CostBudget) => {
+                    DeliveryFailureClass::CostBudgetExhausted
+                }
+                _ => DeliveryFailureClass::Cancelled,
             }
-            Some(crate::outcome::CancelKind::PollQuota) => {
-                DeliveryFailureClass::PollBudgetExhausted
-            }
-            Some(crate::outcome::CancelKind::CostBudget) => {
-                DeliveryFailureClass::CostBudgetExhausted
-            }
-            _ => DeliveryFailureClass::Cancelled,
-        },
+        }
         _ => DeliveryFailureClass::Context,
     }
 }
@@ -640,14 +642,8 @@ impl WebhookDispatcher {
         suppressed_since_last: u64,
     ) -> Vec<DeliveryRecord> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.dispatch_with_cx(
-            &cx,
-            detection,
-            pane_id,
-            rendered,
-            suppressed_since_last,
-        )
-        .await
+        self.dispatch_with_cx(&cx, detection, pane_id, rendered, suppressed_since_last)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`dispatch`].
@@ -1273,10 +1269,7 @@ mod tests {
             let payload =
                 NotificationPayload::from_detection(&test_detection(), 3, &test_rendered(), 0);
             let cx = crate::cx::for_request();
-            cx.cancel_with(
-                crate::outcome::CancelKind::User,
-                Some(SECRET),
-            );
+            cx.cancel_with(crate::outcome::CancelKind::User, Some(SECRET));
 
             let delivery = dispatcher.send_with_cx(&cx, &payload).await;
 
@@ -1313,9 +1306,8 @@ mod tests {
             let dispatcher = WebhookDispatcher::new(vec![endpoint], Box::new(transport.clone()));
             let payload =
                 NotificationPayload::from_detection(&test_detection(), 3, &test_rendered(), 0);
-            let cx = crate::cx::Cx::for_request_with_budget(
-                crate::cx::Budget::new().with_poll_quota(0),
-            );
+            let cx =
+                crate::cx::Cx::for_request_with_budget(crate::cx::Budget::new().with_poll_quota(0));
 
             let delivery = dispatcher.send_with_cx(&cx, &payload).await;
 
@@ -1326,10 +1318,7 @@ mod tests {
                 delivery.records[0].error.as_deref(),
                 Some(WEBHOOK_POLL_BUDGET_ERROR)
             );
-            assert_eq!(
-                delivery.error.as_deref(),
-                Some(WEBHOOK_POLL_BUDGET_ERROR)
-            );
+            assert_eq!(delivery.error.as_deref(), Some(WEBHOOK_POLL_BUDGET_ERROR));
             assert!(
                 transport.requests().is_empty(),
                 "an exhausted poll budget must stop before transport dispatch"
@@ -1343,7 +1332,7 @@ mod tests {
         let error = crate::runtime_async::ContextError::new(
             crate::runtime_async::ContextErrorKind::Internal,
         )
-            .with_message("sentinel-private-context-detail");
+        .with_message("sentinel-private-context-detail");
 
         assert_eq!(
             checkpoint_error_class(&cx, &error),
@@ -1441,7 +1430,10 @@ mod tests {
             );
             assert_eq!(records.len(), 2);
             assert_eq!(records[0].target, "first");
-            assert!(records[0].accepted, "the completed first attempt is retained");
+            assert!(
+                records[0].accepted,
+                "the completed first attempt is retained"
+            );
             assert_eq!(records[1].target, WEBHOOK_DISPATCH_TARGET);
             assert!(!records[1].accepted);
             assert_eq!(
@@ -1456,10 +1448,7 @@ mod tests {
     fn typed_transport_control_failure_stops_fanout_without_duplicate_record() {
         run_async_test(async {
             let cases = [
-                (
-                    DeliveryResult::cancelled(),
-                    DeliveryFailureClass::Cancelled,
-                ),
+                (DeliveryResult::cancelled(), DeliveryFailureClass::Cancelled),
                 (
                     DeliveryResult::cancellation_cleanup_timeout(),
                     DeliveryFailureClass::CancellationCleanupTimeout,
@@ -1496,14 +1485,9 @@ mod tests {
                         WebhookTemplate::Generic,
                     ),
                 ];
-                let dispatcher =
-                    WebhookDispatcher::new(endpoints, Box::new(transport.clone()));
-                let payload = NotificationPayload::from_detection(
-                    &test_detection(),
-                    3,
-                    &test_rendered(),
-                    0,
-                );
+                let dispatcher = WebhookDispatcher::new(endpoints, Box::new(transport.clone()));
+                let payload =
+                    NotificationPayload::from_detection(&test_detection(), 3, &test_rendered(), 0);
                 let cx = crate::cx::for_request();
 
                 let records = dispatcher.dispatch_payload_with_cx(&cx, &payload).await;
@@ -1528,10 +1512,7 @@ mod tests {
     fn typed_transport_control_failure_from_final_endpoint_is_retained_exactly() {
         run_async_test(async {
             let cases = [
-                (
-                    DeliveryResult::cancelled(),
-                    DeliveryFailureClass::Cancelled,
-                ),
+                (DeliveryResult::cancelled(), DeliveryFailureClass::Cancelled),
                 (
                     DeliveryResult::poll_budget_exhausted(),
                     DeliveryFailureClass::PollBudgetExhausted,
@@ -1550,12 +1531,8 @@ mod tests {
                     WebhookTemplate::Generic,
                 );
                 let dispatcher = WebhookDispatcher::new(vec![endpoint], Box::new(transport));
-                let payload = NotificationPayload::from_detection(
-                    &test_detection(),
-                    3,
-                    &test_rendered(),
-                    0,
-                );
+                let payload =
+                    NotificationPayload::from_detection(&test_detection(), 3, &test_rendered(), 0);
                 let cx = crate::cx::for_request();
 
                 let delivery = dispatcher.send_with_cx(&cx, &payload).await;
@@ -1603,8 +1580,7 @@ mod tests {
     #[test]
     fn invalid_http_status_uses_invalid_result_class() {
         run_async_test(async {
-            let transport =
-                MockTransport::responding(DeliveryResult::from_http_status(u16::MAX));
+            let transport = MockTransport::responding(DeliveryResult::from_http_status(u16::MAX));
             let endpoint = test_endpoint(
                 "inconsistent-two-xx",
                 "https://example.invalid/hook",
@@ -2180,7 +2156,10 @@ url = "http://localhost:8080/hook"
         let dbg = format!("{result:?}");
         assert!(dbg.contains("DeliveryResult"));
         assert!(dbg.contains("DeadlineExceeded"));
-        assert!(dbg.len() < 128, "finite debug output grew unexpectedly: {dbg}");
+        assert!(
+            dbg.len() < 128,
+            "finite debug output grew unexpectedly: {dbg}"
+        );
     }
 
     #[test]
@@ -2198,10 +2177,7 @@ url = "http://localhost:8080/hook"
     #[test]
     fn delivery_result_control_failure_constructors_are_distinct() {
         let cases = [
-            (
-                DeliveryResult::cancelled(),
-                DeliveryFailureClass::Cancelled,
-            ),
+            (DeliveryResult::cancelled(), DeliveryFailureClass::Cancelled),
             (
                 DeliveryResult::cancellation_cleanup_timeout(),
                 DeliveryFailureClass::CancellationCleanupTimeout,
@@ -2507,9 +2483,8 @@ url = "http://localhost:8080/hook"
     #[test]
     fn webhook_log_scheme_never_exposes_url_credentials() {
         const SECRET: &str = "sentinel-webhook-path-credential";
-        let url = format!(
-            "https://user:{SECRET}@hooks.example.invalid/services/{SECRET}?token={SECRET}"
-        );
+        let url =
+            format!("https://user:{SECRET}@hooks.example.invalid/services/{SECRET}?token={SECRET}");
 
         let diagnostic = webhook_url_scheme(&url);
 

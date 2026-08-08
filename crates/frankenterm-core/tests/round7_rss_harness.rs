@@ -262,9 +262,7 @@ fn run_pane(
         sb.push_line(line.clone());
     }
     let resident = sb.estimated_memory_bytes();
-    let engaged = sb
-        .cdc_adaptive_snapshot()
-        .is_some_and(|snap| snap.enabled);
+    let engaged = sb.cdc_adaptive_snapshot().is_some_and(|snap| snap.enabled);
     let chunks = sb.cdc_stats().map(|(unique, _total)| unique);
     (resident, engaged, chunks)
 }
@@ -439,12 +437,10 @@ fn adaptive_m4_rss_win_on_redundant_redraw_adjudicated() {
         "fleet sum must be panes * per-pane"
     );
     assert_eq!(
-        adaptive.adaptive_engaged_panes,
-        FLEET_PANES,
+        adaptive.adaptive_engaged_panes, FLEET_PANES,
         "adaptive probe failed to engage on a maximally-redundant trace ({}/{} panes) — \
          the harness cannot adjudicate an RSS win it never measured",
-        adaptive.adaptive_engaged_panes,
-        FLEET_PANES,
+        adaptive.adaptive_engaged_panes, FLEET_PANES,
     );
     assert!(
         adaptive.sample_cdc_chunks.unwrap_or(0) > 0,

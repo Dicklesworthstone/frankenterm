@@ -50,7 +50,7 @@
 //! assert_eq!(graph.get_value(should_restart), Some(&Value::Bool(true)));
 //! ```
 
-use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;

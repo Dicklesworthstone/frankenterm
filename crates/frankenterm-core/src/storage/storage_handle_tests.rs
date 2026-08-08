@@ -320,10 +320,8 @@ fn event_delivery_lease_validation_ceil_rounds_positive_ttls_and_checks_boundari
         "dispatch time plus i64::MAX milliseconds must overflow"
     );
     assert!(
-        checked_event_delivery_lease_ttl_ms(std::time::Duration::from_millis(
-            i64::MAX as u64 + 1,
-        ))
-        .is_err(),
+        checked_event_delivery_lease_ttl_ms(std::time::Duration::from_millis(i64::MAX as u64 + 1,))
+            .is_err(),
         "a TTL wider than i64 milliseconds must be rejected"
     );
     assert!(
@@ -457,8 +455,8 @@ fn query_panes_by_ids_empty_does_not_touch_the_backend() {
         Connection::open_in_memory().expect("open schema-free in-memory database"),
     );
 
-    let panes = query_panes_by_ids_backend(&backend, Vec::new())
-        .expect("empty query should succeed");
+    let panes =
+        query_panes_by_ids_backend(&backend, Vec::new()).expect("empty query should succeed");
 
     assert!(panes.is_empty());
 }
@@ -573,9 +571,7 @@ fn storage_handle_get_panes_by_ids_honors_precancelled_context() {
         );
 
         assert_typed_storage_cancellation(
-            handle
-                .get_panes_by_ids_with_cx(&cancelled_cx, &[1])
-                .await,
+            handle.get_panes_by_ids_with_cx(&cancelled_cx, &[1]).await,
             "get_panes_by_ids",
         );
 

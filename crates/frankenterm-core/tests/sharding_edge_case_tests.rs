@@ -839,7 +839,10 @@ fn health_report_serde_roundtrip() {
     assert_eq!(back.overall, HealthStatus::Degraded);
     assert_eq!(back.outcome(), ShardHealthReportOutcome::Complete);
     assert_eq!(back.shards.len(), 2);
-    assert_eq!(back.shards[0].probe_outcome, ShardHealthProbeOutcome::Complete);
+    assert_eq!(
+        back.shards[0].probe_outcome,
+        ShardHealthProbeOutcome::Complete
+    );
     assert_eq!(
         back.shards[1].probe_outcome,
         ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other)
@@ -888,13 +891,26 @@ fn cancelled_health_report_preserves_stable_typed_topology() {
 
     assert_eq!(report.outcome(), ShardHealthReportOutcome::Cancelled);
     assert_eq!(report.shards.len(), 3);
-    assert_eq!(report.shards[0].probe_outcome, ShardHealthProbeOutcome::Complete);
-    assert_eq!(report.shards[1].probe_outcome, ShardHealthProbeOutcome::Cancelled);
-    assert_eq!(report.shards[2].probe_outcome, ShardHealthProbeOutcome::NotStarted);
+    assert_eq!(
+        report.shards[0].probe_outcome,
+        ShardHealthProbeOutcome::Complete
+    );
+    assert_eq!(
+        report.shards[1].probe_outcome,
+        ShardHealthProbeOutcome::Cancelled
+    );
+    assert_eq!(
+        report.shards[2].probe_outcome,
+        ShardHealthProbeOutcome::NotStarted
+    );
 
     let warnings = report.watchdog_warnings();
     assert_eq!(warnings.len(), 2);
-    assert!(warnings.iter().all(|warning| warning.contains("health unknown")));
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| warning.contains("health unknown"))
+    );
     assert!(warnings[0].contains("probe=scan_cancelled"));
     assert!(warnings[0].contains("circuit=closed"));
     assert!(warnings[1].contains("probe=not_started"));
@@ -929,9 +945,11 @@ fn typed_health_report_projections_are_cardinality_bounded() {
 
     let warnings = report.watchdog_warnings();
     assert_eq!(warnings.len(), WARNING_LIMIT + 1);
-    assert!(warnings[..WARNING_LIMIT]
-        .iter()
-        .all(|warning| warning.len() < 256 && warning.contains("probe=other")));
+    assert!(
+        warnings[..WARNING_LIMIT]
+            .iter()
+            .all(|warning| warning.len() < 256 && warning.contains("probe=other"))
+    );
     assert_eq!(
         warnings.last().map(String::as_str),
         Some("Shard watchdog omitted 6 additional unhealthy shard(s) after bounded limit 64")
@@ -945,8 +963,7 @@ fn typed_health_report_projections_are_cardinality_bounded() {
     assert!(json.len() < 128 * 1_024);
     let back: ShardHealthReport = serde_json::from_str(&json).unwrap();
     assert!(back.shards.iter().all(|entry| {
-        entry.probe_outcome
-            == ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other)
+        entry.probe_outcome == ShardHealthProbeOutcome::Failed(ShardBackendErrorClass::Other)
     }));
 }
 
@@ -982,13 +999,11 @@ fn health_report_wire_rejects_conflicting_or_noncanonical_authority() {
     assert!(serde_json::from_value::<ShardHealthReport>(missing_report_outcome).is_err());
 
     let mut raw_error_injection = valid_value.clone();
-    raw_error_injection["shards"][0]["error"] =
-        serde_json::Value::String("raw-secret".to_owned());
+    raw_error_injection["shards"][0]["error"] = serde_json::Value::String("raw-secret".to_owned());
     assert!(serde_json::from_value::<ShardHealthReport>(raw_error_injection).is_err());
 
     let mut raw_label_injection = valid_value.clone();
-    raw_label_injection["shards"][0]["label"] =
-        serde_json::Value::String("raw-secret".to_owned());
+    raw_label_injection["shards"][0]["label"] = serde_json::Value::String("raw-secret".to_owned());
     assert!(serde_json::from_value::<ShardHealthReport>(raw_label_injection).is_err());
 
     let mut missing_typed_outcome = valid_value.clone();
@@ -1000,9 +1015,7 @@ fn health_report_wire_rejects_conflicting_or_noncanonical_authority() {
 
     let mut impossible_not_started_count = valid_value.clone();
     impossible_not_started_count["shards"][0]["pane_count"] = serde_json::json!(5);
-    assert!(
-        serde_json::from_value::<ShardHealthReport>(impossible_not_started_count).is_err()
-    );
+    assert!(serde_json::from_value::<ShardHealthReport>(impossible_not_started_count).is_err());
 
     let invalid_duplicate = ShardHealthReport {
         timestamp_ms: 12_349,

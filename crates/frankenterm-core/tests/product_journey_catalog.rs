@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use frankenterm_core::product_journey_catalog::{
     ActorMode, CatalogClaimState, CatalogValidationCode, ContradictionStatus, EvidenceState,
     FleetPoint, FreshnessState, JourneyVariant, MAX_PRODUCT_JOURNEY_CATALOG_BYTES,
-    ProducerCoverage, ProductJourneyCatalog, ProductJourneyDecodeCode, REQUIRED_COVERAGE_CELL_COUNT,
-    ReleaseRequirement, ReviewAuthorityKind, ReviewDisposition, RunVerdict, SupportDeclaration,
-    TargetAvailability, TargetMode, Topology, Transport,
+    ProducerCoverage, ProductJourneyCatalog, ProductJourneyDecodeCode,
+    REQUIRED_COVERAGE_CELL_COUNT, ReleaseRequirement, ReviewAuthorityKind, ReviewDisposition,
+    RunVerdict, SupportDeclaration, TargetAvailability, TargetMode, Topology, Transport,
 };
 use jsonschema::{Draft, Validator};
 use proptest::prelude::*;
@@ -71,11 +71,7 @@ fn duplicate_scalar_field(
     let marker = format!("\"{key}\"");
     let field_start = text
         .match_indices(&marker)
-        .filter(|(start, _)| {
-            text[*start + marker.len()..]
-                .trim_start()
-                .starts_with(':')
-        })
+        .filter(|(start, _)| text[*start + marker.len()..].trim_start().starts_with(':'))
         .nth(occurrence)
         .map(|(start, _)| start)
         .unwrap_or_else(|| panic!("catalog contains field occurrence {occurrence} of `{key}`"));
@@ -108,18 +104,14 @@ fn duplicate_scalar_field(
         value_start
             + raw[value_start..]
                 .iter()
-                .position(|byte| {
-                    byte.is_ascii_whitespace() || matches!(*byte, b',' | b'}' | b']')
-                })
+                .position(|byte| byte.is_ascii_whitespace() || matches!(*byte, b',' | b'}' | b']'))
                 .unwrap_or(raw.len() - value_start)
     };
     let (insertion_at, insertion) = match order {
         DuplicateFieldOrder::BeforeOriginal => {
             (field_start, format!("\"{key}\":{duplicate_json},"))
         }
-        DuplicateFieldOrder::AfterOriginal => {
-            (value_end, format!(",\"{key}\":{duplicate_json}"))
-        }
+        DuplicateFieldOrder::AfterOriginal => (value_end, format!(",\"{key}\":{duplicate_json}")),
     };
     let mut mutated = Vec::with_capacity(raw.len() + insertion.len());
     mutated.extend_from_slice(&raw[..insertion_at]);
@@ -488,8 +480,8 @@ fn checked_in_catalog_round_trips_without_shape_loss() {
     let root = repository_root();
     let original = load_catalog_value(&root);
     let typed = load_catalog(&root);
-    let encoded = serde_json::to_value(&typed)
-        .expect("public catalog DTO should serialize back to JSON");
+    let encoded =
+        serde_json::to_value(&typed).expect("public catalog DTO should serialize back to JSON");
     assert_eq!(
         encoded, original,
         "serde DTO shape drifted from the checked-in public JSON contract"

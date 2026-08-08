@@ -12,9 +12,9 @@
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use frankenterm_core::input_latency::{
-    InputLatencyBudget, InputLatencyClockDomainId, InputLatencyCollector,
-    InputLatencyMeasurement, InputLatencyProducerId, InputLatencyStage, InputLatencyTimestamp,
-    Percentile, evaluate_budget, generate_report,
+    InputLatencyBudget, InputLatencyClockDomainId, InputLatencyCollector, InputLatencyMeasurement,
+    InputLatencyProducerId, InputLatencyStage, InputLatencyTimestamp, Percentile, evaluate_budget,
+    generate_report,
 };
 use std::hint::black_box;
 
@@ -63,10 +63,7 @@ fn make_full_measurement(id: u64, base: u64) -> InputLatencyMeasurement {
 fn make_populated_collector(n: usize) -> InputLatencyCollector {
     let mut collector = InputLatencyCollector::new(n + 100);
     for i in 0..n {
-        collector.record(make_full_measurement(
-            i as u64 + 1,
-            1000 + i as u64 * 10,
-        ));
+        collector.record(make_full_measurement(i as u64 + 1, 1000 + i as u64 * 10));
     }
     collector
 }

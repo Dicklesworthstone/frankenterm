@@ -367,10 +367,7 @@ where
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(value)) => {
                 let future = this.future.take();
-                match catch_recoverable_internal(
-                    this.site,
-                    AssertUnwindSafe(|| drop(future)),
-                ) {
+                match catch_recoverable_internal(this.site, AssertUnwindSafe(|| drop(future))) {
                     Ok(()) => Poll::Ready(Ok(value)),
                     Err(error) => {
                         // The completed future failed during teardown, so its
@@ -379,10 +376,8 @@ where
                         // destructor is just as untrusted as the future's.
                         // Preserve the first error because it identifies the
                         // operation that made the output unusable.
-                        let _ = catch_recoverable_internal(
-                            this.site,
-                            AssertUnwindSafe(|| drop(value)),
-                        );
+                        let _ =
+                            catch_recoverable_internal(this.site, AssertUnwindSafe(|| drop(value)));
                         Poll::Ready(Err(error))
                     }
                 }
@@ -394,10 +389,7 @@ where
                 // it before returning, under a second marked boundary, so a
                 // panicking Drop cannot escape later during cancellation or
                 // an unrelated outer unwind.
-                let _ = catch_recoverable_internal(
-                    this.site,
-                    AssertUnwindSafe(|| drop(future)),
-                );
+                let _ = catch_recoverable_internal(this.site, AssertUnwindSafe(|| drop(future)));
                 Poll::Ready(Err(error))
             }
         }
@@ -417,10 +409,7 @@ impl<F> Drop for RecoverableFuture<F> {
 
 /// Wrap an asynchronous recovery contract without holding thread-local state
 /// across executor suspension.
-pub fn catch_recoverable_future<F>(
-    site: RecoverablePanicSite,
-    future: F,
-) -> RecoverableFuture<F>
+pub fn catch_recoverable_future<F>(site: RecoverablePanicSite, future: F) -> RecoverableFuture<F>
 where
     F: Future,
 {
@@ -673,19 +662,22 @@ mod tests {
         let ran = Arc::new(AtomicBool::new(false));
         let saw_recoverable_marker = Arc::new(AtomicBool::new(true));
         let nested_panic_was_contained = Arc::new(AtomicBool::new(false));
-        let outer = catch_recoverable(RecoverablePanicSite::CoreAsyncTaskJoin, AssertUnwindSafe({
-            let ran = Arc::clone(&ran);
-            let saw_recoverable_marker = Arc::clone(&saw_recoverable_marker);
-            let nested_panic_was_contained = Arc::clone(&nested_panic_was_contained);
-            move || {
-                let _probe = CleanupProbe {
-                    ran,
-                    saw_recoverable_marker,
-                    nested_panic_was_contained,
-                };
-                panic!("outer-unwind-test-sentinel");
-            }
-        }));
+        let outer = catch_recoverable(
+            RecoverablePanicSite::CoreAsyncTaskJoin,
+            AssertUnwindSafe({
+                let ran = Arc::clone(&ran);
+                let saw_recoverable_marker = Arc::clone(&saw_recoverable_marker);
+                let nested_panic_was_contained = Arc::clone(&nested_panic_was_contained);
+                move || {
+                    let _probe = CleanupProbe {
+                        ran,
+                        saw_recoverable_marker,
+                        nested_panic_was_contained,
+                    };
+                    panic!("outer-unwind-test-sentinel");
+                }
+            }),
+        );
 
         assert!(outer.is_err());
         assert!(ran.load(Ordering::Relaxed));
@@ -975,9 +967,7 @@ mod tests {
             type Output = OutputWithPanickingDrop;
 
             fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
-                Poll::Ready(OutputWithPanickingDrop(Arc::clone(
-                    &self.output_drop_ran,
-                )))
+                Poll::Ready(OutputWithPanickingDrop(Arc::clone(&self.output_drop_ran)))
             }
         }
 
@@ -1047,9 +1037,7 @@ mod tests {
                     RecoverablePanicSite::CoreAsyncTaskJoin,
                     PendingFutureWithObservedDrop {
                         drop_ran: Arc::clone(&inner_drop_ran),
-                        drop_was_marked_recoverable: Arc::clone(
-                            &drop_was_marked_recoverable,
-                        ),
+                        drop_was_marked_recoverable: Arc::clone(&drop_was_marked_recoverable),
                     },
                 );
                 panic!("unrelated-outer-unwind");
@@ -1121,8 +1109,6 @@ mod tests {
             r"C:\rustc\toolchain\library/std/src/io/stdio.rs"
         ));
         assert!(!is_std_stdio_location("plugin/src/io/stdio.rs"));
-        assert!(!is_std_stdio_location(
-            "plugin/library/std/src/io/stdio.rs"
-        ));
+        assert!(!is_std_stdio_location("plugin/library/std/src/io/stdio.rs"));
     }
 }

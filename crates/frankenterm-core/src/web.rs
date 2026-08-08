@@ -303,10 +303,7 @@ impl WebServerHandle {
     ///
     /// Tick 101 established the consuming shutdown seam.
     pub async fn shutdown_with_cx(self, cx: &crate::cx::Cx) -> Result<()> {
-        let WebServerHandle {
-            mut runtime,
-            ..
-        } = self;
+        let WebServerHandle { mut runtime, .. } = self;
         runtime.signal_shutdown();
 
         // Graceful shutdown is a consuming cleanup boundary. `finish_with_cx`

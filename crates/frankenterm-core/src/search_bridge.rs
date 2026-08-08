@@ -908,9 +908,7 @@ mod tests {
     fn test_cancellation_token_closes_check_to_registration_race() {
         let token = BridgeCancellationToken::new();
         run_async(async {
-            token
-                .cancelled_after_initial_check(|| token.cancel())
-                .await;
+            token.cancelled_after_initial_check(|| token.cancel()).await;
         });
         assert!(token.is_cancelled());
     }

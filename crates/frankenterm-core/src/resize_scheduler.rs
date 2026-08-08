@@ -365,6 +365,8 @@ pub struct ResizeSchedulerMetrics {
     pub completed_active: u64,
     /// Count of completion attempts rejected due to sequence mismatch.
     pub completion_rejected: u64,
+    /// Lifecycle events dropped after the diagnostic sequence space exhausted.
+    pub lifecycle_events_dropped_after_sequence_exhaustion: u64,
     /// Count of storm conditions detected (tab exceeded storm threshold).
     pub storm_events_detected: u64,
     /// Count of candidate picks throttled by per-tab storm limit.
@@ -1299,13 +1301,19 @@ impl ResizeScheduler {
                     .entry(c.domain_key.clone())
                     .or_insert(c.domain_weight);
             }
-            let total_weight: u32 = domain_weights.values().sum();
+            let total_weight = domain_weights.values().fold(0_u64, |total, &weight| {
+                total.saturating_add(u64::from(weight))
+            });
             if total_weight > 0 {
                 domain_weights
                     .into_iter()
                     .map(|(key, weight)| {
-                        let share = (u64::from(effective_budget_units) * u64::from(weight)
-                            / u64::from(total_weight)) as u32;
+                        // Both factors originate as u32, so their exact product
+                        // fits u64; the aggregate denominator is accumulated
+                        // separately with saturation.
+                        let share =
+                            u64::from(effective_budget_units) * u64::from(weight) / total_weight;
+                        let share = u32::try_from(share).unwrap_or(u32::MAX);
                         (key, share.max(1))
                     })
                     .collect()
@@ -1429,10 +1437,12 @@ impl ResizeScheduler {
 
             // Track domain and tab usage for throttling within this frame.
             if self.config.domain_budget_enabled {
-                *domain_spent.entry(candidate.domain_key).or_insert(0) += candidate.work_units;
+                let spent = domain_spent.entry(candidate.domain_key).or_insert(0);
+                *spent = spent.saturating_add(candidate.work_units);
             }
             if let Some(tab) = candidate.tab_id {
-                *tab_picks.entry(tab).or_insert(0) += 1;
+                let picks = tab_picks.entry(tab).or_insert(0);
+                *picks = picks.saturating_add(1);
             }
         }
 
@@ -1994,11 +2004,23 @@ impl ResizeScheduler {
         stage: ResizeLifecycleStage,
         detail: ResizeLifecycleDetail,
     ) {
-        self.next_lifecycle_event_seq = self.next_lifecycle_event_seq.wrapping_add(1);
+        let Some(event_seq) = self.next_lifecycle_event_seq.checked_add(1) else {
+            // Lifecycle events are a bounded diagnostic stream. Wrapping would
+            // violate the strict-order invariant and make ancient events look
+            // newer than current ones, so stop publishing once its cursor
+            // space is exhausted rather than corrupting the retained history.
+            self.metrics
+                .lifecycle_events_dropped_after_sequence_exhaustion = self
+                .metrics
+                .lifecycle_events_dropped_after_sequence_exhaustion
+                .saturating_add(1);
+            return;
+        };
+        self.next_lifecycle_event_seq = event_seq;
         let pane_state = self.panes.get(&pane_id);
         self.lifecycle_events
             .push_back(ResizeTransactionLifecycleEvent {
-                event_seq: self.next_lifecycle_event_seq,
+                event_seq,
                 frame_seq: self.metrics.frames,
                 pane_id,
                 intent_seq,
@@ -2326,6 +2348,41 @@ mod tests {
 
         assert_eq!(scheduler.metrics().cancelled_active, 1);
         assert_eq!(scheduler.metrics().completed_active, 1);
+    }
+
+    #[test]
+    fn lifecycle_event_sequence_exhaustion_drops_new_diagnostics_without_wrapping() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
+        scheduler.next_lifecycle_event_seq = u64::MAX - 1;
+        scheduler.push_lifecycle_event(
+            1,
+            1,
+            Some(1),
+            ResizeLifecycleStage::Queued,
+            ResizeLifecycleDetail::IntentSubmitted {
+                replaced_pending_seq: None,
+            },
+        );
+        scheduler.push_lifecycle_event(
+            1,
+            2,
+            Some(2),
+            ResizeLifecycleStage::Queued,
+            ResizeLifecycleDetail::IntentSubmitted {
+                replaced_pending_seq: None,
+            },
+        );
+
+        let events = scheduler.lifecycle_events(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_seq, u64::MAX);
+        assert_eq!(scheduler.next_lifecycle_event_seq, u64::MAX);
+        assert_eq!(
+            scheduler
+                .metrics()
+                .lifecycle_events_dropped_after_sequence_exhaustion,
+            1
+        );
     }
 
     #[test]

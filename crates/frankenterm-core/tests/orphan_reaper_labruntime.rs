@@ -92,7 +92,10 @@ fn run_orphan_reaper_nonzero_setting_returns_without_waiting() {
 
         let handle = runtime_async::task::spawn(run_orphan_reaper(config, shutdown_clone));
         let result = runtime_async::timeout(Duration::from_millis(100), handle).await;
-        assert!(result.is_ok(), "inert cleanup surface should return immediately");
+        assert!(
+            result.is_ok(),
+            "inert cleanup surface should return immediately"
+        );
         assert!(!shutdown.load(Ordering::Relaxed));
     });
 }

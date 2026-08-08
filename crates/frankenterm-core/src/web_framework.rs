@@ -151,9 +151,9 @@ fn resolve_unauthenticated_bind_addr(bind_addr: &str) -> Result<SocketAddr> {
             "web_bind_host_not_numeric_loopback_or_localhost",
         ));
     }
-    let port = port.parse::<u16>().map_err(|_| {
-        Error::runtime_backend("web bind validation", "web_bind_port_invalid")
-    })?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| Error::runtime_backend("web bind validation", "web_bind_port_invalid"))?;
     validate_unauthenticated_bind_candidates([SocketAddr::new(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         port,
@@ -214,9 +214,7 @@ fn web_server_join_failure_code(error: JoinError) -> &'static str {
         JoinErrorKind::CostBudgetExhausted => "web_server_task_cost_budget_exhausted",
         JoinErrorKind::ContextFailure => "web_server_task_context_failure",
         JoinErrorKind::TaskFailed => "web_server_task_failed",
-        JoinErrorKind::WakerRegistrationFailed => {
-            "web_server_task_waker_registration_failed"
-        }
+        JoinErrorKind::WakerRegistrationFailed => "web_server_task_waker_registration_failed",
     }
 }
 
@@ -262,16 +260,15 @@ pub(crate) fn classify_web_cx_failure(
         ContextErrorKind::CancelTimeout => WebCxFailureClass::CancellationCleanupTimeout,
         ContextErrorKind::PollQuotaExhausted => WebCxFailureClass::PollBudgetExhausted,
         ContextErrorKind::CostQuotaExhausted => WebCxFailureClass::CostBudgetExhausted,
-        ContextErrorKind::Cancelled => match cx.cancel_reason().map(|reason| reason.root_cause().kind) {
+        ContextErrorKind::Cancelled => match cx
+            .cancel_reason()
+            .map(|reason| reason.root_cause().kind)
+        {
             Some(crate::outcome::CancelKind::Timeout | crate::outcome::CancelKind::Deadline) => {
                 WebCxFailureClass::DeadlineExceeded
             }
-            Some(crate::outcome::CancelKind::PollQuota) => {
-                WebCxFailureClass::PollBudgetExhausted
-            }
-            Some(crate::outcome::CancelKind::CostBudget) => {
-                WebCxFailureClass::CostBudgetExhausted
-            }
+            Some(crate::outcome::CancelKind::PollQuota) => WebCxFailureClass::PollBudgetExhausted,
+            Some(crate::outcome::CancelKind::CostBudget) => WebCxFailureClass::CostBudgetExhausted,
             _ => WebCxFailureClass::Cancelled,
         },
         _ => WebCxFailureClass::Context,
@@ -408,10 +405,8 @@ impl FrameworkWebRuntime {
                 warn!(target: "wa.web", warnings, "web startup hooks had warnings");
             }
             StartupOutcome::Aborted(_err) => {
-                let primary_error = Error::runtime_backend(
-                    "web startup hooks",
-                    "web_startup_hook_aborted",
-                );
+                let primary_error =
+                    Error::runtime_backend("web startup hooks", "web_startup_hook_aborted");
                 return rollback_started_app(&app, primary_error).await;
             }
         }
@@ -478,10 +473,7 @@ impl FrameworkWebRuntime {
             }) {
                 Ok(join) => join,
                 Err(err) => {
-                    let primary_error = Error::runtime_backend(
-                        "web runtime spawn",
-                        err.code(),
-                    );
+                    let primary_error = Error::runtime_backend("web runtime spawn", err.code());
                     return rollback_started_app(app.as_ref(), primary_error).await;
                 }
             }
@@ -670,9 +662,8 @@ where
 mod tests {
     use super::{
         ConnectionDrainOutcome, ConnectionDrainTimerFailure, ResponseBody, StatusCode,
-        WebCxFailureClass, classify_web_cx_failure, json_response_with_status,
-        listener_wake_addr, resolve_unauthenticated_bind_addr,
-        validate_unauthenticated_bind_candidates,
+        WebCxFailureClass, classify_web_cx_failure, json_response_with_status, listener_wake_addr,
+        resolve_unauthenticated_bind_addr, validate_unauthenticated_bind_candidates,
         validate_unauthenticated_bound_addr, wait_for_connections_to_drain_with, web_cx_error,
     };
     use crate::error::RuntimeOperationSource;
@@ -705,9 +696,11 @@ mod tests {
                     body.as_slice(),
                     br#"{"error":"response_serialization_failed"}"#
                 );
-                assert!(!body
-                    .windows(b"credential-bearing".len())
-                    .any(|window| window == b"credential-bearing"));
+                assert!(
+                    !body
+                        .windows(b"credential-bearing".len())
+                        .any(|window| window == b"credential-bearing")
+                );
             }
             other => panic!("expected finite JSON error body, got {other:?}"),
         }
@@ -948,9 +941,9 @@ mod tests {
                         ..
                     },
                 ) => assert_eq!(detail, expected.code()),
-                (_, other) => panic!(
-                    "root cancel class {expected:?} mapped to unexpected error {other:?}"
-                ),
+                (_, other) => {
+                    panic!("root cancel class {expected:?} mapped to unexpected error {other:?}")
+                }
             }
         }
     }
@@ -963,7 +956,7 @@ mod tests {
         let source = crate::runtime_async::ContextError::new(
             crate::runtime_async::ContextErrorKind::Cancelled,
         )
-            .with_message(SECRET);
+        .with_message(SECRET);
 
         let error = web_cx_error(&cx, "web test operation", &source);
 

@@ -1682,12 +1682,9 @@ fn truncate_prepared_bounded(s: &str, max_width: usize, max_bytes: usize) -> Str
     }
 
     if max_width > 3 && max_bytes > 3 {
-        let mut truncated = super::table::prefix_within_width_and_bytes(
-            s,
-            max_width - 3,
-            max_bytes - 3,
-        )
-        .to_string();
+        let mut truncated =
+            super::table::prefix_within_width_and_bytes(s, max_width - 3, max_bytes - 3)
+                .to_string();
         truncated.push_str("...");
         truncated
     } else {
@@ -3261,10 +3258,16 @@ mod tests {
         assert_eq!(truncate("hello", 0), "");
         assert_eq!(truncate("\x1b[31mred\x1b[0m", 20), "red");
         assert_eq!(
-            truncate("\x1b]8;;https://example.invalid\x1b\\link\x1b]8;;\x1b\\", 20),
+            truncate(
+                "\x1b]8;;https://example.invalid\x1b\\link\x1b]8;;\x1b\\",
+                20
+            ),
             "link"
         );
-        assert_eq!(truncate("line one\nline two\tend", 80), "line one line two end");
+        assert_eq!(
+            truncate("line one\nline two\tend", 80),
+            "line one line two end"
+        );
         assert_eq!(
             truncate("safe\u{2028}line\u{202e}spoof\u{206a}shape", 80),
             "safe line spoof shape"

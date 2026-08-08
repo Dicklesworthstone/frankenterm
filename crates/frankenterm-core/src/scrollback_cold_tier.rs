@@ -578,11 +578,11 @@ impl ColdTierStats {
     /// Cache hit rate `[0..=100]`. 0 when no reads observed.
     #[must_use]
     pub fn cache_hit_rate_pct(&self) -> u32 {
-        let total = self.cache_hits + self.cache_misses;
+        let total = u128::from(self.cache_hits) + u128::from(self.cache_misses);
         if total == 0 {
             return 0;
         }
-        ((self.cache_hits * 100) / total).min(100) as u32
+        ((u128::from(self.cache_hits) * 100) / total).min(100) as u32
     }
 }
 
@@ -1259,6 +1259,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(s.cache_hit_rate_pct(), 100);
+    }
+
+    #[test]
+    fn stats_cache_hit_rate_handles_saturated_counters_without_overflow() {
+        let s = ColdTierStats {
+            cache_hits: u64::MAX,
+            cache_misses: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(s.cache_hit_rate_pct(), 50);
     }
 
     // ----------------------------------------------------------------

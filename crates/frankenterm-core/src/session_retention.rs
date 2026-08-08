@@ -21,9 +21,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use tracing::{debug, info, warn};
 
-use crate::checkpoint_witness::{
-    MAX_CHECKPOINT_METADATA_BYTES, MAX_CHECKPOINT_SESSION_ID_BYTES,
-};
+use crate::checkpoint_witness::{MAX_CHECKPOINT_METADATA_BYTES, MAX_CHECKPOINT_SESSION_ID_BYTES};
 use crate::config::SessionRetentionConfig;
 
 // [ft-xcsm0 / ft-8nqx0 Phase 4] CleanupResult lifted to the audit-types
@@ -166,8 +164,7 @@ pub fn cleanup_sessions(
 
     // 4. Clean orphaned data
     let orphaned = cleanup_orphaned_data(conn)?;
-    result.orphaned_restore_lifecycle_rows =
-        orphaned.orphaned_restore_lifecycle_rows;
+    result.orphaned_restore_lifecycle_rows = orphaned.orphaned_restore_lifecycle_rows;
     result.orphaned_checkpoints = orphaned.orphaned_checkpoints;
     result.orphaned_pane_states = orphaned.orphaned_pane_states;
     if orphaned != OrphanCleanupOutcome::default() {
@@ -192,14 +189,11 @@ pub fn cleanup_sessions(
 }
 
 fn u64_to_sqlite_integer(value: u64) -> Result<i64, rusqlite::Error> {
-    i64::try_from(value)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    i64::try_from(value).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
 fn clean_authority_error(error: crate::session_restore::RestoreError) -> rusqlite::Error {
-    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
-        error.to_string(),
-    )))
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error.to_string())))
 }
 
 fn begin_retention_transaction(conn: &Connection) -> rusqlite::Result<Transaction<'_>> {
@@ -358,9 +352,8 @@ fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize,
                 cutoff_ms,
                 i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX),
             ],
-            |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?
         .collect::<Result<_, _>>()?
     };
     let mut deleted = 0usize;
@@ -421,7 +414,7 @@ fn delete_excess_closed_sessions(
             [i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX)],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?
-            .collect::<Result<_, _>>()?
+        .collect::<Result<_, _>>()?
     };
     let mut retained = 0usize;
     let mut deleted = 0usize;
@@ -487,10 +480,7 @@ fn delete_sessions_by_size(
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     if minimum_bytes < 0 {
-        return Err(rusqlite::Error::IntegralValueOutOfRange(
-            1,
-            minimum_bytes,
-        ));
+        return Err(rusqlite::Error::IntegralValueOutOfRange(1, minimum_bytes));
     }
     let total_bytes = u64::try_from(total_bytes)
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, total_bytes))?;
@@ -530,18 +520,13 @@ fn delete_sessions_by_size(
             .query_map(
                 [i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX)],
                 |row| {
-                let session_id = row.get(0)?;
-                let session_bytes: i64 = row.get(1)?;
-                let session_bytes = u64::try_from(session_bytes).map_err(|_| {
-                    rusqlite::Error::IntegralValueOutOfRange(1, session_bytes)
-                })?;
-                Ok((
-                    session_id,
-                    session_bytes,
-                    row.get(2)?,
-                    row.get(3)?,
-                ))
-            })?
+                    let session_id = row.get(0)?;
+                    let session_bytes: i64 = row.get(1)?;
+                    let session_bytes = u64::try_from(session_bytes)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, session_bytes))?;
+                    Ok((session_id, session_bytes, row.get(2)?, row.get(3)?))
+                },
+            )?
             .collect::<Result<_, _>>()?;
         sessions
     };
@@ -766,9 +751,7 @@ fn session_cleanup_database_error_class(error: &rusqlite::Error) -> &'static str
     match error.sqlite_error_code() {
         Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => "contention",
         Some(ErrorCode::OperationAborted | ErrorCode::OperationInterrupted) => "interrupted",
-        Some(ErrorCode::PermissionDenied | ErrorCode::ReadOnly | ErrorCode::CannotOpen) => {
-            "access"
-        }
+        Some(ErrorCode::PermissionDenied | ErrorCode::ReadOnly | ErrorCode::CannotOpen) => "access",
         Some(ErrorCode::SystemIoFailure | ErrorCode::DiskFull) => "storage_io",
         Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) => "invalid_database",
         Some(
@@ -886,10 +869,7 @@ mod tests {
         let not_admitted = classify_session_cleanup_blocking_failure(
             SpawnBlockingWithCxError::CancelledBeforeSpawn { kind: None },
         );
-        assert_eq!(
-            not_admitted,
-            SessionCleanupError::CancelledBeforeHandoff
-        );
+        assert_eq!(not_admitted, SessionCleanupError::CancelledBeforeHandoff);
         assert!(!not_admitted.requires_reconciliation());
 
         let observation_losses = [
@@ -940,9 +920,8 @@ mod tests {
         assert_eq!(class, "access");
         assert!(!class.contains(canary));
 
-        let wrapped_content = rusqlite::Error::ToSqlConversionFailure(Box::new(
-            std::io::Error::other(canary),
-        ));
+        let wrapped_content =
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(canary)));
         assert!(wrapped_content.to_string().contains(canary));
         let wrapped_class = session_cleanup_database_error_class(&wrapped_content);
         assert_eq!(wrapped_class, "rusqlite_contract");
@@ -1122,8 +1101,8 @@ mod tests {
     #[test]
     fn cleanup_candidate_queries_retain_oversized_session_identity() {
         let conn = make_test_db();
-        let old = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer")
-            - 90 * 86_400_000;
+        let old =
+            i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer") - 90 * 86_400_000;
         let oversized_session_id = "s".repeat(MAX_CHECKPOINT_SESSION_ID_BYTES + 1);
         conn.execute(
             "INSERT INTO mux_sessions (
@@ -1154,8 +1133,8 @@ mod tests {
     #[test]
     fn age_cleanup_never_deletes_session_with_corrupt_v2_clean_receipt() {
         let conn = make_test_db();
-        let old = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer")
-            - 90 * 86_400_000;
+        let old =
+            i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer") - 90 * 86_400_000;
         insert_session(&conn, "corrupt-v2-clean", old, false);
         let receipt_id = insert_v2_clean_receipt(&conn, "corrupt-v2-clean", old);
         conn.execute(
@@ -1176,12 +1155,7 @@ mod tests {
         let now = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer");
         let old = now - 90 * 86_400_000;
         insert_session(&conn, "unresolved-restore", old, true);
-        let source_id = insert_checkpoint(
-            &conn,
-            "unresolved-restore",
-            old,
-            2 * 1_024 * 1_024,
-        );
+        let source_id = insert_checkpoint(&conn, "unresolved-restore", old, 2 * 1_024 * 1_024);
         conn.execute(
             "INSERT INTO session_checkpoints (
                  session_id, checkpoint_at, checkpoint_type, state_hash,
@@ -1209,12 +1183,7 @@ mod tests {
         // The later snapshot and clean receipt make the ordinary clean-session
         // authority valid again, but cannot resolve the older external-effect
         // intent merely by displacing it from the latest-row position.
-        insert_checkpoint(
-            &conn,
-            "unresolved-restore",
-            old + 2,
-            2 * 1_024 * 1_024,
-        );
+        insert_checkpoint(&conn, "unresolved-restore", old + 2, 2 * 1_024 * 1_024);
         assert!(
             has_unresolved_restore_intent(&conn, "unresolved-restore")
                 .expect("query unresolved intent"),
@@ -1301,8 +1270,8 @@ mod tests {
     #[test]
     fn linked_outcome_cannot_resolve_an_intent_without_lifecycle_authority() {
         let conn = make_test_db();
-        let old = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer")
-            - 90 * 86_400_000;
+        let old =
+            i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer") - 90 * 86_400_000;
         insert_session(&conn, "missing-lifecycle", old, true);
         conn.execute(
             "INSERT INTO session_checkpoints (
@@ -1364,12 +1333,7 @@ mod tests {
         let now = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer");
         let created_at = now - 90 * 86_400_000;
         insert_session(&conn, "long-lived-recently-closed", created_at, true);
-        insert_checkpoint(
-            &conn,
-            "long-lived-recently-closed",
-            now - 1_000,
-            1_024,
-        );
+        insert_checkpoint(&conn, "long-lived-recently-closed", now - 1_000, 1_024);
         conn.execute(
             "UPDATE mux_sessions SET last_checkpoint_at = ?1 WHERE session_id = ?2",
             rusqlite::params![now - 1_000, "long-lived-recently-closed"],
@@ -1395,12 +1359,7 @@ mod tests {
         .unwrap();
 
         insert_session(&conn, "recent-checkpoint-stale-cache", old, true);
-        insert_checkpoint(
-            &conn,
-            "recent-checkpoint-stale-cache",
-            now - 500,
-            1_024,
-        );
+        insert_checkpoint(&conn, "recent-checkpoint-stale-cache", now - 500, 1_024);
         conn.execute(
             "UPDATE mux_sessions SET last_checkpoint_at = ?1 WHERE session_id = ?2",
             rusqlite::params![old, "recent-checkpoint-stale-cache"],
@@ -1609,10 +1568,7 @@ mod tests {
 
         let error = delete_sessions_by_size(&conn, 1)
             .expect_err("an unaudited ignore trigger must fail before any deletion");
-        assert!(matches!(
-            error,
-            rusqlite::Error::ToSqlConversionFailure(_)
-        ));
+        assert!(matches!(error, rusqlite::Error::ToSqlConversionFailure(_)));
         assert_eq!(count_sessions(&conn), 2);
         assert_eq!(count_checkpoints(&conn), 2);
     }

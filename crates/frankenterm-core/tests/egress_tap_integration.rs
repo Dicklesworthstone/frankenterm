@@ -246,10 +246,7 @@ fn egress_tap_captures_gap_segments() {
         assert!(gap.is_gap);
         assert_eq!(gap.gap_reason.as_deref(), Some("overlap_not_found"));
         assert_eq!(gap.segment_kind, RecorderSegmentKind::Gap);
-        assert_eq!(
-            gap.text,
-            "completely different text that shares no overlap"
-        );
+        assert_eq!(gap.text, "completely different text that shares no overlap");
     });
 }
 
@@ -321,9 +318,7 @@ fn independent_supervisors_emit_deterministic_pane_local_sequences() {
         let right_pane = 202;
 
         source.set_text(left_pane, "left supervisor output").await;
-        source
-            .set_text(right_pane, "right supervisor output")
-            .await;
+        source.set_text(right_pane, "right supervisor output").await;
         left_cursors
             .write()
             .await
@@ -425,7 +420,10 @@ fn egress_tap_not_set_still_works() {
         while rx.try_recv().is_ok() {
             count += 1;
         }
-        assert_eq!(count, 1, "capture must proceed when no observer is installed");
+        assert_eq!(
+            count, 1,
+            "capture must proceed when no observer is installed"
+        );
     });
 }
 

@@ -494,11 +494,11 @@ impl FontFeaturesTelemetry {
     /// no lookups recorded.
     #[must_use]
     pub fn cache_hit_rate_pct(&self) -> u32 {
-        let total = self.atlas_cache_hits + self.atlas_cache_misses;
+        let total = u128::from(self.atlas_cache_hits) + u128::from(self.atlas_cache_misses);
         if total == 0 {
             return 0;
         }
-        ((self.atlas_cache_hits * 100) / total).min(100) as u32
+        ((u128::from(self.atlas_cache_hits) * 100) / total).min(100) as u32
     }
 }
 
@@ -807,6 +807,16 @@ mod tests {
         assert_eq!(t.atlas_cache_hits, 7);
         assert_eq!(t.atlas_cache_misses, 3);
         assert_eq!(t.cache_hit_rate_pct(), 70);
+    }
+
+    #[test]
+    fn telemetry_cache_rate_handles_saturated_counters_without_overflow() {
+        let t = FontFeaturesTelemetry {
+            atlas_cache_hits: u64::MAX,
+            atlas_cache_misses: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(t.cache_hit_rate_pct(), 50);
     }
 
     #[test]

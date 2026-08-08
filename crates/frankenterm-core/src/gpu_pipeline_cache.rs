@@ -321,11 +321,11 @@ impl CacheStats {
     /// lookups have occurred.
     #[must_use]
     pub fn hit_rate_pct(&self) -> u32 {
-        let total = self.cache_hits_total + self.cache_misses_total;
+        let total = u128::from(self.cache_hits_total) + u128::from(self.cache_misses_total);
         if total == 0 {
             return 0;
         }
-        ((self.cache_hits_total * 100) / total).min(100) as u32
+        ((u128::from(self.cache_hits_total) * 100) / total).min(100) as u32
     }
 
     /// Whether the cold-start time meets the bead's <100 ms
@@ -608,6 +608,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(s.hit_rate_pct(), 100);
+    }
+
+    #[test]
+    fn stats_hit_rate_handles_saturated_counters_without_overflow() {
+        let s = CacheStats {
+            cache_hits_total: u64::MAX,
+            cache_misses_total: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(s.hit_rate_pct(), 50);
     }
 
     // ----------------------------------------------------------------

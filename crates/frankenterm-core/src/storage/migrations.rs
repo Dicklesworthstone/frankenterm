@@ -2013,9 +2013,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
 
     if current != 0 && needs_init {
         return Err(StorageError::Corruption {
-            details: format!(
-                "schema version {current} is missing mandatory panes authority table"
-            ),
+            details: format!("schema version {current} is missing mandatory panes authority table"),
         }
         .into());
     }
@@ -2277,11 +2275,10 @@ fn require_table_sql_fragment(
     expected_fragment: &str,
     context: &str,
 ) -> Result<()> {
-    let sql = load_schema_object_sql(conn, "table", table)?.ok_or_else(|| {
-        StorageError::Corruption {
+    let sql =
+        load_schema_object_sql(conn, "table", table)?.ok_or_else(|| StorageError::Corruption {
             details: format!("{context}: missing required table {table}"),
-        }
-    })?;
+        })?;
     let compact_sql = compact_schema_sql(&sql);
     let compact_fragment = compact_schema_sql(expected_fragment);
     if compact_sql.contains(&compact_fragment) {
@@ -2289,9 +2286,7 @@ fn require_table_sql_fragment(
     }
 
     Err(StorageError::Corruption {
-        details: format!(
-            "{context}: {table} is missing canonical constraint {expected_fragment}"
-        ),
+        details: format!("{context}: {table} is missing canonical constraint {expected_fragment}"),
     }
     .into())
 }
@@ -2480,12 +2475,14 @@ fn validate_checkpoint_snapshot_authority_columns(conn: &Connection) -> Result<(
         },
         "checkpoint snapshot authority",
     )?;
-    let table_sql = load_schema_object_sql(conn, "table", "session_checkpoints")?.ok_or_else(|| {
-        StorageError::Corruption {
-            details: "checkpoint snapshot authority: missing required table session_checkpoints"
-                .to_string(),
-        }
-    })?;
+    let table_sql =
+        load_schema_object_sql(conn, "table", "session_checkpoints")?.ok_or_else(|| {
+            StorageError::Corruption {
+                details:
+                    "checkpoint snapshot authority: missing required table session_checkpoints"
+                        .to_string(),
+            }
+        })?;
     let compact_table_sql = compact_schema_sql(&table_sql);
     let v36_role_check = compact_schema_sql(
         "checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
@@ -2495,8 +2492,7 @@ fn validate_checkpoint_snapshot_authority_columns(conn: &Connection) -> Result<(
         "checkpoint_role TEXT NOT NULL DEFAULT 'snapshot'
          CHECK(checkpoint_role IN ('snapshot','restore_intent','restore_receipt'))",
     );
-    if !compact_table_sql.contains(&v36_role_check)
-        && !compact_table_sql.contains(&v38_role_check)
+    if !compact_table_sql.contains(&v36_role_check) && !compact_table_sql.contains(&v38_role_check)
     {
         return Err(StorageError::Corruption {
             details: "checkpoint snapshot authority: session_checkpoints is missing a canonical checkpoint-role constraint"
@@ -2523,20 +2519,12 @@ fn validate_checkpoint_snapshot_authority_schema(conn: &Connection) -> Result<()
             CHECKPOINT_GLOBAL_SNAPSHOT_LATEST_INDEX_SQL,
         ),
     ] {
-        validate_exact_index(
-            conn,
-            name,
-            canonical_sql,
-            "checkpoint snapshot authority",
-        )?;
+        validate_exact_index(conn, name, canonical_sql, "checkpoint snapshot authority")?;
     }
     Ok(())
 }
 
-fn ensure_checkpoint_snapshot_authority_indexes(
-    conn: &Connection,
-    context: &str,
-) -> Result<()> {
+fn ensure_checkpoint_snapshot_authority_indexes(conn: &Connection, context: &str) -> Result<()> {
     for (name, drop_sql, canonical_sql) in [
         (
             "idx_checkpoints_session_role_latest",
@@ -2807,8 +2795,7 @@ fn ensure_clean_checkpoint_receipt_schema(conn: &Connection) -> Result<()> {
 
 /// Schema v38: make checkpoint row identities durable across deletion and
 /// reserve an explicit, one-outcome-per-intent restore-attempt relation.
-const CHECKPOINT_SESSION_INDEX_SQL: &str =
-    "CREATE INDEX IF NOT EXISTS idx_checkpoints_session
+const CHECKPOINT_SESSION_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_checkpoints_session
      ON session_checkpoints(session_id, checkpoint_at);";
 
 const CHECKPOINT_V38_TABLE_SQL: &str = r"
@@ -2908,20 +2895,15 @@ fn checkpoint_v38_table_has_identity_surface(conn: &Connection) -> Result<bool> 
     let Some(sql) = load_schema_object_sql(conn, "table", "session_checkpoints")? else {
         return Ok(false);
     };
-    Ok(compact_schema_sql(&sql).contains("integerprimarykeyautoincrement")
-        || table_has_column(
-            conn,
-            "session_checkpoints",
-            "restore_intent_checkpoint_id",
-        )?)
+    Ok(
+        compact_schema_sql(&sql).contains("integerprimarykeyautoincrement")
+            || table_has_column(conn, "session_checkpoints", "restore_intent_checkpoint_id")?,
+    )
 }
 
 type CheckpointForeignKey = (String, String, String, String, String, String);
 
-fn checkpoint_foreign_keys(
-    conn: &Connection,
-    table: &str,
-) -> Result<Vec<CheckpointForeignKey>> {
+fn checkpoint_foreign_keys(conn: &Connection, table: &str) -> Result<Vec<CheckpointForeignKey>> {
     let mut statement = conn
         .prepare(&format!("PRAGMA foreign_key_list({table})"))
         .map_err(|error| StorageError::Database(error.to_string()))?;
@@ -3080,12 +3062,7 @@ fn validate_restore_attempt_lifecycle_v38_schema(conn: &Connection) -> Result<()
             RESTORE_ATTEMPT_OUTCOME_INDEX_SQL,
         ),
     ] {
-        validate_exact_index(
-            conn,
-            name,
-            canonical_sql,
-            "restore attempt lifecycle v38",
-        )?;
+        validate_exact_index(conn, name, canonical_sql, "restore attempt lifecycle v38")?;
     }
 
     let expected_foreign_keys = vec![
@@ -3127,12 +3104,7 @@ fn validate_restore_attempt_lifecycle_v38_schema(conn: &Connection) -> Result<()
 }
 
 fn validate_checkpoint_identity_v38_schema(conn: &Connection) -> Result<()> {
-    require_exact_table_column_count(
-        conn,
-        "session_checkpoints",
-        11,
-        "checkpoint identity v38",
-    )?;
+    require_exact_table_column_count(conn, "session_checkpoints", 11, "checkpoint identity v38")?;
     require_exact_column_descriptor(
         conn,
         "session_checkpoints",
@@ -3493,9 +3465,11 @@ fn ensure_checkpoint_identity_v38_schema(conn: &Connection) -> Result<()> {
         ))
     })?;
     let backfilled_intent_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM restore_attempt_lifecycle", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT COUNT(*) FROM restore_attempt_lifecycle",
+            [],
+            |row| row.get(0),
+        )
         .map_err(|error| StorageError::Database(error.to_string()))?;
     if backfilled_intent_count != legacy_intent_count {
         return Err(StorageError::Corruption {
@@ -4411,17 +4385,11 @@ fn run_owned_migration_transaction(
     match mutation {
         Err(_panic) => rollback_migration_transaction(
             transaction,
-            StorageError::MigrationFailed(format!(
-                "{context}: migration mutation panicked"
-            ))
-            .into(),
+            StorageError::MigrationFailed(format!("{context}: migration mutation panicked")).into(),
         ),
         Ok(Err(_error)) => rollback_migration_transaction(
             transaction,
-            StorageError::MigrationFailed(format!(
-                "{context}: migration mutation failed"
-            ))
-            .into(),
+            StorageError::MigrationFailed(format!("{context}: migration mutation failed")).into(),
         ),
         Ok(Ok(())) => {
             let commit_failed = take_migration_commit_fault()
@@ -4490,9 +4458,7 @@ fn set_migration_foreign_keys(conn: &Connection, enabled: bool) -> Result<()> {
         frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
         std::panic::AssertUnwindSafe(|| conn.execute_batch(sql)),
     );
-    if !matches!(applied, Ok(Ok(())))
-        || migration_foreign_keys_enabled(conn)? != enabled
-    {
+    if !matches!(applied, Ok(Ok(()))) || migration_foreign_keys_enabled(conn)? != enabled {
         return Err(poison_migration_connection_epoch(conn));
     }
     Ok(())
@@ -4549,46 +4515,42 @@ fn run_v0_init_in_transaction(conn: &Connection, stamp_fresh_fts_index: bool) ->
         }
     }
 
-    run_owned_migration_transaction_with_foreign_keys_suspended(
-        conn,
-        "v0 init",
-        |transaction| {
-            repair_existing_v0_tables_before_schema_sql(transaction)?;
-            #[cfg(test)]
-            check_v0_init_fault(V0InitStep::RepairComplete)?;
+    run_owned_migration_transaction_with_foreign_keys_suspended(conn, "v0 init", |transaction| {
+        repair_existing_v0_tables_before_schema_sql(transaction)?;
+        #[cfg(test)]
+        check_v0_init_fault(V0InitStep::RepairComplete)?;
 
+        transaction
+            .execute_batch(&schema_body)
+            .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
+        #[cfg(test)]
+        check_v0_init_fault(V0InitStep::SchemaSqlApplied)?;
+
+        run_migrations_in_existing_transaction(transaction, 0)?;
+        #[cfg(test)]
+        check_v0_init_fault(V0InitStep::MigrationsApplied)?;
+
+        ensure_ft_meta(transaction, SCHEMA_VERSION)?;
+        if stamp_fresh_fts_index {
+            // A genuinely fresh database has no historical postings to
+            // repair. Keep this authority stamp in the same transaction as
+            // schema creation so a failed update cannot expose a committed
+            // schema with an indeterminate index-version marker.
             transaction
-                .execute_batch(&schema_body)
-                .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
-            #[cfg(test)]
-            check_v0_init_fault(V0InitStep::SchemaSqlApplied)?;
-
-            run_migrations_in_existing_transaction(transaction, 0)?;
-            #[cfg(test)]
-            check_v0_init_fault(V0InitStep::MigrationsApplied)?;
-
-            ensure_ft_meta(transaction, SCHEMA_VERSION)?;
-            if stamp_fresh_fts_index {
-                // A genuinely fresh database has no historical postings to
-                // repair. Keep this authority stamp in the same transaction as
-                // schema creation so a failed update cannot expose a committed
-                // schema with an indeterminate index-version marker.
-                transaction
-                    .execute(
-                        "UPDATE fts_index_state
+                .execute(
+                    "UPDATE fts_index_state
                          SET index_version = ?1, updated_at = strftime('%s', 'now') * 1000
                          WHERE id = 1",
-                        params![i64::from(super::FTS_INDEX_VERSION)],
+                    params![i64::from(super::FTS_INDEX_VERSION)],
+                )
+                .map_err(|_| {
+                    StorageError::MigrationFailed(
+                        "v0 init: failed to stamp fresh FTS index authority".to_string(),
                     )
-                    .map_err(|_| {
-                        StorageError::MigrationFailed(
-                            "v0 init: failed to stamp fresh FTS index authority".to_string(),
-                        )
-                    })?;
-            }
-            Ok(())
-        },
-    )
+                })?;
+        }
+        Ok(())
+    })
 }
 
 fn repair_existing_v0_tables_before_schema_sql(conn: &Connection) -> Result<()> {
@@ -5303,9 +5265,7 @@ mod tests {
     #[test]
     fn schema_sql_comparison_ignores_statement_terminators() {
         assert_eq!(
-            compact_schema_sql(
-                "CREATE INDEX IF NOT EXISTS idx_example ON example(value DESC);",
-            ),
+            compact_schema_sql("CREATE INDEX IF NOT EXISTS idx_example ON example(value DESC);",),
             compact_schema_sql("CREATE INDEX idx_example ON example(value DESC)"),
             "sqlite_schema may omit the semicolon accepted by execute_batch"
         );
@@ -5421,9 +5381,7 @@ mod tests {
     #[test]
     fn migration_mutation_panic_rolls_back_schema_and_version_before_retry() {
         let conn = Connection::open_in_memory().expect("in-memory database");
-        set_migration_transaction_fault_for_test(Some(
-            MigrationTransactionFault::MutationPanic,
-        ));
+        set_migration_transaction_fault_for_test(Some(MigrationTransactionFault::MutationPanic));
         let error = run_owned_migration_transaction(&conn, "migration step", |transaction| {
             execute_migration_test_sql(transaction, "CREATE TABLE panic_probe(id INTEGER)")?;
             set_user_version(transaction, 17)?;
@@ -5505,7 +5463,8 @@ mod tests {
         assert!(is_migration_epoch_poisoned(&later));
 
         // Test cleanup only: production callers retire the Connection instead.
-        conn.execute_batch("ROLLBACK").expect("cleanup open test transaction");
+        conn.execute_batch("ROLLBACK")
+            .expect("cleanup open test transaction");
         conn.execute_batch("PRAGMA query_only = OFF")
             .expect("cleanup test query_only fence");
     }
@@ -5566,10 +5525,7 @@ mod tests {
         let reopened = Connection::open(&path).expect("open fresh connection epoch");
         assert!(!migration_connection_is_query_only(&reopened).unwrap());
         run_owned_migration_transaction(&reopened, "authority verification", |transaction| {
-            execute_migration_test_sql(
-                transaction,
-                "CREATE TABLE allowed_after_reopen(id INTEGER)",
-            )
+            execute_migration_test_sql(transaction, "CREATE TABLE allowed_after_reopen(id INTEGER)")
         })
         .expect("fresh connection must regain write authority");
     }
@@ -5587,7 +5543,9 @@ mod tests {
             .expect("hold SQLite writer lock");
         initialize_schema(&conn)
             .expect("healthy current-schema reopen must remain read-only under writer lock");
-        holder.execute_batch("ROLLBACK").expect("release writer lock");
+        holder
+            .execute_batch("ROLLBACK")
+            .expect("release writer lock");
 
         conn.execute("UPDATE ft_meta SET schema_version = 0 WHERE id = 1", [])
             .expect("seed repairable metadata drift");
@@ -5597,7 +5555,9 @@ mod tests {
             .execute_batch("BEGIN IMMEDIATE")
             .expect("hold writer lock during repair");
         initialize_schema(&conn).expect_err("metadata repair must acquire writer authority");
-        holder.execute_batch("ROLLBACK").expect("release repair lock");
+        holder
+            .execute_batch("ROLLBACK")
+            .expect("release repair lock");
 
         initialize_schema(&conn).expect("repair succeeds after lock release");
         assert_eq!(
@@ -6304,7 +6264,8 @@ mod tests {
         assert_eq!(state.3, 9);
         assert_eq!((state.4, state.5, state.6), (0, 0, None));
         assert!(
-            conn.execute("INSERT INTO events (id) VALUES (8)", []).is_err(),
+            conn.execute("INSERT INTO events (id) VALUES (8)", [])
+                .is_err(),
             "upgraded epoch must reject a non-advancing id"
         );
         conn.execute("INSERT INTO events (id) VALUES (10)", [])
@@ -6443,17 +6404,18 @@ mod tests {
             let mut stmt = conn
                 .prepare("PRAGMA table_info(events)")
                 .expect("prepare events table_info");
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            })
-            .expect("query events table_info");
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })
+                .expect("query events table_info");
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .expect("collect events table_info")
         }
@@ -6517,8 +6479,7 @@ mod tests {
             "delivery_lease_expires_at",
         ] {
             assert!(
-                !table_has_column(&upgraded, "events", column)
-                    .expect("inspect v32 fixture schema"),
+                !table_has_column(&upgraded, "events", column).expect("inspect v32 fixture schema"),
                 "v32 fixture must omit {column}"
             );
         }
@@ -6621,12 +6582,7 @@ mod tests {
                     None,
                     "dddddddddddddddd".to_string(),
                 ),
-                (
-                    -1,
-                    "snapshot".to_string(),
-                    None,
-                    "restore".to_string(),
-                ),
+                (-1, "snapshot".to_string(), None, "restore".to_string(),),
                 (
                     0,
                     "snapshot".to_string(),
@@ -6737,7 +6693,10 @@ mod tests {
         create_v35_checkpoint_fixture(&upgraded);
         let plan = build_migration_plan(35, 38).expect("build v35-to-v38 authority plan");
         apply_migration_plan(&upgraded, &plan).expect("apply v36-to-v38 authority migrations");
-        assert_eq!(get_user_version(&upgraded).expect("upgraded user version"), 38);
+        assert_eq!(
+            get_user_version(&upgraded).expect("upgraded user version"),
+            38
+        );
 
         assert_eq!(
             table_descriptors(&upgraded, "session_checkpoints"),
@@ -6772,30 +6731,21 @@ mod tests {
         }
         assert_eq!(
             compact_schema_sql(
-                &load_schema_object_sql(
-                    &upgraded,
-                    "index",
-                    "idx_mux_sessions_clean_checkpoint",
-                )
-                .expect("read upgraded v37 index")
-                .expect("upgraded v37 index")
+                &load_schema_object_sql(&upgraded, "index", "idx_mux_sessions_clean_checkpoint",)
+                    .expect("read upgraded v37 index")
+                    .expect("upgraded v37 index")
             ),
             compact_schema_sql(
-                &load_schema_object_sql(
-                    &fresh,
-                    "index",
-                    "idx_mux_sessions_clean_checkpoint",
-                )
-                .expect("read fresh v37 index")
-                .expect("fresh v37 index")
+                &load_schema_object_sql(&fresh, "index", "idx_mux_sessions_clean_checkpoint",)
+                    .expect("read fresh v37 index")
+                    .expect("fresh v37 index")
             )
         );
         validate_checkpoint_snapshot_authority_schema(&fresh)
             .expect("fresh v36 CHECK and index semantics");
         validate_checkpoint_snapshot_authority_schema(&upgraded)
             .expect("upgraded v36 CHECK and index semantics");
-        validate_clean_checkpoint_receipt_schema(&fresh)
-            .expect("fresh v37 FK and index semantics");
+        validate_clean_checkpoint_receipt_schema(&fresh).expect("fresh v37 FK and index semantics");
         validate_clean_checkpoint_receipt_schema(&upgraded)
             .expect("upgraded v37 FK and index semantics");
         validate_checkpoint_identity_v38_schema(&fresh)
@@ -6954,17 +6904,13 @@ mod tests {
         )
         .expect("seed current-schema index drift");
 
-        let error = initialize_schema(&conn)
-            .expect_err("current-version authority drift must fail closed");
+        let error =
+            initialize_schema(&conn).expect_err("current-version authority drift must fail closed");
         assert!(error.to_string().contains("non-canonical index"));
         let still_drifted = compact_schema_sql(
-            &load_schema_object_sql(
-                &conn,
-                "index",
-                "idx_checkpoints_session_role_latest",
-            )
-            .expect("inspect drifted current index")
-            .expect("drifted current index"),
+            &load_schema_object_sql(&conn, "index", "idx_checkpoints_session_role_latest")
+                .expect("inspect drifted current index")
+                .expect("drifted current index"),
         );
         assert!(
             still_drifted.contains("onsession_checkpoints(id)"),
@@ -7208,7 +7154,10 @@ mod tests {
             .expect("collect preserved checkpoints");
         assert_eq!(preserved_rows.len(), 2);
         assert_eq!(preserved_rows[0].0, 7);
-        assert_eq!(preserved_rows[0].7.as_deref(), Some("{\"source\":\"snapshot\"}"));
+        assert_eq!(
+            preserved_rows[0].7.as_deref(),
+            Some("{\"source\":\"snapshot\"}")
+        );
         assert_eq!(preserved_rows[0].9.as_deref(), Some("{}"));
         assert_eq!(preserved_rows[0].10, None);
         assert_eq!(preserved_rows[1].0, 42);
@@ -7248,7 +7197,10 @@ mod tests {
         )
         .expect("allocate after deleted high-water row");
         let first_new_id = conn.last_insert_rowid();
-        assert!(first_new_id > 42, "AUTOINCREMENT must not reuse deleted id 42");
+        assert!(
+            first_new_id > 42,
+            "AUTOINCREMENT must not reuse deleted id 42"
+        );
         conn.execute(
             "DELETE FROM session_checkpoints WHERE id = ?1",
             [first_new_id],
@@ -7522,13 +7474,14 @@ mod tests {
             .into_iter()
             .next()
             .expect("v38 step");
-        set_migration_transaction_fault_for_test(Some(
-            MigrationTransactionFault::MutationPanic,
-        ));
+        set_migration_transaction_fault_for_test(Some(MigrationTransactionFault::MutationPanic));
         let error = apply_migration_step(&conn, &step)
             .expect_err("synthetic post-mutation panic must roll v38 back");
         assert!(error.to_string().contains("migration mutation panicked"));
-        assert_eq!(get_user_version(&conn).expect("rolled-back user_version"), 37);
+        assert_eq!(
+            get_user_version(&conn).expect("rolled-back user_version"),
+            37
+        );
         assert!(migration_foreign_keys_enabled(&conn).expect("restored FK mode"));
         assert!(
             !checkpoint_v38_table_has_identity_surface(&conn)
@@ -7672,11 +7625,17 @@ mod tests {
             Some(fresh_pane_activity),
             "upgraded and fresh pane-activity indexes must be identical"
         );
-        assert_eq!(normalized_index_sql(&upgraded, "idx_events_unhandled"), None);
+        assert_eq!(
+            normalized_index_sql(&upgraded, "idx_events_unhandled"),
+            None
+        );
 
         let down_again = build_migration_plan(35, 34).expect("rebuild v35 down plan");
         apply_migration_plan(&upgraded, &down_again).expect("reapply v35 down migration");
-        assert_eq!(get_user_version(&upgraded).expect("restored v34 user_version"), 34);
+        assert_eq!(
+            get_user_version(&upgraded).expect("restored v34 user_version"),
+            34
+        );
         assert_eq!(
             normalized_index_sql(&upgraded, "idx_events_unhandled"),
             Some(

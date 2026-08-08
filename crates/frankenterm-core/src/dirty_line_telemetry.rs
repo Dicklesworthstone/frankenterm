@@ -101,11 +101,7 @@ impl DirtyEventSource {
     pub const fn is_whole_screen(self) -> bool {
         matches!(
             self,
-            Self::ThemeSwap
-                | Self::FontSwap
-                | Self::FocusChange
-                | Self::Resize
-                | Self::Viewport
+            Self::ThemeSwap | Self::FontSwap | Self::FocusChange | Self::Resize | Self::Viewport
         )
     }
 

@@ -103,11 +103,13 @@ impl Serialize for E2ETestReport {
             .count();
         let not_tested_contracts = HERMETIC_NOT_TESTED_CONTRACTS
             .into_iter()
-            .chain(self.pane_reports
-            .iter()
-            .flat_map(|pane| pane.checks.iter())
-            .filter(|check| check.status == PaneCheckStatus::NotTested)
-            .map(|check| check.contract))
+            .chain(
+                self.pane_reports
+                    .iter()
+                    .flat_map(|pane| pane.checks.iter())
+                    .filter(|check| check.status == PaneCheckStatus::NotTested)
+                    .map(|check| check.contract),
+            )
             .collect::<std::collections::BTreeSet<_>>();
         let pane_contract_checks_present = self.pane_contract_checks_present();
         let exercised_checks_present = self.exercised_checks_present();
@@ -121,7 +123,10 @@ impl Serialize for E2ETestReport {
         state.serialize_field("total_duration_ms", &self.total_duration_ms)?;
         state.serialize_field("test_assertions_passed", &self.passed)?;
         state.serialize_field("exercised_contracts_passed", &exercised_contracts_passed)?;
-        state.serialize_field("pane_contract_checks_present", &pane_contract_checks_present)?;
+        state.serialize_field(
+            "pane_contract_checks_present",
+            &pane_contract_checks_present,
+        )?;
         state.serialize_field("exercised_checks_present", &exercised_checks_present)?;
         state.serialize_field("exercised_checks_passed", &exercised_checks_passed)?;
         state.serialize_field("not_tested_contracts", &not_tested_contracts)?;
@@ -203,10 +208,7 @@ fn one_failed_check_overrides_a_passed_check_in_pane_and_e2e_reports() {
         Some(false)
     );
     assert_eq!(serialized["exercised_checks_passed"].as_u64(), Some(1));
-    assert_eq!(
-        serialized["exercised_checks_present"].as_bool(),
-        Some(true)
-    );
+    assert_eq!(serialized["exercised_checks_present"].as_bool(), Some(true));
 }
 
 #[test]
@@ -729,27 +731,24 @@ fn e2e_snapshot_roundtrip_single_pane_report() {
                 PaneContractCheck::exercised(
                     "persisted_pane_state",
                     normalize_cwd(pane.cwd.as_deref()) == restored.cwd
-                && pane.effective_rows()
-                    == restored
-                        .terminal_state
-                        .as_ref()
-                        .map(|t| u32::from(t.rows))
-                        .unwrap_or_default()
-                && pane.effective_cols()
-                    == restored
-                        .terminal_state
-                        .as_ref()
-                        .map(|t| u32::from(t.cols))
-                        .unwrap_or_default(),
+                        && pane.effective_rows()
+                            == restored
+                                .terminal_state
+                                .as_ref()
+                                .map(|t| u32::from(t.rows))
+                                .unwrap_or_default()
+                        && pane.effective_cols()
+                            == restored
+                                .terminal_state
+                                .as_ref()
+                                .map(|t| u32::from(t.cols))
+                                .unwrap_or_default(),
                 ),
                 PaneContractCheck::exercised(
                     "checkpoint_shape",
                     checkpoint.pane_count == 1 && checkpoints.len() == 1,
                 ),
-                PaneContractCheck::exercised(
-                    "captured_command_absent",
-                    restored.command.is_none(),
-                ),
+                PaneContractCheck::exercised("captured_command_absent", restored.command.is_none()),
             ],
         };
         report.pane_reports.push(pane_report);
@@ -887,14 +886,8 @@ fn e2e_targeted_checkpoint_load_distinguishes_versions() {
                     "checkpoint_versions_distinct",
                     checkpoint_versions_distinct,
                 ),
-                PaneContractCheck::exercised(
-                    "new_checkpoint_has_extra_pane",
-                    new_has_extra_pane,
-                ),
-                PaneContractCheck::exercised(
-                    "latest_checkpoint_selection",
-                    latest_matches_new,
-                ),
+                PaneContractCheck::exercised("new_checkpoint_has_extra_pane", new_has_extra_pane),
+                PaneContractCheck::exercised("latest_checkpoint_selection", latest_matches_new),
             ],
         });
 
@@ -1137,18 +1130,18 @@ fn e2e_restore_bookkeeping_preserves_manual_restore_checkpoint() {
             i64,
             Option<i64>,
         ) = verify_conn
-                .query_row(
-                    "SELECT c.id, c.metadata_json, s.shutdown_clean, s.clean_checkpoint_id
+            .query_row(
+                "SELECT c.id, c.metadata_json, s.shutdown_clean, s.clean_checkpoint_id
                      FROM session_checkpoints c
                      JOIN mux_sessions s ON s.session_id = c.session_id
                      WHERE c.session_id = ?1
                        AND c.checkpoint_role = 'restore_receipt'
                      ORDER BY c.checkpoint_at DESC, c.id DESC
                      LIMIT 1",
-                    [snapshot.session_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .expect("restore receipt should be recorded");
+                [snapshot.session_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("restore receipt should be recorded");
         let startup_metadata: Value =
             serde_json::from_str(&startup_metadata_json).expect("parse startup metadata");
         let restored_new_pane_id = *summary
@@ -1221,10 +1214,7 @@ fn e2e_restore_bookkeeping_preserves_manual_restore_checkpoint() {
                 ),
                 PaneContractCheck::exercised(
                     "authority_settled_without_pty_input",
-                    session_clean
-                        && clean_receipt_matches
-                        && detect_cleared
-                        && pty_input_untouched,
+                    session_clean && clean_receipt_matches && detect_cleared && pty_input_untouched,
                 ),
             ],
         });
@@ -1707,10 +1697,7 @@ fn e2e_restore_rejects_unsafe_scrollback_before_mux_or_authority_effects() {
             observed_artifact_hash: hash_text(""),
             checks: vec![
                 PaneContractCheck::exercised("mux_side_effects_absent", no_mux_effects),
-                PaneContractCheck::exercised(
-                    "authority_side_effects_absent",
-                    no_authority_effects,
-                ),
+                PaneContractCheck::exercised("authority_side_effects_absent", no_authority_effects),
                 PaneContractCheck::not_tested("process_continuity"),
             ],
         });
@@ -2159,10 +2146,7 @@ fn e2e_persisted_scrollback_bytes_survive_engine_rebuild_but_replay_is_rejected(
             &mut report,
             "verify_persisted_scrollback_bytes",
             persistence_start,
-            if persisted_metadata_matches
-                && checkpoint_boundary_matches
-                && persisted_bytes_match
-            {
+            if persisted_metadata_matches && checkpoint_boundary_matches && persisted_bytes_match {
                 "ok"
             } else {
                 "error"
@@ -2268,9 +2252,7 @@ fn e2e_persisted_scrollback_bytes_survive_engine_rebuild_but_replay_is_rejected(
         report.failure_reason = if success {
             None
         } else {
-            Some(
-                "scrollback persistence or fail-closed restore boundary was violated".to_string(),
-            )
+            Some("scrollback persistence or fail-closed restore boundary was violated".to_string())
         };
         emit_report(&report);
         assert!(
@@ -2286,9 +2268,8 @@ fn e2e_persisted_capture_topology_survives_engine_rebuild_and_maps_all_panes() {
     run_async_test(async {
         let run_start = Instant::now();
         let mut report = E2ETestReport {
-            test_name:
-                "e2e_persisted_capture_topology_survives_engine_rebuild_and_maps_all_panes"
-                    .to_string(),
+            test_name: "e2e_persisted_capture_topology_survives_engine_rebuild_and_maps_all_panes"
+                .to_string(),
             phases: Vec::new(),
             total_duration_ms: 0,
             passed: false,

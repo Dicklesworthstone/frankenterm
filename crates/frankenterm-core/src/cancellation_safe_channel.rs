@@ -62,12 +62,7 @@ fn allocate_monotonic_nonzero(counter: &AtomicU64) -> Option<u64> {
             return None;
         }
         let next = current.wrapping_add(1);
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(previous) => return Some(previous),
             Err(observed) => current = observed,
         }
@@ -480,12 +475,9 @@ impl<T> TxProducer<T> {
                             }
                             cx.checkpoint()
                                 .map_err(|error| cx_checkpoint_error(cx, &error))?;
-                            if crate::runtime_async::sleep_with_cx(
-                                cx,
-                                Duration::from_millis(50),
-                            )
-                            .await
-                            .is_err()
+                            if crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50))
+                                .await
+                                .is_err()
                             {
                                 return match cx.checkpoint() {
                                     Err(error) => Err(cx_checkpoint_error(cx, &error)),
@@ -1272,7 +1264,10 @@ mod tests {
             )
             .await
             .expect("reserve must not hang after close");
-            assert_eq!(result.expect_err("closed channel must reject reserve"), TxChannelError::Closed);
+            assert_eq!(
+                result.expect_err("closed channel must reject reserve"),
+                TxChannelError::Closed
+            );
             drop(held);
         });
     }
@@ -1303,7 +1298,10 @@ mod tests {
             .await
             .expect("recv must not hang after close")
             .expect("close is not a capability failure");
-            assert!(result.is_none(), "closed and drained channel must return None");
+            assert!(
+                result.is_none(),
+                "closed and drained channel must return None"
+            );
         });
     }
 
@@ -1342,7 +1340,11 @@ mod tests {
                 .expect("pre-close reservation remains commit-capable");
 
             assert_eq!(
-                rx.recv().await.expect("recv value").expect("queued value").value,
+                rx.recv()
+                    .await
+                    .expect("recv value")
+                    .expect("queued value")
+                    .value,
                 42
             );
             assert!(

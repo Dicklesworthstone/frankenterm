@@ -2528,12 +2528,7 @@ fn increment_policy_failure_counter(counter: &AtomicU64) -> u64 {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
         let next = current.saturating_add(1);
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return next,
             Err(observed) => current = observed,
         }
@@ -2578,10 +2573,7 @@ fn record_policy_audit_write_failure(pane_id: u64, action: ActionKind) {
     );
 }
 
-fn settle_workflow_parent_lookup(
-    result: crate::Result<Option<i64>>,
-    pane_id: u64,
-) -> Option<i64> {
+fn settle_workflow_parent_lookup(result: crate::Result<Option<i64>>, pane_id: u64) -> Option<i64> {
     match result {
         Ok(parent_action_id) => parent_action_id,
         Err(_) => {
@@ -8449,15 +8441,8 @@ where
         workflow_id: Option<&str>,
     ) -> InjectionResult {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.send_control_with_cx(
-            &cx,
-            pane_id,
-            control_char,
-            actor,
-            capabilities,
-            workflow_id,
-        )
-        .await
+        self.send_control_with_cx(&cx, pane_id, control_char, actor, capabilities, workflow_id)
+            .await
     }
 
     /// Cx-first [`Self::send_ctrl_c`] (ft-xbnl0.2.3). Pure

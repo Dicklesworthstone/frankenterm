@@ -261,33 +261,35 @@ impl FrameBudgetTelemetrySnapshot {
         if self.queue_depth > QUEUE_DEPTH_HEALTHY {
             return false;
         }
-        // Saturating add — non-saturating would panic in
-        // debug builds at u64 overflow. Theoretical only
-        // (2^63 events needed) but cheap to harden.
-        let total = self.lifetime_drops.saturating_add(self.lifetime_deferrals);
-        if total == 0 {
+        // Convert before adding so two independently saturated counters retain
+        // their meaningful ratio instead of overflowing or collapsing into a
+        // saturated integer denominator.
+        let total = self.lifetime_drops as f64 + self.lifetime_deferrals as f64;
+        if total == 0.0 {
             return true;
         }
-        let drop_ratio = self.lifetime_drops as f64 / total as f64;
+        let drop_ratio = self.lifetime_drops as f64 / total;
         drop_ratio <= 0.05
     }
 
     /// Record a deferral into the per-kind counter.
     pub fn record_deferral(&mut self, op_kind: OpKindSlug) {
         self.lifetime_deferrals = self.lifetime_deferrals.saturating_add(1);
-        *self
+        let by_kind = self
             .deferrals_by_op_kind
             .entry(op_kind.slug().to_string())
-            .or_insert(0) += 1;
+            .or_insert(0);
+        *by_kind = by_kind.saturating_add(1);
     }
 
     /// Record a drop into the per-kind counter.
     pub fn record_drop(&mut self, op_kind: OpKindSlug) {
         self.lifetime_drops = self.lifetime_drops.saturating_add(1);
-        *self
+        let by_kind = self
             .drops_by_op_kind
             .entry(op_kind.slug().to_string())
-            .or_insert(0) += 1;
+            .or_insert(0);
+        *by_kind = by_kind.saturating_add(1);
     }
 }
 
@@ -665,19 +667,21 @@ mod tests {
     }
 
     #[test]
-    fn is_safe_handles_potential_overflow_via_saturating_add() {
-        // Regression: previously, is_safe used
-        // non-saturating add on lifetime_drops +
-        // lifetime_deferrals. With u64::MAX values this
-        // would panic in debug. Theoretical only — but
-        // pin the saturating behavior so a future
-        // refactor doesn't revert.
+    fn is_safe_handles_saturated_counters_without_ratio_distortion() {
+        // Equal saturated counters mean a 50% drop ratio, not the 100% ratio
+        // produced by a saturated u64 denominator and not an integer overflow.
         let mut s = FrameBudgetTelemetrySnapshot::baseline();
         s.lifetime_drops = u64::MAX;
         s.lifetime_deferrals = u64::MAX;
-        // Should not panic, even if the sum overflows
-        // logically.
-        let _ = s.is_safe();
+        s.drops_by_op_kind
+            .insert(OpKindSlug::Cursor.slug().to_string(), u64::MAX);
+        s.deferrals_by_op_kind
+            .insert(OpKindSlug::Cursor.slug().to_string(), u64::MAX);
+        s.record_drop(OpKindSlug::Cursor);
+        s.record_deferral(OpKindSlug::Cursor);
+        assert!(!s.is_safe());
+        assert_eq!(s.drops_by_op_kind[OpKindSlug::Cursor.slug()], u64::MAX);
+        assert_eq!(s.deferrals_by_op_kind[OpKindSlug::Cursor.slug()], u64::MAX);
     }
 
     // ------------------------------------------------------------------------

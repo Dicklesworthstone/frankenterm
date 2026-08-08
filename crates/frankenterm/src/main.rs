@@ -76,6 +76,8 @@ use frankenterm_core::rehearsal_score::{
     REHEARSAL_SCORE_SURFACE_CONTRACT_ID, RehearsalScoreSurface, RehearsalScoreSurfaceReport,
     RehearsalVerdict,
 };
+#[cfg(feature = "distributed")]
+use frankenterm_core::runtime_async::{io as runtime_io, net as runtime_net};
 use frankenterm_core::runtime_telemetry::{
     HealthTier, ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID, SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI,
     SWARM_CAPACITY_OPERATOR_MCP_RUN_URI_TEMPLATE, SwarmCapacityAgentWorkloadClass,
@@ -87,8 +89,6 @@ use frankenterm_core::runtime_telemetry::{
 };
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 use frankenterm_core::swarm_scheduler::{HerdWaveEventKind, HerdWaveMcpResourceSurface};
-#[cfg(feature = "distributed")]
-use frankenterm_core::runtime_async::{io as runtime_io, net as runtime_net};
 
 /// Build metadata captured at compile time.
 mod build_meta {
@@ -7035,14 +7035,12 @@ fn classify_auth_profile_evidence(
                 next_step: Some("Re-run ft auth bootstrap for this profile".to_string()),
             }
         }
-        Ok(StorageStateValidation::Missing) if profile.exists() => {
-            AuthTestOutcome::NeedsHuman {
-                service: service.to_string(),
-                account: account.to_string(),
-                reason: "Profile exists but has no persisted storage state".to_string(),
-                next_step: "Run ft auth bootstrap for this profile".to_string(),
-            }
-        }
+        Ok(StorageStateValidation::Missing) if profile.exists() => AuthTestOutcome::NeedsHuman {
+            service: service.to_string(),
+            account: account.to_string(),
+            reason: "Profile exists but has no persisted storage state".to_string(),
+            next_step: "Run ft auth bootstrap for this profile".to_string(),
+        },
         Ok(StorageStateValidation::Missing) => AuthTestOutcome::NeedsHuman {
             service: service.to_string(),
             account: account.to_string(),
@@ -7066,8 +7064,7 @@ const ROBOT_ERR_APPROVAL: &str = "robot.approval_error";
 const ROBOT_ERR_PANE_NOT_FOUND: &str = "robot.pane_not_found";
 const ROBOT_ERR_RESERVATION_CONFLICT: &str = "robot.reservation_conflict";
 const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
-const ROBOT_ERR_STORAGE_EFFECT_INDETERMINATE: &str =
-    "robot.storage_effect_indeterminate";
+const ROBOT_ERR_STORAGE_EFFECT_INDETERMINATE: &str = "robot.storage_effect_indeterminate";
 const ROBOT_ERR_CURSOR_DISCONTINUITY: &str = "robot.cursor_discontinuity";
 const ROBOT_ERR_FEATURE_NOT_AVAILABLE: &str = "robot.feature_not_available";
 const ROBOT_ERR_POLICY_DENIED: &str = "robot.policy_denied";
@@ -7100,11 +7097,9 @@ const ROBOT_ERR_SESSION_RESUME_EFFECT_INDETERMINATE: &str =
 #[cfg(feature = "session-resume")]
 const ROBOT_ERR_SESSION_RESUME_CANCELLED: &str = "robot.session_resume.cancelled";
 #[cfg(feature = "session-resume")]
-const ROBOT_ERR_SESSION_RESUME_CAPTURE_INCOMPLETE: &str =
-    "robot.session_resume.capture_incomplete";
+const ROBOT_ERR_SESSION_RESUME_CAPTURE_INCOMPLETE: &str = "robot.session_resume.capture_incomplete";
 #[cfg(feature = "session-resume")]
-const ROBOT_ERR_SESSION_RESUME_CLEANUP_INCOMPLETE: &str =
-    "robot.session_resume.cleanup_incomplete";
+const ROBOT_ERR_SESSION_RESUME_CLEANUP_INCOMPLETE: &str = "robot.session_resume.cleanup_incomplete";
 const ROBOT_ERR_INCIDENT_NOT_FOUND: &str = "robot.incident.not_found";
 const ROBOT_ERR_INCIDENT_SOURCE_UNAVAILABLE: &str = "robot.incident.source_unavailable";
 const ROBOT_ERR_INCIDENT_DAG: &str = "robot.incident.dag_error";
@@ -7172,9 +7167,7 @@ fn robot_reservation_error_details(
     }
 }
 
-fn robot_storage_error_details(
-    err: &frankenterm_core::Error,
-) -> (&'static str, Option<String>) {
+fn robot_storage_error_details(err: &frankenterm_core::Error) -> (&'static str, Option<String>) {
     match err {
         frankenterm_core::Error::Storage(
             frankenterm_core::StorageError::IndeterminateMutation { .. }
@@ -7418,10 +7411,7 @@ fn robot_gui_unify_window_snapshots(mux: &mux::Mux) -> Vec<mux::unify::WindowSna
         .filter_map(|window_id| {
             let window = mux.get_window(window_id)?;
             let workspace = window.get_workspace().to_string();
-            let tabs = window
-                .iter()
-                .map(robot_gui_unify_tab_snapshot)
-                .collect();
+            let tabs = window.iter().map(robot_gui_unify_tab_snapshot).collect();
             Some(mux::unify::WindowSnapshot {
                 window_id,
                 workspace,
@@ -13531,12 +13521,7 @@ async fn build_robot_session_resume_resume_data(
         }
         argv
     };
-    let config = robot_session_resume_config(
-        casr_binary,
-        resolved_home,
-        timeout_secs,
-        dry_run,
-    );
+    let config = robot_session_resume_config(casr_binary, resolved_home, timeout_secs, dry_run);
     let resumer = frankenterm_core::session_resume::SessionResumer::new(config);
     let casr_resume = resumer
         .resume_session_with_cx(cx, &session_id, &provider)
@@ -16815,11 +16800,7 @@ fn bounded_terminal_diagnostic(text: &str, max_columns: usize, max_bytes: usize)
         |sanitized| output_redactor().redact(sanitized),
     );
     if bounded.trim().is_empty() {
-        frankenterm_core::output::truncate_bounded(
-            "diagnostic unavailable",
-            max_columns,
-            max_bytes,
-        )
+        frankenterm_core::output::truncate_bounded("diagnostic unavailable", max_columns, max_bytes)
     } else {
         bounded
     }
@@ -16833,24 +16814,17 @@ fn bounded_crash_bundle_summary_for_output(
         "bundle_path": bounded_terminal_diagnostic(&path, 256, 1_024),
     });
     if let Some(report) = crash.report.as_ref() {
-        summary["message"] = serde_json::Value::String(bounded_terminal_diagnostic(
-            &report.message,
-            256,
-            1_024,
-        ));
+        summary["message"] =
+            serde_json::Value::String(bounded_terminal_diagnostic(&report.message, 256, 1_024));
         summary["timestamp"] = serde_json::Value::Number(report.timestamp.into());
         if let Some(location) = report.location.as_deref() {
-            summary["location"] = serde_json::Value::String(bounded_terminal_diagnostic(
-                location, 256, 1_024,
-            ));
+            summary["location"] =
+                serde_json::Value::String(bounded_terminal_diagnostic(location, 256, 1_024));
         }
     }
     if let Some(manifest) = crash.manifest.as_ref() {
-        summary["created_at"] = serde_json::Value::String(bounded_terminal_diagnostic(
-            &manifest.created_at,
-            64,
-            256,
-        ));
+        summary["created_at"] =
+            serde_json::Value::String(bounded_terminal_diagnostic(&manifest.created_at, 64, 256));
     }
     summary
 }
@@ -16984,9 +16958,7 @@ fn sanitize_diagnostic_json_strings(value: &mut serde_json::Value) {
                 sanitize_diagnostic_json_strings(value);
             }
         }
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_) => {}
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
@@ -17036,10 +17008,7 @@ fn emit_bounded_format_error(
     message
 }
 
-fn emit_error_message(
-    output_format: frankenterm_core::output::OutputFormat,
-    message: &str,
-) {
+fn emit_error_message(output_format: frankenterm_core::output::OutputFormat, message: &str) {
     if output_format.is_json() {
         match serialize_error_envelope(message) {
             Ok(encoded) => println!("{encoded}"),
@@ -17108,11 +17077,7 @@ fn bounded_terminal_helpers_preserve_empty_preview_and_bound_fallbacks() {
     let preview = bounded_terminal_preview(secret, 60, 512);
     assert!(!preview.contains("AKIAIOSFODNN7EXAMPLE"));
     assert!(preview.contains("[REDACTED]"));
-    let ansi_split_secret = bounded_terminal_preview(
-        "send AKIAIOSF\x1b[31mODNN7EXAMPLE",
-        60,
-        512,
-    );
+    let ansi_split_secret = bounded_terminal_preview("send AKIAIOSF\x1b[31mODNN7EXAMPLE", 60, 512);
     assert!(!ansi_split_secret.contains("AKIAIOSFODNN7EXAMPLE"));
     assert!(ansi_split_secret.contains("[REDACTED]"));
     assert_eq!(
@@ -17146,10 +17111,7 @@ fn bounded_terminal_helpers_preserve_empty_preview_and_bound_fallbacks() {
             bundle_size_bytes: 0,
         }),
         report: Some(frankenterm_core::crash::CrashReport {
-            message: format!(
-                "panic AKIAIOSFODNN7EXAMPLE\n\u{202e}{}",
-                "x".repeat(2_000)
-            ),
+            message: format!("panic AKIAIOSFODNN7EXAMPLE\n\u{202e}{}", "x".repeat(2_000)),
             location: Some("src/AKIAIOSFODNN7EXAMPLE.rs\n\u{202e}:1".to_string()),
             backtrace: None,
             timestamp: 1,
@@ -17172,10 +17134,8 @@ fn bounded_terminal_helpers_preserve_empty_preview_and_bound_fallbacks() {
 #[test]
 fn send_text_summary_is_bounded_and_normalizes_before_redaction() {
     let engine = frankenterm_core::policy::PolicyEngine::new(10, 100, false);
-    let split_secret = bounded_send_text_summary(
-        &engine,
-        "send AKIAIOSF\x1b[31mODNN7EXAMPLE\nnext",
-    );
+    let split_secret =
+        bounded_send_text_summary(&engine, "send AKIAIOSF\x1b[31mODNN7EXAMPLE\nnext");
     assert_eq!(split_secret, "send [REDACTED] next");
 
     let oversized = "x".repeat(TERMINAL_TEXT_INPUT_MAX_BYTES + 1);
@@ -17221,9 +17181,8 @@ fn output_redaction_normalizes_ansi_split_secrets_without_breaking_explicit_esca
 #[cfg(test)]
 #[test]
 fn search_failure_output_is_bounded_redacted_terminal_safe_and_valid_json() {
-    let message = bounded_search_failure(
-        "bad \"quote\"\nsecret AKIAIOSF\x1b[31mODNN7EXAMPLE\u{202e}tail",
-    );
+    let message =
+        bounded_search_failure("bad \"quote\"\nsecret AKIAIOSF\x1b[31mODNN7EXAMPLE\u{202e}tail");
     assert!(message.contains("bad \"quote\" secret"));
     assert!(!message.contains("AKIAIOSFODNN7EXAMPLE"));
     assert!(message.contains("[REDACTED]"));
@@ -17239,9 +17198,8 @@ fn search_failure_output_is_bounded_redacted_terminal_safe_and_valid_json() {
     assert_eq!(decoded["error"], message);
     assert_eq!(decoded["version"], frankenterm_core::VERSION);
 
-    let simple = serialize_simple_display_error(
-        "quoted \"failure\" AKIAIOSF\x1b[31mODNN7EXAMPLE\nnext",
-    );
+    let simple =
+        serialize_simple_display_error("quoted \"failure\" AKIAIOSF\x1b[31mODNN7EXAMPLE\nnext");
     let simple: serde_json::Value =
         serde_json::from_str(&simple).expect("simple error response is valid JSON");
     let simple_error = simple["error"].as_str().expect("simple error string");
@@ -17684,16 +17642,13 @@ async fn resolve_bookmark_pane_ids(
     };
 
     if let Some(tag) = bookmark_tag {
-        let records = storage
-            .list_pane_bookmarks_by_tag(tag)
-            .await
-            .map_err(|e| {
-                bounded_format_diagnostic(
-                    format_args!("Failed to resolve bookmark tag \"{tag}\": {e}"),
-                    600,
-                    600,
-                )
-            })?;
+        let records = storage.list_pane_bookmarks_by_tag(tag).await.map_err(|e| {
+            bounded_format_diagnostic(
+                format_args!("Failed to resolve bookmark tag \"{tag}\": {e}"),
+                600,
+                600,
+            )
+        })?;
         let tag_ids: HashSet<u64> = records.into_iter().map(|record| record.pane_id).collect();
         pane_ids = Some(match pane_ids {
             Some(existing_ids) => existing_ids.intersection(&tag_ids).copied().collect(),
@@ -18567,12 +18522,7 @@ async fn fetch_pane_state_from_ipc(
                 serde_json::from_value::<IpcPaneState>(data)
                     .map(Some)
                     .map_err(|e| {
-                        bounded_display_diagnostic(
-                            "invalid pane state payload: ",
-                            &e,
-                            400,
-                            1_600,
-                        )
+                        bounded_display_diagnostic("invalid pane state payload: ", &e, 400, 1_600)
                     })
             } else {
                 Ok(None)
@@ -18743,24 +18693,18 @@ fn bounded_send_text_summary(
     if text.len() > TERMINAL_TEXT_INPUT_MAX_BYTES {
         return format!("payload omitted: {} bytes", text.len());
     }
-    frankenterm_core::output::sanitize_redact_truncate_bounded(
-        text,
-        400,
-        1_600,
-        |normalized| engine.redact_secrets(normalized),
-    )
+    frankenterm_core::output::sanitize_redact_truncate_bounded(text, 400, 1_600, |normalized| {
+        engine.redact_secrets(normalized)
+    })
 }
 
 fn requested_submit_guarantee_level(
     verify_submit: bool,
     submit_level: Option<SubmitGuaranteeLevelArg>,
 ) -> Option<frankenterm_core::robot_types::SubmitGuaranteeLevel> {
-    submit_level
-        .map(Into::into)
-        .or_else(|| {
-            verify_submit
-                .then_some(frankenterm_core::robot_types::SubmitGuaranteeLevel::Submitted)
-        })
+    submit_level.map(Into::into).or_else(|| {
+        verify_submit.then_some(frankenterm_core::robot_types::SubmitGuaranteeLevel::Submitted)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -21862,12 +21806,9 @@ impl std::fmt::Display for CheckpointResolveError {
                 requested_latest,
                 scope,
             } => match (*requested_latest, scope) {
-                (true, CheckpointResolveScope::Snapshot) => formatter.write_str(
-                    "No snapshots found. Capture one first with `ft snapshot save`.",
-                ),
-                (true, CheckpointResolveScope::Any) => {
-                    formatter.write_str("No checkpoints found.")
-                }
+                (true, CheckpointResolveScope::Snapshot) => formatter
+                    .write_str("No snapshots found. Capture one first with `ft snapshot save`."),
+                (true, CheckpointResolveScope::Any) => formatter.write_str("No checkpoints found."),
                 (false, CheckpointResolveScope::Snapshot) => {
                     formatter.write_str("The requested snapshot checkpoint was not found.")
                 }
@@ -21903,9 +21844,7 @@ impl std::error::Error for CheckpointResolveError {
     }
 }
 
-fn checkpoint_resolve_cli_contract(
-    error: &CheckpointResolveError,
-) -> (&'static str, &'static str) {
+fn checkpoint_resolve_cli_contract(error: &CheckpointResolveError) -> (&'static str, &'static str) {
     match error {
         CheckpointResolveError::InvalidId => (
             "invalid_snapshot_id",
@@ -21919,8 +21858,7 @@ fn checkpoint_resolve_cli_contract(
             "invalid_checkpoint_role",
             "The requested checkpoint is not a snapshot.",
         ),
-        CheckpointResolveError::InvalidStoredRole { .. }
-        | CheckpointResolveError::Database(_) => (
+        CheckpointResolveError::InvalidStoredRole { .. } | CheckpointResolveError::Database(_) => (
             "checkpoint_resolution_failed",
             "Snapshot checkpoint resolution failed.",
         ),
@@ -21987,17 +21925,13 @@ impl std::fmt::Display for WatcherControlRequestFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
             Self::IpcDisabled => "watcher IPC is disabled by configuration",
-            Self::NoWriteCredential => {
-                "no current IPC credential authorizes watcher control"
-            }
+            Self::NoWriteCredential => "no current IPC credential authorizes watcher control",
             Self::NoExecutionBudget => "watcher control has no execution budget",
             Self::Cancelled => "watcher control was cancelled",
             Self::TimedOut => "watcher control timed out",
             Self::Transport => "watcher control transport failed",
             Self::Rejected => "watcher rejected the control request",
-            Self::InvalidAcknowledgement => {
-                "watcher returned an invalid control acknowledgement"
-            }
+            Self::InvalidAcknowledgement => "watcher returned an invalid control acknowledgement",
         };
         formatter.write_str(message)
     }
@@ -22008,7 +21942,9 @@ fn ipc_token_allows_watcher_control(
     now_ms: u64,
 ) -> bool {
     !token.token.is_empty()
-        && token.expires_at_ms.is_none_or(|expires_at| now_ms < expires_at)
+        && token
+            .expires_at_ms
+            .is_none_or(|expires_at| now_ms < expires_at)
         && (token.scopes.is_empty()
             || token
                 .scopes
@@ -22156,11 +22092,7 @@ async fn request_watcher_control_with_cx(
     }
 
     let environment_token = std::env::var("FT_IPC_TOKEN").ok();
-    let auth_selection = select_watcher_control_auth(
-        ipc,
-        environment_token.as_deref(),
-        now_ms(),
-    )?;
+    let auth_selection = select_watcher_control_auth(ipc, environment_token.as_deref(), now_ms())?;
     let client = match auth_selection {
         WatcherControlAuthSelection::Environment => {
             frankenterm_core::ipc::IpcClient::new(socket_path)
@@ -22239,20 +22171,14 @@ fn same_watcher_identity(
     )
 }
 
-fn watcher_lock_diagnostic_check(
-    status: &frankenterm_core::lock::LockStatus,
-) -> DiagnosticCheck {
+fn watcher_lock_diagnostic_check(status: &frankenterm_core::lock::LockStatus) -> DiagnosticCheck {
     match status {
         frankenterm_core::lock::LockStatus::HeldKnown(meta) => {
-            DiagnosticCheck::ok_with_detail(
-                "daemon status",
-                format!("running (PID {})", meta.pid),
-            )
+            DiagnosticCheck::ok_with_detail("daemon status", format!("running (PID {})", meta.pid))
         }
-        frankenterm_core::lock::LockStatus::Free => DiagnosticCheck::ok_with_detail(
-            "daemon status",
-            "not running; watcher lock is free",
-        ),
+        frankenterm_core::lock::LockStatus::Free => {
+            DiagnosticCheck::ok_with_detail("daemon status", "not running; watcher lock is free")
+        }
         frankenterm_core::lock::LockStatus::HeldUnknown => DiagnosticCheck::warning(
             "daemon status",
             "watcher lock is held; holder identity metadata is unavailable",
@@ -22266,13 +22192,10 @@ fn watcher_lock_diagnostic_check(
     }
 }
 
-fn open_cli_read_only_connection(
-    db_path: &str,
-) -> rusqlite::Result<rusqlite::Connection> {
+fn open_cli_read_only_connection(db_path: &str) -> rusqlite::Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open_with_flags(
         db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     Ok(conn)
@@ -22357,9 +22280,7 @@ fn resolve_checkpoint_id(
                 role,
             })
         }
-        Ok(Some(_)) | Ok(None) => Err(CheckpointResolveError::InvalidStoredRole {
-            checkpoint_id,
-        }),
+        Ok(Some(_)) | Ok(None) => Err(CheckpointResolveError::InvalidStoredRole { checkpoint_id }),
         Err(rusqlite::Error::QueryReturnedNoRows) => Err(CheckpointResolveError::NotFound {
             requested_latest: false,
             scope,
@@ -22427,18 +22348,14 @@ fn load_checkpoint_identity(
             let checkpoint_at = checkpoint_at
                 .ok_or_else(|| anyhow::anyhow!("checkpoint identity has invalid checkpoint_at"))
                 .and_then(|value| {
-                    robot_checkpoint_nonnegative_u64(
-                        "session_checkpoints.checkpoint_at",
-                        value,
-                    )
+                    robot_checkpoint_nonnegative_u64("session_checkpoints.checkpoint_at", value)
                 })?;
-            let checkpoint_role = robot_checkpoint_validate_role(
-                robot_checkpoint_required_bounded_text(
+            let checkpoint_role =
+                robot_checkpoint_validate_role(robot_checkpoint_required_bounded_text(
                     checkpoint_role,
                     "checkpoint_role",
                     MAX_ROBOT_CHECKPOINT_ROLE_BYTES,
-                )?,
-            )?;
+                )?)?;
             let state_hash = robot_checkpoint_required_bounded_text(
                 state_hash,
                 "state_hash",
@@ -22610,8 +22527,8 @@ fn robot_checkpoint_required_bounded_text(
     field: &'static str,
     max_bytes: usize,
 ) -> anyhow::Result<String> {
-    let value = value
-        .ok_or_else(|| anyhow::anyhow!("checkpoint projection contains invalid {field}"))?;
+    let value =
+        value.ok_or_else(|| anyhow::anyhow!("checkpoint projection contains invalid {field}"))?;
     if value.is_empty() || value.len() > max_bytes {
         return Err(anyhow::anyhow!(
             "checkpoint projection contains invalid {field}"
@@ -22784,9 +22701,7 @@ fn load_bounded_snapshot_list(
     session_id: Option<&str>,
 ) -> anyhow::Result<BoundedSnapshotListPage> {
     if limit == 0 {
-        return Err(anyhow::anyhow!(
-            "snapshot list limit must be at least one"
-        ));
+        return Err(anyhow::anyhow!("snapshot list limit must be at least one"));
     }
     if limit > MAX_ROBOT_CHECKPOINT_LIST_LIMIT {
         return Err(anyhow::anyhow!(
@@ -22813,8 +22728,8 @@ fn load_bounded_snapshot_list(
         .ok_or_else(|| anyhow::anyhow!("snapshot list row limit overflowed"))?;
     let row_limit_i64 = i64::try_from(row_limit)
         .map_err(|_| anyhow::anyhow!("snapshot list row limit is invalid"))?;
-    let offset_i64 = i64::try_from(offset)
-        .map_err(|_| anyhow::anyhow!("snapshot list offset is invalid"))?;
+    let offset_i64 =
+        i64::try_from(offset).map_err(|_| anyhow::anyhow!("snapshot list offset is invalid"))?;
     let session_id_cap = i64::try_from(MAX_ROBOT_CHECKPOINT_SESSION_ID_BYTES)
         .map_err(|_| anyhow::anyhow!("checkpoint session-id cap is invalid"))?;
     let checkpoint_type_cap = i64::try_from(MAX_ROBOT_CHECKPOINT_TYPE_BYTES)
@@ -22944,41 +22859,29 @@ fn load_bounded_snapshot_list(
             let checkpoint_at = checkpoint_at
                 .ok_or_else(|| anyhow::anyhow!("snapshot list contains invalid checkpoint_at"))
                 .and_then(|value| {
-                    robot_checkpoint_nonnegative_u64(
-                        "session_checkpoints.checkpoint_at",
-                        value,
-                    )
+                    robot_checkpoint_nonnegative_u64("session_checkpoints.checkpoint_at", value)
                 })?;
-            let checkpoint_type = robot_checkpoint_validate_type(
-                robot_checkpoint_required_bounded_text(
+            let checkpoint_type =
+                robot_checkpoint_validate_type(robot_checkpoint_required_bounded_text(
                     checkpoint_type,
                     "checkpoint_type",
                     MAX_ROBOT_CHECKPOINT_TYPE_BYTES,
-                )?,
-            )?;
-            let pane_count = robot_checkpoint_pane_count(
-                pane_count.ok_or_else(|| {
+                )?)?;
+            let pane_count =
+                robot_checkpoint_pane_count(pane_count.ok_or_else(|| {
                     anyhow::anyhow!("snapshot list contains invalid pane_count")
-                })?,
-            )?;
+                })?)?;
             let total_bytes = total_bytes
                 .ok_or_else(|| anyhow::anyhow!("snapshot list contains invalid total_bytes"))
                 .and_then(|value| {
-                    robot_checkpoint_nonnegative_u64(
-                        "session_checkpoints.total_bytes",
-                        value,
-                    )
+                    robot_checkpoint_nonnegative_u64("session_checkpoints.total_bytes", value)
                 })?;
             let state_hash = robot_checkpoint_required_bounded_text(
                 state_hash,
                 "state_hash",
                 MAX_ROBOT_CHECKPOINT_STATE_HASH_BYTES,
             )?;
-            let label = checkpoint_label_from_projection(
-                metadata_valid,
-                robot_label,
-                cli_label,
-            )?;
+            let label = checkpoint_label_from_projection(metadata_valid, robot_label, cli_label)?;
             entries.push(BoundedSnapshotListEntry {
                 checkpoint_id,
                 session_id,
@@ -23017,23 +22920,18 @@ fn checkpoint_label_from_loaded_metadata(
     }
     let metadata: serde_json::Value = serde_json::from_str(metadata_json)
         .map_err(|_| anyhow::anyhow!("loaded checkpoint metadata is invalid JSON"))?;
-    let projected_label = |pointer: &str, field: &'static str| {
-        match metadata.pointer(pointer) {
-            None | Some(serde_json::Value::Null) => Ok(None),
-            Some(serde_json::Value::String(label)) => {
-                robot_checkpoint_optional_bounded_text(
-                    Some(label.clone()),
-                    field,
-                    MAX_ROBOT_CHECKPOINT_LABEL_BYTES,
-                )
-            }
-            Some(_) => Err(anyhow::anyhow!(
-                "loaded checkpoint metadata contains an invalid label"
-            )),
-        }
+    let projected_label = |pointer: &str, field: &'static str| match metadata.pointer(pointer) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(label)) => robot_checkpoint_optional_bounded_text(
+            Some(label.clone()),
+            field,
+            MAX_ROBOT_CHECKPOINT_LABEL_BYTES,
+        ),
+        Some(_) => Err(anyhow::anyhow!(
+            "loaded checkpoint metadata contains an invalid label"
+        )),
     };
-    let robot_label =
-        projected_label("/robot_checkpoint/label", "robot metadata label")?;
+    let robot_label = projected_label("/robot_checkpoint/label", "robot metadata label")?;
     let cli_label = projected_label("/cli_snapshot/label", "CLI metadata label")?;
     checkpoint_label_from_projection(1, robot_label, cli_label)
 }
@@ -23084,9 +22982,7 @@ fn load_bounded_snapshot_pane_ids_from_conn(
     for pane_id in rows {
         let pane_id = pane_id?
             .ok_or_else(|| anyhow::anyhow!("snapshot pane-id projection contains invalid id"))
-            .and_then(|value| {
-                robot_checkpoint_nonnegative_u64("mux_pane_state.pane_id", value)
-            })?;
+            .and_then(|value| robot_checkpoint_nonnegative_u64("mux_pane_state.pane_id", value))?;
         if previous_pane_id == Some(pane_id) {
             return Err(anyhow::anyhow!(
                 "snapshot pane-id projection contains duplicate identities"
@@ -23226,10 +23122,8 @@ fn robot_checkpoint_scrollback_coverage(
         rusqlite::params![checkpoint_id, row_limit],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
-    let pane_rows = robot_checkpoint_nonnegative_usize(
-        "mux_pane_state.scrollback_coverage_rows",
-        pane_rows,
-    )?;
+    let pane_rows =
+        robot_checkpoint_nonnegative_usize("mux_pane_state.scrollback_coverage_rows", pane_rows)?;
     let panes_with_scrollback = robot_checkpoint_nonnegative_usize(
         "mux_pane_state.scrollback_coverage_present",
         panes_with_scrollback,
@@ -23275,8 +23169,7 @@ fn robot_checkpoint_list_data(
     )?;
     let total_observed =
         robot_checkpoint_nonnegative_usize("session_checkpoints.bounded_count", total_observed)?;
-    let (total, total_at_least, total_exact) =
-        robot_checkpoint_total_summary(total_observed);
+    let (total, total_at_least, total_exact) = robot_checkpoint_total_summary(total_observed);
 
     let row_limit = limit
         .checked_add(1)
@@ -23430,36 +23323,29 @@ fn robot_checkpoint_list_data(
         let checkpoint_at = checkpoint_at.ok_or_else(|| {
             anyhow::anyhow!("checkpoint projection contains invalid checkpoint_at")
         })?;
-        let checkpoint_type = robot_checkpoint_validate_type(
-            robot_checkpoint_required_bounded_text(
+        let checkpoint_type =
+            robot_checkpoint_validate_type(robot_checkpoint_required_bounded_text(
                 checkpoint_type,
                 "checkpoint_type",
                 MAX_ROBOT_CHECKPOINT_TYPE_BYTES,
-            )?,
-        )?;
-        let checkpoint_role = robot_checkpoint_validate_role(
-            robot_checkpoint_required_bounded_text(
+            )?)?;
+        let checkpoint_role =
+            robot_checkpoint_validate_role(robot_checkpoint_required_bounded_text(
                 checkpoint_role,
                 "checkpoint_role",
                 MAX_ROBOT_CHECKPOINT_ROLE_BYTES,
-            )?,
-        )?;
+            )?)?;
         let pane_count = robot_checkpoint_pane_count(pane_count.ok_or_else(|| {
             anyhow::anyhow!("checkpoint projection contains invalid pane_count")
         })?)?;
-        let total_bytes = total_bytes.ok_or_else(|| {
-            anyhow::anyhow!("checkpoint projection contains invalid total_bytes")
-        })?;
+        let total_bytes = total_bytes
+            .ok_or_else(|| anyhow::anyhow!("checkpoint projection contains invalid total_bytes"))?;
         let state_hash = robot_checkpoint_required_bounded_text(
             state_hash,
             "state_hash",
             MAX_ROBOT_CHECKPOINT_STATE_HASH_BYTES,
         )?;
-        let label = checkpoint_label_from_projection(
-            metadata_valid,
-            robot_label,
-            cli_label,
-        )?;
+        let label = checkpoint_label_from_projection(metadata_valid, robot_label, cli_label)?;
         checkpoints.push(serde_json::json!({
             "checkpoint_id": id.to_string(),
             "numeric_checkpoint_id": id,
@@ -23644,39 +23530,30 @@ fn robot_checkpoint_show_data(
         "session_id",
         MAX_ROBOT_CHECKPOINT_SESSION_ID_BYTES,
     )?;
-    let checkpoint_at = checkpoint_at.ok_or_else(|| {
-        anyhow::anyhow!("checkpoint projection contains invalid checkpoint_at")
-    })?;
-    let checkpoint_type = robot_checkpoint_validate_type(
-        robot_checkpoint_required_bounded_text(
-            checkpoint_type,
-            "checkpoint_type",
-            MAX_ROBOT_CHECKPOINT_TYPE_BYTES,
-        )?,
-    )?;
-    let checkpoint_role = robot_checkpoint_validate_role(
-        robot_checkpoint_required_bounded_text(
-            checkpoint_role,
-            "checkpoint_role",
-            MAX_ROBOT_CHECKPOINT_ROLE_BYTES,
-        )?,
-    )?;
-    let pane_count = robot_checkpoint_pane_count(pane_count.ok_or_else(|| {
-        anyhow::anyhow!("checkpoint projection contains invalid pane_count")
-    })?)?;
-    let total_bytes = total_bytes.ok_or_else(|| {
-        anyhow::anyhow!("checkpoint projection contains invalid total_bytes")
-    })?;
+    let checkpoint_at = checkpoint_at
+        .ok_or_else(|| anyhow::anyhow!("checkpoint projection contains invalid checkpoint_at"))?;
+    let checkpoint_type = robot_checkpoint_validate_type(robot_checkpoint_required_bounded_text(
+        checkpoint_type,
+        "checkpoint_type",
+        MAX_ROBOT_CHECKPOINT_TYPE_BYTES,
+    )?)?;
+    let checkpoint_role = robot_checkpoint_validate_role(robot_checkpoint_required_bounded_text(
+        checkpoint_role,
+        "checkpoint_role",
+        MAX_ROBOT_CHECKPOINT_ROLE_BYTES,
+    )?)?;
+    let pane_count =
+        robot_checkpoint_pane_count(pane_count.ok_or_else(|| {
+            anyhow::anyhow!("checkpoint projection contains invalid pane_count")
+        })?)?;
+    let total_bytes = total_bytes
+        .ok_or_else(|| anyhow::anyhow!("checkpoint projection contains invalid total_bytes"))?;
     let state_hash = robot_checkpoint_required_bounded_text(
         state_hash,
         "state_hash",
         MAX_ROBOT_CHECKPOINT_STATE_HASH_BYTES,
     )?;
-    let label = checkpoint_label_from_projection(
-        metadata_valid,
-        robot_label,
-        cli_label,
-    )?;
+    let label = checkpoint_label_from_projection(metadata_valid, robot_label, cli_label)?;
 
     let expected_pane_rows = if checkpoint_role == "snapshot" {
         pane_count
@@ -23973,9 +23850,7 @@ fn admit_robot_checkpoint_save_request(
     if label.is_some_and(|label| label.len() > MAX_ROBOT_CHECKPOINT_LABEL_BYTES) {
         return Err(Box::new(robot_checkpoint_error_response(
             ROBOT_ERR_INVALID_ARGS,
-            format!(
-                "Checkpoint label exceeds the {MAX_ROBOT_CHECKPOINT_LABEL_BYTES}-byte limit."
-            ),
+            format!("Checkpoint label exceeds the {MAX_ROBOT_CHECKPOINT_LABEL_BYTES}-byte limit."),
             Some("Use a shorter UTF-8 checkpoint label.".to_string()),
             elapsed_ms,
         )));
@@ -24013,7 +23888,10 @@ fn admit_robot_checkpoint_save_request(
     }
     let requested_pane_set = match pane_ids.filter(|ids| !ids.is_empty()) {
         Some(pane_ids) => {
-            let requested = pane_ids.iter().copied().collect::<std::collections::HashSet<_>>();
+            let requested = pane_ids
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
             if requested.len() != pane_ids.len() {
                 return Err(Box::new(robot_checkpoint_error_response(
                     ROBOT_ERR_INVALID_ARGS,
@@ -24152,18 +24030,15 @@ async fn robot_checkpoint_save_data(
     let verification_db_path = db_path.clone();
     let verification_checkpoint_id = result.checkpoint_id;
     let expected_pane_rows = result.pane_count;
-    let scrollback_verification = run_cli_blocking_with_cx(
-        &cx,
-        "robot checkpoint scrollback verification",
-        move || {
+    let scrollback_verification =
+        run_cli_blocking_with_cx(&cx, "robot checkpoint scrollback verification", move || {
             robot_checkpoint_scrollback_coverage(
                 &verification_db_path,
                 verification_checkpoint_id,
                 expected_pane_rows,
             )
-        },
-    )
-    .await;
+        })
+        .await;
 
     engine
         .close_after_checkpoint_with_cx(&cx, &result)
@@ -24173,9 +24048,7 @@ async fn robot_checkpoint_save_data(
                 ROBOT_ERR_STORAGE,
                 "robot checkpoint session close",
                 "Checkpoint committed, but one-shot session close failed.",
-                Some(
-                    "Reconcile the committed checkpoint before retrying this save.".to_string(),
-                ),
+                Some("Reconcile the committed checkpoint before retrying this save.".to_string()),
                 &err,
                 elapsed_ms,
             )
@@ -24278,19 +24151,16 @@ async fn handle_robot_checkpoint_command(
             }
             let resolve_db_path = db_path.clone();
             let requested_checkpoint_id = checkpoint_id.clone();
-            let resolved = run_cli_blocking_with_cx(
-                &cx,
-                "robot checkpoint id resolution",
-                move || {
+            let resolved =
+                run_cli_blocking_with_cx(&cx, "robot checkpoint id resolution", move || {
                     Ok(robot_checkpoint_resolve_id(
                         &resolve_db_path,
                         &requested_checkpoint_id,
                         CheckpointResolveScope::Any,
                         elapsed_ms,
                     ))
-                },
-            )
-            .await;
+                })
+                .await;
             let checkpoint_id_i64 = match resolved {
                 Ok(Ok(id)) => id,
                 Ok(Err(response)) => return *response,
@@ -24379,19 +24249,16 @@ async fn handle_robot_checkpoint_command(
 
             let resolve_db_path = db_path.clone();
             let requested_checkpoint_id = checkpoint_id.clone();
-            let resolved = run_cli_blocking_with_cx(
-                &cx,
-                "robot rollback checkpoint resolution",
-                move || {
+            let resolved =
+                run_cli_blocking_with_cx(&cx, "robot rollback checkpoint resolution", move || {
                     Ok(robot_checkpoint_resolve_id(
                         &resolve_db_path,
                         &requested_checkpoint_id,
                         CheckpointResolveScope::Snapshot,
                         elapsed_ms,
                     ))
-                },
-            )
-            .await;
+                })
+                .await;
             let checkpoint_id_i64 = match resolved {
                 Ok(Ok(id)) => id,
                 Ok(Err(response)) => return *response,
@@ -24410,14 +24277,10 @@ async fn handle_robot_checkpoint_command(
             let checkpoint = match run_cli_blocking_with_cx(
                 &cx,
                 "robot rollback dry-run descriptor",
-                move || {
-                    load_snapshot_restore_descriptor(
-                        &descriptor_db_path,
-                        checkpoint_id_i64,
-                    )
-                },
+                move || load_snapshot_restore_descriptor(&descriptor_db_path, checkpoint_id_i64),
             )
-            .await {
+            .await
+            {
                 Ok(Some(checkpoint)) => checkpoint,
                 Ok(None) => return robot_checkpoint_not_found(checkpoint_id, elapsed_ms),
                 Err(err) => {
@@ -24638,14 +24501,13 @@ fn load_session_show_pane_lookup(
             verification: "not_computed",
         });
     };
-    let checkpoint = frankenterm_core::session_restore::load_checkpoint_by_id(
-        db_path,
-        selected_checkpoint_id,
-    )?
-    .ok_or_else(|| anyhow::anyhow!("selected session checkpoint changed during pane lookup"))?;
+    let checkpoint =
+        frankenterm_core::session_restore::load_checkpoint_by_id(db_path, selected_checkpoint_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("selected session checkpoint changed during pane lookup")
+            })?;
     if checkpoint.session_id != session_id
-        || checkpoint.checkpoint_role
-            != frankenterm_core::session_restore::CheckpointRole::Snapshot
+        || checkpoint.checkpoint_role != frankenterm_core::session_restore::CheckpointRole::Snapshot
     {
         return Err(anyhow::anyhow!(
             "selected session checkpoint identity changed during pane lookup"
@@ -24712,11 +24574,7 @@ fn build_session_list_json_payload(
         })
         .collect::<Vec<_>>();
     let session_count = session_values.len();
-    let next_offset = bounded_session_query_next_offset(
-        page.offset,
-        session_count,
-        page.has_more,
-    );
+    let next_offset = bounded_session_query_next_offset(page.offset, session_count, page.has_more);
     serde_json::json!({
         "ok": true,
         "count": session_count,
@@ -24756,11 +24614,8 @@ fn build_session_show_json_payload(
         })
         .collect::<Vec<_>>();
     let checkpoint_count = checkpoint_values.len();
-    let next_offset = bounded_session_query_next_offset(
-        page.offset,
-        checkpoint_count,
-        page.has_more,
-    );
+    let next_offset =
+        bounded_session_query_next_offset(page.offset, checkpoint_count, page.has_more);
     let mut data = serde_json::json!({
         "ok": true,
         "verification": "not_computed",
@@ -24812,12 +24667,12 @@ fn build_session_doctor_json_payload(
     guidance: &OperatorGuidance,
 ) -> anyhow::Result<serde_json::Value> {
     let mut payload = serde_json::to_value(report)?;
-    let object = payload.as_object_mut().ok_or_else(|| {
-        anyhow::anyhow!("session doctor report did not serialize as an object")
-    })?;
-    let estimate = object.remove("total_data_bytes").ok_or_else(|| {
-        anyhow::anyhow!("session doctor report omitted its pane-state estimate")
-    })?;
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("session doctor report did not serialize as an object"))?;
+    let estimate = object
+        .remove("total_data_bytes")
+        .ok_or_else(|| anyhow::anyhow!("session doctor report omitted its pane-state estimate"))?;
     object.insert("pane_state_estimate_bytes".to_string(), estimate);
     object.insert(
         "operator_guidance".to_string(),
@@ -24852,10 +24707,7 @@ async fn restore_snapshot_checkpoint(
     checkpoint_id: i64,
     wezterm: frankenterm_core::wezterm::WeztermHandle,
     _layout_only: bool,
-) -> Result<
-    frankenterm_core::session_restore::RestoreSummary,
-    SnapshotRestoreExecutionError,
-> {
+) -> Result<frankenterm_core::session_restore::RestoreSummary, SnapshotRestoreExecutionError> {
     use frankenterm_core::session_restore::{
         SessionRestoreConfig, SessionRestorer, load_checkpoint_by_id_with_cx,
         show_session_page_with_cx,
@@ -24865,15 +24717,9 @@ async fn restore_snapshot_checkpoint(
         .await
         .map_err(SnapshotRestoreExecutionError::Restore)?
         .ok_or(SnapshotRestoreExecutionError::CheckpointNotFound)?;
-    let session = show_session_page_with_cx(
-        restore_cx,
-        db_path,
-        &checkpoint.session_id,
-        1,
-        0,
-    )
-    .await?
-    .session;
+    let session = show_session_page_with_cx(restore_cx, db_path, &checkpoint.session_id, 1, 0)
+        .await?
+        .session;
     let restorer = SessionRestorer::new(
         Arc::new(db_path.to_string()),
         SessionRestoreConfig {
@@ -24967,9 +24813,7 @@ impl RestoreDiagnosticCode {
             #[cfg(all(unix, test))]
             Self::DetectedCheckpointChanged => "detected_checkpoint_changed",
             #[cfg(all(unix, test))]
-            Self::RestorePartialReconciliationRequired => {
-                "restore_partial_reconciliation_required"
-            }
+            Self::RestorePartialReconciliationRequired => "restore_partial_reconciliation_required",
             Self::RestoreInfrastructureFailure => "restore_infrastructure_failure",
             #[cfg(all(unix, test))]
             Self::RestoreFailed => "restore_failed",
@@ -25019,7 +24863,9 @@ impl RestoreDiagnosticCode {
             #[cfg(all(unix, test))]
             Self::RestoreFailed => "layout restore did not settle",
             #[cfg(all(unix, test))]
-            Self::CleanupFailed => "operation cleanup did not settle; reconcile state before retrying",
+            Self::CleanupFailed => {
+                "operation cleanup did not settle; reconcile state before retrying"
+            }
             Self::SnapshotRestoreUnavailableNoAuthenticatedMuxIdentity => {
                 "snapshot restore execution is unavailable because FrankenTerm cannot authenticate one exact mux endpoint and process incarnation without implicit startup or global discovery"
             }
@@ -25057,10 +24903,8 @@ struct SnapshotRestoreDescriptor {
     pane_count: usize,
 }
 
-const MAX_SNAPSHOT_RESTORE_SESSION_ID_BYTES: usize =
-    MAX_ROBOT_CHECKPOINT_SESSION_ID_BYTES;
-const MAX_SNAPSHOT_RESTORE_CHECKPOINT_TYPE_BYTES: usize =
-    MAX_ROBOT_CHECKPOINT_TYPE_BYTES;
+const MAX_SNAPSHOT_RESTORE_SESSION_ID_BYTES: usize = MAX_ROBOT_CHECKPOINT_SESSION_ID_BYTES;
+const MAX_SNAPSHOT_RESTORE_CHECKPOINT_TYPE_BYTES: usize = MAX_ROBOT_CHECKPOINT_TYPE_BYTES;
 
 fn bounded_snapshot_restore_descriptor_text(
     value: String,
@@ -25121,25 +24965,19 @@ fn load_snapshot_restore_descriptor(
                 "session_id",
                 MAX_SNAPSHOT_RESTORE_SESSION_ID_BYTES,
             )?;
-            let checkpoint_type = robot_checkpoint_validate_type(
-                bounded_snapshot_restore_descriptor_text(
+            let checkpoint_type =
+                robot_checkpoint_validate_type(bounded_snapshot_restore_descriptor_text(
                     checkpoint_type,
                     "checkpoint_type",
                     MAX_SNAPSHOT_RESTORE_CHECKPOINT_TYPE_BYTES,
-                )?,
-            )?;
+                )?)?;
             let checkpoint_at = checkpoint_at
                 .ok_or_else(|| anyhow::anyhow!("checkpoint timestamp is invalid"))
                 .and_then(|value| {
-                    robot_checkpoint_nonnegative_u64(
-                        "session_checkpoints.checkpoint_at",
-                        value,
-                    )
+                    robot_checkpoint_nonnegative_u64("session_checkpoints.checkpoint_at", value)
                 })?;
             let pane_count = pane_count
-                .ok_or_else(|| {
-                    anyhow::anyhow!("snapshot restore descriptor pane_count is invalid")
-                })
+                .ok_or_else(|| anyhow::anyhow!("snapshot restore descriptor pane_count is invalid"))
                 .and_then(robot_checkpoint_pane_count)?;
             Ok(Some(SnapshotRestoreDescriptor {
                 checkpoint_id,
@@ -25246,8 +25084,7 @@ fn process_disposition_completed_successfully(
     summary.process_launch_report.as_ref().map_or_else(
         || summary.expected_pane_count() == 0,
         |report| {
-            process_disposition_report_is_consistent(summary)
-                && report.interruption().is_none()
+            process_disposition_report_is_consistent(summary) && report.interruption().is_none()
         },
     )
 }
@@ -25465,9 +25302,7 @@ enum SnapshotRestoreExecutionError {
 }
 
 #[cfg(all(unix, test))]
-impl From<frankenterm_core::session_restore::RestoreError>
-    for SnapshotRestoreExecutionError
-{
+impl From<frankenterm_core::session_restore::RestoreError> for SnapshotRestoreExecutionError {
     fn from(error: frankenterm_core::session_restore::RestoreError) -> Self {
         Self::Restore(error)
     }
@@ -25496,9 +25331,7 @@ struct SnapshotRestoreAbort {
     hint: Option<String>,
     intent_checkpoint_id: Option<i64>,
     outcome_checkpoint_id: Option<i64>,
-    interruption_reason: Option<
-        frankenterm_core::session_restore::RestoreInterruptionReason,
-    >,
+    interruption_reason: Option<frankenterm_core::session_restore::RestoreInterruptionReason>,
     completed_summary: Option<frankenterm_core::session_restore::RestoreSummary>,
     completed_layout_only: Option<bool>,
     cleanup_failed: bool,
@@ -25525,11 +25358,7 @@ impl std::fmt::Debug for SnapshotRestoreAbort {
 
 #[cfg(all(unix, test))]
 impl SnapshotRestoreAbort {
-    fn new(
-        phase: &'static str,
-        checkpoint_id: i64,
-        diagnostic: RestoreDiagnosticCode,
-    ) -> Self {
+    fn new(phase: &'static str, checkpoint_id: i64, diagnostic: RestoreDiagnosticCode) -> Self {
         Self {
             phase,
             checkpoint_id,
@@ -25554,10 +25383,7 @@ impl SnapshotRestoreAbort {
         self
     }
 
-    fn from_execution_error(
-        checkpoint_id: i64,
-        error: SnapshotRestoreExecutionError,
-    ) -> Self {
+    fn from_execution_error(checkpoint_id: i64, error: SnapshotRestoreExecutionError) -> Self {
         use frankenterm_core::session_restore::RestoreError;
 
         match error {
@@ -25771,7 +25597,10 @@ fn snapshot_restore_abort_json(abort: &SnapshotRestoreAbort) -> serde_json::Valu
                 "restore_authority_resolved".to_string(),
                 serde_json::json!(summary.restore_authority_resolved),
             );
-            object.insert("elapsed_ms".to_string(), serde_json::json!(summary.elapsed_ms));
+            object.insert(
+                "elapsed_ms".to_string(),
+                serde_json::json!(summary.elapsed_ms),
+            );
             object.insert(
                 "layout_only".to_string(),
                 serde_json::json!(abort.completed_layout_only),
@@ -25794,10 +25623,7 @@ fn snapshot_restore_abort_json(abort: &SnapshotRestoreAbort) -> serde_json::Valu
             );
         }
         if let Some(reason) = abort.interruption_reason {
-            object.insert(
-                "interruption_reason".to_string(),
-                serde_json::json!(reason),
-            );
+            object.insert("interruption_reason".to_string(), serde_json::json!(reason));
         }
         if abort.cleanup_failed {
             object.insert("cleanup_failed".to_string(), serde_json::json!(true));
@@ -25962,10 +25788,8 @@ async fn execute_snapshot_restore_workflow<AuthenticateMux>(
     authenticate_mux: AuthenticateMux,
 ) -> Result<SnapshotRestoreWorkflowResult, SnapshotRestoreAbort>
 where
-    AuthenticateMux: FnOnce(
-        i64,
-        u64,
-    ) -> Result<frankenterm_core::wezterm::WeztermHandle, SnapshotRestoreAbort>,
+    AuthenticateMux:
+        FnOnce(i64, u64) -> Result<frankenterm_core::wezterm::WeztermHandle, SnapshotRestoreAbort>,
 {
     let authenticated_mux = authenticate_mux(checkpoint_id, options.wezterm_timeout_secs)?;
     let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
@@ -25982,7 +25806,7 @@ where
             checkpoint_id,
             RestoreDiagnosticCode::OperationLockUnavailable,
         )
-            .with_hint("Wait for the other snapshot restore to finish, then retry.")
+        .with_hint("Wait for the other snapshot restore to finish, then retry.")
     })?;
 
     let restore_cx = cx.clone();
@@ -26065,18 +25889,16 @@ fn restart_plan_lines(options: RestartWorkflowOptions) -> Vec<String> {
             "  Hypothetical execution would require {RESTART_ACKNOWLEDGEMENT_FLAG}; provided={}",
             options.acknowledge_process_and_scrollback_loss
         ),
-        format!(
-            "  Session continuity: incomplete; {SESSION_CONTINUITY_INCOMPLETE_REASON}"
-        ),
+        format!("  Session continuity: incomplete; {SESSION_CONTINUITY_INCOMPLETE_REASON}"),
         "  No snapshot, process discovery, signal, or mux mutation will run.".to_string(),
     ];
     if !options.skip_restore {
         lines.push(format!(
             "  Scrollback replay: {SCROLLBACK_REPLAY_DISABLED_REASON}"
         ));
-        lines.push(
-            format!("  Process restoration: {PROCESS_RESTORATION_DISABLED_REASON}"),
-        );
+        lines.push(format!(
+            "  Process restoration: {PROCESS_RESTORATION_DISABLED_REASON}"
+        ));
     }
     lines.push(
         "Dry-run complete; no workspace, snapshot, process, signal, or mux mutation was performed."
@@ -26173,10 +25995,7 @@ fn dispatch_static_restart(command: Option<&Commands>) -> anyhow::Result<bool> {
     };
 
     let output_format = resolve_prepare_output_format(format);
-    let emit_json = matches!(
-        output_format,
-        frankenterm_core::output::OutputFormat::Json
-    );
+    let emit_json = matches!(output_format, frankenterm_core::output::OutputFormat::Json);
     let restart_options = RestartWorkflowOptions {
         stop_timeout_secs: *stop_timeout,
         start_timeout_secs: *start_timeout,
@@ -26250,9 +26069,8 @@ async fn release_restore_operation_lock(
 ) -> anyhow::Result<()> {
     // Cleanup must get an independent chance to release the file lock even if
     // the caller's operation context was cancelled after a durable mutation.
-    let cleanup_cx = frankenterm_core::cx::Cx::for_request_with_budget(
-        frankenterm_core::cx::Budget::MINIMAL,
-    );
+    let cleanup_cx =
+        frankenterm_core::cx::Cx::for_request_with_budget(frankenterm_core::cx::Budget::MINIMAL);
     run_cli_blocking_with_cx(&cleanup_cx, "restore operation-lock cleanup", move || {
         drop(lock);
         Ok(())
@@ -27046,20 +26864,18 @@ fn validate_event_cursor_token_parts(
     cursor_scope: Option<&str>,
 ) -> Result<(), &'static str> {
     match (cursor, cursor_epoch, cursor_scope) {
-        (Some(_), None, _) => Err(
-            "Invalid cursor: --cursor-epoch and --cursor-scope are required with --cursor",
-        ),
-        (Some(_), Some(_), None) => {
-            Err("Invalid cursor: --cursor-scope is required with --cursor")
+        (Some(_), None, _) => {
+            Err("Invalid cursor: --cursor-epoch and --cursor-scope are required with --cursor")
         }
+        (Some(_), Some(_), None) => Err("Invalid cursor: --cursor-scope is required with --cursor"),
         (None, Some(_), _) => Err("Invalid cursor: --cursor-epoch requires --cursor"),
         (None, None, Some(_)) => Err("Invalid cursor: --cursor-scope requires --cursor"),
-        (Some(_), Some(epoch), Some(_)) if !event_cursor_epoch_is_canonical(epoch) => Err(
-            "Invalid --cursor-epoch: expected exactly 32 lowercase hexadecimal characters",
-        ),
-        (Some(_), Some(_), Some(scope)) if !event_cursor_scope_is_canonical(scope) => Err(
-            "Invalid --cursor-scope: expected exactly 64 lowercase hexadecimal characters",
-        ),
+        (Some(_), Some(epoch), Some(_)) if !event_cursor_epoch_is_canonical(epoch) => {
+            Err("Invalid --cursor-epoch: expected exactly 32 lowercase hexadecimal characters")
+        }
+        (Some(_), Some(_), Some(scope)) if !event_cursor_scope_is_canonical(scope) => {
+            Err("Invalid --cursor-scope: expected exactly 64 lowercase hexadecimal characters")
+        }
         _ => Ok(()),
     }
 }
@@ -27242,9 +27058,7 @@ fn normalize_watch_severity(value: Option<&str>) -> Result<Option<String>, &'sta
         Some(value) if value.eq_ignore_ascii_case("info") => Ok(Some("info".to_string())),
         Some(value) if value.eq_ignore_ascii_case("warning") => Ok(Some("warning".to_string())),
         Some(value) if value.eq_ignore_ascii_case("error") => Ok(Some("error".to_string())),
-        Some(value) if value.eq_ignore_ascii_case("critical") => {
-            Ok(Some("critical".to_string()))
-        }
+        Some(value) if value.eq_ignore_ascii_case("critical") => Ok(Some("critical".to_string())),
         Some(_) => Err("Invalid --severity: expected info, warning, error, or critical"),
     }
 }
@@ -27522,15 +27336,11 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatchEventClaimDelivery {
-    Delivered {
-        flushed_at: std::time::Instant,
-    },
+    Delivered { flushed_at: std::time::Instant },
     PipeClosed,
     LeasedUntil { expires_at_ms: i64 },
     AlreadyHandledOrMissing,
-    FinalizationLost {
-        flushed_at: std::time::Instant,
-    },
+    FinalizationLost { flushed_at: std::time::Instant },
 }
 
 impl WatchEventClaimDelivery {
@@ -27622,11 +27432,7 @@ where
     let started_at = std::time::Instant::now();
     loop {
         watch_checkpoint(cx, operation)?;
-        let remaining = watch_delay_remaining_at(
-            started_at,
-            delay,
-            std::time::Instant::now(),
-        );
+        let remaining = watch_delay_remaining_at(started_at, delay, std::time::Instant::now());
         if remaining.is_zero() {
             break;
         }
@@ -27669,10 +27475,7 @@ fn watch_claim_retry_delay(
     expires_at_ms: i64,
     poll: std::time::Duration,
 ) -> std::time::Duration {
-    let until_expiry_ms = expires_at_ms
-        .saturating_sub(now_ms)
-        .try_into()
-        .unwrap_or(0);
+    let until_expiry_ms = expires_at_ms.saturating_sub(now_ms).try_into().unwrap_or(0);
     poll.min(std::time::Duration::from_millis(until_expiry_ms))
 }
 
@@ -27706,7 +27509,10 @@ fn annotate_watch_event_claim_delivery(
         "cursor_commit_state".to_string(),
         serde_json::Value::String("pending_finalize".to_string()),
     );
-    object.insert("pending_finalize".to_string(), serde_json::Value::Bool(true));
+    object.insert(
+        "pending_finalize".to_string(),
+        serde_json::Value::Bool(true),
+    );
     object.insert(
         "candidate_cursor".to_string(),
         serde_json::Value::from(event_id),
@@ -27896,11 +27702,9 @@ async fn resolve_watch_claim_skip_with_cx(
         Some(event) if event.id == event_id && event.handled_at.is_some() => {
             Ok(WatchClaimSkipResolution::Handled)
         }
-        Some(event) if event.id == event_id => Ok(WatchClaimSkipResolution::Unhandled(
-            format!(
-                "event {event_id} remained unhandled after delivery reservation classified it as handled or missing"
-            ),
-        )),
+        Some(event) if event.id == event_id => Ok(WatchClaimSkipResolution::Unhandled(format!(
+            "event {event_id} remained unhandled after delivery reservation classified it as handled or missing"
+        ))),
         Some(next) => Ok(WatchClaimSkipResolution::Inconsistent(format!(
             "event {event_id} is missing without retention evidence; the next durable event is {}",
             next.id
@@ -28308,13 +28112,7 @@ fn update_await_quiescence_set_from_snapshot(
         // Unlike a rule occurrence, quiescence is a level-triggered state, not
         // a historical latch. New output must be able to turn a previously
         // satisfied condition false before the composite is evaluated.
-        *is_met = refresh_await_condition_state(
-            condition,
-            *is_met,
-            *last_output_at,
-            now,
-            config,
-        );
+        *is_met = refresh_await_condition_state(condition, *is_met, *last_output_at, now, config);
     }
     Ok(())
 }
@@ -28440,8 +28238,7 @@ fn emit_watch_heartbeat_if_due(
         return Ok(true);
     }
 
-    let heartbeat_record =
-        watch_heartbeat_ndjson(cursor, cursor_epoch, cursor_scope, now_ms_i64());
+    let heartbeat_record = watch_heartbeat_ndjson(cursor, cursor_epoch, cursor_scope, now_ms_i64());
     let continue_writing = {
         let mut lock = stdout.lock();
         write_ndjson_line(&mut lock, &heartbeat_record)?
@@ -28488,9 +28285,7 @@ fn event_retention_status_reason(
     match status {
         EventRetentionStatus::CompleteNoPruning => "complete",
         EventRetentionStatus::Pruned { .. } => "retention_pruned",
-        EventRetentionStatus::LegacyHistoryUnavailable { .. } => {
-            "legacy_history_unavailable"
-        }
+        EventRetentionStatus::LegacyHistoryUnavailable { .. } => "legacy_history_unavailable",
         EventRetentionStatus::CursorEpochMismatch => "cursor_epoch_mismatch",
         EventRetentionStatus::CursorAheadOfHighWater { .. } => "cursor_ahead_of_high_water",
     }
@@ -28525,10 +28320,7 @@ fn event_cursor_discontinuity_ndjson(
     requested_scope: &str,
 ) -> Option<serde_json::Value> {
     use frankenterm_core::storage::EventRetentionStatus;
-    if matches!(
-        &check.status,
-        EventRetentionStatus::CompleteNoPruning
-    ) {
+    if matches!(&check.status, EventRetentionStatus::CompleteNoPruning) {
         return None;
     }
     let mut record = serde_json::json!({
@@ -28696,8 +28488,7 @@ fn write_ipc_transport_gap_once<W: std::io::Write>(
     if *gap_open {
         return Ok(true);
     }
-    let record =
-        watch_ipc_transport_gap_ndjson(cursor, cursor_epoch, cursor_scope, reason, now);
+    let record = watch_ipc_transport_gap_ndjson(cursor, cursor_epoch, cursor_scope, reason, now);
     let continue_writing = write_ndjson_line(writer, &record)?;
     if continue_writing {
         *gap_open = true;
@@ -28721,13 +28512,7 @@ fn write_ipc_protocol_fault_once<W: std::io::Write>(
     if *gap_open {
         return Ok(true);
     }
-    let record = watch_ipc_protocol_fault_ndjson(
-        cursor,
-        cursor_epoch,
-        cursor_scope,
-        fault,
-        now,
-    );
+    let record = watch_ipc_protocol_fault_ndjson(cursor, cursor_epoch, cursor_scope, fault, now);
     let continue_writing = write_ndjson_line(writer, &record)?;
     if continue_writing {
         *gap_open = true;
@@ -28899,8 +28684,7 @@ impl IpcFallbackDiagnosticKind {
 }
 
 #[cfg(unix)]
-const IPC_FALLBACK_DIAGNOSTIC_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(30);
+const IPC_FALLBACK_DIAGNOSTIC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Fixed-size transport counters plus one timestamp/suppression bucket per
 /// category. Nothing here grows with session duration, reconnect count, or
@@ -29097,9 +28881,7 @@ fn ipc_event_is_duplicate(cursor: Option<i64>, current_cursor: Option<i64>) -> b
 /// cursorless records admitted by the server contract are the two live-only
 /// pane lifecycle signals; they cannot be reconstructed by the DB backfill.
 #[cfg(unix)]
-fn ipc_event_cursor(
-    value: &serde_json::Value,
-) -> Result<Option<i64>, IpcRelayProtocolFault> {
+fn ipc_event_cursor(value: &serde_json::Value) -> Result<Option<i64>, IpcRelayProtocolFault> {
     const EVENT_KEYS: [&str; 14] = [
         "type",
         "cursor",
@@ -29150,7 +28932,9 @@ fn ipc_event_cursor(
                 && value
                     .get("agent_type")
                     .is_some_and(serde_json::Value::is_null)
-                && value.get("severity").is_some_and(serde_json::Value::is_null)
+                && value
+                    .get("severity")
+                    .is_some_and(serde_json::Value::is_null)
                 && value
                     .get("confidence")
                     .is_some_and(serde_json::Value::is_null)
@@ -29177,7 +28961,9 @@ fn ipc_event_cursor(
                 && value
                     .get("agent_type")
                     .is_some_and(serde_json::Value::is_null)
-                && value.get("severity").is_some_and(serde_json::Value::is_null)
+                && value
+                    .get("severity")
+                    .is_some_and(serde_json::Value::is_null)
                 && value
                     .get("confidence")
                     .is_some_and(serde_json::Value::is_null)
@@ -29208,9 +28994,7 @@ fn ipc_event_cursor(
         && value
             .get("severity")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|severity| {
-                matches!(severity, "info" | "warning" | "error" | "critical")
-            })
+            .is_some_and(|severity| matches!(severity, "info" | "warning" | "error" | "critical"))
         && value
             .get("confidence")
             .and_then(serde_json::Value::as_f64)
@@ -29228,9 +29012,7 @@ fn ipc_event_cursor(
         {
             Ok(Some(cursor))
         }
-        (false, _, _) if persisted_shape_is_valid => {
-            Err(IpcRelayProtocolFault::InvalidEventCursor)
-        }
+        (false, _, _) if persisted_shape_is_valid => Err(IpcRelayProtocolFault::InvalidEventCursor),
         _ => Err(IpcRelayProtocolFault::InvalidRecordShape),
     }
 }
@@ -29248,9 +29030,7 @@ fn json_is_null_or_string(value: Option<&serde_json::Value>) -> bool {
 }
 
 #[cfg(unix)]
-fn validate_ipc_heartbeat_record(
-    value: &serde_json::Value,
-) -> Result<(), IpcRelayProtocolFault> {
+fn validate_ipc_heartbeat_record(value: &serde_json::Value) -> Result<(), IpcRelayProtocolFault> {
     const HEARTBEAT_KEYS: [&str; 3] = ["type", "cursor", "now"];
     let valid = json_object_has_exact_keys(value, &HEARTBEAT_KEYS)
         && value.get("type").and_then(serde_json::Value::as_str) == Some("heartbeat")
@@ -29300,17 +29080,15 @@ fn ipc_gap_with_follower_cursor(
     current_cursor_scope: Option<&str>,
 ) -> serde_json::Value {
     value["cursor"] = current_cursor.map_or(serde_json::Value::Null, serde_json::Value::from);
-    value["cursor_epoch"] = current_cursor_epoch
-        .map_or(serde_json::Value::Null, serde_json::Value::from);
-    value["cursor_scope"] = current_cursor_scope
-        .map_or(serde_json::Value::Null, serde_json::Value::from);
+    value["cursor_epoch"] =
+        current_cursor_epoch.map_or(serde_json::Value::Null, serde_json::Value::from);
+    value["cursor_scope"] =
+        current_cursor_scope.map_or(serde_json::Value::Null, serde_json::Value::from);
     value
 }
 
 #[cfg(unix)]
-fn decode_ipc_relay_record(
-    line: &str,
-) -> Result<serde_json::Value, IpcRelayProtocolFault> {
+fn decode_ipc_relay_record(line: &str) -> Result<serde_json::Value, IpcRelayProtocolFault> {
     serde_json::from_str(line).map_err(|_| IpcRelayProtocolFault::MalformedJson)
 }
 
@@ -29395,12 +29173,12 @@ async fn relay_ipc_event_line(
             // claims; they remain best-effort live notifications.
             watch_checkpoint(cx, "IPC lifecycle output")?;
             let mut value = value;
-            value["cursor"] = (*current_cursor)
-                .map_or(serde_json::Value::Null, serde_json::Value::from);
-            value["cursor_epoch"] = current_cursor_epoch
-                .map_or(serde_json::Value::Null, serde_json::Value::from);
-            value["cursor_scope"] = current_cursor_scope
-                .map_or(serde_json::Value::Null, serde_json::Value::from);
+            value["cursor"] =
+                (*current_cursor).map_or(serde_json::Value::Null, serde_json::Value::from);
+            value["cursor_epoch"] =
+                current_cursor_epoch.map_or(serde_json::Value::Null, serde_json::Value::from);
+            value["cursor_scope"] =
+                current_cursor_scope.map_or(serde_json::Value::Null, serde_json::Value::from);
             let mut lock = stdout.lock();
             let continue_writing = write_ndjson_line(&mut lock, &value)?;
             drop(lock);
@@ -29969,7 +29747,10 @@ mod watch_events_tests {
         assert!(!hostile_error.contains('\u{2028}'));
         assert!(!hostile_error.contains('\u{202e}'));
         assert!(!hostile_error.contains('\u{206a}'));
-        assert!(hostile_error.len() <= 2_200, "diagnostic was not byte-bounded");
+        assert!(
+            hostile_error.len() <= 2_200,
+            "diagnostic was not byte-bounded"
+        );
 
         assert_eq!(
             watch_core_failure_source(&frankenterm_core::Error::Cancelled(
@@ -29985,9 +29766,9 @@ mod watch_events_tests {
             WatchFailureSource::Cancellation
         );
         assert_eq!(
-            watch_core_failure_source(&frankenterm_core::Error::Io(
-                std::io::Error::other("transport failed")
-            )),
+            watch_core_failure_source(&frankenterm_core::Error::Io(std::io::Error::other(
+                "transport failed"
+            ))),
             WatchFailureSource::Degradation
         );
     }
@@ -30035,11 +29816,7 @@ mod watch_events_tests {
                 let (lock, wake) = &*worker_gate;
                 let state = lock.lock().expect("lock blocking-delay test gate");
                 let (mut state, timeout) = wake
-                    .wait_timeout_while(
-                        state,
-                        std::time::Duration::from_secs(2),
-                        |state| !state.0,
-                    )
+                    .wait_timeout_while(state, std::time::Duration::from_secs(2), |state| !state.0)
                     .expect("wait for blocking-delay test release");
                 // The timeout is a test-failure escape hatch, not a success
                 // path: the assertion below requires the await to return while
@@ -30110,12 +29887,7 @@ mod watch_events_tests {
         e.extracted = Some(serde_json::json!({"key": "AKIAIOSFODNN7EXAMPLE", "count": 3}));
         let redacted =
             frankenterm_core::export::redact_event(e, &frankenterm_core::redactor::Redactor::new());
-        let v = watch_event_ndjson(
-            &redacted,
-            Some(42),
-            TEST_CURSOR_EPOCH,
-            TEST_CURSOR_SCOPE,
-        );
+        let v = watch_event_ndjson(&redacted, Some(42), TEST_CURSOR_EPOCH, TEST_CURSOR_SCOPE);
         assert_eq!(v["type"], "event");
         assert_eq!(v["cursor"], 42);
         assert_eq!(v["cursor_epoch"], TEST_CURSOR_EPOCH);
@@ -30284,7 +30056,9 @@ mod watch_events_tests {
                 serde_json::Value::Null
             );
             assert!(
-                !partial_or_malformed.to_string().contains("AKIAIOSFODNN7EXAMPLE"),
+                !partial_or_malformed
+                    .to_string()
+                    .contains("AKIAIOSFODNN7EXAMPLE"),
                 "malformed cursor authority must not be reflected"
             );
         }
@@ -30363,27 +30137,18 @@ mod watch_events_tests {
             success_record["cursor"] = serde_json::Value::from(0);
             success_record["cursor_epoch"] =
                 serde_json::Value::String(TEST_CURSOR_EPOCH.to_string());
-            let success = deliver_claimed_watch_event(
-                &cx,
-                &storage,
-                success_id,
-                success_record,
-                |record| write_ndjson_line(&mut success_output, record),
-            )
-            .await
-            .expect("deliver claimed event");
-            assert!(matches!(
-                success,
-                WatchEventClaimDelivery::Delivered { .. }
-            ));
-            let emitted: serde_json::Value = serde_json::from_slice(&success_output)
-                .expect("parse claimed NDJSON record");
+            let success =
+                deliver_claimed_watch_event(&cx, &storage, success_id, success_record, |record| {
+                    write_ndjson_line(&mut success_output, record)
+                })
+                .await
+                .expect("deliver claimed event");
+            assert!(matches!(success, WatchEventClaimDelivery::Delivered { .. }));
+            let emitted: serde_json::Value =
+                serde_json::from_slice(&success_output).expect("parse claimed NDJSON record");
             assert_eq!(emitted["handled"].as_bool(), Some(false));
             assert!(emitted["handled_status"].is_null());
-            assert_eq!(
-                emitted["claim_delivery"],
-                "finalize_after_output_flush"
-            );
+            assert_eq!(emitted["claim_delivery"], "finalize_after_output_flush");
             assert_eq!(emitted["cursor_commit_state"], "pending_finalize");
             assert_eq!(emitted["pending_finalize"], true);
             assert_eq!(emitted["cursor"], 0);
@@ -30398,7 +30163,10 @@ mod watch_events_tests {
                 .expect("finalized event remains queryable");
             assert_eq!(stored.id, success_id);
             assert!(stored.handled_at.is_some());
-            assert_eq!(stored.handled_status.as_deref(), Some(WATCH_EVENTS_CLAIM_STATUS));
+            assert_eq!(
+                stored.handled_status.as_deref(),
+                Some(WATCH_EVENTS_CLAIM_STATUS)
+            );
 
             let write_failure_id = event_ids[1];
             let write_error = deliver_claimed_watch_event(
@@ -30406,9 +30174,7 @@ mod watch_events_tests {
                 &storage,
                 write_failure_id,
                 ipc_persisted_event(write_failure_id),
-                |_record| {
-                    Err(std::io::Error::other("injected watch write failure"))
-                },
+                |_record| Err(std::io::Error::other("injected watch write failure")),
             )
             .await
             .expect_err("write failure must propagate");
@@ -30644,9 +30410,9 @@ mod watch_events_tests {
                 .expect("cancelled closed-pipe writer must release immediately");
             let reacquired = match reacquired {
                 frankenterm_core::storage::EventDeliveryReservation::Acquired(lease) => lease,
-                other => panic!(
-                    "cancelled closed-pipe event was not immediately reacquired: {other:?}"
-                ),
+                other => {
+                    panic!("cancelled closed-pipe event was not immediately reacquired: {other:?}")
+                }
             };
             assert!(
                 storage
@@ -30688,9 +30454,7 @@ mod watch_events_tests {
                 .expect("cancelled error writer must release immediately");
             let reacquired = match reacquired {
                 frankenterm_core::storage::EventDeliveryReservation::Acquired(lease) => lease,
-                other => panic!(
-                    "cancelled error event was not immediately reacquired: {other:?}"
-                ),
+                other => panic!("cancelled error event was not immediately reacquired: {other:?}"),
             };
             assert!(
                 storage
@@ -30699,7 +30463,10 @@ mod watch_events_tests {
                     .expect("release cancellation error verification lease")
             );
 
-            storage.shutdown().await.expect("shutdown watch claim storage");
+            storage
+                .shutdown()
+                .await
+                .expect("shutdown watch claim storage");
         });
     }
 
@@ -30718,11 +30485,7 @@ mod watch_events_tests {
         assert_eq!(last_emit, flushed_at);
         assert_eq!(last_event_emit, Some(flushed_at));
         assert!(
-            watch_heartbeat_is_due(
-                1_000,
-                std::time::Duration::from_secs(1),
-                last_emit,
-            ),
+            watch_heartbeat_is_due(1_000, std::time::Duration::from_secs(1), last_emit,),
             "heartbeat accounting must start at the completed output flush"
         );
         assert_eq!(
@@ -30833,11 +30596,7 @@ mod watch_events_tests {
         ));
         assert_eq!(met, [true, false, false]);
         assert!(
-            !apply_await_rule_event(
-                &conditions,
-                &mut met,
-                &ev(11, "build.a", "info", None)
-            ),
+            !apply_await_rule_event(&conditions, &mut met, &ev(11, "build.a", "info", None)),
             "a duplicate occurrence must not create a second hidden latch"
         );
         assert!(apply_await_rule_event(
@@ -30870,26 +30629,14 @@ mod watch_events_tests {
         let mut met = vec![false; any.len()];
         let activity = std::collections::HashMap::from([(9, None)]);
         assert_eq!(
-            update_await_quiescence_set_from_snapshot(
-                &config,
-                &any,
-                &mut met,
-                &activity,
-                1_000,
-            ),
+            update_await_quiescence_set_from_snapshot(&config, &any, &mut met, &activity, 1_000,),
             Err(7),
             "a missing pane is not the same as an existing pane with no output"
         );
 
         let activity = std::collections::HashMap::from([(7, Some(990)), (9, None)]);
-        update_await_quiescence_set_from_snapshot(
-            &config,
-            &any,
-            &mut met,
-            &activity,
-            1_000,
-        )
-        .expect("all pane IDs exist");
+        update_await_quiescence_set_from_snapshot(&config, &any, &mut met, &activity, 1_000)
+            .expect("all pane IDs exist");
         assert_eq!(met, [true, false]);
     }
 
@@ -30936,21 +30683,10 @@ mod watch_events_tests {
             pane_id: 7,
             idle_ms: Some(500),
         };
-        let quiet = refresh_await_condition_state(
-            &quiescence,
-            false,
-            Some(1_000),
-            1_500,
-            &config,
-        );
+        let quiet = refresh_await_condition_state(&quiescence, false, Some(1_000), 1_500, &config);
         assert!(quiet);
-        let resumed = refresh_await_condition_state(
-            &quiescence,
-            quiet,
-            Some(1_499),
-            1_500,
-            &config,
-        );
+        let resumed =
+            refresh_await_condition_state(&quiescence, quiet, Some(1_499), 1_500, &config);
         assert!(
             !resumed,
             "new pane output must clear a previously met quiescence condition"
@@ -31075,7 +30811,10 @@ mod watch_events_tests {
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
-            Err(std::io::Error::new(self.error_kind, "injected flush failure"))
+            Err(std::io::Error::new(
+                self.error_kind,
+                "injected flush failure",
+            ))
         }
     }
 
@@ -31107,7 +30846,10 @@ mod watch_events_tests {
 
     impl std::io::Write for WriteErrorWriter {
         fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::new(self.error_kind, "injected write failure"))
+            Err(std::io::Error::new(
+                self.error_kind,
+                "injected write failure",
+            ))
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
@@ -31160,10 +30902,7 @@ mod watch_events_tests {
             );
             assert_eq!(gap["live_only_signal_recovery"], "unavailable");
             assert_eq!(gap["live_only_signals_at_risk"][0], "pane_discovered");
-            assert_eq!(
-                gap["live_only_signals_at_risk"][1],
-                "pane_disappeared"
-            );
+            assert_eq!(gap["live_only_signals_at_risk"][1], "pane_disappeared");
         }
 
         let mut output = Vec::new();
@@ -31295,8 +31034,8 @@ mod watch_events_tests {
         let mut stream_validated = false;
 
         for now in [12_345, 12_346] {
-            let fault = decode_ipc_relay_record("{")
-                .expect_err("truncated JSON must be a protocol fault");
+            let fault =
+                decode_ipc_relay_record("{").expect_err("truncated JSON must be a protocol fault");
             assert_eq!(fault, IpcRelayProtocolFault::MalformedJson);
             assert!(
                 write_ipc_protocol_fault_once(
@@ -31319,16 +31058,18 @@ mod watch_events_tests {
             &mut stream_validated,
             &mut gap_open,
         ));
-        assert!(write_ipc_protocol_fault_once(
-            &mut output,
-            &mut gap_open,
-            Some(18),
-            Some(TEST_CURSOR_EPOCH),
-            Some(TEST_CURSOR_SCOPE),
-            IpcRelayProtocolFault::MalformedJson,
-            12_347,
-        )
-        .unwrap());
+        assert!(
+            write_ipc_protocol_fault_once(
+                &mut output,
+                &mut gap_open,
+                Some(18),
+                Some(TEST_CURSOR_EPOCH),
+                Some(TEST_CURSOR_SCOPE),
+                IpcRelayProtocolFault::MalformedJson,
+                12_347,
+            )
+            .unwrap()
+        );
         assert!(output.len() > first_interval_len);
         assert_eq!(output.iter().filter(|&&byte| byte == b'\n').count(), 2);
     }
@@ -31829,12 +31570,8 @@ mod watch_events_tests {
             Ok(())
         );
         assert!(validate_event_cursor_token_parts(Some(7), None, None).is_err());
-        assert!(
-            validate_event_cursor_token_parts(Some(7), Some(TEST_CURSOR_EPOCH), None).is_err()
-        );
-        assert!(
-            validate_event_cursor_token_parts(None, Some(TEST_CURSOR_EPOCH), None).is_err()
-        );
+        assert!(validate_event_cursor_token_parts(Some(7), Some(TEST_CURSOR_EPOCH), None).is_err());
+        assert!(validate_event_cursor_token_parts(None, Some(TEST_CURSOR_EPOCH), None).is_err());
         assert!(validate_event_cursor_token_parts(None, None, Some(TEST_CURSOR_SCOPE)).is_err());
         assert!(
             validate_event_cursor_token_parts(
@@ -31845,20 +31582,12 @@ mod watch_events_tests {
             .is_err()
         );
         assert!(
-            validate_event_cursor_token_parts(
-                Some(7),
-                Some("abc"),
-                Some(TEST_CURSOR_SCOPE),
-            )
-            .is_err()
+            validate_event_cursor_token_parts(Some(7), Some("abc"), Some(TEST_CURSOR_SCOPE),)
+                .is_err()
         );
         assert!(
-            validate_event_cursor_token_parts(
-                Some(7),
-                Some(TEST_CURSOR_EPOCH),
-                Some("ABC"),
-            )
-            .is_err()
+            validate_event_cursor_token_parts(Some(7), Some(TEST_CURSOR_EPOCH), Some("ABC"),)
+                .is_err()
         );
     }
 
@@ -31877,15 +31606,10 @@ mod watch_events_tests {
             watch_scope,
             watch_events_cursor_scope(None, Some("warning"), None, false, false)
         );
-        assert!(
-            validate_event_cursor_scope_matches(Some(&watch_scope), &watch_scope).is_ok()
-        );
-        assert!(
-            validate_event_cursor_scope_matches(Some(&events_scope), &watch_scope).is_err()
-        );
+        assert!(validate_event_cursor_scope_matches(Some(&watch_scope), &watch_scope).is_ok());
+        assert!(validate_event_cursor_scope_matches(Some(&events_scope), &watch_scope).is_err());
 
-        let mut config =
-            frankenterm_core::agent_pane_state::AgentDetectionConfig::default();
+        let mut config = frankenterm_core::agent_pane_state::AgentDetectionConfig::default();
         config.idle_silence_ms = 500;
         let implicit = [AwaitCondition::Quiescence {
             pane_id: 7,
@@ -31960,11 +31684,7 @@ mod watch_events_tests {
                 },
             },
         };
-        let value = event_cursor_discontinuity_ndjson(
-            &check,
-            TEST_CURSOR_EPOCH,
-            TEST_CURSOR_SCOPE,
-        )
+        let value = event_cursor_discontinuity_ndjson(&check, TEST_CURSOR_EPOCH, TEST_CURSOR_SCOPE)
             .expect("pruning is terminal");
         assert_eq!(value["type"], "cursor_discontinuity");
         assert_eq!(value["terminal"], true);
@@ -33878,9 +33598,7 @@ fn semaphore_acquire_failure(
 ) -> frankenterm_core::Error {
     let source = match error {
         frankenterm_core::runtime_async::AcquireError::Closed => {
-            frankenterm_core::error::RuntimeOperationSource::Backend(
-                "semaphore closed".to_string(),
-            )
+            frankenterm_core::error::RuntimeOperationSource::Backend("semaphore closed".to_string())
         }
         frankenterm_core::runtime_async::AcquireError::PolledAfterCompletion => {
             frankenterm_core::error::RuntimeOperationSource::Backend(
@@ -33990,7 +33708,11 @@ fn capability_context_failure_maps_every_cancel_kind_without_reason_text() {
         (CancelKind::User, true, "robot operation cancelled"),
         (CancelKind::FailFast, true, "robot operation cancelled"),
         (CancelKind::RaceLost, true, "robot operation cancelled"),
-        (CancelKind::ParentCancelled, true, "robot operation cancelled"),
+        (
+            CancelKind::ParentCancelled,
+            true,
+            "robot operation cancelled",
+        ),
         (
             CancelKind::ResourceUnavailable,
             true,
@@ -34003,11 +33725,8 @@ fn capability_context_failure_maps_every_cancel_kind_without_reason_text() {
     for (kind, expected_cancelled, expected_detail) in cases {
         let cx = frankenterm_core::cx::for_testing();
         cx.cancel_with(kind, Some("SECRET cancellation reason"));
-        let error = capability_context_failure(
-            "test.context",
-            &cx,
-            CapabilityContextSite::RobotOperation,
-        );
+        let error =
+            capability_context_failure("test.context", &cx, CapabilityContextSite::RobotOperation);
         let frankenterm_core::Error::RuntimeOperation { operation, source } = error else {
             panic!("context failure must remain a runtime operation");
         };
@@ -34090,11 +33809,7 @@ fn session_recovery_timeout_failure_preserves_budget_vs_operation_timeout() {
         frankenterm_core::outcome::CancelKind::User,
         Some("SECRET session recovery cancellation reason"),
     );
-    assert_timeout_failure(
-        &cancelled,
-        true,
-        "session recovery operation cancelled",
-    );
+    assert_timeout_failure(&cancelled, true, "session recovery operation cancelled");
 }
 
 async fn robot_list_panes_on_runtime_task(
@@ -34102,17 +33817,15 @@ async fn robot_list_panes_on_runtime_task(
 ) -> frankenterm_core::Result<Vec<frankenterm_core::wezterm::PaneInfo>> {
     let parent_cx =
         frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-    let task = frankenterm_core::runtime_async::task::spawn_with_cx(
-        &parent_cx,
-        move |cx| async move {
+    let task =
+        frankenterm_core::runtime_async::task::spawn_with_cx(&parent_cx, move |cx| async move {
             runtime_context_preflight(
                 "robot.list_panes.context",
                 &cx,
                 CapabilityContextSite::RobotOperation,
             )?;
             wezterm.list_panes_with_cx(&cx).await
-        },
-    );
+        });
     task.await
         .map_err(|error| runtime_task_join_failure("robot.list_panes.await_task", error))?
 }
@@ -34124,17 +33837,15 @@ async fn robot_get_text_on_runtime_task(
 ) -> frankenterm_core::Result<String> {
     let parent_cx =
         frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-    let task = frankenterm_core::runtime_async::task::spawn_with_cx(
-        &parent_cx,
-        move |cx| async move {
+    let task =
+        frankenterm_core::runtime_async::task::spawn_with_cx(&parent_cx, move |cx| async move {
             runtime_context_preflight(
                 "robot.get_text.context",
                 &cx,
                 CapabilityContextSite::RobotOperation,
             )?;
             wezterm.get_text_with_cx(&cx, pane_id, escapes).await
-        },
-    );
+        });
     task.await
         .map_err(|error| runtime_task_join_failure("robot.get_text.await_task", error))?
 }
@@ -34145,17 +33856,15 @@ async fn robot_get_semantic_snapshot_on_runtime_task(
 ) -> frankenterm_core::Result<frankenterm_core::wezterm::MuxSemanticSnapshot> {
     let parent_cx =
         frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-    let task = frankenterm_core::runtime_async::task::spawn_with_cx(
-        &parent_cx,
-        move |cx| async move {
+    let task =
+        frankenterm_core::runtime_async::task::spawn_with_cx(&parent_cx, move |cx| async move {
             runtime_context_preflight(
                 "robot.dom.context",
                 &cx,
                 CapabilityContextSite::RobotOperation,
             )?;
             wezterm.get_semantic_zones_with_cx(&cx, pane_id).await
-        },
-    );
+        });
     task.await
         .map_err(|error| runtime_task_join_failure("robot.dom.await_task", error))?
 }
@@ -34215,16 +33924,17 @@ async fn batch_get_pane_text(
         let task = frankenterm_core::runtime_async::task::spawn_with_cx(
             &parent_cx,
             move |child_cx| async move {
-                let _permit = semaphore
-                    .acquire_owned_with_cx(&child_cx)
-                    .await
-                    .map_err(|error| {
-                        semaphore_acquire_failure(
-                            "batch_get_text.acquire_permit",
-                            &child_cx,
-                            error,
-                        )
-                    })?;
+                let _permit =
+                    semaphore
+                        .acquire_owned_with_cx(&child_cx)
+                        .await
+                        .map_err(|error| {
+                            semaphore_acquire_failure(
+                                "batch_get_text.acquire_permit",
+                                &child_cx,
+                                error,
+                            )
+                        })?;
                 wezterm.get_text_with_cx(&child_cx, pane_id, escapes).await
             },
         );
@@ -35100,9 +34810,7 @@ impl AsupersyncWebhookTransport {
 
         if let Some(reason) = cx.root_cancel_cause() {
             return Some(match reason.kind {
-                CancelKind::Timeout | CancelKind::Deadline => {
-                    DeliveryResult::deadline_exceeded()
-                }
+                CancelKind::Timeout | CancelKind::Deadline => DeliveryResult::deadline_exceeded(),
                 CancelKind::PollQuota => DeliveryResult::poll_budget_exhausted(),
                 CancelKind::CostBudget => DeliveryResult::cost_budget_exhausted(),
                 CancelKind::User
@@ -35164,20 +34872,17 @@ impl AsupersyncWebhookTransport {
             // the exact caller Cx instead of treating the client discriminant
             // as authoritative on its own.
             ClientError::DeadlineExceeded => match cx.checkpoint() {
-                Ok(()) => Self::capability_failure(cx)
-                    .unwrap_or_else(DeliveryResult::transport_failure),
+                Ok(()) => {
+                    Self::capability_failure(cx).unwrap_or_else(DeliveryResult::transport_failure)
+                }
                 Err(error) => Self::checkpoint_failure(cx, &error),
             },
             // Cancellation initiated through the Cx may have a more precise
             // finite budget class. Never retain or format its free-text cause.
-            ClientError::Cancelled => {
-                match cx.checkpoint() {
-                    Ok(()) => {
-                        Self::capability_failure(cx).unwrap_or_else(DeliveryResult::cancelled)
-                    }
-                    Err(error) => Self::checkpoint_failure(cx, &error),
-                }
-            }
+            ClientError::Cancelled => match cx.checkpoint() {
+                Ok(()) => Self::capability_failure(cx).unwrap_or_else(DeliveryResult::cancelled),
+                Err(error) => Self::checkpoint_failure(cx, &error),
+            },
             // URL, DNS, TLS, protocol, proxy, pool, and I/O details may carry
             // caller-controlled or secret text. Collapse them to the finite
             // transport class without formatting or retaining their payloads.
@@ -35215,9 +34920,7 @@ impl frankenterm_core::webhook::WebhookTransport for EndpointTimeoutThenSuccessW
             dyn std::future::Future<Output = frankenterm_core::webhook::DeliveryResult> + Send + 'a,
         >,
     > {
-        let call = self
-            .calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async move {
             if call == 0 {
                 AsupersyncWebhookTransport::client_failure(
@@ -35310,10 +35013,7 @@ fn asupersync_webhook_capability_failure_maps_every_cancel_kind_without_reason_t
         (CancelKind::User, DeliveryFailureClass::Cancelled),
         (CancelKind::FailFast, DeliveryFailureClass::Cancelled),
         (CancelKind::RaceLost, DeliveryFailureClass::Cancelled),
-        (
-            CancelKind::ParentCancelled,
-            DeliveryFailureClass::Cancelled,
-        ),
+        (CancelKind::ParentCancelled, DeliveryFailureClass::Cancelled),
         (
             CancelKind::ResourceUnavailable,
             DeliveryFailureClass::Cancelled,
@@ -35329,15 +35029,8 @@ fn asupersync_webhook_capability_failure_maps_every_cancel_kind_without_reason_t
             .expect("cancelled Cx must have a finite webhook failure");
         assert_eq!(result.status_code(), 0, "kind: {kind:?}");
         assert!(!result.accepted(), "kind: {kind:?}");
-        assert_eq!(
-            result.failure_class(),
-            Some(expected),
-            "kind: {kind:?}"
-        );
-        assert!(
-            !format!("{result:?}").contains("SECRET"),
-            "kind: {kind:?}"
-        );
+        assert_eq!(result.failure_class(), Some(expected), "kind: {kind:?}");
+        assert!(!format!("{result:?}").contains("SECRET"), "kind: {kind:?}");
     }
 }
 
@@ -35397,13 +35090,10 @@ fn asupersync_webhook_checkpoint_failure_preserves_cleanup_timeout_without_detai
     );
     assert!(!format!("{result:?}").contains("SECRET"));
 
-    let unknown = ContextError::new(ContextErrorKind::Internal)
-        .with_message("SECRET context diagnostic");
+    let unknown =
+        ContextError::new(ContextErrorKind::Internal).with_message("SECRET context diagnostic");
     let result = AsupersyncWebhookTransport::checkpoint_failure(&cx, &unknown);
-    assert_eq!(
-        result.failure_class(),
-        Some(DeliveryFailureClass::Context)
-    );
+    assert_eq!(result.failure_class(), Some(DeliveryFailureClass::Context));
     assert!(!format!("{result:?}").contains("SECRET"));
 }
 
@@ -35466,54 +35156,56 @@ fn endpoint_local_webhook_timeout_does_not_stop_two_endpoint_fanout() {
         .enable_all()
         .build()
         .expect("webhook fanout test runtime");
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(async {
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let transport = EndpointTimeoutThenSuccessWebhookTransport {
-            calls: std::sync::Arc::clone(&calls),
-        };
-        let endpoint = |name: &str| WebhookEndpointConfig {
-            name: name.to_string(),
-            url: format!("https://{name}.invalid/hook"),
-            template: WebhookTemplate::Generic,
-            events: Vec::new(),
-            headers: std::collections::HashMap::new(),
-            enabled: true,
-        };
-        let dispatcher = WebhookDispatcher::new(
-            vec![endpoint("times-out"), endpoint("still-runs")],
-            Box::new(transport),
-        );
-        let payload = frankenterm_core::notifications::NotificationPayload {
-            event_type: "test.webhook".to_string(),
-            pane_id: 7,
-            timestamp: "2026-08-05T00:00:00Z".to_string(),
-            summary: "test".to_string(),
-            description: "test".to_string(),
-            severity: "warning".to_string(),
-            agent_type: "test".to_string(),
-            confidence: 1.0,
-            quick_fix: None,
-            suppressed_since_last: 0,
-        };
-        let cx = frankenterm_core::cx::for_testing();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let transport = EndpointTimeoutThenSuccessWebhookTransport {
+                calls: std::sync::Arc::clone(&calls),
+            };
+            let endpoint = |name: &str| WebhookEndpointConfig {
+                name: name.to_string(),
+                url: format!("https://{name}.invalid/hook"),
+                template: WebhookTemplate::Generic,
+                events: Vec::new(),
+                headers: std::collections::HashMap::new(),
+                enabled: true,
+            };
+            let dispatcher = WebhookDispatcher::new(
+                vec![endpoint("times-out"), endpoint("still-runs")],
+                Box::new(transport),
+            );
+            let payload = frankenterm_core::notifications::NotificationPayload {
+                event_type: "test.webhook".to_string(),
+                pane_id: 7,
+                timestamp: "2026-08-05T00:00:00Z".to_string(),
+                summary: "test".to_string(),
+                description: "test".to_string(),
+                severity: "warning".to_string(),
+                agent_type: "test".to_string(),
+                confidence: 1.0,
+                quick_fix: None,
+                suppressed_since_last: 0,
+            };
+            let cx = frankenterm_core::cx::for_testing();
 
-        let records = dispatcher.dispatch_payload_with_cx(&cx, &payload).await;
+            let records = dispatcher.dispatch_payload_with_cx(&cx, &payload).await;
 
-        assert_eq!(
-            calls.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "a live caller Cx must allow the second endpoint after a request-local timeout"
-        );
-        assert_eq!(records.len(), 2, "both endpoint attempts must be recorded");
-        assert_eq!(records[0].target, "times-out");
-        assert_eq!(
-            records[0].error.as_deref(),
-            Some(DeliveryFailureClass::Transport.code())
-        );
-        assert_eq!(records[1].target, "still-runs");
-        assert!(records[1].accepted);
-        assert_eq!(records[1].status_code, 204);
-    })));
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "a live caller Cx must allow the second endpoint after a request-local timeout"
+            );
+            assert_eq!(records.len(), 2, "both endpoint attempts must be recorded");
+            assert_eq!(records[0].target, "times-out");
+            assert_eq!(
+                records[0].error.as_deref(),
+                Some(DeliveryFailureClass::Transport.code())
+            );
+            assert_eq!(records[1].target, "still-runs");
+            assert!(records[1].accepted);
+            assert_eq!(records[1].status_code, 204);
+        })
+    }));
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         frankenterm_core::runtime_async::clear_runtime_handle();
@@ -35565,27 +35257,29 @@ fn asupersync_webhook_send_with_cx_short_circuits_exact_cancelled_caller() {
         .enable_all()
         .build()
         .expect("webhook test runtime");
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(async {
-        let transport = AsupersyncWebhookTransport::new();
-        let cx = frankenterm_core::cx::for_testing();
-        cx.cancel_with(
-            frankenterm_core::outcome::CancelKind::User,
-            Some("SECRET exact caller cancellation"),
-        );
-        let headers = std::collections::HashMap::new();
-        let body = serde_json::json!({"private": "SECRET body"});
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            let transport = AsupersyncWebhookTransport::new();
+            let cx = frankenterm_core::cx::for_testing();
+            cx.cancel_with(
+                frankenterm_core::outcome::CancelKind::User,
+                Some("SECRET exact caller cancellation"),
+            );
+            let headers = std::collections::HashMap::new();
+            let body = serde_json::json!({"private": "SECRET body"});
 
-        let result = transport
-            .send_with_cx(&cx, "not a valid URL", &headers, &body)
-            .await;
-        assert_eq!(result.status_code(), 0);
-        assert!(!result.accepted());
-        assert_eq!(
-            result.failure_class(),
-            Some(DeliveryFailureClass::Cancelled)
-        );
-        assert!(!format!("{result:?}").contains("SECRET"));
-    })));
+            let result = transport
+                .send_with_cx(&cx, "not a valid URL", &headers, &body)
+                .await;
+            assert_eq!(result.status_code(), 0);
+            assert!(!result.accepted());
+            assert_eq!(
+                result.failure_class(),
+                Some(DeliveryFailureClass::Cancelled)
+            );
+            assert!(!format!("{result:?}").contains("SECRET"));
+        })
+    }));
     // Runtime::block_on intentionally retains its ambient handle. Test
     // teardown must drop the runtime first and then clear that TLS slot under
     // containment; otherwise a destructor panic can leak into a later test.
@@ -37361,10 +37055,7 @@ async fn spawn_distributed_listener(
 trait DistributedIo: runtime_io::AsyncRead + runtime_io::AsyncWrite + Unpin + Send {}
 
 #[cfg(feature = "distributed")]
-impl<T> DistributedIo for T where
-    T: runtime_io::AsyncRead + runtime_io::AsyncWrite + Unpin + Send
-{
-}
+impl<T> DistributedIo for T where T: runtime_io::AsyncRead + runtime_io::AsyncWrite + Unpin + Send {}
 
 #[cfg(feature = "distributed")]
 type DistributedIoStream = Box<dyn DistributedIo>;
@@ -39152,13 +38843,9 @@ async fn settle_snapshot_background_tasks(
     // its own cleanup path. WatchdogHandle retains the two-second fallback abort
     // for either task if cooperative acknowledgement stalls.
     let mut failures = Vec::new();
-    if let Err(error) = settle_watcher_background_task(
-        "snapshot_shutdown_bridge",
-        tasks.bridge,
-        cleanup_cx,
-        false,
-    )
-    .await
+    if let Err(error) =
+        settle_watcher_background_task("snapshot_shutdown_bridge", tasks.bridge, cleanup_cx, false)
+            .await
     {
         failures.push(error);
     }
@@ -39298,14 +38985,10 @@ const fn classify_watcher_control_receive_failure(
     }
 }
 
-fn log_watcher_control_receive_failure(
-    error: frankenterm_core::runtime_async::mpsc::RecvError,
-) {
+fn log_watcher_control_receive_failure(error: frankenterm_core::runtime_async::mpsc::RecvError) {
     match classify_watcher_control_receive_failure(error) {
         WatcherControlReceiveFailure::ContextCancelled => {
-            tracing::info!(
-                "Watcher control wait context cancelled; initiating graceful shutdown"
-            );
+            tracing::info!("Watcher control wait context cancelled; initiating graceful shutdown");
         }
         WatcherControlReceiveFailure::QueueUnavailable => {
             tracing::error!(
@@ -39958,15 +39641,17 @@ async fn run_watcher(
     };
 
     #[cfg(not(feature = "distributed"))]
-    let distributed_listener_handle: Option<frankenterm_core::watchdog::WatchdogHandle> =
-        if config.distributed.enabled {
-            tracing::warn!(
-                "Distributed mode enabled in config, but ft was built without the distributed feature"
-            );
-            None
-        } else {
-            None
-        };
+    let distributed_listener_handle: Option<frankenterm_core::watchdog::WatchdogHandle> = if config
+        .distributed
+        .enabled
+    {
+        tracing::warn!(
+            "Distributed mode enabled in config, but ft was built without the distributed feature"
+        );
+        None
+    } else {
+        None
+    };
 
     // Background scheduler for saved searches (scheduled alerts).
     //
@@ -40137,9 +39822,7 @@ async fn run_watcher(
             )
             .await;
         });
-        Some(
-            frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(task, shutdown_flag),
-        )
+        Some(frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(task, shutdown_flag))
     } else {
         None
     };
@@ -40153,16 +39836,10 @@ async fn run_watcher(
         let shutdown_flag = Arc::clone(&handle.shutdown_flag);
         let task_shutdown_flag = Arc::clone(&shutdown_flag);
         let task = frankenterm_core::runtime_async::task::spawn(async move {
-            frankenterm_core::orphan_reaper::run_orphan_reaper(
-                cli_config,
-                task_shutdown_flag,
-            )
-            .await;
+            frankenterm_core::orphan_reaper::run_orphan_reaper(cli_config, task_shutdown_flag)
+                .await;
         });
-        Some(frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
-            task,
-            shutdown_flag,
-        ))
+        Some(frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(task, shutdown_flag))
     };
 
     // Start mux server watchdog (health monitoring + memory tracking)
@@ -40170,12 +39847,7 @@ async fn run_watcher(
         let watchdog_config = frankenterm_core::watchdog::MuxWatchdogConfig::default();
         let wezterm = wezterm_handle.clone();
         let shutdown_flag = Arc::clone(&handle.shutdown_flag);
-        frankenterm_core::watchdog::spawn_mux_watchdog(
-            cx,
-            watchdog_config,
-            wezterm,
-            shutdown_flag,
-        )
+        frankenterm_core::watchdog::spawn_mux_watchdog(cx, watchdog_config, wezterm, shutdown_flag)
     };
 
     // Start snapshot engine for session persistence
@@ -40227,14 +39899,14 @@ async fn run_watcher(
                 .run_periodic(snap_shutdown_rx, move || {
                     let wez = snapshot_wezterm.clone();
                     async move {
-                    // ft-xbnl0.2.3 tick 284: cx-first periodic list_panes probe.
-                    let probe_cx = frankenterm_core::cx::Cx::current()
-                        .unwrap_or_else(frankenterm_core::cx::for_request);
-                    wez.list_panes_with_cx(&probe_cx).await.map_err(|error| {
-                        frankenterm_core::snapshot_engine::SnapshotError::PaneList(
-                            error.to_string(),
-                        )
-                    })
+                        // ft-xbnl0.2.3 tick 284: cx-first periodic list_panes probe.
+                        let probe_cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
+                        wez.list_panes_with_cx(&probe_cx).await.map_err(|error| {
+                            frankenterm_core::snapshot_engine::SnapshotError::PaneList(
+                                error.to_string(),
+                            )
+                        })
                     }
                 })
                 .await
@@ -40242,8 +39914,7 @@ async fn run_watcher(
                 tracing::warn!(%error, "snapshot scheduler failed");
                 *task_scheduler_failure
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                    Some(error.to_string());
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.to_string());
             }
         });
         let scheduler_handle = frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(
@@ -40397,13 +40068,9 @@ async fn run_watcher(
                 "failed to publish IPC shutdown intent: {error}"
             ));
         }
-        if let Err(error) = settle_watcher_background_task(
-            "ipc_server",
-            ipc_task,
-            &background_shutdown_cx,
-            false,
-        )
-        .await
+        if let Err(error) =
+            settle_watcher_background_task("ipc_server", ipc_task, &background_shutdown_cx, false)
+                .await
         {
             shutdown_failures.push(error);
         }
@@ -40412,8 +40079,9 @@ async fn run_watcher(
     tracing::info!("Shutting down observation runtime...");
     handle.signal_shutdown();
     if let Some(snapshot_tasks) = snapshot_task_handles.take() {
-        shutdown_failures
-            .extend(settle_snapshot_background_tasks(snapshot_tasks, &background_shutdown_cx).await);
+        shutdown_failures.extend(
+            settle_snapshot_background_tasks(snapshot_tasks, &background_shutdown_cx).await,
+        );
     }
 
     if let Some(notification_handle) = notification_handle
@@ -40517,8 +40185,8 @@ async fn run_watcher(
         && let Some(ref engine) = snapshot_engine
     {
         let wez = wezterm_handle.clone();
-        let shutdown_snap_cx = frankenterm_core::cx::Cx::current()
-            .unwrap_or_else(frankenterm_core::cx::for_request);
+        let shutdown_snap_cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
         match wez.list_panes_with_cx(&shutdown_snap_cx).await {
             Ok(panes) => match engine
                 .shutdown_checkpoint_with_cx(&shutdown_snap_cx, &panes, Duration::from_secs(5))
@@ -40582,8 +40250,7 @@ fn maybe_trigger_e2e_watcher_panic_once(layout: &frankenterm_core::config::Works
     // This is intentionally environment-gated and uses an on-disk marker for one-shot behavior.
     const ENV_VAR: &str = "FT_E2E_WATCHER_PANIC_ONCE";
 
-    let enabled = std::env::var(ENV_VAR)
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let enabled = std::env::var(ENV_VAR).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     if !enabled {
         return;
     }
@@ -40614,10 +40281,7 @@ fn retain_live_saved_search_state<T>(
 #[cfg(test)]
 #[test]
 fn saved_search_scheduler_state_drops_deleted_search_ids() {
-    let mut state = HashMap::from([
-        ("live".to_string(), 1_u32),
-        ("deleted".to_string(), 2_u32),
-    ]);
+    let mut state = HashMap::from([("live".to_string(), 1_u32), ("deleted".to_string(), 2_u32)]);
     let live_search_ids = HashSet::from(["live"]);
 
     retain_live_saved_search_state(&mut state, &live_search_ids);
@@ -42326,7 +41990,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             &states,
                                             &mut pane_text,
                                         );
-                                        redact_pane_text_results_for_output(&mut pane_text, escapes);
+                                        redact_pane_text_results_for_output(
+                                            &mut pane_text,
+                                            escapes,
+                                        );
                                         let data = RobotStateWithTextData {
                                             panes: states,
                                             tail_lines: tail,
@@ -43063,7 +42730,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             };
 
                             if command_ctx.is_dry_run() {
-                                let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+                                let wezterm =
+                                    frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                                 // ft-xbnl0.2.3 tick 231: cx-first.
                                 let cx = frankenterm_core::cx::Cx::current()
                                     .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -43127,7 +42795,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     }
                                 };
 
-                                let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+                                let wezterm =
+                                    frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                                 // ft-xbnl0.2.3 tick 231: cx-first.
                                 let cx = frankenterm_core::cx::Cx::current()
                                     .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -44926,8 +44595,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 )
                                                 .await
                                         } {
-                                            let (code, hint) =
-                                                robot_storage_error_details(&e);
+                                            let (code, hint) = robot_storage_error_details(&e);
                                             let response = RobotResponse::<RobotEventMutationData>::error_with_code(
                                                 code,
                                                 format!("Failed to update note: {e}"),
@@ -45048,8 +44716,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         {
                                             Ok(v) => v,
                                             Err(e) => {
-                                                let (code, hint) =
-                                                    robot_storage_error_details(&e);
+                                                let (code, hint) = robot_storage_error_details(&e);
                                                 let response = RobotResponse::<
                                                     RobotEventMutationData,
                                                 >::error_with_code(
@@ -45511,9 +45178,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                         discontinuity,
                                                         elapsed_ms(start),
                                                     );
-                                                    print_robot_response(
-                                                        &response, format, stats,
-                                                    )?;
+                                                    print_robot_response(&response, format, stats)?;
                                                     return Ok(());
                                                 }
                                             }
@@ -45537,18 +45202,15 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                     ),
                                                     elapsed_ms(start),
                                                 );
-                                                print_robot_response(
-                                                    &response, format, stats,
-                                                )?;
+                                                print_robot_response(&response, format, stats)?;
                                                 return Ok(());
                                             }
                                         }
-                                        authoritative_next_cursor = Some(
-                                            event_stream_page_checked_through(
+                                        authoritative_next_cursor =
+                                            Some(event_stream_page_checked_through(
                                                 &page,
                                                 effective_limit,
-                                            ),
-                                        );
+                                            ));
                                         response_cursor_epoch = Some(epoch.to_string());
                                         Ok(page.events)
                                     }
@@ -45577,10 +45239,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             };
                             match events_result {
                                 Ok(events) => {
-                                    let event_ids = events
-                                        .iter()
-                                        .map(|event| event.id)
-                                        .collect::<Vec<_>>();
+                                    let event_ids =
+                                        events.iter().map(|event| event.id).collect::<Vec<_>>();
                                     let annotations_cx = frankenterm_core::cx::Cx::current()
                                         .unwrap_or_else(frankenterm_core::cx::for_request);
                                     let mut annotations_by_event = match storage
@@ -45749,8 +45409,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 cursor,
                                 cursor_epoch.as_deref(),
                                 cursor_scope.as_deref(),
-                            )
-                            {
+                            ) {
                                 let _ = write_terminal_stream_error_ndjson(
                                     ROBOT_ERR_INVALID_ARGS,
                                     message,
@@ -45844,23 +45503,25 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 }
                             };
                             let db_path = layout.db_path.to_string_lossy();
-                            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                &cx,
-                                &db_path,
-                            ).await {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    match classify_watch_outer_failure(
-                                        &cx,
-                                        "storage open",
-                                        watch_core_failure_source(&e),
-                                    ) {
-                                        WatchOuterFailure::Cancelled(error) => {
-                                            return Err(error.into());
+                            let storage =
+                                match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &cx, &db_path,
+                                )
+                                .await
+                                {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        match classify_watch_outer_failure(
+                                            &cx,
+                                            "storage open",
+                                            watch_core_failure_source(&e),
+                                        ) {
+                                            WatchOuterFailure::Cancelled(error) => {
+                                                return Err(error.into());
+                                            }
+                                            WatchOuterFailure::Degraded => {}
                                         }
-                                        WatchOuterFailure::Degraded => {}
-                                    }
-                                    let _ = write_terminal_stream_error_ndjson(
+                                        let _ = write_terminal_stream_error_ndjson(
                                         ROBOT_ERR_STORAGE,
                                         format!("Failed to open storage: {e}"),
                                         Some("Is the database initialized? Run 'ft watch' first.".to_string()),
@@ -45869,9 +45530,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         Some(&expected_cursor_scope),
                                         true,
                                     )?;
-                                    return Ok(());
-                                }
-                            };
+                                        return Ok(());
+                                    }
+                                };
                             if let Err(error) = watch_checkpoint(&cx, "post-storage-open") {
                                 storage.shutdown().await.ok();
                                 return Err(error.into());
@@ -46001,8 +45662,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     }
                                     continue 'follow;
                                 } else {
-                                    let requested = current_cursor
-                                        .expect("cursor branch requires a cursor");
+                                    let requested =
+                                        current_cursor.expect("cursor branch requires a cursor");
                                     let epoch = current_cursor_epoch
                                         .as_deref()
                                         .expect("validated durable cursor requires an epoch");
@@ -46029,10 +45690,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 }
                                                 WatchOuterFailure::Degraded => {}
                                             }
-                                            watch_checkpoint(
-                                                &cx,
-                                                "retention error response",
-                                            )?;
+                                            watch_checkpoint(&cx, "retention error response")?;
                                             let record = watch_terminal_error_ndjson(
                                                 ROBOT_ERR_STORAGE,
                                                 format!(
@@ -46194,10 +45852,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                     WatchClaimCheckpointDisposition::FinalizedAfterOutputFlush,
                                                     redacted.id,
                                                 );
-                                                watch_checkpoint(
-                                                    &cx,
-                                                    "claim checkpoint output",
-                                                )?;
+                                                watch_checkpoint(&cx, "claim checkpoint output")?;
                                                 if !emit_watch_stream_record(
                                                     &stdout,
                                                     &checkpoint,
@@ -46209,27 +45864,30 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             }
                                             WatchEventClaimDelivery::PipeClosed => break 'follow,
                                             WatchEventClaimDelivery::AlreadyHandledOrMissing => {
-                                                let resolution = match resolve_watch_claim_skip_with_cx(
-                                                    &cx,
-                                                    &storage,
-                                                    redacted.id,
-                                                    &page_epoch,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(resolution) => resolution,
-                                                    Err(error) => {
-                                                        match classify_watch_outer_failure(
-                                                            &cx,
-                                                            "claim skip reconciliation",
-                                                            watch_core_failure_source(&error),
-                                                        ) {
-                                                            WatchOuterFailure::Cancelled(error) => {
-                                                                return Err(error.into());
+                                                let resolution =
+                                                    match resolve_watch_claim_skip_with_cx(
+                                                        &cx,
+                                                        &storage,
+                                                        redacted.id,
+                                                        &page_epoch,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(resolution) => resolution,
+                                                        Err(error) => {
+                                                            match classify_watch_outer_failure(
+                                                                &cx,
+                                                                "claim skip reconciliation",
+                                                                watch_core_failure_source(&error),
+                                                            ) {
+                                                                WatchOuterFailure::Cancelled(
+                                                                    error,
+                                                                ) => {
+                                                                    return Err(error.into());
+                                                                }
+                                                                WatchOuterFailure::Degraded => {}
                                                             }
-                                                            WatchOuterFailure::Degraded => {}
-                                                        }
-                                                        let record = watch_terminal_error_ndjson(
+                                                            let record = watch_terminal_error_ndjson(
                                                             ROBOT_ERR_STORAGE,
                                                             format!(
                                                                 "Failed to reconcile event {} after its delivery reservation reported handled or missing: {error}",
@@ -46244,14 +45902,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                             Some(&expected_cursor_scope),
                                                             true,
                                                         );
-                                                        let _ = emit_watch_stream_record(
-                                                            &stdout,
-                                                            &record,
-                                                            &mut last_emit,
-                                                        )?;
-                                                        break 'follow;
-                                                    }
-                                                };
+                                                            let _ = emit_watch_stream_record(
+                                                                &stdout,
+                                                                &record,
+                                                                &mut last_emit,
+                                                            )?;
+                                                            break 'follow;
+                                                        }
+                                                    };
                                                 match resolution {
                                                     WatchClaimSkipResolution::Handled => {
                                                         let checkpoint =
@@ -46344,28 +46002,31 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 claim_retry_hint_ms = Some(expires_at_ms);
                                                 break;
                                             }
-                                            WatchEventClaimDelivery::FinalizationLost { .. } => {
+                                            WatchEventClaimDelivery::FinalizationLost {
+                                                ..
+                                            } => {
                                                 // The pending record reached the
                                                 // consumer, but ownership changed
                                                 // before our CAS. Resolve exact
                                                 // durable truth before deciding
                                                 // whether a checkpoint is legal.
-                                                let resolution = match resolve_watch_claim_skip_with_cx(
-                                                    &cx,
-                                                    &storage,
-                                                    redacted.id,
-                                                    &page_epoch,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(resolution) => resolution,
-                                                    Err(error) => {
-                                                        if watch_core_failure_source(&error)
-                                                            == WatchFailureSource::Cancellation
-                                                        {
-                                                            return Err(error.into());
-                                                        }
-                                                        let record = watch_terminal_error_ndjson(
+                                                let resolution =
+                                                    match resolve_watch_claim_skip_with_cx(
+                                                        &cx,
+                                                        &storage,
+                                                        redacted.id,
+                                                        &page_epoch,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(resolution) => resolution,
+                                                        Err(error) => {
+                                                            if watch_core_failure_source(&error)
+                                                                == WatchFailureSource::Cancellation
+                                                            {
+                                                                return Err(error.into());
+                                                            }
+                                                            let record = watch_terminal_error_ndjson(
                                                             ROBOT_ERR_STORAGE,
                                                             format!(
                                                                 "Event {} was flushed, claim ownership changed, and exact reconciliation failed: {error}",
@@ -46380,14 +46041,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                             Some(&expected_cursor_scope),
                                                             true,
                                                         );
-                                                        let _ = emit_watch_stream_record(
-                                                            &stdout,
-                                                            &record,
-                                                            &mut last_emit,
-                                                        )?;
-                                                        break 'follow;
-                                                    }
-                                                };
+                                                            let _ = emit_watch_stream_record(
+                                                                &stdout,
+                                                                &record,
+                                                                &mut last_emit,
+                                                            )?;
+                                                            break 'follow;
+                                                        }
+                                                    };
                                                 match resolution {
                                                     WatchClaimSkipResolution::Handled => {
                                                         let checkpoint =
@@ -46495,9 +46156,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     // retains the prior cursor above.
                                     let committed_before_page_checkpoint =
                                         current_cursor.unwrap_or(0);
-                                    if page_checked_through
-                                        > committed_before_page_checkpoint
-                                    {
+                                    if page_checked_through > committed_before_page_checkpoint {
                                         let epoch = current_cursor_epoch
                                             .as_deref()
                                             .expect("durable page has an epoch");
@@ -46537,11 +46196,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     // an owner that releases early wakes this
                                     // follower before the original expiry. The
                                     // storage CAS still prevents an early steal.
-                                    let wait = watch_claim_retry_delay(
-                                        now_ms_i64(),
-                                        retry_hint_ms,
-                                        poll,
-                                    );
+                                    let wait =
+                                        watch_claim_retry_delay(now_ms_i64(), retry_hint_ms, poll);
                                     let wait = watch_delay_bounded_by_heartbeat(
                                         wait,
                                         heartbeat_interval_ms,
@@ -46604,9 +46260,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             )
                                             .await
                                             {
-                                                Ok(
-                                                    WatchIpcStreamRead::CancellationCheckpoint,
-                                                ) => {
+                                                Ok(WatchIpcStreamRead::CancellationCheckpoint) => {
                                                     // The elapsed durable-poll
                                                     // window is still open. The
                                                     // helper has observed Cx;
@@ -46778,12 +46432,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                         IpcFallbackObservation::StreamEof,
                                                         "watcher closed the IPC event stream",
                                                     );
-                                                    let gap_was_open =
-                                                        ipc_transport_gap_open;
-                                                    watch_checkpoint(
-                                                        &cx,
-                                                        "IPC EOF gap output",
-                                                    )?;
+                                                    let gap_was_open = ipc_transport_gap_open;
+                                                    watch_checkpoint(&cx, "IPC EOF gap output")?;
                                                     let continue_writing = {
                                                         let mut lock = stdout.lock();
                                                         write_ipc_transport_gap_once(
@@ -46800,9 +46450,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                         break 'follow;
                                                     }
                                                     if !gap_was_open {
-                                                        note_watch_output_emitted(
-                                                            &mut last_emit,
-                                                        );
+                                                        note_watch_output_emitted(&mut last_emit);
                                                     }
                                                     break;
                                                 }
@@ -46824,8 +46472,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                         IpcFallbackObservation::StreamReadFailed,
                                                         &error,
                                                     );
-                                                    let gap_was_open =
-                                                        ipc_transport_gap_open;
+                                                    let gap_was_open = ipc_transport_gap_open;
                                                     watch_checkpoint(
                                                         &cx,
                                                         "IPC read-failure gap output",
@@ -46846,9 +46493,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                         break 'follow;
                                                     }
                                                     if !gap_was_open {
-                                                        note_watch_output_emitted(
-                                                            &mut last_emit,
-                                                        );
+                                                        note_watch_output_emitted(&mut last_emit);
                                                     }
                                                     break;
                                                 }
@@ -46892,9 +46537,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                     "IPC subscription",
                                                     WatchFailureSource::Degradation,
                                                 ) {
-                                                    WatchOuterFailure::Cancelled(
-                                                        cancel_error,
-                                                    ) => {
+                                                    WatchOuterFailure::Cancelled(cancel_error) => {
                                                         return Err(cancel_error.into());
                                                     }
                                                     WatchOuterFailure::Degraded => {}
@@ -46904,8 +46547,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                     IpcFallbackObservation::SubscribeFailed,
                                                     &error,
                                                 );
-                                                let gap_was_open =
-                                                    ipc_transport_gap_open;
+                                                let gap_was_open = ipc_transport_gap_open;
                                                 watch_checkpoint(
                                                     &cx,
                                                     "IPC subscribe-failure gap output",
@@ -46926,9 +46568,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                     break 'follow;
                                                 }
                                                 if !gap_was_open {
-                                                    note_watch_output_emitted(
-                                                        &mut last_emit,
-                                                    );
+                                                    note_watch_output_emitted(&mut last_emit);
                                                 }
                                             }
                                         }
@@ -46987,8 +46627,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 cursor,
                                 cursor_epoch.as_deref(),
                                 cursor_scope.as_deref(),
-                            )
-                            {
+                            ) {
                                 let _ = write_terminal_stream_error_ndjson(
                                     ROBOT_ERR_INVALID_ARGS,
                                     message,
@@ -47056,11 +46695,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 )?;
                                 return Ok(());
                             }
-                            let expected_cursor_scope = await_cursor_scope(
-                                &any_conds,
-                                &all_conds,
-                                &config.agent_detection,
-                            );
+                            let expected_cursor_scope =
+                                await_cursor_scope(&any_conds, &all_conds, &config.agent_detection);
                             let cx = frankenterm_core::cx::Cx::current()
                                 .unwrap_or_else(frankenterm_core::cx::for_request);
                             if validate_event_cursor_scope_matches(
@@ -47102,23 +46738,25 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 }
                             };
                             let db_path = layout.db_path.to_string_lossy();
-                            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                &cx,
-                                &db_path,
-                            ).await {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    match classify_watch_outer_failure(
-                                        &cx,
-                                        "await storage open",
-                                        watch_core_failure_source(&e),
-                                    ) {
-                                        WatchOuterFailure::Cancelled(error) => {
-                                            return Err(error.into());
+                            let storage =
+                                match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &cx, &db_path,
+                                )
+                                .await
+                                {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        match classify_watch_outer_failure(
+                                            &cx,
+                                            "await storage open",
+                                            watch_core_failure_source(&e),
+                                        ) {
+                                            WatchOuterFailure::Cancelled(error) => {
+                                                return Err(error.into());
+                                            }
+                                            WatchOuterFailure::Degraded => {}
                                         }
-                                        WatchOuterFailure::Degraded => {}
-                                    }
-                                    let _ = write_terminal_stream_error_ndjson(
+                                        let _ = write_terminal_stream_error_ndjson(
                                         ROBOT_ERR_STORAGE,
                                         format!("Failed to open storage: {e}"),
                                         Some("Is the database initialized? Run 'ft watch' first.".to_string()),
@@ -47127,9 +46765,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         Some(&expected_cursor_scope),
                                         true,
                                     )?;
-                                    return Ok(());
-                                }
-                            };
+                                        return Ok(());
+                                    }
+                                };
                             if let Err(error) = watch_checkpoint(&cx, "await post-storage-open") {
                                 storage.shutdown().await.ok();
                                 return Err(error.into());
@@ -47205,8 +46843,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 if after_id.is_none() {
                                     current_cursor_epoch =
                                         Some(page.retention.cursor_epoch.clone());
-                                    after_id =
-                                        Some(fresh_event_cursor_baseline(&page.retention));
+                                    after_id = Some(fresh_event_cursor_baseline(&page.retention));
                                     committed_cursor = after_id;
                                     committed_cursor_epoch = current_cursor_epoch.clone();
                                     let checkpoint = watch_cursor_checkpoint_ndjson(
@@ -47295,10 +46932,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             record["candidate_cursor"] =
                                                 serde_json::Value::from(requested);
                                         }
-                                        watch_checkpoint(
-                                            &cx,
-                                            "await cursor-discontinuity output",
-                                        )?;
+                                        watch_checkpoint(&cx, "await cursor-discontinuity output")?;
                                         let mut lock = stdout.lock();
                                         let _ = write_ndjson_line(&mut lock, &record)?;
                                         drop(lock);
@@ -47307,8 +46941,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     }
                                 }
 
-                                let checked_through =
-                                    event_stream_page_checked_through(&page, 500);
+                                let checked_through = event_stream_page_checked_through(&page, 500);
                                 let batch_len = page.events.len();
                                 match update_await_quiescence_conditions(
                                     &cx,
@@ -47372,16 +47005,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 }
 
                                 for event in &page.events {
-                                    let any_contributed = apply_await_rule_event(
-                                        &any_conds,
-                                        &mut any_met,
-                                        event,
-                                    );
-                                    let all_contributed = apply_await_rule_event(
-                                        &all_conds,
-                                        &mut all_met,
-                                        event,
-                                    );
+                                    let any_contributed =
+                                        apply_await_rule_event(&any_conds, &mut any_met, event);
+                                    let all_contributed =
+                                        apply_await_rule_event(&all_conds, &mut all_met, event);
                                     let contributed = any_contributed || all_contributed;
 
                                     if await_is_satisfied(&any_met, &all_met) {
@@ -47476,7 +47103,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 true,
                                             );
                                         let wezterm =
-                                            frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+                                            frankenterm_core::wezterm::wezterm_handle_from_config(
+                                                &config,
+                                            );
                                         // ft-xbnl0.2.3 tick 232: cx-first.
                                         let cx = frankenterm_core::cx::Cx::current()
                                             .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -47499,7 +47128,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
 
                                     // Verify pane exists
                                     let wezterm =
-                                        frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+                                        frankenterm_core::wezterm::wezterm_handle_from_config(
+                                            &config,
+                                        );
                                     // ft-xbnl0.2.3 tick 232: cx-first.
                                     let cx = frankenterm_core::cx::Cx::current()
                                         .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -47583,7 +47214,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
 
                                     // Create policy-gated injector with WezTerm client
                                     let wezterm_handle =
-                                        frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+                                        frankenterm_core::wezterm::wezterm_handle_from_config(
+                                            &config,
+                                        );
                                     let injector =
                                         CxPolicyInjector::new(PolicyGatedInjector::with_storage(
                                             policy_engine,
@@ -48305,7 +47938,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     .with_command_gate_config(config.safety.command_gate.clone())
                                     .with_policy_rules(config.safety.rules.clone());
                                     let wezterm_handle =
-                                        frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+                                        frankenterm_core::wezterm::wezterm_handle_from_config(
+                                            &config,
+                                        );
                                     let injector =
                                         CxPolicyInjector::new(PolicyGatedInjector::with_storage(
                                             policy_engine,
@@ -50835,11 +50470,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     Err(e) => {
                                         payload["watcher_running"] = serde_json::json!(false);
                                         payload["watcher_error"] = serde_json::Value::String(
-                                            bounded_terminal_diagnostic(
-                                                &e.to_string(),
-                                                160,
-                                                512,
-                                            ),
+                                            bounded_terminal_diagnostic(&e.to_string(), 160, 512),
                                         );
                                     }
                                 }
@@ -52000,9 +51631,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         .update_saved_search_run(
                                             &saved.id,
                                             now_ms_i64,
-                                            Some(
-                                                i64::try_from(results.len()).unwrap_or(i64::MAX),
-                                            ),
+                                            Some(i64::try_from(results.len()).unwrap_or(i64::MAX)),
                                             None,
                                         )
                                         .await
@@ -52927,12 +52556,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             let panes = match wezterm.list_panes_with_cx(&cx).await {
                 Ok(panes) => panes,
                 Err(e) => {
-                    let error = bounded_display_diagnostic(
-                        "Failed to list panes: ",
-                        &e,
-                        600,
-                        600,
-                    );
+                    let error = bounded_display_diagnostic("Failed to list panes: ", &e, 600, 600);
                     eprintln!("{error}");
                     return Err(e.into());
                 }
@@ -53135,8 +52759,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     println!("{}", serde_json::to_string_pretty(&list)?);
                                 } else if list.is_empty() {
                                     if let Some(ref tag) = tag {
-                                        let display_tag =
-                                            bounded_terminal_preview(tag, 100, 400);
+                                        let display_tag = bounded_terminal_preview(tag, 100, 400);
                                         println!("No bookmarks with tag \"{display_tag}\"");
                                     } else {
                                         println!(
@@ -53223,9 +52846,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     println!("Pane {}", pane.pane_id);
                     println!(
                         "  Tab: {}  Window: {}  Domain: {}",
-                        pane.tab_id,
-                        pane.window_id,
-                        domain
+                        pane.tab_id, pane.window_id, domain
                     );
                     if let Some(title) = &pane.title {
                         let title = bounded_terminal_preview(title, 400, 1_600);
@@ -53419,12 +53040,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     Ok(info) => info,
                     Err(e) => {
                         let (_code, hint) = map_wezterm_error_to_robot(&e);
-                        emit_bounded_display_error_with_hint(
-                            emit_json,
-                            "",
-                            &e,
-                            hint.as_deref(),
-                        );
+                        emit_bounded_display_error_with_hint(emit_json, "", &e, hint.as_deref());
                         return Ok(());
                     }
                 };
@@ -53653,8 +53269,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 }
 
                 let submit_verification = if injection.is_allowed()
-                    && submit_guarantee_level
-                        .is_some_and(|level| level.requires_submit_profile())
+                    && submit_guarantee_level.is_some_and(|level| level.requires_submit_profile())
                 {
                     let polls = wait_for_data
                         .as_ref()
@@ -53914,7 +53529,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             || (matches!(output_format, OutputFormat::Auto)
                                 && !std::io::stdout().is_terminal());
 
-                        let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+                        let wezterm =
+                            frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                         // ft-xbnl0.2.3 tick 234: cx-first.
                         let cx = frankenterm_core::cx::Cx::current()
                             .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -53943,7 +53559,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         tracing::info!("Running workflow '{}' on pane {}", name, pane);
 
                         // Verify pane exists
-                        let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+                        let wezterm =
+                            frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                         // ft-xbnl0.2.3 tick 234: cx-first.
                         let cx = frankenterm_core::cx::Cx::current()
                             .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -53993,7 +53610,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         )
                         .with_tuning(&config.tuning);
 
-                        let wezterm_handle = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+                        let wezterm_handle =
+                            frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                         let injector = CxPolicyInjector::new(PolicyGatedInjector::with_storage(
                             policy_engine,
                             wezterm_handle,
@@ -54406,9 +54024,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     }
                     Err(err) => {
                         payload["watcher_running"] = serde_json::Value::Bool(false);
-                        payload["watcher_error"] = serde_json::Value::String(
-                            bounded_terminal_diagnostic(&err, 160, 512),
-                        );
+                        payload["watcher_error"] =
+                            serde_json::Value::String(bounded_terminal_diagnostic(&err, 160, 512));
                     }
                 }
                 if payload.get("health").is_none() {
@@ -54893,11 +54510,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             }
                             std::process::exit(1);
                         }
-                        emit_bounded_display_error(
-                            output_format,
-                            "Failed to list panes: ",
-                            &e,
-                        );
+                        emit_bounded_display_error(output_format, "Failed to list panes: ", &e);
                         if !output_format.is_json() {
                             eprintln!("Is the active backend bridge (current: WezTerm) running?");
                         }
@@ -56305,8 +55918,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     println!("{formatted}");
                 }
             } else {
-                let error =
-                    bounded_prefixed_diagnostic("Unknown explanation id: ", &id, 600, 600);
+                let error = bounded_prefixed_diagnostic("Unknown explanation id: ", &id, 600, 600);
                 let hint = "Use 'ft why --list' to see available templates.";
                 if output_format.is_json() {
                     let response = serde_json::json!({
@@ -56326,12 +55938,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
 
         Some(Commands::Stop { force, timeout }) => {
             let lock_path = layout.lock_path.clone();
-            let preflight = check_watcher_running_with_cx(
-                cx,
-                lock_path.clone(),
-                "watcher-stop preflight",
-            )
-            .await?;
+            let preflight =
+                check_watcher_running_with_cx(cx, lock_path.clone(), "watcher-stop preflight")
+                    .await?;
             let meta = match preflight {
                 frankenterm_core::lock::LockStatus::HeldKnown(metadata) => metadata,
                 frankenterm_core::lock::LockStatus::Free => {
@@ -56391,7 +56000,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     if classify_watcher_stop_settlement(&reconciliation)
                         == WatcherStopSettlement::Stopped
                     {
-                        println!("Watcher stopped before the control reply was received (pid {pid}).");
+                        println!(
+                            "Watcher stopped before the control reply was received (pid {pid})."
+                        );
                         return Ok(());
                     }
                     eprintln!("Cooperative watcher stop request failed: {failure}.");
@@ -57553,7 +57164,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         true,
                     )
                     .with_tuning(&config.tuning);
-                    let wezterm_handle = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+                    let wezterm_handle =
+                        frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                     let injector = frankenterm_core::workflows::CxPolicyInjector::new(
                         frankenterm_core::policy::PolicyGatedInjector::with_storage(
                             policy_engine,
@@ -58581,11 +58193,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 {
                     Ok(s) => s,
                     Err(e) => {
-                        emit_bounded_display_error(
-                            output_format,
-                            "Failed to open storage: ",
-                            &e,
-                        );
+                        emit_bounded_display_error(output_format, "Failed to open storage: ", &e);
                         if !output_format.is_json() {
                             eprintln!("Is the database initialized? Run 'ft watch' first.");
                         }
@@ -59066,8 +58674,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         action_id,
                         strategy: "unknown".to_string(),
                         outcome: UndoOutcome::Failed,
-                        message:
-                            "Undo execution failed (error_class=undo_execution_error)".to_string(),
+                        message: "Undo execution failed (error_class=undo_execution_error)"
+                            .to_string(),
                         guidance: Some(
                             "Inspect action history and workflow status for remediation."
                                 .to_string(),
@@ -63282,11 +62890,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             {
                 Ok(s) => s,
                 Err(e) => {
-                    emit_bounded_display_error(
-                        output_format,
-                        "Failed to open storage: ",
-                        &e,
-                    );
+                    emit_bounded_display_error(output_format, "Failed to open storage: ", &e);
                     if !output_format.is_json() {
                         eprintln!("Is the database initialized? Run 'ft watch' first.");
                     }
@@ -64218,11 +63822,7 @@ async fn handle_why_recent(
     let layout = match config.workspace_layout(Some(workspace_root)) {
         Ok(l) => l,
         Err(e) => {
-            emit_bounded_display_error(
-                output_format,
-                "Failed to get workspace layout: ",
-                &e,
-            );
+            emit_bounded_display_error(output_format, "Failed to get workspace layout: ", &e);
             std::process::exit(1);
         }
     };
@@ -64280,11 +63880,7 @@ async fn handle_why_recent(
                 }
             }
             Err(e) => {
-                emit_bounded_display_error(
-                    output_format,
-                    "Failed to query audit trail: ",
-                    &e,
-                );
+                emit_bounded_display_error(output_format, "Failed to query audit trail: ", &e);
                 std::process::exit(1);
             }
         }
@@ -64317,7 +63913,10 @@ async fn handle_why_recent(
                         "filter": display_filter_desc,
                         "version": frankenterm_core::VERSION,
                     });
-                    println!("{}", serde_json::to_string_pretty(&response).unwrap_or_default());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response).unwrap_or_default()
+                    );
                 } else {
                     println!("No recent {display_filter_desc} decisions found.");
                     if pane.is_some() {
@@ -64390,11 +63989,7 @@ async fn handle_why_recent(
             }
         }
         Err(e) => {
-            emit_bounded_display_error(
-                output_format,
-                "Failed to query audit trail: ",
-                &e,
-            );
+            emit_bounded_display_error(output_format, "Failed to query audit trail: ", &e);
             std::process::exit(1);
         }
     }
@@ -65823,14 +65418,9 @@ async fn handle_rules_command(
         }
 
         RulesCommands::Profile { command } => {
-            if let Err(err) = handle_rules_profile_command(
-                cx,
-                command,
-                cli_config,
-                resolved_config_path,
-                layout,
-            )
-            .await
+            if let Err(err) =
+                handle_rules_profile_command(cx, command, cli_config, resolved_config_path, layout)
+                    .await
             {
                 eprintln!("{err}");
                 std::process::exit(1);
@@ -71731,19 +71321,20 @@ async fn handle_snapshot_command(
             format,
         } => {
             let output_format = resolve_snapshot_session_output_format(&format);
-            let (snap_trigger, requested_trigger) =
-                match snapshot_trigger_from_cli_label(trigger.as_str()) {
-                    Ok(trigger) => trigger,
-                    Err(error) => {
-                        trace_bounded_cli_internal_error("snapshot trigger admission", &error);
-                        emit_snapshot_session_error(
-                            output_format,
-                            "invalid_trigger",
-                            "Invalid snapshot trigger; use manual, event, pre_restart, pre_shutdown, shutdown, or startup.",
-                        )?;
-                        std::process::exit(1);
-                    }
-                };
+            let (snap_trigger, requested_trigger) = match snapshot_trigger_from_cli_label(
+                trigger.as_str(),
+            ) {
+                Ok(trigger) => trigger,
+                Err(error) => {
+                    trace_bounded_cli_internal_error("snapshot trigger admission", &error);
+                    emit_snapshot_session_error(
+                        output_format,
+                        "invalid_trigger",
+                        "Invalid snapshot trigger; use manual, event, pre_restart, pre_shutdown, shutdown, or startup.",
+                    )?;
+                    std::process::exit(1);
+                }
+            };
             if label
                 .as_ref()
                 .is_some_and(|label| label.len() > MAX_ROBOT_CHECKPOINT_LABEL_BYTES)
@@ -71827,10 +71418,7 @@ async fn handle_snapshot_command(
                 .await
             {
                 Ok(result) => {
-                    if let Err(error) = engine
-                        .close_after_checkpoint_with_cx(&cx, &result)
-                        .await
-                    {
+                    if let Err(error) = engine.close_after_checkpoint_with_cx(&cx, &result).await {
                         trace_bounded_cli_internal_error("snapshot session close", &error);
                         if !print_snapshot_session_structured_output(
                             &serde_json::json!({
@@ -71875,11 +71463,11 @@ async fn handle_snapshot_command(
                         );
                         println!("  Checkpoint: {}", result.checkpoint_id);
                         println!("  Panes:      {}", result.pane_count);
+                        println!("  Pane-state estimate: {} bytes", result.total_bytes);
                         println!(
-                            "  Pane-state estimate: {} bytes",
-                            result.total_bytes
+                            "  Persisted text:      {} bytes",
+                            result.persisted_text_bytes
                         );
-                        println!("  Persisted text:      {} bytes", result.persisted_text_bytes);
                         println!("  Truncated panes:     {}", result.truncated_pane_count);
                         println!("  Verification:        verified_v2");
                     }
@@ -71943,12 +71531,9 @@ async fn handle_snapshot_command(
                     .entries
                     .iter()
                     .map(|entry| {
-                        let session_id =
-                            redact_single_line_for_output(&entry.session_id);
-                        let checkpoint_type =
-                            redact_single_line_for_output(&entry.checkpoint_type);
-                        let state_hash =
-                            redact_single_line_for_output(&entry.state_hash);
+                        let session_id = redact_single_line_for_output(&entry.session_id);
+                        let checkpoint_type = redact_single_line_for_output(&entry.checkpoint_type);
+                        let state_hash = redact_single_line_for_output(&entry.state_hash);
                         serde_json::json!({
                             "checkpoint_id": entry.checkpoint_id,
                             "session_id": session_id,
@@ -71991,8 +71576,7 @@ async fn handle_snapshot_command(
                 for entry in &snapshots.entries {
                     let session_id = redact_single_line_for_output(&entry.session_id);
                     let short_session = truncate_id(&session_id, 26);
-                    let checkpoint_type =
-                        redact_single_line_for_output(&entry.checkpoint_type);
+                    let checkpoint_type = redact_single_line_for_output(&entry.checkpoint_type);
                     let label = truncate_id(entry.label.as_deref().unwrap_or("-"), 40);
                     println!(
                         "{:<6} {:<28} {:<10} {:<6} {:<14} {}",
@@ -72031,13 +71615,12 @@ async fn handle_snapshot_command(
                     std::process::exit(1);
                 }
             };
-            let checkpoint = match
-                frankenterm_core::session_restore::load_checkpoint_by_id_with_cx(
-                    &cx,
-                    db_path.as_str(),
-                    cp_id,
-                )
-                .await
+            let checkpoint = match frankenterm_core::session_restore::load_checkpoint_by_id_with_cx(
+                &cx,
+                db_path.as_str(),
+                cp_id,
+            )
+            .await
             {
                 Ok(checkpoint) => checkpoint,
                 Err(error) => {
@@ -72065,9 +71648,7 @@ async fn handle_snapshot_command(
                 }
                 std::process::exit(1);
             };
-            let label = match checkpoint_label_from_loaded_metadata(
-                checkpoint.metadata_json(),
-            ) {
+            let label = match checkpoint_label_from_loaded_metadata(checkpoint.metadata_json()) {
                 Ok(label) => label,
                 Err(error) => {
                     trace_bounded_cli_internal_error("snapshot inspect label", &error);
@@ -72196,10 +71777,7 @@ async fn handle_snapshot_command(
                     }
                     if let Some(agent) = state.agent_metadata.as_ref() {
                         let agent_type = redact_single_line_for_output(&agent.agent_type);
-                        let agent_state = agent
-                            .state
-                            .as_deref()
-                            .map(redact_single_line_for_output);
+                        let agent_state = agent.state.as_deref().map(redact_single_line_for_output);
                         println!("    Agent:   {agent_type} ({agent_state:?})");
                     }
                     println!();
@@ -72232,19 +71810,15 @@ async fn handle_snapshot_command(
                 }
             };
             let diff_db_path = Arc::clone(&db_path);
-            let (missing_checkpoint, panes1, panes2) = match
-                run_cli_blocking_with_cx(&cx, "snapshot diff", move || {
+            let (missing_checkpoint, panes1, panes2) =
+                match run_cli_blocking_with_cx(&cx, "snapshot diff", move || {
                     let mut conn = open_cli_read_only_connection(diff_db_path.as_str())?;
                     let tx = conn.transaction()?;
-                    let Some(panes1) =
-                        load_bounded_snapshot_pane_ids_from_conn(&tx, cp1)?
-                    else {
+                    let Some(panes1) = load_bounded_snapshot_pane_ids_from_conn(&tx, cp1)? else {
                         tx.commit()?;
                         return Ok((Some(cp1), Vec::new(), Vec::new()));
                     };
-                    let Some(panes2) =
-                        load_bounded_snapshot_pane_ids_from_conn(&tx, cp2)?
-                    else {
+                    let Some(panes2) = load_bounded_snapshot_pane_ids_from_conn(&tx, cp2)? else {
                         tx.commit()?;
                         return Ok((Some(cp2), Vec::new(), Vec::new()));
                     };
@@ -72252,18 +71826,18 @@ async fn handle_snapshot_command(
                     Ok((None, panes1, panes2))
                 })
                 .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    trace_bounded_cli_internal_error("snapshot pane-membership diff", &error);
-                    emit_snapshot_session_error(
-                        output_format,
-                        "snapshot_diff_failed",
-                        "Snapshot pane-membership comparison failed.",
-                    )?;
-                    std::process::exit(1);
-                }
-            };
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        trace_bounded_cli_internal_error("snapshot pane-membership diff", &error);
+                        emit_snapshot_session_error(
+                            output_format,
+                            "snapshot_diff_failed",
+                            "Snapshot pane-membership comparison failed.",
+                        )?;
+                        std::process::exit(1);
+                    }
+                };
             if let Some(cp_id) = missing_checkpoint {
                 let response = serde_json::json!({
                     "ok": false,
@@ -72474,7 +72048,9 @@ async fn handle_snapshot_command(
             let checkpoint = match run_cli_blocking_with_cx(
                 &cx,
                 "snapshot restore dry-run descriptor",
-                move || load_snapshot_restore_descriptor(descriptor_db_path.as_str(), checkpoint_id),
+                move || {
+                    load_snapshot_restore_descriptor(descriptor_db_path.as_str(), checkpoint_id)
+                },
             )
             .await
             {
@@ -72495,10 +72071,7 @@ async fn handle_snapshot_command(
                     std::process::exit(1);
                 }
                 Err(error) => {
-                    trace_bounded_cli_internal_error(
-                        "snapshot restore dry-run descriptor",
-                        &error,
-                    );
+                    trace_bounded_cli_internal_error("snapshot restore dry-run descriptor", &error);
                     let diagnostic = RestoreDiagnosticCode::RestoreInfrastructureFailure;
                     if !print_snapshot_session_structured_output(
                         &serde_json::json!({
@@ -72543,8 +72116,7 @@ async fn handle_session_command(
     use frankenterm_core::session_restore;
 
     let db_path = layout.db_path.to_string_lossy().to_string();
-    let cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
 
     match command {
         SessionCommands::List {
@@ -72564,22 +72136,21 @@ async fn handle_session_command(
                 )?;
                 std::process::exit(1);
             }
-            let page = match session_restore::list_sessions_page_with_cx(
-                &cx, &db_path, limit, offset,
-            )
-            .await
-            {
-                Ok(page) => page,
-                Err(error) => {
-                    trace_bounded_cli_internal_error("session list", &error);
-                    emit_snapshot_session_error(
-                        output_format,
-                        "session_list_failed",
-                        "Session list failed.",
-                    )?;
-                    std::process::exit(1);
-                }
-            };
+            let page =
+                match session_restore::list_sessions_page_with_cx(&cx, &db_path, limit, offset)
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(error) => {
+                        trace_bounded_cli_internal_error("session list", &error);
+                        emit_snapshot_session_error(
+                            output_format,
+                            "session_list_failed",
+                            "Session list failed.",
+                        )?;
+                        std::process::exit(1);
+                    }
+                };
 
             if output_format.is_structured() {
                 print_snapshot_session_structured_output(
@@ -72702,41 +72273,40 @@ async fn handle_session_command(
                 let pane_db_path = db_path.clone();
                 let pane_session_id = session.session_id.clone();
                 let selected_checkpoint_id = session.selected_checkpoint_id;
-                let lookup = match frankenterm_core::runtime_async::spawn_blocking_with_cx(
-                    &cx,
-                    move || {
+                let lookup =
+                    match frankenterm_core::runtime_async::spawn_blocking_with_cx(&cx, move || {
                         load_session_show_pane_lookup(
                             &pane_db_path,
                             &pane_session_id,
                             selected_checkpoint_id,
                             pane_id,
                         )
-                    },
-                )
-                .await {
-                    Ok(Ok(lookup)) => lookup,
-                    Ok(Err(error)) => {
-                        trace_bounded_cli_internal_error("session pane lookup", &error);
-                        emit_snapshot_session_error(
-                            output_format,
-                            "session_pane_lookup_failed",
-                            "Session pane lookup failed.",
-                        )?;
-                        std::process::exit(1);
-                    }
-                    Err(error) => {
-                        trace_bounded_cli_internal_error(
-                            "session pane lookup blocking boundary",
-                            &error,
-                        );
-                        emit_snapshot_session_error(
-                            output_format,
-                            "session_pane_lookup_failed",
-                            "Session pane lookup failed.",
-                        )?;
-                        std::process::exit(1);
-                    }
-                };
+                    })
+                    .await
+                    {
+                        Ok(Ok(lookup)) => lookup,
+                        Ok(Err(error)) => {
+                            trace_bounded_cli_internal_error("session pane lookup", &error);
+                            emit_snapshot_session_error(
+                                output_format,
+                                "session_pane_lookup_failed",
+                                "Session pane lookup failed.",
+                            )?;
+                            std::process::exit(1);
+                        }
+                        Err(error) => {
+                            trace_bounded_cli_internal_error(
+                                "session pane lookup blocking boundary",
+                                &error,
+                            );
+                            emit_snapshot_session_error(
+                                output_format,
+                                "session_pane_lookup_failed",
+                                "Session pane lookup failed.",
+                            )?;
+                            std::process::exit(1);
+                        }
+                    };
                 let lookup = redact_session_show_pane_lookup_for_output(lookup);
                 if let Some((error_code, message)) = session_show_pane_error_contract(&lookup) {
                     emit_snapshot_session_error(output_format, error_code, message)?;
@@ -72787,11 +72357,9 @@ async fn handle_session_command(
                 );
             }
             if page.has_more {
-                if let Some(next_offset) = bounded_session_query_next_offset(
-                    page.offset,
-                    checkpoints.len(),
-                    page.has_more,
-                ) {
+                if let Some(next_offset) =
+                    bounded_session_query_next_offset(page.offset, checkpoints.len(), page.has_more)
+                {
                     println!(
                         "More checkpoints are available; continue with --offset {next_offset} --limit {}.",
                         page.limit
@@ -73499,9 +73067,8 @@ async fn session_recovery_list_panes_on_runtime_task(
 ) -> frankenterm_core::Result<Vec<frankenterm_core::wezterm::PaneInfo>> {
     let parent_cx =
         frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-    let task = frankenterm_core::runtime_async::task::spawn_with_cx(
-        &parent_cx,
-        move |cx| async move {
+    let task =
+        frankenterm_core::runtime_async::task::spawn_with_cx(&parent_cx, move |cx| async move {
             runtime_context_preflight(
                 "session.recovery.list_panes.context",
                 &cx,
@@ -73520,12 +73087,10 @@ async fn session_recovery_list_panes_on_runtime_task(
                     &cx,
                 )),
             }
-        },
-    );
-    task.await
-        .map_err(|error| {
-            runtime_task_join_failure("session.recovery.list_panes.await_task", error)
-        })?
+        });
+    task.await.map_err(|error| {
+        runtime_task_join_failure("session.recovery.list_panes.await_task", error)
+    })?
 }
 
 async fn session_recovery_split_pane_on_runtime_task(
@@ -73534,9 +73099,8 @@ async fn session_recovery_split_pane_on_runtime_task(
 ) -> frankenterm_core::Result<u64> {
     let parent_cx =
         frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-    let task = frankenterm_core::runtime_async::task::spawn_with_cx(
-        &parent_cx,
-        move |cx| async move {
+    let task =
+        frankenterm_core::runtime_async::task::spawn_with_cx(&parent_cx, move |cx| async move {
             runtime_context_preflight(
                 "session.recovery.split_pane.context",
                 &cx,
@@ -73556,12 +73120,10 @@ async fn session_recovery_split_pane_on_runtime_task(
                     Some(50),
                 )
                 .await
-        },
-    );
-    task.await
-        .map_err(|error| {
-            session_recovery_mutation_join_failure("session_recovery_split_pane", error)
-        })?
+        });
+    task.await.map_err(|error| {
+        session_recovery_mutation_join_failure("session_recovery_split_pane", error)
+    })?
 }
 
 async fn session_recovery_send_text_on_runtime_task(
@@ -73571,9 +73133,8 @@ async fn session_recovery_send_text_on_runtime_task(
 ) -> frankenterm_core::Result<()> {
     let parent_cx =
         frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-    let task = frankenterm_core::runtime_async::task::spawn_with_cx(
-        &parent_cx,
-        move |cx| async move {
+    let task =
+        frankenterm_core::runtime_async::task::spawn_with_cx(&parent_cx, move |cx| async move {
             runtime_context_preflight(
                 "session.recovery.send_text.context",
                 &cx,
@@ -73585,12 +73146,10 @@ async fn session_recovery_send_text_on_runtime_task(
             wezterm
                 .send_text_with_options_with_cx(&cx, pane_id, &text, true, true)
                 .await
-        },
-    );
-    task.await
-        .map_err(|error| {
-            session_recovery_mutation_join_failure("session_recovery_send_text", error)
-        })?
+        });
+    task.await.map_err(|error| {
+        session_recovery_mutation_join_failure("session_recovery_send_text", error)
+    })?
 }
 
 fn session_recovery_mutation_join_failure(
@@ -73709,8 +73268,7 @@ async fn handle_auth_command(
                     account: account.clone(),
                     error: "Unsupported browser authentication service".to_string(),
                     next_step: Some(
-                        "Use one of the supported services: openai, google, anthropic"
-                            .to_string(),
+                        "Use one of the supported services: openai, google, anthropic".to_string(),
                     ),
                 }
             } else if ctx.try_profile(&service, &account).is_err() {
@@ -73762,7 +73320,9 @@ async fn handle_auth_command(
                     } => {
                         let display_service = auth_identity_for_display(service);
                         let display_account = auth_identity_for_display(account);
-                        println!("✓ Local auth state is valid: {display_service}/{display_account}");
+                        println!(
+                            "✓ Local auth state is valid: {display_service}/{display_account}"
+                        );
                         println!("  Live service authentication: not verified");
                         println!("  Bootstrapped: {last_bootstrapped}");
                         if verbose {
@@ -73787,7 +73347,10 @@ async fn handle_auth_command(
                         let display_service = auth_identity_for_display(service);
                         let display_account = auth_identity_for_display(account);
                         println!("⚠ Auth test: needs human: {display_service}/{display_account}");
-                        println!("  Reason: {}", bounded_terminal_diagnostic(reason, 256, 1_024));
+                        println!(
+                            "  Reason: {}",
+                            bounded_terminal_diagnostic(reason, 256, 1_024)
+                        );
                         println!(
                             "  Next: {}",
                             bounded_terminal_diagnostic(next_step, 256, 1_024)
@@ -73807,10 +73370,7 @@ async fn handle_auth_command(
                             bounded_terminal_diagnostic(error, 256, 1_024)
                         );
                         if let Some(step) = next_step {
-                            eprintln!(
-                                "  Next: {}",
-                                bounded_terminal_diagnostic(step, 256, 1_024)
-                            );
+                            eprintln!("  Next: {}", bounded_terminal_diagnostic(step, 256, 1_024));
                         }
                         std::process::exit(1);
                     }
@@ -74038,9 +73598,10 @@ async fn handle_auth_command(
                 }
             };
             bootstrap_config.timeout_ms = timeout_ms;
-            if login_url.as_deref().is_some_and(|url| {
-                bootstrap_config.set_login_url_override(url).is_err()
-            }) {
+            if login_url
+                .as_deref()
+                .is_some_and(|url| bootstrap_config.set_login_url_override(url).is_err())
+            {
                 let message = "Login URL is not admitted for the selected service";
                 if json {
                     println!(
@@ -74238,9 +73799,7 @@ fn build_profile_status(profile: &frankenterm_core::browser::BrowserProfile) -> 
         Err(_) => (AuthEvidenceState::InvalidOrUnavailable, None),
     };
     let storage_state = match profile.validate_storage_state() {
-        Ok(frankenterm_core::browser::StorageStateValidation::Valid) => {
-            AuthEvidenceState::Valid
-        }
+        Ok(frankenterm_core::browser::StorageStateValidation::Valid) => AuthEvidenceState::Valid,
         Ok(frankenterm_core::browser::StorageStateValidation::Missing) => {
             AuthEvidenceState::Missing
         }
@@ -74891,9 +74450,7 @@ enum WeztermScrollbackCheckFailure {
 impl WeztermScrollbackCheckFailure {
     const fn diagnostic_detail(self) -> &'static str {
         match self {
-            Self::MetadataUnavailable => {
-                "WezTerm config metadata could not be inspected safely"
-            }
+            Self::MetadataUnavailable => "WezTerm config metadata could not be inspected safely",
             Self::NotRegularFile => "WezTerm config path is not a regular file",
             Self::Oversized => "WezTerm config exceeds the 1 MiB diagnostic safety limit",
             Self::ReadUnavailable => "WezTerm config could not be read safely",
@@ -74950,13 +74507,10 @@ fn parse_wezterm_scrollback_lines(content: &str) -> Option<u64> {
     })
 }
 
-fn parse_wezterm_config_bytes(
-    bytes: &[u8],
-) -> Result<u64, WeztermScrollbackCheckFailure> {
-    let content = std::str::from_utf8(bytes)
-        .map_err(|_| WeztermScrollbackCheckFailure::InvalidEncoding)?;
-    parse_wezterm_scrollback_lines(content)
-        .ok_or(WeztermScrollbackCheckFailure::SettingMissing)
+fn parse_wezterm_config_bytes(bytes: &[u8]) -> Result<u64, WeztermScrollbackCheckFailure> {
+    let content =
+        std::str::from_utf8(bytes).map_err(|_| WeztermScrollbackCheckFailure::InvalidEncoding)?;
+    parse_wezterm_scrollback_lines(content).ok_or(WeztermScrollbackCheckFailure::SettingMissing)
 }
 
 fn diagnostic_path_for_output(path: &Path) -> String {
@@ -74986,14 +74540,13 @@ fn check_wezterm_scrollback() -> Result<(u64, PathBuf), WeztermScrollbackCheckFa
 
     for (authority_root, relative_path) in config_candidates {
         let config_path = authority_root.join(&relative_path);
-        let directory = match cap_std::fs::Dir::open_ambient_dir(
-            &authority_root,
-            cap_std::ambient_authority(),
-        ) {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(WeztermScrollbackCheckFailure::MetadataUnavailable),
-        };
+        let directory =
+            match cap_std::fs::Dir::open_ambient_dir(&authority_root, cap_std::ambient_authority())
+            {
+                Ok(directory) => directory,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(WeztermScrollbackCheckFailure::MetadataUnavailable),
+            };
         let metadata = match directory.symlink_metadata(&relative_path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -75034,7 +74587,8 @@ fn check_wezterm_scrollback() -> Result<(u64, PathBuf), WeztermScrollbackCheckFa
         )?;
         let path_snapshot_after = DiagnosticFileSnapshot::capture_cap(&path_metadata_after)
             .map_err(|_| WeztermScrollbackCheckFailure::MetadataUnavailable)?;
-        if handle_snapshot_after != opened_snapshot || path_snapshot_after != handle_snapshot_after {
+        if handle_snapshot_after != opened_snapshot || path_snapshot_after != handle_snapshot_after
+        {
             return Err(WeztermScrollbackCheckFailure::ChangedDuringRead);
         }
         let lines = parse_wezterm_config_bytes(&bytes)?;
@@ -76643,9 +76197,9 @@ fn build_status_health_operator_guidance(
 #[cfg(test)]
 mod operator_guidance_tests {
     use super::{
-        DiagnosticCheck, DiagnosticStatus, build_doctor_operator_guidance,
-        build_session_recovery_guidance, build_status_health_operator_guidance,
-        bounded_terminal_diagnostic, session_persistence_is_healthy,
+        DiagnosticCheck, DiagnosticStatus, bounded_terminal_diagnostic,
+        build_doctor_operator_guidance, build_session_recovery_guidance,
+        build_status_health_operator_guidance, session_persistence_is_healthy,
         session_recovery_diagnostic_check, session_restore_lifecycle_needs_reconciliation,
         workspace_bootstrap_pending_from_checks,
     };
@@ -76751,7 +76305,11 @@ mod operator_guidance_tests {
         let guidance = build_session_recovery_guidance(&report);
         assert_eq!(guidance.status, "recovery_required");
         assert!(guidance.summary.contains("inspection-only"));
-        assert!(guidance.summary.contains("restore execution is unavailable"));
+        assert!(
+            guidance
+                .summary
+                .contains("restore execution is unavailable")
+        );
         assert!(!guidance.summary.contains("manual recovery"));
         assert!(
             guidance
@@ -76839,26 +76397,28 @@ mod operator_guidance_tests {
         let diagnostic = session_recovery_diagnostic_check(&report);
         assert_eq!(diagnostic.status, DiagnosticStatus::Error);
         assert_eq!(diagnostic.name, "session restore lifecycle");
-        assert!(
-            diagnostic
-                .detail
-                .as_deref()
-                .is_some_and(|detail| {
-                    detail.contains("2 unresolved")
-                        && detail.contains("1 orphaned checkpoint(s)")
-                        && detail.contains("1 invalid resolved chain(s)")
-                })
-        );
+        assert!(diagnostic.detail.as_deref().is_some_and(|detail| {
+            detail.contains("2 unresolved")
+                && detail.contains("1 orphaned checkpoint(s)")
+                && detail.contains("1 invalid resolved chain(s)")
+        }));
 
         let guidance = build_session_recovery_guidance(&report);
         assert_eq!(guidance.status, "reconciliation_required");
         assert!(guidance.summary.contains("2 unresolved attempt"));
         assert!(guidance.summary.contains("1 orphaned intent"));
         assert!(guidance.summary.contains("1 orphaned checkpoint"));
-        assert!(guidance.summary.contains("1 invalid resolved restore chain"));
-        assert!(guidance.next_steps.iter().any(|step| {
-            step.command == "ft robot checkpoint list --limit 100"
-        }));
+        assert!(
+            guidance
+                .summary
+                .contains("1 invalid resolved restore chain")
+        );
+        assert!(
+            guidance
+                .next_steps
+                .iter()
+                .any(|step| { step.command == "ft robot checkpoint list --limit 100" })
+        );
         assert!(
             guidance
                 .next_steps
@@ -77224,8 +76784,7 @@ const LOGS_DIRECTORY_INSPECTED_DETAIL: &str =
     "shape/basic permission metadata inspected; writability was not tested";
 const LOGS_DIRECTORY_METADATA_ERROR_DETAIL: &str =
     "shape/basic permission metadata could not be inspected";
-const LOGS_DIRECTORY_MISSING_DETAIL: &str =
-    "shape check: configured logs directory does not exist";
+const LOGS_DIRECTORY_MISSING_DETAIL: &str = "shape check: configured logs directory does not exist";
 
 #[cfg(feature = "browser")]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -77297,8 +76856,7 @@ fn scan_browser_profiles_for_diagnostics(
                 counts.bootstrapped = counts.bootstrapped.saturating_add(1);
             }
             Ok(Some(_)) => {
-                counts.known_unbootstrapped =
-                    counts.known_unbootstrapped.saturating_add(1);
+                counts.known_unbootstrapped = counts.known_unbootstrapped.saturating_add(1);
             }
             Ok(None) => {
                 counts.metadata_unknown = counts.metadata_unknown.saturating_add(1);
@@ -77437,10 +76995,8 @@ fn terminate_diagnostic_process_tree(
         None => {}
     }
 
-    let group_signal = frankenterm_core::runtime_async::process::send_signal_to_process_group(
-        child.id(),
-        "KILL",
-    );
+    let group_signal =
+        frankenterm_core::runtime_async::process::send_signal_to_process_group(child.id(), "KILL");
     let signal_helper_settled = group_signal.as_ref().err().is_none_or(|error| {
         frankenterm_core::runtime_async::process::CommandSignalHelperCleanupIncomplete::from_io_error(
             error,
@@ -77674,10 +77230,7 @@ fn diagnostic_capture_pair(
         .set_non_blocking(true)
         .map_err(std::io::Error::other)?;
     let writer = writer.as_stdio().map_err(std::io::Error::other)?;
-    Ok((
-        NonblockingCommandCapture::new(reader, max_bytes),
-        writer,
-    ))
+    Ok((NonblockingCommandCapture::new(reader, max_bytes), writer))
 }
 
 fn drain_diagnostic_captures_until_closed(
@@ -77872,7 +77425,6 @@ impl SingleLineOutputAdmissionError {
             Self::ContainsControl => "wezterm --version returned unsafe control characters",
         }
     }
-
 }
 
 fn admit_single_line_output(
@@ -78139,11 +77691,7 @@ fn run_diagnostics(
     let config_source = if config.general.log_level.is_empty() {
         "defaults".to_string()
     } else {
-        bounded_terminal_diagnostic(
-            &format!("log_level={}", config.general.log_level),
-            128,
-            256,
-        )
+        bounded_terminal_diagnostic(&format!("log_level={}", config.general.log_level), 128, 256)
     };
     checks.push(DiagnosticCheck::ok_with_detail("config", config_source));
     checks.push(tuning_diagnostic_check(config));
@@ -79045,9 +78593,7 @@ mod tests {
             let first_page =
                 robot_checkpoint_list_data(&db_path, 1, 0).expect("list first checkpoint page");
             assert_eq!(
-                first_page["checkpoints"]
-                    .as_array()
-                    .map(std::vec::Vec::len),
+                first_page["checkpoints"].as_array().map(std::vec::Vec::len),
                 Some(1)
             );
             assert_eq!(first_page["has_more"].as_bool(), Some(true));
@@ -79083,14 +78629,8 @@ mod tests {
             );
             assert_eq!(shown["panes"][0]["command"].as_str(), Some("codex"));
             assert_eq!(shown["panes"][0]["title"].as_str(), Some("test"));
-            assert_eq!(
-                shown["panes"][0]["title_truncated"].as_bool(),
-                Some(false)
-            );
-            assert_eq!(
-                shown["display_projection_complete"].as_bool(),
-                Some(true)
-            );
+            assert_eq!(shown["panes"][0]["title_truncated"].as_bool(), Some(false));
+            assert_eq!(shown["display_projection_complete"].as_bool(), Some(true));
             assert_eq!(
                 shown["display_projection_completeness"].as_str(),
                 Some("complete")
@@ -79099,18 +78639,9 @@ mod tests {
                 shown["display_projection_scope"].as_str(),
                 Some("pane_titles")
             );
-            assert_eq!(
-                shown["display_title_max_bytes"].as_u64(),
-                Some(1_024)
-            );
-            assert_eq!(
-                shown["display_title_max_cells"].as_u64(),
-                Some(1_024)
-            );
-            assert_eq!(
-                shown["display_truncated_pane_count"].as_u64(),
-                Some(0)
-            );
+            assert_eq!(shown["display_title_max_bytes"].as_u64(), Some(1_024));
+            assert_eq!(shown["display_title_max_cells"].as_u64(), Some(1_024));
+            assert_eq!(shown["display_truncated_pane_count"].as_u64(), Some(0));
             assert_ne!(shown["panes"][0]["title"], shown["panes"][0]["command"]);
             assert_eq!(shown["panes"][0]["has_scrollback"].as_bool(), Some(true));
             assert!(shown["panes"][0]["scrollback_lines"].is_null());
@@ -79162,10 +78693,7 @@ mod tests {
             .expect("checkpoint deleted");
             assert_eq!(deleted["family"].as_str(), Some("checkpoint"));
             assert_eq!(deleted["action"].as_str(), Some("delete"));
-            assert_eq!(
-                deleted["pane_state_estimate_bytes"].as_u64(),
-                Some(2048)
-            );
+            assert_eq!(deleted["pane_state_estimate_bytes"].as_u64(), Some(2048));
             assert!(
                 robot_checkpoint_show_data(&db_path, newer)
                     .expect("show after delete")
@@ -79176,12 +78704,8 @@ mod tests {
 
     #[test]
     fn robot_checkpoint_list_window_and_total_probe_are_hard_bounded() {
-        assert!(
-            robot_checkpoint_validate_list_window(MAX_ROBOT_CHECKPOINT_LIST_LIMIT, 0).is_ok()
-        );
-        assert!(
-            robot_checkpoint_validate_list_window(0, MAX_ROBOT_CHECKPOINT_LIST_OFFSET).is_ok()
-        );
+        assert!(robot_checkpoint_validate_list_window(MAX_ROBOT_CHECKPOINT_LIST_LIMIT, 0).is_ok());
+        assert!(robot_checkpoint_validate_list_window(0, MAX_ROBOT_CHECKPOINT_LIST_OFFSET).is_ok());
         assert!(
             robot_checkpoint_validate_list_window(
                 MAX_ROBOT_CHECKPOINT_LIST_LIMIT.saturating_add(1),
@@ -79207,11 +78731,7 @@ mod tests {
         );
         assert_eq!(
             robot_checkpoint_total_summary(MAX_ROBOT_CHECKPOINT_TOTAL_SCAN + 1),
-            (
-                None,
-                Some(MAX_ROBOT_CHECKPOINT_TOTAL_SCAN + 1),
-                false,
-            )
+            (None, Some(MAX_ROBOT_CHECKPOINT_TOTAL_SCAN + 1), false,)
         );
     }
 
@@ -79228,9 +78748,7 @@ mod tests {
 
         let oversized = (0..=frankenterm_core::session_topology::MAX_TOPOLOGY_PANES)
             .map(|pane_id| {
-                robot_checkpoint_test_pane(
-                    u64::try_from(pane_id).expect("test pane id fits u64"),
-                )
+                robot_checkpoint_test_pane(u64::try_from(pane_id).expect("test pane id fits u64"))
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -79244,21 +78762,9 @@ mod tests {
         let (_dir, layout, conn) = setup_robot_checkpoint_test_workspace();
         let db_path = layout.db_path.to_string_lossy().to_string();
         insert_session_for_session_show_test(&conn, "sess-scrollback-coverage", false);
-        let checkpoint_id = insert_robot_checkpoint_for_test(
-            &conn,
-            "sess-scrollback-coverage",
-            2_000,
-            None,
-            128,
-        );
-        insert_robot_checkpoint_pane_for_test(
-            &conn,
-            checkpoint_id,
-            7,
-            None,
-            None,
-            None,
-        );
+        let checkpoint_id =
+            insert_robot_checkpoint_for_test(&conn, "sess-scrollback-coverage", 2_000, None, 128);
+        insert_robot_checkpoint_pane_for_test(&conn, checkpoint_id, 7, None, None, None);
 
         let absent = robot_checkpoint_scrollback_coverage(&db_path, checkpoint_id, 1)
             .expect("absent scrollback coverage");
@@ -79279,14 +78785,7 @@ mod tests {
         assert!(present.all());
         assert_eq!(present.panes_with_scrollback, 1);
 
-        insert_robot_checkpoint_pane_for_test(
-            &conn,
-            checkpoint_id,
-            8,
-            None,
-            None,
-            None,
-        );
+        insert_robot_checkpoint_pane_for_test(&conn, checkpoint_id, 8, None, None, None);
         conn.execute(
             "UPDATE session_checkpoints SET pane_count = 2 WHERE id = ?1",
             [checkpoint_id],
@@ -79331,13 +78830,7 @@ mod tests {
             Some("robot label"),
             128,
         );
-        let newest = insert_robot_checkpoint_for_test(
-            &conn,
-            "sess-human-list",
-            3_000,
-            None,
-            256,
-        );
+        let newest = insert_robot_checkpoint_for_test(&conn, "sess-human-list", 3_000, None, 256);
         let cli_metadata = serde_json::json!({
             "cli_snapshot": {
                 "requested_trigger": "manual",
@@ -79350,13 +78843,8 @@ mod tests {
             rusqlite::params![newest, cli_metadata],
         )
         .expect("install CLI snapshot metadata");
-        let backdated = insert_robot_checkpoint_for_test(
-            &conn,
-            "sess-human-list",
-            500,
-            Some("backdated"),
-            64,
-        );
+        let backdated =
+            insert_robot_checkpoint_for_test(&conn, "sess-human-list", 500, Some("backdated"), 64);
         assert!(backdated > newest && newest > older);
 
         let first = load_bounded_snapshot_list(&db_path, 1, 0, None)
@@ -79371,12 +78859,10 @@ mod tests {
             Some("CLI label".to_string())
         );
         assert!(
-            checkpoint_label_from_loaded_metadata(Some(
-                r#"{"cli_snapshot":{"label":42}}"#
-            ))
-            .expect_err("non-text loaded labels must fail closed")
-            .to_string()
-            .contains("invalid label")
+            checkpoint_label_from_loaded_metadata(Some(r#"{"cli_snapshot":{"label":42}}"#))
+                .expect_err("non-text loaded labels must fail closed")
+                .to_string()
+                .contains("invalid label")
         );
 
         let second = load_bounded_snapshot_list(&db_path, 1, 1, Some("sess-human-list"))
@@ -79391,15 +78877,10 @@ mod tests {
         assert!(!third.has_more);
 
         assert!(
-            load_bounded_snapshot_list(
-                &db_path,
-                1,
-                MAX_ROBOT_CHECKPOINT_LIST_OFFSET + 1,
-                None,
-            )
-            .expect_err("oversized human snapshot offset must fail")
-            .to_string()
-            .contains("offset")
+            load_bounded_snapshot_list(&db_path, 1, MAX_ROBOT_CHECKPOINT_LIST_OFFSET + 1, None,)
+                .expect_err("oversized human snapshot offset must fail")
+                .to_string()
+                .contains("offset")
         );
 
         conn.execute(
@@ -79538,9 +79019,8 @@ mod tests {
         assert_eq!(projected, "first second ");
         assert!(!truncated);
 
-        let (exact, exact_truncated) = robot_checkpoint_title_for_output(
-            "t".repeat(MAX_ROBOT_CHECKPOINT_DISPLAY_TITLE_BYTES),
-        );
+        let (exact, exact_truncated) =
+            robot_checkpoint_title_for_output("t".repeat(MAX_ROBOT_CHECKPOINT_DISPLAY_TITLE_BYTES));
         assert_eq!(exact.len(), MAX_ROBOT_CHECKPOINT_DISPLAY_TITLE_BYTES);
         assert!(!exact_truncated);
 
@@ -79582,10 +79062,7 @@ mod tests {
 
         assert_eq!(response["trigger"].as_str(), Some("manual"));
         assert_eq!(response["pane_count"].as_u64(), Some(2));
-        assert_eq!(
-            response["pane_state_estimate_bytes"].as_u64(),
-            Some(4_096)
-        );
+        assert_eq!(response["pane_state_estimate_bytes"].as_u64(), Some(4_096));
         assert_eq!(response["persisted_text_bytes"].as_u64(), Some(2_048));
         assert_eq!(response["truncated_pane_count"].as_u64(), Some(1));
         assert_eq!(response["projection_complete"].as_bool(), Some(false));
@@ -79753,10 +79230,8 @@ mod tests {
             "UPDATE session_checkpoints SET pane_count = ?2 WHERE id = ?1",
             rusqlite::params![
                 checkpoint_id,
-                i64::try_from(
-                    frankenterm_core::session_topology::MAX_TOPOLOGY_PANES + 1,
-                )
-                .expect("topology pane cap fits i64"),
+                i64::try_from(frankenterm_core::session_topology::MAX_TOPOLOGY_PANES + 1,)
+                    .expect("topology pane cap fits i64"),
             ],
         )
         .expect("inject oversized checkpoint pane count");
@@ -79793,18 +79268,12 @@ mod tests {
             .expect("valid persisted title must be display-projected")
             .expect("checkpoint exists");
         assert_eq!(shown["panes"][0]["title_truncated"].as_bool(), Some(true));
-        assert_eq!(
-            shown["display_projection_complete"].as_bool(),
-            Some(false)
-        );
+        assert_eq!(shown["display_projection_complete"].as_bool(), Some(false));
         assert_eq!(
             shown["display_projection_completeness"].as_str(),
             Some("truncated")
         );
-        assert_eq!(
-            shown["display_truncated_pane_count"].as_u64(),
-            Some(1)
-        );
+        assert_eq!(shown["display_truncated_pane_count"].as_u64(), Some(1));
         assert!(
             shown["panes"][0]["title"]
                 .as_str()
@@ -79835,13 +79304,8 @@ mod tests {
         let (_dir, layout, conn) = setup_robot_checkpoint_test_workspace();
         let db_path = layout.db_path.to_string_lossy().to_string();
         insert_session_for_session_show_test(&conn, "sess-checkpoint-row-count", false);
-        let checkpoint_id = insert_robot_checkpoint_for_test(
-            &conn,
-            "sess-checkpoint-row-count",
-            3_000,
-            None,
-            128,
-        );
+        let checkpoint_id =
+            insert_robot_checkpoint_for_test(&conn, "sess-checkpoint-row-count", 3_000, None, 128);
         insert_robot_checkpoint_pane_for_test(
             &conn,
             checkpoint_id,
@@ -79888,38 +79352,24 @@ mod tests {
         assert_eq!(parse_bounded_checkpoint_id("-1"), None);
 
         let latest_error =
-            robot_checkpoint_resolve_id(
-                &db_path,
-                "latest",
-                CheckpointResolveScope::Any,
-                5,
-            )
-            .expect_err("latest is absent");
+            robot_checkpoint_resolve_id(&db_path, "latest", CheckpointResolveScope::Any, 5)
+                .expect_err("latest is absent");
         assert_eq!(
             latest_error.error_code.as_deref(),
             Some(ROBOT_ERR_CHECKPOINT_NOT_FOUND)
         );
 
         let invalid_error =
-            robot_checkpoint_resolve_id(
-                &db_path,
-                "not-a-number",
-                CheckpointResolveScope::Any,
-                5,
-            )
-            .expect_err("invalid id");
+            robot_checkpoint_resolve_id(&db_path, "not-a-number", CheckpointResolveScope::Any, 5)
+                .expect_err("invalid id");
         assert_eq!(
             invalid_error.error_code.as_deref(),
             Some(ROBOT_ERR_INVALID_ARGS)
         );
 
-        let negative_error = robot_checkpoint_resolve_id(
-            &db_path,
-            "-1",
-            CheckpointResolveScope::Any,
-            5,
-        )
-        .expect_err("non-positive checkpoint id is invalid");
+        let negative_error =
+            robot_checkpoint_resolve_id(&db_path, "-1", CheckpointResolveScope::Any, 5)
+                .expect_err("non-positive checkpoint id is invalid");
         assert_eq!(
             negative_error.error_code.as_deref(),
             Some(ROBOT_ERR_INVALID_ARGS)
@@ -79944,10 +79394,7 @@ mod tests {
             "invalid checkpoint-id diagnostics must be finite and content-free"
         );
 
-        let inaccessible_db = layout
-            .ft_dir
-            .join("missing-parent")
-            .join("checkpoints.db");
+        let inaccessible_db = layout.ft_dir.join("missing-parent").join("checkpoints.db");
         let storage_error = robot_checkpoint_resolve_id(
             inaccessible_db.to_string_lossy().as_ref(),
             "latest",
@@ -79955,10 +79402,7 @@ mod tests {
             5,
         )
         .expect_err("database open failure is not an argument error");
-        assert_eq!(
-            storage_error.error_code.as_deref(),
-            Some(ROBOT_ERR_STORAGE)
-        );
+        assert_eq!(storage_error.error_code.as_deref(), Some(ROBOT_ERR_STORAGE));
     }
 
     #[test]
@@ -79970,7 +79414,9 @@ mod tests {
             Some(ROBOT_ERR_FEATURE_NOT_AVAILABLE)
         );
         assert_ne!(response.error_code.as_deref(), Some(ROBOT_ERR_APPROVAL));
-        let data = response.data.expect("unavailable response should carry facts");
+        let data = response
+            .data
+            .expect("unavailable response should carry facts");
         assert_eq!(data["executable"].as_bool(), Some(false));
         assert_eq!(
             data["external_effects_may_have_occurred"].as_bool(),
@@ -80019,12 +79465,8 @@ mod tests {
         assert!(backdated_snapshot > receipt);
         assert!(second_snapshot > first_snapshot);
         assert_eq!(
-            resolve_checkpoint_id(
-                &db_path,
-                &receipt.to_string(),
-                CheckpointResolveScope::Any,
-            )
-            .expect("resolve numeric receipt without a role restriction"),
+            resolve_checkpoint_id(&db_path, &receipt.to_string(), CheckpointResolveScope::Any,)
+                .expect("resolve numeric receipt without a role restriction"),
             receipt
         );
         assert!(matches!(
@@ -80156,8 +79598,8 @@ mod tests {
 
         let null_dir = tempfile::tempdir().expect("create nullable descriptor fixture");
         let null_db_path = null_dir.path().join("nullable.db");
-        let null_conn = rusqlite::Connection::open(&null_db_path)
-            .expect("open nullable descriptor fixture");
+        let null_conn =
+            rusqlite::Connection::open(&null_db_path).expect("open nullable descriptor fixture");
         null_conn
             .execute_batch(
                 "CREATE TABLE session_checkpoints (
@@ -80264,14 +79706,9 @@ mod tests {
                 receipt_dry_run.error_code.as_deref(),
                 Some(ROBOT_ERR_INVALID_ARGS)
             );
-            assert!(
-                receipt_dry_run
-                    .error
-                    .as_deref()
-                    .is_some_and(|message| {
-                        message.len() < 256 && !message.contains("restore_receipt")
-                    })
-            );
+            assert!(receipt_dry_run.error.as_deref().is_some_and(|message| {
+                message.len() < 256 && !message.contains("restore_receipt")
+            }));
 
             let apply = handle_robot_checkpoint_command(
                 &RobotCheckpointCommands::Rollback {
@@ -80349,13 +79786,9 @@ mod tests {
         )
         .expect("insert newer startup checkpoint");
 
-        let selected_page = frankenterm_core::session_restore::show_session_page(
-            &db_path,
-            "sess-shadowed",
-            1,
-            0,
-        )
-        .expect("select paged session checkpoint before concurrent capture");
+        let selected_page =
+            frankenterm_core::session_restore::show_session_page(&db_path, "sess-shadowed", 1, 0)
+                .expect("select paged session checkpoint before concurrent capture");
         assert_eq!(selected_page.total_checkpoints, 2);
         assert_eq!(selected_page.checkpoints.len(), 1);
         assert!(selected_page.has_more);
@@ -80410,9 +79843,8 @@ mod tests {
         let (db_path, conn, _dir) = setup_session_show_test_db();
         insert_session_for_session_show_test(&conn, "sess-no-checkpoints", false);
 
-        let lookup =
-            load_session_show_pane_lookup(&db_path, "sess-no-checkpoints", None, 7)
-                .expect("load pane lookup");
+        let lookup = load_session_show_pane_lookup(&db_path, "sess-no-checkpoints", None, 7)
+            .expect("load pane lookup");
 
         assert_eq!(
             lookup,
@@ -80680,10 +80112,7 @@ mod tests {
         );
         assert_eq!(payload["pane_state_estimate_bytes"].as_u64(), Some(5_120));
         assert_eq!(payload["orphaned_checkpoints"].as_u64(), Some(5));
-        assert_eq!(
-            payload["invalid_resolved_restore_chains"].as_u64(),
-            Some(6)
-        );
+        assert_eq!(payload["invalid_resolved_restore_chains"].as_u64(), Some(6));
         assert!(payload.get("total_data_bytes").is_none());
         assert_eq!(payload["verification"].as_str(), Some("not_computed"));
         assert_eq!(
@@ -81006,7 +80435,7 @@ mod tests {
         use frankenterm_core::restore_process::{
             LaunchAction, ProcessDispositionReason, ProcessLauncher, ProcessPlan,
         };
-        use frankenterm_core::session_restore::{RestoredPaneState, RestoreSummary};
+        use frankenterm_core::session_restore::{RestoreSummary, RestoredPaneState};
         use std::collections::HashMap;
 
         let mut pane_id_map = HashMap::new();
@@ -81204,18 +80633,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn snapshot_restore_typed_admission_errors_have_stable_content_free_contracts() {
-        use frankenterm_core::session_restore::{
-            RestoreError, UncleanSessionBlockReason,
-        };
+        use frankenterm_core::session_restore::{RestoreError, UncleanSessionBlockReason};
 
         let unclean = SnapshotRestoreAbort::from_execution_error(
             42,
-            SnapshotRestoreExecutionError::Restore(
-                RestoreError::UncleanSessionsNotRestorable {
-                    session_count: 3,
-                    reason: UncleanSessionBlockReason::Mixed,
-                },
-            ),
+            SnapshotRestoreExecutionError::Restore(RestoreError::UncleanSessionsNotRestorable {
+                session_count: 3,
+                reason: UncleanSessionBlockReason::Mixed,
+            }),
         );
         assert_eq!(unclean.phase, "restore_admission");
         assert_eq!(unclean.checkpoint_id, 42);
@@ -81232,9 +80657,9 @@ mod tests {
 
         let detected = SnapshotRestoreAbort::from_execution_error(
             42,
-            SnapshotRestoreExecutionError::Restore(
-                RestoreError::DetectedCheckpointChanged { checkpoint_id: 77 },
-            ),
+            SnapshotRestoreExecutionError::Restore(RestoreError::DetectedCheckpointChanged {
+                checkpoint_id: 77,
+            }),
         );
         assert_eq!(detected.phase, "checkpoint_admission");
         assert_eq!(detected.checkpoint_id, 77);
@@ -81286,11 +80711,11 @@ mod tests {
             );
             assert_eq!(payload["intent_checkpoint_id"].as_i64(), Some(43));
             assert_eq!(payload["outcome_checkpoint_id"].as_i64(), Some(44));
+            assert_eq!(payload["restore_authority_resolved"].as_bool(), Some(false));
             assert_eq!(
-                payload["restore_authority_resolved"].as_bool(),
-                Some(false)
+                payload["external_effects_may_have_occurred"].as_bool(),
+                Some(true)
             );
-            assert_eq!(payload["external_effects_may_have_occurred"].as_bool(), Some(true));
         });
     }
 
@@ -81357,9 +80782,8 @@ mod tests {
         );
         primary.intent_checkpoint_id = Some(90);
         primary.outcome_checkpoint_id = Some(91);
-        primary.interruption_reason = Some(
-            frankenterm_core::session_restore::RestoreInterruptionReason::IntegrityFailure,
-        );
+        primary.interruption_reason =
+            Some(frankenterm_core::session_restore::RestoreInterruptionReason::IntegrityFailure);
         primary.hint = Some("primary reconciliation hint".to_string());
 
         let combined = combine_snapshot_restore_cleanup(Err(primary), false, 88)
@@ -81371,7 +80795,10 @@ mod tests {
         );
         assert_eq!(combined.intent_checkpoint_id, Some(90));
         assert_eq!(combined.outcome_checkpoint_id, Some(91));
-        assert_eq!(combined.hint.as_deref(), Some("primary reconciliation hint"));
+        assert_eq!(
+            combined.hint.as_deref(),
+            Some("primary reconciliation hint")
+        );
         assert!(combined.cleanup_failed);
 
         let payload = snapshot_restore_abort_json(&combined);
@@ -81380,15 +80807,18 @@ mod tests {
             Some("restore_attempt_interrupted")
         );
         assert_eq!(payload["cleanup_failed"].as_bool(), Some(true));
-        assert_eq!(payload["cleanup_error_code"].as_str(), Some("cleanup_failed"));
+        assert_eq!(
+            payload["cleanup_error_code"].as_str(),
+            Some("cleanup_failed")
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn cleanup_failure_preserves_successful_restore_evidence() {
         let mut summary = sample_restore_summary();
-        summary.session_id = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678901234567890\nforged"
-            .to_string();
+        summary.session_id =
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678901234567890\nforged".to_string();
         summary.layout_result.pane_id_map.insert(3, 103);
         summary.layout_result.failed_panes.clear();
         summary.restore_authority_resolved = true;
@@ -81442,7 +80872,10 @@ mod tests {
             payload["checkpoint_projection_verification"].as_str(),
             Some("metadata_only_unchecked")
         );
-        assert_eq!(payload["scrollback_replay"]["enabled"].as_bool(), Some(false));
+        assert_eq!(
+            payload["scrollback_replay"]["enabled"].as_bool(),
+            Some(false)
+        );
         assert_eq!(
             payload["scrollback_replay"]["reason"].as_str(),
             Some(SCROLLBACK_REPLAY_DISABLED_REASON)
@@ -81455,7 +80888,10 @@ mod tests {
             payload["process_restoration"]["reason"].as_str(),
             Some(PROCESS_RESTORATION_DISABLED_REASON)
         );
-        assert_eq!(payload["session_continuity_complete"].as_bool(), Some(false));
+        assert_eq!(
+            payload["session_continuity_complete"].as_bool(),
+            Some(false)
+        );
     }
 
     #[test]
@@ -81501,10 +80937,7 @@ mod tests {
         let mut descriptor = sample_snapshot_restore_checkpoint();
         descriptor.session_id = "session\u{1b}[2J\nforged".to_string();
 
-        let lines = snapshot_restore_plan_lines(
-            &descriptor,
-            sample_snapshot_restore_options(),
-        );
+        let lines = snapshot_restore_plan_lines(&descriptor, sample_snapshot_restore_options());
         let rendered = lines.join("\n");
         let session_line = lines
             .iter()
@@ -81531,8 +80964,7 @@ mod tests {
             Some(false)
         );
         assert_eq!(
-            payload["execution_acknowledgement"]["required_for_hypothetical_execution"]
-                .as_bool(),
+            payload["execution_acknowledgement"]["required_for_hypothetical_execution"].as_bool(),
             Some(true)
         );
         assert_eq!(
@@ -81543,7 +80975,10 @@ mod tests {
             payload["execution_acknowledgement"]["flag"].as_str(),
             Some(RESTART_ACKNOWLEDGEMENT_FLAG)
         );
-        assert_eq!(payload["session_continuity_complete"].as_bool(), Some(false));
+        assert_eq!(
+            payload["session_continuity_complete"].as_bool(),
+            Some(false)
+        );
         assert_eq!(
             payload["planned"]["snapshot_trigger"].as_str(),
             Some("pre_restart")
@@ -81589,16 +81024,20 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Session continuity: incomplete"))
         );
-        assert!(lines.iter().any(|line| {
-            line.contains("restart_unavailable_no_authenticated_mux_identity")
-        }));
+        assert!(
+            lines
+                .iter()
+                .any(|line| { line.contains("restart_unavailable_no_authenticated_mux_identity") })
+        );
         assert!(lines.iter().any(|line| {
             line.contains("No snapshot, process discovery, signal, or mux mutation")
         }));
         assert!(!lines.iter().any(|line| line.contains("Stop `")));
         assert_eq!(
             lines.last().map(String::as_str),
-            Some("Dry-run complete; no workspace, snapshot, process, signal, or mux mutation was performed."),
+            Some(
+                "Dry-run complete; no workspace, snapshot, process, signal, or mux mutation was performed."
+            ),
         );
     }
 
@@ -81611,13 +81050,16 @@ mod tests {
                 42,
                 RestoreDiagnosticCode::OperationLockUnavailable,
             )
-                .with_hint("Wait for the other snapshot restore to finish, then retry."),
+            .with_hint("Wait for the other snapshot restore to finish, then retry."),
         );
 
         assert_eq!(payload["ok"].as_bool(), Some(false));
         assert_eq!(payload["operation_complete"].as_bool(), Some(false));
         assert_eq!(payload["layout_authority_complete"].as_bool(), Some(false));
-        assert_eq!(payload["session_continuity_complete"].as_bool(), Some(false));
+        assert_eq!(
+            payload["session_continuity_complete"].as_bool(),
+            Some(false)
+        );
         assert_eq!(payload["phase"].as_str(), Some("preflight"));
         assert_eq!(payload["checkpoint_id"].as_i64(), Some(42));
         assert_eq!(
@@ -81715,8 +81157,8 @@ mod tests {
     #[test]
     fn snapshot_restore_result_json_is_truthful_and_redacts_process_details() {
         let mut summary = sample_restore_summary();
-        summary.session_id = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678901234567890\nforged"
-            .to_string();
+        summary.session_id =
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678901234567890\nforged".to_string();
         let payload = snapshot_restore_result_json(&SnapshotRestoreWorkflowResult {
             summary,
             layout_only: true,
@@ -81739,7 +81181,10 @@ mod tests {
         assert_eq!(payload["expected_panes"].as_u64(), Some(3));
         assert_eq!(payload["operation_complete"].as_bool(), Some(false));
         assert_eq!(payload["layout_authority_complete"].as_bool(), Some(false));
-        assert_eq!(payload["session_continuity_complete"].as_bool(), Some(false));
+        assert_eq!(
+            payload["session_continuity_complete"].as_bool(),
+            Some(false)
+        );
         assert_eq!(payload["restore_authority_resolved"].as_bool(), Some(false));
         assert_eq!(payload["elapsed_ms"].as_u64(), Some(2500));
         assert_eq!(payload["scrollback"]["enabled"].as_bool(), Some(false));
@@ -81750,14 +81195,19 @@ mod tests {
             Some(3)
         );
         assert!(payload["process_disposition"].get("failed").is_none());
-        assert_eq!(payload["process_disposition"]["interrupted"].as_bool(), Some(false));
+        assert_eq!(
+            payload["process_disposition"]["interrupted"].as_bool(),
+            Some(false)
+        );
         assert_eq!(
             payload["process_disposition"]["process_restoration_complete"].as_bool(),
             Some(false)
         );
         for forbidden_field in ["results", "action", "command", "cwd", "hint", "detail"] {
             assert!(
-                payload["process_disposition"].get(forbidden_field).is_none(),
+                payload["process_disposition"]
+                    .get(forbidden_field)
+                    .is_none(),
                 "raw process field must not be emitted: {forbidden_field}"
             );
         }
@@ -81779,7 +81229,10 @@ mod tests {
             Some("restart_unavailable_no_authenticated_mux_identity")
         );
         assert_eq!(payload["layout_authority_complete"].as_bool(), Some(false));
-        assert_eq!(payload["session_continuity_complete"].as_bool(), Some(false));
+        assert_eq!(
+            payload["session_continuity_complete"].as_bool(),
+            Some(false)
+        );
         assert!(payload.get("snapshot").is_none());
         assert!(payload.get("stopped_mux_pids").is_none());
     }
@@ -81809,12 +81262,8 @@ mod tests {
             _ => panic!("expected restart command"),
         }
 
-        let with_ack = Cli::try_parse_from([
-            "ft",
-            "restart",
-            RESTART_ACKNOWLEDGEMENT_FLAG,
-        ])
-        .expect("documented restart acknowledgement flag should parse");
+        let with_ack = Cli::try_parse_from(["ft", "restart", RESTART_ACKNOWLEDGEMENT_FLAG])
+            .expect("documented restart acknowledgement flag should parse");
         match with_ack.command.as_deref() {
             Some(Commands::Restart {
                 acknowledge_process_and_scrollback_loss,
@@ -85632,8 +85081,7 @@ recorder_backend = "frankensqlite"
             },
         ] {
             let redacted = redact_session_show_pane_lookup_for_output(lookup);
-            let json =
-                serde_json::to_string(&redacted).expect("serialize redacted lookup variant");
+            let json = serde_json::to_string(&redacted).expect("serialize redacted lookup variant");
             assert!(!json.contains(&secret));
             assert!(!json.contains("\\n"));
             assert!(!json.contains('\u{202e}'));
@@ -85764,12 +85212,8 @@ recorder_backend = "frankensqlite"
         );
         let hint = format!("hint\u{202e}\n{}", "h".repeat(30_000));
 
-        let response = RobotResponse::<serde_json::Value>::error_with_code(
-            &code,
-            message,
-            Some(hint),
-            1,
-        );
+        let response =
+            RobotResponse::<serde_json::Value>::error_with_code(&code, message, Some(hint), 1);
         let error = response.error.as_deref().expect("error field");
         let error_code = response.error_code.as_deref().expect("error code field");
         let hint = response.hint.as_deref().expect("hint field");
@@ -87283,9 +86727,9 @@ recorder_backend = "frankensqlite"
             .build()
             .unwrap()
             .block_on(async {
-                use runtime_net::{TcpListener, TcpStream};
                 use frankenterm_core::storage::PaneRecord;
                 use frankenterm_core::wire_protocol::{AgentStreamer, WireEnvelope, WirePayload};
+                use runtime_net::{TcpListener, TcpStream};
 
                 let (storage_handle, db_path) =
                     setup_storage("distributed_agent_replay_gap_history").await;
@@ -88236,9 +87680,9 @@ recorder_backend = "frankensqlite"
             .build()
             .unwrap()
             .block_on(async {
+                use frankenterm_core::wire_protocol::{PaneMeta, WireEnvelope, WirePayload};
                 use runtime_io::AsyncWriteExt;
                 use runtime_net::TcpStream;
-                use frankenterm_core::wire_protocol::{PaneMeta, WireEnvelope, WirePayload};
                 use std::sync::atomic::Ordering;
 
                 let (storage_handle, db_path) =
@@ -89004,9 +88448,9 @@ recorder_backend = "frankensqlite"
             .build()
             .unwrap()
             .block_on(async {
+                use frankenterm_core::wire_protocol::{PaneMeta, WireEnvelope, WirePayload};
                 use runtime_io::AsyncWriteExt;
                 use runtime_net::TcpStream;
-                use frankenterm_core::wire_protocol::{PaneMeta, WireEnvelope, WirePayload};
                 use std::sync::atomic::Ordering;
 
                 let (storage_handle, db_path) =
@@ -90928,9 +90372,7 @@ log_level = "debug"
 
         let hostile = "AKIAIOSF\x1b[31mODNN7EXAMPLE\nspoof\u{202e}tail";
         let mut policy = PolicyEvaluation::new();
-        policy.add_check(
-            PolicyCheck::failed(hostile, hostile).with_details(hostile),
-        );
+        policy.add_check(PolicyCheck::failed(hostile, hostile).with_details(hostile));
         let report = DryRunReport {
             command: hostile.to_string(),
             target_resolution: Some(
@@ -90979,10 +90421,7 @@ log_level = "debug"
             Some(SubmitGuaranteeLevel::Submitted)
         );
         assert_eq!(
-            requested_submit_guarantee_level(
-                true,
-                Some(SubmitGuaranteeLevelArg::Working),
-            ),
+            requested_submit_guarantee_level(true, Some(SubmitGuaranteeLevelArg::Working),),
             Some(SubmitGuaranteeLevel::Working),
             "an explicit level must take precedence over the shorthand flag"
         );
@@ -94218,11 +93657,8 @@ log_level = "debug"
         fn build_profile_status_with_metadata() {
             let tmp = tempfile::tempdir().expect("isolated auth-profile root");
 
-            let profile = frankenterm_core::browser::BrowserProfile::new(
-                tmp.path(),
-                "openai",
-                "default",
-            );
+            let profile =
+                frankenterm_core::browser::BrowserProfile::new(tmp.path(), "openai", "default");
             let _ = profile.ensure_dir();
 
             let mut metadata = frankenterm_core::browser::ProfileMetadata::new("openai", "default");
@@ -94243,11 +93679,8 @@ log_level = "debug"
         fn build_profile_status_with_storage_state() {
             let tmp = tempfile::tempdir().expect("isolated auth-profile root");
 
-            let profile = frankenterm_core::browser::BrowserProfile::new(
-                tmp.path(),
-                "openai",
-                "default",
-            );
+            let profile =
+                frankenterm_core::browser::BrowserProfile::new(tmp.path(), "openai", "default");
             let _ = profile.ensure_dir();
             profile
                 .save_storage_state(br#"{"cookies":[],"origins":[]}"#)
@@ -94266,12 +93699,9 @@ log_level = "debug"
         #[test]
         fn classify_auth_profile_evidence_reaches_local_ready_from_a_real_bound_pair() {
             let tmp = tempfile::tempdir().expect("isolated auth-profile root");
-            let profile = frankenterm_core::browser::BrowserProfile::try_new(
-                tmp.path(),
-                "openai",
-                "default",
-            )
-            .expect("valid profile identity");
+            let profile =
+                frankenterm_core::browser::BrowserProfile::try_new(tmp.path(), "openai", "default")
+                    .expect("valid profile identity");
             profile
                 .record_authenticated_state(
                     br#"{"cookies":[],"origins":[]}"#,
@@ -94300,13 +93730,12 @@ log_level = "debug"
         #[test]
         fn classify_auth_profile_evidence_rejects_bad_metadata_even_without_state() {
             let tmp = tempfile::tempdir().expect("isolated auth-profile root");
-            let profile = frankenterm_core::browser::BrowserProfile::try_new(
-                tmp.path(),
-                "openai",
-                "default",
-            )
-            .expect("valid profile identity");
-            profile.ensure_dir().expect("create private profile directory");
+            let profile =
+                frankenterm_core::browser::BrowserProfile::try_new(tmp.path(), "openai", "default")
+                    .expect("valid profile identity");
+            profile
+                .ensure_dir()
+                .expect("create private profile directory");
             std::fs::write(profile.metadata_path(), b"{not-json")
                 .expect("write malformed metadata fixture");
 
@@ -95288,7 +94717,9 @@ log_level = "debug"
         for error in &cases {
             let (code, hint) = robot_storage_error_details(error);
             assert_eq!(code, ROBOT_ERR_STORAGE_EFFECT_INDETERMINATE);
-            let hint = hint.as_deref().expect("uncertain storage effect needs guidance");
+            let hint = hint
+                .as_deref()
+                .expect("uncertain storage effect needs guidance");
             assert!(hint.contains("Reconcile the affected state"));
             assert!(hint.contains("do not automatically retry"));
         }
@@ -100802,7 +100233,10 @@ A  docs/new-proof.md\n";
             SessionResumeError::Cancelled,
             7,
         );
-        assert_eq!(cancelled.error_code.as_deref(), Some(ROBOT_ERR_SESSION_RESUME_CANCELLED));
+        assert_eq!(
+            cancelled.error_code.as_deref(),
+            Some(ROBOT_ERR_SESSION_RESUME_CANCELLED)
+        );
 
         let indeterminate = robot_session_resume_error_response::<serde_json::Value>(
             SessionResumeError::ResumeEffectIndeterminate {
@@ -100839,8 +100273,7 @@ A  docs/new-proof.md\n";
 
         let cleanup = robot_session_resume_error_response::<serde_json::Value>(
             SessionResumeError::CleanupIncomplete {
-                trigger:
-                    frankenterm_core::runtime_async::process::CommandCleanupTrigger::TimedOut,
+                trigger: frankenterm_core::runtime_async::process::CommandCleanupTrigger::TimedOut,
                 leader_reaped: false,
                 signal_helper_settled: true,
                 process_tree_signalled: false,
@@ -101557,9 +100990,7 @@ A  docs/new-proof.md\n";
                     );
                     assert_eq!(
                         cursor_scope.as_deref(),
-                        Some(
-                            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                        )
+                        Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
                     );
                     assert_eq!(replay_limit, Some(7));
                 }
@@ -101593,8 +101024,7 @@ A  docs/new-proof.md\n";
         }
 
         assert!(
-            Cli::try_parse_from(["ft", "robot", "events", "--replay-limit", "7"])
-                .is_err(),
+            Cli::try_parse_from(["ft", "robot", "events", "--replay-limit", "7"]).is_err(),
             "replay-limit without a paired resume cursor must be rejected"
         );
         assert!(
@@ -101617,10 +101047,8 @@ A  docs/new-proof.md\n";
 
     #[test]
     fn cli_robot_events_mutations_reject_query_options() {
-        Cli::try_parse_from([
-            "ft", "robot", "events", "annotate", "7", "--clear",
-        ])
-        .expect("event mutation without query options should parse");
+        Cli::try_parse_from(["ft", "robot", "events", "annotate", "7", "--clear"])
+            .expect("event mutation without query options should parse");
 
         assert!(
             Cli::try_parse_from([
@@ -103155,18 +102583,35 @@ A  docs/new-proof.md\n";
             &metadata
         ));
         assert!(!same_watcher_identity(&LockStatus::HeldUnknown, &metadata));
-        assert!(!same_watcher_identity(&LockStatus::ProbeUnavailable, &metadata));
+        assert!(!same_watcher_identity(
+            &LockStatus::ProbeUnavailable,
+            &metadata
+        ));
         assert!(!same_watcher_identity(&LockStatus::Free, &metadata));
 
         let free = watcher_lock_diagnostic_check(&LockStatus::Free);
         assert_eq!(free.status, DiagnosticStatus::Ok);
-        assert!(free.detail.as_deref().is_some_and(|value| value.contains("free")));
+        assert!(
+            free.detail
+                .as_deref()
+                .is_some_and(|value| value.contains("free"))
+        );
         let known_check = watcher_lock_diagnostic_check(&known);
         assert_eq!(known_check.status, DiagnosticStatus::Ok);
-        assert!(known_check.detail.as_deref().is_some_and(|value| value.contains("PID 42")));
+        assert!(
+            known_check
+                .detail
+                .as_deref()
+                .is_some_and(|value| value.contains("PID 42"))
+        );
         let unknown = watcher_lock_diagnostic_check(&LockStatus::HeldUnknown);
         assert_eq!(unknown.status, DiagnosticStatus::Warning);
-        assert!(unknown.detail.as_deref().is_some_and(|value| value.contains("held")));
+        assert!(
+            unknown
+                .detail
+                .as_deref()
+                .is_some_and(|value| value.contains("held"))
+        );
         let unavailable = watcher_lock_diagnostic_check(&LockStatus::ProbeUnavailable);
         assert_eq!(unavailable.status, DiagnosticStatus::Warning);
         assert!(
@@ -103243,7 +102688,10 @@ A  docs/new-proof.md\n";
             instance_id,
         )
         .expect("exact acknowledgement");
-        assert_eq!(rx.try_recv().expect("queued reload"), WatcherControlAction::Reload);
+        assert_eq!(
+            rx.try_recv().expect("queued reload"),
+            WatcherControlAction::Reload
+        );
 
         tx.try_send(WatcherControlAction::Reload)
             .expect("fill bounded control queue");
@@ -103257,7 +102705,10 @@ A  docs/new-proof.md\n";
             full.error_code.as_deref(),
             Some("ipc.watcher_control.queue_full")
         );
-        assert_eq!(rx.try_recv().expect("original queued action"), WatcherControlAction::Reload);
+        assert_eq!(
+            rx.try_recv().expect("original queued action"),
+            WatcherControlAction::Reload
+        );
 
         drop(rx);
         let unavailable = admit_watcher_control(
@@ -103623,10 +103074,7 @@ A  docs/new-proof.md\n";
             Ok(())
         );
         assert_eq!(
-            admit_wezterm_config_shape_and_size(
-                true,
-                WEZTERM_CONFIG_MAX_BYTES.saturating_add(1)
-            ),
+            admit_wezterm_config_shape_and_size(true, WEZTERM_CONFIG_MAX_BYTES.saturating_add(1)),
             Err(WeztermScrollbackCheckFailure::Oversized)
         );
         assert_eq!(
@@ -103634,8 +103082,8 @@ A  docs/new-proof.md\n";
             Err(WeztermScrollbackCheckFailure::NotRegularFile)
         );
 
-        let max_bytes = usize::try_from(WEZTERM_CONFIG_MAX_BYTES)
-            .expect("WezTerm config cap must fit usize");
+        let max_bytes =
+            usize::try_from(WEZTERM_CONFIG_MAX_BYTES).expect("WezTerm config cap must fit usize");
         let exact = vec![b'x'; max_bytes];
         assert_eq!(
             read_wezterm_config_bounded(Cursor::new(exact))
@@ -103848,8 +103296,7 @@ A  docs/new-proof.md\n";
     #[cfg(feature = "browser")]
     #[test]
     fn diagnostic_browser_profile_incomplete_counts_never_claim_completeness() {
-        let discovery_limit =
-            frankenterm_core::browser::BROWSER_PROFILE_DISCOVERY_MAX_ENTRIES;
+        let discovery_limit = frankenterm_core::browser::BROWSER_PROFILE_DISCOVERY_MAX_ENTRIES;
         let exact_cap = BrowserProfileDiagnosticCounts {
             entries_examined: discovery_limit,
             truncated: false,

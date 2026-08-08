@@ -11,8 +11,8 @@ use frankenterm_core::sharding::{
     AssignmentStrategy, LOCAL_PANE_ID_BITS, LOCAL_PANE_ID_MASK, MAX_CONFIGURED_SHARDS,
     MAX_GLOBAL_PANE_ID, MAX_SHARD_ID, ShardBackendErrorClass, ShardHealthEntry,
     ShardHealthProbeOutcome, ShardHealthReport, ShardHealthReportOutcome, ShardId,
-    assign_pane_with_strategy, decode_sharded_pane_id, encode_sharded_pane_id,
-    is_sharded_pane_id, try_decode_sharded_pane_id, try_encode_sharded_pane_id,
+    assign_pane_with_strategy, decode_sharded_pane_id, encode_sharded_pane_id, is_sharded_pane_id,
+    try_decode_sharded_pane_id, try_encode_sharded_pane_id,
 };
 use frankenterm_core::watchdog::HealthStatus;
 
@@ -172,8 +172,7 @@ fn arb_shard_health_entry() -> impl Strategy<Value = ShardHealthEntry> {
                     ShardHealthProbeOutcome::Failed(_) | ShardHealthProbeOutcome::NotStarted
                 ) {
                     pane_count = None;
-                } else if probe_outcome == ShardHealthProbeOutcome::Complete
-                    && pane_count.is_none()
+                } else if probe_outcome == ShardHealthProbeOutcome::Complete && pane_count.is_none()
                 {
                     pane_count = Some(0);
                 }
@@ -197,11 +196,9 @@ fn arb_shard_health_report() -> impl Strategy<Value = ShardHealthReport> {
             for (index, entry) in shards.iter_mut().enumerate() {
                 entry.shard_id = ShardId(index);
             }
-            let overall = shards
-                .iter()
-                .fold(HealthStatus::Healthy, |worst, entry| {
-                    worst.max(entry.status)
-                });
+            let overall = shards.iter().fold(HealthStatus::Healthy, |worst, entry| {
+                worst.max(entry.status)
+            });
             ShardHealthReport {
                 timestamp_ms,
                 overall,

@@ -45,7 +45,9 @@ pub enum CleanupAuditStatus {
     /// No cleanup deletion was admitted: the caller was already cancelled or
     /// the in-progress receipt could not be confirmed open.
     NotRequired,
-    Recorded { maintenance_id: i64 },
+    Recorded {
+        maintenance_id: i64,
+    },
     Failed {
         error: crate::Error,
         /// The exact finalization that failed to update the already-durable
@@ -338,7 +340,10 @@ fn cleanup_termination_from_error(error: crate::Error) -> CleanupTermination {
     }
 }
 
-fn append_cleanup_summary(plan: &mut CleanupPlan, summary: CleanupTableSummary) -> crate::Result<()> {
+fn append_cleanup_summary(
+    plan: &mut CleanupPlan,
+    summary: CleanupTableSummary,
+) -> crate::Result<()> {
     let total_eligible = plan
         .total_eligible
         .checked_add(summary.eligible_rows)
@@ -424,8 +429,7 @@ async fn finish_cleanup_apply_outcome(
         CleanupTermination::Cancelled { .. } => "cancelled_partial",
         CleanupTermination::Failed { .. } => "failed_partial",
     };
-    let receipt_cx =
-        crate::cx::Cx::for_request_with_budget(crate::cx::Budget::MINIMAL);
+    let receipt_cx = crate::cx::Cx::for_request_with_budget(crate::cx::Budget::MINIMAL);
     let pending_record = cleanup_receipt_record(maintenance_id, attempt_status, &plan);
     let receipt = storage
         .record_maintenance_with_cx(&receipt_cx, pending_record.clone())
@@ -453,9 +457,7 @@ async fn finish_cleanup_apply_outcome(
     }
 }
 
-fn durable_delete_step(
-    progress: DurableMutationProgress<usize>,
-) -> (usize, Option<crate::Error>) {
+fn durable_delete_step(progress: DurableMutationProgress<usize>) -> (usize, Option<crate::Error>) {
     match progress {
         DurableMutationProgress::Complete(deleted) => (deleted, None),
         DurableMutationProgress::Interrupted { durable, error } => {
@@ -514,12 +516,15 @@ pub async fn cleanup_preview_with_cx(
         let count = storage
             .count_segments_before_with_cx(cx, global_cutoff_ms)
             .await?;
-        append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "output_segments".to_string(),
-            eligible_rows: count,
-            deleted_rows: 0,
-            retention_days: config.retention_days,
-        })?;
+        append_cleanup_summary(
+            &mut plan,
+            CleanupTableSummary {
+                table: "output_segments".to_string(),
+                eligible_rows: count,
+                deleted_rows: 0,
+                retention_days: config.retention_days,
+            },
+        )?;
     }
 
     if config.retention_days > 0 {
@@ -528,12 +533,15 @@ pub async fn cleanup_preview_with_cx(
         let count = storage
             .count_audit_actions_before_with_cx(cx, global_cutoff_ms)
             .await?;
-        append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "audit_actions".to_string(),
-            eligible_rows: count,
-            deleted_rows: 0,
-            retention_days: config.retention_days,
-        })?;
+        append_cleanup_summary(
+            &mut plan,
+            CleanupTableSummary {
+                table: "audit_actions".to_string(),
+                eligible_rows: count,
+                deleted_rows: 0,
+                retention_days: config.retention_days,
+            },
+        )?;
     }
 
     if config.retention_days > 0 {
@@ -542,12 +550,15 @@ pub async fn cleanup_preview_with_cx(
         let count = storage
             .count_usage_metrics_before_with_cx(cx, global_cutoff_ms)
             .await?;
-        append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "usage_metrics".to_string(),
-            eligible_rows: count,
-            deleted_rows: 0,
-            retention_days: config.retention_days,
-        })?;
+        append_cleanup_summary(
+            &mut plan,
+            CleanupTableSummary {
+                table: "usage_metrics".to_string(),
+                eligible_rows: count,
+                deleted_rows: 0,
+                retention_days: config.retention_days,
+            },
+        )?;
     }
 
     if config.retention_days > 0 {
@@ -556,27 +567,32 @@ pub async fn cleanup_preview_with_cx(
         let count = storage
             .count_notification_history_before_with_cx(cx, global_cutoff_ms)
             .await?;
-        append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "notification_history".to_string(),
-            eligible_rows: count,
-            deleted_rows: 0,
-            retention_days: config.retention_days,
-        })?;
+        append_cleanup_summary(
+            &mut plan,
+            CleanupTableSummary {
+                table: "notification_history".to_string(),
+                eligible_rows: count,
+                deleted_rows: 0,
+                retention_days: config.retention_days,
+            },
+        )?;
     }
 
     if config.retention_days > 0 {
-        cx.checkpoint().map_err(|err| {
-            cleanup_cancelled("cleanup_preview.operational_maintenance", err)
-        })?;
+        cx.checkpoint()
+            .map_err(|err| cleanup_cancelled("cleanup_preview.operational_maintenance", err))?;
         let count = storage
             .count_operational_maintenance_before_with_cx(cx, global_cutoff_ms)
             .await?;
-        append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "maintenance_log (operational)".to_string(),
-            eligible_rows: count,
-            deleted_rows: 0,
-            retention_days: config.retention_days,
-        })?;
+        append_cleanup_summary(
+            &mut plan,
+            CleanupTableSummary {
+                table: "maintenance_log (operational)".to_string(),
+                eligible_rows: count,
+                deleted_rows: 0,
+                retention_days: config.retention_days,
+            },
+        )?;
     }
 
     Ok(plan)
@@ -732,19 +748,18 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
             }
         };
         let progress = storage
-            .prune_segments_before_progress_with_cx(
-                cx,
-                global_cutoff_ms,
-                Some(maintenance_id),
-            )
+            .prune_segments_before_progress_with_cx(cx, global_cutoff_ms, Some(maintenance_id))
             .await;
         let (deleted, error) = durable_delete_step(progress);
-        if let Err(aggregate_error) = append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "output_segments".to_string(),
-            eligible_rows: count,
-            deleted_rows: deleted,
-            retention_days,
-        }) {
+        if let Err(aggregate_error) = append_cleanup_summary(
+            &mut plan,
+            CleanupTableSummary {
+                table: "output_segments".to_string(),
+                eligible_rows: count,
+                deleted_rows: deleted,
+                retention_days,
+            },
+        ) {
             return finish_cleanup_apply_outcome(
                 storage,
                 maintenance_id,
@@ -793,19 +808,18 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
             }
         };
         let progress = storage
-            .purge_audit_actions_before_progress_with_cx(
-                cx,
-                global_cutoff_ms,
-                Some(maintenance_id),
-            )
+            .purge_audit_actions_before_progress_with_cx(cx, global_cutoff_ms, Some(maintenance_id))
             .await;
         let (deleted, error) = durable_delete_step(progress);
-        if let Err(aggregate_error) = append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "audit_actions".to_string(),
-            eligible_rows: count,
-            deleted_rows: deleted,
-            retention_days,
-        }) {
+        if let Err(aggregate_error) = append_cleanup_summary(
+            &mut plan,
+            CleanupTableSummary {
+                table: "audit_actions".to_string(),
+                eligible_rows: count,
+                deleted_rows: deleted,
+                retention_days,
+            },
+        ) {
             return finish_cleanup_apply_outcome(
                 storage,
                 maintenance_id,
@@ -854,19 +868,18 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
             }
         };
         let progress = storage
-            .purge_usage_metrics_progress_with_cx(
-                cx,
-                global_cutoff_ms,
-                Some(maintenance_id),
-            )
+            .purge_usage_metrics_progress_with_cx(cx, global_cutoff_ms, Some(maintenance_id))
             .await;
         let (deleted, error) = durable_delete_step(progress);
-        if let Err(aggregate_error) = append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "usage_metrics".to_string(),
-            eligible_rows: count,
-            deleted_rows: deleted,
-            retention_days,
-        }) {
+        if let Err(aggregate_error) = append_cleanup_summary(
+            &mut plan,
+            CleanupTableSummary {
+                table: "usage_metrics".to_string(),
+                eligible_rows: count,
+                deleted_rows: deleted,
+                retention_days,
+            },
+        ) {
             return finish_cleanup_apply_outcome(
                 storage,
                 maintenance_id,
@@ -915,19 +928,18 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
             }
         };
         let progress = storage
-            .purge_notification_history_progress_with_cx(
-                cx,
-                global_cutoff_ms,
-                Some(maintenance_id),
-            )
+            .purge_notification_history_progress_with_cx(cx, global_cutoff_ms, Some(maintenance_id))
             .await;
         let (deleted, error) = durable_delete_step(progress);
-        if let Err(aggregate_error) = append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "notification_history".to_string(),
-            eligible_rows: count,
-            deleted_rows: deleted,
-            retention_days,
-        }) {
+        if let Err(aggregate_error) = append_cleanup_summary(
+            &mut plan,
+            CleanupTableSummary {
+                table: "notification_history".to_string(),
+                eligible_rows: count,
+                deleted_rows: deleted,
+                retention_days,
+            },
+        ) {
             return finish_cleanup_apply_outcome(
                 storage,
                 maintenance_id,
@@ -948,9 +960,10 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
     }
 
     if retention_days > 0 {
-        if let Err(error) = cx.checkpoint().map_err(|err| {
-            cleanup_cancelled("cleanup_apply.operational_maintenance", err)
-        }) {
+        if let Err(error) = cx
+            .checkpoint()
+            .map_err(|err| cleanup_cancelled("cleanup_apply.operational_maintenance", err))
+        {
             return finish_cleanup_apply_outcome(
                 storage,
                 maintenance_id,
@@ -982,12 +995,15 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
             )
             .await;
         let (deleted, error) = durable_delete_step(progress);
-        if let Err(aggregate_error) = append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "maintenance_log (operational)".to_string(),
-            eligible_rows: count,
-            deleted_rows: deleted,
-            retention_days,
-        }) {
+        if let Err(aggregate_error) = append_cleanup_summary(
+            &mut plan,
+            CleanupTableSummary {
+                table: "maintenance_log (operational)".to_string(),
+                eligible_rows: count,
+                deleted_rows: deleted,
+                retention_days,
+            },
+        ) {
             return finish_cleanup_apply_outcome(
                 storage,
                 maintenance_id,
@@ -1007,13 +1023,7 @@ pub(crate) async fn cleanup_apply_with_compiled_retention_with_cx(
         }
     }
 
-    finish_cleanup_apply_outcome(
-        storage,
-        maintenance_id,
-        plan,
-        CleanupTermination::Completed,
-    )
-    .await
+    finish_cleanup_apply_outcome(storage, maintenance_id, plan, CleanupTermination::Completed).await
 }
 
 fn compiled_retention_cutoffs(
@@ -1026,8 +1036,7 @@ fn compiled_retention_cutoffs(
         (tier.retention_days > 0).then(|| retention_cutoff_ms(now, tier.retention_days))
     }));
     cutoffs.push(
-        (fallback_retention_days > 0)
-            .then(|| retention_cutoff_ms(now, fallback_retention_days)),
+        (fallback_retention_days > 0).then(|| retention_cutoff_ms(now, fallback_retention_days)),
     );
     cutoffs.into()
 }
@@ -1182,24 +1191,20 @@ async fn apply_events_by_tier_progress_with_cx(
             Some(error),
         ),
     };
-    let summaries = match event_cleanup_summaries(
-        &retention_policy,
-        retention_days,
-        &eligible,
-        &deleted,
-    ) {
-        Ok(summaries) => summaries,
-        Err(error) => {
-            return CleanupStep::Interrupted {
-                durable: vec![fallback_event_cleanup_summary(
-                    retention_days,
-                    &eligible,
-                    &deleted,
-                )],
-                error,
-            };
-        }
-    };
+    let summaries =
+        match event_cleanup_summaries(&retention_policy, retention_days, &eligible, &deleted) {
+            Ok(summaries) => summaries,
+            Err(error) => {
+                return CleanupStep::Interrupted {
+                    durable: vec![fallback_event_cleanup_summary(
+                        retention_days,
+                        &eligible,
+                        &deleted,
+                    )],
+                    error,
+                };
+            }
+        };
     match error {
         Some(error) => CleanupStep::Interrupted {
             durable: summaries,
@@ -1336,12 +1341,15 @@ mod tests {
             total_deleted: usize::MAX,
             ..Default::default()
         };
-        let result = append_cleanup_summary(&mut plan, CleanupTableSummary {
-            table: "events".to_string(),
-            eligible_rows: 1,
-            deleted_rows: 1,
-            retention_days: 30,
-        });
+        let result = append_cleanup_summary(
+            &mut plan,
+            CleanupTableSummary {
+                table: "events".to_string(),
+                eligible_rows: 1,
+                deleted_rows: 1,
+                retention_days: 30,
+            },
+        );
 
         assert!(result.is_err());
         assert_eq!(plan.total_eligible, 7);
@@ -1895,7 +1903,10 @@ mod tests {
                 pre_cancelled.termination,
                 CleanupTermination::Cancelled { .. }
             ));
-            assert!(matches!(pre_cancelled.audit, CleanupAuditStatus::NotRequired));
+            assert!(matches!(
+                pre_cancelled.audit,
+                CleanupAuditStatus::NotRequired
+            ));
             assert_eq!(pre_cancelled.plan.total_deleted, 0);
 
             let connection = rusqlite::Connection::open(&db_path)
@@ -1925,9 +1936,7 @@ mod tests {
                 .expect("seed a later cleanup table");
 
             let cancelled_cx = crate::cx::for_testing();
-            storage.cancel_after_next_committed_batch_for_test(
-                "delete_events_by_retention_policy",
-            );
+            storage.cancel_after_next_committed_batch_for_test("delete_events_by_retention_policy");
             let partial = cleanup_apply_with_compiled_retention_with_cx(
                 &cancelled_cx,
                 &storage,
@@ -1986,8 +1995,7 @@ mod tests {
             assert!(matches!(retry.termination, CleanupTermination::Completed));
             assert!(matches!(retry.audit, CleanupAuditStatus::Recorded { .. }));
             assert_eq!(
-                retry.plan.total_deleted,
-                2,
+                retry.plan.total_deleted, 2,
                 "retry must delete only the one remaining event and untouched segment"
             );
             assert_eq!(storage.count_events_before(i64::MAX).await.unwrap(), 0);
@@ -2018,8 +2026,8 @@ mod tests {
                 .record_event(make_event(1, "info", "receipt-failure"))
                 .await
                 .unwrap();
-            let connection = rusqlite::Connection::open(&db_path)
-                .expect("open cleanup audit-failure fixture");
+            let connection =
+                rusqlite::Connection::open(&db_path).expect("open cleanup audit-failure fixture");
             connection
                 .execute_batch(
                     "CREATE TRIGGER fail_tiered_cleanup_receipt
@@ -2074,7 +2082,10 @@ mod tests {
             assert_eq!(metadata["attempt_status"], "completed");
             assert_eq!(metadata["deleted_rows"], 1);
             assert_eq!(metadata["eligible_rows"], 1);
-            assert!(pending_record.id > 0, "retry must update the open receipt row");
+            assert!(
+                pending_record.id > 0,
+                "retry must update the open receipt row"
+            );
 
             connection
                 .execute_batch("DROP TRIGGER fail_tiered_cleanup_receipt")
@@ -2158,7 +2169,10 @@ mod tests {
             )
             .await;
 
-            assert!(matches!(outcome.termination, CleanupTermination::Failed { .. }));
+            assert!(matches!(
+                outcome.termination,
+                CleanupTermination::Failed { .. }
+            ));
             assert!(matches!(outcome.audit, CleanupAuditStatus::NotRequired));
             assert_eq!(outcome.plan.total_deleted, 0);
             assert_eq!(storage.count_events_before(i64::MAX).await.unwrap(), 1);
@@ -2215,7 +2229,10 @@ mod tests {
             )
             .await;
 
-            assert!(matches!(outcome.termination, CleanupTermination::Failed { .. }));
+            assert!(matches!(
+                outcome.termination,
+                CleanupTermination::Failed { .. }
+            ));
             assert!(matches!(outcome.audit, CleanupAuditStatus::Recorded { .. }));
             assert_eq!(outcome.plan.total_deleted, 0);
             assert_eq!(

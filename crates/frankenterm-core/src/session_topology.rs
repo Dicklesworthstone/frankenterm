@@ -362,10 +362,8 @@ impl TopologySnapshot {
                 limit: MAX_SNAPSHOT_BYTES,
             });
         }
-        String::from_utf8(writer.bytes).map_err(|_error| {
-            TopologySnapshotError::InvalidStructure {
-                reason: "topology serializer emitted non-UTF-8 JSON",
-            }
+        String::from_utf8(writer.bytes).map_err(|_error| TopologySnapshotError::InvalidStructure {
+            reason: "topology serializer emitted non-UTF-8 JSON",
         })
     }
 
@@ -820,7 +818,10 @@ fn infer_flat_split(geometries: &[PaneGeometry<'_>]) -> (PaneNode, InferenceQual
         // Dimensions hint at orientation and ratios, but not which pane is
         // topmost. Canonical pane-ID order is deterministic, not visual-order
         // authority, so every multi-pane legacy tree remains a fallback.
-        (PaneNode::HSplit { children }, InferenceQuality::FlatFallback)
+        (
+            PaneNode::HSplit { children },
+            InferenceQuality::FlatFallback,
+        )
     } else if all_same_rows && !all_same_cols {
         // Vertical split: same height, different widths → side by side
         let total_cols: f64 = geometries.iter().map(|g| f64::from(g.cols)).sum();
@@ -838,7 +839,10 @@ fn infer_flat_split(geometries: &[PaneGeometry<'_>]) -> (PaneNode, InferenceQual
         // Dimensions hint at orientation and ratios, but not which pane is
         // leftmost. Canonical pane-ID order is deterministic, not visual-order
         // authority, so every multi-pane legacy tree remains a fallback.
-        (PaneNode::VSplit { children }, InferenceQuality::FlatFallback)
+        (
+            PaneNode::VSplit { children },
+            InferenceQuality::FlatFallback,
+        )
     } else if all_same_cols && all_same_rows {
         // Equal dimensions carry no split-direction authority. Preserve the
         // canonical pane-ID order, but mark the arbitrary
@@ -2634,16 +2638,7 @@ mod tests {
 
     #[test]
     fn schema_v1_dimensions_saturate_instead_of_wrapping() {
-        let pane = make_pane(
-            0,
-            0,
-            0,
-            u32::from(u16::MAX) + 1,
-            u32::MAX,
-            None,
-            None,
-            true,
-        );
+        let pane = make_pane(0, 0, 0, u32::from(u16::MAX) + 1, u32::MAX, None, None, true);
         let (snapshot, _) = TopologySnapshot::from_panes(&[pane], 1000);
         let PaneNode::Leaf { rows, cols, .. } = snapshot.windows[0].tabs[0].pane_tree else {
             panic!("one pane must produce one leaf");
@@ -3813,8 +3808,7 @@ mod tests {
                         title: None,
                         pane_tree: leaf(MAX_TOPOLOGY_PANES),
                         active_pane_id: Some(
-                            u64::try_from(MAX_TOPOLOGY_PANES)
-                                .expect("test pane id fits u64"),
+                            u64::try_from(MAX_TOPOLOGY_PANES).expect("test pane id fits u64"),
                         ),
                     },
                 ],
@@ -3839,7 +3833,12 @@ mod tests {
                 (
                     1.0,
                     PaneNode::HSplit {
-                        children: vec![(1.0, PaneNode::VSplit { children: Vec::new() })],
+                        children: vec![(
+                            1.0,
+                            PaneNode::VSplit {
+                                children: Vec::new(),
+                            },
+                        )],
                     },
                 )
             })

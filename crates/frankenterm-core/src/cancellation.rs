@@ -36,33 +36,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::scope_tree::{ScopeId, ScopeState, ScopeTier, ScopeTree, ScopeTreeError};
 
-/// Global counter for `CancellationToken::propagate_inner` depth-limit hits
-/// (ft-l5hqi). Bumped each time `propagate_inner` short-circuits because the
-/// recursion reached `MAX_PROPAGATION_DEPTH`. Read via
-/// [`cancellation_propagation_depth_limit_hits`]; reset for tests via
-/// [`reset_cancellation_propagation_depth_limit_hits`].
-static PROPAGATION_DEPTH_LIMIT_HITS: AtomicU64 = AtomicU64::new(0);
-
-/// Read the current count of cancellation-propagation depth-limit hits.
-///
-/// In release builds the depth guard is a silent no-op (the prior
-/// `debug_assert!` only fires in debug). This counter makes the silent
-/// truncation observable so an operator with a legitimately deep token
-/// tree can correlate truncation events against incident timelines.
-#[must_use]
-pub fn cancellation_propagation_depth_limit_hits() -> u64 {
-    PROPAGATION_DEPTH_LIMIT_HITS.load(Ordering::Relaxed)
-}
-
-/// Test-only: reset the depth-limit-hit counter to zero. The counter is a
-/// `static` so tests run in process-wide shared state — this lets a single
-/// test deterministically observe its own contribution. Not part of the
-/// production API.
-#[cfg(test)]
-pub(crate) fn reset_cancellation_propagation_depth_limit_hits() {
-    PROPAGATION_DEPTH_LIMIT_HITS.store(0, Ordering::Relaxed);
-}
-
 /// Global counter for `CancellationToken` Mutex-poison recoveries
 /// (br-ft-h2vyr). Bumped each time the inner `reason` or `children`
 /// Mutex on a token is acquired after a prior holder panicked, so the
@@ -111,7 +84,11 @@ pub(crate) fn reset_cancellation_lock_poisoned_count_for_test() {
 /// cascade through the runtime's cancellation graph.
 fn lock_recovering<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poison| {
-        CANCELLATION_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+        let _ = CANCELLATION_LOCK_POISONED_COUNT.try_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |count| Some(count.saturating_add(1)),
+        );
         poison.into_inner()
     })
 }
@@ -141,6 +118,10 @@ pub struct ShutdownCoordinatorTelemetry {
     finalizers_failed: u64,
     /// Total complete_shutdown() calls.
     shutdowns_completed: u64,
+}
+
+fn increment_shutdown_telemetry(counter: &mut u64) {
+    *counter = counter.saturating_add(1);
 }
 
 impl ShutdownCoordinatorTelemetry {
@@ -363,9 +344,35 @@ struct CancellationTokenInner {
     children: std::sync::Mutex<Vec<Arc<CancellationTokenInner>>>,
 }
 
-impl CancellationToken {
-    const MAX_PROPAGATION_DEPTH: usize = 64;
+impl Drop for CancellationTokenInner {
+    fn drop(&mut self) {
+        // Parent-to-child strong ownership can form a very deep chain. Letting
+        // each Vec<Arc<_>> field drop normally would recursively destroy that
+        // chain and can overflow the thread stack. Drain uniquely owned
+        // descendants iteratively; shared descendants remain owned by their
+        // external token and will run the same teardown when their last Arc is
+        // eventually released.
+        let children = match self.children.get_mut() {
+            Ok(children) => std::mem::take(children),
+            Err(poisoned) => std::mem::take(poisoned.into_inner()),
+        };
+        let mut pending = children;
+        while let Some(child) = pending.pop() {
+            let Ok(mut child) = Arc::try_unwrap(child) else {
+                continue;
+            };
+            let grandchildren = match child.children.get_mut() {
+                Ok(children) => std::mem::take(children),
+                Err(poisoned) => std::mem::take(poisoned.into_inner()),
+            };
+            pending.extend(grandchildren);
+            // `child` now owns no descendants, so its Drop invocation is
+            // constant-depth when this iteration ends.
+        }
+    }
+}
 
+impl CancellationToken {
     /// Create a new root cancellation token for a scope.
     #[must_use]
     pub fn new(scope_id: ScopeId) -> Self {
@@ -388,13 +395,11 @@ impl CancellationToken {
         let mut children = lock_recovering(&self.inner.children);
         // If parent is already cancelled, cancel child immediately
         if self.is_cancelled() {
-            let reason = self.reason().map(|_| ShutdownReason::ParentShutdown {
+            *lock_recovering(&child.inner.reason) = Some(ShutdownReason::ParentShutdown {
                 parent_id: self.inner.scope_id.clone(),
             });
+            child.inner.generation.store(1, Ordering::Relaxed);
             child.inner.cancelled.store(true, Ordering::Release);
-            if let Some(r) = reason {
-                *lock_recovering(&child.inner.reason) = Some(r);
-            }
         }
         children.push(Arc::clone(&child.inner));
         child
@@ -402,6 +407,10 @@ impl CancellationToken {
 
     /// Cancel this token and all descendant tokens.
     pub fn cancel(&self, reason: ShutdownReason) {
+        // Hold the reason lock across the flag transition. A concurrent
+        // `child()` that observes `cancelled = true` can then never race ahead
+        // and observe an absent reason before publication completes.
+        let mut reason_slot = lock_recovering(&self.inner.reason);
         if self
             .inner
             .cancelled
@@ -409,7 +418,8 @@ impl CancellationToken {
             .is_ok()
         {
             // br-ft-h2vyr: hot path — every Cx::cancel call hits this lock.
-            *lock_recovering(&self.inner.reason) = Some(reason);
+            *reason_slot = Some(reason);
+            drop(reason_slot);
             self.inner.generation.fetch_add(1, Ordering::Relaxed);
             self.propagate_to_children();
         }
@@ -419,44 +429,32 @@ impl CancellationToken {
     fn propagate_to_children(&self) {
         // br-ft-h2vyr: hot path — every cancellation propagation hits this.
         let children = lock_recovering(&self.inner.children).clone();
-        for child in &children {
-            Self::propagate_inner(child, &self.inner.scope_id, 0);
-        }
-    }
+        let mut pending = children
+            .into_iter()
+            .rev()
+            .map(|child| (child, self.inner.scope_id.clone()))
+            .collect::<Vec<_>>();
 
-    fn propagate_inner(inner: &CancellationTokenInner, parent_id: &ScopeId, depth: usize) {
-        if depth >= Self::MAX_PROPAGATION_DEPTH {
-            // ft-l5hqi: the depth guard previously fired a debug_assert! and
-            // silently returned in release. Operators with a deep-but-acyclic
-            // token tree had no way to know cancellation was being truncated.
-            // Now we increment a global counter and emit a warn-level trace
-            // event so the truncation is observable. The debug_assert! is
-            // retained for tests to keep the existing failure mode in CI.
-            PROPAGATION_DEPTH_LIMIT_HITS.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                target: "frankenterm_core::cancellation",
-                parent_id = %parent_id,
-                scope_id = %inner.scope_id,
-                max_depth = Self::MAX_PROPAGATION_DEPTH,
-                "cancellation propagation truncated at max depth — descendant scopes will not receive cancellation; check for cycles or unexpectedly deep scope nesting"
-            );
-            debug_assert!(false, "cancellation propagation exceeded max depth");
-            return;
-        }
-        if inner
-            .cancelled
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            // br-ft-h2vyr: recursive descent path — hits every node in
-            // a cancelled subtree.
-            *lock_recovering(&inner.reason) = Some(ShutdownReason::ParentShutdown {
-                parent_id: parent_id.clone(),
-            });
-            inner.generation.fetch_add(1, Ordering::Relaxed);
-            let children = lock_recovering(&inner.children).clone();
-            for child in &children {
-                Self::propagate_inner(child, &inner.scope_id, depth + 1);
+        // Traverse iteratively so a valid deep scope tree neither overflows
+        // the call stack nor silently leaves descendants running. `child()`
+        // creates a fresh node and exposes no reparenting API, so this graph is
+        // acyclic by construction and needs no lossy depth cap.
+        while let Some((inner, parent_id)) = pending.pop() {
+            let mut reason_slot = lock_recovering(&inner.reason);
+            if inner
+                .cancelled
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // br-ft-h2vyr: recursive descent path — hits every node in
+                // a cancelled subtree.
+                *reason_slot = Some(ShutdownReason::ParentShutdown { parent_id });
+                drop(reason_slot);
+                inner.generation.fetch_add(1, Ordering::Relaxed);
+                let children = lock_recovering(&inner.children).clone();
+                for child in children.into_iter().rev() {
+                    pending.push((child, inner.scope_id.clone()));
+                }
             }
         }
     }
@@ -842,7 +840,7 @@ impl ShutdownCoordinator {
             .insert(scope_id.clone(), ShutdownPolicy::for_tier(tier));
         self.finalizers.insert(scope_id.clone(), Vec::new());
 
-        self.telemetry.scopes_registered += 1;
+        increment_shutdown_telemetry(&mut self.telemetry.scopes_registered);
         Ok(token)
     }
 
@@ -891,7 +889,7 @@ impl ShutdownCoordinator {
             .position(|f| f.priority < finalizer.priority)
             .unwrap_or(finalizers.len());
         finalizers.insert(pos, finalizer);
-        self.telemetry.finalizers_registered += 1;
+        increment_shutdown_telemetry(&mut self.telemetry.finalizers_registered);
         Ok(())
     }
 
@@ -944,7 +942,7 @@ impl ShutdownCoordinator {
         // Transition in tree
         tree.request_shutdown(scope_id, timestamp_ms)?;
 
-        self.telemetry.shutdowns_requested += 1;
+        increment_shutdown_telemetry(&mut self.telemetry.shutdowns_requested);
 
         // Emit event
         let policy = self.policy(scope_id).clone();
@@ -982,7 +980,7 @@ impl ShutdownCoordinator {
                             .request_shutdown(tree, &child_id, child_reason, timestamp_ms)
                             .is_ok()
                         {
-                            self.telemetry.cascades_triggered += 1;
+                            increment_shutdown_telemetry(&mut self.telemetry.cascades_triggered);
                             self.emit_event(
                                 scope_id.clone(),
                                 ShutdownEventType::CascadeTriggered {
@@ -1015,7 +1013,8 @@ impl ShutdownCoordinator {
             None => return false,
         };
         let policy = self.policy(scope_id);
-        let deadline = requested_at + policy.grace_period_ms as i64;
+        let grace_ms = i64::try_from(policy.grace_period_ms).unwrap_or(i64::MAX);
+        let deadline = requested_at.saturating_add(grace_ms);
         current_ms >= deadline
     }
 
@@ -1029,7 +1028,7 @@ impl ShutdownCoordinator {
         let policy = self.policy(scope_id).clone();
         let action = policy.escalation.clone();
 
-        self.telemetry.escalations += 1;
+        increment_shutdown_telemetry(&mut self.telemetry.escalations);
 
         self.emit_event(
             scope_id.clone(),
@@ -1181,7 +1180,7 @@ impl ShutdownCoordinator {
             })?;
 
         finalizer.status = FinalizerStatus::Running;
-        self.telemetry.finalizers_started += 1;
+        increment_shutdown_telemetry(&mut self.telemetry.finalizers_started);
         self.emit_event(
             scope_id.clone(),
             ShutdownEventType::FinalizerStarted {
@@ -1215,7 +1214,7 @@ impl ShutdownCoordinator {
             })?;
 
         finalizer.status = FinalizerStatus::Completed { duration_ms };
-        self.telemetry.finalizers_completed += 1;
+        increment_shutdown_telemetry(&mut self.telemetry.finalizers_completed);
         self.emit_event(
             scope_id.clone(),
             ShutdownEventType::FinalizerCompleted {
@@ -1254,7 +1253,7 @@ impl ShutdownCoordinator {
             error: error.to_string(),
             duration_ms,
         };
-        self.telemetry.finalizers_failed += 1;
+        increment_shutdown_telemetry(&mut self.telemetry.finalizers_failed);
         self.emit_event(
             scope_id.clone(),
             ShutdownEventType::FinalizerFailed {
@@ -1300,7 +1299,7 @@ impl ShutdownCoordinator {
         // Close in tree
         tree.close(scope_id, timestamp_ms)?;
 
-        self.telemetry.shutdowns_completed += 1;
+        increment_shutdown_telemetry(&mut self.telemetry.shutdowns_completed);
 
         let total_elapsed = (timestamp_ms - shutdown_requested_at).max(0);
 
@@ -1512,20 +1511,11 @@ mod tests {
         (tree, coord)
     }
 
-    /// ft-l5hqi: a deep-but-acyclic token tree must trip the depth guard,
-    /// bumping the global hit counter and emitting a warn-level trace event.
-    /// Previously the guard was a silent no-op in release builds.
+    /// A deep-but-acyclic token tree must propagate completely without using
+    /// the Rust call stack or imposing an arbitrary depth limit.
     #[test]
-    fn propagation_depth_limit_increments_telemetry_counter() {
-        // Reset the process-wide counter so we can attribute the increment.
-        // Fresh-built test binary: counter is normally zero already, but
-        // running multiple tests in a single process means earlier cases
-        // may have bumped it.
-        reset_cancellation_propagation_depth_limit_hits();
-
-        // Build a linear token chain longer than MAX_PROPAGATION_DEPTH so
-        // recursion guaranteed to bottom out on the depth guard.
-        let chain_len = CancellationToken::MAX_PROPAGATION_DEPTH + 4;
+    fn propagation_reaches_every_descendant_in_a_deep_scope_tree() {
+        let chain_len = 4_096;
         let root = CancellationToken::new(ScopeId::root());
         let mut current = root.clone();
         let mut deep_chain = Vec::with_capacity(chain_len);
@@ -1537,33 +1527,41 @@ mod tests {
             current = next;
         }
 
-        // The propagate_inner debug_assert! still fires in debug builds
-        // (test profile is debug). We catch_unwind so the assertion is
-        // observable but doesn't fail the test — the contract under test
-        // is the counter + tracing::warn!, not the panic itself. The
-        // counter is bumped *before* the debug_assert! so it is observable
-        // even when the assertion fires.
         let cancel_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             root.cancel(ShutdownReason::UserRequested);
         }));
-        // Either Ok (release-mode behavior) or Err (debug-mode panic) is
-        // acceptable for this test — both paths must have bumped the
-        // counter on their way through propagate_inner.
-        let _ = cancel_result;
-
-        let hits = cancellation_propagation_depth_limit_hits();
+        assert!(cancel_result.is_ok());
+        assert!(deep_chain.iter().all(CancellationToken::is_cancelled));
+        assert!(deep_chain.iter().all(|token| token.generation() == 1));
         assert!(
-            hits >= 1,
-            "expected propagation depth-limit counter to increment at least once, got {hits}"
+            deep_chain
+                .iter()
+                .all(|token| matches!(token.reason(), Some(ShutdownReason::ParentShutdown { .. })))
         );
 
-        // Sanity check: the descendants beyond the depth limit are exactly
-        // those the bead complains about — silently uncancelled.
-        let truncated = &deep_chain[CancellationToken::MAX_PROPAGATION_DEPTH..];
-        assert!(
-            truncated.iter().any(|t| !t.is_cancelled()),
-            "expected at least one descendant beyond MAX_PROPAGATION_DEPTH to remain uncancelled (the silent-truncation bug ft-l5hqi makes observable)"
-        );
+        // The test intentionally constructs an unusually deep strong-Arc
+        // ownership chain. Break those parent-to-child links explicitly so
+        // fixture teardown itself does not become a recursive-drop stress
+        // test unrelated to cancellation propagation.
+        lock_recovering(&root.inner.children).clear();
+        for token in &deep_chain {
+            lock_recovering(&token.inner.children).clear();
+        }
+    }
+
+    #[test]
+    fn deep_scope_tree_teardown_releases_descendants_without_recursive_drop() {
+        let root = CancellationToken::new(ScopeId::root());
+        let mut current = root.clone();
+        for index in 0..16_384 {
+            current = current.child(ScopeId(format!("drop-depth-{index}")));
+        }
+        let deepest = Arc::downgrade(&current.inner);
+
+        drop(current);
+        drop(root);
+
+        assert!(deepest.upgrade().is_none());
     }
 
     #[test]
@@ -1723,6 +1721,34 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_lock_poison_counter_saturates_without_wrapping() {
+        let _guard = cancellation_poison_test_lock();
+        CANCELLATION_LOCK_POISONED_COUNT.store(u64::MAX, Ordering::Relaxed);
+        let mutex = Arc::new(std::sync::Mutex::new(()));
+        let poisoned = Arc::clone(&mutex);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned.lock().expect("lock before poison");
+                panic!("intentional poison");
+            })
+            .join()
+            .is_err()
+        );
+
+        drop(lock_recovering(&mutex));
+
+        assert_eq!(cancellation_lock_poisoned_count(), u64::MAX);
+        reset_cancellation_lock_poisoned_count_for_test();
+    }
+
+    #[test]
+    fn shutdown_telemetry_increment_saturates_without_wrapping() {
+        let mut counter = u64::MAX;
+        increment_shutdown_telemetry(&mut counter);
+        assert_eq!(counter, u64::MAX);
+    }
+
+    #[test]
     fn cancellation_propagates_to_children() {
         let parent = CancellationToken::new(ScopeId("parent".into()));
         let child = parent.child(ScopeId("child".into()));
@@ -1768,6 +1794,7 @@ mod tests {
 
         let child = parent.child(ScopeId("child".into()));
         assert!(child.is_cancelled());
+        assert_eq!(child.generation(), 1);
         assert!(matches!(
             child.reason(),
             Some(ShutdownReason::ParentShutdown { .. })
@@ -2053,6 +2080,32 @@ mod tests {
 
         // Expired
         assert!(coord.is_grace_expired(&tree, &well_known::discovery(), 5600));
+    }
+
+    #[test]
+    fn grace_period_deadline_saturates_instead_of_wrapping_expired() {
+        let (mut tree, mut coord) = setup_tree_and_coordinator();
+        coord
+            .set_policy(
+                &well_known::discovery(),
+                ShutdownPolicy {
+                    grace_period_ms: u64::MAX,
+                    ..ShutdownPolicy::for_tier(ScopeTier::Daemon)
+                },
+            )
+            .unwrap();
+        coord
+            .request_shutdown(
+                &mut tree,
+                &well_known::discovery(),
+                ShutdownReason::UserRequested,
+                5_000,
+            )
+            .unwrap();
+
+        assert!(!coord.is_grace_expired(&tree, &well_known::discovery(), 5_000));
+        assert!(!coord.is_grace_expired(&tree, &well_known::discovery(), i64::MAX - 1));
+        assert!(coord.is_grace_expired(&tree, &well_known::discovery(), i64::MAX));
     }
 
     #[test]

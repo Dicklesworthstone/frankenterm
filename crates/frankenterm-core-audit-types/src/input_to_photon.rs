@@ -531,18 +531,14 @@ fn validate_trace(trace: &InputToPhotonTrace, expected_platform: &str) -> Result
     if total_latency_us == 0 {
         return Err("trace total_latency_us must be nonzero".to_string());
     }
-    if !trace.instrumentation_overhead_pct.is_finite()
-        || trace.instrumentation_overhead_pct < 0.0
-    {
+    if !trace.instrumentation_overhead_pct.is_finite() || trace.instrumentation_overhead_pct < 0.0 {
         return Err("instrumentation_overhead_pct must be finite and nonnegative".to_string());
     }
-    let expected_overhead_pct =
-        overhead_pct(trace.instrumentation_overhead_us, total_latency_us);
+    let expected_overhead_pct = overhead_pct(trace.instrumentation_overhead_us, total_latency_us);
     if (trace.instrumentation_overhead_pct - expected_overhead_pct).abs() > 1.0e-9 {
         return Err("instrumentation overhead percentage does not match trace timing".to_string());
     }
-    let overhead_exceeded =
-        trace.instrumentation_overhead_pct > MAX_INSTRUMENTATION_OVERHEAD_PCT;
+    let overhead_exceeded = trace.instrumentation_overhead_pct > MAX_INSTRUMENTATION_OVERHEAD_PCT;
     match trace.state {
         InputToPhotonState::Measured if !overhead_exceeded => {
             if trace.degradation_reason.is_some() {
@@ -567,9 +563,7 @@ fn validate_trace(trace: &InputToPhotonTrace, expected_platform: &str) -> Result
     };
     let expected_render_us = headless_render_duration_us(headless_render_ms);
     if trace.stages.last().map(|stage| stage.duration_us) != Some(expected_render_us) {
-        return Err(
-            "headless_render_ms does not match the gpu_present stage duration".to_string(),
-        );
+        return Err("headless_render_ms does not match the gpu_present stage duration".to_string());
     }
     if trace
         .gpu_adapter
@@ -617,11 +611,7 @@ fn percentile_nearest_rank_fraction(sorted_values: &[u64], fraction: f64) -> Opt
 
 fn overhead_pct(overhead_us: u64, total_us: u64) -> f64 {
     if total_us == 0 {
-        if overhead_us == 0 {
-            0.0
-        } else {
-            100.0
-        }
+        if overhead_us == 0 { 0.0 } else { 100.0 }
     } else {
         overhead_us as f64 * 100.0 / total_us as f64
     }
@@ -829,7 +819,9 @@ mod tests {
 
         let value = serde_json::to_value(&trace).expect("serialize v2 trace");
         assert_eq!(
-            value.get("schema_version").and_then(serde_json::Value::as_str),
+            value
+                .get("schema_version")
+                .and_then(serde_json::Value::as_str),
             Some(INPUT_TO_PHOTON_SCHEMA_VERSION)
         );
         assert_eq!(
@@ -895,8 +887,7 @@ mod tests {
             1,
         );
 
-        let evidence =
-            summarize_input_to_photon_traces("wayland", &[trace.clone(), trace]);
+        let evidence = summarize_input_to_photon_traces("wayland", &[trace.clone(), trace]);
 
         assert_eq!(evidence.state, InputToPhotonState::InvalidTrace);
         assert_eq!(evidence.sample_count, 0);
@@ -982,8 +973,7 @@ mod tests {
             wrong_platform,
             mixed_class,
         ] {
-            let evidence =
-                summarize_input_to_photon_traces("macos", &[valid.clone(), invalid]);
+            let evidence = summarize_input_to_photon_traces("macos", &[valid.clone(), invalid]);
             assert_eq!(evidence.state, InputToPhotonState::InvalidTrace);
             assert_eq!(evidence.sample_count, 0);
             assert_eq!(evidence.p50_us, None);

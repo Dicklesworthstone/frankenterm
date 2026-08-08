@@ -24,10 +24,9 @@ use crate::casr_types::{
 };
 use crate::runtime_async::process::{
     Command, CommandCancellation, CommandCancelled, CommandCleanupTrigger,
-    CommandOutputCaptureIncomplete, CommandOutputLimitExceeded,
-    CommandOutputStream, CommandProcessCleanupIncomplete, CommandTimedOut,
-    DEFAULT_COMMAND_STDERR_LIMIT_BYTES, DEFAULT_COMMAND_STDOUT_LIMIT_BYTES,
-    decode_captured_bytes_lossy,
+    CommandOutputCaptureIncomplete, CommandOutputLimitExceeded, CommandOutputStream,
+    CommandProcessCleanupIncomplete, CommandTimedOut, DEFAULT_COMMAND_STDERR_LIMIT_BYTES,
+    DEFAULT_COMMAND_STDOUT_LIMIT_BYTES, decode_captured_bytes_lossy,
 };
 
 // =============================================================================
@@ -641,17 +640,14 @@ impl std::fmt::Display for SessionResumeError {
                 write!(f, "casr returned invalid JSON ({output_bytes} bytes)")
             }
             Self::ResumeRejected => f.write_str("casr reported that resume failed"),
-            Self::ResumeEffectIndeterminate { cause } => write!(
-                f,
-                "casr resume effect is indeterminate (cause={cause})"
-            ),
+            Self::ResumeEffectIndeterminate { cause } => {
+                write!(f, "casr resume effect is indeterminate (cause={cause})")
+            }
             Self::SessionNotFound { identifier_bytes } => {
                 write!(f, "session not found (identifier_bytes={identifier_bytes})")
             }
             Self::ProviderNotInstalled => f.write_str("provider not installed"),
-            Self::NativeProviderNotFound => {
-                f.write_str("native provider binary unavailable")
-            }
+            Self::NativeProviderNotFound => f.write_str("native provider binary unavailable"),
             Self::NativeInteractiveTerminalRequired => {
                 f.write_str("native resume requires an owned interactive terminal")
             }
@@ -668,10 +664,9 @@ impl std::fmt::Display for SessionResumeError {
                 f,
                 "native provider model is not the required pinned model (requested_bytes={requested_model_bytes})"
             ),
-            Self::InvalidSessionIdentifier { input_bytes } => write!(
-                f,
-                "invalid session identifier (input_bytes={input_bytes})"
-            ),
+            Self::InvalidSessionIdentifier { input_bytes } => {
+                write!(f, "invalid session identifier (input_bytes={input_bytes})")
+            }
             Self::InvalidProviderSlug { input_bytes } => {
                 write!(f, "invalid provider slug (input_bytes={input_bytes})")
             }
@@ -760,9 +755,9 @@ pub fn validate_session_identifier(session_id: &str) -> Result<(), SessionResume
 pub fn validate_provider_slug(provider_slug: &str) -> Result<(), SessionResumeError> {
     if provider_slug.is_empty()
         || provider_slug.len() > MAX_SESSION_RESUME_PROVIDER_BYTES
-        || !provider_slug.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-        })
+        || !provider_slug
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
         return Err(SessionResumeError::InvalidProviderSlug {
             input_bytes: provider_slug.len(),
@@ -965,19 +960,17 @@ impl SessionResumer {
         info!(session_resume = true, "discovering sessions");
 
         match self.run_casr(&["list", "--json"]) {
-            Ok(output) => {
-                match parse_casr_discovery_entries(&output) {
-                    Ok(casr_entries) => {
-                        merge_session_discovery_entries(&mut native, casr_entries)?;
-                    }
-                    Err(error) => {
-                        let Some(reason) = casr_discovery_incomplete_reason(&error) else {
-                            return Err(error);
-                        };
-                        native.mark_incomplete(SessionDiscoverySource::Casr, reason);
-                    }
+            Ok(output) => match parse_casr_discovery_entries(&output) {
+                Ok(casr_entries) => {
+                    merge_session_discovery_entries(&mut native, casr_entries)?;
                 }
-            }
+                Err(error) => {
+                    let Some(reason) = casr_discovery_incomplete_reason(&error) else {
+                        return Err(error);
+                    };
+                    native.mark_incomplete(SessionDiscoverySource::Casr, reason);
+                }
+            },
             Err(error) => {
                 let Some(reason) = casr_discovery_incomplete_reason(&error) else {
                     return Err(error);
@@ -1093,8 +1086,7 @@ impl SessionResumer {
         let output = self
             .run_casr(&args)
             .map_err(|error| self.classify_resume_failure(error))?;
-        parse_casr_resume_output(&output)
-            .map_err(|error| self.classify_resume_failure(error))
+        parse_casr_resume_output(&output).map_err(|error| self.classify_resume_failure(error))
     }
 
     /// Cx-first session resume. The subprocess never blocks the async worker,
@@ -1134,11 +1126,11 @@ impl SessionResumer {
         // is bounded by the admitted stdout limit and its blocking join is
         // retained until it settles.
         crate::runtime_async::spawn_blocking(move || parse_casr_resume_output(&output))
-        .await
-        .map_err(|_| {
-            self.classify_resume_failure(SessionResumeError::AsyncInfrastructureFailure)
-        })?
-        .map_err(|error| self.classify_resume_failure(error))
+            .await
+            .map_err(|_| {
+                self.classify_resume_failure(SessionResumeError::AsyncInfrastructureFailure)
+            })?
+            .map_err(|error| self.classify_resume_failure(error))
     }
 
     /// List installed providers.
@@ -1187,9 +1179,9 @@ impl SessionResumer {
         validate_provider_slug(provider.slug())?;
         let providers = self.list_providers_with_cx(cx).await?;
         let slug = provider.slug();
-        Ok(providers.iter().any(|candidate| {
-            candidate.slug == slug && candidate.installed
-        }))
+        Ok(providers
+            .iter()
+            .any(|candidate| candidate.slug == slug && candidate.installed))
     }
 
     /// Check if `casr` is available on PATH.
@@ -1323,9 +1315,8 @@ impl SessionResumer {
             watcher_cancellation,
             Arc::clone(&watcher_done_inner),
         );
-        let watcher_handle = crate::runtime_async::task::try_spawn_with_cx(
-            cx,
-            move |_child_cx| async move {
+        let watcher_handle =
+            crate::runtime_async::task::try_spawn_with_cx(cx, move |_child_cx| async move {
                 while !watcher_done_inner.load(Ordering::SeqCst) {
                     if watcher_cx.checkpoint().is_err() {
                         if watcher_command_state
@@ -1369,9 +1360,8 @@ impl SessionResumer {
                     }
                 }
                 watcher_guard.disarm();
-            },
-        )
-        .map_err(|_| SessionResumeError::AsyncInfrastructureFailure)?;
+            })
+            .map_err(|_| SessionResumeError::AsyncInfrastructureFailure)?;
         let mut cancellation_guard =
             SessionCommandCancellationGuard::new(cancellation, Arc::clone(&watcher_done));
 
@@ -1433,9 +1423,7 @@ impl SessionResumer {
         cmd.stdout_limit(self.stdout_limit);
         cmd.stderr_limit(self.stderr_limit);
 
-        if apply_working_dir
-            && let Some(ref dir) = self.config.working_dir
-        {
+        if apply_working_dir && let Some(ref dir) = self.config.working_dir {
             if !dir.is_dir() {
                 return Err(SessionResumeError::WorkingDirectoryUnavailable);
             }
@@ -1510,9 +1498,7 @@ impl SessionResumer {
             SessionResumeError::AsyncInfrastructureFailure => {
                 ResumeEffectIndeterminateCause::AsyncInfrastructureFailure
             }
-            SessionResumeError::ParseError { .. } => {
-                ResumeEffectIndeterminateCause::InvalidOutput
-            }
+            SessionResumeError::ParseError { .. } => ResumeEffectIndeterminateCause::InvalidOutput,
             other => return other,
         };
         SessionResumeError::ResumeEffectIndeterminate { cause }
@@ -1552,7 +1538,12 @@ fn select_session_resume_home(
     windows: bool,
 ) -> Option<PathBuf> {
     home.filter(|value| !value.is_empty())
-        .or_else(|| windows.then_some(user_profile).flatten().filter(|value| !value.is_empty()))
+        .or_else(|| {
+            windows
+                .then_some(user_profile)
+                .flatten()
+                .filter(|value| !value.is_empty())
+        })
         .map(PathBuf::from)
 }
 
@@ -1622,7 +1613,10 @@ fn open_session_child_directory_nofollow(
     component: &Path,
 ) -> std::io::Result<cap_std::fs::Dir> {
     let mut options = cap_std::fs::OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No).maybe_dir(true);
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
     let directory = parent.open_with(component, &options)?;
     if !directory.metadata()?.is_dir() {
         return Err(std::io::Error::other(
@@ -1656,10 +1650,7 @@ fn discover_antigravity_conversations_from_home_with_checkpoint(
     };
     for component in ANTIGRAVITY_CONVERSATIONS_RELATIVE_DIR {
         checkpoint()?;
-        directory = match open_session_child_directory_nofollow(
-            &directory,
-            Path::new(component),
-        ) {
+        directory = match open_session_child_directory_nofollow(&directory, Path::new(component)) {
             Ok(directory) => directory,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // The caller-provided home was proven to be a real directory;
@@ -1923,8 +1914,8 @@ fn discover_antigravity_conversations_in_open_dir_with_checkpoint(
 }
 
 /// Discover Antigravity conversations under the process HOME, if available.
-pub fn discover_current_home_antigravity_conversations(
-) -> Result<SessionDiscoveryResult, SessionResumeError> {
+pub fn discover_current_home_antigravity_conversations()
+-> Result<SessionDiscoveryResult, SessionResumeError> {
     let Some(home) = session_resume_home_dir() else {
         return Ok(unavailable_native_discovery());
     };
@@ -1943,11 +1934,8 @@ pub async fn discover_antigravity_conversations_from_home_with_cx(
     home_dir: &Path,
 ) -> Result<SessionDiscoveryResult, SessionResumeError> {
     validate_session_resume_home(home_dir)?;
-    discover_antigravity_conversations_for_optional_home_with_cx(
-        cx,
-        Some(home_dir.to_path_buf()),
-    )
-    .await
+    discover_antigravity_conversations_for_optional_home_with_cx(cx, Some(home_dir.to_path_buf()))
+        .await
 }
 
 /// Cx-first native Antigravity discovery under the process HOME. This path
@@ -1971,7 +1959,9 @@ async fn discover_antigravity_conversations_for_optional_home_with_cx(
     let scan_cx = cx.clone();
     crate::runtime_async::spawn_blocking(move || {
         discover_antigravity_conversations_from_home_with_checkpoint(&home_dir, || {
-            scan_cx.checkpoint().map_err(|_| SessionResumeError::Cancelled)
+            scan_cx
+                .checkpoint()
+                .map_err(|_| SessionResumeError::Cancelled)
         })
     })
     .await
@@ -1995,9 +1985,7 @@ fn validate_discovery_entry(entry: &CasrListEntry) -> Result<(), SessionResumeEr
     Ok(())
 }
 
-fn parse_casr_discovery_entries(
-    output: &str,
-) -> Result<Vec<CasrListEntry>, SessionResumeError> {
+fn parse_casr_discovery_entries(output: &str) -> Result<Vec<CasrListEntry>, SessionResumeError> {
     let output_bytes = output.len();
     let entries: Vec<CasrListEntry> = serde_json::from_str(output)
         .map_err(|_| SessionResumeError::ParseError { output_bytes })?;
@@ -2051,7 +2039,10 @@ pub fn merge_session_discovery_entries(
     let capacity = native.entries.len().saturating_add(casr_entries.len());
     let mut seen = HashSet::with_capacity(capacity);
     let mut merged = Vec::with_capacity(capacity);
-    for entry in casr_entries.into_iter().chain(native.entries.iter().cloned()) {
+    for entry in casr_entries
+        .into_iter()
+        .chain(native.entries.iter().cloned())
+    {
         let key = (
             provider_from_list_entry(&entry).slug().to_string(),
             entry.session_id.clone(),
@@ -2242,10 +2233,7 @@ pub fn summarize_entry(entry: &CasrListEntry) -> String {
         256,
     );
     let msgs = entry.messages;
-    format!(
-        "[{}] {} ({} msgs) — {}",
-        provider, session_id, msgs, title
-    )
+    format!("[{}] {} ({} msgs) — {}", provider, session_id, msgs, title)
 }
 
 fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> &str {
@@ -2361,8 +2349,7 @@ mod tests {
 
     #[test]
     fn antigravity_native_resume_plan_reports_missing_binary_provider_specifically() {
-        let plan =
-            antigravity_native_resume_plan("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let plan = antigravity_native_resume_plan("123e4567-e89b-12d3-a456-426614174000").unwrap();
         let empty_path = tempfile::tempdir().expect("temp empty path");
         let err = plan
             .require_binary_available_in_path(Some(empty_path.path().to_str().unwrap()))
@@ -2377,8 +2364,7 @@ mod tests {
     fn antigravity_native_resume_plan_rejects_non_executable_path_entry() {
         use std::os::unix::fs::PermissionsExt;
 
-        let plan =
-            antigravity_native_resume_plan("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let plan = antigravity_native_resume_plan("123e4567-e89b-12d3-a456-426614174000").unwrap();
         let path_dir = tempfile::tempdir().expect("temporary PATH directory");
         let candidate = path_dir.path().join(ANTIGRAVITY_BINARY);
         fs::write(&candidate, b"not executable").expect("write non-executable PATH fixture");
@@ -2755,9 +2741,8 @@ mod tests {
 
     #[test]
     fn failopen_conversion_marks_empty_inventory_incomplete_without_execution() {
-        let result = SessionDiscoveryResult::fail_open_from_error(
-            &SessionResumeError::CasrNotFound,
-        );
+        let result =
+            SessionDiscoveryResult::fail_open_from_error(&SessionResumeError::CasrNotFound);
         assert!(result.entries.is_empty());
         assert!(!result.is_complete());
         assert!(result.incomplete.contains(&SessionDiscoveryIncomplete {
@@ -3020,10 +3005,7 @@ mod tests {
             r.config().working_dir.as_deref(),
             Some(Path::new("/my/project"))
         );
-        assert_eq!(
-            r.config().home_dir.as_deref(),
-            Some(Path::new("/my/home"))
-        );
+        assert_eq!(r.config().home_dir.as_deref(), Some(Path::new("/my/home")));
     }
 
     #[test]
@@ -3198,10 +3180,7 @@ mod tests {
     #[test]
     fn output_limit_overrides_reject_effectively_unbounded_capture() {
         let stdout_error = SessionResumer::with_defaults()
-            .with_output_limits(
-                MAX_CASR_STDOUT_LIMIT_BYTES + 1,
-                MAX_CASR_STDERR_LIMIT_BYTES,
-            )
+            .with_output_limits(MAX_CASR_STDOUT_LIMIT_BYTES + 1, MAX_CASR_STDERR_LIMIT_BYTES)
             .expect_err("stdout above the hard ceiling must be rejected");
         assert_eq!(
             stdout_error,
@@ -3213,10 +3192,7 @@ mod tests {
         );
 
         let stderr_error = SessionResumer::with_defaults()
-            .with_output_limits(
-                MAX_CASR_STDOUT_LIMIT_BYTES,
-                MAX_CASR_STDERR_LIMIT_BYTES + 1,
-            )
+            .with_output_limits(MAX_CASR_STDOUT_LIMIT_BYTES, MAX_CASR_STDERR_LIMIT_BYTES + 1)
             .expect_err("stderr above the hard ceiling must be rejected");
         assert_eq!(
             stderr_error,
@@ -3385,10 +3361,7 @@ mod tests {
             .with_output_limits(64, 2)
             .expect("limits are below hard admission ceilings");
         let error = over
-            .run_casr(&[
-                "-c",
-                "printf 'abc' >&2; while :; do sleep 1; done",
-            ])
+            .run_casr(&["-c", "printf 'abc' >&2; while :; do sleep 1; done"])
             .expect_err("first byte beyond stderr cap must fail closed");
         assert!(matches!(
             &error,
@@ -3434,10 +3407,7 @@ mod tests {
             ..Default::default()
         });
         let error = resumer
-            .run_casr(&[
-                "-c",
-                "printf 'raw-child-output-canary' >&2; exit 19",
-            ])
+            .run_casr(&["-c", "printf 'raw-child-output-canary' >&2; exit 19"])
             .expect_err("nonzero child must fail");
         assert!(matches!(
             &error,
@@ -3485,11 +3455,7 @@ mod tests {
         });
         let started = std::time::Instant::now();
         let error = resumer
-            .run_casr_with_options_and_cancellation(
-                &["-c", "sleep 10"],
-                true,
-                Some(&cancellation),
-            )
+            .run_casr_with_options_and_cancellation(&["-c", "sleep 10"], true, Some(&cancellation))
             .expect_err("explicit cancellation must stop the subprocess");
         trigger.join().expect("cancellation trigger must finish");
         assert_eq!(error, SessionResumeError::Cancelled);
@@ -3643,9 +3609,10 @@ mod tests {
             .expect("native Cx API boundary");
         let native_cx_surface = &production[start..end];
         assert!(native_cx_surface.contains("runtime_async::spawn_blocking"));
-        assert!(native_cx_surface.contains(
-            "discover_antigravity_conversations_from_home_with_checkpoint"
-        ));
+        assert!(
+            native_cx_surface
+                .contains("discover_antigravity_conversations_from_home_with_checkpoint")
+        );
         assert!(native_cx_surface.contains("scan_cx"));
         assert!(native_cx_surface.contains("checkpoint()"));
         assert!(!native_cx_surface.contains("spawn_blocking_with_cx"));
@@ -3657,18 +3624,16 @@ mod tests {
     fn native_scan_observes_cancellation_after_empty_enumeration() {
         let directory = tempfile::tempdir().expect("empty native scan directory");
         let mut checkpoints = 0_usize;
-        let error = discover_antigravity_conversations_in_dir_with_checkpoint(
-            directory.path(),
-            || {
+        let error =
+            discover_antigravity_conversations_in_dir_with_checkpoint(directory.path(), || {
                 checkpoints = checkpoints.saturating_add(1);
                 if checkpoints == 2 {
                     Err(SessionResumeError::Cancelled)
                 } else {
                     Ok(())
                 }
-            },
-        )
-        .expect_err("final checkpoint must observe empty-scan cancellation");
+            })
+            .expect_err("final checkpoint must observe empty-scan cancellation");
         assert_eq!(error, SessionResumeError::Cancelled);
     }
 
@@ -3683,18 +3648,16 @@ mod tests {
         )
         .expect("write native SQLite fixture");
         let mut checkpoints = 0_usize;
-        let error = discover_antigravity_conversations_in_dir_with_checkpoint(
-            directory.path(),
-            || {
+        let error =
+            discover_antigravity_conversations_in_dir_with_checkpoint(directory.path(), || {
                 checkpoints = checkpoints.saturating_add(1);
                 if checkpoints == 3 {
                     Err(SessionResumeError::Cancelled)
                 } else {
                     Ok(())
                 }
-            },
-        )
-        .expect_err("final checkpoint must observe last-entry cancellation");
+            })
+            .expect_err("final checkpoint must observe last-entry cancellation");
         assert_eq!(error, SessionResumeError::Cancelled);
     }
 }

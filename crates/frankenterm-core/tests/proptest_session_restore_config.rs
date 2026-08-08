@@ -40,12 +40,12 @@ use proptest::prelude::*;
 // =========================================================================
 
 fn arb_session_restore_config() -> impl Strategy<Value = SessionRestoreConfig> {
-    (any::<bool>(), any::<bool>()).prop_map(
-        |(auto_restore, restore_scrollback)| SessionRestoreConfig {
+    (any::<bool>(), any::<bool>()).prop_map(|(auto_restore, restore_scrollback)| {
+        SessionRestoreConfig {
             auto_restore,
             restore_scrollback,
-        },
-    )
+        }
+    })
 }
 
 fn arb_log_config() -> impl Strategy<Value = LogConfig> {
@@ -362,7 +362,10 @@ fn restore_config_defaults_match_empty_json_and_all_boolean_combinations_roundtr
     let from_default = SessionRestoreConfig::default();
     let from_json: SessionRestoreConfig = serde_json::from_str("{}").unwrap();
     assert_eq!(from_default.auto_restore, from_json.auto_restore);
-    assert_eq!(from_default.restore_scrollback, from_json.restore_scrollback);
+    assert_eq!(
+        from_default.restore_scrollback,
+        from_json.restore_scrollback
+    );
 
     for auto_restore in [false, true] {
         for restore_scrollback in [false, true] {

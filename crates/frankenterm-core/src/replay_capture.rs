@@ -1487,11 +1487,12 @@ mod tests {
             let error = adapter
                 .capture_control(pane_id, RecorderControlMarkerType::Resize, json!({}))
                 .expect_err("the terminal sentinel must remain sticky");
+            assert_eq!(error, ReplayCaptureSequenceError::PaneExhausted { pane_id });
             assert_eq!(
-                error,
-                ReplayCaptureSequenceError::PaneExhausted { pane_id }
+                sink.len(),
+                1,
+                "an exhausted capture must not reach the sink"
             );
-            assert_eq!(sink.len(), 1, "an exhausted capture must not reach the sink");
             assert_eq!(
                 adapter.total_captured(),
                 1,
@@ -1506,10 +1507,7 @@ mod tests {
         const THREADS: usize = 16;
 
         let sink = Arc::new(CollectingCaptureSink::new());
-        let adapter = Arc::new(CaptureAdapter::new(
-            sink.clone(),
-            CaptureConfig::default(),
-        ));
+        let adapter = Arc::new(CaptureAdapter::new(sink.clone(), CaptureConfig::default()));
         let pane_id = 92;
         seed_pane_frontier(&adapter, pane_id, u64::MAX - 1);
         let barrier = Arc::new(std::sync::Barrier::new(THREADS));
@@ -1614,10 +1612,7 @@ mod tests {
         let (sink, adapter) = make_adapter();
         let pane_id = 95;
 
-        expect_capture(adapter.capture_egress_event(&make_egress_event(
-            pane_id,
-            u64::MAX - 1,
-        )));
+        expect_capture(adapter.capture_egress_event(&make_egress_event(pane_id, u64::MAX - 1)));
         assert_eq!(sink.recorder_events()[0].sequence, u64::MAX - 1);
         assert_eq!(pane_frontier(&adapter, pane_id), u64::MAX);
 
@@ -1629,10 +1624,7 @@ mod tests {
                 json!({}),
             )
             .expect_err("the supplied last identity must exhaust the pane");
-        assert_eq!(
-            error,
-            ReplayCaptureSequenceError::PaneExhausted { pane_id }
-        );
+        assert_eq!(error, ReplayCaptureSequenceError::PaneExhausted { pane_id });
         assert_eq!(sink.len(), 1);
         assert_eq!(adapter.total_captured(), 1);
     }
@@ -1659,13 +1651,19 @@ mod tests {
     #[test]
     fn total_captured_saturates_without_regression() {
         let (sink, adapter) = make_adapter();
-        adapter.total_captured.store(u64::MAX - 1, Ordering::Relaxed);
+        adapter
+            .total_captured
+            .store(u64::MAX - 1, Ordering::Relaxed);
 
         expect_capture(adapter.capture_egress(&make_segment(1, "last-count", 0)));
         assert_eq!(adapter.total_captured(), u64::MAX);
         expect_capture(adapter.capture_egress(&make_segment(2, "saturated-count", 0)));
         assert_eq!(adapter.total_captured(), u64::MAX);
-        assert_eq!(sink.len(), 2, "counter saturation must not drop valid events");
+        assert_eq!(
+            sink.len(),
+            2,
+            "counter saturation must not drop valid events"
+        );
     }
 
     #[test]
@@ -1890,11 +1888,7 @@ mod tests {
     #[test]
     fn test_control_has_control_stream_kind() {
         let (sink, adapter) = make_adapter();
-        expect_capture(adapter.capture_control(
-            1,
-            RecorderControlMarkerType::Resize,
-            json!({}),
-        ));
+        expect_capture(adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({})));
 
         let (_, mk) = &sink.events()[0];
         assert_eq!(mk.stream_kind, StreamKind::Control);
@@ -1983,11 +1977,7 @@ mod tests {
             None,
             json!({}),
         ));
-        expect_capture(adapter.capture_control(
-            1,
-            RecorderControlMarkerType::Resize,
-            json!({}),
-        ));
+        expect_capture(adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({})));
         expect_capture(adapter.capture_ingress(
             1,
             "x".into(),
@@ -2036,11 +2026,7 @@ mod tests {
             json!({}),
         ));
         assert_eq!(adapter.total_captured(), 2);
-        expect_capture(adapter.capture_control(
-            1,
-            RecorderControlMarkerType::Resize,
-            json!({}),
-        ));
+        expect_capture(adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({})));
         assert_eq!(adapter.total_captured(), 3);
     }
 
@@ -2056,11 +2042,7 @@ mod tests {
             None,
             json!({}),
         ));
-        expect_capture(adapter.capture_control(
-            1,
-            RecorderControlMarkerType::Resize,
-            json!({}),
-        ));
+        expect_capture(adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({})));
         expect_capture(adapter.capture_ingress(
             1,
             "y".into(),
@@ -2277,11 +2259,7 @@ mod tests {
             None,
             json!({}),
         ));
-        expect_capture(adapter.capture_control(
-            1,
-            RecorderControlMarkerType::Resize,
-            json!({}),
-        ));
+        expect_capture(adapter.capture_control(1, RecorderControlMarkerType::Resize, json!({})));
         expect_capture(adapter.capture_ingress(
             1,
             "i1".into(),
@@ -2481,11 +2459,7 @@ mod tests {
         let (sink, adapter) = make_adapter();
         for i in 0..10u64 {
             let pane_id = i % 3;
-            expect_capture(adapter.capture_egress(&make_segment(
-                pane_id,
-                &format!("msg{i}"),
-                i,
-            )));
+            expect_capture(adapter.capture_egress(&make_segment(pane_id, &format!("msg{i}"), i)));
         }
         assert_eq!(sink.len(), 10);
     }

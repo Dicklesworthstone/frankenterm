@@ -273,8 +273,7 @@ fn invalid_events_arguments_do_not_create_or_open_storage() {
 
 #[test]
 fn malformed_stream_cursor_tokens_are_rejected_without_echoing_untrusted_fields() {
-    const VALID_SCOPE: &str =
-        "0000000000000000000000000000000000000000000000000000000000000000";
+    const VALID_SCOPE: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
     let ws = TempDir::new().expect("temp workspace");
     for (surface, args) in [
@@ -477,7 +476,10 @@ fn watch_events_stale_epoch_is_terminal_and_never_rebaselines() {
     );
     assert!(out.contains("\"type\":\"cursor_discontinuity\""), "{out}");
     assert!(out.contains("\"terminal\":true"), "{out}");
-    assert!(out.contains("\"reason\":\"cursor_epoch_mismatch\""), "{out}");
+    assert!(
+        out.contains("\"reason\":\"cursor_epoch_mismatch\""),
+        "{out}"
+    );
     assert!(
         !out.contains("\"type\":\"event\""),
         "a stale epoch must not emit or rebaseline onto retained events: {out}"
@@ -551,8 +553,7 @@ fn watch_claim_emits_pending_record_before_committed_checkpoint() {
     let committed = records[event_index + 1..]
         .iter()
         .find(|record| {
-            record["type"] == "cursor_checkpoint"
-                && record["event_id"].as_i64() == Some(candidate)
+            record["type"] == "cursor_checkpoint" && record["event_id"].as_i64() == Some(candidate)
         })
         .unwrap_or_else(|| panic!("missing post-finalization checkpoint: {out}"));
     assert_eq!(committed["cursor"], candidate);
@@ -597,12 +598,7 @@ fn await_any_satisfies_via_glob() {
     let ws = empty_workspace();
     let token = bootstrap_await(
         ws.path(),
-        &[
-            "--any",
-            "rule:nope.nope",
-            "--any",
-            "rule:build.*",
-        ],
+        &["--any", "rule:nope.nope", "--any", "rule:build.*"],
     );
     seed_events(ws.path());
     let cursor = token.cursor.to_string();

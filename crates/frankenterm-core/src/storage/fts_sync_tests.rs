@@ -225,13 +225,17 @@ fn startup_fts_failure_storm_pages_panes_and_bounds_content_free_warnings() {
     assert_eq!(result.segments_indexed, 0);
     assert_eq!(result.panes_processed, u64::try_from(pane_count).unwrap());
     assert_eq!(result.warnings.len(), FTS_STARTUP_WARNING_LIMIT);
-    assert!(result.warnings[..FTS_STARTUP_WARNING_DETAIL_LIMIT]
-        .iter()
-        .all(|warning| warning.contains("error_class=database")));
-    assert!(result
-        .warnings
-        .iter()
-        .all(|warning| !warning.contains("/private/sensitive")));
+    assert!(
+        result.warnings[..FTS_STARTUP_WARNING_DETAIL_LIMIT]
+            .iter()
+            .all(|warning| warning.contains("error_class=database"))
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("/private/sensitive"))
+    );
     assert_eq!(
         result.warnings.last().unwrap(),
         &format!(
@@ -885,12 +889,7 @@ fn fts_sync_rolls_back_postings_when_progress_checkpoint_fails() {
             };
 
             with_fts_backend(&mut conn, |backend| {
-                sync_fts_for_pane_backend_with_mode(
-                    backend,
-                    1,
-                    &config,
-                    insert_select_batch,
-                )
+                sync_fts_for_pane_backend_with_mode(backend, 1, &config, insert_select_batch)
             })
             .expect_err("injected progress failure must abort the atomic FTS unit");
             let indexed: i64 = conn
@@ -910,12 +909,7 @@ fn fts_sync_rolls_back_postings_when_progress_checkpoint_fails() {
             conn.execute_batch("DROP TRIGGER reject_fts_progress")
                 .unwrap();
             let (indexed, max_seq) = with_fts_backend(&mut conn, |backend| {
-                sync_fts_for_pane_backend_with_mode(
-                    backend,
-                    1,
-                    &config,
-                    insert_select_batch,
-                )
+                sync_fts_for_pane_backend_with_mode(backend, 1, &config, insert_select_batch)
             })
             .expect("retry after the injected failure must recover cleanly");
             assert_eq!((indexed, max_seq), (2, 1));
@@ -1639,9 +1633,13 @@ fn search_fails_closed_while_fts_rebuild_is_pending() {
     insert_test_pane(&conn, 1);
     insert_test_segment(&conn, 1, 1, "pendingsearchgatetoken");
     assert_eq!(
-        fts_search_projection(&mut conn, "pendingsearchgatetoken", &SearchOptions::default())
-            .unwrap()
-            .len(),
+        fts_search_projection(
+            &mut conn,
+            "pendingsearchgatetoken",
+            &SearchOptions::default()
+        )
+        .unwrap()
+        .len(),
         1
     );
 
@@ -1649,16 +1647,23 @@ fn search_fails_closed_while_fts_rebuild_is_pending() {
         mark_fts_rebuild_pending_backend(backend, now_ms())
     })
     .unwrap();
-    let error =
-        fts_search_projection(&mut conn, "pendingsearchgatetoken", &SearchOptions::default())
-            .expect_err("search must not expose a potentially partial pending index");
+    let error = fts_search_projection(
+        &mut conn,
+        "pendingsearchgatetoken",
+        &SearchOptions::default(),
+    )
+    .expect_err("search must not expose a potentially partial pending index");
     assert!(error.to_string().contains("rebuilding or requires repair"));
 
     full_fts_rebuild_test(&mut conn, &FtsSyncConfig::default()).unwrap();
     assert_eq!(
-        fts_search_projection(&mut conn, "pendingsearchgatetoken", &SearchOptions::default())
-            .unwrap()
-            .len(),
+        fts_search_projection(
+            &mut conn,
+            "pendingsearchgatetoken",
+            &SearchOptions::default()
+        )
+        .unwrap()
+        .len(),
         1
     );
 }

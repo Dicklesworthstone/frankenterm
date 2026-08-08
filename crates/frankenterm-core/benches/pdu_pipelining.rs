@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use codec::{
-    CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, Pdu,
-    StreamingPduBuffer, UnitResponse,
+    CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, Pdu, StreamingPduBuffer,
+    UnitResponse,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::runtime_async::unix::AsyncWriteExt;

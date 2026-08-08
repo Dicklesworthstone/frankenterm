@@ -689,15 +689,13 @@ impl Scenario {
             });
         }
 
-        mock.add_panes_with_cx(cx, panes)
-            .await
-            .map_err(|error| {
-                contextualize_simulation_runtime_error(
-                    error,
-                    "simulation.setup",
-                    "atomic pane batch commit",
-                )
-            })
+        mock.add_panes_with_cx(cx, panes).await.map_err(|error| {
+            contextualize_simulation_runtime_error(
+                error,
+                "simulation.setup",
+                "atomic pane batch commit",
+            )
+        })
     }
 
     /// Convert a scenario event to a MockEvent for injection.
@@ -1269,17 +1267,17 @@ impl TutorialSandbox {
 
         match kind {
             ExpectationKind::Contains { pane, text } => {
-                let content = self
-                    .mock
-                    .get_text_with_cx(cx, *pane, false)
-                    .await
-                    .map_err(|error| {
-                        contextualize_simulation_runtime_error(
-                            error,
-                            "simulation.expectation.check",
-                            format!("pane {pane}"),
-                        )
-                    })?;
+                let content =
+                    self.mock
+                        .get_text_with_cx(cx, *pane, false)
+                        .await
+                        .map_err(|error| {
+                            contextualize_simulation_runtime_error(
+                                error,
+                                "simulation.expectation.check",
+                                format!("pane {pane}"),
+                            )
+                        })?;
                 Ok(content.contains(text))
             }
             ExpectationKind::Event { .. } | ExpectationKind::Workflow { .. } => Ok(false),
@@ -1326,10 +1324,7 @@ impl TutorialSandbox {
 
         for exp in expectations {
             cx.checkpoint().map_err(|error| {
-                simulation_cancelled_error(
-                    "simulation.expectations.check_all",
-                    error.to_string(),
-                )
+                simulation_cancelled_error("simulation.expectations.check_all", error.to_string())
             })?;
             match &exp.kind {
                 ExpectationKind::Contains { .. } => {

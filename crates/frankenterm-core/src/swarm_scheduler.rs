@@ -1575,9 +1575,9 @@ impl SwarmScheduler {
             0.0
         };
 
-        let total_completions = stats.completed + stats.failed;
-        let failure_rate = if total_completions > 0 {
-            stats.failed as f64 / total_completions as f64
+        let total_completions = stats.completed as f64 + stats.failed as f64;
+        let failure_rate = if total_completions > 0.0 {
+            stats.failed as f64 / total_completions
         } else {
             0.0
         };
@@ -4334,6 +4334,24 @@ mod tests {
         };
         let pressure = scheduler.compute_pressure(&stats, 3);
         assert!((pressure.failure_rate - 2.0 / 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pressure_failure_rate_handles_saturated_completion_counters() {
+        let scheduler = SwarmScheduler::with_defaults();
+        let stats = QueueStats {
+            total_items: usize::MAX,
+            blocked: 0,
+            ready: 0,
+            in_progress: 0,
+            completed: usize::MAX,
+            failed: usize::MAX,
+            cancelled: 0,
+            active_agents: 0,
+            completion_log_size: 0,
+        };
+
+        assert_eq!(scheduler.compute_pressure(&stats, 3).failure_rate, 0.5);
     }
 
     #[test]

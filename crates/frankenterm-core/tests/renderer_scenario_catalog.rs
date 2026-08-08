@@ -9,24 +9,22 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
 use frankenterm_core::renderer_scenario_catalog::{
-    MAX_RENDERER_SCENARIO_CATALOG_BYTES, REQUIRED_RENDERER_CHECKPOINT_BINDING_COUNT,
+    MAX_RENDERER_SCENARIO_CATALOG_BYTES, RENDERER_OUTPUT_AUTHORITY_TRACKING_REF,
+    RENDERER_SCENARIO_CATALOG_REVISION, REQUIRED_RENDERER_CHECKPOINT_BINDING_COUNT,
     REQUIRED_RENDERER_COVERAGE_OVERLAY_COUNT, REQUIRED_RENDERER_SCENARIO_COUNT,
-    REQUIRED_RENDERER_TERMINAL_FEATURE_COUNT, RENDERER_OUTPUT_AUTHORITY_TRACKING_REF,
-    RENDERER_SCENARIO_CATALOG_REVISION, RQ_S11_COMPARATOR_POLICY_REF,
-    RQ_S13_COMPARATOR_POLICY_REF,
-    RendererCatalogAuthority,
-    RendererAccessibilityGeometryState, RendererCheckpointDetectorId, RendererCheckpointRole,
-    RendererContentApplicationBoundary, RendererContentDecoder,
-    RendererContentCompositionOperation, RendererContentDeterministicIdentity,
-    RendererContentEncoding, RendererContentInputAvailability, RendererContentPayloadSelector,
-    RendererCoverageOverlayId, RendererDynamicRangeMode, RendererFleetPoint, RendererGesture,
-    RendererKeyModifier, RendererNegativeControlId,
-    RendererMutationTarget, RendererOutputRateOverride, RendererPaneOrdinalSelector,
-    RendererPixelCoordinateSpace, RendererPixelRect, RendererResolvedCheckpointAnchor,
-    RendererResolvedScenarioOverlay, RendererScenarioCatalog, RendererScenarioDecodeCode,
+    REQUIRED_RENDERER_TERMINAL_FEATURE_COUNT, RQ_S11_COMPARATOR_POLICY_REF,
+    RQ_S13_COMPARATOR_POLICY_REF, RendererAccessibilityGeometryState, RendererCatalogAuthority,
+    RendererCheckpointDetectorId, RendererCheckpointRole, RendererContentApplicationBoundary,
+    RendererContentCompositionOperation, RendererContentDecoder,
+    RendererContentDeterministicIdentity, RendererContentEncoding,
+    RendererContentInputAvailability, RendererContentPayloadSelector, RendererCoverageOverlayId,
+    RendererDynamicRangeMode, RendererFleetPoint, RendererGesture, RendererKeyModifier,
+    RendererMutationTarget, RendererNegativeControlId, RendererOutputRateOverride,
+    RendererPaneOrdinalSelector, RendererPixelCoordinateSpace, RendererPixelRect,
+    RendererResolvedCheckpointAnchor, RendererResolvedScenarioOverlay,
+    RendererResolverPreparationStats, RendererScenarioCatalog, RendererScenarioDecodeCode,
     RendererScenarioGapCode, RendererScenarioResolveError, RendererScenarioValidationCode,
-    RendererResolverPreparationStats, RendererSelectionState,
-    RendererTerminalBufferKind, RendererTimelineAction,
+    RendererSelectionState, RendererTerminalBufferKind, RendererTimelineAction,
     expected_renderer_scenario_id, expected_renderer_scenario_seed,
     prepare_renderer_scenario_catalog, resolve_renderer_scenario_overlay,
     validate_renderer_repository_reference,
@@ -211,9 +209,7 @@ fn collect_catalog_references(
                 bead_refs.insert(string.clone());
             }
             if field_name.is_some_and(|field| {
-                field == "repository_ref"
-                    || field.ends_with("_ref")
-                    || field.ends_with("_refs")
+                field == "repository_ref" || field.ends_with("_ref") || field.ends_with("_refs")
             }) && !is_bead_reference(string)
             {
                 repository_refs.insert(string.clone());
@@ -476,7 +472,10 @@ fn assert_payload_digests(root: &Path, catalog: &RendererScenarioCatalog) {
                     RendererContentDecoder::HexDecodeV1 => decode_hex_v1(&payload_path, &encoded),
                     RendererContentDecoder::JsonFixtureStateV1 => {
                         serde_json::from_slice::<Value>(&encoded).unwrap_or_else(|error| {
-                            panic!("{} is not valid fixture JSON: {error}", payload_path.display())
+                            panic!(
+                                "{} is not valid fixture JSON: {error}",
+                                payload_path.display()
+                            )
                         });
                         encoded.clone()
                     }
@@ -611,10 +610,7 @@ fn rect_contains(container: RendererPixelRect, child: RendererPixelRect) -> bool
 fn rects_are_disjoint(left: RendererPixelRect, right: RendererPixelRect) -> bool {
     let first = rect_bounds(left);
     let second = rect_bounds(right);
-    first.2 <= second.0
-        || second.2 <= first.0
-        || first.3 <= second.1
-        || second.3 <= first.1
+    first.2 <= second.0 || second.2 <= first.0 || first.3 <= second.1 || second.3 <= first.1
 }
 
 fn assert_resolved_anchor_topology(
@@ -622,7 +618,10 @@ fn assert_resolved_anchor_topology(
     fleet_point: RendererFleetPoint,
     known_content_ids: &BTreeSet<&str>,
 ) {
-    assert_eq!(anchor.windows.len(), usize::from(fleet_point.window_count()));
+    assert_eq!(
+        anchor.windows.len(),
+        usize::from(fleet_point.window_count())
+    );
     assert_eq!(anchor.tabs.len(), usize::from(fleet_point.tab_count()));
     assert_eq!(anchor.panes.len(), usize::from(fleet_point.pane_count()));
     assert!(!anchor.layout_profile_id.is_empty());
@@ -652,7 +651,11 @@ fn assert_resolved_anchor_topology(
         );
     }
     assert_eq!(
-        anchor.windows.iter().filter(|window| window.focused).count(),
+        anchor
+            .windows
+            .iter()
+            .filter(|window| window.focused)
+            .count(),
         1
     );
     assert_eq!(
@@ -703,7 +706,10 @@ fn assert_resolved_anchor_topology(
             pane.coordinate_space,
             RendererPixelCoordinateSpace::WindowDrawable
         );
-        assert!(rect_contains(window.drawable_rect, pane.window_content_rect));
+        assert!(rect_contains(
+            window.drawable_rect,
+            pane.window_content_rect
+        ));
         assert_eq!(
             pane.surface_state.display.viewport_width_px,
             pane.window_content_rect.width
@@ -757,10 +763,7 @@ fn assert_resolved_anchor_topology(
             );
         }
     }
-    assert_eq!(
-        anchor.panes.iter().filter(|pane| pane.focused).count(),
-        1
-    );
+    assert_eq!(anchor.panes.iter().filter(|pane| pane.focused).count(), 1);
     let focused_pane = anchor
         .panes
         .iter()
@@ -811,7 +814,10 @@ fn assert_resolved_overlay_topology(
     known_content_ids: &BTreeSet<&str>,
 ) {
     assert_eq!(resolved.fleet_point, fleet_point);
-    assert_eq!(resolved.overlay_id, RendererCoverageOverlayId::ProductionDefault);
+    assert_eq!(
+        resolved.overlay_id,
+        RendererCoverageOverlayId::ProductionDefault
+    );
     assert_eq!(
         resolved.catalog_revision,
         RENDERER_SCENARIO_CATALOG_REVISION
@@ -830,12 +836,12 @@ fn assert_resolved_overlay_topology(
                 && anchor.panes[0].window_content_rect == anchor.windows[0].drawable_rect
         }));
     } else if fleet_point == RendererFleetPoint::P200 {
-        assert!(resolved.anchors.iter().all(|anchor| {
-            anchor
-                .panes
+        assert!(
+            resolved
+                .anchors
                 .iter()
-                .all(|pane| !pane.split_path.is_empty())
-        }));
+                .all(|anchor| { anchor.panes.iter().all(|pane| !pane.split_path.is_empty()) })
+        );
     }
 }
 
@@ -855,10 +861,7 @@ fn checked_in_catalog_passes_typed_semantic_validation() {
         "checked-in renderer catalog failed semantic validation:\n{}",
         validation_errors(&catalog)
     );
-    assert_eq!(
-        catalog.catalog_revision,
-        RENDERER_SCENARIO_CATALOG_REVISION
-    );
+    assert_eq!(catalog.catalog_revision, RENDERER_SCENARIO_CATALOG_REVISION);
     assert_eq!(catalog.authority, RendererCatalogAuthority::ContractOnly);
     assert!(
         !catalog
@@ -893,7 +896,10 @@ fn checked_in_catalog_uses_bounded_deterministic_round_trip() {
 fn exact_matrix_overlay_readiness_and_checkpoint_counts_are_frozen() {
     let catalog = load_catalog(&repository_root());
     let report = catalog.validate();
-    assert!(report.valid, "catalog must validate before count assertions");
+    assert!(
+        report.valid,
+        "catalog must validate before count assertions"
+    );
     assert_eq!(catalog.scenarios.len(), REQUIRED_RENDERER_SCENARIO_COUNT);
     assert_eq!(
         catalog.coverage_overlay_profiles.len(),
@@ -967,8 +973,7 @@ fn scenario_ids_seeds_and_coverage_cells_are_exact_and_unique() {
             scenario.scenario_id,
             expected_renderer_scenario_id(scenario.gesture, scenario.fleet_point)
         );
-        let expected_seed =
-            expected_renderer_scenario_seed(scenario.gesture, scenario.fleet_point);
+        let expected_seed = expected_renderer_scenario_seed(scenario.gesture, scenario.fleet_point);
         assert_eq!(scenario.seed, expected_seed);
         let expected_wire_seed = format!("0x{expected_seed:016x}");
         assert_eq!(
@@ -1023,10 +1028,7 @@ fn checkpoint_comparator_policies_are_exact_for_every_role() {
         (
             "snap-back comparator order is canonical",
             RendererCheckpointRole::StandardSnapBackSubject,
-            &[
-                RQ_S13_COMPARATOR_POLICY_REF,
-                RQ_S11_COMPARATOR_POLICY_REF,
-            ],
+            &[RQ_S13_COMPARATOR_POLICY_REF, RQ_S11_COMPARATOR_POLICY_REF],
         ),
         (
             "snap-back comparators cannot be replaced",
@@ -1045,10 +1047,8 @@ fn checkpoint_comparator_policies_are_exact_for_every_role() {
             .flat_map(|scenario| scenario.visual_checkpoints.iter_mut())
             .find(|checkpoint| checkpoint.role == role)
             .unwrap_or_else(|| panic!("canonical catalog must contain {role:?}"));
-        checkpoint.comparator_policy_refs = policies
-            .iter()
-            .map(|&policy| policy.to_owned())
-            .collect();
+        checkpoint.comparator_policy_refs =
+            policies.iter().map(|&policy| policy.to_owned()).collect();
         let report = mutated.validate();
         assert!(
             report.contains_code(RendererScenarioValidationCode::InvalidCheckpoint),
@@ -1068,17 +1068,14 @@ fn scenario_order_and_overlay_conditional_invariants_fail_closed() {
         RendererScenarioValidationCode::MissingRequiredCoverage,
     );
 
-    let scenario_id = expected_renderer_scenario_id(
-        RendererGesture::SameGridDrag,
-        RendererFleetPoint::P001,
-    );
+    let scenario_id =
+        expected_renderer_scenario_id(RendererGesture::SameGridDrag, RendererFleetPoint::P001);
     for overlay_id in RendererCoverageOverlayId::ALL {
         let resolved = resolve_renderer_scenario_overlay(&catalog, &scenario_id, overlay_id)
             .unwrap_or_else(|error| panic!("failed to resolve {}: {error}", overlay_id.as_str()));
         for anchor in &resolved.anchors {
             let derives_alternate = anchor.panes.iter().any(|pane| {
-                pane.surface_state.terminal.active_buffer
-                    == RendererTerminalBufferKind::Alternate
+                pane.surface_state.terminal.active_buffer == RendererTerminalBufferKind::Alternate
             });
             let derives_accessibility = anchor.panes.iter().any(|pane| {
                 matches!(
@@ -1087,21 +1084,43 @@ fn scenario_order_and_overlay_conditional_invariants_fail_closed() {
                 )
             });
             assert_eq!(
-                anchor.expected_invariant_ids.iter().any(|id| id == "alternate_screen_isolation"),
+                anchor
+                    .expected_invariant_ids
+                    .iter()
+                    .any(|id| id == "alternate_screen_isolation"),
                 derives_alternate
             );
             assert_eq!(
-                anchor.expected_invariant_ids.iter().any(|id| id == "accessibility_focus_geometry"),
+                anchor
+                    .expected_invariant_ids
+                    .iter()
+                    .any(|id| id == "accessibility_focus_geometry"),
                 derives_accessibility
             );
         }
     }
 
     for (overlay_id, invariant_id, remove) in [
-        (RendererCoverageOverlayId::ProductionDefault, "alternate_screen_isolation", false),
-        (RendererCoverageOverlayId::AlternateScreen, "alternate_screen_isolation", true),
-        (RendererCoverageOverlayId::ProductionDefault, "accessibility_focus_geometry", false),
-        (RendererCoverageOverlayId::A11yGeometry, "accessibility_focus_geometry", true),
+        (
+            RendererCoverageOverlayId::ProductionDefault,
+            "alternate_screen_isolation",
+            false,
+        ),
+        (
+            RendererCoverageOverlayId::AlternateScreen,
+            "alternate_screen_isolation",
+            true,
+        ),
+        (
+            RendererCoverageOverlayId::ProductionDefault,
+            "accessibility_focus_geometry",
+            false,
+        ),
+        (
+            RendererCoverageOverlayId::A11yGeometry,
+            "accessibility_focus_geometry",
+            true,
+        ),
     ] {
         let mut mutated = catalog.clone();
         let checkpoint = mutated.scenarios[0]
@@ -1110,9 +1129,13 @@ fn scenario_order_and_overlay_conditional_invariants_fail_closed() {
             .find(|checkpoint| checkpoint.overlay_id == overlay_id)
             .expect("required overlay checkpoint exists");
         if remove {
-            checkpoint.expected_invariant_ids.retain(|id| id != invariant_id);
+            checkpoint
+                .expected_invariant_ids
+                .retain(|id| id != invariant_id);
         } else {
-            checkpoint.expected_invariant_ids.push(invariant_id.to_string());
+            checkpoint
+                .expected_invariant_ids
+                .push(invariant_id.to_string());
         }
         assert_has_code(&mutated, RendererScenarioValidationCode::InvalidCheckpoint);
     }
@@ -1140,11 +1163,8 @@ fn hold_through_rejects_early_alternate_exit_and_replacement() {
             .expect("alternate distribution enters the alternate buffer");
         let mut destructive = steps[enter_position].clone();
         destructive.operation = destructive_operation;
-        if destructive_operation
-            == RendererContentCompositionOperation::ReplaceActiveBuffer
-        {
-            destructive.content_corpus_id =
-                "content.gpu_text_basic_paragraph.v1".to_string();
+        if destructive_operation == RendererContentCompositionOperation::ReplaceActiveBuffer {
+            destructive.content_corpus_id = "content.gpu_text_basic_paragraph.v1".to_string();
         }
         destructive.hold_through_checkpoint_ids.clear();
         destructive.step_ordinal = u16::try_from(enter_position + 1)
@@ -1195,7 +1215,9 @@ fn hold_through_rejects_early_alternate_exit_and_replacement() {
     let report = remove_then_reintroduce.validate();
     assert!(
         report.errors.iter().any(|error| {
-            error.detail.contains("does not survive continuously through promised checkpoint")
+            error
+                .detail
+                .contains("does not survive continuously through promised checkpoint")
         }),
         "remove-then-reintroduce must not satisfy a continuous hold promise"
     );
@@ -1374,7 +1396,10 @@ fn p200_display_move_keeps_metadata_and_split_derived_geometry_disjoint() {
             },
             RendererTimelineAction::SetRevisions { .. },
         ] => {
-            assert_eq!(target, display_target, "atomic display actions must share one target");
+            assert_eq!(
+                target, display_target,
+                "atomic display actions must share one target"
+            );
             (target, *width_px, *height_px, display)
         }
         actions => panic!("unexpected DPI mutation action order: {actions:?}"),
@@ -1417,7 +1442,10 @@ fn p200_display_move_keeps_metadata_and_split_derived_geometry_disjoint() {
         .iter()
         .find(|window| window.window_id == target.window_id)
         .expect("display target window resolves");
-    assert_eq!((window.drawable_rect.width, window.drawable_rect.height), (width_px, height_px));
+    assert_eq!(
+        (window.drawable_rect.width, window.drawable_rect.height),
+        (width_px, height_px)
+    );
     for pane in anchor
         .panes
         .iter()
@@ -1440,10 +1468,8 @@ fn p200_display_move_keeps_metadata_and_split_derived_geometry_disjoint() {
 #[test]
 fn retina_scale_applies_once_to_logical_dpi_cell_metrics_and_padding() {
     let catalog = load_catalog(&repository_root());
-    let scenario_id = expected_renderer_scenario_id(
-        RendererGesture::DpiDisplayMove,
-        RendererFleetPoint::P001,
-    );
+    let scenario_id =
+        expected_renderer_scenario_id(RendererGesture::DpiDisplayMove, RendererFleetPoint::P001);
     let resolved = resolve_renderer_scenario_overlay(
         &catalog,
         &scenario_id,
@@ -1469,17 +1495,20 @@ fn retina_scale_applies_once_to_logical_dpi_cell_metrics_and_padding() {
     assert_eq!(initial.display.scale_factor_milli, 1_000);
     assert_eq!(retina.display.scale_factor_milli, 2_000);
 
-    let cell_width_milli = |state: &frankenterm_core::renderer_scenario_catalog::RendererSurfaceState| {
-        u64::from(state.font.base_cell_width_milli_px)
-            * u64::from(state.font.scale_milli)
-            * u64::from(state.display.dpi_milli)
-            * u64::from(state.display.scale_factor_milli)
-            / (1_000_u64
-                * 1_000
-                * u64::from(state.font.metric_reference_dpi_milli))
-    };
+    let cell_width_milli =
+        |state: &frankenterm_core::renderer_scenario_catalog::RendererSurfaceState| {
+            u64::from(state.font.base_cell_width_milli_px)
+                * u64::from(state.font.scale_milli)
+                * u64::from(state.display.dpi_milli)
+                * u64::from(state.display.scale_factor_milli)
+                / (1_000_u64 * 1_000 * u64::from(state.font.metric_reference_dpi_milli))
+        };
     assert_eq!(cell_width_milli(initial), 8_000);
-    assert_eq!(cell_width_milli(retina), 16_000, "Retina must be 2x, not 4x");
+    assert_eq!(
+        cell_width_milli(retina),
+        16_000,
+        "Retina must be 2x, not 4x"
+    );
 
     for (state, expected_cell_milli) in [(initial, 8_000_u64), (retina, 16_000_u64)] {
         let grid_width_px = u64::from(state.grid.columns) * expected_cell_milli / 1_000;
@@ -1504,7 +1533,10 @@ fn p200_atomic_surface_and_revision_targets_cannot_diverge() {
             RendererCoverageOverlayId::ProductionDefault,
         )
         .unwrap_or_else(|error| panic!("failed to resolve {scenario_id}: {error}"));
-        let topology = resolved.anchors.first().expect("p200 overlay has an anchor");
+        let topology = resolved
+            .anchors
+            .first()
+            .expect("p200 overlay has an anchor");
         let scenario_position = canonical
             .scenarios
             .iter()
@@ -1514,9 +1546,10 @@ fn p200_atomic_surface_and_revision_targets_cannot_diverge() {
             .timeline
             .iter()
             .position(|event| {
-                let has_revision = event.actions.iter().any(|action| {
-                    matches!(action, RendererTimelineAction::SetRevisions { .. })
-                });
+                let has_revision = event
+                    .actions
+                    .iter()
+                    .any(|action| matches!(action, RendererTimelineAction::SetRevisions { .. }));
                 let has_surface_change = event.actions.iter().any(|action| {
                     matches!(
                         action,
@@ -1585,10 +1618,8 @@ fn p200_atomic_surface_and_revision_targets_cannot_diverge() {
 fn structural_resolution_exposes_pair_scoped_execution_readiness() {
     let catalog = load_catalog(&repository_root());
     let report = catalog.validate();
-    let scenario_id = expected_renderer_scenario_id(
-        RendererGesture::SameGridDrag,
-        RendererFleetPoint::P001,
-    );
+    let scenario_id =
+        expected_renderer_scenario_id(RendererGesture::SameGridDrag, RendererFleetPoint::P001);
     let mut observed_not_ready = false;
     for overlay_id in RendererCoverageOverlayId::ALL {
         let resolved = resolve_renderer_scenario_overlay(&catalog, &scenario_id, overlay_id)
@@ -1600,7 +1631,10 @@ fn structural_resolution_exposes_pair_scoped_execution_readiness() {
             .expect("validation report contains every pair");
         assert_eq!(resolved.execution_ready, expected.execution_ready);
         assert_eq!(resolved.blocking_gap_codes, expected.blocking_gap_codes);
-        assert_eq!(resolved.execution_ready, resolved.blocking_gap_codes.is_empty());
+        assert_eq!(
+            resolved.execution_ready,
+            resolved.blocking_gap_codes.is_empty()
+        );
         assert_eq!(resolved.execution_ready, resolved.blocking_gaps.is_empty());
         observed_not_ready |= !resolved.execution_ready;
     }
@@ -1614,7 +1648,10 @@ fn structural_resolution_exposes_pair_scoped_execution_readiness() {
 fn output_and_key_authority_gaps_have_exact_pair_scope() {
     let catalog = load_catalog(&repository_root());
     let report = catalog.validate();
-    assert!(report.valid, "authority gaps must not make the contract malformed");
+    assert!(
+        report.valid,
+        "authority gaps must not make the contract malformed"
+    );
     let output_scenarios = catalog
         .scenarios
         .iter()
@@ -1655,7 +1692,11 @@ fn output_and_key_authority_gaps_have_exact_pair_scope() {
         .iter()
         .filter(|gap| gap.code == RendererScenarioGapCode::KeyEffectOracleUnavailable)
         .collect::<Vec<_>>();
-    assert_eq!(key_gaps.len(), 4, "one production-default key gap per output cell");
+    assert_eq!(
+        key_gaps.len(),
+        4,
+        "one production-default key gap per output cell"
+    );
     assert!(key_gaps.iter().all(|gap| {
         gap.tracking_ref == RENDERER_OUTPUT_AUTHORITY_TRACKING_REF
             && gap.overlay_id == Some(RendererCoverageOverlayId::ProductionDefault)
@@ -1695,9 +1736,11 @@ fn output_and_key_authority_gaps_have_exact_pair_scope() {
         let resolved = resolve_renderer_scenario_overlay(&catalog, &output_id, overlay_id)
             .expect("gap-blocked pair still resolves structurally");
         assert!(!resolved.execution_ready);
-        assert!(resolved
-            .blocking_gap_codes
-            .contains(&RendererScenarioGapCode::DeterministicOutputStreamUnavailable));
+        assert!(
+            resolved
+                .blocking_gap_codes
+                .contains(&RendererScenarioGapCode::DeterministicOutputStreamUnavailable)
+        );
         assert_eq!(
             resolved
                 .blocking_gap_codes
@@ -1705,22 +1748,24 @@ fn output_and_key_authority_gaps_have_exact_pair_scope() {
             expects_key_gap
         );
     }
-    let non_output_id = expected_renderer_scenario_id(
-        RendererGesture::SameGridDrag,
-        RendererFleetPoint::P001,
-    );
+    let non_output_id =
+        expected_renderer_scenario_id(RendererGesture::SameGridDrag, RendererFleetPoint::P001);
     let non_output = resolve_renderer_scenario_overlay(
         &catalog,
         &non_output_id,
         RendererCoverageOverlayId::ProductionDefault,
     )
     .expect("non-output pair resolves structurally");
-    assert!(!non_output
-        .blocking_gap_codes
-        .contains(&RendererScenarioGapCode::DeterministicOutputStreamUnavailable));
-    assert!(!non_output
-        .blocking_gap_codes
-        .contains(&RendererScenarioGapCode::KeyEffectOracleUnavailable));
+    assert!(
+        !non_output
+            .blocking_gap_codes
+            .contains(&RendererScenarioGapCode::DeterministicOutputStreamUnavailable)
+    );
+    assert!(
+        !non_output
+            .blocking_gap_codes
+            .contains(&RendererScenarioGapCode::KeyEffectOracleUnavailable)
+    );
 }
 
 #[test]
@@ -1780,10 +1825,8 @@ fn public_resolver_rejects_unknown_scenario_and_reordered_window_rows() {
             if scenario_id == unknown
     ));
 
-    let scenario_id = expected_renderer_scenario_id(
-        RendererGesture::SameGridDrag,
-        RendererFleetPoint::P200,
-    );
+    let scenario_id =
+        expected_renderer_scenario_id(RendererGesture::SameGridDrag, RendererFleetPoint::P200);
     let resolved = resolve_renderer_scenario_overlay(
         &catalog,
         &scenario_id,
@@ -1937,12 +1980,7 @@ fn every_repository_and_bead_reference_resolves() {
     let value = load_catalog_value(&root);
     let mut repository_refs = BTreeSet::new();
     let mut bead_refs = BTreeSet::new();
-    collect_catalog_references(
-        &value,
-        None,
-        &mut repository_refs,
-        &mut bead_refs,
-    );
+    collect_catalog_references(&value, None, &mut repository_refs, &mut bead_refs);
     let unresolved = unresolved_repository_refs(&root, repository_refs);
     assert!(
         unresolved.is_empty(),
@@ -2424,10 +2462,15 @@ fn every_finite_scenario_and_control_mutation_is_exhaustive() {
     for index in 0..canonical.scenarios.len() {
         let mut removed = canonical.clone();
         removed.scenarios.remove(index);
-        assert_has_code(&removed, RendererScenarioValidationCode::MissingRequiredCoverage);
+        assert_has_code(
+            &removed,
+            RendererScenarioValidationCode::MissingRequiredCoverage,
+        );
 
         let mut duplicated = canonical.clone();
-        duplicated.scenarios.push(canonical.scenarios[index].clone());
+        duplicated
+            .scenarios
+            .push(canonical.scenarios[index].clone());
         let report = duplicated.validate();
         assert!(report.contains_code(RendererScenarioValidationCode::DuplicateCoverageCell));
         assert!(report.contains_code(RendererScenarioValidationCode::DuplicateId));
@@ -2437,12 +2480,18 @@ fn every_finite_scenario_and_control_mutation_is_exhaustive() {
     for index in 0..canonical.negative_controls.len() {
         let mut removed = canonical.clone();
         removed.negative_controls.remove(index);
-        assert_has_code(&removed, RendererScenarioValidationCode::InvalidNegativeControl);
+        assert_has_code(
+            &removed,
+            RendererScenarioValidationCode::InvalidNegativeControl,
+        );
 
         let mut duplicated = canonical.clone();
         duplicated
             .negative_controls
             .push(canonical.negative_controls[index].clone());
-        assert_has_code(&duplicated, RendererScenarioValidationCode::InvalidNegativeControl);
+        assert_has_code(
+            &duplicated,
+            RendererScenarioValidationCode::InvalidNegativeControl,
+        );
     }
 }

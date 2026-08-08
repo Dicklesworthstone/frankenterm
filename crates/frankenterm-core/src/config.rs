@@ -1938,9 +1938,7 @@ fn canonical_retention_tier(
         .severities
         .len()
         .checked_add(tier.event_types.len())
-        .ok_or_else(|| {
-            format!("storage.retention_tiers[{tier_index}] filter count overflowed")
-        })?;
+        .ok_or_else(|| format!("storage.retention_tiers[{tier_index}] filter count overflowed"))?;
     if filter_count > RETENTION_POLICY_MAX_FILTERS_PER_TIER {
         return Err(format!(
             "storage.retention_tiers[{tier_index}] has {filter_count} filters; maximum is {RETENTION_POLICY_MAX_FILTERS_PER_TIER}"
@@ -2096,17 +2094,9 @@ pub(crate) fn compile_retention_policy_tiers(
             })?,
             "SQL bind cost",
         )?;
-        retention_policy_checked_add(
-            &mut input_utf8_bytes,
-            tier.name.len(),
-            "UTF-8 byte count",
-        )?;
+        retention_policy_checked_add(&mut input_utf8_bytes, tier.name.len(), "UTF-8 byte count")?;
         for value in tier.severities.iter().chain(&tier.event_types) {
-            retention_policy_checked_add(
-                &mut input_utf8_bytes,
-                value.len(),
-                "UTF-8 byte count",
-            )?;
+            retention_policy_checked_add(&mut input_utf8_bytes, value.len(), "UTF-8 byte count")?;
         }
 
         canonical_tiers.push(canonical_retention_tier(tier, tier_index)?);
@@ -2131,11 +2121,7 @@ pub(crate) fn compile_retention_policy_tiers(
     let mut bind_values = Vec::with_capacity(input_sql_bind_cost);
     for (branch_index, tier) in canonical_tiers.iter().enumerate() {
         classification_sql.push_str(" WHEN (");
-        append_compiled_retention_tier_predicate(
-            &mut classification_sql,
-            &mut bind_values,
-            tier,
-        );
+        append_compiled_retention_tier_predicate(&mut classification_sql, &mut bind_values, tier);
         classification_sql.push_str(") THEN ");
         classification_sql.push_str(&branch_index.to_string());
     }
@@ -8958,7 +8944,10 @@ recorder_backend = "franken_sqlite"
             )
         );
         for summary in [&change.old_value, &change.new_value] {
-            assert!(summary.len() <= 96, "summary must stay log-bounded: {summary}");
+            assert!(
+                summary.len() <= 96,
+                "summary must stay log-bounded: {summary}"
+            );
             assert!(!summary.contains(secret_name));
             assert!(!summary.contains(secret_filter));
         }
@@ -9042,26 +9031,23 @@ retention_tiers = []
 
     #[test]
     fn retention_policy_validation_accepts_exact_caps_and_rejects_cap_plus_one() {
-        let tier = |name: String, severities: Vec<String>, event_types: Vec<String>| {
-            RetentionTier {
+        let tier =
+            |name: String, severities: Vec<String>, event_types: Vec<String>| RetentionTier {
                 name,
                 retention_days: 7,
                 severities,
                 event_types,
                 handled: None,
-            }
-        };
+            };
 
         let mut exact_tiers = StorageConfig::default();
         exact_tiers.retention_tiers = (0..RETENTION_POLICY_MAX_TIERS)
             .map(|index| tier(format!("tier-{index}"), Vec::new(), Vec::new()))
             .collect();
         exact_tiers.validate().expect("exact tier cap is valid");
-        exact_tiers.retention_tiers.push(tier(
-            "tier-overflow".to_string(),
-            Vec::new(),
-            Vec::new(),
-        ));
+        exact_tiers
+            .retention_tiers
+            .push(tier("tier-overflow".to_string(), Vec::new(), Vec::new()));
         let tier_error = exact_tiers.validate().expect_err("tier cap + 1 must fail");
         assert!(tier_error.contains(&format!("{} tiers", RETENTION_POLICY_MAX_TIERS + 1)));
         assert!(tier_error.contains(&format!("maximum is {RETENTION_POLICY_MAX_TIERS}")));
@@ -9070,14 +9056,12 @@ retention_tiers = []
             .map(|index| format!("severity-{index}"))
             .collect::<Vec<_>>();
         let mut filter_config = StorageConfig {
-            retention_tiers: vec![tier(
-                "filter-cap".to_string(),
-                exact_filters,
-                Vec::new(),
-            )],
+            retention_tiers: vec![tier("filter-cap".to_string(), exact_filters, Vec::new())],
             ..StorageConfig::default()
         };
-        filter_config.validate().expect("exact per-tier filter cap is valid");
+        filter_config
+            .validate()
+            .expect("exact per-tier filter cap is valid");
         filter_config.retention_tiers[0]
             .severities
             .push("severity-overflow".to_string());
@@ -9130,11 +9114,7 @@ retention_tiers = []
 
         let exact_byte_filter = "x".repeat(RETENTION_POLICY_MAX_UTF8_BYTES - 1);
         let mut byte_config = StorageConfig {
-            retention_tiers: vec![tier(
-                "b".to_string(),
-                vec![exact_byte_filter],
-                Vec::new(),
-            )],
+            retention_tiers: vec![tier("b".to_string(), vec![exact_byte_filter], Vec::new())],
             ..StorageConfig::default()
         };
         let exact_byte_plan = byte_config

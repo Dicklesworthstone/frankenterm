@@ -31,8 +31,8 @@ use rusqlite::{Connection, params};
 use frankenterm_core::restore_layout::RestoreResult;
 use frankenterm_core::session_pane_state::{AgentMetadata, TerminalState};
 use frankenterm_core::session_restore::{
-    CheckpointInfo, CheckpointRole, RestoreSummary, RestoredPaneState, SessionDoctorReport, SessionInfo,
-    SessionRestoreConfig, format_restore_summary,
+    CheckpointInfo, CheckpointRole, RestoreSummary, RestoredPaneState, SessionDoctorReport,
+    SessionInfo, SessionRestoreConfig, format_restore_summary,
 };
 use frankenterm_core::session_retention::CleanupResult;
 
@@ -187,12 +187,8 @@ fn insert_clean_receipt(conn: &Connection, session_id: &str, checkpoint_at: i64)
     )
     .unwrap();
     let receipt_id = conn.last_insert_rowid();
-    let state_hash = independent_empty_snapshot_witness(
-        session_id,
-        receipt_id,
-        checkpoint_at,
-        &topology_json,
-    );
+    let state_hash =
+        independent_empty_snapshot_witness(session_id, receipt_id, checkpoint_at, &topology_json);
     conn.execute(
         "UPDATE session_checkpoints SET state_hash = ?1 WHERE id = ?2",
         params![state_hash, receipt_id],
@@ -239,11 +235,7 @@ fn independent_empty_snapshot_witness(
     }
 
     let mut hasher = Sha256::new();
-    required(
-        &mut hasher,
-        "domain",
-        b"frankenterm:snapshot-checkpoint:v2",
-    );
+    required(&mut hasher, "domain", b"frankenterm:snapshot-checkpoint:v2");
     required(&mut hasher, "checkpoint_role", b"snapshot");
     required(&mut hasher, "session_id", session_id.as_bytes());
     required(&mut hasher, "checkpoint_id", &checkpoint_id.to_be_bytes());
@@ -252,11 +244,7 @@ fn independent_empty_snapshot_witness(
     required(&mut hasher, "pane_count", &0_i64.to_be_bytes());
     required(&mut hasher, "total_bytes", &0_i64.to_be_bytes());
     optional(&mut hasher, "metadata_json", None);
-    optional(
-        &mut hasher,
-        "topology_json",
-        Some(topology_json.as_bytes()),
-    );
+    optional(&mut hasher, "topology_json", Some(topology_json.as_bytes()));
     required(
         &mut hasher,
         "persisted_pane_row_count",
@@ -336,12 +324,12 @@ fn insert_pane_state(
 // ────────────────────────────────────────────────────────────────────
 
 fn arb_session_restore_config() -> impl Strategy<Value = SessionRestoreConfig> {
-    (any::<bool>(), any::<bool>()).prop_map(
-        |(auto_restore, restore_scrollback)| SessionRestoreConfig {
+    (any::<bool>(), any::<bool>()).prop_map(|(auto_restore, restore_scrollback)| {
+        SessionRestoreConfig {
             auto_restore,
             restore_scrollback,
-        },
-    )
+        }
+    })
 }
 
 fn arb_restore_result() -> impl Strategy<Value = RestoreResult> {
@@ -498,7 +486,9 @@ fn independent_failed_source_ids(summary: &RestoreSummary) -> Vec<u64> {
         .collect::<HashSet<_>>();
     let mut target_multiplicity = HashMap::with_capacity(summary.layout_result.pane_id_map.len());
     for target_pane_id in summary.layout_result.pane_id_map.values() {
-        *target_multiplicity.entry(*target_pane_id).or_insert(0_usize) += 1;
+        *target_multiplicity
+            .entry(*target_pane_id)
+            .or_insert(0_usize) += 1;
     }
 
     let mut failed = expected_source_ids
@@ -596,13 +586,15 @@ fn arb_checkpoint_info() -> impl Strategy<Value = CheckpointInfo> {
         0usize..1_000_000,
     )
         .prop_map(
-            |(id, checkpoint_at, checkpoint_type, checkpoint_role, pane_count, total_bytes)| CheckpointInfo {
-                id,
-                checkpoint_at,
-                checkpoint_type,
-                checkpoint_role,
-                pane_count,
-                total_bytes,
+            |(id, checkpoint_at, checkpoint_type, checkpoint_role, pane_count, total_bytes)| {
+                CheckpointInfo {
+                    id,
+                    checkpoint_at,
+                    checkpoint_type,
+                    checkpoint_role,
+                    pane_count,
+                    total_bytes,
+                }
             },
         )
 }
@@ -617,31 +609,31 @@ fn arb_session_doctor_report() -> impl Strategy<Value = SessionDoctorReport> {
         0usize..1000,
     )
         .prop_flat_map(
-        |(
-            total_sessions,
-            total_checkpoints,
-            orphaned_checkpoints,
-            orphaned_pane_states,
-            invalid_resolved_restore_chains,
-            total_data_bytes,
-        )| {
-            // unclean_sessions must be <= total_sessions
-            let max_unclean = total_sessions;
-            (0..=max_unclean).prop_map(move |unclean_sessions| SessionDoctorReport {
+            |(
                 total_sessions,
-                unclean_sessions,
                 total_checkpoints,
                 orphaned_checkpoints,
                 orphaned_pane_states,
-                unresolved_restore_attempts: 0,
                 invalid_resolved_restore_chains,
-                outcome_complete_restore_attempts: 0,
-                reconciliation_required_restore_attempts: 0,
-                orphaned_restore_intents: 0,
                 total_data_bytes,
-            })
-        },
-    )
+            )| {
+                // unclean_sessions must be <= total_sessions
+                let max_unclean = total_sessions;
+                (0..=max_unclean).prop_map(move |unclean_sessions| SessionDoctorReport {
+                    total_sessions,
+                    unclean_sessions,
+                    total_checkpoints,
+                    orphaned_checkpoints,
+                    orphaned_pane_states,
+                    unresolved_restore_attempts: 0,
+                    invalid_resolved_restore_chains,
+                    outcome_complete_restore_attempts: 0,
+                    reconciliation_required_restore_attempts: 0,
+                    orphaned_restore_intents: 0,
+                    total_data_bytes,
+                })
+            },
+        )
 }
 
 fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
@@ -1352,10 +1344,11 @@ proptest! {
             elapsed_ms: 50,
         };
         let formatted = format_restore_summary(&summary);
-        prop_assert!(formatted.contains(&format!(
+        let expected = format!(
             "Session {}: layout/authority settled for 0/0 panes in 50ms",
             summary.session_id
-        )));
+        );
+        prop_assert!(formatted.contains(&expected));
         prop_assert!(formatted.contains(
             "Process continuity, historical scrollback, and full-session continuity were not restored."
         ));
@@ -1479,7 +1472,10 @@ fn session_restore_config_defaults_and_empty_json_agree() {
     assert!(!from_default.auto_restore);
     assert!(!from_default.restore_scrollback);
     assert_eq!(from_json.auto_restore, from_default.auto_restore);
-    assert_eq!(from_json.restore_scrollback, from_default.restore_scrollback);
+    assert_eq!(
+        from_json.restore_scrollback,
+        from_default.restore_scrollback
+    );
 }
 
 #[test]
@@ -1491,9 +1487,7 @@ fn cleanup_result_default_has_no_work() {
 
 #[test]
 fn format_restore_summary_caps_sorted_missing_mapping_details() {
-    let pane_states = (0_u64..25)
-        .map(restored_pane_stub)
-        .collect::<Vec<_>>();
+    let pane_states = (0_u64..25).map(restored_pane_stub).collect::<Vec<_>>();
     let summary = RestoreSummary {
         session_id: "bounded-failure-details".to_string(),
         checkpoint_id: 1,
@@ -1515,9 +1509,8 @@ fn format_restore_summary_caps_sorted_missing_mapping_details() {
     let formatted = format_restore_summary(&summary);
     let mut previous_position = None;
     for pane_id in 0_u64..20 {
-        let expected_line = format!(
-            "  pane {pane_id}: layout backend returned no mapping or explicit failure\n"
-        );
+        let expected_line =
+            format!("  pane {pane_id}: layout backend returned no mapping or explicit failure\n");
         let position = formatted
             .find(&expected_line)
             .unwrap_or_else(|| panic!("missing bounded detail line {expected_line:?}"));

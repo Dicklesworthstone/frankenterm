@@ -195,29 +195,19 @@ pub(crate) fn effective_cap_mask(cx: &Cx) -> asupersync::cx::CapMask {
     let effective = cx.capabilities().effective;
     let mut mask = CapMask::all();
     if !effective.spawn {
-        mask = mask.intersect(
-            <CapSet<false, true, true, true, true> as CapSetRuntimeMask>::MASK,
-        );
+        mask = mask.intersect(<CapSet<false, true, true, true, true> as CapSetRuntimeMask>::MASK);
     }
     if !effective.time {
-        mask = mask.intersect(
-            <CapSet<true, false, true, true, true> as CapSetRuntimeMask>::MASK,
-        );
+        mask = mask.intersect(<CapSet<true, false, true, true, true> as CapSetRuntimeMask>::MASK);
     }
     if !effective.entropy {
-        mask = mask.intersect(
-            <CapSet<true, true, false, true, true> as CapSetRuntimeMask>::MASK,
-        );
+        mask = mask.intersect(<CapSet<true, true, false, true, true> as CapSetRuntimeMask>::MASK);
     }
     if !effective.io {
-        mask = mask.intersect(
-            <CapSet<true, true, true, false, true> as CapSetRuntimeMask>::MASK,
-        );
+        mask = mask.intersect(<CapSet<true, true, true, false, true> as CapSetRuntimeMask>::MASK);
     }
     if !effective.remote {
-        mask = mask.intersect(
-            <CapSet<true, true, true, true, false> as CapSetRuntimeMask>::MASK,
-        );
+        mask = mask.intersect(<CapSet<true, true, true, true, false> as CapSetRuntimeMask>::MASK);
     }
     mask
 }
@@ -456,9 +446,7 @@ impl std::fmt::Display for SpawnWithTimeoutError {
             SpawnWithTimeoutErrorKind::CostBudgetExhausted => {
                 "child task capability cost budget exhausted"
             }
-            SpawnWithTimeoutErrorKind::ContextFailure => {
-                "child task capability context failed"
-            }
+            SpawnWithTimeoutErrorKind::ContextFailure => "child task capability context failed",
         };
         write!(f, "SpawnWithTimeoutError: {message}")
     }
@@ -816,9 +804,8 @@ mod tests {
             let observed = runtime.block_on(async {
                 spawn_with_cx(&handle, &restricted, move |child_cx| async move {
                     assert_eq!(effective_capability_bits(&child_cx), expected);
-                    let before = effective_capability_bits(
-                        &Cx::current().expect("installed restricted cx"),
-                    );
+                    let before =
+                        effective_capability_bits(&Cx::current().expect("installed restricted cx"));
                     crate::runtime_async::task::yield_now().await;
                     let after = effective_capability_bits(
                         &Cx::current().expect("reinstalled restricted cx"),
@@ -1347,8 +1334,7 @@ mod tests {
                         crate::runtime_async::oneshot_recv(release_rx)
                             .await
                             .expect("detached nested release sender");
-                        nested_completed_by_task
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        nested_completed_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
                         let _ = completed_tx.send(());
                     }));
                     std::future::pending::<()>().await;

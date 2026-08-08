@@ -450,18 +450,9 @@ impl UndoExecutor {
             Err(err) if is_undo_cancellation(&err) => {
                 Err(undo_cancelled_error("undo.workflow_abort"))
             }
-            Err(err) => {
-                Ok(self
-                    .reconcile_workflow_abort_error(
-                        cx,
-                        &request,
-                        action,
-                        undo,
-                        &execution_id,
-                        &err,
-                    )
-                    .await)
-            }
+            Err(err) => Ok(self
+                .reconcile_workflow_abort_error(cx, &request, action, undo, &execution_id, &err)
+                .await),
         }
     }
 
@@ -597,9 +588,7 @@ impl UndoExecutor {
                 return Ok(UndoExecutionResult::failed(
                     action.id,
                     undo.undo_strategy.clone(),
-                    format!(
-                        "Invalid pane-close undo target; refusing automatic undo: {detail}"
-                    ),
+                    format!("Invalid pane-close undo target; refusing automatic undo: {detail}"),
                     undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
                     action.actor_id.clone(),
                     action.pane_id,
@@ -617,9 +606,8 @@ impl UndoExecutor {
             ));
         };
 
-        cx.checkpoint().map_err(|_| {
-            undo_cancelled_error("undo.execute_pane_close.before_get_pane")
-        })?;
+        cx.checkpoint()
+            .map_err(|_| undo_cancelled_error("undo.execute_pane_close.before_get_pane"))?;
 
         match self.wezterm.get_pane_with_cx(cx, pane_id).await {
             Ok(_) => {}
@@ -650,9 +638,8 @@ impl UndoExecutor {
             }
         }
 
-        cx.checkpoint().map_err(|_| {
-            undo_cancelled_error("undo.execute_pane_close.before_kill_pane")
-        })?;
+        cx.checkpoint()
+            .map_err(|_| undo_cancelled_error("undo.execute_pane_close.before_kill_pane"))?;
 
         match self.wezterm.kill_pane_with_cx(cx, pane_id).await {
             Ok(()) => {
@@ -733,11 +720,7 @@ impl UndoExecutor {
     /// committed. Caller cancellation is no longer a safe reason to abandon
     /// this write: doing so would make a successful pane close or workflow
     /// abort appear eligible for a duplicate undo attempt.
-    async fn mark_undone_after_effect(
-        &self,
-        action_id: i64,
-        actor: &str,
-    ) -> Result<Option<i64>> {
+    async fn mark_undone_after_effect(&self, action_id: i64, actor: &str) -> Result<Option<i64>> {
         let cleanup_cx = crate::cx::for_request();
         self.mark_undone_with_cx(&cleanup_cx, action_id, actor)
             .await
@@ -754,10 +737,7 @@ impl UndoExecutor {
             .storage
             .mark_action_undone_with_cx(cx, action_id, actor)
             .await?;
-        let row = self
-            .storage
-            .get_action_undo_with_cx(cx, action_id)
-            .await?;
+        let row = self.storage.get_action_undo_with_cx(cx, action_id).await?;
 
         match row.and_then(|row| row.undone_at) {
             Some(undone_at) => Ok(Some(undone_at)),
@@ -871,9 +851,7 @@ fn nonempty_legacy_execution_id(
     Ok(Some(value.to_string()))
 }
 
-fn pane_id_from_undo(
-    undo: &ActionUndoRecord,
-) -> std::result::Result<Option<u64>, String> {
+fn pane_id_from_undo(undo: &ActionUndoRecord) -> std::result::Result<Option<u64>, String> {
     let Some(payload) = parse_undo_payload_checked(undo)
         .map_err(|err| format!("payload is malformed JSON: {err}"))?
     else {
@@ -2406,7 +2384,10 @@ mod tests {
                 .mark_undone_after_effect(9_999_999, "operator")
                 .await
                 .expect_err("missing undo metadata cannot be reported as durable success");
-            assert!(matches!(error, Error::Storage(crate::StorageError::Database(_))));
+            assert!(matches!(
+                error,
+                Error::Storage(crate::StorageError::Database(_))
+            ));
 
             storage.shutdown().await.expect("shutdown");
         });
@@ -2450,7 +2431,13 @@ mod tests {
                 .await
                 .expect_err("pre-cancelled undo must return structured cancellation");
             assert!(is_undo_cancellation(&error));
-            assert_eq!(mock.get_pane(pane_id).await.expect("pane must remain").pane_id, pane_id);
+            assert_eq!(
+                mock.get_pane(pane_id)
+                    .await
+                    .expect("pane must remain")
+                    .pane_id,
+                pane_id
+            );
             let undo = storage
                 .get_action_undo(action_id)
                 .await
@@ -2522,7 +2509,9 @@ mod tests {
     fn explicit_payload_without_pane_id_does_not_fall_back_to_action_pane() {
         run_async_test(async {
             let temp = tempfile::TempDir::new().expect("tempdir");
-            let db_path = temp.path().join("undo-pane-close-missing-payload-target.db");
+            let db_path = temp
+                .path()
+                .join("undo-pane-close-missing-payload-target.db");
             let db_path = db_path.to_string_lossy().to_string();
             let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
             let pane_id = 70_u64;

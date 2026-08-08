@@ -324,11 +324,11 @@ impl ReflowHealth {
     /// > 0.95 skip ratio.
     #[must_use]
     pub fn skip_ratio(&self) -> f64 {
-        let total = self.lines_reflowed_total + self.lines_skipped_total;
-        if total == 0 {
+        let total = self.lines_reflowed_total as f64 + self.lines_skipped_total as f64;
+        if total == 0.0 {
             return 0.0;
         }
-        self.lines_skipped_total as f64 / total as f64
+        self.lines_skipped_total as f64 / total
     }
 }
 
@@ -549,6 +549,17 @@ mod tests {
         };
         // 195 / 200 = 0.975
         assert!(h.skip_ratio() > 0.95);
+    }
+
+    #[test]
+    fn skip_ratio_handles_saturated_counters_without_overflow() {
+        let h = ReflowHealth {
+            reflows_total: u64::MAX,
+            lines_reflowed_total: u64::MAX,
+            lines_skipped_total: u64::MAX,
+            last_reflow_duration_ms: 0,
+        };
+        assert_eq!(h.skip_ratio(), 0.5);
     }
 
     #[test]

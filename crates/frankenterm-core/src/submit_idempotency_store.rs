@@ -10,9 +10,7 @@
 
 use crate::robot_types::{SubmitGuaranteeLevel, SubmitReceipt, SubmitReceiptState};
 use crate::verified_submit::SubmitIdempotencyBinding;
-use cap_fs_ext::{
-    DirExt, FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt,
-};
+use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt};
 use cap_std::fs::{
     Dir as CapDir, File as CapFile, Metadata as CapMetadata, OpenOptions as CapOpenOptions,
 };
@@ -484,9 +482,7 @@ fn schema_header(conn: &Connection) -> Result<(i64, i64), SubmitIdempotencyError
     Ok((application_id, user_version))
 }
 
-fn validate_initialized_schema_locked(
-    conn: &Connection,
-) -> Result<(), SubmitIdempotencyError> {
+fn validate_initialized_schema_locked(conn: &Connection) -> Result<(), SubmitIdempotencyError> {
     if schema_header(conn)? != (STORE_APPLICATION_ID, STORE_SCHEMA_VERSION) {
         return Err(SubmitIdempotencyError::SchemaMismatch);
     }
@@ -513,8 +509,7 @@ fn validate_initialized_schema_locked(
     }
 
     let (without_rowid, strict) = map_sqlite(
-        conn
-        .query_row(
+        conn.query_row(
             "SELECT wr, strict FROM pragma_table_list \
              WHERE schema = 'main' AND name = 'verified_submit_idempotency'",
             [],
@@ -547,8 +542,7 @@ fn validate_initialized_schema_locked(
         SubmitIdempotencyError::SchemaMismatch,
     )?;
     let (triggers, foreign_keys, indexes) = map_sqlite(
-        conn
-        .query_row(
+        conn.query_row(
             "SELECT \
                  (SELECT COUNT(*) FROM main.sqlite_schema \
                   WHERE type = 'trigger' AND tbl_name = 'verified_submit_idempotency'), \
@@ -567,8 +561,7 @@ fn validate_initialized_schema_locked(
         SubmitIdempotencyError::SchemaMismatch,
     )?;
     let (index_unique, index_origin, index_partial) = map_sqlite(
-        conn
-        .query_row(
+        conn.query_row(
             "SELECT \"unique\", origin, partial \
              FROM pragma_index_list('verified_submit_idempotency') \
              WHERE name = 'verified_submit_idempotency_request_lookup'",
@@ -869,10 +862,7 @@ fn harden_existing_store_leaf(
         return Ok(false);
     };
     let mut options = CapOpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .follow(FollowSymlinks::No);
+    options.read(true).write(true).follow(FollowSymlinks::No);
     let file = directory
         .open_with(filename, &options)
         .map_err(|_| SubmitIdempotencyError::OpenFailed)?;
@@ -956,8 +946,7 @@ fn prepare_store_path(
     ft_dir: &Path,
     mode: StoreOpenMode,
 ) -> Result<Option<PreparedStorePath>, SubmitIdempotencyError> {
-    let Some((directory_path, pinned_directory)) =
-        walk_store_directory_nofollow(ft_dir, mode)?
+    let Some((directory_path, pinned_directory)) = walk_store_directory_nofollow(ft_dir, mode)?
     else {
         return Ok(None);
     };
@@ -1074,8 +1063,7 @@ fn open_store(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err(SubmitIdempotencyError::DirectoryUnavailable),
     }
-    let _database_present =
-        harden_existing_store_leaf(&current_directory, STORE_FILENAME, true)?;
+    let _database_present = harden_existing_store_leaf(&current_directory, STORE_FILENAME, true)?;
     harden_store_auxiliary_leaves(&current_directory)?;
     map_sqlite(
         conn.busy_timeout(BUSY_TIMEOUT),
@@ -1211,8 +1199,7 @@ fn read_header(
                 && lease_expires_unix_ms.is_none()
                 && bytes.is_some_and(|value| {
                     value >= 0
-                        && usize::try_from(value)
-                            .is_ok_and(|size| size <= MAX_RECEIPT_JSON_BYTES)
+                        && usize::try_from(value).is_ok_and(|size| size <= MAX_RECEIPT_JSON_BYTES)
                 })
         }
         STATE_RETRYABLE => {
@@ -1304,8 +1291,8 @@ fn serialize_receipt(
         effect_sha256: binding.effect_sha256().to_string(),
         receipt: receipt.into(),
     };
-    let json = serde_json::to_string(&envelope)
-        .map_err(|_| SubmitIdempotencyError::ReceiptInvalid)?;
+    let json =
+        serde_json::to_string(&envelope).map_err(|_| SubmitIdempotencyError::ReceiptInvalid)?;
     if json.len() > MAX_RECEIPT_JSON_BYTES {
         return Err(SubmitIdempotencyError::ReceiptOversize);
     }
@@ -1455,11 +1442,7 @@ fn expire_active_owner_locked(
         ),
         fallback,
     )?;
-    if changed == 1 {
-        Ok(())
-    } else {
-        Err(fallback)
-    }
+    if changed == 1 { Ok(()) } else { Err(fallback) }
 }
 
 /// Atomically claim a request before any possible injection side effect.
@@ -1486,9 +1469,7 @@ pub fn claim(
         ) {
             Err(SubmitIdempotencyError::Busy) if attempt < CLAIM_BUSY_MAX_ATTEMPTS => {
                 std::thread::sleep(Duration::from_millis(backoff_ms));
-                backoff_ms = backoff_ms
-                    .saturating_mul(2)
-                    .min(CLAIM_BUSY_MAX_BACKOFF_MS);
+                backoff_ms = backoff_ms.saturating_mul(2).min(CLAIM_BUSY_MAX_BACKOFF_MS);
             }
             result => return result,
         }
@@ -1546,8 +1527,8 @@ where
     {
         return Err(SubmitIdempotencyError::CapacityExceeded);
     }
-    let mut conn = open_store(ft_dir, StoreOpenMode::Create)?
-        .ok_or(SubmitIdempotencyError::OpenFailed)?;
+    let mut conn =
+        open_store(ft_dir, StoreOpenMode::Create)?.ok_or(SubmitIdempotencyError::OpenFailed)?;
     let tx = map_sqlite(
         conn.transaction_with_behavior(TransactionBehavior::Immediate),
         SubmitIdempotencyError::ClaimFailed,
@@ -1747,8 +1728,8 @@ where
 {
     validate_binding(binding)?;
     let receipt_json = serialize_receipt(binding, receipt)?;
-    let mut conn = open_store(ft_dir, StoreOpenMode::Existing)?
-        .ok_or(SubmitIdempotencyError::MissingClaim)?;
+    let mut conn =
+        open_store(ft_dir, StoreOpenMode::Existing)?.ok_or(SubmitIdempotencyError::MissingClaim)?;
     let tx = map_sqlite(
         conn.transaction_with_behavior(TransactionBehavior::Immediate),
         SubmitIdempotencyError::TransitionFailed,
@@ -1848,8 +1829,8 @@ where
     F: FnMut() -> i64,
 {
     validate_binding(binding)?;
-    let mut conn = open_store(ft_dir, StoreOpenMode::Existing)?
-        .ok_or(SubmitIdempotencyError::MissingClaim)?;
+    let mut conn =
+        open_store(ft_dir, StoreOpenMode::Existing)?.ok_or(SubmitIdempotencyError::MissingClaim)?;
     let tx = map_sqlite(
         conn.transaction_with_behavior(TransactionBehavior::Immediate),
         SubmitIdempotencyError::TransitionFailed,
@@ -1948,8 +1929,8 @@ where
     F: FnMut() -> i64,
 {
     validate_binding(binding)?;
-    let mut conn = open_store(ft_dir, StoreOpenMode::Existing)?
-        .ok_or(SubmitIdempotencyError::MissingClaim)?;
+    let mut conn =
+        open_store(ft_dir, StoreOpenMode::Existing)?.ok_or(SubmitIdempotencyError::MissingClaim)?;
     let tx = map_sqlite(
         conn.transaction_with_behavior(TransactionBehavior::Immediate),
         SubmitIdempotencyError::TransitionFailed,
@@ -2319,12 +2300,7 @@ mod tests {
         let completed = binding(7, "entropy-completed");
         let completed_receipt = receipt(&completed, SubmitReceiptState::Submitted);
         let completed_token = claim_token(dir.path(), &completed);
-        complete_owned(
-            dir.path(),
-            &completed,
-            completed_token,
-            &completed_receipt,
-        );
+        complete_owned(dir.path(), &completed, completed_token, &completed_receipt);
         assert_eq!(
             claim_without_entropy_at(dir.path(), &completed, now + 1),
             Ok(ClaimOutcome::Completed(completed_receipt))
@@ -2368,10 +2344,7 @@ mod tests {
         let ambiguous = binding(7, "ambiguous-error");
         let ambiguous_token = claim_token(dir.path(), &ambiguous);
         mark_in_doubt(dir.path(), &ambiguous, ambiguous_token).expect("mark in doubt");
-        assert_eq!(
-            claim(dir.path(), &ambiguous),
-            Ok(ClaimOutcome::InDoubt)
-        );
+        assert_eq!(claim(dir.path(), &ambiguous), Ok(ClaimOutcome::InDoubt));
     }
 
     #[test]
@@ -2686,11 +2659,7 @@ mod tests {
         .expect("slow claim should fail closed");
         assert_eq!(outcome, ClaimOutcome::InDoubt);
         assert_eq!(
-            lookup_at(
-                dir.path(),
-                &binding,
-                40_000 + OWNER_LEASE_DURATION_MS,
-            ),
+            lookup_at(dir.path(), &binding, 40_000 + OWNER_LEASE_DURATION_MS,),
             Ok(Some(StoredSubmitState::InDoubt))
         );
     }
@@ -3020,8 +2989,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let first = binding(10, "capacity-first");
         let second = binding(10, "capacity-second");
-        let record_bytes = new_record_logical_bytes(&first, PRODUCTION_LIMITS)
-            .expect("bounded record size");
+        let record_bytes =
+            new_record_logical_bytes(&first, PRODUCTION_LIMITS).expect("bounded record size");
         let limits = StoreLimits {
             max_records: 10,
             max_logical_bytes: record_bytes
@@ -3073,8 +3042,8 @@ mod tests {
     fn reserved_headroom_allows_terminal_receipt_without_overcommit() {
         let dir = tempfile::tempdir().expect("tempdir");
         let binding = binding(10, "terminal-headroom");
-        let exact_capacity = new_record_logical_bytes(&binding, PRODUCTION_LIMITS)
-            .expect("bounded record size");
+        let exact_capacity =
+            new_record_logical_bytes(&binding, PRODUCTION_LIMITS).expect("bounded record size");
         let limits = StoreLimits {
             max_records: 1,
             max_logical_bytes: exact_capacity,

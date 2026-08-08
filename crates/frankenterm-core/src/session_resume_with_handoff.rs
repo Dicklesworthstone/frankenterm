@@ -285,9 +285,7 @@ impl std::fmt::Display for HandoffApplySummaryError {
             Self::DuplicateAcceptedSectionIndex { section_index } => {
                 ("duplicate_accepted_index", section_index)
             }
-            Self::DuplicateSectionOutcome { section_index } => {
-                ("duplicate_outcome", section_index)
-            }
+            Self::DuplicateSectionOutcome { section_index } => ("duplicate_outcome", section_index),
             Self::UnacceptedSectionOutcome { section_index } => {
                 ("unaccepted_outcome", section_index)
             }
@@ -315,14 +313,10 @@ fn validate_apply_outcomes(
     let mut accepted = HashSet::with_capacity(validation.accepted.len());
     for &section_index in &validation.accepted {
         if section_index >= capsule.sections.len() {
-            return Err(HandoffApplySummaryError::InvalidAcceptedSectionIndex {
-                section_index,
-            });
+            return Err(HandoffApplySummaryError::InvalidAcceptedSectionIndex { section_index });
         }
         if !accepted.insert(section_index) {
-            return Err(HandoffApplySummaryError::DuplicateAcceptedSectionIndex {
-                section_index,
-            });
+            return Err(HandoffApplySummaryError::DuplicateAcceptedSectionIndex { section_index });
         }
     }
 
@@ -346,9 +340,7 @@ fn validate_apply_outcomes(
     }
     for &section_index in &validation.accepted {
         if !observed.contains(&section_index) {
-            return Err(HandoffApplySummaryError::MissingAcceptedSectionOutcome {
-                section_index,
-            });
+            return Err(HandoffApplySummaryError::MissingAcceptedSectionOutcome { section_index });
         }
     }
     Ok(())
@@ -416,7 +408,11 @@ impl AppliedHandoffSummary {
         if self.applied.len() != self.accepted_indices.len() {
             return false;
         }
-        let accepted = self.accepted_indices.iter().copied().collect::<HashSet<_>>();
+        let accepted = self
+            .accepted_indices
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
         let observed = self
             .applied
             .iter()
@@ -695,29 +691,27 @@ mod tests {
         let dest = dest_passport(&["inherit_mission_state", "inherit_pending_approvals"]);
         let completed = completed_resume(&capsule, Some(&dest), fake_resume_output());
         let summary = completed
-            .apply_to_resumed_session(
-                vec![
-                    SectionApplyOutcome {
-                        section_index: 0,
-                        section_label: "context_summary".into(),
-                        disposition: SectionDisposition::Applied,
+            .apply_to_resumed_session(vec![
+                SectionApplyOutcome {
+                    section_index: 0,
+                    section_label: "context_summary".into(),
+                    disposition: SectionDisposition::Applied,
+                },
+                SectionApplyOutcome {
+                    section_index: 1,
+                    section_label: "mission_state".into(),
+                    disposition: SectionDisposition::SkippedByPolicy {
+                        reason: skip_by_policy_reasons::OPERATOR_OPTED_OUT.into(),
                     },
-                    SectionApplyOutcome {
-                        section_index: 1,
-                        section_label: "mission_state".into(),
-                        disposition: SectionDisposition::SkippedByPolicy {
-                            reason: skip_by_policy_reasons::OPERATOR_OPTED_OUT.into(),
-                        },
+                },
+                SectionApplyOutcome {
+                    section_index: 2,
+                    section_label: "pending_approvals".into(),
+                    disposition: SectionDisposition::Errored {
+                        error: "approval queue full".into(),
                     },
-                    SectionApplyOutcome {
-                        section_index: 2,
-                        section_label: "pending_approvals".into(),
-                        disposition: SectionDisposition::Errored {
-                            error: "approval queue full".into(),
-                        },
-                    },
-                ],
-            )
+                },
+            ])
             .expect("one canonical outcome per accepted section");
         assert_eq!(summary.session_id, "src-session");
         assert_eq!(summary.target_provider_slug, "claude-code");
@@ -767,20 +761,18 @@ mod tests {
         let completed = || completed_resume(&capsule, Some(&dest), fake_resume_output());
 
         let missing = completed()
-            .apply_to_resumed_session(
-                vec![
-                    SectionApplyOutcome {
-                        section_index: 0,
-                        section_label: "context_summary".into(),
-                        disposition: SectionDisposition::Applied,
-                    },
-                    SectionApplyOutcome {
-                        section_index: 1,
-                        section_label: "mission_state".into(),
-                        disposition: SectionDisposition::Applied,
-                    },
-                ],
-            )
+            .apply_to_resumed_session(vec![
+                SectionApplyOutcome {
+                    section_index: 0,
+                    section_label: "context_summary".into(),
+                    disposition: SectionDisposition::Applied,
+                },
+                SectionApplyOutcome {
+                    section_index: 1,
+                    section_label: "mission_state".into(),
+                    disposition: SectionDisposition::Applied,
+                },
+            ])
             .expect_err("an accepted section cannot be omitted");
         assert_eq!(
             missing,
@@ -788,20 +780,18 @@ mod tests {
         );
 
         let duplicate = completed()
-            .apply_to_resumed_session(
-                vec![
-                    SectionApplyOutcome {
-                        section_index: 0,
-                        section_label: "context_summary".into(),
-                        disposition: SectionDisposition::Applied,
-                    },
-                    SectionApplyOutcome {
-                        section_index: 0,
-                        section_label: "context_summary".into(),
-                        disposition: SectionDisposition::Applied,
-                    },
-                ],
-            )
+            .apply_to_resumed_session(vec![
+                SectionApplyOutcome {
+                    section_index: 0,
+                    section_label: "context_summary".into(),
+                    disposition: SectionDisposition::Applied,
+                },
+                SectionApplyOutcome {
+                    section_index: 0,
+                    section_label: "context_summary".into(),
+                    disposition: SectionDisposition::Applied,
+                },
+            ])
             .expect_err("duplicate accounting cannot satisfy coverage");
         assert_eq!(
             duplicate,
@@ -809,13 +799,11 @@ mod tests {
         );
 
         let unaccepted = completed()
-            .apply_to_resumed_session(
-                vec![SectionApplyOutcome {
-                    section_index: 99,
-                    section_label: "context_summary".into(),
-                    disposition: SectionDisposition::Applied,
-                }],
-            )
+            .apply_to_resumed_session(vec![SectionApplyOutcome {
+                section_index: 99,
+                section_label: "context_summary".into(),
+                disposition: SectionDisposition::Applied,
+            }])
             .expect_err("unaccepted section cannot be recorded");
         assert_eq!(
             unaccepted,
@@ -823,25 +811,23 @@ mod tests {
         );
 
         let mislabeled = completed()
-            .apply_to_resumed_session(
-                vec![
-                    SectionApplyOutcome {
-                        section_index: 0,
-                        section_label: "mission_state".into(),
-                        disposition: SectionDisposition::Applied,
-                    },
-                    SectionApplyOutcome {
-                        section_index: 1,
-                        section_label: "mission_state".into(),
-                        disposition: SectionDisposition::Applied,
-                    },
-                    SectionApplyOutcome {
-                        section_index: 2,
-                        section_label: "pending_approvals".into(),
-                        disposition: SectionDisposition::Applied,
-                    },
-                ],
-            )
+            .apply_to_resumed_session(vec![
+                SectionApplyOutcome {
+                    section_index: 0,
+                    section_label: "mission_state".into(),
+                    disposition: SectionDisposition::Applied,
+                },
+                SectionApplyOutcome {
+                    section_index: 1,
+                    section_label: "mission_state".into(),
+                    disposition: SectionDisposition::Applied,
+                },
+                SectionApplyOutcome {
+                    section_index: 2,
+                    section_label: "pending_approvals".into(),
+                    disposition: SectionDisposition::Applied,
+                },
+            ])
             .expect_err("section labels must match the capsule authority");
         assert_eq!(
             mislabeled,
@@ -894,8 +880,15 @@ mod tests {
         let source_error = completed_resume(&capsule, Some(&dest), output.clone())
             .apply_to_resumed_session(outcomes())
             .expect_err("resume output must bind to the requested source session");
-        assert_eq!(source_error, HandoffApplySummaryError::SourceSessionMismatch);
-        assert!(!source_error.to_string().contains("different-source-session-canary"));
+        assert_eq!(
+            source_error,
+            HandoffApplySummaryError::SourceSessionMismatch
+        );
+        assert!(
+            !source_error
+                .to_string()
+                .contains("different-source-session-canary")
+        );
 
         output.source_session_id = Some("src-session".into());
         output.target_provider = Some("../different-provider-canary".into());
@@ -906,7 +899,11 @@ mod tests {
             provider_error,
             HandoffApplySummaryError::TargetProviderMismatch
         );
-        assert!(!provider_error.to_string().contains("different-provider-canary"));
+        assert!(
+            !provider_error
+                .to_string()
+                .contains("different-provider-canary")
+        );
 
         output.target_provider = Some("claude-code".into());
         output.target_session_id = None;
@@ -918,8 +915,7 @@ mod tests {
 
         output.target_session_id = Some("bad\nidentity".into());
         assert_eq!(
-            completed_resume(&capsule, Some(&dest), output)
-                .apply_to_resumed_session(outcomes()),
+            completed_resume(&capsule, Some(&dest), output).apply_to_resumed_session(outcomes()),
             Err(HandoffApplySummaryError::InvalidResumedSessionId {
                 identifier_bytes: "bad\nidentity".len(),
             })
@@ -966,9 +962,7 @@ mod tests {
         };
         assert_eq!(
             validate_apply_outcomes(&capsule, &duplicate, &no_outcomes),
-            Err(HandoffApplySummaryError::DuplicateAcceptedSectionIndex {
-                section_index: 0,
-            })
+            Err(HandoffApplySummaryError::DuplicateAcceptedSectionIndex { section_index: 0 })
         );
     }
 

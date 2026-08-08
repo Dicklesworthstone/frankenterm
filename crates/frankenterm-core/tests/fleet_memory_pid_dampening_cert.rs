@@ -32,8 +32,8 @@
 //! Domain: fleet-memory controller — M9 anti-windup PID de-escalation.
 
 use frankenterm_core::fleet_memory_controller::{
-    EvictionPlan, EvictionTarget, FleetPressureTier, FleetScrollbackOrchestrator,
-    MemoryDampening, PaneScrollbackInfo, PidDampeningConfig, PidReclaimController,
+    EvictionPlan, EvictionTarget, FleetPressureTier, FleetScrollbackOrchestrator, MemoryDampening,
+    PaneScrollbackInfo, PidDampeningConfig, PidReclaimController,
 };
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
@@ -78,11 +78,7 @@ fn phase_near(reference_degrees: f64, principal_degrees: f64) -> f64 {
     turns.mul_add(360.0, principal_degrees)
 }
 
-fn refine_bracketed_root(
-    mut lower: f64,
-    mut upper: f64,
-    value_at: impl Fn(f64) -> f64,
-) -> f64 {
+fn refine_bracketed_root(mut lower: f64, mut upper: f64, value_at: impl Fn(f64) -> f64) -> f64 {
     let mut lower_value = value_at(lower);
     let upper_value = value_at(upper);
     assert!(lower_value.is_finite() && upper_value.is_finite());
@@ -193,8 +189,7 @@ fn pid_nominal_model_margin_and_closed_loop_proxy() {
     //   P(z) = b_hat/(z - p_hat)
     let open_loop_at_point = |unit_circle_point: Complex| -> Complex {
         let point_minus_one = complex_subtract(unit_circle_point, (1.0, 0.0));
-        let point_minus_pole =
-            complex_subtract(unit_circle_point, (estimated_pole, 0.0));
+        let point_minus_pole = complex_subtract(unit_circle_point, (estimated_pole, 0.0));
         let integral_term = complex_multiply(
             (ki, 0.0),
             complex_divide(unit_circle_point, point_minus_one),
@@ -203,12 +198,9 @@ fn pid_nominal_model_margin_and_closed_loop_proxy() {
             (kd, 0.0),
             complex_divide(point_minus_one, unit_circle_point),
         );
-        let controller_response = complex_add(
-            complex_add((kp, 0.0), integral_term),
-            derivative_term,
-        );
-        let plant_response =
-            complex_divide((estimated_input_gain, 0.0), point_minus_pole);
+        let controller_response =
+            complex_add(complex_add((kp, 0.0), integral_term), derivative_term);
+        let plant_response = complex_divide((estimated_input_gain, 0.0), point_minus_pole);
         complex_multiply(controller_response, plant_response)
     };
     let open_loop_response = |theta: f64| -> Complex {
@@ -247,37 +239,29 @@ fn pid_nominal_model_margin_and_closed_loop_proxy() {
 
         let gain_crossover_theta = if gain_residual.abs() <= f64::EPSILON {
             Some(theta)
-        } else if gain_residual.is_sign_negative()
-            != previous_gain_residual.is_sign_negative()
-        {
+        } else if gain_residual.is_sign_negative() != previous_gain_residual.is_sign_negative() {
             Some(refine_bracketed_root(
                 previous_theta,
                 theta,
-                |candidate_theta| {
-                    complex_magnitude(open_loop_response(candidate_theta)) - 1.0
-                },
+                |candidate_theta| complex_magnitude(open_loop_response(candidate_theta)) - 1.0,
             ))
         } else {
             None
         };
         if let Some(crossover_theta) = gain_crossover_theta {
             let crossover_response = open_loop_response(crossover_theta);
-            let interval_fraction =
-                (crossover_theta - previous_theta) / (theta - previous_theta);
+            let interval_fraction = (crossover_theta - previous_theta) / (theta - previous_theta);
             let reference_phase = interval_fraction.mul_add(
                 unwrapped_phase - previous_unwrapped_phase,
                 previous_unwrapped_phase,
             );
-            let crossover_phase = phase_near(
-                reference_phase,
-                principal_phase_degrees(crossover_response),
-            );
+            let crossover_phase =
+                phase_near(reference_phase, principal_phase_degrees(crossover_response));
             unity_crossing_margins.push(180.0 + crossover_phase);
         }
 
         let crosses_real_axis = loop_response.1.abs() <= f64::EPSILON
-            || loop_response.1.is_sign_negative()
-                != previous_response.1.is_sign_negative();
+            || loop_response.1.is_sign_negative() != previous_response.1.is_sign_negative();
         if crosses_real_axis {
             let crossover_theta = if loop_response.1.abs() <= f64::EPSILON {
                 theta
@@ -355,8 +339,8 @@ fn pid_nominal_model_margin_and_closed_loop_proxy() {
                 && control_output < closed_loop_config.out_max,
             "nominal response unexpectedly left the linear operating region"
         );
-        simulated_headroom = plant_pole
-            .mul_add(simulated_headroom, plant_input_gain * control_output);
+        simulated_headroom =
+            plant_pole.mul_add(simulated_headroom, plant_input_gain * control_output);
         peak = peak.max(simulated_headroom);
     }
     assert!(
@@ -785,7 +769,11 @@ fn pid_invalid_configuration_and_sensor_inputs_fail_closed() {
         Some(1.1),
     ] {
         let mut controller = PidReclaimController::new();
-        assert!(controller.reclaim_fraction(invalid_sample, &valid).is_none());
+        assert!(
+            controller
+                .reclaim_fraction(invalid_sample, &valid)
+                .is_none()
+        );
     }
 
     assert!(
@@ -950,9 +938,7 @@ fn pid_smooth_deescalation_reduces_eviction_at_elevated() {
         "trajectory never exercised non-zero PID reclaim"
     );
     assert!(
-        control_outputs
-            .windows(2)
-            .all(|pair| pair[1] < pair[0]),
+        control_outputs.windows(2).all(|pair| pair[1] < pair[0]),
         "PID output did not decrease strictly with the retained trajectory: \
          {control_outputs:?}"
     );
@@ -965,8 +951,7 @@ fn pid_smooth_deescalation_reduces_eviction_at_elevated() {
     let legacy = legacy_orchestrator
         .plan_eviction(tier, &panes)
         .expect("non-empty Elevated corpus must produce a legacy plan");
-    let legacy_requested_reclaim =
-        legacy.fleet_warm_bytes_before - legacy.fleet_warm_bytes_target;
+    let legacy_requested_reclaim = legacy.fleet_warm_bytes_before - legacy.fleet_warm_bytes_target;
     assert!(
         legacy_requested_reclaim > 0,
         "legacy must request reclaim at Elevated"
@@ -977,13 +962,7 @@ fn pid_smooth_deescalation_reduces_eviction_at_elevated() {
     let mut intermediate_orchestrator = FleetScrollbackOrchestrator::new();
     let mut intermediate_controller = PidReclaimController::new();
     let intermediate = intermediate_orchestrator
-        .plan_eviction_damped(
-            tier,
-            &panes,
-            Some(0.20),
-            &mut intermediate_controller,
-            &cfg,
-        )
+        .plan_eviction_damped(tier, &panes, Some(0.20), &mut intermediate_controller, &cfg)
         .expect("intermediate headroom must request non-zero reclaim");
     let intermediate_requested_reclaim =
         intermediate.fleet_warm_bytes_before - intermediate.fleet_warm_bytes_target;
@@ -1004,11 +983,9 @@ fn pid_smooth_deescalation_reduces_eviction_at_elevated() {
         &mut ample_controller,
         &cfg,
     );
-    let ample_requested_reclaim = ample
-        .as_ref()
-        .map_or(0, |plan| {
-            plan.fleet_warm_bytes_before - plan.fleet_warm_bytes_target
-        });
+    let ample_requested_reclaim = ample.as_ref().map_or(0, |plan| {
+        plan.fleet_warm_bytes_before - plan.fleet_warm_bytes_target
+    });
 
     assert!(ample.is_none(), "ample headroom must request zero reclaim");
     assert_eq!(ample_requested_reclaim, 0);

@@ -5338,10 +5338,7 @@ pub fn execute_device_auth_step(
     // Step 4: Map browser result to workflow outcome
     match result {
         AuthFlowResult::Success { elapsed_ms } => {
-            tracing::info!(
-                elapsed_ms,
-                "Device auth step: success"
-            );
+            tracing::info!(elapsed_ms, "Device auth step: success");
             // NOTE: device_code intentionally NOT logged
             DeviceAuthStepOutcome::Authenticated {
                 elapsed_ms,

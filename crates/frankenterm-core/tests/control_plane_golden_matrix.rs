@@ -434,7 +434,10 @@ fn matrix_covers_representative_contract_cases() {
         .and_then(Value::as_object)
         .expect("healthy wa.events data must be an object");
     assert_eq!(
-        events_data.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        events_data
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
         BTreeSet::from([
             "cursor_capability",
             "events",
@@ -445,11 +448,15 @@ fn matrix_covers_representative_contract_cases() {
         "wa.events golden must pin its complete unfiltered snapshot shape"
     );
     assert_eq!(
-        events.pointer("/data/cursor_capability").and_then(Value::as_str),
+        events
+            .pointer("/data/cursor_capability")
+            .and_then(Value::as_str),
         Some("non_resumable_newest_first_snapshot")
     );
     assert_eq!(
-        events.pointer("/data/unhandled_only").and_then(Value::as_bool),
+        events
+            .pointer("/data/unhandled_only")
+            .and_then(Value::as_bool),
         Some(false)
     );
     assert!(

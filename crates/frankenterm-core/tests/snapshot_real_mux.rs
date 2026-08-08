@@ -187,11 +187,9 @@ fn one_pane_listing_carries_basic_metadata() {
         serde_json::json!({"pid": fixture.pid()}),
     );
 
-    let panes =
-        block_on_owned_mux_operation(
-            "one_pane list_panes",
-            async move { Box::pin(client.list_panes()).await },
-        );
+    let panes = block_on_owned_mux_operation("one_pane list_panes", async move {
+        Box::pin(client.list_panes()).await
+    });
 
     log(
         "one_pane",
@@ -527,13 +525,7 @@ fn no_mock_spawn_send_resize_read_loopback() {
     let split_pane_id = block_on_owned_mux_operation("split source pane", {
         let client = client.clone();
         async move {
-            Box::pin(client.split_pane(
-                source.pane_id,
-                SplitDirection::Right,
-                None,
-                Some(40),
-            ))
-            .await
+            Box::pin(client.split_pane(source.pane_id, SplitDirection::Right, None, Some(40))).await
         }
     });
     let after_spawn = block_on_owned_mux_operation("post-spawn list_panes", {

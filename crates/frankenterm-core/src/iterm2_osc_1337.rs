@@ -523,10 +523,11 @@ impl Osc1337Health {
     /// snapshot.
     pub fn fold_event(&mut self, sub: &Osc1337Sub, decision: SecurityGateDecision) {
         self.commands_total = self.commands_total.saturating_add(1);
-        *self
+        let by_subcommand = self
             .by_subcommand
             .entry(sub.slug().to_string())
-            .or_insert(0) += 1;
+            .or_insert(0);
+        *by_subcommand = by_subcommand.saturating_add(1);
         if matches!(sub, Osc1337Sub::SetProfile { .. }) {
             match decision {
                 SecurityGateDecision::Allow => {
@@ -563,8 +564,8 @@ impl Osc1337Health {
             // and must NOT report healthy.
             return self.rejected_total == 0;
         }
-        let total = self.commands_total + self.rejected_total;
-        let rejection_ratio = self.rejected_total as f64 / total as f64;
+        let total = self.commands_total as f64 + self.rejected_total as f64;
+        let rejection_ratio = self.rejected_total as f64 / total;
         rejection_ratio <= 0.05
     }
 }
@@ -1103,6 +1104,27 @@ mod tests {
         }
         h.fold_rejection();
         assert!(h.is_safe());
+    }
+
+    #[test]
+    fn health_ratio_and_subcommand_counter_handle_saturation() {
+        let mut h = Osc1337Health {
+            commands_total: u64::MAX,
+            rejected_total: u64::MAX,
+            ..Default::default()
+        };
+        h.by_subcommand.insert("file".to_string(), u64::MAX);
+        let sub = Osc1337Sub::File {
+            name: None,
+            size_bytes: None,
+            inline: false,
+            base64_payload_len: 0,
+        };
+
+        h.fold_event(&sub, SecurityGateDecision::Allow);
+
+        assert!(!h.is_safe());
+        assert_eq!(h.by_subcommand["file"], u64::MAX);
     }
 
     // ------------------------------------------------------------------------

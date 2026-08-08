@@ -399,14 +399,8 @@ impl<'a> ApprovalStore<'a> {
         risk_summary: Option<String>,
     ) -> Result<ApprovalRequest> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.issue_for_plan_with_cx(
-            &cx,
-            input,
-            plan_hash,
-            plan_version,
-            risk_summary,
-        )
-        .await
+        self.issue_for_plan_with_cx(&cx, input, plan_hash, plan_version, risk_summary)
+            .await
     }
 
     /// Cx-first [`Self::issue_for_plan`] (ft-xbnl0.2.3). Parallel

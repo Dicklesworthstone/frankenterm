@@ -177,18 +177,19 @@ impl TailLatencyController {
 
     /// Record a wakeup event.
     pub fn record_wakeup(&mut self, source: WakeupSource, latency_us: u64) {
-        self.total_wakeups += 1;
-        match source {
-            WakeupSource::Timer => self.timer_wakeups += 1,
-            WakeupSource::IoEvent => self.io_wakeups += 1,
-            WakeupSource::Signal => self.signal_wakeups += 1,
-            WakeupSource::Nudge => self.nudge_wakeups += 1,
-        }
+        self.total_wakeups = self.total_wakeups.saturating_add(1);
+        let source_count = match source {
+            WakeupSource::Timer => &mut self.timer_wakeups,
+            WakeupSource::IoEvent => &mut self.io_wakeups,
+            WakeupSource::Signal => &mut self.signal_wakeups,
+            WakeupSource::Nudge => &mut self.nudge_wakeups,
+        };
+        *source_count = source_count.saturating_add(1);
         if latency_us > self.max_latency_us {
             self.max_latency_us = latency_us;
         }
         if latency_us > self.config.p99_budget_us {
-            self.budget_violations += 1;
+            self.budget_violations = self.budget_violations.saturating_add(1);
         }
         // Ring buffer for samples
         if self.latency_samples.len() < self.max_samples {
@@ -201,9 +202,10 @@ impl TailLatencyController {
 
     /// Record a syscall batch.
     pub fn record_batch(&mut self, depth: usize) {
-        self.total_batches += 1;
-        self.total_syscalls += depth as u64;
-        self.batch_depth_sum += depth as u64;
+        let depth = u64::try_from(depth).unwrap_or(u64::MAX);
+        self.total_batches = self.total_batches.saturating_add(1);
+        self.total_syscalls = self.total_syscalls.saturating_add(depth);
+        self.batch_depth_sum = self.batch_depth_sum.saturating_add(depth);
     }
 
     /// Estimate p99 latency from stored samples.
@@ -383,10 +385,13 @@ impl TailLatencyController {
 
     /// Wakeup source distribution as fractions (timer, io, signal, nudge).
     pub fn wakeup_distribution(&self) -> (f64, f64, f64, f64) {
-        if self.total_wakeups == 0 {
+        let total = self.timer_wakeups as f64
+            + self.io_wakeups as f64
+            + self.signal_wakeups as f64
+            + self.nudge_wakeups as f64;
+        if total == 0.0 {
             return (0.0, 0.0, 0.0, 0.0);
         }
-        let total = self.total_wakeups as f64;
         (
             self.timer_wakeups as f64 / total,
             self.io_wakeups as f64 / total,
@@ -436,5 +441,34 @@ impl TailLatencyController {
     /// Total budget violations.
     pub fn budget_violations(&self) -> u64 {
         self.budget_violations
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wakeup_distribution_and_counters_handle_saturation() {
+        let mut controller = TailLatencyController::with_defaults();
+        controller.total_wakeups = u64::MAX - 1;
+        controller.timer_wakeups = u64::MAX - 1;
+        controller.io_wakeups = u64::MAX;
+        controller.signal_wakeups = u64::MAX;
+        controller.nudge_wakeups = u64::MAX;
+        controller.total_batches = u64::MAX - 1;
+        controller.total_syscalls = u64::MAX - 1;
+        controller.batch_depth_sum = u64::MAX - 1;
+        controller.budget_violations = u64::MAX - 1;
+
+        controller.record_wakeup(WakeupSource::Timer, u64::MAX);
+        controller.record_batch(1);
+
+        assert_eq!(controller.total_wakeups, u64::MAX);
+        assert_eq!(controller.total_batches, u64::MAX);
+        assert_eq!(controller.total_syscalls, u64::MAX);
+        assert_eq!(controller.batch_depth_sum, u64::MAX);
+        assert_eq!(controller.budget_violations, u64::MAX);
+        assert_eq!(controller.wakeup_distribution(), (0.25, 0.25, 0.25, 0.25));
     }
 }

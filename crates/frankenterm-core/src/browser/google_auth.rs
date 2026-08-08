@@ -236,20 +236,19 @@ impl GoogleAuthFlow {
                 };
             }
         };
-        let profile_lock = match profile
-            .acquire_operation_lock(ctx.config().profile_lock_timeout_ms)
-        {
-            Ok(profile_lock) => profile_lock,
-            Err(_) => {
-                return AuthFlowResult::Failed {
-                    error: AuthFlowFailureKind::ProfileUnavailable
-                        .stable_detail()
-                        .to_string(),
-                    kind: AuthFlowFailureKind::ProfileUnavailable,
-                    artifacts_dir: None,
-                };
-            }
-        };
+        let profile_lock =
+            match profile.acquire_operation_lock(ctx.config().profile_lock_timeout_ms) {
+                Ok(profile_lock) => profile_lock,
+                Err(_) => {
+                    return AuthFlowResult::Failed {
+                        error: AuthFlowFailureKind::ProfileUnavailable
+                            .stable_detail()
+                            .to_string(),
+                        kind: AuthFlowFailureKind::ProfileUnavailable,
+                        artifacts_dir: None,
+                    };
+                }
+            };
 
         tracing::info!("Starting Google OAuth auth flow");
         // NOTE: auth_url is intentionally NOT logged (may contain OAuth tokens)
@@ -268,14 +267,13 @@ impl GoogleAuthFlow {
             };
         }
 
-        let result =
-            self.run_playwright_flow(
-                &profile_dir,
-                target_url,
-                email,
-                artifacts_dir.as_deref(),
-                ctx.config(),
-            );
+        let result = self.run_playwright_flow(
+            &profile_dir,
+            target_url,
+            email,
+            artifacts_dir.as_deref(),
+            ctx.config(),
+        );
 
         if !profile_lock.is_current_for(&profile) {
             return AuthFlowResult::Failed {
@@ -337,8 +335,7 @@ impl GoogleAuthFlow {
                          Kind: {:?}\n\
                          Elapsed: {elapsed_ms}ms\n\
                          Sensitive execution inputs: redacted\n",
-                        e.error,
-                        e.kind,
+                        e.error, e.kind,
                     );
                     let _ = ArtifactCapture::write_artifact(
                         dir,
@@ -362,7 +359,9 @@ impl GoogleAuthFlow {
             .and_then(|a| match a.ensure_invocation_dir("google_auth") {
                 Ok(dir) => Some(dir),
                 Err(_) => {
-                    tracing::warn!("Failed to create artifacts directory; continuing without artifacts");
+                    tracing::warn!(
+                        "Failed to create artifacts directory; continuing without artifacts"
+                    );
                     None
                 }
             })
@@ -1065,10 +1064,8 @@ mod tests {
     #[test]
     fn execute_rejects_untrusted_auth_url_before_profile_creation() {
         let temp = tempfile::tempdir().expect("isolated Google URL rejection root");
-        let mut ctx = super::super::BrowserContext::new(
-            super::super::BrowserConfig::default(),
-            temp.path(),
-        );
+        let mut ctx =
+            super::super::BrowserContext::new(super::super::BrowserConfig::default(), temp.path());
         ctx.status = BrowserStatus::Ready;
         let result = GoogleAuthFlow::with_defaults().execute(
             &ctx,
@@ -1089,19 +1086,12 @@ mod tests {
     #[test]
     fn execute_rejects_invalid_selectors_before_profile_creation() {
         let temp = tempfile::tempdir().expect("isolated Google preflight root");
-        let mut ctx = super::super::BrowserContext::new(
-            super::super::BrowserConfig::default(),
-            temp.path(),
-        );
+        let mut ctx =
+            super::super::BrowserContext::new(super::super::BrowserConfig::default(), temp.path());
         ctx.status = BrowserStatus::Ready;
         let mut config = GoogleAuthConfig::default();
         config.selectors.signed_in_marker.clear();
-        let result = GoogleAuthFlow::new(config).execute(
-            &ctx,
-            "invalid-selectors",
-            None,
-            None,
-        );
+        let result = GoogleAuthFlow::new(config).execute(&ctx, "invalid-selectors", None, None);
         assert!(matches!(
             result,
             AuthFlowResult::Failed {
@@ -1148,16 +1138,15 @@ mod tests {
     fn success_requires_storage_state() {
         let result = GoogleAuthFlow::parse_playwright_result(r#"{"status":"success"}"#);
         match result {
-            Err(error) => assert_eq!(
-                error.kind,
-                AuthFlowFailureKind::ProfilePersistenceFailed
-            ),
+            Err(error) => assert_eq!(error.kind, AuthFlowFailureKind::ProfilePersistenceFailed),
             _ => panic!("success without durable state must fail closed"),
         }
-        assert!(GoogleAuthFlow::parse_playwright_result(
-            r#"{"status":"success","storage_state":"{\"cookies\":[],\"origins\":[]}"}"#
-        )
-        .is_err());
+        assert!(
+            GoogleAuthFlow::parse_playwright_result(
+                r#"{"status":"success","storage_state":"{\"cookies\":[],\"origins\":[]}"}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1180,7 +1169,10 @@ mod tests {
         match result {
             Err(e) => {
                 assert_eq!(e.kind, AuthFlowFailureKind::SelectorMismatch);
-                assert_eq!(e.error, AuthFlowFailureKind::SelectorMismatch.stable_detail());
+                assert_eq!(
+                    e.error,
+                    AuthFlowFailureKind::SelectorMismatch.stable_detail()
+                );
                 assert!(!e.error.contains("No selectors matched"));
             }
             _ => panic!("Expected error"),
@@ -1219,13 +1211,15 @@ mod tests {
     #[test]
     fn script_transports_auth_url_without_plaintext_literal() {
         let flow = GoogleAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://accounts.google.com/",
-            None,
-            None,
-            false,
-        ).expect("bounded Google script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://accounts.google.com/",
+                None,
+                None,
+                false,
+            )
+            .expect("bounded Google script");
         assert!(!script.contains("accounts.google.com"));
         assert_eq!(
             super::super::decode_node_script_input(&script)["auth_url"],
@@ -1236,13 +1230,15 @@ mod tests {
     #[test]
     fn script_contains_email_when_provided() {
         let flow = GoogleAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://accounts.google.com/",
-            Some("user@gmail.com"),
-            None,
-            false,
-        ).expect("bounded Google script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://accounts.google.com/",
+                Some("user@gmail.com"),
+                None,
+                false,
+            )
+            .expect("bounded Google script");
         assert!(!script.contains("user@gmail.com"));
         assert_eq!(
             super::super::decode_node_script_input(&script)["email"],
@@ -1253,26 +1249,30 @@ mod tests {
     #[test]
     fn script_has_null_email_when_not_provided() {
         let flow = GoogleAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://accounts.google.com/",
-            None,
-            None,
-            false,
-        ).expect("bounded Google script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://accounts.google.com/",
+                None,
+                None,
+                false,
+            )
+            .expect("bounded Google script");
         assert!(super::super::decode_node_script_input(&script)["email"].is_null());
     }
 
     #[test]
     fn script_checks_for_signed_in_markers() {
         let flow = GoogleAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://accounts.google.com/",
-            None,
-            None,
-            false,
-        ).expect("bounded Google script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://accounts.google.com/",
+                None,
+                None,
+                false,
+            )
+            .expect("bounded Google script");
         assert!(script.contains("alreadySignedIn"));
         assert!(
             super::super::decode_node_script_input(&script)["selectors"]["signed_in_marker"]
@@ -1284,13 +1284,15 @@ mod tests {
     #[test]
     fn script_checks_for_password_prompt() {
         let flow = GoogleAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://accounts.google.com/",
-            None,
-            None,
-            false,
-        ).expect("bounded Google script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://accounts.google.com/",
+                None,
+                None,
+                false,
+            )
+            .expect("bounded Google script");
         assert!(
             super::super::decode_node_script_input(&script)["selectors"]["password_prompt"]
                 .as_str()
@@ -1302,13 +1304,15 @@ mod tests {
     #[test]
     fn script_checks_for_mfa() {
         let flow = GoogleAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://accounts.google.com/",
-            None,
-            None,
-            false,
-        ).expect("bounded Google script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://accounts.google.com/",
+                None,
+                None,
+                false,
+            )
+            .expect("bounded Google script");
         assert!(
             super::super::decode_node_script_input(&script)["selectors"]["mfa_indicator"]
                 .as_str()
@@ -1320,16 +1324,17 @@ mod tests {
     #[test]
     fn script_checks_for_security_key() {
         let flow = GoogleAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://accounts.google.com/",
-            None,
-            None,
-            false,
-        ).expect("bounded Google script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://accounts.google.com/",
+                None,
+                None,
+                false,
+            )
+            .expect("bounded Google script");
         assert!(
-            super::super::decode_node_script_input(&script)["selectors"]
-                ["security_key_indicator"]
+            super::super::decode_node_script_input(&script)["selectors"]["security_key_indicator"]
                 .as_str()
                 .is_some_and(|value| value.contains("security key"))
         );
@@ -1339,13 +1344,15 @@ mod tests {
     #[test]
     fn script_checks_for_sso() {
         let flow = GoogleAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://accounts.google.com/",
-            None,
-            None,
-            false,
-        ).expect("bounded Google script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://accounts.google.com/",
+                None,
+                None,
+                false,
+            )
+            .expect("bounded Google script");
         assert!(
             super::super::decode_node_script_input(&script)["selectors"]["sso_indicator"]
                 .as_str()
@@ -1357,13 +1364,15 @@ mod tests {
     #[test]
     fn script_uses_custom_oauth_url() {
         let flow = GoogleAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://accounts.google.com/o/oauth2/auth?client_id=123",
-            None,
-            None,
-            false,
-        ).expect("bounded Google script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://accounts.google.com/o/oauth2/auth?client_id=123",
+                None,
+                None,
+                false,
+            )
+            .expect("bounded Google script");
         assert!(!script.contains("oauth2/auth?client_id=123"));
         assert_eq!(
             super::super::decode_node_script_input(&script)["auth_url"],
@@ -1380,7 +1389,10 @@ mod tests {
         let stdout = r#"{"status":"error","kind":"NavigationFailed","message":"/private/secret"}"#;
         let error = GoogleAuthFlow::parse_playwright_error(stdout);
         assert_eq!(error.kind, AuthFlowFailureKind::NavigationFailed);
-        assert_eq!(error.error, AuthFlowFailureKind::NavigationFailed.stable_detail());
+        assert_eq!(
+            error.error,
+            AuthFlowFailureKind::NavigationFailed.stable_detail()
+        );
         assert!(!error.error.contains("secret"));
     }
 
@@ -1388,20 +1400,25 @@ mod tests {
     fn parse_playwright_error_fallback_is_content_free() {
         let error = GoogleAuthFlow::parse_playwright_error("");
         assert_eq!(error.kind, AuthFlowFailureKind::PlaywrightError);
-        assert_eq!(error.error, AuthFlowFailureKind::PlaywrightError.stable_detail());
+        assert_eq!(
+            error.error,
+            AuthFlowFailureKind::PlaywrightError.stable_detail()
+        );
     }
 
     #[test]
     fn hostile_google_input_round_trips_without_javascript_literal_injection() {
         let hostile_email = "mail'\\\n\u{2028}@example.com";
         let flow = GoogleAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile'\\\n"),
-            "https://accounts.google.com/o/oauth2/v2/auth?token=secret",
-            Some(hostile_email),
-            None,
-            false,
-        ).expect("bounded hostile Google script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile'\\\n"),
+                "https://accounts.google.com/o/oauth2/v2/auth?token=secret",
+                Some(hostile_email),
+                None,
+                false,
+            )
+            .expect("bounded hostile Google script");
         assert!(!script.contains(hostile_email));
         assert!(!script.contains("token=secret"));
         assert!(!script.contains('\u{2028}'));
@@ -1425,7 +1442,7 @@ mod tests {
                 None,
                 false,
             )
-                .is_ok()
+            .is_ok()
         );
         let one_over = format!("{exact}x");
         assert_eq!(
@@ -1504,9 +1521,13 @@ mod tests {
     #[test]
     fn node_runner_is_stdin_bounded_and_never_uses_inline_argv() {
         let source = include_str!("google_auth.rs");
-        let start = source.find("fn run_playwright_flow(").expect("runner source");
+        let start = source
+            .find("fn run_playwright_flow(")
+            .expect("runner source");
         let tail = &source[start..];
-        let end = tail.find("\n    /// Build the Node.js/Playwright script").expect("runner boundary");
+        let end = tail
+            .find("\n    /// Build the Node.js/Playwright script")
+            .expect("runner boundary");
         let body = &tail[..end];
         assert!(body.contains("run_node_script_bounded"));
         assert!(!body.contains("std::process::Command"));

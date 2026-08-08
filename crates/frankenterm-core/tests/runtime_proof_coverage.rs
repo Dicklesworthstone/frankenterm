@@ -45,9 +45,7 @@ fn runtime_proof_coverage_does_not_regress() {
     // gate. Missing tooling must fail closed: returning success here would let
     // an exact-SHA proof lane report a zero-work false positive.
     let python = which_python3().unwrap_or_else(|| {
-        panic!(
-            "ft-3kv6e: python3/python is required to execute the RuntimeProof coverage gate"
-        )
+        panic!("ft-3kv6e: python3/python is required to execute the RuntimeProof coverage gate")
     });
 
     let output = Command::new(python)

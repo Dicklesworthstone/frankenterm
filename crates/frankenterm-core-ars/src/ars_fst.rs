@@ -123,6 +123,8 @@ pub enum FstError {
     InvalidMinHashKeyLength { len: usize },
     /// Trigger builder exhausted the reflex ID space.
     ReflexIdExhausted,
+    /// Hot-swap generation space is exhausted.
+    GenerationExhausted,
 }
 
 impl std::fmt::Display for FstError {
@@ -138,6 +140,7 @@ impl std::fmt::Display for FstError {
                 write!(f, "invalid MinHash key length: {len} is not divisible by 8")
             }
             Self::ReflexIdExhausted => write!(f, "reflex ID space exhausted"),
+            Self::GenerationExhausted => write!(f, "FST generation space exhausted"),
         }
     }
 }
@@ -568,15 +571,21 @@ impl FstHandle {
     }
 
     /// Hot-swap the index with a newly compiled one.
-    pub fn swap(&self, new_index: FstIndex) {
+    pub fn swap(&self, new_index: FstIndex) -> Result<(), FstError> {
         let mut guard = self.write_index();
-        let old_gen = self.generation.fetch_add(1, Ordering::Release);
+        let old_gen = self.generation.load(Ordering::Acquire);
+        let new_gen = old_gen
+            .checked_add(1)
+            .ok_or(FstError::GenerationExhausted)?;
+        *guard = new_index;
+        self.generation.store(new_gen, Ordering::Release);
         debug!(
             old_gen,
-            new_entries = new_index.entry_count,
+            new_gen,
+            new_entries = guard.entry_count,
             "FST hot-swapped"
         );
-        *guard = new_index;
+        Ok(())
     }
 
     /// Get stats from the current index.
@@ -990,7 +999,7 @@ mod tests {
         assert!(handle.lookup(b"old").is_some());
         assert!(handle.lookup(b"new").is_none());
 
-        handle.swap(idx2);
+        handle.swap(idx2).unwrap();
         assert_eq!(handle.generation(), 1);
         assert!(handle.lookup(b"old").is_none());
         assert!(handle.lookup(b"new").is_some());
@@ -1013,11 +1022,30 @@ mod tests {
         assert_eq!(old_match.reflex_id, 1);
         assert_eq!(handle.stats().entry_count, 1);
 
-        handle.swap(idx2);
+        handle.swap(idx2).unwrap();
         assert_eq!(handle.generation(), 1);
         assert!(handle.lookup(b"old").is_none());
         let new_match = handle.lookup(b"new").unwrap();
         assert_eq!(new_match.reflex_id, 2);
+    }
+
+    #[test]
+    fn handle_swap_generation_exhaustion_preserves_the_current_index() {
+        let compiler = FstCompiler::with_defaults();
+        let old_index = compiler.compile(&[entry("old", 1, 0)]).unwrap();
+        let new_index = compiler.compile(&[entry("new", 2, 0)]).unwrap();
+        let handle = FstHandle::new(old_index);
+        handle.generation.store(u64::MAX, Ordering::Release);
+
+        let error = handle
+            .swap(new_index)
+            .expect_err("generation exhaustion must reject the hot swap");
+
+        assert_eq!(error, FstError::GenerationExhausted);
+        assert_eq!(handle.generation(), u64::MAX);
+        assert_eq!(handle.lookup(b"old").unwrap().reflex_id, 1);
+        assert!(handle.lookup(b"new").is_none());
+        assert!(!handle.inner.is_poisoned());
     }
 
     #[test]

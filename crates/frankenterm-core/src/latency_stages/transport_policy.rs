@@ -1,4 +1,26 @@
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+
+const MAX_SAFE_COST_PER_BYTE_US: f64 = f64::MAX / 1.0e20;
+
+fn sanitized_cost(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() && value >= 0.0 {
+        value.min(MAX_SAFE_COST_PER_BYTE_US)
+    } else {
+        fallback
+    }
+}
+
+fn saturating_f64_add(current: f64, delta: f64) -> f64 {
+    let sum = current + delta;
+    if sum.is_finite() {
+        sum
+    } else if delta.is_sign_negative() {
+        -f64::MAX
+    } else {
+        f64::MAX
+    }
+}
 
 // ── C4: Adaptive Transport Policy ──────────────────────────────────
 
@@ -112,8 +134,8 @@ pub struct TransportPolicySnapshot {
 /// Adaptive transport policy engine.
 ///
 /// # Invariants
-/// - `local_count + compressed_count + bypass_count == total_decisions`.
-/// - Mode selection is pure function of (payload_bytes, cost_model, ewma state).
+/// - Before counter saturation, mode buckets partition `total_decisions`.
+/// - Mode selection is a pure function of (payload_bytes, cost_model).
 /// - EWMA cost tracks running average of actual transfer costs.
 pub struct TransportPolicy {
     config: TransportPolicyConfig,
@@ -124,12 +146,41 @@ pub struct TransportPolicy {
     total_bytes: u64,
     total_savings_us: f64,
     ewma_cost_us: f64,
-    decisions: Vec<TransportDecision>,
+    decisions: VecDeque<TransportDecision>,
 }
 
 impl TransportPolicy {
     /// Create with explicit config.
-    pub fn new(config: TransportPolicyConfig) -> Self {
+    pub fn new(mut config: TransportPolicyConfig) -> Self {
+        let defaults = TransportPolicyConfig::default();
+        config.cost_model.compress_cost_per_byte_us = sanitized_cost(
+            config.cost_model.compress_cost_per_byte_us,
+            defaults.cost_model.compress_cost_per_byte_us,
+        );
+        config.cost_model.decompress_cost_per_byte_us = sanitized_cost(
+            config.cost_model.decompress_cost_per_byte_us,
+            defaults.cost_model.decompress_cost_per_byte_us,
+        );
+        config.cost_model.network_cost_per_byte_us = sanitized_cost(
+            config.cost_model.network_cost_per_byte_us,
+            defaults.cost_model.network_cost_per_byte_us,
+        );
+        config.cost_model.expected_compression_ratio =
+            if config.cost_model.expected_compression_ratio.is_finite() {
+                config.cost_model.expected_compression_ratio.clamp(0.0, 1.0)
+            } else {
+                defaults.cost_model.expected_compression_ratio
+            };
+        config.cost_model.compress_threshold_bytes = config
+            .cost_model
+            .compress_threshold_bytes
+            .max(config.cost_model.bypass_threshold_bytes);
+        config.ewma_alpha = if config.ewma_alpha.is_finite() {
+            config.ewma_alpha.clamp(0.0, 1.0)
+        } else {
+            defaults.ewma_alpha
+        };
+
         Self {
             config,
             total_decisions: 0,
@@ -139,7 +190,9 @@ impl TransportPolicy {
             total_bytes: 0,
             total_savings_us: 0.0,
             ewma_cost_us: 0.0,
-            decisions: Vec::new(),
+            // `max_history` is deserializable operator input. Grow only as
+            // observations arrive rather than trusting it as an allocation.
+            decisions: VecDeque::new(),
         }
     }
 
@@ -189,19 +242,33 @@ impl TransportPolicy {
         actual_cost_us: f64,
         timestamp_us: u64,
     ) {
+        let estimated_cost_us = if estimated_cost_us.is_finite() && estimated_cost_us >= 0.0 {
+            estimated_cost_us
+        } else {
+            0.0
+        };
+        let actual_cost_us = if actual_cost_us.is_finite() && actual_cost_us >= 0.0 {
+            actual_cost_us
+        } else {
+            // An invalid observation must not poison all later EWMA/health
+            // output; treat it as neutral against the available estimate.
+            estimated_cost_us
+        };
         let savings = estimated_cost_us - actual_cost_us;
-        self.total_decisions += 1;
-        match mode {
-            TransportMode::Local => self.local_count += 1,
-            TransportMode::Compressed => self.compressed_count += 1,
-            TransportMode::Bypass => self.bypass_count += 1,
-        }
-        self.total_bytes += payload_bytes;
-        self.total_savings_us += savings;
+        self.total_decisions = self.total_decisions.saturating_add(1);
+        let mode_count = match mode {
+            TransportMode::Local => &mut self.local_count,
+            TransportMode::Compressed => &mut self.compressed_count,
+            TransportMode::Bypass => &mut self.bypass_count,
+        };
+        *mode_count = mode_count.saturating_add(1);
+        self.total_bytes = self.total_bytes.saturating_add(payload_bytes);
+        self.total_savings_us = saturating_f64_add(self.total_savings_us, savings);
 
         // EWMA update
         let alpha = self.config.ewma_alpha;
-        self.ewma_cost_us = alpha.mul_add(actual_cost_us, (1.0 - alpha) * self.ewma_cost_us);
+        let ewma = alpha.mul_add(actual_cost_us, (1.0 - alpha) * self.ewma_cost_us);
+        self.ewma_cost_us = if ewma.is_finite() { ewma } else { f64::MAX };
 
         let decision = TransportDecision {
             payload_bytes,
@@ -211,8 +278,11 @@ impl TransportPolicy {
             savings_us: savings,
             timestamp_us,
         };
-        if self.decisions.len() < self.config.max_history {
-            self.decisions.push(decision);
+        if self.config.max_history > 0 {
+            if self.decisions.len() == self.config.max_history {
+                let _ = self.decisions.pop_front();
+            }
+            self.decisions.push_back(decision);
         }
     }
 
@@ -242,8 +312,8 @@ impl TransportPolicy {
     }
 
     /// Recent decision history.
-    pub fn recent_decisions(&self) -> &[TransportDecision] {
-        &self.decisions
+    pub fn recent_decisions(&self) -> impl DoubleEndedIterator<Item = &TransportDecision> {
+        self.decisions.iter()
     }
 
     /// Reset all state.
@@ -315,12 +385,14 @@ impl TransportPolicy {
             };
         }
         // Mode imbalance: any single mode > 95% of decisions (with 20+ decisions)
-        if self.total_decisions >= 20 {
+        let outcome_total =
+            self.local_count as f64 + self.compressed_count as f64 + self.bypass_count as f64;
+        if outcome_total >= 20.0 {
             let max_count = self
                 .local_count
                 .max(self.compressed_count)
                 .max(self.bypass_count);
-            let share = max_count as f64 / self.total_decisions as f64;
+            let share = max_count as f64 / outcome_total;
             if share > 0.95 {
                 let mode_name = if max_count == self.local_count {
                     "Local"
@@ -384,10 +456,11 @@ impl TransportPolicy {
 
     /// Mode distribution as fractions (local_share, compressed_share, bypass_share).
     pub fn mode_distribution(&self) -> (f64, f64, f64) {
-        if self.total_decisions == 0 {
+        let total =
+            self.local_count as f64 + self.compressed_count as f64 + self.bypass_count as f64;
+        if total == 0.0 {
             return (0.0, 0.0, 0.0);
         }
-        let total = self.total_decisions as f64;
         (
             self.local_count as f64 / total,
             self.compressed_count as f64 / total,
@@ -397,7 +470,7 @@ impl TransportPolicy {
 
     /// Average cost per byte across all recorded decisions.
     pub fn avg_cost_per_byte(&self) -> f64 {
-        if self.total_bytes == 0 {
+        if self.total_bytes == 0 || self.total_decisions == 0 {
             return 0.0;
         }
         self.ewma_cost_us / (self.total_bytes as f64 / self.total_decisions as f64)
@@ -420,6 +493,29 @@ impl TransportPolicy {
 
     /// Update the cost model at runtime (e.g., after measuring real network costs).
     pub fn update_cost_model(&mut self, cost_model: TransportCostModel) {
+        let defaults = TransportCostModel::default();
+        let mut cost_model = cost_model;
+        cost_model.compress_cost_per_byte_us = sanitized_cost(
+            cost_model.compress_cost_per_byte_us,
+            defaults.compress_cost_per_byte_us,
+        );
+        cost_model.decompress_cost_per_byte_us = sanitized_cost(
+            cost_model.decompress_cost_per_byte_us,
+            defaults.decompress_cost_per_byte_us,
+        );
+        cost_model.network_cost_per_byte_us = sanitized_cost(
+            cost_model.network_cost_per_byte_us,
+            defaults.network_cost_per_byte_us,
+        );
+        cost_model.expected_compression_ratio = if cost_model.expected_compression_ratio.is_finite()
+        {
+            cost_model.expected_compression_ratio.clamp(0.0, 1.0)
+        } else {
+            defaults.expected_compression_ratio
+        };
+        cost_model.compress_threshold_bytes = cost_model
+            .compress_threshold_bytes
+            .max(cost_model.bypass_threshold_bytes);
         self.config.cost_model = cost_model;
     }
 
@@ -431,5 +527,90 @@ impl TransportPolicy {
     /// Set fixed mode (used when adaptive is disabled).
     pub fn set_fixed_mode(&mut self, mode: TransportMode) {
         self.config.fixed_mode = mode;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_distribution_and_counters_handle_saturation() {
+        let mut policy = TransportPolicy::with_defaults();
+        policy.total_decisions = u64::MAX - 1;
+        policy.local_count = u64::MAX - 1;
+        policy.compressed_count = u64::MAX;
+        policy.bypass_count = u64::MAX;
+        policy.total_bytes = u64::MAX - 1;
+
+        policy.record(1, TransportMode::Local, 1.0, 1.0, 1);
+
+        assert_eq!(policy.total_decisions, u64::MAX);
+        assert_eq!(policy.local_count, u64::MAX);
+        assert_eq!(policy.total_bytes, u64::MAX);
+        let expected = 1.0 / 3.0;
+        let distribution = policy.mode_distribution();
+        assert!((distribution.0 - expected).abs() < f64::EPSILON);
+        assert!((distribution.1 - expected).abs() < f64::EPSILON);
+        assert!((distribution.2 - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn bounded_history_retains_newest_decisions_in_chronological_order() {
+        let mut policy = TransportPolicy::new(TransportPolicyConfig {
+            max_history: 2,
+            ..TransportPolicyConfig::default()
+        });
+        for timestamp_us in 1..=3 {
+            policy.record(timestamp_us, TransportMode::Local, 0.0, 0.0, timestamp_us);
+        }
+
+        let timestamps = policy
+            .recent_decisions()
+            .map(|decision| decision.timestamp_us)
+            .collect::<Vec<_>>();
+        assert_eq!(timestamps, vec![2, 3]);
+    }
+
+    #[test]
+    fn malformed_cost_inputs_cannot_poison_selection_or_telemetry() {
+        let mut policy = TransportPolicy::new(TransportPolicyConfig {
+            cost_model: TransportCostModel {
+                compress_cost_per_byte_us: f64::NAN,
+                decompress_cost_per_byte_us: f64::INFINITY,
+                network_cost_per_byte_us: -1.0,
+                expected_compression_ratio: f64::NAN,
+                bypass_threshold_bytes: 100,
+                compress_threshold_bytes: 10,
+            },
+            ewma_alpha: f64::NAN,
+            ..TransportPolicyConfig::default()
+        });
+
+        let mode = policy.select_and_record(u64::MAX, f64::NAN, 1);
+        let estimated = policy.estimate_cost(u64::MAX, mode);
+        let snapshot = policy.snapshot();
+
+        assert!(estimated.is_finite());
+        assert!(estimated >= 0.0);
+        assert!(snapshot.ewma_cost_us.is_finite());
+        assert!(snapshot.total_savings_us.is_finite());
+        assert!(
+            policy
+                .recent_decisions()
+                .all(|decision| decision.actual_cost_us.is_finite())
+        );
+    }
+
+    #[test]
+    fn accumulated_savings_saturate_at_finite_extremes() {
+        let mut policy = TransportPolicy::with_defaults();
+        policy.total_savings_us = f64::MAX;
+        policy.record(1, TransportMode::Local, 1.0, 0.0, 1);
+        assert_eq!(policy.total_savings_us, f64::MAX);
+
+        policy.total_savings_us = -f64::MAX;
+        policy.record(1, TransportMode::Local, 0.0, 1.0, 2);
+        assert_eq!(policy.total_savings_us, -f64::MAX);
     }
 }

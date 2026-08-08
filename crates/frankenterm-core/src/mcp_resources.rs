@@ -2685,7 +2685,11 @@ mod tests {
 
     #[test]
     fn panes_resource_definition_uri() {
-        let resource = WaPanesResource::new(Arc::new(Config::default()), PaneFilterConfig::default(), None);
+        let resource = WaPanesResource::new(
+            Arc::new(Config::default()),
+            PaneFilterConfig::default(),
+            None,
+        );
         let def = resource.definition();
         assert_eq!(def.uri, "wa://panes");
         assert_eq!(def.mime_type.as_deref(), Some("application/json"));
@@ -3369,9 +3373,13 @@ mod tests {
         let db = db_path();
         let config = Arc::new(Config::default());
         let uris = [
-            WaPanesResource::new(Arc::new(Config::default()), PaneFilterConfig::default(), None)
-                .definition()
-                .uri,
+            WaPanesResource::new(
+                Arc::new(Config::default()),
+                PaneFilterConfig::default(),
+                None,
+            )
+            .definition()
+            .uri,
             WaEventsResource::new(Arc::clone(&db)).definition().uri,
             WaEventsTemplateResource::new(Arc::clone(&db))
                 .definition()
@@ -3443,9 +3451,13 @@ mod tests {
         let db = db_path();
         let config = Arc::new(Config::default());
         let uris = [
-            WaPanesResource::new(Arc::new(Config::default()), PaneFilterConfig::default(), None)
-                .definition()
-                .uri,
+            WaPanesResource::new(
+                Arc::new(Config::default()),
+                PaneFilterConfig::default(),
+                None,
+            )
+            .definition()
+            .uri,
             WaEventsResource::new(Arc::clone(&db)).definition().uri,
             WaRulesResource.definition().uri,
             WaWorkflowsResource::new(Arc::new(Config::default()))
@@ -3502,7 +3514,12 @@ mod tests {
         let db = db_path();
         let config = Arc::new(Config::default());
         let defs = [
-            WaPanesResource::new(Arc::new(Config::default()), PaneFilterConfig::default(), None).definition(),
+            WaPanesResource::new(
+                Arc::new(Config::default()),
+                PaneFilterConfig::default(),
+                None,
+            )
+            .definition(),
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
@@ -3542,7 +3559,12 @@ mod tests {
         let db = db_path();
         let config = Arc::new(Config::default());
         let defs = [
-            WaPanesResource::new(Arc::new(Config::default()), PaneFilterConfig::default(), None).definition(),
+            WaPanesResource::new(
+                Arc::new(Config::default()),
+                PaneFilterConfig::default(),
+                None,
+            )
+            .definition(),
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),

@@ -528,9 +528,7 @@ mod tests {
 
         let samples = vec![
             Error::Wezterm(WeztermError::CliNotFound),
-            Error::Wezterm(WeztermError::IndeterminateMutation {
-                operation: "spawn",
-            }),
+            Error::Wezterm(WeztermError::IndeterminateMutation { operation: "spawn" }),
             Error::Storage(StorageError::Database("db".to_string())),
             Error::Storage(StorageError::IndeterminateMutation {
                 operation: "store_embedding",
@@ -595,11 +593,9 @@ mod tests {
             "FT-1020"
         );
         assert_eq!(
-            ErrorRenderer::error_code(&Error::Wezterm(
-                WeztermError::IndeterminateMutation {
-                    operation: "spawn",
-                },
-            )),
+            ErrorRenderer::error_code(&Error::Wezterm(WeztermError::IndeterminateMutation {
+                operation: "spawn",
+            },)),
             "FT-1024"
         );
         assert_eq!(
@@ -633,21 +629,15 @@ mod tests {
             "FT-2001"
         );
         assert_eq!(
-            ErrorRenderer::error_code(&Error::Storage(
-                StorageError::WriterBackendEpochPoisoned,
-            )),
+            ErrorRenderer::error_code(&Error::Storage(StorageError::WriterBackendEpochPoisoned,)),
             "FT-2005"
         );
         assert_eq!(
-            ErrorRenderer::error_code(&Error::Storage(
-                StorageError::MigrationEpochPoisoned,
-            )),
+            ErrorRenderer::error_code(&Error::Storage(StorageError::MigrationEpochPoisoned,)),
             "FT-2006"
         );
         assert_eq!(
-            ErrorRenderer::error_code(&Error::Storage(
-                StorageError::BackendEpochPoisoned,
-            )),
+            ErrorRenderer::error_code(&Error::Storage(StorageError::BackendEpochPoisoned,)),
             "FT-2007"
         );
         assert_eq!(
@@ -655,11 +645,9 @@ mod tests {
             "FT-2008"
         );
         assert_eq!(
-            ErrorRenderer::error_code(&Error::Storage(
-                StorageError::IndeterminateMutation {
-                    operation: "store_embedding",
-                },
-            )),
+            ErrorRenderer::error_code(&Error::Storage(StorageError::IndeterminateMutation {
+                operation: "store_embedding",
+            },)),
             "FT-2009"
         );
         assert_eq!(
@@ -671,11 +659,9 @@ mod tests {
             "FT-2055"
         );
         assert_eq!(
-            ErrorRenderer::error_code(&Error::Storage(
-                StorageError::SubmitIdempotency(
-                    crate::submit_idempotency_store::SubmitIdempotencyError::SchemaMismatch,
-                ),
-            )),
+            ErrorRenderer::error_code(&Error::Storage(StorageError::SubmitIdempotency(
+                crate::submit_idempotency_store::SubmitIdempotencyError::SchemaMismatch,
+            ),)),
             "FT-2054"
         );
         assert_eq!(

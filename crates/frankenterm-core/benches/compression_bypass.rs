@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use codec::{
-    CODEC_VERSION, CompressionMode, GetCodecVersionResponse, Pdu, StreamingPduBuffer,
-    UnitResponse, WriteToPane,
+    CODEC_VERSION, CompressionMode, GetCodecVersionResponse, Pdu, StreamingPduBuffer, UnitResponse,
+    WriteToPane,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::config::VendoredCompressionMode;

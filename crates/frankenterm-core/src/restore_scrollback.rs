@@ -60,27 +60,25 @@ fn restore_scrollback_context_error(
         ContextErrorKind::PollQuotaExhausted => RuntimeOperationSource::PollQuotaExhausted,
         ContextErrorKind::CostQuotaExhausted => RuntimeOperationSource::CostBudgetExhausted,
         ContextErrorKind::CancelTimeout => RuntimeOperationSource::CancellationCleanupTimedOut,
-        ContextErrorKind::Cancelled => {
-            match cx.root_cancel_cause().map(|reason| reason.kind) {
-                Some(CancelKind::Deadline | CancelKind::Timeout) => {
-                    RuntimeOperationSource::DeadlineExceeded
-                }
-                Some(CancelKind::PollQuota) => RuntimeOperationSource::PollQuotaExhausted,
-                Some(CancelKind::CostBudget) => RuntimeOperationSource::CostBudgetExhausted,
-                Some(
-                    CancelKind::User
-                    | CancelKind::FailFast
-                    | CancelKind::RaceLost
-                    | CancelKind::ParentCancelled
-                    | CancelKind::ResourceUnavailable
-                    | CancelKind::Shutdown
-                    | CancelKind::LinkedExit,
-                )
-                | None => RuntimeOperationSource::Cancelled(
-                    "caller capability stopped during scrollback preflight".to_string(),
-                ),
+        ContextErrorKind::Cancelled => match cx.root_cancel_cause().map(|reason| reason.kind) {
+            Some(CancelKind::Deadline | CancelKind::Timeout) => {
+                RuntimeOperationSource::DeadlineExceeded
             }
-        }
+            Some(CancelKind::PollQuota) => RuntimeOperationSource::PollQuotaExhausted,
+            Some(CancelKind::CostBudget) => RuntimeOperationSource::CostBudgetExhausted,
+            Some(
+                CancelKind::User
+                | CancelKind::FailFast
+                | CancelKind::RaceLost
+                | CancelKind::ParentCancelled
+                | CancelKind::ResourceUnavailable
+                | CancelKind::Shutdown
+                | CancelKind::LinkedExit,
+            )
+            | None => RuntimeOperationSource::Cancelled(
+                "caller capability stopped during scrollback preflight".to_string(),
+            ),
+        },
         _ => RuntimeOperationSource::ContextFailure,
     };
 
@@ -195,10 +193,7 @@ impl InjectionReport {
 
     /// Deterministic ascending sample of the smallest skipped pane IDs.
     pub fn skipped_sample(&self) -> &[u64] {
-        let retained = self
-            .skipped_sample
-            .len()
-            .min(INJECTION_SKIPPED_SAMPLE_CAP);
+        let retained = self.skipped_sample.len().min(INJECTION_SKIPPED_SAMPLE_CAP);
         &self.skipped_sample[..retained]
     }
 
@@ -267,8 +262,7 @@ impl InjectionGuard {
             if pane_ids.iter().any(|id| {
                 set.get(id)
                     .is_some_and(|count| *count == 0 || *count == usize::MAX)
-            })
-            {
+            }) {
                 return Err(crate::Error::RuntimeOperation {
                     operation: "restore_scrollback.suppression_guard.acquire",
                     source: RuntimeOperationSource::ContextFailure,
@@ -405,11 +399,7 @@ impl ScrollbackInjector {
         pane_id_map: &HashMap<u64, u64>,
         scrollbacks: &HashMap<u64, ScrollbackData>,
     ) -> impl std::future::Future<Output = crate::Result<InjectionReport>> {
-        std::future::ready(Self::inject_preflight_with_cx(
-            cx,
-            pane_id_map,
-            scrollbacks,
-        ))
+        std::future::ready(Self::inject_preflight_with_cx(cx, pane_id_map, scrollbacks))
     }
 
     /// Execute the bounded, zero-I/O injection preflight synchronously.
@@ -682,8 +672,12 @@ mod tests {
 
     #[test]
     fn scrollback_data_truncate() {
-        let mut data =
-            ScrollbackData::from_terminal_lines(vec!["a".into(), "b".into(), "c".into(), "d".into()]);
+        let mut data = ScrollbackData::from_terminal_lines(vec![
+            "a".into(),
+            "b".into(),
+            "c".into(),
+            "d".into(),
+        ]);
         data.truncate(2);
         assert_eq!(data.lines, vec!["c", "d"]); // Keeps most recent.
         assert_eq!(data.total_bytes(), 2);
@@ -877,7 +871,10 @@ mod tests {
                 .expect_err("mapped replay must report the unsupported safe-output channel");
 
             let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
-            assert!(text.is_empty(), "historical output must not reach PTY input");
+            assert!(
+                text.is_empty(),
+                "historical output must not reach PTY input"
+            );
         });
     }
 
@@ -1027,12 +1024,7 @@ mod tests {
             let sample_cap = u64::try_from(INJECTION_SKIPPED_SAMPLE_CAP).unwrap();
             let scrollbacks = (0..sample_cap + 37)
                 .rev()
-                .map(|pane_id| {
-                    (
-                        pane_id,
-                        ScrollbackData::from_terminal_lines(Vec::new()),
-                    )
-                })
+                .map(|pane_id| (pane_id, ScrollbackData::from_terminal_lines(Vec::new())))
                 .collect::<HashMap<_, _>>();
 
             let report = injector.inject(&pane_id_map, &scrollbacks).await.unwrap();
@@ -1098,7 +1090,8 @@ mod tests {
 
     #[test]
     fn scrollback_data_truncate_to_exact_count() {
-        let mut data = ScrollbackData::from_terminal_lines(vec!["a".into(), "b".into(), "c".into()]);
+        let mut data =
+            ScrollbackData::from_terminal_lines(vec!["a".into(), "b".into(), "c".into()]);
         data.truncate(3); // Exactly the count
         assert_eq!(data.lines.len(), 3);
         assert_eq!(data.total_bytes(), 3);
@@ -1106,8 +1099,11 @@ mod tests {
 
     #[test]
     fn scrollback_data_truncate_to_one_keeps_last() {
-        let mut data =
-            ScrollbackData::from_terminal_lines(vec!["first".into(), "middle".into(), "last".into()]);
+        let mut data = ScrollbackData::from_terminal_lines(vec![
+            "first".into(),
+            "middle".into(),
+            "last".into(),
+        ]);
         data.truncate(1);
         assert_eq!(data.lines, vec!["last"]);
         assert_eq!(data.total_bytes(), 4);
@@ -1357,5 +1353,4 @@ mod tests {
         let pos = find_safe_split(content, 0, 2);
         assert!(content.is_char_boundary(pos));
     }
-
 }

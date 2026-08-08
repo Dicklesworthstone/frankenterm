@@ -526,10 +526,8 @@ mod tests {
         let r = Redactor::new();
         let split_secret = "AKIAIOSF\x1b[31mODNN7EXAMPLE";
 
-        let semantic_zone = dom_zone_from_mux(
-            &zone(MuxSemanticZoneKind::Output, 0, split_secret),
-            &r,
-        );
+        let semantic_zone =
+            dom_zone_from_mux(&zone(MuxSemanticZoneKind::Output, 0, split_secret), &r);
         assert_eq!(semantic_zone.text, "[REDACTED]");
 
         let unavailable = dom_unavailable(
@@ -554,14 +552,7 @@ mod tests {
             cursor_y: 0,
             rows: vec![grid_row(0, split_secret, 1)],
         };
-        let data = build_dom_grid_data(
-            9,
-            DomGridQueryKind::BottomRows,
-            &grid,
-            Some(1),
-            None,
-            &r,
-        );
+        let data = build_dom_grid_data(9, DomGridQueryKind::BottomRows, &grid, Some(1), None, &r);
         assert_eq!(data.rows[0].text, "[REDACTED]");
     }
 

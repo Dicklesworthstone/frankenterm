@@ -5,9 +5,7 @@
 //! `release-abort-probe`, then executes the exact artifacts through
 //! `scripts/check-release-panic-contract.sh`.
 
-use frankenterm_sigpipe::{
-    RecoverablePanicSite, catch_recoverable, catch_recoverable_future,
-};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable, catch_recoverable_future};
 use std::path::PathBuf;
 
 const SECRET_SENTINEL: &str = "FT_PANIC_SECRET_SENTINEL_DO_NOT_REFLECT";
@@ -24,12 +22,7 @@ fn main() {
     // not silence the GUI layer or duplicate the base report.
     if matches!(
         scenario.as_deref(),
-        Some(
-            "gui-uncaught"
-                | "gui-uncaught-epipe-spoof"
-                | "gui-caught-epipe-spoof"
-                | "gui-epipe"
-        )
+        Some("gui-uncaught" | "gui-uncaught-epipe-spoof" | "gui-caught-epipe-spoof" | "gui-epipe")
     ) {
         install_probe_gui_hook();
     }
@@ -90,7 +83,9 @@ fn run_release_contract_suite() {
         Some("release-interactive"),
         "suite must execute the release-interactive artifact"
     );
-    let target_dir = profile_dir.parent().expect("profile directory has target root");
+    let target_dir = profile_dir
+        .parent()
+        .expect("profile directory has target root");
     let abort_probe = target_dir
         .join("release-abort-probe")
         .join("examples")
@@ -254,15 +249,9 @@ fn install_probe_gui_hook() {
 
 fn run_caught(site_name: Option<&str>) {
     let (site, payload) = match site_name {
-        Some("mux-pane-callback") => (
-            RecoverablePanicSite::MuxPaneCallback,
-            SECRET_SENTINEL,
-        ),
+        Some("mux-pane-callback") => (RecoverablePanicSite::MuxPaneCallback, SECRET_SENTINEL),
         Some("mux-subscriber") => (RecoverablePanicSite::MuxSubscriber, SECRET_SENTINEL),
-        Some("mux-pane-retirement") => (
-            RecoverablePanicSite::MuxPaneRetirement,
-            SECRET_SENTINEL,
-        ),
+        Some("mux-pane-retirement") => (RecoverablePanicSite::MuxPaneRetirement, SECRET_SENTINEL),
         Some("storage-writer") => (RecoverablePanicSite::StorageWriter, SECRET_SENTINEL),
         Some("epipe-spoof") => (
             RecoverablePanicSite::MuxPaneCallback,
@@ -283,8 +272,8 @@ fn run_caught(site_name: Option<&str>) {
     );
     match outcome {
         Err(error) => {
-            let recovered_delta = frankenterm_sigpipe::recovered_panics_total()
-                .saturating_sub(before);
+            let recovered_delta =
+                frankenterm_sigpipe::recovered_panics_total().saturating_sub(before);
             println!(
                 "recovered site={} alive=true recovered_delta={recovered_delta}",
                 error.site().as_str()

@@ -189,9 +189,7 @@ impl AuthFlowFailureKind {
         match self {
             Self::InvalidUserCode => "The device user code is invalid",
             Self::BrowserNotReady => "The browser automation context is not ready",
-            Self::ProfileUnavailable => {
-                "The isolated browser profile directory is unavailable"
-            }
+            Self::ProfileUnavailable => "The isolated browser profile directory is unavailable",
             Self::ProfilePersistenceFailed => {
                 "Authenticated browser profile state could not be persisted safely"
             }
@@ -504,24 +502,21 @@ impl OpenAiDeviceAuthFlow {
                 };
             }
         };
-        let profile_lock = match profile
-            .acquire_operation_lock(ctx.config().profile_lock_timeout_ms)
-        {
-            Ok(profile_lock) => profile_lock,
-            Err(_) => {
-                return AuthFlowResult::Failed {
-                    error: AuthFlowFailureKind::ProfileUnavailable
-                        .stable_detail()
-                        .to_string(),
-                    kind: AuthFlowFailureKind::ProfileUnavailable,
-                    artifacts_dir: None,
-                };
-            }
-        };
+        let profile_lock =
+            match profile.acquire_operation_lock(ctx.config().profile_lock_timeout_ms) {
+                Ok(profile_lock) => profile_lock,
+                Err(_) => {
+                    return AuthFlowResult::Failed {
+                        error: AuthFlowFailureKind::ProfileUnavailable
+                            .stable_detail()
+                            .to_string(),
+                        kind: AuthFlowFailureKind::ProfileUnavailable,
+                        artifacts_dir: None,
+                    };
+                }
+            };
 
-        tracing::info!(
-            "Starting OpenAI device auth flow"
-        );
+        tracing::info!("Starting OpenAI device auth flow");
         // NOTE: user_code is intentionally NOT logged (secret material)
 
         // Step 4: Build and run the Playwright script
@@ -607,8 +602,7 @@ impl OpenAiDeviceAuthFlow {
                          Kind: {:?}\n\
                          Elapsed: {elapsed_ms}ms\n\
                          Sensitive execution inputs: redacted\n",
-                        e.error,
-                        e.kind,
+                        e.error, e.kind,
                     );
                     let _ = ArtifactCapture::write_artifact(
                         dir,
@@ -632,7 +626,9 @@ impl OpenAiDeviceAuthFlow {
             .and_then(|a| match a.ensure_invocation_dir("openai_device") {
                 Ok(dir) => Some(dir),
                 Err(_) => {
-                    tracing::warn!("Failed to create artifacts directory; continuing without artifacts");
+                    tracing::warn!(
+                        "Failed to create artifacts directory; continuing without artifacts"
+                    );
                     None
                 }
             })
@@ -1432,19 +1428,13 @@ mod tests {
     #[test]
     fn execute_rejects_untrusted_device_url_before_profile_creation() {
         let temp = tempfile::tempdir().expect("isolated OpenAI URL rejection root");
-        let mut ctx = super::super::BrowserContext::new(
-            super::super::BrowserConfig::default(),
-            temp.path(),
-        );
+        let mut ctx =
+            super::super::BrowserContext::new(super::super::BrowserConfig::default(), temp.path());
         ctx.status = BrowserStatus::Ready;
         let mut config = OpenAiDeviceAuthConfig::default();
         config.device_url = "https://127.0.0.1/codex/device".to_string();
-        let result = OpenAiDeviceAuthFlow::new(config).execute(
-            &ctx,
-            "ABCD-EFGH",
-            "untrusted-url",
-            None,
-        );
+        let result =
+            OpenAiDeviceAuthFlow::new(config).execute(&ctx, "ABCD-EFGH", "untrusted-url", None);
         assert!(matches!(
             result,
             AuthFlowResult::Failed {
@@ -1458,19 +1448,13 @@ mod tests {
     #[test]
     fn execute_rejects_invalid_selectors_before_profile_creation() {
         let temp = tempfile::tempdir().expect("isolated OpenAI preflight root");
-        let mut ctx = super::super::BrowserContext::new(
-            super::super::BrowserConfig::default(),
-            temp.path(),
-        );
+        let mut ctx =
+            super::super::BrowserContext::new(super::super::BrowserConfig::default(), temp.path());
         ctx.status = BrowserStatus::Ready;
         let mut config = OpenAiDeviceAuthConfig::default();
         config.selectors.success_marker.clear();
-        let result = OpenAiDeviceAuthFlow::new(config).execute(
-            &ctx,
-            "ABCD-EFGH",
-            "invalid-selectors",
-            None,
-        );
+        let result =
+            OpenAiDeviceAuthFlow::new(config).execute(&ctx, "ABCD-EFGH", "invalid-selectors", None);
         assert!(matches!(
             result,
             AuthFlowResult::Failed {
@@ -1619,22 +1603,17 @@ mod tests {
 
     #[test]
     fn artifact_write_and_read() {
-        let temp = canonical_system_temp_dir().join(format!(
-            "wa_artifact_write_test_{}",
-            std::process::id()
-        ));
+        let temp = canonical_system_temp_dir()
+            .join(format!("wa_artifact_write_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
         let invocation = ArtifactCapture::new(&temp)
             .ensure_invocation_dir("openai_device")
             .expect("private artifact invocation");
 
         let content = b"Test failure report";
-        let path = ArtifactCapture::write_artifact(
-            &invocation,
-            ArtifactKind::FailureReport,
-            content,
-        )
-        .unwrap();
+        let path =
+            ArtifactCapture::write_artifact(&invocation, ArtifactKind::FailureReport, content)
+                .unwrap();
         assert_eq!(path.file_name().unwrap(), "failure_report.txt");
         assert_eq!(std::fs::read(&path).unwrap(), content);
 
@@ -1653,12 +1632,8 @@ mod tests {
             .expect("private artifact invocation");
 
         let content = b"\x89PNG fake screenshot data";
-        let path = ArtifactCapture::write_artifact(
-            &invocation,
-            ArtifactKind::Screenshot,
-            content,
-        )
-        .unwrap();
+        let path = ArtifactCapture::write_artifact(&invocation, ArtifactKind::Screenshot, content)
+            .unwrap();
         assert_eq!(path.file_name().unwrap(), "screenshot.png");
 
         let _ = std::fs::remove_dir_all(&temp);
@@ -1666,22 +1641,16 @@ mod tests {
 
     #[test]
     fn artifact_write_redacted_dom() {
-        let temp = canonical_system_temp_dir().join(format!(
-            "wa_artifact_dom_test_{}",
-            std::process::id()
-        ));
+        let temp = canonical_system_temp_dir()
+            .join(format!("wa_artifact_dom_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
         let invocation = ArtifactCapture::new(&temp)
             .ensure_invocation_dir("openai_device")
             .expect("private artifact invocation");
 
         let content = b"<html><body>[REDACTED]</body></html>";
-        let path = ArtifactCapture::write_artifact(
-            &invocation,
-            ArtifactKind::RedactedDom,
-            content,
-        )
-        .unwrap();
+        let path = ArtifactCapture::write_artifact(&invocation, ArtifactKind::RedactedDom, content)
+            .unwrap();
         assert_eq!(path.file_name().unwrap(), "redacted_dom.html");
 
         let _ = std::fs::remove_dir_all(&temp);
@@ -1712,12 +1681,9 @@ mod tests {
             0o700
         );
         let report = b"finite content-free report";
-        let report_path = ArtifactCapture::write_artifact(
-            &invocation,
-            ArtifactKind::FailureReport,
-            report,
-        )
-        .expect("exclusive report creation");
+        let report_path =
+            ArtifactCapture::write_artifact(&invocation, ArtifactKind::FailureReport, report)
+                .expect("exclusive report creation");
         assert_eq!(
             std::fs::metadata(&report_path)
                 .expect("report metadata")
@@ -1734,7 +1700,10 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(std::fs::read(&report_path).expect("retained report"), report);
+        assert_eq!(
+            std::fs::read(&report_path).expect("retained report"),
+            report
+        );
 
         let symlink_invocation = capture
             .ensure_invocation_dir("openai_device")
@@ -1854,7 +1823,10 @@ mod tests {
         let stdout = r#"{"status":"error","kind":"NavigationFailed","message":"/private/secret"}"#;
         let err = OpenAiDeviceAuthFlow::parse_playwright_error(stdout);
         assert_eq!(err.kind, AuthFlowFailureKind::NavigationFailed);
-        assert_eq!(err.error, AuthFlowFailureKind::NavigationFailed.stable_detail());
+        assert_eq!(
+            err.error,
+            AuthFlowFailureKind::NavigationFailed.stable_detail()
+        );
         assert!(!err.error.contains("secret"));
     }
 
@@ -1862,7 +1834,10 @@ mod tests {
     fn parse_playwright_error_fallback_is_content_free() {
         let err = OpenAiDeviceAuthFlow::parse_playwright_error("");
         assert_eq!(err.kind, AuthFlowFailureKind::PlaywrightError);
-        assert_eq!(err.error, AuthFlowFailureKind::PlaywrightError.stable_detail());
+        assert_eq!(
+            err.error,
+            AuthFlowFailureKind::PlaywrightError.stable_detail()
+        );
     }
 
     // =========================================================================
@@ -1911,13 +1886,7 @@ mod tests {
         let profile_dir = PathBuf::from("/tmp/profile");
         let artifacts_dir = PathBuf::from("/tmp/artifacts");
         let script = flow
-            .build_playwright_script(
-                &profile_dir,
-                "ABCD-EFGH",
-                None,
-                Some(&artifacts_dir),
-                false,
-            )
+            .build_playwright_script(&profile_dir, "ABCD-EFGH", None, Some(&artifacts_dir), false)
             .expect("bounded OpenAI script");
         assert!(!script.contains("/tmp/artifacts"));
         assert_eq!(
@@ -1999,29 +1968,22 @@ mod tests {
     fn success_requires_storage_state() {
         let result = OpenAiDeviceAuthFlow::parse_playwright_result(r#"{"status":"success"}"#);
         match result {
-            Err(error) => assert_eq!(
-                error.kind,
-                AuthFlowFailureKind::ProfilePersistenceFailed
-            ),
+            Err(error) => assert_eq!(error.kind, AuthFlowFailureKind::ProfilePersistenceFailed),
             _ => panic!("success without durable state must fail closed"),
         }
-        assert!(OpenAiDeviceAuthFlow::parse_playwright_result(
-            r#"{"status":"success","storage_state":"{\"cookies\":[],\"origins\":[]}"}"#
-        )
-        .is_err());
+        assert!(
+            OpenAiDeviceAuthFlow::parse_playwright_result(
+                r#"{"status":"success","storage_state":"{\"cookies\":[],\"origins\":[]}"}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn script_honors_headless_and_avoids_sequential_or_generic_success_checks() {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
         let script = flow
-            .build_playwright_script(
-                Path::new("/tmp/profile"),
-                "ABCD-EFGH",
-                None,
-                None,
-                true,
-            )
+            .build_playwright_script(Path::new("/tmp/profile"), "ABCD-EFGH", None, None, true)
             .expect("bounded headless OpenAI script");
         let input = super::super::decode_node_script_input(&script);
         assert_eq!(input["headless"], true);
@@ -2078,9 +2040,13 @@ mod tests {
     #[test]
     fn node_runner_is_stdin_bounded_and_never_uses_inline_argv() {
         let source = include_str!("openai_device.rs");
-        let start = source.find("fn run_playwright_flow(").expect("runner source");
+        let start = source
+            .find("fn run_playwright_flow(")
+            .expect("runner source");
         let tail = &source[start..];
-        let end = tail.find("\n    /// Build the Node.js/Playwright script").expect("runner boundary");
+        let end = tail
+            .find("\n    /// Build the Node.js/Playwright script")
+            .expect("runner boundary");
         let body = &tail[..end];
         assert!(body.contains("run_node_script_bounded"));
         assert!(!body.contains("std::process::Command"));

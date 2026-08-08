@@ -20,8 +20,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -30,13 +30,11 @@ use serde_json::Value;
 
 use crate::agent_correlator::AgentCorrelator;
 use crate::checkpoint_witness::{
-    CHECKPOINT_ROLE_SNAPSHOT, CheckpointWitnessError, PersistedPaneState,
-    MAX_CHECKPOINT_METADATA_BYTES, MAX_CHECKPOINT_ROLE_BYTES,
-    MAX_CHECKPOINT_SESSION_ID_BYTES, MAX_CHECKPOINT_STATE_HASH_BYTES,
-    MAX_PERSISTED_CHECKPOINT_TEXT_BYTES, MAX_PERSISTED_PANE_TEXT_BYTES,
+    CHECKPOINT_ROLE_SNAPSHOT, CheckpointWitnessError, MAX_CHECKPOINT_METADATA_BYTES,
+    MAX_CHECKPOINT_ROLE_BYTES, MAX_CHECKPOINT_SESSION_ID_BYTES, MAX_CHECKPOINT_STATE_HASH_BYTES,
+    MAX_PERSISTED_CHECKPOINT_TEXT_BYTES, MAX_PERSISTED_PANE_TEXT_BYTES, PersistedPaneState,
     SNAPSHOT_WITNESS_PREFIX, canonical_json_string, checkpoint_witness,
-    persisted_checkpoint_text_bytes, persisted_pane_text_bytes,
-    snapshot_dedup_witness,
+    persisted_checkpoint_text_bytes, persisted_pane_text_bytes, snapshot_dedup_witness,
 };
 use crate::config::{SnapshotConfig, SnapshotSchedulingMode};
 use crate::outcome::CancelKind;
@@ -45,9 +43,7 @@ use crate::runtime_async::{LockAcquireError, RwLock, mpsc, watch};
 use crate::session_pane_state::{
     AgentMetadata, CapturedEnv, PaneStateSnapshot, SAFE_ENV_VARS, ScrollbackRef,
 };
-use crate::session_topology::{
-    MAX_TOPOLOGY_PANES, TopologySnapshot, TopologySnapshotError,
-};
+use crate::session_topology::{MAX_TOPOLOGY_PANES, TopologySnapshot, TopologySnapshotError};
 use crate::wezterm::PaneInfo;
 
 // =============================================================================
@@ -66,12 +62,7 @@ fn saturating_telemetry_add(counter: &AtomicU64, delta: u64) {
             return;
         }
         let next = current.saturating_add(delta);
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return,
             Err(observed) => current = observed,
         }
@@ -403,10 +394,7 @@ pub enum SnapshotDeleteTarget {
 impl std::fmt::Debug for SnapshotDeleteTarget {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Id(checkpoint_id) => formatter
-                .debug_tuple("Id")
-                .field(checkpoint_id)
-                .finish(),
+            Self::Id(checkpoint_id) => formatter.debug_tuple("Id").field(checkpoint_id).finish(),
             Self::Exact(identity) => formatter.debug_tuple("Exact").field(identity).finish(),
             Self::Latest(scope) => formatter.debug_tuple("Latest").field(scope).finish(),
         }
@@ -745,9 +733,7 @@ impl std::fmt::Debug for SnapshotError {
             Self::InProgress => formatter.write_str("InProgress"),
             Self::ShuttingDown => formatter.write_str("ShuttingDown"),
             Self::SchedulerInProgress => formatter.write_str("SchedulerInProgress"),
-            Self::TriggerReceiverUnavailable => {
-                formatter.write_str("TriggerReceiverUnavailable")
-            }
+            Self::TriggerReceiverUnavailable => formatter.write_str("TriggerReceiverUnavailable"),
             Self::NoPanes => formatter.write_str("NoPanes"),
             Self::NoChanges => formatter.write_str("NoChanges"),
             Self::PaneList(_) => formatter.write_str("PaneList"),
@@ -799,9 +785,7 @@ impl std::fmt::Debug for SnapshotError {
             Self::PollQuotaExhausted => formatter.write_str("PollQuotaExhausted"),
             Self::CostBudgetExhausted => formatter.write_str("CostBudgetExhausted"),
             Self::ContextFailure => formatter.write_str("ContextFailure"),
-            Self::BlockingRuntimeFailure => {
-                formatter.write_str("BlockingRuntimeFailure")
-            }
+            Self::BlockingRuntimeFailure => formatter.write_str("BlockingRuntimeFailure"),
             Self::ShutdownTimedOut { timeout_ms } => formatter
                 .debug_struct("ShutdownTimedOut")
                 .field("timeout_ms", timeout_ms)
@@ -816,9 +800,7 @@ impl std::fmt::Debug for SnapshotError {
                 .field("deadline_nanos", deadline_nanos)
                 .finish(),
             Self::LockPoisoned => formatter.write_str("LockPoisoned"),
-            Self::LockPolledAfterCompletion => {
-                formatter.write_str("LockPolledAfterCompletion")
-            }
+            Self::LockPolledAfterCompletion => formatter.write_str("LockPolledAfterCompletion"),
         }
     }
 }
@@ -840,15 +822,9 @@ impl SnapshotError {
             Self::Topology(error) => topology_snapshot_error_class(error),
             Self::ProjectionResourceLimit { .. } => "projection_resource_limit",
             Self::PaneIdentitySetMismatch { .. } => "pane_identity_set_mismatch",
-            Self::IndeterminateAuthorityMutation { .. } => {
-                "indeterminate_authority_mutation"
-            }
-            Self::AuthorityReconciliationRequired { .. } => {
-                "authority_reconciliation_required"
-            }
-            Self::AuthorityMutationInProgress { .. } => {
-                "authority_mutation_in_progress"
-            }
+            Self::IndeterminateAuthorityMutation { .. } => "indeterminate_authority_mutation",
+            Self::AuthorityReconciliationRequired { .. } => "authority_reconciliation_required",
+            Self::AuthorityMutationInProgress { .. } => "authority_mutation_in_progress",
             Self::Cancelled => "cancelled",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::PollQuotaExhausted => "poll_quota_exhausted",
@@ -939,16 +915,11 @@ fn snapshot_context_error(cx: &crate::cx::Cx) -> SnapshotError {
     }
 }
 
-fn snapshot_cx_checkpoint(
-    cx: &crate::cx::Cx,
-) -> std::result::Result<(), SnapshotError> {
+fn snapshot_cx_checkpoint(cx: &crate::cx::Cx) -> std::result::Result<(), SnapshotError> {
     cx.checkpoint().map_err(|_| snapshot_context_error(cx))
 }
 
-fn classify_shutdown_timeout(
-    cx: &crate::cx::Cx,
-    timeout: Duration,
-) -> SnapshotError {
+fn classify_shutdown_timeout(cx: &crate::cx::Cx, timeout: Duration) -> SnapshotError {
     if cx.root_cancel_cause().is_some() || cx.is_cancel_requested() {
         snapshot_context_error(cx)
     } else {
@@ -1058,12 +1029,7 @@ impl SchedulerCaptureRetryState {
             self.consecutive_backoff_deferrals =
                 self.consecutive_backoff_deferrals.saturating_add(1);
         }
-        scheduler_capture_retry_deadline(
-            now,
-            trigger,
-            reason,
-            self.consecutive_backoff_deferrals,
-        )
+        scheduler_capture_retry_deadline(now, trigger, reason, self.consecutive_backoff_deferrals)
     }
 }
 
@@ -1076,8 +1042,7 @@ fn scheduler_capture_retry_delay(
         SchedulerCaptureDeferredReason::RetrySafeFailure
         | SchedulerCaptureDeferredReason::CapacityAdmission => {
             let exponent = consecutive_backoff_deferrals.saturating_sub(1).min(5);
-            let delay = SCHEDULER_RETRY_SAFE_CAPTURE_MIN_DELAY
-                .saturating_mul(1_u32 << exponent);
+            let delay = SCHEDULER_RETRY_SAFE_CAPTURE_MIN_DELAY.saturating_mul(1_u32 << exponent);
             delay.min(SCHEDULER_RETRY_SAFE_CAPTURE_MAX_DELAY)
         }
         SchedulerCaptureDeferredReason::Busy if scheduler_trigger_priority(trigger) == 2 => {
@@ -1103,7 +1068,7 @@ fn scheduler_capture_retry_deadline(
         reason,
         consecutive_backoff_deferrals,
     ))
-        .unwrap_or(now)
+    .unwrap_or(now)
 }
 
 const fn scheduler_trigger_priority(trigger: SnapshotTrigger) -> u8 {
@@ -1276,8 +1241,9 @@ impl Drop for CaptureShutdownReservation<'_> {
                 CAPTURE_LIFECYCLE_SHUTDOWN_PENDING_OWNED => {
                     CAPTURE_LIFECYCLE_SHUTDOWN_PENDING_RETRYABLE
                 }
-                CAPTURE_LIFECYCLE_SHUTDOWN_RESERVED_OWNED
-                | CAPTURE_LIFECYCLE_SHUTDOWN_ACTIVE => CAPTURE_LIFECYCLE_SHUTDOWN_RETRYABLE,
+                CAPTURE_LIFECYCLE_SHUTDOWN_RESERVED_OWNED | CAPTURE_LIFECYCLE_SHUTDOWN_ACTIVE => {
+                    CAPTURE_LIFECYCLE_SHUTDOWN_RETRYABLE
+                }
                 _ => return,
             };
             if self
@@ -1362,9 +1328,7 @@ impl SnapshotAuthorityState {
     }
 
     fn first_latched_operation(&self) -> Option<SnapshotAuthorityOperation> {
-        SnapshotAuthorityOperation::from_code(
-            self.first_latched_operation.load(Ordering::Acquire),
-        )
+        SnapshotAuthorityOperation::from_code(self.first_latched_operation.load(Ordering::Acquire))
     }
 }
 
@@ -1402,11 +1366,10 @@ fn snapshot_authority_object_identities(identities: &[String]) -> Vec<&str> {
         .collect()
 }
 
-fn snapshot_authority_registry(
-) -> &'static StdMutex<HashMap<String, SnapshotAuthorityRegistryEntry>> {
-    static REGISTRY: OnceLock<
-        StdMutex<HashMap<String, SnapshotAuthorityRegistryEntry>>,
-    > = OnceLock::new();
+fn snapshot_authority_registry()
+-> &'static StdMutex<HashMap<String, SnapshotAuthorityRegistryEntry>> {
+    static REGISTRY: OnceLock<StdMutex<HashMap<String, SnapshotAuthorityRegistryEntry>>> =
+        OnceLock::new();
     REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
@@ -1476,9 +1439,7 @@ fn refresh_snapshot_authority_file_identities(
             Some(SnapshotAuthorityIdentityError::MultipleObservedObjects)
         } else {
             match (registered_objects.first(), observed_objects.first()) {
-                (Some(_), None) => {
-                    Some(SnapshotAuthorityIdentityError::EstablishedObjectMissing)
-                }
+                (Some(_), None) => Some(SnapshotAuthorityIdentityError::EstablishedObjectMissing),
                 (Some(registered), Some(observed)) if registered != observed => {
                     Some(SnapshotAuthorityIdentityError::EstablishedObjectReplaced)
                 }
@@ -1529,17 +1490,18 @@ fn freeze_filesystem_path_from_base(path: &Path, base: &Path) -> PathBuf {
     } else {
         base.join(path)
     };
-    std::fs::canonicalize(&absolute).or_else(|_| {
-        let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
-        let file_name = absolute.file_name().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "snapshot database path has no file name",
-            )
-        })?;
-        std::fs::canonicalize(parent).map(|canonical_parent| canonical_parent.join(file_name))
-    })
-    .unwrap_or(absolute)
+    std::fs::canonicalize(&absolute)
+        .or_else(|_| {
+            let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
+            let file_name = absolute.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "snapshot database path has no file name",
+                )
+            })?;
+            std::fs::canonicalize(parent).map(|canonical_parent| canonical_parent.join(file_name))
+        })
+        .unwrap_or(absolute)
 }
 
 fn freeze_filesystem_path(path: &Path) -> PathBuf {
@@ -1630,11 +1592,7 @@ fn filesystem_snapshot_authority_identity_from_uri_bytes(bytes: &[u8]) -> String
 #[cfg(windows)]
 fn sqlite_windows_uri_drive_path(path: &str) -> &str {
     let bytes = path.as_bytes();
-    if bytes.len() >= 3
-        && bytes[0] == b'/'
-        && bytes[1].is_ascii_alphabetic()
-        && bytes[2] == b':'
-    {
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
         &path[1..]
     } else {
         path
@@ -1652,9 +1610,7 @@ fn filesystem_snapshot_authority_identity_from_uri_bytes(bytes: &[u8]) -> String
 fn sqlite_uri_vfs_is_project_default(vfs: Option<&[u8]>) -> bool {
     match vfs {
         None => true,
-        Some(vfs) => {
-            (cfg!(unix) && vfs == b"unix") || (cfg!(windows) && vfs == b"win32")
-        }
+        Some(vfs) => (cfg!(unix) && vfs == b"unix") || (cfg!(windows) && vfs == b"win32"),
     }
 }
 
@@ -1662,14 +1618,15 @@ fn sqlite_uri_raw_file_path(raw_path: &str) -> Option<&str> {
     let Some(authority_and_path) = raw_path.strip_prefix("//") else {
         return Some(raw_path);
     };
-    let (authority, path) = authority_and_path
-        .find('/')
-        .map_or((authority_and_path, ""), |separator| {
-            (
-                &authority_and_path[..separator],
-                &authority_and_path[separator..],
-            )
-        });
+    let (authority, path) =
+        authority_and_path
+            .find('/')
+            .map_or((authority_and_path, ""), |separator| {
+                (
+                    &authority_and_path[..separator],
+                    &authority_and_path[separator..],
+                )
+            });
     // SQLite validates the literal raw authority before percent-decoding the
     // filename. Encoded spellings of localhost are therefore invalid.
     if authority.is_empty() || authority == "localhost" {
@@ -1776,7 +1733,11 @@ fn freeze_snapshot_db_locator_from_base(db_path: &str, base: &Path) -> String {
     };
     let query = db_path
         .strip_prefix("file:")
-        .and_then(|uri| uri.split_once('#').map_or(uri, |(before, _)| before).split_once('?'))
+        .and_then(|uri| {
+            uri.split_once('#')
+                .map_or(uri, |(before, _)| before)
+                .split_once('?')
+        })
         .map_or("", |(_, query)| query);
     if query.is_empty() {
         format!("file:{encoded_path}")
@@ -1821,11 +1782,12 @@ fn snapshot_authority_file_identity(db_path: &str) -> Option<String> {
                 vfs = Some(value);
             }
         }
-        if mode.as_deref().is_some_and(|value| {
-            !matches!(value, b"ro" | b"rw" | b"rwc" | b"memory")
-        }) || cache
+        if mode
             .as_deref()
-            .is_some_and(|value| !matches!(value, b"shared" | b"private"))
+            .is_some_and(|value| !matches!(value, b"ro" | b"rw" | b"rwc" | b"memory"))
+            || cache
+                .as_deref()
+                .is_some_and(|value| !matches!(value, b"shared" | b"private"))
         {
             // sqlite3ParseUri rejects invalid recognized option values before
             // VFS open. Such an input cannot share durable authority with a
@@ -1845,8 +1807,8 @@ fn snapshot_authority_file_identity(db_path: &str) -> Option<String> {
             // `mode=memory&cache=shared`; no name exists to share.
             return None;
         }
-        let memory = uri_path == b":memory:"
-            || mode.as_deref().is_some_and(|value| value == b"memory");
+        let memory =
+            uri_path == b":memory:" || mode.as_deref().is_some_and(|value| value == b"memory");
         if vfs.as_deref() == Some(b"memdb") {
             // Bundled SQLite's memdb VFS chooses its backing-store identity
             // solely from the decoded filename: names longer than one byte
@@ -1855,14 +1817,9 @@ fn snapshot_authority_file_identity(db_path: &str) -> Option<String> {
             // same filename/VFS before a second xOpen. Both mechanisms resolve
             // to one authority key; every other memdb spelling is private.
             let shared = cache.as_deref() == Some(b"shared")
-                || (uri_path.len() > 1
-                    && matches!(uri_path.first(), Some(b'/' | b'\\')));
-            return shared.then(|| {
-                format!(
-                    "sqlite-memdb-vfs:{}",
-                    sqlite_uri_identity_bytes(uri_path)
-                )
-            });
+                || (uri_path.len() > 1 && matches!(uri_path.first(), Some(b'/' | b'\\')));
+            return shared
+                .then(|| format!("sqlite-memdb-vfs:{}", sqlite_uri_identity_bytes(uri_path)));
         }
         if memory {
             if cache.as_deref().is_some_and(|value| value == b"shared") {
@@ -1911,9 +1868,7 @@ fn shared_snapshot_authority_state(db_path: &str) -> Arc<SnapshotAuthorityState>
         for identity in &identities {
             let matched = match entries.get(identity) {
                 Some(SnapshotAuthorityRegistryEntry::Live(state)) => state.upgrade(),
-                Some(SnapshotAuthorityRegistryEntry::Latched(state)) => {
-                    Some(Arc::clone(state))
-                }
+                Some(SnapshotAuthorityRegistryEntry::Latched(state)) => Some(Arc::clone(state)),
                 None => None,
             };
             if let Some(matched) = matched
@@ -2091,7 +2046,10 @@ impl Drop for SnapshotAuthorityAttemptGuard {
     fn drop(&mut self) {
         if !self.settled && !self.suppress_pending_handoff() {
             let state = self.handoff_state.load(Ordering::Acquire);
-            if matches!(state, AUTHORITY_HANDOFF_STARTED | AUTHORITY_HANDOFF_COMPLETED) {
+            if matches!(
+                state,
+                AUTHORITY_HANDOFF_STARTED | AUTHORITY_HANDOFF_COMPLETED
+            ) {
                 self.authority.latch_reconciliation(self.operation);
             }
         }
@@ -2282,12 +2240,9 @@ impl SnapshotEngine {
                                 return Ok(reservation);
                             }
                             CAPTURE_LIFECYCLE_SHUTDOWN_PENDING_OWNED => {
-                                crate::runtime_async::sleep_with_cx(
-                                    cx,
-                                    Duration::from_millis(1),
-                                )
-                                .await
-                                .map_err(|_| snapshot_context_error(cx))?;
+                                crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(1))
+                                    .await
+                                    .map_err(|_| snapshot_context_error(cx))?;
                             }
                             _ => return Err(SnapshotError::ContextFailure),
                         }
@@ -2315,12 +2270,9 @@ impl SnapshotEngine {
                                 return Ok(reservation);
                             }
                             CAPTURE_LIFECYCLE_SHUTDOWN_PENDING_OWNED => {
-                                crate::runtime_async::sleep_with_cx(
-                                    cx,
-                                    Duration::from_millis(1),
-                                )
-                                .await
-                                .map_err(|_| snapshot_context_error(cx))?;
+                                crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(1))
+                                    .await
+                                    .map_err(|_| snapshot_context_error(cx))?;
                             }
                             _ => return Err(SnapshotError::ContextFailure),
                         }
@@ -2627,9 +2579,9 @@ impl SnapshotEngine {
         }
         if self.authority_reconciliation_is_required() {
             saturating_telemetry_add(&self.telemetry.capture_errors, 1);
-            return Err(self.authority_reconciliation_error(
-                SnapshotAuthorityOperation::CheckpointCommit,
-            ));
+            return Err(
+                self.authority_reconciliation_error(SnapshotAuthorityOperation::CheckpointCommit)
+            );
         }
         if trigger == SnapshotTrigger::Shutdown && shutdown_reservation.is_none() {
             // A caller cannot smuggle a terminal trigger through ordinary
@@ -2772,8 +2724,8 @@ impl SnapshotEngine {
         let db_path_for_detections = Arc::clone(&self.db_path);
         let detection_max_age_ms =
             u64::try_from(STATE_DETECTION_MAX_AGE.as_millis()).unwrap_or(u64::MAX);
-        let cutoff_ms: i64 = i64::try_from(now_ms.saturating_sub(detection_max_age_ms))
-            .unwrap_or(i64::MAX);
+        let cutoff_ms: i64 =
+            i64::try_from(now_ms.saturating_sub(detection_max_age_ms)).unwrap_or(i64::MAX);
 
         let detections_by_pane = match crate::runtime_async::spawn_blocking_with_cx(cx, move || {
             load_latest_detections_by_pane_sync(
@@ -2835,8 +2787,7 @@ impl SnapshotEngine {
             let pane_states: Vec<PaneStateSnapshot> = owned_panes
                 .iter()
                 .map(|pane| {
-                    let mut snapshot =
-                        PaneStateSnapshot::from_pane_info(pane, now_ms, false);
+                    let mut snapshot = PaneStateSnapshot::from_pane_info(pane, now_ms, false);
                     if let Some(scrollback_ref) = scrollback_refs.get(&pane.pane_id) {
                         snapshot = snapshot.with_scrollback(scrollback_ref.clone());
                     }
@@ -2861,9 +2812,9 @@ impl SnapshotEngine {
         // 4. Skip if periodic-like and unchanged — Cx-bound read
         if periodic_dedup_allowed
             && matches!(
-            trigger,
-            SnapshotTrigger::Periodic | SnapshotTrigger::PeriodicFallback
-        )
+                trigger,
+                SnapshotTrigger::Periodic | SnapshotTrigger::PeriodicFallback
+            )
         {
             let cached_checkpoint = {
                 let last = self
@@ -2876,9 +2827,8 @@ impl SnapshotEngine {
                     .cloned()
             };
             if self.authority_reconciliation_is_required() {
-                return Err(self.authority_reconciliation_error(
-                    SnapshotAuthorityOperation::CheckpointCommit,
-                ));
+                return Err(self
+                    .authority_reconciliation_error(SnapshotAuthorityOperation::CheckpointCommit));
             }
             if let Some(cached) = cached_checkpoint {
                 // A cache hit is only a hint. Another SnapshotEngine or process
@@ -2914,9 +2864,7 @@ impl SnapshotEngine {
             .await
             .map_err(snapshot_lock_error)?;
         let creates_session = session_id_guard.is_none();
-        let session_id = session_id_guard
-            .clone()
-            .unwrap_or_else(generate_session_id);
+        let session_id = session_id_guard.clone().unwrap_or_else(generate_session_id);
         let new_session = creates_session.then(|| NewSessionMetadata {
             ft_version: crate::VERSION.to_string(),
             host_id: current_host_id(),
@@ -3155,9 +3103,9 @@ impl SnapshotEngine {
         cx: &crate::cx::Cx,
     ) -> std::result::Result<(), SnapshotError> {
         if self.authority_reconciliation_is_required() {
-            return Err(self.authority_reconciliation_error(
-                SnapshotAuthorityOperation::CheckpointCleanup,
-            ));
+            return Err(
+                self.authority_reconciliation_error(SnapshotAuthorityOperation::CheckpointCleanup)
+            );
         }
         let Some(_attempt) = self.try_begin_automatic_checkpoint_cleanup(Instant::now()) else {
             return Ok(());
@@ -3270,8 +3218,7 @@ impl SnapshotEngine {
     ) -> bool
     where
         F: Fn() -> Fut + Send + Sync + 'static,
-        Fut:
-            std::future::Future<Output = std::result::Result<Vec<PaneInfo>, SnapshotError>> + Send,
+        Fut: std::future::Future<Output = std::result::Result<Vec<PaneInfo>, SnapshotError>> + Send,
     {
         match pane_provider().await {
             Ok(panes) => match self.capture(&panes, trigger).await {
@@ -3351,13 +3298,12 @@ impl SnapshotEngine {
     ) -> std::result::Result<SchedulerCaptureOutcome, SnapshotError>
     where
         F: Fn() -> Fut + Send + Sync + 'static,
-        Fut:
-            std::future::Future<Output = std::result::Result<Vec<PaneInfo>, SnapshotError>> + Send,
+        Fut: std::future::Future<Output = std::result::Result<Vec<PaneInfo>, SnapshotError>> + Send,
     {
         if self.authority_reconciliation_is_required() {
-            return Err(self.authority_reconciliation_error(
-                SnapshotAuthorityOperation::CheckpointCommit,
-            ));
+            return Err(
+                self.authority_reconciliation_error(SnapshotAuthorityOperation::CheckpointCommit)
+            );
         }
         match self.capture_lifecycle.load(Ordering::Acquire) {
             CAPTURE_LIFECYCLE_OPEN_IDLE => {}
@@ -3491,8 +3437,7 @@ impl SnapshotEngine {
     ) -> std::result::Result<(), SnapshotError>
     where
         F: Fn() -> Fut + Send + Sync + 'static,
-        Fut:
-            std::future::Future<Output = std::result::Result<Vec<PaneInfo>, SnapshotError>> + Send,
+        Fut: std::future::Future<Output = std::result::Result<Vec<PaneInfo>, SnapshotError>> + Send,
     {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.run_periodic_with_cx(&cx, shutdown, pane_provider)
@@ -3526,8 +3471,7 @@ impl SnapshotEngine {
     ) -> std::result::Result<(), SnapshotError>
     where
         F: Fn() -> Fut + Send + Sync + 'static,
-        Fut:
-            std::future::Future<Output = std::result::Result<Vec<PaneInfo>, SnapshotError>> + Send,
+        Fut: std::future::Future<Output = std::result::Result<Vec<PaneInfo>, SnapshotError>> + Send,
     {
         if cx.checkpoint().is_err() {
             tracing::info!("snapshot engine run_periodic cancelled at entry");
@@ -3548,8 +3492,7 @@ impl SnapshotEngine {
     ) -> std::result::Result<(), SnapshotError>
     where
         F: Fn() -> Fut + Send + Sync + 'static,
-        Fut:
-            std::future::Future<Output = std::result::Result<Vec<PaneInfo>, SnapshotError>> + Send,
+        Fut: std::future::Future<Output = std::result::Result<Vec<PaneInfo>, SnapshotError>> + Send,
     {
         if self
             .scheduler_in_progress
@@ -3601,12 +3544,9 @@ impl SnapshotEngine {
                         // shutdown.changed(cx) — both the outer interval-timeout
                         // AND the inner shutdown wait now honor cx-cancel.
                         let shutdown_fut = shutdown.changed(cx);
-                        let shutdown_wait = crate::runtime_async::timeout_with_cx(
-                            cx,
-                            next_wait,
-                            shutdown_fut,
-                        )
-                        .await;
+                        let shutdown_wait =
+                            crate::runtime_async::timeout_with_cx(cx, next_wait, shutdown_fut)
+                                .await;
                         if cx.is_cancel_requested() {
                             return Err(SnapshotError::Cancelled);
                         }
@@ -3641,9 +3581,9 @@ impl SnapshotEngine {
                     }
 
                     let now = Instant::now();
-                    let snapshot_is_due = last_snapshot_completion.is_none_or(|last| {
-                        now.saturating_duration_since(last) >= interval
-                    }) && snapshot_retry_not_before.is_none_or(|retry_at| now >= retry_at);
+                    let snapshot_is_due = last_snapshot_completion
+                        .is_none_or(|last| now.saturating_duration_since(last) >= interval)
+                        && snapshot_retry_not_before.is_none_or(|retry_at| now >= retry_at);
                     if !snapshot_is_due {
                         // Cleanup-only wake: do not manufacture an unrelated
                         // pane snapshot or move the snapshot cadence.
@@ -3702,11 +3642,7 @@ impl SnapshotEngine {
                 }
 
                 let startup_outcome = self
-                    .capture_from_provider_with_cx(
-                        cx,
-                        &pane_provider,
-                        SnapshotTrigger::Startup,
-                    )
+                    .capture_from_provider_with_cx(cx, &pane_provider, SnapshotTrigger::Startup)
                     .await?;
                 cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
 
@@ -3803,9 +3739,7 @@ impl SnapshotEngine {
                                 }
                             }
                             SchedulerCaptureOutcome::Unchanged => {
-                                if self.is_immediate_trigger(trigger)
-                                    || snapshot_threshold <= 0.0
-                                {
+                                if self.is_immediate_trigger(trigger) || snapshot_threshold <= 0.0 {
                                     accumulated_value = 0.0;
                                 }
                                 pending_trigger = None;
@@ -3869,8 +3803,7 @@ impl SnapshotEngine {
                         let wait_step = poll_wait.min(Duration::from_millis(250));
                         let recv_fut = trigger_rx.receiver_mut()?.recv(cx);
                         let recv_result =
-                            crate::runtime_async::timeout_with_cx(cx, wait_step, recv_fut)
-                                .await;
+                            crate::runtime_async::timeout_with_cx(cx, wait_step, recv_fut).await;
 
                         if cx.is_cancel_requested() {
                             return Err(SnapshotError::Cancelled);
@@ -3914,11 +3847,10 @@ impl SnapshotEngine {
                                         trigger,
                                         SchedulerCaptureDeferredReason::Busy,
                                     );
-                                    capture_retry_at = Some(
-                                        capture_retry_at.map_or(upgraded_retry, |current| {
+                                    capture_retry_at =
+                                        Some(capture_retry_at.map_or(upgraded_retry, |current| {
                                             current.max(upgraded_retry)
-                                        }),
-                                    );
+                                        }));
                                 }
                             } else if should_capture {
                                 let outcome = self
@@ -3940,13 +3872,12 @@ impl SnapshotEngine {
                                     SchedulerCaptureOutcome::Unchanged => {}
                                     SchedulerCaptureOutcome::Deferred(reason) => {
                                         pending_trigger = Some(trigger);
-                                        capture_retry_at = Some(
-                                            snapshot_retry_state.retry_deadline(
+                                        capture_retry_at =
+                                            Some(snapshot_retry_state.retry_deadline(
                                                 Instant::now(),
                                                 trigger,
                                                 reason,
-                                            ),
-                                        );
+                                            ));
                                     }
                                 }
                             }
@@ -3986,13 +3917,11 @@ impl SnapshotEngine {
                                 }
                                 SchedulerCaptureOutcome::Deferred(reason) => {
                                     pending_trigger = Some(SnapshotTrigger::PeriodicFallback);
-                                    capture_retry_at = Some(
-                                        snapshot_retry_state.retry_deadline(
-                                            Instant::now(),
-                                            SnapshotTrigger::PeriodicFallback,
-                                            reason,
-                                        ),
-                                    );
+                                    capture_retry_at = Some(snapshot_retry_state.retry_deadline(
+                                        Instant::now(),
+                                        SnapshotTrigger::PeriodicFallback,
+                                        reason,
+                                    ));
                                 }
                             }
                         }
@@ -4054,10 +3983,7 @@ impl SnapshotEngine {
                 cx,
                 SnapshotAuthorityOperation::SessionRetentionCleanup,
                 move || {
-                    crate::session_retention::cleanup_sessions_from_path(
-                        db_path.as_str(),
-                        &config,
-                    )
+                    crate::session_retention::cleanup_sessions_from_path(db_path.as_str(), &config)
                 },
             )
             .await
@@ -4068,13 +3994,11 @@ impl SnapshotEngine {
                 if result.any_work_done() {
                     tracing::info!(
                         sessions_deleted = total,
-                        orphaned_restore_lifecycle_rows =
-                            result.orphaned_restore_lifecycle_rows,
+                        orphaned_restore_lifecycle_rows = result.orphaned_restore_lifecycle_rows,
                         orphaned_checkpoints = result.orphaned_checkpoints,
                         orphaned_pane_states = result.orphaned_pane_states,
                         explicit_vacuum_attempted = false,
-                        expected_default_free_space_policy =
-                            "auto_vacuum_none_freelist_reuse",
+                        expected_default_free_space_policy = "auto_vacuum_none_freelist_reuse",
                         interval_hours,
                         "Session retention cleanup completed"
                     );
@@ -4186,9 +4110,9 @@ impl SnapshotEngine {
         timeout: Duration,
     ) -> std::result::Result<SnapshotResult, SnapshotError> {
         if self.authority_reconciliation_is_required() {
-            return Err(self.authority_reconciliation_error(
-                SnapshotAuthorityOperation::CheckpointCommit,
-            ));
+            return Err(
+                self.authority_reconciliation_error(SnapshotAuthorityOperation::CheckpointCommit)
+            );
         }
         if let Err(error) = snapshot_cx_checkpoint(cx) {
             tracing::debug!(
@@ -4229,9 +4153,8 @@ impl SnapshotEngine {
         match result {
             Ok(Ok(checkpoint)) => {
                 if self.authority_reconciliation_is_required() {
-                    Err(self.authority_reconciliation_error(
-                        SnapshotAuthorityOperation::ShutdownMark,
-                    ))
+                    Err(self
+                        .authority_reconciliation_error(SnapshotAuthorityOperation::ShutdownMark))
                 } else {
                     Ok(checkpoint)
                 }
@@ -4297,9 +4220,9 @@ impl SnapshotEngine {
     ) -> std::result::Result<(), SnapshotError> {
         snapshot_cx_checkpoint(cx)?;
         if self.authority_reconciliation_is_required() {
-            return Err(self.authority_reconciliation_error(
-                SnapshotAuthorityOperation::ShutdownMark,
-            ));
+            return Err(
+                self.authority_reconciliation_error(SnapshotAuthorityOperation::ShutdownMark)
+            );
         }
         let reservation = self.reserve_capture_lifecycle(cx).await?;
         self.mark_shutdown_with_reservation(cx, &reservation, checkpoint)
@@ -4327,9 +4250,9 @@ impl SnapshotEngine {
         // without publishing an ID, so recheck before treating `None` as an
         // authoritative no-op.
         if self.authority_reconciliation_is_required() {
-            return Err(self.authority_reconciliation_error(
-                SnapshotAuthorityOperation::ShutdownMark,
-            ));
+            return Err(
+                self.authority_reconciliation_error(SnapshotAuthorityOperation::ShutdownMark)
+            );
         }
         let id = session_id.ok_or(SnapshotError::ContextFailure)?;
         if id != checkpoint.session_id {
@@ -4376,9 +4299,7 @@ where
     let engine = SnapshotEngine::new(db_path, SnapshotConfig::default());
     let frozen_db_path = Arc::clone(&engine.db_path);
     engine
-        .spawn_blocking_authority_with_cx(cx, operation, move || {
-            work(frozen_db_path.as_str())
-        })
+        .spawn_blocking_authority_with_cx(cx, operation, move || work(frozen_db_path.as_str()))
         .await
 }
 
@@ -4580,16 +4501,13 @@ fn load_latest_scrollback_refs_sync(
             .map_err(|error| error.to_string())?;
         while let Some(row) = rows.next().map_err(|error| error.to_string())? {
             let pane_id_raw: i64 = row.get(0).map_err(|error| error.to_string())?;
-            let pane_id = sqlite_integer_to_u64(0, pane_id_raw)
-                .map_err(|error| error.to_string())?;
+            let pane_id =
+                sqlite_integer_to_u64(0, pane_id_raw).map_err(|error| error.to_string())?;
             let min_seq: Option<i64> = row.get(1).map_err(|error| error.to_string())?;
             let max_seq: Option<i64> = row.get(2).map_err(|error| error.to_string())?;
-            let total_segments_captured: i64 =
-                row.get(3).map_err(|error| error.to_string())?;
-            let min_capture_at: Option<i64> =
-                row.get(4).map_err(|error| error.to_string())?;
-            let last_capture_at: Option<i64> =
-                row.get(5).map_err(|error| error.to_string())?;
+            let total_segments_captured: i64 = row.get(3).map_err(|error| error.to_string())?;
+            let min_capture_at: Option<i64> = row.get(4).map_err(|error| error.to_string())?;
+            let last_capture_at: Option<i64> = row.get(5).map_err(|error| error.to_string())?;
 
             let Some(min_seq) = min_seq else {
                 continue;
@@ -4679,9 +4597,9 @@ fn checkpoint_cleanup_due(
     }) {
         return false;
     }
-    cadence.last_authoritative_success.is_none_or(|completed_at| {
-        now.saturating_duration_since(completed_at) >= interval
-    })
+    cadence
+        .last_authoritative_success
+        .is_none_or(|completed_at| now.saturating_duration_since(completed_at) >= interval)
 }
 
 /// Monotonic wait until this database may next run automatic checkpoint
@@ -4702,9 +4620,11 @@ fn checkpoint_cleanup_wait_duration(
             return CHECKPOINT_CLEANUP_RETRY_DELAY.saturating_sub(elapsed);
         }
     }
-    cadence.last_authoritative_success.map_or(Duration::ZERO, |completed_at| {
-        interval.saturating_sub(now.saturating_duration_since(completed_at))
-    })
+    cadence
+        .last_authoritative_success
+        .map_or(Duration::ZERO, |completed_at| {
+            interval.saturating_sub(now.saturating_duration_since(completed_at))
+        })
 }
 
 /// Decide whether `[snapshots.session_retention]` cleanup is due (ft-0yuxe).
@@ -4927,8 +4847,8 @@ fn project_snapshot_panes(
     });
     let uniform_workspace = !oversized_workspace
         && panes
-        .iter()
-        .all(|pane| pane.workspace.as_deref() == first_workspace);
+            .iter()
+            .all(|pane| pane.workspace.as_deref() == first_workspace);
     let topology_workspace_id = if oversized_workspace {
         None
     } else if uniform_workspace {
@@ -4959,19 +4879,18 @@ fn project_snapshot_panes(
             .extra
             .get(FOREGROUND_PROCESS_NAME_FIELD)
             .and_then(Value::as_str);
-        let process_truncated = if process
-            .is_some_and(|process| process.len() > SNAPSHOT_TEXT_FIELD_INPUT_BYTES)
-        {
-            true
-        } else if let Some(process) = process {
-            extra.insert(
-                FOREGROUND_PROCESS_NAME_FIELD.to_owned(),
-                Value::String(process.to_owned()),
-            );
-            false
-        } else {
-            false
-        };
+        let process_truncated =
+            if process.is_some_and(|process| process.len() > SNAPSHOT_TEXT_FIELD_INPUT_BYTES) {
+                true
+            } else if let Some(process) = process {
+                extra.insert(
+                    FOREGROUND_PROCESS_NAME_FIELD.to_owned(),
+                    Value::String(process.to_owned()),
+                );
+                false
+            } else {
+                false
+            };
 
         let workspace_omitted = pane
             .workspace
@@ -5022,10 +4941,8 @@ fn bounded_agent_metadata(agent: &AgentMetadata) -> (Option<AgentMetadata>, bool
         agent.session_id.as_deref(),
         SNAPSHOT_AGENT_FIELD_INPUT_BYTES,
     );
-    let (state, state_truncated) = admitted_optional_utf8(
-        agent.state.as_deref(),
-        SNAPSHOT_AGENT_FIELD_INPUT_BYTES,
-    );
+    let (state, state_truncated) =
+        admitted_optional_utf8(agent.state.as_deref(), SNAPSHOT_AGENT_FIELD_INPUT_BYTES);
     (
         Some(AgentMetadata {
             agent_type: agent.agent_type.clone(),
@@ -5082,9 +4999,7 @@ fn admit_checkpoint_metadata_child<'a>(
     Ok(())
 }
 
-fn canonical_checkpoint_metadata(
-    metadata: &Value,
-) -> Result<String, SnapshotPreparationError> {
+fn canonical_checkpoint_metadata(metadata: &Value) -> Result<String, SnapshotPreparationError> {
     // `canonical_json_string` recursively rebuilds the Value tree. Bound both
     // recursion depth and allocation-amplifying node count iteratively before
     // either serde or canonicalization receives programmatically-built input.
@@ -5175,8 +5090,8 @@ fn canonical_checkpoint_metadata(
 fn reduce_persisted_pane_to_budget(
     pane: &mut PersistedPaneState,
 ) -> Result<bool, SnapshotPreparationError> {
-    let mut bytes = persisted_pane_text_bytes(pane)
-        .ok_or(SnapshotPreparationError::ByteCountOverflow)?;
+    let mut bytes =
+        persisted_pane_text_bytes(pane).ok_or(SnapshotPreparationError::ByteCountOverflow)?;
     if bytes <= MAX_PERSISTED_PANE_TEXT_BYTES {
         return Ok(false);
     }
@@ -5199,8 +5114,8 @@ fn reduce_persisted_pane_to_budget(
             }
             _ => unreachable!(),
         }
-        bytes = persisted_pane_text_bytes(pane)
-            .ok_or(SnapshotPreparationError::ByteCountOverflow)?;
+        bytes =
+            persisted_pane_text_bytes(pane).ok_or(SnapshotPreparationError::ByteCountOverflow)?;
         if bytes <= MAX_PERSISTED_PANE_TEXT_BYTES {
             return Ok(true);
         }
@@ -5430,7 +5345,10 @@ fn prepare_snapshot_persistence_with_canonical_metadata(
         let (agent_metadata_json, agent_truncated) = match pane.agent.as_ref() {
             Some(agent) => {
                 let (agent, truncated) = bounded_agent_metadata(agent);
-                (agent.as_ref().map(canonical_json_string).transpose()?, truncated)
+                (
+                    agent.as_ref().map(canonical_json_string).transpose()?,
+                    truncated,
+                )
             }
             None => (None, false),
         };
@@ -5508,12 +5426,9 @@ fn prepare_snapshot_persistence_with_canonical_metadata(
         i64::try_from(pane_count).map_err(|_| SnapshotPreparationError::PaneCountOverflow)?;
     let total_bytes_sql =
         i64::try_from(total_bytes).map_err(|_| SnapshotPreparationError::ByteCountOverflow)?;
-    let persisted_text_bytes = persisted_checkpoint_text_bytes(
-        Some(&topology_json),
-        metadata_json.as_deref(),
-        &panes,
-    )
-    .ok_or(SnapshotPreparationError::ByteCountOverflow)?;
+    let persisted_text_bytes =
+        persisted_checkpoint_text_bytes(Some(&topology_json), metadata_json.as_deref(), &panes)
+            .ok_or(SnapshotPreparationError::ByteCountOverflow)?;
     if persisted_text_bytes > MAX_PERSISTED_CHECKPOINT_TEXT_BYTES {
         return Err(SnapshotPreparationError::CheckpointTextResourceLimit {
             bytes: persisted_text_bytes,
@@ -5600,8 +5515,7 @@ impl SnapshotAuthorityWorkFailure for SnapshotAuthorityDbError {
     fn requires_reconciliation(&self) -> bool {
         matches!(
             self,
-            Self::IndeterminateCommit { .. }
-                | Self::IndeterminateRollback { .. }
+            Self::IndeterminateCommit { .. } | Self::IndeterminateRollback { .. }
         )
     }
 }
@@ -5649,9 +5563,7 @@ fn run_optional_snapshot_authority_transaction<T, F>(
     work: F,
 ) -> std::result::Result<Option<T>, SnapshotAuthorityDbError>
 where
-    F: FnOnce(
-        &rusqlite::Transaction<'_>,
-    ) -> std::result::Result<Option<T>, rusqlite::Error>,
+    F: FnOnce(&rusqlite::Transaction<'_>) -> std::result::Result<Option<T>, rusqlite::Error>,
 {
     let tx = conn
         .unchecked_transaction()
@@ -5676,20 +5588,15 @@ where
 }
 
 fn u64_to_sqlite_integer(value: u64) -> std::result::Result<i64, rusqlite::Error> {
-    i64::try_from(value)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    i64::try_from(value).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
 #[cfg(test)]
 fn usize_to_sqlite_integer(value: usize) -> std::result::Result<i64, rusqlite::Error> {
-    i64::try_from(value)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    i64::try_from(value).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
-fn sqlite_integer_to_u64(
-    column: usize,
-    value: i64,
-) -> std::result::Result<u64, rusqlite::Error> {
+fn sqlite_integer_to_u64(column: usize, value: i64) -> std::result::Result<u64, rusqlite::Error> {
     u64::try_from(value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
             column,
@@ -5749,19 +5656,13 @@ fn open_conn(db_path: &str) -> std::result::Result<Connection, rusqlite::Error> 
 /// Open a connection for an exact authority observation without issuing a
 /// write-capable journal-mode PRAGMA. The cached checkpoint can only exist
 /// after schema initialization, so validation must observe rather than repair.
-fn open_snapshot_query_conn(
-    db_path: &str,
-) -> std::result::Result<Connection, rusqlite::Error> {
+fn open_snapshot_query_conn(db_path: &str) -> std::result::Result<Connection, rusqlite::Error> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE;
     #[cfg(any(unix, windows))]
-    let conn = Connection::open_with_flags_and_vfs(
-        db_path,
-        flags,
-        SNAPSHOT_SQLITE_DEFAULT_VFS,
-    )?;
+    let conn = Connection::open_with_flags_and_vfs(db_path, flags, SNAPSHOT_SQLITE_DEFAULT_VFS)?;
     #[cfg(not(any(unix, windows)))]
     let conn = Connection::open_with_flags(db_path, flags)?;
     conn.busy_timeout(Duration::from_secs(5))?;
@@ -5817,20 +5718,14 @@ fn exact_snapshot_checkpoint_is_verified(
         return Ok(false);
     }
 
-    match crate::session_restore::load_checkpoint_by_id_from_conn(
-        conn,
-        identity.checkpoint_id,
-    ) {
-        Ok(Some(checkpoint)) => Ok(
-            checkpoint.checkpoint_id == identity.checkpoint_id
-                && checkpoint.session_id.as_str() == identity.session_id.as_str()
-                && checkpoint.checkpoint_at == identity.checkpoint_at
-                && checkpoint.checkpoint_role
-                    == crate::session_restore::CheckpointRole::Snapshot
-                && checkpoint.state_hash.as_str() == identity.state_hash.as_str()
-                && checkpoint.verification
-                    == crate::session_restore::CheckpointVerification::VerifiedV2,
-        ),
+    match crate::session_restore::load_checkpoint_by_id_from_conn(conn, identity.checkpoint_id) {
+        Ok(Some(checkpoint)) => Ok(checkpoint.checkpoint_id == identity.checkpoint_id
+            && checkpoint.session_id.as_str() == identity.session_id.as_str()
+            && checkpoint.checkpoint_at == identity.checkpoint_at
+            && checkpoint.checkpoint_role == crate::session_restore::CheckpointRole::Snapshot
+            && checkpoint.state_hash.as_str() == identity.state_hash.as_str()
+            && checkpoint.verification
+                == crate::session_restore::CheckpointVerification::VerifiedV2),
         Ok(None) => Ok(false),
         Err(error) => {
             tracing::warn!(
@@ -5925,9 +5820,7 @@ fn create_session_sync(
     let conn = open_conn(db_path)?;
     let host_id = current_host_id();
     let tx = conn.unchecked_transaction()?;
-    crate::session_retention::ensure_session_authority_tables_have_no_unaudited_triggers(
-        &tx,
-    )?;
+    crate::session_retention::ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
     let inserted = tx.execute(
         "INSERT INTO mux_sessions (session_id, created_at, topology_json, ft_version, host_id)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -6013,7 +5906,7 @@ fn mark_shutdown_sync(
         checkpoint_at,
         state_hash,
     )
-        .map_err(SnapshotAuthorityDbError::into_primary_source)
+    .map_err(SnapshotAuthorityDbError::into_primary_source)
 }
 
 /// Save a checkpoint with all pane states in a single transaction. When
@@ -6250,18 +6143,7 @@ fn reconcile_session_after_checkpoint_deletion(
     require_exactly_one_changed_row(updated)
 }
 
-type CheckpointDeleteRow = (
-    i64,
-    String,
-    i64,
-    String,
-    String,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-);
+type CheckpointDeleteRow = (i64, String, i64, String, String, i64, i64, i64, i64, i64);
 
 fn decode_checkpoint_delete_row(
     row: &rusqlite::Row<'_>,
@@ -6423,9 +6305,7 @@ fn delete_checkpoint_authoritatively_sync(
         )?;
         if protects_unresolved_restore != 0 {
             return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                std::io::Error::other(
-                    "checkpoint is protected by an unresolved restore attempt",
-                ),
+                std::io::Error::other("checkpoint is protected by an unresolved restore attempt"),
             )));
         }
 
@@ -6682,7 +6562,9 @@ mod tests {
             "snapshot observation connections must be enforced read-only by SQLite"
         );
         let count: i64 = reader
-            .query_row("SELECT COUNT(*) FROM observation_guard", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM observation_guard", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -6720,10 +6602,7 @@ mod tests {
                         .unwrap();
                     conn.execute(
                         "UPDATE session_checkpoints SET checkpoint_role = ?2 WHERE id = ?1",
-                        rusqlite::params![
-                            checkpoint_id,
-                            "r".repeat(MAX_CHECKPOINT_ROLE_BYTES + 1)
-                        ],
+                        rusqlite::params![checkpoint_id, "r".repeat(MAX_CHECKPOINT_ROLE_BYTES + 1)],
                     )
                     .unwrap();
                     conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")
@@ -6884,8 +6763,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let detections =
-            load_latest_detections_by_pane_sync(db_path, &[1, 2, 3], 0).unwrap();
+        let detections = load_latest_detections_by_pane_sync(db_path, &[1, 2, 3], 0).unwrap();
         let pane_one = &detections[&1];
         assert_eq!(pane_one.rule_id, "codex.working");
         assert_eq!(pane_one.extracted["session_id"], "kept");
@@ -6911,10 +6789,7 @@ mod tests {
         let (_tmp, db_path) = setup_test_db();
         let error = mark_shutdown_sync(db_path.as_str(), "missing-session", 1, 1, "missing")
             .expect_err("a missing session cannot be reported as cleanly shut down");
-        assert!(matches!(
-            error,
-            rusqlite::Error::StatementChangedRows(0)
-        ));
+        assert!(matches!(error, rusqlite::Error::StatementChangedRows(0)));
     }
 
     #[test]
@@ -6939,10 +6814,7 @@ mod tests {
             crate::VERSION,
         )
         .expect_err("an unaudited session trigger must fail before creation");
-        assert!(matches!(
-            error,
-            rusqlite::Error::ToSqlConversionFailure(_)
-        ));
+        assert!(matches!(error, rusqlite::Error::ToSqlConversionFailure(_)));
 
         let session_count: i64 = Connection::open(db_path.as_str())
             .unwrap()
@@ -6974,18 +6846,9 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let error = mark_shutdown_sync(
-            db_path.as_str(),
-            "sess-trigger-shutdown",
-            1,
-            1,
-            "missing",
-        )
+        let error = mark_shutdown_sync(db_path.as_str(), "sess-trigger-shutdown", 1, 1, "missing")
             .expect_err("an unaudited session trigger must fail before shutdown marking");
-        assert!(matches!(
-            error,
-            rusqlite::Error::ToSqlConversionFailure(_)
-        ));
+        assert!(matches!(error, rusqlite::Error::ToSqlConversionFailure(_)));
 
         let shutdown_clean: i64 = Connection::open(db_path.as_str())
             .unwrap()
@@ -7023,10 +6886,7 @@ mod tests {
                 LockAcquireError::TimedOut { deadline_nanos: 73 },
                 SnapshotError::LockTimedOut { deadline_nanos: 73 },
             ),
-            (
-                LockAcquireError::Poisoned,
-                SnapshotError::LockPoisoned,
-            ),
+            (LockAcquireError::Poisoned, SnapshotError::LockPoisoned),
             (
                 LockAcquireError::PolledAfterCompletion,
                 SnapshotError::LockPolledAfterCompletion,
@@ -7071,11 +6931,7 @@ mod tests {
                 3,
                 "session_retention_cleanup",
             ),
-            (
-                SnapshotAuthorityOperation::ShutdownMark,
-                4,
-                "shutdown_mark",
-            ),
+            (SnapshotAuthorityOperation::ShutdownMark, 4, "shutdown_mark"),
             (
                 SnapshotAuthorityOperation::CheckpointDelete,
                 5,
@@ -7175,15 +7031,11 @@ mod tests {
     fn pure_preparation_blocking_failures_never_claim_indeterminate_mutation() {
         let cases = [
             (
-                crate::runtime_async::SpawnBlockingWithCxError::CancelledBeforeSpawn {
-                    kind: None,
-                },
+                crate::runtime_async::SpawnBlockingWithCxError::CancelledBeforeSpawn { kind: None },
                 SnapshotError::Cancelled,
             ),
             (
-                crate::runtime_async::SpawnBlockingWithCxError::CancelledMidFlight {
-                    kind: None,
-                },
+                crate::runtime_async::SpawnBlockingWithCxError::CancelledMidFlight { kind: None },
                 SnapshotError::Cancelled,
             ),
             (
@@ -7328,9 +7180,7 @@ mod tests {
         assert!(matches!(
             blocked,
             SnapshotError::AuthorityReconciliationRequired {
-                first_indeterminate_operation: Some(
-                    SnapshotAuthorityOperation::CheckpointCommit
-                ),
+                first_indeterminate_operation: Some(SnapshotAuthorityOperation::CheckpointCommit),
                 ..
             }
         ));
@@ -7353,10 +7203,15 @@ mod tests {
             settled: false,
         };
         let handoff_state = guard.handoff_state();
-        let outcome = run_authority_work_if_started(&handoff_state, || {
-            Ok::<(), SnapshotAuthorityDbError>(())
-        });
-        assert!(matches!(outcome, AuthorityBlockingOutcome::Executed(Ok(()))));
+        let outcome =
+            run_authority_work_if_started(
+                &handoff_state,
+                || Ok::<(), SnapshotAuthorityDbError>(()),
+            );
+        assert!(matches!(
+            outcome,
+            AuthorityBlockingOutcome::Executed(Ok(()))
+        ));
         assert_eq!(
             handoff_state.load(Ordering::Acquire),
             AUTHORITY_HANDOFF_COMPLETED
@@ -7404,13 +7259,10 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let object_identity = identities
                 .iter_mut()
-                .find(|identity| {
-                    identity.starts_with(SNAPSHOT_AUTHORITY_OBJECT_IDENTITY_PREFIX)
-                })
+                .find(|identity| identity.starts_with(SNAPSHOT_AUTHORITY_OBJECT_IDENTITY_PREFIX))
                 .expect("existing database object identity");
             *object_identity =
-                "sqlite-file-object-unix:18446744073709551615:18446744073709551615"
-                    .to_string();
+                "sqlite-file-object-unix:18446744073709551615:18446744073709551615".to_string();
         }
 
         let blocked = engine
@@ -7507,9 +7359,7 @@ mod tests {
                 ));
                 assert!(engine.authority_reconciliation_is_required());
                 assert!(matches!(
-                    engine.try_begin_snapshot_authority(
-                        SnapshotAuthorityOperation::ShutdownMark
-                    ),
+                    engine.try_begin_snapshot_authority(SnapshotAuthorityOperation::ShutdownMark),
                     Err(SnapshotError::AuthorityReconciliationRequired { .. })
                 ));
             }
@@ -7569,14 +7419,10 @@ mod tests {
             &uri_engine.snapshot_authority
         ));
 
-        let memory_a = SnapshotEngine::new(
-            Arc::new(":memory:".to_owned()),
-            SnapshotConfig::default(),
-        );
-        let memory_b = SnapshotEngine::new(
-            Arc::new(":memory:".to_owned()),
-            SnapshotConfig::default(),
-        );
+        let memory_a =
+            SnapshotEngine::new(Arc::new(":memory:".to_owned()), SnapshotConfig::default());
+        let memory_b =
+            SnapshotEngine::new(Arc::new(":memory:".to_owned()), SnapshotConfig::default());
         assert!(!Arc::ptr_eq(
             &memory_a.snapshot_authority,
             &memory_b.snapshot_authority
@@ -7635,9 +7481,7 @@ mod tests {
             ));
         }
         let shared_memory_alternate_vfs = SnapshotEngine::new(
-            Arc::new(
-                "file:authority-a?mode=memory&cache=shared&vfs=unix-dotfile".to_owned(),
-            ),
+            Arc::new("file:authority-a?mode=memory&cache=shared&vfs=unix-dotfile".to_owned()),
             SnapshotConfig::default(),
         );
         assert!(!Arc::ptr_eq(
@@ -7662,15 +7506,11 @@ mod tests {
             &memdb_alias.snapshot_authority
         ));
         let memdb_mode_memory_private = SnapshotEngine::new(
-            Arc::new(
-                "file:/authority-memdb?mode=memory&cache=private&vfs=memdb".to_owned(),
-            ),
+            Arc::new("file:/authority-memdb?mode=memory&cache=private&vfs=memdb".to_owned()),
             SnapshotConfig::default(),
         );
         let memdb_mode_memory_shared = SnapshotEngine::new(
-            Arc::new(
-                "file:/authority-memdb?mode=memory&cache=shared&vfs=memdb".to_owned(),
-            ),
+            Arc::new("file:/authority-memdb?mode=memory&cache=shared&vfs=memdb".to_owned()),
             SnapshotConfig::default(),
         );
         assert!(Arc::ptr_eq(
@@ -7702,9 +7542,7 @@ mod tests {
             SnapshotConfig::default(),
         );
         let shared_relative_memdb_b = SnapshotEngine::new(
-            Arc::new(
-                "file:authority-shared-memdb?mode=memory&vfs=memdb&cache=shared".to_owned(),
-            ),
+            Arc::new("file:authority-shared-memdb?mode=memory&vfs=memdb&cache=shared".to_owned()),
             SnapshotConfig::default(),
         );
         assert!(Arc::ptr_eq(
@@ -7781,9 +7619,7 @@ mod tests {
         assert!(matches!(
             alias.try_begin_snapshot_authority(SnapshotAuthorityOperation::ShutdownMark),
             Err(SnapshotError::AuthorityReconciliationRequired {
-                first_indeterminate_operation: Some(
-                    SnapshotAuthorityOperation::CheckpointCommit
-                ),
+                first_indeterminate_operation: Some(SnapshotAuthorityOperation::CheckpointCommit),
                 ..
             })
         ));
@@ -7852,10 +7688,19 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_file_uri_drive_path_matches_ordinary_drive_path() {
-        assert_eq!(sqlite_windows_uri_drive_path("/C:/data/frankenterm.db"), "C:/data/frankenterm.db");
-        assert_eq!(sqlite_windows_uri_drive_path("/z:/data/frankenterm.db"), "z:/data/frankenterm.db");
+        assert_eq!(
+            sqlite_windows_uri_drive_path("/C:/data/frankenterm.db"),
+            "C:/data/frankenterm.db"
+        );
+        assert_eq!(
+            sqlite_windows_uri_drive_path("/z:/data/frankenterm.db"),
+            "z:/data/frankenterm.db"
+        );
         assert_eq!(sqlite_windows_uri_drive_path("/D:"), "D:");
-        assert_eq!(sqlite_windows_uri_drive_path("/server/share.db"), "/server/share.db");
+        assert_eq!(
+            sqlite_windows_uri_drive_path("/server/share.db"),
+            "/server/share.db"
+        );
         assert_eq!(
             snapshot_authority_file_identity("file:///C:/data/frankenterm.db"),
             snapshot_authority_file_identity("C:/data/frankenterm.db")
@@ -7871,21 +7716,13 @@ mod tests {
         let percent_path = percent_path.to_string_lossy();
 
         assert_eq!(
-            snapshot_authority_file_identity(
-                "file:authority-a?mode=memory&ca%63he=sh%61red"
-            ),
-            snapshot_authority_file_identity(
-                "file:authority-a?mode=memory&cache=shared"
-            ),
+            snapshot_authority_file_identity("file:authority-a?mode=memory&ca%63he=sh%61red"),
+            snapshot_authority_file_identity("file:authority-a?mode=memory&cache=shared"),
             "percent-decoded query names and values identify the same shared memory DB"
         );
         assert_ne!(
-            snapshot_authority_file_identity(
-                "file:authority-a?MODE=memory&CACHE=shared"
-            ),
-            snapshot_authority_file_identity(
-                "file:authority-a?mode=memory&cache=shared"
-            ),
+            snapshot_authority_file_identity("file:authority-a?MODE=memory&CACHE=shared"),
+            snapshot_authority_file_identity("file:authority-a?mode=memory&cache=shared"),
             "SQLite URI option names are case-sensitive"
         );
         assert_eq!(
@@ -7900,17 +7737,11 @@ mod tests {
         );
         assert_eq!(
             snapshot_authority_file_identity(&format!("file:{percent_path}")),
-            snapshot_authority_file_identity(&format!(
-                "file:{}",
-                percent_path.replace('%', "%25")
-            )),
+            snapshot_authority_file_identity(&format!("file:{}", percent_path.replace('%', "%25"))),
             "literal invalid percent escapes and encoded percent bytes alias like SQLite"
         );
         assert_eq!(
-            snapshot_authority_file_identity(&format!(
-                "file:{}%00ignored",
-                db_path.as_str()
-            )),
+            snapshot_authority_file_identity(&format!("file:{}%00ignored", db_path.as_str())),
             snapshot_authority_file_identity(&format!("file:{}", db_path.as_str())),
             "SQLite's bundled default terminates a URI component at percent-zero"
         );
@@ -7923,10 +7754,7 @@ mod tests {
             "an encoded hash remains filename data while a raw hash starts the fragment"
         );
         assert_eq!(
-            snapshot_authority_file_identity(&format!(
-                "file://local%68ost{}",
-                db_path.as_str()
-            )),
+            snapshot_authority_file_identity(&format!("file://local%68ost{}", db_path.as_str())),
             None,
             "SQLite rejects an encoded spelling of the literal localhost authority"
         );
@@ -7936,18 +7764,12 @@ mod tests {
             "bundled SQLite rejects an explicitly empty VFS name"
         );
         assert_eq!(
-            snapshot_authority_file_identity(&format!(
-                "file:{}?mode=bogus",
-                db_path.as_str()
-            )),
+            snapshot_authority_file_identity(&format!("file:{}?mode=bogus", db_path.as_str())),
             None,
             "invalid access modes are rejected before SQLite opens a VFS"
         );
         assert_eq!(
-            snapshot_authority_file_identity(&format!(
-                "file:{}?cache=bogus",
-                db_path.as_str()
-            )),
+            snapshot_authority_file_identity(&format!("file:{}?cache=bogus", db_path.as_str())),
             None,
             "invalid cache modes are rejected before SQLite opens a VFS"
         );
@@ -7994,13 +7816,9 @@ mod tests {
             Some(SnapshotAuthorityOperation::CheckpointCleanup)
         );
         assert!(matches!(
-            replacement.try_begin_snapshot_authority(
-                SnapshotAuthorityOperation::CheckpointCommit
-            ),
+            replacement.try_begin_snapshot_authority(SnapshotAuthorityOperation::CheckpointCommit),
             Err(SnapshotError::AuthorityReconciliationRequired {
-                first_indeterminate_operation: Some(
-                    SnapshotAuthorityOperation::CheckpointCleanup
-                ),
+                first_indeterminate_operation: Some(SnapshotAuthorityOperation::CheckpointCleanup),
                 ..
             })
         ));
@@ -8088,7 +7906,9 @@ mod tests {
                 CAPTURE_LIFECYCLE_SHUTDOWN_RESERVED_OWNED,
                 "final capture guard returns ownership to the reservation"
             );
-            reservation.complete().expect("terminal lifecycle completion");
+            reservation
+                .complete()
+                .expect("terminal lifecycle completion");
             assert_eq!(
                 engine.capture_lifecycle.load(Ordering::Acquire),
                 CAPTURE_LIFECYCLE_SHUTDOWN_COMPLETE
@@ -8135,11 +7955,7 @@ mod tests {
             };
 
             let outcome = engine
-                .capture_from_provider_with_cx(
-                    &cx,
-                    &provider,
-                    SnapshotTrigger::Periodic,
-                )
+                .capture_from_provider_with_cx(&cx, &provider, SnapshotTrigger::Periodic)
                 .await
                 .expect("authority contention is a retry-safe scheduler skip");
             assert_eq!(
@@ -8176,11 +7992,7 @@ mod tests {
             };
 
             let outcome = engine
-                .capture_from_provider_with_cx(
-                    &cx,
-                    &over_limit_provider,
-                    SnapshotTrigger::Periodic,
-                )
+                .capture_from_provider_with_cx(&cx, &over_limit_provider, SnapshotTrigger::Periodic)
                 .await
                 .expect("capacity admission should defer rather than terminate the scheduler");
             assert_eq!(
@@ -8192,11 +8004,7 @@ mod tests {
 
             let recovered_provider = || async { Ok(vec![make_test_pane(1, 24, 80)]) };
             let recovered = engine
-                .capture_from_provider_with_cx(
-                    &cx,
-                    &recovered_provider,
-                    SnapshotTrigger::Periodic,
-                )
+                .capture_from_provider_with_cx(&cx, &recovered_provider, SnapshotTrigger::Periodic)
                 .await
                 .expect("scheduler should remain usable after capacity recovers");
             assert_eq!(recovered, SchedulerCaptureOutcome::Captured);
@@ -8207,12 +8015,7 @@ mod tests {
     fn periodic_scheduler_survives_retry_safe_startup_database_failure() {
         run_async_test_isolated(|| async {
             let invalid_db_directory = tempfile::tempdir().expect("temporary directory");
-            let db_path = Arc::new(
-                invalid_db_directory
-                    .path()
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            let db_path = Arc::new(invalid_db_directory.path().to_string_lossy().into_owned());
             let engine = Arc::new(SnapshotEngine::new(
                 db_path,
                 SnapshotConfig {
@@ -8229,8 +8032,7 @@ mod tests {
             });
 
             let deadline = Instant::now() + Duration::from_secs(10);
-            while engine.telemetry().snapshot().captures_attempted == 0
-                && Instant::now() < deadline
+            while engine.telemetry().snapshot().captures_attempted == 0 && Instant::now() < deadline
             {
                 sleep(Duration::from_millis(20)).await;
             }
@@ -8368,7 +8170,10 @@ mod tests {
     fn checkpoint_cleanup_cadence_is_monotonic_bounded_and_retry_safe() {
         let base = Instant::now();
         let interval = checkpoint_cleanup_interval(120);
-        assert_eq!(checkpoint_cleanup_interval(0), CHECKPOINT_CLEANUP_MIN_INTERVAL);
+        assert_eq!(
+            checkpoint_cleanup_interval(0),
+            CHECKPOINT_CLEANUP_MIN_INTERVAL
+        );
         assert_eq!(interval, Duration::from_secs(120));
         assert_eq!(
             checkpoint_cleanup_interval(u64::MAX),
@@ -8751,13 +8556,14 @@ mod tests {
         );
         assert!(SnapshotError::BlockingRuntimeFailure.is_retry_safe_scheduler_failure());
         assert!(
-            SnapshotError::LockTimedOut { deadline_nanos: 1 }
-                .is_retry_safe_scheduler_failure()
+            SnapshotError::LockTimedOut { deadline_nanos: 1 }.is_retry_safe_scheduler_failure()
         );
-        assert!(!SnapshotError::IndeterminateAuthorityMutation {
-            operation: SnapshotAuthorityOperation::CheckpointCommit,
-        }
-        .is_retry_safe_scheduler_failure());
+        assert!(
+            !SnapshotError::IndeterminateAuthorityMutation {
+                operation: SnapshotAuthorityOperation::CheckpointCommit,
+            }
+            .is_retry_safe_scheduler_failure()
+        );
         assert!(!SnapshotError::Cancelled.is_retry_safe_scheduler_failure());
         assert!(!SnapshotError::ContextFailure.is_retry_safe_scheduler_failure());
     }
@@ -8867,14 +8673,10 @@ mod tests {
 
     #[test]
     fn session_cleanup_reconciliation_latch_is_monotonic() {
-        use crate::session_retention::{
-            SessionCleanupError, SessionCleanupIndeterminatePhase,
-        };
+        use crate::session_retention::{SessionCleanupError, SessionCleanupIndeterminatePhase};
 
-        let engine = SnapshotEngine::new(
-            Arc::new(":memory:".to_owned()),
-            SnapshotConfig::default(),
-        );
+        let engine =
+            SnapshotEngine::new(Arc::new(":memory:".to_owned()), SnapshotConfig::default());
         for retry_safe in [
             SessionCleanupError::CancelledBeforeHandoff,
             SessionCleanupError::DatabaseOpen,
@@ -8910,14 +8712,10 @@ mod tests {
     #[test]
     fn session_cleanup_reconciliation_latch_survives_same_engine_scheduler_restart() {
         run_async_test(async {
-            use crate::session_retention::{
-                SessionCleanupError, SessionCleanupIndeterminatePhase,
-            };
+            use crate::session_retention::{SessionCleanupError, SessionCleanupIndeterminatePhase};
 
-            let engine = SnapshotEngine::new(
-                Arc::new(":memory:".to_owned()),
-                SnapshotConfig::default(),
-            );
+            let engine =
+                SnapshotEngine::new(Arc::new(":memory:".to_owned()), SnapshotConfig::default());
             assert!(engine.latch_session_cleanup_reconciliation(
                 SessionCleanupError::IndeterminateCleanup {
                     phase: SessionCleanupIndeterminatePhase::CleanupExecution,
@@ -8985,9 +8783,7 @@ mod tests {
                 Some("session cleanup retry-safe scheduling test"),
             );
 
-            engine
-                .maybe_run_session_cleanup(&cx, &mut schedule)
-                .await;
+            engine.maybe_run_session_cleanup(&cx, &mut schedule).await;
 
             assert!(schedule.last_authoritative_success.is_none());
             assert!(schedule.retry_deferred_at.is_some());
@@ -9019,9 +8815,7 @@ mod tests {
             let mut schedule = SessionCleanupSchedule::default();
             let cx = crate::cx::for_testing();
 
-            engine
-                .maybe_run_session_cleanup(&cx, &mut schedule)
-                .await;
+            engine.maybe_run_session_cleanup(&cx, &mut schedule).await;
 
             let first_success = schedule
                 .last_authoritative_success
@@ -9029,9 +8823,7 @@ mod tests {
             assert!(schedule.retry_deferred_at.is_none());
             assert!(!session_cleanup_due(&schedule, 0, Instant::now()));
 
-            engine
-                .maybe_run_session_cleanup(&cx, &mut schedule)
-                .await;
+            engine.maybe_run_session_cleanup(&cx, &mut schedule).await;
             assert_eq!(
                 schedule.last_authoritative_success,
                 Some(first_success),
@@ -9042,10 +8834,8 @@ mod tests {
 
     #[test]
     fn session_cleanup_admission_is_exclusive_and_drop_only_releases_scheduler_flag() {
-        let engine = SnapshotEngine::new(
-            Arc::new(":memory:".to_owned()),
-            SnapshotConfig::default(),
-        );
+        let engine =
+            SnapshotEngine::new(Arc::new(":memory:".to_owned()), SnapshotConfig::default());
 
         let attempt = engine
             .try_begin_session_cleanup()
@@ -9110,11 +8900,9 @@ mod tests {
 
             let (_second_shutdown_tx, second_shutdown_rx) = watch::channel(false);
             let second = engine
-                .run_periodic_with_cx(
-                    &crate::cx::for_testing(),
-                    second_shutdown_rx,
-                    || async { Ok(vec![make_test_pane(2, 24, 80)]) },
-                )
+                .run_periodic_with_cx(&crate::cx::for_testing(), second_shutdown_rx, || async {
+                    Ok(vec![make_test_pane(2, 24, 80)])
+                })
                 .await;
             assert!(matches!(second, Err(SnapshotError::SchedulerInProgress)));
 
@@ -9127,11 +8915,9 @@ mod tests {
 
             let (_restart_shutdown_tx, restart_shutdown_rx) = watch::channel(true);
             engine
-                .run_periodic_with_cx(
-                    &crate::cx::for_testing(),
-                    restart_shutdown_rx,
-                    || async { panic!("initially stopped restart must not call provider") },
-                )
+                .run_periodic_with_cx(&crate::cx::for_testing(), restart_shutdown_rx, || async {
+                    panic!("initially stopped restart must not call provider")
+                })
                 .await
                 .expect("normal scheduler exit must release admission for restart");
             assert!(!engine.scheduler_in_progress.load(Ordering::Acquire));
@@ -9717,7 +9503,10 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(persisted_metadata, canonical_json_string(&metadata).unwrap());
+            assert_eq!(
+                persisted_metadata,
+                canonical_json_string(&metadata).unwrap()
+            );
         });
     }
 
@@ -9853,7 +9642,9 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row.get(0))
                 .expect("count sessions");
             let checkpoints: i64 = conn
-                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| row.get(0))
+                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                    row.get(0)
+                })
                 .expect("count checkpoints");
             assert_eq!((sessions, checkpoints), (0, 0));
         });
@@ -9882,7 +9673,9 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row.get(0))
                 .expect("count sessions");
             let checkpoints: i64 = conn
-                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| row.get(0))
+                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                    row.get(0)
+                })
                 .expect("count checkpoints");
             assert_eq!((sessions, checkpoints), (0, 0));
         });
@@ -10073,19 +9866,14 @@ mod tests {
         let corrupt_pane_info = make_test_pane(8, 24, 80);
         let (corrupt_topology, _) =
             TopologySnapshot::from_panes(std::slice::from_ref(&corrupt_pane_info), 3000);
-        let mut corrupt_pane =
-            PaneStateSnapshot::from_pane_info(&corrupt_pane_info, 3000, false);
+        let mut corrupt_pane = PaneStateSnapshot::from_pane_info(&corrupt_pane_info, 3000, false);
         corrupt_pane.scrollback_ref = Some(ScrollbackRef {
             output_segments_seq: -1,
             total_segments_captured: 1,
             last_capture_at: 3000,
         });
-        let error = prepare_snapshot_persistence(
-            &corrupt_topology,
-            &[corrupt_pane],
-            None,
-        )
-        .expect_err("a negative scrollback sequence cannot be prepared");
+        let error = prepare_snapshot_persistence(&corrupt_topology, &[corrupt_pane], None)
+            .expect_err("a negative scrollback sequence cannot be prepared");
         assert!(matches!(
             error,
             SnapshotPreparationError::NegativeScrollbackSequence
@@ -10130,20 +9918,18 @@ mod tests {
             .expect_err("persistence preparation must enforce topology admission");
         assert!(matches!(
             error,
-            SnapshotPreparationError::Topology(
-                TopologySnapshotError::ResourceLimit {
-                    resource: "split_fanout",
-                    ..
-                }
-            )
+            SnapshotPreparationError::Topology(TopologySnapshotError::ResourceLimit {
+                resource: "split_fanout",
+                ..
+            })
         ));
 
         let oversized_topology = TopologySnapshot {
             schema_version: crate::session_topology::TOPOLOGY_SCHEMA_VERSION,
             captured_at: 3_000,
-            workspace_id: Some("x".repeat(
-                crate::session_topology::MAX_SNAPSHOT_BYTES.saturating_add(1),
-            )),
+            workspace_id: Some(
+                "x".repeat(crate::session_topology::MAX_SNAPSHOT_BYTES.saturating_add(1)),
+            ),
             windows: Vec::new(),
         };
         let error = prepare_snapshot_persistence(&oversized_topology, &[], None)
@@ -10182,14 +9968,12 @@ mod tests {
             Value::String("u".repeat(100_000)),
         );
 
-        let projection = project_snapshot_panes(&[raw_pane])
-            .expect("one pane is inside topology admission");
+        let projection =
+            project_snapshot_panes(&[raw_pane]).expect("one pane is inside topology admission");
         assert_eq!(projection.panes.len(), 1);
         assert!(projection.truncated_pane_ids.contains(&41));
         let projected_pane = &projection.panes[0];
-        assert!(
-            projected_pane.title.as_ref().unwrap().len() <= SNAPSHOT_TEXT_FIELD_INPUT_BYTES
-        );
+        assert!(projected_pane.title.as_ref().unwrap().len() <= SNAPSHOT_TEXT_FIELD_INPUT_BYTES);
         assert!(
             projected_pane.cwd.is_none(),
             "an oversized cwd must be omitted rather than rewritten into a synthetic path"
@@ -10206,9 +9990,10 @@ mod tests {
         );
 
         let (mut topology, _) = TopologySnapshot::from_panes(&projection.panes, 4_100);
-        topology.workspace_id.clone_from(&projection.topology_workspace_id);
-        let mut pane =
-            PaneStateSnapshot::from_pane_info(projected_pane, 4_100, false);
+        topology
+            .workspace_id
+            .clone_from(&projection.topology_workspace_id);
+        let mut pane = PaneStateSnapshot::from_pane_info(projected_pane, 4_100, false);
         let hostile = "\u{1}".repeat(100_000);
         pane.terminal.title = hostile.clone();
         pane.cwd = Some(hostile.clone());
@@ -10361,12 +10146,9 @@ mod tests {
     #[test]
     fn actual_persistence_projection_rejects_oversized_metadata() {
         let metadata = Value::String("m".repeat(MAX_CHECKPOINT_METADATA_BYTES));
-        let error = prepare_snapshot_persistence(
-            &TopologySnapshot::empty(4_200),
-            &[],
-            Some(&metadata),
-        )
-        .expect_err("encoded metadata over the hard limit must fail closed");
+        let error =
+            prepare_snapshot_persistence(&TopologySnapshot::empty(4_200), &[], Some(&metadata))
+                .expect_err("encoded metadata over the hard limit must fail closed");
         assert!(matches!(
             error,
             SnapshotPreparationError::MetadataResourceLimit {
@@ -10380,17 +10162,11 @@ mod tests {
     fn actual_persistence_projection_accepts_exact_metadata_boundaries() {
         let exact_bytes =
             Value::String("m".repeat(MAX_CHECKPOINT_METADATA_BYTES.saturating_sub(2)));
-        let exact_bytes_prepared = prepare_snapshot_persistence(
-            &TopologySnapshot::empty(4_200),
-            &[],
-            Some(&exact_bytes),
-        )
-        .expect("metadata at the exact encoded-byte limit must be admitted");
+        let exact_bytes_prepared =
+            prepare_snapshot_persistence(&TopologySnapshot::empty(4_200), &[], Some(&exact_bytes))
+                .expect("metadata at the exact encoded-byte limit must be admitted");
         assert_eq!(
-            exact_bytes_prepared
-                .metadata_json
-                .as_deref()
-                .map(str::len),
+            exact_bytes_prepared.metadata_json.as_deref().map(str::len),
             Some(MAX_CHECKPOINT_METADATA_BYTES)
         );
 
@@ -10398,22 +10174,14 @@ mod tests {
         for _ in 1..SNAPSHOT_METADATA_MAX_DEPTH {
             exact_depth = Value::Array(vec![exact_depth]);
         }
-        prepare_snapshot_persistence(
-            &TopologySnapshot::empty(4_200),
-            &[],
-            Some(&exact_depth),
-        )
-        .expect("metadata at the exact nesting-depth limit must be admitted");
+        prepare_snapshot_persistence(&TopologySnapshot::empty(4_200), &[], Some(&exact_depth))
+            .expect("metadata at the exact nesting-depth limit must be admitted");
 
         let exact_nodes = Value::Array(
             std::iter::repeat_n(Value::Null, SNAPSHOT_METADATA_MAX_NODES - 1).collect(),
         );
-        prepare_snapshot_persistence(
-            &TopologySnapshot::empty(4_200),
-            &[],
-            Some(&exact_nodes),
-        )
-        .expect("metadata at the exact node-count limit must be admitted");
+        prepare_snapshot_persistence(&TopologySnapshot::empty(4_200), &[], Some(&exact_nodes))
+            .expect("metadata at the exact node-count limit must be admitted");
     }
 
     #[test]
@@ -10449,9 +10217,8 @@ mod tests {
             } if observed == SNAPSHOT_METADATA_MAX_DEPTH + 1
         ));
 
-        let wide_metadata = Value::Array(
-            std::iter::repeat_n(Value::Null, SNAPSHOT_METADATA_MAX_NODES).collect(),
-        );
+        let wide_metadata =
+            Value::Array(std::iter::repeat_n(Value::Null, SNAPSHOT_METADATA_MAX_NODES).collect());
         let node_error = prepare_snapshot_persistence(
             &TopologySnapshot::empty(4_200),
             &[],
@@ -10906,15 +10673,13 @@ mod tests {
 
             let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
             let deleted = engine
-                .delete_checkpoint(SnapshotDeleteTarget::Exact(
-                    SnapshotCheckpointIdentity {
-                        checkpoint_id: old_id,
-                        session_id: "sess-delete-old".to_string(),
-                        checkpoint_at: 1_000,
-                        checkpoint_role: CHECKPOINT_ROLE_SNAPSHOT.to_string(),
-                        state_hash: "0000000000000004".to_string(),
-                    },
-                ))
+                .delete_checkpoint(SnapshotDeleteTarget::Exact(SnapshotCheckpointIdentity {
+                    checkpoint_id: old_id,
+                    session_id: "sess-delete-old".to_string(),
+                    checkpoint_at: 1_000,
+                    checkpoint_role: CHECKPOINT_ROLE_SNAPSHOT.to_string(),
+                    state_hash: "0000000000000004".to_string(),
+                }))
                 .await
                 .unwrap()
                 .expect("old checkpoint should match exact identity");
@@ -11034,11 +10799,8 @@ mod tests {
                 state_hash: "0000000000000007".to_string(),
             };
             let conn = Connection::open(db_path.as_str()).unwrap();
-            conn.execute(
-                "DELETE FROM session_checkpoints WHERE id = ?1",
-                [reused_id],
-            )
-            .unwrap();
+            conn.execute("DELETE FROM session_checkpoints WHERE id = ?1", [reused_id])
+                .unwrap();
             drop(conn);
             let replacement_id = insert_checkpoint_fixture(
                 db_path.as_str(),
@@ -11049,7 +10811,10 @@ mod tests {
                 Some(r#"{"version":"replacement"}"#),
                 11,
             );
-            assert_eq!(replacement_id, reused_id, "SQLite should reuse the max ROWID");
+            assert_eq!(
+                replacement_id, reused_id,
+                "SQLite should reuse the max ROWID"
+            );
 
             let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
             let deleted = engine
@@ -11264,8 +11029,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut pane =
-            PaneStateSnapshot::from_pane_info(&make_test_pane(9, 24, 80), 2_000, false);
+        let mut pane = PaneStateSnapshot::from_pane_info(&make_test_pane(9, 24, 80), 2_000, false);
         pane.terminal.title = "終端🙂".to_owned();
         pane.cwd = Some("/ignored/路径".to_owned());
         pane.foreground_process = Some(crate::session_pane_state::ProcessInfo {
@@ -11274,10 +11038,7 @@ mod tests {
             argv: None,
         });
         pane.env = Some(crate::session_pane_state::CapturedEnv {
-            vars: std::collections::HashMap::from([(
-                "LANG".to_owned(),
-                "日本語.UTF-8".to_owned(),
-            )]),
+            vars: std::collections::HashMap::from([("LANG".to_owned(), "日本語.UTF-8".to_owned())]),
             redacted_count: 0,
         });
         pane.agent = Some(crate::session_pane_state::AgentMetadata {
@@ -11287,8 +11048,12 @@ mod tests {
         });
 
         let expected = serde_json::to_string(&pane.terminal).unwrap().len()
-            + serde_json::to_string(pane.env.as_ref().unwrap()).unwrap().len()
-            + serde_json::to_string(pane.agent.as_ref().unwrap()).unwrap().len();
+            + serde_json::to_string(pane.env.as_ref().unwrap())
+                .unwrap()
+                .len()
+            + serde_json::to_string(pane.agent.as_ref().unwrap())
+                .unwrap()
+                .len();
         let prepared = prepare_test_snapshot(r#"{"version":"bytes-2"}"#, &[pane]);
         let receipt = save_checkpoint_sync(
             db_path.as_str(),
@@ -11356,9 +11121,7 @@ mod tests {
             })
             .unwrap();
         let pane_state_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
             .unwrap();
         let (last_checkpoint_at, topology_json): (Option<i64>, String) = conn
             .query_row(
@@ -11418,10 +11181,7 @@ mod tests {
             None,
         )
         .expect_err("unexpected trigger DML must invalidate the checkpoint receipt");
-        assert!(matches!(
-            error,
-            rusqlite::Error::ToSqlConversionFailure(_)
-        ));
+        assert!(matches!(error, rusqlite::Error::ToSqlConversionFailure(_)));
 
         let conn = Connection::open(db_path.as_str()).unwrap();
         let checkpoint_count: i64 = conn
@@ -11483,10 +11243,7 @@ mod tests {
 
         let error = cleanup_sync(db_path.as_str(), 0, 365)
             .expect_err("a trigger on an FK cascade target must block cleanup before deletion");
-        assert!(matches!(
-            error,
-            rusqlite::Error::ToSqlConversionFailure(_)
-        ));
+        assert!(matches!(error, rusqlite::Error::ToSqlConversionFailure(_)));
 
         let conn = Connection::open(db_path.as_str()).unwrap();
         let checkpoint_count: i64 = conn
@@ -11495,9 +11252,7 @@ mod tests {
             })
             .unwrap();
         let pane_state_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
             .unwrap();
         assert_eq!(checkpoint_count, 2);
         assert_eq!(pane_state_count, 2);
@@ -11600,13 +11355,12 @@ mod tests {
             );
 
             let checkpoints_before_retry: i64 = conn
-                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| row.get(0))
+                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                    row.get(0)
+                })
                 .unwrap();
             let retry_error = engine
-                .shutdown_checkpoint(
-                    &[make_test_pane(1, 40, 120)],
-                    Duration::from_secs(5),
-                )
+                .shutdown_checkpoint(&[make_test_pane(1, 40, 120)], Duration::from_secs(5))
                 .await
                 .expect_err("a completed shutdown lifecycle cannot capture again");
             assert!(matches!(retry_error, SnapshotError::ShuttingDown));
@@ -11614,9 +11368,14 @@ mod tests {
                 .capture(&[make_test_pane(1, 50, 140)], SnapshotTrigger::Manual)
                 .await
                 .expect_err("ordinary capture remains fenced after clean shutdown");
-            assert!(matches!(ordinary_capture_error, SnapshotError::ShuttingDown));
+            assert!(matches!(
+                ordinary_capture_error,
+                SnapshotError::ShuttingDown
+            ));
             let checkpoints_after_retry: i64 = conn
-                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| row.get(0))
+                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                    row.get(0)
+                })
                 .unwrap();
             assert_eq!(checkpoints_after_retry, checkpoints_before_retry);
         });
@@ -11729,10 +11488,7 @@ mod tests {
             let (_tmp, db_path) = setup_test_db();
             let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
             let receipt = engine
-                .capture(
-                    &[make_test_pane(1, 24, 80)],
-                    SnapshotTrigger::Startup,
-                )
+                .capture(&[make_test_pane(1, 24, 80)], SnapshotTrigger::Startup)
                 .await
                 .expect("capture close receipt");
 
@@ -11742,10 +11498,7 @@ mod tests {
                 Some("pre-cancel close_after_checkpoint test"),
             );
 
-            let err = match engine
-                .close_after_checkpoint_with_cx(&cx, &receipt)
-                .await
-            {
+            let err = match engine.close_after_checkpoint_with_cx(&cx, &receipt).await {
                 Err(e) => e,
                 Ok(()) => panic!("receipt close should fail on cancelled cx"),
             };
@@ -11864,13 +11617,9 @@ mod tests {
             prepare_snapshot_persistence(&topology_at_200, &[process_baseline], None)
                 .unwrap()
                 .dedup_hash,
-            prepare_snapshot_persistence(
-                &topology_at_200,
-                &[process_ephemera_changed],
-                None,
-            )
-            .unwrap()
-            .dedup_hash,
+            prepare_snapshot_persistence(&topology_at_200, &[process_ephemera_changed], None,)
+                .unwrap()
+                .dedup_hash,
             "PID, argv, and shell are not persisted and must not affect dedup"
         );
 
@@ -12101,16 +11850,12 @@ mod tests {
         );
     }
 
-    fn counting_pane_provider()
-    -> impl Fn()
-        -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = std::result::Result<Vec<PaneInfo>, SnapshotError>,
-                    > + Send,
-            >,
-        >
-    + Send
+    fn counting_pane_provider() -> impl Fn() -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<Vec<PaneInfo>, SnapshotError>>
+                + Send,
+        >,
+    > + Send
     + Sync
     + 'static {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -13041,13 +12786,11 @@ mod tests {
             "pane listing failed"
         );
         assert_eq!(
-            SnapshotError::Database("CONTENT_FREE_DATABASE_SOURCE".into())
-                .to_string(),
+            SnapshotError::Database("CONTENT_FREE_DATABASE_SOURCE".into()).to_string(),
             "snapshot database operation failed"
         );
         assert_eq!(
-            SnapshotError::Serialization("CONTENT_FREE_SERIALIZATION_SOURCE".into())
-                .to_string(),
+            SnapshotError::Serialization("CONTENT_FREE_SERIALIZATION_SOURCE".into()).to_string(),
             "snapshot serialization failed"
         );
         assert_eq!(
@@ -13063,9 +12806,7 @@ mod tests {
         assert_eq!(
             SnapshotError::AuthorityReconciliationRequired {
                 operation: SnapshotAuthorityOperation::ShutdownMark,
-                first_indeterminate_operation: Some(
-                    SnapshotAuthorityOperation::CheckpointCommit,
-                ),
+                first_indeterminate_operation: Some(SnapshotAuthorityOperation::CheckpointCommit,),
             }
             .to_string(),
             concat!(
@@ -13903,14 +13644,8 @@ mod tests {
             assert_eq!(result.pane_count, 1);
             assert_eq!(result.truncated_pane_count, 1);
             assert!(result.persisted_text_bytes > 0);
-            assert_eq!(
-                after.captures_attempted - before.captures_attempted,
-                1
-            );
-            assert_eq!(
-                after.captures_succeeded - before.captures_succeeded,
-                1
-            );
+            assert_eq!(after.captures_attempted - before.captures_attempted, 1);
+            assert_eq!(after.captures_succeeded - before.captures_succeeded, 1);
             assert_eq!(after.panes_captured - before.panes_captured, 1);
             assert_eq!(
                 after.pane_states_truncated - before.pane_states_truncated,

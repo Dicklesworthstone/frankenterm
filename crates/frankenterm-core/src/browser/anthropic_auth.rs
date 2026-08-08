@@ -83,9 +83,8 @@ pub struct AnthropicPageSelectors {
 impl Default for AnthropicPageSelectors {
     fn default() -> Self {
         Self {
-            logged_in_marker:
-                "text=Dashboard, text=API Keys, [data-testid='dashboard']"
-                    .to_string(),
+            logged_in_marker: "text=Dashboard, text=API Keys, [data-testid='dashboard']"
+                .to_string(),
             email_input: "input[name='email'], input[type='email']".to_string(),
             email_submit: "button[type='submit']".to_string(),
             password_prompt: "input[type='password']".to_string(),
@@ -171,7 +170,8 @@ impl AnthropicAuthFlow {
         }
 
         let target_url = login_url.unwrap_or(&self.config.login_url);
-        if super::admit_automated_auth_url(super::BrowserAuthService::Anthropic, target_url).is_err()
+        if super::admit_automated_auth_url(super::BrowserAuthService::Anthropic, target_url)
+            .is_err()
         {
             return AuthFlowResult::Failed {
                 error: AuthFlowFailureKind::PlaywrightError
@@ -226,20 +226,19 @@ impl AnthropicAuthFlow {
                 };
             }
         };
-        let profile_lock = match profile
-            .acquire_operation_lock(ctx.config().profile_lock_timeout_ms)
-        {
-            Ok(profile_lock) => profile_lock,
-            Err(_) => {
-                return AuthFlowResult::Failed {
-                    error: AuthFlowFailureKind::ProfileUnavailable
-                        .stable_detail()
-                        .to_string(),
-                    kind: AuthFlowFailureKind::ProfileUnavailable,
-                    artifacts_dir: None,
-                };
-            }
-        };
+        let profile_lock =
+            match profile.acquire_operation_lock(ctx.config().profile_lock_timeout_ms) {
+                Ok(profile_lock) => profile_lock,
+                Err(_) => {
+                    return AuthFlowResult::Failed {
+                        error: AuthFlowFailureKind::ProfileUnavailable
+                            .stable_detail()
+                            .to_string(),
+                        kind: AuthFlowFailureKind::ProfileUnavailable,
+                        artifacts_dir: None,
+                    };
+                }
+            };
 
         tracing::info!("Starting Anthropic auth flow");
 
@@ -257,14 +256,13 @@ impl AnthropicAuthFlow {
             };
         }
 
-        let result =
-            self.run_playwright_flow(
-                &profile_dir,
-                target_url,
-                email,
-                artifacts_dir.as_deref(),
-                ctx.config(),
-            );
+        let result = self.run_playwright_flow(
+            &profile_dir,
+            target_url,
+            email,
+            artifacts_dir.as_deref(),
+            ctx.config(),
+        );
 
         if !profile_lock.is_current_for(&profile) {
             return AuthFlowResult::Failed {
@@ -327,8 +325,7 @@ impl AnthropicAuthFlow {
                          Kind: {:?}\n\
                          Elapsed: {elapsed_ms}ms\n\
                          Sensitive execution inputs: redacted\n",
-                        e.error,
-                        e.kind,
+                        e.error, e.kind,
                     );
                     let _ = ArtifactCapture::write_artifact(
                         dir,
@@ -352,7 +349,9 @@ impl AnthropicAuthFlow {
             .and_then(|a| match a.ensure_invocation_dir("anthropic_auth") {
                 Ok(dir) => Some(dir),
                 Err(_) => {
-                    tracing::warn!("Failed to create artifacts directory; continuing without artifacts");
+                    tracing::warn!(
+                        "Failed to create artifacts directory; continuing without artifacts"
+                    );
                     None
                 }
             })
@@ -427,10 +426,9 @@ impl AnthropicAuthFlow {
         browser_config: &super::BrowserConfig,
     ) -> Result<String, super::BrowserNodeCommandFailure> {
         let sel = &self.config.selectors;
-        let success_urls = super::bootstrap::BootstrapConfig::for_service(
-            super::BrowserAuthService::Anthropic,
-        )
-        .success_url_prefixes;
+        let success_urls =
+            super::bootstrap::BootstrapConfig::for_service(super::BrowserAuthService::Anthropic)
+                .success_url_prefixes;
         super::admit_browser_timeout(self.config.flow_timeout_ms)?;
         super::admit_browser_timeout(browser_config.navigation_timeout_ms)?;
         super::admit_browser_timeout(browser_config.page_load_timeout_ms)?;
@@ -446,10 +444,7 @@ impl AnthropicAuthFlow {
             super::admit_selector_group(selector_group)?;
         }
         for success_url in &success_urls {
-            super::admit_bootstrap_success_url(
-                super::BrowserAuthService::Anthropic,
-                success_url,
-            )?;
+            super::admit_bootstrap_success_url(super::BrowserAuthService::Anthropic, success_url)?;
         }
         super::admit_node_script_input_parts(
             &[
@@ -1002,10 +997,8 @@ mod tests {
     #[test]
     fn execute_rejects_untrusted_login_url_before_profile_creation() {
         let temp = tempfile::tempdir().expect("isolated Anthropic URL rejection root");
-        let mut ctx = super::super::BrowserContext::new(
-            super::super::BrowserConfig::default(),
-            temp.path(),
-        );
+        let mut ctx =
+            super::super::BrowserContext::new(super::super::BrowserConfig::default(), temp.path());
         ctx.status = BrowserStatus::Ready;
         let result = AnthropicAuthFlow::with_defaults().execute(
             &ctx,
@@ -1026,19 +1019,12 @@ mod tests {
     #[test]
     fn execute_rejects_invalid_selectors_before_profile_creation() {
         let temp = tempfile::tempdir().expect("isolated Anthropic preflight root");
-        let mut ctx = super::super::BrowserContext::new(
-            super::super::BrowserConfig::default(),
-            temp.path(),
-        );
+        let mut ctx =
+            super::super::BrowserContext::new(super::super::BrowserConfig::default(), temp.path());
         ctx.status = BrowserStatus::Ready;
         let mut config = AnthropicAuthConfig::default();
         config.selectors.logged_in_marker.clear();
-        let result = AnthropicAuthFlow::new(config).execute(
-            &ctx,
-            "invalid-selectors",
-            None,
-            None,
-        );
+        let result = AnthropicAuthFlow::new(config).execute(&ctx, "invalid-selectors", None, None);
         assert!(matches!(
             result,
             AuthFlowResult::Failed {
@@ -1046,7 +1032,11 @@ mod tests {
                 ..
             }
         ));
-        assert!(!ctx.profile("anthropic", "invalid-selectors").path().exists());
+        assert!(
+            !ctx.profile("anthropic", "invalid-selectors")
+                .path()
+                .exists()
+        );
     }
 
     #[test]
@@ -1085,16 +1075,15 @@ mod tests {
     fn success_requires_storage_state() {
         let result = AnthropicAuthFlow::parse_playwright_result(r#"{"status":"success"}"#);
         match result {
-            Err(error) => assert_eq!(
-                error.kind,
-                AuthFlowFailureKind::ProfilePersistenceFailed
-            ),
+            Err(error) => assert_eq!(error.kind, AuthFlowFailureKind::ProfilePersistenceFailed),
             _ => panic!("success without durable state must fail closed"),
         }
-        assert!(AnthropicAuthFlow::parse_playwright_result(
-            r#"{"status":"success","storage_state":"{\"cookies\":[],\"origins\":[]}"}"#
-        )
-        .is_err());
+        assert!(
+            AnthropicAuthFlow::parse_playwright_result(
+                r#"{"status":"success","storage_state":"{\"cookies\":[],\"origins\":[]}"}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1117,7 +1106,10 @@ mod tests {
         match result {
             Err(e) => {
                 assert_eq!(e.kind, AuthFlowFailureKind::SelectorMismatch);
-                assert_eq!(e.error, AuthFlowFailureKind::SelectorMismatch.stable_detail());
+                assert_eq!(
+                    e.error,
+                    AuthFlowFailureKind::SelectorMismatch.stable_detail()
+                );
                 assert!(!e.error.contains("No selectors matched"));
             }
             _ => panic!("Expected error"),
@@ -1156,13 +1148,15 @@ mod tests {
     #[test]
     fn script_transports_login_url_without_plaintext_literal() {
         let flow = AnthropicAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://console.anthropic.com/login",
-            None,
-            None,
-            false,
-        ).expect("bounded Anthropic script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://console.anthropic.com/login",
+                None,
+                None,
+                false,
+            )
+            .expect("bounded Anthropic script");
         assert!(!script.contains("console.anthropic.com/login"));
         assert_eq!(
             super::super::decode_node_script_input(&script)["login_url"],
@@ -1173,13 +1167,15 @@ mod tests {
     #[test]
     fn script_contains_email_when_provided() {
         let flow = AnthropicAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://console.anthropic.com/login",
-            Some("user@example.com"),
-            None,
-            false,
-        ).expect("bounded Anthropic script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://console.anthropic.com/login",
+                Some("user@example.com"),
+                None,
+                false,
+            )
+            .expect("bounded Anthropic script");
         assert!(!script.contains("user@example.com"));
         assert_eq!(
             super::super::decode_node_script_input(&script)["email"],
@@ -1190,26 +1186,30 @@ mod tests {
     #[test]
     fn script_has_null_email_when_not_provided() {
         let flow = AnthropicAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://console.anthropic.com/login",
-            None,
-            None,
-            false,
-        ).expect("bounded Anthropic script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://console.anthropic.com/login",
+                None,
+                None,
+                false,
+            )
+            .expect("bounded Anthropic script");
         assert!(super::super::decode_node_script_input(&script)["email"].is_null());
     }
 
     #[test]
     fn script_accepts_trusted_oauth_path_with_query() {
         let flow = AnthropicAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://console.anthropic.com/oauth/authorize?state=opaque",
-            None,
-            None,
-            false,
-        ).expect("bounded Anthropic script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://console.anthropic.com/oauth/authorize?state=opaque",
+                None,
+                None,
+                false,
+            )
+            .expect("bounded Anthropic script");
         assert!(!script.contains("state=opaque"));
         assert_eq!(
             super::super::decode_node_script_input(&script)["login_url"],
@@ -1221,13 +1221,15 @@ mod tests {
     fn script_round_trips_quotes_newlines_backslashes_and_unicode_separators() {
         let flow = AnthropicAuthFlow::with_defaults();
         let hostile_email = "mail'\\\n\u{2028}@example.com";
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile'\\\n"),
-            "https://console.anthropic.com/login?token=secret",
-            Some(hostile_email),
-            None,
-            false,
-        ).expect("bounded hostile Anthropic script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile'\\\n"),
+                "https://console.anthropic.com/login?token=secret",
+                Some(hostile_email),
+                None,
+                false,
+            )
+            .expect("bounded hostile Anthropic script");
         assert!(!script.contains(hostile_email));
         assert!(!script.contains("token=secret"));
         assert!(!script.contains('\u{2028}'));
@@ -1242,13 +1244,15 @@ mod tests {
     #[test]
     fn script_checks_for_logged_in_markers() {
         let flow = AnthropicAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://console.anthropic.com/login",
-            None,
-            None,
-            false,
-        ).expect("bounded Anthropic script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://console.anthropic.com/login",
+                None,
+                None,
+                false,
+            )
+            .expect("bounded Anthropic script");
         assert!(
             super::super::decode_node_script_input(&script)["selectors"]["logged_in_marker"]
                 .as_str()
@@ -1260,13 +1264,15 @@ mod tests {
     #[test]
     fn script_checks_for_password_prompt() {
         let flow = AnthropicAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://console.anthropic.com/login",
-            None,
-            None,
-            false,
-        ).expect("bounded Anthropic script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://console.anthropic.com/login",
+                None,
+                None,
+                false,
+            )
+            .expect("bounded Anthropic script");
         assert!(
             super::super::decode_node_script_input(&script)["selectors"]["password_prompt"]
                 .as_str()
@@ -1278,13 +1284,15 @@ mod tests {
     #[test]
     fn script_checks_for_sso() {
         let flow = AnthropicAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://console.anthropic.com/login",
-            None,
-            None,
-            false,
-        ).expect("bounded Anthropic script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://console.anthropic.com/login",
+                None,
+                None,
+                false,
+            )
+            .expect("bounded Anthropic script");
         assert!(
             super::super::decode_node_script_input(&script)["selectors"]["sso_indicator"]
                 .as_str()
@@ -1296,13 +1304,15 @@ mod tests {
     #[test]
     fn script_checks_for_captcha() {
         let flow = AnthropicAuthFlow::with_defaults();
-        let script = flow.build_playwright_script(
-            Path::new("/tmp/profile"),
-            "https://console.anthropic.com/login",
-            None,
-            None,
-            false,
-        ).expect("bounded Anthropic script");
+        let script = flow
+            .build_playwright_script(
+                Path::new("/tmp/profile"),
+                "https://console.anthropic.com/login",
+                None,
+                None,
+                false,
+            )
+            .expect("bounded Anthropic script");
         assert!(
             super::super::decode_node_script_input(&script)["selectors"]["captcha_indicator"]
                 .as_str()
@@ -1322,7 +1332,7 @@ mod tests {
                 None,
                 false,
             )
-                .is_ok()
+            .is_ok()
         );
         let one_over = format!("{exact}x");
         assert_eq!(
@@ -1360,9 +1370,11 @@ mod tests {
                     value.as_str() == Some("https://console.anthropic.com/dashboard")
                 }))
         );
-        assert!(!input["selectors"]["logged_in_marker"]
-            .as_str()
-            .is_some_and(|value| value.contains("Welcome back")));
+        assert!(
+            !input["selectors"]["logged_in_marker"]
+                .as_str()
+                .is_some_and(|value| value.contains("Welcome back"))
+        );
         assert!(script.contains("browser.storageState()"));
         assert!(script.contains("fullPage: false"));
     }
@@ -1415,7 +1427,10 @@ mod tests {
         let stdout = r#"{"status":"error","kind":"NavigationFailed","message":"/private/secret"}"#;
         let error = AnthropicAuthFlow::parse_playwright_error(stdout);
         assert_eq!(error.kind, AuthFlowFailureKind::NavigationFailed);
-        assert_eq!(error.error, AuthFlowFailureKind::NavigationFailed.stable_detail());
+        assert_eq!(
+            error.error,
+            AuthFlowFailureKind::NavigationFailed.stable_detail()
+        );
         assert!(!error.error.contains("secret"));
     }
 
@@ -1423,15 +1438,22 @@ mod tests {
     fn parse_playwright_error_fallback_is_content_free() {
         let error = AnthropicAuthFlow::parse_playwright_error("");
         assert_eq!(error.kind, AuthFlowFailureKind::PlaywrightError);
-        assert_eq!(error.error, AuthFlowFailureKind::PlaywrightError.stable_detail());
+        assert_eq!(
+            error.error,
+            AuthFlowFailureKind::PlaywrightError.stable_detail()
+        );
     }
 
     #[test]
     fn node_runner_is_stdin_bounded_and_never_uses_inline_argv() {
         let source = include_str!("anthropic_auth.rs");
-        let start = source.find("fn run_playwright_flow(").expect("runner source");
+        let start = source
+            .find("fn run_playwright_flow(")
+            .expect("runner source");
         let tail = &source[start..];
-        let end = tail.find("\n    /// Build the Node.js/Playwright script").expect("runner boundary");
+        let end = tail
+            .find("\n    /// Build the Node.js/Playwright script")
+            .expect("runner boundary");
         let body = &tail[..end];
         assert!(body.contains("run_node_script_bounded"));
         assert!(!body.contains("std::process::Command"));

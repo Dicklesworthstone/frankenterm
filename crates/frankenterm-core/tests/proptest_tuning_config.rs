@@ -260,8 +260,7 @@ fn ipc_tuning_strategy() -> impl Strategy<Value = IpcTuning> {
     (
         IpcTuning::MIN_MAX_MESSAGE_SIZE..=IpcTuning::MAX_MAX_MESSAGE_SIZE,
         IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS..=IpcTuning::MAX_ACCEPT_POLL_INTERVAL_MS,
-        IpcTuning::MIN_MAX_CONCURRENT_CONNECTIONS
-            ..=IpcTuning::MAX_MAX_CONCURRENT_CONNECTIONS,
+        IpcTuning::MIN_MAX_CONCURRENT_CONNECTIONS..=IpcTuning::MAX_MAX_CONCURRENT_CONNECTIONS,
         IpcTuning::MIN_INITIAL_REQUEST_TIMEOUT_MS..=IpcTuning::MAX_INITIAL_REQUEST_TIMEOUT_MS,
         IpcTuning::MIN_IO_TIMEOUT_MS..=IpcTuning::MAX_IO_TIMEOUT_MS,
     )

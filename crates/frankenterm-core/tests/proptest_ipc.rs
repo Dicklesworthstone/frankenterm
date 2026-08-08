@@ -6,9 +6,7 @@
 
 #![cfg(unix)]
 
-use frankenterm_core::ipc::{
-    IpcRequest, IpcResponse, WatcherControlAction, WatcherControlRequest,
-};
+use frankenterm_core::ipc::{IpcRequest, IpcResponse, WatcherControlAction, WatcherControlRequest};
 use proptest::prelude::*;
 
 // =========================================================================
@@ -45,12 +43,14 @@ fn arb_ipc_request() -> impl Strategy<Value = IpcRequest> {
             ],
             "[0-9a-f]{32}",
         )
-            .prop_map(|(action, expected_instance_id)| IpcRequest::WatcherControl {
-                control: WatcherControlRequest {
-                    action,
-                    expected_instance_id,
-                },
-            }),
+            .prop_map(
+                |(action, expected_instance_id)| IpcRequest::WatcherControl {
+                    control: WatcherControlRequest {
+                        action,
+                        expected_instance_id,
+                    },
+                }
+            ),
         proptest::collection::vec("[a-z_]{2,10}", 0..5).prop_map(|args| IpcRequest::Rpc { args }),
         (
             proptest::option::of(0_u64..100_000),

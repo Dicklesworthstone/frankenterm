@@ -34,12 +34,7 @@ fn saturating_atomic_increment(counter: &AtomicU64) -> u64 {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
         let next = current.saturating_add(1);
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return next,
             Err(observed) => current = observed,
         }
@@ -430,10 +425,7 @@ impl WatchdogHandle {
     /// chance to run their own bounded drains before the outer future is
     /// cancelled. Callers must await this method; `Drop` can request abort but
     /// cannot synchronously prove acknowledgement from inside an executor.
-    pub async fn join_with_cx(
-        self,
-        cx: &crate::cx::Cx,
-    ) -> Result<(), WatchdogJoinError> {
+    pub async fn join_with_cx(self, cx: &crate::cx::Cx) -> Result<(), WatchdogJoinError> {
         self.join_with_cx_with_grace_timeout(cx, WATCHDOG_JOIN_SETTLEMENT_TIMEOUT)
             .await
     }
@@ -459,9 +451,8 @@ impl WatchdogHandle {
         )
         .await;
         if self.tasks.settlement() == JoinSetSettlement::Settled {
-            return terminal_failure.map_or(Ok(()), |kind| {
-                Err(WatchdogJoinError::TaskFailed { kind })
-            });
+            return terminal_failure
+                .map_or(Ok(()), |kind| Err(WatchdogJoinError::TaskFailed { kind }));
         }
 
         self.abort_and_settle().await
@@ -493,9 +484,9 @@ impl WatchdogHandle {
         )
         .await;
         match self.tasks.settlement() {
-            JoinSetSettlement::Settled => terminal_failure.map_or(Ok(()), |kind| {
-                Err(WatchdogJoinError::TaskFailed { kind })
-            }),
+            JoinSetSettlement::Settled => {
+                terminal_failure.map_or(Ok(()), |kind| Err(WatchdogJoinError::TaskFailed { kind }))
+            }
             JoinSetSettlement::Incomplete { .. } if settlement_result.is_err() => {
                 Err(WatchdogJoinError::SettlementTimedOut)
             }
@@ -630,9 +621,9 @@ pub fn spawn_watchdog(
 
                 #[cfg(test)]
                 task_wait_entered.store(true, Ordering::SeqCst);
-                let shutdown_wait = std::pin::pin!(internal_notify.wait_until(|| {
-                    internal_flag.load(Ordering::SeqCst)
-                }));
+                let shutdown_wait = std::pin::pin!(
+                    internal_notify.wait_until(|| { internal_flag.load(Ordering::SeqCst) })
+                );
                 let interval_wait = std::pin::pin!(crate::runtime_async::sleep_with_cx(
                     &watchdog_cx,
                     check_interval,
@@ -1100,9 +1091,8 @@ pub fn spawn_mux_watchdog(
             }
 
             use futures::future::{Either, select};
-            let shutdown_wait = std::pin::pin!(task_notify.wait_until(|| {
-                internal_flag.load(Ordering::SeqCst)
-            }));
+            let shutdown_wait =
+                std::pin::pin!(task_notify.wait_until(|| { internal_flag.load(Ordering::SeqCst) }));
             let interval_wait = std::pin::pin!(crate::runtime_async::sleep_with_cx(
                 &mux_watchdog_cx,
                 check_interval,
@@ -1731,7 +1721,9 @@ mod tests {
             handle
                 .join_with_cx_with_grace_timeout(&cx, Duration::from_millis(5))
                 .await
-                .expect("a task that ignores cooperative shutdown must settle after fallback abort");
+                .expect(
+                    "a task that ignores cooperative shutdown must settle after fallback abort",
+                );
 
             assert!(shutdown.load(Ordering::SeqCst));
             assert!(

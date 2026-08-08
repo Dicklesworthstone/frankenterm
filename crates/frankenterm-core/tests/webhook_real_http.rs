@@ -144,9 +144,11 @@ impl WebhookTransport for RealHttpTransport {
             };
             let mut request_headers = Vec::with_capacity(headers.len() + 1);
             request_headers.push(("Content-Type".to_string(), "application/json".to_string()));
-            request_headers.extend(headers.iter().map(|(key, value)| {
-                (key.clone(), value.clone())
-            }));
+            request_headers.extend(
+                headers
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
 
             if let Err(error) = cx.checkpoint() {
                 return Self::checkpoint_failure(cx, &error);

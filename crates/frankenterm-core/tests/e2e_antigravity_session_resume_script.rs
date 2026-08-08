@@ -428,11 +428,10 @@ fn log_optional_real_smoke(log_jsonl: &Path, project_root: &Path) {
         return;
     };
     let started = Instant::now();
-    let entries = frankenterm_core::session_resume::discover_antigravity_conversations_from_home(
-        &home,
-    )
-    .expect("bounded read-only real-home discovery")
-    .entries;
+    let entries =
+        frankenterm_core::session_resume::discover_antigravity_conversations_from_home(&home)
+            .expect("bounded read-only real-home discovery")
+            .entries;
     for entry in &entries {
         log_jsonl_record(
             log_jsonl,

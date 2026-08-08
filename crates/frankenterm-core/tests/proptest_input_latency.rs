@@ -13,8 +13,8 @@ use frankenterm_core::input_latency::{
     InputLatencyCollector, InputLatencyCollectorError, InputLatencyEvidenceError,
     InputLatencyEvidenceStatus, InputLatencyMeasurement, InputLatencyMeasurementError,
     InputLatencyProducerId, InputLatencyStage, InputLatencyTimestamp,
-    MAX_INPUT_LATENCY_EVIDENCE_WINDOW, Percentile, StageBudget, evaluate_budget,
-    generate_report, percentile_nearest_rank,
+    MAX_INPUT_LATENCY_EVIDENCE_WINDOW, Percentile, StageBudget, evaluate_budget, generate_report,
+    percentile_nearest_rank,
 };
 
 // =============================================================================
@@ -127,7 +127,10 @@ fn assert_invalid_gate_and_report(
     prop_assert!(verdict.details().is_empty());
 
     let report = generate_report(collector, Some(&budget));
-    prop_assert_eq!(report.evidence_status(), InputLatencyEvidenceStatus::Invalid);
+    prop_assert_eq!(
+        report.evidence_status(),
+        InputLatencyEvidenceStatus::Invalid
+    );
     prop_assert_eq!(report.sample_count(), collector.count());
     prop_assert_eq!(report.admitted_sample_count(), 0);
     prop_assert!(report.evidence_error().is_some());

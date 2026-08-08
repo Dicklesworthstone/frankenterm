@@ -879,9 +879,9 @@ impl SubmitGuaranteeLevel {
             ),
             Self::Working => {
                 state == SubmitReceiptState::Submitted
-                    && evidence_rule_ids.iter().any(|rule| {
-                        is_canonical_submit_working_evidence(rule)
-                    })
+                    && evidence_rule_ids
+                        .iter()
+                        .any(|rule| is_canonical_submit_working_evidence(rule))
             }
         }
     }
@@ -4004,10 +4004,7 @@ mod tests {
             ("robot.reservation_conflict", ErrorCategory::Storage),
             ("robot.rule_not_found", ErrorCategory::Pattern),
             ("robot.storage_error", ErrorCategory::Storage),
-            (
-                "robot.storage_effect_indeterminate",
-                ErrorCategory::Storage,
-            ),
+            ("robot.storage_effect_indeterminate", ErrorCategory::Storage),
             ("robot.timeout", ErrorCategory::Network),
             ("robot.tx_error", ErrorCategory::Workflow),
             ("robot.tx_execution_failed", ErrorCategory::Workflow),
@@ -4032,10 +4029,7 @@ mod tests {
                 "robot.wezterm_mutation_indeterminate",
                 ErrorCategory::Wezterm,
             ),
-            (
-                "robot.wezterm_output_too_large",
-                ErrorCategory::Wezterm,
-            ),
+            ("robot.wezterm_output_too_large", ErrorCategory::Wezterm),
             ("robot.wezterm_parse_error", ErrorCategory::Wezterm),
             ("robot.wezterm_socket_not_found", ErrorCategory::Wezterm),
             ("robot.workflow_aborted", ErrorCategory::Workflow),
@@ -5103,14 +5097,12 @@ mod tests {
             "killswitch hint must direct operator at ft mission unkill"
         );
 
-        let mux_indeterminate =
-            ErrorCode::parse("robot.wezterm_mutation_indeterminate").unwrap();
+        let mux_indeterminate = ErrorCode::parse("robot.wezterm_mutation_indeterminate").unwrap();
         let mux_hint = hint_for(&mux_indeterminate).unwrap();
         assert!(mux_hint.contains("Reconcile live mux state"));
         assert!(mux_hint.contains("do not blindly retry"));
 
-        let storage_indeterminate =
-            ErrorCode::parse("robot.storage_effect_indeterminate").unwrap();
+        let storage_indeterminate = ErrorCode::parse("robot.storage_effect_indeterminate").unwrap();
         let storage_hint = hint_for(&storage_indeterminate).unwrap();
         assert!(storage_hint.contains("Reconcile the affected state"));
         assert!(storage_hint.contains("do not automatically retry"));

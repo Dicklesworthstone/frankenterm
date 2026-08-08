@@ -480,7 +480,7 @@ fn pct(dist: Option<&Distribution>, q: f64) -> f64 {
             .find(|p| (p.q - q).abs() < 1e-9)
             .map(|p| p.value)
     })
-        .unwrap_or(f64::NAN)
+    .unwrap_or(f64::NAN)
 }
 
 fn max_of(dist: Option<&Distribution>) -> f64 {

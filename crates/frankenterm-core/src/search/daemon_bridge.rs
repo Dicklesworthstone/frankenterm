@@ -340,11 +340,11 @@ pub fn from_coalescer_metrics(
 /// Returns 0.0 if no cache requests have been made.
 #[must_use]
 pub fn compute_cache_hit_rate(metrics: &DaemonBridgeMetrics) -> f64 {
-    let total = metrics.cache_hits + metrics.cache_misses;
-    if total == 0 {
+    let total = metrics.cache_hits as f64 + metrics.cache_misses as f64;
+    if total == 0.0 {
         return 0.0;
     }
-    metrics.cache_hits as f64 / total as f64
+    metrics.cache_hits as f64 / total
 }
 
 /// Compute batch utilization as a fraction of max batch size.
@@ -493,7 +493,7 @@ pub fn explain_bridge(
     // - Cache hit rate below 10% with significant traffic suggests poor locality
     // - Batch utilization below 25% suggests config mismatch (min_batch_size too high
     //   or max_wait_ms too low for the traffic pattern)
-    let total_requests = metrics.cache_hits + metrics.cache_misses;
+    let total_requests = u128::from(metrics.cache_hits) + u128::from(metrics.cache_misses);
     let is_low_cache = total_requests > 100 && cache_hit_rate < 0.1;
     let is_low_batch = metrics.total_batches > 10 && batch_utilization < 0.25;
     let is_degraded = is_low_cache || is_low_batch;
@@ -884,6 +884,29 @@ mod tests {
             ..Default::default()
         };
         assert!((compute_cache_hit_rate(&m) - 0.75).abs() < 1e-10);
+    }
+
+    #[test]
+    fn cache_hit_rate_handles_saturated_counters_without_overflow() {
+        let m = DaemonBridgeMetrics {
+            cache_hits: u64::MAX,
+            cache_misses: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(compute_cache_hit_rate(&m), 0.5);
+
+        let low_cache_after_integer_wrap = DaemonBridgeMetrics {
+            cache_hits: 1,
+            cache_misses: u64::MAX,
+            ..Default::default()
+        };
+        assert!(
+            explain_bridge(
+                &DaemonBridgeConfig::default(),
+                &low_cache_after_integer_wrap
+            )
+            .is_degraded
+        );
     }
 
     #[test]

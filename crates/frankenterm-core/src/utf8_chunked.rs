@@ -50,12 +50,19 @@ pub struct Utf8ChunkedValidator {
 /// Result of validating a single chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkValidation {
-    /// Number of bytes in this chunk that are valid UTF-8 content.
+    /// Number of stream bytes newly finalized as valid by this call.
+    ///
+    /// Completing a code point buffered from the preceding chunk counts the
+    /// entire code point here; those bytes were deliberately not counted by
+    /// the earlier call.
     pub valid_bytes: usize,
-    /// Number of bytes that were invalid (replaced with U+FFFD).
+    /// Number of stream bytes newly finalized as invalid by this call.
     pub invalid_bytes: usize,
-    /// Byte offset where the valid UTF-8 prefix ends (and trailing
-    /// incomplete code point begins, if any).
+    /// Byte offset in the current input where the processable prefix ends.
+    ///
+    /// Invalid sequences inside this prefix require replacement with U+FFFD.
+    /// When `has_trailing_partial` is true, this points to the first buffered
+    /// byte of the incomplete trailing code point.
     pub valid_prefix_end: usize,
     /// Whether the chunk ends mid-code-point (bytes buffered for next chunk).
     pub has_trailing_partial: bool,
@@ -127,7 +134,7 @@ impl Utf8ChunkedValidator {
                     total_valid += self.expected_len as usize;
                 } else {
                     total_invalid += self.expected_len as usize;
-                    self.replacements += 1;
+                    self.replacements = self.replacements.saturating_add(1);
                 }
                 self.pending_len = 0;
                 self.expected_len = 0;
@@ -146,8 +153,8 @@ impl Utf8ChunkedValidator {
         // Step 2: Validate the remaining bytes
         let remaining = &bytes[consumed..];
         if remaining.is_empty() {
-            self.valid_bytes += total_valid as u64;
-            self.invalid_bytes += total_invalid as u64;
+            self.valid_bytes = self.valid_bytes.saturating_add(total_valid as u64);
+            self.invalid_bytes = self.invalid_bytes.saturating_add(total_invalid as u64);
             return ChunkValidation {
                 valid_bytes: total_valid,
                 invalid_bytes: total_invalid,
@@ -171,9 +178,9 @@ impl Utf8ChunkedValidator {
                 if let Some(error_len) = e.error_len() {
                     // Definite invalid sequence — count it and continue
                     total_invalid += error_len;
-                    self.replacements += 1;
+                    self.replacements = self.replacements.saturating_add(1);
 
-                    // Recursively validate the remainder after the error
+                    // Iteratively validate the remainder after the error.
                     let after_error = &remaining[valid_up_to + error_len..];
                     let sub = self.validate_tail(after_error);
                     total_valid += sub.0;
@@ -188,45 +195,49 @@ impl Utf8ChunkedValidator {
             }
         }
 
-        self.valid_bytes += total_valid as u64;
-        self.invalid_bytes += total_invalid as u64;
+        self.valid_bytes = self.valid_bytes.saturating_add(total_valid as u64);
+        self.invalid_bytes = self.invalid_bytes.saturating_add(total_invalid as u64);
 
         ChunkValidation {
             valid_bytes: total_valid,
             invalid_bytes: total_invalid,
-            valid_prefix_end: consumed + total_valid,
+            valid_prefix_end: bytes.len() - self.pending_len as usize,
             has_trailing_partial: self.pending_len > 0,
         }
     }
 
     /// Validate remaining bytes after an error (handles multiple errors).
     fn validate_tail(&mut self, bytes: &[u8]) -> (usize, usize) {
-        if bytes.is_empty() {
-            return (0, 0);
-        }
-
         let mut total_valid = 0;
         let mut total_invalid = 0;
 
-        match std::str::from_utf8(bytes) {
-            Ok(_) => {
-                total_valid += bytes.len();
-            }
-            Err(e) => {
-                total_valid += e.valid_up_to();
-                let rest = &bytes[e.valid_up_to()..];
-                if let Some(error_len) = e.error_len() {
-                    total_invalid += error_len;
-                    self.replacements += 1;
-                    let sub = self.validate_tail(&rest[error_len..]);
-                    total_valid += sub.0;
-                    total_invalid += sub.1;
-                } else {
-                    // Incomplete at end
-                    let incomplete_len = rest.len();
-                    self.pending[..incomplete_len].copy_from_slice(rest);
-                    self.pending_len = incomplete_len as u8;
-                    self.expected_len = utf8_char_width(rest[0]);
+        // Each definite UTF-8 error advances by at least one byte. Scan in a
+        // loop so a large adversarial chunk of invalid bytes consumes bounded
+        // stack space instead of recursing once per replacement character.
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            match std::str::from_utf8(remaining) {
+                Ok(_) => {
+                    total_valid += remaining.len();
+                    break;
+                }
+                Err(error) => {
+                    total_valid += error.valid_up_to();
+                    let rest = &remaining[error.valid_up_to()..];
+                    if let Some(error_len) = error.error_len() {
+                        total_invalid += error_len;
+                        self.replacements = self.replacements.saturating_add(1);
+                        remaining = &rest[error_len..];
+                    } else {
+                        // Incomplete sequence at the end. UTF-8 code points are
+                        // at most four bytes, so the fixed pending buffer is
+                        // sufficient for every valid incomplete prefix.
+                        let incomplete_len = rest.len();
+                        self.pending[..incomplete_len].copy_from_slice(rest);
+                        self.pending_len = incomplete_len as u8;
+                        self.expected_len = utf8_char_width(rest[0]);
+                        break;
+                    }
                 }
             }
         }
@@ -239,8 +250,8 @@ impl Utf8ChunkedValidator {
     pub fn finish(&mut self) -> ChunkValidation {
         let invalid = self.pending_len as usize;
         if invalid > 0 {
-            self.invalid_bytes += invalid as u64;
-            self.replacements += 1;
+            self.invalid_bytes = self.invalid_bytes.saturating_add(invalid as u64);
+            self.replacements = self.replacements.saturating_add(1);
             self.pending_len = 0;
             self.expected_len = 0;
         }
@@ -255,13 +266,13 @@ impl Utf8ChunkedValidator {
     /// Get cumulative validation statistics.
     #[must_use]
     pub fn stats(&self) -> Utf8ValidationStats {
-        let total = self.valid_bytes + self.invalid_bytes;
+        let total = self.valid_bytes as f64 + self.invalid_bytes as f64;
         Utf8ValidationStats {
             valid_bytes: self.valid_bytes,
             invalid_bytes: self.invalid_bytes,
             replacements: self.replacements,
-            validity_ratio: if total > 0 {
-                self.valid_bytes as f64 / total as f64
+            validity_ratio: if total > 0.0 {
+                self.valid_bytes as f64 / total
             } else {
                 1.0
             },
@@ -378,6 +389,7 @@ mod tests {
         let r = v.validate_chunk(&data);
         assert_eq!(r.valid_bytes, 4); // h, i, o, k
         assert_eq!(r.invalid_bytes, 1); // 0xFF
+        assert_eq!(r.valid_prefix_end, data.len());
     }
 
     // -----------------------------------------------------------------------
@@ -462,6 +474,38 @@ mod tests {
         assert_eq!(stats.replacements, 1);
         let expected_ratio = 2.0 / 3.0;
         assert!((stats.validity_ratio - expected_ratio).abs() < 0.01);
+    }
+
+    #[test]
+    fn stats_handles_saturated_byte_counters_without_overflow() {
+        let mut v = Utf8ChunkedValidator::new();
+        v.valid_bytes = u64::MAX;
+        v.invalid_bytes = u64::MAX;
+        v.replacements = u64::MAX;
+
+        let _ = v.validate_chunk(&[b'a', 0xff]);
+        let stats = v.stats();
+
+        assert_eq!(stats.valid_bytes, u64::MAX);
+        assert_eq!(stats.invalid_bytes, u64::MAX);
+        assert_eq!(stats.replacements, u64::MAX);
+        assert_eq!(stats.validity_ratio, 0.5);
+    }
+
+    #[test]
+    fn large_invalid_chunk_uses_bounded_stack_and_counts_every_replacement() {
+        const INVALID_BYTES: usize = 256 * 1024;
+        let mut validator = Utf8ChunkedValidator::new();
+        let chunk = vec![0xff; INVALID_BYTES];
+
+        let result = validator.validate_chunk(&chunk);
+        let stats = validator.stats();
+
+        assert_eq!(result.valid_bytes, 0);
+        assert_eq!(result.invalid_bytes, INVALID_BYTES);
+        assert!(!result.has_trailing_partial);
+        assert_eq!(stats.invalid_bytes, INVALID_BYTES as u64);
+        assert_eq!(stats.replacements, INVALID_BYTES as u64);
     }
 
     #[test]

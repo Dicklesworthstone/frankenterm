@@ -459,9 +459,7 @@ impl Error {
             Self::Wezterm(e) => e.error_kind(),
             Self::Io(e) => crate::network_reliability::classify_io_error(e),
             Self::Cancelled(_) => NetworkErrorKind::Transient,
-            Self::Panicked(_) | Self::Runtime(_) => {
-                NetworkErrorKind::Transient
-            }
+            Self::Panicked(_) | Self::Runtime(_) => NetworkErrorKind::Transient,
             Self::RuntimeOperation {
                 source:
                     RuntimeOperationSource::DeadlineExceeded
@@ -499,9 +497,7 @@ impl Error {
                 | StorageError::FtsQueryError(_)
                 | StorageError::Corruption { .. }
                 | StorageError::NotFound(_),
-            ) => {
-                NetworkErrorKind::Permanent
-            }
+            ) => NetworkErrorKind::Permanent,
             Self::Storage(StorageError::SubmitIdempotency(error)) => {
                 if error.is_retryable() {
                     NetworkErrorKind::Transient
@@ -767,9 +763,7 @@ pub enum StorageError {
     /// Durable verified-submit claim/replay failure with a finite,
     /// content-free store-local taxonomy.
     #[error(transparent)]
-    SubmitIdempotency(
-        #[from] crate::submit_idempotency_store::SubmitIdempotencyError,
-    ),
+    SubmitIdempotency(#[from] crate::submit_idempotency_store::SubmitIdempotencyError),
 
     #[error("Pane {pane_id} already has active reservation (id={existing_id})")]
     ReservationConflict { pane_id: u64, existing_id: i64 },
@@ -1114,9 +1108,7 @@ mod tests {
             Error::Wezterm(WeztermError::PaneNotFound(1)),
             Error::Wezterm(WeztermError::SocketNotFound("/tmp/wez.sock".to_string())),
             Error::Wezterm(WeztermError::CommandFailed("boom".to_string())),
-            Error::Wezterm(WeztermError::IndeterminateMutation {
-                operation: "spawn",
-            }),
+            Error::Wezterm(WeztermError::IndeterminateMutation { operation: "spawn" }),
             Error::Wezterm(WeztermError::ParseError("bad json".to_string())),
             Error::Wezterm(WeztermError::Timeout(5)),
             Error::Wezterm(WeztermError::CircuitOpen {
@@ -1428,9 +1420,7 @@ mod tests {
         use crate::network_reliability::NetworkErrorKind;
 
         for error in [
-            Error::Wezterm(WeztermError::IndeterminateMutation {
-                operation: "spawn",
-            }),
+            Error::Wezterm(WeztermError::IndeterminateMutation { operation: "spawn" }),
             Error::Storage(StorageError::IndeterminateMutation {
                 operation: "store_embedding",
             }),

@@ -99,10 +99,8 @@ async fn settle_workflow_runner_children(
 }
 
 type WorkflowChildJoinResult = Result<(), crate::runtime_async::task::JoinError>;
-type WorkflowChildDrainResult = Result<
-    Option<WorkflowChildJoinResult>,
-    crate::runtime_async::task::JoinError,
->;
+type WorkflowChildDrainResult =
+    Result<Option<WorkflowChildJoinResult>, crate::runtime_async::task::JoinError>;
 
 enum WorkflowRunnerWake {
     Shutdown,
@@ -123,9 +121,9 @@ async fn wait_for_workflow_runner_activity(
 
     if child_tasks.is_empty() {
         if let Some((shutdown_flag, shutdown_notify)) = shutdown {
-            let shutdown_wait = std::pin::pin!(shutdown_notify.wait_until(|| {
-                shutdown_flag.load(Ordering::SeqCst)
-            }));
+            let shutdown_wait = std::pin::pin!(
+                shutdown_notify.wait_until(|| { shutdown_flag.load(Ordering::SeqCst) })
+            );
             let event_wait = std::pin::pin!(subscriber.recv_cx(cx));
             return match select(shutdown_wait, event_wait).await {
                 Either::Left(((), _)) => WorkflowRunnerWake::Shutdown,
@@ -136,9 +134,8 @@ async fn wait_for_workflow_runner_activity(
     }
 
     if let Some((shutdown_flag, shutdown_notify)) = shutdown {
-        let shutdown_wait = std::pin::pin!(shutdown_notify.wait_until(|| {
-            shutdown_flag.load(Ordering::SeqCst)
-        }));
+        let shutdown_wait =
+            std::pin::pin!(shutdown_notify.wait_until(|| { shutdown_flag.load(Ordering::SeqCst) }));
         let activity_wait = std::pin::pin!(async {
             let event_wait = std::pin::pin!(subscriber.recv_cx(cx));
             let child_wait = std::pin::pin!(child_tasks.drain_next_with_cx(cx));
@@ -311,11 +308,7 @@ fn retry_backoff_scale(multiplier: f64, mut exponent: usize) -> f64 {
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-fn retry_backoff_delay(
-    base_delay_ms: u64,
-    retry_attempt: usize,
-    multiplier: f64,
-) -> Duration {
+fn retry_backoff_delay(base_delay_ms: u64, retry_attempt: usize, multiplier: f64) -> Duration {
     let base_delay = Duration::from_millis(base_delay_ms);
     if base_delay.is_zero() || retry_attempt <= 1 {
         return base_delay;
@@ -1927,12 +1920,7 @@ impl WorkflowRunner {
                         );
                         workflow.cleanup(&mut ctx).await;
                         if let Err(error) = self
-                            .persist_aborted_execution_with_cx(
-                                cx,
-                                execution_id,
-                                &reason,
-                                "aborted",
-                            )
+                            .persist_aborted_execution_with_cx(cx, execution_id, &reason, "aborted")
                             .await
                         {
                             return workflow_execution_error(
@@ -3061,12 +3049,8 @@ impl WorkflowRunner {
         shutdown_flag: &std::sync::atomic::AtomicBool,
         shutdown_notify: &crate::runtime_async::notify::Notify,
     ) {
-        self.run_loop_with_cx(
-            cx,
-            event_bus,
-            Some((shutdown_flag, shutdown_notify)),
-        )
-        .await;
+        self.run_loop_with_cx(cx, event_bus, Some((shutdown_flag, shutdown_notify)))
+            .await;
     }
 
     async fn run_loop_with_cx(
@@ -4295,12 +4279,7 @@ mod tests {
             let wake = crate::runtime_async::timeout_with_cx(
                 &cx,
                 Duration::from_secs(1),
-                wait_for_workflow_runner_activity(
-                    &cx,
-                    &mut subscriber,
-                    &mut child_tasks,
-                    None,
-                ),
+                wait_for_workflow_runner_activity(&cx, &mut subscriber, &mut child_tasks, None),
             )
             .await
             .expect("child completion must wake an otherwise-idle runner");
@@ -4542,18 +4521,9 @@ mod tests {
 
     #[test]
     fn retry_backoff_uses_step_delay_as_first_attempt_base() {
-        assert_eq!(
-            retry_backoff_delay(100, 1, 2.0),
-            Duration::from_millis(100)
-        );
-        assert_eq!(
-            retry_backoff_delay(100, 2, 2.0),
-            Duration::from_millis(200)
-        );
-        assert_eq!(
-            retry_backoff_delay(100, 3, 2.0),
-            Duration::from_millis(400)
-        );
+        assert_eq!(retry_backoff_delay(100, 1, 2.0), Duration::from_millis(100));
+        assert_eq!(retry_backoff_delay(100, 2, 2.0), Duration::from_millis(200));
+        assert_eq!(retry_backoff_delay(100, 3, 2.0), Duration::from_millis(400));
         assert_eq!(
             retry_backoff_delay(100, 4, 1.5),
             Duration::from_millis(338),
@@ -4994,14 +4964,10 @@ mod tests {
             shutdown_flag.store(true, Ordering::SeqCst);
             shutdown_notify.notify_waiters();
             let join_cx = crate::cx::for_testing();
-            crate::runtime_async::timeout_with_cx(
-                &join_cx,
-                Duration::from_secs(1),
-                runner_task,
-            )
-            .await
-            .expect("cooperative shutdown must remain bounded")
-            .expect("workflow runner task must settle cleanly");
+            crate::runtime_async::timeout_with_cx(&join_cx, Duration::from_secs(1), runner_task)
+                .await
+                .expect("cooperative shutdown must remain bounded")
+                .expect("workflow runner task must settle cleanly");
 
             storage.shutdown().await.expect("shutdown workflow storage");
         });
@@ -5482,8 +5448,7 @@ mod tests {
 
             match outcome {
                 ManualWorkflowRunOutcome::Ran(WorkflowExecutionResult::Aborted {
-                    reason,
-                    ..
+                    reason, ..
                 }) => assert!(reason.contains("exceeded maximum jump count")),
                 other => panic!("jump cycle should terminate as a durable abort: {other:?}"),
             }

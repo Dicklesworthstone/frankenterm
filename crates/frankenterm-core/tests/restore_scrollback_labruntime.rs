@@ -18,9 +18,7 @@ use frankenterm_core::error::RuntimeOperationSource;
 use frankenterm_core::outcome::CancelKind;
 use frankenterm_core::restore_scrollback::{InjectionGuard, ScrollbackData, ScrollbackInjector};
 use frankenterm_core::session_topology::MAX_TOPOLOGY_PANES;
-use frankenterm_core::test_fixtures::lab_runtime::{
-    assert_ran_to_completion, lab_runtime_test,
-};
+use frankenterm_core::test_fixtures::lab_runtime::{assert_ran_to_completion, lab_runtime_test};
 use frankenterm_core::wezterm::{MockWezterm, WeztermInterface};
 
 fn run_lab<F, Fut>(test: F)

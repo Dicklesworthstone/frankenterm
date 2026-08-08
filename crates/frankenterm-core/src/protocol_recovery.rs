@@ -188,8 +188,7 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
     if lower.starts_with("remote error:") {
         return ProtocolErrorKind::Transient;
     }
-    if lower.starts_with("mux ")
-        && (lower.contains(" cancelled:") || lower.contains(" canceled:"))
+    if lower.starts_with("mux ") && (lower.contains(" cancelled:") || lower.contains(" canceled:"))
     {
         return ProtocolErrorKind::Transient;
     }
@@ -203,8 +202,7 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
         // Defensive parity for cancellation strings emitted before the typed
         // `DirectMuxError::Cancelled` variant existed. This recovers only the
         // diagnostic kind; text cannot recover the cancellation authority.
-        if lower.contains("mux ")
-            && (lower.contains(" cancelled:") || lower.contains(" canceled:"))
+        if lower.contains("mux ") && (lower.contains(" cancelled:") || lower.contains(" canceled:"))
         {
             return ProtocolErrorKind::Transient;
         }
@@ -1299,12 +1297,10 @@ mod tests {
                 recoverable_no_replay,
             ),
             (
-                DirectMuxError::InFlightScopeAbandoned(Box::new(
-                    DirectMuxError::Cancelled {
-                        phase: "request_write_wait",
-                        detail: "later batch admission cancelled".to_string(),
-                    },
-                )),
+                DirectMuxError::InFlightScopeAbandoned(Box::new(DirectMuxError::Cancelled {
+                    phase: "request_write_wait",
+                    detail: "later batch admission cancelled".to_string(),
+                })),
                 cancelled_discard,
             ),
             (
@@ -1693,10 +1689,7 @@ mod tests {
                 resource: "pending mux responses",
             },
         ] {
-            assert_eq!(
-                classify_mux_error(&error),
-                ProtocolErrorKind::Recoverable
-            );
+            assert_eq!(classify_mux_error(&error), ProtocolErrorKind::Recoverable);
         }
 
         for error in [

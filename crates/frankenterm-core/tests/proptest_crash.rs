@@ -135,12 +135,12 @@ fn arb_shutdown_summary() -> impl Strategy<Value = ShutdownSummary> {
                 clean,
                 warnings,
             )| {
-                let (final_capture_queue, final_write_queue, clean) =
-                    if requested_quiescence_proof {
-                        (0, 0, true)
-                    } else {
-                        (final_capture_queue, final_write_queue, clean)
-                    };
+                let (final_capture_queue, final_write_queue, clean) = if requested_quiescence_proof
+                {
+                    (0, 0, true)
+                } else {
+                    (final_capture_queue, final_write_queue, clean)
+                };
                 ShutdownSummary::try_new(
                     elapsed_secs,
                     final_capture_queue,

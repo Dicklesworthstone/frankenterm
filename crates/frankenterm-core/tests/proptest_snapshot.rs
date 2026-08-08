@@ -13,9 +13,7 @@ use std::sync::Arc;
 use proptest::prelude::*;
 
 use frankenterm_core::restore_layout::{LayoutRestorer, RestoreConfig};
-use frankenterm_core::restore_process::{
-    LaunchAction, ProcessDispositionReason, ProcessLauncher,
-};
+use frankenterm_core::restore_process::{LaunchAction, ProcessDispositionReason, ProcessLauncher};
 use frankenterm_core::restore_scrollback::{ScrollbackData, ScrollbackInjector};
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::session_pane_state::{
@@ -305,9 +303,7 @@ fn first_leaf_id(node: &PaneNode) -> u64 {
 fn set_active_leaf(node: &mut PaneNode, active_pane_id: Option<u64>) {
     match node {
         PaneNode::Leaf {
-            pane_id,
-            is_active,
-            ..
+            pane_id, is_active, ..
         } => {
             *is_active = active_pane_id == Some(*pane_id);
         }
@@ -1079,14 +1075,10 @@ proptest! {
 
 #[test]
 fn launch_action_debug_omits_sensitive_payloads() {
-    let action = LaunchAction::Manual(
-        ProcessDispositionReason::CapturedAgentRequiresManualRecovery,
-    );
+    let action =
+        LaunchAction::Manual(ProcessDispositionReason::CapturedAgentRequiresManualRecovery);
     let debug = format!("{action:?}");
-    assert_eq!(
-        debug,
-        "Manual(CapturedAgentRequiresManualRecovery)"
-    );
+    assert_eq!(debug, "Manual(CapturedAgentRequiresManualRecovery)");
     for canary in [
         "raw-command-canary",
         "raw-secret-canary",

@@ -176,8 +176,7 @@ fn parse_tool_envelope(contents: &[FrameworkContent]) -> Value {
 fn parse_toon_tool_envelope(contents: &[FrameworkContent]) -> Value {
     let decoded =
         toon_rust::try_decode(first_text_content(contents), None).expect("decode TOON envelope");
-    let json_text =
-        toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+    let json_text = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
     serde_json::from_str(&json_text).expect("TOON envelope should stringify back to JSON")
 }
 
@@ -605,11 +604,7 @@ fn mark_fixture_event_handled(db_path: &PathBuf, event_id: i64) {
     });
 }
 
-fn wait_for_event_delivery_lease(
-    db_path: &PathBuf,
-    event_id: i64,
-    watchdog: std::time::Duration,
-) {
+fn wait_for_event_delivery_lease(db_path: &PathBuf, event_id: i64, watchdog: std::time::Duration) {
     let connection = rusqlite::Connection::open(db_path).expect("open lease observer");
     connection
         .busy_timeout(std::time::Duration::from_secs(1))
@@ -672,11 +667,7 @@ fn hash_await_event_scope_field(hasher: &mut sha2::Sha256, field: &[u8]) {
     hasher.update(field);
 }
 
-fn hash_await_event_scope_conditions(
-    hasher: &mut sha2::Sha256,
-    set_name: &[u8],
-    args: &Value,
-) {
+fn hash_await_event_scope_conditions(hasher: &mut sha2::Sha256, set_name: &[u8], args: &Value) {
     let mut conditions = args
         .get(std::str::from_utf8(set_name).expect("ASCII condition-set name"))
         .and_then(Value::as_array)
@@ -707,10 +698,7 @@ fn canonical_await_event_cursor_scope(args: &Value) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
-    hash_await_event_scope_field(
-        &mut hasher,
-        b"frankenterm.wa.await_event.cursor-scope.v1",
-    );
+    hash_await_event_scope_field(&mut hasher, b"frankenterm.wa.await_event.cursor-scope.v1");
     hash_await_event_scope_conditions(&mut hasher, b"any", args);
     hash_await_event_scope_conditions(&mut hasher, b"all", args);
     hash_await_event_scope_field(&mut hasher, b"pane");
@@ -1156,8 +1144,8 @@ fn assert_await_event_claim_send_failure_releases_lease(
 ) {
     let workspace = tempfile::tempdir().expect("create temp workspace");
     let db_path = workspace.path().join(db_name);
-    let server = build_server_with_db(&Config::default(), Some(db_path.clone()))
-        .expect("build MCP server");
+    let server =
+        build_server_with_db(&Config::default(), Some(db_path.clone())).expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     let server_thread = std::thread::spawn(move || {
         // Response 1 is initialize. Response 2 is wa.await_event and is the
@@ -1168,14 +1156,17 @@ fn assert_await_event_claim_send_failure_releases_lease(
     client.initialize().expect("initialize MCP client");
     seed_events_fixture_at(&db_path);
 
-    let mut arguments = with_current_event_cursor_token(&db_path, json!({
-        "any": ["rule:codex.*"],
-        "cursor": 0,
-        "pane": FIXTURE_PANE_ID,
-        "timeout_secs": 1,
-        "poll_interval_ms": 10,
-        "claim": true
-    }));
+    let mut arguments = with_current_event_cursor_token(
+        &db_path,
+        json!({
+            "any": ["rule:codex.*"],
+            "cursor": 0,
+            "pane": FIXTURE_PANE_ID,
+            "timeout_secs": 1,
+            "poll_interval_ms": 10,
+            "claim": true
+        }),
+    );
     if let Some(format) = requested_format {
         arguments["format"] = Value::String(format.to_string());
     }
@@ -1304,11 +1295,8 @@ fn mcp_conformance_retried_hole_across_large_backlog_preserves_order_and_cursor(
     }
     backlog.push(make_event_with(502, "rule.b", FIXTURE_TS + 502));
     seed_many_events(&harness, backlog);
-    let competing_lease = reserve_fixture_event_id(
-        &harness.db_path,
-        1,
-        std::time::Duration::from_secs(5),
-    );
+    let competing_lease =
+        reserve_fixture_event_id(&harness.db_path, 1, std::time::Duration::from_secs(5));
     let release_db_path = harness.db_path.clone();
     let releaser = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(150));
@@ -1374,11 +1362,8 @@ fn mcp_conformance_foreign_hole_outlives_met_mask_until_exact_refetch() {
             make_event_with(2, "rule.a", FIXTURE_TS + 1),
         ],
     );
-    let competing_lease = reserve_fixture_event_id(
-        &harness.db_path,
-        1,
-        std::time::Duration::from_secs(10),
-    );
+    let competing_lease =
+        reserve_fixture_event_id(&harness.db_path, 1, std::time::Duration::from_secs(10));
 
     let db_path = harness.db_path.clone();
     let mut await_client = spawn_client(Some(db_path.clone()));
@@ -1411,10 +1396,7 @@ fn mcp_conformance_foreign_hole_outlives_met_mask_until_exact_refetch() {
     // condition is met while id=1 remains a foreign-owned cursor hole.
     wait_for_event_delivery_lease(&db_path, 2, std::time::Duration::from_secs(5));
     release_fixture_event(&db_path, &competing_lease);
-    seed_many_events_at(
-        &db_path,
-        vec![make_event_with(3, "rule.b", FIXTURE_TS + 2)],
-    );
+    seed_many_events_at(&db_path, vec![make_event_with(3, "rule.b", FIXTURE_TS + 2)]);
 
     let acquired = waiter.join().expect("join delayed-B A/A/B waiter");
     assert_success_envelope_shape(&acquired);
@@ -1424,10 +1406,12 @@ fn mcp_conformance_foreign_hole_outlives_met_mask_until_exact_refetch() {
     assert_eq!(acquired["data"]["candidate_cursor"], Value::from(3));
     assert_eq!(acquired["data"]["pending_finalize"], Value::Bool(true));
     assert_eq!(
-        acquired["data"]["final_cursor_epoch"], expected_cursor_epoch
+        acquired["data"]["final_cursor_epoch"],
+        expected_cursor_epoch
     );
     assert_eq!(
-        acquired["data"]["final_cursor_scope"], expected_cursor_scope
+        acquired["data"]["final_cursor_scope"],
+        expected_cursor_scope
     );
     assert_eq!(
         acquired["data"]["events"]
@@ -1458,11 +1442,8 @@ fn mcp_conformance_exact_hole_refetch_does_not_substitute_next_unhandled_row() {
             make_event_with(2, "rule.b", FIXTURE_TS + 1),
         ],
     );
-    let _competing_lease = reserve_fixture_event_id(
-        &harness.db_path,
-        1,
-        std::time::Duration::from_secs(10),
-    );
+    let _competing_lease =
+        reserve_fixture_event_id(&harness.db_path, 1, std::time::Duration::from_secs(10));
 
     let db_path = harness.db_path.clone();
     let mut await_client = spawn_client(Some(db_path.clone()));
@@ -1496,10 +1477,7 @@ fn mcp_conformance_exact_hole_refetch_does_not_substitute_next_unhandled_row() {
     // refetch. The query's first row is now id=2, which must not be mistaken
     // for id=1 merely because it is the next row after cursor 0.
     mark_fixture_event_handled(&db_path, 1);
-    seed_many_events_at(
-        &db_path,
-        vec![make_event_with(3, "rule.a", FIXTURE_TS + 2)],
-    );
+    seed_many_events_at(&db_path, vec![make_event_with(3, "rule.a", FIXTURE_TS + 2)]);
 
     let acquired = waiter.join().expect("join exact-refetch waiter");
     assert_success_envelope_shape(&acquired);
@@ -1507,10 +1485,12 @@ fn mcp_conformance_exact_hole_refetch_does_not_substitute_next_unhandled_row() {
     assert_eq!(acquired["data"]["candidate_cursor"], Value::from(3));
     assert_eq!(acquired["data"]["pending_finalize"], Value::Bool(true));
     assert_eq!(
-        acquired["data"]["final_cursor_epoch"], expected_cursor_epoch
+        acquired["data"]["final_cursor_epoch"],
+        expected_cursor_epoch
     );
     assert_eq!(
-        acquired["data"]["final_cursor_scope"], expected_cursor_scope
+        acquired["data"]["final_cursor_scope"],
+        expected_cursor_scope
     );
     assert_eq!(
         acquired["data"]["events"]
@@ -1609,12 +1589,12 @@ fn mcp_conformance_storage_paths_are_redacted_from_event_tool_errors() {
         (
             "wa.await_event",
             with_canonical_await_event_cursor_scope(json!({
-                    "any": ["rule:rule.a"],
-                    "cursor": 0,
-                    "cursor_epoch": "00000000000000000000000000000000",
-                    "timeout_secs": 1,
-                    "poll_interval_ms": 10
-                })),
+                "any": ["rule:rule.a"],
+                "cursor": 0,
+                "cursor_epoch": "00000000000000000000000000000000",
+                "timeout_secs": 1,
+                "poll_interval_ms": 10
+            })),
         ),
     ] {
         let envelope = parse_tool_envelope(
@@ -1809,16 +1789,20 @@ fn mcp_conformance_wa_await_event_concurrent_claimers_emit_event_once() {
     let envelope_a = claim_a.join().expect("join claimant A");
     let envelope_b = claim_b.join().expect("join claimant B");
     assert_eq!(
-        envelope_a["data"]["final_cursor_epoch"], expected_cursor_epoch
+        envelope_a["data"]["final_cursor_epoch"],
+        expected_cursor_epoch
     );
     assert_eq!(
-        envelope_b["data"]["final_cursor_epoch"], expected_cursor_epoch
+        envelope_b["data"]["final_cursor_epoch"],
+        expected_cursor_epoch
     );
     assert_eq!(
-        envelope_a["data"]["final_cursor_scope"], expected_cursor_scope
+        envelope_a["data"]["final_cursor_scope"],
+        expected_cursor_scope
     );
     assert_eq!(
-        envelope_b["data"]["final_cursor_scope"], expected_cursor_scope
+        envelope_b["data"]["final_cursor_scope"],
+        expected_cursor_scope
     );
 
     let emitted_a = envelope_a["data"]["events"]

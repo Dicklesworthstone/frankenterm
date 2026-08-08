@@ -348,7 +348,9 @@ fn projection_raw_text_exceeds_budget(
             if exceeds(process.name.len()) {
                 return true;
             }
-            if retain.argv && let Some(argv) = &process.argv {
+            if retain.argv
+                && let Some(argv) = &process.argv
+            {
                 // Each JSON string contributes at least two quotes and all
                 // but one element contributes a comma. This makes even a
                 // caller-supplied vector of empty strings bounded before
@@ -368,7 +370,9 @@ fn projection_raw_text_exceeds_budget(
     if retain.title && exceeds(snapshot.terminal.title.len()) {
         return true;
     }
-    if retain.agent && let Some(agent) = &snapshot.agent {
+    if retain.agent
+        && let Some(agent) = &snapshot.agent
+    {
         if exceeds(agent.agent_type.len())
             || exceeds(agent.session_id.as_ref().map_or(0, String::len))
             || exceeds(agent.state.as_ref().map_or(0, String::len))
@@ -376,7 +380,9 @@ fn projection_raw_text_exceeds_budget(
             return true;
         }
     }
-    if retain.env && let Some(env) = &snapshot.env {
+    if retain.env
+        && let Some(env) = &snapshot.env
+    {
         // Four quotes and a colon are unavoidable for every key/value
         // pair. Bound an adversarial map of empty strings before walking
         // it, then count the retained raw bytes with early exit.
@@ -812,9 +818,7 @@ mod tests {
                 session_id: Some("sess-123".to_string()),
                 state: Some("working".to_string()),
             })
-            .with_env_from_iter(
-                [("PATH".to_owned(), "/usr/bin".to_owned())].into_iter(),
-            );
+            .with_env_from_iter([("PATH".to_owned(), "/usr/bin".to_owned())].into_iter());
 
         let json = snapshot.to_json().unwrap();
         let restored = PaneStateSnapshot::from_json(&json).unwrap();
@@ -950,10 +954,14 @@ mod tests {
     #[test]
     fn size_budget_huge_title_cwd_process_and_agent_is_hard_bounded() {
         let hostile = "\u{1}".repeat(PANE_STATE_SIZE_BUDGET * 2);
-        let mut snapshot = PaneStateSnapshot::new(7, 1000, TerminalState {
-            title: hostile.clone(),
-            ..make_terminal()
-        })
+        let mut snapshot = PaneStateSnapshot::new(
+            7,
+            1000,
+            TerminalState {
+                title: hostile.clone(),
+                ..make_terminal()
+            },
+        )
         .with_cwd(hostile.clone())
         .with_shell(hostile.clone())
         .with_process(ProcessInfo {
@@ -988,19 +996,25 @@ mod tests {
 
     #[test]
     fn size_budget_accounts_for_json_escape_expansion() {
-        let snapshot = PaneStateSnapshot::new(8, 1000, TerminalState {
-            title: "\u{1}".repeat(PANE_STATE_SIZE_BUDGET / 2),
-            ..make_terminal()
-        });
+        let snapshot = PaneStateSnapshot::new(
+            8,
+            1000,
+            TerminalState {
+                title: "\u{1}".repeat(PANE_STATE_SIZE_BUDGET / 2),
+                ..make_terminal()
+            },
+        );
 
         let (json, truncated) = snapshot.to_json_budgeted().unwrap();
         assert!(truncated);
         assert!(json.len() <= PANE_STATE_SIZE_BUDGET);
-        assert!(PaneStateSnapshot::from_json(&json)
-            .unwrap()
-            .terminal
-            .title
-            .is_empty());
+        assert!(
+            PaneStateSnapshot::from_json(&json)
+                .unwrap()
+                .terminal
+                .title
+                .is_empty()
+        );
     }
 
     // ---- Schema version forward compat ----
@@ -1200,8 +1214,11 @@ mod tests {
     #[test]
     fn env_counts_common_sensitive_name_longer_than_allowlist_names() {
         let env = capture_env_from_iter(
-            [("AWS_SECRET_ACCESS_KEY".to_owned(), "must-not-be-captured".to_owned())]
-                .into_iter(),
+            [(
+                "AWS_SECRET_ACCESS_KEY".to_owned(),
+                "must-not-be-captured".to_owned(),
+            )]
+            .into_iter(),
         );
         assert!(env.vars.is_empty());
         assert_eq!(env.redacted_count, 1);

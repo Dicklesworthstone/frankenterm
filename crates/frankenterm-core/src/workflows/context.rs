@@ -214,10 +214,7 @@ impl WorkflowContext {
     /// Note: [`CxPolicyInjector`] keeps the underlying injector lock around
     /// the async send so policy evaluation and terminal injection remain one
     /// atomic operation from the workflow caller's perspective.
-    pub async fn send_text(
-        &mut self,
-        text: &str,
-    ) -> crate::Result<crate::policy::InjectionResult> {
+    pub async fn send_text(&mut self, text: &str) -> crate::Result<crate::policy::InjectionResult> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.send_text_with_cx(&cx, text).await
     }
@@ -249,10 +246,7 @@ impl WorkflowContext {
             .await
     }
 
-    pub async fn send_verified(
-        &mut self,
-        text: &str,
-    ) -> crate::Result<WorkflowVerifiedSubmit> {
+    pub async fn send_verified(&mut self, text: &str) -> crate::Result<WorkflowVerifiedSubmit> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.send_verified_with_cx(&cx, text).await
     }

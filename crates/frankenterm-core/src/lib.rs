@@ -55,20 +55,13 @@
 /// Reserve one process-local `u64` identity without ever wrapping back into
 /// an already-issued value. `u64::MAX` is retained as the exhausted sentinel.
 #[must_use]
-pub(crate) fn try_next_unique_atomic_u64(
-    counter: &std::sync::atomic::AtomicU64,
-) -> Option<u64> {
+pub(crate) fn try_next_unique_atomic_u64(counter: &std::sync::atomic::AtomicU64) -> Option<u64> {
     use std::sync::atomic::Ordering;
 
     let mut current = counter.load(Ordering::Acquire);
     loop {
         let next = current.checked_add(1)?;
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return Some(current),
             Err(observed) => current = observed,
         }

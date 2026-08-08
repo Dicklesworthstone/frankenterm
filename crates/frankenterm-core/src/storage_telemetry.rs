@@ -1570,7 +1570,9 @@ mod tests {
             RecorderBackendKind::AppendLog,
         );
         assert_eq!(
-            telemetry.registry().counter_value(COUNTER_BATCHES_PROCESSED),
+            telemetry
+                .registry()
+                .counter_value(COUNTER_BATCHES_PROCESSED),
             1,
             "completed append telemetry must be recorded at call time"
         );
@@ -1581,7 +1583,9 @@ mod tests {
         );
         drop(unpolled);
         assert_eq!(
-            telemetry.registry().counter_value(COUNTER_BATCHES_PROCESSED),
+            telemetry
+                .registry()
+                .counter_value(COUNTER_BATCHES_PROCESSED),
             1,
             "dropping the settled future must not duplicate telemetry"
         );

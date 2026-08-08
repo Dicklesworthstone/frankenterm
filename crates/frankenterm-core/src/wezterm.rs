@@ -1786,9 +1786,7 @@ impl WeztermClient {
                                 err,
                             ));
                         }
-                        return Err(Self::mux_tiered_scrollback_unavailable_error(
-                            pane_id, &err,
-                        ));
+                        return Err(Self::mux_tiered_scrollback_unavailable_error(pane_id, &err));
                     }
                 }
             }
@@ -2564,8 +2562,7 @@ impl WeztermClient {
                     if cx.checkpoint().is_ok()
                         && matches!(
                             error.kind(),
-                            std::io::ErrorKind::NotFound
-                                | std::io::ErrorKind::PermissionDenied
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
                         )
                     {
                         return Self::cli_effect_result(
@@ -2693,9 +2690,8 @@ impl WeztermClient {
     /// strings to structured variants.
     fn finalize_cli_output(output: std::process::Output) -> Result<String> {
         if !output.status.success() {
-            let stderr_full = crate::runtime_async::process::decode_captured_bytes_lossy(
-                output.stderr,
-            );
+            let stderr_full =
+                crate::runtime_async::process::decode_captured_bytes_lossy(output.stderr);
             let stderr_str = if stderr_full.len() > MAX_CLI_ERROR_OUTPUT_BYTES {
                 // Truncate at a char boundary to avoid splitting multi-byte characters
                 let mut end = MAX_CLI_ERROR_OUTPUT_BYTES;
@@ -2832,9 +2828,7 @@ impl WeztermClient {
         error: &std::io::Error,
         contract: CliCaptureContract,
     ) -> WeztermError {
-        use crate::runtime_async::process::{
-            CommandOutputLimitExceeded, CommandOutputStream,
-        };
+        use crate::runtime_async::process::{CommandOutputLimitExceeded, CommandOutputStream};
 
         if let Some(exceeded) = CommandOutputLimitExceeded::from_io_error(error)
             && exceeded.stream() == CommandOutputStream::Stdout
@@ -2932,9 +2926,7 @@ impl WeztermClient {
     }
 
     #[cfg(all(feature = "vendored", unix))]
-    fn direct_mux_error_is_authoritative_response(
-        error: &crate::vendored::DirectMuxError,
-    ) -> bool {
+    fn direct_mux_error_is_authoritative_response(error: &crate::vendored::DirectMuxError) -> bool {
         matches!(
             error,
             crate::vendored::DirectMuxError::RemoteError(_)
@@ -2943,9 +2935,7 @@ impl WeztermClient {
     }
 
     #[cfg(all(feature = "vendored", unix))]
-    fn mux_error_circuit_evidence(
-        err: &crate::vendored::MuxPoolError,
-    ) -> MuxCircuitEvidence {
+    fn mux_error_circuit_evidence(err: &crate::vendored::MuxPoolError) -> MuxCircuitEvidence {
         match err {
             crate::vendored::MuxPoolError::Pool(_) => MuxCircuitEvidence::Ignore,
             crate::vendored::MuxPoolError::Mux(mux)
@@ -2971,12 +2961,10 @@ impl WeztermClient {
     fn mux_error_public_code(err: &crate::vendored::MuxPoolError) -> &'static str {
         match err {
             crate::vendored::MuxPoolError::Pool(_) => "mux_pool_failure",
-            crate::vendored::MuxPoolError::IndeterminateMutation(_) => {
-                "mux_indeterminate_mutation"
+            crate::vendored::MuxPoolError::IndeterminateMutation(_) => "mux_indeterminate_mutation",
+            crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteError(_)) => {
+                "mux_authoritative_rejection"
             }
-            crate::vendored::MuxPoolError::Mux(
-                crate::vendored::DirectMuxError::RemoteError(_),
-            ) => "mux_authoritative_rejection",
             crate::vendored::MuxPoolError::Mux(
                 crate::vendored::DirectMuxError::AlignedUnexpectedResponse { .. },
             ) => "mux_authoritative_response_mismatch",
@@ -3021,10 +3009,7 @@ impl WeztermClient {
     }
 
     #[cfg(all(feature = "vendored", unix))]
-    fn mux_cancelled_error(
-        op: &'static str,
-        err: crate::vendored::MuxPoolError,
-    ) -> crate::Error {
+    fn mux_cancelled_error(op: &'static str, err: crate::vendored::MuxPoolError) -> crate::Error {
         use crate::error::RuntimeOperationSource;
         use crate::runtime_async::LockAcquireError;
 
@@ -3050,21 +3035,19 @@ impl WeztermClient {
             crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::ContextFailure) => {
                 runtime_failure(RuntimeOperationSource::ContextFailure)
             }
-            crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::LockTimedOut { .. }) => {
-                runtime_failure(RuntimeOperationSource::LockTimedOut)
-            }
+            crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::LockTimedOut {
+                ..
+            }) => runtime_failure(RuntimeOperationSource::LockTimedOut),
             crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::PolledAfterCompletion) => {
                 runtime_failure(RuntimeOperationSource::PolledAfterCompletion)
             }
             crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::LockAcquire(lock)) => {
                 let source = match lock {
                     LockAcquireError::Poisoned => RuntimeOperationSource::LockPoisoned,
-                    LockAcquireError::Cancelled => RuntimeOperationSource::Cancelled(
-                        "mux_pool_lock_cancelled".to_string(),
-                    ),
-                    LockAcquireError::DeadlineExceeded => {
-                        RuntimeOperationSource::DeadlineExceeded
+                    LockAcquireError::Cancelled => {
+                        RuntimeOperationSource::Cancelled("mux_pool_lock_cancelled".to_string())
                     }
+                    LockAcquireError::DeadlineExceeded => RuntimeOperationSource::DeadlineExceeded,
                     LockAcquireError::PollQuotaExhausted => {
                         RuntimeOperationSource::PollQuotaExhausted
                     }
@@ -3082,11 +3065,9 @@ impl WeztermClient {
             crate::vendored::MuxPoolError::IndeterminateMutation(_) => {
                 WeztermError::IndeterminateMutation { operation: op }.into()
             }
-            crate::vendored::MuxPoolError::Mux(mux) if mux.is_cancelled() => {
-                runtime_failure(RuntimeOperationSource::Cancelled(
-                    "mux_transport_context_cancelled".to_string(),
-                ))
-            }
+            crate::vendored::MuxPoolError::Mux(mux) if mux.is_cancelled() => runtime_failure(
+                RuntimeOperationSource::Cancelled("mux_transport_context_cancelled".to_string()),
+            ),
             _ => WeztermError::CommandFailed(format!(
                 "wezterm mux {op} failed without CLI fallback: {}",
                 Self::mux_error_public_code(&err)
@@ -3273,11 +3254,8 @@ impl WeztermClient {
                         // waiter backoff so a retry delay checks cancellation
                         // at least once per WAIT_CX_CHECK_INTERVAL instead of
                         // remaining asleep for the entire configured delay.
-                        wait_backoff_with_cx(
-                            cx,
-                            Duration::from_millis(self.retry_delay_ms),
-                        )
-                        .await?;
+                        wait_backoff_with_cx(cx, Duration::from_millis(self.retry_delay_ms))
+                            .await?;
                     }
                 }
             }
@@ -4325,13 +4303,10 @@ async fn wait_backoff_with_cx(cx: &crate::cx::Cx, duration: Duration) -> Result<
         let step = remaining.min(WAIT_CX_CHECK_INTERVAL);
         crate::runtime_async::sleep_with_cx(cx, step)
             .await
-            .map_err(|_| {
-                wezterm_cx_error(cx, "wezterm wait backoff", "capability timer failed")
-            })?;
+            .map_err(|_| wezterm_cx_error(cx, "wezterm wait backoff", "capability timer failed"))?;
     }
-    cx.checkpoint().map_err(|_| {
-        wezterm_cx_error(cx, "wezterm wait backoff", "capability checkpoint failed")
-    })
+    cx.checkpoint()
+        .map_err(|_| wezterm_cx_error(cx, "wezterm wait backoff", "capability checkpoint failed"))
 }
 
 /// Shared waiter for polling pane text until a matcher succeeds.
@@ -4721,9 +4696,7 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
 }
 
 pub(crate) fn elapsed_ms(cx: &crate::cx::Cx, start: RuntimeTime) -> u64 {
-    crate::runtime_async::timer_now_with_cx(cx)
-        .duration_since(start)
-        / 1_000_000
+    crate::runtime_async::timer_now_with_cx(cx).duration_since(start) / 1_000_000
 }
 
 pub(crate) fn next_poll_count(polls: usize) -> usize {
@@ -4826,12 +4799,7 @@ mod tests {
                 true,
             ),
         ];
-        let percentages = [
-            (Some(0), 1),
-            (Some(1), 1),
-            (Some(99), 99),
-            (Some(100), 99),
-        ];
+        let percentages = [(Some(0), 1), (Some(1), 1), (Some(99), 99), (Some(100), 99)];
 
         for (direction, expected_direction, expected_target_is_second) in directions {
             for (percent, expected_percent) in percentages {
@@ -5531,7 +5499,9 @@ mod tests {
             .await
             .expect("bounded cancel-aware backoff must beat the 2 second safety timeout");
             let error = retry_result.expect_err("cancel during backoff must stop retries");
-            cancel_handle.await.expect("cancel trigger task must settle");
+            cancel_handle
+                .await
+                .expect("cancel trigger task must settle");
 
             assert_eq!(
                 invocations.load(std::sync::atomic::Ordering::SeqCst),
@@ -6166,13 +6136,7 @@ mod tests {
         assert_eq!(metadata.stdout_limit, MAX_CLI_METADATA_OUTPUT_BYTES);
         assert_eq!(metadata.output_too_large_command, Some("cli list"));
         assert_eq!(
-            CliCaptureContract::for_args(&[
-                "cli",
-                "--no-auto-start",
-                "list",
-                "--format",
-                "json"
-            ]),
+            CliCaptureContract::for_args(&["cli", "--no-auto-start", "list", "--format", "json"]),
             metadata
         );
 
@@ -6182,10 +6146,7 @@ mod tests {
         assert!(bulk.stdout_limit > metadata.stdout_limit);
 
         let mutation = CliCaptureContract::for_args(&["cli", "send-text", "hello"]);
-        assert_eq!(
-            mutation.stdout_limit,
-            DEFAULT_COMMAND_STDOUT_LIMIT_BYTES
-        );
+        assert_eq!(mutation.stdout_limit, DEFAULT_COMMAND_STDOUT_LIMIT_BYTES);
         assert_eq!(mutation.output_too_large_command, None);
         assert!(MAX_CLI_ERROR_OUTPUT_BYTES > 0);
         assert!(MAX_CLI_ERROR_OUTPUT_BYTES < usize::MAX);
@@ -6193,9 +6154,7 @@ mod tests {
 
     #[test]
     fn metadata_and_bulk_capture_overflow_preserve_output_too_large_variant() {
-        use crate::runtime_async::process::{
-            CommandOutputLimitExceeded, CommandOutputStream,
-        };
+        use crate::runtime_async::process::{CommandOutputLimitExceeded, CommandOutputStream};
 
         let contract = CliCaptureContract::for_args(&["cli", "list", "--format", "json"]);
         let io_error = CommandOutputLimitExceeded::new(
@@ -6215,8 +6174,7 @@ mod tests {
                 && cap == MAX_CLI_METADATA_OUTPUT_BYTES
         ));
 
-        let bulk_contract =
-            CliCaptureContract::for_args(&["cli", "get-text", "--pane-id", "7"]);
+        let bulk_contract = CliCaptureContract::for_args(&["cli", "get-text", "--pane-id", "7"]);
         let bulk_error = CommandOutputLimitExceeded::new(
             CommandOutputStream::Stdout,
             MAX_CLI_BULK_OUTPUT_BYTES + 1,
@@ -6443,7 +6401,10 @@ mod tests {
         );
         assert_eq!(
             WeztermClient::mux_error_is_circuit_breaker_trigger(err),
-            matches!(expected_circuit_evidence, MuxCircuitEvidence::BackendFailure),
+            matches!(
+                expected_circuit_evidence,
+                MuxCircuitEvidence::BackendFailure
+            ),
             "circuit-breaker consumer disagreed for {err:?}"
         );
         assert_eq!(
@@ -6688,15 +6649,8 @@ mod tests {
             ),
         ];
 
-        for (
-            error,
-            kind,
-            retry,
-            discard,
-            cancelled,
-            should_fail_over,
-            expected_circuit_evidence,
-        ) in cases
+        for (error, kind, retry, discard, cancelled, should_fail_over, expected_circuit_evidence) in
+            cases
         {
             let decision = crate::protocol_recovery::mux_recovery_decision(&error);
             assert_eq!(decision.kind, kind, "kind disagreed for {error:?}");
@@ -7091,9 +7045,7 @@ mod tests {
 
         let pane_rejection = WeztermClient::map_cli_mutation_pane_error(
             CliMutationOutcome {
-                result: Err(
-                    WeztermError::CommandFailed("pane 41 not found".to_string()).into(),
-                ),
+                result: Err(WeztermError::CommandFailed("pane 41 not found".to_string()).into()),
                 circuit_evidence: CliMutationCircuitEvidence::SuccessfulResponse,
             },
             41,
@@ -7125,11 +7077,9 @@ mod tests {
         );
         assert!(matches!(
             &authoritative_failure,
-            Err(crate::Error::Wezterm(
-                WeztermError::IndeterminateMutation {
-                    operation: "send_text"
-                }
-            ))
+            Err(crate::Error::Wezterm(WeztermError::IndeterminateMutation {
+                operation: "send_text"
+            }))
         ));
         let evidence =
             WeztermClient::completed_cli_mutation_circuit_evidence(&authoritative_failure);
@@ -7772,10 +7722,7 @@ mod tests {
                 .await
                 .expect("direct cancellation remains a typed wait outcome");
 
-            assert!(matches!(
-                &result,
-                WaitResult::Cancelled { polls: 1, .. }
-            ));
+            assert!(matches!(&result, WaitResult::Cancelled { polls: 1, .. }));
             assert!(!format!("{result:?}").contains("SECRET"));
         });
     }
@@ -8925,9 +8872,7 @@ fn mock_lock_error(
         LockAcquireError::ContextFailure => RuntimeOperationSource::ContextFailure,
         LockAcquireError::TimedOut { .. } => RuntimeOperationSource::LockTimedOut,
         LockAcquireError::Poisoned => RuntimeOperationSource::LockPoisoned,
-        LockAcquireError::PolledAfterCompletion => {
-            RuntimeOperationSource::PolledAfterCompletion
-        }
+        LockAcquireError::PolledAfterCompletion => RuntimeOperationSource::PolledAfterCompletion,
     };
     crate::Error::RuntimeOperation { operation, source }
 }
@@ -9002,7 +8947,10 @@ impl MockWezterm {
             if pane.is_active && !batch_active_tabs.insert(pane.tab_id) {
                 return Err(crate::Error::runtime_backend(
                     "mock add panes",
-                    format!("batch contains multiple active panes in tab {}", pane.tab_id),
+                    format!(
+                        "batch contains multiple active panes in tab {}",
+                        pane.tab_id
+                    ),
                 ));
             }
         }
@@ -9034,7 +8982,9 @@ impl MockWezterm {
         {
             return Err(crate::Error::runtime_backend(
                 "mock add panes",
-                format!("combined mock state would contain multiple active panes in tab {conflicting_tab_id}"),
+                format!(
+                    "combined mock state would contain multiple active panes in tab {conflicting_tab_id}"
+                ),
             ));
         }
 
@@ -9975,9 +9925,7 @@ mod mock_tests {
                 .await
                 .expect_err("multiple active panes must reject the whole batch");
 
-            assert!(error
-                .to_string()
-                .contains("multiple active panes in tab 0"));
+            assert!(error.to_string().contains("multiple active panes in tab 0"));
             assert_eq!(mock.pane_count().await, 0);
             assert_eq!(mock.next_pane_id.load(Ordering::SeqCst), 0);
         });

@@ -261,6 +261,12 @@ pub struct AsupersyncTelemetry {
 }
 
 impl AsupersyncTelemetry {
+    fn saturating_add(counter: &AtomicU64, delta: u64) {
+        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(delta))
+        });
+    }
+
     /// Create a new zeroed telemetry instance.
     #[must_use]
     pub fn new() -> Self {
@@ -367,25 +373,25 @@ impl AsupersyncTelemetry {
 
     /// Record a health tier sample.
     pub fn record_health_sample(&self, tier: HealthTier) {
-        self.health_samples.fetch_add(1, Ordering::Relaxed);
-        match tier {
-            HealthTier::Green => self.health_green_samples.fetch_add(1, Ordering::Relaxed),
-            HealthTier::Yellow => self.health_yellow_samples.fetch_add(1, Ordering::Relaxed),
-            HealthTier::Red => self.health_red_samples.fetch_add(1, Ordering::Relaxed),
-            HealthTier::Black => self.health_black_samples.fetch_add(1, Ordering::Relaxed),
+        Self::saturating_add(&self.health_samples, 1);
+        let tier_counter = match tier {
+            HealthTier::Green => &self.health_green_samples,
+            HealthTier::Yellow => &self.health_yellow_samples,
+            HealthTier::Red => &self.health_red_samples,
+            HealthTier::Black => &self.health_black_samples,
         };
+        Self::saturating_add(tier_counter, 1);
     }
 
     /// Record a gate evaluation result.
     pub fn record_gate_verdict(&self, verdict: GateVerdict) {
-        self.gate_evaluations.fetch_add(1, Ordering::Relaxed);
-        match verdict {
-            GateVerdict::Pass => self.gate_passes.fetch_add(1, Ordering::Relaxed),
-            GateVerdict::ConditionalPass => {
-                self.gate_conditional_passes.fetch_add(1, Ordering::Relaxed)
-            }
-            GateVerdict::Fail => self.gate_failures.fetch_add(1, Ordering::Relaxed),
+        Self::saturating_add(&self.gate_evaluations, 1);
+        let verdict_counter = match verdict {
+            GateVerdict::Pass => &self.gate_passes,
+            GateVerdict::ConditionalPass => &self.gate_conditional_passes,
+            GateVerdict::Fail => &self.gate_failures,
         };
+        Self::saturating_add(verdict_counter, 1);
     }
 
     /// Update a max-value counter (e.g., max depth, max latency).
@@ -406,8 +412,7 @@ impl AsupersyncTelemetry {
 
     /// Record a cancellation latency sample (microseconds).
     pub fn record_cancel_latency_us(&self, latency_us: u64) {
-        self.cancel_latency_sum_us
-            .fetch_add(latency_us, Ordering::Relaxed);
+        Self::saturating_add(&self.cancel_latency_sum_us, latency_us);
         Self::update_max(&self.cancel_latency_max_us, latency_us);
     }
 
@@ -564,10 +569,13 @@ impl AsupersyncTelemetrySnapshot {
     /// Health tier distribution as fractions. Returns `[green, yellow, red, black]`.
     #[must_use]
     pub fn health_distribution(&self) -> [f64; 4] {
-        if self.health_samples == 0 {
+        let total = self.health_green_samples as f64
+            + self.health_yellow_samples as f64
+            + self.health_red_samples as f64
+            + self.health_black_samples as f64;
+        if total == 0.0 {
             return [1.0, 0.0, 0.0, 0.0];
         }
-        let total = self.health_samples as f64;
         [
             self.health_green_samples as f64 / total,
             self.health_yellow_samples as f64 / total,
@@ -576,13 +584,21 @@ impl AsupersyncTelemetrySnapshot {
         ]
     }
 
-    /// Gate pass ratio. Returns 1.0 if no evaluations.
+    /// Strict gate pass ratio. Returns 1.0 if no outcomes were recorded.
+    ///
+    /// The denominator comes from the mutually exclusive outcome buckets rather
+    /// than `gate_evaluations`.  Both the aggregate and buckets saturate, so the
+    /// aggregate can otherwise become permanently detached from the outcome mix
+    /// once a long-running process reaches the counter ceiling.
     #[must_use]
     pub fn gate_pass_ratio(&self) -> f64 {
-        if self.gate_evaluations == 0 {
+        let outcomes = self.gate_passes as f64
+            + self.gate_conditional_passes as f64
+            + self.gate_failures as f64;
+        if outcomes == 0.0 {
             return 1.0;
         }
-        self.gate_passes as f64 / self.gate_evaluations as f64
+        self.gate_passes as f64 / outcomes
     }
 
     /// Pending task count (spawned - completed - cancelled - leaked - panicked).
@@ -1689,6 +1705,39 @@ mod tests {
     }
 
     #[test]
+    fn health_distribution_uses_bucket_sum_after_counter_saturation() {
+        let telem = AsupersyncTelemetry::new();
+        telem.health_samples.store(u64::MAX, Ordering::Relaxed);
+        telem
+            .health_green_samples
+            .store(u64::MAX, Ordering::Relaxed);
+        telem
+            .health_yellow_samples
+            .store(u64::MAX, Ordering::Relaxed);
+        telem.health_red_samples.store(u64::MAX, Ordering::Relaxed);
+        telem
+            .health_black_samples
+            .store(u64::MAX, Ordering::Relaxed);
+        telem.gate_evaluations.store(u64::MAX, Ordering::Relaxed);
+        telem.gate_passes.store(u64::MAX, Ordering::Relaxed);
+        telem
+            .cancel_latency_sum_us
+            .store(u64::MAX, Ordering::Relaxed);
+
+        telem.record_health_sample(HealthTier::Green);
+        telem.record_gate_verdict(GateVerdict::Pass);
+        telem.record_cancel_latency_us(1);
+
+        let snapshot = telem.snapshot();
+        assert_eq!(snapshot.health_distribution(), [0.25; 4]);
+        assert_eq!(snapshot.health_samples, u64::MAX);
+        assert_eq!(snapshot.health_green_samples, u64::MAX);
+        assert_eq!(snapshot.gate_evaluations, u64::MAX);
+        assert_eq!(snapshot.gate_passes, u64::MAX);
+        assert_eq!(snapshot.cancel_latency_sum_us, u64::MAX);
+    }
+
+    #[test]
     fn tasks_pending_saturates_to_zero() {
         let telem = AsupersyncTelemetry::new();
         telem.tasks_completed.fetch_add(100, Ordering::Relaxed);
@@ -1715,6 +1764,17 @@ mod tests {
     fn gate_pass_ratio_is_one_when_no_evaluations() {
         let snap = AsupersyncTelemetry::new().snapshot();
         assert_eq!(snap.gate_pass_ratio(), 1.0);
+    }
+
+    #[test]
+    fn gate_pass_ratio_uses_saturated_outcome_distribution() {
+        let mut snap = AsupersyncTelemetry::new().snapshot();
+        snap.gate_evaluations = u64::MAX;
+        snap.gate_passes = u64::MAX;
+        snap.gate_conditional_passes = u64::MAX;
+        snap.gate_failures = u64::MAX;
+
+        assert!((snap.gate_pass_ratio() - (1.0 / 3.0)).abs() < f64::EPSILON);
     }
 
     #[test]

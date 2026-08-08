@@ -1004,12 +1004,7 @@ impl<T> McpEnvelope<T> {
         }
     }
 
-    pub fn error(
-        code: &str,
-        msg: impl AsRef<str>,
-        hint: Option<String>,
-        elapsed_ms: u64,
-    ) -> Self {
+    pub fn error(code: &str, msg: impl AsRef<str>, hint: Option<String>, elapsed_ms: u64) -> Self {
         let msg = redact_mcp_envelope_text(msg.as_ref());
         let hint = hint.as_deref().map(redact_mcp_envelope_text);
         Self {
@@ -1400,12 +1395,7 @@ mod tests {
             &secret[split_at..],
             "x".repeat(4_000)
         );
-        let envelope = McpEnvelope::<()>::error(
-            "FT-MCP-0001",
-            &hostile,
-            Some(hostile.clone()),
-            0,
-        );
+        let envelope = McpEnvelope::<()>::error("FT-MCP-0001", &hostile, Some(hostile.clone()), 0);
 
         for field in [envelope.error.as_deref(), envelope.hint.as_deref()] {
             let field = field.expect("error envelope diagnostic field");
@@ -1418,12 +1408,8 @@ mod tests {
         }
 
         let oversized = "x".repeat(MCP_ENVELOPE_TEXT_INPUT_MAX_BYTES + 1);
-        let envelope = McpEnvelope::<()>::error(
-            "FT-MCP-0001",
-            &oversized,
-            Some(oversized.clone()),
-            0,
-        );
+        let envelope =
+            McpEnvelope::<()>::error("FT-MCP-0001", &oversized, Some(oversized.clone()), 0);
         assert_eq!(envelope.error.as_deref(), Some(MCP_ENVELOPE_TEXT_OVERSIZE));
         assert_eq!(envelope.hint.as_deref(), Some(MCP_ENVELOPE_TEXT_OVERSIZE));
     }

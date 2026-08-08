@@ -2301,12 +2301,8 @@ fn purge_audit_actions_removes_old_entries() {
     // purge_audit_actions_backend at c64527d9c. Wrap the test
     // conn into a RusqliteBackend for the backend-trait call.
     let backend = RusqliteBackend::new(conn);
-    let deleted = purge_audit_actions_backend(
-        &backend,
-        1_500,
-        AUXILIARY_RETENTION_DELETE_BATCH_MAX,
-    )
-    .unwrap();
+    let deleted =
+        purge_audit_actions_backend(&backend, 1_500, AUXILIARY_RETENTION_DELETE_BATCH_MAX).unwrap();
     assert_eq!(deleted, 1);
 
     let rows = query_audit_actions_backend(&backend, &AuditQuery::default()).unwrap();

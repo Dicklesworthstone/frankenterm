@@ -321,11 +321,11 @@ impl WireDedupHealth {
 
     #[must_use]
     pub fn duplicate_ratio(&self) -> f64 {
-        let total = self.accepts_total + self.duplicates_total;
-        if total == 0 {
+        let total = self.accepts_total as f64 + self.duplicates_total as f64;
+        if total == 0.0 {
             return 0.0;
         }
-        self.duplicates_total as f64 / total as f64
+        self.duplicates_total as f64 / total
     }
 }
 
@@ -498,6 +498,18 @@ mod tests {
         };
         assert!((h.duplicate_ratio() - 0.25).abs() < 1e-9);
         assert!(h.is_safe());
+    }
+
+    #[test]
+    fn duplicate_ratio_handles_saturated_counters_without_overflow() {
+        let h = WireDedupHealth {
+            schedules_explored: 1,
+            states_visited: u64::MAX,
+            accepts_total: u64::MAX,
+            duplicates_total: u64::MAX,
+            safety_violations_total: 0,
+        };
+        assert_eq!(h.duplicate_ratio(), 0.5);
     }
 
     #[test]

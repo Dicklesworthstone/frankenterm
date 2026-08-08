@@ -522,10 +522,7 @@ fn snapshot_delete_with_precancelled_cx_does_not_mutate() {
         let (_tmp, db_path, _storage) = setup_test_db().await;
         let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
         let checkpoint = engine
-            .capture(
-                &[make_test_pane(41, 24, 80)],
-                SnapshotTrigger::Manual,
-            )
+            .capture(&[make_test_pane(41, 24, 80)], SnapshotTrigger::Manual)
             .await
             .expect("fixture checkpoint");
 
@@ -535,10 +532,7 @@ fn snapshot_delete_with_precancelled_cx_does_not_mutate() {
             Some("snapshot delete pre-cancel proof"),
         );
         let error = engine
-            .delete_checkpoint_with_cx(
-                &cx,
-                SnapshotDeleteTarget::Id(checkpoint.checkpoint_id),
-            )
+            .delete_checkpoint_with_cx(&cx, SnapshotDeleteTarget::Id(checkpoint.checkpoint_id))
             .await
             .expect_err("pre-cancelled delete must not reach SQLite");
         assert!(matches!(error, SnapshotError::Cancelled));
@@ -551,10 +545,7 @@ fn snapshot_delete_with_precancelled_cx_does_not_mutate() {
         assert_eq!(deleted.identity.checkpoint_id, checkpoint.checkpoint_id);
 
         let replacement = engine
-            .capture(
-                &[make_test_pane(41, 24, 80)],
-                SnapshotTrigger::Periodic,
-            )
+            .capture(&[make_test_pane(41, 24, 80)], SnapshotTrigger::Periodic)
             .await
             .expect("deleting the durable row must invalidate periodic dedup state");
         let persisted_replacement: i64 = Connection::open(db_path.as_str())
@@ -649,10 +640,7 @@ fn snapshot_cleanup_with_zero_retention_deletes_all() {
         );
 
         let replacement = engine
-            .capture(
-                &[make_test_pane(2, 26, 80)],
-                SnapshotTrigger::Periodic,
-            )
+            .capture(&[make_test_pane(2, 26, 80)], SnapshotTrigger::Periodic)
             .await
             .expect("cleanup must invalidate a digest whose durable row may be gone");
         assert_eq!(replacement.pane_count, 1);

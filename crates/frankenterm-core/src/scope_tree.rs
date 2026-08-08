@@ -746,11 +746,18 @@ impl ScopeHandle {
 
     /// Request shutdown by setting the flag and bumping the generation.
     ///
-    /// Both stores use `Release` ordering so that readers using `Acquire`
-    /// on either the flag or the generation observe a consistent state.
+    /// The flag is published first so shutdown remains fail-safe even if the
+    /// diagnostic generation space is exhausted. The generation saturates at
+    /// its terminal value rather than wrapping or panicking in a shutdown
+    /// path. Acquiring an advanced generation also observes the preceding flag
+    /// publication.
     pub fn request_shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Release);
-        self.generation.fetch_add(1, Ordering::Release);
+        let _ = self
+            .generation
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            });
     }
 
     /// Check if shutdown has been requested.
@@ -1210,6 +1217,20 @@ mod tests {
         handle.request_shutdown();
         assert!(handle.is_shutdown_requested());
         assert_eq!(handle.current_generation(), 1);
+    }
+
+    #[test]
+    fn scope_handle_generation_exhaustion_keeps_shutdown_published_without_panicking_or_wrapping() {
+        let handle = ScopeHandle::new(well_known::discovery());
+        handle.generation.store(u64::MAX, Ordering::Release);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle.request_shutdown();
+        }));
+
+        assert!(result.is_ok());
+        assert!(handle.is_shutdown_requested());
+        assert_eq!(handle.current_generation(), u64::MAX);
     }
 
     #[test]

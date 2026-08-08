@@ -350,11 +350,9 @@ fn execute_cx_poll_quota_exhaustion_preserves_exact_prefix() {
             vec![0, 1]
         );
         assert_eq!(
-            report.interruption().map(|value| (
-                value.plan_index,
-                value.phase,
-                value.reason,
-            )),
+            report
+                .interruption()
+                .map(|value| (value.plan_index, value.phase, value.reason,)),
             Some((
                 2,
                 LaunchInterruptionPhase::BeforePlan,

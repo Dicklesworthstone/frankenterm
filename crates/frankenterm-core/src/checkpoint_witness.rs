@@ -92,11 +92,7 @@ pub fn persisted_pane_text_bytes(pane: &PersistedPaneState) -> Option<usize> {
         .checked_add(pane.command.as_ref().map_or(0, String::len))?
         .checked_add(pane.env_json.as_ref().map_or(0, String::len))?
         .checked_add(pane.terminal_state_json.len())?
-        .checked_add(
-            pane.agent_metadata_json
-                .as_ref()
-                .map_or(0, String::len),
-        )
+        .checked_add(pane.agent_metadata_json.as_ref().map_or(0, String::len))
 }
 
 /// Exact admitted text bytes for a complete checkpoint projection.
@@ -155,7 +151,10 @@ fn validate_persisted_projection(
         if pane.pane_id < 0 {
             return Err(CheckpointWitnessError::NegativeValue("pane_id"));
         }
-        if pane.scrollback_checkpoint_seq.is_some_and(|value| value < 0) {
+        if pane
+            .scrollback_checkpoint_seq
+            .is_some_and(|value| value < 0)
+        {
             return Err(CheckpointWitnessError::NegativeValue(
                 "scrollback_checkpoint_seq",
             ));
@@ -165,11 +164,7 @@ fn validate_persisted_projection(
         }
         let pane_bytes = persisted_pane_text_bytes(pane)
             .ok_or(CheckpointWitnessError::LengthOverflow("pane text bytes"))?;
-        require_resource_limit(
-            "pane text bytes",
-            pane_bytes,
-            MAX_PERSISTED_PANE_TEXT_BYTES,
-        )?;
+        require_resource_limit("pane text bytes", pane_bytes, MAX_PERSISTED_PANE_TEXT_BYTES)?;
         checkpoint_bytes = checkpoint_bytes.checked_add(pane_bytes).ok_or(
             CheckpointWitnessError::LengthOverflow("checkpoint text bytes"),
         )?;
@@ -199,19 +194,14 @@ fn canonicalize_json_value(value: Value) -> Value {
             }
             Value::Object(canonical)
         }
-        Value::Array(values) => Value::Array(
-            values
-                .into_iter()
-                .map(canonicalize_json_value)
-                .collect(),
-        ),
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(canonicalize_json_value).collect())
+        }
         scalar => scalar,
     }
 }
 
-pub fn canonical_json_string<T: Serialize>(
-    value: &T,
-) -> Result<String, CheckpointWitnessError> {
+pub fn canonical_json_string<T: Serialize>(value: &T) -> Result<String, CheckpointWitnessError> {
     let value = serde_json::to_value(value)?;
     Ok(serde_json::to_string(&canonicalize_json_value(value))?)
 }
@@ -309,9 +299,7 @@ fn sorted_panes(
     panes.sort_unstable_by_key(|pane| pane.pane_id);
     for adjacent in panes.windows(2) {
         if adjacent[0].pane_id == adjacent[1].pane_id {
-            return Err(CheckpointWitnessError::DuplicatePaneId(
-                adjacent[0].pane_id,
-            ));
+            return Err(CheckpointWitnessError::DuplicatePaneId(adjacent[0].pane_id));
         }
     }
     Ok(panes)
@@ -330,9 +318,7 @@ fn frame_panes(
     let mut already_sorted = true;
     for adjacent in panes.windows(2) {
         if adjacent[0].pane_id == adjacent[1].pane_id {
-            return Err(CheckpointWitnessError::DuplicatePaneId(
-                adjacent[0].pane_id,
-            ));
+            return Err(CheckpointWitnessError::DuplicatePaneId(adjacent[0].pane_id));
         }
         if adjacent[0].pane_id > adjacent[1].pane_id {
             already_sorted = false;
@@ -358,22 +344,13 @@ fn frame_pane(
     framed.required_i64("pane_id", pane.pane_id)?;
     framed.optional_bytes("cwd", pane.cwd.as_deref().map(str::as_bytes))?;
     framed.optional_bytes("command", pane.command.as_deref().map(str::as_bytes))?;
-    framed.optional_bytes(
-        "env_json",
-        pane.env_json.as_deref().map(str::as_bytes),
-    )?;
-    framed.required_bytes(
-        "terminal_state_json",
-        pane.terminal_state_json.as_bytes(),
-    )?;
+    framed.optional_bytes("env_json", pane.env_json.as_deref().map(str::as_bytes))?;
+    framed.required_bytes("terminal_state_json", pane.terminal_state_json.as_bytes())?;
     framed.optional_bytes(
         "agent_metadata_json",
         pane.agent_metadata_json.as_deref().map(str::as_bytes),
     )?;
-    framed.optional_i64(
-        "scrollback_checkpoint_seq",
-        pane.scrollback_checkpoint_seq,
-    )?;
+    framed.optional_i64("scrollback_checkpoint_seq", pane.scrollback_checkpoint_seq)?;
     framed.optional_i64("last_output_at", pane.last_output_at)?;
     Ok(())
 }
@@ -415,11 +392,7 @@ pub fn checkpoint_witness(
     topology_json: Option<&str>,
     panes: &[PersistedPaneState],
 ) -> Result<String, CheckpointWitnessError> {
-    require_resource_limit(
-        "checkpoint_role",
-        role.len(),
-        MAX_CHECKPOINT_ROLE_BYTES,
-    )?;
+    require_resource_limit("checkpoint_role", role.len(), MAX_CHECKPOINT_ROLE_BYTES)?;
     // Reject an unsupported role before inspecting any pane payload. The role
     // selects the hash domain, so no other projection work is useful until it
     // is known to be valid.
@@ -467,11 +440,7 @@ pub fn checkpoint_witness(
     }
     let declared_pane_count = usize::try_from(pane_count)
         .map_err(|_| CheckpointWitnessError::LengthOverflow("pane_count"))?;
-    require_resource_limit(
-        "pane_count",
-        declared_pane_count,
-        MAX_TOPOLOGY_PANES,
-    )?;
+    require_resource_limit("pane_count", declared_pane_count, MAX_TOPOLOGY_PANES)?;
     let declared_total_bytes = usize::try_from(total_bytes)
         .map_err(|_| CheckpointWitnessError::LengthOverflow("total_bytes"))?;
     require_resource_limit(
