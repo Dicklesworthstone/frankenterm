@@ -5,9 +5,7 @@ use xkbcommon::xkb::CONTEXT_NO_FLAGS;
 
 use crate::x11::KeyboardWithFallback;
 
-use super::state::{
-    clear_surface_authority_if_matches, replace_surface_authority, WaylandState,
-};
+use super::state::{clear_surface_authority_if_matches, replace_surface_authority, WaylandState};
 use super::SurfaceUserData;
 
 fn cancel_window_key_repeat(state: &WaylandState, window_id: usize) {
@@ -70,19 +68,10 @@ enum ModifierRoute {
 }
 
 fn route_modifiers(focused_window: Option<usize>) -> ModifierRoute {
-    focused_window.map_or(ModifierRoute::UpdateMapperOnly, ModifierRoute::DispatchToWindow)
-}
-
-fn update_unfocused_modifier_state(
-    mapper: Option<&mut KeyboardWithFallback>,
-    mods_depressed: u32,
-    mods_latched: u32,
-    mods_locked: u32,
-    group: u32,
-) {
-    if let Some(mapper) = mapper {
-        mapper.update_modifier_state(mods_depressed, mods_latched, mods_locked, group);
-    }
+    focused_window.map_or(
+        ModifierRoute::UpdateMapperOnly,
+        ModifierRoute::DispatchToWindow,
+    )
 }
 
 // We can't use the xkbcommon feature because it is too abstract for us
@@ -104,21 +93,31 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
                 *state.last_serial.borrow_mut() = *serial;
                 let entered_window_id =
                     SurfaceUserData::try_from_wl(surface).map(|data| data.window_id);
-                replace_surface_authority(
-                    &mut state.keyboard_active_surface_id.borrow_mut(),
-                    surface.id(),
-                );
+                {
+                    let mut active_surface = state.keyboard_active_surface_id.borrow_mut();
+                    replace_surface_authority(&mut *active_surface, surface.id());
+                }
                 let route = route_keyboard_enter(state.keyboard_window_id, entered_window_id);
                 if let Some(window_id) = route.cancel_repeat_for {
-                    cancel_window_key_repeat(state, window_id);
                     let previous_window = state.window_by_id(window_id);
                     if let Some(previous_window) = previous_window {
                         // Enter should normally be preceded by Leave.  If it
                         // is not, retire the old focus coherently before the
-                        // new window receives Enter(true).
-                        previous_window
-                            .borrow_mut()
-                            .emit_focus(state.keyboard_mapper.as_mut(), false);
+                        // new window receives Enter(true). Preserve the
+                        // seat-global mapper when focus transfers directly to
+                        // another known surface; the new window must inherit
+                        // the compositor's current modifier state.
+                        if entered_window_id.is_some() {
+                            previous_window.borrow_mut().emit_focus_transfer_out();
+                        } else {
+                            previous_window
+                                .borrow_mut()
+                                .emit_focus(state.keyboard_mapper.as_mut(), false);
+                        }
+                    } else {
+                        log::warn!(
+                            "Wayland keyboard focus transfer referenced missing window {window_id}"
+                        );
                     }
                 }
                 state.keyboard_window_id = route.focused;
@@ -141,10 +140,11 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
             } => {
                 *state.last_serial.borrow_mut() = *serial;
                 let left_surface_id = surface.id();
-                if !clear_surface_authority_if_matches(
-                    &mut state.keyboard_active_surface_id.borrow_mut(),
-                    &left_surface_id,
-                ) {
+                let cleared = {
+                    let mut active_surface = state.keyboard_active_surface_id.borrow_mut();
+                    clear_surface_authority_if_matches(&mut *active_surface, &left_surface_id)
+                };
+                if !cleared {
                     log::warn!(
                         "Ignoring stale Wayland keyboard Leave for surface {left_surface_id:?}"
                     );
@@ -179,18 +179,22 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
                 group,
             } => {
                 *state.last_serial.borrow_mut() = *serial;
+                if let Some(mapper) = state.keyboard_mapper.as_mut() {
+                    // XKB state belongs to the wl_keyboard/seat, not to a
+                    // particular window. Update it even when there is no
+                    // focused surface or the focused window has disappeared.
+                    mapper.update_modifier_state(
+                        *mods_depressed,
+                        *mods_latched,
+                        *mods_locked,
+                        *group,
+                    );
+                }
                 match route_modifiers(state.keyboard_window_id) {
                     ModifierRoute::DispatchToWindow(window_id) => {
                         event_window_id = Some(window_id);
                     }
                     ModifierRoute::UpdateMapperOnly => {
-                        update_unfocused_modifier_state(
-                            state.keyboard_mapper.as_mut(),
-                            *mods_depressed,
-                            *mods_latched,
-                            *mods_locked,
-                            *group,
-                        );
                         return;
                     }
                 }
@@ -362,9 +366,6 @@ mod tests {
     #[test]
     fn modifiers_without_surface_focus_still_update_the_global_mapper() {
         assert_eq!(route_modifiers(None), ModifierRoute::UpdateMapperOnly);
-        assert_eq!(
-            route_modifiers(Some(9)),
-            ModifierRoute::DispatchToWindow(9)
-        );
+        assert_eq!(route_modifiers(Some(9)), ModifierRoute::DispatchToWindow(9));
     }
 }

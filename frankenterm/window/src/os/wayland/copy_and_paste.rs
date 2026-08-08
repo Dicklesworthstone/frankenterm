@@ -112,31 +112,65 @@ impl CopyAndPaste {
     pub(super) fn confirm_selection(&mut self, offer: SelectionOffer) {
         self.data_offer.replace(offer);
     }
+
+    pub(super) fn clear_selection(&mut self) {
+        self.data_offer.take();
+    }
+}
+
+fn clipboard_surface_authority<T>(keyboard_surface: &Option<T>) -> Option<&T> {
+    // Wayland selection offers are seat/keyboard-focus state. Pointer focus is
+    // independent and must not redirect clipboard ownership to the surface
+    // merely under the mouse.
+    keyboard_surface.as_ref()
 }
 
 impl WaylandState {
     pub(super) fn resolve_copy_and_paste(&mut self) -> Option<Arc<Mutex<CopyAndPaste>>> {
-        let active_surface_id = self.active_surface_id.borrow();
-        let Some(active_surface_id) = active_surface_id.as_ref() else {
-            log::warn!("Wayland clipboard selection arrived without an active surface");
+        let keyboard_surface_id = self.keyboard_active_surface_id.borrow();
+        let Some(keyboard_surface_id) = clipboard_surface_authority(&keyboard_surface_id) else {
+            log::warn!("Wayland clipboard selection arrived without keyboard surface focus");
             return None;
         };
-        let Some(pending) = self.surface_to_pending.get(active_surface_id) else {
+        let Some(pending) = self.surface_to_pending.get(keyboard_surface_id) else {
             log::warn!(
-                "Wayland clipboard selection arrived without pending surface state for {:?}",
-                active_surface_id
+                "Wayland clipboard selection arrived without pending keyboard surface state for {:?}",
+                keyboard_surface_id
             );
             return None;
         };
 
         match pending.lock() {
             Ok(pending) => Some(Arc::clone(&pending.copy_and_paste)),
-            Err(_) => {
+            Err(poisoned) => {
                 log::error!(
-                    "Wayland pending surface lock was poisoned while resolving clipboard selection"
+                    "Wayland pending surface lock was poisoned while resolving clipboard selection; recovering"
                 );
-                None
+                Some(Arc::clone(&poisoned.into_inner().copy_and_paste))
             }
+        }
+    }
+
+    pub(super) fn clear_copy_and_paste_offers(&self) {
+        for pending in self.surface_to_pending.values() {
+            let copy_and_paste = match pending.lock() {
+                Ok(pending) => Arc::clone(&pending.copy_and_paste),
+                Err(poisoned) => {
+                    log::error!(
+                        "Wayland pending surface lock was poisoned while clearing clipboard offers; recovering"
+                    );
+                    Arc::clone(&poisoned.into_inner().copy_and_paste)
+                }
+            };
+            match copy_and_paste.lock() {
+                Ok(mut copy_and_paste) => copy_and_paste.clear_selection(),
+                Err(poisoned) => {
+                    log::error!(
+                        "Wayland copy-and-paste lock was poisoned while clearing clipboard offers; recovering"
+                    );
+                    poisoned.into_inner().clear_selection();
+                }
+            };
         }
     }
 }
@@ -269,7 +303,7 @@ impl PrimarySelectionSourceHandler for WaylandState {
 
 #[cfg(test)]
 mod tests {
-    use super::{set_pipe_nonblocking, write_pipe_with_timeout};
+    use super::{clipboard_surface_authority, set_pipe_nonblocking, write_pipe_with_timeout};
     use smithay_client_toolkit::data_device_manager::WritePipe;
     use std::fs::File;
     use std::io::Read;
@@ -298,6 +332,15 @@ mod tests {
         assert_ne!(updated, -1);
         assert_ne!(updated & libc::O_NONBLOCK, 0);
         assert_ne!(updated & libc::O_APPEND, 0);
+    }
+
+    #[test]
+    fn clipboard_authority_follows_keyboard_when_pointer_focus_differs() {
+        let keyboard_surface = Some(22_u32);
+        let pointer_surface = Some(11_u32);
+
+        assert_eq!(clipboard_surface_authority(&keyboard_surface), Some(&22));
+        assert_eq!(pointer_surface, Some(11));
     }
 
     #[test]

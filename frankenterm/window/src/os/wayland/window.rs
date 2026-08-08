@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::max;
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryFrom;
 use std::io::{ErrorKind, Read};
 use std::num::NonZeroU32;
 use std::os::fd::AsRawFd;
@@ -80,6 +80,27 @@ impl WaylandDimensions for Dimensions {
     fn surface_to_pixels(&self, surface: i32) -> i32 {
         (surface as f64 * self.dpi_factor()).ceil() as i32
     }
+}
+
+fn checked_surface_dimensions(width: u32, height: u32) -> Option<(i32, i32)> {
+    let dimensions = (i32::try_from(width).ok()?, i32::try_from(height).ok()?);
+    (dimensions.0 > 0 && dimensions.1 > 0).then_some(dimensions)
+}
+
+fn checked_pixel_dimensions(width: usize, height: usize) -> Option<(i32, i32)> {
+    let dimensions = (i32::try_from(width).ok()?, i32::try_from(height).ok()?);
+    (dimensions.0 > 0 && dimensions.1 > 0).then_some(dimensions)
+}
+
+fn validate_resize_increments(incr: ResizeIncrement) -> anyhow::Result<()> {
+    if incr.x == 0 || incr.y == 0 {
+        bail!(
+            "Wayland resize increments must be non-zero, got {}x{}",
+            incr.x,
+            incr.y
+        );
+    }
+    Ok(())
 }
 
 use super::copy_and_paste::{set_pipe_nonblocking, CopyAndPaste};
@@ -456,9 +477,13 @@ impl WaylandWindow {
         window_frame.set_hidden(hidden);
         if !hidden {
             window_frame.resize(
-                NonZeroU32::new(dimensions.pixel_width as u32)
+                u32::try_from(dimensions.pixel_width)
+                    .ok()
+                    .and_then(NonZeroU32::new)
                     .ok_or_else(|| anyhow!("dimensions {dimensions:?} are invalid"))?,
-                NonZeroU32::new(dimensions.pixel_height as u32)
+                u32::try_from(dimensions.pixel_height)
+                    .ok()
+                    .and_then(NonZeroU32::new)
                     .ok_or_else(|| anyhow!("dimensions {dimensions:?} are invalid"))?,
             );
         }
@@ -601,39 +626,50 @@ impl WindowOps for WaylandWindow {
             let Some(handle) = connection.window_by_id(window_id) else {
                 return;
             };
-            let surface_id = {
-                let mut inner = handle.borrow_mut();
-                let surface_id = inner.window.as_ref().map(|window| window.wl_surface().id());
-                inner.close();
-                surface_id
-            };
+            let surface_id = handle
+                .borrow()
+                .window
+                .as_ref()
+                .map(|window| window.wl_surface().id());
 
-            let mut state = connection.wayland_state.borrow_mut();
-            let removed = state.windows.get_mut().remove(&window_id);
+            {
+                let mut state = connection.wayland_state.borrow_mut();
+                let authority_cleanup =
+                    state.clear_destroyed_window_authorities(window_id, surface_id.as_ref());
+                if authority_cleanup.keyboard {
+                    if let (Some(text_input), Some(keyboard)) = (&state.text_input, &state.keyboard)
+                    {
+                        if let Some(input) = text_input.get_text_input_for_keyboard(keyboard) {
+                            input.disable();
+                            input.commit();
+                        }
+                    }
+                }
+                if let Some(surface_id) = surface_id.as_ref() {
+                    if let Some(text_input) = &state.text_input {
+                        text_input.forget_surface_id(surface_id);
+                    }
+                    state.surface_to_pending.remove(surface_id);
+                }
+            }
+
+            // Publish destroyed input authority before dispatching Destroyed,
+            // but keep the registry entry alive during the callback so
+            // re-entrant window queries observe a coherent closing object.
+            handle.borrow_mut().close();
+
+            let removed = connection
+                .wayland_state
+                .borrow_mut()
+                .windows
+                .get_mut()
+                .remove(&window_id);
             debug_assert!(
                 removed
                     .as_ref()
                     .is_some_and(|removed| Rc::ptr_eq(removed, &handle)),
                 "closed Wayland window registry entry changed before removal"
             );
-            if state.keyboard_window_id == Some(window_id) {
-                if let (Some(text_input), Some(keyboard)) = (&state.text_input, &state.keyboard) {
-                    if let Some(input) = text_input.get_text_input_for_keyboard(keyboard) {
-                        input.disable();
-                        input.commit();
-                    }
-                }
-                state.keyboard_window_id = None;
-            }
-            if let Some(surface_id) = surface_id {
-                if let Some(text_input) = &state.text_input {
-                    text_input.forget_surface_id(&surface_id);
-                }
-                state.surface_to_pending.remove(&surface_id);
-                if *state.active_surface_id.get_mut() == Some(surface_id) {
-                    *state.active_surface_id.get_mut() = None;
-                }
-            }
         })
         .detach();
     }
@@ -676,13 +712,20 @@ impl WindowOps for WaylandWindow {
 
     fn set_resize_increments(&self, incr: ResizeIncrement) {
         WaylandConnection::with_window_inner(self.0, move |inner| {
-            inner.set_resize_increments(incr)
+            if let Err(err) = inner.set_resize_increments(incr) {
+                log::error!("Wayland set_resize_increments failed: {err:#}");
+            }
+            Ok(())
         });
     }
 
     fn get_clipboard(&self, clipboard: Clipboard) -> Future<String> {
         let mut promise = Promise::new();
-        let future = promise.get_future().unwrap();
+        let Some(future) = promise.get_future() else {
+            return Future::err(anyhow!(
+                "new Wayland clipboard promise did not yield a future"
+            ));
+        };
         let promise = Arc::new(Mutex::new(promise));
         // Clone for the setup closure so the original `promise` stays owned here
         // and remains usable on the error path below (line `promise_on_error`).
@@ -1023,25 +1066,31 @@ impl WaylandWindowInner {
                 .as_ref()
                 .ok_or(anyhow!("Window does not exist"))?;
             let object_id = window.wl_surface().id();
+            let (pixel_width, pixel_height) =
+                checked_pixel_dimensions(self.dimensions.pixel_width, self.dimensions.pixel_height)
+                    .ok_or_else(|| {
+                        anyhow!(
+                    "Wayland EGL dimensions {}x{} must fit the positive i32 coordinate range",
+                    self.dimensions.pixel_width,
+                    self.dimensions.pixel_height
+                )
+                    })?;
 
-            wegl_surface = Some(WlEglSurface::new(
-                object_id,
-                self.dimensions.pixel_width as i32,
-                self.dimensions.pixel_height as i32,
-            )?);
+            let surface = WlEglSurface::new(object_id, pixel_width, pixel_height)?;
 
-            log::trace!("WEGL Surface here {:?}", wegl_surface);
+            log::trace!("WEGL Surface here {:?}", surface);
 
-            match wayland_conn.gl_connection.borrow().as_ref() {
-                Some(glconn) => crate::egl::GlState::create_wayland_with_existing_connection(
-                    glconn,
-                    wegl_surface.as_ref().unwrap(),
-                ),
+            let gl_state = match wayland_conn.gl_connection.borrow().as_ref() {
+                Some(glconn) => {
+                    crate::egl::GlState::create_wayland_with_existing_connection(glconn, &surface)
+                }
                 None => crate::egl::GlState::create_wayland(
                     Some(wayland_conn.connection.backend().display_ptr() as *const _),
-                    wegl_surface.as_ref().unwrap(),
+                    &surface,
                 ),
-            }
+            };
+            wegl_surface = Some(surface);
+            gl_state
         };
         let gl_state = gl_state.map(Rc::new).and_then(|state| unsafe {
             wayland_conn
@@ -1209,10 +1258,22 @@ impl WaylandWindowInner {
 
         if pending.configure.is_none() && pending.dpi.is_some() {
             // Synthesize a pending configure event for the dpi change
-            pending.configure.replace((
-                self.pixels_to_surface(self.dimensions.pixel_width as i32) as u32,
-                self.pixels_to_surface(self.dimensions.pixel_height as i32) as u32,
-            ));
+            let converted =
+                checked_pixel_dimensions(self.dimensions.pixel_width, self.dimensions.pixel_height)
+                    .and_then(|(width, height)| {
+                        Some((
+                            u32::try_from(self.pixels_to_surface(width)).ok()?,
+                            u32::try_from(self.pixels_to_surface(height)).ok()?,
+                        ))
+                    });
+            if let Some(dimensions) = converted {
+                pending.configure.replace(dimensions);
+            } else {
+                log::error!(
+                    "Cannot synthesize Wayland DPI configure for invalid dimensions {:?}",
+                    self.dimensions
+                );
+            }
             log::debug!("synthesize configure with {:?}", pending.configure);
         }
 
@@ -1224,7 +1285,16 @@ impl WaylandWindowInner {
 
         if let Some((mut w, mut h)) = pending.configure.take() {
             log::trace!("Pending configure: w:{w}, h{h} -- {:?}", self.window);
-            if self.window.is_some() {
+            'valid_configure: {
+                if self.window.is_none() {
+                    break 'valid_configure;
+                }
+                let Some((surface_width, surface_height)) = checked_surface_dimensions(w, h) else {
+                    log::error!(
+                        "Ignoring invalid Wayland configure dimensions {w}x{h}: values must fit the positive i32 coordinate range"
+                    );
+                    break 'valid_configure;
+                };
                 let surface_udata = SurfaceUserData::from_wl(self.surface());
                 let factor = surface_udata.surface_data.scale_factor() as f64;
                 let old_dimensions = self.dimensions;
@@ -1247,46 +1317,65 @@ impl WaylandWindowInner {
                 // Do this early because this affects surface_to_pixels/pixels_to_surface
                 self.dimensions.dpi = dpi;
 
-                let mut pixel_width = self.surface_to_pixels(w.try_into().unwrap());
-                let mut pixel_height = self.surface_to_pixels(h.try_into().unwrap());
+                let mut pixel_width = self.surface_to_pixels(surface_width);
+                let mut pixel_height = self.surface_to_pixels(surface_height);
 
                 if self.window_state.can_resize() {
                     self.window_frame.set_resizable(true);
                     if let Some(incr) = self.resize_increments {
-                        let min_width = incr.base_width + incr.x;
-                        let min_height = incr.base_height + incr.y;
+                        let min_width = i32::from(incr.base_width) + i32::from(incr.x);
+                        let min_height = i32::from(incr.base_height) + i32::from(incr.y);
                         let extra_width = (pixel_width - incr.base_width as i32) % incr.x as i32;
                         let extra_height = (pixel_height - incr.base_height as i32) % incr.y as i32;
-                        let desired_pixel_width = max(pixel_width - extra_width, min_width as i32);
-                        let desired_pixel_height =
-                            max(pixel_height - extra_height, min_height as i32);
-                        w = self.pixels_to_surface(desired_pixel_width) as u32;
-                        h = self.pixels_to_surface(desired_pixel_height) as u32;
-                        pixel_width = self.surface_to_pixels(w.try_into().unwrap());
-                        pixel_height = self.surface_to_pixels(h.try_into().unwrap());
+                        let desired_pixel_width = max(pixel_width - extra_width, min_width);
+                        let desired_pixel_height = max(pixel_height - extra_height, min_height);
+                        let adjusted_surface_width = self.pixels_to_surface(desired_pixel_width);
+                        let adjusted_surface_height = self.pixels_to_surface(desired_pixel_height);
+                        let (Ok(adjusted_w), Ok(adjusted_h)) = (
+                            u32::try_from(adjusted_surface_width),
+                            u32::try_from(adjusted_surface_height),
+                        ) else {
+                            log::error!(
+                                "Ignoring invalid Wayland resize-increment result {adjusted_surface_width}x{adjusted_surface_height}"
+                            );
+                            break 'valid_configure;
+                        };
+                        w = adjusted_w;
+                        h = adjusted_h;
+                        pixel_width = self.surface_to_pixels(adjusted_surface_width);
+                        pixel_height = self.surface_to_pixels(adjusted_surface_height);
                     }
                 }
 
                 log::trace!("Resizing frame");
                 if !self.window_frame.is_hidden() {
                     // Clamp the size to at least one surface heigh/width.
-                    let width = NonZeroU32::new(w).unwrap_or(NonZeroU32::new(1).unwrap());
-                    let height = NonZeroU32::new(h).unwrap_or(NonZeroU32::new(1).unwrap());
+                    let width = NonZeroU32::new(w).unwrap_or(NonZeroU32::MIN);
+                    let height = NonZeroU32::new(h).unwrap_or(NonZeroU32::MIN);
                     self.window_frame.resize(width, height);
                     pending.refresh_decorations = true
                 }
                 let (x, y) = self.window_frame.location();
                 let surface_width = self.pixels_to_surface(pixel_width);
                 let surface_height = self.pixels_to_surface(pixel_height);
-                self.window
-                    .as_mut()
-                    .unwrap()
+                let Some(window) = self.window.as_mut() else {
+                    break 'valid_configure;
+                };
+                window
                     .xdg_surface()
                     .set_window_geometry(x, y, surface_width, surface_height);
                 // Compute the new pixel dimensions
+                let (Ok(pixel_width_usize), Ok(pixel_height_usize)) =
+                    (usize::try_from(pixel_width), usize::try_from(pixel_height))
+                else {
+                    log::error!(
+                        "Ignoring invalid Wayland pixel dimensions {pixel_width}x{pixel_height}"
+                    );
+                    break 'valid_configure;
+                };
                 let new_dimensions = Dimensions {
-                    pixel_width: pixel_width.try_into().unwrap(),
-                    pixel_height: pixel_height.try_into().unwrap(),
+                    pixel_width: pixel_width_usize,
+                    pixel_height: pixel_height_usize,
                     dpi,
                 };
 
@@ -1411,10 +1500,10 @@ impl WaylandWindowInner {
         let conn = conn.wayland();
         let state = conn.wayland_state.borrow();
         let surface = self.surface().clone();
-        let active_surface_id = state.active_surface_id.borrow();
+        let keyboard_surface_id = state.keyboard_active_surface_id.borrow();
         let surface_id = surface.id();
 
-        if active_surface_id.as_ref() == Some(&surface_id)
+        if keyboard_surface_id.as_ref() == Some(&surface_id)
             && self.text_cursor.map(|prior| prior != rect).unwrap_or(true)
         {
             self.text_cursor.replace(rect);
@@ -1450,15 +1539,30 @@ impl WaylandWindowInner {
     }
 
     fn set_resize_increments(&mut self, incr: ResizeIncrement) -> anyhow::Result<()> {
+        validate_resize_increments(incr)?;
         self.resize_increments.replace(incr);
         Ok(())
     }
 
     fn set_inner_size(&mut self, width: usize, height: usize) {
-        let pixel_width = width as i32;
-        let pixel_height = height as i32;
-        let surface_width = self.pixels_to_surface(pixel_width) as u32;
-        let surface_height = self.pixels_to_surface(pixel_height) as u32;
+        let Some((pixel_width, pixel_height)) = checked_pixel_dimensions(width, height) else {
+            log::error!(
+                "Ignoring invalid Wayland inner size {width}x{height}: values must fit the positive i32 coordinate range"
+            );
+            self.events.dispatch(WindowEvent::SetInnerSizeCompleted);
+            return;
+        };
+        let surface_width = self.pixels_to_surface(pixel_width);
+        let surface_height = self.pixels_to_surface(pixel_height);
+        let (Ok(surface_width), Ok(surface_height)) =
+            (u32::try_from(surface_width), u32::try_from(surface_height))
+        else {
+            log::error!(
+                "Ignoring invalid converted Wayland inner size {surface_width}x{surface_height}"
+            );
+            self.events.dispatch(WindowEvent::SetInnerSizeCompleted);
+            return;
+        };
         // window.resize() doesn't generate a configure event,
         // so we're going to fake one up, otherwise the window
         // contents don't reflect the real size until eg:
@@ -1577,19 +1681,41 @@ impl WaylandWindowInner {
     }
 
     pub(crate) fn emit_focus(&mut self, mapper: Option<&mut KeyboardWithFallback>, focused: bool) {
-        // Clear the modifiers when we change focus, otherwise weird
-        // things can happen.  For instance, if we lost focus because
-        // CTRL+SHIFT+N was pressed to spawn a new window, we'd be
-        // left stuck with CTRL+SHIFT held down and the window would
-        // be left in a broken state.
-
-        self.modifiers = Modifiers::NONE;
-        if let Some(mapper) = mapper {
-            mapper.update_modifier_state(0, 0, 0, 0);
-        }
         self.cancel_key_repeat();
-        self.events.dispatch(WindowEvent::FocusChanged(focused));
+
+        if focused {
+            self.events.dispatch(WindowEvent::FocusChanged(true));
+            // A Modifiers event may arrive while no surface has keyboard
+            // focus. Preserve that compositor-authoritative XKB state and
+            // publish it to the newly focused window instead of zeroing it.
+            if let Some(mapper) = mapper {
+                let modifiers = mapper.get_key_modifiers();
+                let leds = mapper.get_led_status();
+                if modifiers != self.modifiers || leds != self.leds {
+                    self.modifiers = modifiers;
+                    self.leds = leds;
+                    self.events
+                        .dispatch(WindowEvent::AdviseModifiersLedStatus(modifiers, leds));
+                }
+            }
+        } else {
+            // Clear state on focus loss so a chord that caused a focus change
+            // cannot remain logically held in the unfocused window. Future
+            // unfocused Modifiers events repopulate the mapper before Enter.
+            self.modifiers = Modifiers::NONE;
+            self.leds = KeyboardLedStatus::empty();
+            if let Some(mapper) = mapper {
+                mapper.update_modifier_state(0, 0, 0, 0);
+            }
+            self.events.dispatch(WindowEvent::FocusChanged(false));
+        }
         self.text_cursor.take();
+    }
+
+    /// Retire this window during a direct keyboard-focus transfer while
+    /// preserving the seat-global mapper for the destination window.
+    pub(super) fn emit_focus_transfer_out(&mut self) {
+        self.emit_focus(None, false);
     }
 
     pub(crate) fn appearance_changed(&mut self, appearance: Appearance) {
@@ -1717,15 +1843,7 @@ impl WaylandWindowInner {
             WlKeyboardEvent::RepeatInfo { .. } => {
                 self.refresh_key_repeat_timing(window_id, key_repeat_rate, key_repeat_delay);
             }
-            WlKeyboardEvent::Modifiers {
-                mods_depressed,
-                mods_latched,
-                mods_locked,
-                group,
-                ..
-            } => {
-                mapper.update_modifier_state(mods_depressed, mods_latched, mods_locked, group);
-
+            WlKeyboardEvent::Modifiers { .. } => {
                 let mods = mapper.get_key_modifiers();
                 let leds = mapper.get_led_status();
 
@@ -1744,7 +1862,10 @@ impl WaylandWindowInner {
     }
 
     pub(super) fn frame_action(&mut self, pointer: &WlPointer, serial: u32, action: FrameAction) {
-        let pointer_data = pointer.data::<PointerUserData>().unwrap();
+        let Some(pointer_data) = pointer.data::<PointerUserData>() else {
+            log::warn!("Ignoring Wayland frame action without pointer user data");
+            return;
+        };
         let seat = pointer_data.pdata.seat();
         match action {
             FrameAction::Close => self.events.dispatch(WindowEvent::CloseRequested),
@@ -2138,12 +2259,15 @@ impl HasWindowHandle for WaylandWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        compositor_repeat_transition, key_repeat_first_due, key_repeat_timer_plan,
-        key_repeat_timing, key_repeat_window_event, new_pending_first_configure,
-        read_pipe_with_timeout, resolve_pending_first_configure, CompositorRepeatTransition,
-        KeyRepeatAbort, KeyRepeatTimerPlan,
+        checked_pixel_dimensions, checked_surface_dimensions, compositor_repeat_transition,
+        key_repeat_first_due, key_repeat_timer_plan, key_repeat_timing, key_repeat_window_event,
+        new_pending_first_configure, read_pipe_with_timeout, resolve_pending_first_configure,
+        validate_resize_increments, CompositorRepeatTransition, KeyRepeatAbort, KeyRepeatTimerPlan,
     };
-    use crate::{Handled, KeyCode, KeyEvent, Modifiers, RawKeyEvent, WindowEvent, WindowKeyEvent};
+    use crate::{
+        Handled, KeyCode, KeyEvent, Modifiers, RawKeyEvent, ResizeIncrement, WindowEvent,
+        WindowKeyEvent,
+    };
     use futures_util::future::Abortable;
     use promise::BrokenPromise;
     use smithay_client_toolkit::data_device_manager::ReadPipe;
@@ -2155,6 +2279,40 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
+
+    #[test]
+    fn wayland_dimensions_reject_values_outside_the_signed_protocol_range() {
+        const I32_MAX_U32: u32 = 2_147_483_647;
+        const I32_OVERFLOW_U32: u32 = 2_147_483_648;
+
+        assert_eq!(
+            checked_surface_dimensions(I32_MAX_U32, 1),
+            Some((i32::MAX, 1))
+        );
+        assert_eq!(checked_surface_dimensions(I32_OVERFLOW_U32, 1), None);
+        assert_eq!(checked_surface_dimensions(0, 1), None);
+        assert_eq!(checked_pixel_dimensions(I32_OVERFLOW_U32 as usize, 1), None);
+        assert_eq!(checked_pixel_dimensions(1, 0), None);
+    }
+
+    #[test]
+    fn wayland_resize_increments_reject_zero_divisors() {
+        assert!(validate_resize_increments(ResizeIncrement::disabled()).is_ok());
+        assert!(validate_resize_increments(ResizeIncrement {
+            x: 0,
+            y: 1,
+            base_width: 0,
+            base_height: 0,
+        })
+        .is_err());
+        assert!(validate_resize_increments(ResizeIncrement {
+            x: 1,
+            y: 0,
+            base_width: 0,
+            base_height: 0,
+        })
+        .is_err());
+    }
     use wezterm_input_types::KeyboardLedStatus;
 
     fn repeat_event() -> WindowKeyEvent {

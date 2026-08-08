@@ -124,6 +124,10 @@ impl DataDeviceHandler for WaylandState {
                 return;
             }
         };
+        // A selection notification replaces the seat's prior offer even when
+        // the new selection is empty or has no text MIME. Clear per-window
+        // caches first so an invalidated offer cannot be read later.
+        self.clear_copy_and_paste_offers();
         if let Some(offer) = offer {
             if !offer.with_mime_types(|mime_types| mime_types.iter().any(|s| s == TEXT_MIME_TYPE)) {
                 return;
@@ -132,12 +136,13 @@ impl DataDeviceHandler for WaylandState {
             if let Some(copy_and_paste) = self.resolve_copy_and_paste() {
                 match copy_and_paste.lock() {
                     Ok(mut copy_and_paste) => copy_and_paste.confirm_selection(offer),
-                    Err(_) => {
+                    Err(poisoned) => {
                         log::error!(
-                            "Wayland copy-and-paste lock was poisoned during data-device selection"
+                            "Wayland copy-and-paste lock was poisoned during data-device selection; recovering"
                         );
+                        poisoned.into_inner().confirm_selection(offer);
                     }
-                }
+                };
             }
         }
     }

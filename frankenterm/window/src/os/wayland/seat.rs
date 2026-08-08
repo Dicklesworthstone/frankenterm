@@ -31,6 +31,7 @@ impl SeatHandler for WaylandState {
         match capability {
             Capability::Keyboard if self.keyboard.is_none() => {
                 log::trace!("Setting keyboard capability");
+                self.emit_keyboard_focus_lost();
                 let keyboard = seat.get_keyboard(qh, KeyboardData {});
                 self.seat_bindings.note_keyboard(seat.id());
                 self.keyboard = Some(keyboard.clone());
@@ -41,6 +42,7 @@ impl SeatHandler for WaylandState {
             }
             Capability::Pointer if self.pointer.is_none() => {
                 log::trace!("Setting pointer capability");
+                self.clear_pointer_focus();
                 let surface = self.compositor.create_surface(qh);
                 let pointer = match self
                     .seat
@@ -100,6 +102,7 @@ impl SeatHandler for WaylandState {
             Capability::Pointer => {
                 if self.seat_bindings.clear_pointer_if_matches(&seat.id()) {
                     log::trace!("Lost pointer capability for seat {:?}", seat.id());
+                    self.clear_pointer_focus();
                     if let Some(pointer) = self.pointer.take() {
                         pointer.pointer().release();
                     }
@@ -117,6 +120,7 @@ impl SeatHandler for WaylandState {
         let cleanup = self.seat_bindings.clear_removed_seat(&seat.id());
 
         if cleanup.keyboard {
+            self.disable_current_keyboard_text_input();
             self.emit_keyboard_focus_lost();
             if let Some(keyboard) = self.keyboard.take() {
                 if let Some(text_input) = &self.text_input {
@@ -128,6 +132,7 @@ impl SeatHandler for WaylandState {
         }
 
         if cleanup.pointer {
+            self.clear_pointer_focus();
             if let Some(pointer) = self.pointer.take() {
                 pointer.pointer().release();
             }
@@ -136,6 +141,7 @@ impl SeatHandler for WaylandState {
         if cleanup.data_device {
             self.data_device.take();
             self.copy_paste_source.take();
+            self.clear_copy_and_paste_offers();
         }
 
         if cleanup.primary_selection {
@@ -160,6 +166,7 @@ impl WaylandState {
     }
 
     fn emit_keyboard_focus_lost(&mut self) {
+        self.keyboard_active_surface_id.get_mut().take();
         let Some(window_id) = self.keyboard_window_id.take() else {
             return;
         };

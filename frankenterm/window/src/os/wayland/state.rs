@@ -162,6 +162,58 @@ pub(super) fn clear_surface_authority_if_matches<T: Eq>(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct DestroyedWindowAuthorityCleanup {
+    pub(super) keyboard: bool,
+    pub(super) pointer: bool,
+}
+
+fn clear_destroyed_window_authorities<T: Eq>(
+    keyboard_surface: &mut Option<T>,
+    keyboard_window: &mut Option<usize>,
+    pointer_surface: &mut Option<T>,
+    pointer_window: &mut Option<usize>,
+    destroyed_window: usize,
+    destroyed_surface: Option<&T>,
+) -> DestroyedWindowAuthorityCleanup {
+    let keyboard = *keyboard_window == Some(destroyed_window)
+        || destroyed_surface.is_some_and(|surface| keyboard_surface.as_ref() == Some(surface));
+    let pointer = *pointer_window == Some(destroyed_window)
+        || destroyed_surface.is_some_and(|surface| pointer_surface.as_ref() == Some(surface));
+
+    if keyboard {
+        keyboard_surface.take();
+        keyboard_window.take();
+    }
+    if pointer {
+        pointer_surface.take();
+        pointer_window.take();
+    }
+
+    DestroyedWindowAuthorityCleanup { keyboard, pointer }
+}
+
+impl WaylandState {
+    /// Retire only the input authorities owned by a window that is actually
+    /// being destroyed. Pointer focus may name a client-side decoration
+    /// surface rather than the main surface, so the resolved window identity
+    /// participates in the match as well.
+    pub(super) fn clear_destroyed_window_authorities(
+        &mut self,
+        window_id: usize,
+        surface_id: Option<&ObjectId>,
+    ) -> DestroyedWindowAuthorityCleanup {
+        clear_destroyed_window_authorities(
+            self.keyboard_active_surface_id.get_mut(),
+            &mut self.keyboard_window_id,
+            self.pointer_active_surface_id.get_mut(),
+            &mut self.pointer_window_id,
+            window_id,
+            surface_id,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SeatBindings<T: Clone + Eq> {
     keyboard: Option<T>,
@@ -298,7 +350,8 @@ delegate_dispatch!(WaylandState: [ZwlrOutputModeV1: OutputManagerData] => Output
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_surface_authority_if_matches, replace_surface_authority, RemovedSeatCleanup,
+        clear_destroyed_window_authorities, clear_surface_authority_if_matches,
+        replace_surface_authority, DestroyedWindowAuthorityCleanup, RemovedSeatCleanup,
         SeatBindings,
     };
 
@@ -327,6 +380,84 @@ mod tests {
         assert_eq!(replace_surface_authority(&mut active, 7), None);
         assert!(!clear_surface_authority_if_matches(&mut active, &8));
         assert_eq!(active, Some(7));
+    }
+
+    #[test]
+    fn destroyed_window_clears_only_the_modalities_it_owns() {
+        let mut keyboard_surface = Some(11_u32);
+        let mut keyboard_window = Some(1_usize);
+        let mut pointer_surface = Some(22_u32);
+        let mut pointer_window = Some(2_usize);
+
+        assert_eq!(
+            clear_destroyed_window_authorities(
+                &mut keyboard_surface,
+                &mut keyboard_window,
+                &mut pointer_surface,
+                &mut pointer_window,
+                1,
+                Some(&11),
+            ),
+            DestroyedWindowAuthorityCleanup {
+                keyboard: true,
+                pointer: false,
+            }
+        );
+        assert_eq!(keyboard_surface, None);
+        assert_eq!(keyboard_window, None);
+        assert_eq!(pointer_surface, Some(22));
+        assert_eq!(pointer_window, Some(2));
+    }
+
+    #[test]
+    fn destroyed_window_matches_pointer_decoration_by_window_identity() {
+        let mut keyboard_surface = Some(11_u32);
+        let mut keyboard_window = Some(1_usize);
+        let mut pointer_surface = Some(99_u32);
+        let mut pointer_window = Some(2_usize);
+
+        assert_eq!(
+            clear_destroyed_window_authorities(
+                &mut keyboard_surface,
+                &mut keyboard_window,
+                &mut pointer_surface,
+                &mut pointer_window,
+                2,
+                Some(&22),
+            ),
+            DestroyedWindowAuthorityCleanup {
+                keyboard: false,
+                pointer: true,
+            }
+        );
+        assert_eq!(keyboard_surface, Some(11));
+        assert_eq!(keyboard_window, Some(1));
+        assert_eq!(pointer_surface, None);
+        assert_eq!(pointer_window, None);
+    }
+
+    #[test]
+    fn unrelated_window_destruction_preserves_both_modalities() {
+        let mut keyboard_surface = Some(11_u32);
+        let mut keyboard_window = Some(1_usize);
+        let mut pointer_surface = Some(22_u32);
+        let mut pointer_window = Some(2_usize);
+
+        assert_eq!(
+            clear_destroyed_window_authorities(
+                &mut keyboard_surface,
+                &mut keyboard_window,
+                &mut pointer_surface,
+                &mut pointer_window,
+                3,
+                Some(&33),
+            ),
+            DestroyedWindowAuthorityCleanup::default()
+        );
+        assert_eq!(keyboard_surface, Some(11));
+        assert_eq!(keyboard_window, Some(1));
+        assert_eq!(pointer_surface, Some(22));
+        assert_eq!(pointer_window, Some(2));
     }
 
     #[test]
