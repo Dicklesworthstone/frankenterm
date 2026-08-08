@@ -74,7 +74,7 @@ fn ft_help_exits_cleanly_or_141_but_never_signals() {
         "ft --help must not die from a signal when stdout closes early; got {status:?}"
     );
     assert!(
-        matches!(status.code(), Some(0) | Some(141)),
+        matches!(status.code(), Some(0 | 141)),
         "ft --help must exit successfully or with 128+SIGPIPE=141; got {status:?}"
     );
 }

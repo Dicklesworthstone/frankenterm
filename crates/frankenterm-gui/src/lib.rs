@@ -891,37 +891,26 @@ pub mod glyph_run_interning {
 
 #[doc(hidden)]
 pub mod owner_last_guard {
-    use std::mem::ManuallyDrop;
-
     pub struct OwnerLastGuardedMapping<M, S, O> {
-        mapping: ManuallyDrop<M>,
-        slice: ManuallyDrop<S>,
-        owner: ManuallyDrop<O>,
+        // Rust drops struct fields in declaration order. Keep the derived
+        // mapping and slice ahead of their owner so this dependency ordering
+        // needs no manual-drop unsafe block.
+        mapping: M,
+        _slice: S,
+        _owner: O,
     }
 
     impl<M, S, O> OwnerLastGuardedMapping<M, S, O> {
         pub fn new(mapping: M, slice: S, owner: O) -> Self {
             Self {
-                mapping: ManuallyDrop::new(mapping),
-                slice: ManuallyDrop::new(slice),
-                owner: ManuallyDrop::new(owner),
+                mapping,
+                _slice: slice,
+                _owner: owner,
             }
         }
 
         pub fn mapping_mut(&mut self) -> &mut M {
             &mut self.mapping
-        }
-    }
-
-    impl<M, S, O> Drop for OwnerLastGuardedMapping<M, S, O> {
-        fn drop(&mut self) {
-            unsafe {
-                // SAFETY: each field is wrapped in ManuallyDrop and is dropped exactly
-                // once here, in dependency order, so derived views go away before owner.
-                ManuallyDrop::drop(&mut self.mapping);
-                ManuallyDrop::drop(&mut self.slice);
-                ManuallyDrop::drop(&mut self.owner);
-            }
         }
     }
 
@@ -1637,17 +1626,37 @@ pub mod gui_debug_log {
         })
     }
 
+    fn try_update_atomic_u64(
+        counter: &AtomicU64,
+        set_order: Ordering,
+        fetch_order: Ordering,
+        mut update: impl FnMut(u64) -> Option<u64>,
+    ) -> std::result::Result<u64, u64> {
+        let mut current = counter.load(fetch_order);
+        loop {
+            let Some(next) = update(current) else {
+                return Err(current);
+            };
+            match counter.compare_exchange_weak(current, next, set_order, fetch_order) {
+                Ok(previous) => return Ok(previous),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     pub fn record(level: Level, target: impl Into<String>, message: impl Into<String>) -> u64 {
-        let Ok(sequence) =
-            NEXT_SEQUENCE.try_update(Ordering::AcqRel, Ordering::Acquire, |sequence| {
-                sequence.checked_add(1)
-            })
-        else {
+        let Ok(sequence) = try_update_atomic_u64(
+            &NEXT_SEQUENCE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |sequence| sequence.checked_add(1),
+        ) else {
             // This bounded diagnostic stream must never wrap and make ancient
             // entries appear newer than a caller's cursor. Once the identity
             // space is exhausted, fail closed by dropping subsequent debug-log
             // entries; the returned sentinel is never inserted into ENTRIES.
-            let _ = DROPPED_AFTER_SEQUENCE_EXHAUSTION.try_update(
+            let _ = try_update_atomic_u64(
+                &DROPPED_AFTER_SEQUENCE_EXHAUSTION,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |dropped| Some(dropped.saturating_add(1)),

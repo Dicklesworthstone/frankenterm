@@ -1203,7 +1203,7 @@ impl PendingPaneAlerts {
         self.entries.len()
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 }

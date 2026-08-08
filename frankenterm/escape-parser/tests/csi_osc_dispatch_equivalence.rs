@@ -324,6 +324,10 @@ fn read_corpus_hex(path: &Path, relative: &str) -> TestResult<Vec<u8>> {
     decode_hex(&text, relative)
 }
 
+// `slice::as_chunks` is newer than the workspace's Rust 1.85 MSRV. Retain the
+// exact two-byte iterator until the compiler floor makes Clippy's replacement
+// available.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn decode_hex(text: &str, label: &str) -> TestResult<Vec<u8>> {
     let clean: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     if clean.is_empty() {

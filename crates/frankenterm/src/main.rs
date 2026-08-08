@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
@@ -18707,11 +18707,8 @@ fn requested_submit_guarantee_level(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_send_command_summary(
-    command_name: &str,
-    pane_id: u64,
-    text_bytes: usize,
+#[derive(Clone, Copy)]
+struct SendCommandSummaryOptions {
     dry_run: bool,
     no_paste: bool,
     no_newline: bool,
@@ -18721,15 +18718,31 @@ fn build_send_command_summary(
     has_approval_code: bool,
     verify_submit: bool,
     submit_level: Option<SubmitGuaranteeLevelArg>,
+}
+
+fn build_send_command_summary(
+    command_name: &str,
+    pane_id: u64,
+    text_bytes: usize,
+    options: SendCommandSummaryOptions,
 ) -> String {
-    let submit_level = submit_level
+    let submit_level = options
+        .submit_level
         .map(|level| {
             let core_level: frankenterm_core::robot_types::SubmitGuaranteeLevel = level.into();
             core_level.as_str()
         })
         .unwrap_or("none");
     format!(
-        "{command_name} pane_id={pane_id} text_bytes={text_bytes} dry_run={dry_run} no_paste={no_paste} no_newline={no_newline} wait_for={has_wait_for} wait_for_regex={wait_for_regex} timeout_secs={timeout_secs} approval_code={has_approval_code} verify_submit={verify_submit} submit_level={submit_level}"
+        "{command_name} pane_id={pane_id} text_bytes={text_bytes} dry_run={} no_paste={} no_newline={} wait_for={} wait_for_regex={} timeout_secs={} approval_code={} verify_submit={} submit_level={submit_level}",
+        options.dry_run,
+        options.no_paste,
+        options.no_newline,
+        options.has_wait_for,
+        options.wait_for_regex,
+        options.timeout_secs,
+        options.has_approval_code,
+        options.verify_submit,
     )
 }
 
@@ -22004,8 +22017,7 @@ fn validate_watcher_control_acknowledgement(
     }
     let acknowledgement = response
         .data
-        .as_ref()
-        .cloned()
+        .clone()
         .ok_or(WatcherControlRequestFailure::InvalidAcknowledgement)
         .and_then(|data| {
             serde_json::from_value::<WatcherControlAcknowledgement>(data)
@@ -22280,7 +22292,7 @@ fn resolve_checkpoint_id(
                 role,
             })
         }
-        Ok(Some(_)) | Ok(None) => Err(CheckpointResolveError::InvalidStoredRole { checkpoint_id }),
+        Ok(Some(_) | None) => Err(CheckpointResolveError::InvalidStoredRole { checkpoint_id }),
         Err(rusqlite::Error::QueryReturnedNoRows) => Err(CheckpointResolveError::NotFound {
             requested_latest: false,
             scope,
@@ -25332,7 +25344,7 @@ struct SnapshotRestoreAbort {
     intent_checkpoint_id: Option<i64>,
     outcome_checkpoint_id: Option<i64>,
     interruption_reason: Option<frankenterm_core::session_restore::RestoreInterruptionReason>,
-    completed_summary: Option<frankenterm_core::session_restore::RestoreSummary>,
+    completed_summary: Option<Box<frankenterm_core::session_restore::RestoreSummary>>,
     completed_layout_only: Option<bool>,
     cleanup_failed: bool,
 }
@@ -25479,7 +25491,7 @@ impl SnapshotRestoreAbort {
                 );
                 abort.intent_checkpoint_id = Some(summary.intent_checkpoint_id);
                 abort.outcome_checkpoint_id = Some(summary.outcome_checkpoint_id);
-                abort.completed_summary = Some(summary);
+                abort.completed_summary = Some(Box::new(summary));
                 abort.with_hint(
                     "Inspect the exact restore intent/outcome receipts and reconcile durable authority before retrying.",
                 )
@@ -25517,7 +25529,7 @@ impl SnapshotRestoreAbort {
 
 #[cfg(all(unix, test))]
 fn snapshot_restore_abort_json(abort: &SnapshotRestoreAbort) -> serde_json::Value {
-    let completed_summary = abort.completed_summary.as_ref();
+    let completed_summary = abort.completed_summary.as_deref();
     let external_effects_may_have_occurred = completed_summary.is_some()
         || abort.intent_checkpoint_id.is_some()
         || abort.outcome_checkpoint_id.is_some();
@@ -25528,22 +25540,20 @@ fn snapshot_restore_abort_json(abort: &SnapshotRestoreAbort) -> serde_json::Valu
             serde_json::Value::Bool(false)
         }
     };
-    let layout_restored = completed_summary.map_or_else(
-        || unknown_after_effect(),
-        |summary| serde_json::Value::Bool(layout_restored_successfully(summary)),
-    );
-    let authority_finalized = completed_summary.map_or_else(
-        || unknown_after_effect(),
-        |summary| serde_json::Value::Bool(authority_finalized_successfully(summary)),
-    );
-    let layout_authority_complete = completed_summary.map_or_else(
-        || unknown_after_effect(),
-        |summary| serde_json::Value::Bool(layout_authority_completed_successfully(summary)),
-    );
-    let restore_operation_complete = completed_summary.map_or_else(
-        || unknown_after_effect(),
-        |summary| serde_json::Value::Bool(restore_operation_completed_successfully(summary)),
-    );
+    let layout_restored = completed_summary.map_or_else(&unknown_after_effect, |summary| {
+        serde_json::Value::Bool(layout_restored_successfully(summary))
+    });
+    let authority_finalized = completed_summary.map_or_else(&unknown_after_effect, |summary| {
+        serde_json::Value::Bool(authority_finalized_successfully(summary))
+    });
+    let layout_authority_complete = completed_summary
+        .map_or_else(&unknown_after_effect, |summary| {
+            serde_json::Value::Bool(layout_authority_completed_successfully(summary))
+        });
+    let restore_operation_complete = completed_summary
+        .map_or_else(unknown_after_effect, |summary| {
+            serde_json::Value::Bool(restore_operation_completed_successfully(summary))
+        });
     let mut payload = serde_json::json!({
         "ok": false,
         "operation_complete": false,
@@ -25753,7 +25763,7 @@ fn combine_snapshot_restore_cleanup(
             .with_hint("Inspect session state before retrying the restore.")
             .with_cleanup_failure();
             abort.completed_layout_only = Some(result.layout_only);
-            abort.completed_summary = Some(result.summary);
+            abort.completed_summary = Some(Box::new(result.summary));
             Err(abort)
         }
         (Err(abort), false) => Err(abort.with_cleanup_failure()),
@@ -25791,7 +25801,7 @@ where
     AuthenticateMux:
         FnOnce(i64, u64) -> Result<frankenterm_core::wezterm::WeztermHandle, SnapshotRestoreAbort>,
 {
-    let authenticated_mux = authenticate_mux(checkpoint_id, options.wezterm_timeout_secs)?;
+    let mux_handle = authenticate_mux(checkpoint_id, options.wezterm_timeout_secs)?;
     let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let lock_db_path = db_path.to_string();
     let restore_lock = run_cli_blocking_with_cx(
@@ -25818,7 +25828,7 @@ where
                 &restore_cx,
                 db_path,
                 checkpoint_id,
-                authenticated_mux,
+                mux_handle,
                 layout_only,
             )
             .await
@@ -29116,7 +29126,7 @@ async fn relay_ipc_event_line(
     cx: &frankenterm_core::cx::Cx,
     stdout: &std::io::Stdout,
     line: &str,
-    current_cursor: &mut Option<i64>,
+    current_cursor: Option<i64>,
     current_cursor_epoch: Option<&str>,
     current_cursor_scope: Option<&str>,
     max_hz_interval: Option<std::time::Duration>,
@@ -29140,7 +29150,7 @@ async fn relay_ipc_event_line(
                 Ok(cursor) => cursor,
                 Err(fault) => return Ok(IpcRelayAction::ProtocolFault(fault)),
             };
-            if ipc_event_is_duplicate(cursor, *current_cursor) {
+            if ipc_event_is_duplicate(cursor, current_cursor) {
                 return Ok(IpcRelayAction::Skipped); // already emitted via DB drain
             }
             if cursor.is_some() {
@@ -29157,7 +29167,7 @@ async fn relay_ipc_event_line(
                 max_hz_interval,
                 *last_event_emit,
                 stdout,
-                *current_cursor,
+                current_cursor,
                 current_cursor_epoch,
                 current_cursor_scope,
                 heartbeat_interval_ms,
@@ -29174,7 +29184,7 @@ async fn relay_ipc_event_line(
             watch_checkpoint(cx, "IPC lifecycle output")?;
             let mut value = value;
             value["cursor"] =
-                (*current_cursor).map_or(serde_json::Value::Null, serde_json::Value::from);
+                current_cursor.map_or(serde_json::Value::Null, serde_json::Value::from);
             value["cursor_epoch"] =
                 current_cursor_epoch.map_or(serde_json::Value::Null, serde_json::Value::from);
             value["cursor_scope"] =
@@ -29202,7 +29212,7 @@ async fn relay_ipc_event_line(
             watch_checkpoint(cx, "IPC heartbeat output")?;
             if !emit_watch_heartbeat_if_due(
                 stdout,
-                *current_cursor,
+                current_cursor,
                 current_cursor_epoch,
                 current_cursor_scope,
                 heartbeat_interval_ms,
@@ -29223,7 +29233,7 @@ async fn relay_ipc_event_line(
             // (ft-7h5da.4.2, no-silent-gaps).
             let output = ipc_gap_with_follower_cursor(
                 value,
-                *current_cursor,
+                current_cursor,
                 current_cursor_epoch,
                 current_cursor_scope,
             );
@@ -29491,7 +29501,7 @@ mod watch_events_tests {
         run_watch_claim_async(async move {
             let cx = frankenterm_core::cx::for_testing();
             let stdout = std::io::stdout();
-            let mut cursor = Some(7);
+            let cursor = Some(7);
             let mut last_event_emit = None;
             let mut last_emit = std::time::Instant::now();
             let initial_last_emit = last_emit;
@@ -29506,7 +29516,7 @@ mod watch_events_tests {
                 &cx,
                 &stdout,
                 &line,
-                &mut cursor,
+                cursor,
                 Some("0123456789abcdef0123456789abcdef"),
                 Some(TEST_CURSOR_SCOPE),
                 None,
@@ -29713,10 +29723,12 @@ mod watch_events_tests {
         assert!(error.to_string().contains("outer-loop cancellation"));
 
         let secret_cancelled = frankenterm_core::cx::for_testing();
-        let secret = "sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const SECRET: &str = "sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const SECRET_REASON: &str =
+            "operator request carried sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         secret_cancelled.cancel_with(
             frankenterm_core::outcome::CancelKind::User,
-            Some(&format!("operator request carried {secret}")),
+            Some(SECRET_REASON),
         );
         let secret_error = watch_checkpoint(&secret_cancelled, "secret-bearing cancellation")
             .expect_err("cancelled checkpoint must fail");
@@ -29726,18 +29738,21 @@ mod watch_events_tests {
             "the cancellation reason must retain an explicit redaction marker: {rendered}"
         );
         assert!(
-            !rendered.contains(secret),
+            !rendered.contains(SECRET),
             "the raw cancellation reason must not cross the watch output boundary: {rendered}"
         );
 
         let hostile_cancelled = frankenterm_core::cx::for_testing();
-        let hostile_reason = format!(
-            "\x1b]0;stolen title\x07{}\nspoofed\u{2028}line\u{202e}direction\u{206a}shape",
-            "猫".repeat(5_000)
-        );
+        static HOSTILE_REASON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let hostile_reason = HOSTILE_REASON.get_or_init(|| {
+            format!(
+                "\x1b]0;stolen title\x07{}\nspoofed\u{2028}line\u{202e}direction\u{206a}shape",
+                "猫".repeat(5_000)
+            )
+        });
         hostile_cancelled.cancel_with(
             frankenterm_core::outcome::CancelKind::User,
-            Some(&hostile_reason),
+            Some(hostile_reason.as_str()),
         );
         let hostile_error = watch_checkpoint(&hostile_cancelled, "hostile cancellation")
             .expect_err("hostile cancellation must fail safely")
@@ -29859,7 +29874,9 @@ mod watch_events_tests {
     #[test]
     fn a_control_record_resets_the_idle_heartbeat_deadline() {
         let heartbeat = std::time::Duration::from_millis(100);
-        let mut last_emit = std::time::Instant::now() - heartbeat;
+        let mut last_emit = std::time::Instant::now()
+            .checked_sub(heartbeat)
+            .expect("test process uptime must exceed the 100ms heartbeat fixture");
         assert!(watch_heartbeat_is_due(100, heartbeat, last_emit));
 
         note_watch_output_emitted(&mut last_emit);
@@ -30472,7 +30489,9 @@ mod watch_events_tests {
 
     #[test]
     fn finalization_lost_uses_actual_flush_time_for_rate_and_heartbeat_clocks() {
-        let flushed_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        let flushed_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(2))
+            .expect("test process uptime must exceed the two-second flush fixture");
         let mut last_emit = std::time::Instant::now();
         let mut last_event_emit = None;
 
@@ -31051,7 +31070,13 @@ mod watch_events_tests {
             );
         }
         let first_interval_len = output.len();
-        assert_eq!(output.iter().filter(|&&byte| byte == b'\n').count(), 1);
+        assert_eq!(
+            output
+                .split(|byte| *byte == b'\n')
+                .count()
+                .saturating_sub(1),
+            1
+        );
 
         assert!(note_valid_ipc_stream_record(
             IpcRelayAction::Emitted,
@@ -31071,7 +31096,13 @@ mod watch_events_tests {
             .unwrap()
         );
         assert!(output.len() > first_interval_len);
-        assert_eq!(output.iter().filter(|&&byte| byte == b'\n').count(), 2);
+        assert_eq!(
+            output
+                .split(|byte| *byte == b'\n')
+                .count()
+                .saturating_sub(1),
+            2
+        );
     }
 
     #[cfg(unix)]
@@ -31332,7 +31363,7 @@ mod watch_events_tests {
                     &cx,
                     &stdout,
                     &line,
-                    &mut cursor,
+                    cursor,
                     Some("0123456789abcdef0123456789abcdef"),
                     Some(TEST_CURSOR_SCOPE),
                     None,
@@ -35148,6 +35179,7 @@ fn asupersync_webhook_client_failure_preserves_finite_discriminants_without_deta
 #[cfg(test)]
 #[test]
 fn endpoint_local_webhook_timeout_does_not_stop_two_endpoint_fanout() {
+    use frankenterm_core::runtime_async::CompatRuntime;
     use frankenterm_core::webhook::{
         DeliveryFailureClass, WebhookDispatcher, WebhookEndpointConfig, WebhookTemplate,
     };
@@ -35204,7 +35236,7 @@ fn endpoint_local_webhook_timeout_does_not_stop_two_endpoint_fanout() {
             assert_eq!(records[1].target, "still-runs");
             assert!(records[1].accepted);
             assert_eq!(records[1].status_code, 204);
-        })
+        });
     }));
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -35251,6 +35283,7 @@ fn webhook_http_client_constructor_pins_redirects_disabled() {
 #[cfg(test)]
 #[test]
 fn asupersync_webhook_send_with_cx_short_circuits_exact_cancelled_caller() {
+    use frankenterm_core::runtime_async::CompatRuntime;
     use frankenterm_core::webhook::{DeliveryFailureClass, WebhookTransport};
 
     let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
@@ -35278,7 +35311,7 @@ fn asupersync_webhook_send_with_cx_short_circuits_exact_cancelled_caller() {
                 Some(DeliveryFailureClass::Cancelled)
             );
             assert!(!format!("{result:?}").contains("SECRET"));
-        })
+        });
     }));
     // Runtime::block_on intentionally retains its ambient handle. Test
     // teardown must drop the runtime first and then clear that TLS slot under
@@ -38651,12 +38684,24 @@ async fn run_distributed_agent(
         let mut sigterm = signal(SignalKind::terminate())?;
 
         frankenterm_core::runtime_async::select! {
-            _ = sigint.recv() => {
-                tracing::info!("Received SIGINT, shutting down distributed agent");
+            signal = sigint.recv() => {
+                if signal.is_some() {
+                    tracing::info!("Received SIGINT, shutting down distributed agent");
+                } else {
+                    tracing::error!(
+                        "SIGINT stream closed unexpectedly; shutting down distributed agent"
+                    );
+                }
                 task_result = None;
             }
-            _ = sigterm.recv() => {
-                tracing::info!("Received SIGTERM, shutting down distributed agent");
+            signal = sigterm.recv() => {
+                if signal.is_some() {
+                    tracing::info!("Received SIGTERM, shutting down distributed agent");
+                } else {
+                    tracing::error!(
+                        "SIGTERM stream closed unexpectedly; shutting down distributed agent"
+                    );
+                }
                 task_result = None;
             }
             result = &mut distributed_task => {
@@ -38745,7 +38790,7 @@ async fn run_watcher_with_backoff(
 
     loop {
         let started_at = Instant::now();
-        let result = run_watcher(
+        let result = Box::pin(run_watcher(
             cx,
             layout,
             config,
@@ -38759,7 +38804,7 @@ async fn run_watcher_with_backoff(
             notify_via.clone(),
             disable_lock,
             dangerous_bind_any,
-        )
+        ))
         .await;
 
         match result {
@@ -39000,40 +39045,55 @@ fn log_watcher_control_receive_failure(error: frankenterm_core::runtime_async::m
 }
 
 async fn wait_for_ctrl_c_or_watcher_control(
-    control_rx: &mut frankenterm_core::runtime_async::mpsc::Receiver<
+    control_receiver: &mut frankenterm_core::runtime_async::mpsc::Receiver<
         frankenterm_core::ipc::WatcherControlAction,
     >,
-    control_cx: &frankenterm_core::cx::Cx,
+    control_context: &frankenterm_core::cx::Cx,
     config_path: Option<&Path>,
     current_config: &mut frankenterm_core::config::Config,
     handle: &frankenterm_core::runtime::RuntimeHandle,
 ) -> anyhow::Result<()> {
+    enum WatcherWaitEvent {
+        Interrupt(std::io::Result<()>),
+        Control(
+            Result<
+                frankenterm_core::ipc::WatcherControlAction,
+                frankenterm_core::runtime_async::mpsc::RecvError,
+            >,
+        ),
+    }
+
     loop {
-        frankenterm_core::runtime_async::select! {
+        let event = frankenterm_core::runtime_async::select! {
             ctrl_c_result = frankenterm_core::runtime_async::signal::ctrl_c() => {
+                WatcherWaitEvent::Interrupt(ctrl_c_result)
+            }
+            control_result = control_receiver.recv(control_context) => {
+                WatcherWaitEvent::Control(control_result)
+            }
+        };
+        // The select futures, including the receive future that mutably
+        // borrows `control_receiver`, have been dropped before we
+        // drain/coalesce the
+        // same bounded receiver here.
+        match event {
+            WatcherWaitEvent::Interrupt(ctrl_c_result) => {
                 ctrl_c_result?;
                 tracing::info!("Received Ctrl+C, initiating graceful shutdown");
                 break;
             }
-            control_result = control_rx.recv(control_cx) => {
-                match control_result {
-                    Ok(first) => {
-                        let action = coalesce_watcher_control_action(first, control_rx);
-                        if process_watcher_control_action(
-                            action,
-                            config_path,
-                            current_config,
-                            handle,
-                        ) {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        log_watcher_control_receive_failure(error);
+            WatcherWaitEvent::Control(control_result) => match control_result {
+                Ok(first) => {
+                    let action = coalesce_watcher_control_action(first, control_receiver);
+                    if process_watcher_control_action(action, config_path, current_config, handle) {
                         break;
                     }
                 }
-            }
+                Err(error) => {
+                    log_watcher_control_receive_failure(error);
+                    break;
+                }
+            },
         }
     }
     Ok(())
@@ -39939,7 +39999,7 @@ async fn run_watcher(
     // function. IPC token authentication is additionally enforced when tokens
     // are configured.
     let mut current_config = config.clone();
-    let watcher_control_cx = (*cx).clone();
+    let watcher_control_context = (*cx).clone();
 
     // Wait for signals (SIGINT/SIGTERM to shutdown, SIGHUP to reload config)
     // and instance-bound cooperative watcher control.
@@ -39963,62 +40023,89 @@ async fn run_watcher(
                     Interrupt,
                     Terminate,
                     Hangup,
+                    StreamClosed(&'static str),
+                }
+                enum WatcherUnixEvent {
+                    Control(
+                        Result<
+                            frankenterm_core::ipc::WatcherControlAction,
+                            frankenterm_core::runtime_async::mpsc::RecvError,
+                        >,
+                    ),
+                    Signal(WatcherUnixSignal),
                 }
                 loop {
                     let next_signal = async {
                         frankenterm_core::runtime_async::select! {
-                            _ = sigint.recv() => WatcherUnixSignal::Interrupt,
-                            _ = sigterm.recv() => WatcherUnixSignal::Terminate,
-                            _ = sighup.recv() => WatcherUnixSignal::Hangup,
+                            signal = sigint.recv() => signal.map_or(
+                                WatcherUnixSignal::StreamClosed("SIGINT"),
+                                |()| WatcherUnixSignal::Interrupt,
+                            ),
+                            signal = sigterm.recv() => signal.map_or(
+                                WatcherUnixSignal::StreamClosed("SIGTERM"),
+                                |()| WatcherUnixSignal::Terminate,
+                            ),
+                            signal = sighup.recv() => signal.map_or(
+                                WatcherUnixSignal::StreamClosed("SIGHUP"),
+                                |()| WatcherUnixSignal::Hangup,
+                            ),
                         }
                     };
-                    frankenterm_core::runtime_async::select! {
-                        control_result = watcher_control_rx.recv(&watcher_control_cx) => {
-                            match control_result {
-                                Ok(first) => {
-                                    let action = coalesce_watcher_control_action(
-                                        first,
-                                        &mut watcher_control_rx,
-                                    );
-                                    if process_watcher_control_action(
-                                        action,
-                                        config_path,
-                                        &mut current_config,
-                                        handle.as_ref(),
-                                    ) {
-                                        break;
-                                    }
-                                }
-                                Err(error) => {
-                                    log_watcher_control_receive_failure(error);
-                                    break;
-                                }
-                            }
+                    let event = frankenterm_core::runtime_async::select! {
+                        control_result = watcher_control_rx.recv(&watcher_control_context) => {
+                            WatcherUnixEvent::Control(control_result)
                         }
                         signal_kind = next_signal => {
-                            match signal_kind {
-                                WatcherUnixSignal::Interrupt => {
-                                    tracing::info!(
-                                        "Received SIGINT, initiating graceful shutdown"
-                                    );
+                            WatcherUnixEvent::Signal(signal_kind)
+                        }
+                    };
+                    // Drop the selected receive future before coalescing from
+                    // `watcher_control_rx`; the future itself owns the first
+                    // mutable borrow for the duration of the select expression.
+                    match event {
+                        WatcherUnixEvent::Control(control_result) => match control_result {
+                            Ok(first) => {
+                                let action =
+                                    coalesce_watcher_control_action(first, &mut watcher_control_rx);
+                                if process_watcher_control_action(
+                                    action,
+                                    config_path,
+                                    &mut current_config,
+                                    handle.as_ref(),
+                                ) {
                                     break;
-                                }
-                                WatcherUnixSignal::Terminate => {
-                                    tracing::info!(
-                                        "Received SIGTERM, initiating graceful shutdown"
-                                    );
-                                    break;
-                                }
-                                WatcherUnixSignal::Hangup => {
-                                    tracing::info!("Received SIGHUP, attempting config reload");
-                                    reload_watcher_configuration(
-                                        config_path,
-                                        &mut current_config,
-                                        handle.as_ref(),
-                                    );
                                 }
                             }
-                        }
+                            Err(error) => {
+                                log_watcher_control_receive_failure(error);
+                                break;
+                            }
+                        },
+                        WatcherUnixEvent::Signal(signal_kind) => match signal_kind {
+                            WatcherUnixSignal::Interrupt => {
+                                tracing::info!("Received SIGINT, initiating graceful shutdown");
+                                break;
+                            }
+                            WatcherUnixSignal::Terminate => {
+                                tracing::info!("Received SIGTERM, initiating graceful shutdown");
+                                break;
+                            }
+                            WatcherUnixSignal::Hangup => {
+                                tracing::info!("Received SIGHUP, attempting config reload");
+                                reload_watcher_configuration(
+                                    config_path,
+                                    &mut current_config,
+                                    handle.as_ref(),
+                                );
+                            }
+                            WatcherUnixSignal::StreamClosed(signal_name) => {
+                                tracing::error!(
+                                    signal = signal_name,
+                                    "Watcher signal stream closed unexpectedly; initiating graceful shutdown"
+                                );
+                                break;
+                            }
+                        },
                     }
                 }
             }
@@ -40030,7 +40117,7 @@ async fn run_watcher(
                 );
                 wait_for_ctrl_c_or_watcher_control(
                     &mut watcher_control_rx,
-                    &watcher_control_cx,
+                    &watcher_control_context,
                     config_path,
                     &mut current_config,
                     handle.as_ref(),
@@ -40044,7 +40131,7 @@ async fn run_watcher(
     {
         wait_for_ctrl_c_or_watcher_control(
             &mut watcher_control_rx,
-            &watcher_control_cx,
+            &watcher_control_context,
             config_path,
             &mut current_config,
             handle.as_ref(),
@@ -41499,7 +41586,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 include_backtrace: true,
             });
 
-            run_watcher_with_backoff(
+            Box::pin(run_watcher_with_backoff(
                 cx,
                 &layout,
                 &config,
@@ -41513,7 +41600,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 notify_via,
                 dangerous_disable_lock,
                 dangerous_bind_any,
-            )
+            ))
             .await?;
         }
 
@@ -42694,15 +42781,17 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 "ft robot send",
                                 pane_id,
                                 text.len(),
-                                dry_run,
-                                no_paste,
-                                no_newline,
-                                wait_for.is_some(),
-                                wait_for_regex,
-                                timeout_secs,
-                                approval_code.is_some(),
-                                verify_submit,
-                                submit_level,
+                                SendCommandSummaryOptions {
+                                    dry_run,
+                                    no_paste,
+                                    no_newline,
+                                    has_wait_for: wait_for.is_some(),
+                                    wait_for_regex,
+                                    timeout_secs,
+                                    has_approval_code: approval_code.is_some(),
+                                    verify_submit,
+                                    submit_level,
+                                },
                             );
                             let command_ctx =
                                 frankenterm_core::dry_run::CommandContext::new(command, dry_run);
@@ -45632,66 +45721,67 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     }
                                 };
                                 watch_checkpoint(&cx, "durable event query completion")?;
-                                if current_cursor.is_none() {
-                                    // No external resume claim exists yet. Adopt
-                                    // the atomic page epoch and allocation tail
-                                    // as the fresh baseline. The provisional
-                                    // page was not queried after that baseline,
-                                    // so discard it unconditionally and requery.
-                                    // This also prevents pre-token deletion
-                                    // intervals from becoming false future-loss
-                                    // reports on reconnect.
-                                    current_cursor_epoch =
-                                        Some(page.retention.cursor_epoch.clone());
-                                    current_cursor =
-                                        Some(fresh_event_cursor_baseline(&page.retention));
-                                    let checkpoint = watch_cursor_checkpoint_ndjson(
-                                        current_cursor.expect("fresh baseline was assigned"),
-                                        current_cursor_epoch
-                                            .as_deref()
-                                            .expect("fresh baseline epoch was assigned"),
-                                        &expected_cursor_scope,
-                                        WatchCursorCheckpointReason::FreshWatchTailBaseline,
-                                    );
-                                    if !emit_watch_stream_record(
-                                        &stdout,
-                                        &checkpoint,
-                                        &mut last_emit,
-                                    )? {
-                                        break 'follow;
+                                let requested = match current_cursor {
+                                    None => {
+                                        // No external resume claim exists yet. Adopt
+                                        // the atomic page epoch and allocation tail
+                                        // as the fresh baseline. The provisional
+                                        // page was not queried after that baseline,
+                                        // so discard it unconditionally and requery.
+                                        // This also prevents pre-token deletion
+                                        // intervals from becoming false future-loss
+                                        // reports on reconnect.
+                                        let baseline = fresh_event_cursor_baseline(&page.retention);
+                                        current_cursor_epoch =
+                                            Some(page.retention.cursor_epoch.clone());
+                                        current_cursor = Some(baseline);
+                                        let checkpoint = watch_cursor_checkpoint_ndjson(
+                                            baseline,
+                                            current_cursor_epoch
+                                                .as_deref()
+                                                .expect("fresh baseline epoch was assigned"),
+                                            &expected_cursor_scope,
+                                            WatchCursorCheckpointReason::FreshWatchTailBaseline,
+                                        );
+                                        if !emit_watch_stream_record(
+                                            &stdout,
+                                            &checkpoint,
+                                            &mut last_emit,
+                                        )? {
+                                            break 'follow;
+                                        }
+                                        continue 'follow;
                                     }
-                                    continue 'follow;
-                                } else {
-                                    let requested =
-                                        current_cursor.expect("cursor branch requires a cursor");
-                                    let epoch = current_cursor_epoch
-                                        .as_deref()
-                                        .expect("validated durable cursor requires an epoch");
-                                    let check = match reconcile_event_stream_cursor_page(
-                                        &cx,
-                                        &storage,
-                                        requested,
-                                        epoch,
-                                        &page,
-                                        batch_limit,
-                                        &mut retention_coverage,
-                                    )
-                                    .await
-                                    {
-                                        Ok(check) => check,
-                                        Err(error) => {
-                                            match classify_watch_outer_failure(
-                                                &cx,
-                                                "retention reconciliation",
-                                                watch_core_failure_source(&error),
-                                            ) {
-                                                WatchOuterFailure::Cancelled(error) => {
-                                                    return Err(error.into());
-                                                }
-                                                WatchOuterFailure::Degraded => {}
+                                    Some(requested) => requested,
+                                };
+                                let epoch = current_cursor_epoch
+                                    .as_deref()
+                                    .expect("validated durable cursor requires an epoch");
+                                let check = match reconcile_event_stream_cursor_page(
+                                    &cx,
+                                    &storage,
+                                    requested,
+                                    epoch,
+                                    &page,
+                                    batch_limit,
+                                    &mut retention_coverage,
+                                )
+                                .await
+                                {
+                                    Ok(check) => check,
+                                    Err(error) => {
+                                        match classify_watch_outer_failure(
+                                            &cx,
+                                            "retention reconciliation",
+                                            watch_core_failure_source(&error),
+                                        ) {
+                                            WatchOuterFailure::Cancelled(error) => {
+                                                return Err(error.into());
                                             }
-                                            watch_checkpoint(&cx, "retention error response")?;
-                                            let record = watch_terminal_error_ndjson(
+                                            WatchOuterFailure::Degraded => {}
+                                        }
+                                        watch_checkpoint(&cx, "retention error response")?;
+                                        let record = watch_terminal_error_ndjson(
                                                 ROBOT_ERR_STORAGE,
                                                 format!(
                                                     "Failed to reconcile the watch-events cursor with retention: {error}"
@@ -45705,32 +45795,31 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 Some(&expected_cursor_scope),
                                                 true,
                                             );
-                                            let _ = emit_watch_stream_record(
-                                                &stdout,
-                                                &record,
-                                                &mut last_emit,
-                                            )?;
-                                            break 'follow;
-                                        }
-                                    };
-                                    if let Some(record) = check.as_ref().and_then(|check| {
-                                        event_cursor_discontinuity_ndjson(
-                                            check,
-                                            epoch,
-                                            &expected_cursor_scope,
-                                        )
-                                    }) {
-                                        watch_checkpoint(&cx, "cursor-discontinuity output")?;
-                                        let continue_writing = {
-                                            let mut lock = stdout.lock();
-                                            write_ndjson_line(&mut lock, &record)?
-                                        };
-                                        if !continue_writing {
-                                            break 'follow;
-                                        }
-                                        note_watch_output_emitted(&mut last_emit);
+                                        let _ = emit_watch_stream_record(
+                                            &stdout,
+                                            &record,
+                                            &mut last_emit,
+                                        )?;
                                         break 'follow;
                                     }
+                                };
+                                if let Some(record) = check.as_ref().and_then(|check| {
+                                    event_cursor_discontinuity_ndjson(
+                                        check,
+                                        epoch,
+                                        &expected_cursor_scope,
+                                    )
+                                }) {
+                                    watch_checkpoint(&cx, "cursor-discontinuity output")?;
+                                    let continue_writing = {
+                                        let mut lock = stdout.lock();
+                                        write_ndjson_line(&mut lock, &record)?
+                                    };
+                                    if !continue_writing {
+                                        break 'follow;
+                                    }
+                                    note_watch_output_emitted(&mut last_emit);
+                                    break 'follow;
                                 }
                                 let page_checked_through =
                                     event_stream_page_checked_through(&page, batch_limit);
@@ -46266,7 +46355,6 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                     // helper has observed Cx;
                                                     // retain the stream locally
                                                     // and continue the same stint.
-                                                    continue;
                                                 }
                                                 Ok(WatchIpcStreamRead::DurablePollDeadline) => {
                                                     // A connected peer can stall without
@@ -46282,7 +46370,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                         &cx,
                                                         &stdout,
                                                         &line,
-                                                        &mut current_cursor,
+                                                        current_cursor,
                                                         current_cursor_epoch.as_deref(),
                                                         Some(&expected_cursor_scope),
                                                         max_hz_interval,
@@ -46840,70 +46928,71 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         return Ok(());
                                     }
                                 };
-                                if after_id.is_none() {
-                                    current_cursor_epoch =
-                                        Some(page.retention.cursor_epoch.clone());
-                                    after_id = Some(fresh_event_cursor_baseline(&page.retention));
-                                    committed_cursor = after_id;
-                                    committed_cursor_epoch = current_cursor_epoch.clone();
-                                    let checkpoint = watch_cursor_checkpoint_ndjson(
-                                        after_id.expect("fresh await baseline was assigned"),
-                                        current_cursor_epoch
-                                            .as_deref()
-                                            .expect("fresh await epoch was assigned"),
-                                        &expected_cursor_scope,
-                                        WatchCursorCheckpointReason::FreshAwaitTailBaseline,
-                                    );
-                                    watch_checkpoint(&cx, "await baseline output")?;
-                                    let continue_writing = {
-                                        let mut lock = stdout.lock();
-                                        write_ndjson_line(&mut lock, &checkpoint)?
-                                    };
-                                    if !continue_writing {
-                                        storage.shutdown().await.ok();
-                                        return Ok(());
+                                let requested = match after_id {
+                                    None => {
+                                        let baseline = fresh_event_cursor_baseline(&page.retention);
+                                        current_cursor_epoch =
+                                            Some(page.retention.cursor_epoch.clone());
+                                        after_id = Some(baseline);
+                                        committed_cursor = after_id;
+                                        committed_cursor_epoch = current_cursor_epoch.clone();
+                                        let checkpoint = watch_cursor_checkpoint_ndjson(
+                                            baseline,
+                                            current_cursor_epoch
+                                                .as_deref()
+                                                .expect("fresh await epoch was assigned"),
+                                            &expected_cursor_scope,
+                                            WatchCursorCheckpointReason::FreshAwaitTailBaseline,
+                                        );
+                                        watch_checkpoint(&cx, "await baseline output")?;
+                                        let continue_writing = {
+                                            let mut lock = stdout.lock();
+                                            write_ndjson_line(&mut lock, &checkpoint)?
+                                        };
+                                        if !continue_writing {
+                                            storage.shutdown().await.ok();
+                                            return Ok(());
+                                        }
+                                        if checkpoint_only {
+                                            storage.shutdown().await.ok();
+                                            return Ok(());
+                                        }
+                                        // The provisional page was not queried
+                                        // after the newly established tail. Never
+                                        // process it or allow its final row to move
+                                        // the public cursor below the safe baseline.
+                                        continue;
                                     }
-                                    if checkpoint_only {
-                                        storage.shutdown().await.ok();
-                                        return Ok(());
-                                    }
-                                    // The provisional page was not queried
-                                    // after the newly established tail. Never
-                                    // process it or allow its final row to move
-                                    // the public cursor below the safe baseline.
-                                    continue;
-                                } else {
-                                    let requested =
-                                        after_id.expect("cursor branch requires a cursor");
-                                    let epoch = current_cursor_epoch
-                                        .as_deref()
-                                        .expect("an await cursor always has an epoch");
-                                    let reconciliation_cursor =
-                                        committed_cursor.unwrap_or(requested);
-                                    let check = match reconcile_event_stream_cursor_page(
-                                        &cx,
-                                        &storage,
-                                        reconciliation_cursor,
-                                        epoch,
-                                        &page,
-                                        500,
-                                        &mut retention_coverage,
-                                    )
-                                    .await
-                                    {
-                                        Ok(check) => check,
-                                        Err(error) => {
-                                            match classify_watch_outer_failure(
-                                                &cx,
-                                                "await retention reconciliation",
-                                                watch_core_failure_source(&error),
-                                            ) {
-                                                WatchOuterFailure::Cancelled(cancel_error) => {
-                                                    return Err(cancel_error.into());
-                                                }
-                                                WatchOuterFailure::Degraded => {}
+                                    Some(requested) => requested,
+                                };
+                                let epoch = current_cursor_epoch
+                                    .as_deref()
+                                    .expect("an await cursor always has an epoch");
+                                let reconciliation_cursor = committed_cursor.unwrap_or(requested);
+                                let check = match reconcile_event_stream_cursor_page(
+                                    &cx,
+                                    &storage,
+                                    reconciliation_cursor,
+                                    epoch,
+                                    &page,
+                                    500,
+                                    &mut retention_coverage,
+                                )
+                                .await
+                                {
+                                    Ok(check) => check,
+                                    Err(error) => {
+                                        match classify_watch_outer_failure(
+                                            &cx,
+                                            "await retention reconciliation",
+                                            watch_core_failure_source(&error),
+                                        ) {
+                                            WatchOuterFailure::Cancelled(cancel_error) => {
+                                                return Err(cancel_error.into());
                                             }
-                                            let _ = write_terminal_stream_error_ndjson(
+                                            WatchOuterFailure::Degraded => {}
+                                        }
+                                        let _ = write_terminal_stream_error_ndjson(
                                                 ROBOT_ERR_STORAGE,
                                                 format!(
                                                     "Failed to reconcile the await cursor with retention: {error}"
@@ -46917,28 +47006,28 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 Some(&expected_cursor_scope),
                                                 true,
                                             )?;
-                                            storage.shutdown().await.ok();
-                                            return Ok(());
-                                        }
-                                    };
-                                    if let Some(mut record) = check.as_ref().and_then(|check| {
-                                        event_cursor_discontinuity_ndjson(
-                                            check,
-                                            epoch,
-                                            &expected_cursor_scope,
-                                        )
-                                    }) {
-                                        if reconciliation_cursor != requested {
-                                            record["candidate_cursor"] =
-                                                serde_json::Value::from(requested);
-                                        }
-                                        watch_checkpoint(&cx, "await cursor-discontinuity output")?;
-                                        let mut lock = stdout.lock();
-                                        let _ = write_ndjson_line(&mut lock, &record)?;
-                                        drop(lock);
                                         storage.shutdown().await.ok();
                                         return Ok(());
                                     }
+                                };
+                                if let Some(mut record) = check.as_ref().and_then(|check| {
+                                    event_cursor_discontinuity_ndjson(
+                                        check,
+                                        epoch,
+                                        &expected_cursor_scope,
+                                    )
+                                }) {
+                                    if reconciliation_cursor != requested {
+                                        record["candidate_cursor"] =
+                                            serde_json::Value::from(requested);
+                                    }
+                                    watch_checkpoint(&cx, "await cursor-discontinuity output")?;
+                                    {
+                                        let mut lock = stdout.lock();
+                                        let _ = write_ndjson_line(&mut lock, &record)?;
+                                    }
+                                    storage.shutdown().await.ok();
+                                    return Ok(());
                                 }
 
                                 let checked_through = event_stream_page_checked_through(&page, 500);
@@ -52935,15 +53024,17 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 "ft send",
                 pane_id,
                 text.len(),
-                dry_run,
-                no_paste,
-                no_newline,
-                wait_for.is_some(),
-                wait_for_regex,
-                timeout_secs,
-                approval_code.is_some(),
-                verify_submit,
-                submit_level,
+                SendCommandSummaryOptions {
+                    dry_run,
+                    no_paste,
+                    no_newline,
+                    has_wait_for: wait_for.is_some(),
+                    wait_for_regex,
+                    timeout_secs,
+                    has_approval_code: approval_code.is_some(),
+                    verify_submit,
+                    submit_level,
+                },
             );
             let command_ctx = frankenterm_core::dry_run::CommandContext::new(command, dry_run);
             let wait_matcher = match wait_for.as_ref() {
@@ -73389,9 +73480,7 @@ async fn handle_auth_command(
             let profiles_root = ctx.profiles_root();
 
             let mut statuses: Vec<AuthProfileStatus> = Vec::new();
-            let scan: AuthStatusScan;
-
-            if all {
+            let scan = if all {
                 let discovery = match discover_browser_profiles_bounded(profiles_root) {
                     Ok(discovery) => discovery,
                     Err(_) => {
@@ -73413,14 +73502,14 @@ async fn handle_auth_command(
                 for profile in &discovery.profiles {
                     statuses.push(build_profile_status(profile));
                 }
-                scan = AuthStatusScan {
+                AuthStatusScan {
                     scope: "all_profiles",
                     entries_examined: discovery.entries_examined,
                     metadata_bytes_examined: discovery.metadata_bytes_examined,
                     unclassified_entries: discovery.unclassified_entries,
                     truncated: discovery.truncated,
                     complete: discovery.is_complete(),
-                };
+                }
             } else {
                 let svc = service.as_deref().unwrap_or_else(|| {
                     eprintln!("Error: --service is required unless --all is used.");
@@ -73461,15 +73550,15 @@ async fn handle_auth_command(
                     }
                 };
                 statuses.push(build_profile_status(&profile));
-                scan = AuthStatusScan {
+                AuthStatusScan {
                     scope: "single_profile",
                     entries_examined: 1,
                     metadata_bytes_examined: 0,
                     unclassified_entries: 0,
                     truncated: false,
                     complete: true,
-                };
-            }
+                }
+            };
 
             let report = AuthStatusReport {
                 profiles: statuses,
@@ -74410,29 +74499,6 @@ fn open_diagnostic_file_nofollow(
     directory
         .open_with(leaf, &options)
         .map(cap_std::fs::File::into_std)
-}
-
-fn open_diagnostic_directory_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("diagnostic directory has no parent"))?;
-    let leaf = path
-        .file_name()
-        .map(PathBuf::from)
-        .ok_or_else(|| std::io::Error::other("diagnostic directory has no file name"))?;
-    let parent = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
-    let mut options = cap_std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .follow(FollowSymlinks::No)
-        .maybe_dir(true);
-    let directory = parent.open_with(&leaf, &options)?;
-    if !directory.metadata()?.is_dir() {
-        return Err(std::io::Error::other(
-            "diagnostic directory path is not a directory",
-        ));
-    }
-    Ok(cap_std::fs::Dir::from_std_file(directory.into_std()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79003,7 +79069,7 @@ mod tests {
         .concat();
         let hostile_label = format!("capture\n{secret}\u{202e}");
         let admitted = admit_robot_checkpoint_save_request(Some(&hostile_label), None, 11)
-            .expect("bounded hostile label should be safely projected");
+            .unwrap_or_else(|_| panic!("bounded hostile label should be safely projected"));
         let label = admitted.label.expect("admitted label");
         assert!(!label.contains(&secret));
         assert!(!label.contains('\n'));
@@ -90434,15 +90500,17 @@ log_level = "debug"
             "ft robot send",
             7,
             payload.len(),
-            true,
-            false,
-            true,
-            true,
-            true,
-            30,
-            true,
-            true,
-            Some(SubmitGuaranteeLevelArg::Submitted),
+            SendCommandSummaryOptions {
+                dry_run: true,
+                no_paste: false,
+                no_newline: true,
+                has_wait_for: true,
+                wait_for_regex: true,
+                timeout_secs: 30,
+                has_approval_code: true,
+                verify_submit: true,
+                submit_level: Some(SubmitGuaranteeLevelArg::Submitted),
+            },
         );
 
         assert!(summary.len() < 512);
@@ -103224,7 +103292,7 @@ A  docs/new-proof.md\n";
     fn diagnostic_playwright_probe_reuses_exact_auth_capability_and_safe_details() {
         use frankenterm_core::browser::PlaywrightCapabilityProbeError;
 
-        let _exact_probe = frankenterm_core::browser::probe_playwright_chromium_capability;
+        std::hint::black_box(frankenterm_core::browser::probe_playwright_chromium_capability);
         for detail in [
             PlaywrightCapabilityProbeError::InvalidTimeout.detail(),
             PlaywrightCapabilityProbeError::TimedOut.detail(),

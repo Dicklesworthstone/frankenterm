@@ -3224,6 +3224,158 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Replace checked fail-closed allocation only after same-millisecond concurrency, wall-clock advance and rollback, terminal-minus-one/terminal boundaries, raw/wire terminal-value round trips, causal trace correlation, acknowledgement, and key/paste ordering models prove every locally generated input identity remains unique without rejecting valid peer data.
 
+### IS-N111 — One Wayland active-surface ID cannot represent two focus authorities
+
+- **Classification:** cross-modality authority alias rejection; split focus
+  state retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.16`
+- **Rejected inference:** the most recent `wl_keyboard.enter` or
+  `wl_pointer.enter` surface is a sufficient global target for keyboard, IME,
+  clipboard, pointer motion, button, and frame delivery.
+- **Negative evidence:** Wayland keyboard and pointer focus have independent
+  enter/leave lifecycles. With keyboard focus on surface B while the pointer
+  remained on A, one shared ID allowed keyboard entry to redirect coalesced
+  pointer delivery to B. An unknown or stale enter/leave and destruction of
+  one surface could likewise erase the other modality's still-valid authority.
+  A pointer frame containing leave-A/enter-B also cannot be routed correctly
+  from one final global ID because events earlier in the frame belong to A.
+- **Decision:** retain separate keyboard and pointer surface identities, route
+  pointer batches by event-local authority, bind IME/text-cursor and clipboard
+  routing explicitly to keyboard focus, and clear only the affected modality
+  on leave, capability loss, seat loss, or matching surface destruction.
+- **Primary retry condition:**
+  > Recombine focus state only after interleaved pointer-A/keyboard-B, same-frame leave-A/enter-B, unknown/stale enter/leave, modality-local close, seat/capability loss, unfocused modifiers, clipboard, IME, and native compositor traces prove that no event can cross a protocol authority boundary.
+
+### IS-N112 — Remote Wayland unit gates are not native compositor proof
+
+- **Classification:** wrong evidence pipeline; support claim withheld
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.16`
+- **Rejected inference:** a strict-remote Wayland-only check, 107 passing unit
+  tests, and warning-clean focused Clippy establish end-to-end keyboard,
+  pointer, IME, clipboard, resize, and presentation behavior under a real
+  compositor.
+- **Negative evidence:** those gates compile and exercise pure state/event
+  transitions but do not supply a native Wayland compositor, real seat
+  capability churn, hardware input, frame callbacks, or presented pixels. The
+  available `ovh-b` worker also lacked the X11/XCB prerequisite for the broader
+  portable window lane. Local app execution was intentionally excluded because
+  it would disrupt the operator's live FrankenTerm session.
+- **Decision:** retain the static/unit evidence as source-level proof only and
+  keep the native compositor gate explicitly separate; make no runtime or
+  latency claim from these results.
+- **Primary retry condition:**
+  > Promote the result to native support proof only after a non-disruptive dedicated compositor fixture retains protocol traces and visual/input outcomes for independent focus, cross-surface pointer frames, IME, clipboard, resize, capability loss, and destruction without interacting with an operator session.
+
+### IS-N113 — Ordinary-index normalization does not validate unique indexes
+
+- **Classification:** proof-validator false negative; canonicalization repair
+  retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.16`
+- **Rejected inference:** normalizing SQLite's omission of `IF NOT EXISTS` for
+  `CREATE INDEX` also normalizes the corresponding `CREATE UNIQUE INDEX`
+  rendering.
+- **Negative evidence:** SQLite stores both forms without `IF NOT EXISTS`, but
+  `compact_schema_sql` normalized only the ordinary-index prefix. Migration
+  v38's two unique checkpoint/lifecycle indexes therefore made the correct head
+  DDL fail its idempotent validator, breaking fresh database initialization and
+  masking downstream saturation tests behind `v0 init: migration mutation
+  failed`.
+- **Decision:** normalize ordinary and unique index renderings separately; add
+  a direct unique-index regression plus a head-DDL-to-v38 contract test. The
+  corrected direct contract ran exactly one test and passed on strict-remote
+  worker `vmi1227854`.
+- **Primary retry condition:**
+  > Replace textual schema canonicalization only after an introspection-based validator proves ordinary, unique, partial, expression, collation, and sort-order indexes across fresh head DDL, every supported upgrade shape, replay, and SQLite rendering differences without accepting semantic drift.
+
+### IS-N114 — Global SQL compaction can erase semantic literal drift
+
+- **Classification:** proof-validator false positive; token-aware
+  canonicalization retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.16`
+- **Rejected inference:** lowercasing and removing whitespace from an entire
+  `sqlite_schema.sql` string is safe because SQL keywords and identifiers are
+  case-insensitive and whitespace-insensitive.
+- **Negative evidence:** partial and expression indexes may contain quoted SQL
+  literals whose case and whitespace are semantic. Whole-string compaction
+  made predicates such as `value = 'A B'` and `value = 'ab'` compare equal,
+  allowing a drifted index to satisfy an exact-schema authority check. A global
+  replacement could also rewrite keyword-like text inside a literal.
+- **Decision:** normalize keyword spelling and insignificant whitespace only
+  outside SQLite string and quoted-identifier regions, preserve escaped quote
+  contents exactly, and limit `IF NOT EXISTS` normalization to the leading
+  ordinary/unique index clause. Retain hostile literal and quoted-identifier
+  regressions alongside the v38 head-schema contract.
+- **Primary retry condition:**
+  > Replace the token-aware comparison only after structured SQLite introspection proves every indexed expression, partial predicate, collation, sort order, and uniqueness constraint without accepting case, whitespace, quoting, or embedded-keyword drift inside semantic literals.
+
+### IS-N115 — An async command router does not make direct file reads bounded
+
+- **Classification:** executor-stall and hostile-file rejection; repository-wide
+  read-surface follow-up required
+- **Bead:** `ft-interactive-systems-performance-4tenz.60`
+- **Rejected inference:** caller-supplied file reads are harmless because they
+  occur in one-shot CLI commands rather than the long-running watcher loop.
+- **Negative evidence:** the async CLI router still directly reads passport,
+  connector-manifest, commit-text, and other caller-selected paths without a
+  streaming byte ceiling or pre-read regular-file authority. A FIFO, device,
+  growing file, slow mount, or oversized regular file can block the runtime
+  thread, delay cancellation and signal handling, or grow memory without a
+  finite bound. Moving the same unbounded operation to a blocking pool would
+  only hide the executor stall while permitting abandoned work to remain.
+- **Decision:** do not patch only the sampled call sites. Track one canonical
+  capability-safe reader and a complete async-command-path migration with
+  no-follow admission, stable regular-file identity, format-specific max-plus-
+  one limits, Cx-aware settlement, and a source canary for unaudited direct
+  reads.
+- **Primary retry condition:**
+  > Treat CLI file ingestion as bounded only after every production async-command read rejects non-regular and replaced paths, enforces streaming exact/one-over limits, remains responsive under slow or stalled readers, and proves cancellation and terminal resource settlement without launching FrankenTerm.
+
+### IS-N116 — SQLite no-follow rejects a trusted ancestor symlink too
+
+- **Classification:** platform-path alias rejection; trusted-anchor
+  canonicalization retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.16`
+- **Rejected inference:** capability-walking every caller-controlled component
+  with no-follow is sufficient for SQLite to open the resulting filename with
+  `SQLITE_OPEN_NOFOLLOW` when the ambient trusted anchor is spelled through a
+  platform path alias.
+- **Negative evidence:** concurrent first-open tests repeatedly returned the
+  finite site `sqlite_cannot_open_symlink` on macOS even though the store
+  directory itself contained no symlink. Bundled SQLite applies its no-follow
+  check to every component in the complete filename, so the trusted system
+  alias `/var` to `/private/var` was rejected before any database operation.
+  Retrying could not repair this permanent spelling mismatch and obscured its
+  actual failure class.
+- **Decision:** canonicalize only the ambient anchor already admitted by the
+  trusted-anchor policy, then capability-walk each relative component with
+  no-follow and retain SQLite no-follow plus post-open directory/database
+  identity revalidation. Classify SQLite open failures with finite,
+  content-free sites so permanent symlink, permission, path-conversion, and
+  contract failures fail immediately while genuinely transient open races stay
+  bounded and retryable.
+- **Primary retry condition:**
+  > Remove trusted-anchor canonicalization only after SQLite no-follow can open platform temp aliases while adversarial symlinks in every caller-controlled component, database leaf, journal, WAL, and SHM path remain rejected under concurrent create, unlink, and replacement races.
+
+### IS-N117 — A hostile-symlink test can accidentally attack its own trusted root
+
+- **Classification:** invalid security fixture; canonical fixture root retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.16`
+- **Rejected inference:** a lexical `tempfile` path is always a neutral root for
+  testing rejection of adversarial symlinks created beneath it.
+- **Negative evidence:** on macOS the lexical temporary-directory path itself
+  can traverse the trusted `/var` platform alias. Two browser security tests
+  therefore failed before reaching the service/profile symlinks and hard-link
+  substitutions they intended to exercise. Treating those failures as product
+  regressions would conflate a trusted platform alias above the fixture with an
+  attacker-controlled child inside it.
+- **Decision:** canonicalize only each test's freshly created isolated temp
+  root before constructing hostile descendants. Production browser path policy
+  remains unchanged and continues to reject every symlink component. The broad
+  strict-remote `symlink` filter then exercised all 34 matching tests without a
+  failure.
+- **Primary retry condition:**
+  > Revert canonical fixture roots only after the test substrate proves its ambient root contains no platform alias and the same adversarial child symlink, hard-link, discovery, lock, and replacement cases still reach their intended production rejection boundary on every supported host.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

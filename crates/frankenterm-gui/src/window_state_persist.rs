@@ -6597,12 +6597,15 @@ mod tests {
             )
             .expect_err("reserved remote identity must fail before overlay admission");
             assert_eq!(error.code(), PersistenceFailureCode::Invalid);
+            let PersistenceFailure::Invalid { reason } = &error else {
+                panic!("reserved remote identity returned the wrong failure: {error}");
+            };
             assert!(
-                error.to_string().starts_with("overlay remote tab slot"),
+                reason.starts_with("overlay remote tab slot"),
                 "overlay rejection must identify its authority source: {error}"
             );
             assert!(
-                error.to_string().contains(expected_reason),
+                reason.contains(expected_reason),
                 "unexpected rejection: {error}"
             );
 
@@ -6613,12 +6616,15 @@ mod tests {
             )
             .expect_err("reserved live identity must fail before reconciliation");
             assert_eq!(error.code(), PersistenceFailureCode::Invalid);
+            let PersistenceFailure::Invalid { reason } = &error else {
+                panic!("reserved live identity returned the wrong failure: {error}");
+            };
             assert!(
-                error.to_string().starts_with("live layout remote tab slot"),
+                reason.starts_with("live layout remote tab slot"),
                 "live rejection must identify its authority source: {error}"
             );
             assert!(
-                error.to_string().contains(expected_reason),
+                reason.contains(expected_reason),
                 "unexpected live-slot rejection: {error}"
             );
         }

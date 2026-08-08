@@ -374,6 +374,9 @@ mod tests {
     }
 
     #[cfg(panic = "unwind")]
+    // This is intentionally not `Waker::noop()`: the custom `Drop` below is
+    // the lifetime canary exercised by final-drop panic-containment tests.
+    #[allow(clippy::manual_noop_waker)]
     impl Wake for PanicOnFinalDrop {
         fn wake(self: Arc<Self>) {}
 
