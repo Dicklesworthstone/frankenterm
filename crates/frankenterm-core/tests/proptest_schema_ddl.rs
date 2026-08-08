@@ -33,7 +33,9 @@ const REQUIRED_TABLES: &[&str] = &[
     "pane_bookmarks",
     "mux_sessions",
     "session_checkpoints",
+    "restore_attempt_lifecycle",
     "mux_pane_state",
+    "session_retained_size",
 ];
 
 const REQUIRED_INDEXES: &[(&str, &str)] = &[
@@ -126,6 +128,84 @@ const SCROLLBACK_SUMMARY_TRIGGERS: &[(&str, &str, &str)] = &[
         "output_segments_scrollback_metadata_bu",
         "BEFORE UPDATE OF pane_id, seq, captured_at ON output_segments",
         "output segment scrollback metadata is immutable",
+    ),
+];
+
+const SESSION_RETAINED_SIZE_TRIGGERS: &[(&str, &str, &str)] = &[
+    (
+        "session_retained_size_bi",
+        "BEFORE INSERT ON session_retained_size",
+        "session retained-size row requires a persisted session",
+    ),
+    (
+        "session_retained_size_bd",
+        "BEFORE DELETE ON session_retained_size",
+        "live session retained-size authority is permanent",
+    ),
+    (
+        "session_retained_size_session_id_bu",
+        "BEFORE UPDATE OF session_id ON session_retained_size",
+        "session retained-size identity is immutable",
+    ),
+    (
+        "mux_sessions_retained_size_ai",
+        "AFTER INSERT ON mux_sessions",
+        "INSERT INTO session_retained_size",
+    ),
+    (
+        "mux_sessions_retained_size_au",
+        "AFTER UPDATE ON mux_sessions",
+        "SET session_row_bytes =",
+    ),
+    (
+        "mux_sessions_retained_size_ad",
+        "AFTER DELETE ON mux_sessions",
+        "DELETE FROM session_retained_size",
+    ),
+    (
+        "session_checkpoints_retained_size_ai",
+        "AFTER INSERT ON session_checkpoints",
+        "checkpoint_row_bytes = checkpoint_row_bytes",
+    ),
+    (
+        "session_checkpoints_retained_size_au",
+        "AFTER UPDATE ON session_checkpoints",
+        "checkpoint retained-size identity is immutable",
+    ),
+    (
+        "session_checkpoints_retained_size_bd",
+        "BEFORE DELETE ON session_checkpoints",
+        "pane_state_row_bytes = pane_state_row_bytes",
+    ),
+    (
+        "mux_pane_state_retained_size_ai",
+        "AFTER INSERT ON mux_pane_state",
+        "pane_state_row_bytes = pane_state_row_bytes",
+    ),
+    (
+        "mux_pane_state_retained_size_au",
+        "AFTER UPDATE ON mux_pane_state",
+        "pane-state retained-size identity is immutable",
+    ),
+    (
+        "mux_pane_state_retained_size_ad",
+        "AFTER DELETE ON mux_pane_state",
+        "pane_state_row_bytes = pane_state_row_bytes",
+    ),
+    (
+        "restore_attempt_lifecycle_retained_size_ai",
+        "AFTER INSERT ON restore_attempt_lifecycle",
+        "restore_lifecycle_row_bytes = restore_lifecycle_row_bytes",
+    ),
+    (
+        "restore_attempt_lifecycle_retained_size_au",
+        "AFTER UPDATE ON restore_attempt_lifecycle",
+        "restore-lifecycle retained-size identity is immutable",
+    ),
+    (
+        "restore_attempt_lifecycle_retained_size_ad",
+        "AFTER DELETE ON restore_attempt_lifecycle",
+        "restore_lifecycle_row_bytes = restore_lifecycle_row_bytes",
     ),
 ];
 
@@ -235,6 +315,26 @@ fn schema_ddl_output_segment_fts_triggers_keep_expected_actions() {
 #[test]
 fn schema_ddl_scrollback_summary_triggers_keep_transactional_actions() {
     for &(trigger_name, trigger_timing, action) in SCROLLBACK_SUMMARY_TRIGGERS {
+        let trigger_start = unique_declaration_start("CREATE TRIGGER IF NOT EXISTS ", trigger_name);
+        let trigger_tail = &SCHEMA_SQL[trigger_start..];
+        let trigger_end = trigger_tail
+            .find("\nEND;")
+            .expect("trigger declaration should end with END;")
+            + "\nEND;".len();
+        let trigger_sql = &trigger_tail[..trigger_end];
+
+        assert!(trigger_sql.contains(trigger_timing));
+        assert!(trigger_sql.contains(action));
+    }
+}
+
+#[test]
+fn schema_ddl_session_retained_size_view_and_triggers_are_declared_once() {
+    let _ = unique_declaration_start(
+        "CREATE VIEW IF NOT EXISTS ",
+        "session_retained_size_recomputed",
+    );
+    for &(trigger_name, trigger_timing, action) in SESSION_RETAINED_SIZE_TRIGGERS {
         let trigger_start = unique_declaration_start("CREATE TRIGGER IF NOT EXISTS ", trigger_name);
         let trigger_tail = &SCHEMA_SQL[trigger_start..];
         let trigger_end = trigger_tail

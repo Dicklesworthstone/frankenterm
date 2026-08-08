@@ -3376,6 +3376,49 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Revert canonical fixture roots only after the test substrate proves its ambient root contains no platform alias and the same adversarial child symlink, hard-link, discovery, lock, and replacement cases still reach their intended production rejection boundary on every supported host.
 
+### IS-N118 — Trigger CHECK constraints do not defeat an outer OR IGNORE
+
+- **Classification:** accounting false green; explicit trigger abort retained
+- **Bead:** `ft-0yuxe.3`
+- **Rejected inference:** a non-negative/INTEGER CHECK on the generated
+  retained-byte total makes every trigger-maintained increment fail closed at
+  arithmetic overflow.
+- **Negative evidence:** SQLite applies an outer statement's conflict policy to
+  constraint failures in trigger-body writes. At the exact `i64::MAX` boundary,
+  `INSERT OR IGNORE INTO session_checkpoints` persisted the checkpoint while
+  silently ignoring the retained-size summary update. The source row and byte
+  authority therefore diverged even though every summary-table CHECK remained
+  intact.
+- **Decision:** retain the summary CHECKs as defense in depth, but precede every
+  additive/subtractive trigger mutation with explicit `RAISE(ABORT)`
+  overflow/underflow guards and subtract-before-add update order. Direct SQLite
+  negative controls now require checkpoint, pane, and lifecycle outer-ignore
+  attempts to error while leaving source cardinality unchanged. Rust gate proof
+  remains pending strict-remote worker availability.
+- **Primary retry condition:**
+  > Remove explicit trigger aborts only after every SQLite conflict policy proves atomic source-row and accounting settlement at exact, plus-one, underflow, overflow, cascade, and drift boundaries across all four retained-session tables.
+
+### IS-N119 — Source-row DML counts exclude triggers, total_changes does not
+
+- **Classification:** integration rollback false positive; exact doubled witness retained
+- **Bead:** `ft-0yuxe.3`
+- **Rejected inference:** adding transactionally maintained retained-size
+  triggers cannot affect the snapshot persistence transaction's existing exact
+  DML witness.
+- **Negative evidence:** `rusqlite::execute` reports the direct source-row
+  change, but SQLite `total_changes()` also counts trigger-body writes. Schema
+  v40 intentionally performs one summary mutation for every session,
+  checkpoint, witness-finalization, and pane mutation in checkpoint save. The
+  old `pane_count + 3` connection-wide expectation would therefore reject and
+  roll back every otherwise valid checkpoint transaction.
+- **Decision:** keep per-statement exact-one checks and make the connection-wide
+  witness exactly `2 * (pane_count + 3)` under the canonical-trigger allowlist
+  and exact schema-body validator. This preserves the no-payload-reread hot path
+  while detecting missing, extra, or multiplicative trigger writes. Rust gate
+  proof remains pending strict-remote worker availability.
+- **Primary retry condition:**
+  > Replace the doubled total_changes witness only with an equally bounded transaction receipt that proves every source mutation and exactly one matching byte-authority mutation without rereading retained payloads or accepting unaudited trigger effects.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

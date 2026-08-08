@@ -186,6 +186,28 @@ fn insert_checkpoint(
     checkpoint_id
 }
 
+fn insert_sized_checkpoint(
+    conn: &Connection,
+    session_id: &str,
+    checkpoint_at: i64,
+    logical_payload_bytes: usize,
+) -> i64 {
+    assert!(logical_payload_bytes >= 2);
+    let checkpoint_id = insert_checkpoint(
+        conn,
+        session_id,
+        checkpoint_at,
+        i64::try_from(logical_payload_bytes).expect("test payload fits SQLite integer"),
+    );
+    let topology_json = format!("\"{}\"", "x".repeat(logical_payload_bytes - 2));
+    conn.execute(
+        "UPDATE session_checkpoints SET topology_json = ?1 WHERE id = ?2",
+        params![topology_json, checkpoint_id],
+    )
+    .unwrap();
+    checkpoint_id
+}
+
 fn insert_pane_state(conn: &Connection, checkpoint_id: i64, pane_id: u64) {
     conn.execute(
         "INSERT INTO mux_pane_state
@@ -198,7 +220,14 @@ fn insert_pane_state(conn: &Connection, checkpoint_id: i64, pane_id: u64) {
 
 /// Insert an orphaned checkpoint (FK disabled temporarily).
 fn insert_orphaned_checkpoint(conn: &Connection, fake_session_id: &str, checkpoint_at: i64) -> i64 {
-    conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+    // Model a row retained from before schema v40. Current writers fail closed
+    // on an unmappable insert, so suspend only the canonical insert trigger,
+    // seed the legacy corruption shape, and reinstall the exact schema body.
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         DROP TRIGGER session_checkpoints_retained_size_ai;",
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO session_checkpoints
          (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
@@ -208,12 +237,17 @@ fn insert_orphaned_checkpoint(conn: &Connection, fake_session_id: &str, checkpoi
     .unwrap();
     let id = conn.last_insert_rowid();
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    conn.execute_batch(SCHEMA_SQL).unwrap();
     id
 }
 
 /// Insert an orphaned pane_state (FK disabled temporarily).
 fn insert_orphaned_pane_state(conn: &Connection, fake_checkpoint_id: i64, pane_id: u64) {
-    conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         DROP TRIGGER mux_pane_state_retained_size_ai;",
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO mux_pane_state
          (checkpoint_id, pane_id, terminal_state_json)
@@ -222,11 +256,16 @@ fn insert_orphaned_pane_state(conn: &Connection, fake_checkpoint_id: i64, pane_i
     )
     .unwrap();
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    conn.execute_batch(SCHEMA_SQL).unwrap();
 }
 
 /// Insert an orphaned restore lifecycle row (FK disabled temporarily).
 fn insert_orphaned_restore_lifecycle(conn: &Connection, intent_id: i64) {
-    conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         DROP TRIGGER restore_attempt_lifecycle_retained_size_ai;",
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO restore_attempt_lifecycle (
              intent_checkpoint_id, session_id, source_checkpoint_id,
@@ -240,6 +279,7 @@ fn insert_orphaned_restore_lifecycle(conn: &Connection, intent_id: i64) {
     )
     .unwrap();
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    conn.execute_batch(SCHEMA_SQL).unwrap();
 }
 
 fn count_sessions(conn: &Connection) -> i64 {
@@ -280,13 +320,15 @@ fn count_pane_states(conn: &Connection) -> i64 {
         .unwrap()
 }
 
-fn total_checkpoint_bytes(conn: &Connection) -> i64 {
-    conn.query_row(
-        "SELECT COALESCE(SUM(total_bytes), 0) FROM session_checkpoints",
-        [],
-        |row| row.get(0),
-    )
-    .unwrap()
+fn total_retained_bytes(conn: &Connection) -> u64 {
+    let retained: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(retained_bytes), 0) FROM session_retained_size",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    u64::try_from(retained).unwrap()
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -298,19 +340,37 @@ fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
         any::<usize>(),
         any::<usize>(),
         any::<usize>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
         0..100usize,
         0..100usize,
         0..100usize,
     )
         .prop_map(
-            |(age, count, size, orphan_lifecycle, orphan_cp, orphan_ps)| CleanupResult {
+            |(
+                age,
+                count,
+                size,
+                measured_bytes,
+                deleted_bytes,
+                retained_bytes,
+                shortfall_bytes,
+                orphan_lifecycle,
+                orphan_cp,
+                orphan_ps,
+            )| CleanupResult {
                 deleted_by_age: age,
                 deleted_by_count: count,
                 deleted_by_size: size,
+                size_measured_bytes: measured_bytes,
+                size_deleted_bytes: deleted_bytes,
+                size_retained_bytes: retained_bytes,
+                size_ineligible_shortfall_bytes: shortfall_bytes,
                 orphaned_restore_lifecycle_rows: orphan_lifecycle,
                 orphaned_checkpoints: orphan_cp,
                 orphaned_pane_states: orphan_ps,
-                ..CleanupResult::default()
             },
         )
 }
@@ -855,7 +915,7 @@ proptest! {
         for i in 0..num_linked_orphans {
             let cp_id = insert_orphaned_checkpoint(&conn, &format!("ghost-link-{i}"), now);
             for c in 0..children_per_orphan {
-                insert_pane_state(&conn, cp_id, (10_000 + i * 100 + c) as u64);
+                insert_orphaned_pane_state(&conn, cp_id, (10_000 + i * 100 + c) as u64);
             }
         }
 
@@ -1067,13 +1127,13 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
+    #![proptest_config(ProptestConfig::with_cases(24))]
 
     #[test]
     fn size_cleanup_stays_under_budget(
-        num_closed in 1..15usize,
-        bytes_per_session in 1..50u64,  // in MB
-        max_size_mb in 1..200u64,
+        num_closed in 1..6usize,
+        payload_mib_per_session in 1..4usize,
+        max_size_mb in 1..10u64,
     ) {
         let conn = make_test_db();
         let now = epoch_ms() as i64;
@@ -1082,8 +1142,8 @@ proptest! {
             let sid = format!("sess-{}", i);
             let created = now - (i as i64) * 1000;
             insert_session(&conn, &sid, created, true);
-            let bytes = (bytes_per_session as i64) * 1024 * 1024;
-            insert_checkpoint(&conn, &sid, created, bytes);
+            let payload_bytes = payload_mib_per_session * 1024 * 1024;
+            insert_sized_checkpoint(&conn, &sid, created, payload_bytes);
         }
 
         let config = SessionRetentionConfig {
@@ -1093,21 +1153,21 @@ proptest! {
             cleanup_interval_hours: 24,
         };
 
-        let _result = cleanup_sessions(&conn, &config).unwrap();
+        let result = cleanup_sessions(&conn, &config).unwrap();
 
-        let remaining_bytes = total_checkpoint_bytes(&conn);
-        let budget_bytes = (max_size_mb as i64) * 1024 * 1024;
+        let remaining_bytes = total_retained_bytes(&conn);
+        let budget_bytes = max_size_mb * 1024 * 1024;
 
-        // After cleanup, remaining should be under budget
-        // (or all closed sessions were exhausted)
-        let remaining_closed = count_closed_sessions(&conn);
-        if remaining_closed > 0 {
-            prop_assert!(
-                remaining_bytes <= budget_bytes,
-                "remaining bytes ({}) should be <= budget ({}) when closed sessions remain ({})",
-                remaining_bytes, budget_bytes, remaining_closed
-            );
-        }
+        prop_assert_eq!(result.size_retained_bytes, remaining_bytes);
+        prop_assert_eq!(
+            result.size_measured_bytes,
+            result.size_deleted_bytes + result.size_retained_bytes,
+        );
+        prop_assert_eq!(result.size_ineligible_shortfall_bytes, 0);
+        prop_assert!(
+            remaining_bytes <= budget_bytes,
+            "remaining authoritative bytes ({remaining_bytes}) must be <= budget ({budget_bytes})"
+        );
     }
 }
 
@@ -1237,16 +1297,16 @@ proptest! {
         for i in 0..num_active {
             let sid = format!("active-{}", i);
             insert_session(&conn, &sid, now - (i as i64) * 1000, false);
-            // We can't add checkpoints for active sessions easily because
-            // we'd need the FK. We do add them to contribute to total_bytes.
-            insert_checkpoint(&conn, &sid, now, 100 * 1024 * 1024); // 100MB each
+            // Active checkpoints contribute to the same exact logical-byte
+            // authority, but their owning sessions remain ineligible.
+            insert_sized_checkpoint(&conn, &sid, now, 1024 * 1024);
         }
 
         // Closed sessions with big checkpoints
         for i in 0..num_closed {
             let sid = format!("closed-{}", i);
             insert_session(&conn, &sid, now - (i as i64) * 1000, true);
-            insert_checkpoint(&conn, &sid, now, 100 * 1024 * 1024); // 100MB each
+            insert_sized_checkpoint(&conn, &sid, now, 1024 * 1024);
         }
 
         let active_before = count_active_sessions(&conn);
@@ -1258,12 +1318,17 @@ proptest! {
             cleanup_interval_hours: 24,
         };
 
-        let _result = cleanup_sessions(&conn, &config).unwrap();
+        let result = cleanup_sessions(&conn, &config).unwrap();
         let active_after = count_active_sessions(&conn);
 
         prop_assert_eq!(
             active_after, active_before,
             "size policy must not delete active sessions"
+        );
+        prop_assert_eq!(result.size_retained_bytes, total_retained_bytes(&conn));
+        prop_assert_eq!(
+            result.size_ineligible_shortfall_bytes,
+            result.size_retained_bytes.saturating_sub(1024 * 1024),
         );
     }
 }
@@ -1395,6 +1460,10 @@ proptest! {
         prop_assert_eq!(cloned.deleted_by_age, result.deleted_by_age, "age preserved");
         prop_assert_eq!(cloned.deleted_by_count, result.deleted_by_count, "count preserved");
         prop_assert_eq!(cloned.deleted_by_size, result.deleted_by_size, "size preserved");
+        prop_assert_eq!(cloned.size_measured_bytes, result.size_measured_bytes, "measured bytes preserved");
+        prop_assert_eq!(cloned.size_deleted_bytes, result.size_deleted_bytes, "deleted bytes preserved");
+        prop_assert_eq!(cloned.size_retained_bytes, result.size_retained_bytes, "retained bytes preserved");
+        prop_assert_eq!(cloned.size_ineligible_shortfall_bytes, result.size_ineligible_shortfall_bytes, "shortfall bytes preserved");
         prop_assert_eq!(
             cloned.orphaned_restore_lifecycle_rows,
             result.orphaned_restore_lifecycle_rows,
@@ -1872,7 +1941,7 @@ proptest! {
         // corruption shape the GC must collect, not propagate).
         for i in 0..num_orphan_cp {
             let cp = insert_orphaned_checkpoint(&conn, &format!("ghost-{i}"), old);
-            insert_pane_state(&conn, cp, (70_000 + i) as u64);
+            insert_orphaned_pane_state(&conn, cp, (70_000 + i) as u64);
         }
 
         // Aggressive retention so GC removes as much as it is ALLOWED to.
@@ -1973,7 +2042,7 @@ fn gc_golden_preserves_active_drops_old_closed_and_stays_consistent() {
     insert_session(&conn, "closed-old-2", old, true);
     insert_session(&conn, "closed-recent", now, true);
     let orphan = insert_orphaned_checkpoint(&conn, "ghost", old);
-    insert_pane_state(&conn, orphan, 999);
+    insert_orphaned_pane_state(&conn, orphan, 999);
 
     // Age GC only (generous count + size budgets).
     let config = SessionRetentionConfig {
