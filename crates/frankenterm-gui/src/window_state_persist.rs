@@ -22,7 +22,7 @@
 //! the prior generation or the new generation, never a partially decoded
 //! topology mutation.
 
-use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
@@ -83,9 +83,7 @@ pub enum PersistenceFailure {
     UnsupportedVersion { found: u32, current: u32 },
     #[error("persisted state is oversized: {actual} bytes exceeds {maximum}")]
     Oversized { actual: u64, maximum: u64 },
-    #[error(
-        "persisted state encoded-byte upper bound {projected_upper_bound} exceeds {maximum}"
-    )]
+    #[error("persisted state encoded-byte upper bound {projected_upper_bound} exceeds {maximum}")]
     EncodedQuota {
         projected_upper_bound: u64,
         maximum: u64,
@@ -122,21 +120,15 @@ impl PersistenceFailure {
             Self::Io { .. } => PersistenceFailureCode::Io,
             Self::Corrupt { .. } => PersistenceFailureCode::Corrupt,
             Self::UnsupportedVersion { .. } => PersistenceFailureCode::UnsupportedVersion,
-            Self::Oversized { .. } | Self::EncodedQuota { .. } => {
-                PersistenceFailureCode::Oversized
-            }
+            Self::Oversized { .. } | Self::EncodedQuota { .. } => PersistenceFailureCode::Oversized,
             Self::Invalid { .. } => PersistenceFailureCode::Invalid,
             Self::Quota { .. } => PersistenceFailureCode::Quota,
             Self::RevisionExhausted => PersistenceFailureCode::RevisionExhausted,
             Self::StaleOverlay { .. } => PersistenceFailureCode::StaleOverlay,
-            Self::OverlayRevisionConflict { .. } => {
-                PersistenceFailureCode::OverlayRevisionConflict
-            }
+            Self::OverlayRevisionConflict { .. } => PersistenceFailureCode::OverlayRevisionConflict,
             Self::OverlayCasConflict { .. } => PersistenceFailureCode::OverlayCasConflict,
             Self::RetiredOverlay { .. } => PersistenceFailureCode::RetiredOverlay,
-            Self::AmbiguousGeneration { .. } => {
-                PersistenceFailureCode::AmbiguousGeneration
-            }
+            Self::AmbiguousGeneration { .. } => PersistenceFailureCode::AmbiguousGeneration,
             Self::WorkerPanicked => PersistenceFailureCode::WorkerPanicked,
             Self::WorkerStopped => PersistenceFailureCode::WorkerStopped,
         }
@@ -184,9 +176,7 @@ impl PersistenceFailure {
 ///
 /// It is random, contains no credentials, and remains stable across GUI
 /// process restarts. The privacy-safe target fingerprint is stored separately.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct DomainBindingId([u8; 16]);
 
 impl DomainBindingId {
@@ -214,9 +204,7 @@ impl Default for DomainBindingId {
 
 /// Hash of a canonical non-secret transport target. The raw hostname, socket
 /// path, username, and credentials are never stored in this file.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct PrivacySafeTargetFingerprint([u8; 32]);
 
 impl PrivacySafeTargetFingerprint {
@@ -232,9 +220,7 @@ impl PrivacySafeTargetFingerprint {
 }
 
 /// Server-owned identity for one live mux-session incarnation.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct StableMuxSessionId([u8; 16]);
 
 impl StableMuxSessionId {
@@ -250,9 +236,7 @@ impl StableMuxSessionId {
 }
 
 /// Client-owned stable association for one mixed GUI window.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct LayoutWindowId([u8; 16]);
 
 impl LayoutWindowId {
@@ -280,9 +264,7 @@ impl Default for LayoutWindowId {
 
 /// Stable local-session identity required before a local tab can participate
 /// in a durable mixed overlay.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct StableLocalSessionId([u8; 16]);
 
 impl StableLocalSessionId {
@@ -298,9 +280,7 @@ impl StableLocalSessionId {
 }
 
 /// Stable local tab identity supplied by a restorable local/session runtime.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct StableLocalTabId([u8; 16]);
 
 impl StableLocalTabId {
@@ -320,9 +300,7 @@ impl StableLocalTabId {
 /// A remote tab keeps this identity when the server atomically moves it to a
 /// different window.  The parent window is routing/placement state carried by
 /// [`StableTabSlot`], not part of equality or ownership authority here.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StableTabIdentity {
     Remote {
@@ -406,9 +384,7 @@ impl StableTabSlot {
                 session_id,
                 remote_tab_id,
             },
-            Self::Local { session_id, tab_id } => {
-                StableTabIdentity::Local { session_id, tab_id }
-            }
+            Self::Local { session_id, tab_id } => StableTabIdentity::Local { session_id, tab_id },
         }
     }
 
@@ -828,8 +804,7 @@ pub fn reconcile_overlay(
         .len()
         .checked_add(live.len())
         .unwrap_or(MAX_TABS_PER_OVERLAY);
-    let mut ordered_slots =
-        Vec::with_capacity(requested_capacity.min(MAX_TABS_PER_OVERLAY));
+    let mut ordered_slots = Vec::with_capacity(requested_capacity.min(MAX_TABS_PER_OVERLAY));
     let mut seen = HashSet::with_capacity(ordered_slots.capacity());
     let mut retained_unavailable = 0usize;
     let mut dropped_closed_or_stale = 0usize;
@@ -915,8 +890,7 @@ pub fn reconcile_overlay(
         .collect::<Vec<_>>();
     debug_assert!(
         active_live_slot.is_none()
-            || active_live_slot
-                .is_some_and(|slot| live_by_identity.contains_key(&slot.identity()))
+            || active_live_slot.is_some_and(|slot| live_by_identity.contains_key(&slot.identity()))
     );
 
     Ok(ReconciledOverlay {
@@ -1143,10 +1117,7 @@ impl PendingBatch {
         window_id: LayoutWindowId,
         base_revision: Option<u64>,
     ) -> Result<EnqueueOutcome, PersistenceFailure> {
-        self.queue_overlay_mutation(PendingOverlayMutation::deleted(
-            window_id,
-            base_revision,
-        )?)
+        self.queue_overlay_mutation(PendingOverlayMutation::deleted(window_id, base_revision)?)
     }
 
     fn queue_overlay_mutation(
@@ -1177,19 +1148,13 @@ impl PendingBatch {
                 self.overlay_mutations.insert(window_id, mutation);
                 Ok(EnqueueOutcome::Queued)
             }
-            Some(previous) if previous.desired == mutation.desired => {
-                Ok(EnqueueOutcome::Unchanged)
-            }
-            Some(previous)
-                if matches!(&previous.desired, DesiredOverlayState::Deleted { .. }) =>
-            {
+            Some(previous) if previous.desired == mutation.desired => Ok(EnqueueOutcome::Unchanged),
+            Some(previous) if matches!(&previous.desired, DesiredOverlayState::Deleted { .. }) => {
                 Err(PersistenceFailure::RetiredOverlay {
                     last_revision: previous.desired_revision(),
                 })
             }
-            Some(previous)
-                if mutation.base_revision == Some(previous.desired_revision()) =>
-            {
+            Some(previous) if mutation.base_revision == Some(previous.desired_revision()) => {
                 let total = self
                     .overlay_tab_count
                     .checked_sub(previous.live_tab_count())
@@ -1246,14 +1211,13 @@ impl PendingBatch {
                     .get(workspace)
                     .copied()
                     .unwrap_or(0);
-                let remove_counter = if let Some(current) =
-                    self.window_state_superseded.get_mut(workspace)
-                {
-                    *current = current.saturating_sub(committed_superseded.saturating_add(1));
-                    *current == 0
-                } else {
-                    false
-                };
+                let remove_counter =
+                    if let Some(current) = self.window_state_superseded.get_mut(workspace) {
+                        *current = current.saturating_sub(committed_superseded.saturating_add(1));
+                        *current == 0
+                    } else {
+                        false
+                    };
                 if remove_counter {
                     self.window_state_superseded.remove(workspace);
                 }
@@ -1275,15 +1239,14 @@ impl PendingBatch {
                 continue;
             };
             let committed_revision = committed.desired_revision();
-            let continues_committed_live =
-                current.desired_revision() > committed_revision
-                    || matches!(
-                        &current.desired,
-                        DesiredOverlayState::Deleted {
-                            last_local_revision,
-                            ..
-                        } if *last_local_revision == committed_revision
-                    );
+            let continues_committed_live = current.desired_revision() > committed_revision
+                || matches!(
+                    &current.desired,
+                    DesiredOverlayState::Deleted {
+                        last_local_revision,
+                        ..
+                    } if *last_local_revision == committed_revision
+                );
             if current.base_revision == committed.base_revision
                 && matches!(&committed.desired, DesiredOverlayState::Live(_))
                 && continues_committed_live
@@ -1375,9 +1338,9 @@ impl BatchCommit {
 pub type CommitResult = Result<CommitReceipt, PersistenceFailure>;
 pub type BindingResult = Result<DomainBindingId, PersistenceFailure>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct SemanticFailureOutcome {
-    sequence: u64,
+    identity: Arc<()>,
     failure: PersistenceFailure,
 }
 
@@ -1412,14 +1375,14 @@ impl FlushWaiter {
             .map_or(Ok(receipt), Err)
     }
 
-    fn reported_semantic_sequence(
+    fn reported_semantic_identity(
         &self,
         current_semantic_failure: Option<&SemanticFailureOutcome>,
-    ) -> Option<u64> {
+    ) -> Option<Arc<()>> {
         self.prior_semantic_failure
             .as_ref()
             .or(current_semantic_failure)
-            .map(|outcome| outcome.sequence)
+            .map(|outcome| Arc::clone(&outcome.identity))
     }
 
     fn transaction_failure_result(&self, failure: &PersistenceFailure) -> CommitResult {
@@ -1615,47 +1578,38 @@ impl TestWorkerCommitControl {
 struct CoordinatorPending {
     batch: PendingBatch,
     flush_waiters: Vec<FlushWaiter>,
-    binding_waiters:
-        BTreeMap<PrivacySafeTargetFingerprint, Vec<flume::Sender<BindingResult>>>,
+    binding_waiters: BTreeMap<PrivacySafeTargetFingerprint, Vec<flume::Sender<BindingResult>>>,
     waiter_count: usize,
-    next_semantic_sequence: u64,
     unreported_semantic_failure: Option<SemanticFailureOutcome>,
     #[cfg(test)]
     worker_commit_control: Option<TestWorkerCommitControl>,
 }
 
 impl CoordinatorPending {
-    fn record_semantic_failure(
-        &mut self,
-        failure: &PersistenceFailure,
-    ) -> SemanticFailureOutcome {
+    fn record_semantic_failure(&mut self, failure: &PersistenceFailure) -> SemanticFailureOutcome {
         // Retain the first rejection not yet crossed by a successful explicit
         // flush. Later rejections in the same barrier interval remain covered
         // by that deterministic first failure; exact per-lineage receipts are
         // a separate API layer.
-        let outcome = self
-            .unreported_semantic_failure
-            .clone()
-            .unwrap_or_else(|| {
-                self.next_semantic_sequence = self.next_semantic_sequence.saturating_add(1);
-                let outcome = SemanticFailureOutcome {
-                    sequence: self.next_semantic_sequence,
-                    failure: failure.clone(),
-                };
-                self.unreported_semantic_failure = Some(outcome.clone());
-                outcome
-            });
+        let outcome = self.unreported_semantic_failure.clone().unwrap_or_else(|| {
+            let outcome = SemanticFailureOutcome {
+                identity: Arc::new(()),
+                failure: failure.clone(),
+            };
+            self.unreported_semantic_failure = Some(outcome.clone());
+            outcome
+        });
         for waiter in &mut self.flush_waiters {
             waiter.remember_semantic_failure(&outcome);
         }
         outcome
     }
 
-    fn clear_reported_semantic_failure(&mut self, sequence: u64) {
+    fn clear_reported_semantic_failure(&mut self, identity: &Arc<()>) {
         if self
             .unreported_semantic_failure
             .as_ref()
-            .is_some_and(|outcome| outcome.sequence == sequence)
+            .is_some_and(|outcome| Arc::ptr_eq(&outcome.identity, identity))
         {
             self.unreported_semantic_failure = None;
         }
@@ -1796,9 +1750,7 @@ impl PersistenceWriter {
     fn wake_worker(&self) -> Result<(), PersistenceFailure> {
         match self.wake.try_send(()) {
             Ok(()) | Err(flume::TrySendError::Full(())) => Ok(()),
-            Err(flume::TrySendError::Disconnected(())) => {
-                Err(PersistenceFailure::WorkerStopped)
-            }
+            Err(flume::TrySendError::Disconnected(())) => Err(PersistenceFailure::WorkerStopped),
         }
     }
 }
@@ -1808,15 +1760,18 @@ fn lock_pending<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         Ok(guard) => guard,
         Err(poisoned) => {
             log::error!("window-state: recovering a poisoned coordinator mutex");
-            poisoned.into_inner()
+            let guard = poisoned.into_inner();
+            // Existing recovery already trusts and continues with the
+            // protected value. Clear the poison while this recovered guard is
+            // still exclusive so every later persistence operation does not
+            // re-enter the error path and emit an unbounded log storm.
+            mutex.clear_poison();
+            guard
         }
     }
 }
 
-type BindingWaiters = BTreeMap<
-    PrivacySafeTargetFingerprint,
-    Vec<flume::Sender<BindingResult>>,
->;
+type BindingWaiters = BTreeMap<PrivacySafeTargetFingerprint, Vec<flume::Sender<BindingResult>>>;
 
 /// Owns one exact admitted waiter cohort outside the coordinator mutex.
 ///
@@ -1937,20 +1892,11 @@ impl AdmittedWaiters {
         self.flush.pop().map(AdmittedFlushWaiter::new)
     }
 
-    fn next_binding(
-        &mut self,
-    ) -> Option<(PrivacySafeTargetFingerprint, AdmittedBindingWaiter)> {
+    fn next_binding(&mut self) -> Option<(PrivacySafeTargetFingerprint, AdmittedBindingWaiter)> {
         loop {
             let fingerprint = *self.bindings.keys().next()?;
-            let sender = self
-                .bindings
-                .get_mut(&fingerprint)
-                .and_then(Vec::pop);
-            if self
-                .bindings
-                .get(&fingerprint)
-                .is_some_and(Vec::is_empty)
-            {
+            let sender = self.bindings.get_mut(&fingerprint).and_then(Vec::pop);
+            if self.bindings.get(&fingerprint).is_some_and(Vec::is_empty) {
                 self.bindings.remove(&fingerprint);
             }
             if let Some(sender) = sender {
@@ -2077,15 +2023,13 @@ fn controlled_worker_commit(
         ));
     };
     let result = match control.enter_commit(phase, batch)? {
-        TestWorkerCommitAction::Run(interruption) => commit_batch(
-            &shared.primary_path,
-            batch,
-            interruption,
-        ),
+        TestWorkerCommitAction::Run(interruption) => {
+            commit_batch(&shared.primary_path, batch, interruption)
+        }
         TestWorkerCommitAction::ReturnDefinite(failure) => Err(failure),
         TestWorkerCommitAction::Panic => {
             panic!("intentional controlled persistence transaction panic")
-        },
+        }
     };
     if control.commit_finished(phase, &result) {
         Some(result)
@@ -2101,15 +2045,11 @@ fn controlled_worker_exact_retry(
     control: &mut Option<TestWorkerCommitControl>,
 ) -> Option<Result<(), PersistenceFailure>> {
     Some(
-        controlled_worker_commit(
-            shared,
-            batch,
-            control,
-            TestWorkerCommitPhase::ExactRetry,
-        )?
-        .map(|committed| {
-            let _ = acknowledge_committed_batch(shared, batch, &committed);
-        }),
+        controlled_worker_commit(shared, batch, control, TestWorkerCommitPhase::ExactRetry)?.map(
+            |committed| {
+                let _ = acknowledge_committed_batch(shared, batch, &committed);
+            },
+        ),
     )
 }
 
@@ -2171,23 +2111,18 @@ fn persistence_worker_loop(
         if let Some(batch) = retry_batch.take() {
             #[cfg(test)]
             let retry_result = match run_persistence_transaction(|| {
-                controlled_worker_exact_retry(
-                    shared,
-                    &batch,
-                    &mut *worker_commit_control,
-                )
+                controlled_worker_exact_retry(shared, &batch, &mut *worker_commit_control)
             }) {
                 Ok(Some(result)) => result,
                 Ok(None) => break,
                 Err(failure) => Err(failure),
             };
             #[cfg(not(test))]
-            let retry_result = match run_persistence_transaction(|| {
-                resolve_exact_retry(shared, &batch)
-            }) {
-                Ok(result) => result,
-                Err(failure) => Err(failure),
-            };
+            let retry_result =
+                match run_persistence_transaction(|| resolve_exact_retry(shared, &batch)) {
+                    Ok(result) => result,
+                    Err(failure) => Err(failure),
+                };
             match retry_result {
                 Ok(()) => {}
                 Err(failure) => {
@@ -2214,10 +2149,7 @@ fn persistence_worker_loop(
             let binding_waiters = std::mem::take(&mut pending.binding_waiters);
             pending.waiter_count = 0;
             drop(pending);
-            (
-                batch,
-                AdmittedWaiters::new(flush_waiters, binding_waiters),
-            )
+            (batch, AdmittedWaiters::new(flush_waiters, binding_waiters))
         };
 
         #[cfg(test)]
@@ -2246,13 +2178,11 @@ fn persistence_worker_loop(
         match result {
             Ok(committed) => {
                 let flush_outcome = acknowledge_committed_batch(shared, &batch, &committed);
-                let reported_semantic_sequence = waiters
+                let reported_semantic_identity = waiters
                     .flush_in_admission_order()
-                    .find_map(|waiter| {
-                        waiter.reported_semantic_sequence(flush_outcome.as_ref())
-                    });
-                if let Some(sequence) = reported_semantic_sequence {
-                    lock_pending(&shared.pending).clear_reported_semantic_failure(sequence);
+                    .find_map(|waiter| waiter.reported_semantic_identity(flush_outcome.as_ref()));
+                if let Some(identity) = reported_semantic_identity {
+                    lock_pending(&shared.pending).clear_reported_semantic_failure(&identity);
                 }
                 let mut binding_result = None;
                 while let Some((fingerprint, waiter)) = waiters.next_binding() {
@@ -2262,8 +2192,7 @@ fn persistence_worker_loop(
                     if needs_result {
                         let result = if let Some(binding) = committed.bindings.get(&fingerprint) {
                             Ok(*binding)
-                        } else if let Some(failure) =
-                            committed.rejected_bindings.get(&fingerprint)
+                        } else if let Some(failure) = committed.rejected_bindings.get(&fingerprint)
                         {
                             Err(failure.clone())
                         } else {
@@ -2396,8 +2325,7 @@ fn validate_remote_binding_aliases(
 ) -> Result<(), PersistenceFailure> {
     let mut bindings_by_authority = HashMap::new();
     for slot in slots {
-        let (Some(authority), Some(binding)) =
-            (slot.remote_authority(), slot.remote_binding())
+        let (Some(authority), Some(binding)) = (slot.remote_authority(), slot.remote_binding())
         else {
             continue;
         };
@@ -2659,12 +2587,12 @@ struct JsonLengthWriter {
 
 impl Write for JsonLengthWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let added = u64::try_from(buf.len()).map_err(|_| {
-            io::Error::other("serialized JSON chunk length does not fit u64")
-        })?;
-        self.bytes = self.bytes.checked_add(added).ok_or_else(|| {
-            io::Error::other("serialized JSON length overflowed")
-        })?;
+        let added = u64::try_from(buf.len())
+            .map_err(|_| io::Error::other("serialized JSON chunk length does not fit u64"))?;
+        self.bytes = self
+            .bytes
+            .checked_add(added)
+            .ok_or_else(|| io::Error::other("serialized JSON length overflowed"))?;
         Ok(buf.len())
     }
 
@@ -2916,11 +2844,7 @@ fn schema_version_probe(value: &serde_json::Value) -> Option<u32> {
         .and_then(|version| u32::try_from(version).ok())
 }
 
-fn corrupt_slot(
-    path: &Path,
-    bytes: Vec<u8>,
-    failure: PersistenceFailure,
-) -> ReadSlot {
+fn corrupt_slot(path: &Path, bytes: Vec<u8>, failure: PersistenceFailure) -> ReadSlot {
     ReadSlot::Corrupt {
         failure,
         evidence: CorruptEvidence {
@@ -2957,8 +2881,7 @@ fn read_slot(path: &Path, allow_legacy: bool) -> Result<ReadSlot, PersistenceFai
         return Ok(ReadSlot::Oversized(metadata.len()));
     }
     let read_limit = MAX_STATE_FILE_BYTES + 1;
-    let bounded_capacity = usize::try_from(metadata.len().min(MAX_STATE_FILE_BYTES))
-        .unwrap_or(0);
+    let bounded_capacity = usize::try_from(metadata.len().min(MAX_STATE_FILE_BYTES)).unwrap_or(0);
     let mut bytes = Vec::with_capacity(bounded_capacity);
     File::open(path)
         .map_err(|error| PersistenceFailure::io("open state slot", error))?
@@ -3287,19 +3210,15 @@ fn load_authoritative_unlocked(
             },
             ReadSlot::Corrupt { .. },
         ) => Err(failure),
-        (unexpected_primary, unexpected_shadow) => {
-            Err(PersistenceFailure::corrupt(format!(
-                "unsupported slot combination: primary={}, shadow={}",
-                unexpected_primary.kind(),
-                unexpected_shadow.kind()
-            )))
-        }
+        (unexpected_primary, unexpected_shadow) => Err(PersistenceFailure::corrupt(format!(
+            "unsupported slot combination: primary={}, shadow={}",
+            unexpected_primary.kind(),
+            unexpected_shadow.kind()
+        ))),
     }
 }
 
-fn load_snapshot_unlocked(
-    primary_path: &Path,
-) -> Result<LayoutStateSnapshot, PersistenceFailure> {
+fn load_snapshot_unlocked(primary_path: &Path) -> Result<LayoutStateSnapshot, PersistenceFailure> {
     let loaded = load_authoritative_unlocked(primary_path)?;
     Ok(LayoutStateSnapshot {
         source: loaded.source,
@@ -3532,8 +3451,7 @@ fn quarantine_corrupt_evidence(evidence: &CorruptEvidence) -> Result<(), Persist
     }
     if let Some(parent) = evidence.path.parent() {
         let prefix = format!("{name}.corrupt-");
-        let retained =
-            count_retained_evidence(parent, &prefix, "list corrupt-state evidence")?;
+        let retained = count_retained_evidence(parent, &prefix, "list corrupt-state evidence")?;
         if retained >= MAX_CORRUPT_EVIDENCE_FILES {
             return Err(PersistenceFailure::quota(format!(
                 "corrupt-state evidence count reached {MAX_CORRUPT_EVIDENCE_FILES}"
@@ -3711,10 +3629,7 @@ impl AdmissionCountBudget {
         Ok(())
     }
 
-    fn apply_candidate(
-        &mut self,
-        mutation: &ByteBudgetMutation,
-    ) -> Result<(), PersistenceFailure> {
+    fn apply_candidate(&mut self, mutation: &ByteBudgetMutation) -> Result<(), PersistenceFailure> {
         match mutation {
             ByteBudgetMutation::Workspace {
                 old_entry_bytes: None,
@@ -3813,9 +3728,7 @@ impl ByteBudgetMutation {
                     .replace(*old_entry_bytes, *new_entry_bytes),
                 None => budget.window_states.insert(*new_entry_bytes),
             },
-            Self::Binding { new_record_bytes } => {
-                budget.domain_bindings.insert(*new_record_bytes)
-            }
+            Self::Binding { new_record_bytes } => budget.domain_bindings.insert(*new_record_bytes),
             Self::OverlayComponent { mutations, .. } => {
                 for mutation in mutations {
                     if let Some(old_overlay_bytes) = mutation.old_overlay_bytes {
@@ -3844,9 +3757,7 @@ impl ByteBudgetMutation {
                     .replace(*new_entry_bytes, *old_entry_bytes),
                 None => budget.window_states.remove(*new_entry_bytes),
             },
-            Self::Binding { new_record_bytes } => {
-                budget.domain_bindings.remove(*new_record_bytes)
-            }
+            Self::Binding { new_record_bytes } => budget.domain_bindings.remove(*new_record_bytes),
             Self::OverlayComponent { mutations, .. } => {
                 for mutation in mutations.iter().rev() {
                     if let Some(new_tombstone_bytes) = mutation.new_tombstone_bytes {
@@ -3902,11 +3813,7 @@ fn preflight_one_overlay_mutation(
             expected: mutation.base_revision,
             committed: None,
         }),
-        (Some(current), None)
-            if mutation.base_revision == Some(current.local_revision) =>
-        {
-            Ok(true)
-        }
+        (Some(current), None) if mutation.base_revision == Some(current.local_revision) => Ok(true),
         (Some(current), None) => {
             let incoming = mutation.desired_revision();
             if incoming < current.local_revision {
@@ -3917,9 +3824,7 @@ fn preflight_one_overlay_mutation(
             } else if incoming == current.local_revision
                 && matches!(&mutation.desired, DesiredOverlayState::Live(_))
             {
-                Err(PersistenceFailure::OverlayRevisionConflict {
-                    revision: incoming,
-                })
+                Err(PersistenceFailure::OverlayRevisionConflict { revision: incoming })
             } else {
                 Err(PersistenceFailure::OverlayCasConflict {
                     expected: mutation.base_revision,
@@ -4253,9 +4158,7 @@ fn build_byte_admission_candidates(
             let old_tab_count = old_overlay.map_or(0, |overlay| overlay.slots.len());
             let (new_overlay_bytes, new_tombstone_bytes) =
                 match &batch.overlay_mutations[window_id].desired {
-                    DesiredOverlayState::Live(overlay) => {
-                        (Some(encoded_json_len(overlay)?), None)
-                    }
+                    DesiredOverlayState::Live(overlay) => (Some(encoded_json_len(overlay)?), None),
                     DesiredOverlayState::Deleted {
                         last_local_revision,
                         ..
@@ -4309,10 +4212,7 @@ fn build_byte_admission_candidates(
     Ok(candidates)
 }
 
-fn byte_quota_failure(
-    projected_upper_bound: u64,
-    maximum_bytes: u64,
-) -> PersistenceFailure {
+fn byte_quota_failure(projected_upper_bound: u64, maximum_bytes: u64) -> PersistenceFailure {
     PersistenceFailure::EncodedQuota {
         projected_upper_bound,
         maximum: maximum_bytes,
@@ -4345,26 +4245,17 @@ fn reject_byte_admission_candidate(
     failure: PersistenceFailure,
 ) {
     match (&candidate.key, &candidate.mutation) {
-        (
-            ByteAdmissionKey::Workspace(workspace),
-            ByteBudgetMutation::Workspace { .. },
-        ) => {
+        (ByteAdmissionKey::Workspace(workspace), ByteBudgetMutation::Workspace { .. }) => {
             preflight.accepted_workspaces.remove(workspace);
             preflight
                 .rejected_workspaces
                 .insert(workspace.clone(), failure);
         }
-        (
-            ByteAdmissionKey::Binding(fingerprint),
-            ByteBudgetMutation::Binding { .. },
-        ) => {
+        (ByteAdmissionKey::Binding(fingerprint), ByteBudgetMutation::Binding { .. }) => {
             preflight.accepted_bindings.remove(fingerprint);
             preflight.rejected_bindings.insert(*fingerprint, failure);
         }
-        (
-            ByteAdmissionKey::Overlay(_),
-            ByteBudgetMutation::OverlayComponent { window_ids, .. },
-        ) => {
+        (ByteAdmissionKey::Overlay(_), ByteBudgetMutation::OverlayComponent { window_ids, .. }) => {
             reject_overlay_admission_component(window_ids, batch, preflight, failure);
         }
         _ => unreachable!("byte-admission key and mutation kind must agree"),
@@ -4550,10 +4441,7 @@ impl AdmissionDelta {
             values: [
                 signed_usize_delta(projected.counts.workspaces, base.counts.workspaces)?,
                 signed_usize_delta(projected.counts.bindings, base.counts.bindings)?,
-                signed_usize_delta(
-                    projected.counts.live_overlays,
-                    base.counts.live_overlays,
-                )?,
+                signed_usize_delta(projected.counts.live_overlays, base.counts.live_overlays)?,
                 signed_usize_delta(projected.counts.tombstones, base.counts.tombstones)?,
                 signed_usize_delta(projected.counts.tabs, base.counts.tabs)?,
                 i128::from(projected_normalized) - i128::from(base_normalized),
@@ -4575,8 +4463,7 @@ impl AdmissionDelta {
     }
 
     fn support_count(self) -> u64 {
-        u64::try_from(self.values.iter().filter(|value| **value < 0).count())
-            .unwrap_or(u64::MAX)
+        u64::try_from(self.values.iter().filter(|value| **value < 0).count()).unwrap_or(u64::MAX)
     }
 
     fn support_mask(self) -> u8 {
@@ -4670,11 +4557,7 @@ fn select_compatible_candidate_subset(
         )? == 0
         {
             let choice = (
-                removal_priority(
-                    initial_violation_mask,
-                    &candidates[*index],
-                    deltas[*index],
-                ),
+                removal_priority(initial_violation_mask, &candidates[*index], deltas[*index]),
                 *index,
             );
             if isolating_removal
@@ -4702,14 +4585,13 @@ fn select_compatible_candidate_subset(
     // peel phase O(C log C) in the number of candidate lineages and prevents
     // alternating byte/count violations from triggering rescans. The exact
     // backfill below has a separately retained quadratic worst case.
-    let mut relief_heaps: Vec<Vec<RemovalHeap>> =
-        (0..ADMISSION_RESOURCE_BITS.len())
-            .map(|_| {
-                (0..ADMISSION_SUPPORT_MASKS)
-                    .map(|_| BinaryHeap::new())
-                    .collect()
-            })
-            .collect();
+    let mut relief_heaps: Vec<Vec<RemovalHeap>> = (0..ADMISSION_RESOURCE_BITS.len())
+        .map(|_| {
+            (0..ADMISSION_SUPPORT_MASKS)
+                .map(|_| BinaryHeap::new())
+                .collect()
+        })
+        .collect();
     for index in pending {
         let support_bucket = usize::from(deltas[*index].support_mask());
         for (resource, resource_heaps) in relief_heaps.iter_mut().enumerate() {
@@ -4744,19 +4626,12 @@ fn select_compatible_candidate_subset(
                 continue;
             }
             for heap in resource_heaps {
-                while heap
-                    .peek()
-                    .is_some_and(|(_, index)| !remaining[*index])
-                {
+                while heap.peek().is_some_and(|(_, index)| !remaining[*index]) {
                     heap.pop();
                 }
                 if let Some((_, index)) = heap.peek() {
                     let choice = (
-                        removal_priority(
-                            violation_mask,
-                            &candidates[*index],
-                            deltas[*index],
-                        ),
+                        removal_priority(violation_mask, &candidates[*index], deltas[*index]),
                         *index,
                     );
                     if selected.as_ref().is_none_or(|current| choice > *current) {
@@ -4830,9 +4705,13 @@ fn select_compatible_candidate_subset(
         force_write || accepted_count != 0,
     )?;
     if final_violation_mask != 0 {
-        return Err(aggregate.counts.quota_failure().unwrap_or(
-            byte_quota_failure(aggregate.normalized_bytes.upper_bound()?, maximum_bytes),
-        ));
+        return Err(aggregate
+            .counts
+            .quota_failure()
+            .unwrap_or(byte_quota_failure(
+                aggregate.normalized_bytes.upper_bound()?,
+                maximum_bytes,
+            )));
     }
 
     let mut removed = deferred.into_iter().collect::<Vec<_>>();
@@ -4963,13 +4842,7 @@ fn preflight_batch_with_byte_limit(
         rejected_bindings,
         encoded_upper_bound: 0,
     };
-    enforce_encoded_byte_admission(
-        state,
-        batch,
-        &mut preflight,
-        force_write,
-        maximum_bytes,
-    )?;
+    enforce_encoded_byte_admission(state, batch, &mut preflight, force_write, maximum_bytes)?;
     Ok(preflight)
 }
 
@@ -5004,9 +4877,7 @@ fn apply_batch(
         else {
             rejected_bindings.insert(
                 *fingerprint,
-                PersistenceFailure::invalid(
-                    "could not allocate a unique domain binding identity",
-                ),
+                PersistenceFailure::invalid("could not allocate a unique domain binding identity"),
             );
             continue;
         };
@@ -5269,12 +5140,7 @@ fn commit_batch(
     batch: &PendingBatch,
     interruption: WriteInterruption,
 ) -> Result<BatchCommit, PersistenceFailure> {
-    commit_batch_with_byte_limit(
-        primary_path,
-        batch,
-        interruption,
-        MAX_STATE_FILE_BYTES,
-    )
+    commit_batch_with_byte_limit(primary_path, batch, interruption, MAX_STATE_FILE_BYTES)
 }
 
 fn commit_batch_with_byte_limit(
@@ -5312,12 +5178,7 @@ fn commit_batch_with_byte_limit(
         changed: batch_changed,
         bindings,
         rejected_bindings: allocation_rejections,
-    } = apply_batch(
-        &mut state,
-        batch,
-        &preflight,
-        reserved_retirement_revision,
-    )?;
+    } = apply_batch(&mut state, batch, &preflight, reserved_retirement_revision)?;
     let committed_binding_count = preflight
         .accepted_bindings
         .len()
@@ -5461,16 +5322,11 @@ pub fn save_for_workspace(workspace: &str, window_state: WindowState) {
         maximized: window_state.contains(WindowState::MAXIMIZED),
         fullscreen: window_state.contains(WindowState::FULL_SCREEN),
     };
-    let result = admit_window_state_and_record(
-        &STARTUP_SNAPSHOT,
-        workspace,
-        state,
-        |workspace, state| {
-            global_writer().and_then(|writer| {
-                writer.queue_window_state(workspace, state).map(|_| ())
-            })
-        },
-    );
+    let result =
+        admit_window_state_and_record(&STARTUP_SNAPSHOT, workspace, state, |workspace, state| {
+            global_writer()
+                .and_then(|writer| writer.queue_window_state(workspace, state).map(|_| ()))
+        });
     if let Err(failure) = result {
         log::warn!(
             "window-state: could not enqueue geometry state ({:?})",
@@ -5525,8 +5381,8 @@ mod tests {
     use proptest::prelude::*;
     use std::fs::OpenOptions;
     use std::process::Command;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const CONTROLLED_WORKER_WATCHDOG: Duration = Duration::from_secs(5);
     // The terminal numeric identity is reserved; its predecessor retains the
@@ -5613,11 +5469,7 @@ mod tests {
             }
         }
 
-        fn expect_commit(
-            &self,
-            commit_epoch: u64,
-            phase: TestWorkerCommitPhase,
-        ) -> PendingBatch {
+        fn expect_commit(&self, commit_epoch: u64, phase: TestWorkerCommitPhase) -> PendingBatch {
             match self.next_event() {
                 TestWorkerCommitEvent::CommitEntered {
                     commit_epoch: actual_epoch,
@@ -5663,10 +5515,7 @@ mod tests {
             self.directives
                 .as_ref()
                 .expect("controlled directive sender is connected")
-                .try_send(TestWorkerCommitDirective {
-                    epoch,
-                    action,
-                })
+                .try_send(TestWorkerCommitDirective { epoch, action })
                 .expect("release controlled worker epoch");
         }
 
@@ -5675,24 +5524,15 @@ mod tests {
         }
 
         fn panic_before_wake(&self, waiting_epoch: u64) {
-            self.send_directive(
-                waiting_epoch,
-                TestWorkerDirectiveAction::PanicBeforeWake,
-            );
+            self.send_directive(waiting_epoch, TestWorkerDirectiveAction::PanicBeforeWake);
         }
 
         fn release_commit(&self, commit_epoch: u64, action: TestWorkerCommitAction) {
-            self.send_directive(
-                commit_epoch,
-                TestWorkerDirectiveAction::Commit(action),
-            );
+            self.send_directive(commit_epoch, TestWorkerDirectiveAction::Commit(action));
         }
 
         fn continue_after_commit(&self, commit_epoch: u64) {
-            self.send_directive(
-                commit_epoch,
-                TestWorkerDirectiveAction::ContinueAfterCommit,
-            );
+            self.send_directive(commit_epoch, TestWorkerDirectiveAction::ContinueAfterCommit);
         }
 
         fn wake_without_waiter(&self) {
@@ -5701,10 +5541,7 @@ mod tests {
                 .expect("wake controlled persistence worker");
         }
 
-        fn admit_batch_with_flush(
-            &self,
-            batch: PendingBatch,
-        ) -> flume::Receiver<CommitResult> {
+        fn admit_batch_with_flush(&self, batch: PendingBatch) -> flume::Receiver<CommitResult> {
             let (sender, receiver) = flume::bounded(1);
             {
                 let mut pending = lock_pending(&self.writer().shared.pending);
@@ -5745,9 +5582,7 @@ mod tests {
                 pending
                     .binding_waiters
                     .insert(fingerprint, vec![binding_sender]);
-                pending
-                    .flush_waiters
-                    .push(FlushWaiter::new(flush_sender));
+                pending.flush_waiters.push(FlushWaiter::new(flush_sender));
                 pending.waiter_count = 2;
             }
             self.wake_without_waiter();
@@ -5821,22 +5656,11 @@ mod tests {
         tab_value: u8,
     ) -> MixedDomainLayoutOverlay {
         let slot = local_slot(tab_value);
-        MixedDomainLayoutOverlay::new(
-            window_id,
-            "default",
-            local_revision,
-            vec![slot],
-            Some(slot),
-        )
-        .expect("valid local overlay")
+        MixedDomainLayoutOverlay::new(window_id, "default", local_revision, vec![slot], Some(slot))
+            .expect("valid local overlay")
     }
 
-    fn remote_slot(
-        binding: DomainBindingId,
-        session: u8,
-        window: u64,
-        tab: u64,
-    ) -> StableTabSlot {
+    fn remote_slot(binding: DomainBindingId, session: u8, window: u64, tab: u64) -> StableTabSlot {
         StableTabSlot::remote(
             binding,
             StableMuxSessionId::from_bytes([session; 16]),
@@ -5881,9 +5705,7 @@ mod tests {
         workspace
     }
 
-    fn workspace_state_at_encoded_upper_bound(
-        target_bytes: u64,
-    ) -> (PersistedState, String) {
+    fn workspace_state_at_encoded_upper_bound(target_bytes: u64) -> (PersistedState, String) {
         let window_state = PersistedWindowState {
             maximized: true,
             fullscreen: true,
@@ -5919,13 +5741,10 @@ mod tests {
             .checked_mul(4)
             .expect("minimum workspace bytes fit u64");
         let maximum_workspace_bytes = workspace_count
-            .checked_mul(
-                u64::try_from(MAX_WORKSPACE_BYTES).expect("workspace byte cap fits u64"),
-            )
+            .checked_mul(u64::try_from(MAX_WORKSPACE_BYTES).expect("workspace byte cap fits u64"))
             .expect("maximum workspace bytes fit u64");
         assert!(
-            (minimum_workspace_bytes..=maximum_workspace_bytes)
-                .contains(&target_workspace_bytes)
+            (minimum_workspace_bytes..=maximum_workspace_bytes).contains(&target_workspace_bytes)
         );
 
         let mut remaining_workspace_bytes = target_workspace_bytes;
@@ -5944,7 +5763,12 @@ mod tests {
             assert!((4..=MAX_WORKSPACE_BYTES).contains(&workspace_bytes));
             let workspace = boundary_workspace_key(index, workspace_bytes);
             assert_eq!(workspace.len(), workspace_bytes);
-            assert!(state.window_states.insert(workspace, window_state).is_none());
+            assert!(
+                state
+                    .window_states
+                    .insert(workspace, window_state)
+                    .is_none()
+            );
             remaining_workspace_bytes = remaining_workspace_bytes
                 .checked_sub(u64::try_from(workspace_bytes).expect("workspace length fits u64"))
                 .expect("distributed workspace bytes do not underflow");
@@ -5961,12 +5785,7 @@ mod tests {
 
     fn near_ceiling_state_with_overlay(
         target_bytes: u64,
-    ) -> (
-        PersistedState,
-        String,
-        String,
-        MixedDomainLayoutOverlay,
-    ) {
+    ) -> (PersistedState, String, String, MixedDomainLayoutOverlay) {
         let overlay = local_overlay(window_id(90_001), 1, 0x91);
         let empty = PersistedState {
             store_revision: 1,
@@ -6184,10 +6003,15 @@ mod tests {
             Some(captured)
         );
         assert_eq!(
-            resolve_saved_window_state("workspace-a", Some(captured), Some("workspace-b"), |name| {
-                assert_eq!(name, "workspace-b");
-                Some(current)
-            }),
+            resolve_saved_window_state(
+                "workspace-a",
+                Some(captured),
+                Some("workspace-b"),
+                |name| {
+                    assert_eq!(name, "workspace-b");
+                    Some(current)
+                }
+            ),
             Some(current)
         );
         assert_eq!(
@@ -6217,10 +6041,7 @@ mod tests {
             maximized: false,
             fullscreen: true,
         };
-        let states = BTreeMap::from([
-            ("first".to_string(), first),
-            ("second".to_string(), second),
-        ]);
+        let states = BTreeMap::from([("first".to_string(), first), ("second".to_string(), second)]);
 
         assert_eq!(
             load_startup_workspace_from(&cache, "first", || {
@@ -6345,12 +6166,9 @@ mod tests {
             Some(initial)
         );
 
-        let failure = admit_window_state_and_record(
-            &cache,
-            "default",
-            rejected,
-            |_, _| Err(PersistenceFailure::WorkerStopped),
-        )
+        let failure = admit_window_state_and_record(&cache, "default", rejected, |_, _| {
+            Err(PersistenceFailure::WorkerStopped)
+        })
         .expect_err("failed queue admission must remain a failure");
         assert_eq!(failure.code(), PersistenceFailureCode::WorkerStopped);
         assert_eq!(
@@ -6365,9 +6183,8 @@ mod tests {
     #[test]
     fn override_quota_failure_does_not_enqueue_window_state() {
         let cache = OnceLock::new();
-        let startup = cached_startup_snapshot(&cache, || {
-            Ok(snapshot_with_window_states(BTreeMap::new()))
-        });
+        let startup =
+            cached_startup_snapshot(&cache, || Ok(snapshot_with_window_states(BTreeMap::new())));
         {
             let mut admitted = lock_pending(&startup.admitted_window_states);
             for index in 0..MAX_WORKSPACES {
@@ -6489,14 +6306,11 @@ mod tests {
                 },
             )
             .expect("queue first state");
-        commit_for_test(&path, &first_batch, WriteInterruption::None)
-            .expect("commit first state");
+        commit_for_test(&path, &first_batch, WriteInterruption::None).expect("commit first state");
 
         let cache = OnceLock::new();
-        let first = load_startup_workspace_from(&cache, "default", || {
-            load_snapshot_at(&path)
-        })
-        .expect("load pinned snapshot");
+        let first = load_startup_workspace_from(&cache, "default", || load_snapshot_at(&path))
+            .expect("load pinned snapshot");
 
         let mut second_batch = PendingBatch::default();
         second_batch
@@ -6563,14 +6377,15 @@ mod tests {
         assert!(before.window_states["default"].maximized);
 
         let mut batch = PendingBatch::default();
-        batch.queue_window_state(
-            "other".to_string(),
-            PersistedWindowState {
-                maximized: false,
-                fullscreen: true,
-            },
-        )
-        .expect("queue migrated state");
+        batch
+            .queue_window_state(
+                "other".to_string(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue migrated state");
         commit_for_test(&path, &batch, WriteInterruption::None).expect("migrate");
 
         let after = load_snapshot_at(&path).expect("load migrated");
@@ -6605,12 +6420,8 @@ mod tests {
         assert_eq!(before.overlays, vec![overlay.clone()]);
         assert!(before.tombstones.is_empty());
 
-        let migration = commit_for_test(
-            &path,
-            &PendingBatch::default(),
-            WriteInterruption::None,
-        )
-        .expect("publish schema-v3 generation");
+        let migration = commit_for_test(&path, &PendingBatch::default(), WriteInterruption::None)
+            .expect("publish schema-v3 generation");
         assert!(migration.receipt.wrote_new_generation);
         assert_eq!(migration.receipt.store_revision, 8);
         assert_eq!(migration.receipt.committed_updates, 0);
@@ -6657,13 +6468,9 @@ mod tests {
             PersistenceFailureCode::Corrupt
         );
         assert_eq!(
-            commit_for_test(
-                &path,
-                &PendingBatch::default(),
-                WriteInterruption::None,
-            )
-            .expect_err("bad schema-v2 checksum must not migrate")
-            .code(),
+            commit_for_test(&path, &PendingBatch::default(), WriteInterruption::None,)
+                .expect_err("bad schema-v2 checksum must not migrate")
+                .code(),
             PersistenceFailureCode::Corrupt
         );
         assert!(!shadow_file_name(&path).exists());
@@ -6693,7 +6500,9 @@ mod tests {
         )
         .expect("write matching schema-v3 slot");
         assert_eq!(
-            load_snapshot_at(&path).expect("load matching generations").source,
+            load_snapshot_at(&path)
+                .expect("load matching generations")
+                .source,
             StoreSource::Shadow
         );
 
@@ -6701,7 +6510,11 @@ mod tests {
         std::fs::write(&ambiguous_path, encode_v2_slot_for_test(v2.clone()))
             .expect("write ambiguous schema-v2 slot");
         let mut different = v2.into_current();
-        different.window_states.get_mut("default").expect("window state").fullscreen = true;
+        different
+            .window_states
+            .get_mut("default")
+            .expect("window state")
+            .fullscreen = true;
         std::fs::write(
             shadow_file_name(&ambiguous_path),
             encode_disk_slot(&different).expect("encode different schema-v3 slot"),
@@ -6757,21 +6570,11 @@ mod tests {
         .expect("valid local-only overlay");
         let cases = [
             (
-                StableTabSlot::remote(
-                    DomainBindingId::from_bytes([0; 16]),
-                    session,
-                    1,
-                    2,
-                ),
+                StableTabSlot::remote(DomainBindingId::from_bytes([0; 16]), session, 1, 2),
                 "zero domain binding",
             ),
             (
-                StableTabSlot::remote(
-                    binding,
-                    StableMuxSessionId::from_bytes([0; 16]),
-                    1,
-                    2,
-                ),
+                StableTabSlot::remote(binding, StableMuxSessionId::from_bytes([0; 16]), 1, 2),
                 "zero mux-session",
             ),
             (
@@ -6811,9 +6614,7 @@ mod tests {
             .expect_err("reserved live identity must fail before reconciliation");
             assert_eq!(error.code(), PersistenceFailureCode::Invalid);
             assert!(
-                error
-                    .to_string()
-                    .starts_with("live layout remote tab slot"),
+                error.to_string().starts_with("live layout remote tab slot"),
                 "live rejection must identify its authority source: {error}"
             );
             assert!(
@@ -6870,8 +6671,8 @@ mod tests {
         retire
             .queue_overlay_delete(window, Some(1))
             .expect("queue exact retirement");
-        let retirement = commit_for_test(&path, &retire, WriteInterruption::None)
-            .expect("commit retirement");
+        let retirement =
+            commit_for_test(&path, &retire, WriteInterruption::None).expect("commit retirement");
         assert!(retirement.receipt.wrote_new_generation);
         let retired_revision = retirement.receipt.store_revision;
 
@@ -6879,10 +6680,7 @@ mod tests {
         assert!(snapshot.overlay(window).is_none());
         assert_eq!(
             snapshot.tombstone(window),
-            Some(
-                OverlayTombstone::new(window, 1, retired_revision)
-                    .expect("expected tombstone")
-            )
+            Some(OverlayTombstone::new(window, 1, retired_revision).expect("expected tombstone"))
         );
 
         for (base_revision, overlay) in [
@@ -6893,18 +6691,12 @@ mod tests {
             resurrection
                 .queue_overlay_live(base_revision, overlay)
                 .expect("queue stale resurrection attempt");
-            let rejection = commit_for_test(
-                &path,
-                &resurrection,
-                WriteInterruption::None,
-            )
-            .expect("retired lineage is partitioned");
+            let rejection = commit_for_test(&path, &resurrection, WriteInterruption::None)
+                .expect("retired lineage is partitioned");
             assert!(!rejection.receipt.wrote_new_generation);
             assert_eq!(rejection.receipt.rejected_updates, 1);
             assert_eq!(
-                rejection.rejected_overlay_mutations[&window]
-                    .failure
-                    .code(),
+                rejection.rejected_overlay_mutations[&window].failure.code(),
                 PersistenceFailureCode::RetiredOverlay
             );
         }
@@ -6995,8 +6787,7 @@ mod tests {
             DesiredOverlayState::Deleted { .. }
         ));
 
-        commit_for_test(&path, &pending, WriteInterruption::None)
-            .expect("commit retained delete");
+        commit_for_test(&path, &pending, WriteInterruption::None).expect("commit retained delete");
         let snapshot = load_snapshot_at(&path).expect("load retained delete");
         assert!(snapshot.overlay(window).is_none());
         assert!(snapshot.tombstone(window).is_some());
@@ -7038,8 +6829,7 @@ mod tests {
         initial
             .queue_overlay_live(None, local_overlay(window, 1, 61))
             .expect("queue initial overlay");
-        commit_for_test(&path, &initial, WriteInterruption::None)
-            .expect("commit initial overlay");
+        commit_for_test(&path, &initial, WriteInterruption::None).expect("commit initial overlay");
 
         let mut in_flight = PendingBatch::default();
         in_flight
@@ -7053,26 +6843,31 @@ mod tests {
             }),
         };
 
-        commit_for_test(
-            &path,
-            &in_flight,
-            WriteInterruption::AfterDirectorySync,
-        )
-        .expect_err("inject acknowledgement loss after durable publication");
+        commit_for_test(&path, &in_flight, WriteInterruption::AfterDirectorySync)
+            .expect_err("inject acknowledgement loss after durable publication");
         {
             let mut pending = lock_pending(&shared.pending);
             pending
                 .batch
                 .queue_overlay_live(Some(2), local_overlay(window, 3, 63))
                 .expect("queue successor behind ambiguous in-flight update");
-            assert_eq!(pending.batch.overlay_mutations[&window].base_revision, Some(1));
+            assert_eq!(
+                pending.batch.overlay_mutations[&window].base_revision,
+                Some(1)
+            );
         }
 
         resolve_exact_retry(&shared, &in_flight).expect("resolve exact durable snapshot first");
         let successor = {
             let pending = lock_pending(&shared.pending);
-            assert_eq!(pending.batch.overlay_mutations[&window].base_revision, Some(2));
-            assert_eq!(pending.batch.overlay_mutations[&window].desired_revision(), 3);
+            assert_eq!(
+                pending.batch.overlay_mutations[&window].base_revision,
+                Some(2)
+            );
+            assert_eq!(
+                pending.batch.overlay_mutations[&window].desired_revision(),
+                3
+            );
             pending.batch.clone()
         };
         let committed = commit_for_test(&path, &successor, WriteInterruption::None)
@@ -7087,10 +6882,12 @@ mod tests {
                 .local_revision(),
             3
         );
-        assert!(lock_pending(&shared.pending)
-            .batch
-            .overlay_mutations
-            .is_empty());
+        assert!(
+            lock_pending(&shared.pending)
+                .batch
+                .overlay_mutations
+                .is_empty()
+        );
     }
 
     #[test]
@@ -7102,8 +6899,7 @@ mod tests {
         initial
             .queue_overlay_live(None, local_overlay(window, 1, 64))
             .expect("queue initial overlay");
-        commit_for_test(&path, &initial, WriteInterruption::None)
-            .expect("commit initial overlay");
+        commit_for_test(&path, &initial, WriteInterruption::None).expect("commit initial overlay");
 
         let mut in_flight = PendingBatch::default();
         in_flight
@@ -7117,12 +6913,8 @@ mod tests {
             }),
         };
 
-        commit_for_test(
-            &path,
-            &in_flight,
-            WriteInterruption::AfterDirectorySync,
-        )
-        .expect_err("inject acknowledgement loss after durable publication");
+        commit_for_test(&path, &in_flight, WriteInterruption::AfterDirectorySync)
+            .expect_err("inject acknowledgement loss after durable publication");
         {
             let mut pending = lock_pending(&shared.pending);
             pending
@@ -7190,27 +6982,15 @@ mod tests {
         batch
             .queue_overlay_live(
                 None,
-                MixedDomainLayoutOverlay::new(
-                    window,
-                    "default",
-                    1,
-                    vec![first],
-                    Some(first),
-                )
-                .expect("first"),
+                MixedDomainLayoutOverlay::new(window, "default", 1, vec![first], Some(first))
+                    .expect("first"),
             )
             .expect("queue first");
         let failure = batch
             .queue_overlay_live(
                 None,
-                MixedDomainLayoutOverlay::new(
-                    window,
-                    "default",
-                    1,
-                    vec![second],
-                    Some(second),
-                )
-                .expect("second"),
+                MixedDomainLayoutOverlay::new(window, "default", 1, vec![second], Some(second))
+                    .expect("second"),
             )
             .expect_err("revision reuse must fail");
         assert_eq!(
@@ -7460,10 +7240,9 @@ mod tests {
         valid_only
             .queue_overlay_live(None, valid_overlay.clone())
             .expect("queue valid overlay");
-        let exact_limit =
-            preflight_batch_with_byte_limit(&state, &valid_only, false, u64::MAX)
-                .expect("measure valid mixed batch")
-                .encoded_upper_bound;
+        let exact_limit = preflight_batch_with_byte_limit(&state, &valid_only, false, u64::MAX)
+            .expect("measure valid mixed batch")
+            .encoded_upper_bound;
 
         let oversized_workspace = format!("a-{}", "x".repeat(MAX_WORKSPACE_BYTES - 2));
         assert_eq!(oversized_workspace.len(), MAX_WORKSPACE_BYTES);
@@ -7478,9 +7257,8 @@ mod tests {
             )
             .expect("queue independently valid long workspace");
 
-        let preflight =
-            preflight_batch_with_byte_limit(&state, &mixed, false, exact_limit)
-                .expect("partition byte-exhausting workspace");
+        let preflight = preflight_batch_with_byte_limit(&state, &mixed, false, exact_limit)
+            .expect("partition byte-exhausting workspace");
         assert_eq!(preflight.encoded_upper_bound, exact_limit);
         assert!(preflight.accepted_workspaces.contains(&valid_workspace));
         assert_eq!(
@@ -7560,12 +7338,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
         let target_before_race = MAX_STATE_FILE_BYTES - 1;
-        let (
-            base,
-            external_growth_workspace,
-            stale_growth_workspace,
-            base_overlay,
-        ) = near_ceiling_state_with_overlay(target_before_race);
+        let (base, external_growth_workspace, stale_growth_workspace, base_overlay) =
+            near_ceiling_state_with_overlay(target_before_race);
         std::fs::write(
             &path,
             encode_disk_slot(&base).expect("encode near-ceiling mixed authority"),
@@ -7608,7 +7382,11 @@ mod tests {
             frozen.window_states.get(&stale_growth_workspace),
             Some(&one_byte_wider_state)
         );
-        assert!(frozen.overlay_mutations.contains_key(&base_overlay.window_id()));
+        assert!(
+            frozen
+                .overlay_mutations
+                .contains_key(&base_overlay.window_id())
+        );
 
         // Interpose a literal second process' one-byte authority growth after
         // the worker freezes its queued batch but before it takes the file
@@ -7639,10 +7417,7 @@ mod tests {
             "2"
         );
 
-        worker.release_commit(
-            1,
-            TestWorkerCommitAction::Run(WriteInterruption::None),
-        );
+        worker.release_commit(1, TestWorkerCommitAction::Run(WriteInterruption::None));
         let receipt = match worker.expect_commit_finished(1, TestWorkerCommitPhase::Pending) {
             TestWorkerCommitResult::Committed(receipt) => receipt,
             TestWorkerCommitResult::Failed(code) => {
@@ -7747,12 +7522,8 @@ mod tests {
                 },
             )
             .expect("queue external one-byte authority growth");
-        let external = commit_for_test(
-            Path::new(&path),
-            &external_batch,
-            WriteInterruption::None,
-        )
-        .expect("publish intervening authority growth from child process");
+        let external = commit_for_test(Path::new(&path), &external_batch, WriteInterruption::None)
+            .expect("publish intervening authority growth from child process");
         assert_eq!(external.receipt.committed_updates, 1);
         assert_eq!(external.receipt.rejected_updates, 0);
         assert!(external.receipt.wrote_new_generation);
@@ -7771,12 +7542,8 @@ mod tests {
         ] {
             let temp = tempfile::tempdir().expect("tempdir");
             let path = temp.path().join("window-state.json");
-            let (
-                base,
-                external_growth_workspace,
-                stale_growth_workspace,
-                base_overlay,
-            ) = near_ceiling_state_with_overlay(MAX_STATE_FILE_BYTES - 1);
+            let (base, external_growth_workspace, stale_growth_workspace, base_overlay) =
+                near_ceiling_state_with_overlay(MAX_STATE_FILE_BYTES - 1);
             std::fs::write(
                 &path,
                 encode_disk_slot(&base).expect("encode crash-matrix base authority"),
@@ -7789,10 +7556,7 @@ mod tests {
             };
             let mut external_batch = PendingBatch::default();
             external_batch
-                .queue_window_state(
-                    external_growth_workspace.clone(),
-                    one_byte_wider_state,
-                )
+                .queue_window_state(external_growth_workspace.clone(), one_byte_wider_state)
                 .expect("queue crash-matrix external growth");
             commit_for_test(&path, &external_batch, WriteInterruption::None)
                 .expect("publish crash-matrix external growth");
@@ -7916,7 +7680,11 @@ mod tests {
         assert!(state.tombstones.iter().all(|tombstone| {
             tombstone.last_local_revision == u64::MAX
                 && tombstone.retired_at_store_revision == u64::MAX
-                && tombstone.window_id.as_bytes().iter().all(|byte| *byte >= 100)
+                && tombstone
+                    .window_id
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| *byte >= 100)
         }));
 
         for binding in &state.domain_bindings {
@@ -7927,7 +7695,13 @@ mod tests {
                     .iter()
                     .all(|byte| *byte >= 100)
             );
-            assert!(binding.binding_id.as_bytes().iter().all(|byte| *byte >= 100));
+            assert!(
+                binding
+                    .binding_id
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| *byte >= 100)
+            );
             assert_eq!(
                 encoded_json_len(binding).expect("count maximum-width binding"),
                 maximum_width_binding_len(binding.target_fingerprint)
@@ -8068,10 +7842,9 @@ mod tests {
             )
             .expect("queue count shrink");
 
-        let exchange_limit =
-            preflight_batch_with_byte_limit(&state, &exchange, false, u64::MAX)
-                .expect("measure aggregate-valid exchange")
-                .encoded_upper_bound;
+        let exchange_limit = preflight_batch_with_byte_limit(&state, &exchange, false, u64::MAX)
+            .expect("measure aggregate-valid exchange")
+            .encoded_upper_bound;
         // This poison is deliberately much smaller than the byte-growing
         // half of the valid exchange. A relief-only greedy selector would
         // remove that required half first and lose both overlay mutations.
@@ -8133,14 +7906,9 @@ mod tests {
         canonicalize_state(&mut state);
         validate_state(&state).expect("authority has one live-overlay slot available");
 
-        let backfill_overlay = MixedDomainLayoutOverlay::new(
-            backfill_window,
-            "backfill",
-            1,
-            Vec::new(),
-            None,
-        )
-        .expect("small backfill overlay");
+        let backfill_overlay =
+            MixedDomainLayoutOverlay::new(backfill_window, "backfill", 1, Vec::new(), None)
+                .expect("small backfill overlay");
         let mut backfill_only = PendingBatch::default();
         backfill_only
             .queue_overlay_live(None, backfill_overlay.clone())
@@ -8164,13 +7932,9 @@ mod tests {
                 .expect("independently valid but byte-expensive overlay"),
             )
             .expect("queue byte-expensive overlay");
-        let preflight = preflight_batch_with_byte_limit(
-            &state,
-            &mixed,
-            false,
-            exact_backfill_limit,
-        )
-        .expect("backfill around rejected earlier candidate");
+        let preflight =
+            preflight_batch_with_byte_limit(&state, &mixed, false, exact_backfill_limit)
+                .expect("backfill around rejected earlier candidate");
 
         assert_eq!(
             preflight.overlays.apply_overlay_ids,
@@ -8196,7 +7960,12 @@ mod tests {
         let mut state = PersistedState::default();
         state.store_revision = 1;
         state.window_states = (0..MAX_WORKSPACES - 1)
-            .map(|index| (format!("existing-{index:04}"), PersistedWindowState::default()))
+            .map(|index| {
+                (
+                    format!("existing-{index:04}"),
+                    PersistedWindowState::default(),
+                )
+            })
             .collect();
         validate_state(&state).expect("authority has one workspace slot available");
 
@@ -8219,13 +7988,9 @@ mod tests {
             )
             .expect("queue byte-expensive workspace");
 
-        let preflight = preflight_batch_with_byte_limit(
-            &state,
-            &mixed,
-            false,
-            exact_backfill_limit,
-        )
-        .expect("backfill the cardinality slot after byte rejection");
+        let preflight =
+            preflight_batch_with_byte_limit(&state, &mixed, false, exact_backfill_limit)
+                .expect("backfill the cardinality slot after byte rejection");
         assert!(preflight.accepted_workspaces.contains(&backfill_workspace));
         assert!(!preflight.accepted_workspaces.contains(&oversized_workspace));
         assert_eq!(
@@ -8274,13 +8039,9 @@ mod tests {
         let mut mixed = backfill_only;
         mixed.ensure_bindings.insert(oversized_fingerprint);
 
-        let preflight = preflight_batch_with_byte_limit(
-            &state,
-            &mixed,
-            false,
-            exact_backfill_limit,
-        )
-        .expect("backfill the binding slot after byte rejection");
+        let preflight =
+            preflight_batch_with_byte_limit(&state, &mixed, false, exact_backfill_limit)
+                .expect("backfill the binding slot after byte rejection");
         assert!(preflight.accepted_bindings.contains(&backfill_fingerprint));
         assert!(!preflight.accepted_bindings.contains(&oversized_fingerprint));
         assert_eq!(
@@ -8323,13 +8084,9 @@ mod tests {
                 },
             )
             .expect("queue independently valid long workspace");
-        let committed = commit_batch_with_byte_limit(
-            &path,
-            &batch,
-            WriteInterruption::None,
-            exact_limit,
-        )
-        .expect("commit valid lineage and reject oversized lineage");
+        let committed =
+            commit_batch_with_byte_limit(&path, &batch, WriteInterruption::None, exact_limit)
+                .expect("commit valid lineage and reject oversized lineage");
 
         assert_eq!(committed.receipt.committed_updates, 1);
         assert_eq!(committed.receipt.rejected_updates, 1);
@@ -8339,7 +8096,10 @@ mod tests {
             PersistenceFailureCode::Oversized
         );
         let snapshot = load_snapshot_at(&path).expect("load partitioned commit");
-        assert_eq!(snapshot.window_states.get(&valid_workspace), Some(&geometry));
+        assert_eq!(
+            snapshot.window_states.get(&valid_workspace),
+            Some(&geometry)
+        );
         assert!(!snapshot.window_states.contains_key(&oversized_workspace));
 
         let shared = CoordinatorShared {
@@ -8380,14 +8140,8 @@ mod tests {
             .expect("source overlay"),
         );
         state.overlays.push(
-            MixedDomainLayoutOverlay::new(
-                destination_window,
-                "destination",
-                1,
-                Vec::new(),
-                None,
-            )
-            .expect("empty destination overlay"),
+            MixedDomainLayoutOverlay::new(destination_window, "destination", 1, Vec::new(), None)
+                .expect("empty destination overlay"),
         );
         canonicalize_state(&mut state);
         validate_state(&state).expect("valid transfer authority");
@@ -8399,14 +8153,8 @@ mod tests {
         batch
             .queue_overlay_live(
                 Some(1),
-                MixedDomainLayoutOverlay::new(
-                    source_window,
-                    "source",
-                    2,
-                    Vec::new(),
-                    None,
-                )
-                .expect("source release"),
+                MixedDomainLayoutOverlay::new(source_window, "source", 2, Vec::new(), None)
+                    .expect("source release"),
             )
             .expect("queue source release");
         batch
@@ -8423,13 +8171,9 @@ mod tests {
             )
             .expect("queue destination acquisition");
 
-        let preflight = preflight_batch_with_byte_limit(
-            &state,
-            &batch,
-            false,
-            unchanged_upper_bound,
-        )
-        .expect("reject transfer component semantically");
+        let preflight =
+            preflight_batch_with_byte_limit(&state, &batch, false, unchanged_upper_bound)
+                .expect("reject transfer component semantically");
         assert!(preflight.overlays.apply_overlay_ids.is_empty());
         assert!(preflight.overlays.accepted_overlay_ids.is_empty());
         assert_eq!(preflight.overlays.rejected_overlay_mutations.len(), 2);
@@ -8450,14 +8194,8 @@ mod tests {
         let mut state = PersistedState::default();
         state.store_revision = 1;
         state.overlays.push(
-            MixedDomainLayoutOverlay::new(
-                growing_window,
-                "default",
-                1,
-                Vec::new(),
-                None,
-            )
-            .expect("empty growing overlay"),
+            MixedDomainLayoutOverlay::new(growing_window, "default", 1, Vec::new(), None)
+                .expect("empty growing overlay"),
         );
         let shrinking_slots = local_slots(0xf0, MAX_TABS_PER_OVERLAY);
         state.overlays.push(
@@ -8523,9 +8261,8 @@ mod tests {
             )
             .expect("queue shrink");
 
-        let preflight =
-            preflight_batch_with_byte_limit(&state, &batch, false, byte_limit)
-                .expect("partition mutually incompatible quota candidates");
+        let preflight = preflight_batch_with_byte_limit(&state, &batch, false, byte_limit)
+            .expect("partition mutually incompatible quota candidates");
         assert!(preflight.overlays.apply_overlay_ids.is_empty());
         assert_eq!(
             preflight.overlays.rejected_overlay_mutations[&growing_window]
@@ -8578,18 +8315,13 @@ mod tests {
         batch
             .queue_window_state(workspace.clone(), reduced_state)
             .expect("queue byte-reducing workspace update");
-        let preflight =
-            preflight_batch_with_byte_limit(&state, &batch, false, physical_limit)
-                .expect("conservative overage must retain a real reduction");
+        let preflight = preflight_batch_with_byte_limit(&state, &batch, false, physical_limit)
+            .expect("conservative overage must retain a real reduction");
         assert!(preflight.accepted_workspaces.contains(&workspace));
         assert!(preflight.encoded_upper_bound > physical_limit);
-        let committed = commit_batch_with_byte_limit(
-            &path,
-            &batch,
-            WriteInterruption::None,
-            physical_limit,
-        )
-        .expect("physical upper bound permits the reducing commit");
+        let committed =
+            commit_batch_with_byte_limit(&path, &batch, WriteInterruption::None, physical_limit)
+                .expect("physical upper bound permits the reducing commit");
         assert_eq!(committed.receipt.committed_updates, 1);
         let loaded = load_snapshot_at(&path).expect("load reducing commit");
         assert_eq!(loaded.window_states.get(&workspace), Some(&reduced_state));
@@ -8639,13 +8371,8 @@ mod tests {
         batch
             .queue_window_state(workspace.clone(), reduced_state)
             .expect("queue insufficient reduction");
-        let preflight = preflight_batch_with_byte_limit(
-            &state,
-            &batch,
-            false,
-            maximum_bytes,
-        )
-        .expect("conservative debt must not become transaction corruption");
+        let preflight = preflight_batch_with_byte_limit(&state, &batch, false, maximum_bytes)
+            .expect("conservative debt must not become transaction corruption");
         assert!(!preflight.accepted_workspaces.contains(&workspace));
         assert_eq!(
             preflight.rejected_workspaces[&workspace].code(),
@@ -8673,8 +8400,7 @@ mod tests {
         canonicalize_state(&mut state);
 
         let base = AdmissionProjection {
-            normalized_bytes: EncodedStateBudget::from_state(&state, 2)
-                .expect("normalized base"),
+            normalized_bytes: EncodedStateBudget::from_state(&state, 2).expect("normalized base"),
             physical_bytes: EncodedStateBudget::from_state_with_physical_bindings(&state, 2)
                 .expect("physical base"),
             counts: AdmissionCountBudget::from_state(&state).expect("count base"),
@@ -8716,9 +8442,7 @@ mod tests {
                 },
             },
             ByteAdmissionCandidate {
-                key: ByteAdmissionKey::Binding(
-                    PrivacySafeTargetFingerprint::from_bytes([1; 32]),
-                ),
+                key: ByteAdmissionKey::Binding(PrivacySafeTargetFingerprint::from_bytes([1; 32])),
                 admission_rank: 2,
                 mutation: ByteBudgetMutation::Binding {
                     new_record_bytes: maximum_width_binding_len(
@@ -8803,8 +8527,8 @@ mod tests {
                 tabs: MAX_TOTAL_OVERLAY_TABS,
             },
         };
-        let replacement = |number, old_bytes, new_bytes, old_tabs, new_tabs, rank| {
-            ByteAdmissionCandidate {
+        let replacement =
+            |number, old_bytes, new_bytes, old_tabs, new_tabs, rank| ByteAdmissionCandidate {
                 key: ByteAdmissionKey::Overlay(window_id(number)),
                 admission_rank: rank,
                 mutation: ByteBudgetMutation::OverlayComponent {
@@ -8820,8 +8544,7 @@ mod tests {
                         adds_tombstone: false,
                     }],
                 },
-            }
-        };
+            };
         let candidates = [
             replacement(0x81, 10, 13, 2, 0, 2),
             replacement(0x82, 10, 22, 3, 0, 2),
@@ -8829,14 +8552,9 @@ mod tests {
             replacement(0x84, 10, 5, 0, 2, 0),
         ];
 
-        let (selected, rejected, accepted_count) = select_compatible_candidate_subset(
-            base,
-            &candidates,
-            &[0, 1, 2, 3],
-            100,
-            false,
-        )
-        .expect("select an inclusion-maximal fixed point");
+        let (selected, rejected, accepted_count) =
+            select_compatible_candidate_subset(base, &candidates, &[0, 1, 2, 3], 100, false)
+                .expect("select an inclusion-maximal fixed point");
 
         assert_eq!(accepted_count, 2);
         assert_eq!(rejected, vec![1, 2]);
@@ -8913,14 +8631,9 @@ mod tests {
             );
         }
 
-        let (selected, rejected, accepted_count) = select_compatible_candidate_subset(
-            base,
-            &candidates,
-            &[0, 1, 2],
-            maximum_bytes,
-            false,
-        )
-        .expect("reconstruct exact separator-safe subset");
+        let (selected, rejected, accepted_count) =
+            select_compatible_candidate_subset(base, &candidates, &[0, 1, 2], maximum_bytes, false)
+                .expect("reconstruct exact separator-safe subset");
 
         assert_eq!(accepted_count, 1);
         assert_eq!(rejected.len(), 2);
@@ -9066,14 +8779,9 @@ mod tests {
             },
         ];
 
-        let (selected, rejected, accepted_count) = select_compatible_candidate_subset(
-            base,
-            &candidates,
-            &[0, 1, 2],
-            maximum_bytes,
-            false,
-        )
-        .expect("select mutually enabling exchange");
+        let (selected, rejected, accepted_count) =
+            select_compatible_candidate_subset(base, &candidates, &[0, 1, 2], maximum_bytes, false)
+                .expect("select mutually enabling exchange");
         assert_eq!(rejected, vec![2]);
         assert_eq!(accepted_count, 2);
         assert_eq!(selected.counts.tabs, MAX_TOTAL_OVERLAY_TABS);
@@ -9111,8 +8819,8 @@ mod tests {
                 tabs: MAX_TOTAL_OVERLAY_TABS,
             },
         };
-        let replacement = |number, old_bytes, new_bytes, old_tabs, new_tabs, rank| {
-            ByteAdmissionCandidate {
+        let replacement =
+            |number, old_bytes, new_bytes, old_tabs, new_tabs, rank| ByteAdmissionCandidate {
                 key: ByteAdmissionKey::Overlay(window_id(number)),
                 admission_rank: rank,
                 mutation: ByteBudgetMutation::OverlayComponent {
@@ -9128,27 +8836,24 @@ mod tests {
                         adds_tombstone: false,
                     }],
                 },
-            }
-        };
+            };
         let candidates = [
             replacement(0x61, 20, 30, 10, 0, 2),
             replacement(0x62, 30, 20, 0, 10, 0),
             replacement(0x63, 40, 41, 1, 0, 2),
         ];
 
-        let (selected, rejected, accepted_count) = select_compatible_candidate_subset(
-            base,
-            &candidates,
-            &[0, 1, 2],
-            maximum_bytes,
-            false,
-        )
-        .expect("select balanced exchange over smaller inactive supplier");
+        let (selected, rejected, accepted_count) =
+            select_compatible_candidate_subset(base, &candidates, &[0, 1, 2], maximum_bytes, false)
+                .expect("select balanced exchange over smaller inactive supplier");
         assert_eq!(rejected, vec![2]);
         assert_eq!(accepted_count, 2);
         assert_eq!(selected.counts.tabs, MAX_TOTAL_OVERLAY_TABS);
         assert_eq!(
-            selected.normalized_bytes.upper_bound().expect("selected bytes"),
+            selected
+                .normalized_bytes
+                .upper_bound()
+                .expect("selected bytes"),
             maximum_bytes
         );
     }
@@ -9243,14 +8948,9 @@ mod tests {
             },
         ];
 
-        let (selected, rejected, accepted_count) = select_compatible_candidate_subset(
-            base,
-            &candidates,
-            &[0, 1, 2],
-            maximum_bytes,
-            false,
-        )
-        .expect("isolate one mixed-sign poison exactly");
+        let (selected, rejected, accepted_count) =
+            select_compatible_candidate_subset(base, &candidates, &[0, 1, 2], maximum_bytes, false)
+                .expect("isolate one mixed-sign poison exactly");
         assert_eq!(rejected, vec![1]);
         assert_eq!(accepted_count, 2);
         assert_eq!(selected.counts.tabs, MAX_TOTAL_OVERLAY_TABS);
@@ -9286,31 +8986,22 @@ mod tests {
             })
             .collect();
         state.overlays.push(
-            MixedDomainLayoutOverlay::new(
-                retiring_window,
-                "default",
-                1,
-                Vec::new(),
-                None,
-            )
-            .expect("valid retiring overlay"),
+            MixedDomainLayoutOverlay::new(retiring_window, "default", 1, Vec::new(), None)
+                .expect("valid retiring overlay"),
         );
         canonicalize_state(&mut state);
-        std::fs::write(&path, encode_disk_slot(&state).expect("encode full live state"))
-            .expect("write full live state");
+        std::fs::write(
+            &path,
+            encode_disk_slot(&state).expect("encode full live state"),
+        )
+        .expect("write full live state");
 
         let mut batch = PendingBatch::default();
         batch
             .queue_overlay_live(
                 None,
-                MixedDomainLayoutOverlay::new(
-                    create_window,
-                    "default",
-                    1,
-                    Vec::new(),
-                    None,
-                )
-                .expect("valid empty create"),
+                MixedDomainLayoutOverlay::new(create_window, "default", 1, Vec::new(), None)
+                    .expect("valid empty create"),
             )
             .expect("queue lexically earlier create");
         batch
@@ -9334,14 +9025,8 @@ mod tests {
         let mut state = PersistedState::default();
         state.store_revision = 1;
         state.overlays.push(
-            MixedDomainLayoutOverlay::new(
-                growing_window,
-                "default",
-                1,
-                Vec::new(),
-                None,
-            )
-            .expect("empty growing overlay"),
+            MixedDomainLayoutOverlay::new(growing_window, "default", 1, Vec::new(), None)
+                .expect("empty growing overlay"),
         );
         let full_slots = local_slots(0xf0, MAX_TABS_PER_OVERLAY);
         state.overlays.push(
@@ -9374,10 +9059,7 @@ mod tests {
 
         let mut batch = PendingBatch::default();
         batch
-            .queue_overlay_live(
-                Some(1),
-                local_overlay(growing_window, 2, 90),
-            )
+            .queue_overlay_live(Some(1), local_overlay(growing_window, 2, 90))
             .expect("queue lexically earlier growth");
         let mut reduced_slots = full_slots;
         reduced_slots.pop();
@@ -9427,8 +9109,11 @@ mod tests {
             local_overlay(updating_window, 1, 71),
         ];
         canonicalize_state(&mut state);
-        std::fs::write(&path, encode_disk_slot(&state).expect("encode capped state"))
-            .expect("write capped state");
+        std::fs::write(
+            &path,
+            encode_disk_slot(&state).expect("encode capped state"),
+        )
+        .expect("write capped state");
 
         let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x72; 32]);
         let mut batch = PendingBatch::default();
@@ -9436,10 +9121,7 @@ mod tests {
             .queue_overlay_delete(retiring_window, Some(1))
             .expect("queue cap-exceeding retirement");
         batch
-            .queue_overlay_live(
-                Some(1),
-                local_overlay(updating_window, 2, 73),
-            )
+            .queue_overlay_live(Some(1), local_overlay(updating_window, 2, 73))
             .expect("queue unrelated overlay update");
         batch
             .queue_window_state(
@@ -9482,7 +9164,10 @@ mod tests {
             2
         );
         assert!(after.window_states["other"].fullscreen);
-        assert_eq!(after.binding_for(fingerprint), committed.bindings.get(&fingerprint).copied());
+        assert_eq!(
+            after.binding_for(fingerprint),
+            committed.bindings.get(&fingerprint).copied()
+        );
 
         let replay_window = window_id(1);
         let mut replay = PendingBatch::default();
@@ -9509,15 +9194,11 @@ mod tests {
         initial
             .queue_overlay_live(None, local_overlay(valid_window, 1, 81))
             .expect("queue second overlay");
-        commit_for_test(&path, &initial, WriteInterruption::None)
-            .expect("commit initial overlays");
+        commit_for_test(&path, &initial, WriteInterruption::None).expect("commit initial overlays");
 
         let mut advance_conflicted = PendingBatch::default();
         advance_conflicted
-            .queue_overlay_live(
-                Some(1),
-                local_overlay(conflicted_window, 2, 82),
-            )
+            .queue_overlay_live(Some(1), local_overlay(conflicted_window, 2, 82))
             .expect("queue committed advance");
         commit_for_test(&path, &advance_conflicted, WriteInterruption::None)
             .expect("advance conflicted authority");
@@ -9525,10 +9206,7 @@ mod tests {
         let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x83; 32]);
         let mut mixed = PendingBatch::default();
         mixed
-            .queue_overlay_live(
-                Some(3),
-                local_overlay(conflicted_window, 4, 84),
-            )
+            .queue_overlay_live(Some(3), local_overlay(conflicted_window, 4, 84))
             .expect("queue wrong-base update");
         mixed
             .queue_overlay_live(Some(1), local_overlay(valid_window, 2, 85))
@@ -9582,13 +9260,21 @@ mod tests {
         let mut state = PersistedState::default();
         state.store_revision = 1;
         state.window_states = (0..MAX_WORKSPACES)
-            .map(|index| (format!("workspace-{index}"), PersistedWindowState::default()))
+            .map(|index| {
+                (
+                    format!("workspace-{index}"),
+                    PersistedWindowState::default(),
+                )
+            })
             .collect();
         state.domain_bindings = capped_domain_bindings();
         canonicalize_state(&mut state);
         validate_state(&state).expect("valid state at independent authority caps");
-        std::fs::write(&path, encode_disk_slot(&state).expect("encode capped authority"))
-            .expect("write capped authority");
+        std::fs::write(
+            &path,
+            encode_disk_slot(&state).expect("encode capped authority"),
+        )
+        .expect("write capped authority");
 
         let existing_fingerprint = indexed_fingerprint(0);
         let new_fingerprint = PrivacySafeTargetFingerprint::from_bytes([0xff; 32]);
@@ -9663,9 +9349,11 @@ mod tests {
 
         let snapshot = load_snapshot_at(&path).expect("load partitioned capped authority");
         assert!(snapshot.window_states["workspace-0"].maximized);
-        assert!(!snapshot
-            .window_states
-            .contains_key("zz-cross-process-overflow"));
+        assert!(
+            !snapshot
+                .window_states
+                .contains_key("zz-cross-process-overflow")
+        );
         assert_eq!(snapshot.domain_bindings.len(), MAX_DOMAIN_BINDINGS);
         assert!(snapshot.overlay(valid_window).is_some());
     }
@@ -9674,7 +9362,12 @@ mod tests {
     fn final_workspace_and_binding_capacity_is_admitted_deterministically() {
         let mut state = PersistedState::default();
         state.window_states = (0..MAX_WORKSPACES - 1)
-            .map(|index| (format!("workspace-{index}"), PersistedWindowState::default()))
+            .map(|index| {
+                (
+                    format!("workspace-{index}"),
+                    PersistedWindowState::default(),
+                )
+            })
             .collect();
         state.domain_bindings = capped_domain_bindings();
         state.domain_bindings.pop();
@@ -9752,10 +9445,7 @@ mod tests {
         worker.expect_waiting(2, true);
         worker.continue_wake(2);
         let first_retry = worker.expect_commit(2, TestWorkerCommitPhase::ExactRetry);
-        assert_eq!(
-            first_retry.overlay_mutations[&window].desired_revision(),
-            1
-        );
+        assert_eq!(first_retry.overlay_mutations[&window].desired_revision(), 1);
         worker.release_commit(
             2,
             TestWorkerCommitAction::Run(WriteInterruption::AfterDirectorySync),
@@ -9811,14 +9501,8 @@ mod tests {
         let recovery_flush = worker.writer().flush().expect("recovery flush");
         worker.continue_wake(4);
         let third_retry = worker.expect_commit(4, TestWorkerCommitPhase::ExactRetry);
-        assert_eq!(
-            third_retry.overlay_mutations[&window].desired_revision(),
-            1
-        );
-        worker.release_commit(
-            4,
-            TestWorkerCommitAction::Run(WriteInterruption::None),
-        );
+        assert_eq!(third_retry.overlay_mutations[&window].desired_revision(), 1);
+        worker.release_commit(4, TestWorkerCommitAction::Run(WriteInterruption::None));
         assert!(matches!(
             worker.expect_commit_finished(4, TestWorkerCommitPhase::ExactRetry),
             TestWorkerCommitResult::Committed(CommitReceipt {
@@ -9870,18 +9554,14 @@ mod tests {
             successor_retry.overlay_mutations[&window].desired_revision(),
             2
         );
-        worker.release_commit(
-            6,
-            TestWorkerCommitAction::Run(WriteInterruption::None),
-        );
-        let successor_receipt = match worker
-            .expect_commit_finished(6, TestWorkerCommitPhase::Pending)
-        {
-            TestWorkerCommitResult::Committed(receipt) => receipt,
-            TestWorkerCommitResult::Failed(code) => {
-                panic!("successor retry failed unexpectedly: {code:?}")
-            }
-        };
+        worker.release_commit(6, TestWorkerCommitAction::Run(WriteInterruption::None));
+        let successor_receipt =
+            match worker.expect_commit_finished(6, TestWorkerCommitPhase::Pending) {
+                TestWorkerCommitResult::Committed(receipt) => receipt,
+                TestWorkerCommitResult::Failed(code) => {
+                    panic!("successor retry failed unexpectedly: {code:?}")
+                }
+            };
         assert!(successor_receipt.wrote_new_generation);
         assert_eq!(successor_receipt.committed_updates, 1);
         worker.continue_after_commit(6);
@@ -9900,12 +9580,8 @@ mod tests {
         assert!(empty.window_states.is_empty());
         assert!(empty.overlay_mutations.is_empty());
         assert!(empty.ensure_bindings.is_empty());
-        worker.release_commit(
-            7,
-            TestWorkerCommitAction::Run(WriteInterruption::None),
-        );
-        let barrier_receipt = match worker
-            .expect_commit_finished(7, TestWorkerCommitPhase::Pending)
+        worker.release_commit(7, TestWorkerCommitAction::Run(WriteInterruption::None));
+        let barrier_receipt = match worker.expect_commit_finished(7, TestWorkerCommitPhase::Pending)
         {
             TestWorkerCommitResult::Committed(receipt) => receipt,
             TestWorkerCommitResult::Failed(code) => {
@@ -9913,7 +9589,10 @@ mod tests {
             }
         };
         assert!(!barrier_receipt.wrote_new_generation);
-        assert_eq!(barrier_receipt.store_revision, successor_receipt.store_revision);
+        assert_eq!(
+            barrier_receipt.store_revision,
+            successor_receipt.store_revision
+        );
         worker.continue_after_commit(7);
         assert_eq!(
             barrier
@@ -10018,10 +9697,7 @@ mod tests {
             repeated_retry.overlay_mutations[&window].desired_revision(),
             1
         );
-        worker.release_commit(
-            3,
-            TestWorkerCommitAction::Run(WriteInterruption::None),
-        );
+        worker.release_commit(3, TestWorkerCommitAction::Run(WriteInterruption::None));
         assert!(matches!(
             worker.expect_commit_finished(3, TestWorkerCommitPhase::ExactRetry),
             TestWorkerCommitResult::Committed(_)
@@ -10029,22 +9705,15 @@ mod tests {
         worker.continue_after_commit(3);
 
         let successor = worker.expect_commit(4, TestWorkerCommitPhase::Pending);
-        assert_eq!(
-            successor.overlay_mutations[&window].desired_revision(),
-            2
-        );
-        worker.release_commit(
-            4,
-            TestWorkerCommitAction::Run(WriteInterruption::None),
-        );
-        let successor_receipt = match worker
-            .expect_commit_finished(4, TestWorkerCommitPhase::Pending)
-        {
-            TestWorkerCommitResult::Committed(receipt) => receipt,
-            TestWorkerCommitResult::Failed(code) => {
-                panic!("successor after recovered panic failed: {code:?}")
-            }
-        };
+        assert_eq!(successor.overlay_mutations[&window].desired_revision(), 2);
+        worker.release_commit(4, TestWorkerCommitAction::Run(WriteInterruption::None));
+        let successor_receipt =
+            match worker.expect_commit_finished(4, TestWorkerCommitPhase::Pending) {
+                TestWorkerCommitResult::Committed(receipt) => receipt,
+                TestWorkerCommitResult::Failed(code) => {
+                    panic!("successor after recovered panic failed: {code:?}")
+                }
+            };
         worker.continue_after_commit(4);
         assert_eq!(
             recovery_flush
@@ -10094,8 +9763,7 @@ mod tests {
         batch
             .queue_overlay_live(None, local_overlay(window, 1, 84))
             .expect("queue before worker-loop panic");
-        let (flush, binding) =
-            worker.admit_batch_with_flush_and_binding(batch, fingerprint);
+        let (flush, binding) = worker.admit_batch_with_flush_and_binding(batch, fingerprint);
         let shared = Arc::clone(&worker.writer().shared);
 
         // Panic before the blocking receive, outside the narrower journal
@@ -10152,10 +9820,7 @@ mod tests {
         let (remaining_binding_sender, remaining_binding) = flume::bounded(1);
         let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x85; 32]);
         let mut bindings = BindingWaiters::new();
-        bindings.insert(
-            fingerprint,
-            vec![remaining_binding_sender, binding_sender],
-        );
+        bindings.insert(fingerprint, vec![remaining_binding_sender, binding_sender]);
 
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut waiters = AdmittedWaiters::new(
@@ -10324,6 +9989,7 @@ mod tests {
             PersistenceFailureCode::WorkerPanicked
         );
         let pending = lock_pending(&shared.pending);
+        assert!(!shared.pending.is_poisoned());
         assert!(pending.flush_waiters.is_empty());
         assert!(pending.binding_waiters.is_empty());
         assert_eq!(pending.waiter_count, 0);
@@ -10342,8 +10008,7 @@ mod tests {
             },
         )
         .expect("queue journal seed");
-        commit_for_test(&path, &seed, WriteInterruption::None)
-            .expect("seed controlled journal");
+        commit_for_test(&path, &seed, WriteInterruption::None).expect("seed controlled journal");
 
         let window = window_id(11_056);
         let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x82; 32]);
@@ -10361,10 +10026,7 @@ mod tests {
             &entered.overlay_mutations[&window].desired,
             DesiredOverlayState::Live(overlay) if overlay.local_revision() == 1
         ));
-        worker.release_commit(
-            1,
-            TestWorkerCommitAction::Run(WriteInterruption::AfterSync),
-        );
+        worker.release_commit(1, TestWorkerCommitAction::Run(WriteInterruption::AfterSync));
         assert_eq!(
             worker.expect_commit_finished(1, TestWorkerCommitPhase::Pending),
             TestWorkerCommitResult::Failed(PersistenceFailureCode::Io)
@@ -10406,10 +10068,7 @@ mod tests {
             &retry.overlay_mutations[&window].desired,
             DesiredOverlayState::Live(overlay) if overlay.local_revision() == 1
         ));
-        worker.release_commit(
-            2,
-            TestWorkerCommitAction::Run(WriteInterruption::None),
-        );
+        worker.release_commit(2, TestWorkerCommitAction::Run(WriteInterruption::None));
         assert!(matches!(
             worker.expect_commit_finished(2, TestWorkerCommitPhase::ExactRetry),
             TestWorkerCommitResult::Committed(_)
@@ -10427,18 +10086,14 @@ mod tests {
             }
         ));
         assert!(retirement.ensure_bindings.contains(&fingerprint));
-        worker.release_commit(
-            3,
-            TestWorkerCommitAction::Run(WriteInterruption::None),
-        );
-        let retirement_receipt = match worker
-            .expect_commit_finished(3, TestWorkerCommitPhase::Pending)
-        {
-            TestWorkerCommitResult::Committed(receipt) => receipt,
-            TestWorkerCommitResult::Failed(code) => {
-                panic!("retirement successor failed unexpectedly: {code:?}")
-            }
-        };
+        worker.release_commit(3, TestWorkerCommitAction::Run(WriteInterruption::None));
+        let retirement_receipt =
+            match worker.expect_commit_finished(3, TestWorkerCommitPhase::Pending) {
+                TestWorkerCommitResult::Committed(receipt) => receipt,
+                TestWorkerCommitResult::Failed(code) => {
+                    panic!("retirement successor failed unexpectedly: {code:?}")
+                }
+            };
         assert!(retirement_receipt.wrote_new_generation);
         assert_eq!(retirement_receipt.committed_updates, 2);
         worker.continue_after_commit(3);
@@ -10520,12 +10175,8 @@ mod tests {
         let rejected = worker.expect_commit(1, TestWorkerCommitPhase::Pending);
         assert_eq!(rejected.overlay_mutations[&window].base_revision, Some(2));
         assert!(rejected.ensure_bindings.contains(&fingerprint));
-        worker.release_commit(
-            1,
-            TestWorkerCommitAction::Run(WriteInterruption::None),
-        );
-        let partial_receipt = match worker
-            .expect_commit_finished(1, TestWorkerCommitPhase::Pending)
+        worker.release_commit(1, TestWorkerCommitAction::Run(WriteInterruption::None));
+        let partial_receipt = match worker.expect_commit_finished(1, TestWorkerCommitPhase::Pending)
         {
             TestWorkerCommitResult::Committed(receipt) => receipt,
             TestWorkerCommitResult::Failed(code) => {
@@ -10563,10 +10214,7 @@ mod tests {
         assert!(reporting_batch.window_states.is_empty());
         assert!(reporting_batch.overlay_mutations.is_empty());
         assert!(reporting_batch.ensure_bindings.is_empty());
-        worker.release_commit(
-            2,
-            TestWorkerCommitAction::Run(WriteInterruption::None),
-        );
+        worker.release_commit(2, TestWorkerCommitAction::Run(WriteInterruption::None));
         worker.expect_commit_finished(2, TestWorkerCommitPhase::Pending);
         worker.continue_after_commit(2);
         assert_eq!(
@@ -10589,13 +10237,8 @@ mod tests {
         assert!(clean_batch.window_states.is_empty());
         assert!(clean_batch.overlay_mutations.is_empty());
         assert!(clean_batch.ensure_bindings.is_empty());
-        worker.release_commit(
-            3,
-            TestWorkerCommitAction::Run(WriteInterruption::None),
-        );
-        let clean_receipt = match worker
-            .expect_commit_finished(3, TestWorkerCommitPhase::Pending)
-        {
+        worker.release_commit(3, TestWorkerCommitAction::Run(WriteInterruption::None));
+        let clean_receipt = match worker.expect_commit_finished(3, TestWorkerCommitPhase::Pending) {
             TestWorkerCommitResult::Committed(receipt) => receipt,
             TestWorkerCommitResult::Failed(code) => {
                 panic!("post-report barrier failed unexpectedly: {code:?}")
@@ -10648,8 +10291,7 @@ mod tests {
         batch
             .queue_overlay_live(None, local_overlay(window, 1, 89))
             .expect("admit pre-wake disconnect overlay");
-        let (flush, binding) =
-            worker.admit_batch_with_flush_and_binding(batch, fingerprint);
+        let (flush, binding) = worker.admit_batch_with_flush_and_binding(batch, fingerprint);
         let shared = Arc::clone(&worker.writer().shared);
 
         // The admitted work has queued a wake token, but the worker is still
@@ -10699,8 +10341,7 @@ mod tests {
         batch
             .queue_overlay_live(None, local_overlay(window, 1, 90))
             .expect("admit stale-epoch overlay");
-        let (flush, binding) =
-            worker.admit_batch_with_flush_and_binding(batch, fingerprint);
+        let (flush, binding) = worker.admit_batch_with_flush_and_binding(batch, fingerprint);
         let shared = Arc::clone(&worker.writer().shared);
         worker.continue_wake(1);
         worker.expect_commit(1, TestWorkerCommitPhase::Pending);
@@ -10709,9 +10350,7 @@ mod tests {
         // requested commit action can touch storage.
         worker.send_directive(
             0,
-            TestWorkerDirectiveAction::Commit(TestWorkerCommitAction::Run(
-                WriteInterruption::None,
-            )),
+            TestWorkerDirectiveAction::Commit(TestWorkerCommitAction::Run(WriteInterruption::None)),
         );
         assert_eq!(
             flush
@@ -10757,8 +10396,7 @@ mod tests {
         batch
             .queue_overlay_live(None, local_overlay(window, 1, 86))
             .expect("admit disconnect overlay");
-        let (flush, binding) =
-            worker.admit_batch_with_flush_and_binding(batch, fingerprint);
+        let (flush, binding) = worker.admit_batch_with_flush_and_binding(batch, fingerprint);
         let shared = Arc::clone(&worker.writer().shared);
         worker.continue_wake(1);
         worker.expect_commit(1, TestWorkerCommitPhase::Pending);
@@ -10808,8 +10446,7 @@ mod tests {
         batch
             .queue_overlay_live(None, local_overlay(window, 1, 88))
             .expect("admit post-commit disconnect overlay");
-        let (flush, binding) =
-            worker.admit_batch_with_flush_and_binding(batch, fingerprint);
+        let (flush, binding) = worker.admit_batch_with_flush_and_binding(batch, fingerprint);
         let shared = Arc::clone(&worker.writer().shared);
         worker.continue_wake(1);
         worker.expect_commit(1, TestWorkerCommitPhase::Pending);
@@ -10948,8 +10585,7 @@ mod tests {
                 .expect("initial owner"),
             )
             .expect("queue initial owner");
-        commit_for_test(&path, &initial, WriteInterruption::None)
-            .expect("commit initial owner");
+        commit_for_test(&path, &initial, WriteInterruption::None).expect("commit initial owner");
 
         let mut first_batch = PendingBatch::default();
         first_batch
@@ -11037,14 +10673,8 @@ mod tests {
         initial
             .queue_overlay_live(
                 None,
-                MixedDomainLayoutOverlay::new(
-                    destination_window,
-                    "default",
-                    1,
-                    Vec::new(),
-                    None,
-                )
-                .expect("initial empty destination"),
+                MixedDomainLayoutOverlay::new(destination_window, "default", 1, Vec::new(), None)
+                    .expect("initial empty destination"),
             )
             .expect("queue initial destination");
         commit_for_test(&path, &initial, WriteInterruption::None)
@@ -11052,12 +10682,8 @@ mod tests {
         // Initial publication creates one valid slot by design. Repair the
         // missing journal peer before testing rejected-batch publication so
         // durability maintenance cannot legitimately write a generation.
-        commit_for_test(
-            &path,
-            &PendingBatch::default(),
-            WriteInterruption::None,
-        )
-        .expect("establish healthy two-slot transfer authority");
+        commit_for_test(&path, &PendingBatch::default(), WriteInterruption::None)
+            .expect("establish healthy two-slot transfer authority");
         let before = load_snapshot_at(&path).expect("load healthy transfer authority");
         assert!(!before.degraded_recovery);
 
@@ -11065,14 +10691,8 @@ mod tests {
         transfer
             .queue_overlay_live(
                 Some(1),
-                MixedDomainLayoutOverlay::new(
-                    source_window,
-                    "default",
-                    2,
-                    Vec::new(),
-                    None,
-                )
-                .expect("source release"),
+                MixedDomainLayoutOverlay::new(source_window, "default", 2, Vec::new(), None)
+                    .expect("source release"),
             )
             .expect("queue source release");
         transfer
@@ -11213,8 +10833,7 @@ mod tests {
                 second_conflict_right,
             ] {
                 assert_eq!(
-                    committed.rejected_overlay_mutations[&window_id]
-                        .failure,
+                    committed.rejected_overlay_mutations[&window_id].failure,
                     PersistenceFailure::invalid(
                         "one stable tab identity would be owned by multiple layout windows"
                     )
@@ -11253,22 +10872,10 @@ mod tests {
             ..PersistedState::default()
         };
         state.overlays = vec![
-            MixedDomainLayoutOverlay::new(
-                source_window,
-                "default",
-                1,
-                vec![slot],
-                Some(slot),
-            )
-            .expect("revision-ceiling source owner"),
-            MixedDomainLayoutOverlay::new(
-                destination_window,
-                "default",
-                1,
-                Vec::new(),
-                None,
-            )
-            .expect("revision-ceiling empty destination"),
+            MixedDomainLayoutOverlay::new(source_window, "default", 1, vec![slot], Some(slot))
+                .expect("revision-ceiling source owner"),
+            MixedDomainLayoutOverlay::new(destination_window, "default", 1, Vec::new(), None)
+                .expect("revision-ceiling empty destination"),
         ];
         canonicalize_state(&mut state);
         validate_state(&state).expect("revision-ceiling authority is valid");
@@ -11283,14 +10890,8 @@ mod tests {
         transfer
             .queue_overlay_live(
                 Some(1),
-                MixedDomainLayoutOverlay::new(
-                    source_window,
-                    "default",
-                    2,
-                    Vec::new(),
-                    None,
-                )
-                .expect("revision-ceiling source release"),
+                MixedDomainLayoutOverlay::new(source_window, "default", 2, Vec::new(), None)
+                    .expect("revision-ceiling source release"),
             )
             .expect("queue revision-ceiling source release");
         transfer
@@ -11352,31 +10953,18 @@ mod tests {
         initial
             .queue_overlay_live(
                 None,
-                MixedDomainLayoutOverlay::new(
-                    source_window,
-                    "default",
-                    1,
-                    vec![slot],
-                    Some(slot),
-                )
-                .expect("source owner"),
+                MixedDomainLayoutOverlay::new(source_window, "default", 1, vec![slot], Some(slot))
+                    .expect("source owner"),
             )
             .expect("queue source owner");
-        commit_for_test(&path, &initial, WriteInterruption::None)
-            .expect("commit source owner");
+        commit_for_test(&path, &initial, WriteInterruption::None).expect("commit source owner");
 
         let mut transfer = PendingBatch::default();
         transfer
             .queue_overlay_live(
                 Some(1),
-                MixedDomainLayoutOverlay::new(
-                    source_window,
-                    "default",
-                    2,
-                    Vec::new(),
-                    None,
-                )
-                .expect("empty source after transfer"),
+                MixedDomainLayoutOverlay::new(source_window, "default", 2, Vec::new(), None)
+                    .expect("empty source after transfer"),
             )
             .expect("queue source removal");
         transfer
@@ -11397,11 +10985,13 @@ mod tests {
         assert_eq!(committed.receipt.rejected_updates, 0);
 
         let snapshot = load_snapshot_at(&path).expect("load ownership transfer");
-        assert!(snapshot
-            .overlay(source_window)
-            .expect("source overlay retained")
-            .slots()
-            .is_empty());
+        assert!(
+            snapshot
+                .overlay(source_window)
+                .expect("source overlay retained")
+                .slots()
+                .is_empty()
+        );
         assert_eq!(
             snapshot
                 .overlay(destination_window)
@@ -11420,7 +11010,10 @@ mod tests {
         let destination_window = window_id(11_081);
         let source_placement = remote_slot(binding, 0x94, 10, 55);
         let destination_placement = remote_slot(binding, 0x94, 20, 55);
-        assert_eq!(source_placement.identity(), destination_placement.identity());
+        assert_eq!(
+            source_placement.identity(),
+            destination_placement.identity()
+        );
 
         let mut initial = PendingBatch::default();
         initial
@@ -11443,14 +11036,8 @@ mod tests {
         transfer
             .queue_overlay_live(
                 Some(1),
-                MixedDomainLayoutOverlay::new(
-                    source_window,
-                    "default",
-                    2,
-                    Vec::new(),
-                    None,
-                )
-                .expect("empty source after remote transfer"),
+                MixedDomainLayoutOverlay::new(source_window, "default", 2, Vec::new(), None)
+                    .expect("empty source after remote transfer"),
             )
             .expect("queue remote source removal");
         transfer
@@ -11471,11 +11058,13 @@ mod tests {
         assert_eq!(committed.receipt.rejected_updates, 0);
 
         let snapshot = load_snapshot_at(&path).expect("load remote ownership transfer");
-        assert!(snapshot
-            .overlay(source_window)
-            .expect("source overlay retained")
-            .slots()
-            .is_empty());
+        assert!(
+            snapshot
+                .overlay(source_window)
+                .expect("source overlay retained")
+                .slots()
+                .is_empty()
+        );
         assert_eq!(
             snapshot
                 .overlay(destination_window)
@@ -11494,14 +11083,9 @@ mod tests {
         let unknown_binding = DomainBindingId::from_bytes([0x86; 16]);
         let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x85; 32]);
         let remote = remote_slot(unknown_binding, 0x87, 1, 1);
-        let invalid_overlay = MixedDomainLayoutOverlay::new(
-            invalid_window,
-            "default",
-            1,
-            vec![remote],
-            Some(remote),
-        )
-        .expect("structurally valid overlay");
+        let invalid_overlay =
+            MixedDomainLayoutOverlay::new(invalid_window, "default", 1, vec![remote], Some(remote))
+                .expect("structurally valid overlay");
         let mut batch = PendingBatch::default();
         batch.ensure_bindings.insert(fingerprint);
         batch
@@ -11526,11 +11110,8 @@ mod tests {
         assert_eq!(committed.receipt.coalesced_updates, 0);
         assert_eq!(committed.receipt.rejected_updates, 1);
         assert_eq!(
-            committed.rejected_overlay_mutations[&invalid_window]
-                .failure,
-            PersistenceFailure::invalid(
-                "overlay remote slot references an unknown domain binding"
-            )
+            committed.rejected_overlay_mutations[&invalid_window].failure,
+            PersistenceFailure::invalid("overlay remote slot references an unknown domain binding")
         );
         let committed_binding = committed.bindings[&fingerprint];
         assert!(committed.accepted_overlay_ids.contains(&valid_window));
@@ -11552,8 +11133,7 @@ mod tests {
         initial
             .queue_overlay_live(None, local_overlay(window, 1, 91))
             .expect("queue initial overlay");
-        commit_for_test(&path, &initial, WriteInterruption::None)
-            .expect("commit initial overlay");
+        commit_for_test(&path, &initial, WriteInterruption::None).expect("commit initial overlay");
 
         let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x92; 32]);
         let mut batch = PendingBatch::default();
@@ -11628,8 +11208,7 @@ mod tests {
         initial
             .queue_overlay_live(None, local_overlay(window, 1, 94))
             .expect("queue initial overlay");
-        commit_for_test(&path, &initial, WriteInterruption::None)
-            .expect("commit initial overlay");
+        commit_for_test(&path, &initial, WriteInterruption::None).expect("commit initial overlay");
 
         let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x95; 32]);
         let mut rejected_batch = PendingBatch::default();
@@ -11681,10 +11260,12 @@ mod tests {
         drop(writer);
         drop(wake);
         worker.join().expect("persistence worker exits");
-        assert!(load_snapshot_at(&path)
-            .expect("load first batch partial success")
-            .binding_for(fingerprint)
-            .is_some());
+        assert!(
+            load_snapshot_at(&path)
+                .expect("load first batch partial success")
+                .binding_for(fingerprint)
+                .is_some()
+        );
     }
 
     #[test]
@@ -11776,14 +11357,12 @@ mod tests {
             committed: Some(2),
         };
         waiter.remember_semantic_failure(&SemanticFailureOutcome {
-            sequence: 1,
+            identity: Arc::new(()),
             failure: first.clone(),
         });
         waiter.remember_semantic_failure(&SemanticFailureOutcome {
-            sequence: 2,
-            failure: PersistenceFailure::RetiredOverlay {
-                last_revision: 4,
-            },
+            identity: Arc::new(()),
+            failure: PersistenceFailure::RetiredOverlay { last_revision: 4 },
         });
         let later_receipt = CommitReceipt {
             store_revision: 9,
@@ -11812,6 +11391,24 @@ mod tests {
     }
 
     #[test]
+    fn stale_semantic_failure_identity_cannot_clear_a_new_identical_failure() {
+        let mut pending = CoordinatorPending::default();
+        let failure = PersistenceFailure::RetiredOverlay { last_revision: 7 };
+        let first = pending.record_semantic_failure(&failure);
+        pending.clear_reported_semantic_failure(&first.identity);
+        let second = pending.record_semantic_failure(&failure);
+
+        pending.clear_reported_semantic_failure(&first.identity);
+
+        let retained = pending
+            .unreported_semantic_failure
+            .as_ref()
+            .expect("the newer semantic failure must remain pending");
+        assert!(Arc::ptr_eq(&retained.identity, &second.identity));
+        assert!(!Arc::ptr_eq(&first.identity, &second.identity));
+    }
+
+    #[test]
     fn unavailable_remote_slots_keep_position_but_never_become_active() {
         let unavailable = DomainBindingId::from_bytes([0x71; 16]);
         let available = DomainBindingId::from_bytes([0x72; 16]);
@@ -11828,9 +11425,8 @@ mod tests {
         )
         .expect("overlay");
         let unavailable_bindings = BTreeSet::from([unavailable]);
-        let reconciled =
-            reconcile_overlay(&overlay, &[right, left, unseen], &unavailable_bindings)
-                .expect("reconcile");
+        let reconciled = reconcile_overlay(&overlay, &[right, left, unseen], &unavailable_bindings)
+            .expect("reconcile");
 
         assert_eq!(
             reconciled.ordered_slots,
@@ -11860,9 +11456,8 @@ mod tests {
             Some(moved_before),
         )
         .expect("overlay before remote move");
-        let reconciled =
-            reconcile_overlay(&overlay, &[right, moved_after, left], &BTreeSet::new())
-                .expect("moved placement reconciles by stable tab identity");
+        let reconciled = reconcile_overlay(&overlay, &[right, moved_after, left], &BTreeSet::new())
+            .expect("moved placement reconciles by stable tab identity");
 
         assert_eq!(reconciled.ordered_slots, vec![left, moved_after, right]);
         assert_eq!(reconciled.live_slots, vec![left, moved_after, right]);
@@ -11942,9 +11537,8 @@ mod tests {
         )
         .expect("overlay");
 
-        let failure =
-            reconcile_overlay(&overlay, &[slot], &BTreeSet::from([unavailable]))
-                .expect_err("conflicting availability must fail closed");
+        let failure = reconcile_overlay(&overlay, &[slot], &BTreeSet::from([unavailable]))
+            .expect_err("conflicting availability must fail closed");
         assert_eq!(failure.code(), PersistenceFailureCode::Invalid);
     }
 
@@ -11964,12 +11558,9 @@ mod tests {
         )
         .expect("overlay");
 
-        let disconnected = reconcile_overlay(
-            &overlay,
-            &[right, left],
-            &BTreeSet::from([unavailable]),
-        )
-        .expect("retain unavailable placeholder");
+        let disconnected =
+            reconcile_overlay(&overlay, &[right, left], &BTreeSet::from([unavailable]))
+                .expect("retain unavailable placeholder");
         assert_eq!(
             disconnected.ordered_slots,
             vec![left, missing_active, right]
@@ -11980,10 +11571,7 @@ mod tests {
         let reappeared =
             reconcile_overlay(&overlay, &[right, moved_active, left], &BTreeSet::new())
                 .expect("reconcile reappeared binding after remote-window move");
-        assert_eq!(
-            reappeared.ordered_slots,
-            vec![left, moved_active, right]
-        );
+        assert_eq!(reappeared.ordered_slots, vec![left, moved_active, right]);
         assert_eq!(reappeared.active_live_slot, Some(moved_active));
         assert_eq!(reappeared.retained_unavailable, 0);
         assert_eq!(reappeared.appended_new, 0);
@@ -12015,25 +11603,27 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
         let mut first = PendingBatch::default();
-        first.queue_window_state(
-            "default".to_string(),
-            PersistedWindowState {
-                maximized: true,
-                fullscreen: false,
-            },
-        )
-        .expect("queue first state");
+        first
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue first state");
         commit_for_test(&path, &first, WriteInterruption::None).expect("first commit");
 
         let mut second = PendingBatch::default();
-        second.queue_window_state(
-            "default".to_string(),
-            PersistedWindowState {
-                maximized: false,
-                fullscreen: true,
-            },
-        )
-        .expect("queue second state");
+        second
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue second state");
         commit_for_test(&path, &second, WriteInterruption::AfterPartialWrite)
             .expect_err("injected partial write");
         let after_partial = load_snapshot_at(&path).expect("recover old");
@@ -12042,14 +11632,15 @@ mod tests {
 
         commit_for_test(&path, &second, WriteInterruption::None).expect("retry second");
         let mut third = PendingBatch::default();
-        third.queue_window_state(
-            "default".to_string(),
-            PersistedWindowState {
-                maximized: true,
-                fullscreen: true,
-            },
-        )
-        .expect("queue third state");
+        third
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue third state");
         commit_for_test(&path, &third, WriteInterruption::AfterSync)
             .expect_err("injected acknowledgement loss");
         let after_sync = load_snapshot_at(&path).expect("recover new");
@@ -12091,22 +11682,20 @@ mod tests {
             .expect_err("inject failure after complete but unsynced bytes");
 
         assert_eq!(
-            commit_for_test(
-                &path,
-                &second,
-                WriteInterruption::AfterDirectorySync,
-            )
-            .expect_err("prove idempotent retry crosses the durability barrier")
-            .code(),
+            commit_for_test(&path, &second, WriteInterruption::AfterDirectorySync,)
+                .expect_err("prove idempotent retry crosses the durability barrier")
+                .code(),
             PersistenceFailureCode::Io
         );
         let replay = commit_for_test(&path, &second, WriteInterruption::None)
             .expect("durable idempotent replay");
         assert!(!replay.receipt.wrote_new_generation);
-        assert!(load_snapshot_at(&path)
-            .expect("load durable retry")
-            .window_states["default"]
-            .fullscreen);
+        assert!(
+            load_snapshot_at(&path)
+                .expect("load durable retry")
+                .window_states["default"]
+                .fullscreen
+        );
     }
 
     #[test]
@@ -12145,8 +11734,7 @@ mod tests {
             let recovered = load_snapshot_at(&path).expect("recover complete generation");
             let state = recovered.window_states["default"];
             assert!(
-                (state.maximized && !state.fullscreen)
-                    || (!state.maximized && state.fullscreen),
+                (state.maximized && !state.fullscreen) || (!state.maximized && state.fullscreen),
                 "recovery must select the prior or fully encoded generation"
             );
         }
@@ -12157,14 +11745,15 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
         let mut first = PendingBatch::default();
-        first.queue_window_state(
-            "default".to_string(),
-            PersistedWindowState {
-                maximized: true,
-                fullscreen: false,
-            },
-        )
-        .expect("queue first state");
+        first
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue first state");
         commit_for_test(&path, &first, WriteInterruption::AfterPartialWrite)
             .expect_err("injected first partial write");
 
@@ -12173,10 +11762,12 @@ mod tests {
         assert!(snapshot.window_states.is_empty());
 
         commit_for_test(&path, &first, WriteInterruption::None).expect("retry first publish");
-        assert!(load_snapshot_at(&path)
-            .expect("load committed first generation")
-            .window_states["default"]
-            .maximized);
+        assert!(
+            load_snapshot_at(&path)
+                .expect("load committed first generation")
+                .window_states["default"]
+                .maximized
+        );
     }
 
     #[test]
@@ -12184,26 +11775,28 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
         let mut first = PendingBatch::default();
-        first.queue_window_state(
-            "default".to_string(),
-            PersistedWindowState {
-                maximized: true,
-                fullscreen: false,
-            },
-        )
-        .expect("queue first state");
+        first
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue first state");
         commit_for_test(&path, &first, WriteInterruption::None).expect("first");
         std::fs::write(shadow_file_name(&path), b"truncated").expect("corrupt inactive shadow");
 
         let mut second = PendingBatch::default();
-        second.queue_window_state(
-            "default".to_string(),
-            PersistedWindowState {
-                maximized: false,
-                fullscreen: true,
-            },
-        )
-        .expect("queue second state");
+        second
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue second state");
         commit_for_test(&path, &second, WriteInterruption::None).expect("recover and commit");
         let quarantines = std::fs::read_dir(temp.path())
             .expect("list directory")
@@ -12211,10 +11804,12 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
             .count();
         assert_eq!(quarantines, 1);
-        assert!(load_snapshot_at(&path)
-            .expect("load recovered")
-            .window_states["default"]
-            .fullscreen);
+        assert!(
+            load_snapshot_at(&path)
+                .expect("load recovered")
+                .window_states["default"]
+                .fullscreen
+        );
     }
 
     #[test]
@@ -12252,13 +11847,9 @@ mod tests {
         std::fs::write(&quarantine, b"partial").expect("simulate partial evidence publish");
 
         assert_eq!(
-            commit_for_test(
-                &path,
-                &PendingBatch::default(),
-                WriteInterruption::None,
-            )
-            .expect_err("partial evidence must block corrupt-slot reuse")
-            .code(),
+            commit_for_test(&path, &PendingBatch::default(), WriteInterruption::None,)
+                .expect_err("partial evidence must block corrupt-slot reuse")
+                .code(),
             PersistenceFailureCode::Corrupt
         );
         assert_eq!(
@@ -12283,16 +11874,14 @@ mod tests {
             .expect("queue first state");
         commit_for_test(&path, &first, WriteInterruption::None).expect("first commit");
         std::fs::write(shadow_file_name(&path), b"truncated").expect("corrupt inactive slot");
-        assert!(load_snapshot_at(&path)
-            .expect("load degraded authority")
-            .degraded_recovery);
+        assert!(
+            load_snapshot_at(&path)
+                .expect("load degraded authority")
+                .degraded_recovery
+        );
 
-        let repaired = commit_for_test(
-            &path,
-            &PendingBatch::default(),
-            WriteInterruption::None,
-        )
-        .expect("empty barrier repairs degraded redundancy");
+        let repaired = commit_for_test(&path, &PendingBatch::default(), WriteInterruption::None)
+            .expect("empty barrier repairs degraded redundancy");
         assert!(repaired.receipt.wrote_new_generation);
         let snapshot = load_snapshot_at(&path).expect("load repaired journal");
         assert!(!snapshot.degraded_recovery);
@@ -12321,18 +11910,22 @@ mod tests {
             .expect("queue primary-only state");
         commit_for_test(&primary_only, &initial, WriteInterruption::None)
             .expect("publish primary-only authority");
-        assert!(load_snapshot_at(&primary_only)
-            .expect("load primary-only authority")
-            .degraded_recovery);
+        assert!(
+            load_snapshot_at(&primary_only)
+                .expect("load primary-only authority")
+                .degraded_recovery
+        );
         commit_for_test(
             &primary_only,
             &PendingBatch::default(),
             WriteInterruption::None,
         )
         .expect("repair missing shadow");
-        assert!(!load_snapshot_at(&primary_only)
-            .expect("load repaired primary authority")
-            .degraded_recovery);
+        assert!(
+            !load_snapshot_at(&primary_only)
+                .expect("load repaired primary authority")
+                .degraded_recovery
+        );
 
         let shadow_only = temp.path().join("shadow-only.json");
         let mut shadow_state = PersistedState::default();
@@ -12437,21 +12030,18 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
         let mut first = PendingBatch::default();
-        first.queue_window_state(
-            "default".to_string(),
-            PersistedWindowState {
-                maximized: true,
-                fullscreen: false,
-            },
-        )
-        .expect("queue first state");
+        first
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue first state");
         commit_for_test(&path, &first, WriteInterruption::None).expect("first");
-        commit_for_test(
-            &path,
-            &PendingBatch::default(),
-            WriteInterruption::None,
-        )
-        .expect("repair initial one-slot journal");
+        commit_for_test(&path, &PendingBatch::default(), WriteInterruption::None)
+            .expect("repair initial one-slot journal");
         let before = load_snapshot_at(&path).expect("before");
         assert!(!before.degraded_recovery);
 
@@ -12471,10 +12061,9 @@ mod tests {
         };
         let mut batch = PendingBatch::default();
         batch.overlay_tab_count = malformed.slots.len();
-        batch.overlay_mutations.insert(
-            malformed_window,
-            malformed_mutation.clone(),
-        );
+        batch
+            .overlay_mutations
+            .insert(malformed_window, malformed_mutation.clone());
         let rejection = commit_for_test(&path, &batch, WriteInterruption::None)
             .expect("malformed overlay lineage is partitioned");
         assert!(!rejection.receipt.wrote_new_generation);
@@ -12555,12 +12144,13 @@ mod tests {
         assert!(!rejection.receipt.wrote_new_generation);
         assert_eq!(rejection.receipt.rejected_updates, 1);
         assert_eq!(
-            rejection.rejected_overlay_mutations[&window]
-                .failure
-                .code(),
+            rejection.rejected_overlay_mutations[&window].failure.code(),
             PersistenceFailureCode::StaleOverlay
         );
-        assert_eq!(load_snapshot_at(&path).expect("load after rejection"), before);
+        assert_eq!(
+            load_snapshot_at(&path).expect("load after rejection"),
+            before
+        );
     }
 
     #[test]
@@ -12761,8 +12351,8 @@ mod tests {
             )
             .expect("overlay"),
         );
-        let encoded = String::from_utf8(encode_disk_slot(&state).expect("encode"))
-            .expect("JSON is UTF-8");
+        let encoded =
+            String::from_utf8(encode_disk_slot(&state).expect("encode")).expect("JSON is UTF-8");
         for forbidden in [
             "terminal_contents",
             "command",

@@ -25,9 +25,9 @@ use mux::{Mux, MuxNotification};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Channel capacity for the bounded event queue.
@@ -143,12 +143,7 @@ fn saturating_increment(counter: &AtomicU64) -> u64 {
         if next == current {
             return current;
         }
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(previous) => return previous,
             Err(observed) => current = observed,
         }
@@ -424,9 +419,7 @@ fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown
                     if shutdown.load(Ordering::Acquire) {
                         break;
                     }
-                    log::warn!(
-                        "Native event bridge: failed to send Hello ({error}), reconnecting"
-                    );
+                    log::warn!("Native event bridge: failed to send Hello ({error}), reconnecting");
                     stream = None;
                     if !wait_for_retry_or_shutdown(connect_backoff, shutdown) {
                         break;
@@ -447,9 +440,7 @@ fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown
                 let (event_kind, pane_id) = event.metadata();
                 let wire = event.into_wire_event();
                 if let Some(ref mut s) = stream {
-                    if let Err(error) =
-                        write_event(s, &wire, &mut serialized_event, shutdown)
-                    {
+                    if let Err(error) = write_event(s, &wire, &mut serialized_event, shutdown) {
                         if shutdown.load(Ordering::Acquire) {
                             break;
                         }
@@ -469,8 +460,7 @@ fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown
                         if !wait_for_retry_or_shutdown(write_failure_backoff, shutdown) {
                             break;
                         }
-                        write_failure_backoff =
-                            (write_failure_backoff * 2).min(MAX_BACKOFF);
+                        write_failure_backoff = (write_failure_backoff * 2).min(MAX_BACKOFF);
                     } else {
                         write_failure_backoff = INITIAL_BACKOFF;
                     }
@@ -706,9 +696,11 @@ mod tests {
     impl std::io::Write for ScriptedWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.calls = self.calls.saturating_add(1);
-            match self.steps.pop_front().unwrap_or(ScriptedWrite::Error(
-                std::io::ErrorKind::WouldBlock,
-            )) {
+            match self
+                .steps
+                .pop_front()
+                .unwrap_or(ScriptedWrite::Error(std::io::ErrorKind::WouldBlock))
+            {
                 ScriptedWrite::Bytes(maximum) => {
                     let written = maximum.min(bytes.len());
                     self.written.extend_from_slice(&bytes[..written]);
@@ -925,10 +917,7 @@ mod tests {
             handle_mux_notification(&mux, &MuxNotification::PaneOutput(42), &tx),
             "byte-less PaneOutput must keep the native bridge subscribed"
         );
-        assert!(matches!(
-            rx.try_recv(),
-            Err(std_mpsc::TryRecvError::Empty)
-        ));
+        assert!(matches!(rx.try_recv(), Err(std_mpsc::TryRecvError::Empty)));
     }
 
     #[test]
@@ -952,10 +941,7 @@ mod tests {
             },
             &tx,
         ));
-        assert!(matches!(
-            rx.try_recv(),
-            Err(std_mpsc::TryRecvError::Empty)
-        ));
+        assert!(matches!(rx.try_recv(), Err(std_mpsc::TryRecvError::Empty)));
     }
 
     #[test]
@@ -1038,10 +1024,7 @@ mod tests {
 
         assert_eq!(writer.written, b"abcdef");
         assert_eq!(writer.calls, 4);
-        assert_eq!(
-            clock.get().duration_since(start),
-            Duration::from_millis(2)
-        );
+        assert_eq!(clock.get().duration_since(start), Duration::from_millis(2));
     }
 
     #[test]

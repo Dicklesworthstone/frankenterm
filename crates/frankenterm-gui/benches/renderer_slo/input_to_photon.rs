@@ -75,13 +75,16 @@ fn bench_classified_input_to_headless_proxy_frame(c: &mut Criterion) {
         return;
     }
 
-    c.bench_function("input_to_photon/classified_input_headless_proxy_frame", |b| {
-        b.iter(|| {
-            let frame = render_headless(black_box(&input))
-                .expect("headless renderer must be available for measured Criterion run");
-            black_box(frame.rgba.len());
-        });
-    });
+    c.bench_function(
+        "input_to_photon/classified_input_headless_proxy_frame",
+        |b| {
+            b.iter(|| {
+                let frame = render_headless(black_box(&input))
+                    .expect("headless renderer must be available for measured Criterion run");
+                black_box(frame.rgba.len());
+            });
+        },
+    );
 }
 
 fn bench_ft_p4vzl_glyph_dense_gpu_frame_ab(c: &mut Criterion) {

@@ -1069,6 +1069,7 @@ pub(crate) struct ImageCacheKey {
 }
 
 impl ImageCacheKey {
+    #[cfg(test)]
     fn new(image: &Arc<ImageData>, revision: [u8; 32]) -> Self {
         Self {
             object: ImageObjectKey::of(image),
@@ -1158,6 +1159,7 @@ impl DecodedImage {
         })
     }
 
+    #[cfg(test)]
     fn load(image_data: &Arc<ImageData>) -> anyhow::Result<Self> {
         Self::load_for_revision(image_data, image_data.current_content_hash())
     }
@@ -1782,7 +1784,7 @@ impl GlyphCache {
                 break;
             }
 
-            stats.attempted_requests += 1;
+            stats.attempted_requests = stats.attempted_requests.saturating_add(1);
 
             let glyphs = match font.blocking_shape(
                 &request.text,
@@ -1798,7 +1800,7 @@ impl GlyphCache {
                         request.text,
                         request.priority
                     );
-                    stats.failed_glyphs += 1;
+                    stats.failed_glyphs = stats.failed_glyphs.saturating_add(1);
                     continue;
                 }
             };
@@ -1820,15 +1822,19 @@ impl GlyphCache {
                     num_cells,
                     SubpixelBin::Quarter0,
                 ) {
-                    Ok((_, true)) => stats.cache_hits += 1,
-                    Ok((_, false)) => stats.warmed_glyphs += 1,
+                    Ok((_, true)) => {
+                        stats.cache_hits = stats.cache_hits.saturating_add(1);
+                    }
+                    Ok((_, false)) => {
+                        stats.warmed_glyphs = stats.warmed_glyphs.saturating_add(1);
+                    }
                     Err(err) => {
                         log::debug!(
                             "glyph warm-up rasterization failed for {:?} ({:?}): {err:#}",
                             request.text,
                             request.priority
                         );
-                        stats.failed_glyphs += 1;
+                        stats.failed_glyphs = stats.failed_glyphs.saturating_add(1);
                     }
                 }
             }
@@ -2495,7 +2501,7 @@ impl GlyphCache {
         let mut decoder_queue_was_empty = false;
         if now >= next_due {
             if frames.load_next_frame() {
-                *decoded_current_frame = (*decoded_current_frame).wrapping_add(1);
+                *decoded_current_frame = (*decoded_current_frame).saturating_add(1);
                 // A zero-duration first frame is animation composition state,
                 // not visible content. If the decoder already queued the
                 // first timed frame, consume exactly that one additional frame
@@ -2506,7 +2512,7 @@ impl GlyphCache {
                 // unbounded paint latency.
                 if frames.awaiting_first_visible_frame() {
                     if frames.load_next_frame() {
-                        *decoded_current_frame = (*decoded_current_frame).wrapping_add(1);
+                        *decoded_current_frame = (*decoded_current_frame).saturating_add(1);
                     } else if matches!(&frames.source, FrameSource::Decoder(_)) {
                         decoder_queue_was_empty = true;
                     }

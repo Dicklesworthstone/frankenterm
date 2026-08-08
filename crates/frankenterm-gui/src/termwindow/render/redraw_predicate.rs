@@ -181,11 +181,11 @@ impl RedrawDecisionStats {
     /// `total()` is 0 so the telemetry path doesn't need to
     /// special-case startup.
     pub fn skip_rate(&self) -> f64 {
-        let total = self.total();
-        if total == 0 {
+        let total = self.paints as f64 + self.skips as f64;
+        if total == 0.0 {
             return 0.0;
         }
-        self.skips as f64 / total as f64
+        self.skips as f64 / total
     }
 }
 
@@ -438,6 +438,16 @@ mod tests {
         let stats = RedrawDecisionStats::default();
         assert_eq!(stats.total(), 0);
         assert!((stats.skip_rate() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stats_skip_rate_handles_saturated_counters_without_distortion() {
+        let stats = RedrawDecisionStats {
+            paints: u64::MAX,
+            skips: u64::MAX,
+        };
+        assert_eq!(stats.total(), u64::MAX);
+        assert_eq!(stats.skip_rate(), 0.5);
     }
 
     #[test]

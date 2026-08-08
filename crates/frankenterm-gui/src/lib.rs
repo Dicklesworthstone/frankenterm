@@ -63,9 +63,7 @@ pub mod workspace_reconcile {
     impl WorkspaceReconcileWaiters {
         #[must_use]
         pub fn waiter_count(&self) -> usize {
-            self.active_pass
-                .len()
-                .saturating_add(self.next_pass.len())
+            self.active_pass.len().saturating_add(self.next_pass.len())
         }
 
         pub fn push(&mut self, starts_new_pass: bool, promise: Promise<()>) {
@@ -975,9 +973,9 @@ pub mod owner_last_guard {
 #[cfg(test)]
 mod selection_lifecycle_tests {
     use super::{
-        RenderDirtySequenceFence, RemovedPaneMouseCleanup, cached_line_shape_hash_is_fresh,
-        checked_stable_row_range_from_top, removed_pane_mouse_cleanup, take_monotonic_cache_id,
-        should_preserve_dirty_selection_during_mouse_drag,
+        RemovedPaneMouseCleanup, RenderDirtySequenceFence, cached_line_shape_hash_is_fresh,
+        checked_stable_row_range_from_top, removed_pane_mouse_cleanup,
+        should_preserve_dirty_selection_during_mouse_drag, take_monotonic_cache_id,
     };
     use wezterm_term::StableRowIndex;
 
@@ -1624,6 +1622,7 @@ pub mod gui_debug_log {
     }
 
     static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    static DROPPED_AFTER_SEQUENCE_EXHAUSTION: AtomicU64 = AtomicU64::new(0);
 
     lazy_static::lazy_static! {
         static ref ENTRIES: Mutex<VecDeque<GuiDebugLogEntry>> =
@@ -1639,7 +1638,22 @@ pub mod gui_debug_log {
     }
 
     pub fn record(level: Level, target: impl Into<String>, message: impl Into<String>) -> u64 {
-        let sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let Ok(sequence) =
+            NEXT_SEQUENCE.try_update(Ordering::AcqRel, Ordering::Acquire, |sequence| {
+                sequence.checked_add(1)
+            })
+        else {
+            // This bounded diagnostic stream must never wrap and make ancient
+            // entries appear newer than a caller's cursor. Once the identity
+            // space is exhausted, fail closed by dropping subsequent debug-log
+            // entries; the returned sentinel is never inserted into ENTRIES.
+            let _ = DROPPED_AFTER_SEQUENCE_EXHAUSTION.try_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |dropped| Some(dropped.saturating_add(1)),
+            );
+            return u64::MAX;
+        };
         let entry = GuiDebugLogEntry {
             sequence,
             then: Local::now(),
@@ -1656,6 +1670,12 @@ pub mod gui_debug_log {
         sequence
     }
 
+    /// Number of debug-log records dropped after sequence-space exhaustion.
+    #[must_use]
+    pub fn dropped_after_sequence_exhaustion() -> u64 {
+        DROPPED_AFTER_SEQUENCE_EXHAUSTION.load(Ordering::Relaxed)
+    }
+
     pub fn entries_after(sequence: Option<u64>) -> Vec<GuiDebugLogEntry> {
         let min_sequence = sequence.unwrap_or(0);
         lock_entries("reading log entries")
@@ -1668,6 +1688,7 @@ pub mod gui_debug_log {
     #[cfg(test)]
     fn reset_for_tests() {
         NEXT_SEQUENCE.store(1, Ordering::Relaxed);
+        DROPPED_AFTER_SEQUENCE_EXHAUSTION.store(0, Ordering::Relaxed);
         lock_entries("resetting test state").clear();
     }
 
@@ -1697,6 +1718,18 @@ pub mod gui_debug_log {
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].sequence, second);
             assert_eq!(entries[0].message, "second");
+        }
+
+        #[test]
+        fn sequence_exhaustion_drops_entries_without_wrapping_the_cursor() {
+            let _guard = lock_test();
+            reset_for_tests();
+            NEXT_SEQUENCE.store(u64::MAX, Ordering::Release);
+
+            assert_eq!(record(Level::Info, "test", "must be dropped"), u64::MAX);
+            assert!(entries_after(None).is_empty());
+            assert_eq!(NEXT_SEQUENCE.load(Ordering::Acquire), u64::MAX);
+            assert_eq!(dropped_after_sequence_exhaustion(), 1);
         }
 
         #[test]

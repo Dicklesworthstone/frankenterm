@@ -154,11 +154,11 @@ impl FrameDedupStats {
     /// `total()` is 0 so the telemetry path doesn't have to
     /// special-case startup.
     pub fn dedup_rate(&self) -> f64 {
-        let total = self.total();
-        if total == 0 {
+        let total = self.presents_total as f64 + self.skip_duplicate_total as f64;
+        if total == 0.0 {
             return 0.0;
         }
-        self.skip_duplicate_total as f64 / total as f64
+        self.skip_duplicate_total as f64 / total
     }
 }
 
@@ -432,6 +432,17 @@ mod tests {
         let stats = FrameDedupStats::default();
         assert_eq!(stats.total(), 0);
         assert!((stats.dedup_rate() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dedup_rate_handles_saturated_counters_without_distortion() {
+        let stats = FrameDedupStats {
+            presents_total: u64::MAX,
+            skip_duplicate_total: u64::MAX,
+            forced_presents_total: 0,
+        };
+        assert_eq!(stats.total(), u64::MAX);
+        assert_eq!(stats.dedup_rate(), 0.5);
     }
 
     #[test]
