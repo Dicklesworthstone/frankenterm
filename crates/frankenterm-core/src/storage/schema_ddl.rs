@@ -1161,6 +1161,7 @@ CREATE TABLE IF NOT EXISTS mux_pane_state (
 CREATE INDEX IF NOT EXISTS idx_pane_state_checkpoint ON mux_pane_state(checkpoint_id);
 CREATE INDEX IF NOT EXISTS idx_pane_state_pane ON mux_pane_state(pane_id);
 
+-- FT_SESSION_RETAINED_SIZE_V40_BEGIN
 -- Exact logical retained-payload bytes for session size retention (ft-0yuxe.3).
 --
 -- Contract: each non-NULL INTEGER field contributes 8 bytes; each TEXT/BLOB
@@ -1248,6 +1249,14 @@ CREATE TABLE IF NOT EXISTS session_retained_size (
     ) STORED
         CHECK(typeof(retained_bytes) = 'integer' AND retained_bytes >= 0)
 );
+
+INSERT OR IGNORE INTO session_retained_size (
+    session_id, session_row_bytes, checkpoint_row_bytes,
+    pane_state_row_bytes, restore_lifecycle_row_bytes
+)
+SELECT session_id, session_row_bytes, checkpoint_row_bytes,
+       pane_state_row_bytes, restore_lifecycle_row_bytes
+FROM session_retained_size_recomputed;
 
 CREATE TRIGGER IF NOT EXISTS session_retained_size_bi
 BEFORE INSERT ON session_retained_size
@@ -1571,6 +1580,7 @@ AFTER DELETE ON restore_attempt_lifecycle BEGIN
         )
     WHERE session_id = old.session_id;
 END;
+-- FT_SESSION_RETAINED_SIZE_V40_END
 
 -- Action history view (audit + undo + workflow step info)
 CREATE VIEW IF NOT EXISTS action_history AS

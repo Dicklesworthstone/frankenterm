@@ -2113,6 +2113,18 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // correctness boundary forward-only.
         down_sql: None,
     },
+    Migration {
+        version: 40,
+        description: "Maintain exact logical retained-session byte authority",
+        // Applied by `ensure_session_retained_size_schema` from the canonical
+        // marked SCHEMA_SQL section so the fresh and upgrade definitions
+        // cannot drift apart.
+        up_sql: "",
+        // Removing the summary would make cleanup fall back to the historical
+        // incomplete pane-JSON estimate. Keep the exact byte authority
+        // forward-only.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -2190,6 +2202,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         validate_clean_checkpoint_receipt_schema(conn)?;
         validate_checkpoint_identity_v38_schema(conn)?;
         validate_pane_scrollback_summary_schema(conn)?;
+        validate_session_retained_size_schema(conn)?;
         check_ft_version_compatibility(conn)?;
         // The overwhelmingly common reopen path is read-only and must not
         // acquire SQLite's singleton writer lock. If the optimistic probe
@@ -2415,6 +2428,229 @@ fn validate_pane_scrollback_summary_schema(conn: &Connection) -> Result<()> {
     if let Some(pane_id) = orphan_summary {
         return Err(StorageError::Corruption {
             details: format!("scrollback summary {pane_id} has no persisted pane"),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+const SESSION_RETAINED_SIZE_V40_BEGIN: &str = "-- FT_SESSION_RETAINED_SIZE_V40_BEGIN";
+const SESSION_RETAINED_SIZE_V40_END: &str = "-- FT_SESSION_RETAINED_SIZE_V40_END";
+
+fn session_retained_size_schema_sql() -> Result<&'static str> {
+    let start = SCHEMA_SQL
+        .find(SESSION_RETAINED_SIZE_V40_BEGIN)
+        .ok_or_else(|| StorageError::Corruption {
+            details: "SCHEMA_SQL is missing the v40 retained-size begin marker".to_string(),
+        })?
+        .checked_add(SESSION_RETAINED_SIZE_V40_BEGIN.len())
+        .ok_or_else(|| StorageError::Corruption {
+            details: "SCHEMA_SQL v40 retained-size marker offset overflow".to_string(),
+        })?;
+    let end = SCHEMA_SQL
+        .find(SESSION_RETAINED_SIZE_V40_END)
+        .ok_or_else(|| StorageError::Corruption {
+            details: "SCHEMA_SQL is missing the v40 retained-size end marker".to_string(),
+        })?;
+    if start >= end {
+        return Err(StorageError::Corruption {
+            details: "SCHEMA_SQL v40 retained-size markers are reversed or empty".to_string(),
+        }
+        .into());
+    }
+    Ok(&SCHEMA_SQL[start..end])
+}
+
+fn ensure_session_retained_size_schema(conn: &Connection) -> Result<()> {
+    let sql = session_retained_size_schema_sql()?;
+    conn.execute_batch(sql).map_err(|error| {
+        StorageError::MigrationFailed(format!(
+            "session retained-size schema installation failed: {error}"
+        ))
+    })?;
+    validate_session_retained_size_schema(conn)
+}
+
+/// Validate the O(sessions) retained-byte authority without walking checkpoint
+/// or pane history. Full row-by-row recomputation is deliberately owned by the
+/// infrequent cleanup transaction, where a mismatch fails closed before any
+/// retention deletion.
+fn validate_session_retained_size_schema(conn: &Connection) -> Result<()> {
+    let view_sql = load_schema_object_sql(conn, "view", "session_retained_size_recomputed")?
+        .ok_or_else(|| StorageError::Corruption {
+            details: "schema v40 is missing session_retained_size_recomputed".to_string(),
+        })?;
+    let compact_view_sql = compact_schema_sql(&view_sql);
+    for required in [
+        "length(CAST(s.session_id AS BLOB))",
+        "FROM session_checkpoints c WHERE c.session_id = s.session_id",
+        "FROM mux_pane_state p INNER JOIN session_checkpoints c ON c.id = p.checkpoint_id",
+        "FROM restore_attempt_lifecycle r WHERE r.session_id = s.session_id",
+        "AS session_row_bytes",
+        "AS checkpoint_row_bytes",
+        "AS pane_state_row_bytes",
+        "AS restore_lifecycle_row_bytes",
+    ] {
+        if !compact_view_sql.contains(&compact_schema_sql(required)) {
+            return Err(StorageError::Corruption {
+                details: format!(
+                    "schema v40 retained-size recomputation view is missing contract {required}"
+                ),
+            }
+            .into());
+        }
+    }
+
+    let table_sql = load_schema_object_sql(conn, "table", "session_retained_size")?.ok_or_else(
+        || StorageError::Corruption {
+            details: "schema v40 is missing session_retained_size".to_string(),
+        },
+    )?;
+    let compact_table_sql = compact_schema_sql(&table_sql);
+    for required in [
+        "session_id TEXT PRIMARY KEY",
+        "REFERENCES mux_sessions(session_id) ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED",
+        "typeof(session_row_bytes) = 'integer' AND session_row_bytes >= 0",
+        "typeof(checkpoint_row_bytes) = 'integer' AND checkpoint_row_bytes >= 0",
+        "typeof(pane_state_row_bytes) = 'integer' AND pane_state_row_bytes >= 0",
+        "typeof(restore_lifecycle_row_bytes) = 'integer' AND restore_lifecycle_row_bytes >= 0",
+        "session_row_bytes + checkpoint_row_bytes + pane_state_row_bytes + restore_lifecycle_row_bytes",
+        "typeof(retained_bytes) = 'integer' AND retained_bytes >= 0",
+    ] {
+        if !compact_table_sql.contains(&compact_schema_sql(required)) {
+            return Err(StorageError::Corruption {
+                details: format!("schema v40 session_retained_size is missing invariant {required}"),
+            }
+            .into());
+        }
+    }
+    for column in [
+        "session_id",
+        "session_row_bytes",
+        "checkpoint_row_bytes",
+        "pane_state_row_bytes",
+        "restore_lifecycle_row_bytes",
+    ] {
+        if !table_has_column(conn, "session_retained_size", column)? {
+            return Err(StorageError::Corruption {
+                details: format!(
+                    "schema v40 session_retained_size is missing required column {column}"
+                ),
+            }
+            .into());
+        }
+    }
+
+    for (trigger, required_action) in [
+        (
+            "session_retained_size_bi",
+            "session retained-size row requires a persisted session",
+        ),
+        (
+            "session_retained_size_bd",
+            "live session retained-size authority is permanent",
+        ),
+        (
+            "session_retained_size_session_id_bu",
+            "session retained-size identity is immutable",
+        ),
+        (
+            "mux_sessions_retained_size_ai",
+            "INSERT INTO session_retained_size",
+        ),
+        (
+            "mux_sessions_retained_size_au",
+            "SET session_row_bytes =",
+        ),
+        (
+            "mux_sessions_retained_size_ad",
+            "DELETE FROM session_retained_size",
+        ),
+        (
+            "session_checkpoints_retained_size_ai",
+            "checkpoint_row_bytes = checkpoint_row_bytes + 8",
+        ),
+        (
+            "session_checkpoints_retained_size_au",
+            "checkpoint retained-size identity is immutable",
+        ),
+        (
+            "session_checkpoints_retained_size_bd",
+            "pane_state_row_bytes = pane_state_row_bytes - COALESCE",
+        ),
+        (
+            "mux_pane_state_retained_size_ai",
+            "pane_state_row_bytes = pane_state_row_bytes + 8 + 8 + 8",
+        ),
+        (
+            "mux_pane_state_retained_size_au",
+            "pane-state retained-size identity is immutable",
+        ),
+        (
+            "mux_pane_state_retained_size_ad",
+            "pane_state_row_bytes = pane_state_row_bytes -",
+        ),
+        (
+            "restore_attempt_lifecycle_retained_size_ai",
+            "restore_lifecycle_row_bytes = restore_lifecycle_row_bytes + 8",
+        ),
+        (
+            "restore_attempt_lifecycle_retained_size_au",
+            "restore-lifecycle retained-size identity is immutable",
+        ),
+        (
+            "restore_attempt_lifecycle_retained_size_ad",
+            "restore_lifecycle_row_bytes = restore_lifecycle_row_bytes -",
+        ),
+    ] {
+        let trigger_sql = load_schema_object_sql(conn, "trigger", trigger)?.ok_or_else(|| {
+            StorageError::Corruption {
+                details: format!("schema v40 is missing required trigger {trigger}"),
+            }
+        })?;
+        if !compact_schema_sql(&trigger_sql).contains(&compact_schema_sql(required_action)) {
+            return Err(StorageError::Corruption {
+                details: format!(
+                    "schema v40 trigger {trigger} is missing required action {required_action}"
+                ),
+            }
+            .into());
+        }
+    }
+
+    let missing_summary: Option<String> = conn
+        .query_row(
+            "SELECT s.session_id
+             FROM mux_sessions s
+             LEFT JOIN session_retained_size z ON z.session_id = s.session_id
+             WHERE z.session_id IS NULL
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    if missing_summary.is_some() {
+        return Err(StorageError::Corruption {
+            details: "a persisted session is missing retained-size authority".to_string(),
+        }
+        .into());
+    }
+    let orphan_summary: Option<String> = conn
+        .query_row(
+            "SELECT z.session_id
+             FROM session_retained_size z
+             LEFT JOIN mux_sessions s ON s.session_id = z.session_id
+             WHERE s.session_id IS NULL
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    if orphan_summary.is_some() {
+        return Err(StorageError::Corruption {
+            details: "a retained-size authority row has no persisted session".to_string(),
         }
         .into());
     }
@@ -4526,7 +4762,20 @@ fn check_v0_init_fault(step: V0InitStep) -> Result<()> {
 pub(crate) fn split_schema_sql_pragmas() -> (String, String) {
     let mut preamble = String::new();
     let mut body = String::new();
+    let mut skipping_v40_retained_size = false;
     for line in SCHEMA_SQL.lines() {
+        let trimmed = line.trim();
+        if trimmed == SESSION_RETAINED_SIZE_V40_BEGIN {
+            skipping_v40_retained_size = true;
+            continue;
+        }
+        if trimmed == SESSION_RETAINED_SIZE_V40_END {
+            skipping_v40_retained_size = false;
+            continue;
+        }
+        if skipping_v40_retained_size {
+            continue;
+        }
         if line
             .trim_start()
             .to_ascii_uppercase()
@@ -5039,7 +5288,8 @@ pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result
     // protects durable retention-loss evidence; v36 protects row-local snapshot
     // authority; v37 protects exact clean-checkpoint receipt identity; v38
     // protects never-reused IDs and restore-attempt settlement evidence; v39
-    // protects the transactional bounded scrollback projection. V39 is
+    // protects the transactional bounded scrollback projection; v40 protects
+    // exact retained-session byte authority. V40 is
     // therefore the current downgrade floor.
     let mut steps = Vec::new();
     for migration in MIGRATIONS.iter().rev() {
@@ -5145,6 +5395,10 @@ fn apply_migration_mutation(
                     ensure_no_foreign_key_violations(conn, "migration v38")?;
                     apply_raw_up_sql = false;
                 }
+                40 => {
+                    ensure_session_retained_size_schema(conn)?;
+                    apply_raw_up_sql = false;
+                }
                 _ => {}
             }
             if apply_raw_up_sql && !migration.up_sql.is_empty() {
@@ -5158,6 +5412,10 @@ fn apply_migration_mutation(
             if migration.version == 39 {
                 validate_pane_scrollback_summary_schema(conn)?;
                 ensure_no_foreign_key_violations(conn, "migration v39")?;
+            }
+            if migration.version == 40 {
+                validate_session_retained_size_schema(conn)?;
+                ensure_no_foreign_key_violations(conn, "migration v40")?;
             }
             set_user_version(conn, migration.version)?;
             record_migration(conn, migration.version, migration.description)?;
