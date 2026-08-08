@@ -194,6 +194,11 @@ fn setup_db() -> (String, Connection) {
          CREATE INDEX idx_pane_state_pane ON mux_pane_state(pane_id);",
     )
     .unwrap();
+    conn.execute_batch(
+        frankenterm_core::storage::migrations::session_retained_size_schema_sql()
+            .expect("locate canonical v40 retained-size schema"),
+    )
+    .expect("install canonical v40 retained-size authority");
 
     // Insert a session
     conn.execute(

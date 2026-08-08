@@ -292,18 +292,21 @@ pub(crate) fn has_unresolved_restore_intent(
 /// persistent allowlist: migration validation pins their bodies, and cleanup
 /// depends on them to keep byte deletion receipts exact.
 ///
-/// SQLite identifiers are case-insensitive while both schema catalogs preserve
-/// the spelling used by `CREATE TRIGGER`, so both the persistent and TEMP
-/// catalog comparisons must use `NOCASE`.
+/// The complete 12-trigger source-table set is required, not merely allowed:
+/// snapshot DML receipts rely on exactly one summary mutation per source-row
+/// mutation. SQLite identifiers are case-insensitive while both schema catalogs
+/// preserve the spelling used by `CREATE TRIGGER`, so all comparisons use
+/// `NOCASE`.
 ///
 /// # Errors
 ///
 /// Returns the underlying catalog-query error, or a fail-closed conversion
-/// error when any unaudited trigger targets an authority table.
+/// error when a canonical trigger is missing or any unaudited trigger targets
+/// an authority table.
 pub(crate) fn ensure_session_authority_tables_have_no_unaudited_triggers(
     conn: &Connection,
 ) -> Result<(), rusqlite::Error> {
-    let trigger_count: i64 = conn.query_row(
+    let (unaudited_count, canonical_count, temp_count): (i64, i64, i64) = conn.query_row(
         "SELECT
              (SELECT COUNT(*) FROM sqlite_schema
              WHERE type = 'trigger'
@@ -323,21 +326,40 @@ pub(crate) fn ensure_session_authority_tables_have_no_unaudited_triggers(
                     'restore_attempt_lifecycle_retained_size_ai',
                     'restore_attempt_lifecycle_retained_size_au',
                     'restore_attempt_lifecycle_retained_size_ad'
-                ))
-           + (SELECT COUNT(*) FROM sqlite_temp_schema
+                )),
+             (SELECT COUNT(*) FROM sqlite_schema
+              WHERE type = 'trigger'
+                AND tbl_name COLLATE NOCASE
+                    IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
+                        'restore_attempt_lifecycle')
+                AND name COLLATE NOCASE IN (
+                    'mux_sessions_retained_size_ai',
+                    'mux_sessions_retained_size_au',
+                    'mux_sessions_retained_size_ad',
+                    'session_checkpoints_retained_size_ai',
+                    'session_checkpoints_retained_size_au',
+                    'session_checkpoints_retained_size_bd',
+                    'mux_pane_state_retained_size_ai',
+                    'mux_pane_state_retained_size_au',
+                    'mux_pane_state_retained_size_ad',
+                    'restore_attempt_lifecycle_retained_size_ai',
+                    'restore_attempt_lifecycle_retained_size_au',
+                    'restore_attempt_lifecycle_retained_size_ad'
+                )),
+             (SELECT COUNT(*) FROM sqlite_temp_schema
               WHERE type = 'trigger'
                 AND tbl_name COLLATE NOCASE
                     IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
                         'restore_attempt_lifecycle'))",
         [],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
-    if trigger_count == 0 {
+    if unaudited_count == 0 && canonical_count == 12 && temp_count == 0 {
         Ok(())
     } else {
         Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
             std::io::Error::other(
-                "session authority mutation refuses unaudited triggers on authoritative tables",
+                "session authority mutation requires the exact canonical retained-size trigger set",
             ),
         )))
     }
@@ -1876,6 +1898,147 @@ mod tests {
     }
 
     #[test]
+    fn every_retained_size_update_guard_defeats_outer_or_ignore() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+
+        insert_session(&conn, "session-update-guard", now, false);
+        conn.execute(
+            "UPDATE session_retained_size
+             SET checkpoint_row_bytes = 9223372036854775807 - retained_bytes
+             WHERE session_id = 'session-update-guard'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE OR IGNORE mux_sessions
+                 SET topology_json = '{\"expanded\":true}'
+                 WHERE session_id = 'session-update-guard'",
+                [],
+            )
+            .is_err()
+        );
+        let topology_json: String = conn
+            .query_row(
+                "SELECT topology_json FROM mux_sessions
+                 WHERE session_id = 'session-update-guard'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(topology_json, "{}");
+
+        insert_session(&conn, "checkpoint-update-guard", now + 1, false);
+        let checkpoint_id = insert_checkpoint(&conn, "checkpoint-update-guard", now + 1, 0);
+        conn.execute(
+            "UPDATE session_retained_size
+             SET pane_state_row_bytes = 9223372036854775807 - retained_bytes
+             WHERE session_id = 'checkpoint-update-guard'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE OR IGNORE session_checkpoints
+                 SET state_hash = state_hash || 'x' WHERE id = ?1",
+                [checkpoint_id],
+            )
+            .is_err()
+        );
+        let state_hash: String = conn
+            .query_row(
+                "SELECT state_hash FROM session_checkpoints WHERE id = ?1",
+                [checkpoint_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_hash, "hash");
+
+        insert_session(&conn, "pane-update-guard", now + 2, false);
+        let pane_checkpoint_id = insert_checkpoint(&conn, "pane-update-guard", now + 2, 0);
+        conn.execute(
+            "INSERT INTO mux_pane_state (
+                 checkpoint_id, pane_id, terminal_state_json
+             ) VALUES (?1, 7, '{}')",
+            [pane_checkpoint_id],
+        )
+        .unwrap();
+        let pane_state_id = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE session_retained_size
+             SET restore_lifecycle_row_bytes = 9223372036854775807 - retained_bytes
+             WHERE session_id = 'pane-update-guard'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE OR IGNORE mux_pane_state
+                 SET terminal_state_json = '{\"expanded\":true}' WHERE id = ?1",
+                [pane_state_id],
+            )
+            .is_err()
+        );
+        let terminal_state_json: String = conn
+            .query_row(
+                "SELECT terminal_state_json FROM mux_pane_state WHERE id = ?1",
+                [pane_state_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_state_json, "{}");
+
+        insert_session(&conn, "lifecycle-update-guard", now + 3, false);
+        let source_id = insert_checkpoint(&conn, "lifecycle-update-guard", now + 3, 0);
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, checkpoint_role
+             ) VALUES (
+                 'lifecycle-update-guard', ?1, 'startup', 'intent', 0, 0,
+                 'restore_intent'
+             )",
+            [now + 4],
+        )
+        .unwrap();
+        let intent_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO restore_attempt_lifecycle (
+                 intent_checkpoint_id, session_id, source_checkpoint_id,
+                 status, created_at
+             ) VALUES (?1, 'lifecycle-update-guard', ?2, 'intent', ?3)",
+            rusqlite::params![intent_id, source_id, now + 5],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE session_retained_size
+             SET pane_state_row_bytes = 9223372036854775807 - retained_bytes
+             WHERE session_id = 'lifecycle-update-guard'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE OR IGNORE restore_attempt_lifecycle
+                 SET status = 'reconciliation_required'
+                 WHERE intent_checkpoint_id = ?1",
+                [intent_id],
+            )
+            .is_err()
+        );
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM restore_attempt_lifecycle
+                 WHERE intent_checkpoint_id = ?1",
+                [intent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "intent");
+    }
+
+    #[test]
     fn size_cleanup_evicts_by_authoritative_checkpoint_recency() {
         let conn = make_test_db();
         let now = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer");
@@ -2067,9 +2230,7 @@ mod tests {
         drop(conn);
 
         let reopened = Connection::open(&path).expect("reopen before cleanup");
-        reopened
-            .execute_batch("PRAGMA foreign_keys = ON;")
-            .unwrap();
+        reopened.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         let outcome = delete_sessions_by_size(&reopened, 1).unwrap();
         assert_eq!(outcome.deleted, 1);
         assert_eq!(

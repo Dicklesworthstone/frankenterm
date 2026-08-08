@@ -3419,6 +3419,29 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Replace the doubled total_changes witness only with an equally bounded transaction receipt that proves every source mutation and exactly one matching byte-authority mutation without rereading retained payloads or accepting unaudited trigger effects.
 
+### IS-N120 — An allowlist that permits absence cannot authorize an exact trigger multiplier
+
+- **Classification:** stale-fixture false green; exact trigger-set preflight retained
+- **Bead:** `ft-0yuxe.3`
+- **Rejected inference:** rejecting unknown authority-table triggers is enough to
+  justify a checkpoint receipt that expects exactly one canonical summary write
+  per source-row mutation.
+- **Negative evidence:** three snapshot fixture families still created the
+  pre-v40 authority tables without installing the retained-size triggers, while
+  the trigger preflight accepted an empty canonical set. The new doubled
+  `total_changes()` witness would therefore roll back every valid fixture save;
+  the same missing-trigger shape after startup would be detected only after a
+  mutation had begun.
+- **Decision:** expose the marker-validated canonical v40 DDL section for
+  focused fixtures and benchmarks, install it in every snapshot persistence
+  fixture, and require all 12 source-table retained-size triggers plus zero
+  unaudited persistent/TEMP triggers before authority mutation. Same-name body
+  drift remains covered by current-schema exact-body validation and the
+  transaction's exact row/DML receipts. Rust gate proof remains pending
+  strict-remote worker availability.
+- **Primary retry condition:**
+  > Relax exact trigger-set admission only after a replacement receipt proves canonical trigger presence, identity, and one-to-one settlement without schema-specific fixture setup or retained-payload rereads.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

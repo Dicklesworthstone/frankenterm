@@ -3997,8 +3997,7 @@ impl SnapshotEngine {
                         size_measured_bytes = result.size_measured_bytes,
                         size_deleted_bytes = result.size_deleted_bytes,
                         size_retained_bytes = result.size_retained_bytes,
-                        size_ineligible_shortfall_bytes =
-                            result.size_ineligible_shortfall_bytes,
+                        size_ineligible_shortfall_bytes = result.size_ineligible_shortfall_bytes,
                         interval_hours,
                         "Session retention cleanup completed above its size budget because no more sessions were eligible"
                     );
@@ -4011,8 +4010,7 @@ impl SnapshotEngine {
                         size_measured_bytes = result.size_measured_bytes,
                         size_deleted_bytes = result.size_deleted_bytes,
                         size_retained_bytes = result.size_retained_bytes,
-                        size_ineligible_shortfall_bytes =
-                            result.size_ineligible_shortfall_bytes,
+                        size_ineligible_shortfall_bytes = result.size_ineligible_shortfall_bytes,
                         explicit_vacuum_attempted = false,
                         expected_default_free_space_policy = "auto_vacuum_none_freelist_reuse",
                         interval_hours,
@@ -4023,8 +4021,7 @@ impl SnapshotEngine {
                         size_measured_bytes = result.size_measured_bytes,
                         size_deleted_bytes = result.size_deleted_bytes,
                         size_retained_bytes = result.size_retained_bytes,
-                        size_ineligible_shortfall_bytes =
-                            result.size_ineligible_shortfall_bytes,
+                        size_ineligible_shortfall_bytes = result.size_ineligible_shortfall_bytes,
                         interval_hours,
                         "Session retention cleanup: nothing to remove"
                     );
@@ -9222,10 +9219,8 @@ mod tests {
             ",
         )
         .unwrap();
-        conn.execute_batch(
-            crate::storage::migrations::session_retained_size_schema_sql().unwrap(),
-        )
-        .expect("snapshot fixture must install the canonical v40 retained-size authority");
+        conn.execute_batch(crate::storage::migrations::session_retained_size_schema_sql().unwrap())
+            .expect("snapshot fixture must install the canonical v40 retained-size authority");
 
         (tmp, db_path)
     }
@@ -9446,7 +9441,8 @@ mod tests {
             let (_tmp, db_path) = setup_test_db();
             let conn = Connection::open(db_path.as_str()).unwrap();
             conn.execute_batch(
-                "CREATE TRIGGER abort_first_checkpoint
+                "DROP TRIGGER session_checkpoints_retained_size_ai;
+                 CREATE TRIGGER session_checkpoints_retained_size_ai
                  BEFORE INSERT ON session_checkpoints
                  BEGIN
                      SELECT RAISE(ABORT, 'synthetic checkpoint failure');
@@ -11190,7 +11186,8 @@ mod tests {
 
         let conn = Connection::open(db_path.as_str()).unwrap();
         conn.execute_batch(
-            "CREATE TRIGGER ignore_snapshot_session_update
+            "DROP TRIGGER mux_sessions_retained_size_au;
+             CREATE TRIGGER mux_sessions_retained_size_au
              BEFORE UPDATE OF last_checkpoint_at ON mux_sessions
              WHEN OLD.session_id = 'sess-rollback'
              BEGIN

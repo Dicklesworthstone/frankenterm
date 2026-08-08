@@ -518,6 +518,11 @@ fn setup_test_db() -> (tempfile::NamedTempFile, Arc<String>) {
         ",
     )
     .expect("create schema");
+    conn.execute_batch(
+        frankenterm_core::storage::migrations::session_retained_size_schema_sql()
+            .expect("locate canonical v40 retained-size schema"),
+    )
+    .expect("install canonical v40 retained-size authority");
     (tmp, db_path)
 }
 
