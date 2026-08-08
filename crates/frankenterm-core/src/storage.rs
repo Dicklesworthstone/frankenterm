@@ -10880,9 +10880,12 @@ static STORAGE_WRITER_WAKER_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STORAGE_WRITER_QUEUE_ACCOUNTING_UNDERFLOWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 fn saturating_atomic_u64_add(counter: &AtomicU64, delta: u64) {
-    let _ = counter.try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |value| {
-        Some(value.saturating_add(delta))
-    });
+    let _ = crate::try_update_atomic_u64(
+        counter,
+        AtomicOrdering::Relaxed,
+        AtomicOrdering::Relaxed,
+        |value| Some(value.saturating_add(delta)),
+    );
 }
 
 #[cfg(test)]
@@ -10908,7 +10911,7 @@ mod saturation_counter_tests {
         };
 
         assert_eq!(snapshot.total_acquires(), u64::MAX);
-        assert_eq!(snapshot.hit_rate(), 0.5);
+        assert_eq!(snapshot.hit_rate().to_bits(), 0.5f64.to_bits());
     }
 }
 
@@ -13901,14 +13904,11 @@ mod writer_epoch_transaction_tests {
         }
     }
 
-    struct NoopWake;
-
-    impl std::task::Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
     struct PanickingDropWake;
 
+    // This intentionally no-op Wake implementation carries a panicking Drop;
+    // Waker::noop cannot exercise caller-waker destructor containment.
+    #[allow(clippy::manual_noop_waker)]
     impl std::task::Wake for PanickingDropWake {
         fn wake(self: Arc<Self>) {}
     }
@@ -14000,7 +14000,7 @@ mod writer_epoch_transaction_tests {
             );
             assert!(storage_writer_waker_panics_total() > start);
 
-            let noop_waker = std::task::Waker::from(Arc::new(NoopWake));
+            let noop_waker = std::task::Waker::noop().clone();
             for result in [
                 poll_writer_send(&mut hostile_send, &noop_waker),
                 poll_writer_send(&mut later_send, &noop_waker),
@@ -14039,7 +14039,7 @@ mod writer_epoch_transaction_tests {
                     respond: waiting_tx,
                 },
             ));
-            let noop_waker = std::task::Waker::from(Arc::new(NoopWake));
+            let noop_waker = std::task::Waker::noop().clone();
             assert!(poll_writer_send(&mut waiting_send, &noop_waker).is_pending());
 
             sender.terminal_state.store(
@@ -14078,7 +14078,7 @@ mod writer_epoch_transaction_tests {
                     respond: waiting_tx,
                 },
             ));
-            let noop_waker = std::task::Waker::from(Arc::new(NoopWake));
+            let noop_waker = std::task::Waker::noop().clone();
             assert!(poll_writer_send(&mut waiting_send, &noop_waker).is_pending());
 
             sender
@@ -31832,7 +31832,7 @@ fn event_retention_cursor_tokens_and_stream_page_limits_are_hard_bounded() {
     let backend = memory_backend();
     let huge = "a".repeat(1_000_000);
     for invalid in [
-        "".to_string(),
+        String::new(),
         "a".repeat(31),
         "a".repeat(33),
         "g".repeat(32),
@@ -39470,12 +39470,13 @@ fn indeterminate_embedding_mutation_invalidates_semantic_cache_before_return() {
             query_vector_hash: 7,
             query_vector_len: 4,
         };
+        let generation = Arc::clone(&guard.generation);
         let _ = guard.cache.put(
             key,
             CachedSemanticHits {
                 hits: Vec::new(),
                 expires_at_ms: i64::MAX,
-                generation: Arc::clone(&guard.generation),
+                generation,
             },
         );
         assert_eq!(guard.cache.len(), 1);
@@ -39579,7 +39580,7 @@ fn semantic_completion_cannot_publish_across_a_reconfigured_cache_epoch() {
         state.metrics.last_fallback_reason.as_deref(),
         Some("replacement-epoch-marker")
     );
-    assert_eq!(state.ewma_semantic_latency_ms, 0.0);
+    assert_eq!(state.ewma_semantic_latency_ms.to_bits(), 0.0f64.to_bits());
 }
 
 #[test]
@@ -39665,6 +39666,7 @@ fn semantic_budget_poison_recovery_retires_cache_authority_and_transient_state()
         guard.backoff_until_ms = Some(i64::MAX);
         guard.rate_window_started_at_ms = 42;
         guard.rate_window_queries = 9;
+        let generation = Arc::clone(&guard.generation);
         let _ = guard.cache.put(
             SemanticQueryCacheKey {
                 embedder_id: "poison-test".to_owned(),
@@ -39679,7 +39681,7 @@ fn semantic_budget_poison_recovery_retires_cache_authority_and_transient_state()
             CachedSemanticHits {
                 hits: Vec::new(),
                 expires_at_ms: i64::MAX,
-                generation: Arc::clone(&guard.generation),
+                generation,
             },
         );
         panic!("intentional semantic budget poison");

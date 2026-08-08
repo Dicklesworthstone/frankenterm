@@ -48,14 +48,15 @@ const RETRYABLE_APPROVAL_REQUIRED: i64 = 2;
 // blocking workers for the former five-second timeout; callers receive `Busy`.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 // Claim acquisition is pre-effect and therefore safe to retry as a whole when
-// SQLite reports BUSY. Keep retries store-local so direct and MCP callers obey
-// the same one-owner contract instead of exposing scheduler-dependent lock
+// SQLite reports BUSY or a concurrent first-open sidecar transition produces a
+// transient open failure. Keep retries store-local so direct and MCP callers
+// obey the same one-owner contract instead of exposing scheduler-dependent
 // failures. Eight attempts cap SQLite busy-wait plus scheduled backoff below
 // 300 ms; capability-path and schema validation time remains separately
 // bounded by ordinary filesystem/SQLite calls.
-const CLAIM_BUSY_MAX_ATTEMPTS: usize = 8;
-const CLAIM_BUSY_INITIAL_BACKOFF_MS: u64 = 1;
-const CLAIM_BUSY_MAX_BACKOFF_MS: u64 = 32;
+const CLAIM_RETRY_MAX_ATTEMPTS: usize = 8;
+const CLAIM_RETRY_INITIAL_BACKOFF_MS: u64 = 1;
+const CLAIM_RETRY_MAX_BACKOFF_MS: u64 = 32;
 const OWNER_NONCE_BYTES: usize = 32;
 const OWNER_LEASE_DURATION_MS: i64 = 60_000;
 const MAX_OWNER_LEASE_FUTURE_MS: i64 = OWNER_LEASE_DURATION_MS * 2;
@@ -85,8 +86,10 @@ pub enum SubmitIdempotencyError {
     LegacyStorePresent,
     #[error("submit idempotency database directory is unavailable")]
     DirectoryUnavailable,
-    #[error("submit idempotency database open failed")]
-    OpenFailed,
+    #[error("submit idempotency database open failed at {site}")]
+    OpenFailed {
+        site: SubmitIdempotencyOpenFailureSite,
+    },
     #[error("submit idempotency database is busy")]
     Busy,
     #[error("submit idempotency database configuration failed")]
@@ -125,7 +128,7 @@ impl SubmitIdempotencyError {
             Self::SymlinkRejected => "symlink_rejected",
             Self::LegacyStorePresent => "legacy_store_present",
             Self::DirectoryUnavailable => "directory_unavailable",
-            Self::OpenFailed => "open_failed",
+            Self::OpenFailed { .. } => "open_failed",
             Self::Busy => "busy",
             Self::ConfigurationFailed => "configuration_failed",
             Self::SchemaMismatch => "schema_mismatch",
@@ -142,10 +145,151 @@ impl SubmitIdempotencyError {
         }
     }
 
-    /// Only a real open failure or SQLite lock/busy result is retryable.
+    /// Only explicitly transient open sites or SQLite lock/busy results are
+    /// retryable. Permission and path-authority failures fail immediately.
     #[must_use]
     pub const fn is_retryable(self) -> bool {
-        matches!(self, Self::OpenFailed | Self::Busy)
+        match self {
+            Self::OpenFailed { site } => site.is_retryable(),
+            Self::Busy => true,
+            _ => false,
+        }
+    }
+}
+
+/// Finite, content-free site label for open-path diagnosis. The label never
+/// retains a caller path, filename, backend error, or SQL text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitIdempotencyOpenFailureSite {
+    LeafMetadata,
+    LeafType,
+    OpenedLeafMetadata,
+    OpenedLeafType,
+    NamedLeafMissing,
+    LeafOpen,
+    AuxiliaryOpen,
+    AuxiliaryMetadata,
+    AuxiliaryType,
+    DatabaseMissing,
+    DatabaseIdentity,
+    DatabaseCreate,
+    DatabaseMetadata,
+    DatabaseType,
+    SqliteCannotOpen,
+    SqliteCannotOpenNoTempDir,
+    SqliteCannotOpenIsDir,
+    SqliteCannotOpenFullPath,
+    SqliteCannotOpenConvertPath,
+    SqliteCannotOpenDirtyWal,
+    SqliteCannotOpenSymlink,
+    SqliteOpenPermission,
+    SqliteOpenIo,
+    SqliteOpenOther,
+    FilesystemPermission,
+    RusqliteOpenContract,
+}
+
+impl SubmitIdempotencyOpenFailureSite {
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::LeafMetadata
+                | Self::OpenedLeafMetadata
+                | Self::NamedLeafMissing
+                | Self::LeafOpen
+                | Self::AuxiliaryOpen
+                | Self::AuxiliaryMetadata
+                | Self::DatabaseMissing
+                | Self::DatabaseIdentity
+                | Self::DatabaseCreate
+                | Self::DatabaseMetadata
+                | Self::SqliteCannotOpen
+                | Self::SqliteCannotOpenDirtyWal
+                | Self::SqliteOpenIo
+                | Self::SqliteOpenOther
+        )
+    }
+}
+
+impl fmt::Display for SubmitIdempotencyOpenFailureSite {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::LeafMetadata => "leaf_metadata",
+            Self::LeafType => "leaf_type",
+            Self::OpenedLeafMetadata => "opened_leaf_metadata",
+            Self::OpenedLeafType => "opened_leaf_type",
+            Self::NamedLeafMissing => "named_leaf_missing",
+            Self::LeafOpen => "leaf_open",
+            Self::AuxiliaryOpen => "auxiliary_open",
+            Self::AuxiliaryMetadata => "auxiliary_metadata",
+            Self::AuxiliaryType => "auxiliary_type",
+            Self::DatabaseMissing => "database_missing",
+            Self::DatabaseIdentity => "database_identity",
+            Self::DatabaseCreate => "database_create",
+            Self::DatabaseMetadata => "database_metadata",
+            Self::DatabaseType => "database_type",
+            Self::SqliteCannotOpen => "sqlite_cannot_open",
+            Self::SqliteCannotOpenNoTempDir => "sqlite_cannot_open_no_temp_dir",
+            Self::SqliteCannotOpenIsDir => "sqlite_cannot_open_is_dir",
+            Self::SqliteCannotOpenFullPath => "sqlite_cannot_open_full_path",
+            Self::SqliteCannotOpenConvertPath => "sqlite_cannot_open_convert_path",
+            Self::SqliteCannotOpenDirtyWal => "sqlite_cannot_open_dirty_wal",
+            Self::SqliteCannotOpenSymlink => "sqlite_cannot_open_symlink",
+            Self::SqliteOpenPermission => "sqlite_open_permission",
+            Self::SqliteOpenIo => "sqlite_open_io",
+            Self::SqliteOpenOther => "sqlite_open_other",
+            Self::FilesystemPermission => "filesystem_permission",
+            Self::RusqliteOpenContract => "rusqlite_open_contract",
+        })
+    }
+}
+
+fn filesystem_open_failure_site(
+    error: &std::io::Error,
+    fallback: SubmitIdempotencyOpenFailureSite,
+) -> SubmitIdempotencyOpenFailureSite {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        SubmitIdempotencyOpenFailureSite::FilesystemPermission
+    } else {
+        fallback
+    }
+}
+
+fn sqlite_open_failure_site(error: &rusqlite::Error) -> SubmitIdempotencyOpenFailureSite {
+    use rusqlite::ffi::{
+        ErrorCode, SQLITE_CANTOPEN, SQLITE_CANTOPEN_CONVPATH, SQLITE_CANTOPEN_DIRTYWAL,
+        SQLITE_CANTOPEN_FULLPATH, SQLITE_CANTOPEN_ISDIR, SQLITE_CANTOPEN_NOTEMPDIR,
+        SQLITE_CANTOPEN_SYMLINK,
+    };
+
+    match error.sqlite_extended_error_code() {
+        Some(SQLITE_CANTOPEN) => SubmitIdempotencyOpenFailureSite::SqliteCannotOpen,
+        Some(SQLITE_CANTOPEN_NOTEMPDIR) => {
+            SubmitIdempotencyOpenFailureSite::SqliteCannotOpenNoTempDir
+        }
+        Some(SQLITE_CANTOPEN_ISDIR) => SubmitIdempotencyOpenFailureSite::SqliteCannotOpenIsDir,
+        Some(SQLITE_CANTOPEN_FULLPATH) => {
+            SubmitIdempotencyOpenFailureSite::SqliteCannotOpenFullPath
+        }
+        Some(SQLITE_CANTOPEN_CONVPATH) => {
+            SubmitIdempotencyOpenFailureSite::SqliteCannotOpenConvertPath
+        }
+        Some(SQLITE_CANTOPEN_DIRTYWAL) => {
+            SubmitIdempotencyOpenFailureSite::SqliteCannotOpenDirtyWal
+        }
+        Some(SQLITE_CANTOPEN_SYMLINK) => SubmitIdempotencyOpenFailureSite::SqliteCannotOpenSymlink,
+        Some(_) => match error.sqlite_error_code() {
+            Some(ErrorCode::PermissionDenied | ErrorCode::ReadOnly) => {
+                SubmitIdempotencyOpenFailureSite::SqliteOpenPermission
+            }
+            Some(ErrorCode::SystemIoFailure | ErrorCode::DiskFull) => {
+                SubmitIdempotencyOpenFailureSite::SqliteOpenIo
+            }
+            Some(_) => SubmitIdempotencyOpenFailureSite::SqliteOpenOther,
+            None => SubmitIdempotencyOpenFailureSite::RusqliteOpenContract,
+        },
+        None => SubmitIdempotencyOpenFailureSite::RusqliteOpenContract,
     }
 }
 
@@ -752,9 +896,21 @@ fn walk_store_directory_nofollow(
     ft_dir: &Path,
     mode: StoreOpenMode,
 ) -> Result<Option<(PathBuf, CapDir)>, SubmitIdempotencyError> {
-    let directory = normalized_absolute_path(ft_dir)?;
-    let (anchor, relative) = trusted_anchor_and_relative(&directory)?;
-    let mut current = CapDir::open_ambient_dir(&anchor, cap_std::ambient_authority())
+    let requested_directory = normalized_absolute_path(ft_dir)?;
+    let (anchor, relative) = trusted_anchor_and_relative(&requested_directory)?;
+    // SQLite's SQLITE_OPEN_NOFOLLOW rejects any symlink in the full filename,
+    // including a trusted platform alias such as macOS /var -> /private/var.
+    // Resolve only the ambient-authority anchor that the policy already trusts;
+    // every caller-controlled component below it is still walked one at a time
+    // with open_dir_nofollow and the pinned directory identity is revalidated
+    // after SQLite opens the database.
+    #[cfg(unix)]
+    let sqlite_anchor =
+        std::fs::canonicalize(&anchor).map_err(|_| SubmitIdempotencyError::DirectoryUnavailable)?;
+    #[cfg(not(unix))]
+    let sqlite_anchor = anchor;
+    let directory = sqlite_anchor.join(&relative);
+    let mut current = CapDir::open_ambient_dir(&sqlite_anchor, cap_std::ambient_authority())
         .map_err(|_| SubmitIdempotencyError::DirectoryUnavailable)?;
     for component in relative.components() {
         let std::path::Component::Normal(name) = component else {
@@ -820,10 +976,17 @@ fn store_leaf_metadata_nofollow(
         Ok(metadata) if metadata.file_type().is_symlink() => {
             Err(SubmitIdempotencyError::SymlinkRejected)
         }
-        Ok(metadata) if !metadata.is_file() => Err(SubmitIdempotencyError::OpenFailed),
+        Ok(metadata) if !metadata.is_file() => Err(SubmitIdempotencyError::OpenFailed {
+            site: SubmitIdempotencyOpenFailureSite::LeafType,
+        }),
         Ok(metadata) => Ok(Some(metadata)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),
-        Err(_) => Err(SubmitIdempotencyError::OpenFailed),
+        Err(error) => Err(SubmitIdempotencyError::OpenFailed {
+            site: filesystem_open_failure_site(
+                &error,
+                SubmitIdempotencyOpenFailureSite::LeafMetadata,
+            ),
+        }),
     }
 }
 
@@ -834,9 +997,16 @@ fn harden_opened_store_leaf(
 ) -> Result<(), SubmitIdempotencyError> {
     let opened_metadata = file
         .metadata()
-        .map_err(|_| SubmitIdempotencyError::OpenFailed)?;
+        .map_err(|error| SubmitIdempotencyError::OpenFailed {
+            site: filesystem_open_failure_site(
+                &error,
+                SubmitIdempotencyOpenFailureSite::OpenedLeafMetadata,
+            ),
+        })?;
     if !opened_metadata.is_file() {
-        return Err(SubmitIdempotencyError::OpenFailed);
+        return Err(SubmitIdempotencyError::OpenFailed {
+            site: SubmitIdempotencyOpenFailureSite::OpenedLeafType,
+        });
     }
     #[cfg(unix)]
     if opened_metadata.permissions().mode() & 0o7777 != 0o600 {
@@ -844,8 +1014,11 @@ fn harden_opened_store_leaf(
             .map_err(|_| SubmitIdempotencyError::ConfigurationFailed)?;
     }
 
-    let named_metadata = store_leaf_metadata_nofollow(directory, filename, true)?
-        .ok_or(SubmitIdempotencyError::OpenFailed)?;
+    let named_metadata = store_leaf_metadata_nofollow(directory, filename, true)?.ok_or(
+        SubmitIdempotencyError::OpenFailed {
+            site: SubmitIdempotencyOpenFailureSite::NamedLeafMissing,
+        },
+    )?;
     if same_file_identity(&opened_metadata, &named_metadata) {
         Ok(())
     } else {
@@ -863,17 +1036,81 @@ fn harden_existing_store_leaf(
     };
     let mut options = CapOpenOptions::new();
     options.read(true).write(true).follow(FollowSymlinks::No);
-    let file = directory
-        .open_with(filename, &options)
-        .map_err(|_| SubmitIdempotencyError::OpenFailed)?;
+    let file = directory.open_with(filename, &options).map_err(|error| {
+        SubmitIdempotencyError::OpenFailed {
+            site: filesystem_open_failure_site(&error, SubmitIdempotencyOpenFailureSite::LeafOpen),
+        }
+    })?;
     let opened_metadata = file
         .metadata()
-        .map_err(|_| SubmitIdempotencyError::OpenFailed)?;
+        .map_err(|error| SubmitIdempotencyError::OpenFailed {
+            site: filesystem_open_failure_site(
+                &error,
+                SubmitIdempotencyOpenFailureSite::OpenedLeafMetadata,
+            ),
+        })?;
     if !same_file_identity(&before_open, &opened_metadata) {
         return Err(SubmitIdempotencyError::SymlinkRejected);
     }
     harden_opened_store_leaf(directory, filename, &file)?;
     Ok(true)
+}
+
+fn harden_optional_auxiliary_leaf(
+    directory: &CapDir,
+    filename: &str,
+) -> Result<bool, SubmitIdempotencyError> {
+    let Some(before_open) = store_leaf_metadata_nofollow(directory, filename, false)? else {
+        return Ok(false);
+    };
+    let mut options = CapOpenOptions::new();
+    options.read(true).write(true).follow(FollowSymlinks::No);
+    let file = match directory.open_with(filename, &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(SubmitIdempotencyError::OpenFailed {
+                site: filesystem_open_failure_site(
+                    &error,
+                    SubmitIdempotencyOpenFailureSite::AuxiliaryOpen,
+                ),
+            });
+        }
+    };
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| SubmitIdempotencyError::OpenFailed {
+            site: filesystem_open_failure_site(
+                &error,
+                SubmitIdempotencyOpenFailureSite::AuxiliaryMetadata,
+            ),
+        })?;
+    if !same_file_identity(&before_open, &opened_metadata) {
+        return Err(SubmitIdempotencyError::SymlinkRejected);
+    }
+    if !opened_metadata.is_file() {
+        return Err(SubmitIdempotencyError::OpenFailed {
+            site: SubmitIdempotencyOpenFailureSite::AuxiliaryType,
+        });
+    }
+    #[cfg(unix)]
+    if opened_metadata.permissions().mode() & 0o7777 != 0o600 {
+        file.set_permissions(cap_std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| SubmitIdempotencyError::ConfigurationFailed)?;
+    }
+
+    // SQLite may unlink a rollback journal or WAL/SHM sidecar after the first
+    // no-follow observation while another connection is opening. Absence is a
+    // valid terminal state for these optional leaves. A replacement that is
+    // present must still match the pinned file identity or fail closed.
+    let Some(named_metadata) = store_leaf_metadata_nofollow(directory, filename, false)? else {
+        return Ok(false);
+    };
+    if same_file_identity(&opened_metadata, &named_metadata) {
+        Ok(true)
+    } else {
+        Err(SubmitIdempotencyError::SymlinkRejected)
+    }
 }
 
 #[cfg(unix)]
@@ -905,7 +1142,9 @@ fn ensure_private_database_leaf(
         return Ok(());
     }
     if matches!(mode, StoreOpenMode::Existing) {
-        return Err(SubmitIdempotencyError::OpenFailed);
+        return Err(SubmitIdempotencyError::OpenFailed {
+            site: SubmitIdempotencyOpenFailureSite::DatabaseMissing,
+        });
     }
 
     let mut options = CapOpenOptions::new();
@@ -928,16 +1167,23 @@ fn ensure_private_database_leaf(
             if harden_existing_store_leaf(directory, STORE_FILENAME, true)? {
                 Ok(())
             } else {
-                Err(SubmitIdempotencyError::OpenFailed)
+                Err(SubmitIdempotencyError::OpenFailed {
+                    site: SubmitIdempotencyOpenFailureSite::DatabaseIdentity,
+                })
             }
         }
-        Err(_) => Err(SubmitIdempotencyError::OpenFailed),
+        Err(error) => Err(SubmitIdempotencyError::OpenFailed {
+            site: filesystem_open_failure_site(
+                &error,
+                SubmitIdempotencyOpenFailureSite::DatabaseCreate,
+            ),
+        }),
     }
 }
 
 fn harden_store_auxiliary_leaves(directory: &CapDir) -> Result<(), SubmitIdempotencyError> {
     for filename in STORE_AUXILIARY_FILENAMES {
-        let _present = harden_existing_store_leaf(directory, filename, false)?;
+        let _present = harden_optional_auxiliary_leaf(directory, filename)?;
     }
     Ok(())
 }
@@ -960,14 +1206,25 @@ fn prepare_store_path(
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(SubmitIdempotencyError::SymlinkRejected);
         }
-        Ok(metadata) if !metadata.is_file() => return Err(SubmitIdempotencyError::OpenFailed),
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(SubmitIdempotencyError::OpenFailed {
+                site: SubmitIdempotencyOpenFailureSite::DatabaseType,
+            });
+        }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if matches!(mode, StoreOpenMode::Existing) {
                 return Ok(None);
             }
         }
-        Err(_) => return Err(SubmitIdempotencyError::OpenFailed),
+        Err(error) => {
+            return Err(SubmitIdempotencyError::OpenFailed {
+                site: filesystem_open_failure_site(
+                    &error,
+                    SubmitIdempotencyOpenFailureSite::DatabaseMetadata,
+                ),
+            });
+        }
     }
     for filename in STORE_AUXILIARY_FILENAMES {
         let _metadata = store_leaf_metadata_nofollow(&pinned_directory, filename, false)?;
@@ -1043,8 +1300,14 @@ fn open_store(
     if matches!(mode, StoreOpenMode::Create) {
         flags |= OpenFlags::SQLITE_OPEN_CREATE;
     }
-    let conn = Connection::open_with_flags(&prepared.database_path, flags)
-        .map_err(|_| SubmitIdempotencyError::OpenFailed)?;
+    let conn = Connection::open_with_flags(&prepared.database_path, flags).map_err(|error| {
+        map_sqlite_error(
+            &error,
+            SubmitIdempotencyError::OpenFailed {
+                site: sqlite_open_failure_site(&error),
+            },
+        )
+    })?;
     let Some((_, current_directory)) =
         walk_store_directory_nofollow(&prepared.directory_path, StoreOpenMode::Existing)?
     else {
@@ -1458,8 +1721,8 @@ pub fn claim(
     ft_dir: &Path,
     binding: &SubmitIdempotencyBinding,
 ) -> Result<ClaimOutcome, SubmitIdempotencyError> {
-    let mut backoff_ms = CLAIM_BUSY_INITIAL_BACKOFF_MS;
-    for attempt in 1..=CLAIM_BUSY_MAX_ATTEMPTS {
+    let mut backoff_ms = CLAIM_RETRY_INITIAL_BACKOFF_MS;
+    for attempt in 1..=CLAIM_RETRY_MAX_ATTEMPTS {
         match claim_with_nonce_factory_limits_and_clock(
             ft_dir,
             binding,
@@ -1467,9 +1730,9 @@ pub fn claim(
             PRODUCTION_LIMITS,
             now_unix_ms,
         ) {
-            Err(SubmitIdempotencyError::Busy) if attempt < CLAIM_BUSY_MAX_ATTEMPTS => {
+            Err(error) if error.is_retryable() && attempt < CLAIM_RETRY_MAX_ATTEMPTS => {
                 std::thread::sleep(Duration::from_millis(backoff_ms));
-                backoff_ms = backoff_ms.saturating_mul(2).min(CLAIM_BUSY_MAX_BACKOFF_MS);
+                backoff_ms = backoff_ms.saturating_mul(2).min(CLAIM_RETRY_MAX_BACKOFF_MS);
             }
             result => return result,
         }
@@ -1528,7 +1791,9 @@ where
         return Err(SubmitIdempotencyError::CapacityExceeded);
     }
     let mut conn =
-        open_store(ft_dir, StoreOpenMode::Create)?.ok_or(SubmitIdempotencyError::OpenFailed)?;
+        open_store(ft_dir, StoreOpenMode::Create)?.ok_or(SubmitIdempotencyError::OpenFailed {
+            site: SubmitIdempotencyOpenFailureSite::DatabaseMissing,
+        })?;
     let tx = map_sqlite(
         conn.transaction_with_behavior(TransactionBehavior::Immediate),
         SubmitIdempotencyError::ClaimFailed,
@@ -2193,6 +2458,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sqlite_open_failure_classification_is_finite_and_content_free() {
+        let canary = "credential-canary /private/database/path";
+        let raw = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::CannotOpen,
+                extended_code: rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK,
+            },
+            Some(canary.to_owned()),
+        );
+        assert!(raw.to_string().contains(canary));
+
+        let site = sqlite_open_failure_site(&raw);
+        assert_eq!(
+            site,
+            SubmitIdempotencyOpenFailureSite::SqliteCannotOpenSymlink
+        );
+        assert!(!site.is_retryable());
+        let classified = SubmitIdempotencyError::OpenFailed { site };
+        assert_eq!(classified.error_class(), "open_failed");
+        assert!(!classified.to_string().contains(canary));
+
+        let filesystem_error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, canary);
+        let filesystem_site = filesystem_open_failure_site(
+            &filesystem_error,
+            SubmitIdempotencyOpenFailureSite::LeafOpen,
+        );
+        assert_eq!(
+            filesystem_site,
+            SubmitIdempotencyOpenFailureSite::FilesystemPermission
+        );
+        assert!(!filesystem_site.is_retryable());
+        assert!(
+            !SubmitIdempotencyError::OpenFailed {
+                site: filesystem_site,
+            }
+            .to_string()
+            .contains(canary)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_path_resolves_only_the_trusted_temp_anchor_alias() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let canonical = std::fs::canonicalize(temp.path()).expect("canonical tempdir");
+        let (sqlite_directory, pinned_directory) =
+            walk_store_directory_nofollow(temp.path(), StoreOpenMode::Existing)
+                .expect("walk trusted temp path")
+                .expect("existing temp directory");
+        assert_eq!(sqlite_directory, canonical);
+
+        let canonical_directory =
+            CapDir::open_ambient_dir(&canonical, cap_std::ambient_authority())
+                .expect("open canonical tempdir");
+        assert!(same_directory_identity(
+            &pinned_directory,
+            &canonical_directory
+        ));
+    }
+
     fn claim_without_entropy_at(
         ft_dir: &Path,
         binding: &SubmitIdempotencyBinding,
@@ -2818,6 +3144,9 @@ mod tests {
     }
 
     #[test]
+    // All worker threads must be spawned eagerly before any join waits at the
+    // eight-party barrier; fusing these iterators would deadlock the test.
+    #[allow(clippy::needless_collect)]
     fn concurrent_callers_have_exactly_one_owner() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = Arc::new(dir.path().to_path_buf());

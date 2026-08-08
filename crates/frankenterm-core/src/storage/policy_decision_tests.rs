@@ -1218,7 +1218,15 @@ fn each_migration_step_can_be_reapplied_without_panicking() {
     // covered separately above.
     for migration in MIGRATIONS.iter().skip(1) {
         let conn = Connection::open_in_memory().unwrap();
-        initialize_schema(&conn).unwrap();
+        // Build the head DDL directly. Calling `initialize_schema` here would
+        // run the complete migration plan before the per-step assertion and
+        // turn any fresh-init regression into an unhelpful generic setup
+        // failure instead of identifying the first non-idempotent migration.
+        let (pragma_preamble, schema_body) = split_schema_sql_pragmas();
+        conn.execute_batch(&pragma_preamble)
+            .expect("apply schema PRAGMA preamble");
+        conn.execute_batch(&schema_body)
+            .expect("apply head schema body");
 
         let step = MigrationStep {
             migration_version: migration.version,

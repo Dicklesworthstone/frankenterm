@@ -2244,14 +2244,87 @@ fn require_exact_table_column_count(
 }
 
 fn compact_schema_sql(sql: &str) -> String {
-    let compact = sql
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|character| !character.is_ascii_whitespace())
-        .collect::<String>();
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Single,
+        Double,
+        Backtick,
+        Bracket,
+    }
+
+    let mut compact = String::with_capacity(sql.len());
+    let mut quote = None;
+    let mut characters = sql.chars().peekable();
+    while let Some(character) = characters.next() {
+        match quote {
+            Some(Quote::Single) => {
+                compact.push(character);
+                if character == '\'' {
+                    if characters.peek() == Some(&'\'') {
+                        compact.push(characters.next().expect("peeked escaped quote"));
+                    } else {
+                        quote = None;
+                    }
+                }
+            }
+            Some(Quote::Double) => {
+                compact.push(character);
+                if character == '"' {
+                    if characters.peek() == Some(&'"') {
+                        compact.push(characters.next().expect("peeked escaped identifier quote"));
+                    } else {
+                        quote = None;
+                    }
+                }
+            }
+            Some(Quote::Backtick) => {
+                compact.push(character);
+                if character == '`' {
+                    if characters.peek() == Some(&'`') {
+                        compact.push(characters.next().expect("peeked escaped backtick"));
+                    } else {
+                        quote = None;
+                    }
+                }
+            }
+            Some(Quote::Bracket) => {
+                compact.push(character);
+                if character == ']' {
+                    quote = None;
+                }
+            }
+            None => match character {
+                '\'' => {
+                    compact.push(character);
+                    quote = Some(Quote::Single);
+                }
+                '"' => {
+                    compact.push(character);
+                    quote = Some(Quote::Double);
+                }
+                '`' => {
+                    compact.push(character);
+                    quote = Some(Quote::Backtick);
+                }
+                '[' => {
+                    compact.push(character);
+                    quote = Some(Quote::Bracket);
+                }
+                character if character.is_ascii_whitespace() => {}
+                character => compact.push(character.to_ascii_lowercase()),
+            },
+        }
+    }
+    while compact.ends_with(';') {
+        compact.pop();
+    }
+    if let Some(suffix) = compact.strip_prefix("createuniqueindexifnotexists") {
+        return format!("createuniqueindex{suffix}");
+    }
+    if let Some(suffix) = compact.strip_prefix("createindexifnotexists") {
+        return format!("createindex{suffix}");
+    }
     compact
-        .trim_end_matches(';')
-        .replace("createindexifnotexists", "createindex")
 }
 
 fn load_schema_object_sql(
@@ -5263,12 +5336,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schema_sql_comparison_ignores_statement_terminators() {
+    fn schema_sql_comparison_normalizes_only_non_semantic_syntax() {
         assert_eq!(
             compact_schema_sql("CREATE INDEX IF NOT EXISTS idx_example ON example(value DESC);",),
             compact_schema_sql("CREATE INDEX idx_example ON example(value DESC)"),
             "sqlite_schema may omit the semicolon accepted by execute_batch"
         );
+        assert_eq!(
+            compact_schema_sql("CREATE UNIQUE INDEX IF NOT EXISTS idx_unique ON example(value);",),
+            compact_schema_sql("CREATE UNIQUE INDEX idx_unique ON example(value)"),
+            "sqlite_schema also omits IF NOT EXISTS from unique indexes"
+        );
+        assert!(
+            compact_schema_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_literal ON example(value) \
+                 WHERE value <> 'createuniqueindexifnotexists';",
+            )
+            .ends_with("wherevalue<>'createuniqueindexifnotexists'"),
+            "normalization must not rewrite SQL string literals that happen to contain the prefix"
+        );
+        assert_ne!(
+            compact_schema_sql(
+                "CREATE UNIQUE INDEX idx_literal ON example(value) WHERE value = 'A B';",
+            ),
+            compact_schema_sql(
+                "create unique index idx_literal on example(value) where value = 'ab'",
+            ),
+            "normalization must preserve case and whitespace inside SQL string literals"
+        );
+        assert_eq!(
+            compact_schema_sql(
+                "CREATE INDEX idx_literal ON example(value) WHERE value = 'O''Reilly A';",
+            ),
+            "createindexidx_literalonexample(value)wherevalue='O''Reilly A'",
+            "an escaped quote must not end literal-preservation mode early"
+        );
+        assert_eq!(
+            compact_schema_sql(
+                "CREATE INDEX IF NOT EXISTS \"Index Name\" ON [Table Name](`Column Name`);",
+            ),
+            "createindex\"Index Name\"on[Table Name](`Column Name`)",
+            "quoted identifier spelling must remain fail-closed while surrounding SQL is normalized"
+        );
+    }
+
+    #[test]
+    fn head_schema_ddl_satisfies_checkpoint_identity_v38_contract() {
+        let conn = Connection::open_in_memory().expect("open head-schema fixture");
+        let (pragma_preamble, schema_body) = split_schema_sql_pragmas();
+        conn.execute_batch(&pragma_preamble)
+            .expect("apply schema PRAGMA preamble");
+        conn.execute_batch(&schema_body)
+            .expect("apply head schema body");
+
+        validate_checkpoint_identity_v38_schema(&conn)
+            .expect("head DDL must satisfy the v38 checkpoint authority contract");
     }
 
     fn create_v35_checkpoint_fixture(conn: &Connection) {
