@@ -3991,12 +3991,28 @@ impl SnapshotEngine {
             Ok(result) => {
                 schedule.record_authoritative_success(Instant::now());
                 let total = result.total_sessions_deleted();
-                if result.any_work_done() {
+                if result.size_ineligible_shortfall_bytes > 0 {
+                    tracing::warn!(
+                        sessions_deleted = total,
+                        size_measured_bytes = result.size_measured_bytes,
+                        size_deleted_bytes = result.size_deleted_bytes,
+                        size_retained_bytes = result.size_retained_bytes,
+                        size_ineligible_shortfall_bytes =
+                            result.size_ineligible_shortfall_bytes,
+                        interval_hours,
+                        "Session retention cleanup completed above its size budget because no more sessions were eligible"
+                    );
+                } else if result.any_work_done() {
                     tracing::info!(
                         sessions_deleted = total,
                         orphaned_restore_lifecycle_rows = result.orphaned_restore_lifecycle_rows,
                         orphaned_checkpoints = result.orphaned_checkpoints,
                         orphaned_pane_states = result.orphaned_pane_states,
+                        size_measured_bytes = result.size_measured_bytes,
+                        size_deleted_bytes = result.size_deleted_bytes,
+                        size_retained_bytes = result.size_retained_bytes,
+                        size_ineligible_shortfall_bytes =
+                            result.size_ineligible_shortfall_bytes,
                         explicit_vacuum_attempted = false,
                         expected_default_free_space_policy = "auto_vacuum_none_freelist_reuse",
                         interval_hours,
@@ -4004,6 +4020,11 @@ impl SnapshotEngine {
                     );
                 } else {
                     tracing::debug!(
+                        size_measured_bytes = result.size_measured_bytes,
+                        size_deleted_bytes = result.size_deleted_bytes,
+                        size_retained_bytes = result.size_retained_bytes,
+                        size_ineligible_shortfall_bytes =
+                            result.size_ineligible_shortfall_bytes,
                         interval_hours,
                         "Session retention cleanup: nothing to remove"
                     );
@@ -6050,9 +6071,12 @@ fn save_checkpoint_authoritatively_sync(
             require_exactly_one_changed_row(updated_session)?;
         }
 
-        // Direct execute counts deliberately exclude trigger side effects. The
-        // connection-wide DML delta therefore proves that the transaction changed
-        // exactly the checkpoint, its pane rows, and the session authority row.
+        // Direct execute counts deliberately exclude trigger side effects, while
+        // SQLite's connection-wide total_changes() includes them. Schema v40
+        // performs exactly one canonical retained-size summary write for every
+        // session/checkpoint/pane source-row mutation below, so the exact DML
+        // witness is twice the source-row count. The trigger allowlist above and
+        // current-schema exact-body validation make that multiplier authoritative.
         // Avoid re-reading every just-written JSON payload here: that doubled
         // large-session I/O and allocation while the SQLite writer lock was held.
         let total_changes_after: i64 =
@@ -6060,6 +6084,7 @@ fn save_checkpoint_authoritatively_sync(
         let expected_changes = prepared
             .pane_count_sql
             .checked_add(3)
+            .and_then(|source_changes| source_changes.checked_mul(2))
             .ok_or_else(|| snapshot_integer_overflow("snapshot expected DML count overflow"))?;
         if total_changes_after.checked_sub(total_changes_before) != Some(expected_changes) {
             return Err(snapshot_integer_overflow(

@@ -7,8 +7,8 @@
 //!
 //! 1. Delete sessions older than `max_age_days` (skip active sessions)
 //! 2. Delete excess closed sessions beyond `max_closed_sessions` (oldest first)
-//! 3. If the summed snapshot pane-state JSON estimate exceeds
-//!    `max_total_size_mb`, delete oldest closed sessions
+//! 3. If the schema-v40 exact logical retained-payload authority exceeds
+//!    `max_total_size_mb`, delete oldest eligible closed sessions
 //! 4. Clean orphaned data (lifecycle/checkpoint rows without a session and
 //!    pane-state rows without a checkpoint)
 //!
@@ -486,9 +486,7 @@ fn retained_size_contract_error(message: &'static str) -> rusqlite::Error {
 /// agreement with the trigger-maintained O(sessions) authority before cleanup
 /// trusts a byte. This scan is intentionally confined to the infrequent
 /// retention transaction; normal mutation and decision paths remain bounded.
-fn validate_session_retained_size_authority(
-    conn: &Connection,
-) -> Result<(), rusqlite::Error> {
+fn validate_session_retained_size_authority(conn: &Connection) -> Result<(), rusqlite::Error> {
     let invalid_row: bool = conn.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM mux_sessions s
@@ -601,7 +599,12 @@ fn delete_sessions_by_size(
     conn: &Connection,
     max_total_mb: u64,
 ) -> Result<SizeCleanupOutcome, rusqlite::Error> {
-    let max_bytes = max_total_mb.saturating_mul(1_024).saturating_mul(1_024);
+    let max_bytes = max_total_mb
+        .checked_mul(1_024)
+        .and_then(|bytes| bytes.checked_mul(1_024))
+        .ok_or_else(|| {
+            retained_size_contract_error("session retained-size budget conversion overflow")
+        })?;
 
     // Keep the measurement, candidate set, and deletions in one transaction.
     // Without this boundary, a later DELETE failure left earlier session
@@ -734,9 +737,8 @@ fn delete_sessions_by_size(
         [],
         |row| row.get(0),
     )?;
-    let stored_retained_bytes = u64::try_from(stored_retained_bytes).map_err(|_| {
-        rusqlite::Error::IntegralValueOutOfRange(0, stored_retained_bytes)
-    })?;
+    let stored_retained_bytes = u64::try_from(stored_retained_bytes)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, stored_retained_bytes))?;
     if stored_retained_bytes != retained_bytes {
         return Err(retained_size_contract_error(
             "session retained-size deletion receipt disagrees with durable summary",
@@ -1114,6 +1116,35 @@ mod tests {
             .unwrap();
         conn.execute_batch(crate::storage::SCHEMA_SQL).unwrap();
         conn
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum LegacyOrphanInsertSurface {
+        Checkpoint,
+        PaneState,
+        RestoreLifecycle,
+    }
+
+    fn seed_legacy_orphan<T>(
+        conn: &Connection,
+        surface: LegacyOrphanInsertSurface,
+        seed: impl FnOnce(&Connection) -> T,
+    ) -> T {
+        let drop_trigger_sql = match surface {
+            LegacyOrphanInsertSurface::Checkpoint => {
+                "DROP TRIGGER session_checkpoints_retained_size_ai;"
+            }
+            LegacyOrphanInsertSurface::PaneState => "DROP TRIGGER mux_pane_state_retained_size_ai;",
+            LegacyOrphanInsertSurface::RestoreLifecycle => {
+                "DROP TRIGGER restore_attempt_lifecycle_retained_size_ai;"
+            }
+        };
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(drop_trigger_sql).unwrap();
+        let output = seed(conn);
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(crate::storage::SCHEMA_SQL).unwrap();
+        output
     }
 
     fn insert_session(conn: &Connection, id: &str, created_at: i64, shutdown_clean: bool) {
@@ -1656,6 +1687,195 @@ mod tests {
     }
 
     #[test]
+    fn size_cleanup_honors_exact_budget_and_plus_one_boundary() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        insert_session(&conn, "boundary", now, true);
+        let checkpoint_id = insert_checkpoint(&conn, "boundary", now, 0);
+        let baseline: i64 = conn
+            .query_row(
+                "SELECT retained_bytes FROM session_retained_size
+                 WHERE session_id = 'boundary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let budget = 1_024_u64 * 1_024;
+        let padding_len = usize::try_from(budget - u64::try_from(baseline).unwrap()).unwrap();
+        let exact_budget_payload = format!("\"{}\"", "x".repeat(padding_len - 2));
+        conn.execute(
+            "UPDATE session_checkpoints SET topology_json = ?1 WHERE id = ?2",
+            rusqlite::params![exact_budget_payload, checkpoint_id],
+        )
+        .unwrap();
+
+        let at_budget = delete_sessions_by_size(&conn, 1).unwrap();
+        assert_eq!(at_budget.measured_bytes, budget);
+        assert_eq!(at_budget.deleted, 0);
+        assert_eq!(at_budget.deleted_bytes, 0);
+        assert_eq!(at_budget.retained_bytes, budget);
+        assert_eq!(at_budget.ineligible_shortfall_bytes, 0);
+
+        let plus_one_payload = format!("\"{}\"", "x".repeat(padding_len - 1));
+        conn.execute(
+            "UPDATE session_checkpoints SET topology_json = ?1 WHERE id = ?2",
+            rusqlite::params![plus_one_payload, checkpoint_id],
+        )
+        .unwrap();
+        let over_budget = delete_sessions_by_size(&conn, 1).unwrap();
+        assert_eq!(over_budget.measured_bytes, budget + 1);
+        assert_eq!(over_budget.deleted, 1);
+        assert_eq!(over_budget.deleted_bytes, budget + 1);
+        assert_eq!(over_budget.retained_bytes, 0);
+        assert_eq!(over_budget.ineligible_shortfall_bytes, 0);
+    }
+
+    #[test]
+    fn size_cleanup_rejects_summary_drift_before_any_deletion() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        insert_session(&conn, "drifted", now, true);
+        insert_checkpoint(&conn, "drifted", now, 2 * 1_024 * 1_024);
+        conn.execute(
+            "UPDATE session_retained_size
+             SET checkpoint_row_bytes = checkpoint_row_bytes + 1
+             WHERE session_id = 'drifted'",
+            [],
+        )
+        .unwrap();
+
+        let error = delete_sessions_by_size(&conn, 1)
+            .expect_err("trigger authority drift must fail before eviction");
+        assert!(matches!(error, rusqlite::Error::ToSqlConversionFailure(_)));
+        assert_eq!(count_sessions(&conn), 1);
+        assert_eq!(count_checkpoints(&conn), 1);
+    }
+
+    #[test]
+    fn retained_size_trigger_overflow_and_underflow_are_atomic() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        insert_session(&conn, "arithmetic", now, false);
+        let session_bytes: i64 = conn
+            .query_row(
+                "SELECT session_row_bytes FROM session_retained_size
+                 WHERE session_id = 'arithmetic'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE session_retained_size
+             SET checkpoint_row_bytes = ?1
+             WHERE session_id = 'arithmetic'",
+            [i64::MAX - session_bytes],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT OR IGNORE INTO session_checkpoints (
+                     session_id, checkpoint_at, checkpoint_type, state_hash,
+                     pane_count, total_bytes
+                 ) VALUES ('arithmetic', ?1, 'periodic', 'hash', 0, 0)",
+                [now],
+            )
+            .is_err(),
+            "RAISE(ABORT) must defeat outer OR IGNORE at the i64 boundary"
+        );
+        assert_eq!(count_checkpoints(&conn), 0);
+
+        conn.execute(
+            "UPDATE session_retained_size
+             SET checkpoint_row_bytes = 0
+             WHERE session_id = 'arithmetic'",
+            [],
+        )
+        .unwrap();
+        let checkpoint_id = insert_checkpoint(&conn, "arithmetic", now, 0);
+        conn.execute(
+            "UPDATE session_retained_size
+             SET checkpoint_row_bytes = 0
+             WHERE session_id = 'arithmetic'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "DELETE FROM session_checkpoints WHERE id = ?1",
+                [checkpoint_id],
+            )
+            .is_err(),
+            "trigger subtraction below zero must roll back the deletion"
+        );
+        assert_eq!(count_checkpoints(&conn), 1);
+    }
+
+    #[test]
+    fn pane_and_lifecycle_overflow_guards_defeat_outer_or_ignore() {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        insert_session(&conn, "additive-guards", now, false);
+        let source_id = insert_checkpoint(&conn, "additive-guards", now, 0);
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, checkpoint_role
+             ) VALUES ('additive-guards', ?1, 'startup', 'intent', 0, 0,
+                       'restore_intent')",
+            [now + 1],
+        )
+        .unwrap();
+        let intent_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "UPDATE session_retained_size
+             SET pane_state_row_bytes = 9223372036854775807 - retained_bytes
+             WHERE session_id = 'additive-guards'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT OR IGNORE INTO mux_pane_state (
+                     checkpoint_id, pane_id, terminal_state_json
+                 ) VALUES (?1, 7, '{}')",
+                [source_id],
+            )
+            .is_err()
+        );
+        assert_eq!(count_pane_states(&conn), 0);
+
+        conn.execute(
+            "UPDATE session_retained_size
+             SET pane_state_row_bytes = 0,
+                 restore_lifecycle_row_bytes =
+                     9223372036854775807
+                     - (session_row_bytes + checkpoint_row_bytes)
+             WHERE session_id = 'additive-guards'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT OR IGNORE INTO restore_attempt_lifecycle (
+                     intent_checkpoint_id, session_id, source_checkpoint_id,
+                     status, created_at
+                 ) VALUES (?1, 'additive-guards', ?2, 'intent', ?3)",
+                rusqlite::params![intent_id, source_id, now + 2],
+            )
+            .is_err()
+        );
+        let lifecycle_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM restore_attempt_lifecycle",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lifecycle_rows, 0);
+    }
+
+    #[test]
     fn size_cleanup_evicts_by_authoritative_checkpoint_recency() {
         let conn = make_test_db();
         let now = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer");
@@ -1833,6 +2053,52 @@ mod tests {
     }
 
     #[test]
+    fn size_receipt_and_active_shortfall_remain_consistent_across_restart() {
+        let file = tempfile::NamedTempFile::new().expect("temporary retention database");
+        let path = file.path().to_path_buf();
+        let conn = Connection::open(&path).expect("open retention database");
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(crate::storage::SCHEMA_SQL).unwrap();
+        let now = epoch_ms() as i64;
+        insert_session(&conn, "restart-active", now, false);
+        insert_checkpoint(&conn, "restart-active", now, 2 * 1_024 * 1_024);
+        insert_session(&conn, "restart-closed", now - 1, true);
+        insert_checkpoint(&conn, "restart-closed", now - 1, 400 * 1_024);
+        drop(conn);
+
+        let reopened = Connection::open(&path).expect("reopen before cleanup");
+        reopened
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        let outcome = delete_sessions_by_size(&reopened, 1).unwrap();
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(
+            outcome.measured_bytes,
+            outcome.deleted_bytes + outcome.retained_bytes
+        );
+        assert_eq!(
+            outcome.ineligible_shortfall_bytes,
+            outcome.retained_bytes - 1_024 * 1_024
+        );
+        drop(reopened);
+
+        let restarted = Connection::open(&path).expect("reopen after cleanup");
+        let retained: i64 = restarted
+            .query_row(
+                "SELECT COALESCE(SUM(retained_bytes), 0)
+                 FROM session_retained_size",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(u64::try_from(retained).unwrap(), outcome.retained_bytes);
+        assert_eq!(
+            outcome.ineligible_shortfall_bytes,
+            outcome.retained_bytes - 1_024 * 1_024
+        );
+    }
+
+    #[test]
     fn size_cleanup_charges_and_deletes_closed_session_without_payload_checkpoint() {
         let conn = make_test_db();
         let now = epoch_ms() as i64;
@@ -1859,15 +2125,15 @@ mod tests {
 
         // Simulate legacy/corrupt orphan data. Its 2 MiB is reclaimed by the
         // orphan phase, not by evicting an unrelated valid session.
-        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        conn.execute(
-            "INSERT INTO session_checkpoints
-             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
-             VALUES ('orphan-session', ?1, 'periodic', 'orphan', 0, ?2)",
-            rusqlite::params![now, 2 * 1024 * 1024],
-        )
-        .unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        seed_legacy_orphan(&conn, LegacyOrphanInsertSurface::Checkpoint, |conn| {
+            conn.execute(
+                "INSERT INTO session_checkpoints
+                 (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
+                 VALUES ('orphan-session', ?1, 'periodic', 'orphan', 0, ?2)",
+                rusqlite::params![now, 2 * 1024 * 1024],
+            )
+            .unwrap();
+        });
 
         let outcome = delete_sessions_by_size(&conn, 1).unwrap();
         assert_eq!(outcome.deleted, 0);
@@ -1921,15 +2187,15 @@ mod tests {
         insert_checkpoint(&conn, "valid", now, 1024);
 
         // Temporarily disable FK to insert orphaned checkpoint (simulates corruption)
-        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        conn.execute(
-            "INSERT INTO session_checkpoints
-             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
-             VALUES ('orphan-sess', ?1, 'periodic', '0123456789abcdef', 0, 0)",
-            [now],
-        )
-        .unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        seed_legacy_orphan(&conn, LegacyOrphanInsertSurface::Checkpoint, |conn| {
+            conn.execute(
+                "INSERT INTO session_checkpoints
+                 (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
+                 VALUES ('orphan-sess', ?1, 'periodic', '0123456789abcdef', 0, 0)",
+                [now],
+            )
+            .unwrap();
+        });
 
         assert_eq!(count_checkpoints(&conn), 2);
 
@@ -1948,15 +2214,15 @@ mod tests {
         insert_pane_state(&conn, cp_id, 1);
 
         // Temporarily disable FK to insert orphaned pane_state (simulates corruption)
-        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        conn.execute(
-            "INSERT INTO mux_pane_state
-             (checkpoint_id, pane_id, terminal_state_json)
-             VALUES (99999, 42, '{}')",
-            [],
-        )
-        .unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        seed_legacy_orphan(&conn, LegacyOrphanInsertSurface::PaneState, |conn| {
+            conn.execute(
+                "INSERT INTO mux_pane_state
+                 (checkpoint_id, pane_id, terminal_state_json)
+                 VALUES (99999, 42, '{}')",
+                [],
+            )
+            .unwrap();
+        });
 
         assert_eq!(count_pane_states(&conn), 2);
 
@@ -1977,22 +2243,28 @@ mod tests {
 
         // Orphan checkpoint (ghost session) WITH a pane_state child, inserted
         // with FK enforcement off to simulate an older/corrupt DB.
-        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        conn.execute(
-            "INSERT INTO session_checkpoints
-             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
-             VALUES ('orphan-sess', ?1, 'periodic', '0123456789abcdef', 1, 0)",
-            [now],
-        )
-        .unwrap();
-        let orphan_cp_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO mux_pane_state (checkpoint_id, pane_id, terminal_state_json)
-             VALUES (?1, 7, '{}')",
-            [orphan_cp_id],
-        )
-        .unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let orphan_cp_id = seed_legacy_orphan(
+            &conn,
+            LegacyOrphanInsertSurface::Checkpoint,
+            |conn| {
+                conn.execute(
+                    "INSERT INTO session_checkpoints
+                     (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
+                     VALUES ('orphan-sess', ?1, 'periodic', '0123456789abcdef', 1, 0)",
+                    [now],
+                )
+                .unwrap();
+                conn.last_insert_rowid()
+            },
+        );
+        seed_legacy_orphan(&conn, LegacyOrphanInsertSurface::PaneState, |conn| {
+            conn.execute(
+                "INSERT INTO mux_pane_state (checkpoint_id, pane_id, terminal_state_json)
+                 VALUES (?1, 7, '{}')",
+                [orphan_cp_id],
+            )
+            .unwrap();
+        });
 
         assert_eq!(count_checkpoints(&conn), 1);
         assert_eq!(count_pane_states(&conn), 1);
@@ -2019,30 +2291,32 @@ mod tests {
     fn cleanup_removes_orphan_lifecycle_before_its_intent_checkpoint() {
         let conn = make_test_db();
         let now = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer");
-        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        conn.execute(
-            "INSERT INTO session_checkpoints (
-                 session_id, checkpoint_at, checkpoint_type, state_hash,
-                 pane_count, total_bytes, metadata_json, checkpoint_role
-             ) VALUES (
-                 'orphan-attempt', ?1, 'startup', 'pending:rsi2',
-                 0, 0, '{\"restore_attempt\":{\"phase\":\"intent\"}}',
-                 'restore_intent'
-             )",
-            [now],
-        )
-        .expect("seed orphan restore intent");
-        let intent_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO restore_attempt_lifecycle (
-                 intent_checkpoint_id, session_id, source_checkpoint_id,
-                 status, created_at
-             ) VALUES (?1, 'orphan-attempt', ?2,
-                       'reconciliation_required', ?3)",
-            rusqlite::params![intent_id, intent_id + 1, now],
-        )
-        .expect("seed orphan restore lifecycle");
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let intent_id = seed_legacy_orphan(&conn, LegacyOrphanInsertSurface::Checkpoint, |conn| {
+            conn.execute(
+                "INSERT INTO session_checkpoints (
+                         session_id, checkpoint_at, checkpoint_type, state_hash,
+                         pane_count, total_bytes, metadata_json, checkpoint_role
+                     ) VALUES (
+                         'orphan-attempt', ?1, 'startup', 'pending:rsi2',
+                         0, 0, '{\"restore_attempt\":{\"phase\":\"intent\"}}',
+                         'restore_intent'
+                     )",
+                [now],
+            )
+            .expect("seed orphan restore intent");
+            conn.last_insert_rowid()
+        });
+        seed_legacy_orphan(&conn, LegacyOrphanInsertSurface::RestoreLifecycle, |conn| {
+            conn.execute(
+                "INSERT INTO restore_attempt_lifecycle (
+                         intent_checkpoint_id, session_id, source_checkpoint_id,
+                         status, created_at
+                     ) VALUES (?1, 'orphan-attempt', ?2,
+                               'reconciliation_required', ?3)",
+                rusqlite::params![intent_id, intent_id + 1, now],
+            )
+            .expect("seed orphan restore lifecycle");
+        });
 
         let orphaned = cleanup_orphaned_data(&conn).unwrap();
         assert_eq!(orphaned.orphaned_restore_lifecycle_rows, 1);
@@ -2062,16 +2336,16 @@ mod tests {
     #[test]
     fn full_cleanup_reports_lifecycle_only_orphan_as_completed_work() {
         let conn = make_test_db();
-        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        conn.execute(
-            "INSERT INTO restore_attempt_lifecycle (
-                 intent_checkpoint_id, session_id, source_checkpoint_id,
-                 status, created_at
-             ) VALUES (999, 'missing-session', 998, 'intent', 1000)",
-            [],
-        )
-        .expect("seed lifecycle-only orphan");
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        seed_legacy_orphan(&conn, LegacyOrphanInsertSurface::RestoreLifecycle, |conn| {
+            conn.execute(
+                "INSERT INTO restore_attempt_lifecycle (
+                         intent_checkpoint_id, session_id, source_checkpoint_id,
+                         status, created_at
+                     ) VALUES (999, 'missing-session', 998, 'intent', 1000)",
+                [],
+            )
+            .expect("seed lifecycle-only orphan");
+        });
 
         let config = SessionRetentionConfig {
             max_age_days: 0,
@@ -2630,17 +2904,18 @@ mod tests {
     // ── Config edge cases ──
 
     #[test]
-    fn config_all_max_values() {
+    fn overflowing_size_budget_fails_closed_even_on_an_empty_database() {
         let config = SessionRetentionConfig {
             max_age_days: u64::MAX,
             max_closed_sessions: usize::MAX,
             max_total_size_mb: u64::MAX,
             cleanup_interval_hours: u64::MAX,
         };
-        // With extreme limits, nothing should be deleted from an empty DB
         let conn = make_test_db();
-        let result = cleanup_sessions(&conn, &config).unwrap();
-        assert_eq!(result.total_sessions_deleted(), 0);
+        let error = cleanup_sessions(&conn, &config)
+            .expect_err("MiB-to-byte overflow must not silently become an unlimited budget");
+        assert!(matches!(error, rusqlite::Error::ToSqlConversionFailure(_)));
+        assert_eq!(count_sessions(&conn), 0);
     }
 
     #[test]
