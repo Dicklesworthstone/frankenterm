@@ -1372,6 +1372,95 @@ precondition. Use related edges for shared context and independently
 progressing lanes. Closed substrate remains evidence to reuse, not a reason to
 reimplement it.
 
+### 15.4 Source-grounded soak-substrate reuse matrix (2026-08-08)
+
+This audit is the input contract for `ft-interactive-systems-performance-4tenz.4`.
+Classifications describe what current source and retained artifacts establish,
+independent of an earlier bead's status:
+
+- **Live**: a production call path reaches the substrate; this is not long-haul
+  or target-class proof.
+- **Partial**: a useful production slice, historical result, or evidence
+  contract exists, but the advertised end-to-end claim is not established.
+- **Proxy**: a deterministic model, simulation, unit oracle, microbenchmark, or
+  headless substitute is useful for regressions but skips the claimed path.
+- **Dead/unwired**: code or a design shape exists without a production caller
+  for the claimed behavior.
+- **Obsolete**: the substrate may retain regression value but is not authority
+  for this long-haul campaign.
+
+#### Long-haul, load, and gate substrate
+
+| Substrate | Class | Entry point, workload, metrics, and duration | Authority, limitation, reuse, and owner |
+|---|---|---|---|
+| `ft-xbnl0.4.1` leak-risk inventory | Live/partial | `runtime.rs::build_leak_risk_inventory` builds `LeakRiskInventorySnapshot` from runtime, mux, storage, workflow, watchdog, window, tab, workspace, and pane state; `HealthSnapshot` exposes point-in-time counts and waits through robot health renderers. | Queryable instrumentation, not allocation attribution or an aged result. `.4.3` must reuse its producers and add missing ownership fields instead of creating a second inventory API. |
+| `ft-xbnl0.4.2` mux leak/fix tranche | Partial | Historical production mux teardown and leak fixes with focused regression evidence. | A closed fix tranche cannot establish absence of long-haul growth. `.4.7` and `.4.8` own current-source native proof. |
+| `ft-xbnl0.4.3` runtime compaction | Partial | `compact_runtime_pane_state`, search watermark pruning, and related retention paths have deterministic source-level bounds. | Verification was blocked before relevant tests ran, so steady-state retention/recovery under production churn remains open at `.4.7`. |
+| `ft-xbnl0.4.4` leak oracles | Proxy/partial | Short deterministic runtime, search, workflow, teardown, reconnect, compaction, watermark, and lock-storm unit oracles; no GUI, mux server, PTY, transport, or aged session. | `tests/e2e/artifacts/goal-line/ft-xbnl0.4.4/leak_oracle_regressions/20260419T163650Z/` has no `summary.json`; the retained run was blocked before the new tests executed. Keep fast oracles; `.4.4` supplies the isolated production runner. |
+| `ft-xbnl0.4.5` stress matrix | Proxy | `tests/e2e/test_ft_xbnl0_4_5_swarm_soak_matrix.sh`, `scripts/e2e_swarm_stress.sh`, and `e2e_swarm_stress_core.rs` label metrics `core_simulation` and repeatedly construct independent `TieredScrollback` and `BackpressureManager` models. | They skip live mux, PTY, transport, GUI, storage, search, and aged state. The referenced retained summary is absent; repeated CPU-test cycles are not elapsed 4h/24h/72h runs. Reuse seeds and pressure shapes only; `.4.5` wires production and `.4.8` retains extended evidence. |
+| `ft-xbnl0.4.6` gate evaluator | Live contract/partial evidence | `docs/ft-xbnl0-4-6-release-gates.json`, validators, tests, and completion evidence consume `.4.4`/`.4.5` outputs. | The retained evaluator reported a missing leak summary and short-run duration failure. Reuse the validation shape in `.4.6`, but feed source-bound `.4.7`/`.4.8` artifacts and long-haul thresholds. |
+| Replay corpus load rig | Proxy/partial | `examples/load_rig.rs` and `chaos_scale_harness.rs::run_replay_corpus_load_rig` build deterministic `LargeSwarmScenario` frames and run real `PatternEngine::detect`, recording replay-time poll/native-push bytes, frames, and detections; native push applies the real dedup-window coalescing to that corpus. | It still lacks production storage writes, live capture, mux panes, network, PTYs, and GUI. `.4.2` reuses the corpus/metamorphic checks; `ft-7h5da.10.3.2` owns production capture/storage reality and fail-closed remote proof. |
+| Mission soak | Proxy/obsolete as long-haul authority | `tests/e2e/test_mission_soak.sh` runs fixed-seed suites and three roughly 16-18 second cycles. | `docs/metrics/mission_soak_chaos_evidence.json` says raw logs were not retained. Keep deterministic checks, but never use them for `.4.7`/`.4.8`. |
+| Generic E2E soak runner | Partial framework | `scripts/e2e_test.sh --soak-duration` has checkpoint, resume, fault-loop, and isolation concepts; some paths execute the product and clean isolated resources. | Existence is not evidence. `.4.4` may reuse concepts only after adding fail-closed identity/ownership guards that prevent launching, attaching to, inputting to, sampling, signalling, or cleaning up an operator session. |
+
+#### GUI, resource-cockpit, and renderer substrate
+
+| Substrate | Class | Entry point, workload, metrics, and duration | Authority, limitation, reuse, and owner |
+|---|---|---|---|
+| `ft-dohm7` GUI soak | Partial/historical native | Isolated patched-GUI image/text ran 182 seconds/36 samples (RSS about 638240 KiB to 230736 KiB, maximum 719072 KiB); overflow text ran 103 seconds/35 samples (RSS about 156928 KiB to 137744 KiB, maximum 156928 KiB). It also sampled `vmmap`, heap, and cold-tier bytes. | Evidence lived under `/tmp/ft-dohm7-*`; no tracked source-bound artifact remains. Reuse workload shapes and hypotheses in `.4.2`/`.4.3`; `.4.7`/`.4.8` retain current-source native evidence. |
+| Resource-cockpit schema/target receipt | Live schema/partial; target not proven | Resource DTOs, validators, `ft-rz0eb.4` conformance, and `docs/attestations/proofs/resource-cockpit-target-class.json`. The tracked target summary observed Darwin arm64, 14 CPUs, and 64 GiB instead of Linux x86_64, at least 64 CPUs, and 256 GiB. | The summary and attestation correctly say `skipped_not_proven`; target conformance was not run. `.4.3` reuses schema/unavailable semantics; `ft-7h5da.10.4.3`, `.4.7`, `.4.8`, then `ft-tf6g3.1` own target evidence and release promotion. |
+| Resource pressure soak | Proxy/partial | `ft-p3457.4` generates before/during/after snapshots and validates a pressure receipt declaring `live_pane_mutation:false`. | Its cited summary exists only as untracked output and is not durable authority. Reuse fields/monotonicity in `.4.3`/`.4.6`; `.4.5` creates real pressure. |
+| Dirty-row/resize SLO | Proxy/partial | Dirty-row state, line-quad cache, audit documents, and RQ-S1 deterministic core traces/timings. | No presented GUI resize/zoom/raster/compositor/display path. Reuse thresholds/traces in campaign `.8`; renderer proof leaves own native presented qualification. |
+| Input-to-photon SLO | Proxy/blocked | RQ-S8 headless macOS GPU-readback measured about 33 ms steady state and 351.65 ms cold path, both over target. | It omits real `NSEvent`, mux, PTY, transport, window-server presentation, and photons; no target Wayland run. Preserve as a negative control; `ft-tf6g3.8` and campaign input-latency leaves own end-to-end proof. |
+| Idle-GPU SLO | Proxy/blocked | RQ-S9 scheduler/predicate checks cover pacing decisions. | No production GPU counters or current native idle-window measurement. `ft-tf6g3.9`, `ft-96uy6`, and `ft-1l5n2` own counters and compositor evidence. |
+| Visual SSIM corpus | Proxy/partial | Deterministic static golden comparisons. | A self-consistent golden does not show that live native resize/zoom produced it. Reuse comparison machinery; `ft-interactive-swarm-product-convergence-7xqz4.9.1` owns the real corpus and `.8.10` consumes it. |
+
+#### Scrollback, cache, atlas, reconnect, and incident substrate
+
+| Substrate | Class | Entry point, workload, metrics, and duration | Authority, limitation, reuse, and owner |
+|---|---|---|---|
+| Production scrollback tiering/spill | Live/partial | `Screen` receives `ScrollbackTierConfig`; `ScrollbackTieringState`, `ColdScrollbackReflowWorker`, and mux-server `LiveScrollbackSpillSink` reach `MmapScrollbackStore` and expose live spill/tiering counters. | The core stress model skips this path. The typed cold-tier document says compression, structured async I/O, encryption, indexing, cleanup, and search integration remain incomplete. `.4.3` consumes counters, `.4.5` drives churn, and `ft-35zzw` owns viewport-first background reflow. |
+| Typed cold-tier pipeline | Dead/unwired/partial foundation | Types and source contracts in `docs/security/scrollback-cold-tier-pipeline.md`. | The document calls itself a foundation, not a complete live pipeline. Reuse types only where they match real owners; do not claim production persistence, cleanup, or search coverage. |
+| Wrap/image/glyph/line-quad/shape caches | Live/partial | `LogicalLineWrapCache`, terminal image LRU, GUI `GlyphCache`, image LFU byte budgeting, line-quad cache, and shape cache are production-reachable; some expose hit/miss or retained-byte metrics. | Complete ownership, eviction attribution, GPU allocation, compositor-command, and per-operation frame-budget telemetry are missing. `.4.3` joins producers; `.4.5` drives pressure; `ft-th8ag`, `ft-gwzrm`, `ft-96uy6`, `ft-th8ag.1`, `ft-1g4mv`, and `ft-1l5n2` own missing sources. |
+| Production glyph atlas | Live/partial | GUI `GlyphCache` owns `window::bitmaps::atlas::Atlas`, allocates sprites, reports footprint, and recreates atlases. `AllowImage::Scale(n)` performs allocation/staging/resampling on the paint thread. | `docs/perf/atlas-packing.json` is pure packer evidence; RQ-S10 synthesizes zero-rebuild events; `atlas_tiered_swap` is unwired pseudocode. `.4.3` consumes footprint, `.4.5` drives churn, and `.8.8.1` owns the paint-thread fix/A-B. |
+| Reconnect loop | Live/partial | `frankenterm/client/src/client.rs` has generation authority, one lazy `ConnectionUI`, bounded attempts, healthy-session reset, and reattach-if-current. | No retained real unreachable-host/healthy-interruption run; the `.4.4` oracle run never reached tests. Same-numeric-pane-ID ABA/application acknowledgement is separate. `.4.5` owns churn; `ft-c4rn6` owns real down-host proof. |
+| Incident collector/replay | Live/partial plus proxy corpus | `crash.rs::collect_incident_bundle` collects privacy-budgeted sources with robot-state global/database fallback, warnings, and replay metadata. The tracked flight-recorder attestation covers five deterministic scenarios. | That corpus is not rolling native GUI/mux capture or long-run causal fidelity. `.4.9` reuses the collector and owns content-free rolling capture, minimization, and replay fidelity. |
+| Observed long-run GUI incident | Partial incident evidence | `.4.9.1` records a historical approximately 80-hour GUI incident at about 6.8 GiB and 92-95% CPU against an older installed build. | It is not current-source reproduction and grants no authority to inspect or touch an operator process. Use only as a hypothesis/workload target; `.4.9.1` owns safe isolated reproduction and durable evidence. |
+
+#### Dependency and evidence decisions
+
+1. `.4.2` reuses deterministic replay/mission corpora and historical
+   `ft-dohm7` workload shapes, but specifies the real pane, fleet, transport,
+   resize, zoom, search, reconnect, and pressure actions that replace proxies.
+2. `.4.3` joins live leak, scrollback, cache, atlas, mux, storage, renderer, and
+   resource producers into one ownership/unavailable-data schema. It must not
+   synthesize unavailable target metrics.
+3. `.4.4` reuses checkpoint/resume concepts and deterministic oracles while
+   adding fail-closed process identity/ownership. Its runner must be unable to
+   affect an operator's FrankenTerm session.
+4. `.4.5` replaces independent core simulations with production scrollback,
+   cache/atlas, resize/zoom, reconnect, capture, storage, search, and
+   maintenance churn.
+5. `.4.6` analyzes source-bound long-haul outputs. Its old short-run gate shape
+   is reusable; its proxy inputs and three-second threshold are not.
+6. `.4.7` owns isolated 4-hour current-source qualification, `.4.8` owns
+   24-hour/72-hour target-class qualification, and `.4.9` owns privacy-safe
+   incident capture, minimization, and replay. Subsystem beads retain their
+   implementation and native-SLO ownership.
+
+Authoritative results must be retained in Git or a content-addressed release
+evidence store; bind the exact full source SHA, workload/seed, binary/package
+identity, target predicate, elapsed duration, clocks, schema, and raw-metric
+manifest; and pass their validator. Ignored or untracked output, `/tmp` logs,
+bead comments, screenshots, missing summaries, and artifacts from another
+revision are context only.
+
+No current artifact proves a 4h/24h/72h native production run, an M4/M5 or
+high-core-count Threadripper target, a real presented resize/zoom path, or a
+complete input-to-photon path. Historical GUI observations, skipped target
+receipts, short simulations, static goldens, and microbenchmarks cannot promote
+those claims. In this matrix, **live** is callgraph evidence only.
+
 ## 16. Dependency and execution order
 
 ### Phase A — truth, immediate correctness, and atomic identity
