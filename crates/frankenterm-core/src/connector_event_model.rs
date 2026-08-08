@@ -349,7 +349,13 @@ impl CanonicalConnectorEvent {
 
 /// Generate a unique event ID based on timestamp and a process-local sequence.
 fn generate_event_id(timestamp_ms: u64) -> String {
-    let seq = EVENT_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    generate_event_id_with_counter(timestamp_ms, &EVENT_ID_SEQUENCE)
+}
+
+fn generate_event_id_with_counter(timestamp_ms: u64, counter: &AtomicU64) -> String {
+    let seq = crate::try_next_unique_atomic_u64(counter).unwrap_or_else(|| {
+        panic!("connector event id space exhausted; refusing to reuse an event identity")
+    });
     format!("evt-{timestamp_ms}-{seq:016x}")
 }
 
@@ -994,6 +1000,20 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with("evt-1234-"));
         assert!(second.starts_with("evt-1234-"));
+    }
+
+    #[test]
+    fn connector_event_id_allocator_fails_closed_at_exhaustion() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+
+        assert_eq!(
+            generate_event_id_with_counter(1234, &counter),
+            format!("evt-1234-{:016x}", u64::MAX - 1)
+        );
+        assert_eq!(counter.load(Ordering::Acquire), u64::MAX);
+        let result = std::panic::catch_unwind(|| generate_event_id_with_counter(1234, &counter));
+        assert!(result.is_err());
+        assert_eq!(counter.load(Ordering::Acquire), u64::MAX);
     }
 
     #[test]

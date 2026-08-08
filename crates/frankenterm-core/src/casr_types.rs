@@ -108,7 +108,7 @@ pub struct ToolResult {
 // ---------------------------------------------------------------------------
 
 /// JSON output from `casr resume --json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CasrResumeOutput {
     #[serde(default)]
     pub ok: bool,

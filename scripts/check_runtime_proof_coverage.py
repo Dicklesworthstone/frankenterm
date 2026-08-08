@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """ft-3kv6e — RuntimeProof coverage audit for frankenterm-core.
 
-Walks `crates/frankenterm-core/src/` and classifies every `pub async fn`
-site into a fail-closed census. A site is *covered* only when one direct
+Walks `crates/frankenterm-core/src/` and classifies every `pub async fn`, plus
+an exact allowlist of intentionally eager settled-future APIs, into a
+fail-closed census. A site is *covered* only when one direct
 call argument carries one of:
 
   * `&Cx` / `&mut Cx` parameter (Cx is sealed — see `runtime_proof.rs`)
@@ -16,6 +17,10 @@ take a `RuntimeProof` bound on themselves.
 Narrow ambient-Cx wrappers and fresh-context cleanup adapters have separate,
 body-validated allowlists and separate census categories. Nested types such as
 `Option<&Cx>` and `impl FnOnce(&Cx)` are not proof arguments.
+
+Eager settled-future APIs are not exemptions: each must take a direct proof,
+return `impl std::future::Future<Output = ...>`, and end in an exact
+`std::future::ready(...)` tail expression after performing its call-time work.
 
 The script ratchets a baseline at `tests/runtime_proof_coverage_baseline.json`.
 A run fails (exit 1) on uncovered growth or a stable-site/category/per-file
@@ -73,6 +78,17 @@ EXEMPT_FILES: set[str] = {
     "runtime_proof.rs",       # defines the seal itself
     "cx.rs",                  # Cx is the canonical structured-async witness; sealed in runtime_proof.rs
     "cx_stub.rs",             # build-time stub of cx.rs (no-op shim)
+}
+
+# Public Cx-aware APIs whose contract intentionally performs synchronous work
+# at call time and then returns an already-settled future. These are audited as
+# a distinct covered category, not skipped or wrapper-exempt. The exact parser
+# rejects async declarations, indirect proof values, suspension syntax, and
+# any tail expression other than `std::future::ready(...)`.
+EAGER_SETTLED_FUTURE_APIS: set[tuple[str, str]] = {
+    ("restore_scrollback.rs", "inject_with_cx"),
+    ("storage.rs", "is_writable_with_cx"),
+    ("storage_telemetry.rs", "append_batch_instrumented_with_cx"),
 }
 
 # Functions that are ergonomic wrappers around a `_with_cx` / `_cx` sibling.
@@ -673,6 +689,7 @@ NEGATIVE_EVIDENCE = [
     "source files unreachable from the lexical lib.rs module graph remain in the census with an explicit @unresolved-module-ancestry identity marker; their effective rustc cfg and build reachability are unproven",
     "scope ownership is reconstructed lexically with delimiter-aware generic and const-expression handling; exotic braced expressions in item/control-flow headers require compiler-side proof",
     "proof parameters must be direct values; nested callback/container Cx types are rejected",
+    "eager settled-future proof is an exact source grammar for direct-Cx synchronous functions ending in std::future::ready; macro expansion and semantic Future behavior remain compiler-side proof obligations",
     "wrapper proof accepts only canonical ambient-Cx binding plus sibling await and optional literal expect grammar",
     "required-ambient wrapper proof accepts only Cx::current fail-closed acquisition plus the exact Cx sibling await",
     "required-ambient error-helper resolution is lexical; direct for_request constructors are rejected, while aliased/helper-body semantics require compiler-side review",
@@ -690,6 +707,7 @@ class Token:
 @dataclass(frozen=True)
 class FunctionSite:
     name: str
+    is_async: bool
     line: int
     start: int
     signature: str
@@ -1233,8 +1251,14 @@ def _scope_header_start(
 def discover_functions(
     source: str,
     parsed: ParsedRustSource | None = None,
+    include_sync_names: frozenset[str] = frozenset(),
 ) -> tuple[list[FunctionSite], list[str]]:
-    """Discover source-declared public async functions without scanning macro bodies."""
+    """Discover public async functions plus named synchronous future APIs.
+
+    Macro bodies remain outside the source-declared census. Synchronous
+    functions are included only by exact name so ordinary public sync APIs do
+    not silently broaden the RuntimeProof surface.
+    """
     parsed = _parse_rust_source(source) if parsed is None else parsed
     clean = parsed.clean
     tokens = parsed.tokens
@@ -1312,8 +1336,6 @@ def discover_functions(
             if saw_async:
                 errors.append(f"ambiguous public async item at offset {pub_token.start}")
             continue
-        if not saw_async:
-            continue
         fn_index = cursor
         cursor += 1
         if cursor >= len(tokens) or not IDENT_RE.fullmatch(tokens[cursor].value):
@@ -1321,6 +1343,8 @@ def discover_functions(
             continue
         name = _normal_name(tokens[cursor].value)
         cursor += 1
+        if not saw_async and name not in include_sync_names:
+            continue
 
         angle_depth = 0
         param_open = None
@@ -1390,6 +1414,7 @@ def discover_functions(
         sites.append(
             FunctionSite(
                 name=name,
+                is_async=saw_async,
                 line=bisect_right(newline_offsets, pub_token.start) + 1,
                 start=pub_token.start,
                 signature=clean[pub_token.start:signature_end],
@@ -1900,6 +1925,96 @@ def is_covered(site: FunctionSite) -> bool:
     return bool(proof_param_positions(site))
 
 
+def parse_eager_settled_future(site: FunctionSite) -> str | None:
+    """Validate one direct-proof, call-time-work, ready-future API.
+
+    This category exists to preserve APIs whose observable contract requires
+    cancellation checks or telemetry to run when the function is called, even
+    if its returned future is never polled. It is deliberately narrower than
+    Rust's general `impl Future` surface.
+    """
+    if site.is_async:
+        return "eager settled-future API must be a synchronous `fn`, not `async fn`"
+    if len(proof_param_positions(site)) != 1:
+        return "eager settled-future API must take one direct Cx/RuntimeProof argument"
+    if site.body is None:
+        return "eager settled-future API has no parseable body"
+
+    signature_values = [token.value for token in tokenize(site.signature)]
+    try:
+        arrow = signature_values.index("->")
+    except ValueError:
+        return "eager settled-future API has no explicit return type"
+    return_values = signature_values[arrow + 1 :]
+    expected_prefix = [
+        "impl",
+        "std",
+        "::",
+        "future",
+        "::",
+        "Future",
+        "<",
+        "Output",
+        "=",
+    ]
+    if return_values[: len(expected_prefix)] != expected_prefix:
+        return (
+            "eager settled-future API must return exact "
+            "`impl std::future::Future<Output = ...>`"
+        )
+    output_values = return_values[len(expected_prefix) :]
+    if not output_values or output_values[-1:] != [">"]:
+        return "eager settled-future API return type has no exact closing `>`"
+    angle_depth = 1
+    for index, value in enumerate(output_values):
+        if value == "<":
+            angle_depth += 1
+        elif value == ">":
+            angle_depth -= 1
+            if angle_depth == 0 and index != len(output_values) - 1:
+                return "eager settled-future API return type has trailing syntax"
+            if angle_depth < 0:
+                return "eager settled-future API return type has unbalanced angle brackets"
+    if angle_depth != 0 or len(output_values) == 1:
+        return "eager settled-future API return type has an empty or unbalanced Output"
+
+    body_tokens = tokenize(site.body)
+    if not body_tokens:
+        return "eager settled-future API body is empty"
+    forbidden = sorted(
+        {
+            _normal_name(token.value)
+            for token in body_tokens
+            if _normal_name(token.value) in {"async", "await", "yield", "return"}
+        }
+    )
+    if forbidden:
+        return (
+            "eager settled-future API contains deferred/early-return syntax: "
+            + ", ".join(forbidden)
+        )
+    pairs, delimiter_errors = delimiter_pairs(body_tokens)
+    if delimiter_errors:
+        return "eager settled-future body has unbalanced delimiters"
+    tail_close = len(body_tokens) - 1
+    if body_tokens[tail_close].value != ")":
+        return "eager settled-future body must end in a direct ready call"
+    tail_open = pairs.get(tail_close)
+    if tail_open is None:
+        return "eager settled-future ready call has no matching argument list"
+    callee = ["std", "::", "future", "::", "ready"]
+    callee_start = tail_open - len(callee)
+    if callee_start < 0 or [
+        token.value for token in body_tokens[callee_start:tail_open]
+    ] != callee:
+        return "eager settled-future tail must call exact `std::future::ready(...)`"
+    if callee_start and body_tokens[callee_start - 1].value not in {";", "}"}:
+        return "eager settled-future ready call is not a standalone tail expression"
+    if pairs.get(tail_open) != tail_close:
+        return "eager settled-future ready call is not the outermost tail expression"
+    return None
+
+
 def _cfg_predicate(key: tuple[tuple[str, ...], ...]) -> tuple[str, ...] | None:
     if len(key) != 1:
         return None
@@ -2243,6 +2358,74 @@ pub async fn const_generic(_: Foo<{ 1 }>, cx: &Cx) {}
         failures.append("signature comments falsely satisfy RuntimeProof coverage")
     if "const_generic" in by_name and by_name["const_generic"].body is None:
         failures.append("const-generic braces were mistaken for the function body")
+
+    eager_source = """
+pub fn eager(cx: &Cx) -> impl std::future::Future<Output = Result<bool>> {
+    record_call_time_side_effect(cx);
+    std::future::ready(Ok(true))
+}
+pub fn unrelated_sync(cx: &Cx) -> impl std::future::Future<Output = Result<bool>> {
+    std::future::ready(Ok(true))
+}
+"""
+    eager_sites, eager_errors = discover_functions(
+        eager_source,
+        include_sync_names=frozenset({"eager"}),
+    )
+    if eager_errors or [site.name for site in eager_sites] != ["eager"]:
+        failures.append(
+            "eager settled-future discovery did not remain exact-name bounded: "
+            f"sites={[site.name for site in eager_sites]!r}, errors={eager_errors!r}"
+        )
+    elif (error := parse_eager_settled_future(eager_sites[0])) is not None:
+        failures.append(f"valid eager settled-future fixture was rejected: {error}")
+
+    eager_invalid_fixtures = {
+        "async declaration": """
+pub async fn eager(cx: &Cx) -> impl std::future::Future<Output = Result<bool>> {
+    std::future::ready(Ok(true))
+}
+""",
+        "indirect proof": """
+pub fn eager(cx: Option<&Cx>) -> impl std::future::Future<Output = Result<bool>> {
+    std::future::ready(Ok(cx.is_some()))
+}
+""",
+        "multiple direct proofs": """
+pub fn eager(cx: &Cx, proof: &impl RuntimeProof) -> impl std::future::Future<Output = Result<bool>> {
+    std::future::ready(Ok(use_proofs(cx, proof)))
+}
+""",
+        "deferred body": """
+pub fn eager(cx: &Cx) -> impl std::future::Future<Output = Result<bool>> {
+    async move { use_cx(cx).await }
+}
+""",
+        "wrapped ready tail": """
+pub fn eager(cx: &Cx) -> impl std::future::Future<Output = Result<bool>> {
+    use_cx(cx);
+    wrap(std::future::ready(Ok(true)))
+}
+""",
+        "early return": """
+pub fn eager(cx: &Cx) -> impl std::future::Future<Output = Result<bool>> {
+    if stopped(cx) { return std::future::ready(Ok(false)); }
+    std::future::ready(Ok(true))
+}
+""",
+    }
+    for label, fixture in eager_invalid_fixtures.items():
+        invalid_sites, invalid_errors = discover_functions(
+            fixture,
+            include_sync_names=frozenset({"eager"}),
+        )
+        if invalid_errors or len(invalid_sites) != 1:
+            failures.append(
+                f"{label} eager fixture did not parse deterministically: "
+                f"{invalid_errors!r}"
+            )
+        elif parse_eager_settled_future(invalid_sites[0]) is None:
+            failures.append(f"eager settled-future grammar accepted {label}")
 
     proof_shape_source = """
 pub async fn direct(cx: &crate::cx::Cx) {}
@@ -2623,12 +2806,13 @@ pub async fn run(&self) {
         "occurrences": 1,
     }
     baseline_fixture = {
-        "schema_version": 4,
+        "schema_version": 5,
         "site_identity_algorithm": SITE_IDENTITY_ALGORITHM,
         "site_identities": [baseline_identity],
         "total_sites": 1,
         "covered_sites": 0,
         "exempt_files_sites": 0,
+        "eager_settled_future_sites": 0,
         "wrapper_exempt_sites": 1,
         "required_ambient_wrapper_sites": 1,
         "independent_context_adapter_sites": 0,
@@ -2638,6 +2822,7 @@ pub async fn run(&self) {
                 "total": 1,
                 "covered": 0,
                 "exempt": 0,
+                "eager_settled_future": 0,
                 "wrapper_exempt": 1,
                 "required_ambient_wrapper": 1,
                 "independent_adapter": 0,
@@ -2649,6 +2834,7 @@ pub async fn run(&self) {
         "total_sites": 1,
         "covered_sites": 0,
         "exempt_files_sites": 0,
+        "eager_settled_future_sites": 0,
         "wrapper_exempt_sites": 0,
         "required_ambient_wrapper_sites": 0,
         "independent_context_adapter_sites": 1,
@@ -2658,6 +2844,7 @@ pub async fn run(&self) {
                 "total": 1,
                 "covered": 0,
                 "exempt": 0,
+                "eager_settled_future": 0,
                 "wrapper_exempt": 0,
                 "required_ambient_wrapper": 0,
                 "independent_adapter": 1,
@@ -2722,6 +2909,7 @@ pub async fn run(&self) {
         "total_sites": 1,
         "covered_sites": 0,
         "exempt_files_sites": 0,
+        "eager_settled_future_sites": 0,
         "wrapper_exempt_sites": 1,
         "required_ambient_wrapper_sites": 1,
         "independent_context_adapter_sites": 0,
@@ -2731,6 +2919,7 @@ pub async fn run(&self) {
                 "total": 1,
                 "covered": 0,
                 "exempt": 0,
+                "eager_settled_future": 0,
                 "wrapper_exempt": 1,
                 "required_ambient_wrapper": 1,
                 "independent_adapter": 0,
@@ -2748,7 +2937,7 @@ pub async fn run(&self) {
     scope_swap_errors = validate_baseline(live_scope_swap, baseline_fixture)
     if not any("stable site identity disappeared or changed" in error for error in scope_swap_errors):
         failures.append(
-            "schema-v4 identity ratchet allowed a wrapper to move between impl scopes"
+            "schema-v5 identity ratchet allowed a wrapper to move between impl scopes"
         )
     live_scope_duplicate = {
         **live_scope_swap,
@@ -2777,7 +2966,7 @@ pub async fn run(&self) {
     )
     if not any("unbaselined privileged site identity" in error for error in duplicate_scope_errors):
         failures.append(
-            "schema-v4 identity ratchet allowed a same-name wrapper in another impl scope"
+            "schema-v5 identity ratchet allowed a same-name wrapper in another impl scope"
         )
 
     const_generic_source = """
@@ -2793,7 +2982,7 @@ impl<const N: usize> Bar<{ N }> {
     )
     if const_generic_errors or len(const_generic_sites) != 2:
         failures.append(
-            "schema-v4 const-generic scope fixture did not parse: "
+            "schema-v5 const-generic scope fixture did not parse: "
             f"{const_generic_errors!r}"
         )
     else:
@@ -2803,7 +2992,7 @@ impl<const N: usize> Bar<{ N }> {
         ]
         if const_generic_identities[0] == const_generic_identities[1]:
             failures.append(
-                "schema-v4 const-generic impl scopes collapsed to one identity"
+                "schema-v5 const-generic impl scopes collapsed to one identity"
             )
         if not all(
             header.startswith("impl<const N: usize>")
@@ -2811,7 +3000,7 @@ impl<const N: usize> Bar<{ N }> {
             for header in site.scope_headers
         ):
             failures.append(
-                "schema-v4 const-generic impl scope header lost its owning item"
+                "schema-v5 const-generic impl scope header lost its owning item"
             )
 
     generic_parameter_source = """
@@ -2824,12 +3013,12 @@ impl<const N: usize = { 1 }> Trait for Foo<N> {
     )
     if generic_parameter_errors or len(generic_parameter_sites) != 1:
         failures.append(
-            "schema-v4 generic-parameter scope fixture did not parse: "
+            "schema-v5 generic-parameter scope fixture did not parse: "
             f"{generic_parameter_errors!r}"
         )
     elif not generic_parameter_sites[0].scope_headers[0].startswith("impl<const"):
         failures.append(
-            "schema-v4 generic-parameter const block truncated its impl scope: "
+            "schema-v5 generic-parameter const block truncated its impl scope: "
             f"{generic_parameter_sites[0].scope_headers!r}"
         )
 
@@ -2846,12 +3035,12 @@ fn outer() {
     )
     if comparison_scope_errors or len(comparison_scope_sites) != 1:
         failures.append(
-            "schema-v4 comparison scope fixture did not parse: "
+            "schema-v5 comparison scope fixture did not parse: "
             f"{comparison_scope_errors!r}"
         )
     elif comparison_scope_sites[0].scope_headers[-1] != "if left > right":
         failures.append(
-            "schema-v4 comparison operator was mistaken for a generic delimiter: "
+            "schema-v5 comparison operator was mistaken for a generic delimiter: "
             f"{comparison_scope_sites[0].scope_headers!r}"
         )
 
@@ -2868,12 +3057,12 @@ impl Foo {
     )
     if macro_boundary_errors or len(macro_boundary_sites) != 1:
         failures.append(
-            "schema-v4 macro-boundary scope fixture did not parse: "
+            "schema-v5 macro-boundary scope fixture did not parse: "
             f"{macro_boundary_errors!r}"
         )
     elif macro_boundary_sites[0].scope_headers != ("impl Foo",):
         failures.append(
-            "schema-v4 impl scope absorbed a preceding braced macro item: "
+            "schema-v5 impl scope absorbed a preceding braced macro item: "
             f"{macro_boundary_sites[0].scope_headers!r}"
         )
 
@@ -2901,7 +3090,7 @@ impl /* identity-neutral comment */ < const N : usize > Foo < { N } > {
         or len(formatted_b) != 1
     ):
         failures.append(
-            "schema-v4 semantic-format fixture did not parse: "
+            "schema-v5 semantic-format fixture did not parse: "
             f"a={formatted_a_errors!r} b={formatted_b_errors!r}"
         )
     else:
@@ -2913,21 +3102,21 @@ impl /* identity-neutral comment */ < const N : usize > Foo < { N } > {
         )
         if formatted_identity_a != formatted_identity_b:
             failures.append(
-                "schema-v4 semantic identity changed for whitespace/comment-only edits"
+                "schema-v5 semantic identity changed for whitespace/comment-only edits"
             )
         signature_mutation, signature_mutation_errors = discover_functions(
             formatted_source_a.replace("cx: &Cx", "cx: &mut Cx")
         )
         if signature_mutation_errors or len(signature_mutation) != 1:
             failures.append(
-                "schema-v4 signature-mutation fixture did not parse: "
+                "schema-v5 signature-mutation fixture did not parse: "
                 f"{signature_mutation_errors!r}"
             )
         elif _site_identity(
             "fixture.rs", signature_mutation[0], "covered"
         ) == formatted_identity_a:
             failures.append(
-                "schema-v4 semantic identity ignored a meaningful signature change"
+                "schema-v5 semantic identity ignored a meaningful signature change"
             )
 
     child_source = "#![cfg(unix)]\npub async fn run(cx: &Cx) {}\n"
@@ -2948,7 +3137,7 @@ impl /* identity-neutral comment */ < const N : usize > Foo < { N } > {
     child_sites, child_errors = discover_functions(child_source)
     if module_errors_a or module_errors_b or child_errors or len(child_sites) != 1:
         failures.append(
-            "schema-v4 inherited-cfg fixture did not parse: "
+            "schema-v5 inherited-cfg fixture did not parse: "
             f"a={module_errors_a!r} b={module_errors_b!r} child={child_errors!r}"
         )
     else:
@@ -2960,14 +3149,14 @@ impl /* identity-neutral comment */ < const N : usize > Foo < { N } > {
         )
         if inherited_a == inherited_b:
             failures.append(
-                "schema-v4 identity ignored cfg on an external mod declaration"
+                "schema-v5 identity ignored cfg on an external mod declaration"
             )
         inner_cfg_mutation, inner_cfg_errors = discover_functions(
             child_source.replace("cfg(unix)", "cfg(windows)")
         )
         if inner_cfg_errors or len(inner_cfg_mutation) != 1:
             failures.append(
-                "schema-v4 inner-cfg fixture did not parse: "
+                "schema-v5 inner-cfg fixture did not parse: "
                 f"{inner_cfg_errors!r}"
             )
         elif _site_identity(
@@ -2976,7 +3165,7 @@ impl /* identity-neutral comment */ < const N : usize > Foo < { N } > {
             "covered",
             module_context_a["child.rs"],
         ) == inherited_a:
-            failures.append("schema-v4 identity ignored a file inner cfg change")
+            failures.append("schema-v5 identity ignored a file inner cfg change")
 
     multi_path_child_source = "pub async fn run(cx: &Cx) {}\n"
     multi_path_context, multi_path_errors = _effective_module_cfg_contexts(
@@ -3003,7 +3192,7 @@ impl /* identity-neutral comment */ < const N : usize > Foo < { N } > {
         or len(multi_paths) != 2
     ):
         failures.append(
-            "schema-v4 multi-path permutation fixture did not parse: "
+            "schema-v5 multi-path permutation fixture did not parse: "
             f"context={multi_path_errors!r} site={multi_path_site_errors!r} "
             f"paths={multi_paths!r}"
         )
@@ -3016,7 +3205,7 @@ impl /* identity-neutral comment */ < const N : usize > Foo < { N } > {
         tuple(reversed(multi_paths)),
     ):
         failures.append(
-            "schema-v4 identity changed when equivalent module cfg paths were reordered"
+            "schema-v5 identity changed when equivalent module cfg paths were reordered"
         )
 
     path_context, path_errors = _effective_module_cfg_contexts(
@@ -3029,7 +3218,7 @@ impl /* identity-neutral comment */ < const N : usize > Foo < { N } > {
         (("@unresolved-module-ancestry", "renamed.rs"),),
     ):
         failures.append(
-            "schema-v4 literal #[path] module fixture was not resolved: "
+            "schema-v5 literal #[path] module fixture was not resolved: "
             f"{path_errors!r}"
         )
     inline_path_context, inline_path_errors = _effective_module_cfg_contexts(
@@ -3049,7 +3238,7 @@ impl /* identity-neutral comment */ < const N : usize > Foo < { N } > {
         (("@unresolved-module-ancestry", "outer/renamed.rs"),),
     ):
         failures.append(
-            "schema-v4 inline literal #[path] module fixture was not resolved: "
+            "schema-v5 inline literal #[path] module fixture was not resolved: "
             f"{inline_path_errors!r}"
         )
     else:
@@ -3077,7 +3266,7 @@ impl /* identity-neutral comment */ < const N : usize > Foo < { N } > {
             or len(inline_path_sites) != 1
         ):
             failures.append(
-                "schema-v4 inline enclosing-cfg fixture did not parse: "
+                "schema-v5 inline enclosing-cfg fixture did not parse: "
                 f"context={inline_path_errors_b!r} site={inline_path_site_errors!r}"
             )
         elif _site_identity(
@@ -3092,7 +3281,7 @@ impl /* identity-neutral comment */ < const N : usize > Foo < { N } > {
             inline_path_context_b["outer/renamed.rs"],
         ):
             failures.append(
-                "schema-v4 identity ignored cfg on an enclosing inline module"
+                "schema-v5 identity ignored cfg on an enclosing inline module"
             )
 
     exceptional_source = """
@@ -3102,7 +3291,7 @@ pub async fn second(cx: &Cx) {}
     exceptional_sites, exceptional_errors = discover_functions(exceptional_source)
     if exceptional_errors or len(exceptional_sites) != 2:
         failures.append(
-            "schema-v4 exceptional-identity fixture did not parse: "
+            "schema-v5 exceptional-identity fixture did not parse: "
             f"{exceptional_errors!r}"
         )
     else:
@@ -3119,16 +3308,17 @@ pub async fn second(cx: &Cx) {}
             "occurrences"
         ) != 2:
             failures.append(
-                "schema-v4 duplicate exceptional identities did not aggregate occurrences"
+                "schema-v5 duplicate exceptional identities did not aggregate occurrences"
             )
 
         baseline_exceptional = {
-            "schema_version": 4,
+            "schema_version": 5,
             "site_identity_algorithm": SITE_IDENTITY_ALGORITHM,
             "site_identities": [{**first_exceptional, "occurrences": 1}],
             "total_sites": 1,
             "covered_sites": 0,
             "exempt_files_sites": 1,
+            "eager_settled_future_sites": 0,
             "wrapper_exempt_sites": 0,
             "required_ambient_wrapper_sites": 0,
             "independent_context_adapter_sites": 0,
@@ -3138,6 +3328,7 @@ pub async fn second(cx: &Cx) {}
                     "total": 1,
                     "covered": 0,
                     "exempt": 1,
+                    "eager_settled_future": 0,
                     "wrapper_exempt": 0,
                     "required_ambient_wrapper": 0,
                     "independent_adapter": 0,
@@ -3154,6 +3345,7 @@ pub async fn second(cx: &Cx) {}
             "total_sites": 2,
             "covered_sites": 0,
             "exempt_files_sites": 2,
+            "eager_settled_future_sites": 0,
             "wrapper_exempt_sites": 0,
             "required_ambient_wrapper_sites": 0,
             "independent_context_adapter_sites": 0,
@@ -3163,6 +3355,7 @@ pub async fn second(cx: &Cx) {}
                     "total": 2,
                     "covered": 0,
                     "exempt": 2,
+                    "eager_settled_future": 0,
                     "wrapper_exempt": 0,
                     "required_ambient_wrapper": 0,
                     "independent_adapter": 0,
@@ -3178,7 +3371,7 @@ pub async fn second(cx: &Cx) {}
             for error in exceptional_growth_errors
         ):
             failures.append(
-                "schema-v4 identity ratchet allowed a new exempt-file identity"
+                "schema-v5 identity ratchet allowed a new exempt-file identity"
             )
         duplicate_exceptional_live = {
             **live_exceptional,
@@ -3192,7 +3385,7 @@ pub async fn second(cx: &Cx) {}
             for error in duplicate_exceptional_errors
         ):
             failures.append(
-                "schema-v4 identity ratchet allowed a duplicate exempt-file occurrence"
+                "schema-v5 identity ratchet allowed a duplicate exempt-file occurrence"
             )
 
         malformed_category = {
@@ -3233,7 +3426,7 @@ pub async fn second(cx: &Cx) {}
             for error in malformed_category_errors
         ):
             failures.append(
-                "schema-v4 validator accepted identity/aggregate category disagreement"
+                "schema-v5 validator accepted identity/aggregate category disagreement"
             )
 
         malformed_file_identity = {
@@ -3268,6 +3461,7 @@ pub async fn second(cx: &Cx) {}
             "total_sites": 2,
             "covered_sites": 2,
             "exempt_files_sites": 0,
+            "eager_settled_future_sites": 0,
             "wrapper_exempt_sites": 0,
             "required_ambient_wrapper_sites": 0,
             "independent_context_adapter_sites": 0,
@@ -3277,6 +3471,7 @@ pub async fn second(cx: &Cx) {}
                     "total": 1,
                     "covered": 1,
                     "exempt": 0,
+                    "eager_settled_future": 0,
                     "wrapper_exempt": 0,
                     "required_ambient_wrapper": 0,
                     "independent_adapter": 0,
@@ -3286,6 +3481,7 @@ pub async fn second(cx: &Cx) {}
                     "total": 1,
                     "covered": 1,
                     "exempt": 0,
+                    "eager_settled_future": 0,
                     "wrapper_exempt": 0,
                     "required_ambient_wrapper": 0,
                     "independent_adapter": 0,
@@ -3301,7 +3497,7 @@ pub async fn second(cx: &Cx) {}
             for error in malformed_file_errors
         ):
             failures.append(
-                "schema-v4 validator accepted identity/per-file disagreement"
+                "schema-v5 validator accepted identity/per-file disagreement"
             )
 
     perf_site_count = 1_200
@@ -3320,12 +3516,12 @@ pub async fn second(cx: &Cx) {}
     perf_elapsed = time.perf_counter() - perf_started
     if perf_errors or len(perf_sites) != perf_site_count:
         failures.append(
-            "schema-v4 bounded performance fixture did not parse: "
+            "schema-v5 bounded performance fixture did not parse: "
             f"sites={len(perf_sites)} errors={perf_errors!r}"
         )
     elif perf_elapsed > 5.0:
         failures.append(
-            "schema-v4 cached scope discovery exceeded the generous 5s bound: "
+            "schema-v5 cached scope discovery exceeded the generous 5s bound: "
             f"{perf_elapsed:.3f}s"
         )
     return failures
@@ -3387,6 +3583,7 @@ def audit() -> dict:
     results = {
         "total_sites": 0,
         "exempt_files_sites": 0,
+        "eager_settled_future_sites": 0,
         "wrapper_exempt_sites": 0,
         "required_ambient_wrapper_sites": 0,
         "independent_context_adapter_sites": 0,
@@ -3428,6 +3625,23 @@ def audit() -> dict:
             results["wrapper_audit_errors"].append(
                 f"{exempt_file}::{exempt_name} allowlist entry names a nonexistent file"
             )
+    for eager_file, eager_name in sorted(EAGER_SETTLED_FUTURE_APIS):
+        if eager_file not in relative_files:
+            results["wrapper_audit_errors"].append(
+                f"{eager_file}::{eager_name} eager-settled entry names a nonexistent file"
+            )
+        if eager_file in EXEMPT_FILES:
+            results["wrapper_audit_errors"].append(
+                f"{eager_file}::{eager_name} cannot be both eager-settled and runtime-file exempt"
+            )
+        if (eager_file, eager_name) in WRAPPER_EXEMPTIONS:
+            results["wrapper_audit_errors"].append(
+                f"{eager_file}::{eager_name} cannot be both eager-settled and wrapper-exempt"
+            )
+        if (eager_file, eager_name) in INDEPENDENT_CONTEXT_ADAPTERS:
+            results["wrapper_audit_errors"].append(
+                f"{eager_file}::{eager_name} cannot be both eager-settled and independent"
+            )
     for required_wrapper in sorted(REQUIRED_AMBIENT_CX_WRAPPERS):
         if required_wrapper not in WRAPPER_EXEMPTIONS:
             results["wrapper_audit_errors"].append(
@@ -3461,15 +3675,24 @@ def audit() -> dict:
         is_exempt_file = rel in EXEMPT_FILES
         source = sources[rel]
         module_cfg_paths = module_cfg_contexts[rel]
-        sites, parse_errors = discover_functions(source, parsed_sources[rel])
+        eager_names = frozenset(
+            name for eager_file, name in EAGER_SETTLED_FUTURE_APIS if eager_file == rel
+        )
+        sites, parse_errors = discover_functions(
+            source,
+            parsed_sources[rel],
+            include_sync_names=eager_names,
+        )
         results["wrapper_audit_errors"].extend(f"{rel}: {error}" for error in parse_errors)
 
         fn_names: Counter[str] = Counter(site.name for site in sites)
         ordinary_wrapper_fn_names: Counter[str] = Counter()
         independent_adapter_fn_names: Counter[str] = Counter()
+        eager_settled_fn_names: Counter[str] = Counter()
         covered_positions: dict[int, tuple[int, ...]] = {}
         wrappers: list[tuple[FunctionSite, WrapperCall]] = []
         local_total = local_covered = local_uncovered = local_wrapper = 0
+        local_eager_settled = 0
         local_required_ambient = 0
         local_independent = local_exempt = 0
         local_uncovered_lines: list[tuple[int, str]] = []
@@ -3484,6 +3707,26 @@ def audit() -> dict:
                 )
                 continue
             positions = proof_param_positions(site)
+            if (rel, site.name) in EAGER_SETTLED_FUTURE_APIS:
+                results["eager_settled_future_sites"] += 1
+                local_eager_settled += 1
+                eager_settled_fn_names[site.name] += 1
+                results["site_identities"].append(
+                    _site_identity(
+                        rel,
+                        site,
+                        "eager_settled_future",
+                        module_cfg_paths,
+                    )
+                )
+                error = parse_eager_settled_future(site)
+                if error:
+                    results["wrapper_audit_errors"].append(
+                        f"{rel}:{site.line}::{site.name} {error}"
+                    )
+                else:
+                    covered_positions[site.start] = positions
+                continue
             if positions:
                 results["covered_sites"] += 1
                 local_covered += 1
@@ -3556,6 +3799,22 @@ def audit() -> dict:
                     f"{rel}::{exempt_name} allowlist entry is unused; every occurrence is "
                     "directly covered or exempt"
                 )
+        for eager_file, eager_name in EAGER_SETTLED_FUTURE_APIS:
+            if eager_file != rel:
+                continue
+            if fn_names[eager_name] == 0:
+                results["wrapper_audit_errors"].append(
+                    f"{rel}::{eager_name} eager-settled entry has no public function"
+                )
+            elif fn_names[eager_name] != 1:
+                results["wrapper_audit_errors"].append(
+                    f"{rel}::{eager_name} eager-settled entry is ambiguous across "
+                    f"{fn_names[eager_name]} occurrences"
+                )
+            elif eager_settled_fn_names[eager_name] != 1:
+                results["wrapper_audit_errors"].append(
+                    f"{rel}::{eager_name} eager-settled entry was not classified exactly once"
+                )
         for adapter_file, adapter_name in INDEPENDENT_CONTEXT_ADAPTERS:
             if adapter_file != rel:
                 continue
@@ -3599,6 +3858,7 @@ def audit() -> dict:
             "total": local_total,
             "exempt": local_exempt,
             "covered": local_covered,
+            "eager_settled_future": local_eager_settled,
             "uncovered": local_uncovered,
             "wrapper_exempt": local_wrapper,
             "required_ambient_wrapper": local_required_ambient,
@@ -3608,6 +3868,7 @@ def audit() -> dict:
         local_classified = (
             local_exempt
             + local_covered
+            + local_eager_settled
             + local_wrapper
             + local_independent
             + local_uncovered
@@ -3623,6 +3884,7 @@ def audit() -> dict:
     classified = (
         results["exempt_files_sites"]
         + results["covered_sites"]
+        + results["eager_settled_future_sites"]
         + results["wrapper_exempt_sites"]
         + results["independent_context_adapter_sites"]
         + results["uncovered_sites"]
@@ -3646,7 +3908,7 @@ def load_baseline() -> dict | None:
 
 def save_baseline(audit_data: dict) -> None:
     payload = {
-        "schema_version": 4,
+        "schema_version": 5,
         "comment": "ft-3kv6e fail-closed census ratchet. Update only with an audited source "
                    "change. Generated by scripts/check_runtime_proof_coverage.py.",
         "site_identity_algorithm": audit_data["site_identity_algorithm"],
@@ -3654,6 +3916,7 @@ def save_baseline(audit_data: dict) -> None:
         "uncovered_sites": audit_data["uncovered_sites"],
         "covered_sites": audit_data["covered_sites"],
         "exempt_files_sites": audit_data["exempt_files_sites"],
+        "eager_settled_future_sites": audit_data["eager_settled_future_sites"],
         "wrapper_exempt_sites": audit_data["wrapper_exempt_sites"],
         "required_ambient_wrapper_sites": audit_data[
             "required_ambient_wrapper_sites"
@@ -3672,6 +3935,7 @@ def save_baseline(audit_data: dict) -> None:
                 "total": data["total"],
                 "exempt": data["exempt"],
                 "covered": data["covered"],
+                "eager_settled_future": data["eager_settled_future"],
                 "wrapper_exempt": data["wrapper_exempt"],
                 "required_ambient_wrapper": data["required_ambient_wrapper"],
                 "independent_adapter": data["independent_adapter"],
@@ -3708,6 +3972,7 @@ def _site_identity_counter(
     allowed_categories = {
         "covered",
         "exempt_file",
+        "eager_settled_future",
         "wrapper_exempt",
         "required_ambient_wrapper",
         "independent_adapter",
@@ -3768,6 +4033,7 @@ def _identity_census(
         "total_sites": 0,
         "covered_sites": 0,
         "exempt_files_sites": 0,
+        "eager_settled_future_sites": 0,
         "wrapper_exempt_sites": 0,
         "required_ambient_wrapper_sites": 0,
         "independent_context_adapter_sites": 0,
@@ -3784,6 +4050,7 @@ def _identity_census(
                 "total": 0,
                 "covered": 0,
                 "exempt": 0,
+                "eager_settled_future": 0,
                 "wrapper_exempt": 0,
                 "required_ambient_wrapper": 0,
                 "independent_adapter": 0,
@@ -3798,6 +4065,9 @@ def _identity_census(
         elif category == "exempt_file":
             aggregate["exempt_files_sites"] += occurrences
             counts["exempt"] += occurrences
+        elif category == "eager_settled_future":
+            aggregate["eager_settled_future_sites"] += occurrences
+            counts["eager_settled_future"] += occurrences
         elif category in {"wrapper_exempt", "required_ambient_wrapper"}:
             aggregate["wrapper_exempt_sites"] += occurrences
             counts["wrapper_exempt"] += occurrences
@@ -3841,6 +4111,7 @@ def _identity_reconciliation_errors(
         "total",
         "covered",
         "exempt",
+        "eager_settled_future",
         "wrapper_exempt",
         "required_ambient_wrapper",
         "independent_adapter",
@@ -3883,13 +4154,14 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
         return [f"required baseline is missing: {BASELINE_PATH}"]
     if not isinstance(baseline, dict):
         return ["baseline root must be a JSON object"]
-    if baseline.get("schema_version") != 4:
+    if baseline.get("schema_version") != 5:
         return [
-            f"{BASELINE_PATH.name} does not use census schema 4; run --update-baseline "
-            "only after reviewing the live schema-v4 identity census"
+            f"{BASELINE_PATH.name} does not use census schema 5; run --update-baseline "
+            "only after reviewing the live schema-v5 identity census"
         ]
     required = {
-        "total_sites", "covered_sites", "exempt_files_sites", "wrapper_exempt_sites",
+        "total_sites", "covered_sites", "exempt_files_sites",
+        "eager_settled_future_sites", "wrapper_exempt_sites",
         "required_ambient_wrapper_sites",
         "independent_context_adapter_sites", "uncovered_sites", "by_file_counts",
         "site_identity_algorithm", "site_identities",
@@ -3908,7 +4180,7 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
         return errors
     if baseline["site_identity_algorithm"] != SITE_IDENTITY_ALGORITHM:
         errors.append(
-            "baseline site_identity_algorithm differs from the live schema-v4 algorithm"
+            "baseline site_identity_algorithm differs from the live schema-v5 algorithm"
         )
     if data.get("site_identity_algorithm") != SITE_IDENTITY_ALGORITHM:
         errors.append("live site_identity_algorithm is missing or inconsistent")
@@ -3951,6 +4223,7 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
             )
         privileged_categories = {
             "exempt_file",
+            "eager_settled_future",
             "wrapper_exempt",
             "required_ambient_wrapper",
             "independent_adapter",
@@ -3974,6 +4247,7 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
     baseline_classified = (
         baseline["covered_sites"]
         + baseline["exempt_files_sites"]
+        + baseline["eager_settled_future_sites"]
         + baseline["wrapper_exempt_sites"]
         + baseline["independent_context_adapter_sites"]
         + baseline["uncovered_sites"]
@@ -4003,6 +4277,7 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
         ("total_sites", "total site census"),
         ("covered_sites", "directly covered census"),
         ("exempt_files_sites", "runtime-file exempt census"),
+        ("eager_settled_future_sites", "eager settled-future census"),
         ("wrapper_exempt_sites", "ordinary-wrapper census"),
         ("required_ambient_wrapper_sites", "required-ambient wrapper census"),
         ("independent_context_adapter_sites", "independent-context adapter census"),
@@ -4011,12 +4286,14 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
             errors.append(f"{label} collapsed from {baseline[field]} to {data[field]}")
     live_accepted = (
         data["covered_sites"]
+        + data["eager_settled_future_sites"]
         + data["wrapper_exempt_sites"]
         + data["independent_context_adapter_sites"]
         + data["exempt_files_sites"]
     )
     baseline_accepted = (
         baseline["covered_sites"]
+        + baseline["eager_settled_future_sites"]
         + baseline["wrapper_exempt_sites"]
         + baseline["independent_context_adapter_sites"]
         + baseline["exempt_files_sites"]
@@ -4034,6 +4311,7 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
         "total",
         "covered",
         "exempt",
+        "eager_settled_future",
         "wrapper_exempt",
         "required_ambient_wrapper",
         "independent_adapter",
@@ -4074,6 +4352,7 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
             for field in (
                 "covered",
                 "exempt",
+                "eager_settled_future",
                 "wrapper_exempt",
                 "independent_adapter",
                 "uncovered",
@@ -4108,6 +4387,7 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
             "total",
             "covered",
             "exempt",
+            "eager_settled_future",
             "wrapper_exempt",
             "required_ambient_wrapper",
             "independent_adapter",
@@ -4117,11 +4397,23 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
                 errors.append(f"per-file {rel}:{field} collapsed from {floor} to {live[field]}")
         expected_accepted = sum(
             expected[field]
-            for field in ("covered", "wrapper_exempt", "independent_adapter", "exempt")
+            for field in (
+                "covered",
+                "eager_settled_future",
+                "wrapper_exempt",
+                "independent_adapter",
+                "exempt",
+            )
         )
         live_accepted_for_file = sum(
             live[field]
-            for field in ("covered", "wrapper_exempt", "independent_adapter", "exempt")
+            for field in (
+                "covered",
+                "eager_settled_future",
+                "wrapper_exempt",
+                "independent_adapter",
+                "exempt",
+            )
         )
         if live_accepted_for_file < expected_accepted:
             errors.append(
@@ -4139,6 +4431,7 @@ def validate_baseline(data: dict, baseline: dict | None) -> list[str]:
             "total": "total_sites",
             "covered": "covered_sites",
             "exempt": "exempt_files_sites",
+            "eager_settled_future": "eager_settled_future_sites",
             "wrapper_exempt": "wrapper_exempt_sites",
             "required_ambient_wrapper": "required_ambient_wrapper_sites",
             "independent_adapter": "independent_context_adapter_sites",
@@ -4199,6 +4492,7 @@ def main() -> int:
         save_baseline(data)
         print(f"Baseline updated: uncovered={data['uncovered_sites']} "
               f"covered={data['covered_sites']} "
+              f"eager={data['eager_settled_future_sites']} "
               f"independent={data['independent_context_adapter_sites']} "
               f"exempt={data['exempt_files_sites']}")
         return 0
@@ -4229,9 +4523,10 @@ def main() -> int:
         return 2
 
     print(f"ft-3kv6e RuntimeProof coverage audit")
-    print(f"  total pub async fn      : {data['total_sites']}")
+    print(f"  total audited async/eager: {data['total_sites']}")
     print(f"  in exempt runtime files : {data['exempt_files_sites']}")
     print(f"  covered (Cx/RuntimeProof): {data['covered_sites']}")
+    print(f"  eager settled-future    : {data['eager_settled_future_sites']}")
     print(f"  wrapper-exempt          : {data['wrapper_exempt_sites']}")
     print(f"    required ambient      : {data['required_ambient_wrapper_sites']}")
     print(f"  independent-context     : {data['independent_context_adapter_sites']}")
@@ -4250,7 +4545,7 @@ def main() -> int:
                 )
         return 1
     print(
-        f"Baseline ({BASELINE_PATH.name}) passed schema-v4 "
+        f"Baseline ({BASELINE_PATH.name}) passed schema-v5 "
         "stable-site/category/per-file ratchets."
     )
     return 0

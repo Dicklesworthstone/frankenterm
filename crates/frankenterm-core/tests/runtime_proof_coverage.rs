@@ -1,13 +1,13 @@
 //! ft-3kv6e — RuntimeProof coverage ratchet (regression test).
 //!
-//! Asserts that the count of `pub async fn` sites in
-//! `crates/frankenterm-core/src/` lacking either `&Cx` or
-//! `RuntimeProof` in their signature does not exceed the baseline
+//! Asserts that every source-declared `pub async fn`, plus the exact allowlist
+//! of intentionally eager settled-future APIs in
+//! `crates/frankenterm-core/src/`, is classified by the RuntimeProof census
 //! recorded at `tests/runtime_proof_coverage_baseline.json`.
 //!
 //! Each adoption commit is expected to lower the baseline. New
-//! `pub async fn` sites that don't include `&Cx` / `RuntimeProof`
-//! in their signature increase the count and FAIL this test.
+//! New async sites without `&Cx` / `RuntimeProof`, or eager-settled sites that
+//! deviate from their direct-proof + exact-ready grammar, FAIL this test.
 //!
 //! The audit logic lives in `scripts/check_runtime_proof_coverage.py`
 //! so the same source of truth runs in CI (advisory + enforce paths)

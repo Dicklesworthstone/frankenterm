@@ -359,7 +359,11 @@ impl SemanticShockResponder {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
 
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let seq = crate::try_next_unique_atomic_u64(&self.sequence).unwrap_or_else(|| {
+            panic!(
+                "semantic shock sequence space exhausted; refusing to alias an existing record"
+            )
+        });
         let age_ms = u64::try_from(self.created_at.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         let record = ShockRecord {
@@ -804,6 +808,21 @@ mod tests {
         assert!(!r.is_pane_paused(1));
         assert_eq!(r.metrics_snapshot().shocks_recorded, 1);
         assert_eq!(r.metrics_snapshot().notifications_sent, 1);
+    }
+
+    #[test]
+    fn semantic_shock_sequence_exhaustion_fails_before_record_publication() {
+        let responder = SemanticShockResponder::new(SemanticShockConfig::default());
+        responder.sequence.store(u64::MAX, Ordering::Release);
+        let detection = make_semantic_detection(0.001, 0.95);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            responder.handle_detection(1, &detection)
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(responder.tracked_pane_count(), 0);
+        assert_eq!(responder.metrics_snapshot().shocks_recorded, 0);
     }
 
     #[test]

@@ -1015,7 +1015,6 @@ mod tests {
 
     #[test]
     fn script_round_trips_hostile_values_without_javascript_literal_injection() {
-        let bootstrap = InteractiveBootstrap::with_defaults();
         let hostile_marker = "logged'in\\\n\u{2028}with token=secret";
         let profile_dir = PathBuf::from("/tmp/profile'\\\n\u{2028}");
         let mut config = BootstrapConfig::default();

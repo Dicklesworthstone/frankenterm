@@ -4400,15 +4400,46 @@ struct McpAwaitEventRequestAdmissionGuard {
     admissions: Arc<AtomicU64>,
 }
 
+fn try_decrement_atomic(counter: &AtomicU64) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_sub(1) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn try_increment_atomic_below(counter: &AtomicU64, ceiling: u64) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current >= ceiling {
+            return false;
+        }
+        let next = current.saturating_add(1);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 impl Drop for McpAwaitEventRequestAdmissionGuard {
     fn drop(&mut self) {
-        if self
-            .admissions
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
-                admitted.checked_sub(1)
-            })
-            .is_err()
-        {
+        if !try_decrement_atomic(&self.admissions) {
             tracing::error!(
                 "MCP await request admission guard observed an invariant underflow; leaving the bounded count at zero"
             );
@@ -4608,6 +4639,7 @@ struct McpAwaitEventDeliveryCompletionStats {
     request_admission_rejections_unready: AtomicU64,
     request_admission_rejections_saturated: AtomicU64,
     request_admission_rejections_cancelled: AtomicU64,
+    request_admission_rejections_id_exhausted: AtomicU64,
     request_jobs_started: AtomicU64,
     request_jobs_finished: AtomicU64,
     request_jobs_cancelled_for_epoch: AtomicU64,
@@ -4751,6 +4783,7 @@ struct McpAwaitEventDeliveryCompletionStatsSnapshot {
     request_admission_rejections_unready: u64,
     request_admission_rejections_saturated: u64,
     request_admission_rejections_cancelled: u64,
+    request_admission_rejections_id_exhausted: u64,
     request_jobs_started: u64,
     request_jobs_finished: u64,
     request_jobs_cancelled_for_epoch: u64,
@@ -4855,6 +4888,9 @@ impl McpAwaitEventDeliveryCompletionStats {
                 .load(Ordering::Relaxed),
             request_admission_rejections_cancelled: self
                 .request_admission_rejections_cancelled
+                .load(Ordering::Relaxed),
+            request_admission_rejections_id_exhausted: self
+                .request_admission_rejections_id_exhausted
                 .load(Ordering::Relaxed),
             request_jobs_started: self.request_jobs_started.load(Ordering::Relaxed),
             request_jobs_finished: self.request_jobs_finished.load(Ordering::Acquire),
@@ -5284,20 +5320,27 @@ impl McpAwaitEventDeliveryCompletionExecutor {
             return Err(mcp_await_event_service_unready_error());
         }
 
-        if self
-            .request_admissions
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
-                (admitted < MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY)
-                    .then(|| admitted.saturating_add(1))
-            })
-            .is_err()
-        {
+        if !try_increment_atomic_below(
+            &self.request_admissions,
+            MCP_AWAIT_EVENT_REQUEST_ADMISSION_CAPACITY,
+        ) {
             self.stats
                 .request_admission_rejections_saturated
                 .fetch_add(1, Ordering::Relaxed);
             return Err(mcp_await_event_service_saturated_error());
         }
-        let request_id = self.request_sequence.fetch_add(1, Ordering::Relaxed);
+        let admission = McpAwaitEventRequestAdmissionGuard {
+            admissions: Arc::clone(&self.request_admissions),
+        };
+        let Some(request_id) = crate::try_next_unique_atomic_u64(&self.request_sequence) else {
+            self.stats
+                .request_admission_rejections_id_exhausted
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                "MCP await-event request id space exhausted; rejecting admission before publication"
+            );
+            return Err(mcp_await_event_request_id_exhausted_error());
+        };
         let (reply, response) = crossbeam::channel::bounded(1);
         let reply_handoff = Arc::new(std::sync::Mutex::new(
             McpAwaitEventRequestReplyHandoff::default(),
@@ -5309,9 +5352,7 @@ impl McpAwaitEventDeliveryCompletionExecutor {
             operation,
             reply,
             reply_handoff: Arc::clone(&reply_handoff),
-            _admission: McpAwaitEventRequestAdmissionGuard {
-                admissions: Arc::clone(&self.request_admissions),
-            },
+            _admission: admission,
             enqueued_at: Instant::now(),
         };
         let send_result = self.request_sender.try_send(job);
@@ -5992,11 +6033,7 @@ fn run_mcp_await_event_delivery_completion_worker(
                 .storage_initialization_attempts
                 .fetch_add(1, Ordering::Relaxed);
             #[cfg(test)]
-            let synthetic_failure = synthetic_storage_init_failures
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok();
+            let synthetic_failure = try_decrement_atomic(&synthetic_storage_init_failures);
             #[cfg(not(test))]
             let synthetic_failure = false;
 
@@ -6134,11 +6171,8 @@ fn run_mcp_await_event_delivery_completion_worker(
                 #[cfg(test)]
                 let completion_stall = synthetic_completion_stall.clone();
                 #[cfg(test)]
-                let synthetic_epoch_failure = synthetic_storage_epoch_failures
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                        remaining.checked_sub(1)
-                    })
-                    .is_ok();
+                let synthetic_epoch_failure =
+                    try_decrement_atomic(&synthetic_storage_epoch_failures);
                 #[cfg(not(test))]
                 let synthetic_epoch_failure = false;
                 let completion_storage = storage
@@ -7375,6 +7409,15 @@ fn mcp_await_event_service_saturated_error() -> McpToolError {
         Some(
             "Wait for an in-flight await to finish or cancel one before retrying".to_string(),
         ),
+    )
+}
+
+fn mcp_await_event_request_id_exhausted_error() -> McpToolError {
+    McpToolError::new(
+        MCP_ERR_CONFIG,
+        "wa.await_event shared service exhausted its non-reusable request identity space"
+            .to_string(),
+        Some("Restart the MCP server before retrying the await".to_string()),
     )
 }
 
@@ -14325,6 +14368,43 @@ mod tests {
         Arc::new(PathBuf::from("/tmp/test-mcp.db"))
     }
 
+    #[test]
+    fn atomic_admission_helpers_preserve_zero_and_ceiling_bounds() {
+        let counter = std::sync::atomic::AtomicU64::new(0);
+
+        assert!(!super::try_decrement_atomic(&counter));
+        assert!(super::try_increment_atomic_below(&counter, 2));
+        assert!(super::try_increment_atomic_below(&counter, 2));
+        assert!(!super::try_increment_atomic_below(&counter, 2));
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Acquire), 2);
+        assert!(super::try_decrement_atomic(&counter));
+        assert!(super::try_decrement_atomic(&counter));
+        assert!(!super::try_decrement_atomic(&counter));
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn atomic_admission_increment_reaches_max_without_wrapping() {
+        let counter = std::sync::atomic::AtomicU64::new(u64::MAX - 1);
+
+        assert!(super::try_increment_atomic_below(&counter, u64::MAX));
+        assert!(!super::try_increment_atomic_below(&counter, u64::MAX));
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Acquire), u64::MAX);
+    }
+
+    #[test]
+    fn await_event_request_id_allocator_uses_the_last_unreserved_identity_once() {
+        let counter = std::sync::atomic::AtomicU64::new(u64::MAX - 1);
+
+        assert_eq!(
+            crate::try_next_unique_atomic_u64(&counter),
+            Some(u64::MAX - 1)
+        );
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Acquire), u64::MAX);
+        assert_eq!(crate::try_next_unique_atomic_u64(&counter), None);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Acquire), u64::MAX);
+    }
+
     fn config() -> Arc<Config> {
         Arc::new(Config::default())
     }
@@ -16728,6 +16808,54 @@ mod tests {
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.request_admissions, 0);
         assert_eq!(snapshot.request_admission_rejections_saturated, 0);
+        drop(service);
+        wait_for_completion_stats(&stats, "completion-only service shutdown", |snapshot| {
+            snapshot.worker_stops == 1
+        });
+    }
+
+    #[test]
+    fn await_event_service_id_exhaustion_releases_admission_without_running_request() {
+        let handler: super::McpAwaitEventDeliveryCompletionHandler = Arc::new(|_job| {});
+        let service =
+            super::McpAwaitEventDeliveryCompletionExecutor::new_with_handler(handler)
+                .expect("test completion-only service must start");
+        service
+            .request_sequence
+            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+        let stats = service.stats_for_test();
+        let operation_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_ran_for_request = Arc::clone(&operation_ran);
+        let operation: super::McpAwaitEventRequestOperation = Box::new(move |_storage| {
+            operation_ran_for_request.store(true, std::sync::atomic::Ordering::Release);
+            Box::pin(async {
+                super::McpAwaitEventRequestTaskOutput::new(
+                    Err(super::McpToolError::new(
+                        super::MCP_ERR_CONFIG,
+                        "must not run".to_string(),
+                        None,
+                    )),
+                    Vec::new(),
+                    true,
+                )
+            })
+        });
+
+        let error = service
+            .execute_request(crate::cx::for_request(), operation)
+            .expect_err("exhausted request identities must reject before publication");
+
+        assert!(error.message.contains("identity space"));
+        assert!(!operation_ran.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            service
+                .request_admissions
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.request_admissions, 0);
+        assert_eq!(snapshot.request_admission_rejections_id_exhausted, 1);
         drop(service);
         wait_for_completion_stats(&stats, "completion-only service shutdown", |snapshot| {
             snapshot.worker_stops == 1

@@ -2525,12 +2525,19 @@ static POLICY_WORKFLOW_PARENT_LOOKUP_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0
 static POLICY_AUDIT_WRITE_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn increment_policy_failure_counter(counter: &AtomicU64) -> u64 {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_add(1))
-        })
-        .unwrap_or_else(|current| current)
-        .saturating_add(1)
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(1);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 /// Return the cumulative number of failed Trauma Guard feedback writes.

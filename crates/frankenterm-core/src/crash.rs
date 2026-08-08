@@ -246,14 +246,22 @@ fn claim_bounded_crash_bundle_log_slot(
     warning_limit: u64,
 ) -> Option<u64> {
     let terminal = warning_limit.saturating_add(1);
-    counter
-        .fetch_update(
+    let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        if current >= terminal {
+            return None;
+        }
+        let next = current.saturating_add(1);
+        match counter.compare_exchange_weak(
+            current,
+            next,
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
-            |current| (current < terminal).then(|| current.saturating_add(1)),
-        )
-        .ok()
-        .map(|previous| previous.saturating_add(1))
+        ) {
+            Ok(_) => return Some(next),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 #[inline]
@@ -10951,6 +10959,32 @@ mod tests {
             }
         );
         assert_eq!(discovery.payload_files_opened, 0);
+    }
+
+    #[test]
+    fn bounded_crash_log_slot_claim_stops_at_suppression_notice() {
+        let counter = std::sync::atomic::AtomicU64::new(0);
+
+        assert_eq!(claim_bounded_crash_bundle_log_slot(&counter, 2), Some(1));
+        assert_eq!(claim_bounded_crash_bundle_log_slot(&counter, 2), Some(2));
+        assert_eq!(claim_bounded_crash_bundle_log_slot(&counter, 2), Some(3));
+        assert_eq!(claim_bounded_crash_bundle_log_slot(&counter, 2), None);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn bounded_crash_log_slot_claim_handles_maximum_limit_without_wrapping() {
+        let counter = std::sync::atomic::AtomicU64::new(u64::MAX - 1);
+
+        assert_eq!(
+            claim_bounded_crash_bundle_log_slot(&counter, u64::MAX),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            claim_bounded_crash_bundle_log_slot(&counter, u64::MAX),
+            None
+        );
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), u64::MAX);
     }
 
     #[test]

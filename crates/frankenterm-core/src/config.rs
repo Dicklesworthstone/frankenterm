@@ -2003,7 +2003,7 @@ fn append_compiled_retention_tier_predicate(
     bind_values: &mut Vec<String>,
     tier: &RetentionTier,
 ) {
-    let needs_and = !tier.severities.is_empty();
+    let mut needs_and = !tier.severities.is_empty();
     if needs_and {
         sql.push('(');
         for (index, severity) in tier.severities.iter().enumerate() {
@@ -8991,6 +8991,53 @@ retention_tiers = []
                 .resolve_retention_days("critical", "error", false),
             45
         );
+    }
+
+    #[test]
+    fn compiled_retention_predicate_joins_every_filter_combination_correctly() {
+        for has_severity in [false, true] {
+            for has_event_type in [false, true] {
+                for has_handled in [false, true] {
+                    let tier = RetentionTier {
+                        name: "predicate-shape".to_string(),
+                        retention_days: 7,
+                        severities: has_severity
+                            .then(|| vec!["warn".to_string()])
+                            .unwrap_or_default(),
+                        event_types: has_event_type
+                            .then(|| vec!["workflow.".to_string()])
+                            .unwrap_or_default(),
+                        handled: has_handled.then_some(true),
+                    };
+                    let mut sql = String::new();
+                    let mut binds = Vec::new();
+
+                    append_compiled_retention_tier_predicate(&mut sql, &mut binds, &tier);
+
+                    assert!(!sql.starts_with(" AND "), "invalid leading join: {sql}");
+                    assert!(!sql.ends_with(" AND "), "invalid trailing join: {sql}");
+                    assert_eq!(
+                        binds.len(),
+                        usize::from(u8::from(has_severity))
+                            + 2 * usize::from(u8::from(has_event_type))
+                    );
+                    if !has_severity && !has_event_type && !has_handled {
+                        assert_eq!(sql, "1=1");
+                    }
+                    if has_severity && has_event_type {
+                        assert!(sql.contains(") AND ("), "missing filter join: {sql}");
+                    }
+                    if has_handled && (has_severity || has_event_type) {
+                        assert!(
+                            sql.contains(") AND handled_at IS NOT NULL"),
+                            "missing handled join: {sql}"
+                        );
+                    } else if has_handled {
+                        assert_eq!(sql, "handled_at IS NOT NULL");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -56,7 +56,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
@@ -327,7 +327,11 @@ impl DataflowGraph {
     // =========================================================================
 
     fn alloc_id(&self) -> NodeId {
-        NodeId(self.next_id.fetch_add(1, Ordering::Relaxed))
+        NodeId(
+            crate::try_next_unique_atomic_u64(&self.next_id).unwrap_or_else(|| {
+                panic!("dataflow node id space exhausted; refusing to replace an existing node")
+            }),
+        )
     }
 
     /// Add a source node with an initial value.
@@ -1178,12 +1182,28 @@ impl DataflowGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn source_node_stores_value() {
         let mut g = DataflowGraph::new();
         let s = g.add_source("x", Value::Int(42));
         assert_eq!(g.get_value(s), Some(&Value::Int(42)));
+    }
+
+    #[test]
+    fn node_id_exhaustion_fails_before_replacing_an_existing_node() {
+        let mut graph = DataflowGraph::new();
+        let existing = graph.add_source("existing", Value::Int(42));
+        graph.next_id.store(u64::MAX, Ordering::Release);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            graph.add_source("must-not-replace", Value::Int(99))
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(graph.node_count(), 1);
+        assert_eq!(graph.get_value(existing), Some(&Value::Int(42)));
     }
 
     #[test]

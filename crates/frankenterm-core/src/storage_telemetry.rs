@@ -724,6 +724,9 @@ impl<S> InstrumentedStorage<S> {
     /// even if the caller's context was cancelled after the append completed.
     /// Cancellation belongs at the operation boundary; once an outcome exists,
     /// dropping its telemetry would make the accounting observably false.
+    // This is deliberately an eager settled-future API. Recording a completed
+    // outcome must happen at call time, before the returned ready future can be
+    // dropped or polled. Runtime-proof coverage classifies this exact shape.
     #[allow(clippy::future_not_send)]
     pub fn append_batch_instrumented_with_cx(
         &self,
@@ -1525,6 +1528,63 @@ mod tests {
         let (inner, t) = instrumented.into_parts();
         assert_eq!(inner, 42);
         assert!(Arc::ptr_eq(&t, &telem));
+    }
+
+    #[test]
+    fn append_batch_instrumented_with_cx_records_before_unpolled_future_is_dropped() {
+        use crate::recorder_storage::{
+            AppendRequest, AppendResponse, DurabilityLevel, RecorderOffset,
+        };
+
+        let telemetry = Arc::new(StorageTelemetry::with_defaults());
+        let instrumented = InstrumentedStorage::new((), telemetry.clone());
+        let request = AppendRequest {
+            batch_id: "eager-telemetry".to_string(),
+            events: vec![],
+            required_durability: DurabilityLevel::Enqueued,
+            producer_ts_ms: 0,
+        };
+        let response = AppendResponse {
+            backend: RecorderBackendKind::AppendLog,
+            accepted_count: 2,
+            first_offset: RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 0,
+            },
+            last_offset: RecorderOffset {
+                segment_id: 0,
+                byte_offset: 64,
+                ordinal: 1,
+            },
+            committed_durability: DurabilityLevel::Enqueued,
+            committed_at_ms: 0,
+        };
+        let cx = crate::cx::for_request();
+
+        let unpolled = instrumented.append_batch_instrumented_with_cx(
+            &cx,
+            request,
+            Ok(response),
+            Instant::now(),
+            RecorderBackendKind::AppendLog,
+        );
+        assert_eq!(
+            telemetry.registry().counter_value(COUNTER_BATCHES_PROCESSED),
+            1,
+            "completed append telemetry must be recorded at call time"
+        );
+        assert_eq!(
+            telemetry.registry().counter_value(COUNTER_EVENTS_APPENDED),
+            2,
+            "accepted-event telemetry must be recorded before polling"
+        );
+        drop(unpolled);
+        assert_eq!(
+            telemetry.registry().counter_value(COUNTER_BATCHES_PROCESSED),
+            1,
+            "dropping the settled future must not duplicate telemetry"
+        );
     }
 
     /// ft-xbnl0.2.3 Cx-first: `append_batch_instrumented_with_cx`

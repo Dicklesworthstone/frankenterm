@@ -56,11 +56,22 @@ static NEXT_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
 /// zero exhaustion sentinel and fails closed. Atomic modification order makes
 /// each nonzero value unique even under concurrent allocation.
 fn allocate_monotonic_nonzero(counter: &AtomicU64) -> Option<u64> {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            (current != 0).then_some(current.wrapping_add(1))
-        })
-        .ok()
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current == 0 {
+            return None;
+        }
+        let next = current.wrapping_add(1);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(previous) => return Some(previous),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn allocate_channel_id(counter: &AtomicU64) -> u64 {

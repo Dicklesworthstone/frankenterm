@@ -96,6 +96,14 @@ const TIMELINE_PANE_ID_INLINE_LIMIT: usize = 96;
 const WRITER_DISPATCH_PANIC_ERROR: &str =
     "storage writer recovered from dispatch panic (WA-STORAGE-WRITER-PANIC)";
 
+#[cfg(test)]
+std::thread_local! {
+    /// Records whether the eager writable probe observed a failed entry
+    /// checkpoint before returning its settled future.
+    static STORAGE_IS_WRITABLE_ENTRY_CHECKPOINT_FAILED: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Maximum number of identifiers accepted by one storage bulk-read call.
 ///
 /// Bulk readers bind one canonical JSON array rather than one SQLite variable
@@ -3297,7 +3305,7 @@ impl StorageHandle {
                 // contract after every wake so an expired deadline cannot turn
                 // this watcher into a non-yielding hot loop.
                 if cx.checkpoint().is_err() {
-                    return Ok::<(), crate::runtime_async::ContextError>(());
+                    return Ok::<(), String>(());
                 }
                 sleep_result?;
             }
@@ -9166,12 +9174,20 @@ impl StorageHandle {
     /// Health probe routed through a cx seam so a cancelled context surfaces
     /// before the channel state is inspected. The channel-state observation
     /// itself is infallible; only the capability checkpoint can fail.
+    // This is deliberately an eager settled-future API: both the capability
+    // checkpoint and channel observation happen before the returned ready
+    // future can be dropped or polled. Runtime-proof coverage classifies this
+    // exact shape rather than forcing it into deferred `async fn` semantics.
     pub fn is_writable_with_cx(
         &self,
         cx: &crate::cx::Cx,
     ) -> impl std::future::Future<Output = Result<bool>> {
         let result = Self::checkpoint_storage_operation(cx, "is_writable")
             .map(|()| !self.write_tx.is_closed());
+        #[cfg(test)]
+        STORAGE_IS_WRITABLE_ENTRY_CHECKPOINT_FAILED.with(|observed| {
+            observed.set(Some(result.is_err()));
+        });
         std::future::ready(result)
     }
 
@@ -36360,6 +36376,23 @@ fn storage_tick147_misc_step_log_plan_audit_cluster_roundtrip() {
         // 9. is_writable_with_cx — writer thread up, expect true.
         let writable = storage.is_writable_with_cx(&cx).await.unwrap();
         assert!(writable, "fresh storage should be writable");
+
+        // The Cx seam is intentionally eager. A cancelled caller must be
+        // checked even if it drops the already-settled future without polling.
+        let cancelled_cx = crate::cx::for_testing();
+        cancelled_cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("eager writable probe regression test"),
+        );
+        STORAGE_IS_WRITABLE_ENTRY_CHECKPOINT_FAILED.with(|observed| observed.set(None));
+        let unpolled = storage.is_writable_with_cx(&cancelled_cx);
+        assert_eq!(
+            STORAGE_IS_WRITABLE_ENTRY_CHECKPOINT_FAILED.with(std::cell::Cell::get),
+            Some(true),
+            "writable-probe cancellation must be checked before polling"
+        );
+        drop(unpolled);
+        STORAGE_IS_WRITABLE_ENTRY_CHECKPOINT_FAILED.with(|observed| observed.set(None));
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);

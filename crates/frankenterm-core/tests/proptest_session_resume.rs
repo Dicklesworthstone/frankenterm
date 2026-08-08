@@ -260,13 +260,15 @@ fn empty_explicit_home_is_rejected_before_native_or_casr_discovery() {
         ..Default::default()
     });
 
-    assert_eq!(
+    assert!(matches!(
         resumer.discover_sessions_in_home(Path::new("")),
         Err(SessionResumeError::InvalidHomeDirectory)
-    );
-    assert_eq!(
-        resumer.discover_sessions_in_home(Path::new("relative-home")),
-        Err(SessionResumeError::InvalidHomeDirectory),
+    ));
+    assert!(
+        matches!(
+            resumer.discover_sessions_in_home(Path::new("relative-home")),
+            Err(SessionResumeError::InvalidHomeDirectory)
+        ),
         "relative paths would resolve differently for native scanning and a CASR working directory"
     );
 }

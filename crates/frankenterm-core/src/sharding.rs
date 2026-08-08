@@ -4888,13 +4888,6 @@ mod tests {
     #[allow(deprecated)]
     #[test]
     fn sharded_backend_projection_preserves_retry_authority_and_redacts_details() {
-        let handle = Arc::new(MockWezterm::new()) as WeztermHandle;
-        let client = ShardedWeztermClient::new(
-            vec![ShardBackend::new(ShardId(3), handle)],
-            AssignmentStrategy::RoundRobin,
-        )
-        .expect("single sharded backend");
-
         let indeterminate = ShardedWeztermClient::backend_error(
             ShardId(3),
             "split_pane",

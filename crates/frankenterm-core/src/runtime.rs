@@ -572,12 +572,19 @@ static RUNTIME_WAIT_FAILURES_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 fn increment_saturating_atomic(counter: &std::sync::atomic::AtomicU64) -> u64 {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_add(1))
-        })
-        .unwrap_or_else(|current| current)
-        .saturating_add(1)
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(1);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn runtime_cancel_or_budget_failure_kind(
@@ -3908,6 +3915,10 @@ impl ObservationRuntime {
     /// runtime's internal sub-tasks then run under their own request-cx
     /// (see runtime_loop_cx() in shutdown_with_summary), so the seal is
     /// preserved at every boundary the runtime crosses.
+    // This source-level `async fn` identity is part of runtime-proof coverage.
+    // Startup currently completes synchronously once polled; adding an
+    // artificial yield would change task-admission and cancellation ordering.
+    #[allow(clippy::unused_async_trait_impl)]
     pub async fn start_with_cx(&mut self, cx: &crate::cx::Cx) -> Result<RuntimeHandle> {
         cx.checkpoint()
             .map_err(|_| {

@@ -39,6 +39,14 @@ pub const INJECTION_SKIPPED_SAMPLE_CAP: usize = 16;
 /// Number of scrollback pane entries scanned between cooperative capability checks.
 const INJECTION_SCAN_CHECKPOINT_INTERVAL: usize = 256;
 
+#[cfg(test)]
+std::thread_local! {
+    /// Records whether the eager injection preflight observed a failed entry
+    /// checkpoint before returning its settled future.
+    static INJECT_PREFLIGHT_ENTRY_CHECKPOINT_FAILED: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn restore_scrollback_context_error(
     operation: &'static str,
     cx: &crate::cx::Cx,
@@ -388,29 +396,40 @@ impl ScrollbackInjector {
     /// The caller's capability is checked first. An uncancelled request then
     /// receives a structured resource-limit or unsupported-channel error; no
     /// pane API is called.
+    // This is deliberately an eager settled-future API: capability and bounded
+    // input preflight run at call time, before the returned ready future can be
+    // dropped or polled. Runtime-proof coverage classifies this exact shape.
     pub fn inject_with_cx(
         &self,
         cx: &crate::cx::Cx,
         pane_id_map: &HashMap<u64, u64>,
         scrollbacks: &HashMap<u64, ScrollbackData>,
     ) -> impl std::future::Future<Output = crate::Result<InjectionReport>> {
-        std::future::ready(self.inject_preflight_with_cx(cx, pane_id_map, scrollbacks))
+        std::future::ready(Self::inject_preflight_with_cx(
+            cx,
+            pane_id_map,
+            scrollbacks,
+        ))
     }
 
     /// Execute the bounded, zero-I/O injection preflight synchronously.
     ///
     /// Keeping the scan in a synchronous helper makes it explicit that the
-    /// returned future is already settled while retaining every entry and
-    /// cadence checkpoint from the former async-without-await body.
+    /// public operation performs every checkpoint before returning its already
+    /// settled future.
     fn inject_preflight_with_cx(
-        &self,
         cx: &crate::cx::Cx,
         pane_id_map: &HashMap<u64, u64>,
         scrollbacks: &HashMap<u64, ScrollbackData>,
     ) -> crate::Result<InjectionReport> {
         const OPERATION: &str = "restore_scrollback.inject.preflight";
 
-        cx.checkpoint()
+        let entry_checkpoint = cx.checkpoint();
+        #[cfg(test)]
+        INJECT_PREFLIGHT_ENTRY_CHECKPOINT_FAILED.with(|observed| {
+            observed.set(Some(entry_checkpoint.is_err()));
+        });
+        entry_checkpoint
             .map_err(|error| restore_scrollback_context_error(OPERATION, cx, &error))?;
 
         // Restore inputs originate from an admitted topology, but this public
@@ -628,6 +647,28 @@ mod tests {
                 other => panic!("expected structured runtime operation, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn inject_with_cx_checks_cancellation_before_unpolled_future_is_dropped() {
+        let injector = make_injector();
+        let pane_id_map = HashMap::new();
+        let scrollbacks = HashMap::new();
+        let cx = crate::cx::for_testing();
+        cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("eager scrollback preflight regression test"),
+        );
+        INJECT_PREFLIGHT_ENTRY_CHECKPOINT_FAILED.with(|observed| observed.set(None));
+
+        let unpolled = injector.inject_with_cx(&cx, &pane_id_map, &scrollbacks);
+        assert_eq!(
+            INJECT_PREFLIGHT_ENTRY_CHECKPOINT_FAILED.with(std::cell::Cell::get),
+            Some(true),
+            "entry cancellation must be checked before the settled future is polled"
+        );
+        drop(unpolled);
+        INJECT_PREFLIGHT_ENTRY_CHECKPOINT_FAILED.with(|observed| observed.set(None));
     }
 
     // --- ScrollbackData ---

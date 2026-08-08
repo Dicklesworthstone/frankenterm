@@ -362,7 +362,7 @@ mod web_tests {
 
             let mut byte = [0_u8; 1];
             match timeout(Duration::from_secs(1), stalled.read(&mut byte)).await {
-                Ok(Ok(0)) | Ok(Err(_)) => {}
+                Ok(Ok(0) | Err(_)) => {}
                 Ok(Ok(count)) => panic!(
                     "stalled connection should close without response bytes, read {count} byte(s)"
                 ),

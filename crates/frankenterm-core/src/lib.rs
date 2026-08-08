@@ -52,6 +52,45 @@
 // this crate forbids.
 #![cfg_attr(windows, feature(windows_by_handle))]
 
+/// Reserve one process-local `u64` identity without ever wrapping back into
+/// an already-issued value. `u64::MAX` is retained as the exhausted sentinel.
+#[must_use]
+pub(crate) fn try_next_unique_atomic_u64(
+    counter: &std::sync::atomic::AtomicU64,
+) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1)?;
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[cfg(test)]
+mod atomic_identity_tests {
+    use super::try_next_unique_atomic_u64;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn unique_atomic_u64_uses_the_last_unreserved_identity_once() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+
+        assert_eq!(try_next_unique_atomic_u64(&counter), Some(u64::MAX - 1));
+        assert_eq!(counter.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(try_next_unique_atomic_u64(&counter), None);
+        assert_eq!(counter.load(Ordering::Acquire), u64::MAX);
+    }
+}
+
 pub mod a11y_tree;
 pub mod accessibility_preferences;
 pub mod accounts;

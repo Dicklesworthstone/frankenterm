@@ -1082,7 +1082,11 @@ impl SubscriptionRegistry {
         cursor: StreamCursor,
         now_ms: u64,
     ) -> SubscriptionId {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = crate::try_next_unique_atomic_u64(&self.next_id).unwrap_or_else(|| {
+            panic!(
+                "event-stream subscription id space exhausted; refusing to replace an active subscription"
+            )
+        });
         let info = SubscriptionInfo {
             id,
             filter,
@@ -1624,6 +1628,29 @@ mod tests {
         );
         assert_ne!(id1, id2);
         assert_eq!(registry.count(), 2);
+    }
+
+    #[test]
+    fn registry_id_exhaustion_fails_before_replacing_an_active_subscription() {
+        let registry = SubscriptionRegistry::new();
+        let first_id = registry.register(
+            EventStreamFilter::default(),
+            StreamCursor::from_beginning(),
+            1000,
+        );
+        registry.next_id.store(u64::MAX, Ordering::Release);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.register(
+                EventStreamFilter::default(),
+                StreamCursor::from_beginning(),
+                2000,
+            )
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(registry.count(), 1);
+        assert_eq!(registry.get(first_id).unwrap().created_at_ms, 1000);
     }
 
     #[test]

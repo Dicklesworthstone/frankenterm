@@ -2831,13 +2831,7 @@ fn validate_restore_outcome_metadata(
     } else {
         true
     };
-    let process_state_consistent = if !*layout_complete {
-        !*process_plan_evaluated
-            && *process_plans_total == 0
-            && *process_plans_settled == 0
-            && disposition_count == 0
-            && !*process_interrupted
-    } else if *expected_panes == 0 {
+    let process_state_consistent = if !*layout_complete || *expected_panes == 0 {
         !*process_plan_evaluated
             && *process_plans_total == 0
             && *process_plans_settled == 0
