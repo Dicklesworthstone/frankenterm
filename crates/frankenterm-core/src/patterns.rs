@@ -33,7 +33,7 @@ pub const PATTERN_PACK_COMPATIBILITY_TARGET: &str = "frankenterm-patterns.v1";
 type RuleRegexResult = std::result::Result<Regex, Box<fancy_regex::Error>>;
 
 fn saturating_atomic_add(counter: &AtomicU64, delta: u64) {
-    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    let _ = crate::try_update_atomic_u64(counter, Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_add(delta))
     });
 }

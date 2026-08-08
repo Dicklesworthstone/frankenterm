@@ -818,7 +818,7 @@ mod tests {
                 session_id: Some("sess-123".to_string()),
                 state: Some("working".to_string()),
             })
-            .with_env_from_iter([("PATH".to_owned(), "/usr/bin".to_owned())].into_iter());
+            .with_env_from_iter(std::iter::once(("PATH".to_owned(), "/usr/bin".to_owned())));
 
         let json = snapshot.to_json().unwrap();
         let restored = PaneStateSnapshot::from_json(&json).unwrap();

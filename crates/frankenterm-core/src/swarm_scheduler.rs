@@ -1552,9 +1552,11 @@ impl SwarmScheduler {
         stats: &QueueStats,
         max_concurrent_per_agent: u32,
     ) -> QueuePressure {
-        let non_terminal = stats
-            .total_items
-            .saturating_sub(stats.completed + stats.failed + stats.cancelled);
+        let terminal = stats
+            .completed
+            .saturating_add(stats.failed)
+            .saturating_add(stats.cancelled);
+        let non_terminal = stats.total_items.saturating_sub(terminal);
         let ready_ratio = if non_terminal > 0 {
             stats.ready as f64 / non_terminal as f64
         } else {
@@ -4351,7 +4353,10 @@ mod tests {
             completion_log_size: 0,
         };
 
-        assert_eq!(scheduler.compute_pressure(&stats, 3).failure_rate, 0.5);
+        assert_eq!(
+            scheduler.compute_pressure(&stats, 3).failure_rate.to_bits(),
+            0.5f64.to_bits()
+        );
     }
 
     #[test]

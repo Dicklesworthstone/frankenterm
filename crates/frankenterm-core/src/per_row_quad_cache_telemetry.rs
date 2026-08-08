@@ -497,7 +497,7 @@ mod tests {
 
         fold_event(&mut h, RowCacheEvent::FrameBoundary { rows_referenced: 0 });
 
-        assert_eq!(h.last_frame_hit_rate, 0.5);
+        assert_eq!(h.last_frame_hit_rate.to_bits(), 0.5f64.to_bits());
         assert_eq!(h.frame_hits, 0);
         assert_eq!(h.frame_misses, 0);
     }

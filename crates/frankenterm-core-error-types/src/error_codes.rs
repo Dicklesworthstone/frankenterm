@@ -2086,7 +2086,7 @@ mod tests {
             let guidance = def
                 .recovery_steps
                 .iter()
-                .map(|step| step.description.as_str())
+                .map(|step| step.description.as_ref())
                 .collect::<Vec<_>>()
                 .join(" ")
                 .to_ascii_lowercase();

@@ -607,10 +607,10 @@ mod tests {
         let mut policy = TransportPolicy::with_defaults();
         policy.total_savings_us = f64::MAX;
         policy.record(1, TransportMode::Local, 1.0, 0.0, 1);
-        assert_eq!(policy.total_savings_us, f64::MAX);
+        assert_eq!(policy.total_savings_us.to_bits(), f64::MAX.to_bits());
 
         policy.total_savings_us = -f64::MAX;
         policy.record(1, TransportMode::Local, 0.0, 1.0, 2);
-        assert_eq!(policy.total_savings_us, -f64::MAX);
+        assert_eq!(policy.total_savings_us.to_bits(), (-f64::MAX).to_bits());
     }
 }

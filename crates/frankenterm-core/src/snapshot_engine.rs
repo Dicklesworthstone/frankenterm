@@ -6473,6 +6473,13 @@ mod tests {
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder, sleep, timeout};
     use crate::wezterm::PaneSize;
 
+    type TestPaneProviderFuture = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<Vec<PaneInfo>, SnapshotError>>
+                + Send,
+        >,
+    >;
+
     #[test]
     fn sqlite_integer_conversions_reject_wrapping_values_and_corrupt_rows() {
         let sqlite_max_as_u64 = u64::try_from(i64::MAX).unwrap();
@@ -7776,24 +7783,24 @@ mod tests {
 
         #[cfg(unix)]
         {
-            let invalid_ff = snapshot_authority_file_identity(&format!(
+            let reference_identity = snapshot_authority_file_identity(&format!(
                 "file:{}/authority%FF.db",
                 parent.to_string_lossy()
             ));
-            let invalid_ff_alias = snapshot_authority_file_identity(&format!(
+            let hex_case_alias = snapshot_authority_file_identity(&format!(
                 "file:{}/authority%ff.db",
                 parent.to_string_lossy()
             ));
-            let invalid_fe = snapshot_authority_file_identity(&format!(
+            let neighboring_byte_identity = snapshot_authority_file_identity(&format!(
                 "file:{}/authority%FE.db",
                 parent.to_string_lossy()
             ));
             assert_eq!(
-                invalid_ff, invalid_ff_alias,
+                reference_identity, hex_case_alias,
                 "hex-digit case cannot split authority for the same non-UTF-8 Unix filename"
             );
             assert_ne!(
-                invalid_ff, invalid_fe,
+                reference_identity, neighboring_byte_identity,
                 "lossy path display must not couple distinct non-UTF-8 Unix filenames"
             );
         }
@@ -8189,8 +8196,11 @@ mod tests {
         );
 
         cadence.last_authoritative_success = Some(base);
+        let just_before_interval = interval
+            .checked_sub(Duration::from_nanos(1))
+            .expect("cleanup interval fixture is nonzero");
         let before_due = base
-            .checked_add(interval - Duration::from_nanos(1))
+            .checked_add(just_before_interval)
             .expect("cleanup cadence boundary fits in Instant");
         assert!(!checkpoint_cleanup_due(&cadence, interval, before_due));
         assert_eq!(
@@ -8258,8 +8268,11 @@ mod tests {
                 .retry_deferred_at
                 .expect("an unfinished attempt must publish retry deferral")
         };
+        let just_before_retry = CHECKPOINT_CLEANUP_RETRY_DELAY
+            .checked_sub(Duration::from_nanos(1))
+            .expect("checkpoint cleanup retry fixture is nonzero");
         let before_retry = retry_deferred_at
-            .checked_add(CHECKPOINT_CLEANUP_RETRY_DELAY - Duration::from_nanos(1))
+            .checked_add(just_before_retry)
             .expect("cleanup retry boundary fits in Instant");
         assert!(
             second
@@ -8344,8 +8357,11 @@ mod tests {
             Some(SESSION_CLEANUP_RETRY_DELAY),
             "periodic scheduling must expose the independent retry deadline"
         );
+        let just_before_retry = SESSION_CLEANUP_RETRY_DELAY
+            .checked_sub(Duration::from_nanos(1))
+            .expect("session cleanup retry fixture is nonzero");
         let before_retry = base
-            .checked_add(SESSION_CLEANUP_RETRY_DELAY - Duration::from_nanos(1))
+            .checked_add(just_before_retry)
             .expect("retry boundary fits in Instant");
         assert!(!session_cleanup_due(&schedule, 24, before_retry));
         assert_eq!(
@@ -11577,9 +11593,13 @@ mod tests {
         });
         assert_ne!(
             baseline,
-            prepare_snapshot_persistence(&topology_at_200, &[scrollback_changed.clone()], None)
-                .expect("scrollback-enriched projection")
-                .dedup_hash,
+            prepare_snapshot_persistence(
+                &topology_at_200,
+                std::slice::from_ref(&scrollback_changed),
+                None,
+            )
+            .expect("scrollback-enriched projection")
+            .dedup_hash,
             "scrollback authority changes must participate in dedup"
         );
         let total_segments_only = state_at_200.clone().with_scrollback(ScrollbackRef {
@@ -11643,7 +11663,7 @@ mod tests {
         use crate::session_pane_state::CapturedEnv;
 
         let pane = make_test_pane(1, 24, 80);
-        let (topology, _) = TopologySnapshot::from_panes(&[pane.clone()], 100);
+        let (topology, _) = TopologySnapshot::from_panes(std::slice::from_ref(&pane), 100);
         let mut first = PaneStateSnapshot::from_pane_info(&pane, 100, false);
         let mut second = first.clone();
         let mut first_vars = HashMap::new();
@@ -11850,14 +11870,7 @@ mod tests {
         );
     }
 
-    fn counting_pane_provider() -> impl Fn() -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = std::result::Result<Vec<PaneInfo>, SnapshotError>>
-                + Send,
-        >,
-    > + Send
-    + Sync
-    + 'static {
+    fn counting_pane_provider() -> impl Fn() -> TestPaneProviderFuture + Send + Sync + 'static {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         move || {
             let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

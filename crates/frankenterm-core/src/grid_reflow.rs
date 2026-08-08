@@ -559,7 +559,7 @@ mod tests {
             lines_skipped_total: u64::MAX,
             last_reflow_duration_ms: 0,
         };
-        assert_eq!(h.skip_ratio(), 0.5);
+        assert_eq!(h.skip_ratio().to_bits(), 0.5f64.to_bits());
     }
 
     #[test]

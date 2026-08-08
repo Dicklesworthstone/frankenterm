@@ -753,11 +753,12 @@ impl ScopeHandle {
     /// publication.
     pub fn request_shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Release);
-        let _ = self
-            .generation
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
-                generation.checked_add(1)
-            });
+        let _ = crate::try_update_atomic_u64(
+            &self.generation,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |generation| generation.checked_add(1),
+        );
     }
 
     /// Check if shutdown has been requested.

@@ -509,7 +509,7 @@ mod tests {
             duplicates_total: u64::MAX,
             safety_violations_total: 0,
         };
-        assert_eq!(h.duplicate_ratio(), 0.5);
+        assert_eq!(h.duplicate_ratio().to_bits(), 0.5f64.to_bits());
     }
 
     #[test]

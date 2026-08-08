@@ -4053,8 +4053,10 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().expect("isolated adversarial lock root");
-        let profiles_root = temp.path().join("profiles");
-        let outside = temp.path().join("outside-lock");
+        let canonical_temp = std::fs::canonicalize(temp.path())
+            .expect("adversarial lock root must not retain a trusted temp alias");
+        let profiles_root = canonical_temp.join("profiles");
+        let outside = canonical_temp.join("outside-lock");
         std::fs::write(&outside, b"outside").expect("outside lock fixture");
 
         let symlinked = BrowserProfile::new(&profiles_root, "openai", "symlinked-lock");
@@ -4358,8 +4360,10 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().expect("isolated discovery symlink root");
-        let profiles_root = temp.path().join("profiles");
-        let outside = temp.path().join("outside");
+        let canonical_temp = std::fs::canonicalize(temp.path())
+            .expect("discovery root must not retain a trusted temp alias");
+        let profiles_root = canonical_temp.join("profiles");
+        let outside = canonical_temp.join("outside");
         ensure_profiles_root_capability(&profiles_root).expect("private profiles root fixture");
         std::fs::create_dir(&outside).expect("outside fixture");
         std::fs::create_dir(outside.join("account")).expect("outside account fixture");

@@ -164,6 +164,10 @@ async fn setup_client(
     (client, temp_dir)
 }
 
+// Keep the production-shaped batch future inline. Boxing it would add one heap
+// allocation to every measured iteration and contaminate the comparison with
+// benchmark-driver overhead that the real call path does not require.
+#[allow(clippy::large_futures)]
 fn bench_pipeline_vs_sequential_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("pdu_pipelining/pipeline_vs_sequential_throughput");
     group.throughput(Throughput::Elements(50));
@@ -213,6 +217,9 @@ fn bench_pipeline_vs_sequential_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+// See `bench_pipeline_vs_sequential_throughput`: allocation-free future
+// construction is part of this latency measurement's fidelity contract.
+#[allow(clippy::large_futures)]
 fn bench_pipeline_batch_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("pdu_pipelining/pipeline_batch_latency");
     let rt = make_runtime();
@@ -246,6 +253,9 @@ fn bench_pipeline_batch_latency(c: &mut Criterion) {
     group.finish();
 }
 
+// See `bench_pipeline_vs_sequential_throughput`: boxing here would charge one
+// unrelated allocation to every depth sample.
+#[allow(clippy::large_futures)]
 fn bench_pipeline_depth_saturation(c: &mut Criterion) {
     let mut group = c.benchmark_group("pdu_pipelining/pipeline_depth_saturation");
     let rt = make_runtime();

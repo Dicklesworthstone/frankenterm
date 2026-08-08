@@ -12189,11 +12189,13 @@ mod tests {
             });
 
             let (mpsc_decision, mpsc_receipt) = CaptureResyncDecision::channel();
-            let stale_mpsc = test_capture_event_for_lease(pane_id, 0, &predecessor_lease)
-                .with_resync_decision(mpsc_decision);
+            let relay_predecessor_event =
+                test_capture_event_for_lease(pane_id, 0, &predecessor_lease)
+                    .with_resync_decision(mpsc_decision);
             let (spsc_decision, spsc_receipt) = CaptureResyncDecision::channel();
-            let stale_spsc = test_capture_event_for_lease(pane_id, 1, &predecessor_lease)
-                .with_resync_decision(spsc_decision);
+            let ring_predecessor_event =
+                test_capture_event_for_lease(pane_id, 1, &predecessor_lease)
+                    .with_resync_decision(spsc_decision);
 
             publication_tx
                 .send(DiscoveryCapturePublication {
@@ -12252,10 +12254,10 @@ mod tests {
             let (ingress_tx, ingress_rx) = mpsc::channel(2);
             let (ring_tx, ring_rx) = spsc_channel(4);
             ring_tx
-                .try_send(stale_spsc)
+                .try_send(ring_predecessor_event)
                 .expect("park predecessor event in SPSC");
             ingress_tx
-                .try_send(stale_mpsc)
+                .try_send(relay_predecessor_event)
                 .expect("park predecessor event in MPSC");
             ingress_tx
                 .try_send(successor_event)
@@ -16927,8 +16929,11 @@ mod tests {
             !schedule.should_attempt(start),
             "failure must not retry in the same maintenance turn"
         );
+        let just_before_retry = RETENTION_MAINTENANCE_RETRY_DELAY
+            .checked_sub(Duration::from_millis(1))
+            .expect("retry delay fixture is nonzero");
         let before_retry = start
-            .checked_add(RETENTION_MAINTENANCE_RETRY_DELAY - Duration::from_millis(1))
+            .checked_add(just_before_retry)
             .expect("test instant range");
         assert!(!schedule.should_attempt(before_retry));
         let retry_at = start
@@ -16938,8 +16943,11 @@ mod tests {
 
         schedule.finish_attempt(retry_at, true);
         assert!(!schedule.due);
+        let just_before_cadence = RETENTION_MAINTENANCE_CADENCE
+            .checked_sub(Duration::from_millis(1))
+            .expect("maintenance cadence fixture is nonzero");
         let before_cadence = retry_at
-            .checked_add(RETENTION_MAINTENANCE_CADENCE - Duration::from_millis(1))
+            .checked_add(just_before_cadence)
             .expect("test instant range");
         assert!(!schedule.should_attempt(before_cadence));
         let cadence_at = retry_at

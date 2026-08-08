@@ -2627,16 +2627,16 @@ mod tests {
 
     #[test]
     fn undo_outcome_deserialize_from_string_values() {
-        let s: UndoOutcome = serde_json::from_str(r#""success""#).unwrap();
-        assert_eq!(s, UndoOutcome::Success);
-        let w: UndoOutcome = serde_json::from_str(r#""applied_with_warning""#).unwrap();
-        assert_eq!(w, UndoOutcome::AppliedWithWarning);
-        let n: UndoOutcome = serde_json::from_str(r#""not_applicable""#).unwrap();
-        assert_eq!(n, UndoOutcome::NotApplicable);
-        let i: UndoOutcome = serde_json::from_str(r#""indeterminate""#).unwrap();
-        assert_eq!(i, UndoOutcome::Indeterminate);
-        let f: UndoOutcome = serde_json::from_str(r#""failed""#).unwrap();
-        assert_eq!(f, UndoOutcome::Failed);
+        let success: UndoOutcome = serde_json::from_str(r#""success""#).unwrap();
+        assert_eq!(success, UndoOutcome::Success);
+        let warning: UndoOutcome = serde_json::from_str(r#""applied_with_warning""#).unwrap();
+        assert_eq!(warning, UndoOutcome::AppliedWithWarning);
+        let not_applicable: UndoOutcome = serde_json::from_str(r#""not_applicable""#).unwrap();
+        assert_eq!(not_applicable, UndoOutcome::NotApplicable);
+        let indeterminate: UndoOutcome = serde_json::from_str(r#""indeterminate""#).unwrap();
+        assert_eq!(indeterminate, UndoOutcome::Indeterminate);
+        let failed: UndoOutcome = serde_json::from_str(r#""failed""#).unwrap();
+        assert_eq!(failed, UndoOutcome::Failed);
     }
 
     #[test]

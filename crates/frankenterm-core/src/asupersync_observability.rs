@@ -262,9 +262,12 @@ pub struct AsupersyncTelemetry {
 
 impl AsupersyncTelemetry {
     fn saturating_add(counter: &AtomicU64, delta: u64) {
-        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_add(delta))
-        });
+        let _ = crate::try_update_atomic_u64(
+            counter,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(delta)),
+        );
     }
 
     /// Create a new zeroed telemetry instance.

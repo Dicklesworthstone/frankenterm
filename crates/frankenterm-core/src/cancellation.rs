@@ -84,7 +84,8 @@ pub(crate) fn reset_cancellation_lock_poisoned_count_for_test() {
 /// cascade through the runtime's cancellation graph.
 fn lock_recovering<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poison| {
-        let _ = CANCELLATION_LOCK_POISONED_COUNT.try_update(
+        let _ = crate::try_update_atomic_u64(
+            &CANCELLATION_LOCK_POISONED_COUNT,
             Ordering::Relaxed,
             Ordering::Relaxed,
             |count| Some(count.saturating_add(1)),

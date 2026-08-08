@@ -8990,12 +8990,16 @@ retention_tiers = []
                     let tier = RetentionTier {
                         name: "predicate-shape".to_string(),
                         retention_days: 7,
-                        severities: has_severity
-                            .then(|| vec!["warn".to_string()])
-                            .unwrap_or_default(),
-                        event_types: has_event_type
-                            .then(|| vec!["workflow.".to_string()])
-                            .unwrap_or_default(),
+                        severities: if has_severity {
+                            vec!["warn".to_string()]
+                        } else {
+                            Vec::new()
+                        },
+                        event_types: if has_event_type {
+                            vec!["workflow.".to_string()]
+                        } else {
+                            Vec::new()
+                        },
                         handled: has_handled.then_some(true),
                     };
                     let mut sql = String::new();

@@ -3493,7 +3493,7 @@ mod tests {
 
     #[test]
     fn public_cx_resume_reaches_the_cancellation_aware_supervisor() {
-        let _public_api = SessionResumer::resume_session_with_cx;
+        std::hint::black_box(SessionResumer::resume_session_with_cx);
         let source = include_str!("session_resume.rs");
         let production = source
             .split("#[cfg(test)]")
@@ -3593,8 +3593,8 @@ mod tests {
 
     #[test]
     fn public_native_cx_discovery_never_routes_through_casr() {
-        let _explicit_home_api = discover_antigravity_conversations_from_home_with_cx;
-        let _current_home_api = discover_current_home_antigravity_conversations_with_cx;
+        std::hint::black_box(discover_antigravity_conversations_from_home_with_cx);
+        std::hint::black_box(discover_current_home_antigravity_conversations_with_cx);
         let source = include_str!("session_resume.rs");
         let production = source
             .split("#[cfg(test)]")

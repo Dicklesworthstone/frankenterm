@@ -179,11 +179,11 @@ impl PolicyController {
     pub fn new(mut config: PolicyControllerConfig) -> Self {
         let defaults = PolicyControllerConfig::default_asymmetric();
         if config.loss_matrix.len() != 16 {
-            config.loss_matrix = defaults.loss_matrix.clone();
+            config.loss_matrix.clone_from(&defaults.loss_matrix);
         } else {
-            for (index, loss) in config.loss_matrix.iter_mut().enumerate() {
+            for (loss, default_loss) in config.loss_matrix.iter_mut().zip(&defaults.loss_matrix) {
                 if !loss.is_finite() || *loss < 0.0 {
-                    *loss = defaults.loss_matrix[index];
+                    *loss = *default_loss;
                 } else {
                     *loss = loss.min(MAX_SAFE_LOSS);
                 }
@@ -635,7 +635,10 @@ mod tests {
         assert_eq!(controller.total_decisions, u64::MAX);
         assert_eq!(controller.hysteresis_count, u64::MAX);
         assert_eq!(controller.action_counts, [u64::MAX; 4]);
-        assert_eq!(controller.action_distribution(), [0.25; 4]);
+        assert_eq!(
+            controller.action_distribution().map(f64::to_bits),
+            [0.25f64.to_bits(); 4]
+        );
     }
 
     #[test]
@@ -655,8 +658,31 @@ mod tests {
             .into_iter()
             .next()
             .expect("the fail-safe decision is retained");
-        assert_eq!(decision.state_probs, [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(
+            decision.state_probs.map(f64::to_bits),
+            [
+                0.0f64.to_bits(),
+                0.0f64.to_bits(),
+                0.0f64.to_bits(),
+                1.0f64.to_bits()
+            ]
+        );
         assert!(decision.all_losses.iter().all(|loss| loss.is_finite()));
+    }
+
+    #[test]
+    fn malformed_entry_in_full_loss_matrix_uses_matching_default() {
+        let defaults = PolicyControllerConfig::default_asymmetric();
+        let mut config = defaults.clone();
+        config.loss_matrix[7] = f64::NAN;
+
+        let controller = PolicyController::new(config);
+
+        assert_eq!(controller.config.loss_matrix.len(), 16);
+        assert_eq!(
+            controller.config.loss_matrix[7].to_bits(),
+            defaults.loss_matrix[7].to_bits()
+        );
     }
 
     #[test]

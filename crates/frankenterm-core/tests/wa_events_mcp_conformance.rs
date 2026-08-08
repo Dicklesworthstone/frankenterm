@@ -810,7 +810,7 @@ fn assert_await_event_success_data(envelope: &Value, claim: bool) {
     assert_eq!(data["type"], Value::String("await_result".to_string()));
     assert_eq!(data["satisfied"], Value::Bool(true));
     assert_eq!(data["timed_out"], Value::Bool(false));
-    assert_eq!(data["final_cursor"], Value::from(if claim { 0 } else { 1 }));
+    assert_eq!(data["final_cursor"], Value::from(i32::from(!claim)));
     assert_canonical_cursor_epoch(&data["final_cursor_epoch"]);
     assert_canonical_cursor_scope(&data["final_cursor_scope"]);
     assert_eq!(data["unhandled_only"], Value::Bool(claim));

@@ -7002,6 +7002,9 @@ mod tests {
     }
 
     #[cfg(panic = "unwind")]
+    // The no-op wake callbacks are intentional: this probe's behavior is its
+    // panicking Drop, which Waker::noop cannot represent.
+    #[allow(clippy::manual_noop_waker)]
     impl std::task::Wake for RuntimeAsyncDropPanickingWake {
         fn wake(self: std::sync::Arc<Self>) {}
 
@@ -7036,6 +7039,9 @@ mod tests {
     }
 
     #[cfg(panic = "unwind")]
+    // The wake path is deliberately inert; Drop re-enters the mpsc sender and
+    // is the behavior under test.
+    #[allow(clippy::manual_noop_waker)]
     impl std::task::Wake for MpscReentrantDropWake {
         fn wake(self: std::sync::Arc<Self>) {}
 
@@ -7058,6 +7064,9 @@ mod tests {
     }
 
     #[cfg(panic = "unwind")]
+    // The wake path is deliberately inert; Drop re-enters the watch sender and
+    // is the behavior under test.
+    #[allow(clippy::manual_noop_waker)]
     impl std::task::Wake for WatchReentrantDropWake {
         fn wake(self: std::sync::Arc<Self>) {}
 
@@ -7080,6 +7089,9 @@ mod tests {
     }
 
     #[cfg(panic = "unwind")]
+    // The wake path is deliberately inert; Drop re-enters the broadcast sender
+    // and is the behavior under test.
+    #[allow(clippy::manual_noop_waker)]
     impl std::task::Wake for BroadcastReentrantDropWake {
         fn wake(self: std::sync::Arc<Self>) {}
 
@@ -7143,6 +7155,9 @@ mod tests {
 
     #[cfg(panic = "unwind")]
     #[test]
+    // The first half must exercise the owned Wake::wake path independently of
+    // the borrowed wake_by_ref path tested immediately afterward.
+    #[allow(clippy::waker_clone_wake)]
     fn contained_forwarding_proxy_contains_wake_and_wake_by_ref_panics() {
         static LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
@@ -8195,9 +8210,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(2);
         let mut receive = Box::pin(rx.recv(&cx));
         let (drop_count, drop_panicking) = drop_panicking_waker();
-        let mut first_cx = std::task::Context::from_waker(&drop_panicking);
-        assert!(receive.as_mut().poll(&mut first_cx).is_pending());
-        drop(first_cx);
+        {
+            let mut first_cx = std::task::Context::from_waker(&drop_panicking);
+            assert!(receive.as_mut().poll(&mut first_cx).is_pending());
+        }
         drop(drop_panicking);
 
         let (replacement_probe, replacement_waker) = probe_waker(false);
@@ -8436,9 +8452,15 @@ mod tests {
             completed: std::sync::Arc::clone(&mpsc_completed),
         }));
         let mut mpsc_future = Box::pin(mpsc_rx.recv(&cx));
-        let mut mpsc_cx = std::task::Context::from_waker(&mpsc_waker);
-        assert!(mpsc_future.as_mut().poll(&mut mpsc_cx).is_pending());
-        drop(mpsc_cx);
+        {
+            let mut receive_poll_context = std::task::Context::from_waker(&mpsc_waker);
+            assert!(
+                mpsc_future
+                    .as_mut()
+                    .poll(&mut receive_poll_context)
+                    .is_pending()
+            );
+        }
         drop(mpsc_waker);
         drop(mpsc_future);
         assert!(mpsc_completed.load(std::sync::atomic::Ordering::SeqCst));
@@ -8451,9 +8473,15 @@ mod tests {
             completed: std::sync::Arc::clone(&watch_completed),
         }));
         let mut watch_future = Box::pin(watch_rx.changed(&cx));
-        let mut watch_cx = std::task::Context::from_waker(&watch_waker);
-        assert!(watch_future.as_mut().poll(&mut watch_cx).is_pending());
-        drop(watch_cx);
+        {
+            let mut change_poll_context = std::task::Context::from_waker(&watch_waker);
+            assert!(
+                watch_future
+                    .as_mut()
+                    .poll(&mut change_poll_context)
+                    .is_pending()
+            );
+        }
         drop(watch_waker);
         drop(watch_future);
         assert!(watch_completed.load(std::sync::atomic::Ordering::SeqCst));
@@ -8467,14 +8495,15 @@ mod tests {
                 completed: std::sync::Arc::clone(&broadcast_completed),
             }));
         let mut broadcast_future = Box::pin(broadcast_rx.recv_with_cx(&cx));
-        let mut broadcast_cx = std::task::Context::from_waker(&broadcast_waker);
-        assert!(
-            broadcast_future
-                .as_mut()
-                .poll(&mut broadcast_cx)
-                .is_pending()
-        );
-        drop(broadcast_cx);
+        {
+            let mut fanout_poll_context = std::task::Context::from_waker(&broadcast_waker);
+            assert!(
+                broadcast_future
+                    .as_mut()
+                    .poll(&mut fanout_poll_context)
+                    .is_pending()
+            );
+        }
         drop(broadcast_waker);
         drop(broadcast_future);
         assert!(broadcast_completed.load(std::sync::atomic::Ordering::SeqCst));
@@ -8490,9 +8519,15 @@ mod tests {
         reserve_tx.try_send(1).expect("fill reserve channel");
         let (reserve_drop_count, reserve_waker) = drop_panicking_waker();
         let mut reserve_future = Box::pin(reserve_tx.reserve(&cx));
-        let mut reserve_cx = std::task::Context::from_waker(&reserve_waker);
-        assert!(reserve_future.as_mut().poll(&mut reserve_cx).is_pending());
-        drop(reserve_cx);
+        {
+            let mut permit_poll_context = std::task::Context::from_waker(&reserve_waker);
+            assert!(
+                reserve_future
+                    .as_mut()
+                    .poll(&mut permit_poll_context)
+                    .is_pending()
+            );
+        }
         drop(reserve_waker);
         let reserve_before = mpsc::retained_waker_callback_panic_count();
         drop(reserve_future);
@@ -8506,9 +8541,15 @@ mod tests {
         let (_mpsc_tx, mut mpsc_rx) = mpsc::channel::<u8>(1);
         let (mpsc_drop_count, mpsc_waker) = drop_panicking_waker();
         let mut mpsc_future = Box::pin(mpsc_rx.recv(&cx));
-        let mut mpsc_cx = std::task::Context::from_waker(&mpsc_waker);
-        assert!(mpsc_future.as_mut().poll(&mut mpsc_cx).is_pending());
-        drop(mpsc_cx);
+        {
+            let mut receive_poll_context = std::task::Context::from_waker(&mpsc_waker);
+            assert!(
+                mpsc_future
+                    .as_mut()
+                    .poll(&mut receive_poll_context)
+                    .is_pending()
+            );
+        }
         drop(mpsc_waker);
         let mpsc_before = mpsc::retained_waker_callback_panic_count();
         drop(mpsc_future);
@@ -8518,9 +8559,15 @@ mod tests {
         let (_watch_tx, mut watch_rx) = watch::channel(0u8);
         let (watch_drop_count, watch_waker) = drop_panicking_waker();
         let mut watch_future = Box::pin(watch_rx.changed(&cx));
-        let mut watch_cx = std::task::Context::from_waker(&watch_waker);
-        assert!(watch_future.as_mut().poll(&mut watch_cx).is_pending());
-        drop(watch_cx);
+        {
+            let mut change_poll_context = std::task::Context::from_waker(&watch_waker);
+            assert!(
+                watch_future
+                    .as_mut()
+                    .poll(&mut change_poll_context)
+                    .is_pending()
+            );
+        }
         drop(watch_waker);
         let watch_before = watch::retained_waker_callback_panic_count();
         drop(watch_future);
@@ -8533,14 +8580,15 @@ mod tests {
         let (_broadcast_tx, mut broadcast_rx) = broadcast::channel::<u8>(1);
         let (broadcast_drop_count, broadcast_waker) = drop_panicking_waker();
         let mut broadcast_future = Box::pin(broadcast_rx.recv_with_cx(&cx));
-        let mut broadcast_cx = std::task::Context::from_waker(&broadcast_waker);
-        assert!(
-            broadcast_future
-                .as_mut()
-                .poll(&mut broadcast_cx)
-                .is_pending()
-        );
-        drop(broadcast_cx);
+        {
+            let mut fanout_poll_context = std::task::Context::from_waker(&broadcast_waker);
+            assert!(
+                broadcast_future
+                    .as_mut()
+                    .poll(&mut fanout_poll_context)
+                    .is_pending()
+            );
+        }
         drop(broadcast_waker);
         let broadcast_before = broadcast::retained_waker_callback_panic_count();
         drop(broadcast_future);
@@ -8561,9 +8609,10 @@ mod tests {
         let (drop_count, drop_panicking) = drop_panicking_waker();
         let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut receive = Box::pin(rx.recv(&cx));
-            let mut caller_cx = std::task::Context::from_waker(&drop_panicking);
-            assert!(receive.as_mut().poll(&mut caller_cx).is_pending());
-            drop(caller_cx);
+            {
+                let mut caller_cx = std::task::Context::from_waker(&drop_panicking);
+                assert!(receive.as_mut().poll(&mut caller_cx).is_pending());
+            }
             drop(drop_panicking);
             let _keep_sender_live = tx;
             panic!("synthetic authoritative outer panic");

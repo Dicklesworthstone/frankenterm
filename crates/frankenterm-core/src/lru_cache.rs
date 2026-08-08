@@ -713,7 +713,7 @@ mod tests {
             misses: u64::MAX,
             ..Default::default()
         };
-        assert_eq!(stats.hit_rate(), 0.5);
+        assert_eq!(stats.hit_rate().to_bits(), 0.5f64.to_bits());
         assert_eq!(stats.total_lookups(), u64::MAX);
     }
 

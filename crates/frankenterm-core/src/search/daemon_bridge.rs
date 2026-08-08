@@ -893,7 +893,7 @@ mod tests {
             cache_misses: u64::MAX,
             ..Default::default()
         };
-        assert_eq!(compute_cache_hit_rate(&m), 0.5);
+        assert_eq!(compute_cache_hit_rate(&m).to_bits(), 0.5f64.to_bits());
 
         let low_cache_after_integer_wrap = DaemonBridgeMetrics {
             cache_hits: 1,

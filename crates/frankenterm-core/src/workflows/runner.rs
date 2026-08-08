@@ -4534,7 +4534,10 @@ mod tests {
     #[test]
     fn retry_backoff_invalid_multiplier_uses_safe_constant_delay() {
         for multiplier in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.5] {
-            assert_eq!(normalized_retry_backoff_multiplier(multiplier), 1.0);
+            assert_eq!(
+                normalized_retry_backoff_multiplier(multiplier).to_bits(),
+                1.0f64.to_bits()
+            );
             assert_eq!(
                 retry_backoff_delay(250, 10, multiplier),
                 Duration::from_millis(250)
@@ -4741,7 +4744,10 @@ mod tests {
                 },
             );
 
-            assert_eq!(runner.config.retry_backoff_multiplier, 1.0);
+            assert_eq!(
+                runner.config.retry_backoff_multiplier.to_bits(),
+                1.0f64.to_bits()
+            );
             storage.shutdown().await.unwrap();
         });
     }

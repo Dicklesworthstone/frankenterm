@@ -52,20 +52,41 @@
 // this crate forbids.
 #![cfg_attr(windows, feature(windows_by_handle))]
 
+/// MSRV-stable equivalent of `AtomicU64::try_update`.
+///
+/// Rust 1.95 renamed and deprecated `fetch_update` in favor of `try_update`,
+/// but `try_update` is unavailable at this workspace's Rust 1.85 MSRV. Keep
+/// the compare-exchange loop here so callers remain warning-free on current
+/// nightly while preserving the declared compiler floor.
+#[inline]
+pub(crate) fn try_update_atomic_u64(
+    counter: &std::sync::atomic::AtomicU64,
+    set_order: std::sync::atomic::Ordering,
+    fetch_order: std::sync::atomic::Ordering,
+    mut update: impl FnMut(u64) -> Option<u64>,
+) -> std::result::Result<u64, u64> {
+    let mut current = counter.load(fetch_order);
+    loop {
+        let Some(next) = update(current) else {
+            return Err(current);
+        };
+        match counter.compare_exchange_weak(current, next, set_order, fetch_order) {
+            Ok(previous) => return Ok(previous),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// Reserve one process-local `u64` identity without ever wrapping back into
 /// an already-issued value. `u64::MAX` is retained as the exhausted sentinel.
 #[must_use]
 pub(crate) fn try_next_unique_atomic_u64(counter: &std::sync::atomic::AtomicU64) -> Option<u64> {
     use std::sync::atomic::Ordering;
 
-    let mut current = counter.load(Ordering::Acquire);
-    loop {
-        let next = current.checked_add(1)?;
-        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return Some(current),
-            Err(observed) => current = observed,
-        }
-    }
+    try_update_atomic_u64(counter, Ordering::AcqRel, Ordering::Acquire, |current| {
+        current.checked_add(1)
+    })
+    .ok()
 }
 
 #[cfg(test)]

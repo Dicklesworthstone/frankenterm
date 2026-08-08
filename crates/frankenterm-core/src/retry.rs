@@ -1863,11 +1863,15 @@ mod tests {
     #[test]
     fn submit_idempotency_retryability_is_finite_and_typed() {
         use crate::error::StorageError;
-        use crate::submit_idempotency_store::SubmitIdempotencyError;
+        use crate::submit_idempotency_store::{
+            SubmitIdempotencyError, SubmitIdempotencyOpenFailureSite,
+        };
 
         for retryable in [
             SubmitIdempotencyError::Busy,
-            SubmitIdempotencyError::OpenFailed,
+            SubmitIdempotencyError::OpenFailed {
+                site: SubmitIdempotencyOpenFailureSite::SqliteCannotOpen,
+            },
         ] {
             assert!(is_retryable(&Error::Storage(
                 StorageError::SubmitIdempotency(retryable),
@@ -1879,6 +1883,12 @@ mod tests {
             SubmitIdempotencyError::SymlinkRejected,
             SubmitIdempotencyError::LegacyStorePresent,
             SubmitIdempotencyError::DirectoryUnavailable,
+            SubmitIdempotencyError::OpenFailed {
+                site: SubmitIdempotencyOpenFailureSite::SqliteCannotOpenSymlink,
+            },
+            SubmitIdempotencyError::OpenFailed {
+                site: SubmitIdempotencyOpenFailureSite::FilesystemPermission,
+            },
             SubmitIdempotencyError::ConfigurationFailed,
             SubmitIdempotencyError::SchemaMismatch,
             SubmitIdempotencyError::RequestConflict,

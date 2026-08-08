@@ -572,7 +572,8 @@ impl DiscoveryDiff {
 static PANE_CURSOR_SEQ_SATURATION_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn record_pane_cursor_seq_saturation() {
-    let _ = PANE_CURSOR_SEQ_SATURATION_COUNT.try_update(
+    let _ = crate::try_update_atomic_u64(
+        &PANE_CURSOR_SEQ_SATURATION_COUNT,
         Ordering::Relaxed,
         Ordering::Relaxed,
         |count| Some(count.saturating_add(1)),
@@ -6423,7 +6424,7 @@ mod tests {
 
         assert_eq!(cache.hits, u64::MAX);
         assert_eq!(cache.misses, u64::MAX);
-        assert_eq!(cache.hit_rate(), 0.5);
+        assert_eq!(cache.hit_rate().to_bits(), 0.5f64.to_bits());
     }
 
     #[test]

@@ -14852,7 +14852,7 @@ mod tests {
                 generation,
                 evidence_from_event_id: 1,
                 max_event_id,
-                deleted_event_count: if generation > 0 { 1 } else { 0 },
+                deleted_event_count: i64::from(generation > 0),
                 last_deleted_at: (generation > 0).then_some(1),
             },
         }
@@ -18462,8 +18462,8 @@ mod tests {
                     crate::storage::EventDeliveryReservation::LeasedUntil { .. } => {
                         crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
                     }
-                    other => {
-                        panic!("partial claim must remain unhandled and retryable, got {other:?}")
+                    missing @ crate::storage::EventDeliveryReservation::AlreadyHandledOrMissing => {
+                        panic!("partial claim must remain unhandled and retryable, got {missing:?}")
                     }
                 }
             }
@@ -20776,13 +20776,13 @@ mod tests {
                 Some(crate::submit_idempotency_store::StoredSubmitState::InDoubt),
                 "an ambiguous cancelled dispatch must never become retryable"
             );
-            let content = inner
+            let pane_text = inner
                 .pane_state(pane_id)
                 .await
                 .expect("mock pane should remain present")
                 .content;
             assert!(
-                !content.contains(text),
+                !pane_text.contains(text),
                 "the simulated cancelled backend did not apply the effect"
             );
         });
@@ -20855,12 +20855,12 @@ mod tests {
                 envelope["data"]["submit"],
                 "the exact response receipt must already be durable when audit observes cancellation"
             );
-            let content = inner
+            let pane_text = inner
                 .pane_state(pane_id)
                 .await
                 .expect("mock pane should remain present")
                 .content;
-            assert_eq!(content.matches(text).count(), 1);
+            assert_eq!(pane_text.matches(text).count(), 1);
         });
     }
 

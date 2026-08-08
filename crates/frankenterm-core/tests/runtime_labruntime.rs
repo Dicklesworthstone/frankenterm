@@ -596,7 +596,7 @@ fn labruntime_shutdown_does_not_wait_for_full_maintenance_interval() {
         // is parked in its interval sleep when shutdown begins.
         sleep(Duration::from_millis(250)).await;
 
-        let shutdown = timeout(Duration::from_secs(1), handle.shutdown()).await;
+        let shutdown = Box::pin(timeout(Duration::from_secs(1), handle.shutdown())).await;
         assert!(
             shutdown.is_ok(),
             "shutdown should not block on the maintenance interval sleep"

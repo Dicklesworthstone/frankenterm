@@ -1051,7 +1051,7 @@ mod tests {
         start.wait();
         while writers_done.load(Ordering::Acquire) != 2 {
             assert!(
-                matches!(map.get(7), Some(100) | Some(200)),
+                matches!(map.get(7), Some(100 | 200)),
                 "a key present in both generations must never expose a clear/refill gap"
             );
             std::thread::yield_now();

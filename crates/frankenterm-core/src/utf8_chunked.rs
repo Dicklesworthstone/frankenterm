@@ -489,7 +489,7 @@ mod tests {
         assert_eq!(stats.valid_bytes, u64::MAX);
         assert_eq!(stats.invalid_bytes, u64::MAX);
         assert_eq!(stats.replacements, u64::MAX);
-        assert_eq!(stats.validity_ratio, 0.5);
+        assert_eq!(stats.validity_ratio.to_bits(), 0.5f64.to_bits());
     }
 
     #[test]
