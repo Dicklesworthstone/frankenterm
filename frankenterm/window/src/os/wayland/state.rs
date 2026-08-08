@@ -53,7 +53,10 @@ pub(super) struct WaylandState {
     pub(super) xdg: XdgShell,
     pub(super) windows: RefCell<HashMap<usize, Rc<RefCell<WaylandWindowInner>>>>,
 
-    pub(super) active_surface_id: RefCell<Option<ObjectId>>,
+    /// Surface that owns `wl_keyboard` focus.  Keyboard and pointer focus are
+    /// independent Wayland protocol authorities and must never overwrite one
+    /// another.
+    pub(super) keyboard_active_surface_id: RefCell<Option<ObjectId>>,
     pub(super) last_serial: RefCell<u32>,
     pub(super) keyboard: Option<WlKeyboard>,
     pub(super) keyboard_mapper: Option<KeyboardWithFallback>,
@@ -62,6 +65,12 @@ pub(super) struct WaylandState {
     pub(super) keyboard_window_id: Option<usize>,
 
     pub(super) pointer: Option<ThemedPointer<PointerUserData>>,
+    /// Surface that owns `wl_pointer` focus.
+    pub(super) pointer_active_surface_id: RefCell<Option<ObjectId>>,
+    /// Window owning the active pointer surface.  Decoration surfaces have
+    /// their own object IDs, so retain the resolved window identity for exact
+    /// destruction cleanup.
+    pub(super) pointer_window_id: Option<usize>,
     pub(super) surface_to_pending: HashMap<ObjectId, Arc<Mutex<PendingMouse>>>,
 
     pub(super) data_device_manager_state: DataDeviceManagerState,
@@ -100,7 +109,7 @@ impl WaylandState {
             windows: RefCell::new(HashMap::new()),
             seat: SeatState::new(globals, qh),
             xdg: XdgShell::bind(globals, qh)?,
-            active_surface_id: RefCell::new(None),
+            keyboard_active_surface_id: RefCell::new(None),
             last_serial: RefCell::new(0),
             keyboard: None,
             keyboard_mapper: None,
@@ -108,6 +117,8 @@ impl WaylandState {
             key_repeat_delay: 400,
             keyboard_window_id: None,
             pointer: None,
+            pointer_active_surface_id: RefCell::new(None),
+            pointer_window_id: None,
             surface_to_pending: HashMap::new(),
             data_device_manager_state: DataDeviceManagerState::bind(globals, qh)?,
             data_device: None,
@@ -121,6 +132,33 @@ impl WaylandState {
             seat_bindings: SeatBindings::default(),
         };
         Ok(wayland_state)
+    }
+}
+
+/// Publish a new modality-specific surface authority and return the retired
+/// authority when the focus genuinely moved.
+pub(super) fn replace_surface_authority<T: Clone + Eq>(
+    active: &mut Option<T>,
+    entered: T,
+) -> Option<T> {
+    if active.as_ref() == Some(&entered) {
+        return None;
+    }
+    active.replace(entered)
+}
+
+/// Clear a modality-specific authority only when the protocol event names the
+/// surface that still owns it.  A stale Leave or destruction notification for
+/// an older surface must not retire a newer focus.
+pub(super) fn clear_surface_authority_if_matches<T: Eq>(
+    active: &mut Option<T>,
+    surface: &T,
+) -> bool {
+    if active.as_ref() == Some(surface) {
+        *active = None;
+        true
+    } else {
+        false
     }
 }
 
@@ -259,7 +297,37 @@ delegate_dispatch!(WaylandState: [ZwlrOutputModeV1: OutputManagerData] => Output
 
 #[cfg(test)]
 mod tests {
-    use super::{RemovedSeatCleanup, SeatBindings};
+    use super::{
+        clear_surface_authority_if_matches, replace_surface_authority, RemovedSeatCleanup,
+        SeatBindings,
+    };
+
+    #[test]
+    fn surface_authority_replacement_and_stale_leave_are_modality_local() {
+        let mut keyboard = Some(10_u32);
+        let mut pointer = Some(20_u32);
+
+        assert_eq!(replace_surface_authority(&mut keyboard, 11), Some(10));
+        assert_eq!(keyboard, Some(11));
+        assert_eq!(pointer, Some(20));
+
+        assert!(!clear_surface_authority_if_matches(&mut keyboard, &10));
+        assert_eq!(keyboard, Some(11));
+        assert_eq!(pointer, Some(20));
+
+        assert!(clear_surface_authority_if_matches(&mut pointer, &20));
+        assert_eq!(keyboard, Some(11));
+        assert_eq!(pointer, None);
+    }
+
+    #[test]
+    fn repeated_enter_and_unrelated_destruction_preserve_current_authority() {
+        let mut active = Some(7_u32);
+
+        assert_eq!(replace_surface_authority(&mut active, 7), None);
+        assert!(!clear_surface_authority_if_matches(&mut active, &8));
+        assert_eq!(active, Some(7));
+    }
 
     #[test]
     fn removed_seat_cleanup_only_clears_matching_bindings() {
