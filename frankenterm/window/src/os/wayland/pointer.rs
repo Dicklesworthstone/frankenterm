@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -10,6 +9,7 @@ use smithay_client_toolkit::seat::pointer::{
 use wayland_client::backend::ObjectId;
 use wayland_client::protocol::wl_pointer::{ButtonState, WlPointer};
 use wayland_client::protocol::wl_seat::WlSeat;
+use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Proxy, QueueHandle};
 use wezterm_input_types::MousePress;
 
@@ -17,7 +17,9 @@ use crate::wayland::SurfaceUserData;
 
 use super::copy_and_paste::CopyAndPaste;
 use super::drag_and_drop::DragAndDrop;
-use super::state::WaylandState;
+use super::state::{
+    clear_surface_authority_if_matches, replace_surface_authority, WaylandState,
+};
 use super::WaylandConnection;
 
 impl PointerHandler for WaylandState {
@@ -33,21 +35,41 @@ impl PointerHandler for WaylandState {
         };
 
         for evt in events {
-            if let PointerEventKind::Enter { .. } = &evt.kind {
-                let surface_id = evt.surface.id();
-                self.active_surface_id = RefCell::new(Some(surface_id.clone()));
-                pstate.active_surface_id = Some(surface_id);
+            let surface_id = evt.surface.id();
+            let authority_event = match evt.kind {
+                PointerEventKind::Enter { .. } => PointerAuthorityEvent::Enter,
+                PointerEventKind::Leave { .. } => PointerAuthorityEvent::Leave,
+                _ => PointerAuthorityEvent::Activity,
+            };
+            let authority_route = route_pointer_authority(
+                &mut self.pointer_active_surface_id.borrow_mut(),
+                &surface_id,
+                authority_event,
+            );
+            if let Some(retired_surface_id) = authority_route.replaced {
+                self.retire_pending_pointer_surface(&retired_surface_id);
+            }
+            match authority_event {
+                PointerAuthorityEvent::Enter => {
+                    self.pointer_window_id = pointer_window_id_for_surface(&evt.surface);
+                }
+                PointerAuthorityEvent::Leave if authority_route.cleared => {
+                    self.pointer_window_id = None;
+                }
+                PointerAuthorityEvent::Leave | PointerAuthorityEvent::Activity => {}
             }
             if let Some(serial) = event_serial(evt) {
                 *self.last_serial.borrow_mut() = serial;
                 pstate.serial = serial;
             }
-            let Some(active_surface_id) = self.active_surface_id.borrow().as_ref().cloned() else {
-                log::trace!("Wayland pointer event arrived before an active surface was recorded");
+            if !authority_route.route_event {
+                log::trace!(
+                    "Ignoring stale Wayland pointer activity for surface {surface_id:?}"
+                );
                 continue;
-            };
+            }
 
-            if let Some(pending) = self.surface_to_pending.get(&active_surface_id) {
+            if let Some(pending) = self.surface_to_pending.get(&surface_id) {
                 let Some(mut pending) = lock_pending_mouse(pending, "pointer_frame") else {
                     continue;
                 };
@@ -58,9 +80,57 @@ impl PointerHandler for WaylandState {
                     });
                 }
             }
+            self.pointer_window_frame_event(pointer, evt);
         }
-        self.pointer_window_frame(pointer, events);
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointerAuthorityEvent {
+    Enter,
+    Leave,
+    Activity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PointerAuthorityRoute<T> {
+    route_event: bool,
+    replaced: Option<T>,
+    cleared: bool,
+}
+
+fn route_pointer_authority<T: Clone + Eq>(
+    active: &mut Option<T>,
+    event_surface: &T,
+    event: PointerAuthorityEvent,
+) -> PointerAuthorityRoute<T> {
+    match event {
+        PointerAuthorityEvent::Enter => PointerAuthorityRoute {
+            route_event: true,
+            replaced: replace_surface_authority(active, event_surface.clone()),
+            cleared: false,
+        },
+        PointerAuthorityEvent::Leave => PointerAuthorityRoute {
+            // Route a stale Leave to its named surface so old hover/button
+            // state can retire, but do not let it clear a newer authority.
+            route_event: true,
+            replaced: None,
+            cleared: clear_surface_authority_if_matches(active, event_surface),
+        },
+        PointerAuthorityEvent::Activity => PointerAuthorityRoute {
+            route_event: active.as_ref() == Some(event_surface),
+            replaced: None,
+            cleared: false,
+        },
+    }
+}
+
+fn pointer_window_id_for_surface(surface: &WlSurface) -> Option<usize> {
+    if let Some(data) = SurfaceUserData::try_from_wl(surface) {
+        return Some(data.window_id);
+    }
+    let parent = surface.data::<SurfaceData>()?.parent_surface()?;
+    SurfaceUserData::try_from_wl(parent).map(|data| data.window_id)
 }
 
 fn pointer_state_for_frame<'a>(
@@ -97,7 +167,6 @@ impl PointerUserData {
 
 #[derive(Default)]
 pub(super) struct PointerState {
-    active_surface_id: Option<ObjectId>,
     pub(super) drag_and_drop: DragAndDrop,
     serial: u32,
 }
@@ -224,6 +293,13 @@ impl PendingMouse {
             .map(|pending| pending.in_window)
             .unwrap_or(false)
     }
+
+    fn clear_focus(&mut self) -> bool {
+        let changed = self.in_window || self.surface_coords.is_some();
+        self.surface_coords = None;
+        self.in_window = false;
+        changed
+    }
 }
 
 fn event_serial(event: &PointerEvent) -> Option<u32> {
@@ -237,75 +313,133 @@ fn event_serial(event: &PointerEvent) -> Option<u32> {
 }
 
 impl WaylandState {
-    fn pointer_window_frame(&mut self, pointer: &WlPointer, events: &[PointerEvent]) {
-        let windows = self.windows.borrow();
-        let Some(active_surface_id) = self.active_surface_id.borrow().as_ref().cloned() else {
-            if !events.is_empty() {
-                log::trace!(
-                    "Wayland pointer window-frame events arrived before an active surface was recorded"
-                );
-            }
+    pub(super) fn clear_pointer_focus(&mut self) {
+        let retired_surface_id = self.pointer_active_surface_id.get_mut().take();
+        self.pointer_window_id = None;
+        if let Some(retired_surface_id) = retired_surface_id {
+            self.retire_pending_pointer_surface(&retired_surface_id);
+        }
+    }
+
+    fn retire_pending_pointer_surface(&self, surface_id: &ObjectId) {
+        let Some(pending) = self.surface_to_pending.get(surface_id) else {
             return;
         };
+        let Some(mut pending) = lock_pending_mouse(pending, "pointer focus retirement") else {
+            return;
+        };
+        if pending.clear_focus() {
+            WaylandConnection::with_window_inner(pending.window_id, move |inner| {
+                inner.dispatch_pending_mouse();
+                Ok(())
+            });
+        }
+    }
 
-        for evt in events {
-            let surface = &evt.surface;
-            if surface.id() == active_surface_id {
-                let (x, y) = evt.position;
-                let parent_surface = match evt.surface.data::<SurfaceData>() {
-                    Some(data) => match data.parent_surface() {
-                        Some(sd) => sd,
-                        None => continue,
-                    },
-                    None => continue,
+    fn pointer_window_frame_event(&self, pointer: &WlPointer, evt: &PointerEvent) {
+        let parent_surface = match evt.surface.data::<SurfaceData>() {
+            Some(data) => match data.parent_surface() {
+                Some(surface) => surface,
+                None => return,
+            },
+            None => return,
+        };
+        let Some(surface_data) = SurfaceUserData::try_from_wl(parent_surface) else {
+            log::warn!("Wayland pointer frame event referenced an unknown parent surface");
+            return;
+        };
+        let wid = surface_data.window_id;
+        let windows = self.windows.borrow();
+        let Some(window) = windows.get(&wid) else {
+            log::warn!("Wayland pointer window-frame event referenced missing window {wid}");
+            return;
+        };
+        let mut inner = window.borrow_mut();
+        let (x, y) = evt.position;
+
+        match evt.kind {
+            PointerEventKind::Enter { .. } => {
+                inner
+                    .window_frame
+                    .click_point_moved(Duration::ZERO, &evt.surface.id(), x, y);
+            }
+            PointerEventKind::Leave { .. } => {
+                inner.window_frame.click_point_left();
+            }
+            PointerEventKind::Motion { .. } => {
+                inner
+                    .window_frame
+                    .click_point_moved(Duration::ZERO, &evt.surface.id(), x, y);
+            }
+            PointerEventKind::Press { button, serial, .. }
+            | PointerEventKind::Release { button, serial, .. } => {
+                let pressed = matches!(evt.kind, PointerEventKind::Press { .. });
+                let click = match button {
+                    0x110 => FrameClick::Normal,
+                    0x111 => FrameClick::Alternate,
+                    _ => return,
                 };
-
-                let wid = SurfaceUserData::from_wl(parent_surface).window_id;
-                let Some(window) = windows.get(&wid) else {
-                    log::warn!(
-                        "Wayland pointer window-frame event referenced missing window {wid}"
-                    );
-                    continue;
-                };
-                let mut inner = window.borrow_mut();
-
-                match evt.kind {
-                    PointerEventKind::Enter { .. } => {
-                        inner.window_frame.click_point_moved(
-                            Duration::ZERO,
-                            &evt.surface.id(),
-                            x,
-                            y,
-                        );
-                    }
-                    PointerEventKind::Leave { .. } => {
-                        inner.window_frame.click_point_left();
-                    }
-                    PointerEventKind::Motion { .. } => {
-                        inner.window_frame.click_point_moved(
-                            Duration::ZERO,
-                            &evt.surface.id(),
-                            x,
-                            y,
-                        );
-                    }
-                    PointerEventKind::Press { button, serial, .. }
-                    | PointerEventKind::Release { button, serial, .. } => {
-                        let pressed = matches!(evt.kind, PointerEventKind::Press { .. });
-                        let click = match button {
-                            0x110 => FrameClick::Normal,
-                            0x111 => FrameClick::Alternate,
-                            _ => continue,
-                        };
-                        if let Some(action) =
-                            inner.window_frame.on_click(Duration::ZERO, click, pressed)
-                        {
-                            inner.frame_action(pointer, serial, action);
-                        }
-                    }
-                    _ => {}
+                if let Some(action) = inner.window_frame.on_click(Duration::ZERO, click, pressed) {
+                    inner.frame_action(pointer, serial, action);
                 }
             }
+            _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{route_pointer_authority, PointerAuthorityEvent, PointerAuthorityRoute};
+
+    #[test]
+    fn leave_then_enter_in_one_frame_routes_each_named_surface() {
+        let mut active = Some(1_u32);
+
+        assert_eq!(
+            route_pointer_authority(&mut active, &1, PointerAuthorityEvent::Leave),
+            PointerAuthorityRoute {
+                route_event: true,
+                replaced: None,
+                cleared: true,
+            }
+        );
+        assert_eq!(active, None);
+        assert_eq!(
+            route_pointer_authority(&mut active, &2, PointerAuthorityEvent::Enter),
+            PointerAuthorityRoute {
+                route_event: true,
+                replaced: None,
+                cleared: false,
+            }
+        );
+        assert_eq!(active, Some(2));
+    }
+
+    #[test]
+    fn stale_leave_after_new_enter_does_not_clear_new_pointer_authority() {
+        let mut active = Some(1_u32);
+
+        assert_eq!(
+            route_pointer_authority(&mut active, &2, PointerAuthorityEvent::Enter).replaced,
+            Some(1)
+        );
+        let stale_leave =
+            route_pointer_authority(&mut active, &1, PointerAuthorityEvent::Leave);
+        assert!(stale_leave.route_event);
+        assert!(!stale_leave.cleared);
+        assert_eq!(active, Some(2));
+        assert!(!route_pointer_authority(
+            &mut active,
+            &1,
+            PointerAuthorityEvent::Activity
+        )
+        .route_event);
+        assert!(route_pointer_authority(
+            &mut active,
+            &2,
+            PointerAuthorityEvent::Activity
+        )
+        .route_event);
     }
 }
