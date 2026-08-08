@@ -8,14 +8,14 @@ const REQUESTED_SHA_ENV: &str = "FT_FORMAT_PROOF_SHA";
 const SOURCE_MODE_ENV: &str = "FT_FORMAT_PROOF_SOURCE_MODE";
 const RCH_CLEAN_BASELINE_SOURCE_MODE: &str = "rch-clean-baseline-no-overlay-v1";
 
-pub(crate) struct FormatProofContext {
-    pub(crate) repo_root: PathBuf,
-    pub(crate) requested_sha: String,
-    pub(crate) source_mode: String,
-    pub(crate) rustfmt: OsString,
+pub struct FormatProofContext {
+    pub repo_root: PathBuf,
+    pub requested_sha: String,
+    pub source_mode: String,
+    pub rustfmt: OsString,
 }
 
-pub(crate) fn format_proof_context() -> FormatProofContext {
+pub fn format_proof_context() -> FormatProofContext {
     let repo_root = repo_root();
     let requested_sha = env::var(REQUESTED_SHA_ENV)
         .unwrap_or_else(|_| panic!("{REQUESTED_SHA_ENV} must label the RCH --base revision"));
@@ -198,7 +198,7 @@ fn rustfmt_stdin_output(repo_root: &Path, rustfmt: &OsStr, source: &str, label: 
         .unwrap_or_else(|err| panic!("wait for rustfmt {label}: {err}"))
 }
 
-pub(crate) fn assert_command_success(label: &str, output: Output) -> Output {
+pub fn assert_command_success(label: &str, output: Output) -> Output {
     assert!(
         output.status.success(),
         "{label} failed with {}; stdout={} stderr={}",
@@ -209,7 +209,7 @@ pub(crate) fn assert_command_success(label: &str, output: Output) -> Output {
     output
 }
 
-pub(crate) fn assert_formatter_silent(label: &str, output: &Output) {
+pub fn assert_formatter_silent(label: &str, output: &Output) {
     for (stream_name, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
         assert!(
             bytes.is_empty(),
