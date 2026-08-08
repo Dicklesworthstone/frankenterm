@@ -4,6 +4,8 @@
 //! counter arithmetic, confidence gate evaluation logic, and standard
 //! factory invariants.
 
+use std::path::PathBuf;
+
 use frankenterm_core::soak_confidence_gate::*;
 use proptest::prelude::*;
 
@@ -98,6 +100,527 @@ proptest! {
     }
 }
 
+#[test]
+fn custom_matrix_expansion_is_checked_and_bounded() {
+    let scenario = UserJourneyScenario {
+        scenario_id: "duplicate".into(),
+        category: JourneyCategory::Watch,
+        description: "duplicate scenario validation".into(),
+        expected_duration_ms: 1,
+        blocking: true,
+        seed: Some(1),
+    };
+    let duplicate = SoakMatrix::custom(
+        vec![scenario.clone(), scenario],
+        vec![WorkloadProfile::Steady],
+        vec![FailureInjectionProfile::None],
+    );
+    assert!(matches!(
+        duplicate.to_plan(),
+        Err(SoakMatrixPlanError::DuplicateScenarioId { .. })
+    ));
+
+    let scenarios = (0_u64..4_097)
+        .map(|index| UserJourneyScenario {
+            scenario_id: format!("bounded-{index}"),
+            category: JourneyCategory::Watch,
+            description: "bounded matrix scenario".into(),
+            expected_duration_ms: 1,
+            blocking: true,
+            seed: Some(index),
+        })
+        .collect();
+    let oversized = SoakMatrix::custom(
+        scenarios,
+        vec![WorkloadProfile::Steady],
+        vec![FailureInjectionProfile::None],
+    );
+    assert!(matches!(
+        oversized.to_plan(),
+        Err(SoakMatrixPlanError::CellCountLimit {
+            count: 4_097,
+            maximum: 4_096
+        })
+    ));
+}
+
+// =============================================================================
+// Deterministic long-haul workload corpus
+// =============================================================================
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn long_haul_corpus() -> SoakWorkloadCorpus {
+    let path = repo_root().join(SOAK_WORKLOAD_CORPUS_FIXTURE);
+    let json = std::fs::read_to_string(path).expect("read tracked soak workload corpus");
+    parse_soak_workload_corpus(&json).expect("tracked soak workload corpus validates")
+}
+
+#[test]
+fn long_haul_corpus_assets_are_content_addressed() {
+    let corpus = long_haul_corpus();
+    verify_soak_workload_assets(&repo_root(), &corpus)
+        .expect("all deterministic actor assets match their sha256 pins");
+    let plan = materialize_soak_workload_plan(&corpus, 20).expect("20-pane plan");
+    verify_soak_workload_plan_assets(&repo_root(), &plan)
+        .expect("materialized plan preserves verifiable asset pins and modes");
+    assert_eq!(corpus.version, SOAK_WORKLOAD_CORPUS_VERSION);
+    assert!(corpus.dogfood.excluded_from_deterministic_verdict);
+}
+
+#[test]
+fn corpus_actor_activation_and_burst_envelope_are_explicit() {
+    let corpus = long_haul_corpus();
+    let persistent = corpus
+        .actors
+        .iter()
+        .filter(|actor| actor.activation == SoakActorActivation::Persistent)
+        .map(|actor| actor.actor_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected_persistent = ["agent-like-stream", "editor-tui"]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(persistent, expected_persistent);
+    for actor in corpus
+        .actors
+        .iter()
+        .filter(|actor| actor.activation == SoakActorActivation::Persistent)
+    {
+        let timeout_seconds = actor
+            .command
+            .args
+            .last()
+            .expect("persistent actor timeout argument")
+            .parse::<u64>()
+            .expect("numeric persistent actor timeout");
+        assert!(timeout_seconds * 1_000 >= 630_000);
+    }
+
+    let burst = corpus
+        .actors
+        .iter()
+        .find(|actor| actor.actor_id == "output-burst")
+        .expect("output burst actor");
+    assert_eq!(burst.activation, SoakActorActivation::Scheduled);
+    let line_count = burst
+        .command
+        .args
+        .first()
+        .expect("burst line count argument")
+        .parse::<u64>()
+        .expect("numeric burst line count");
+    let marker = burst.command.args.get(1).expect("burst marker argument");
+    let bytes_per_action = (1..=line_count)
+        .map(|line| {
+            u64::try_from(format!("Line {line}: {marker}\n").len())
+                .expect("line byte count fits u64")
+        })
+        .sum::<u64>();
+    let burst_phase = corpus
+        .phases
+        .iter()
+        .find(|phase| phase.phase_id == "adversarial-burst")
+        .expect("adversarial burst phase");
+    let actions_per_second = 1_000 / burst_phase.action_cadence_ms;
+    assert_eq!(
+        bytes_per_action * actions_per_second,
+        burst.output_bytes_per_second
+    );
+}
+
+#[test]
+fn long_haul_plans_are_deterministic_at_every_required_scale() {
+    let corpus = long_haul_corpus();
+    for pane_count in SOAK_WORKLOAD_REQUIRED_PANE_COUNTS {
+        let first =
+            materialize_soak_workload_plan(&corpus, *pane_count).expect("materialize first plan");
+        let second =
+            materialize_soak_workload_plan(&corpus, *pane_count).expect("materialize second plan");
+        assert_eq!(first, second);
+        assert_eq!(first.pane_count, *pane_count);
+        assert_eq!(
+            u32::try_from(first.identities.len()).expect("identity count fits u32"),
+            *pane_count
+        );
+        assert_eq!(first.plan_sha256.len(), 64);
+        assert_eq!(first.base_seed, corpus.base_seed);
+        assert_eq!(first.phases.len(), corpus.phases.len());
+        assert!(!first.actions.is_empty());
+        assert_eq!(
+            u32::try_from(
+                first
+                    .identities
+                    .iter()
+                    .filter(|identity| identity.interactive)
+                    .count()
+            )
+            .expect("interactive identity count fits u32"),
+            first.interactive_pane_count
+        );
+        assert_eq!(first.assets.len(), corpus.assets.len());
+        let interactive_dimensions = first
+            .identities
+            .iter()
+            .filter(|identity| identity.interactive)
+            .map(|identity| identity.dimension)
+            .collect::<std::collections::BTreeSet<_>>();
+        let priority_prefix_len = usize::try_from(first.interactive_pane_count)
+            .expect("interactive count fits usize")
+            .min(first.interactive_dimension_priority.len());
+        assert!(
+            first.interactive_dimension_priority[..priority_prefix_len]
+                .iter()
+                .all(|dimension| interactive_dimensions.contains(dimension))
+        );
+        assert!(interactive_dimensions.contains(&SoakWorkloadDimension::EditorTui));
+        assert!(
+            first
+                .identities
+                .iter()
+                .all(|identity| !identity.expected_final_marker.is_empty())
+        );
+
+        let identity_ids = first
+            .identities
+            .iter()
+            .map(|identity| identity.identity_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let actor_seeds = first
+            .identities
+            .iter()
+            .map(|identity| identity.actor_seed)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(identity_ids.len(), first.identities.len());
+        assert_eq!(actor_seeds.len(), first.identities.len());
+
+        let json = serde_json::to_string(&first).expect("serialize plan");
+        let roundtrip: SoakWorkloadPlan = serde_json::from_str(&json).expect("parse plan");
+        assert_eq!(roundtrip, first);
+
+        let summary = replay_soak_workload_plan(&first, None).expect("logical replay");
+        let repeated_summary =
+            replay_soak_workload_plan(&first, None).expect("repeated logical replay");
+        assert_eq!(repeated_summary, summary);
+        assert_eq!(summary.summary_sha256.len(), 64);
+        assert!(summary.teardown_complete);
+        assert!(summary.all_dimensions_observed);
+        assert_eq!(summary.actions_skipped, 0);
+        assert_eq!(summary.remaining_workspaces, 0);
+        assert_eq!(summary.remaining_windows, 0);
+        assert_eq!(summary.remaining_tabs, 0);
+        assert_eq!(summary.remaining_panes, 0);
+        assert_eq!(summary.remaining_actors, 0);
+        assert!(
+            summary
+                .logical_oracle_results
+                .values()
+                .all(|passed| *passed)
+        );
+        assert_eq!(summary.production_runner_oracles.len(), 6);
+    }
+}
+
+#[test]
+fn corpus_input_order_does_not_change_fleet_identity_or_plan_hash() {
+    let corpus = long_haul_corpus();
+    let expected = materialize_soak_workload_plan(&corpus, 200).expect("canonical plan");
+
+    let mut reordered = corpus;
+    reordered.assets.reverse();
+    reordered.actors.reverse();
+    for actor in &mut reordered.actors {
+        actor.asset_ids.reverse();
+    }
+    reordered.scales.reverse();
+    for scale in &mut reordered.scales {
+        scale.allocations.reverse();
+    }
+    reordered.phases.reverse();
+    for phase in &mut reordered.phases {
+        phase.dimensions.reverse();
+    }
+    reordered.final_oracles.reverse();
+    reordered.dogfood.required_identity_fields.reverse();
+
+    validate_soak_workload_corpus(&reordered).expect("input collections are order-independent");
+    let actual = materialize_soak_workload_plan(&reordered, 200).expect("reordered plan");
+    assert_eq!(actual, expected);
+    assert_eq!(actual.plan_sha256, expected.plan_sha256);
+}
+
+#[test]
+fn failed_actor_still_reaches_exact_teardown_state() {
+    let corpus = long_haul_corpus();
+    let plan = materialize_soak_workload_plan(&corpus, 20).expect("20-pane plan");
+    let failed = plan
+        .identities
+        .iter()
+        .find(|identity| identity.actor_id == "images")
+        .expect("images actor identity");
+    let summary = replay_soak_workload_plan(&plan, Some(&failed.identity_id))
+        .expect("logical failure replay");
+
+    assert!(summary.actions_skipped > 0);
+    assert!(summary.teardown_complete);
+    assert!(!summary.all_dimensions_observed);
+    assert_eq!(summary.remaining_actors, 0);
+    assert_eq!(summary.remaining_panes, 0);
+    assert_eq!(
+        summary.failed_identity_id.as_deref(),
+        Some(failed.identity_id.as_str())
+    );
+}
+
+#[test]
+fn replay_rejects_unknown_failure_and_tampered_plan() {
+    let corpus = long_haul_corpus();
+    let mut plan = materialize_soak_workload_plan(&corpus, 20).expect("20-pane plan");
+    assert!(replay_soak_workload_plan(&plan, Some("unknown-identity")).is_err());
+
+    plan.actions[0].payload_profile.push_str("-tampered");
+    let error = replay_soak_workload_plan(&plan, None).expect_err("action mismatch must fail");
+    assert!(error.to_string().contains("phase contract"));
+
+    let mut digest_tamper = materialize_soak_workload_plan(&corpus, 20).expect("fresh plan");
+    let replacement = if digest_tamper.plan_sha256.starts_with('0') {
+        "1"
+    } else {
+        "0"
+    };
+    digest_tamper.plan_sha256.replace_range(..1, replacement);
+    let error = validate_soak_workload_plan(&digest_tamper).expect_err("digest mismatch must fail");
+    assert!(error.to_string().contains("plan sha256 mismatch"));
+}
+
+#[test]
+fn materialized_plan_rejects_rehashed_structural_tampering_before_digest_authority() {
+    let corpus = long_haul_corpus();
+    let plan = materialize_soak_workload_plan(&corpus, 20).expect("20-pane plan");
+
+    let mut wrong_parent = plan.clone();
+    wrong_parent.setup[1].parent_id = None;
+    assert!(
+        validate_soak_workload_plan(&wrong_parent)
+            .expect_err("wrong lifecycle parent must fail")
+            .to_string()
+            .contains("lifecycle resources")
+    );
+
+    let mut wrong_seed = plan.clone();
+    wrong_seed.identities[0].actor_seed ^= 1;
+    assert!(
+        validate_soak_workload_plan(&wrong_seed)
+            .expect_err("wrong actor seed must fail")
+            .to_string()
+            .contains("actor seed")
+    );
+
+    let mut missing_action = plan.clone();
+    missing_action.actions.pop();
+    assert!(
+        validate_soak_workload_plan(&missing_action)
+            .expect_err("missing scheduled action must fail")
+            .to_string()
+            .contains("phase contract")
+    );
+
+    let mut phase_gap = plan.clone();
+    phase_gap.phases[1].start_offset_ms += 1;
+    assert!(
+        validate_soak_workload_plan(&phase_gap)
+            .expect_err("phase gap must fail")
+            .to_string()
+            .contains("preceding phase boundary")
+    );
+
+    let mut inconsistent_actor = plan.clone();
+    let second_quiet = inconsistent_actor
+        .identities
+        .iter_mut()
+        .filter(|identity| identity.actor_id == "quiet-shell")
+        .nth(1)
+        .expect("second quiet-shell identity");
+    second_quiet.output_bytes_per_second = 1;
+    assert!(
+        validate_soak_workload_plan(&inconsistent_actor)
+            .expect_err("inconsistent actor templates must fail")
+            .to_string()
+            .contains("inconsistent materialized templates")
+    );
+
+    let mut noncanonical_assets = plan.clone();
+    noncanonical_assets.assets.swap(0, 1);
+    assert!(
+        validate_soak_workload_plan(&noncanonical_assets)
+            .expect_err("non-canonical assets must fail")
+            .to_string()
+            .contains("assets are not canonical")
+    );
+
+    let mut noncanonical_oracles = plan;
+    noncanonical_oracles.final_oracles.swap(0, 1);
+    assert!(
+        validate_soak_workload_plan(&noncanonical_oracles)
+            .expect_err("non-canonical oracles must fail")
+            .to_string()
+            .contains("oracles are not canonical")
+    );
+}
+
+#[test]
+fn malformed_workload_contracts_fail_closed() {
+    let corpus = long_haul_corpus();
+
+    let mut wrong_version = corpus.clone();
+    wrong_version.version = "ft.soak_workload_corpus.v2".into();
+    assert!(validate_soak_workload_corpus(&wrong_version).is_err());
+
+    let mut wrong_allocation = corpus.clone();
+    wrong_allocation.scales[0].allocations[0].pane_count += 1;
+    assert!(validate_soak_workload_corpus(&wrong_allocation).is_err());
+
+    let mut duplicate_phase_dimension = corpus.clone();
+    let duplicate = duplicate_phase_dimension.phases[0].dimensions[0];
+    duplicate_phase_dimension.phases[0]
+        .dimensions
+        .push(duplicate);
+    assert!(validate_soak_workload_corpus(&duplicate_phase_dimension).is_err());
+
+    let mut unsafe_output = corpus.clone();
+    unsafe_output.actors[0].output_bytes_per_second = u64::MAX;
+    assert!(validate_soak_workload_corpus(&unsafe_output).is_err());
+
+    let mut incomplete_interactive_priority = corpus.clone();
+    incomplete_interactive_priority
+        .interactive_dimension_priority
+        .pop();
+    assert!(validate_soak_workload_corpus(&incomplete_interactive_priority).is_err());
+
+    let mut non_executable_program = corpus.clone();
+    non_executable_program
+        .assets
+        .iter_mut()
+        .find(|asset| asset.asset_id == "dummy-agent-v1")
+        .expect("dummy agent asset")
+        .executable = false;
+    assert!(validate_soak_workload_corpus(&non_executable_program).is_err());
+
+    let mut invalid_persistent_builtin = corpus.clone();
+    let quiet = invalid_persistent_builtin
+        .actors
+        .iter_mut()
+        .find(|actor| actor.actor_id == "quiet-shell")
+        .expect("quiet-shell actor");
+    quiet.activation = SoakActorActivation::Persistent;
+    assert!(validate_soak_workload_corpus(&invalid_persistent_builtin).is_err());
+
+    let mut unknown_adapter = corpus.clone();
+    unknown_adapter
+        .actors
+        .iter_mut()
+        .find(|actor| actor.dimension == SoakWorkloadDimension::QuietShell)
+        .expect("quiet shell actor")
+        .command
+        .program = "ft.soak.unknown.v1".into();
+    assert!(validate_soak_workload_corpus(&unknown_adapter).is_err());
+
+    let mut oversized_burst = corpus.clone();
+    oversized_burst
+        .actors
+        .iter_mut()
+        .find(|actor| actor.dimension == SoakWorkloadDimension::OutputBurst)
+        .expect("output burst actor")
+        .command
+        .args[0] = "1000001".into();
+    assert!(validate_soak_workload_corpus(&oversized_burst).is_err());
+
+    let mut underdeclared_output = corpus.clone();
+    underdeclared_output
+        .actors
+        .iter_mut()
+        .find(|actor| actor.dimension == SoakWorkloadDimension::OutputBurst)
+        .expect("output burst actor")
+        .output_bytes_per_second -= 1;
+    assert!(validate_soak_workload_corpus(&underdeclared_output).is_err());
+
+    let mut wrong_shutdown = corpus.clone();
+    wrong_shutdown
+        .actors
+        .iter_mut()
+        .find(|actor| actor.dimension == SoakWorkloadDimension::AgentLikeStream)
+        .expect("agent actor")
+        .shutdown = Some(SoakPersistentShutdown::Interrupt);
+    assert!(validate_soak_workload_corpus(&wrong_shutdown).is_err());
+
+    let mut dogfood_promoted = corpus.clone();
+    dogfood_promoted.dogfood.excluded_from_deterministic_verdict = false;
+    assert!(validate_soak_workload_corpus(&dogfood_promoted).is_err());
+
+    let mut wrong_oracle_authority = corpus.clone();
+    wrong_oracle_authority
+        .final_oracles
+        .iter_mut()
+        .find(|oracle| oracle.oracle == SoakFinalOracleKind::FinalTerminalStateHash)
+        .expect("terminal hash oracle")
+        .authority = SoakOracleAuthority::LogicalReplay;
+    assert!(validate_soak_workload_corpus(&wrong_oracle_authority).is_err());
+
+    let mut traversal = corpus;
+    traversal.assets[0].path = "../outside".into();
+    assert!(validate_soak_workload_corpus(&traversal).is_err());
+
+    let mut nonportable_path = long_haul_corpus();
+    nonportable_path.assets[0].path = "fixtures\\outside".into();
+    assert!(validate_soak_workload_corpus(&nonportable_path).is_err());
+
+    let mut unused_asset = long_haul_corpus();
+    let mut extra = unused_asset.assets[0].clone();
+    extra.asset_id = "unused-asset".into();
+    extra.path = "fixtures/perf/unused-asset.txt".into();
+    unused_asset.assets.push(extra);
+    assert!(
+        validate_soak_workload_corpus(&unused_asset)
+            .expect_err("unreferenced asset must fail")
+            .to_string()
+            .contains("referenced")
+    );
+}
+
+#[test]
+fn corpus_json_rejects_unknown_fields() {
+    let path = repo_root().join(SOAK_WORKLOAD_CORPUS_FIXTURE);
+    let mut value: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(path).expect("read tracked soak workload corpus"),
+    )
+    .expect("parse fixture as JSON value");
+    value
+        .as_object_mut()
+        .expect("corpus object")
+        .insert("base_sead".into(), serde_json::json!(7));
+    assert!(serde_json::from_value::<SoakWorkloadCorpus>(value).is_err());
+}
+
+#[test]
+fn legacy_soak_matrix_uses_typed_drivers_not_fabricated_shell_commands() {
+    let matrix = SoakMatrix::standard();
+    let plan = matrix.to_plan().expect("valid standard matrix");
+    let matrix_json = serde_json::to_string(&matrix).expect("serialize standard matrix");
+    let plan_json = serde_json::to_string(&plan).expect("serialize standard plan");
+    assert!(plan_json.contains("\"driver\""));
+    assert!(!matrix_json.contains("\"command\""));
+    assert!(!matrix_json.contains("cargo test --test soak_"));
+    assert!(plan.cells.iter().all(|cell| {
+        let scenario = matrix
+            .scenarios
+            .iter()
+            .find(|scenario| scenario.scenario_id == cell.scenario_id)
+            .expect("cell scenario");
+        cell.driver == JourneyDriver::from(scenario.category)
+    }));
+}
+
 // =============================================================================
 // JourneyCategory invariants
 // =============================================================================
@@ -133,7 +656,6 @@ proptest! {
                 expected_duration_ms: 1000,
                 blocking: true,
                 seed: None,
-                command: String::new(),
             })
             .collect();
 
@@ -142,7 +664,7 @@ proptest! {
 
         let matrix = SoakMatrix::custom(scenarios, workloads, injections);
         let expected = n_scenarios * n_workloads * n_injections;
-        prop_assert_eq!(matrix.cell_count(), expected,
+        prop_assert_eq!(matrix.cell_count().expect("valid generated matrix"), expected,
             "cell_count should be scenarios * workloads * injections: {} * {} * {} = {}",
             n_scenarios, n_workloads, n_injections, expected);
     }
@@ -159,7 +681,6 @@ proptest! {
                 expected_duration_ms: 1000,
                 blocking: true,
                 seed: None,
-                command: String::new(),
             })
             .collect();
 
@@ -168,14 +689,26 @@ proptest! {
             WorkloadProfile::ALL.to_vec(),
             FailureInjectionProfile::ALL.to_vec(),
         );
-        let plan = matrix.to_plan();
-        prop_assert_eq!(plan.total_cells(), matrix.cell_count());
+        let plan = matrix.to_plan().expect("valid generated matrix");
+        prop_assert_eq!(plan.total_cells(), matrix.cell_count().expect("valid generated matrix"));
     }
 }
 
 // =============================================================================
 // Execution result counter arithmetic
 // =============================================================================
+
+#[test]
+fn completion_before_start_is_rejected_without_mutating_result() {
+    let mut result = SoakExecutionResult::new(1_000);
+    let error = result
+        .complete(999)
+        .expect_err("backwards completion time must fail");
+    assert_eq!(error.started_at_ms, 1_000);
+    assert_eq!(error.completed_at_ms, 999);
+    assert_eq!(result.completed_at_ms, 0);
+    assert_eq!(result.total_duration_ms, 0);
+}
 
 proptest! {
     #[test]
@@ -224,7 +757,7 @@ proptest! {
             });
         }
 
-        exec.complete(1000);
+        exec.complete(1000).expect("valid completion time");
 
         prop_assert_eq!(exec.cells_passed(), n_pass);
         prop_assert_eq!(exec.cells_failed(), n_fail);
@@ -295,7 +828,7 @@ proptest! {
             });
         }
 
-        exec.complete(1000);
+        exec.complete(1000).expect("valid completion time");
         let blocking = exec.blocking_failures();
         prop_assert!(blocking <= exec.cells_failed());
         prop_assert_eq!(blocking, n_blocking_fail);
@@ -345,7 +878,7 @@ proptest! {
                 telemetry: CellTelemetry::default(),
             });
         }
-        exec.complete(1000);
+        exec.complete(1000).expect("valid completion time");
 
         let gate = ConfidenceGate::standard();
         let v1 = gate.evaluate(&exec);
@@ -361,7 +894,7 @@ proptest! {
 #[test]
 fn standard_matrix_has_cells() {
     let matrix = SoakMatrix::standard();
-    assert!(matrix.cell_count() > 0);
+    assert!(matrix.cell_count().expect("valid standard matrix") > 0);
     assert!(matrix.blocking_scenario_count() > 0);
 }
 
@@ -369,7 +902,10 @@ fn standard_matrix_has_cells() {
 fn ci_minimal_matrix_is_smaller() {
     let standard = SoakMatrix::standard();
     let ci = SoakMatrix::ci_minimal();
-    assert!(ci.cell_count() <= standard.cell_count());
+    assert!(
+        ci.cell_count().expect("valid CI matrix")
+            <= standard.cell_count().expect("valid standard matrix")
+    );
 }
 
 #[test]
@@ -405,7 +941,7 @@ fn confidence_verdict_summary_renders() {
         seed: None,
         telemetry: CellTelemetry::default(),
     });
-    exec.complete(1000);
+    exec.complete(1000).expect("valid completion time");
 
     let gate = ConfidenceGate::standard();
     let verdict = gate.evaluate(&exec);
@@ -431,9 +967,20 @@ fn arb_cell_telemetry() -> impl Strategy<Value = CellTelemetry> {
         0u64..100,
         0u64..50,
         0u64..50,
+        0u64..10,
     )
         .prop_map(
-            |(attempted, succeeded, failed, spawned, completed, cancelled, faults, recoveries)| {
+            |(
+                attempted,
+                succeeded,
+                failed,
+                spawned,
+                completed,
+                cancelled,
+                faults,
+                recoveries,
+                deadlocks,
+            )| {
                 CellTelemetry {
                     ops_attempted: attempted,
                     ops_succeeded: succeeded,
@@ -443,6 +990,7 @@ fn arb_cell_telemetry() -> impl Strategy<Value = CellTelemetry> {
                     tasks_cancelled: cancelled,
                     faults_injected: faults,
                     recoveries,
+                    deadlock_detected_count: deadlocks,
                 }
             },
         )
@@ -489,7 +1037,7 @@ proptest! {
         let scenario = UserJourneyScenario {
             scenario_id: sid.clone(), category: cat,
             description: "test scenario".to_string(), expected_duration_ms: 60_000,
-            blocking, seed: Some(42), command: "cargo test".to_string(),
+            blocking, seed: Some(42),
         };
         let json = serde_json::to_string(&scenario).unwrap();
         let back: UserJourneyScenario = serde_json::from_str(&json).unwrap();
@@ -503,7 +1051,7 @@ proptest! {
             vec![UserJourneyScenario {
                 scenario_id: "s1".to_string(), category: cat,
                 description: "test".to_string(), expected_duration_ms: 1000,
-                blocking: true, seed: None, command: "echo".to_string(),
+                blocking: true, seed: None,
             }],
             vec![WorkloadProfile::Steady],
             vec![FailureInjectionProfile::None],
@@ -519,7 +1067,8 @@ proptest! {
         let plan = SoakExecutionPlan {
             cells: vec![SoakCell {
                 cell_id: "cell-1".to_string(), scenario_id: "s1".to_string(),
-                category: cat, workload: wp, injection: FailureInjectionProfile::None,
+                category: cat, driver: cat.into(), expected_duration_ms: 1_000,
+                workload: wp, injection: FailureInjectionProfile::None,
                 blocking: true, seed: Some(42),
             }],
         };
@@ -527,6 +1076,7 @@ proptest! {
         let back: SoakExecutionPlan = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.cells.len(), 1);
         prop_assert_eq!(&back.cells[0].cell_id, "cell-1");
+        prop_assert_eq!(back.cells[0].driver, JourneyDriver::from(cat));
     }
 
     #[test]
@@ -536,13 +1086,15 @@ proptest! {
     ) {
         let cell = SoakCell {
             cell_id: cid.clone(), scenario_id: "s1".to_string(),
-            category: cat, workload: wp, injection: fi,
+            category: cat, driver: cat.into(), expected_duration_ms: 1_000,
+            workload: wp, injection: fi,
             blocking: true, seed: Some(99),
         };
         let json = serde_json::to_string(&cell).unwrap();
         let back: SoakCell = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(&back.cell_id, &cid);
         prop_assert_eq!(back.seed, Some(99));
+        prop_assert_eq!(back.driver, JourneyDriver::from(cat));
     }
 
     #[test]
@@ -593,7 +1145,10 @@ proptest! {
             ops_attempted: ops, ops_succeeded: ops, ops_failed: 0,
             tasks_spawned: 100, tasks_completed: 100, tasks_cancelled: 0,
             faults_injected: faults, recoveries: faults,
-            deadlock_detected_count: 0, max_p95_latency_ms: 42.5,
+            deadlock_detected_count: 0,
+            cells_with_task_accounting_mismatch: 0,
+            cells_with_operation_accounting_mismatch: 0,
+            max_p95_latency_ms: 42.5,
         };
         let json = serde_json::to_string(&tel).unwrap();
         let back: AggregatedSoakTelemetry = serde_json::from_str(&json).unwrap();

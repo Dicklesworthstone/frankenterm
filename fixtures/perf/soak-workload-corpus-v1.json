@@ -1,0 +1,357 @@
+{
+  "version": "ft.soak_workload_corpus.v1",
+  "corpus_id": "mux-long-session-real-workload-v1",
+  "base_seed": 104729,
+  "interactive_dimension_priority": [
+    "editor_tui",
+    "agent_like_stream",
+    "progress_redraw",
+    "resize_zoom",
+    "layout_churn",
+    "reconnect"
+  ],
+  "assets": [
+    {
+      "asset_id": "dummy-agent-v1",
+      "path": "fixtures/e2e/dummy_agent.sh",
+      "sha256": "777ea791b4a58e4942b59415cf6dd563e319900c6737b27693a6910824fb5fb9",
+      "executable": true,
+      "purpose": "Deterministic agent-like prompt, compaction, input, and clean-exit actor"
+    },
+    {
+      "asset_id": "dummy-alt-screen-v1",
+      "path": "fixtures/e2e/dummy_alt_screen.sh",
+      "sha256": "3a3d7a81c2ba3df858d5e77ac488dff9fb6b6930b08a4c0cbdf05f52463e9dfd",
+      "executable": true,
+      "purpose": "Deterministic alternate-screen editor and TUI lifecycle actor"
+    },
+    {
+      "asset_id": "dummy-burst-v1",
+      "path": "fixtures/e2e/dummy_burst.sh",
+      "sha256": "ddec0eb1fbd996df7d448e485d9a45394177ee45a7f041e2a13e14cead034a31",
+      "executable": true,
+      "purpose": "Deterministic high-volume line burst actor"
+    },
+    {
+      "asset_id": "build-output-v1",
+      "path": "fixtures/perf/agent-output-corpus/repetitive_sample.txt",
+      "sha256": "5cc25bda75cd869094d3a6671000b39ac1cdbb181798379b3fe83bbfc353693c",
+      "executable": false,
+      "purpose": "Pinned build and test output payload"
+    },
+    {
+      "asset_id": "agent-output-v1",
+      "path": "fixtures/perf/agent-output-corpus/heterogeneous_agent_log_sample.txt",
+      "sha256": "aa23d5155bc02825a147158c1558a458e2f9350105796298978ab8415e0f740d",
+      "executable": false,
+      "purpose": "Pinned heterogeneous agent output for capture and search"
+    },
+    {
+      "asset_id": "mixed-scale-resize-v1",
+      "path": "fixtures/simulations/resize_baseline/mixed_scale_soak.yaml",
+      "sha256": "d12c414928dac2bd92de7cb465789244862273d95bfbfb098107311eb60ecf4d",
+      "executable": false,
+      "purpose": "Pinned multi-window tab pane resize and zoom choreography"
+    },
+    {
+      "asset_id": "interactive-resize-v1",
+      "path": "fixtures/simulations/resize_baseline/mixed_workload_interactive_streaming.yaml",
+      "sha256": "50c4bb3457e107c9e09cc4db274fc88d03065cac0d08569f8c6c8fc11a481c76",
+      "executable": false,
+      "purpose": "Pinned editor log scrollback resize and font choreography"
+    },
+    {
+      "asset_id": "static-image-v1",
+      "path": "tests/fixtures/renderer-corpus/smoke/static-png-roundtrip/frame-000.png",
+      "sha256": "1a245fbd8825c63c4d0a572ff25db103802dd428509d4cb4b5855dc32ad3c17c",
+      "executable": false,
+      "purpose": "Pinned static image decode upload and redraw payload"
+    },
+    {
+      "asset_id": "glyph-combining-v1",
+      "path": "tests/golden/gpu/text-combining-marks/golden.png",
+      "sha256": "96430304f6b7202a59582ae26cd3e50712420c6c211c48f21af81e9052dc57eb",
+      "executable": false,
+      "purpose": "Pinned combining-mark visual oracle input"
+    },
+    {
+      "asset_id": "glyph-emoji-v1",
+      "path": "tests/golden/gpu/text-emoji-fallback/golden.png",
+      "sha256": "136fe36babbedbe284d8bcd5514fc419f2562a9c9b28ed035e1f959c57c74a5a",
+      "executable": false,
+      "purpose": "Pinned emoji and color-glyph visual oracle input"
+    },
+    {
+      "asset_id": "glyph-rtl-v1",
+      "path": "tests/golden/gpu/text-rtl-arabic-hebrew/golden.png",
+      "sha256": "fb179245311e64742383fb00da39a0831867407000a6df7dd9a90aa28f55a68a",
+      "executable": false,
+      "purpose": "Pinned RTL shaping visual oracle input"
+    },
+    {
+      "asset_id": "glyph-cjk-v1",
+      "path": "tests/golden/gpu/text-cjk-mixed/golden.png",
+      "sha256": "ed33f69d27bf28d4c4d28f1f503748eb4756ce17144af9c92b2eff2d26ccc06f",
+      "executable": false,
+      "purpose": "Pinned CJK fallback visual oracle input"
+    }
+  ],
+  "actors": [
+    {
+      "actor_id": "quiet-shell",
+      "dimension": "quiet_shell",
+      "activation": "scheduled",
+      "command": {"driver": "builtin", "program": "ft.soak.quiet-shell.v1", "args": []},
+      "asset_ids": [],
+      "payload_profile": "shell-prompt-heartbeat-v1",
+      "output_bytes_per_second": 0,
+      "expected_final_marker": "FT_SOAK_QUIET_SHELL_COMPLETE_V1"
+    },
+    {
+      "actor_id": "editor-tui",
+      "dimension": "editor_tui",
+      "activation": "persistent",
+      "shutdown": {"kind": "interrupt"},
+      "command": {"driver": "isolated_argv", "program": "fixtures/e2e/dummy_alt_screen.sh", "args": ["660"]},
+      "asset_ids": ["dummy-alt-screen-v1"],
+      "payload_profile": "alternate-screen-editor-v1",
+      "output_bytes_per_second": 512,
+      "expected_final_marker": "Exited alternate screen mode."
+    },
+    {
+      "actor_id": "build-test-output",
+      "dimension": "build_test_output",
+      "activation": "scheduled",
+      "command": {"driver": "fixture_replay", "program": "ft.soak.fixture-replay.v1", "args": ["build-output-v1"]},
+      "asset_ids": ["build-output-v1"],
+      "payload_profile": "paced-build-log-v1",
+      "output_bytes_per_second": 32768,
+      "expected_final_marker": "FT_SOAK_BUILD_OUTPUT_COMPLETE_V1"
+    },
+    {
+      "actor_id": "progress-redraw",
+      "dimension": "progress_redraw",
+      "activation": "scheduled",
+      "command": {"driver": "builtin", "program": "ft.soak.progress-redraw.v1", "args": ["ansi", "carriage-return"]},
+      "asset_ids": [],
+      "payload_profile": "ansi-progress-redraw-v1",
+      "output_bytes_per_second": 8192,
+      "expected_final_marker": "FT_SOAK_PROGRESS_COMPLETE_V1"
+    },
+    {
+      "actor_id": "agent-like-stream",
+      "dimension": "agent_like_stream",
+      "activation": "persistent",
+      "shutdown": {"kind": "stdin_line", "line": "exit"},
+      "command": {"driver": "isolated_argv", "program": "fixtures/e2e/dummy_agent.sh", "args": ["1", "5", "1", "660"]},
+      "asset_ids": ["dummy-agent-v1", "agent-output-v1"],
+      "payload_profile": "agent-prompt-tool-stream-v1",
+      "output_bytes_per_second": 4096,
+      "expected_final_marker": "[CODEX] Session ended"
+    },
+    {
+      "actor_id": "images",
+      "dimension": "images",
+      "activation": "scheduled",
+      "command": {"driver": "fixture_replay", "program": "ft.soak.image-replay.v1", "args": ["static-image-v1"]},
+      "asset_ids": ["static-image-v1"],
+      "payload_profile": "static-image-redraw-v1",
+      "output_bytes_per_second": 2048,
+      "expected_final_marker": "FT_SOAK_IMAGE_COMPLETE_V1"
+    },
+    {
+      "actor_id": "glyph-diversity",
+      "dimension": "glyph_diversity",
+      "activation": "scheduled",
+      "command": {"driver": "fixture_replay", "program": "ft.soak.glyph-replay.v1", "args": ["glyph-combining-v1", "glyph-emoji-v1", "glyph-rtl-v1", "glyph-cjk-v1"]},
+      "asset_ids": ["glyph-combining-v1", "glyph-emoji-v1", "glyph-rtl-v1", "glyph-cjk-v1"],
+      "payload_profile": "unicode-combining-rtl-emoji-cjk-v1",
+      "output_bytes_per_second": 4096,
+      "expected_final_marker": "FT_SOAK_GLYPH_COMPLETE_V1"
+    },
+    {
+      "actor_id": "search",
+      "dimension": "search",
+      "activation": "scheduled",
+      "command": {"driver": "builtin", "program": "ft.soak.search.v1", "args": ["lexical", "semantic", "hybrid"]},
+      "asset_ids": ["agent-output-v1"],
+      "payload_profile": "search-query-mix-v1",
+      "output_bytes_per_second": 512,
+      "expected_final_marker": "FT_SOAK_SEARCH_QUIESCENT_V1"
+    },
+    {
+      "actor_id": "capture",
+      "dimension": "capture",
+      "activation": "scheduled",
+      "command": {"driver": "fixture_replay", "program": "ft.soak.capture-replay.v1", "args": ["agent-output-v1"]},
+      "asset_ids": ["agent-output-v1"],
+      "payload_profile": "capture-delta-gap-v1",
+      "output_bytes_per_second": 2048,
+      "expected_final_marker": "FT_SOAK_CAPTURE_QUIESCENT_V1"
+    },
+    {
+      "actor_id": "workflow",
+      "dimension": "workflow",
+      "activation": "scheduled",
+      "command": {"driver": "builtin", "program": "ft.soak.workflow.v1", "args": ["trigger", "policy", "complete"]},
+      "asset_ids": [],
+      "payload_profile": "workflow-policy-loop-v1",
+      "output_bytes_per_second": 512,
+      "expected_final_marker": "FT_SOAK_WORKFLOW_QUIESCENT_V1"
+    },
+    {
+      "actor_id": "maintenance",
+      "dimension": "maintenance",
+      "activation": "scheduled",
+      "command": {"driver": "builtin", "program": "ft.soak.maintenance.v1", "args": ["wal", "gc", "backup", "prune"]},
+      "asset_ids": [],
+      "payload_profile": "maintenance-overlap-v1",
+      "output_bytes_per_second": 256,
+      "expected_final_marker": "FT_SOAK_MAINTENANCE_QUIESCENT_V1"
+    },
+    {
+      "actor_id": "layout-churn",
+      "dimension": "layout_churn",
+      "activation": "scheduled",
+      "command": {"driver": "fixture_replay", "program": "ft.soak.layout-replay.v1", "args": ["mixed-scale-resize-v1"]},
+      "asset_ids": ["mixed-scale-resize-v1"],
+      "payload_profile": "window-tab-split-focus-v1",
+      "output_bytes_per_second": 128,
+      "expected_final_marker": "soak_cycle_complete"
+    },
+    {
+      "actor_id": "resize-zoom",
+      "dimension": "resize_zoom",
+      "activation": "scheduled",
+      "command": {"driver": "fixture_replay", "program": "ft.soak.resize-replay.v1", "args": ["interactive-resize-v1"]},
+      "asset_ids": ["interactive-resize-v1"],
+      "payload_profile": "continuous-resize-font-zoom-v1",
+      "output_bytes_per_second": 128,
+      "expected_final_marker": "workload_stable"
+    },
+    {
+      "actor_id": "reconnect",
+      "dimension": "reconnect",
+      "activation": "scheduled",
+      "command": {"driver": "builtin", "program": "ft.soak.reconnect.v1", "args": ["interrupt", "retry", "resync", "ack"]},
+      "asset_ids": [],
+      "payload_profile": "generation-bound-reconnect-v1",
+      "output_bytes_per_second": 128,
+      "expected_final_marker": "FT_SOAK_RECONNECT_CONVERGED_V1"
+    },
+    {
+      "actor_id": "output-burst",
+      "dimension": "output_burst",
+      "activation": "scheduled",
+      "command": {"driver": "isolated_argv", "program": "fixtures/e2e/dummy_burst.sh", "args": ["6509", "FT_SOAK_BURST_V1_XX"]},
+      "asset_ids": ["dummy-burst-v1"],
+      "payload_profile": "paced-adversarial-burst-v1",
+      "output_bytes_per_second": 802688,
+      "expected_final_marker": "FT_SOAK_BURST_V1_XX"
+    }
+  ],
+  "scales": [
+    {
+      "pane_count": 20,
+      "window_count": 1,
+      "tab_count": 4,
+      "interactive_pane_count": 1,
+      "aggregate_output_bytes_per_second": 903168,
+      "allocations": [
+        {"actor_id": "quiet-shell", "pane_count": 3},
+        {"actor_id": "editor-tui", "pane_count": 1},
+        {"actor_id": "build-test-output", "pane_count": 2},
+        {"actor_id": "progress-redraw", "pane_count": 2},
+        {"actor_id": "agent-like-stream", "pane_count": 2},
+        {"actor_id": "images", "pane_count": 1},
+        {"actor_id": "glyph-diversity", "pane_count": 1},
+        {"actor_id": "search", "pane_count": 1},
+        {"actor_id": "capture", "pane_count": 1},
+        {"actor_id": "workflow", "pane_count": 1},
+        {"actor_id": "maintenance", "pane_count": 1},
+        {"actor_id": "layout-churn", "pane_count": 1},
+        {"actor_id": "resize-zoom", "pane_count": 1},
+        {"actor_id": "reconnect", "pane_count": 1},
+        {"actor_id": "output-burst", "pane_count": 1}
+      ]
+    },
+    {
+      "pane_count": 50,
+      "window_count": 2,
+      "tab_count": 10,
+      "interactive_pane_count": 5,
+      "aggregate_output_bytes_per_second": 1048576,
+      "allocations": [
+        {"actor_id": "quiet-shell", "pane_count": 10},
+        {"actor_id": "editor-tui", "pane_count": 4},
+        {"actor_id": "build-test-output", "pane_count": 5},
+        {"actor_id": "progress-redraw", "pane_count": 4},
+        {"actor_id": "agent-like-stream", "pane_count": 5},
+        {"actor_id": "images", "pane_count": 2},
+        {"actor_id": "glyph-diversity", "pane_count": 3},
+        {"actor_id": "search", "pane_count": 3},
+        {"actor_id": "capture", "pane_count": 3},
+        {"actor_id": "workflow", "pane_count": 3},
+        {"actor_id": "maintenance", "pane_count": 2},
+        {"actor_id": "layout-churn", "pane_count": 2},
+        {"actor_id": "resize-zoom", "pane_count": 2},
+        {"actor_id": "reconnect", "pane_count": 1},
+        {"actor_id": "output-burst", "pane_count": 1}
+      ]
+    },
+    {
+      "pane_count": 200,
+      "window_count": 4,
+      "tab_count": 20,
+      "interactive_pane_count": 10,
+      "aggregate_output_bytes_per_second": 5802880,
+      "allocations": [
+        {"actor_id": "quiet-shell", "pane_count": 40},
+        {"actor_id": "editor-tui", "pane_count": 15},
+        {"actor_id": "build-test-output", "pane_count": 20},
+        {"actor_id": "progress-redraw", "pane_count": 15},
+        {"actor_id": "agent-like-stream", "pane_count": 25},
+        {"actor_id": "images", "pane_count": 8},
+        {"actor_id": "glyph-diversity", "pane_count": 10},
+        {"actor_id": "search", "pane_count": 12},
+        {"actor_id": "capture", "pane_count": 12},
+        {"actor_id": "workflow", "pane_count": 12},
+        {"actor_id": "maintenance", "pane_count": 8},
+        {"actor_id": "layout-churn", "pane_count": 6},
+        {"actor_id": "resize-zoom", "pane_count": 6},
+        {"actor_id": "reconnect", "pane_count": 5},
+        {"actor_id": "output-burst", "pane_count": 6}
+      ]
+    }
+  ],
+  "phases": [
+    {"phase_id": "quiet-baseline", "start_offset_ms": 0, "duration_ms": 60000, "action_cadence_ms": 5000, "dimensions": ["quiet_shell"]},
+    {"phase_id": "interactive-warmup", "start_offset_ms": 60000, "duration_ms": 120000, "action_cadence_ms": 1000, "dimensions": ["editor_tui", "progress_redraw", "agent_like_stream"]},
+    {"phase_id": "sustained-services", "start_offset_ms": 180000, "duration_ms": 120000, "action_cadence_ms": 500, "dimensions": ["build_test_output", "capture", "search", "workflow", "maintenance"]},
+    {"phase_id": "visual-glyph-pressure", "start_offset_ms": 300000, "duration_ms": 90000, "action_cadence_ms": 1000, "dimensions": ["images", "glyph_diversity"]},
+    {"phase_id": "layout-resize-zoom", "start_offset_ms": 390000, "duration_ms": 90000, "action_cadence_ms": 500, "dimensions": ["layout_churn", "resize_zoom"]},
+    {"phase_id": "reconnect-recovery", "start_offset_ms": 480000, "duration_ms": 60000, "action_cadence_ms": 2000, "dimensions": ["reconnect"]},
+    {"phase_id": "adversarial-burst", "start_offset_ms": 540000, "duration_ms": 30000, "action_cadence_ms": 250, "dimensions": ["output_burst"]},
+    {"phase_id": "cooldown-final-state", "start_offset_ms": 570000, "duration_ms": 60000, "action_cadence_ms": 5000, "dimensions": ["quiet_shell", "editor_tui", "build_test_output", "progress_redraw", "agent_like_stream", "images", "glyph_diversity", "search", "capture", "workflow", "maintenance", "layout_churn", "resize_zoom", "reconnect", "output_burst"]}
+  ],
+  "final_oracles": [
+    {"oracle": "no_owned_workspace", "authority": "logical_replay"},
+    {"oracle": "no_live_actors", "authority": "logical_replay"},
+    {"oracle": "no_open_panes", "authority": "logical_replay"},
+    {"oracle": "no_open_tabs", "authority": "logical_replay"},
+    {"oracle": "no_open_windows", "authority": "logical_replay"},
+    {"oracle": "no_pending_actions", "authority": "logical_replay"},
+    {"oracle": "all_dimensions_observed", "authority": "logical_replay"},
+    {"oracle": "stable_fleet_identity_map", "authority": "logical_replay"},
+    {"oracle": "final_terminal_state_hash", "authority": "production_runner"},
+    {"oracle": "final_layout_state_hash", "authority": "production_runner"},
+    {"oracle": "capture_search_quiescent", "authority": "production_runner"},
+    {"oracle": "no_orphan_children", "authority": "production_runner"},
+    {"oracle": "no_open_transports", "authority": "production_runner"},
+    {"oracle": "resource_ownership_at_baseline", "authority": "production_runner"}
+  ],
+  "dogfood": {
+    "excluded_from_deterministic_verdict": true,
+    "required_identity_fields": ["agent_name", "agent_version", "model_id", "config_digest", "session_id", "transcript_digest"]
+  }
+}

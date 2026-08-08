@@ -34,9 +34,9 @@ The rig's value is comparing the two capture paths on **identical** replay input
 so every run exercises both:
 
 - `poll` — the periodic mux-polling capture path.
-- `native_push` — the native push-event bridge (`native_events.rs`), the path
-  the README marks "required" at 200 panes. The rig proves its dedup-window and
-  queue/lag behaviour, not just poll.
+- `native_push` — a deterministic replay model that applies the native-push
+  dedup-window coalescing rule to the real replay-corpus egress timestamps and
+  byte sizes. It does not call the production `native_events.rs` bridge.
 
 `--mode` only narrows the human-readable display; the JSON report and the
 overall verdict always cover both modes.
@@ -58,8 +58,8 @@ unsupported scale point.
 The rig reports these in every run:
 
 - the replay corpus is deterministic; no live mux panes are launched;
-- `native_push` mode models the bridge contract and dedup window — it is not
-  live OS-event proof;
+- `native_push` applies dedup-window coalescing to replay events, but does not
+  traverse the live bridge, mux, PTY, transport, or OS-event path;
 - `poll` and `native_push` share identical replay input, so their lag and queue
   metrics are directly comparable.
 

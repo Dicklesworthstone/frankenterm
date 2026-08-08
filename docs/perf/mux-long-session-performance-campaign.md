@@ -1461,6 +1461,65 @@ complete input-to-photon path. Historical GUI observations, skipped target
 receipts, short simulations, static goldens, and microbenchmarks cannot promote
 those claims. In this matrix, **live** is callgraph evidence only.
 
+### 15.5 Deterministic long-haul workload corpus
+
+`fixtures/perf/soak-workload-corpus-v1.json` is the compact source of truth for
+`.4.2`. `soak_confidence_gate.rs` parses, validates, materializes, hashes, and
+logically replays it without launching FrankenTerm. The contract has these
+properties:
+
+- exact 20-, 50-, and 200-pane allocations with one stable fleet-slot identity
+  per actor, independent of transient mux IDs and input-list order;
+- a self-contained materialized plan that retains the base seed and canonical
+  phase contract so identities and every scheduled action can be re-derived;
+- deterministic round-robin interactive assignment across editor/TUI,
+  agent-stream, progress-redraw, resize/zoom, layout-churn, and reconnect
+  actors, rather than concentrating interaction in the first sorted actor;
+- fixed per-actor seeds, typed drivers, exact argv vectors where a later
+  isolated child is necessary, content-addressed existing assets with declared
+  executable mode, payload profiles, output-rate envelopes, and final markers.
+  The validator binds every dimension to its registered driver/program,
+  activation, and output envelope; requires every pinned asset to be used;
+  bounds verification reads even if a file grows after metadata inspection;
+  and rejects non-portable paths, unknown adapters, or out-of-range isolated
+  argv before a runner can trust a rehashed plan;
+- explicit activation semantics: the owned editor and agent fixtures are
+  persistent children spanning the 630-second cycle, while bounded built-in,
+  fixture-replay, and burst adapters run on scheduled actions; the burst argv
+  is sized so its 250 ms cadence produces the declared 802,688 B/s peak; each
+  persistent child also carries an explicit owned shutdown contract (stdin line
+  for the agent and interrupt-with-cleanup for the alternate-screen fixture);
+- quiet shell, editor/TUI, build/test output, progress redraw, agent-like
+  stream, image, glyph-diversity, search, capture, workflow, maintenance,
+  layout churn, resize/zoom, reconnect, and burst dimensions at every scale;
+- a repeatable 630-second cycle with non-overlapping quiet, interactive,
+  sustained-service, visual/glyph, layout/resize, reconnect, adversarial-burst,
+  and cooldown/final-state phases;
+- idempotent setup/teardown operations for workspace, window, tab, pane, and
+  actor resources whose exact parents and canonical order are validated, plus
+  logical failure replay that still settles every owned resource. Confidence
+  evidence also fails closed on missing or rewritten canonical invariants,
+  deadlock-counter overflow, per-cell accounting defects that cancel only in
+  aggregate, malformed timestamps/identities, and non-finite metrics; and
+- explicit logical versus production-runner oracle authority. Terminal-state,
+  layout-state, capture/search-quiescence, child settlement, transport closure,
+  and resource-return-to-baseline remain production-runner obligations and
+  cannot be minted by the logical replay.
+
+The corpus reuses pinned agent/build samples, dummy agent/burst/alternate-screen
+actors, resize/zoom simulations, and renderer images/glyph goldens identified by
+the `.4.1` audit. Real Codex, Claude, Gemini, or other model sessions are a
+separately versioned dogfood overlay and are excluded from the deterministic
+verdict. The required dogfood identity binds agent name/version, model,
+configuration, session, and transcript digests; secrets and external model
+availability are not corpus dependencies.
+
+This is workload and lifecycle authority for `.4.4`, not native soak evidence.
+The later runner must execute it only in an explicitly isolated owned session,
+retain actual terminal/layout/capture oracles, and prove process settlement. It
+must never launch against, attach to, input to, sample, signal, or clean up an
+operator's FrankenTerm session.
+
 ## 16. Dependency and execution order
 
 ### Phase A — truth, immediate correctness, and atomic identity
