@@ -22,6 +22,14 @@ pub struct CleanupResult {
     pub deleted_by_count: usize,
     /// Sessions deleted by size budget.
     pub deleted_by_size: usize,
+    /// Exact logical retained-session bytes measured before size cleanup.
+    pub size_measured_bytes: u64,
+    /// Exact logical retained-session bytes removed by size cleanup.
+    pub size_deleted_bytes: u64,
+    /// Exact logical retained-session bytes remaining after size cleanup.
+    pub size_retained_bytes: u64,
+    /// Bytes still above budget because no additional session was eligible.
+    pub size_ineligible_shortfall_bytes: u64,
     /// Orphaned restore-attempt lifecycle rows cleaned.
     pub orphaned_restore_lifecycle_rows: usize,
     /// Orphaned checkpoint rows cleaned.

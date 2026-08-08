@@ -35,7 +35,10 @@ pub use frankenterm_core_audit_types::session_retention_types::CleanupResult;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SizeCleanupOutcome {
     deleted: usize,
-    shortfall_bytes: u64,
+    measured_bytes: u64,
+    deleted_bytes: u64,
+    retained_bytes: u64,
+    ineligible_shortfall_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -146,16 +149,26 @@ pub fn cleanup_sessions(
     if config.max_total_size_mb > 0 {
         let size_outcome = delete_sessions_by_size(conn, config.max_total_size_mb)?;
         result.deleted_by_size = size_outcome.deleted;
-        if size_outcome.shortfall_bytes > 0 {
+        result.size_measured_bytes = size_outcome.measured_bytes;
+        result.size_deleted_bytes = size_outcome.deleted_bytes;
+        result.size_retained_bytes = size_outcome.retained_bytes;
+        result.size_ineligible_shortfall_bytes = size_outcome.ineligible_shortfall_bytes;
+        if size_outcome.ineligible_shortfall_bytes > 0 {
             warn!(
                 deleted = size_outcome.deleted,
-                shortfall_bytes = size_outcome.shortfall_bytes,
+                measured_bytes = size_outcome.measured_bytes,
+                deleted_bytes = size_outcome.deleted_bytes,
+                retained_bytes = size_outcome.retained_bytes,
+                shortfall_bytes = size_outcome.ineligible_shortfall_bytes,
                 max_mb = config.max_total_size_mb,
                 "Session size budget remains above its configured limit because no more closed sessions are eligible"
             );
         } else if size_outcome.deleted > 0 {
             info!(
                 deleted = size_outcome.deleted,
+                measured_bytes = size_outcome.measured_bytes,
+                deleted_bytes = size_outcome.deleted_bytes,
+                retained_bytes = size_outcome.retained_bytes,
                 max_mb = config.max_total_size_mb,
                 "Applied session size budget"
             );
@@ -274,8 +287,10 @@ pub(crate) fn has_unresolved_restore_intent(
     )
 }
 
-/// Fail closed when authority-table triggers could invalidate direct SQLite
-/// row-count receipts.
+/// Fail closed when unaudited authority-table triggers could invalidate direct
+/// SQLite row-count receipts. Schema-v40 retained-size triggers are the sole
+/// persistent allowlist: migration validation pins their bodies, and cleanup
+/// depends on them to keep byte deletion receipts exact.
 ///
 /// SQLite identifiers are case-insensitive while both schema catalogs preserve
 /// the spelling used by `CREATE TRIGGER`, so both the persistent and TEMP
@@ -291,10 +306,24 @@ pub(crate) fn ensure_session_authority_tables_have_no_unaudited_triggers(
     let trigger_count: i64 = conn.query_row(
         "SELECT
              (SELECT COUNT(*) FROM sqlite_schema
-              WHERE type = 'trigger'
+             WHERE type = 'trigger'
                 AND tbl_name COLLATE NOCASE
                     IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
-                        'restore_attempt_lifecycle'))
+                        'restore_attempt_lifecycle')
+                AND name COLLATE NOCASE NOT IN (
+                    'mux_sessions_retained_size_ai',
+                    'mux_sessions_retained_size_au',
+                    'mux_sessions_retained_size_ad',
+                    'session_checkpoints_retained_size_ai',
+                    'session_checkpoints_retained_size_au',
+                    'session_checkpoints_retained_size_bd',
+                    'mux_pane_state_retained_size_ai',
+                    'mux_pane_state_retained_size_au',
+                    'mux_pane_state_retained_size_ad',
+                    'restore_attempt_lifecycle_retained_size_ai',
+                    'restore_attempt_lifecycle_retained_size_au',
+                    'restore_attempt_lifecycle_retained_size_ad'
+                ))
            + (SELECT COUNT(*) FROM sqlite_temp_schema
               WHERE type = 'trigger'
                 AND tbl_name COLLATE NOCASE
@@ -449,10 +478,125 @@ fn delete_excess_closed_sessions(
     Ok(deleted)
 }
 
-/// Delete oldest closed sessions until the summed snapshot pane-state JSON
-/// estimate is under budget. This preserves the historical
-/// `session_checkpoints.total_bytes` contract; it does not claim to include
-/// every checkpoint column or measure SQLite file/WAL/index bytes.
+fn retained_size_contract_error(message: &'static str) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(message)))
+}
+
+/// Recompute the complete logical retained-payload contract and require exact
+/// agreement with the trigger-maintained O(sessions) authority before cleanup
+/// trusts a byte. This scan is intentionally confined to the infrequent
+/// retention transaction; normal mutation and decision paths remain bounded.
+fn validate_session_retained_size_authority(
+    conn: &Connection,
+) -> Result<(), rusqlite::Error> {
+    let invalid_row: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM mux_sessions s
+             WHERE typeof(s.session_id) != 'text'
+                OR length(CAST(s.session_id AS BLOB)) NOT BETWEEN 1 AND ?1
+                OR typeof(s.created_at) != 'integer' OR s.created_at < 0
+                OR (s.last_checkpoint_at IS NOT NULL AND
+                    (typeof(s.last_checkpoint_at) != 'integer' OR s.last_checkpoint_at < 0))
+                OR typeof(s.shutdown_clean) != 'integer' OR s.shutdown_clean NOT IN (0, 1)
+                OR typeof(s.topology_json) != 'text'
+                OR (s.window_metadata_json IS NOT NULL AND
+                    typeof(s.window_metadata_json) != 'text')
+                OR typeof(s.ft_version) != 'text'
+                OR (s.host_id IS NOT NULL AND typeof(s.host_id) != 'text')
+                OR (s.clean_checkpoint_id IS NOT NULL AND
+                    (typeof(s.clean_checkpoint_id) != 'integer' OR s.clean_checkpoint_id <= 0))
+             UNION ALL
+             SELECT 1 FROM session_checkpoints c
+             INNER JOIN mux_sessions s ON s.session_id = c.session_id
+             WHERE typeof(c.id) != 'integer' OR c.id <= 0
+                OR typeof(c.session_id) != 'text'
+                OR typeof(c.checkpoint_at) != 'integer' OR c.checkpoint_at < 0
+                OR typeof(c.checkpoint_type) != 'text'
+                OR typeof(c.state_hash) != 'text'
+                OR typeof(c.pane_count) != 'integer' OR c.pane_count < 0
+                OR typeof(c.total_bytes) != 'integer' OR c.total_bytes < 0
+                OR (c.metadata_json IS NOT NULL AND typeof(c.metadata_json) != 'text')
+                OR typeof(c.checkpoint_role) != 'text'
+                OR (c.topology_json IS NOT NULL AND typeof(c.topology_json) != 'text')
+                OR (c.restore_intent_checkpoint_id IS NOT NULL AND
+                    (typeof(c.restore_intent_checkpoint_id) != 'integer' OR
+                     c.restore_intent_checkpoint_id <= 0))
+             UNION ALL
+             SELECT 1 FROM mux_pane_state p
+             INNER JOIN session_checkpoints c ON c.id = p.checkpoint_id
+             INNER JOIN mux_sessions s ON s.session_id = c.session_id
+             WHERE typeof(p.id) != 'integer' OR p.id <= 0
+                OR typeof(p.checkpoint_id) != 'integer' OR p.checkpoint_id <= 0
+                OR typeof(p.pane_id) != 'integer' OR p.pane_id < 0
+                OR (p.cwd IS NOT NULL AND typeof(p.cwd) != 'text')
+                OR (p.command IS NOT NULL AND typeof(p.command) != 'text')
+                OR (p.env_json IS NOT NULL AND typeof(p.env_json) != 'text')
+                OR typeof(p.terminal_state_json) != 'text'
+                OR (p.agent_metadata_json IS NOT NULL AND
+                    typeof(p.agent_metadata_json) != 'text')
+                OR (p.scrollback_checkpoint_seq IS NOT NULL AND
+                    (typeof(p.scrollback_checkpoint_seq) != 'integer' OR
+                     p.scrollback_checkpoint_seq < 0))
+                OR (p.last_output_at IS NOT NULL AND
+                    (typeof(p.last_output_at) != 'integer' OR p.last_output_at < 0))
+             UNION ALL
+             SELECT 1 FROM restore_attempt_lifecycle r
+             INNER JOIN mux_sessions s ON s.session_id = r.session_id
+             WHERE typeof(r.intent_checkpoint_id) != 'integer' OR r.intent_checkpoint_id <= 0
+                OR typeof(r.session_id) != 'text'
+                OR typeof(r.source_checkpoint_id) != 'integer' OR r.source_checkpoint_id <= 0
+                OR (r.outcome_checkpoint_id IS NOT NULL AND
+                    (typeof(r.outcome_checkpoint_id) != 'integer' OR
+                     r.outcome_checkpoint_id <= 0))
+                OR typeof(r.status) != 'text'
+                OR typeof(r.created_at) != 'integer' OR r.created_at < 0
+                OR (r.resolved_at IS NOT NULL AND
+                    (typeof(r.resolved_at) != 'integer' OR r.resolved_at < r.created_at))
+         )",
+        [i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX)],
+        |row| row.get(0),
+    )?;
+    if invalid_row {
+        return Err(retained_size_contract_error(
+            "session retained-size authority rejected invalid persisted row metadata",
+        ));
+    }
+
+    let drift: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM mux_sessions s
+             LEFT JOIN session_retained_size z ON z.session_id = s.session_id
+             LEFT JOIN session_retained_size_recomputed r ON r.session_id = s.session_id
+             WHERE z.session_id IS NULL OR r.session_id IS NULL
+                OR z.session_row_bytes != r.session_row_bytes
+                OR z.checkpoint_row_bytes != r.checkpoint_row_bytes
+                OR z.pane_state_row_bytes != r.pane_state_row_bytes
+                OR z.restore_lifecycle_row_bytes != r.restore_lifecycle_row_bytes
+                OR z.retained_bytes !=
+                   r.session_row_bytes + r.checkpoint_row_bytes
+                     + r.pane_state_row_bytes + r.restore_lifecycle_row_bytes
+             UNION ALL
+             SELECT 1
+             FROM session_retained_size z
+             LEFT JOIN mux_sessions s ON s.session_id = z.session_id
+             WHERE s.session_id IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if drift {
+        return Err(retained_size_contract_error(
+            "session retained-size authority drifted from stored payload rows",
+        ));
+    }
+    Ok(())
+}
+
+/// Delete oldest eligible closed sessions until exact logical retained-payload
+/// bytes are under budget. Every stored field is charged once by schema-v40
+/// `session_retained_size`; SQLite page, index, freelist, and WAL bytes remain
+/// outside this explicitly logical budget.
 fn delete_sessions_by_size(
     conn: &Connection,
     max_total_mb: u64,
@@ -466,16 +610,15 @@ fn delete_sessions_by_size(
     // connection did not delete.
     let tx = begin_retention_transaction(conn)?;
     ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
+    validate_session_retained_size_authority(&tx)?;
 
-    // Measure only checkpoints owned by a current session. Orphan checkpoints
-    // are reclaimed by `cleanup_orphaned_data`; counting them here would make
-    // an ineligible orphan inflate `to_free`, evict valid closed sessions, and
-    // still leave a false shortfall because no candidate could release those
-    // orphan bytes. Keep total and minimum validation on this same universe.
+    // The generated retained_bytes column is checked non-negative and each
+    // summary row belongs to exactly one live mux session. SUM overflow is a
+    // SQLite error, so an unrepresentable total fails before any deletion.
     let (total_bytes, minimum_bytes): (i64, i64) = tx.query_row(
-        "SELECT COALESCE(SUM(c.total_bytes), 0), COALESCE(MIN(c.total_bytes), 0)
-         FROM session_checkpoints c
-         INNER JOIN mux_sessions s ON s.session_id = c.session_id",
+        "SELECT COALESCE(SUM(retained_bytes), 0),
+                COALESCE(MIN(retained_bytes), 0)
+         FROM session_retained_size",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -486,32 +629,43 @@ fn delete_sessions_by_size(
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, total_bytes))?;
 
     if total_bytes <= max_bytes {
-        return Ok(SizeCleanupOutcome::default());
+        return Ok(SizeCleanupOutcome {
+            measured_bytes: total_bytes,
+            retained_bytes: total_bytes,
+            ..SizeCleanupOutcome::default()
+        });
     }
 
-    // Need to free: total_bytes - max_bytes
-    let to_free = total_bytes.saturating_sub(max_bytes);
+    let to_free = total_bytes.checked_sub(max_bytes).ok_or_else(|| {
+        retained_size_contract_error("session retained-size budget subtraction underflow")
+    })?;
     let mut freed: u64 = 0;
     let mut deleted = 0_usize;
 
-    // Get closed sessions ordered oldest first, with their checkpoint sizes
+    // Get closed sessions ordered oldest first. Session-level payload bytes are
+    // read once from the summary row; no join can multiply topology or other
+    // session fields by checkpoint/pane cardinality.
     let candidate_rows: Vec<(String, u64, i64, Option<i64>)> = {
         let mut stmt = tx.prepare(
             "SELECT s.session_id,
-                    COALESCE(SUM(c.total_bytes), 0) AS session_bytes,
+                    z.retained_bytes,
                     s.shutdown_clean,
                     s.clean_checkpoint_id
              FROM mux_sessions s
-             LEFT JOIN session_checkpoints c ON c.session_id = s.session_id
+             INNER JOIN session_retained_size z ON z.session_id = s.session_id
              WHERE s.shutdown_clean = 1
                AND typeof(s.session_id) = 'text'
                AND length(CAST(s.session_id AS BLOB)) BETWEEN 1 AND ?1
-             GROUP BY s.session_id
-             HAVING COALESCE(SUM(c.total_bytes), 0) > 0
+               AND z.retained_bytes > 0
              ORDER BY MAX(
                           s.created_at,
                           COALESCE(s.last_checkpoint_at, s.created_at),
-                          COALESCE(MAX(c.checkpoint_at), s.created_at)
+                          COALESCE(
+                              (SELECT MAX(c.checkpoint_at)
+                               FROM session_checkpoints c
+                               WHERE c.session_id = s.session_id),
+                              s.created_at
+                          )
                       ) ASC,
                       s.session_id ASC",
         )?;
@@ -566,22 +720,46 @@ fn delete_sessions_by_size(
             return Err(rusqlite::Error::StatementChangedRows(affected));
         }
 
-        freed = freed.saturating_add(session_bytes);
+        freed = freed.checked_add(session_bytes).ok_or_else(|| {
+            retained_size_contract_error("session retained-size deletion receipt overflow")
+        })?;
         deleted = deleted.saturating_add(1);
+    }
+
+    let retained_bytes = total_bytes.checked_sub(freed).ok_or_else(|| {
+        retained_size_contract_error("session retained-size deletion exceeded measurement")
+    })?;
+    let stored_retained_bytes: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(retained_bytes), 0) FROM session_retained_size",
+        [],
+        |row| row.get(0),
+    )?;
+    let stored_retained_bytes = u64::try_from(stored_retained_bytes).map_err(|_| {
+        rusqlite::Error::IntegralValueOutOfRange(0, stored_retained_bytes)
+    })?;
+    if stored_retained_bytes != retained_bytes {
+        return Err(retained_size_contract_error(
+            "session retained-size deletion receipt disagrees with durable summary",
+        ));
     }
 
     tx.commit()?;
     if deleted > 0 {
         debug!(
             deleted,
-            freed_bytes = freed,
+            measured_bytes = total_bytes,
+            deleted_bytes = freed,
+            retained_bytes,
             target_bytes = to_free,
             "Committed bounded session set for size budget"
         );
     }
     Ok(SizeCleanupOutcome {
         deleted,
-        shortfall_bytes: to_free.saturating_sub(freed),
+        measured_bytes: total_bytes,
+        deleted_bytes: freed,
+        retained_bytes,
+        ineligible_shortfall_bytes: retained_bytes.saturating_sub(max_bytes),
     })
 }
 
@@ -956,6 +1134,9 @@ mod tests {
         checkpoint_at: i64,
         total_bytes: i64,
     ) -> i64 {
+        let logical_payload = usize::try_from(total_bytes)
+            .ok()
+            .map(|bytes| "x".repeat(bytes));
         conn.execute(
             "DELETE FROM session_checkpoints
              WHERE id = (
@@ -970,9 +1151,10 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO session_checkpoints
-             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
-             VALUES (?1, ?2, 'periodic', '0123456789abcdef', 1, ?3)",
-            rusqlite::params![session_id, checkpoint_at, total_bytes],
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+              total_bytes, metadata_json)
+             VALUES (?1, ?2, 'periodic', '0123456789abcdef', 1, ?3, ?4)",
+            rusqlite::params![session_id, checkpoint_at, total_bytes, logical_payload],
         )
         .unwrap();
         let checkpoint_id = conn.last_insert_rowid();
@@ -1124,9 +1306,8 @@ mod tests {
 
         assert_eq!(delete_sessions_by_age(&conn, 30).unwrap(), 0);
         assert_eq!(delete_excess_closed_sessions(&conn, 0).unwrap(), 0);
-        let size = delete_sessions_by_size(&conn, 0).unwrap();
-        assert_eq!(size.deleted, 0);
-        assert_eq!(size.shortfall_bytes, 1_048_576);
+        delete_sessions_by_size(&conn, 0)
+            .expect_err("oversized session identity must fail exact byte accounting closed");
         assert_eq!(count_sessions(&conn), 1);
     }
 
@@ -1194,7 +1375,7 @@ mod tests {
         assert_eq!(delete_excess_closed_sessions(&conn, 0).unwrap(), 0);
         let size = delete_sessions_by_size(&conn, 1).unwrap();
         assert_eq!(size.deleted, 0);
-        assert!(size.shortfall_bytes > 0);
+        assert!(size.ineligible_shortfall_bytes > 0);
         assert_eq!(count_sessions(&conn), 1);
     }
 
@@ -1454,7 +1635,7 @@ mod tests {
         // Total: 1200KB. Budget: 1MB (1024KB). Need to free 176KB → delete oldest.
         let outcome = delete_sessions_by_size(&conn, 1).unwrap();
         assert_eq!(outcome.deleted, 1); // Deletes oldest (400KB > 176KB needed)
-        assert_eq!(outcome.shortfall_bytes, 0);
+        assert_eq!(outcome.ineligible_shortfall_bytes, 0);
         assert_eq!(count_sessions(&conn), 2);
     }
 
@@ -1467,7 +1648,11 @@ mod tests {
         insert_checkpoint(&conn, "small", now, 1024); // 1KB
 
         let outcome = delete_sessions_by_size(&conn, 1).unwrap();
-        assert_eq!(outcome, SizeCleanupOutcome::default());
+        assert_eq!(outcome.deleted, 0);
+        assert_eq!(outcome.deleted_bytes, 0);
+        assert_eq!(outcome.measured_bytes, outcome.retained_bytes);
+        assert!(outcome.measured_bytes > 0);
+        assert_eq!(outcome.ineligible_shortfall_bytes, 0);
     }
 
     #[test]
@@ -1485,8 +1670,8 @@ mod tests {
             700 * 1_024,
         );
         conn.execute(
-            "UPDATE mux_sessions SET last_checkpoint_at = -1 WHERE session_id = ?1",
-            ["recent-checkpoint-stale-cache"],
+            "UPDATE mux_sessions SET last_checkpoint_at = ?1 WHERE session_id = ?2",
+            rusqlite::params![old - 2, "recent-checkpoint-stale-cache"],
         )
         .unwrap();
 
@@ -1507,10 +1692,7 @@ mod tests {
 
         let error = delete_sessions_by_size(&conn, 1)
             .expect_err("negative byte accounting must fail closed");
-        assert!(matches!(
-            error,
-            rusqlite::Error::IntegralValueOutOfRange(1, -1)
-        ));
+        assert!(matches!(error, rusqlite::Error::ToSqlConversionFailure(_)));
         assert_eq!(count_sessions(&conn), 1);
     }
 
@@ -1639,12 +1821,19 @@ mod tests {
 
         let outcome = delete_sessions_by_size(&conn, 1).unwrap();
         assert_eq!(outcome.deleted, 1);
-        assert_eq!(outcome.shortfall_bytes, 1024 * 1024);
+        assert_eq!(
+            outcome.ineligible_shortfall_bytes,
+            outcome.retained_bytes - 1024 * 1024
+        );
+        assert_eq!(
+            outcome.measured_bytes,
+            outcome.deleted_bytes + outcome.retained_bytes
+        );
         assert_eq!(count_sessions(&conn), 1);
     }
 
     #[test]
-    fn size_cleanup_preserves_closed_sessions_that_cannot_free_measured_bytes() {
+    fn size_cleanup_charges_and_deletes_closed_session_without_payload_checkpoint() {
         let conn = make_test_db();
         let now = epoch_ms() as i64;
         insert_session(&conn, "active-large", now, false);
@@ -1652,9 +1841,13 @@ mod tests {
         insert_session(&conn, "closed-without-checkpoint", now - 1, true);
 
         let outcome = delete_sessions_by_size(&conn, 1).unwrap();
-        assert_eq!(outcome.deleted, 0);
-        assert_eq!(outcome.shortfall_bytes, 1024 * 1024);
-        assert_eq!(count_sessions(&conn), 2);
+        assert_eq!(outcome.deleted, 1);
+        assert!(outcome.deleted_bytes > 0);
+        assert_eq!(
+            outcome.ineligible_shortfall_bytes,
+            outcome.retained_bytes - 1024 * 1024
+        );
+        assert_eq!(count_sessions(&conn), 1);
     }
 
     #[test]
@@ -1677,7 +1870,11 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
         let outcome = delete_sessions_by_size(&conn, 1).unwrap();
-        assert_eq!(outcome, SizeCleanupOutcome::default());
+        assert_eq!(outcome.deleted, 0);
+        assert_eq!(outcome.deleted_bytes, 0);
+        assert_eq!(outcome.measured_bytes, outcome.retained_bytes);
+        assert!(outcome.measured_bytes > 0);
+        assert_eq!(outcome.ineligible_shortfall_bytes, 0);
         assert_eq!(count_sessions(&conn), 1);
         assert_eq!(count_checkpoints(&conn), 2);
 
@@ -2004,6 +2201,7 @@ mod tests {
             orphaned_restore_lifecycle_rows: 6,
             orphaned_checkpoints: 4,
             orphaned_pane_states: 5,
+            ..Default::default()
         };
         let dbg = format!("{result:?}");
         assert!(dbg.contains("CleanupResult"));
@@ -2041,6 +2239,7 @@ mod tests {
             orphaned_restore_lifecycle_rows: 0,
             orphaned_checkpoints: 1,
             orphaned_pane_states: 0,
+            ..Default::default()
         };
         assert!(result.any_work_done());
     }
@@ -2189,6 +2388,10 @@ mod tests {
         assert_eq!(r.deleted_by_age, 0);
         assert_eq!(r.deleted_by_count, 0);
         assert_eq!(r.deleted_by_size, 0);
+        assert_eq!(r.size_measured_bytes, 0);
+        assert_eq!(r.size_deleted_bytes, 0);
+        assert_eq!(r.size_retained_bytes, 0);
+        assert_eq!(r.size_ineligible_shortfall_bytes, 0);
         assert_eq!(r.orphaned_restore_lifecycle_rows, 0);
         assert_eq!(r.orphaned_checkpoints, 0);
         assert_eq!(r.orphaned_pane_states, 0);
@@ -2278,7 +2481,7 @@ mod tests {
         // deterministically deletes the two oldest 400 KiB sessions.
         let outcome = delete_sessions_by_size(&conn, 1).unwrap();
         assert_eq!(outcome.deleted, 2);
-        assert_eq!(outcome.shortfall_bytes, 0);
+        assert_eq!(outcome.ineligible_shortfall_bytes, 0);
         assert_eq!(count_sessions(&conn), 2);
     }
 
@@ -2403,20 +2606,24 @@ mod tests {
         );
     }
 
-    // ── Size cleanup: sessions with no checkpoints ──
+    // ── Size cleanup: sessions with only clean-receipt checkpoints ──
 
     #[test]
-    fn size_cleanup_with_zero_checkpoint_data() {
+    fn size_cleanup_with_only_session_and_clean_receipt_payloads() {
         let conn = make_test_db();
         let now = epoch_ms() as i64;
 
-        // Sessions with no checkpoint data → total size is 0, always under budget
+        // Session rows and clean receipts are charged even without a snapshot.
         for i in 0..5 {
             insert_session(&conn, &format!("nochk-{i}"), now + i * 1000, true);
         }
 
         let outcome = delete_sessions_by_size(&conn, 1).unwrap();
-        assert_eq!(outcome, SizeCleanupOutcome::default());
+        assert_eq!(outcome.deleted, 0);
+        assert_eq!(outcome.deleted_bytes, 0);
+        assert_eq!(outcome.measured_bytes, outcome.retained_bytes);
+        assert!(outcome.measured_bytes > 0);
+        assert_eq!(outcome.ineligible_shortfall_bytes, 0);
         assert_eq!(count_sessions(&conn), 5);
     }
 
