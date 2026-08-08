@@ -4,7 +4,7 @@
 //! 1.  PaneStateSnapshot serde roundtrip (minimal -- terminal only)
 //! 2.  PaneStateSnapshot serde roundtrip (all fields populated)
 //! 3.  PaneStateSnapshot serde roundtrip (optional fields None)
-//! 4.  PaneStateSnapshot::new() sets schema_version = 1, optionals = None
+//! 4.  PaneStateSnapshot::new() sets schema_version = 2, optionals = None
 //! 5.  Builder with_cwd sets cwd field
 //! 6.  Builder with_process sets foreground_process field
 //! 7.  Builder with_shell sets shell field
@@ -41,7 +41,7 @@
 //! 38. Size budget -- large env triggers truncation and env removed
 //! 39. Size budget -- truncated output <= PANE_STATE_SIZE_BUDGET
 //! 40. Size budget -- large argv also truncated when env removal insufficient
-//! 41. Schema version -- new() always returns PANE_STATE_SCHEMA_VERSION (1)
+//! 41. Schema version -- new() always returns PANE_STATE_SCHEMA_VERSION (2)
 //! 42. Forward compat -- JSON with schema_version=2 and unknown fields parses
 //! 43. Forward compat -- future schema version preserved in roundtrip
 //! 44. PartialEq -- identical snapshots are equal
@@ -171,9 +171,9 @@ fn arb_process_info() -> impl Strategy<Value = ProcessInfo> {
 /// Arbitrary ScrollbackRef.
 fn arb_scrollback_ref() -> impl Strategy<Value = ScrollbackRef> {
     (any::<i64>(), any::<u64>(), arb_timestamp()).prop_map(
-        |(output_segments_seq, total_segments_captured, last_capture_at)| ScrollbackRef {
+        |(output_segments_seq, retained_segment_count, last_capture_at)| ScrollbackRef {
             output_segments_seq,
-            total_segments_captured,
+            retained_segment_count,
             last_capture_at,
         },
     )
@@ -1222,8 +1222,8 @@ proptest! {
     ) {
         let snap = PaneStateSnapshot::new(pane_id, captured_at, terminal);
         prop_assert_eq!(
-            snap.schema_version, 1u32,
-            "schema_version should be 1"
+            snap.schema_version, 2u32,
+            "schema_version should be 2"
         );
         prop_assert_eq!(
             snap.schema_version, PANE_STATE_SCHEMA_VERSION,

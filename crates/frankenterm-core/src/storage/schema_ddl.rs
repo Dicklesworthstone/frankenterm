@@ -78,7 +78,11 @@
 /// explicit restore-intent role, and reserve a unique intent-to-outcome link.
 /// Causal authority now follows the never-reused checkpoint ID; wall-clock
 /// timestamps remain presentation and retention-age data.
-pub const SCHEMA_VERSION: i32 = 38;
+/// Bumped 38 → 39 to make retained scrollback metadata an O(panes) snapshot
+/// projection. `pane_scrollback_summary` is maintained transactionally by the
+/// same SQLite statements that append or prune `output_segments`; snapshots no
+/// longer aggregate an unbounded pane history on every capture.
+pub const SCHEMA_VERSION: i32 = 39;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -175,6 +179,151 @@ CREATE INDEX IF NOT EXISTS idx_segments_captured ON output_segments(captured_at)
 CREATE INDEX IF NOT EXISTS idx_segments_pane_captured
     ON output_segments(pane_id, captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_segments_zone_type ON output_segments(zone_type);
+
+-- Exact retained-segment metadata for bounded snapshot projection (ft-0yuxe.4).
+--
+-- This is deliberately one row per persisted pane, including panes with no
+-- retained output. A segment is an arbitrary captured stream fragment; it is
+-- not a logical line, a CR-delimited record, or a wrapped display row.
+CREATE TABLE IF NOT EXISTS pane_scrollback_summary (
+    pane_id INTEGER PRIMARY KEY
+        REFERENCES panes(pane_id) ON DELETE NO ACTION
+        DEFERRABLE INITIALLY DEFERRED,
+    retained_segment_count INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(retained_segment_count) = 'integer' AND retained_segment_count >= 0),
+    first_seq INTEGER
+        CHECK(first_seq IS NULL OR (typeof(first_seq) = 'integer' AND first_seq >= 0)),
+    last_seq INTEGER
+        CHECK(last_seq IS NULL OR (typeof(last_seq) = 'integer' AND last_seq >= 0)),
+    first_captured_at INTEGER
+        CHECK(first_captured_at IS NULL OR
+              (typeof(first_captured_at) = 'integer' AND first_captured_at >= 0)),
+    last_captured_at INTEGER
+        CHECK(last_captured_at IS NULL OR
+              (typeof(last_captured_at) = 'integer' AND last_captured_at >= 0)),
+    CHECK(
+        (retained_segment_count = 0 AND
+         first_seq IS NULL AND last_seq IS NULL AND
+         first_captured_at IS NULL AND last_captured_at IS NULL)
+        OR
+        (retained_segment_count > 0 AND
+         first_seq IS NOT NULL AND last_seq IS NOT NULL AND first_seq <= last_seq AND
+         first_captured_at IS NOT NULL AND last_captured_at IS NOT NULL AND
+         first_captured_at <= last_captured_at)
+    )
+);
+
+CREATE TRIGGER IF NOT EXISTS pane_scrollback_summary_panes_ai
+AFTER INSERT ON panes BEGIN
+    INSERT INTO pane_scrollback_summary (pane_id) VALUES (new.pane_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS pane_scrollback_summary_panes_ad
+AFTER DELETE ON panes BEGIN
+    DELETE FROM pane_scrollback_summary WHERE pane_id = old.pane_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS pane_scrollback_summary_bi
+BEFORE INSERT ON pane_scrollback_summary
+WHEN NOT EXISTS (SELECT 1 FROM panes WHERE pane_id = new.pane_id) BEGIN
+    SELECT RAISE(ABORT, 'scrollback summary requires a persisted pane');
+END;
+
+CREATE TRIGGER IF NOT EXISTS pane_scrollback_summary_bd
+BEFORE DELETE ON pane_scrollback_summary
+WHEN EXISTS (SELECT 1 FROM panes WHERE pane_id = old.pane_id) BEGIN
+    SELECT RAISE(ABORT, 'live pane scrollback summary is permanent');
+END;
+
+CREATE TRIGGER IF NOT EXISTS pane_scrollback_summary_pane_id_bu
+BEFORE UPDATE OF pane_id ON pane_scrollback_summary
+WHEN new.pane_id != old.pane_id BEGIN
+    SELECT RAISE(ABORT, 'scrollback summary pane identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS output_segments_scrollback_summary_bi
+BEFORE INSERT ON output_segments
+WHEN typeof(new.seq) != 'integer' OR new.seq < 0 OR
+     typeof(new.captured_at) != 'integer' OR new.captured_at < 0 OR
+     NOT EXISTS (
+         SELECT 1 FROM pane_scrollback_summary WHERE pane_id = new.pane_id
+     ) BEGIN
+    SELECT RAISE(ABORT, 'invalid output segment metadata or missing scrollback summary');
+END;
+
+CREATE TRIGGER IF NOT EXISTS output_segments_scrollback_summary_ai
+AFTER INSERT ON output_segments BEGIN
+    UPDATE pane_scrollback_summary
+    SET retained_segment_count = retained_segment_count + 1,
+        first_seq = CASE
+            WHEN retained_segment_count = 0 THEN new.seq
+            ELSE min(first_seq, new.seq)
+        END,
+        last_seq = CASE
+            WHEN retained_segment_count = 0 THEN new.seq
+            ELSE max(last_seq, new.seq)
+        END,
+        first_captured_at = CASE
+            WHEN retained_segment_count = 0 THEN new.captured_at
+            ELSE min(first_captured_at, new.captured_at)
+        END,
+        last_captured_at = CASE
+            WHEN retained_segment_count = 0 THEN new.captured_at
+            ELSE max(last_captured_at, new.captured_at)
+        END
+    WHERE pane_id = new.pane_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS output_segments_scrollback_summary_bd
+BEFORE DELETE ON output_segments
+WHEN EXISTS (SELECT 1 FROM panes WHERE pane_id = old.pane_id) AND
+     NOT EXISTS (
+         SELECT 1 FROM pane_scrollback_summary WHERE pane_id = old.pane_id
+     ) BEGIN
+    SELECT RAISE(ABORT, 'missing scrollback summary during output retention');
+END;
+
+CREATE TRIGGER IF NOT EXISTS output_segments_scrollback_summary_ad
+AFTER DELETE ON output_segments BEGIN
+    UPDATE pane_scrollback_summary
+    SET retained_segment_count = retained_segment_count - 1,
+        first_seq = CASE
+            WHEN retained_segment_count = 1 THEN NULL
+            WHEN old.seq = first_seq THEN (
+                SELECT min(seq) FROM output_segments WHERE pane_id = old.pane_id
+            )
+            ELSE first_seq
+        END,
+        last_seq = CASE
+            WHEN retained_segment_count = 1 THEN NULL
+            WHEN old.seq = last_seq THEN (
+                SELECT max(seq) FROM output_segments WHERE pane_id = old.pane_id
+            )
+            ELSE last_seq
+        END,
+        first_captured_at = CASE
+            WHEN retained_segment_count = 1 THEN NULL
+            WHEN old.captured_at = first_captured_at THEN (
+                SELECT min(captured_at) FROM output_segments WHERE pane_id = old.pane_id
+            )
+            ELSE first_captured_at
+        END,
+        last_captured_at = CASE
+            WHEN retained_segment_count = 1 THEN NULL
+            WHEN old.captured_at = last_captured_at THEN (
+                SELECT max(captured_at) FROM output_segments WHERE pane_id = old.pane_id
+            )
+            ELSE last_captured_at
+        END
+    WHERE pane_id = old.pane_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS output_segments_scrollback_metadata_bu
+BEFORE UPDATE OF pane_id, seq, captured_at ON output_segments
+WHEN new.pane_id != old.pane_id OR new.seq != old.seq OR
+     new.captured_at != old.captured_at BEGIN
+    SELECT RAISE(ABORT, 'output segment scrollback metadata is immutable');
+END;
 
 -- Segment embeddings for semantic search
 CREATE TABLE IF NOT EXISTS segment_embeddings (

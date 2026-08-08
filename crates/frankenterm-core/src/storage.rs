@@ -12,6 +12,7 @@
 //!
 //! - `panes`: Pane metadata and observation decisions
 //! - `output_segments`: Append-only captured terminal output
+//! - `pane_scrollback_summary`: Transactional retained-segment snapshot metadata
 //! - `output_gaps`: Explicit discontinuities in capture
 //! - `events`: Pattern detections with lifecycle tracking
 //! - `workflow_executions`: Durable workflow state
@@ -30897,14 +30898,42 @@ fn pane_last_output_bulk_distinguishes_missing_empty_active_and_corrupt() {
     assert!(query_pane_last_output_at_bulk_backend(&backend, &[u64::MAX]).is_err());
 
     seed_pane_backend(&backend, 3, 1);
-    seed_segment_backend(&backend, 3, 0, "invalid clock", -1);
-    assert!(query_pane_last_output_at_backend(&backend, 3).is_err());
-    assert!(query_pane_last_output_at_bulk_backend(&backend, &[3]).is_err());
-    assert!(query_last_activity_by_pane_backend(&backend).is_err());
+    assert!(
+        execute_typed(
+            &backend,
+            "INSERT INTO output_segments
+                 (pane_id, seq, content, content_len, captured_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                ToSqlValue::Integer(3),
+                ToSqlValue::Integer(0),
+                ToSqlValue::Text("invalid clock"),
+                ToSqlValue::Integer(13),
+                ToSqlValue::Integer(-1),
+            ],
+        )
+        .is_err(),
+        "negative capture timestamps must fail at the transactional summary boundary"
+    );
 
     seed_pane_backend(&backend, 4, 1);
-    seed_segment_backend(&backend, 4, -1, "invalid sequence", 1);
-    assert!(query_max_seq_backend(&backend, 4).is_err());
+    assert!(
+        execute_typed(
+            &backend,
+            "INSERT INTO output_segments
+                 (pane_id, seq, content, content_len, captured_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                ToSqlValue::Integer(4),
+                ToSqlValue::Integer(-1),
+                ToSqlValue::Text("invalid sequence"),
+                ToSqlValue::Integer(16),
+                ToSqlValue::Integer(1),
+            ],
+        )
+        .is_err(),
+        "negative sequences must fail before they can corrupt summary authority"
+    );
 
     seed_pane_backend(&backend, 5, 1);
     execute_typed(
@@ -30919,9 +30948,7 @@ fn pane_last_output_bulk_distinguishes_missing_empty_active_and_corrupt() {
             ToSqlValue::Text("not-a-timestamp"),
         ],
     )
-    .unwrap();
-    assert!(query_pane_last_output_at_backend(&backend, 5).is_err());
-    assert!(query_pane_last_output_at_bulk_backend(&backend, &[5]).is_err());
+    .expect_err("non-integer capture timestamps must fail before persistence");
 
     seed_pane_backend(&backend, 6, 1);
     execute_typed(
@@ -30936,8 +30963,7 @@ fn pane_last_output_bulk_distinguishes_missing_empty_active_and_corrupt() {
             ToSqlValue::Integer(1),
         ],
     )
-    .unwrap();
-    assert!(query_max_seq_backend(&backend, 6).is_err());
+    .expect_err("non-integer sequences must fail before persistence");
 }
 
 #[test]
@@ -32471,6 +32497,15 @@ fn segment_retention_atomically_nulls_surviving_event_source_link() {
     assert_eq!(prune_segments_backend(&backend, 11, 10).unwrap(), 1);
     assert_eq!(
         backend
+            .query_scalar(
+                "SELECT retained_segment_count FROM pane_scrollback_summary WHERE pane_id = 1",
+            )
+            .unwrap(),
+        Some("0".to_string()),
+        "time retention must update the bounded scrollback summary in the delete transaction"
+    );
+    assert_eq!(
+        backend
             .query_scalar(&format!("SELECT segment_id FROM events WHERE id = {event_id}"))
             .unwrap(),
         Some(String::new())
@@ -32487,6 +32522,14 @@ fn segment_retention_atomically_nulls_surviving_event_source_link() {
         "test",
     )
     .unwrap();
+    assert_eq!(
+        backend
+            .query_scalar(
+                "SELECT retained_segment_count FROM pane_scrollback_summary WHERE pane_id = 1",
+            )
+            .unwrap(),
+        Some("1".to_string())
+    );
     let size_event_id = seed_retention_event_backend(
         &backend,
         1,
@@ -32496,6 +32539,15 @@ fn segment_retention_atomically_nulls_surviving_event_source_link() {
         Some(size_segment.id),
     );
     assert_eq!(delete_oldest_segments_backend(&backend, 1).unwrap(), 1);
+    assert_eq!(
+        backend
+            .query_scalar(
+                "SELECT retained_segment_count FROM pane_scrollback_summary WHERE pane_id = 1",
+            )
+            .unwrap(),
+        Some("0".to_string()),
+        "size eviction must update the same summary authority"
+    );
     assert_eq!(
         backend
             .query_scalar(&format!("SELECT segment_id FROM events WHERE id = {size_event_id}"))

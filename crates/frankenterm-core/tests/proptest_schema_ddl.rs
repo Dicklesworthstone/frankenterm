@@ -5,6 +5,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "ft_meta",
     "panes",
     "output_segments",
+    "pane_scrollback_summary",
     "segment_embeddings",
     "output_gaps",
     "events",
@@ -72,6 +73,59 @@ const OUTPUT_SEGMENT_TRIGGERS: &[(&str, &str, &str)] = &[
         "output_segments_au",
         "AFTER UPDATE",
         "INSERT INTO output_segments_fts(rowid, content) VALUES (new.id, new.content)",
+    ),
+];
+
+const SCROLLBACK_SUMMARY_TRIGGERS: &[(&str, &str, &str)] = &[
+    (
+        "pane_scrollback_summary_panes_ai",
+        "AFTER INSERT ON panes",
+        "INSERT INTO pane_scrollback_summary",
+    ),
+    (
+        "pane_scrollback_summary_panes_ad",
+        "AFTER DELETE ON panes",
+        "DELETE FROM pane_scrollback_summary",
+    ),
+    (
+        "pane_scrollback_summary_bi",
+        "BEFORE INSERT ON pane_scrollback_summary",
+        "scrollback summary requires a persisted pane",
+    ),
+    (
+        "pane_scrollback_summary_bd",
+        "BEFORE DELETE ON pane_scrollback_summary",
+        "live pane scrollback summary is permanent",
+    ),
+    (
+        "pane_scrollback_summary_pane_id_bu",
+        "BEFORE UPDATE OF pane_id ON pane_scrollback_summary",
+        "scrollback summary pane identity is immutable",
+    ),
+    (
+        "output_segments_scrollback_summary_bi",
+        "BEFORE INSERT ON output_segments",
+        "invalid output segment metadata or missing scrollback summary",
+    ),
+    (
+        "output_segments_scrollback_summary_ai",
+        "AFTER INSERT ON output_segments",
+        "retained_segment_count = retained_segment_count + 1",
+    ),
+    (
+        "output_segments_scrollback_summary_bd",
+        "BEFORE DELETE ON output_segments",
+        "missing scrollback summary during output retention",
+    ),
+    (
+        "output_segments_scrollback_summary_ad",
+        "AFTER DELETE ON output_segments",
+        "retained_segment_count = retained_segment_count - 1",
+    ),
+    (
+        "output_segments_scrollback_metadata_bu",
+        "BEFORE UPDATE OF pane_id, seq, captured_at ON output_segments",
+        "output segment scrollback metadata is immutable",
     ),
 ];
 
@@ -175,6 +229,22 @@ fn schema_ddl_output_segment_fts_triggers_keep_expected_actions() {
 
         assert!(trigger_sql.contains(trigger_timing));
         assert!(trigger_sql.contains(fts_action));
+    }
+}
+
+#[test]
+fn schema_ddl_scrollback_summary_triggers_keep_transactional_actions() {
+    for &(trigger_name, trigger_timing, action) in SCROLLBACK_SUMMARY_TRIGGERS {
+        let trigger_start = unique_declaration_start("CREATE TRIGGER IF NOT EXISTS ", trigger_name);
+        let trigger_tail = &SCHEMA_SQL[trigger_start..];
+        let trigger_end = trigger_tail
+            .find("\nEND;")
+            .expect("trigger declaration should end with END;")
+            + "\nEND;".len();
+        let trigger_sql = &trigger_tail[..trigger_end];
+
+        assert!(trigger_sql.contains(trigger_timing));
+        assert!(trigger_sql.contains(action));
     }
 }
 

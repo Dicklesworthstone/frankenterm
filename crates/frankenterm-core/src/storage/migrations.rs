@@ -1947,6 +1947,172 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // restore-attempt identities. This authority boundary is forward-only.
         down_sql: None,
     },
+    Migration {
+        version: 39,
+        description: "Maintain exact retained scrollback segment metadata for bounded snapshots",
+        up_sql: r"
+        CREATE TABLE IF NOT EXISTS pane_scrollback_summary (
+            pane_id INTEGER PRIMARY KEY
+                REFERENCES panes(pane_id) ON DELETE NO ACTION
+                DEFERRABLE INITIALLY DEFERRED,
+            retained_segment_count INTEGER NOT NULL DEFAULT 0
+                CHECK(typeof(retained_segment_count) = 'integer' AND retained_segment_count >= 0),
+            first_seq INTEGER
+                CHECK(first_seq IS NULL OR (typeof(first_seq) = 'integer' AND first_seq >= 0)),
+            last_seq INTEGER
+                CHECK(last_seq IS NULL OR (typeof(last_seq) = 'integer' AND last_seq >= 0)),
+            first_captured_at INTEGER
+                CHECK(first_captured_at IS NULL OR
+                      (typeof(first_captured_at) = 'integer' AND first_captured_at >= 0)),
+            last_captured_at INTEGER
+                CHECK(last_captured_at IS NULL OR
+                      (typeof(last_captured_at) = 'integer' AND last_captured_at >= 0)),
+            CHECK(
+                (retained_segment_count = 0 AND
+                 first_seq IS NULL AND last_seq IS NULL AND
+                 first_captured_at IS NULL AND last_captured_at IS NULL)
+                OR
+                (retained_segment_count > 0 AND
+                 first_seq IS NOT NULL AND last_seq IS NOT NULL AND first_seq <= last_seq AND
+                 first_captured_at IS NOT NULL AND last_captured_at IS NOT NULL AND
+                 first_captured_at <= last_captured_at)
+            )
+        );
+
+        INSERT OR IGNORE INTO pane_scrollback_summary (
+            pane_id, retained_segment_count, first_seq, last_seq,
+            first_captured_at, last_captured_at
+        )
+        SELECT panes.pane_id,
+               count(output_segments.id),
+               min(output_segments.seq),
+               max(output_segments.seq),
+               min(output_segments.captured_at),
+               max(output_segments.captured_at)
+        FROM panes
+        LEFT JOIN output_segments ON output_segments.pane_id = panes.pane_id
+        GROUP BY panes.pane_id;
+
+        CREATE TRIGGER IF NOT EXISTS pane_scrollback_summary_panes_ai
+        AFTER INSERT ON panes BEGIN
+            INSERT INTO pane_scrollback_summary (pane_id) VALUES (new.pane_id);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pane_scrollback_summary_panes_ad
+        AFTER DELETE ON panes BEGIN
+            DELETE FROM pane_scrollback_summary WHERE pane_id = old.pane_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pane_scrollback_summary_bi
+        BEFORE INSERT ON pane_scrollback_summary
+        WHEN NOT EXISTS (SELECT 1 FROM panes WHERE pane_id = new.pane_id) BEGIN
+            SELECT RAISE(ABORT, 'scrollback summary requires a persisted pane');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pane_scrollback_summary_bd
+        BEFORE DELETE ON pane_scrollback_summary
+        WHEN EXISTS (SELECT 1 FROM panes WHERE pane_id = old.pane_id) BEGIN
+            SELECT RAISE(ABORT, 'live pane scrollback summary is permanent');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pane_scrollback_summary_pane_id_bu
+        BEFORE UPDATE OF pane_id ON pane_scrollback_summary
+        WHEN new.pane_id != old.pane_id BEGIN
+            SELECT RAISE(ABORT, 'scrollback summary pane identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS output_segments_scrollback_summary_bi
+        BEFORE INSERT ON output_segments
+        WHEN typeof(new.seq) != 'integer' OR new.seq < 0 OR
+             typeof(new.captured_at) != 'integer' OR new.captured_at < 0 OR
+             NOT EXISTS (
+                 SELECT 1 FROM pane_scrollback_summary WHERE pane_id = new.pane_id
+             ) BEGIN
+            SELECT RAISE(ABORT, 'invalid output segment metadata or missing scrollback summary');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS output_segments_scrollback_summary_ai
+        AFTER INSERT ON output_segments BEGIN
+            UPDATE pane_scrollback_summary
+            SET retained_segment_count = retained_segment_count + 1,
+                first_seq = CASE
+                    WHEN retained_segment_count = 0 THEN new.seq
+                    ELSE min(first_seq, new.seq)
+                END,
+                last_seq = CASE
+                    WHEN retained_segment_count = 0 THEN new.seq
+                    ELSE max(last_seq, new.seq)
+                END,
+                first_captured_at = CASE
+                    WHEN retained_segment_count = 0 THEN new.captured_at
+                    ELSE min(first_captured_at, new.captured_at)
+                END,
+                last_captured_at = CASE
+                    WHEN retained_segment_count = 0 THEN new.captured_at
+                    ELSE max(last_captured_at, new.captured_at)
+                END
+            WHERE pane_id = new.pane_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS output_segments_scrollback_summary_bd
+        BEFORE DELETE ON output_segments
+        WHEN EXISTS (SELECT 1 FROM panes WHERE pane_id = old.pane_id) AND
+             NOT EXISTS (
+                 SELECT 1 FROM pane_scrollback_summary WHERE pane_id = old.pane_id
+             ) BEGIN
+            SELECT RAISE(ABORT, 'missing scrollback summary during output retention');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS output_segments_scrollback_summary_ad
+        AFTER DELETE ON output_segments BEGIN
+            UPDATE pane_scrollback_summary
+            SET retained_segment_count = retained_segment_count - 1,
+                first_seq = CASE
+                    WHEN retained_segment_count = 1 THEN NULL
+                    WHEN old.seq = first_seq THEN (
+                        SELECT min(seq) FROM output_segments WHERE pane_id = old.pane_id
+                    )
+                    ELSE first_seq
+                END,
+                last_seq = CASE
+                    WHEN retained_segment_count = 1 THEN NULL
+                    WHEN old.seq = last_seq THEN (
+                        SELECT max(seq) FROM output_segments WHERE pane_id = old.pane_id
+                    )
+                    ELSE last_seq
+                END,
+                first_captured_at = CASE
+                    WHEN retained_segment_count = 1 THEN NULL
+                    WHEN old.captured_at = first_captured_at THEN (
+                        SELECT min(captured_at)
+                        FROM output_segments WHERE pane_id = old.pane_id
+                    )
+                    ELSE first_captured_at
+                END,
+                last_captured_at = CASE
+                    WHEN retained_segment_count = 1 THEN NULL
+                    WHEN old.captured_at = last_captured_at THEN (
+                        SELECT max(captured_at)
+                        FROM output_segments WHERE pane_id = old.pane_id
+                    )
+                    ELSE last_captured_at
+                END
+            WHERE pane_id = old.pane_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS output_segments_scrollback_metadata_bu
+        BEFORE UPDATE OF pane_id, seq, captured_at ON output_segments
+        WHEN new.pane_id != old.pane_id OR new.seq != old.seq OR
+             new.captured_at != old.captured_at BEGIN
+            SELECT RAISE(ABORT, 'output segment scrollback metadata is immutable');
+        END;
+        ",
+        // The summary is derived, but rolling the schema back would restore an
+        // unbounded snapshot query and remove the invariant guards while the
+        // current binary still depends on them. Keep this performance and
+        // correctness boundary forward-only.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -2023,6 +2189,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         validate_checkpoint_snapshot_authority_schema(conn)?;
         validate_clean_checkpoint_receipt_schema(conn)?;
         validate_checkpoint_identity_v38_schema(conn)?;
+        validate_pane_scrollback_summary_schema(conn)?;
         check_ft_version_compatibility(conn)?;
         // The overwhelmingly common reopen path is read-only and must not
         // acquire SQLite's singleton writer lock. If the optimistic probe
@@ -2103,6 +2270,155 @@ pub(crate) fn table_has_column(conn: &Connection, table: &str, column: &str) -> 
     }
 
     Ok(false)
+}
+
+/// Validate the bounded scrollback projection without rescanning retained
+/// segment history. Schema objects and the one-row-per-pane relationship are
+/// bounded by schema/pane cardinality; trigger-maintained counters remain the
+/// runtime authority.
+fn validate_pane_scrollback_summary_schema(conn: &Connection) -> Result<()> {
+    let table_sql =
+        load_schema_object_sql(conn, "table", "pane_scrollback_summary")?.ok_or_else(|| {
+            StorageError::Corruption {
+                details: "schema v39 is missing pane_scrollback_summary".to_string(),
+            }
+        })?;
+    let compact_table_sql = compact_schema_sql(&table_sql);
+    for required in [
+        "pane_id INTEGER PRIMARY KEY",
+        "REFERENCES panes(pane_id) ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED",
+        "typeof(retained_segment_count) = 'integer' AND retained_segment_count >= 0",
+        "first_seq IS NULL OR (typeof(first_seq) = 'integer' AND first_seq >= 0)",
+        "last_seq IS NULL OR (typeof(last_seq) = 'integer' AND last_seq >= 0)",
+        "first_captured_at IS NULL OR (typeof(first_captured_at) = 'integer' AND first_captured_at >= 0)",
+        "last_captured_at IS NULL OR (typeof(last_captured_at) = 'integer' AND last_captured_at >= 0)",
+        "retained_segment_count = 0",
+        "retained_segment_count > 0",
+        "first_seq <= last_seq",
+        "first_captured_at <= last_captured_at",
+    ] {
+        if !compact_table_sql.contains(&compact_schema_sql(required)) {
+            return Err(StorageError::Corruption {
+                details: format!(
+                    "schema v39 pane_scrollback_summary is missing invariant {required}"
+                ),
+            }
+            .into());
+        }
+    }
+    for column in [
+        "pane_id",
+        "retained_segment_count",
+        "first_seq",
+        "last_seq",
+        "first_captured_at",
+        "last_captured_at",
+    ] {
+        if !table_has_column(conn, "pane_scrollback_summary", column)? {
+            return Err(StorageError::Corruption {
+                details: format!(
+                    "schema v39 pane_scrollback_summary is missing required column {column}"
+                ),
+            }
+            .into());
+        }
+    }
+    for (trigger, required_action) in [
+        (
+            "pane_scrollback_summary_panes_ai",
+            "INSERT INTO pane_scrollback_summary",
+        ),
+        (
+            "pane_scrollback_summary_panes_ad",
+            "DELETE FROM pane_scrollback_summary",
+        ),
+        (
+            "pane_scrollback_summary_bi",
+            "scrollback summary requires a persisted pane",
+        ),
+        (
+            "pane_scrollback_summary_bd",
+            "live pane scrollback summary is permanent",
+        ),
+        (
+            "pane_scrollback_summary_pane_id_bu",
+            "scrollback summary pane identity is immutable",
+        ),
+        (
+            "output_segments_scrollback_summary_bi",
+            "invalid output segment metadata or missing scrollback summary",
+        ),
+        (
+            "output_segments_scrollback_summary_ai",
+            "retained_segment_count = retained_segment_count + 1",
+        ),
+        (
+            "output_segments_scrollback_summary_bd",
+            "missing scrollback summary during output retention",
+        ),
+        (
+            "output_segments_scrollback_summary_ad",
+            "retained_segment_count = retained_segment_count - 1",
+        ),
+        (
+            "output_segments_scrollback_metadata_bu",
+            "output segment scrollback metadata is immutable",
+        ),
+    ] {
+        let trigger_sql = load_schema_object_sql(conn, "trigger", trigger)?.ok_or_else(|| {
+            StorageError::Corruption {
+                details: format!("schema v39 is missing required trigger {trigger}"),
+            }
+        })?;
+        if !compact_schema_sql(&trigger_sql).contains(&compact_schema_sql(required_action)) {
+            return Err(StorageError::Corruption {
+                details: format!(
+                    "schema v39 trigger {trigger} is missing required action {required_action}"
+                ),
+            }
+            .into());
+        }
+    }
+
+    let missing_summary: Option<i64> = conn
+        .query_row(
+            "SELECT panes.pane_id
+             FROM panes
+             LEFT JOIN pane_scrollback_summary
+               ON pane_scrollback_summary.pane_id = panes.pane_id
+             WHERE pane_scrollback_summary.pane_id IS NULL
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    if let Some(pane_id) = missing_summary {
+        return Err(StorageError::Corruption {
+            details: format!("persisted pane {pane_id} is missing its scrollback summary"),
+        }
+        .into());
+    }
+
+    let orphan_summary: Option<i64> = conn
+        .query_row(
+            "SELECT pane_scrollback_summary.pane_id
+             FROM pane_scrollback_summary
+             LEFT JOIN panes ON panes.pane_id = pane_scrollback_summary.pane_id
+             WHERE panes.pane_id IS NULL
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    if let Some(pane_id) = orphan_summary {
+        return Err(StorageError::Corruption {
+            details: format!("scrollback summary {pane_id} has no persisted pane"),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
@@ -4722,7 +5038,8 @@ pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result
     // the HIGHEST forward-only version crossed by the requested path. v34
     // protects durable retention-loss evidence; v36 protects row-local snapshot
     // authority; v37 protects exact clean-checkpoint receipt identity; v38
-    // protects never-reused IDs and restore-attempt settlement evidence. V38 is
+    // protects never-reused IDs and restore-attempt settlement evidence; v39
+    // protects the transactional bounded scrollback projection. V39 is
     // therefore the current downgrade floor.
     let mut steps = Vec::new();
     for migration in MIGRATIONS.iter().rev() {
@@ -4837,6 +5154,10 @@ fn apply_migration_mutation(
                         migration.version, migration.description
                     ))
                 })?;
+            }
+            if migration.version == 39 {
+                validate_pane_scrollback_summary_schema(conn)?;
+                ensure_no_foreign_key_violations(conn, "migration v39")?;
             }
             set_user_version(conn, migration.version)?;
             record_migration(conn, migration.version, migration.description)?;
@@ -7630,8 +7951,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_authority_v36_through_v38_are_forward_only() {
-        for version in [36, 37, 38] {
+    fn checkpoint_and_scrollback_authority_v36_through_v39_are_forward_only() {
+        for version in [36, 37, 38, 39] {
             let migration = MIGRATIONS
                 .iter()
                 .find(|migration| migration.version == version)
@@ -7646,6 +7967,8 @@ mod tests {
         assert!(build_migration_plan(37, 35).is_err());
         assert!(build_migration_plan(38, 37).is_err());
         assert!(build_migration_plan(38, 35).is_err());
+        assert!(build_migration_plan(39, 38).is_err());
+        assert!(build_migration_plan(39, 35).is_err());
     }
 
     #[test]
@@ -7915,6 +8238,361 @@ mod tests {
         assert!(
             !table_exists(&conn, "agent_profiles").unwrap(),
             "table must be removed by down_sql",
+        );
+    }
+
+    #[test]
+    fn scrollback_summary_v39_backfills_and_tracks_exact_retained_segments() {
+        use rusqlite::{Connection, params};
+
+        type SummaryRow = (i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>);
+
+        fn load_summary(conn: &Connection, pane_id: i64) -> rusqlite::Result<SummaryRow> {
+            conn.query_row(
+                "SELECT retained_segment_count, first_seq, last_seq,
+                        first_captured_at, last_captured_at
+                 FROM pane_scrollback_summary WHERE pane_id = ?1",
+                [pane_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+        }
+
+        let file = tempfile::NamedTempFile::new().expect("temporary database");
+        let path = file.path().to_path_buf();
+        let conn = Connection::open(&path).expect("open pre-v39 database");
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE panes (pane_id INTEGER PRIMARY KEY);
+             CREATE TABLE output_segments (
+                 id INTEGER PRIMARY KEY,
+                 pane_id INTEGER NOT NULL REFERENCES panes(pane_id) ON DELETE CASCADE,
+                 seq INTEGER NOT NULL,
+                 content TEXT NOT NULL,
+                 content_len INTEGER NOT NULL,
+                 captured_at INTEGER NOT NULL,
+                 UNIQUE(pane_id, seq)
+             );
+             CREATE INDEX idx_segments_pane_seq ON output_segments(pane_id, seq);
+             CREATE INDEX idx_segments_pane_captured
+                 ON output_segments(pane_id, captured_at DESC);
+             CREATE TABLE output_gaps (
+                 id INTEGER PRIMARY KEY,
+                 pane_id INTEGER NOT NULL,
+                 reason TEXT NOT NULL
+             );
+             INSERT INTO panes (pane_id) VALUES (1), (2);
+             INSERT INTO output_segments
+                 (pane_id, seq, content, content_len, captured_at)
+             VALUES
+                 (1, 2, 'multi\nline\n', 11, 500),
+                 (1, 4, 'no newline', 10, 100),
+                 (1, 6, 'rewrite\rover', 12, 300),
+                 (1, 8, 'crlf\r\n', 6, 200),
+                 (1, 9, 'λ', 2, 50);
+             INSERT INTO output_gaps (pane_id, reason) VALUES (1, 'capture_gap');",
+        )
+        .expect("seed legacy segment history");
+
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 39)
+            .expect("v39 migration");
+        assert!(migration.down_sql.is_none(), "v39 must remain forward-only");
+        conn.execute_batch(migration.up_sql)
+            .expect("apply scrollback summary migration");
+        conn.execute_batch(migration.up_sql)
+            .expect("v39 migration SQL is idempotent");
+
+        let fresh = Connection::open_in_memory().expect("open fresh canonical database");
+        initialize_schema(&fresh).expect("initialize fresh canonical schema");
+        for (object_type, object_name) in [
+            ("table", "pane_scrollback_summary"),
+            ("trigger", "pane_scrollback_summary_panes_ai"),
+            ("trigger", "pane_scrollback_summary_panes_ad"),
+            ("trigger", "pane_scrollback_summary_bi"),
+            ("trigger", "pane_scrollback_summary_bd"),
+            ("trigger", "pane_scrollback_summary_pane_id_bu"),
+            ("trigger", "output_segments_scrollback_summary_bi"),
+            ("trigger", "output_segments_scrollback_summary_ai"),
+            ("trigger", "output_segments_scrollback_summary_bd"),
+            ("trigger", "output_segments_scrollback_summary_ad"),
+            ("trigger", "output_segments_scrollback_metadata_bu"),
+        ] {
+            let upgraded_sql = load_schema_object_sql(&conn, object_type, object_name)
+                .unwrap()
+                .unwrap_or_else(|| panic!("upgraded schema is missing {object_name}"));
+            let fresh_sql = load_schema_object_sql(&fresh, object_type, object_name)
+                .unwrap()
+                .unwrap_or_else(|| panic!("fresh schema is missing {object_name}"));
+            assert_eq!(
+                compact_schema_sql(&upgraded_sql),
+                compact_schema_sql(&fresh_sql),
+                "fresh and upgraded definitions must match for {object_name}"
+            );
+        }
+
+        assert_eq!(
+            load_summary(&conn, 1).unwrap(),
+            (5, Some(2), Some(9), Some(50), Some(500))
+        );
+        assert_eq!(load_summary(&conn, 2).unwrap(), (0, None, None, None, None));
+
+        conn.execute("INSERT INTO panes (pane_id) VALUES (3)", [])
+            .expect("pane trigger creates zero summary");
+        assert_eq!(load_summary(&conn, 3).unwrap(), (0, None, None, None, None));
+        conn.execute(
+            "INSERT INTO output_segments
+                 (pane_id, seq, content, content_len, captured_at)
+             VALUES (3, 0, 'first', 5, 700)",
+            [],
+        )
+        .expect("append updates summary");
+        assert_eq!(
+            load_summary(&conn, 3).unwrap(),
+            (1, Some(0), Some(0), Some(700), Some(700))
+        );
+
+        conn.execute(
+            "UPDATE output_segments SET content = 'masked', content_len = 6
+             WHERE pane_id = 1 AND seq = 4",
+            [],
+        )
+        .expect("content redaction does not mutate summary metadata");
+        assert_eq!(
+            load_summary(&conn, 1).unwrap(),
+            (5, Some(2), Some(9), Some(50), Some(500))
+        );
+
+        conn.execute(
+            "DELETE FROM output_segments WHERE pane_id = 1 AND seq IN (2, 9)",
+            [],
+        )
+        .expect("retention removes both sequence and timestamp boundaries");
+        assert_eq!(
+            load_summary(&conn, 1).unwrap(),
+            (3, Some(4), Some(8), Some(100), Some(300))
+        );
+        conn.execute("DELETE FROM output_segments WHERE pane_id = 1", [])
+            .expect("full retention truncation");
+        assert_eq!(load_summary(&conn, 1).unwrap(), (0, None, None, None, None));
+
+        assert!(
+            conn.execute(
+                "UPDATE output_segments SET seq = 1 WHERE pane_id = 3 AND seq = 0",
+                [],
+            )
+            .is_err(),
+            "retained segment identity must be immutable"
+        );
+        assert!(
+            conn.execute("DELETE FROM pane_scrollback_summary WHERE pane_id = 3", [])
+                .is_err(),
+            "a live pane summary cannot be removed"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO output_segments
+                     (pane_id, seq, content, content_len, captured_at)
+                 VALUES (3, -1, 'invalid', 7, 800)",
+                [],
+            )
+            .is_err(),
+            "negative sequence metadata must fail before persistence"
+        );
+
+        conn.execute(
+            "UPDATE pane_scrollback_summary
+             SET retained_segment_count = ?1
+             WHERE pane_id = 3",
+            [i64::MAX],
+        )
+        .expect("seed arithmetic boundary");
+        assert!(
+            conn.execute(
+                "INSERT INTO output_segments
+                     (pane_id, seq, content, content_len, captured_at)
+                 VALUES (3, 1, 'overflow', 8, 800)",
+                [],
+            )
+            .is_err(),
+            "retained segment arithmetic must not wrap or promote to REAL"
+        );
+        let overflow_row_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM output_segments WHERE pane_id = 3 AND seq = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            overflow_row_count, 0,
+            "failed summary update rolls back append"
+        );
+        conn.execute(
+            "UPDATE pane_scrollback_summary
+             SET retained_segment_count = 1
+             WHERE pane_id = 3",
+            [],
+        )
+        .expect("restore valid summary after overflow negative control");
+
+        drop(conn);
+        let reopened = Connection::open(&path).expect("reopen migrated database");
+        reopened
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .expect("enable foreign keys after restart");
+        reopened
+            .execute(
+                "INSERT INTO output_segments
+                     (pane_id, seq, content, content_len, captured_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![3_i64, 1_i64, "after restart", 13_i64, 900_i64],
+            )
+            .expect("triggers persist across restart");
+        let restarted_summary: (i64, i64, i64) = reopened
+            .query_row(
+                "SELECT retained_segment_count, first_seq, last_seq
+                 FROM pane_scrollback_summary WHERE pane_id = 3",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(restarted_summary, (2, 0, 1));
+
+        reopened
+            .execute("DELETE FROM panes WHERE pane_id = 3", [])
+            .expect("pane deletion settles segments before removing summary");
+        let remaining_summary: i64 = reopened
+            .query_row(
+                "SELECT count(*) FROM pane_scrollback_summary WHERE pane_id = 3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_summary, 0);
+    }
+
+    #[test]
+    fn scrollback_summary_v39_serializes_concurrent_append_transactions() {
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        use rusqlite::Connection;
+
+        let file = tempfile::NamedTempFile::new().expect("temporary database");
+        let path = file.path().to_path_buf();
+        let conn = Connection::open(&path).expect("open pre-v39 database");
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA foreign_keys = ON;
+             CREATE TABLE panes (pane_id INTEGER PRIMARY KEY);
+             CREATE TABLE output_segments (
+                 id INTEGER PRIMARY KEY,
+                 pane_id INTEGER NOT NULL REFERENCES panes(pane_id) ON DELETE CASCADE,
+                 seq INTEGER NOT NULL,
+                 content TEXT NOT NULL,
+                 content_len INTEGER NOT NULL,
+                 captured_at INTEGER NOT NULL,
+                 UNIQUE(pane_id, seq)
+             );
+             CREATE INDEX idx_segments_pane_seq ON output_segments(pane_id, seq);
+             CREATE INDEX idx_segments_pane_captured
+                 ON output_segments(pane_id, captured_at DESC);
+             INSERT INTO panes (pane_id) VALUES (11);",
+        )
+        .expect("seed concurrent append database");
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 39)
+            .expect("v39 migration");
+        conn.execute_batch(migration.up_sql)
+            .expect("apply scrollback summary migration");
+        drop(conn);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut workers = Vec::new();
+        for worker in 0_i64..2 {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let mut conn = Connection::open(path).expect("open concurrent writer");
+                conn.busy_timeout(Duration::from_secs(10))
+                    .expect("configure SQLite busy timeout");
+                conn.execute_batch("PRAGMA foreign_keys = ON;")
+                    .expect("enable writer foreign keys");
+                barrier.wait();
+                let tx = conn.transaction().expect("begin append transaction");
+                for offset in 0_i64..64 {
+                    let seq = worker * 64 + offset;
+                    let captured_at = (worker + 1) * 1_000 + offset;
+                    tx.execute(
+                        "INSERT INTO output_segments
+                             (pane_id, seq, content, content_len, captured_at)
+                         VALUES (11, ?1, 'x', 1, ?2)",
+                        [seq, captured_at],
+                    )
+                    .expect("append concurrent segment");
+                }
+                tx.commit().expect("commit append transaction");
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("concurrent writer did not panic");
+        }
+
+        let conn = Connection::open(&path).expect("reopen concurrent append database");
+        let history_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM output_segments WHERE pane_id = 11",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let summary: (i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT retained_segment_count, first_seq, last_seq,
+                        first_captured_at, last_captured_at
+                 FROM pane_scrollback_summary WHERE pane_id = 11",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(history_count, 128);
+        assert_eq!(summary, (128, 0, 127, 1_000, 2_063));
+    }
+
+    #[test]
+    fn current_schema_reopen_fails_closed_when_scrollback_trigger_is_missing() {
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().expect("open database");
+        initialize_schema(&conn).expect("initialize current schema");
+        conn.execute_batch("DROP TRIGGER output_segments_scrollback_summary_ai;")
+            .expect("inject missing-trigger corruption");
+
+        let error = initialize_schema(&conn)
+            .expect_err("an up-to-date version stamp must not mask missing summary authority");
+        assert!(
+            error
+                .to_string()
+                .contains("output_segments_scrollback_summary_ai"),
+            "missing trigger identity must be explicit: {error}"
         );
     }
 }

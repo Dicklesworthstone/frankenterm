@@ -51,7 +51,7 @@ fn make_pane_state(pane_id: u64, seq: i64) -> PaneStateSnapshot {
         .with_cwd(format!("/tmp/replay-diff/{pane_id}"))
         .with_scrollback(ScrollbackRef {
             output_segments_seq: seq,
-            total_segments_captured: total_segments,
+            retained_segment_count: total_segments,
             last_capture_at: 1_700_000_000_000,
         })
 }
@@ -120,7 +120,7 @@ fn build_current_snapshot(
             state.cwd = Some(format!("/tmp/replay-diff/mutated/{pane_id}"));
             state.scrollback_ref = Some(ScrollbackRef {
                 output_segments_seq: i64::try_from(10_000 + i).unwrap_or_default(),
-                total_segments_captured: 50_000,
+                retained_segment_count: 50_000,
                 last_capture_at: 1_700_000_010_000,
             });
         }

@@ -439,6 +439,59 @@ fn setup_test_db() -> (tempfile::NamedTempFile, Arc<String>) {
             UNIQUE(pane_id, seq)
         );
 
+        CREATE TABLE IF NOT EXISTS pane_scrollback_summary (
+            pane_id INTEGER PRIMARY KEY,
+            retained_segment_count INTEGER NOT NULL,
+            first_seq INTEGER NOT NULL,
+            last_seq INTEGER NOT NULL,
+            first_captured_at INTEGER NOT NULL,
+            last_captured_at INTEGER NOT NULL
+        );
+
+        CREATE TRIGGER output_segments_scrollback_summary_ai
+        AFTER INSERT ON output_segments BEGIN
+            INSERT INTO pane_scrollback_summary (
+                pane_id, retained_segment_count, first_seq, last_seq,
+                first_captured_at, last_captured_at
+            ) VALUES (
+                new.pane_id, 1, new.seq, new.seq, new.captured_at, new.captured_at
+            )
+            ON CONFLICT(pane_id) DO UPDATE SET
+                retained_segment_count = retained_segment_count + 1,
+                first_seq = min(first_seq, new.seq),
+                last_seq = max(last_seq, new.seq),
+                first_captured_at = min(first_captured_at, new.captured_at),
+                last_captured_at = max(last_captured_at, new.captured_at);
+        END;
+
+        CREATE TRIGGER output_segments_scrollback_summary_ad
+        AFTER DELETE ON output_segments BEGIN
+            DELETE FROM pane_scrollback_summary
+            WHERE pane_id = old.pane_id
+              AND NOT EXISTS (
+                  SELECT 1 FROM output_segments WHERE pane_id = old.pane_id
+              );
+            UPDATE pane_scrollback_summary
+            SET retained_segment_count = (
+                    SELECT count(*) FROM output_segments WHERE pane_id = old.pane_id
+                ),
+                first_seq = (
+                    SELECT min(seq) FROM output_segments WHERE pane_id = old.pane_id
+                ),
+                last_seq = (
+                    SELECT max(seq) FROM output_segments WHERE pane_id = old.pane_id
+                ),
+                first_captured_at = (
+                    SELECT min(captured_at)
+                    FROM output_segments WHERE pane_id = old.pane_id
+                ),
+                last_captured_at = (
+                    SELECT max(captured_at)
+                    FROM output_segments WHERE pane_id = old.pane_id
+                )
+            WHERE pane_id = old.pane_id;
+        END;
+
         CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON session_checkpoints(session_id, checkpoint_at);
         CREATE INDEX IF NOT EXISTS idx_checkpoints_session_role_latest
             ON session_checkpoints(session_id, checkpoint_role, checkpoint_at DESC, id DESC);

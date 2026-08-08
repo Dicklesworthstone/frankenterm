@@ -22,7 +22,13 @@ use tracing::{debug, trace};
 pub const PANE_STATE_SIZE_BUDGET: usize = 65_536;
 
 /// Current schema version for pane state snapshots.
-pub const PANE_STATE_SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 gives the scrollback cardinality its exact retained-segment
+/// meaning. Version-1 payloads named the same database row count first as
+/// `total_lines_captured` and later as `total_segments_captured`; neither key
+/// is accepted as the version-2 field, so legacy values cannot silently cross
+/// the semantic boundary.
+pub const PANE_STATE_SCHEMA_VERSION: u32 = 2;
 
 /// Environment variable names that are safe to capture.
 pub(crate) const SAFE_ENV_VARS: &[&str] = &[
@@ -132,14 +138,15 @@ pub struct TerminalState {
 
 /// Reference to scrollback data in output_segments.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ScrollbackRef {
-    /// Last captured sequence number in output_segments.
+    /// Highest sequence number among currently retained `output_segments`.
     pub output_segments_seq: i64,
-    /// Total `output_segments` rows captured for this pane.
+    /// Number of `output_segments` rows currently retained for this pane.
     ///
     /// A segment is an arbitrary stream fragment, not a logical terminal line.
-    pub total_segments_captured: u64,
-    /// When the last output was captured (epoch ms).
+    pub retained_segment_count: u64,
+    /// Greatest capture timestamp among currently retained segments (epoch ms).
     pub last_capture_at: u64,
 }
 
@@ -501,7 +508,7 @@ impl PaneStateSnapshot {
         trace!(
             pane_id = self.pane_id,
             seq = scrollback.output_segments_seq,
-            segments = scrollback.total_segments_captured,
+            retained_segments = scrollback.retained_segment_count,
             "Scrollback ref for pane"
         );
         self.scrollback_ref = Some(scrollback);
@@ -810,7 +817,7 @@ mod tests {
             .with_shell("zsh".to_string())
             .with_scrollback(ScrollbackRef {
                 output_segments_seq: 42,
-                total_segments_captured: 1000,
+                retained_segment_count: 1000,
                 last_capture_at: 1999,
             })
             .with_agent(AgentMetadata {
@@ -1120,7 +1127,7 @@ mod tests {
             })
             .with_scrollback(ScrollbackRef {
                 output_segments_seq: 10,
-                total_segments_captured: 500,
+                retained_segment_count: 500,
                 last_capture_at: 4999,
             })
             .with_agent(AgentMetadata {
@@ -1137,7 +1144,7 @@ mod tests {
                 .scrollback_ref
                 .as_ref()
                 .unwrap()
-                .total_segments_captured,
+                .retained_segment_count,
             500
         );
         assert_eq!(snapshot.agent.as_ref().unwrap().agent_type, "codex");
@@ -1354,12 +1361,41 @@ mod tests {
     fn scrollback_ref_serde_roundtrip() {
         let sr = ScrollbackRef {
             output_segments_seq: -5,
-            total_segments_captured: 999_999,
+            retained_segment_count: 999_999,
             last_capture_at: u64::MAX,
         };
         let json = serde_json::to_string(&sr).unwrap();
         let restored: ScrollbackRef = serde_json::from_str(&json).unwrap();
         assert_eq!(sr, restored);
+    }
+
+    #[test]
+    fn pane_state_v2_scrollback_wire_rejects_legacy_cardinality_names() {
+        let snapshot =
+            PaneStateSnapshot::new(7, 100, make_terminal()).with_scrollback(ScrollbackRef {
+                output_segments_seq: 9,
+                retained_segment_count: 3,
+                last_capture_at: 99,
+            });
+        let json = snapshot.to_json().unwrap();
+        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains("\"retained_segment_count\":3"));
+        assert!(!json.contains("total_lines_captured"));
+        assert!(!json.contains("total_segments_captured"));
+        assert_eq!(PaneStateSnapshot::from_json(&json).unwrap(), snapshot);
+
+        for legacy_name in ["total_lines_captured", "total_segments_captured"] {
+            let legacy = format!(
+                "{{\"schema_version\":1,\"pane_id\":7,\"captured_at\":100,\
+                 \"terminal\":{{\"rows\":24,\"cols\":80}},\
+                 \"scrollback_ref\":{{\"output_segments_seq\":9,\
+                 \"{legacy_name}\":3,\"last_capture_at\":99}}}}"
+            );
+            assert!(
+                PaneStateSnapshot::from_json(&legacy).is_err(),
+                "legacy cardinality key {legacy_name} must not cross the v2 boundary"
+            );
+        }
     }
 
     #[test]
@@ -1793,8 +1829,8 @@ mod tests {
     // ---- Schema version constant ----
 
     #[test]
-    fn schema_version_is_one() {
-        assert_eq!(PANE_STATE_SCHEMA_VERSION, 1);
+    fn schema_version_is_two() {
+        assert_eq!(PANE_STATE_SCHEMA_VERSION, 2);
     }
 
     // ---- Pane state with zero pane_id and captured_at ----

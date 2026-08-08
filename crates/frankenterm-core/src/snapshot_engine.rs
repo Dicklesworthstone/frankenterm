@@ -4465,6 +4465,11 @@ fn load_latest_detections_by_pane_sync(
     Ok(out)
 }
 
+/// Load the exact retained-segment projection for the requested panes.
+///
+/// Schema v39 maintains these rows transactionally at append/retention time.
+/// This query must remain independent of `output_segments` history depth; a
+/// `MIN`/`MAX`/`COUNT` regression here reintroduces long-session snapshot lag.
 fn load_latest_scrollback_refs_sync(
     db_path: &str,
     pane_ids: &[u64],
@@ -4482,11 +4487,10 @@ fn load_latest_scrollback_refs_sync(
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT pane_id, MIN(seq), MAX(seq), COUNT(*),
-                    MIN(captured_at), MAX(captured_at)
-             FROM output_segments
-             WHERE pane_id IN ({placeholders})
-             GROUP BY pane_id"
+            "SELECT pane_id, retained_segment_count, first_seq, last_seq,
+                    first_captured_at, last_captured_at
+             FROM pane_scrollback_summary
+             WHERE pane_id IN ({placeholders})"
         );
         let mut params = Vec::with_capacity(pane_chunk.len());
         for &pane_id in pane_chunk {
@@ -4503,34 +4507,59 @@ fn load_latest_scrollback_refs_sync(
             let pane_id_raw: i64 = row.get(0).map_err(|error| error.to_string())?;
             let pane_id =
                 sqlite_integer_to_u64(0, pane_id_raw).map_err(|error| error.to_string())?;
-            let min_seq: Option<i64> = row.get(1).map_err(|error| error.to_string())?;
-            let max_seq: Option<i64> = row.get(2).map_err(|error| error.to_string())?;
-            let total_segments_captured: i64 = row.get(3).map_err(|error| error.to_string())?;
-            let min_capture_at: Option<i64> = row.get(4).map_err(|error| error.to_string())?;
+            let retained_segment_count: i64 = row.get(1).map_err(|error| error.to_string())?;
+            let first_seq: Option<i64> = row.get(2).map_err(|error| error.to_string())?;
+            let last_seq: Option<i64> = row.get(3).map_err(|error| error.to_string())?;
+            let first_capture_at: Option<i64> = row.get(4).map_err(|error| error.to_string())?;
             let last_capture_at: Option<i64> = row.get(5).map_err(|error| error.to_string())?;
 
-            let Some(min_seq) = min_seq else {
+            if retained_segment_count < 0 {
+                return Err(format!(
+                    "invalid scrollback summary for pane_id={pane_id}: \
+                     negative retained segment count {retained_segment_count}"
+                ));
+            }
+            if retained_segment_count == 0 {
+                if first_seq.is_some()
+                    || last_seq.is_some()
+                    || first_capture_at.is_some()
+                    || last_capture_at.is_some()
+                {
+                    return Err(format!(
+                        "invalid empty scrollback summary for pane_id={pane_id}: non-null bounds"
+                    ));
+                }
                 continue;
-            };
-            let Some(output_segments_seq) = max_seq else {
-                continue;
-            };
-            let Some(min_capture_at) = min_capture_at else {
-                continue;
-            };
+            }
+
+            let first_seq = first_seq.ok_or_else(|| {
+                format!("invalid scrollback summary for pane_id={pane_id}: missing first_seq")
+            })?;
+            let output_segments_seq = last_seq.ok_or_else(|| {
+                format!("invalid scrollback summary for pane_id={pane_id}: missing last_seq")
+            })?;
+            let first_capture_at = first_capture_at.ok_or_else(|| {
+                format!(
+                    "invalid scrollback summary for pane_id={pane_id}: missing first_captured_at"
+                )
+            })?;
             let Some(last_capture_at) = last_capture_at else {
-                continue;
+                return Err(format!(
+                    "invalid scrollback summary for pane_id={pane_id}: missing last_captured_at"
+                ));
             };
-            if min_seq < 0
+            if first_seq < 0
                 || output_segments_seq < 0
-                || total_segments_captured <= 0
-                || min_capture_at < 0
+                || first_seq > output_segments_seq
+                || first_capture_at < 0
                 || last_capture_at < 0
+                || first_capture_at > last_capture_at
             {
                 return Err(format!(
-                    "invalid scrollback segment metadata for pane_id={pane_id}: \
-                     min_seq={min_seq}, max_seq={output_segments_seq}, \
-                     count={total_segments_captured}, min_capture_at={min_capture_at}, \
+                    "invalid scrollback summary for pane_id={pane_id}: \
+                     first_seq={first_seq}, last_seq={output_segments_seq}, \
+                     retained_segment_count={retained_segment_count}, \
+                     first_capture_at={first_capture_at}, \
                      last_capture_at={last_capture_at}"
                 ));
             }
@@ -4539,7 +4568,7 @@ fn load_latest_scrollback_refs_sync(
                 pane_id,
                 ScrollbackRef {
                     output_segments_seq,
-                    total_segments_captured: u64::try_from(total_segments_captured)
+                    retained_segment_count: u64::try_from(retained_segment_count)
                         .map_err(|error| error.to_string())?,
                     last_capture_at: u64::try_from(last_capture_at)
                         .map_err(|error| error.to_string())?,
@@ -6498,41 +6527,56 @@ mod tests {
     }
 
     #[test]
-    fn scrollback_loader_rejects_negative_db_metadata_and_oversized_pane_ids() {
+    fn scrollback_loader_rejects_corrupt_summary_metadata_and_oversized_pane_ids() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let db_path = tmp.path().to_str().unwrap();
         let conn = Connection::open(db_path).unwrap();
         conn.execute_batch(
-            "CREATE TABLE output_segments (
+            "CREATE TABLE pane_scrollback_summary (
                  pane_id INTEGER NOT NULL,
-                 seq INTEGER NOT NULL,
-                 captured_at INTEGER NOT NULL
+                 retained_segment_count INTEGER NOT NULL,
+                 first_seq INTEGER,
+                 last_seq INTEGER,
+                 first_captured_at INTEGER,
+                 last_captured_at INTEGER
              );
-             INSERT INTO output_segments (pane_id, seq, captured_at)
-             VALUES (7, 0, -1), (7, 1, 2);",
+             INSERT INTO pane_scrollback_summary (
+                 pane_id, retained_segment_count, first_seq, last_seq,
+                 first_captured_at, last_captured_at
+             ) VALUES (7, 2, 0, 1, -1, 2);",
         )
         .unwrap();
         drop(conn);
 
         let negative_timestamp = load_latest_scrollback_refs_sync(db_path, &[7])
-            .expect_err("a masked negative captured_at must not wrap to u64");
-        assert!(negative_timestamp.contains("min_capture_at=-1"));
+            .expect_err("a negative first_captured_at must not wrap to u64");
+        assert!(negative_timestamp.contains("first_capture_at=-1"));
 
         let conn = Connection::open(db_path).unwrap();
         conn.execute(
-            "UPDATE output_segments SET captured_at = 1 WHERE pane_id = 7;",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE output_segments SET seq = -1 WHERE pane_id = 7 AND seq = 0",
+            "UPDATE pane_scrollback_summary
+             SET first_captured_at = 1, first_seq = -1
+             WHERE pane_id = 7;",
             [],
         )
         .unwrap();
         drop(conn);
         let negative_sequence = load_latest_scrollback_refs_sync(db_path, &[7])
             .expect_err("a masked negative scrollback sequence must fail closed");
-        assert!(negative_sequence.contains("min_seq=-1"));
+        assert!(negative_sequence.contains("first_seq=-1"));
+
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE pane_scrollback_summary
+             SET retained_segment_count = 0, first_seq = 0
+             WHERE pane_id = 7",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let impossible_empty = load_latest_scrollback_refs_sync(db_path, &[7])
+            .expect_err("a zero-count summary with bounds must fail closed");
+        assert!(impossible_empty.contains("invalid empty scrollback summary"));
 
         let oversized_pane_id = load_latest_scrollback_refs_sync(db_path, &[u64::MAX])
             .expect_err("an unrepresentable pane id must not wrap to a SQLite integer");
@@ -6684,10 +6728,13 @@ mod tests {
                  extracted TEXT,
                  detected_at INTEGER NOT NULL
              );
-             CREATE TABLE output_segments (
+             CREATE TABLE pane_scrollback_summary (
                  pane_id INTEGER NOT NULL,
-                 seq INTEGER NOT NULL,
-                 captured_at INTEGER NOT NULL
+                 retained_segment_count INTEGER NOT NULL,
+                 first_seq INTEGER,
+                 last_seq INTEGER,
+                 first_captured_at INTEGER,
+                 last_captured_at INTEGER
              );",
         )
         .unwrap();
@@ -6703,8 +6750,10 @@ mod tests {
             )
             .unwrap();
             tx.execute(
-                "INSERT INTO output_segments (pane_id, seq, captured_at)
-                 VALUES (?1, 0, 10)",
+                "INSERT INTO pane_scrollback_summary (
+                     pane_id, retained_segment_count, first_seq, last_seq,
+                     first_captured_at, last_captured_at
+                 ) VALUES (?1, 1, 0, 0, 10, 10)",
                 [pane_id],
             )
             .unwrap();
@@ -6721,6 +6770,11 @@ mod tests {
             scrollback
                 .values()
                 .all(|reference| reference.output_segments_seq == 0)
+        );
+        assert!(
+            scrollback
+                .values()
+                .all(|reference| reference.retained_segment_count == 1)
         );
     }
 
@@ -9885,7 +9939,7 @@ mod tests {
         let mut corrupt_pane = PaneStateSnapshot::from_pane_info(&corrupt_pane_info, 3000, false);
         corrupt_pane.scrollback_ref = Some(ScrollbackRef {
             output_segments_seq: -1,
-            total_segments_captured: 1,
+            retained_segment_count: 1,
             last_capture_at: 3000,
         });
         let error = prepare_snapshot_persistence(&corrupt_topology, &[corrupt_pane], None)
@@ -11588,7 +11642,7 @@ mod tests {
 
         let scrollback_changed = state_at_200.clone().with_scrollback(ScrollbackRef {
             output_segments_seq: 42,
-            total_segments_captured: 500,
+            retained_segment_count: 500,
             last_capture_at: 150,
         });
         assert_ne!(
@@ -11602,23 +11656,23 @@ mod tests {
             .dedup_hash,
             "scrollback authority changes must participate in dedup"
         );
-        let total_segments_only = state_at_200.clone().with_scrollback(ScrollbackRef {
-            total_segments_captured: 999_999,
+        let retained_count_only = state_at_200.clone().with_scrollback(ScrollbackRef {
+            retained_segment_count: 999_999,
             ..scrollback_changed.scrollback_ref.unwrap()
         });
         let same_scrollback_columns = state_at_200.clone().with_scrollback(ScrollbackRef {
             output_segments_seq: 42,
-            total_segments_captured: 1,
+            retained_segment_count: 1,
             last_capture_at: 150,
         });
         assert_eq!(
-            prepare_snapshot_persistence(&topology_at_200, &[total_segments_only], None)
+            prepare_snapshot_persistence(&topology_at_200, &[retained_count_only], None)
                 .unwrap()
                 .dedup_hash,
             prepare_snapshot_persistence(&topology_at_200, &[same_scrollback_columns], None)
                 .unwrap()
                 .dedup_hash,
-            "non-persisted scrollback segment counts must not create checkpoints"
+            "non-persisted retained-segment counts must not create checkpoints"
         );
 
         let process_baseline = state_at_200.clone().with_process(ProcessInfo {

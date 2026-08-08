@@ -108,9 +108,9 @@ fn arb_process_info() -> impl Strategy<Value = ProcessInfo> {
 
 fn arb_scrollback_ref() -> impl Strategy<Value = ScrollbackRef> {
     (0i64..10_000, 0u64..10_000, 0u64..10_000_000).prop_map(
-        |(output_segments_seq, total_segments_captured, last_capture_at)| ScrollbackRef {
+        |(output_segments_seq, retained_segment_count, last_capture_at)| ScrollbackRef {
             output_segments_seq,
-            total_segments_captured,
+            retained_segment_count,
             last_capture_at,
         },
     )
@@ -453,10 +453,10 @@ proptest! {
 // ── Hand-rolled conformance regressions ─────────────────────────────────
 
 #[test]
-fn pane_state_snapshot_schema_version_constant_is_1() {
+fn pane_state_snapshot_schema_version_constant_is_2() {
     // Pin the current schema version value. Any bump must be deliberate.
     assert_eq!(
-        PANE_STATE_SCHEMA_VERSION, 1,
+        PANE_STATE_SCHEMA_VERSION, 2,
         "PANE_STATE_SCHEMA_VERSION changed — update wire consumers and bump this assertion"
     );
 }

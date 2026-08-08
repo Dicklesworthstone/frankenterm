@@ -371,7 +371,7 @@ proptest! {
                 pane_id: target,
                 new_scrollback_ref: Some(ScrollbackRef {
                     output_segments_seq: 42,
-                    total_segments_captured: 500,
+                    retained_segment_count: 500,
                     last_capture_at: timestamp,
                 }),
             }],
