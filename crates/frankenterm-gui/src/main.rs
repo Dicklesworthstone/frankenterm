@@ -1,8 +1,6 @@
-// Don't create a new standard console window when launched from the windows GUI.
-#![cfg_attr(not(test), windows_subsystem = "windows")]
-// Keep this in sync with Cargo.toml: the vendored GUI crate is not yet a
-// pedantic-clean primary lint target.
-#![allow(clippy::all, clippy::pedantic, clippy::nursery)]
+// Shared production implementation included by the distinct binary and test
+// harness crate roots. Crate-level target attributes live in those
+// wrappers because Cargo must not assign this same source path to two targets.
 
 // Make `wezterm_dynamic` available as an alias for `frankenterm_dynamic`.
 // Many vendored modules still use the old `wezterm_dynamic::` import paths.
@@ -1187,8 +1185,9 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
 
 // The opt-in `glyphcache_unit` target compiles this production module graph
 // under Rust's generated test harness. Excluding the application entry point at
-// compile time is the hard fence that prevents those tests from initializing a
-// frontend, creating a window, or stealing desktop focus.
+// compile time prevents the harness from automatically starting the frontend;
+// focused proof commands must still select tests whose own bodies do not call
+// frontend/window constructors.
 #[cfg(not(test))]
 fn main() {
     // Install the privacy-bounded terminal hook before profiler or runtime

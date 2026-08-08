@@ -53,6 +53,8 @@ const MAX_ACTIVE_BACKGROUND_LAYERS: usize = 127;
 const MAX_ACTIVE_BACKGROUND_DECODED_BYTES: usize = MAX_BACKGROUND_CACHE_BYTES;
 const BACKGROUND_IO_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_BACKGROUND_TILES_PER_LAYER: usize = 16_384;
+#[cfg(test)]
+const FIRST_F64_INTEGER_WITHOUT_UNIT_PRECISION: f64 = 9_007_199_254_740_992.0;
 const BACKGROUND_IMAGE_VALIDATION_LIMITS: ImageDataValidationLimits = ImageDataValidationLimits {
     max_decoded_bytes: MAX_BACKGROUND_DECODED_BYTES,
     max_frame_count: MAX_IMAGE_WIRE_FRAMES,
@@ -244,6 +246,15 @@ fn publish_decoded_background_authority(
     is_cancelled: &dyn Fn() -> bool,
 ) -> anyhow::Result<(Arc<ImageData>, usize)> {
     let revision = image.current_content_hash();
+    if let Some(summary) = image.validated_summary_for_content_revision(
+        revision,
+        BACKGROUND_IMAGE_VALIDATION_LIMITS,
+    ) {
+        // Decode and metadata-only speed adjustment publish private authority
+        // for their exact revisions. Reuse it rather than hashing the same
+        // pixels again before GUI handoff.
+        return Ok((Arc::new(image), summary.decoded_bytes));
+    }
     let validation = image
         .normalize_for_content_revision_with_limits(
             revision,
@@ -298,7 +309,7 @@ fn prepare_background_repeat_axis(
     lower_bound: f32,
     step: f32,
     repeat: BackgroundRepeat,
-    scroll_distance: f32,
+    scroll_distance: f64,
 ) -> anyhow::Result<(f32, bool)> {
     anyhow::ensure!(
         origin.is_finite() && lower_bound.is_finite(),
@@ -314,7 +325,7 @@ fn prepare_background_repeat_axis(
     );
 
     if repeat == BackgroundRepeat::NoRepeat {
-        let adjusted = origin - scroll_distance;
+        let adjusted = (f64::from(origin) - scroll_distance) as f32;
         anyhow::ensure!(
             adjusted.is_finite(),
             "background no-repeat origin overflowed while applying scroll"
@@ -324,37 +335,185 @@ fn prepare_background_repeat_axis(
 
     // Keep the coordinate close to the viewport even after long scrollback.
     // The integral tile displacement affects only mirror parity; the
-    // fractional displacement supplies the visible sub-tile phase.
-    let scroll_tiles = scroll_distance / step;
-    anyhow::ensure!(
-        scroll_tiles.is_finite(),
-        "background scroll tile displacement must be finite"
-    );
-    let shifted_origin = origin - scroll_tiles.fract() * step;
-    let backward_steps = ((shifted_origin - lower_bound) / step).ceil().max(0.0);
+    // fractional displacement supplies the visible sub-tile phase. Stable
+    // rows are signed pointer-width indices, so retain f64 precision through
+    // this reduction; converting the row to f32 first loses phase and parity
+    // beyond 2^24 rows on 64-bit long-session hosts.
+    let step = f64::from(step);
+    let Some((scroll_is_odd, scroll_remainder)) =
+        exact_scroll_tile_phase(scroll_distance, step)
+    else {
+        anyhow::bail!("background repeat scroll could not be reduced exactly");
+    };
+    let shifted_origin = f64::from(origin) - scroll_remainder;
+    let backward_steps = ((shifted_origin - f64::from(lower_bound)) / step)
+        .ceil()
+        .max(0.0);
     anyhow::ensure!(
         backward_steps.is_finite()
-            && backward_steps <= MAX_BACKGROUND_TILES_PER_LAYER as f32,
+            && backward_steps <= MAX_BACKGROUND_TILES_PER_LAYER as f64,
         "background repeat alignment exceeds the per-layer tile limit"
     );
-    let normalized_origin = shifted_origin - backward_steps * step;
+    let normalized_origin = (shifted_origin - backward_steps * step) as f32;
     anyhow::ensure!(
         normalized_origin.is_finite(),
         "background repeat origin overflowed while aligning to the viewport"
     );
 
-    if repeat == BackgroundRepeat::Mirror {
-        anyhow::ensure!(
-            scroll_tiles.abs() <= 16_777_216.0,
-            "mirrored background scroll exceeds exact f32 tile parity"
-        );
-    }
-    let scroll_is_odd = scroll_tiles.trunc().rem_euclid(2.0) >= 1.0;
     let backward_is_odd = backward_steps.rem_euclid(2.0) >= 1.0;
     Ok((
         normalized_origin,
         scroll_is_odd ^ backward_is_odd,
     ))
+}
+
+/// Return the exact truncated whole-tile parity and signed sub-tile remainder
+/// for two finite binary floating-point values.
+///
+/// Computing `distance / step` and then multiplying its fractional part back
+/// by `step` is not exact even while the quotient is below 2^53. For example,
+/// `2^54 / 3` rounds to an integer-valued f64 and erases its exact one-pixel
+/// remainder. Decomposing both inputs as binary rationals lets us preserve the
+/// only quotient property the renderer consumes (odd/even parity) plus the
+/// exact remainder, without materializing an arbitrarily wide whole-tile
+/// count. When the distance has the larger exponent, reducing its aligned
+/// numerator modulo twice the denominator yields both values: the upper half
+/// identifies an odd quotient and the position within that half is the
+/// remainder. Fast modular exponentiation covers every finite f64 exponent.
+fn exact_scroll_tile_phase(distance: f64, step: f64) -> Option<(bool, f64)> {
+    if !distance.is_finite() || !step.is_finite() || step <= 0.0 {
+        return None;
+    }
+
+    let magnitude = distance.abs();
+    if magnitude < step {
+        return Some((false, distance));
+    }
+
+    let (distance_significand, distance_exponent) = binary_rational_parts(magnitude)?;
+    let (step_significand, step_exponent) = binary_rational_parts(step)?;
+    let exponent_delta = distance_exponent.checked_sub(step_exponent)?;
+    let (quotient_is_odd, remainder_significand, common_exponent) = if exponent_delta >= 0 {
+        let denominator = u128::from(step_significand);
+        let modulus = denominator.checked_mul(2)?;
+        let aligned_numerator_modulus = u128::from(distance_significand)
+            .checked_mul(power_of_two_modulo(
+                u32::try_from(exponent_delta).ok()?,
+                modulus,
+            )?)?
+            % modulus;
+        (
+            aligned_numerator_modulus >= denominator,
+            aligned_numerator_modulus % denominator,
+            step_exponent,
+        )
+    } else {
+        // `magnitude >= step` bounds this aligned denominator by the distance
+        // significand, so the negative-delta branch is always small enough to
+        // materialize. Keep the checked arithmetic as an invariant guard.
+        let denominator = u128::from(step_significand).checked_mul(
+            1_u128.checked_shl(exponent_delta.unsigned_abs())?,
+        )?;
+        let numerator = u128::from(distance_significand);
+        (
+            (numerator / denominator) % 2 == 1,
+            numerator % denominator,
+            distance_exponent,
+        )
+    };
+    let remainder = (remainder_significand as f64) * 2.0_f64.powi(common_exponent);
+    if !remainder.is_finite() || remainder >= step {
+        return None;
+    }
+    let signed_remainder = if distance.is_sign_negative() {
+        -remainder
+    } else {
+        remainder
+    };
+    Some((quotient_is_odd, signed_remainder))
+}
+
+/// Compute `2^exponent mod modulus` without constructing `2^exponent`.
+fn power_of_two_modulo(mut exponent: u32, modulus: u128) -> Option<u128> {
+    if modulus == 0 {
+        return None;
+    }
+
+    let mut result = 1 % modulus;
+    let mut base = 2 % modulus;
+    while exponent != 0 {
+        if exponent & 1 == 1 {
+            result = result.checked_mul(base)? % modulus;
+        }
+        exponent >>= 1;
+        if exponent != 0 {
+            base = base.checked_mul(base)? % modulus;
+        }
+    }
+    Some(result)
+}
+
+/// Decompose a positive finite f64 into an odd integer significand and a
+/// base-two exponent, preserving the exact represented value.
+fn binary_rational_parts(value: f64) -> Option<(u64, i32)> {
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    let bits = value.to_bits();
+    let exponent_field = ((bits >> 52) & 0x7ff) as u16;
+    let fraction = bits & ((1_u64 << 52) - 1);
+    let (mut significand, mut exponent) = if exponent_field == 0 {
+        (fraction, -1074)
+    } else {
+        (
+            (1_u64 << 52) | fraction,
+            i32::from(exponent_field) - 1023 - 52,
+        )
+    };
+    if significand == 0 {
+        return None;
+    }
+    let trailing_zeros = significand.trailing_zeros();
+    significand >>= trailing_zeros;
+    exponent = exponent.checked_add(i32::try_from(trailing_zeros).ok()?)?;
+    Some((significand, exponent))
+}
+
+fn background_scroll_distance(
+    top: StableRowIndex,
+    cell_height: isize,
+    factor: f32,
+) -> Option<f64> {
+    if !factor.is_finite() || cell_height <= 0 {
+        return None;
+    }
+    if factor == 0.0 {
+        return Some(0.0);
+    }
+    let row_pixels = (top as i128).checked_mul(cell_height as i128)?;
+    let row_magnitude = row_pixels.unsigned_abs();
+    if row_magnitude == 0 {
+        return Some(0.0);
+    }
+
+    // A fixed magnitude ceiling rejects large values that are nevertheless
+    // exactly representable (powers of two and factor=1 are common examples).
+    // Strip the integer's powers of two and multiply the two odd
+    // significands. The f64 product is exact for this path precisely when the
+    // resulting significand fits its 53-bit precision; the stripped powers of
+    // two affect only the exponent, and every i128/f32 exponent fits f64.
+    let row_significand = row_magnitude >> row_magnitude.trailing_zeros();
+    let (factor_significand, _) = binary_rational_parts(f64::from(factor).abs())?;
+    let product_significand = row_significand.checked_mul(u128::from(factor_significand))?;
+    let product_significant_bits = u128::BITS - product_significand.leading_zeros();
+    if product_significant_bits > f64::MANTISSA_DIGITS {
+        return None;
+    }
+
+    // The significand proof above makes both this integer conversion and the
+    // multiplication exact rather than merely finite.
+    let distance = (row_pixels as f64) * f64::from(factor);
+    distance.is_finite().then_some(distance)
 }
 
 fn linear_gradient_projection_half_extent(
@@ -373,6 +532,19 @@ fn linear_gradient_projection_half_extent(
         "linear-gradient projection must be finite and greater than zero"
     );
     Ok(extent)
+}
+
+fn radial_gradient_distance(
+    x: f64,
+    y: f64,
+    center_x: f64,
+    center_y: f64,
+    noise_x: f64,
+    noise_y: f64,
+    radius: f64,
+) -> f64 {
+    ((x + noise_x - center_x).powi(2) + (y + noise_y - center_y).powi(2)).sqrt()
+        / radius
 }
 
 fn background_sources_match(left: &BackgroundSource, right: &BackgroundSource) -> bool {
@@ -550,7 +722,7 @@ impl CachedGradient {
                         noise(&mut rng, noise_amount)
                     };
 
-                    let t = (nx + (x - cx).powi(2) + (ny + y - cy).powi(2)).sqrt() / radius;
+                    let t = radial_gradient_distance(x, y, cx, cy, nx, ny, radius);
                     *pixel = to_pixel(grad.at(t as f32));
                 }
             }
@@ -773,15 +945,14 @@ impl CachedImage {
         let decoded = normalized
             .replacement
             .context("encoded background normalization did not return decoded data")?;
-        {
-            let mut data = decoded.data_mut();
-            data.adjust_speed(speed)
-                .with_context(|| format!("applying background image speed for {path}"))?;
-        }
-        // Speed adjustment is a real content mutation for animations, so it
-        // correctly clears the decode-time authority. Revalidate the final
-        // revision here on the background worker instead of rewrapping the
-        // payload and forcing the GUI fallback validator on first paint.
+        decoded
+            .adjust_speed(speed)
+            .with_context(|| format!("applying background image speed for {path}"))?;
+        // Non-identity animation speed is a metadata-only content mutation;
+        // static images and identity speed are exact no-ops. The bounded
+        // adjustment validates duration scheduling bounds, preserves pixel
+        // hashes, and rebinds the decode-time authority to its final revision.
+        // Publication below can therefore avoid a second full pixel scan.
         let (image, retained_bytes) =
             publish_decoded_background_authority(decoded, is_cancelled)?;
         anyhow::ensure!(
@@ -1566,15 +1737,19 @@ impl crate::TermWindow {
         let right_pixel = left_pixel + pixel_width;
         let limit_y = top_pixel + pixel_height;
         let scroll_distance = if let Some(factor) = layer.def.attachment.scroll_factor() {
-            if !factor.is_finite() {
+            let Some(distance) = background_scroll_distance(
+                top,
+                self.render_metrics.cell_size.height,
+                factor,
+            ) else {
                 metrics::counter!(
                     "gui.background.layer_rejected.total",
-                    "reason" => "invalid_scroll_factor",
+                    "reason" => "invalid_scroll_distance",
                 )
                 .increment(1);
                 return Ok(false);
-            }
-            top as f32 * self.render_metrics.cell_size.height as f32 * factor
+            };
+            distance
         } else {
             0.0
         };
@@ -1769,6 +1944,17 @@ mod tests {
     }
 
     #[test]
+    fn radial_gradient_noise_offsets_both_axes_before_distance_is_squared() {
+        let distance = radial_gradient_distance(10.0, 20.0, 0.0, 0.0, -3.0, -4.0, 2.0);
+        let transposed =
+            radial_gradient_distance(20.0, 10.0, 0.0, 0.0, -4.0, -3.0, 2.0);
+        let expected = (7.0_f64.powi(2) + 16.0_f64.powi(2)).sqrt() / 2.0;
+
+        assert!((distance - expected).abs() <= f64::EPSILON);
+        assert!((transposed - expected).abs() <= f64::EPSILON);
+    }
+
+    #[test]
     fn active_background_byte_budget_counts_shared_arcs_once_and_distinct_arcs_exactly() {
         let shared = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
             1,
@@ -1854,7 +2040,7 @@ mod tests {
     }
 
     #[test]
-    fn animation_speed_mutation_is_revalidated_before_background_publication() {
+    fn animation_speed_metadata_mutation_rebinds_background_authority() {
         let first = vec![0x10, 0x20, 0x30, 0xff];
         let second = vec![0x40, 0x50, 0x60, 0xff];
         let image = ImageData::with_data(ImageDataType::AnimRgba8 {
@@ -1867,19 +2053,28 @@ mod tests {
             frames: vec![first, second],
             durations: vec![Duration::from_millis(100), Duration::from_millis(200)],
         });
-        {
-            let mut data = image.data_mut();
-            data.adjust_speed(2.0).unwrap();
-        }
+        let original_revision = image.current_content_hash();
+        image
+            .normalize_for_content_revision_with_limits(
+                original_revision,
+                0,
+                BACKGROUND_IMAGE_VALIDATION_LIMITS,
+                &|| false,
+            )
+            .unwrap();
+        image.adjust_speed(2.0).unwrap();
         let adjusted_revision = image.current_content_hash();
-        assert!(
-            image
-                .validated_summary_for_content_revision(
-                    adjusted_revision,
-                    BACKGROUND_IMAGE_VALIDATION_LIMITS,
-                )
-                .is_none(),
-            "mutable speed adjustment must clear the prior validation authority"
+        assert_ne!(adjusted_revision, original_revision);
+        assert_eq!(
+            image.validated_summary_for_content_revision(
+                adjusted_revision,
+                BACKGROUND_IMAGE_VALIDATION_LIMITS,
+            ),
+            Some(termwiz::image::ImageDataValidationSummary {
+                decoded_bytes: 8,
+                frame_count: 2,
+            }),
+            "metadata-only speed adjustment must rebind authority without rescanning pixels"
         );
 
         let (image, retained_bytes) =
@@ -1947,6 +2142,200 @@ mod tests {
         .unwrap();
         assert_eq!(scrolled_origin, -580.0);
         assert!(scrolled_mirrored);
+    }
+
+    #[test]
+    fn repeated_background_scroll_retains_phase_and_parity_beyond_f32_integer_precision() {
+        let former_f32_boundary = 16_777_216.0_f64;
+        let (origin, mirrored) = prepare_background_repeat_axis(
+            0.0,
+            0.0,
+            1.0,
+            BackgroundRepeat::Mirror,
+            former_f32_boundary + 1.25,
+        )
+        .unwrap();
+
+        assert_eq!(origin, -0.25);
+        assert!(mirrored, "the 16,777,217th tile has odd mirror parity");
+        for repeat in [BackgroundRepeat::Repeat, BackgroundRepeat::Mirror] {
+            assert_eq!(
+                prepare_background_repeat_axis(
+                    0.0,
+                    0.0,
+                    1.0,
+                    repeat,
+                    FIRST_F64_INTEGER_WITHOUT_UNIT_PRECISION,
+                )
+                .unwrap(),
+                (0.0, false),
+                "exact rational reduction must not impose a false 2^53 quotient ceiling",
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_background_scroll_uses_exact_binary_remainder_beyond_two_pow_53() {
+        let distance = 2.0_f64.powi(54);
+        let (quotient_is_odd, remainder) = exact_scroll_tile_phase(distance, 3.0)
+            .expect("the exact tile parity and remainder are representable");
+        assert!(quotient_is_odd);
+        assert_eq!(remainder, 1.0);
+
+        let (origin, mirrored) = prepare_background_repeat_axis(
+            0.0,
+            0.0,
+            3.0,
+            BackgroundRepeat::Mirror,
+            distance,
+        )
+        .expect("exact binary reduction must retain the one-pixel phase");
+        assert_eq!(origin, -1.0);
+        assert!(mirrored, "the exact whole-tile quotient is odd");
+
+        let (negative_is_odd, negative_remainder) =
+            exact_scroll_tile_phase(-distance, 3.0)
+                .expect("negative scrolling uses the same exact magnitude");
+        assert_eq!(negative_is_odd, quotient_is_odd);
+        assert_eq!(negative_remainder, -1.0);
+    }
+
+    #[test]
+    fn exact_scroll_tile_phase_rejects_invalid_inputs_without_a_quotient_ceiling() {
+        assert_eq!(exact_scroll_tile_phase(0.0, 3.0), Some((false, 0.0)));
+        assert_eq!(exact_scroll_tile_phase(1.0, 3.0), Some((false, 1.0)));
+        assert_eq!(exact_scroll_tile_phase(-1.0, 3.0), Some((false, -1.0)));
+        assert_eq!(exact_scroll_tile_phase(f64::NAN, 3.0), None);
+        assert_eq!(exact_scroll_tile_phase(1.0, 0.0), None);
+        assert_eq!(exact_scroll_tile_phase(1.0, f64::INFINITY), None);
+        assert_eq!(
+            exact_scroll_tile_phase(FIRST_F64_INTEGER_WITHOUT_UNIT_PRECISION, 1.0),
+            Some((false, 0.0)),
+        );
+        assert_eq!(
+            exact_scroll_tile_phase(2.0_f64.powi(63), 3.0),
+            Some((false, 2.0)),
+            "an exact nonzero remainder remains representable beyond 2^53 tiles",
+        );
+        assert_eq!(
+            exact_scroll_tile_phase(2.0_f64.powi(64) - 2.0_f64.powi(11), 1.0),
+            Some((false, 0.0)),
+            "high-bit alignment retains parity without materializing the quotient",
+        );
+        assert_eq!(
+            exact_scroll_tile_phase(2.0_f64.powi(64), 1.0),
+            Some((false, 0.0)),
+            "tile counts above u64 are admissible because only parity is consumed",
+        );
+
+        // This exact production-shaped pair needs a 129-bit aligned numerator.
+        // A materialized u128 path either rejected it or, with checked_shl
+        // alone, silently discarded its high bit. Modular alignment preserves
+        // its even quotient and exact remainder instead. The step is an
+        // exactly promoted finite f32, matching the production contract.
+        let overflowing_distance = f64::from_bits((1075_u64 << 52) | 1);
+        let tiny_f32_step = f32::from_bits((74_u32 << 23) | ((1_u32 << 23) - 1));
+        assert_eq!(
+            exact_scroll_tile_phase(overflowing_distance, f64::from(tiny_f32_step)),
+            Some((false, 17.0 * 2.0_f64.powi(-72))),
+        );
+    }
+
+    #[test]
+    fn exact_scroll_tile_phase_uses_modular_alignment_beyond_u128() {
+        let promoted_f32_step = f64::from(3.0_f32 * 2.0_f32.powi(-40));
+        assert_eq!(
+            exact_scroll_tile_phase(2.0_f64.powi(100), promoted_f32_step),
+            Some((true, 2.0_f64.powi(-40))),
+            "a 140-bit exponent delta must retain odd parity and exact phase",
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn repeated_background_scroll_accepts_production_two_pow_68_distance() {
+        let top: StableRowIndex = 1_isize << 62;
+        let distance = background_scroll_distance(top, 64, 1.0)
+            .expect("the exact power-of-two scroll distance must be admitted");
+        assert_eq!(distance, 2.0_f64.powi(68));
+        assert_eq!(
+            prepare_background_repeat_axis(
+                0.0,
+                0.0,
+                1.0,
+                BackgroundRepeat::Mirror,
+                distance,
+            )
+            .expect("mirror parity does not require materializing the tile count"),
+            (0.0, false),
+        );
+    }
+
+    #[test]
+    fn background_scroll_distance_enforces_the_exact_product_significand_budget() {
+        assert_eq!(
+            background_scroll_distance(16_777_217, 1, 1.25),
+            Some(20_971_521.25),
+        );
+        assert_eq!(background_scroll_distance(1, 1, f32::NAN), None);
+        assert_eq!(background_scroll_distance(1, 0, 1.0), None);
+        assert_eq!(
+            background_scroll_distance(536_870_912, 1, 1.0),
+            Some(536_870_912.0),
+        );
+        assert_eq!(
+            background_scroll_distance(536_870_913, 1, 1.0),
+            Some(536_870_913.0),
+            "a factor with a one-bit significand must not impose a false 2^29 ceiling",
+        );
+        assert_eq!(
+            background_scroll_distance(-536_870_913, 1, 1.0),
+            Some(-536_870_913.0),
+            "the exactness proof is sign-symmetric",
+        );
+
+        if let Ok(large_power_of_two) = isize::try_from(1_i64 << 62) {
+            assert_eq!(
+                background_scroll_distance(large_power_of_two, 1, 0.5),
+                Some((1_u64 << 61) as f64),
+                "large exponents remain exact when the odd significand is one bit",
+            );
+        }
+
+        if let Ok(first_inexact_isize) = isize::try_from(9_007_199_254_740_993_i64) {
+            assert_eq!(
+                background_scroll_distance(first_inexact_isize, 1, 0.5),
+                None,
+                "a small power-of-two factor cannot recover a lost 54th significand bit",
+            );
+        }
+
+        if let Ok(rounding_product) = isize::try_from(4_503_599_627_370_497_i64) {
+            assert_eq!(
+                background_scroll_distance(rounding_product, 1, 1.5),
+                None,
+                "two exact operands whose product needs 54 bits must fail closed",
+            );
+        }
+
+        if let Ok(top) = isize::try_from(9_007_199_254_740_991_i64) {
+            let distance = background_scroll_distance(top, 2, 1.0)
+                .expect("the 53-bit odd significand and trailing factor remain exact");
+            assert_eq!(distance, 18_014_398_509_481_982.0);
+            let prepared = prepare_background_repeat_axis(
+                0.0,
+                0.0,
+                4.0,
+                BackgroundRepeat::Repeat,
+                distance,
+            )
+            .ok();
+            assert_eq!(
+                prepared,
+                Some((-2.0, true)),
+                "exact large row products retain their two-pixel phase and odd parity",
+            );
+        }
     }
 
     #[test]

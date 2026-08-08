@@ -200,10 +200,15 @@ fn image_padding_fits_cell(
     cell_width: isize,
     cell_height: isize,
 ) -> bool {
+    let (Ok(cell_width), Ok(cell_height)) =
+        (u64::try_from(cell_width), u64::try_from(cell_height))
+    else {
+        return false;
+    };
     cell_width > 0
         && cell_height > 0
-        && isize::from(left) + isize::from(right) < cell_width
-        && isize::from(top) + isize::from(bottom) < cell_height
+        && u64::from(left) + u64::from(right) < cell_width
+        && u64::from(top) + u64::from(bottom) < cell_height
 }
 
 #[inline]
@@ -1051,7 +1056,7 @@ impl crate::TermWindow {
     }
 
     pub fn recreate_texture_atlas(&mut self, size: Option<usize>) -> anyhow::Result<()> {
-        self.shape_generation += 1;
+        self.advance_texture_atlas_shape_generation();
         // Do NOT clear `shape_cache` here: the cached HarfBuzz output is
         // atlas-invariant. The `shape_generation` bump makes each surviving
         // entry re-resolve its glyph sprites (cheap) on next access instead of
@@ -1059,7 +1064,6 @@ impl crate::TermWindow {
         // generation-keyed line_to_ele / line_quad caches. This removes the
         // full-screen re-shape that every atlas overflow used to trigger — the
         // root cause of the progressive GUI slowdown.
-        self.line_to_ele_shape_cache.borrow_mut().clear();
         if let Some(render_state) = self.render_state.as_mut() {
             render_state.recreate_texture_atlas(&self.fonts, &self.render_metrics, size)?;
         }
@@ -1256,6 +1260,16 @@ mod tests {
     fn image_padding_accepts_the_largest_non_empty_cell_interior() {
         assert!(image_padding_fits_cell((4, 3, 5, 6), 10, 10));
         assert!(image_padding_fits_cell((0, 0, 0, 0), 1, 1));
+        assert!(image_padding_fits_cell(
+            (u16::MAX, u16::MAX, u16::MAX, u16::MAX),
+            131_071,
+            131_071,
+        ));
+        assert!(!image_padding_fits_cell(
+            (u16::MAX, u16::MAX, u16::MAX, u16::MAX),
+            131_070,
+            131_070,
+        ));
     }
 
     #[test]

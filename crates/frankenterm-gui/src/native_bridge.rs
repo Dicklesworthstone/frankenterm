@@ -135,6 +135,26 @@ impl BridgeQueueOutcome {
     }
 }
 
+#[inline]
+fn saturating_increment(counter: &AtomicU64) -> u64 {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(1);
+        if next == current {
+            return current;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(previous) => return previous,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 fn enqueue_bridge_event(
     tx: &std_mpsc::SyncSender<BridgeEvent>,
     event: BridgeEvent,
@@ -143,13 +163,7 @@ fn enqueue_bridge_event(
     match tx.try_send(event) {
         Ok(()) => BridgeQueueOutcome::Queued,
         Err(std_mpsc::TrySendError::Full(_)) => {
-            let previous = match BRIDGE_QUEUE_FULL_DROPS.try_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |count| Some(count.saturating_add(1)),
-            ) {
-                Ok(previous) | Err(previous) => previous,
-            };
+            let previous = saturating_increment(&BRIDGE_QUEUE_FULL_DROPS);
             let drop_count = previous.saturating_add(1);
             // Pane-output storms must not turn a bounded data queue into an
             // unbounded warning stream. Powers-of-two sampling stays visible
@@ -185,13 +199,7 @@ fn bridge_text_field_allowed(
         return true;
     }
 
-    let previous = match BRIDGE_OVERSIZED_FIELD_DROPS.try_update(
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-        |count| Some(count.saturating_add(1)),
-    ) {
-        Ok(previous) | Err(previous) => previous,
-    };
+    let previous = saturating_increment(&BRIDGE_OVERSIZED_FIELD_DROPS);
     let drop_count = previous.saturating_add(1);
     if drop_count.is_power_of_two() {
         log::warn!(
@@ -770,6 +778,19 @@ mod tests {
             enqueue_bridge_event(&tx, test_destroyed_event(3)),
             BridgeQueueOutcome::Closed
         );
+    }
+
+    #[test]
+    fn bridge_counter_increment_is_exact_and_saturates_without_wrapping() {
+        let counter = AtomicU64::new(0);
+        assert_eq!(saturating_increment(&counter), 0);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        counter.store(u64::MAX - 1, Ordering::Relaxed);
+        assert_eq!(saturating_increment(&counter), u64::MAX - 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(saturating_increment(&counter), u64::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]

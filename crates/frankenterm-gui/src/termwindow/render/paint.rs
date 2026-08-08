@@ -152,9 +152,7 @@ impl crate::TermWindow {
                         } else if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
                             self.invalidate_fancy_tab_bar();
                             self.invalidate_modal();
-                            self.shape_generation += 1;
-                            self.shape_cache.borrow_mut().clear();
-                            self.line_to_ele_shape_cache.borrow_mut().clear();
+                            self.advance_shaping_input_generation();
                         } else {
                             break 'pass Err(err.context("paint_pass"));
                         }

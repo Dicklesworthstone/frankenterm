@@ -2557,7 +2557,7 @@ impl TermWindow {
         if focused {
             self.note_render_surface_recovery_signal();
         }
-        self.quad_generation += 1;
+        self.advance_quad_generation();
         self.mark_all_panes_dirty_with_source(
             frankenterm_core::dirty_line_telemetry::DirtyEventSource::FocusChange,
         );
