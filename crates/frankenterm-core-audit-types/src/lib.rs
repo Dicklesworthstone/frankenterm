@@ -32,9 +32,11 @@
 //! The crate remains leaf-oriented: it has no dependency on
 //! `frankenterm-core` or its operational runtime/storage clusters. Its live
 //! manifest contains `serde`, `serde_json`, `tracing`, and one leaf-to-leaf
-//! edge to `frankenterm-core-replay-types`; keeping that boundary explicit is
-//! what makes these DTOs safe to lift without a parallel API redesign in their
-//! callers.
+//! edge to `frankenterm-core-replay-types`. The product-catalog lineage
+//! verifier additionally uses leaf crypto primitives (`sha2` and
+//! `ed25519-dalek`) without file, process, network, or runtime dependencies.
+//! Keeping that boundary explicit is what makes these DTOs safe to lift
+//! without a parallel API redesign in their callers.
 //!
 //! ## What stays in `frankenterm-core` (for now)
 //!

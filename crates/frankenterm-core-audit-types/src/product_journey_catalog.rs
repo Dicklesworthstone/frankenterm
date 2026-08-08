@@ -7,14 +7,18 @@
 //! support claim.
 //!
 //! This module is leaf-clean: it performs no file I/O and depends only on
-//! `serde`, `serde_json`, and `std`. Repository-path and Beads existence checks
-//! belong in the integration test that loads the checked-in catalog.
+//! serialization, SHA-256, Ed25519 verification, and `std`. Repository-path,
+//! retained-snapshot resolution, and Beads existence checks belong in the
+//! integration test or offline-verifier caller.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::fmt::Write as _;
 
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// The only contract identifier accepted by schema version 1.
 pub const PRODUCT_JOURNEY_CONTRACT_ID: &str = "ft.product_journey_catalog.v1";
@@ -26,8 +30,72 @@ pub const PRODUCT_JOURNEY_SCHEMA_VERSION: u32 = 1;
 pub const PRODUCT_JOURNEY_SOURCE_BEAD_ID: &str =
     "ft-interactive-swarm-product-convergence-7xqz4.1.1";
 
+/// Content-addressed lineage envelope accepted by the offline verifier.
+pub const PRODUCT_JOURNEY_LINEAGE_CONTRACT_ID: &str = "ft.product_journey_lineage.v1";
+
+/// Version of the content-addressed lineage envelope.
+pub const PRODUCT_JOURNEY_LINEAGE_SCHEMA_VERSION: u32 = 1;
+
+/// Versioned projection used before hashing a lineage record.
+pub const PRODUCT_JOURNEY_LINEAGE_PROJECTION: &str =
+    "ft.product_journey_lineage.record_projection.v1";
+
+/// Domain separator for canonical lineage-record SHA-256 digests.
+pub const PRODUCT_JOURNEY_LINEAGE_DIGEST_DOMAIN: &str =
+    "frankenterm.product-journey.lineage-record.sha256.v1";
+
+/// Domain separator for detached Ed25519 signatures over record digests.
+pub const PRODUCT_JOURNEY_LINEAGE_SIGNATURE_DOMAIN: &str =
+    "frankenterm.product-journey.lineage-record.ed25519.v1";
+
+/// Identifier for the verifier-pinned lineage trust policy.
+pub const PRODUCT_JOURNEY_LINEAGE_TRUST_POLICY_ID: &str = "ft.product_journey_lineage.trust.v1";
+
+/// Verifier-pinned repository lineage root key identifier.
+pub const PRODUCT_JOURNEY_LINEAGE_ROOT_KEY_ID: &str =
+    "ft.product-journey-lineage.repository-root.2026-08";
+
+/// Verifier-pinned raw Ed25519 public key for lineage trust policy v1.
+pub const PRODUCT_JOURNEY_LINEAGE_ROOT_PUBLIC_KEY_HEX: &str =
+    "bccd8e321f07a395b30d9f80e54e40e72d8b4a221e6bc01d520341dab0ffd977";
+
+/// Revision 1 never had retained bytes and must never acquire an identity.
+pub const PRODUCT_JOURNEY_UNRETAINED_REVISION: &str = "2026-07-27.1";
+
+/// Revision 2 is the first retained product-catalog artifact.
+pub const PRODUCT_JOURNEY_GENESIS_REVISION: &str = "2026-07-27.2";
+
+/// Exact Git commit containing the revision-2 genesis catalog.
+pub const PRODUCT_JOURNEY_GENESIS_COMMIT: &str = "32d72991856a9b00d55086ca07384dc082b8a3fc";
+
+/// Exact Git tree containing the revision-2 genesis catalog.
+pub const PRODUCT_JOURNEY_GENESIS_TREE: &str = "9e02a16588e6a3e63f2655bc1fa6f6a5bce70b01";
+
+/// Exact parent of the revision-2 genesis commit.
+pub const PRODUCT_JOURNEY_GENESIS_PARENT: &str = "524d1e76e44167bd39440ab56e8d0d3556f451e3";
+
+/// Exact Git blob containing the revision-2 genesis catalog bytes.
+pub const PRODUCT_JOURNEY_GENESIS_BLOB: &str = "0605d08fed53cb3c0f45b277bb7d71021ffcf6f3";
+
+/// SHA-256 of the exact raw revision-2 catalog bytes.
+pub const PRODUCT_JOURNEY_GENESIS_RAW_SHA256: &str =
+    "ee8c6b9c64d3530c428a6230a5661e21682b49ee1d1599f29043d43871241262";
+
+/// Exact head revision pinned by lineage verifier v1.
+pub const PRODUCT_JOURNEY_LINEAGE_CURRENT_REVISION: &str = "2026-07-27.3";
+
+/// Canonical record digest of the exact v1 head, preventing tail truncation.
+pub const PRODUCT_JOURNEY_LINEAGE_CURRENT_RECORD_SHA256: &str =
+    "381cfaa037e3b3e85a71eee0b3273eabbca8da3d1d345a2ef41c78afe5a89b9c";
+
+/// Revision 1's only truthful status explanation.
+pub const PRODUCT_JOURNEY_UNRETAINED_REASON: &str = "No revision-1 catalog bytes, Git object, content digest, or signature were retained; this row records an uncommitted draft label only.";
+
 /// Maximum raw JSON document accepted by the bounded decoder.
 pub const MAX_PRODUCT_JOURNEY_CATALOG_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum raw lineage manifest accepted by the bounded decoder.
+pub const MAX_PRODUCT_JOURNEY_LINEAGE_BYTES: usize = 256 * 1024;
 
 /// Number of required product-journey coverage cells.
 pub const REQUIRED_COVERAGE_CELL_COUNT: usize = 32;
@@ -820,6 +888,147 @@ pub struct ChangeRecord {
     pub source_refs: Vec<String>,
 }
 
+/// Retention role of one declared catalog revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogRevisionRetention {
+    /// A label survived, but no bytes or content identity did.
+    UnretainedUncommittedDraft,
+    /// The first retained artifact and trust-chain root.
+    RetainedGenesis,
+    /// A retained artifact bound to its exact predecessor.
+    RetainedSuccessor,
+}
+
+/// Whether Git itself carried a verified signature for a retained commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogGitCommitSignature {
+    /// The historical commit was not signed.
+    Unsigned,
+}
+
+/// Immutable content and source-control identity for one catalog snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogSnapshotReceipt {
+    /// Catalog revision encoded by the referenced bytes.
+    pub catalog_revision: String,
+    /// Content-addressed resolver key for the exact raw bytes.
+    pub snapshot_ref: String,
+    /// Lowercase SHA-256 of the exact raw snapshot bytes.
+    pub raw_sha256: String,
+    /// Exact forty-hex Git commit retaining the bytes.
+    pub git_commit: String,
+    /// Exact forty-hex root tree of `git_commit`.
+    pub git_tree: String,
+    /// Exact forty-hex first parent of `git_commit`.
+    pub git_parent: String,
+    /// Exact forty-hex Git blob containing the raw snapshot bytes.
+    pub catalog_blob: String,
+    /// Historical Git commit-signature state, distinct from the lineage signature.
+    pub git_commit_signature: CatalogGitCommitSignature,
+}
+
+/// Key authorized to sign a later retained lineage record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogLineageDelegatedKey {
+    /// Stable key identifier pinned by the verifier trust policy.
+    pub key_id: String,
+}
+
+/// Explicit successor-signer policy authenticated by the current record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogLineageDelegation {
+    /// Non-empty exact set of keys allowed to sign the next retained record.
+    pub authorized_successor_keys: Vec<CatalogLineageDelegatedKey>,
+}
+
+/// One catalog revision in the content-addressed lineage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogLineageRecord {
+    /// Exact catalog revision governed by this record.
+    pub catalog_revision: String,
+    /// Whether this revision has bytes and where it sits in the chain.
+    pub retention: CatalogRevisionRetention,
+    /// Exact current snapshot for retained revisions; absent for revision 1.
+    pub snapshot: Option<CatalogSnapshotReceipt>,
+    /// Exact prior retained snapshot for successors only.
+    pub predecessor_snapshot: Option<CatalogSnapshotReceipt>,
+    /// Unretained predecessor label acknowledged by the genesis record.
+    pub unretained_predecessor_revision: Option<String>,
+    /// Truthful explanation for a revision with no retained bytes.
+    pub no_data_reason: Option<String>,
+    /// Key that signed this retained record.
+    pub signer_key_id: Option<String>,
+    /// Successor-signer policy authenticated by this retained record.
+    pub delegation: Option<CatalogLineageDelegation>,
+    /// SHA-256 of the versioned canonical projection, excluding this field and signature.
+    pub canonical_record_sha256: Option<String>,
+    /// Detached Ed25519 signature over the domain-separated canonical digest.
+    pub signature_ed25519_hex: Option<String>,
+}
+
+/// Content-addressed, signed lineage envelope for the product catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductJourneyLineageManifest {
+    /// Contract identifier; must equal [`PRODUCT_JOURNEY_LINEAGE_CONTRACT_ID`].
+    pub contract_id: String,
+    /// Schema version; must equal [`PRODUCT_JOURNEY_LINEAGE_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// Canonical record projection identifier.
+    pub canonical_projection: String,
+    /// Canonical record digest domain.
+    pub digest_domain: String,
+    /// Detached signature domain.
+    pub signature_domain: String,
+    /// Verifier-pinned key/delegation policy identifier.
+    pub trust_policy_id: String,
+    /// Current catalog revision; must equal the last retained record.
+    pub current_catalog_revision: String,
+    /// Ordered complete history, including the explicit revision-1 NO-DATA row.
+    pub records: Vec<CatalogLineageRecord>,
+}
+
+/// One verifier-pinned Ed25519 public key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalogLineageTrustedKey {
+    /// Stable identifier referenced by records and delegations.
+    key_id: String,
+    /// Lowercase hex encoding of the exact 32-byte Ed25519 public key.
+    public_key_hex: String,
+    /// Whether this key may sign the genesis record.
+    genesis_authority: bool,
+}
+
+/// Trust roots compiled into the offline lineage verifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalogLineageTrustPolicy {
+    /// Identifier bound by the manifest.
+    policy_id: String,
+    /// Closed set of trusted lineage-signing keys.
+    keys: Vec<CatalogLineageTrustedKey>,
+}
+
+impl CatalogLineageTrustPolicy {
+    /// Exact trust roots compiled into the v1 offline verifier.
+    #[must_use]
+    fn pinned_v1() -> Self {
+        Self {
+            policy_id: PRODUCT_JOURNEY_LINEAGE_TRUST_POLICY_ID.to_string(),
+            keys: vec![CatalogLineageTrustedKey {
+                key_id: PRODUCT_JOURNEY_LINEAGE_ROOT_KEY_ID.to_string(),
+                public_key_hex: PRODUCT_JOURNEY_LINEAGE_ROOT_PUBLIC_KEY_HEX.to_string(),
+                genesis_authority: true,
+            }],
+        }
+    }
+}
+
 /// Complete versioned product-journey catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -985,6 +1194,779 @@ pub fn decode_product_journey_catalog(
             detail: error.to_string(),
         })?;
     Ok(catalog)
+}
+
+/// Stable bounded-decoder failure for a lineage manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProductJourneyLineageDecodeError {
+    /// Raw bytes exceed the lineage-manifest limit.
+    PayloadTooLarge {
+        /// Observed byte count.
+        actual_bytes: usize,
+        /// Configured maximum byte count.
+        max_bytes: usize,
+    },
+    /// Serde rejected malformed JSON, a duplicate, an unknown field, or a wrong type.
+    InvalidJson {
+        /// Parser diagnostic.
+        detail: String,
+    },
+    /// A valid first value was followed by non-whitespace data.
+    TrailingData {
+        /// Parser diagnostic.
+        detail: String,
+    },
+}
+
+impl fmt::Display for ProductJourneyLineageDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PayloadTooLarge {
+                actual_bytes,
+                max_bytes,
+            } => write!(
+                formatter,
+                "product journey lineage is {actual_bytes} bytes (maximum {max_bytes})"
+            ),
+            Self::InvalidJson { detail } | Self::TrailingData { detail } => {
+                formatter.write_str(detail)
+            }
+        }
+    }
+}
+
+impl Error for ProductJourneyLineageDecodeError {}
+
+impl ProductJourneyLineageManifest {
+    /// Decode one bounded, closed-shape lineage manifest.
+    pub fn decode_json_bounded(raw: &[u8]) -> Result<Self, ProductJourneyLineageDecodeError> {
+        if raw.len() > MAX_PRODUCT_JOURNEY_LINEAGE_BYTES {
+            return Err(ProductJourneyLineageDecodeError::PayloadTooLarge {
+                actual_bytes: raw.len(),
+                max_bytes: MAX_PRODUCT_JOURNEY_LINEAGE_BYTES,
+            });
+        }
+        let mut decoder = serde_json::Deserializer::from_slice(raw);
+        let manifest = Self::deserialize(&mut decoder).map_err(|error| {
+            ProductJourneyLineageDecodeError::InvalidJson {
+                detail: error.to_string(),
+            }
+        })?;
+        decoder
+            .end()
+            .map_err(|error| ProductJourneyLineageDecodeError::TrailingData {
+                detail: error.to_string(),
+            })?;
+        Ok(manifest)
+    }
+}
+
+/// Stable fail-closed lineage-verification category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CatalogLineageValidationCode {
+    /// Manifest contract identifier is not implemented.
+    UnknownContract,
+    /// Manifest schema version is not implemented.
+    UnknownSchemaVersion,
+    /// Canonical projection or digest/signature domain drifted.
+    UnknownCanonicalDomain,
+    /// The supplied trust policy is not the policy bound by the manifest.
+    UnknownTrustPolicy,
+    /// The history is missing, duplicated, or out of order.
+    InvalidHistoryOrder,
+    /// Revision 1 attempted to acquire invented bytes or authority.
+    InventedUnretainedHistory,
+    /// Revision 2 is absent or differs from the exact genesis identity.
+    InvalidGenesis,
+    /// A retained snapshot receipt is malformed or copied.
+    InvalidSnapshotIdentity,
+    /// Snapshot bytes required by a receipt were not supplied.
+    MissingSnapshot,
+    /// Snapshot raw bytes disagree with their signed SHA-256.
+    SnapshotDigestMismatch,
+    /// Snapshot bytes do not decode to the receipt's catalog revision.
+    SnapshotCatalogMismatch,
+    /// A successor does not embed the exact prior retained snapshot.
+    PredecessorMismatch,
+    /// The stored canonical digest disagrees with the versioned projection.
+    CanonicalDigestMismatch,
+    /// A retained record has no signer or detached signature.
+    MissingSignature,
+    /// A signer or delegated successor key is absent from the trust policy.
+    UnknownSigner,
+    /// Strict Ed25519 verification failed.
+    InvalidSignature,
+    /// A signer was not authorized by genesis policy or its predecessor.
+    InvalidDelegation,
+}
+
+impl CatalogLineageValidationCode {
+    /// Stable machine-facing code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownContract => "PJC-LINEAGE-CONTRACT-001",
+            Self::UnknownSchemaVersion => "PJC-LINEAGE-SCHEMA-001",
+            Self::UnknownCanonicalDomain => "PJC-LINEAGE-DOMAIN-001",
+            Self::UnknownTrustPolicy => "PJC-LINEAGE-TRUST-001",
+            Self::InvalidHistoryOrder => "PJC-LINEAGE-HISTORY-001",
+            Self::InventedUnretainedHistory => "PJC-LINEAGE-HISTORY-002",
+            Self::InvalidGenesis => "PJC-LINEAGE-GENESIS-001",
+            Self::InvalidSnapshotIdentity => "PJC-LINEAGE-SNAPSHOT-001",
+            Self::MissingSnapshot => "PJC-LINEAGE-SNAPSHOT-002",
+            Self::SnapshotDigestMismatch => "PJC-LINEAGE-SNAPSHOT-003",
+            Self::SnapshotCatalogMismatch => "PJC-LINEAGE-SNAPSHOT-004",
+            Self::PredecessorMismatch => "PJC-LINEAGE-PREDECESSOR-001",
+            Self::CanonicalDigestMismatch => "PJC-LINEAGE-DIGEST-001",
+            Self::MissingSignature => "PJC-LINEAGE-SIGNATURE-001",
+            Self::UnknownSigner => "PJC-LINEAGE-SIGNATURE-002",
+            Self::InvalidSignature => "PJC-LINEAGE-SIGNATURE-003",
+            Self::InvalidDelegation => "PJC-LINEAGE-DELEGATION-001",
+        }
+    }
+}
+
+/// One deterministic lineage-verification failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogLineageValidationError {
+    /// Stable error category.
+    pub code: CatalogLineageValidationCode,
+    /// JSON-style location of the failing field.
+    pub path: String,
+    /// Human-readable diagnostic.
+    pub detail: String,
+}
+
+/// Aggregate offline verification report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogLineageValidationReport {
+    /// True only when every structural, content, signature, and delegation check passed.
+    pub valid: bool,
+    /// Deterministically ordered verification errors.
+    pub errors: Vec<CatalogLineageValidationError>,
+}
+
+impl CatalogLineageValidationReport {
+    /// Whether this report contains a particular stable category.
+    #[must_use]
+    pub fn contains_code(&self, code: CatalogLineageValidationCode) -> bool {
+        self.errors.iter().any(|error| error.code == code)
+    }
+}
+
+#[derive(Serialize)]
+struct CatalogLineageRecordProjection<'a> {
+    projection: &'static str,
+    catalog_revision: &'a str,
+    retention: CatalogRevisionRetention,
+    snapshot: &'a Option<CatalogSnapshotReceipt>,
+    predecessor_snapshot: &'a Option<CatalogSnapshotReceipt>,
+    unretained_predecessor_revision: &'a Option<String>,
+    no_data_reason: &'a Option<String>,
+    signer_key_id: &'a Option<String>,
+    delegation: &'a Option<CatalogLineageDelegation>,
+}
+
+/// Compute the canonical, domain-separated SHA-256 for one lineage record.
+///
+/// The projection deliberately omits `canonical_record_sha256` and
+/// `signature_ed25519_hex`, so neither digest nor signature is self-referential.
+pub fn product_journey_lineage_record_digest(
+    record: &CatalogLineageRecord,
+) -> Result<[u8; 32], serde_json::Error> {
+    let projection = CatalogLineageRecordProjection {
+        projection: PRODUCT_JOURNEY_LINEAGE_PROJECTION,
+        catalog_revision: &record.catalog_revision,
+        retention: record.retention,
+        snapshot: &record.snapshot,
+        predecessor_snapshot: &record.predecessor_snapshot,
+        unretained_predecessor_revision: &record.unretained_predecessor_revision,
+        no_data_reason: &record.no_data_reason,
+        signer_key_id: &record.signer_key_id,
+        delegation: &record.delegation,
+    };
+    let canonical = serde_json::to_vec(&projection)?;
+    let mut hasher = Sha256::new();
+    hasher.update(PRODUCT_JOURNEY_LINEAGE_DIGEST_DOMAIN.as_bytes());
+    hasher.update([0]);
+    hasher.update(canonical);
+    Ok(hasher.finalize().into())
+}
+
+/// Construct the exact domain-separated bytes covered by Ed25519.
+pub fn product_journey_lineage_signature_message(
+    record: &CatalogLineageRecord,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let digest = product_journey_lineage_record_digest(record)?;
+    let mut message = Vec::with_capacity(PRODUCT_JOURNEY_LINEAGE_SIGNATURE_DOMAIN.len() + 33);
+    message.extend_from_slice(PRODUCT_JOURNEY_LINEAGE_SIGNATURE_DOMAIN.as_bytes());
+    message.push(0);
+    message.extend_from_slice(&digest);
+    Ok(message)
+}
+
+fn bytes_to_lower_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+fn decode_lower_hex_array<const N: usize>(encoded: &str) -> Option<[u8; N]> {
+    if encoded.len() != N.saturating_mul(2)
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let mut decoded = [0_u8; N];
+    for (index, output) in decoded.iter_mut().enumerate() {
+        let start = index.saturating_mul(2);
+        *output = u8::from_str_radix(&encoded[start..start + 2], 16).ok()?;
+    }
+    Some(decoded)
+}
+
+fn is_lower_hex(encoded: &str, expected_len: usize) -> bool {
+    encoded.len() == expected_len
+        && encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn catalog_revision_sort_key(revision: &str) -> Option<(u32, u32, u32, u64)> {
+    let (date, sequence) = revision.rsplit_once('.')?;
+    if sequence.starts_with('0') || sequence.is_empty() {
+        return None;
+    }
+    let mut date_parts = date.split('-');
+    let year_text = date_parts.next()?;
+    let month_text = date_parts.next()?;
+    let day_text = date_parts.next()?;
+    if date_parts.next().is_some()
+        || year_text.len() != 4
+        || month_text.len() != 2
+        || day_text.len() != 2
+        || !year_text.bytes().all(|byte| byte.is_ascii_digit())
+        || !month_text.bytes().all(|byte| byte.is_ascii_digit())
+        || !day_text.bytes().all(|byte| byte.is_ascii_digit())
+        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let year = year_text.parse().ok()?;
+    let month = month_text.parse().ok()?;
+    let day = day_text.parse().ok()?;
+    let sequence = sequence.parse().ok()?;
+    if year == 0
+        || !(1..=12).contains(&month)
+        || !(1..=days_in_gregorian_month(year, month)).contains(&day)
+        || sequence == 0
+    {
+        return None;
+    }
+    Some((year, month, day, sequence))
+}
+
+const fn days_in_gregorian_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_gregorian_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+const fn is_gregorian_leap_year(year: u32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn is_direct_catalog_revision_successor(
+    previous: (u32, u32, u32, u64),
+    current: (u32, u32, u32, u64),
+) -> bool {
+    let previous_date = (previous.0, previous.1, previous.2);
+    let current_date = (current.0, current.1, current.2);
+    if current_date == previous_date {
+        previous
+            .3
+            .checked_add(1)
+            .is_some_and(|expected| current.3 == expected)
+    } else {
+        current_date > previous_date && current.3 == 1
+    }
+}
+
+struct CatalogLineageValidator {
+    errors: Vec<CatalogLineageValidationError>,
+}
+
+impl CatalogLineageValidator {
+    fn error(
+        &mut self,
+        code: CatalogLineageValidationCode,
+        path: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        self.errors.push(CatalogLineageValidationError {
+            code,
+            path: path.into(),
+            detail: detail.into(),
+        });
+    }
+}
+
+fn verify_snapshot_receipt(
+    snapshot: &CatalogSnapshotReceipt,
+    path: &str,
+    supplied_snapshots: &BTreeMap<String, Vec<u8>>,
+    seen_snapshot_refs: &mut BTreeSet<String>,
+    seen_snapshot_digests: &mut BTreeSet<String>,
+    validator: &mut CatalogLineageValidator,
+) {
+    let expected_ref = format!(
+        "docs/design/product-journey-catalog.snapshots/{}.json#sha256={}",
+        snapshot.catalog_revision, snapshot.raw_sha256
+    );
+    if snapshot.snapshot_ref != expected_ref
+        || !is_lower_hex(&snapshot.raw_sha256, 64)
+        || !is_lower_hex(&snapshot.git_commit, 40)
+        || !is_lower_hex(&snapshot.git_tree, 40)
+        || !is_lower_hex(&snapshot.git_parent, 40)
+        || !is_lower_hex(&snapshot.catalog_blob, 40)
+    {
+        validator.error(
+            CatalogLineageValidationCode::InvalidSnapshotIdentity,
+            path,
+            "snapshot reference must bind the retained repository path and raw SHA-256, and every digest must be canonical lowercase hex",
+        );
+    }
+    if !seen_snapshot_refs.insert(snapshot.snapshot_ref.clone())
+        || !seen_snapshot_digests.insert(snapshot.raw_sha256.clone())
+    {
+        validator.error(
+            CatalogLineageValidationCode::InvalidSnapshotIdentity,
+            path,
+            "retained revisions must not copy a snapshot reference or raw digest",
+        );
+    }
+    let Some(raw) = supplied_snapshots.get(&snapshot.snapshot_ref) else {
+        validator.error(
+            CatalogLineageValidationCode::MissingSnapshot,
+            format!("{path}.snapshot_ref"),
+            format!(
+                "snapshot bytes for `{}` were not supplied",
+                snapshot.snapshot_ref
+            ),
+        );
+        return;
+    };
+    if raw.len() > MAX_PRODUCT_JOURNEY_CATALOG_BYTES {
+        validator.error(
+            CatalogLineageValidationCode::SnapshotCatalogMismatch,
+            format!("{path}.snapshot_ref"),
+            format!(
+                "snapshot is {} bytes, exceeding the bounded catalog limit of {} bytes",
+                raw.len(),
+                MAX_PRODUCT_JOURNEY_CATALOG_BYTES
+            ),
+        );
+        return;
+    }
+    let actual_digest = bytes_to_lower_hex(&Sha256::digest(raw));
+    if actual_digest != snapshot.raw_sha256 {
+        validator.error(
+            CatalogLineageValidationCode::SnapshotDigestMismatch,
+            format!("{path}.raw_sha256"),
+            format!(
+                "snapshot bytes hash to `{actual_digest}`, not `{}`",
+                snapshot.raw_sha256
+            ),
+        );
+    }
+    match decode_product_journey_catalog(raw) {
+        Ok(catalog) if catalog.catalog_revision == snapshot.catalog_revision => {}
+        Ok(catalog) => validator.error(
+            CatalogLineageValidationCode::SnapshotCatalogMismatch,
+            format!("{path}.catalog_revision"),
+            format!(
+                "snapshot encodes catalog revision `{}`, not `{}`",
+                catalog.catalog_revision, snapshot.catalog_revision
+            ),
+        ),
+        Err(error) => validator.error(
+            CatalogLineageValidationCode::SnapshotCatalogMismatch,
+            format!("{path}.snapshot_ref"),
+            format!("snapshot is not a bounded product catalog: {error}"),
+        ),
+    }
+}
+
+fn validate_unretained_record(
+    record: &CatalogLineageRecord,
+    path: &str,
+    validator: &mut CatalogLineageValidator,
+) {
+    if record.catalog_revision != PRODUCT_JOURNEY_UNRETAINED_REVISION
+        || record.retention != CatalogRevisionRetention::UnretainedUncommittedDraft
+        || record.snapshot.is_some()
+        || record.predecessor_snapshot.is_some()
+        || record.unretained_predecessor_revision.is_some()
+        || record.no_data_reason.as_deref() != Some(PRODUCT_JOURNEY_UNRETAINED_REASON)
+        || record.signer_key_id.is_some()
+        || record.delegation.is_some()
+        || record.canonical_record_sha256.is_some()
+        || record.signature_ed25519_hex.is_some()
+    {
+        validator.error(
+            CatalogLineageValidationCode::InventedUnretainedHistory,
+            path,
+            "revision 1 must remain an unsigned unretained_uncommitted_draft with NO-DATA identities",
+        );
+    }
+}
+
+fn validate_genesis_snapshot(
+    snapshot: &CatalogSnapshotReceipt,
+    record: &CatalogLineageRecord,
+    path: &str,
+    validator: &mut CatalogLineageValidator,
+) {
+    if record.catalog_revision != PRODUCT_JOURNEY_GENESIS_REVISION
+        || record.retention != CatalogRevisionRetention::RetainedGenesis
+        || record.predecessor_snapshot.is_some()
+        || record.unretained_predecessor_revision.as_deref()
+            != Some(PRODUCT_JOURNEY_UNRETAINED_REVISION)
+        || record.no_data_reason.is_some()
+        || snapshot.catalog_revision != PRODUCT_JOURNEY_GENESIS_REVISION
+        || snapshot.git_commit != PRODUCT_JOURNEY_GENESIS_COMMIT
+        || snapshot.git_tree != PRODUCT_JOURNEY_GENESIS_TREE
+        || snapshot.git_parent != PRODUCT_JOURNEY_GENESIS_PARENT
+        || snapshot.catalog_blob != PRODUCT_JOURNEY_GENESIS_BLOB
+        || snapshot.raw_sha256 != PRODUCT_JOURNEY_GENESIS_RAW_SHA256
+        || snapshot.git_commit_signature != CatalogGitCommitSignature::Unsigned
+    {
+        validator.error(
+            CatalogLineageValidationCode::InvalidGenesis,
+            path,
+            "revision 2 must be the sole genesis and match its exact commit, tree, parent, blob, raw SHA-256, and unsigned Git-commit state",
+        );
+    }
+}
+
+/// Verify a lineage using only supplied immutable snapshot bytes and pinned keys.
+///
+/// No ambient `HEAD`, working-tree file, network service, or wall clock is
+/// consulted. Callers must resolve every `snapshot_ref` to exact retained bytes.
+#[must_use]
+fn verify_product_journey_lineage_with_trust_policy(
+    manifest: &ProductJourneyLineageManifest,
+    supplied_snapshots: &BTreeMap<String, Vec<u8>>,
+    trust_policy: &CatalogLineageTrustPolicy,
+) -> CatalogLineageValidationReport {
+    let mut validator = CatalogLineageValidator { errors: Vec::new() };
+    if manifest.contract_id != PRODUCT_JOURNEY_LINEAGE_CONTRACT_ID {
+        validator.error(
+            CatalogLineageValidationCode::UnknownContract,
+            "contract_id",
+            format!("expected `{PRODUCT_JOURNEY_LINEAGE_CONTRACT_ID}`"),
+        );
+    }
+    if manifest.schema_version != PRODUCT_JOURNEY_LINEAGE_SCHEMA_VERSION {
+        validator.error(
+            CatalogLineageValidationCode::UnknownSchemaVersion,
+            "schema_version",
+            format!("expected {PRODUCT_JOURNEY_LINEAGE_SCHEMA_VERSION}"),
+        );
+    }
+    if manifest.canonical_projection != PRODUCT_JOURNEY_LINEAGE_PROJECTION
+        || manifest.digest_domain != PRODUCT_JOURNEY_LINEAGE_DIGEST_DOMAIN
+        || manifest.signature_domain != PRODUCT_JOURNEY_LINEAGE_SIGNATURE_DOMAIN
+    {
+        validator.error(
+            CatalogLineageValidationCode::UnknownCanonicalDomain,
+            "canonical_projection",
+            "canonical projection and digest/signature domains must match the implemented v1 contract",
+        );
+    }
+    if manifest.trust_policy_id != PRODUCT_JOURNEY_LINEAGE_TRUST_POLICY_ID
+        || trust_policy.policy_id != PRODUCT_JOURNEY_LINEAGE_TRUST_POLICY_ID
+        || trust_policy.policy_id != manifest.trust_policy_id
+    {
+        validator.error(
+            CatalogLineageValidationCode::UnknownTrustPolicy,
+            "trust_policy_id",
+            "manifest and verifier must bind the exact implemented trust policy",
+        );
+    }
+
+    let mut trusted_keys = BTreeMap::new();
+    let mut genesis_keys = BTreeSet::new();
+    for (index, key) in trust_policy.keys.iter().enumerate() {
+        let Some(raw_key) = decode_lower_hex_array::<32>(&key.public_key_hex) else {
+            validator.error(
+                CatalogLineageValidationCode::UnknownSigner,
+                format!("trust_policy.keys[{index}].public_key_hex"),
+                "trusted Ed25519 public key must be exactly 32 lowercase-hex bytes",
+            );
+            continue;
+        };
+        let Ok(verifying_key) = VerifyingKey::from_bytes(&raw_key) else {
+            validator.error(
+                CatalogLineageValidationCode::UnknownSigner,
+                format!("trust_policy.keys[{index}].public_key_hex"),
+                "trusted Ed25519 public key is not a valid compressed point",
+            );
+            continue;
+        };
+        if trusted_keys
+            .insert(key.key_id.clone(), verifying_key)
+            .is_some()
+        {
+            validator.error(
+                CatalogLineageValidationCode::UnknownSigner,
+                format!("trust_policy.keys[{index}].key_id"),
+                format!("duplicate trusted key id `{}`", key.key_id),
+            );
+        }
+        if key.genesis_authority {
+            genesis_keys.insert(key.key_id.clone());
+        }
+    }
+
+    if manifest.records.len() != 3 {
+        validator.error(
+            CatalogLineageValidationCode::InvalidHistoryOrder,
+            "records",
+            "trust-policy v1 requires exactly revision 1 NO-DATA, revision 2 genesis, and revision 3 signed successor",
+        );
+    }
+    let mut seen_revisions = BTreeSet::new();
+    let mut seen_snapshot_refs = BTreeSet::new();
+    let mut seen_snapshot_digests = BTreeSet::new();
+    let mut previous_revision = None;
+    let mut previous_snapshot: Option<&CatalogSnapshotReceipt> = None;
+    let mut authorized_signers = BTreeSet::new();
+
+    for (index, record) in manifest.records.iter().take(3).enumerate() {
+        let path = format!("records[{index}]");
+        let revision_key = catalog_revision_sort_key(&record.catalog_revision);
+        if !seen_revisions.insert(record.catalog_revision.clone())
+            || revision_key.is_none()
+            || previous_revision.is_some_and(|previous| {
+                revision_key
+                    .is_none_or(|current| !is_direct_catalog_revision_successor(previous, current))
+            })
+        {
+            validator.error(
+                CatalogLineageValidationCode::InvalidHistoryOrder,
+                format!("{path}.catalog_revision"),
+                "catalog revisions must be unique, canonical, and contiguous",
+            );
+        }
+        previous_revision = revision_key;
+
+        if index == 0 {
+            validate_unretained_record(record, &path, &mut validator);
+            continue;
+        }
+
+        let Some(snapshot) = record.snapshot.as_ref() else {
+            validator.error(
+                CatalogLineageValidationCode::InvalidSnapshotIdentity,
+                format!("{path}.snapshot"),
+                "every retained revision requires an exact current snapshot",
+            );
+            continue;
+        };
+        if snapshot.catalog_revision != record.catalog_revision {
+            validator.error(
+                CatalogLineageValidationCode::InvalidSnapshotIdentity,
+                format!("{path}.snapshot.catalog_revision"),
+                "record and snapshot catalog revisions must match",
+            );
+        }
+        verify_snapshot_receipt(
+            snapshot,
+            &format!("{path}.snapshot"),
+            supplied_snapshots,
+            &mut seen_snapshot_refs,
+            &mut seen_snapshot_digests,
+            &mut validator,
+        );
+
+        if index == 1 {
+            validate_genesis_snapshot(snapshot, record, &path, &mut validator);
+        } else {
+            if record.retention != CatalogRevisionRetention::RetainedSuccessor
+                || record.unretained_predecessor_revision.is_some()
+                || record.no_data_reason.is_some()
+            {
+                validator.error(
+                    CatalogLineageValidationCode::InvalidHistoryOrder,
+                    &path,
+                    "every post-genesis record must be a retained_successor",
+                );
+            }
+            if record.predecessor_snapshot.as_ref() != previous_snapshot {
+                validator.error(
+                    CatalogLineageValidationCode::PredecessorMismatch,
+                    format!("{path}.predecessor_snapshot"),
+                    "successor must embed the exact immediately preceding retained snapshot receipt",
+                );
+            }
+        }
+
+        let signer_id = record.signer_key_id.as_deref();
+        let digest_hex = record.canonical_record_sha256.as_deref();
+        let signature_hex = record.signature_ed25519_hex.as_deref();
+        let Some((signer_id, digest_hex, signature_hex)) = signer_id
+            .zip(digest_hex)
+            .zip(signature_hex)
+            .map(|((signer_id, digest_hex), signature_hex)| (signer_id, digest_hex, signature_hex))
+        else {
+            validator.error(
+                CatalogLineageValidationCode::MissingSignature,
+                &path,
+                "every retained record requires signer, canonical digest, and detached Ed25519 signature",
+            );
+            previous_snapshot = Some(snapshot);
+            continue;
+        };
+
+        if (index == 1 && !genesis_keys.contains(signer_id))
+            || (index > 1 && !authorized_signers.contains(signer_id))
+        {
+            validator.error(
+                CatalogLineageValidationCode::InvalidDelegation,
+                format!("{path}.signer_key_id"),
+                format!("signer `{signer_id}` is not authorized for this chain position"),
+            );
+        }
+
+        let computed_digest = product_journey_lineage_record_digest(record);
+        match computed_digest {
+            Ok(computed) => {
+                let computed_hex = bytes_to_lower_hex(&computed);
+                if digest_hex != computed_hex {
+                    validator.error(
+                        CatalogLineageValidationCode::CanonicalDigestMismatch,
+                        format!("{path}.canonical_record_sha256"),
+                        format!("canonical digest is `{computed_hex}`, not `{digest_hex}`"),
+                    );
+                }
+                match (
+                    trusted_keys.get(signer_id),
+                    decode_lower_hex_array::<64>(signature_hex),
+                ) {
+                    (Some(verifying_key), Some(signature_bytes)) => {
+                        let mut message =
+                            Vec::with_capacity(PRODUCT_JOURNEY_LINEAGE_SIGNATURE_DOMAIN.len() + 33);
+                        message
+                            .extend_from_slice(PRODUCT_JOURNEY_LINEAGE_SIGNATURE_DOMAIN.as_bytes());
+                        message.push(0);
+                        message.extend_from_slice(&computed);
+                        let signature = Signature::from_bytes(&signature_bytes);
+                        if verifying_key.verify_strict(&message, &signature).is_err() {
+                            validator.error(
+                                CatalogLineageValidationCode::InvalidSignature,
+                                format!("{path}.signature_ed25519_hex"),
+                                "strict Ed25519 verification failed",
+                            );
+                        }
+                    }
+                    (None, _) => validator.error(
+                        CatalogLineageValidationCode::UnknownSigner,
+                        format!("{path}.signer_key_id"),
+                        format!("signer `{signer_id}` is absent from the trust policy"),
+                    ),
+                    (Some(_), None) => validator.error(
+                        CatalogLineageValidationCode::InvalidSignature,
+                        format!("{path}.signature_ed25519_hex"),
+                        "signature must be exactly 64 lowercase-hex bytes",
+                    ),
+                }
+            }
+            Err(error) => validator.error(
+                CatalogLineageValidationCode::CanonicalDigestMismatch,
+                format!("{path}.canonical_record_sha256"),
+                format!("canonical projection could not be encoded: {error}"),
+            ),
+        }
+
+        let Some(delegation) = record.delegation.as_ref() else {
+            validator.error(
+                CatalogLineageValidationCode::InvalidDelegation,
+                format!("{path}.delegation"),
+                "every retained record must authenticate a non-empty successor-key policy",
+            );
+            previous_snapshot = Some(snapshot);
+            continue;
+        };
+        authorized_signers.clear();
+        for (key_index, key) in delegation.authorized_successor_keys.iter().enumerate() {
+            if !trusted_keys.contains_key(&key.key_id) {
+                validator.error(
+                    CatalogLineageValidationCode::UnknownSigner,
+                    format!("{path}.delegation.authorized_successor_keys[{key_index}].key_id"),
+                    format!(
+                        "delegated key `{}` is absent from the trust policy",
+                        key.key_id
+                    ),
+                );
+            }
+            if !authorized_signers.insert(key.key_id.clone()) {
+                validator.error(
+                    CatalogLineageValidationCode::InvalidDelegation,
+                    format!("{path}.delegation.authorized_successor_keys[{key_index}].key_id"),
+                    format!("delegated key `{}` appears more than once", key.key_id),
+                );
+            }
+        }
+        if authorized_signers.is_empty() {
+            validator.error(
+                CatalogLineageValidationCode::InvalidDelegation,
+                format!("{path}.delegation.authorized_successor_keys"),
+                "at least one trusted successor key is required",
+            );
+        }
+        previous_snapshot = Some(snapshot);
+    }
+
+    if manifest.current_catalog_revision != PRODUCT_JOURNEY_LINEAGE_CURRENT_REVISION
+        || manifest.records.last().is_none_or(|record| {
+            record.catalog_revision != manifest.current_catalog_revision
+                || record.canonical_record_sha256.as_deref()
+                    != Some(PRODUCT_JOURNEY_LINEAGE_CURRENT_RECORD_SHA256)
+        })
+    {
+        validator.error(
+            CatalogLineageValidationCode::InvalidHistoryOrder,
+            "current_catalog_revision",
+            "current revision and canonical head digest must equal the verifier-pinned v1 chain head",
+        );
+    }
+
+    CatalogLineageValidationReport {
+        valid: validator.errors.is_empty(),
+        errors: validator.errors,
+    }
+}
+
+/// Verify a lineage against the exact public keys compiled into this verifier.
+#[must_use]
+pub fn verify_product_journey_lineage(
+    manifest: &ProductJourneyLineageManifest,
+    supplied_snapshots: &BTreeMap<String, Vec<u8>>,
+) -> CatalogLineageValidationReport {
+    verify_product_journey_lineage_with_trust_policy(
+        manifest,
+        supplied_snapshots,
+        &CatalogLineageTrustPolicy::pinned_v1(),
+    )
 }
 
 /// Stable semantic validation category.

@@ -1,9 +1,11 @@
 # Product Journey Contract
 
 - Catalog contract ID: `ft.product_journey_catalog.v1`
-- Human companion revision: 2
+- Human companion revision: 3
 - Machine companion: `docs/design/product-journey-catalog.v1.json`
 - Schema: `docs/json-schema/ft-product-journey-catalog.json`
+- Lineage envelope: `docs/design/product-journey-lineage.v1.json`
+- Lineage schema: `docs/json-schema/ft-product-journey-lineage.json`
 - Owning Bead: `ft-interactive-swarm-product-convergence-7xqz4.1.1`
 - Source baseline at initial draft:
   `df4414f5587cccface7edebdee6028ae758f82f8`
@@ -27,7 +29,8 @@ The following authority boundaries are deliberate:
 
 1. `docs/design/product-journey-catalog.v1.json` is authoritative for stable
    identifiers, the 32-cell inventory, current status fields, target posture,
-   cross-references, and machine validation.
+   cross-references, and machine validation only when its exact bytes equal the
+   current signed snapshot in `product-journey-lineage.v1.json`.
 2. This document is authoritative for the meaning of those fields, the
    promotion rules, non-claims, and how humans should interpret the catalog.
 3. Beads are authoritative for work ownership and dependency state. An open or
@@ -796,15 +799,29 @@ pending.
 | `ft.product_journey_catalog.v1` / companion revision 2 | 2026-07-28 | First retained catalog artifact: initial four-persona/two-topology/q002–q200 contract plus authority-shape, identity, and transitional M5 hardening. Its two-slot setup convention was structural only, not typed lifecycle proof. | Automated adversarial review only; human approval pending. |
 | `ft.product_journey_catalog.v1` / companion revision 3 | 2026-07-28 | Negative-evidence correction: rejected all positive evidence and human-review authority in v1, aligned automated commit rules, enabled date-time assertion, corrected local interactive q050 projection, and disclosed the lineage and lifecycle limits. | Automated adversarial provenance review only; human approval pending. |
 
-The current file retains ordered revision and review metadata, but schema v1
-does not prove append-only history. It has no predecessor content hash,
-detached signature, immutable snapshot reference, or verifier. Its validator
-can reject deletion or rewriting of the canonical draft row inside the current
-document; it cannot prove that the revision-1 bytes ever existed. A later
-content-addressed lineage contract must provide that authority.
+The catalog's internal `change_history` remains informational. Append-only
+history authority lives in `product-journey-lineage.v1.json`, whose closed
+shape, retained snapshots, canonical digests, signatures, and delegation are
+verified by `verify_product_journey_lineage`. The verifier takes exact retained
+snapshot bytes keyed by their path-and-SHA-256 references; it never consults
+ambient `HEAD`, the working tree, a network service, or the wall clock.
 
-`7xqz4.1.1.2` owns the canonical digest, retained snapshot, predecessor, and
-signature contract.
+The canonical record projection is
+`ft.product_journey_lineage.record_projection.v1`. It serializes every
+authority-bearing record field in typed struct order but excludes
+`canonical_record_sha256` and `signature_ed25519_hex`, preventing
+self-reference. SHA-256 and Ed25519 use independent versioned domain
+separators. The verifier pins trust-policy v1 and its root public key, requires
+strict Ed25519 verification, and accepts a successor signer only when the
+immediately preceding signed record delegated to that exact trusted key.
+Trust-policy v1 is closed to exactly three records, validates revision labels as
+real Gregorian dates with contiguous per-date sequence numbers, and rejects a
+supplied snapshot before hashing when it exceeds the bounded catalog limit.
+
+Revision 1 remains `unretained_uncommitted_draft`: snapshot, Git, digest,
+signer, delegation, and signature fields are all null. This is deliberate
+negative evidence, not an unsigned retained record. No migration may convert
+its informational reviews or change row into authority.
 
 Revision 2 is the genesis retained artifact. Its exact source-control identity
 is:
@@ -819,11 +836,28 @@ is:
 | Raw catalog SHA-256 | `ee8c6b9c64d3530c428a6230a5661e21682b49ee1d1599f29043d43871241262` |
 | Commit signature | None (`git log --show-signature` reports no signature) |
 
-These values prove only that Git retained the revision-2 bytes. They do not
-constitute a product-owner review, a signed predecessor receipt, or permission
-to manufacture revision-1 identities. Revision 3 is a working correction until
-a later content-addressed lineage record binds its committed bytes. Breaking
-field or semantic changes still require a new schema/contract version.
+The immutable revision-2 snapshot is retained at
+`docs/design/product-journey-catalog.snapshots/2026-07-27.2.json`; revision 3 is
+retained beside it and embeds the complete revision-2 snapshot receipt as its
+predecessor. Their raw SHA-256 values, canonical record digests, and detached
+signatures are bound by the lineage envelope. The current catalog doorway must
+remain byte-identical to the signed revision-3 snapshot.
+
+These lineage signatures establish integrity and ordered repository history
+only. They do not constitute product-owner, visual, accessibility, privacy, or
+support-promotion approval. The historical revision-2 Git commit itself was
+unsigned, and the lineage envelope records that fact rather than upgrading it.
+Any future revision requires a newly retained current snapshot, the exact
+prior snapshot receipt, a valid signer authorized by that predecessor, and a
+new successor-key policy. Breaking catalog fields or semantics still require a
+new catalog schema/contract version.
+
+Trust-policy v1 is a seal for the retained revision-2/revision-3 history, not a
+claim of ongoing private-key custody. Its one-time private root was never
+written to disk or retained. Therefore no later revision may claim usable v1
+self-delegation. `7xqz4.1.1.2.1` blocks future catalog updates on a
+human-authorized, user-controlled trust-policy-v2 key ceremony that explicitly
+imports the pinned v1 head without pretending a seamless v1 signature bridge.
 
 ## Promotion and Update Procedure
 
@@ -878,9 +912,9 @@ Each cell promotes independently:
     historical contract record, not the promotion output.
 12. Update derived README, GUI guide, playbook, attestation, and release-note
     wording only from the later receipt-authorized claim. V1 may append
-    informational review/change metadata, but exact commit and artifact lineage
-    belongs in the later content-addressed contract. Derived prose must never
-    lead authority-bearing catalog data.
+    informational review/change metadata only when the exact new bytes are
+    retained and the signed content-addressed lineage envelope is extended.
+    Derived prose must never lead authority-bearing catalog data.
 
 Any candidate, config, protocol, renderer, display, hardware, route, topology,
 privacy policy, SLO, or supported-agent-version change that can affect a

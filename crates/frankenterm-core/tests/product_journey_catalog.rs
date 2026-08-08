@@ -1,15 +1,17 @@
 //! Contract, schema, reference, and mutation tests for the product-journey catalog.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use frankenterm_core::product_journey_catalog::{
-    ActorMode, CatalogClaimState, CatalogValidationCode, ContradictionStatus, EvidenceState,
-    FleetPoint, FreshnessState, JourneyVariant, MAX_PRODUCT_JOURNEY_CATALOG_BYTES,
+    ActorMode, CatalogClaimState, CatalogLineageValidationCode, CatalogLineageValidationReport,
+    CatalogValidationCode, ContradictionStatus, EvidenceState, FleetPoint, FreshnessState,
+    JourneyVariant, MAX_PRODUCT_JOURNEY_CATALOG_BYTES, MAX_PRODUCT_JOURNEY_LINEAGE_BYTES,
     ProducerCoverage, ProductJourneyCatalog, ProductJourneyDecodeCode,
-    REQUIRED_COVERAGE_CELL_COUNT, ReleaseRequirement, ReviewAuthorityKind, ReviewDisposition,
-    RunVerdict, SupportDeclaration, TargetAvailability, TargetMode, Topology, Transport,
+    ProductJourneyLineageDecodeError, ProductJourneyLineageManifest, REQUIRED_COVERAGE_CELL_COUNT,
+    ReleaseRequirement, ReviewAuthorityKind, ReviewDisposition, RunVerdict, SupportDeclaration,
+    TargetAvailability, TargetMode, Topology, Transport, verify_product_journey_lineage,
 };
 use jsonschema::{Draft, Validator};
 use proptest::prelude::*;
@@ -17,7 +19,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const CATALOG_RELATIVE_PATH: &str = "docs/design/product-journey-catalog.v1.json";
+const LINEAGE_RELATIVE_PATH: &str = "docs/design/product-journey-lineage.v1.json";
 const SCHEMA_RELATIVE_PATH: &str = "docs/json-schema/ft-product-journey-catalog.json";
+const LINEAGE_SCHEMA_RELATIVE_PATH: &str = "docs/json-schema/ft-product-journey-lineage.json";
 const ISSUES_RELATIVE_PATH: &str = ".beads/issues.jsonl";
 
 fn repository_root() -> PathBuf {
@@ -52,6 +56,100 @@ fn load_catalog(root: &Path) -> ProductJourneyCatalog {
             path.display()
         )
     })
+}
+
+fn load_lineage(root: &Path) -> ProductJourneyLineageManifest {
+    let path = root.join(LINEAGE_RELATIVE_PATH);
+    let bytes = fs::read(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    assert!(
+        bytes.len() <= MAX_PRODUCT_JOURNEY_LINEAGE_BYTES,
+        "checked-in lineage exceeds its public bounded-decoder limit"
+    );
+    ProductJourneyLineageManifest::decode_json_bounded(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "lineage {} failed bounded typed decode: {error}",
+            path.display()
+        )
+    })
+}
+
+fn lineage_snapshots(
+    root: &Path,
+    manifest: &ProductJourneyLineageManifest,
+) -> BTreeMap<String, Vec<u8>> {
+    manifest
+        .records
+        .iter()
+        .filter_map(|record| record.snapshot.as_ref())
+        .map(|snapshot| {
+            let (relative_path, fragment) = snapshot
+                .snapshot_ref
+                .split_once('#')
+                .expect("snapshot reference must contain its detached SHA-256 fragment");
+            assert_eq!(
+                fragment,
+                format!("sha256={}", snapshot.raw_sha256),
+                "snapshot reference must bind its declared raw SHA-256"
+            );
+            let relative_path = Path::new(relative_path);
+            assert!(
+                relative_path.is_relative()
+                    && relative_path
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_))),
+                "snapshot resolver refuses absolute paths or non-normal components: {}",
+                relative_path.display()
+            );
+            assert_eq!(
+                relative_path.parent(),
+                Some(Path::new("docs/design/product-journey-catalog.snapshots")),
+                "snapshot resolver is closed to the retained catalog directory"
+            );
+            let expected_file_name = format!("{}.json", snapshot.catalog_revision);
+            assert_eq!(
+                relative_path.file_name().and_then(|name| name.to_str()),
+                Some(expected_file_name.as_str()),
+                "snapshot filename must equal its catalog revision"
+            );
+            let path = root.join(relative_path);
+            let resolved_path = path.canonicalize().unwrap_or_else(|error| {
+                panic!(
+                    "failed to resolve retained snapshot {}: {error}",
+                    path.display()
+                )
+            });
+            assert!(
+                resolved_path.starts_with(root),
+                "snapshot resolver refuses a path escaping the repository: {}",
+                resolved_path.display()
+            );
+            let bytes = fs::read(&resolved_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read retained snapshot {}: {error}",
+                    resolved_path.display()
+                )
+            });
+            (snapshot.snapshot_ref.clone(), bytes)
+        })
+        .collect()
+}
+
+fn assert_lineage_has_code(
+    report: &CatalogLineageValidationReport,
+    code: CatalogLineageValidationCode,
+) {
+    assert!(
+        report.contains_code(code),
+        "expected lineage code {} ({code:?}), got:\n{}",
+        code.as_str(),
+        report
+            .errors
+            .iter()
+            .map(|error| format!("{} {}: {}", error.code.as_str(), error.path, error.detail))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -122,6 +220,16 @@ fn duplicate_scalar_field(
 
 fn load_schema_validator(root: &Path) -> Validator {
     let path = root.join(SCHEMA_RELATIVE_PATH);
+    let schema = read_json(&path);
+    Validator::options()
+        .with_draft(Draft::Draft202012)
+        .should_validate_formats(true)
+        .build(&schema)
+        .unwrap_or_else(|error| panic!("schema {} failed to compile: {error}", path.display()))
+}
+
+fn load_lineage_schema_validator(root: &Path) -> Validator {
+    let path = root.join(LINEAGE_SCHEMA_RELATIVE_PATH);
     let schema = read_json(&path);
     Validator::options()
         .with_draft(Draft::Draft202012)
@@ -608,6 +716,306 @@ fn bounded_decoder_rejects_duplicate_claim_id_for_every_variant_and_key_order() 
             );
         }
     }
+}
+
+#[test]
+fn checked_in_lineage_verifies_exact_retained_snapshots_offline() {
+    let root = repository_root();
+    let manifest = load_lineage(&root);
+    let lineage_value = read_json(&root.join(LINEAGE_RELATIVE_PATH));
+    let schema = load_lineage_schema_validator(&root);
+    let schema_failures = schema_errors(&schema, &lineage_value);
+    assert!(
+        schema_failures.is_empty(),
+        "checked-in lineage failed its JSON Schema:\n{}",
+        schema_failures.join("\n")
+    );
+    let snapshots = lineage_snapshots(&root, &manifest);
+    let report = verify_product_journey_lineage(&manifest, &snapshots);
+    assert!(
+        report.valid,
+        "checked-in lineage failed offline verification:\n{}",
+        report
+            .errors
+            .iter()
+            .map(|error| format!("{} {}: {}", error.code.as_str(), error.path, error.detail))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let unretained = &manifest.records[0];
+    assert!(unretained.snapshot.is_none());
+    assert!(unretained.canonical_record_sha256.is_none());
+    assert!(unretained.signature_ed25519_hex.is_none());
+
+    let current_snapshot = manifest
+        .records
+        .last()
+        .and_then(|record| record.snapshot.as_ref())
+        .expect("current lineage record retains a snapshot");
+    let current_snapshot_path = current_snapshot
+        .snapshot_ref
+        .split_once('#')
+        .map_or(current_snapshot.snapshot_ref.as_str(), |(path, _)| path);
+    assert_eq!(
+        fs::read(root.join(CATALOG_RELATIVE_PATH)).expect("current catalog is readable"),
+        fs::read(root.join(current_snapshot_path)).expect("current retained snapshot is readable"),
+        "the mutable catalog doorway must equal its signed retained current snapshot"
+    );
+}
+
+#[test]
+fn lineage_bounded_decoder_rejects_duplicates_unknown_trailing_and_oversized_input() {
+    let root = repository_root();
+    let raw = fs::read(root.join(LINEAGE_RELATIVE_PATH)).expect("lineage fixture is readable");
+
+    for order in [
+        DuplicateFieldOrder::BeforeOriginal,
+        DuplicateFieldOrder::AfterOriginal,
+    ] {
+        let duplicate = duplicate_scalar_field(&raw, "schema_version", 0, "1", order);
+        assert!(matches!(
+            ProductJourneyLineageManifest::decode_json_bounded(&duplicate),
+            Err(ProductJourneyLineageDecodeError::InvalidJson { .. })
+        ));
+    }
+
+    let mut unknown = serde_json::from_slice::<Value>(&raw).expect("lineage fixture is JSON");
+    unknown["ambient_head"] = json!("must-not-be-consulted");
+    assert!(matches!(
+        ProductJourneyLineageManifest::decode_json_bounded(
+            &serde_json::to_vec(&unknown).expect("unknown-field mutation encodes")
+        ),
+        Err(ProductJourneyLineageDecodeError::InvalidJson { .. })
+    ));
+
+    let mut trailing = raw;
+    trailing.extend_from_slice(b"\n{}\n");
+    assert!(matches!(
+        ProductJourneyLineageManifest::decode_json_bounded(&trailing),
+        Err(ProductJourneyLineageDecodeError::TrailingData { .. })
+    ));
+
+    let oversized = vec![b' '; MAX_PRODUCT_JOURNEY_LINEAGE_BYTES + 1];
+    assert!(matches!(
+        ProductJourneyLineageManifest::decode_json_bounded(&oversized),
+        Err(ProductJourneyLineageDecodeError::PayloadTooLarge { .. })
+    ));
+}
+
+#[test]
+fn lineage_rejects_modified_reordered_missing_and_copied_history() {
+    let root = repository_root();
+    let manifest = load_lineage(&root);
+    let snapshots = lineage_snapshots(&root, &manifest);
+
+    let mut modified_snapshots = snapshots.clone();
+    let genesis_ref = manifest.records[1]
+        .snapshot
+        .as_ref()
+        .expect("genesis snapshot exists")
+        .snapshot_ref
+        .clone();
+    modified_snapshots
+        .get_mut(&genesis_ref)
+        .expect("genesis bytes are supplied")
+        .push(b'\n');
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&manifest, &modified_snapshots),
+        CatalogLineageValidationCode::SnapshotDigestMismatch,
+    );
+
+    let mut reordered = manifest.clone();
+    reordered.records.swap(1, 2);
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&reordered, &snapshots),
+        CatalogLineageValidationCode::InvalidHistoryOrder,
+    );
+
+    let mut missing = manifest.clone();
+    missing.records.remove(1);
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&missing, &snapshots),
+        CatalogLineageValidationCode::InvalidGenesis,
+    );
+
+    let mut truncated_tail = manifest.clone();
+    truncated_tail.records.pop();
+    truncated_tail.current_catalog_revision = "2026-07-27.2".to_string();
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&truncated_tail, &snapshots),
+        CatalogLineageValidationCode::InvalidHistoryOrder,
+    );
+
+    let mut invented_tail = manifest.clone();
+    invented_tail.records.push(
+        invented_tail
+            .records
+            .last()
+            .expect("lineage has a current record")
+            .clone(),
+    );
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&invented_tail, &snapshots),
+        CatalogLineageValidationCode::InvalidHistoryOrder,
+    );
+
+    let mut impossible_date = manifest.clone();
+    impossible_date.records[0].catalog_revision = "2026-02-31.1".to_string();
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&impossible_date, &snapshots),
+        CatalogLineageValidationCode::InvalidHistoryOrder,
+    );
+
+    let mut copied = manifest.clone();
+    let copied_genesis_snapshot = copied.records[1].snapshot.clone();
+    copied.records[2].snapshot = copied_genesis_snapshot;
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&copied, &snapshots),
+        CatalogLineageValidationCode::InvalidSnapshotIdentity,
+    );
+
+    let mut missing_snapshot = snapshots;
+    missing_snapshot.remove(&genesis_ref);
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&manifest, &missing_snapshot),
+        CatalogLineageValidationCode::MissingSnapshot,
+    );
+
+    let mut oversized_snapshot = lineage_snapshots(&root, &manifest);
+    oversized_snapshot.insert(
+        genesis_ref,
+        vec![b' '; MAX_PRODUCT_JOURNEY_CATALOG_BYTES + 1],
+    );
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&manifest, &oversized_snapshot),
+        CatalogLineageValidationCode::SnapshotCatalogMismatch,
+    );
+}
+
+#[test]
+fn lineage_rejects_wrong_git_identity_unsigned_or_invented_predecessors() {
+    let root = repository_root();
+    let manifest = load_lineage(&root);
+    let snapshots = lineage_snapshots(&root, &manifest);
+
+    let mut wrong_commit = manifest.clone();
+    wrong_commit.records[1]
+        .snapshot
+        .as_mut()
+        .expect("genesis snapshot exists")
+        .git_commit = "0".repeat(40);
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&wrong_commit, &snapshots),
+        CatalogLineageValidationCode::InvalidGenesis,
+    );
+
+    let mut wrong_parent = manifest.clone();
+    wrong_parent.records[1]
+        .snapshot
+        .as_mut()
+        .expect("genesis snapshot exists")
+        .git_parent = "0".repeat(40);
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&wrong_parent, &snapshots),
+        CatalogLineageValidationCode::InvalidGenesis,
+    );
+
+    let mut wrong_successor_commit = manifest.clone();
+    wrong_successor_commit.records[2]
+        .snapshot
+        .as_mut()
+        .expect("successor snapshot exists")
+        .git_commit = "0".repeat(40);
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&wrong_successor_commit, &snapshots),
+        CatalogLineageValidationCode::InvalidSignature,
+    );
+
+    let mut wrong_successor_parent = manifest.clone();
+    wrong_successor_parent.records[2]
+        .snapshot
+        .as_mut()
+        .expect("successor snapshot exists")
+        .git_parent = "0".repeat(40);
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&wrong_successor_parent, &snapshots),
+        CatalogLineageValidationCode::InvalidSignature,
+    );
+
+    let mut unsigned = manifest.clone();
+    unsigned.records[2].signature_ed25519_hex = None;
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&unsigned, &snapshots),
+        CatalogLineageValidationCode::MissingSignature,
+    );
+
+    let mut invented_draft = manifest.clone();
+    let invented_genesis_snapshot = invented_draft.records[1].snapshot.clone();
+    invented_draft.records[0].snapshot = invented_genesis_snapshot;
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&invented_draft, &snapshots),
+        CatalogLineageValidationCode::InventedUnretainedHistory,
+    );
+
+    let mut invented_predecessor = manifest.clone();
+    invented_predecessor.records[2].predecessor_snapshot = None;
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&invented_predecessor, &snapshots),
+        CatalogLineageValidationCode::PredecessorMismatch,
+    );
+}
+
+#[test]
+fn lineage_rejects_digest_signature_and_delegation_tampering() {
+    let root = repository_root();
+    let manifest = load_lineage(&root);
+    let snapshots = lineage_snapshots(&root, &manifest);
+
+    let mut wrong_digest = manifest.clone();
+    wrong_digest.records[2].canonical_record_sha256 = Some("0".repeat(64));
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&wrong_digest, &snapshots),
+        CatalogLineageValidationCode::CanonicalDigestMismatch,
+    );
+
+    let mut wrong_signature = manifest.clone();
+    wrong_signature.records[2].signature_ed25519_hex = Some("0".repeat(128));
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&wrong_signature, &snapshots),
+        CatalogLineageValidationCode::InvalidSignature,
+    );
+
+    let mut missing_delegation = manifest;
+    missing_delegation.records[2].delegation = None;
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&missing_delegation, &snapshots),
+        CatalogLineageValidationCode::InvalidDelegation,
+    );
+
+    let mut unknown_delegated_key = load_lineage(&root);
+    unknown_delegated_key.records[1]
+        .delegation
+        .as_mut()
+        .expect("genesis delegation exists")
+        .authorized_successor_keys[0]
+        .key_id = "ft.product-journey-lineage.untrusted".to_string();
+    let unknown_key_report = verify_product_journey_lineage(&unknown_delegated_key, &snapshots);
+    assert_lineage_has_code(
+        &unknown_key_report,
+        CatalogLineageValidationCode::UnknownSigner,
+    );
+    assert_lineage_has_code(
+        &unknown_key_report,
+        CatalogLineageValidationCode::InvalidDelegation,
+    );
+
+    let mut changed_domain = load_lineage(&root);
+    changed_domain.digest_domain.push_str(".ambient");
+    assert_lineage_has_code(
+        &verify_product_journey_lineage(&changed_domain, &snapshots),
+        CatalogLineageValidationCode::UnknownCanonicalDomain,
+    );
 }
 
 #[test]

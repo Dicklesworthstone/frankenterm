@@ -1,0 +1,86 @@
+{
+  "contract_id": "ft.product_journey_lineage.v1",
+  "schema_version": 1,
+  "canonical_projection": "ft.product_journey_lineage.record_projection.v1",
+  "digest_domain": "frankenterm.product-journey.lineage-record.sha256.v1",
+  "signature_domain": "frankenterm.product-journey.lineage-record.ed25519.v1",
+  "trust_policy_id": "ft.product_journey_lineage.trust.v1",
+  "current_catalog_revision": "2026-07-27.3",
+  "records": [
+    {
+      "catalog_revision": "2026-07-27.1",
+      "retention": "unretained_uncommitted_draft",
+      "snapshot": null,
+      "predecessor_snapshot": null,
+      "unretained_predecessor_revision": null,
+      "no_data_reason": "No revision-1 catalog bytes, Git object, content digest, or signature were retained; this row records an uncommitted draft label only.",
+      "signer_key_id": null,
+      "delegation": null,
+      "canonical_record_sha256": null,
+      "signature_ed25519_hex": null
+    },
+    {
+      "catalog_revision": "2026-07-27.2",
+      "retention": "retained_genesis",
+      "snapshot": {
+        "catalog_revision": "2026-07-27.2",
+        "snapshot_ref": "docs/design/product-journey-catalog.snapshots/2026-07-27.2.json#sha256=ee8c6b9c64d3530c428a6230a5661e21682b49ee1d1599f29043d43871241262",
+        "raw_sha256": "ee8c6b9c64d3530c428a6230a5661e21682b49ee1d1599f29043d43871241262",
+        "git_commit": "32d72991856a9b00d55086ca07384dc082b8a3fc",
+        "git_tree": "9e02a16588e6a3e63f2655bc1fa6f6a5bce70b01",
+        "git_parent": "524d1e76e44167bd39440ab56e8d0d3556f451e3",
+        "catalog_blob": "0605d08fed53cb3c0f45b277bb7d71021ffcf6f3",
+        "git_commit_signature": "unsigned"
+      },
+      "predecessor_snapshot": null,
+      "unretained_predecessor_revision": "2026-07-27.1",
+      "no_data_reason": null,
+      "signer_key_id": "ft.product-journey-lineage.repository-root.2026-08",
+      "delegation": {
+        "authorized_successor_keys": [
+          {
+            "key_id": "ft.product-journey-lineage.repository-root.2026-08"
+          }
+        ]
+      },
+      "canonical_record_sha256": "907197086b599970bacc1ea95d3c0f8cc6d383c20a65da567e00b31585867084",
+      "signature_ed25519_hex": "60e3efb3390dd0c63f119228818ecafb47cdde340d8cf40c13a3b05bb104670fc29892e3cec44eadf2ac7561a3ef8712b4c35283023e4d3e98e0ca3eaeea5602"
+    },
+    {
+      "catalog_revision": "2026-07-27.3",
+      "retention": "retained_successor",
+      "snapshot": {
+        "catalog_revision": "2026-07-27.3",
+        "snapshot_ref": "docs/design/product-journey-catalog.snapshots/2026-07-27.3.json#sha256=dd3b8a2bdd73c369152b291775205bbfc0bc1a0c9d41bf1bd091b53807408a54",
+        "raw_sha256": "dd3b8a2bdd73c369152b291775205bbfc0bc1a0c9d41bf1bd091b53807408a54",
+        "git_commit": "2570dc8119db97fa0aa76e8dee1f69dd1ae59fe0",
+        "git_tree": "51061aeddd0b034bc07f8fe90f770e36fd7e2857",
+        "git_parent": "872b3d0cd7b85801bcd7b8e2821dc19fa23ed407",
+        "catalog_blob": "3171196a12a0db60e44956b210f9605b3b017d00",
+        "git_commit_signature": "unsigned"
+      },
+      "predecessor_snapshot": {
+        "catalog_revision": "2026-07-27.2",
+        "snapshot_ref": "docs/design/product-journey-catalog.snapshots/2026-07-27.2.json#sha256=ee8c6b9c64d3530c428a6230a5661e21682b49ee1d1599f29043d43871241262",
+        "raw_sha256": "ee8c6b9c64d3530c428a6230a5661e21682b49ee1d1599f29043d43871241262",
+        "git_commit": "32d72991856a9b00d55086ca07384dc082b8a3fc",
+        "git_tree": "9e02a16588e6a3e63f2655bc1fa6f6a5bce70b01",
+        "git_parent": "524d1e76e44167bd39440ab56e8d0d3556f451e3",
+        "catalog_blob": "0605d08fed53cb3c0f45b277bb7d71021ffcf6f3",
+        "git_commit_signature": "unsigned"
+      },
+      "unretained_predecessor_revision": null,
+      "no_data_reason": null,
+      "signer_key_id": "ft.product-journey-lineage.repository-root.2026-08",
+      "delegation": {
+        "authorized_successor_keys": [
+          {
+            "key_id": "ft.product-journey-lineage.repository-root.2026-08"
+          }
+        ]
+      },
+      "canonical_record_sha256": "381cfaa037e3b3e85a71eee0b3273eabbca8da3d1d345a2ef41c78afe5a89b9c",
+      "signature_ed25519_hex": "86cbaa6623e8f464ad58c45576d29ec773415195e1b67428aa1ac06d00dd88a62eda5f15a1f6fb923119a178406e401b7c19decc055038ae8bccdf5ab50eb50d"
+    }
+  ]
+}

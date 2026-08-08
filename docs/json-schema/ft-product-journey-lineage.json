@@ -1,0 +1,364 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-product-journey-lineage.json",
+  "title": "FrankenTerm Product Journey Catalog Lineage",
+  "description": "Closed-shape content-addressed history. Semantic equality, snapshot bytes, canonical digests, signatures, and delegation are verified by the Rust offline verifier.",
+  "type": "object",
+  "required": [
+    "contract_id",
+    "schema_version",
+    "canonical_projection",
+    "digest_domain",
+    "signature_domain",
+    "trust_policy_id",
+    "current_catalog_revision",
+    "records"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "contract_id": {
+      "const": "ft.product_journey_lineage.v1"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "canonical_projection": {
+      "const": "ft.product_journey_lineage.record_projection.v1"
+    },
+    "digest_domain": {
+      "const": "frankenterm.product-journey.lineage-record.sha256.v1"
+    },
+    "signature_domain": {
+      "const": "frankenterm.product-journey.lineage-record.ed25519.v1"
+    },
+    "trust_policy_id": {
+      "const": "ft.product_journey_lineage.trust.v1"
+    },
+    "current_catalog_revision": {
+      "$ref": "#/$defs/revision"
+    },
+    "records": {
+      "type": "array",
+      "minItems": 3,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/unretained_revision_1"
+        },
+        {
+          "$ref": "#/$defs/retained_genesis_revision_2"
+        }
+      ],
+      "items": {
+        "$ref": "#/$defs/retained_successor"
+      }
+    }
+  },
+  "$defs": {
+    "revision": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}\\.[1-9][0-9]*$"
+    },
+    "sha1": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "ed25519_signature": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$"
+    },
+    "key_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "snapshot_receipt": {
+      "type": "object",
+      "required": [
+        "catalog_revision",
+        "snapshot_ref",
+        "raw_sha256",
+        "git_commit",
+        "git_tree",
+        "git_parent",
+        "catalog_blob",
+        "git_commit_signature"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "catalog_revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "snapshot_ref": {
+          "type": "string",
+          "pattern": "^docs/design/product-journey-catalog\\.snapshots/[0-9]{4}-[0-9]{2}-[0-9]{2}\\.[1-9][0-9]*\\.json#sha256=[0-9a-f]{64}$"
+        },
+        "raw_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "git_commit": {
+          "$ref": "#/$defs/sha1"
+        },
+        "git_tree": {
+          "$ref": "#/$defs/sha1"
+        },
+        "git_parent": {
+          "$ref": "#/$defs/sha1"
+        },
+        "catalog_blob": {
+          "$ref": "#/$defs/sha1"
+        },
+        "git_commit_signature": {
+          "const": "unsigned"
+        }
+      }
+    },
+    "genesis_snapshot": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/snapshot_receipt"
+        },
+        {
+          "properties": {
+            "catalog_revision": {
+              "const": "2026-07-27.2"
+            },
+            "snapshot_ref": {
+              "const": "docs/design/product-journey-catalog.snapshots/2026-07-27.2.json#sha256=ee8c6b9c64d3530c428a6230a5661e21682b49ee1d1599f29043d43871241262"
+            },
+            "raw_sha256": {
+              "const": "ee8c6b9c64d3530c428a6230a5661e21682b49ee1d1599f29043d43871241262"
+            },
+            "git_commit": {
+              "const": "32d72991856a9b00d55086ca07384dc082b8a3fc"
+            },
+            "git_tree": {
+              "const": "9e02a16588e6a3e63f2655bc1fa6f6a5bce70b01"
+            },
+            "git_parent": {
+              "const": "524d1e76e44167bd39440ab56e8d0d3556f451e3"
+            },
+            "catalog_blob": {
+              "const": "0605d08fed53cb3c0f45b277bb7d71021ffcf6f3"
+            },
+            "git_commit_signature": {
+              "const": "unsigned"
+            }
+          }
+        }
+      ]
+    },
+    "delegated_key": {
+      "type": "object",
+      "required": [
+        "key_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "key_id": {
+          "$ref": "#/$defs/key_id"
+        }
+      }
+    },
+    "delegation": {
+      "type": "object",
+      "required": [
+        "authorized_successor_keys"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "authorized_successor_keys": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/delegated_key"
+          }
+        }
+      }
+    },
+    "signed_record_fields": {
+      "type": "object",
+      "required": [
+        "signer_key_id",
+        "delegation",
+        "canonical_record_sha256",
+        "signature_ed25519_hex"
+      ],
+      "properties": {
+        "signer_key_id": {
+          "$ref": "#/$defs/key_id"
+        },
+        "delegation": {
+          "$ref": "#/$defs/delegation"
+        },
+        "canonical_record_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signature_ed25519_hex": {
+          "$ref": "#/$defs/ed25519_signature"
+        }
+      }
+    },
+    "unretained_revision_1": {
+      "type": "object",
+      "required": [
+        "catalog_revision",
+        "retention",
+        "snapshot",
+        "predecessor_snapshot",
+        "unretained_predecessor_revision",
+        "no_data_reason",
+        "signer_key_id",
+        "delegation",
+        "canonical_record_sha256",
+        "signature_ed25519_hex"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "catalog_revision": {
+          "const": "2026-07-27.1"
+        },
+        "retention": {
+          "const": "unretained_uncommitted_draft"
+        },
+        "snapshot": {
+          "type": "null"
+        },
+        "predecessor_snapshot": {
+          "type": "null"
+        },
+        "unretained_predecessor_revision": {
+          "type": "null"
+        },
+        "no_data_reason": {
+          "const": "No revision-1 catalog bytes, Git object, content digest, or signature were retained; this row records an uncommitted draft label only."
+        },
+        "signer_key_id": {
+          "type": "null"
+        },
+        "delegation": {
+          "type": "null"
+        },
+        "canonical_record_sha256": {
+          "type": "null"
+        },
+        "signature_ed25519_hex": {
+          "type": "null"
+        }
+      }
+    },
+    "retained_genesis_revision_2": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/signed_record_fields"
+        },
+        {
+          "type": "object",
+          "required": [
+            "catalog_revision",
+            "retention",
+            "snapshot",
+            "predecessor_snapshot",
+            "unretained_predecessor_revision",
+            "no_data_reason",
+            "signer_key_id",
+            "delegation",
+            "canonical_record_sha256",
+            "signature_ed25519_hex"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "catalog_revision": {
+              "const": "2026-07-27.2"
+            },
+            "retention": {
+              "const": "retained_genesis"
+            },
+            "snapshot": {
+              "$ref": "#/$defs/genesis_snapshot"
+            },
+            "predecessor_snapshot": {
+              "type": "null"
+            },
+            "unretained_predecessor_revision": {
+              "const": "2026-07-27.1"
+            },
+            "no_data_reason": {
+              "type": "null"
+            },
+            "signer_key_id": {
+              "$ref": "#/$defs/key_id"
+            },
+            "delegation": {
+              "$ref": "#/$defs/delegation"
+            },
+            "canonical_record_sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "signature_ed25519_hex": {
+              "$ref": "#/$defs/ed25519_signature"
+            }
+          }
+        }
+      ]
+    },
+    "retained_successor": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/signed_record_fields"
+        },
+        {
+          "type": "object",
+          "required": [
+            "catalog_revision",
+            "retention",
+            "snapshot",
+            "predecessor_snapshot",
+            "unretained_predecessor_revision",
+            "no_data_reason",
+            "signer_key_id",
+            "delegation",
+            "canonical_record_sha256",
+            "signature_ed25519_hex"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "catalog_revision": {
+              "$ref": "#/$defs/revision"
+            },
+            "retention": {
+              "const": "retained_successor"
+            },
+            "snapshot": {
+              "$ref": "#/$defs/snapshot_receipt"
+            },
+            "predecessor_snapshot": {
+              "$ref": "#/$defs/snapshot_receipt"
+            },
+            "unretained_predecessor_revision": {
+              "type": "null"
+            },
+            "no_data_reason": {
+              "type": "null"
+            },
+            "signer_key_id": {
+              "$ref": "#/$defs/key_id"
+            },
+            "delegation": {
+              "$ref": "#/$defs/delegation"
+            },
+            "canonical_record_sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "signature_ed25519_hex": {
+              "$ref": "#/$defs/ed25519_signature"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
