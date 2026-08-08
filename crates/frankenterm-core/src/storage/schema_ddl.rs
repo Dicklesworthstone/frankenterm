@@ -82,7 +82,11 @@
 /// projection. `pane_scrollback_summary` is maintained transactionally by the
 /// same SQLite statements that append or prune `output_segments`; snapshots no
 /// longer aggregate an unbounded pane history on every capture.
-pub const SCHEMA_VERSION: i32 = 39;
+/// Bumped 39 → 40 to make the session-retention byte budget exact and
+/// O(sessions) at decision time. `session_retained_size` charges every stored
+/// session/checkpoint/pane/lifecycle field exactly once under a documented
+/// logical-byte contract and is maintained by the owning row mutations.
+pub const SCHEMA_VERSION: i32 = 40;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -1156,6 +1160,417 @@ CREATE TABLE IF NOT EXISTS mux_pane_state (
 
 CREATE INDEX IF NOT EXISTS idx_pane_state_checkpoint ON mux_pane_state(checkpoint_id);
 CREATE INDEX IF NOT EXISTS idx_pane_state_pane ON mux_pane_state(pane_id);
+
+-- Exact logical retained-payload bytes for session size retention (ft-0yuxe.3).
+--
+-- Contract: each non-NULL INTEGER field contributes 8 bytes; each TEXT/BLOB
+-- field contributes its exact encoded byte length; NULL contributes 0. Every
+-- stored field in mux_sessions, session_checkpoints, mux_pane_state, and
+-- restore_attempt_lifecycle is charged exactly once. SQLite record framing,
+-- b-tree pages, indexes, freelist pages, and WAL bytes are physical storage and
+-- deliberately outside this logical retained-payload budget.
+CREATE VIEW IF NOT EXISTS session_retained_size_recomputed AS
+SELECT
+    s.session_id,
+    length(CAST(s.session_id AS BLOB))
+        + 8
+        + CASE WHEN s.last_checkpoint_at IS NULL THEN 0 ELSE 8 END
+        + 8
+        + length(CAST(s.topology_json AS BLOB))
+        + COALESCE(length(CAST(s.window_metadata_json AS BLOB)), 0)
+        + length(CAST(s.ft_version AS BLOB))
+        + COALESCE(length(CAST(s.host_id AS BLOB)), 0)
+        + CASE WHEN s.clean_checkpoint_id IS NULL THEN 0 ELSE 8 END
+        AS session_row_bytes,
+    COALESCE((
+        SELECT SUM(
+            8
+            + length(CAST(c.session_id AS BLOB))
+            + 8
+            + length(CAST(c.checkpoint_type AS BLOB))
+            + length(CAST(c.state_hash AS BLOB))
+            + 8
+            + 8
+            + COALESCE(length(CAST(c.metadata_json AS BLOB)), 0)
+            + length(CAST(c.checkpoint_role AS BLOB))
+            + COALESCE(length(CAST(c.topology_json AS BLOB)), 0)
+            + CASE WHEN c.restore_intent_checkpoint_id IS NULL THEN 0 ELSE 8 END
+        )
+        FROM session_checkpoints c
+        WHERE c.session_id = s.session_id
+    ), 0) AS checkpoint_row_bytes,
+    COALESCE((
+        SELECT SUM(
+            8 + 8 + 8
+            + COALESCE(length(CAST(p.cwd AS BLOB)), 0)
+            + COALESCE(length(CAST(p.command AS BLOB)), 0)
+            + COALESCE(length(CAST(p.env_json AS BLOB)), 0)
+            + length(CAST(p.terminal_state_json AS BLOB))
+            + COALESCE(length(CAST(p.agent_metadata_json AS BLOB)), 0)
+            + CASE WHEN p.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN p.last_output_at IS NULL THEN 0 ELSE 8 END
+        )
+        FROM mux_pane_state p
+        INNER JOIN session_checkpoints c ON c.id = p.checkpoint_id
+        WHERE c.session_id = s.session_id
+    ), 0) AS pane_state_row_bytes,
+    COALESCE((
+        SELECT SUM(
+            8
+            + length(CAST(r.session_id AS BLOB))
+            + 8
+            + CASE WHEN r.outcome_checkpoint_id IS NULL THEN 0 ELSE 8 END
+            + length(CAST(r.status AS BLOB))
+            + 8
+            + CASE WHEN r.resolved_at IS NULL THEN 0 ELSE 8 END
+        )
+        FROM restore_attempt_lifecycle r
+        WHERE r.session_id = s.session_id
+    ), 0) AS restore_lifecycle_row_bytes
+FROM mux_sessions s;
+
+CREATE TABLE IF NOT EXISTS session_retained_size (
+    session_id TEXT PRIMARY KEY
+        REFERENCES mux_sessions(session_id) ON DELETE NO ACTION
+        DEFERRABLE INITIALLY DEFERRED,
+    session_row_bytes INTEGER NOT NULL
+        CHECK(typeof(session_row_bytes) = 'integer' AND session_row_bytes >= 0),
+    checkpoint_row_bytes INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(checkpoint_row_bytes) = 'integer' AND checkpoint_row_bytes >= 0),
+    pane_state_row_bytes INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(pane_state_row_bytes) = 'integer' AND pane_state_row_bytes >= 0),
+    restore_lifecycle_row_bytes INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(restore_lifecycle_row_bytes) = 'integer' AND
+              restore_lifecycle_row_bytes >= 0),
+    retained_bytes INTEGER GENERATED ALWAYS AS (
+        session_row_bytes + checkpoint_row_bytes + pane_state_row_bytes
+            + restore_lifecycle_row_bytes
+    ) STORED
+        CHECK(typeof(retained_bytes) = 'integer' AND retained_bytes >= 0)
+);
+
+CREATE TRIGGER IF NOT EXISTS session_retained_size_bi
+BEFORE INSERT ON session_retained_size
+WHEN NOT EXISTS (
+    SELECT 1 FROM mux_sessions WHERE session_id = new.session_id
+) BEGIN
+    SELECT RAISE(ABORT, 'session retained-size row requires a persisted session');
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_retained_size_bd
+BEFORE DELETE ON session_retained_size
+WHEN EXISTS (
+    SELECT 1 FROM mux_sessions WHERE session_id = old.session_id
+) BEGIN
+    SELECT RAISE(ABORT, 'live session retained-size authority is permanent');
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_retained_size_session_id_bu
+BEFORE UPDATE OF session_id ON session_retained_size
+WHEN new.session_id != old.session_id BEGIN
+    SELECT RAISE(ABORT, 'session retained-size identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS mux_sessions_retained_size_ai
+AFTER INSERT ON mux_sessions BEGIN
+    INSERT INTO session_retained_size (session_id, session_row_bytes)
+    VALUES (
+        new.session_id,
+        length(CAST(new.session_id AS BLOB))
+            + 8
+            + CASE WHEN new.last_checkpoint_at IS NULL THEN 0 ELSE 8 END
+            + 8
+            + length(CAST(new.topology_json AS BLOB))
+            + COALESCE(length(CAST(new.window_metadata_json AS BLOB)), 0)
+            + length(CAST(new.ft_version AS BLOB))
+            + COALESCE(length(CAST(new.host_id AS BLOB)), 0)
+            + CASE WHEN new.clean_checkpoint_id IS NULL THEN 0 ELSE 8 END
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS mux_sessions_retained_size_au
+AFTER UPDATE ON mux_sessions BEGIN
+    SELECT CASE WHEN new.session_id != old.session_id THEN
+        RAISE(ABORT, 'session retained-size identity is immutable')
+    END;
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM session_retained_size WHERE session_id = old.session_id
+    ) THEN RAISE(ABORT, 'missing session retained-size authority during session update') END;
+    UPDATE session_retained_size
+    SET session_row_bytes =
+        length(CAST(new.session_id AS BLOB))
+            + 8
+            + CASE WHEN new.last_checkpoint_at IS NULL THEN 0 ELSE 8 END
+            + 8
+            + length(CAST(new.topology_json AS BLOB))
+            + COALESCE(length(CAST(new.window_metadata_json AS BLOB)), 0)
+            + length(CAST(new.ft_version AS BLOB))
+            + COALESCE(length(CAST(new.host_id AS BLOB)), 0)
+            + CASE WHEN new.clean_checkpoint_id IS NULL THEN 0 ELSE 8 END
+    WHERE session_id = old.session_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS mux_sessions_retained_size_ad
+AFTER DELETE ON mux_sessions BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM session_retained_size WHERE session_id = old.session_id
+    ) THEN RAISE(ABORT, 'missing session retained-size authority during session delete') END;
+    DELETE FROM session_retained_size WHERE session_id = old.session_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_checkpoints_retained_size_ai
+AFTER INSERT ON session_checkpoints BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM session_retained_size WHERE session_id = new.session_id
+    ) THEN RAISE(ABORT, 'missing session retained-size authority during checkpoint insert') END;
+    UPDATE session_retained_size
+    SET checkpoint_row_bytes = checkpoint_row_bytes
+        + 8
+        + length(CAST(new.session_id AS BLOB))
+        + 8
+        + length(CAST(new.checkpoint_type AS BLOB))
+        + length(CAST(new.state_hash AS BLOB))
+        + 8
+        + 8
+        + COALESCE(length(CAST(new.metadata_json AS BLOB)), 0)
+        + length(CAST(new.checkpoint_role AS BLOB))
+        + COALESCE(length(CAST(new.topology_json AS BLOB)), 0)
+        + CASE WHEN new.restore_intent_checkpoint_id IS NULL THEN 0 ELSE 8 END
+    WHERE session_id = new.session_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_checkpoints_retained_size_au
+AFTER UPDATE ON session_checkpoints BEGIN
+    SELECT CASE WHEN new.id != old.id OR new.session_id != old.session_id THEN
+        RAISE(ABORT, 'checkpoint retained-size identity is immutable')
+    END;
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM session_retained_size WHERE session_id = old.session_id
+    ) THEN RAISE(ABORT, 'missing session retained-size authority during checkpoint update') END;
+    UPDATE session_retained_size
+    SET checkpoint_row_bytes = checkpoint_row_bytes
+        + (
+            8
+            + length(CAST(new.session_id AS BLOB))
+            + 8
+            + length(CAST(new.checkpoint_type AS BLOB))
+            + length(CAST(new.state_hash AS BLOB))
+            + 8
+            + 8
+            + COALESCE(length(CAST(new.metadata_json AS BLOB)), 0)
+            + length(CAST(new.checkpoint_role AS BLOB))
+            + COALESCE(length(CAST(new.topology_json AS BLOB)), 0)
+            + CASE WHEN new.restore_intent_checkpoint_id IS NULL THEN 0 ELSE 8 END
+        )
+        - (
+            8
+            + length(CAST(old.session_id AS BLOB))
+            + 8
+            + length(CAST(old.checkpoint_type AS BLOB))
+            + length(CAST(old.state_hash AS BLOB))
+            + 8
+            + 8
+            + COALESCE(length(CAST(old.metadata_json AS BLOB)), 0)
+            + length(CAST(old.checkpoint_role AS BLOB))
+            + COALESCE(length(CAST(old.topology_json AS BLOB)), 0)
+            + CASE WHEN old.restore_intent_checkpoint_id IS NULL THEN 0 ELSE 8 END
+        )
+    WHERE session_id = old.session_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_checkpoints_retained_size_bd
+BEFORE DELETE ON session_checkpoints BEGIN
+    SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM mux_sessions WHERE session_id = old.session_id
+    ) AND NOT EXISTS (
+        SELECT 1 FROM session_retained_size WHERE session_id = old.session_id
+    ) THEN RAISE(ABORT, 'missing session retained-size authority during checkpoint delete') END;
+    UPDATE session_retained_size
+    SET checkpoint_row_bytes = checkpoint_row_bytes - (
+            8
+            + length(CAST(old.session_id AS BLOB))
+            + 8
+            + length(CAST(old.checkpoint_type AS BLOB))
+            + length(CAST(old.state_hash AS BLOB))
+            + 8
+            + 8
+            + COALESCE(length(CAST(old.metadata_json AS BLOB)), 0)
+            + length(CAST(old.checkpoint_role AS BLOB))
+            + COALESCE(length(CAST(old.topology_json AS BLOB)), 0)
+            + CASE WHEN old.restore_intent_checkpoint_id IS NULL THEN 0 ELSE 8 END
+        ),
+        pane_state_row_bytes = pane_state_row_bytes - COALESCE((
+            SELECT SUM(
+                8 + 8 + 8
+                + COALESCE(length(CAST(p.cwd AS BLOB)), 0)
+                + COALESCE(length(CAST(p.command AS BLOB)), 0)
+                + COALESCE(length(CAST(p.env_json AS BLOB)), 0)
+                + length(CAST(p.terminal_state_json AS BLOB))
+                + COALESCE(length(CAST(p.agent_metadata_json AS BLOB)), 0)
+                + CASE WHEN p.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
+                + CASE WHEN p.last_output_at IS NULL THEN 0 ELSE 8 END
+            )
+            FROM mux_pane_state p
+            WHERE p.checkpoint_id = old.id
+        ), 0)
+    WHERE session_id = old.session_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS mux_pane_state_retained_size_ai
+AFTER INSERT ON mux_pane_state BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM session_checkpoints c
+        INNER JOIN session_retained_size z ON z.session_id = c.session_id
+        WHERE c.id = new.checkpoint_id
+    ) THEN RAISE(ABORT, 'missing session retained-size authority during pane-state insert') END;
+    UPDATE session_retained_size
+    SET pane_state_row_bytes = pane_state_row_bytes
+        + 8 + 8 + 8
+        + COALESCE(length(CAST(new.cwd AS BLOB)), 0)
+        + COALESCE(length(CAST(new.command AS BLOB)), 0)
+        + COALESCE(length(CAST(new.env_json AS BLOB)), 0)
+        + length(CAST(new.terminal_state_json AS BLOB))
+        + COALESCE(length(CAST(new.agent_metadata_json AS BLOB)), 0)
+        + CASE WHEN new.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
+        + CASE WHEN new.last_output_at IS NULL THEN 0 ELSE 8 END
+    WHERE session_id = (
+        SELECT session_id FROM session_checkpoints WHERE id = new.checkpoint_id
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS mux_pane_state_retained_size_au
+AFTER UPDATE ON mux_pane_state BEGIN
+    SELECT CASE WHEN new.id != old.id OR new.checkpoint_id != old.checkpoint_id THEN
+        RAISE(ABORT, 'pane-state retained-size identity is immutable')
+    END;
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM session_checkpoints c
+        INNER JOIN session_retained_size z ON z.session_id = c.session_id
+        WHERE c.id = old.checkpoint_id
+    ) THEN RAISE(ABORT, 'missing session retained-size authority during pane-state update') END;
+    UPDATE session_retained_size
+    SET pane_state_row_bytes = pane_state_row_bytes
+        + (
+            8 + 8 + 8
+            + COALESCE(length(CAST(new.cwd AS BLOB)), 0)
+            + COALESCE(length(CAST(new.command AS BLOB)), 0)
+            + COALESCE(length(CAST(new.env_json AS BLOB)), 0)
+            + length(CAST(new.terminal_state_json AS BLOB))
+            + COALESCE(length(CAST(new.agent_metadata_json AS BLOB)), 0)
+            + CASE WHEN new.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN new.last_output_at IS NULL THEN 0 ELSE 8 END
+        )
+        - (
+            8 + 8 + 8
+            + COALESCE(length(CAST(old.cwd AS BLOB)), 0)
+            + COALESCE(length(CAST(old.command AS BLOB)), 0)
+            + COALESCE(length(CAST(old.env_json AS BLOB)), 0)
+            + length(CAST(old.terminal_state_json AS BLOB))
+            + COALESCE(length(CAST(old.agent_metadata_json AS BLOB)), 0)
+            + CASE WHEN old.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN old.last_output_at IS NULL THEN 0 ELSE 8 END
+        )
+    WHERE session_id = (
+        SELECT session_id FROM session_checkpoints WHERE id = old.checkpoint_id
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS mux_pane_state_retained_size_ad
+AFTER DELETE ON mux_pane_state BEGIN
+    SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM session_checkpoints WHERE id = old.checkpoint_id
+    ) AND NOT EXISTS (
+        SELECT 1
+        FROM session_checkpoints c
+        INNER JOIN session_retained_size z ON z.session_id = c.session_id
+        WHERE c.id = old.checkpoint_id
+    ) THEN RAISE(ABORT, 'missing session retained-size authority during pane-state delete') END;
+    UPDATE session_retained_size
+    SET pane_state_row_bytes = pane_state_row_bytes - (
+            8 + 8 + 8
+            + COALESCE(length(CAST(old.cwd AS BLOB)), 0)
+            + COALESCE(length(CAST(old.command AS BLOB)), 0)
+            + COALESCE(length(CAST(old.env_json AS BLOB)), 0)
+            + length(CAST(old.terminal_state_json AS BLOB))
+            + COALESCE(length(CAST(old.agent_metadata_json AS BLOB)), 0)
+            + CASE WHEN old.scrollback_checkpoint_seq IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN old.last_output_at IS NULL THEN 0 ELSE 8 END
+        )
+    WHERE session_id = (
+        SELECT session_id FROM session_checkpoints WHERE id = old.checkpoint_id
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS restore_attempt_lifecycle_retained_size_ai
+AFTER INSERT ON restore_attempt_lifecycle BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM session_retained_size WHERE session_id = new.session_id
+    ) THEN RAISE(ABORT, 'missing session retained-size authority during lifecycle insert') END;
+    UPDATE session_retained_size
+    SET restore_lifecycle_row_bytes = restore_lifecycle_row_bytes
+        + 8
+        + length(CAST(new.session_id AS BLOB))
+        + 8
+        + CASE WHEN new.outcome_checkpoint_id IS NULL THEN 0 ELSE 8 END
+        + length(CAST(new.status AS BLOB))
+        + 8
+        + CASE WHEN new.resolved_at IS NULL THEN 0 ELSE 8 END
+    WHERE session_id = new.session_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS restore_attempt_lifecycle_retained_size_au
+AFTER UPDATE ON restore_attempt_lifecycle BEGIN
+    SELECT CASE WHEN new.intent_checkpoint_id != old.intent_checkpoint_id OR
+                     new.session_id != old.session_id THEN
+        RAISE(ABORT, 'restore-lifecycle retained-size identity is immutable')
+    END;
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM session_retained_size WHERE session_id = old.session_id
+    ) THEN RAISE(ABORT, 'missing session retained-size authority during lifecycle update') END;
+    UPDATE session_retained_size
+    SET restore_lifecycle_row_bytes = restore_lifecycle_row_bytes
+        + (
+            8
+            + length(CAST(new.session_id AS BLOB))
+            + 8
+            + CASE WHEN new.outcome_checkpoint_id IS NULL THEN 0 ELSE 8 END
+            + length(CAST(new.status AS BLOB))
+            + 8
+            + CASE WHEN new.resolved_at IS NULL THEN 0 ELSE 8 END
+        )
+        - (
+            8
+            + length(CAST(old.session_id AS BLOB))
+            + 8
+            + CASE WHEN old.outcome_checkpoint_id IS NULL THEN 0 ELSE 8 END
+            + length(CAST(old.status AS BLOB))
+            + 8
+            + CASE WHEN old.resolved_at IS NULL THEN 0 ELSE 8 END
+        )
+    WHERE session_id = old.session_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS restore_attempt_lifecycle_retained_size_ad
+AFTER DELETE ON restore_attempt_lifecycle BEGIN
+    SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM mux_sessions WHERE session_id = old.session_id
+    ) AND NOT EXISTS (
+        SELECT 1 FROM session_retained_size WHERE session_id = old.session_id
+    ) THEN RAISE(ABORT, 'missing session retained-size authority during lifecycle delete') END;
+    UPDATE session_retained_size
+    SET restore_lifecycle_row_bytes = restore_lifecycle_row_bytes - (
+            8
+            + length(CAST(old.session_id AS BLOB))
+            + 8
+            + CASE WHEN old.outcome_checkpoint_id IS NULL THEN 0 ELSE 8 END
+            + length(CAST(old.status AS BLOB))
+            + 8
+            + CASE WHEN old.resolved_at IS NULL THEN 0 ELSE 8 END
+        )
+    WHERE session_id = old.session_id;
+END;
 
 -- Action history view (audit + undo + workflow step info)
 CREATE VIEW IF NOT EXISTS action_history AS
