@@ -9222,6 +9222,10 @@ mod tests {
             ",
         )
         .unwrap();
+        conn.execute_batch(
+            crate::storage::migrations::session_retained_size_schema_sql().unwrap(),
+        )
+        .expect("snapshot fixture must install the canonical v40 retained-size authority");
 
         (tmp, db_path)
     }
@@ -11222,6 +11226,59 @@ mod tests {
             .query_row(
                 "SELECT last_checkpoint_at, topology_json
                  FROM mux_sessions WHERE session_id = 'sess-rollback'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(checkpoint_count, 0);
+        assert_eq!(pane_state_count, 0);
+        assert_eq!(last_checkpoint_at, None);
+        assert_eq!(topology_json, r#"{"version":"old"}"#);
+    }
+
+    #[test]
+    fn save_checkpoint_sync_rejects_and_rolls_back_missing_size_trigger_dml() {
+        let (_tmp, db_path) = setup_test_db();
+        create_session_sync(
+            db_path.as_str(),
+            "sess-missing-size-trigger",
+            1_000,
+            r#"{"version":"old"}"#,
+            crate::VERSION,
+        )
+        .unwrap();
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        conn.execute_batch("DROP TRIGGER session_retained_size_checkpoint_ai;")
+            .unwrap();
+        drop(conn);
+
+        let pane = PaneStateSnapshot::from_pane_info(&make_test_pane(10, 24, 80), 2_000, false);
+        let prepared = prepare_test_snapshot(r#"{"version":"new"}"#, &[pane]);
+        let error = save_checkpoint_sync(
+            db_path.as_str(),
+            "sess-missing-size-trigger",
+            2_000,
+            "event",
+            &prepared,
+            None,
+        )
+        .expect_err("a missing canonical summary mutation must invalidate the checkpoint receipt");
+        assert!(matches!(error, rusqlite::Error::ToSqlConversionFailure(_)));
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let checkpoint_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let pane_state_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
+            .unwrap();
+        let (last_checkpoint_at, topology_json): (Option<i64>, String) = conn
+            .query_row(
+                "SELECT last_checkpoint_at, topology_json
+                 FROM mux_sessions WHERE session_id = 'sess-missing-size-trigger'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )

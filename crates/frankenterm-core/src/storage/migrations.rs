@@ -2437,7 +2437,7 @@ fn validate_pane_scrollback_summary_schema(conn: &Connection) -> Result<()> {
 const SESSION_RETAINED_SIZE_V40_BEGIN: &str = "-- FT_SESSION_RETAINED_SIZE_V40_BEGIN";
 const SESSION_RETAINED_SIZE_V40_END: &str = "-- FT_SESSION_RETAINED_SIZE_V40_END";
 
-fn session_retained_size_schema_sql() -> Result<&'static str> {
+pub(crate) fn session_retained_size_schema_sql() -> Result<&'static str> {
     if SCHEMA_SQL
         .match_indices(SESSION_RETAINED_SIZE_V40_BEGIN)
         .count()
