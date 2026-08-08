@@ -2793,6 +2793,437 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Claim bounded watch output only after a stalled-but-open pipe fixture proves queue admission, cancellation, shutdown, writer teardown, lease release/finalization, memory growth, and cursor behavior remain bounded under partial writes, flush stalls, pipe closure, and sustained producer overload.
 
+### IS-N091 — A zero-test GUI library command is not renderer proof
+
+- **Classification:** false test-topology authority; explicit opt-in crate-root
+  harness retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.6.8.1`
+- **Rejected inference:** an exit-zero `cargo test -p frankenterm-gui --lib`
+  exercises binary-owned glyph-cache, `TermWindow`, background, and paint code.
+- **Negative evidence:** the library target excludes those production modules;
+  prior invocations could run zero relevant tests while reporting success. The
+  explicit `glyphcache_unit` target compiles `src/main.rs` through a distinct
+  crate-root wrapper under the generated Rust test harness, with the
+  application `main` cfg-disabled, but remains an opt-in feature-gated target
+  rather than ordinary workspace test authority. Disabling `main` prevents
+  automatic startup but does not prove that arbitrary included test bodies
+  never call frontend or window constructors.
+- **Decision:** retain the explicit harness as focused structural evidence and
+  require exact named-test counts. Qualify only exact statically audited test
+  filters as nonlaunching; do not infer GUI launch, window-system, visual,
+  presentation, or native-target proof from the target as a whole.
+- **Primary retry condition:**
+  > Claim ordinary renderer-test coverage only after the production binary-owned module graph participates in the normal fail-closed test gate, the retained transcript names and runs the intended tests with nonzero counts, and an authorized isolated native lane separately proves window and presentation behavior without touching an operator session.
+
+### IS-N092 — Off-thread decode is not off-thread paint when frames remain blobs
+
+- **Classification:** hidden GUI-thread I/O/copy rejection; immutable shared
+  frame storage retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.8`
+- **Rejected inference:** decoding animation frames on a bounded worker means
+  the GUI upload path performs no blocking file I/O or full-frame copy.
+- **Negative evidence:** decoded worker frames were stored as blob leases. A
+  later paint called `get_data`, which could reopen/read a temporary file and
+  materialize another full pixel vector synchronously before atlas upload.
+- **Decision:** retain encoded source leases, but publish decoded frames as
+  immutable `Arc<Vec<u8>>` values with dimensions, duration, and hash. A
+  borrowed frame handle implements `BitmapImage`, so normal paint neither
+  reopens the blob nor clones its pixels.
+- **Primary retry condition:**
+  > Reintroduce blob-backed decoded frames only after a deterministic slow-storage fixture proves every ordinary and animated paint/upload path performs zero file opens, reads, and full-frame copies on the GUI thread while preserving exact pixels, duration order, revision fencing, cancellation, and bounded memory.
+
+### IS-N093 — Object provenance is not revision-bound image validation authority
+
+- **Classification:** stale-trust and mismatched-ceiling rejection; private
+  revision witness retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.8`
+- **Rejected inference:** once an `ImageData` object has passed validation, any
+  later clone/rebuild or fast path can trust it without rechecking its content
+  revision and trust class.
+- **Negative evidence:** rebuilding validated content could discard authority,
+  while provenance-only trust could survive mutation or conflate the 64 MiB
+  untrusted-wire ceiling with the separate 256 MiB trusted-local decoded
+  ceiling. That creates either repeated expensive validation or stale/overbroad
+  admission.
+- **Decision:** make the validation authority private and serde-skipped, bind it
+  to the exact content revision and summary, clear it around mutable access,
+  preserve it only when retaining the same object, and check it under the data
+  lock before the trusted fast path.
+- **Primary retry condition:**
+  > Replace revision-bound authority only after mutation-before/during/after-validation, serde round-trip, object rebuild, cache ABA, 64 MiB boundary, 256 MiB boundary, and concurrent fast-path models prove no stale validation is accepted and no valid trusted-local frame is spuriously routed through untrusted fallback.
+
+### IS-N094 — Cache eviction does not bound active background decoded payloads
+
+- **Classification:** wrong ownership/accounting boundary; unique logical
+  decoded-pixel budget retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.8`
+- **Rejected inference:** bounding the decoded background cache also bounds the
+  images retained by the active window background list.
+- **Negative evidence:** active layers hold escaped strong `Arc`s after cache
+  eviction, repeated references to one image must count once, and distinct
+  images must count separately. An unbounded layer list also exhausted the
+  negative `i8` z range, causing later backgrounds to saturate/spill into the
+  content plane.
+- **Decision:** cap active negative-z layers at 127 and admit at most 256 MiB of
+  exact unique active decoded-pixel vector lengths. The budget owns a strong
+  identity witness and verifies `Arc::ptr_eq`, preventing raw-pointer ABA while
+  deduplicating shared layers. This does not bound vector capacity, metadata,
+  allocator overhead, encoded/cache/in-flight copies, GPU residency, or process
+  RSS.
+- **Primary retry condition:**
+  > Claim a resident-memory bound only after shared-Arc, distinct-Arc, pointer-reuse, cache-eviction, replace/remove, 127/128-layer, vector capacity, metadata, allocator, encoded/cache/in-flight, GPU, animation, and long-resize models reconcile the logical payload ledger with retained process and device-memory measurements without dropping an admitted unique image silently.
+
+### IS-N095 — Off-main decode does not remove synchronous atlas scale fallback
+
+- **Classification:** remaining paint-thread latency path; coherent fix tracked
+- **Bead:** `ft-interactive-systems-performance-4tenz.8.8.1`
+- **Rejected inference:** moving validation and animation decode to workers
+  eliminates all image-sized CPU and allocation work from a paint.
+- **Negative evidence:** atlas-capacity recovery promotes `AllowImage::Yes`
+  through scale factors and calls `Atlas::allocate_with_padding`. Its scale
+  branch allocates a full-resolution 4WH image, copies the complete source, and
+  performs a high-quality resize synchronously. Re-entering paint can repeat
+  the fallback unless pressure state and scaled variants are retained.
+- **Decision:** do not install a smaller synchronous helper and call the path
+  fixed. The existing Bead owns direct fallible source scaling, typed/atomic
+  failure, bounded cache/accounting, pixel oracle/readback, latency/byte
+  telemetry, and named-target A/B evidence; an async extension must also own
+  job de-duplication, byte permits, cancellation, repaint, revision/upload
+  fencing, and atlas-recreation semantics.
+- **Primary retry condition:**
+  > Claim nonblocking scaled-image recovery only after exact-source q1/q20/q200 and atlas-pressure fixtures prove the GUI thread performs bounded dimension-independent work, duplicate paints create at most one bounded job per image revision and scale, stale jobs cannot upload after mutation or atlas recreation, pixels match the oracle, and retained M4 plus Threadripper p95/p99 evidence passes with M5 explicitly proven or skipped_not_proven.
+
+### IS-N096 — An f64 tile quotient below 2^53 does not preserve sub-tile phase
+
+- **Classification:** floating-point cancellation rejection; exact
+  binary-rational reduction retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.8`
+- **Rejected inference:** converting long-scroll background arithmetic from
+  f32 to f64 and rejecting quotients at 2^53 preserves both mirror parity and
+  fractional tile phase.
+- **Negative evidence:** integer precision protects the whole-tile witness but
+  not the division remainder. With an exactly represented scroll distance of
+  2^54 pixels and an exactly represented 3-pixel step, the true truncated
+  quotient is below 2^53 with a one-pixel remainder; f64 division rounds the
+  quotient to an integer-valued float, so `fract() * step` produces a false
+  zero phase. A first exact-rational implementation also used
+  `u128::checked_shl` as an overflow check; that API rejects an excessive shift
+  count but silently discards significant high bits shifted past bit 127. It
+  then retained a 2^53 whole-tile cap and a wider successor retained a u64 cap,
+  even though the quotient is never exposed or converted back to f64 and is
+  used only for integer mirror parity.
+- **Decision:** decompose the finite distance and f32-derived step into exact
+  binary significand/exponent pairs. For nonnegative exponent deltas, compute
+  the aligned numerator modulo twice the denominator with fast modular
+  exponentiation: the modulus identifies quotient parity and exact remainder
+  without materializing a whole-tile count. For negative deltas,
+  `distance >= step` bounds the aligned denominator by the distance
+  significand, so checked materialization is finite. Carry the exact signed
+  remainder into origin normalization. Admit the row-pixel/f32-factor product
+  according to its exact combined odd-significand width, not a fixed
+  row-magnitude ceiling, so large powers of two remain representable without
+  admitting rounded inputs.
+- **Primary retry condition:**
+  > Replace exact binary-rational reduction only after positive/negative scroll, odd/even mirror parity, non-power-of-two steps, quotients around and above 2^24, 2^53, u64, and u128, exact nonzero remainders rounded to integral floating quotients, exponent alignments too wide to materialize, invalid/nonfinite inputs, and backward viewport extension all prove identical phase without an arbitrary quotient-type ceiling.
+
+### IS-N097 — A prepared legacy baseline is not delivered-output authority
+
+- **Classification:** speculative-state publication race; exact enqueue-phase
+  settlement retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.5.5.2`
+- **Rejected inference:** once a legacy pane delta has been prepared and its
+  new baseline installed, another render attempt may safely diff from that
+  baseline before the first delta's transport enqueue has settled.
+- **Negative evidence:** the baseline was advanced before `send_bulk` or
+  `send_control`. A reentrant/simultaneous attempt could therefore treat
+  possibly unsent bytes as delivered, while send failure, guard drop, panic,
+  or same-numeric-pane-ID replacement complicated rollback ownership.
+- **Decision:** give each exact per-pane state an `Idle`, revision-bearing
+  `InFlight`, or fail-closed `Closed` legacy enqueue phase. Exclude competing
+  legacy and transactional preparations while in flight; acknowledge only the
+  exact installed revision after successful queue admission; and roll back
+  only that revision on failure/drop. Settlement ambiguity retires the state
+  closed and dirty, and detached push failures remain visible. Queue admission
+  still is not a client application acknowledgement.
+- **Primary retry condition:**
+  > Remove the legacy enqueue phase only after concurrent preparation, reentrant send, queue rejection, guard drop, acknowledgement panic, recovery panic, revision exhaustion, old-registration/new-registration same-ID ABA, and detached-task error fixtures prove no unsent baseline becomes authoritative; claim end-to-end delivery only after a protocol application ACK binds the exact session, pane registration, and delta revision.
+
+### IS-N098 — `async fn` syntax is not proof of call-time side effects
+
+- **Classification:** proof-doctrine semantic regression; exact eager
+  settled-future category retained
+- **Bead:** `ft-3kv6e` (the original closed public-async census did not cover
+  this newly identified synchronous-returning-Future contract)
+- **Rejected inference:** converting every public Cx-aware function that
+  returns a future into `async fn` preserves cancellation, preflight, channel
+  observation, and completed-outcome telemetry semantics.
+- **Negative evidence:** an async body does not execute until first poll. For
+  the three audited APIs, an immediately dropped unpolled future would defer or
+  erase work that the caller contract requires at invocation: bounded restore
+  preflight, storage writability checkpoint/observation, or telemetry for an
+  already completed append.
+- **Decision:** retain synchronous functions that perform the bounded work and
+  return `std::future::ready(result)`. Census them as the exact
+  `eager_settled_future` category: direct proof argument, non-async declaration,
+  exact opaque Future return, no suspension/early-return syntax, and a direct
+  ready tail expression. This is a covered semantic category, not an exemption.
+- **Primary retry condition:**
+  > Convert an eager settled-future API to async only after unpolled-drop, cancelled-at-entry, completed-outcome, and ordinary awaited-call tests prove the required checkpoint, preflight, observation, or telemetry happens at the same contract boundary, and the fail-closed census represents the new semantics without an allowlist escape hatch.
+
+### IS-N099 — A width-one batch fill is not equivalent for wide or control cells
+
+- **Classification:** invalid generalized fast path; narrow batched hot path
+  retained
+- **Bead:** `ft-3xrmq` (closed, but its broad equivalence claim is now
+  unqualified by this regression)
+- **Rejected inference:** duplicating one `Cell` across a slice is equivalent
+  to sequential `set_cell_impl` for every cell width, and a byte-length-one
+  grapheme is always safe for the printable-ASCII append fast path.
+- **Negative evidence:** a width-two assignment invalidates the placeholder
+  produced by the preceding assignment; one slice fill cannot reproduce that
+  ordered overlap behavior. Separately, CR/LF and other one-byte controls meet
+  a length-only test but are not printable cells, and an enormous rejected
+  wide-cell range could otherwise iterate through a pointer-width tail.
+- **Decision:** batch only normalized width-one fills, preserve established
+  sequential invalidation for wider cells, and cap the latter before
+  iteration at the exact materializable start boundary. Restrict the append
+  shortcut to printable ASCII and leave unsupported graphemes untouched.
+- **Primary retry condition:**
+  > Generalize the batch path only after width-zero/one/two cells, every overlapping start order, cap-adjacent and pointer-width ranges, CR/LF/C0/DEL/non-ASCII graphemes, storage variants, attributes, hyperlinks, zones, seqnos, and prune behavior are differentially identical to sequential assignment.
+
+### IS-N100 — Trailing bytes and space counts are not terminal cell-width authority
+
+- **Classification:** wide-cell pruning corruption; width-aware pruning
+  retained
+- **Bead:** `ft-3xrmq` (closed, with the affected optimization equivalence
+  claim unqualified)
+- **Rejected inference:** the last nonblank vector index or number of trailing
+  space characters directly gives the materialized terminal-cell length.
+- **Negative evidence:** vector storage could truncate the blank placeholder
+  owned by a final width-two grapheme. Cluster storage could remove only one
+  terminal column for a trailing width-two space, leaving length and
+  double-wide start bits inconsistent; an emptied bitset could retain stale
+  representation state.
+- **Decision:** retain the full normalized width of the final nonblank vector
+  cell. In clustered storage, subtract the width owned by each trailing space,
+  clear its exact double-wide start, remove exhausted cluster metadata, and
+  drop an empty width bitset.
+- **Primary retry condition:**
+  > Replace width-aware pruning only after vector/clustered permutations of narrow and wide blank/nonblank cells, repeated wide spaces, mixed attributes, cluster boundaries, entirely blank lines, and append/fill/visible-cell iteration prove identical text, length, placeholders, width bits, and change metadata.
+
+### IS-N101 — Radial-gradient noise is an axis offset, not a squared-distance term
+
+- **Classification:** dimensional and axis-asymmetry rejection; coordinate
+  offset retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.8`
+- **Rejected inference:** adding raw noise to one squared axis term while
+  applying it as a coordinate offset on the other preserves radial symmetry.
+- **Negative evidence:** the old expression combined `nx` directly with
+  `(x-cx)^2`, but squared `(ny+y-cy)`. The terms had different units and
+  transposing coordinates/noise changed the nominal radial distance.
+- **Decision:** add each noise sample to its corresponding coordinate before
+  subtracting the center and squaring; retain a transposition oracle for the
+  helper. This is structural appearance correctness, not visual-corpus proof.
+- **Primary retry condition:**
+  > Change radial noise arithmetic only after zero/noise, axis transposition, center suppression, seeded generated pixels, radius boundaries, and retained native visual-corpus comparisons prove symmetry, intended texture, finite values, and stable output.
+
+### IS-N102 — Editing one animation frame must not rehash every frame's pixels
+
+- **Classification:** hidden linear pixel-rescan rejection; targeted
+  revision-bound mutation retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.8.8`
+- **Rejected inference:** a generic mutable image guard is cheap enough for
+  frame-local Kitty edits and worker frame appends in large animations.
+- **Negative evidence:** the generic guard repairs every embedded frame hash on
+  drop. Repeated one-frame edits therefore scale with total animation pixel
+  bytes, while a fallible append can also leave separate resource accounting
+  and image mutation without one atomic commit point.
+- **Decision:** expose only the selected decoded frame through a targeted guard,
+  require full validation authority before trusting unexposed hashes, hash the
+  exposed frame on drop, and derive the outer revision from metadata plus
+  embedded hashes. Prepare appends transactionally: validate the exact locked
+  revision, hash the incoming frame, reserve every destination vector, and
+  admit resource bytes before an infallible commit republishes revision and
+  summary authority. Dropping a prepared append leaves content and authority
+  unchanged.
+- **Primary retry condition:**
+  > Return frame-local edits or append to generic mutation only after animation-size scaling, counterfeit untouched hashes, concurrent mutation, invalid geometry/cardinality/duration, allocation failure, resource denial, prepared-drop rollback, static-to-animation promotion, and commit authority tests prove no full-animation pixel rescan, stale hash, partial mutation, or ledger drift.
+
+### IS-N103 — Pixel-preserving metadata mutation is not validation-preserving by itself
+
+- **Classification:** stale timing-authority rejection; transactional bounded
+  metadata mutation retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.8.8`
+- **Rejected inference:** because animation speed adjustment leaves pixel bytes
+  and embedded pixel hashes unchanged, it may always republish the prior full
+  validation summary for the new revision.
+- **Negative evidence:** a tiny positive speed factor can expand a previously
+  valid duration beyond the renderer's `u32::MAX`-millisecond ceiling or the
+  platform `Instant::checked_add` range. Republishing authority after only
+  `Duration::try_from_secs_f64` would certify content that the ordinary
+  validation path rejects.
+- **Decision:** precompute every adjusted duration against the same renderer
+  timing ceilings before replacing the duration vector. Keep the operation
+  transactional; on failure retain the exact original revision and authority,
+  and on success retain pixel hashes while publishing the new metadata-bound
+  revision and unchanged decoded-pixel summary.
+- **Primary retry condition:**
+  > Retain validation authority across another metadata-only edit only after exact lower/upper boundaries, tiny/identity/nonfinite factors, zero-duration roots, multi-frame partial-failure rollback, Instant scheduling, unchanged pixel hashes, changed outer revision, and failed-operation authority tests prove the transformed metadata still satisfies every original validation invariant.
+
+### IS-N104 — A zero-duration animation root is protocol state, not necessarily a visible frame
+
+- **Classification:** synthetic-first-frame appearance rejection; encoded-worker
+  placeholder policy retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.8.10.2`
+- **Rejected inference:** the zero-duration root created while progressively
+  publishing an encoded animation should be painted like an ordinary visible
+  animation frame.
+- **Negative evidence:** the root exists to support append/composition and has
+  no display duration. Showing it before the first decoded worker frame can
+  produce a synthetic flash even though a real visible frame is imminent.
+- **Decision:** for the encoded-image worker publication path, retain a
+  transparent current-frame placeholder while a zero-duration root is waiting
+  for a timed frame that the decoder may still publish. Consume the root and at
+  most one already queued timed frame in one paint; if the decoder disconnects
+  without any timed frame, publish the root rather than leaving the image blank
+  forever. Do not generalize that policy to every trusted local or Kitty
+  animation: zero duration remains structurally valid and renderer cadence has
+  its own contract.
+- **Primary retry condition:**
+  > Change encoded-worker root presentation only after delayed-first-frame, cancellation, one-frame/static, multi-frame, zero/nonzero root, composition, repaint, and retained native visual-sequence fixtures prove no synthetic flash, missing first frame, timing regression, or unintended change to local/Kitty animations.
+
+### IS-N105 — A fixed scroll magnitude cap is not an exactness proof
+
+- **Classification:** over-conservative fail-closed threshold; exact
+  significand-product admission retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.8`
+- **Rejected inference:** because any f32 factor can carry 24 significant bits,
+  every row-pixel magnitude above 2^29 must be rejected before multiplication
+  to keep the f64 scroll distance exact.
+- **Negative evidence:** the worst-case bound ignores the operands actually in
+  use. A factor of one has a one-bit odd significand, and large integers with
+  trailing zero bits can also have small significands; rejecting them makes a
+  scrolling background disappear in a sufficiently long session even though
+  the exact product and tile phase are representable.
+- **Decision:** strip powers of two from the exact signed i128 row-pixel product
+  and the exact promoted f32 factor, checked-multiply their odd significands,
+  and admit only products fitting f64's 53-bit precision. The exponents affect
+  scale, not significand exactness, and the i128/f32 exponent range remains
+  finite in f64. Continue to reject a genuinely 54-bit product even when both
+  operands are individually representable.
+- **Primary retry condition:**
+  > Replace significand-product admission only after factor powers of two and dense mantissas, row products with large trailing-zero exponents, exact 53-bit and inexact 54-bit products, positive/negative/zero scroll, i128 multiplication overflow, nonfinite factors, and downstream non-power-of-two tile reduction prove exact phase without imposing a false long-session magnitude ceiling.
+
+### IS-N106 — Saturating an identity allocator does not preserve uniqueness
+
+- **Classification:** exhaustion alias rejection; fail-closed unique allocator
+  retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.8`
+- **Rejected inference:** a saturating atomic increment safely prevents widget
+  identifier wraparound.
+- **Negative evidence:** once the counter reached `usize::MAX`, every later
+  allocation returned the same value. `WidgetId` is the key for graph,
+  parent/child, render-state, focus, and event-routing maps, so silent reuse can
+  overwrite or cross-route live widget state even though numeric wrap never
+  occurs.
+- **Decision:** reserve the saturated counter value as exhaustion state. Allocate
+  `usize::MAX - 1` exactly once while advancing to that sentinel, then fail
+  closed with an invariant panic rather than minting a duplicate identifier.
+- **Primary retry condition:**
+  > Replace the fail-closed allocator only after concurrent near-ceiling allocation, graph insertion, render-state retention, focus/event routing, and exhaustion recovery prove every returned WidgetId is process-unique and no map entry can be overwritten by allocator aliasing.
+
+### IS-N107 — Legacy mux constructors cannot safely duplicate an exhausted identifier
+
+- **Classification:** process-local identity alias rejection; fail-closed
+  infallible mux allocator retained
+- **Bead:** `ft-interactive-systems-performance-4tenz`
+- **Rejected inference:** domain, tab, window, and client constructors may keep
+  a saturating allocator as temporary negative evidence until each constructor
+  becomes fallible.
+- **Negative evidence:** after the counter reached `usize::MAX`, every later
+  construction published the same identifier. Those identifiers index live
+  mux topology, routing, ownership, and client state; terminal duplication can
+  therefore overwrite or cross-route unrelated objects rather than merely
+  degrade a diagnostic counter.
+- **Decision:** reserve `usize::MAX` as the exhausted counter state for these
+  infallible constructors. Issue `usize::MAX - 1` exactly once, then invariant-
+  panic before publishing another domain, tab, window, or client identifier.
+  New fallible namespaces continue to use the checked range-reservation API.
+- **Primary retry condition:**
+  > Replace this fail-closed boundary only after every constructor can propagate typed exhaustion and concurrent near-ceiling allocation plus topology, routing, ownership, persistence, and reconnect models prove process-local identifiers remain unique without partial object publication.
+
+### IS-N108 — A saturated Surface sequence makes later mutations invisible
+
+- **Classification:** change-token alias rejection; transactional exhaustion
+  preflight retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.8`
+- **Rejected inference:** saturating the `Surface` change sequence at
+  `usize::MAX` safely preserves rendering once the practically unreachable
+  counter limit is reached.
+- **Negative evidence:** a caller holding the terminal sequence token could
+  observe `has_changes(MAX) == false` even after another single or batched
+  change mutated cells under the same token. Independently of exhaustion, a
+  real dimension change with an already-empty journal did not advance identity,
+  so `get_changes(current_token)` returned an empty delta despite the resize.
+  Batch application also left `self.seqno` at the old frontier until after
+  mutating rows, stamping those `Line`s with the old value so
+  `Line::changed_since(old_frontier)` could return false for changed content.
+- **Decision:** checked-preflight the complete sequence advance before applying
+  any single change, batch, or actual dimension change. Permit the final unique
+  change to advance the frontier to `usize::MAX`, then invariant-panic before a
+  later change or resize invalidation. Stamp batch-mutated lines with the final
+  preflighted frontier. Advance identity and force a full repaint for a real
+  resize even when the journal is empty, while retaining an exact same-
+  dimension no-op. An overflowing batch or resize leaves screen, cursor,
+  dimensions, journal, and sequence unchanged.
+- **Primary retry condition:**
+  > Replace fail-closed exhaustion only with an epoch/resync protocol whose model and near-ceiling single, batch, resize, flush, clone, compositor, and renderer tests prove no consumer token can alias later content and every failed transition is atomic.
+
+### IS-N109 — A nominal no-op resize can still mutate and allocate every row
+
+- **Classification:** hidden resize hot-path work; topology-aware row update
+  retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.8`
+- **Rejected inference:** skipping change-stream invalidation makes a same-size
+  `Surface::resize` a no-op, and `Vec::resize` avoids constructing its template
+  value when the height does not grow.
+- **Negative evidence:** the remaining loop still called `Line::resize` on
+  every row, coercing clustered storage to vectors, invalidating semantic
+  zones, updating line identity, and potentially shrinking allocations.
+  Separately, Rust evaluates `Line::with_width(width, seqno)` before entering
+  `Vec::resize`, allocating a full-width throwaway line even when height was
+  unchanged or shrinking. Growing first also constructed new rows and then
+  resized them a second time, while shrinking resized rows that were about to
+  be discarded.
+- **Decision:** return immediately when both dimensions match. On a real
+  resize, preflight sequence identity, truncate discarded rows first, resize
+  only retained rows, and use `resize_with` to construct only added rows at
+  their final width and sequence. Initialize constructor rows directly so the
+  no-op guard cannot skip a new Surface's storage setup.
+- **Primary retry condition:**
+  > Replace this ordering only after same-size clustered/zoned line identity, grow/shrink/cross-axis geometry, cursor clamping, journal invalidation, constructor parity, allocation counts, and resize latency prove no discarded-row work, throwaway template allocation, duplicate new-row resize, or hidden representation mutation.
+
+### IS-N110 — A saturated causal-input clock is not a unique input identity
+
+- **Classification:** terminal identity alias rejection; checked monotonic
+  process-local allocator retained
+- **Bead:** `ft-interactive-systems-performance-4tenz`
+- **Rejected inference:** using `saturating_add(1)` makes the timestamp-derived
+  input serial monotonic and therefore safe at every counter value.
+- **Negative evidence:** once `LAST_INPUT_SERIAL` reached `u64::MAX`, every
+  later `InputSerial::now` selected and returned the same terminal value.
+  Keypress and paste PDUs use this serial as causal input identity, so numeric
+  non-regression alone did not prevent unrelated inputs from aliasing in
+  tracing, acknowledgement, or ordering state.
+- **Decision:** select the wall-clock floor or the checked successor under one
+  atomic compare/exchange loop. Permit a locally generated `u64::MAX` exactly
+  once, then fail closed before returning another serial. Wall-clock rollback
+  still advances from the observed local floor. Raw/wire
+  `from_millis_since_epoch(u64::MAX)` remains representable because decoding a
+  peer value is not local identity allocation.
+- **Primary retry condition:**
+  > Replace checked fail-closed allocation only after same-millisecond concurrency, wall-clock advance and rollback, terminal-minus-one/terminal boundaries, raw/wire terminal-value round trips, causal trace correlation, acknowledgement, and key/paste ordering models prove every locally generated input identity remains unique without rejecting valid peer data.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

@@ -47,7 +47,7 @@ notifications are not durable tab-order authority.
 | Session/checkpoint restore | Recreates layout using schema-v1 numeric IDs and indices rather than a validated live incarnation mapping. | It may restore approximate layout, but cannot claim live order/active continuity until the checkpoint bead migrates the schema and proves identity mapping. |
 | `mux::unify::TabIdentity` | Uses process-local domain ID plus a sorted remote-pane set as a duplicate-mirror heuristic. | It is not a durable session/tab identity and must never key persistence or reorder CAS. |
 | Client domain config | Names and transport locators identify how to try a connection. | They are routing hints, not proof that a newly reached server is the prior mux session. |
-| Numeric ID allocators | Tab/window/domain constructors still use a legacy saturating allocator pending `ft-interactive-systems-performance-4tenz.5.5.13`. | Reuse or terminal-value duplication must fail closed; order persistence cannot paper over it. |
+| Numeric ID allocators | Tab/window/domain/client constructors use a checked process-local allocator that reserves `usize::MAX` as the exhausted sentinel and panics before it can publish a duplicate ID; pane and subscriber ranges use the fallible checked allocator. | Live numeric identities now fail closed on exhaustion, but remain process-local and therefore cannot substitute for durable order identity. |
 
 ## 3. Identity vocabulary
 
