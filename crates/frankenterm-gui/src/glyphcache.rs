@@ -301,11 +301,44 @@ struct FrameSpriteKey {
     scale_down: Option<usize>,
 }
 
-/// A helper struct to implement BitmapImage for ImageDataType while
-/// holding the mutex for the sake of safety.
-struct DecodedImageHandle<'a> {
-    current_frame: usize,
-    h: termwiz::image::ImageDataReadGuard<'a>,
+/// The single read-only `BitmapImage` adapter used by decoded image uploads.
+/// `Payload` keeps mutable terminal image data locked for the complete atlas
+/// read, while `Frame` borrows immutable worker-owned pixels. Centralizing both
+/// sources here avoids adding another raw-pointer trait implementation for the
+/// zero-copy worker path.
+enum DecodedImageHandle<'a> {
+    Payload {
+        current_frame: Cell<usize>,
+        data: termwiz::image::ImageDataReadGuard<'a>,
+    },
+    Frame(&'a DecodedFrame),
+}
+
+impl<'a> DecodedImageHandle<'a> {
+    fn payload(data: termwiz::image::ImageDataReadGuard<'a>, current_frame: usize) -> Self {
+        Self::Payload {
+            current_frame: Cell::new(current_frame),
+            data,
+        }
+    }
+
+    fn frame(frame: &'a DecodedFrame) -> Self {
+        Self::Frame(frame)
+    }
+
+    fn set_current_frame(&self, frame_index: usize) {
+        let Self::Payload { current_frame, .. } = self else {
+            unreachable!("worker frame adapters do not have a mutable frame index")
+        };
+        current_frame.set(frame_index);
+    }
+
+    fn payload_data(&self) -> &ImageDataType {
+        let Self::Payload { data, .. } = self else {
+            unreachable!("worker frame adapters do not contain terminal image payloads")
+        };
+        data
+    }
 }
 
 // `DecodedImageHandle` is the read-only adapter that glyphcache hands to
@@ -315,19 +348,27 @@ struct DecodedImageHandle<'a> {
 // `BitmapImage` trait still requires `pixel_data_mut`; that method exists to
 // satisfy the trait but must remain unreachable for this adapter.
 //
-// `self.h` can contain an encoded source while its decoded frames are
-// arriving from the worker. `cached_image_impl` handles that match arm
-// separately and never passes this adapter to the atlas in that state, so
-// the `EncodedLease` / `EncodedFile` BitmapImage arms remain unreachable.
+// The `Payload` variant can contain an encoded source while its decoded frames
+// are arriving from the worker. `cached_image_impl` handles that match arm
+// separately and never passes this adapter to the atlas in that state, so the
+// `EncodedLease` / `EncodedFile` BitmapImage arms remain unreachable.
 impl<'a> BitmapImage for DecodedImageHandle<'a> {
     unsafe fn pixel_data(&self) -> *const u8 {
-        match &*self.h {
-            ImageDataType::Rgba8 { data, .. } => data.as_ptr(),
-            ImageDataType::AnimRgba8 { frames, .. } => frames[self.current_frame].as_ptr(),
-            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => unreachable!(
-                "ft-82pp1: DecodedImageHandle::pixel_data called with encoded variant; \
-                 the cache should only hold decoded images"
-            ),
+        match self {
+            Self::Payload {
+                current_frame,
+                data,
+            } => match &**data {
+                ImageDataType::Rgba8 { data, .. } => data.as_ptr(),
+                ImageDataType::AnimRgba8 { frames, .. } => {
+                    frames[current_frame.get()].as_ptr()
+                }
+                ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => unreachable!(
+                    "ft-82pp1: DecodedImageHandle::pixel_data called with encoded variant; \
+                     the cache should only hold decoded images"
+                ),
+            },
+            Self::Frame(frame) => frame.pixels.as_ptr(),
         }
     }
 
@@ -354,13 +395,18 @@ impl<'a> BitmapImage for DecodedImageHandle<'a> {
     }
 
     fn image_dimensions(&self) -> (usize, usize) {
-        match &*self.h {
-            ImageDataType::Rgba8 { width, height, .. }
-            | ImageDataType::AnimRgba8 { width, height, .. } => (*width as usize, *height as usize),
-            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => unreachable!(
-                "ft-82pp1: DecodedImageHandle::image_dimensions called with encoded variant; \
-                 the cache should only hold decoded images"
-            ),
+        match self {
+            Self::Payload { data, .. } => match &**data {
+                ImageDataType::Rgba8 { width, height, .. }
+                | ImageDataType::AnimRgba8 { width, height, .. } => {
+                    (*width as usize, *height as usize)
+                }
+                ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => unreachable!(
+                    "ft-82pp1: DecodedImageHandle::image_dimensions called with encoded variant; \
+                     the cache should only hold decoded images"
+                ),
+            },
+            Self::Frame(frame) => (frame.width, frame.height),
         }
     }
 }
@@ -375,26 +421,6 @@ struct DecodedFrame {
     duration: Duration,
     width: usize,
     height: usize,
-}
-
-struct DecodedFrameHandle<'a>(&'a DecodedFrame);
-
-impl BitmapImage for DecodedFrameHandle<'_> {
-    unsafe fn pixel_data(&self) -> *const u8 {
-        self.0.pixels.as_ptr()
-    }
-
-    unsafe fn pixel_data_mut(&mut self) -> *mut u8 {
-        unreachable!("decoded worker frames are immutable renderer snapshots")
-    }
-
-    fn is_mutable(&self) -> bool {
-        false
-    }
-
-    fn image_dimensions(&self) -> (usize, usize) {
-        (self.0.width, self.0.height)
-    }
 }
 
 fn checked_decoded_frame_bytes(width: usize, height: usize) -> Option<usize> {
@@ -451,6 +477,56 @@ static FRAME_DECODER_POOL: LazyLock<Result<rayon::ThreadPool, String>> = LazyLoc
         .map_err(|error| error.to_string())
 });
 
+/// Reserve `amount` from a bounded atomic counter without wrapping at either
+/// the arithmetic or policy ceiling.
+///
+/// Keep this as an explicit compare/exchange loop rather than relying on
+/// unstable or toolchain-specific atomic update conveniences: FrankenTerm's
+/// supported Rust toolchain must compile the queue-pressure guards, and a
+/// contended retry must always re-evaluate overflow and the bound against the
+/// value that actually won the race.
+fn try_reserve_bounded_atomic(counter: &AtomicUsize, amount: usize, limit: usize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current
+            .checked_add(amount)
+            .filter(|next| *next <= limit)
+        else {
+            return false;
+        };
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Release an exact reservation without permitting an underflow to wrap into
+/// counterfeit capacity. `false` leaves the counter unchanged and lets the
+/// owning RAII guard flag the invariant violation in debug builds.
+fn try_release_atomic(counter: &AtomicUsize, amount: usize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_sub(amount) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 struct FrameDecoderJobPermit<'a> {
     jobs: &'a AtomicUsize,
 }
@@ -463,22 +539,14 @@ impl FrameDecoderJobPermit<'static> {
 
 impl<'a> FrameDecoderJobPermit<'a> {
     fn try_acquire_from(jobs: &'a AtomicUsize, limit: usize) -> Option<Self> {
-        jobs
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < limit).then_some(active + 1)
-            })
-            .ok()
-            .map(|_| Self { jobs })
+        try_reserve_bounded_atomic(jobs, 1, limit).then_some(Self { jobs })
     }
 }
 
 impl Drop for FrameDecoderJobPermit<'_> {
     fn drop(&mut self) {
-        let released =
-            self.jobs.try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                active.checked_sub(1)
-            });
-        debug_assert!(released.is_ok());
+        let released = try_release_atomic(self.jobs, 1);
+        debug_assert!(released);
     }
 }
 
@@ -583,13 +651,12 @@ struct QueuedFrameBudget {
 
 impl QueuedFrameBudget {
     fn try_acquire(bytes: usize) -> Option<Self> {
-        FRAME_DECODER_QUEUED_BYTES
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                let next = queued.checked_add(bytes)?;
-                (next <= MAX_QUEUED_FRAME_DECODER_BYTES).then_some(next)
-            })
-            .ok()
-            .map(|_| Self { bytes })
+        try_reserve_bounded_atomic(
+            &FRAME_DECODER_QUEUED_BYTES,
+            bytes,
+            MAX_QUEUED_FRAME_DECODER_BYTES,
+        )
+        .then_some(Self { bytes })
     }
 
     fn split(&mut self, bytes: usize) -> anyhow::Result<Self> {
@@ -608,11 +675,8 @@ impl QueuedFrameBudget {
 impl Drop for QueuedFrameBudget {
     fn drop(&mut self) {
         let bytes = self.bytes;
-        let released =
-            FRAME_DECODER_QUEUED_BYTES.try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                queued.checked_sub(bytes)
-            });
-        debug_assert!(released.is_ok());
+        let released = try_release_atomic(&FRAME_DECODER_QUEUED_BYTES, bytes);
+        debug_assert!(released);
     }
 }
 
@@ -825,6 +889,7 @@ impl FrameState {
         match &mut self.source {
             FrameSource::Decoder(rx) => match rx.try_recv() {
                 Ok(frame) => {
+                    let is_zero_duration_root = self.frames.is_empty() && frame.duration.is_zero();
                     let frame_bytes = frame.checked_decoded_bytes().unwrap_or(usize::MAX);
                     self.retained_frame_bytes = if self.frames.is_empty() {
                         // The first real frame replaces the transparent
@@ -837,7 +902,14 @@ impl FrameState {
                     };
                     self.frames.push(frame.clone());
                     self.current_frame = frame;
-                    self.load_state = LoadState::Loaded;
+                    // A zero-duration first frame is the Kitty animation root,
+                    // not a visible frame. Keep presenting the transparent
+                    // placeholder until the first timed frame arrives.
+                    self.load_state = if is_zero_duration_root {
+                        LoadState::Loading
+                    } else {
+                        LoadState::Loaded
+                    };
                     true
                 }
                 Err(TryRecvError::Empty) => false,
@@ -856,6 +928,7 @@ impl FrameState {
                         self.frames[0].duration = Duration::from_secs(86400);
                         self.current_frame = self.frames[0].clone();
                         self.source = FrameSource::FrameIndex(0);
+                        self.load_state = LoadState::Loaded;
                         true
                     } else {
                         // The decoder path presents each received frame, so at
@@ -894,6 +967,12 @@ impl FrameState {
         self.current_frame.hash
     }
 
+    fn awaiting_first_visible_frame(&self) -> bool {
+        matches!(&self.source, FrameSource::Decoder(_))
+            && self.frames.len() == 1
+            && self.frames[0].duration.is_zero()
+    }
+
     fn next_frame_due(&self, due: Instant) -> Option<Instant> {
         match (&self.source, self.load_state) {
             (_, LoadState::Failed) => None,
@@ -906,6 +985,33 @@ impl FrameState {
     fn retained_bytes(&self) -> usize {
         self.retained_frame_bytes
     }
+}
+
+/// Finalize the next decoder poll immediately before returning to the window
+/// scheduler. Cold atlas allocation can outlast a short cadence, so a deadline
+/// based on a timestamp captured before sprite construction can already be
+/// expired when it is published and drive an immediate-repaint loop.
+///
+/// Only an open decoder queue that returned `Empty` takes this path. Loaded
+/// animation frames keep their original deadline and catch-up semantics.
+fn finalize_decoder_retry_after_empty_poll(
+    frame_start: &mut Instant,
+    current_due: Instant,
+    frame_duration: Duration,
+    min_frame_duration: Duration,
+    decoder_queue_was_empty: bool,
+) -> Option<Instant> {
+    if !decoder_queue_was_empty {
+        return Some(current_due);
+    }
+
+    let retry_start = Instant::now();
+    let retry_interval = frame_duration
+        .max(min_frame_duration)
+        .max(Duration::from_millis(1));
+    let retry_due = retry_start.checked_add(retry_interval)?;
+    *frame_start = retry_start;
+    Some(retry_due)
 }
 
 impl std::fmt::Debug for FrameState {
@@ -2193,12 +2299,9 @@ impl GlyphCache {
             .data_for_content_revision(decoded.expected_revision)
             .ok_or(DecodedImageRevisionMismatch)?;
 
-        let mut handle = DecodedImageHandle {
-            h: image_data,
-            current_frame: *decoded.current_frame.borrow(),
-        };
+        let handle = DecodedImageHandle::payload(image_data, *decoded.current_frame.borrow());
 
-        match &*handle.h {
+        match handle.payload_data() {
             ImageDataType::Rgba8 {
                 hash,
                 width,
@@ -2263,7 +2366,7 @@ impl GlyphCache {
                         next_due = decoded_frame_start.checked_add(
                             durations[*decoded_current_frame].max(min_frame_duration),
                         );
-                        handle.current_frame = *decoded_current_frame;
+                        handle.set_current_frame(*decoded_current_frame);
                     }
 
                     next = next_due;
@@ -2389,8 +2492,32 @@ impl GlyphCache {
             )?;
             return Ok((sprite, None, LoadState::Failed));
         };
-        if now >= next_due && frames.load_next_frame() {
-            *decoded_current_frame = (*decoded_current_frame).wrapping_add(1);
+        let mut decoder_queue_was_empty = false;
+        if now >= next_due {
+            if frames.load_next_frame() {
+                *decoded_current_frame = (*decoded_current_frame).wrapping_add(1);
+                // A zero-duration first frame is animation composition state,
+                // not visible content. If the decoder already queued the
+                // first timed frame, consume exactly that one additional frame
+                // now so a fast decoder does not force one transparent
+                // presentation interval. This is intentionally bounded to one
+                // extra `try_recv`: draining an arbitrarily long animation on
+                // the GUI thread would exchange the blank-frame bug for
+                // unbounded paint latency.
+                if frames.awaiting_first_visible_frame() {
+                    if frames.load_next_frame() {
+                        *decoded_current_frame = (*decoded_current_frame).wrapping_add(1);
+                    } else if matches!(&frames.source, FrameSource::Decoder(_)) {
+                        decoder_queue_was_empty = true;
+                    }
+                }
+            } else if matches!(&frames.source, FrameSource::Decoder(_)) {
+                decoder_queue_was_empty = true;
+            }
+            // Advance the ordinary animation clock after each due poll. If the
+            // open decoder queue was empty, the deadline is finalized again
+            // from a fresh timestamp after sprite lookup/allocation below; a
+            // cold atlas allocation must not make the published retry stale.
             *decoded_frame_start = now;
             let Some(updated_due) = decoded_frame_start
                 .checked_add(frames.frame_duration().max(min_frame_duration))
@@ -2409,6 +2536,32 @@ impl GlyphCache {
             next_due = updated_due;
         }
 
+        if frames.awaiting_first_visible_frame() {
+            let sprite = Self::cached_blank_frame_sprite(
+                blank_frame_cache,
+                atlas,
+                1,
+                1,
+                padding,
+                scale_down,
+            )?;
+            let Some(next_due) = finalize_decoder_retry_after_empty_poll(
+                &mut decoded_frame_start,
+                next_due,
+                frames.frame_duration(),
+                min_frame_duration,
+                decoder_queue_was_empty,
+            ) else {
+                frames.load_state = LoadState::Failed;
+                return Ok((sprite, None, LoadState::Failed));
+            };
+            return Ok((
+                sprite,
+                frames.next_frame_due(next_due),
+                LoadState::Loading,
+            ));
+        }
+
         let key = FrameSpriteKey {
             hash: frames.frame_hash(),
             width: frames.current_frame.width,
@@ -2418,6 +2571,16 @@ impl GlyphCache {
         };
 
         if let Some(sprite) = frame_cache.get(&key) {
+            let Some(next_due) = finalize_decoder_retry_after_empty_poll(
+                &mut decoded_frame_start,
+                next_due,
+                frames.frame_duration(),
+                min_frame_duration,
+                decoder_queue_was_empty,
+            ) else {
+                frames.load_state = LoadState::Failed;
+                return Ok((sprite.clone(), None, LoadState::Failed));
+            };
             return Ok((
                 sprite.clone(),
                 frames.next_frame_due(next_due),
@@ -2443,7 +2606,7 @@ impl GlyphCache {
         };
 
         let sprite = if frames.current_frame.pixels.len() == expected_byte_size {
-            let frame = DecodedFrameHandle(&frames.current_frame);
+            let frame = DecodedImageHandle::frame(&frames.current_frame);
             let sprite = atlas.allocate_with_padding(&frame, padding, scale_down)?;
             frame_cache.insert(key, sprite.clone());
             sprite
@@ -2461,6 +2624,17 @@ impl GlyphCache {
                 padding,
                 scale_down,
             )?
+        };
+
+        let Some(next_due) = finalize_decoder_retry_after_empty_poll(
+            &mut decoded_frame_start,
+            next_due,
+            frames.frame_duration(),
+            min_frame_duration,
+            decoder_queue_was_empty,
+        ) else {
+            frames.load_state = LoadState::Failed;
+            return Ok((sprite, None, LoadState::Failed));
         };
 
         Ok((
@@ -3035,6 +3209,37 @@ mod tests {
     use crate::termwindow::render::paint::AllowImage;
     use frankenterm_core::font_features::{AxisValue, VariableAxis};
     use window::bitmaps::TextureRect;
+
+    #[test]
+    fn bounded_atomic_reservation_preserves_limit_overflow_and_release_boundaries() {
+        let counter = AtomicUsize::new(0);
+
+        assert!(try_reserve_bounded_atomic(&counter, 2, 2));
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        assert!(
+            !try_reserve_bounded_atomic(&counter, 1, 2),
+            "a counter already at its limit must reject another reservation"
+        );
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        assert!(
+            !try_release_atomic(&counter, 3),
+            "an underflowing release must fail without wrapping"
+        );
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        assert!(try_release_atomic(&counter, 2));
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+
+        assert!(try_reserve_bounded_atomic(&counter, 0, 0));
+        assert!(try_release_atomic(&counter, 0));
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+
+        counter.store(usize::MAX, Ordering::Release);
+        assert!(
+            !try_reserve_bounded_atomic(&counter, 1, usize::MAX),
+            "checked addition must reject arithmetic overflow"
+        );
+        assert_eq!(counter.load(Ordering::Acquire), usize::MAX);
+    }
 
     fn test_glyph_cache() -> (GlyphCache, RenderMetrics) {
         test_glyph_cache_with_atlas_size(128)
@@ -3840,7 +4045,7 @@ mod tests {
     fn decoded_worker_frame_is_memory_resident_and_hash_authoritative_without_blob_io() {
         let frame = decoder_test_frame(0x5a, Duration::from_millis(17));
         let clone = frame.clone();
-        let handle = DecodedFrameHandle(&frame);
+        let handle = DecodedImageHandle::frame(&frame);
 
         assert!(Arc::ptr_eq(&frame.pixels, &clone.pixels));
         assert_eq!(
@@ -4042,6 +4247,207 @@ mod tests {
     }
 
     #[test]
+    fn empty_decoder_retry_finalizer_samples_time_at_publication_boundary() {
+        let original_start = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("short test offset is representable");
+        let original_due = original_start
+            .checked_add(Duration::from_secs(1))
+            .expect("short test offset is representable");
+
+        let mut loaded_start = original_start;
+        let loaded_due = finalize_decoder_retry_after_empty_poll(
+            &mut loaded_start,
+            original_due,
+            Duration::ZERO,
+            Duration::from_secs(1),
+            false,
+        );
+        assert_eq!(loaded_due, Some(original_due));
+        assert_eq!(loaded_start, original_start);
+
+        // This timestamp represents arbitrary sprite/atlas work completed
+        // after the decoder poll. The empty-queue path must sample the clock
+        // after that work rather than preserving the stale `original_due`.
+        let before_publication = Instant::now();
+        let mut empty_start = original_start;
+        let empty_due = finalize_decoder_retry_after_empty_poll(
+            &mut empty_start,
+            original_due,
+            Duration::ZERO,
+            Duration::from_secs(1),
+            true,
+        )
+        .expect("a short retry interval is representable");
+        assert!(empty_start >= before_publication);
+        assert!(empty_due >= before_publication + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn encoded_empty_decoder_poll_rebases_expired_deadline_without_hot_spin() {
+        let (_sender, state) = queued_frame_state();
+        let source = Arc::new(ImageData::with_data(ImageDataType::EncodedFile(vec![
+            0xaa, 0xbb, 0xcc,
+        ])));
+        let expected_revision = source.current_content_hash();
+        let decoded = DecodedImage {
+            frame_start: RefCell::new(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("short test offset is representable"),
+            ),
+            current_frame: RefCell::new(0),
+            image: source,
+            expected_revision,
+            source_retained_bytes: Cell::new(3),
+            decoded_validation: RefCell::new(None),
+            frames: RefCell::new(Some(state)),
+            load_state: Cell::new(LoadState::Loading),
+        };
+        let (mut cache, _) = test_glyph_cache();
+        let retry_interval = Duration::from_secs(1);
+        let before_poll = Instant::now();
+
+        let (_, next_due, load_state) = GlyphCache::cached_image_impl(
+            &mut cache.frame_cache,
+            &mut cache.blank_frame_cache,
+            &mut cache.atlas,
+            &decoded,
+            None,
+            retry_interval,
+            AllowImage::Yes,
+        )
+        .expect("an empty decoder queue renders a nonblocking placeholder");
+
+        assert_eq!(load_state, LoadState::Loading);
+        assert!(
+            next_due.is_some_and(|due| due >= before_poll + retry_interval),
+            "an empty queue must schedule a future retry rather than return its expired deadline"
+        );
+        assert!(cache.frame_cache.is_empty());
+        assert_eq!(cache.blank_frame_cache.len(), 1);
+    }
+
+    #[test]
+    fn encoded_zero_duration_root_stays_blank_until_first_visible_frame() {
+        let (sender, mut state) = queued_frame_state();
+        let root = decoder_test_frame(0x21, Duration::ZERO);
+        let root_hash = root.hash;
+        send_test_frame(&sender, root);
+        assert!(state.load_next_frame());
+        assert!(state.awaiting_first_visible_frame());
+        assert_eq!(state.load_state, LoadState::Loading);
+        assert_eq!(state.frame_hash(), root_hash);
+
+        let source = Arc::new(ImageData::with_data(ImageDataType::EncodedFile(vec![
+            0xaa, 0xbb, 0xcc,
+        ])));
+        let expected_revision = source.current_content_hash();
+        let decoded = DecodedImage {
+            frame_start: RefCell::new(Instant::now()),
+            current_frame: RefCell::new(0),
+            image: source,
+            expected_revision,
+            source_retained_bytes: Cell::new(3),
+            decoded_validation: RefCell::new(None),
+            frames: RefCell::new(Some(state)),
+            load_state: Cell::new(LoadState::Loading),
+        };
+        let (mut cache, _) = test_glyph_cache();
+
+        let (_, first_due, first_state) = GlyphCache::cached_image_impl(
+            &mut cache.frame_cache,
+            &mut cache.blank_frame_cache,
+            &mut cache.atlas,
+            &decoded,
+            None,
+            cache.min_frame_duration,
+            AllowImage::Yes,
+        )
+        .expect("zero-duration root renders a nonblocking transparent placeholder");
+        assert_eq!(first_state, LoadState::Loading);
+        assert!(first_due.is_some());
+        assert!(cache.frame_cache.is_empty(), "root pixels were not uploaded");
+        assert_eq!(cache.blank_frame_cache.len(), 1);
+
+        let visible = decoder_test_frame(0x42, Duration::from_millis(20));
+        let visible_hash = visible.hash;
+        send_test_frame(&sender, visible);
+        *decoded.frame_start.borrow_mut() = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("short test offset is representable");
+
+        let (_, _, visible_state) = GlyphCache::cached_image_impl(
+            &mut cache.frame_cache,
+            &mut cache.blank_frame_cache,
+            &mut cache.atlas,
+            &decoded,
+            None,
+            cache.min_frame_duration,
+            AllowImage::Yes,
+        )
+        .expect("first timed frame replaces the transparent root placeholder");
+        assert_eq!(visible_state, LoadState::Loaded);
+        assert_eq!(cache.frame_cache.len(), 1);
+        let frames = decoded.frames.borrow();
+        let frames = frames.as_ref().expect("encoded frame state remains live");
+        assert!(!frames.awaiting_first_visible_frame());
+        assert_eq!(frames.frame_hash(), visible_hash);
+    }
+
+    #[test]
+    fn encoded_zero_duration_root_and_ready_timed_frame_publish_in_one_paint() {
+        let (sender, state) = queued_frame_state();
+        send_test_frame(&sender, decoder_test_frame(0x21, Duration::ZERO));
+        let visible = decoder_test_frame(0x42, Duration::from_millis(20));
+        let visible_hash = visible.hash;
+        send_test_frame(&sender, visible);
+
+        let source = Arc::new(ImageData::with_data(ImageDataType::EncodedFile(vec![
+            0xaa, 0xbb, 0xcc,
+        ])));
+        let expected_revision = source.current_content_hash();
+        let decoded = DecodedImage {
+            frame_start: RefCell::new(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("short test offset is representable"),
+            ),
+            current_frame: RefCell::new(0),
+            image: source,
+            expected_revision,
+            source_retained_bytes: Cell::new(3),
+            decoded_validation: RefCell::new(None),
+            frames: RefCell::new(Some(state)),
+            load_state: Cell::new(LoadState::Loading),
+        };
+        let (mut cache, _) = test_glyph_cache();
+
+        let (_, next_due, load_state) = GlyphCache::cached_image_impl(
+            &mut cache.frame_cache,
+            &mut cache.blank_frame_cache,
+            &mut cache.atlas,
+            &decoded,
+            None,
+            cache.min_frame_duration,
+            AllowImage::Yes,
+        )
+        .expect("a queued timed frame must replace the zero-duration root immediately");
+
+        assert_eq!(load_state, LoadState::Loaded);
+        assert!(next_due.is_some());
+        assert_eq!(cache.frame_cache.len(), 1);
+        assert!(
+            cache.blank_frame_cache.is_empty(),
+            "the ready timed frame must not spend one paint behind a blank sprite"
+        );
+        let frames = decoded.frames.borrow();
+        let frames = frames.as_ref().expect("encoded frame state remains live");
+        assert!(!frames.awaiting_first_visible_frame());
+        assert_eq!(frames.frame_hash(), visible_hash);
+    }
+
+    #[test]
     fn decoded_animation_source_bytes_are_aggregated_once_at_construction() {
         let first = vec![0x11; 4];
         let second = vec![0x22; 4];
@@ -4061,7 +4467,6 @@ mod tests {
 
         assert_eq!(decoded.source_retained_bytes.get(), 8);
         assert!(decoded.decoded_validation.borrow().is_none());
-        assert_eq!(decoded.retained_bytes(), 8);
         assert_eq!(decoded.retained_bytes(), 8);
     }
 
@@ -4146,6 +4551,23 @@ mod tests {
         assert!(matches!(&state.source, FrameSource::FrameIndex(0)));
         assert_eq!(state.frame_duration(), Duration::from_secs(86_400));
         assert_eq!(state.current_frame.duration, state.frames[0].duration);
+    }
+
+    #[test]
+    fn decoder_zero_duration_single_frame_becomes_visible_after_disconnect() {
+        let (sender, mut state) = queued_frame_state();
+        send_test_frame(&sender, decoder_test_frame(0x45, Duration::ZERO));
+
+        assert!(state.load_next_frame());
+        assert!(state.awaiting_first_visible_frame());
+        assert_eq!(state.load_state, LoadState::Loading);
+
+        drop(sender);
+        assert!(state.load_next_frame());
+        assert!(matches!(&state.source, FrameSource::FrameIndex(0)));
+        assert!(!state.awaiting_first_visible_frame());
+        assert_eq!(state.load_state, LoadState::Loaded);
+        assert_eq!(state.frame_duration(), Duration::from_secs(86_400));
     }
 
     fn one_pixel_image(pixel: [u8; 4]) -> Arc<ImageData> {

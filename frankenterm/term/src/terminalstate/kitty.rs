@@ -41,6 +41,19 @@ pub struct KittyImageState {
     pub(crate) max_transmission_bytes: usize,
 }
 
+/// Fully checked resource-ledger transaction for one image append.
+///
+/// The image performs all fallible validation and allocation separately. This
+/// plan is committed only while that prepared append holds the target payload
+/// stable, after which the image commit itself is infallible.
+#[derive(Debug)]
+struct KittyImageGrowthPlan {
+    image_id: u32,
+    expected_used_memory: usize,
+    evictions: Vec<(u32, usize)>,
+    committed_memory: usize,
+}
+
 impl Default for KittyImageState {
     fn default() -> Self {
         Self {
@@ -157,6 +170,30 @@ fn checked_image_data_len(data: &ImageDataType) -> anyhow::Result<usize> {
 
 fn checked_image_len(data: &ImageData) -> anyhow::Result<usize> {
     checked_image_data_len(&data.data())
+}
+
+fn checked_kitty_frame_buffer_len(width: u32, height: u32) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        width != 0 && height != 0,
+        "Kitty frame dimensions must be nonzero, got {}x{}",
+        width,
+        height
+    );
+    usize::try_from(u128::from(width) * u128::from(height) * 4)
+        .context("Kitty frame dimensions exceed the addressable byte length")
+}
+
+fn ensure_kitty_frame_buffer_len(width: u32, height: u32, actual: usize) -> anyhow::Result<()> {
+    let expected = checked_kitty_frame_buffer_len(width, height)?;
+    anyhow::ensure!(
+        expected == actual,
+        "Kitty frame data size mismatch: {}x{} requires {} bytes, got {}",
+        width,
+        height,
+        expected,
+        actual
+    );
+    Ok(())
 }
 
 /// Inflate a zlib-wrapped Kitty payload in fixed-size output steps while
@@ -550,15 +587,16 @@ impl KittyImageState {
         Ok(())
     }
 
-    /// Reserve resident bytes for an imminent append to an existing mutable
-    /// image.  Call only after all fallible frame construction is complete and
-    /// immediately before mutating the frame vectors.
-    fn admit_image_growth(
-        &mut self,
+    /// Build the complete, nonmutating admission plan for growing an existing
+    /// image. Callers can use this before acquiring `ImageData::data_mut()` so
+    /// a predictable resource rejection never forces the guard to rehash an
+    /// otherwise untouched large animation.
+    fn plan_image_growth(
+        &self,
         image_id: u32,
         current_image_len: usize,
         growth: usize,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<KittyImageGrowthPlan> {
         anyhow::ensure!(
             self.id_to_data.contains_key(&image_id),
             "cannot grow missing Kitty image id {}",
@@ -594,8 +632,30 @@ impl KittyImageState {
             committed,
             self.image_budget_bytes
         );
-        self.apply_eviction_plan(&plan)?;
-        self.used_memory = committed;
+        Ok(KittyImageGrowthPlan {
+            image_id,
+            expected_used_memory: self.used_memory,
+            evictions: plan,
+            committed_memory: committed,
+        })
+    }
+
+    /// Commit a previously checked resource-ledger plan. The caller holds a
+    /// prepared image append whose eventual commit cannot fail.
+    fn commit_image_growth_plan(&mut self, plan: KittyImageGrowthPlan) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.used_memory == plan.expected_used_memory,
+            "Kitty image memory state changed between growth plan and commit: expected {}, got {}",
+            plan.expected_used_memory,
+            self.used_memory
+        );
+        anyhow::ensure!(
+            self.id_to_data.contains_key(&plan.image_id),
+            "cannot commit growth for missing Kitty image id {}",
+            plan.image_id
+        );
+        self.apply_eviction_plan(&plan.evictions)?;
+        self.used_memory = plan.committed_memory;
         Ok(())
     }
 
@@ -1043,109 +1103,150 @@ impl TerminalState {
                 .ok_or_else(|| anyhow::anyhow!("invalid image id {}", image_id))?,
         );
 
-        let mut img = img.data_mut();
-        match &mut *img {
-            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
-                anyhow::bail!("invalid image type")
+        // Reject every shape/cardinality/index error while holding only the
+        // read guard. `ImageDataMutGuard::drop` intentionally repairs embedded
+        // hashes for arbitrary mutations; acquiring it for a command that can
+        // be proven invalid here would turn a cheap rejection into a full
+        // animation rehash.
+        let (target_width, target_height) = {
+            let image = img.data();
+            match &*image {
+                ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
+                    anyhow::bail!("invalid image type")
+                }
+                ImageDataType::Rgba8 {
+                    width,
+                    height,
+                    data,
+                    ..
+                } => {
+                    anyhow::ensure!(
+                        src_frame == target_frame && src_frame == 1,
+                        "src_frame={} target_frame={} but there is only a single frame",
+                        src_frame,
+                        target_frame
+                    );
+                    ensure_kitty_frame_buffer_len(*width, *height, data.len())?;
+                    (*width, *height)
+                }
+                ImageDataType::AnimRgba8 {
+                    width,
+                    height,
+                    frames,
+                    durations,
+                    hashes,
+                } => {
+                    anyhow::ensure!(
+                        frames.len() == durations.len() && frames.len() == hashes.len(),
+                        "ill formed Kitty animation metadata: frames={} durations={} hashes={}",
+                        frames.len(),
+                        durations.len(),
+                        hashes.len()
+                    );
+                    anyhow::ensure!(
+                        frames.len() <= MAX_KITTY_ANIMATION_FRAMES,
+                        "Kitty animation has {} frames, exceeding frame budget {}",
+                        frames.len(),
+                        MAX_KITTY_ANIMATION_FRAMES
+                    );
+                    anyhow::ensure!(
+                        src_frame > 0 && src_frame <= frames.len(),
+                        "src_frame {} is out of range",
+                        src_frame
+                    );
+                    anyhow::ensure!(
+                        target_frame > 0 && target_frame <= frames.len(),
+                        "target_frame {} is out of range",
+                        target_frame
+                    );
+                    ensure_kitty_frame_buffer_len(
+                        *width,
+                        *height,
+                        frames[src_frame - 1].len(),
+                    )?;
+                    ensure_kitty_frame_buffer_len(
+                        *width,
+                        *height,
+                        frames[target_frame - 1].len(),
+                    )?;
+                    (*width, *height)
+                }
             }
-            ImageDataType::Rgba8 {
-                width,
-                height,
-                data,
-                hash,
-            } => {
-                anyhow::ensure!(
-                    src_frame == target_frame && src_frame == 1,
-                    "src_frame={} target_frame={} but there is only a single frame",
-                    src_frame,
-                    target_frame
-                );
+        };
 
-                let src = clip_view(
-                    *width,
-                    *height,
-                    data.as_mut_slice(),
-                    frame.src_x,
-                    frame.src_y,
-                    frame.w,
-                    frame.h,
-                )?;
-
-                let mut dest: ImageBuffer<Rgba<u8>, &mut [u8]> =
-                    ImageBuffer::from_raw(*width, *height, data.as_mut_slice())
-                        .ok_or_else(|| anyhow::anyhow!("ill formed image"))?;
-
-                blit(
-                    &mut dest,
-                    &src,
-                    frame.x.unwrap_or(0),
-                    frame.y.unwrap_or(0),
-                    frame.composition_mode,
-                )?;
-
-                drop(dest);
-
-                *hash = ImageDataType::hash_bytes(data);
-            }
-            ImageDataType::AnimRgba8 {
-                width,
-                height,
-                frames,
-                durations,
-                hashes,
-            } => {
-                anyhow::ensure!(
-                    frames.len() == durations.len() && frames.len() == hashes.len(),
-                    "ill formed Kitty animation metadata: frames={} durations={} hashes={}",
-                    frames.len(),
-                    durations.len(),
-                    hashes.len()
-                );
-                anyhow::ensure!(
-                    frames.len() <= MAX_KITTY_ANIMATION_FRAMES,
-                    "Kitty animation has {} frames, exceeding frame budget {}",
-                    frames.len(),
-                    MAX_KITTY_ANIMATION_FRAMES
-                );
-                anyhow::ensure!(
-                    src_frame > 0 && src_frame <= frames.len(),
-                    "src_frame {} is out of range",
-                    src_frame
-                );
-                anyhow::ensure!(
-                    target_frame > 0 && target_frame <= frames.len(),
-                    "target_frame {} is out of range",
-                    target_frame
-                );
-
-                let src = clip_view(
-                    *width,
-                    *height,
-                    frames[src_frame - 1].as_mut_slice(),
-                    frame.src_x,
-                    frame.src_y,
-                    frame.w,
-                    frame.h,
-                )?;
-
-                let mut dest: ImageBuffer<Rgba<u8>, &mut [u8]> =
-                    ImageBuffer::from_raw(*width, *height, frames[target_frame - 1].as_mut_slice())
-                        .ok_or_else(|| anyhow::anyhow!("ill formed image"))?;
-
-                blit(
-                    &mut dest,
-                    &src,
-                    frame.x.unwrap_or(0),
-                    frame.y.unwrap_or(0),
-                    frame.composition_mode,
-                )?;
-
-                drop(dest);
-                hashes[target_frame - 1] = ImageDataType::hash_bytes(&frames[target_frame - 1]);
-            }
+        let dest_x = frame.x.unwrap_or(0);
+        let dest_y = frame.y.unwrap_or(0);
+        let (_, _, clipped_width, clipped_height) = clipped_view_region(
+            target_width,
+            target_height,
+            frame.src_x,
+            frame.src_y,
+            frame.w,
+            frame.h,
+        )?;
+        if clipped_width == 0
+            || clipped_height == 0
+            || dest_x >= target_width
+            || dest_y >= target_height
+        {
+            // A fully clipped composition is a successful no-op. Validate its
+            // source coordinates above, but do not materialize a potentially
+            // large source-frame copy or invalidate target authority.
+            return Ok(());
         }
 
-        drop(img);
+        let src = {
+            let image = img.data();
+            match &*image {
+                ImageDataType::Rgba8 {
+                    width,
+                    height,
+                    data,
+                    ..
+                } => clip_view(
+                    *width,
+                    *height,
+                    data,
+                    frame.src_x,
+                    frame.src_y,
+                    frame.w,
+                    frame.h,
+                )?,
+                ImageDataType::AnimRgba8 {
+                    width,
+                    height,
+                    frames,
+                    ..
+                } => clip_view(
+                    *width,
+                    *height,
+                    &frames[src_frame - 1],
+                    frame.src_x,
+                    frame.src_y,
+                    frame.w,
+                    frame.h,
+                )?,
+                ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
+                    anyhow::bail!("invalid image type")
+                }
+            }
+        };
+        let mut target = img
+            .decoded_frame_mut(target_frame - 1)
+            .context("acquiring Kitty target frame mutation authority")?;
+        let (width, height) = target.image_dimensions();
+        let mut dest: ImageBuffer<Rgba<u8>, &mut [u8]> =
+            ImageBuffer::from_raw(width, height, &mut *target)
+                .ok_or_else(|| anyhow::anyhow!("ill formed image"))?;
+        blit(
+            &mut dest,
+            &src,
+            dest_x,
+            dest_y,
+            frame.composition_mode,
+        )?;
+        drop(dest);
+        drop(target);
         self.kitty_mark_image_placements_dirty(image_id);
         Ok(())
     }
@@ -1207,57 +1308,130 @@ impl TerminalState {
         };
 
         let current_image_len = checked_image_len(&anim)?;
-        let mut anim = anim.data_mut();
+        let (planned_growth, target_width, target_height) = {
+            let image = anim.data();
+            match &*image {
+                ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
+                    anyhow::bail!("Expected decoded image for image id {}", image_id)
+                }
+                ImageDataType::Rgba8 {
+                    data,
+                    width,
+                    height,
+                    ..
+                } => {
+                    match frame.base_frame {
+                        Some(1) | None => {}
+                        Some(n) => anyhow::bail!(
+                            "attempted to copy frame {} but there is only a single frame",
+                            n
+                        ),
+                    }
+                    ensure_kitty_frame_buffer_len(*width, *height, data.len())?;
+                    let growth = match frame.frame_number {
+                        Some(1) => None,
+                        Some(2) | None => Some(data.len()),
+                        Some(n) => anyhow::bail!(
+                            "attempted to edit frame {} but there is only a single frame",
+                            n
+                        ),
+                    };
+                    (growth, *width, *height)
+                }
+                ImageDataType::AnimRgba8 {
+                    width,
+                    height,
+                    frames,
+                    durations,
+                    hashes,
+                } => {
+                    anyhow::ensure!(
+                        frames.len() == durations.len() && frames.len() == hashes.len(),
+                        "ill formed Kitty animation metadata: frames={} durations={} hashes={}",
+                        frames.len(),
+                        durations.len(),
+                        hashes.len()
+                    );
+                    anyhow::ensure!(
+                        frames.len() <= MAX_KITTY_ANIMATION_FRAMES,
+                        "Kitty animation has {} frames, exceeding frame budget {}",
+                        frames.len(),
+                        MAX_KITTY_ANIMATION_FRAMES
+                    );
+                    let append_frame_no = next_kitty_frame_number(frames.len())?;
+                    let frame_no = frame.frame_number.unwrap_or(append_frame_no);
+                    let growth = if frame_no == append_frame_no {
+                        anyhow::ensure!(
+                            frames.len() < MAX_KITTY_ANIMATION_FRAMES,
+                            "Kitty animation rejected: frame count would exceed {}",
+                            MAX_KITTY_ANIMATION_FRAMES
+                        );
+                        if let Some(base_frame) = frame.base_frame {
+                            let base_frame = base_frame as usize;
+                            anyhow::ensure!(
+                                base_frame > 0 && base_frame <= frames.len(),
+                                "attempted to copy frame {} which is outside range 1-{}",
+                                base_frame,
+                                frames.len()
+                            );
+                            ensure_kitty_frame_buffer_len(
+                                *width,
+                                *height,
+                                frames[base_frame - 1].len(),
+                            )?;
+                        }
+                        Some(checked_kitty_frame_buffer_len(*width, *height)?)
+                    } else {
+                        anyhow::ensure!(
+                            frame_no > 0 && frame_no < append_frame_no,
+                            "attempted to edit frame {} which is outside range 1-{}",
+                            frame_no,
+                            frames.len()
+                        );
+                        ensure_kitty_frame_buffer_len(
+                            *width,
+                            *height,
+                            frames[frame_no as usize - 1].len(),
+                        )?;
+                        None
+                    };
+                    (growth, *width, *height)
+                }
+            }
+        };
+        let mut growth_admission = if let Some(growth) = planned_growth {
+            // This first pass is deliberately nonmutating. The authoritative
+            // commit consumes this exact plan only after frame construction,
+            // validation, hashing, and vector reservation have succeeded.
+            Some(
+                self.kitty_img
+                    .plan_image_growth(image_id, current_image_len, growth)?,
+            )
+        } else {
+            None
+        };
         let x = frame.x.unwrap_or(0);
         let y = frame.y.unwrap_or(0);
         let frame_gap = Duration::from_millis(match frame.duration_ms {
             None | Some(0) => 40,
             Some(n) => n.into(),
         });
-
-        match &mut *anim {
-            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
-                anyhow::bail!("Expected decoded image for image id {}", image_id)
-            }
-            ImageDataType::Rgba8 {
-                data,
-                width,
-                height,
-                hash,
-            } => {
-                let base_frame = match frame.base_frame {
-                    Some(1) => Some(1),
-                    None => None,
-                    Some(n) => anyhow::bail!(
-                        "attempted to copy frame {} but there is only a single frame",
-                        n
-                    ),
-                };
-
-                match frame.frame_number {
-                    Some(1) => {
-                        // Edit in place
-                        let len = data.len();
-                        let mut anim_img: ImageBuffer<Rgba<u8>, &mut [u8]> =
-                            ImageBuffer::from_raw(*width, *height, data.as_mut_slice())
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "ImageBuffer::from_raw failed for single \
-                                         frame of {}x{} ({} bytes)",
-                                        width,
-                                        height,
-                                        len
-                                    )
-                                })?;
-
-                        blit(&mut anim_img, &img, x, y, frame.composition_mode)?;
-
-                        drop(anim_img);
-                        *hash = ImageDataType::hash_bytes(data);
-                    }
+        enum PreparedFrameMutation {
+            Edit(usize),
+            Append(Vec<u8>),
+        }
+        let prepared = {
+            let image = anim.data();
+            match &*image {
+                ImageDataType::Rgba8 {
+                    data,
+                    width,
+                    height,
+                    ..
+                } => match frame.frame_number {
+                    Some(1) => PreparedFrameMutation::Edit(0),
                     Some(2) | None => {
-                        // Create a second frame
-                        let mut new_frame = if base_frame.is_some() {
+                        let mut new_frame = if frame.base_frame.is_some() {
                             RgbaImage::from_vec(*width, *height, data.clone()).ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "kitty image data size mismatch: {}x{} vs {} bytes",
@@ -1269,134 +1443,103 @@ impl TerminalState {
                         } else {
                             RgbaImage::from_pixel(*width, *height, background_pixel)
                         };
-
                         blit(&mut new_frame, &img, x, y, frame.composition_mode)?;
-
-                        let new_frame_data = new_frame.into_vec();
-                        let new_frame_hash = ImageDataType::hash_bytes(&new_frame_data);
-                        self.kitty_img.admit_image_growth(
-                            image_id,
-                            current_image_len,
-                            new_frame_data.len(),
-                        )?;
-
-                        let frames = vec![std::mem::take(data), new_frame_data];
-                        let durations = vec![Duration::from_millis(0), frame_gap];
-                        let hashes = vec![*hash, new_frame_hash];
-
-                        *anim = ImageDataType::AnimRgba8 {
-                            width: *width,
-                            height: *height,
-                            frames,
-                            durations,
-                            hashes,
-                        };
+                        PreparedFrameMutation::Append(new_frame.into_vec())
                     }
                     Some(n) => anyhow::bail!(
                         "attempted to edit frame {} but there is only a single frame",
                         n
                     ),
-                }
-            }
-            ImageDataType::AnimRgba8 {
-                width,
-                height,
-                frames,
-                durations,
-                hashes,
-            } => {
-                anyhow::ensure!(
-                    frames.len() == durations.len() && frames.len() == hashes.len(),
-                    "ill formed Kitty animation metadata: frames={} durations={} hashes={}",
-                    frames.len(),
-                    durations.len(),
-                    hashes.len()
-                );
-                anyhow::ensure!(
-                    frames.len() <= MAX_KITTY_ANIMATION_FRAMES,
-                    "Kitty animation has {} frames, exceeding frame budget {}",
-                    frames.len(),
-                    MAX_KITTY_ANIMATION_FRAMES
-                );
-                let append_frame_no = next_kitty_frame_number(frames.len())?;
-                let frame_no = frame.frame_number.unwrap_or(append_frame_no);
-                if frame_no == append_frame_no {
-                    // Append a new frame
-                    anyhow::ensure!(
-                        frames.len() < MAX_KITTY_ANIMATION_FRAMES,
-                        "Kitty animation rejected: frame count would exceed {}",
-                        MAX_KITTY_ANIMATION_FRAMES
-                    );
-
-                    let mut new_frame = match frame.base_frame {
-                        None => RgbaImage::from_pixel(*width, *height, background_pixel),
-                        Some(n) => {
-                            let n = n as usize;
-                            anyhow::ensure!(
-                                n > 0 && n <= frames.len(),
-                                "attempted to copy frame {} which is outside range 1-{}",
-                                n,
-                                frames.len()
-                            );
-                            RgbaImage::from_vec(*width, *height, frames[n - 1].clone()).ok_or_else(
-                                || {
+                },
+                ImageDataType::AnimRgba8 {
+                    width,
+                    height,
+                    frames,
+                    ..
+                } => {
+                    let append_frame_no = next_kitty_frame_number(frames.len())?;
+                    let frame_no = frame.frame_number.unwrap_or(append_frame_no);
+                    if frame_no == append_frame_no {
+                        let mut new_frame = match frame.base_frame {
+                            None => RgbaImage::from_pixel(*width, *height, background_pixel),
+                            Some(base_frame) => {
+                                let base_frame = base_frame as usize;
+                                RgbaImage::from_vec(
+                                    *width,
+                                    *height,
+                                    frames[base_frame - 1].clone(),
+                                )
+                                .ok_or_else(|| {
                                     anyhow::anyhow!(
                                         "kitty frame {} data size mismatch: {}x{} vs {} bytes",
-                                        n,
+                                        base_frame,
                                         width,
                                         height,
-                                        frames[n - 1].len()
+                                        frames[base_frame - 1].len()
                                     )
-                                },
-                            )?
-                        }
-                    };
-
-                    blit(&mut new_frame, &img, x, y, frame.composition_mode)?;
-
-                    let new_frame_data = new_frame.into_vec();
-                    let new_frame_hash = ImageDataType::hash_bytes(&new_frame_data);
-                    self.kitty_img.admit_image_growth(
-                        image_id,
-                        current_image_len,
-                        new_frame_data.len(),
-                    )?;
-
-                    frames.push(new_frame_data);
-                    hashes.push(new_frame_hash);
-                    durations.push(frame_gap);
-                } else {
-                    anyhow::ensure!(
-                        frame_no > 0 && frame_no < append_frame_no,
-                        "attempted to edit frame {} which is outside range 1-{}",
-                        frame_no,
-                        frames.len()
-                    );
-
-                    let frame_no = frame_no as usize;
-
-                    let len = frames[frame_no - 1].len();
-                    let mut anim_img: ImageBuffer<Rgba<u8>, &mut [u8]> =
-                        ImageBuffer::from_raw(*width, *height, frames[frame_no - 1].as_mut_slice())
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "ImageBuffer::from_raw failed for single \
-                                         frame of {}x{} ({} bytes)",
-                                    width,
-                                    height,
-                                    len
-                                )
-                            })?;
-
-                    blit(&mut anim_img, &img, x, y, frame.composition_mode)?;
-
-                    drop(anim_img);
-                    hashes[frame_no - 1] = ImageDataType::hash_bytes(&frames[frame_no - 1]);
+                                })?
+                            }
+                        };
+                        blit(&mut new_frame, &img, x, y, frame.composition_mode)?;
+                        PreparedFrameMutation::Append(new_frame.into_vec())
+                    } else {
+                        PreparedFrameMutation::Edit(frame_no as usize - 1)
+                    }
+                }
+                ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
+                    anyhow::bail!("Expected decoded image for image id {}", image_id)
                 }
             }
-        }
+        };
 
-        drop(anim);
+        match prepared {
+            PreparedFrameMutation::Edit(frame_index) => {
+                if x >= target_width || y >= target_height {
+                    // The transmitted patch is fully outside the edited
+                    // frame. Preserve revision/authority and avoid hashing a
+                    // large target for this successful no-op.
+                    return Ok(());
+                }
+                let mut target = anim
+                    .decoded_frame_mut(frame_index)
+                    .context("acquiring Kitty transmitted-frame mutation authority")?;
+                let (width, height) = target.image_dimensions();
+                let mut target_image: ImageBuffer<Rgba<u8>, &mut [u8]> =
+                    ImageBuffer::from_raw(width, height, &mut *target)
+                        .ok_or_else(|| anyhow::anyhow!("ill formed image"))?;
+                blit(&mut target_image, &img, x, y, frame.composition_mode)?;
+                drop(target_image);
+                drop(target);
+            }
+            PreparedFrameMutation::Append(new_frame) => {
+                let growth = new_frame.len();
+                let prepared = anim
+                    .prepare_decoded_frame_append(
+                        new_frame,
+                        frame_gap,
+                        MAX_KITTY_ANIMATION_FRAMES,
+                    )
+                    .context("preparing Kitty animation frame append")?;
+                anyhow::ensure!(
+                    prepared.additional_decoded_bytes() == growth,
+                    "prepared Kitty frame growth changed from {} to {} bytes",
+                    growth,
+                    prepared.additional_decoded_bytes()
+                );
+                anyhow::ensure!(
+                    prepared.existing_decoded_bytes() == current_image_len,
+                    "Kitty image {} changed size between growth plan and append preparation: expected {}, got {} bytes",
+                    image_id,
+                    current_image_len,
+                    prepared.existing_decoded_bytes()
+                );
+                let admission = growth_admission.take().ok_or_else(|| {
+                    anyhow::anyhow!("missing Kitty memory admission plan for frame append")
+                })?;
+                self.kitty_img.commit_image_growth_plan(admission)?;
+                prepared.commit();
+            }
+        }
         self.kitty_mark_image_placements_dirty(image_id);
         Ok(())
     }
@@ -1625,7 +1768,7 @@ impl TerminalState {
 fn clip_view(
     width: u32,
     height: u32,
-    data: &mut [u8],
+    data: &[u8],
     src_x: Option<u32>,
     src_y: Option<u32>,
     view_width: Option<u32>,
@@ -1634,20 +1777,48 @@ fn clip_view(
     let src = ImageBuffer::from_raw(width, height, data)
         .ok_or_else(|| anyhow::anyhow!("ill formed image"))?;
 
-    let src_x = src_x.unwrap_or(0);
-    let src_y = src_y.unwrap_or(0);
+    let (src_x, src_y, view_width, view_height) =
+        clipped_view_region(width, height, src_x, src_y, view_width, view_height)?;
 
-    let view_width = view_width.unwrap_or(width);
-    let view_height = view_height.unwrap_or(height);
+    if view_width == 0 || view_height == 0 {
+        return Ok(RgbaImage::new(view_width, view_height));
+    }
 
-    let (view_width, view_height) =
-        image::imageops::overlay_bounds((width, height), (view_width, view_height), src_x, src_y);
-
-    let view = src.view(src_x, src_y, view_width, view_height);
+    let view = src
+        .try_view(src_x, src_y, view_width, view_height)
+        .context("Kitty source image region is outside frame bounds")?;
 
     let mut tmp = RgbaImage::new(view_width, view_height);
     tmp.copy_from(&*view, 0, 0).context("copy source image")?;
     Ok(tmp)
+}
+
+/// Validate and clip a Kitty source rectangle without reading or allocating
+/// its pixel payload. This lets fully off-destination compositions terminate
+/// before cloning a potentially large frame while retaining source-coordinate
+/// error semantics.
+fn clipped_view_region(
+    width: u32,
+    height: u32,
+    src_x: Option<u32>,
+    src_y: Option<u32>,
+    view_width: Option<u32>,
+    view_height: Option<u32>,
+) -> anyhow::Result<(u32, u32, u32, u32)> {
+    let src_x = src_x.unwrap_or(0);
+    let src_y = src_y.unwrap_or(0);
+    anyhow::ensure!(
+        src_x <= width && src_y <= height,
+        "Kitty source image origin ({src_x},{src_y}) is outside frame bounds {width}x{height}"
+    );
+
+    let (view_width, view_height) = image::imageops::overlay_bounds(
+        (width, height),
+        (view_width.unwrap_or(width), view_height.unwrap_or(height)),
+        src_x,
+        src_y,
+    );
+    Ok((src_x, src_y, view_width, view_height))
 }
 
 fn blit<D, S, P>(
@@ -1677,6 +1848,9 @@ mod tests {
     use super::*;
     use crate::color::ColorPalette;
     use crate::{AlertHandler, TerminalConfiguration, TerminalSize};
+    use frankenterm_cell::image::{
+        ImageDataValidationLimits, ImageDataValidationSummary,
+    };
     use serde_json::Value;
     use std::sync::Mutex;
 
@@ -1736,6 +1910,61 @@ mod tests {
         Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
             width, height, data,
         )))
+    }
+
+    fn assert_embedded_hashes_match_pixels(image: &ImageData) {
+        match &*image.data() {
+            ImageDataType::Rgba8 { data, hash, .. } => {
+                assert_eq!(*hash, ImageDataType::hash_bytes(data));
+            }
+            ImageDataType::AnimRgba8 { frames, hashes, .. } => {
+                assert_eq!(frames.len(), hashes.len());
+                for (frame, hash) in frames.iter().zip(hashes) {
+                    assert_eq!(*hash, ImageDataType::hash_bytes(frame));
+                }
+            }
+            ImageDataType::EncodedFile(_) | ImageDataType::EncodedLease(_) => {
+                panic!("Kitty mutation test retained encoded image data")
+            }
+        }
+    }
+
+    fn seed_validation_authority(
+        image: &ImageData,
+    ) -> ([u8; 32], ImageDataValidationSummary) {
+        let revision = image.current_content_hash();
+        let validated = image
+            .normalize_for_content_revision_with_limits(
+                revision,
+                usize::MAX,
+                ImageDataValidationLimits::UNBOUNDED,
+                &|| false,
+            )
+            .expect("test image is structurally valid");
+        assert!(validated.replacement.is_none());
+        assert_eq!(
+            image.validated_summary_for_content_revision(
+                revision,
+                ImageDataValidationLimits::UNBOUNDED,
+            ),
+            Some(validated.summary)
+        );
+        (revision, validated.summary)
+    }
+
+    fn assert_validation_authority(
+        image: &ImageData,
+        revision: [u8; 32],
+        summary: ImageDataValidationSummary,
+    ) {
+        assert_eq!(
+            image.validated_summary_for_content_revision(
+                revision,
+                ImageDataValidationLimits::UNBOUNDED,
+            ),
+            Some(summary),
+            "a rejected nonmutating Kitty command must not acquire data_mut and clear validation authority"
+        );
     }
 
     fn rgba_transmit(
@@ -1968,11 +2197,13 @@ mod tests {
 
     #[test]
     fn accumulator_chunk_count_overflow_discards_incomplete_transfer() {
-        let mut state = KittyImageState::default();
-        state.accumulator = vec![
-            transmission_chunk(KittyImageData::DirectBin(Vec::new()), true);
-            MAX_KITTY_ACCUMULATOR_CHUNKS
-        ];
+        let mut state = KittyImageState {
+            accumulator: vec![
+                transmission_chunk(KittyImageData::DirectBin(Vec::new()), true);
+                MAX_KITTY_ACCUMULATOR_CHUNKS
+            ],
+            ..Default::default()
+        };
 
         let err = state
             .accumulate_chunk(transmission_chunk(
@@ -2003,7 +2234,7 @@ mod tests {
                     ..
                 },
                 ..
-            } if data.as_slice() == &[1, 2]
+            } if data.as_slice() == [1, 2]
         ));
 
         let coalesced = terminal
@@ -2023,8 +2254,10 @@ mod tests {
 
     #[test]
     fn record_id_to_data_replacement_accounts_image_zero() {
-        let mut state = KittyImageState::default();
-        state.image_budget_bytes = 8;
+        let mut state = KittyImageState {
+            image_budget_bytes: 8,
+            ..Default::default()
+        };
         state
             .record_id_to_data(0, rgba_image(1, 1, vec![1; 4]))
             .unwrap();
@@ -2042,8 +2275,10 @@ mod tests {
 
     #[test]
     fn record_id_to_data_evicts_only_after_complete_admission_plan() {
-        let mut state = KittyImageState::default();
-        state.image_budget_bytes = 4;
+        let mut state = KittyImageState {
+            image_budget_bytes: 4,
+            ..Default::default()
+        };
         state
             .record_id_to_data(1, rgba_image(1, 1, vec![1; 4]))
             .unwrap();
@@ -2060,8 +2295,10 @@ mod tests {
 
     #[test]
     fn record_id_to_data_budget_failure_preserves_referenced_state() {
-        let mut state = KittyImageState::default();
-        state.image_budget_bytes = 4;
+        let mut state = KittyImageState {
+            image_budget_bytes: 4,
+            ..Default::default()
+        };
         state
             .record_id_to_data(1, rgba_image(1, 1, vec![1; 4]))
             .unwrap();
@@ -2184,15 +2421,243 @@ mod tests {
 
         assert_ne!(image.current_content_hash(), old_revision);
         assert_eq!(dirty_rows_since(&terminal, baseline), vec![0, 2, 3]);
-        let data = image.data();
-        let ImageDataType::Rgba8 { data, .. } = &*data else {
+        let image_data = image.data();
+        let ImageDataType::Rgba8 { data: pixels, .. } = &*image_data else {
             panic!("frame compose changed a static image to an unexpected variant");
         };
         assert_eq!(
-            data.as_slice(),
+            pixels.as_slice(),
             &[255, 0, 0, 255, 255, 0, 0, 255],
             "the first pixel should have been copied over the second"
         );
+        drop(image_data);
+        assert_embedded_hashes_match_pixels(&image);
+    }
+
+    #[test]
+    fn invalid_frame_compose_preserves_validation_authority_without_mutable_access() {
+        let (mut terminal, _alerts) = terminal_with_alerts(1024);
+        let image = rgba_image(2, 1, vec![1, 2, 3, 255, 4, 5, 6, 255]);
+        terminal
+            .kitty_img
+            .record_id_to_data(7, Arc::clone(&image))
+            .unwrap();
+        let (revision, summary) = seed_validation_authority(&image);
+
+        let error = terminal
+            .kitty_frame_compose(
+                KittyImageFrameCompose {
+                    image_id: Some(7),
+                    image_number: None,
+                    target_frame: Some(1),
+                    source_frame: Some(2),
+                    x: None,
+                    y: None,
+                    w: None,
+                    h: None,
+                    src_x: None,
+                    src_y: None,
+                    composition_mode: KittyFrameCompositionMode::Overwrite,
+                },
+                KittyImageVerbosity::Quiet,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("only a single frame"));
+        assert_validation_authority(&image, revision, summary);
+    }
+
+    #[test]
+    fn fully_clipped_frame_compose_rejects_zero_dimension_stored_image() {
+        let (mut terminal, _alerts) = terminal_with_alerts(1024);
+        let pixels = Vec::new();
+        let image = Arc::new(ImageData::with_data(ImageDataType::Rgba8 {
+            width: 0,
+            height: 1,
+            hash: ImageDataType::hash_bytes(&pixels),
+            data: pixels,
+        }));
+        terminal
+            .kitty_img
+            .record_id_to_data(7, Arc::clone(&image))
+            .unwrap();
+        record_test_placement(&mut terminal, 7, None, 0, 1);
+        let original_revision = image.current_content_hash();
+        let baseline = begin_dirty_tracking(&mut terminal);
+
+        let error = terminal
+            .kitty_frame_compose(
+                KittyImageFrameCompose {
+                    image_id: Some(7),
+                    image_number: None,
+                    target_frame: Some(1),
+                    source_frame: Some(1),
+                    x: None,
+                    y: None,
+                    w: None,
+                    h: None,
+                    src_x: None,
+                    src_y: None,
+                    composition_mode: KittyFrameCompositionMode::Overwrite,
+                },
+                KittyImageVerbosity::Quiet,
+            )
+            .expect_err("zero-width stored images must fail before the clipped no-op path");
+
+        assert!(error.to_string().contains("must be nonzero"));
+        assert_eq!(image.current_content_hash(), original_revision);
+        assert!(dirty_rows_since(&terminal, baseline).is_empty());
+    }
+
+    #[test]
+    fn static_frame_compose_rejects_out_of_bounds_source_without_mutation_or_dirty_rows() {
+        let (mut terminal, _alerts) = terminal_with_alerts(1024);
+        let image = rgba_image(2, 1, vec![1, 2, 3, 255, 4, 5, 6, 255]);
+        terminal
+            .kitty_img
+            .record_id_to_data(7, Arc::clone(&image))
+            .unwrap();
+        record_test_placement(&mut terminal, 7, None, 0, 1);
+        let (revision, summary) = seed_validation_authority(&image);
+        let baseline = begin_dirty_tracking(&mut terminal);
+
+        let error = terminal
+            .kitty_frame_compose(
+                KittyImageFrameCompose {
+                    image_id: Some(7),
+                    image_number: None,
+                    target_frame: Some(1),
+                    source_frame: Some(1),
+                    // Destination is also fully outside. Source validation
+                    // must still fail before the allocation-free no-op path.
+                    x: Some(2),
+                    y: None,
+                    w: Some(1),
+                    h: Some(1),
+                    src_x: Some(3),
+                    src_y: Some(0),
+                    composition_mode: KittyFrameCompositionMode::Overwrite,
+                },
+                KittyImageVerbosity::Quiet,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("outside frame bounds"));
+        assert_validation_authority(&image, revision, summary);
+        assert!(dirty_rows_since(&terminal, baseline).is_empty());
+    }
+
+    #[test]
+    fn static_frame_compose_exact_source_edge_is_zero_area_noop() {
+        let (mut terminal, _alerts) = terminal_with_alerts(1024);
+        let image = rgba_image(2, 1, vec![1, 2, 3, 255, 4, 5, 6, 255]);
+        terminal
+            .kitty_img
+            .record_id_to_data(7, Arc::clone(&image))
+            .unwrap();
+        record_test_placement(&mut terminal, 7, None, 0, 1);
+        let (revision, summary) = seed_validation_authority(&image);
+        let baseline = begin_dirty_tracking(&mut terminal);
+
+        terminal
+            .kitty_frame_compose(
+                KittyImageFrameCompose {
+                    image_id: Some(7),
+                    image_number: None,
+                    target_frame: Some(1),
+                    source_frame: Some(1),
+                    x: None,
+                    y: None,
+                    w: Some(1),
+                    h: Some(1),
+                    src_x: Some(2),
+                    src_y: Some(0),
+                    composition_mode: KittyFrameCompositionMode::Overwrite,
+                },
+                KittyImageVerbosity::Quiet,
+            )
+            .unwrap();
+
+        assert_validation_authority(&image, revision, summary);
+        assert!(dirty_rows_since(&terminal, baseline).is_empty());
+    }
+
+    #[test]
+    fn animation_frame_compose_outside_destination_is_noop_without_frame_hashing() {
+        let (mut terminal, _alerts) = terminal_with_alerts(1024);
+        let first = vec![1, 2, 3, 255];
+        let second = vec![4, 5, 6, 255];
+        let animation = Arc::new(ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![Duration::ZERO, Duration::from_millis(20)],
+            hashes: vec![
+                ImageDataType::hash_bytes(&first),
+                ImageDataType::hash_bytes(&second),
+            ],
+            frames: vec![first, second],
+        }));
+        terminal
+            .kitty_img
+            .record_id_to_data(7, Arc::clone(&animation))
+            .unwrap();
+        record_test_placement(&mut terminal, 7, None, 0, 1);
+        let (revision, summary) = seed_validation_authority(&animation);
+        let baseline = begin_dirty_tracking(&mut terminal);
+
+        terminal
+            .kitty_frame_compose(
+                KittyImageFrameCompose {
+                    image_id: Some(7),
+                    image_number: None,
+                    target_frame: Some(2),
+                    source_frame: Some(1),
+                    x: Some(1),
+                    y: Some(0),
+                    w: None,
+                    h: None,
+                    src_x: None,
+                    src_y: None,
+                    composition_mode: KittyFrameCompositionMode::Overwrite,
+                },
+                KittyImageVerbosity::Quiet,
+            )
+            .unwrap();
+
+        assert_validation_authority(&animation, revision, summary);
+        assert!(dirty_rows_since(&terminal, baseline).is_empty());
+    }
+
+    #[test]
+    fn static_frame_transmit_edit_outside_destination_is_noop_without_hashing() {
+        let (mut terminal, _alerts) = terminal_with_alerts(1024);
+        let image = rgba_image(1, 1, vec![1, 2, 3, 255]);
+        terminal
+            .kitty_img
+            .record_id_to_data(7, Arc::clone(&image))
+            .unwrap();
+        record_test_placement(&mut terminal, 7, None, 0, 1);
+        let (revision, summary) = seed_validation_authority(&image);
+        let baseline = begin_dirty_tracking(&mut terminal);
+
+        terminal
+            .kitty_frame_transmit(
+                rgba_transmit(Some(7), None, 1, 1, vec![9, 8, 7, 255]),
+                KittyImageFrame {
+                    x: Some(1),
+                    y: Some(0),
+                    base_frame: None,
+                    frame_number: Some(1),
+                    duration_ms: Some(20),
+                    composition_mode: KittyFrameCompositionMode::Overwrite,
+                    background_pixel: None,
+                },
+                KittyImageVerbosity::Quiet,
+            )
+            .unwrap();
+
+        assert_validation_authority(&image, revision, summary);
+        assert!(dirty_rows_since(&terminal, baseline).is_empty());
     }
 
     #[test]
@@ -2242,6 +2707,84 @@ mod tests {
         assert_eq!(hashes.len(), 2);
         assert_eq!(&frames[1][4..], &[9, 8, 7, 255]);
         assert_eq!(durations[1], Duration::from_millis(20));
+        drop(data);
+        assert_embedded_hashes_match_pixels(&image);
+    }
+
+    #[test]
+    fn animation_compose_append_and_edit_publish_guard_repaired_hashes() {
+        let (mut terminal, _alerts) = terminal_with_alerts(1024);
+        terminal.kitty_img.image_budget_bytes = 32;
+        let first = vec![1, 2, 3, 255, 4, 5, 6, 255];
+        let second = vec![7, 8, 9, 255, 10, 11, 12, 255];
+        let animation = Arc::new(ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 2,
+            height: 1,
+            durations: vec![Duration::ZERO, Duration::from_millis(20)],
+            hashes: vec![
+                ImageDataType::hash_bytes(&first),
+                ImageDataType::hash_bytes(&second),
+            ],
+            frames: vec![first, second],
+        }));
+        terminal
+            .kitty_img
+            .record_id_to_data(7, Arc::clone(&animation))
+            .unwrap();
+
+        terminal
+            .kitty_frame_compose(
+                KittyImageFrameCompose {
+                    image_id: Some(7),
+                    image_number: None,
+                    target_frame: Some(2),
+                    source_frame: Some(1),
+                    x: Some(1),
+                    y: Some(0),
+                    w: Some(1),
+                    h: Some(1),
+                    src_x: Some(0),
+                    src_y: Some(0),
+                    composition_mode: KittyFrameCompositionMode::Overwrite,
+                },
+                KittyImageVerbosity::Quiet,
+            )
+            .unwrap();
+        assert_embedded_hashes_match_pixels(&animation);
+
+        terminal
+            .kitty_frame_transmit(
+                rgba_transmit(Some(7), None, 1, 1, vec![21, 22, 23, 255]),
+                KittyImageFrame {
+                    x: Some(0),
+                    y: Some(0),
+                    base_frame: Some(2),
+                    frame_number: None,
+                    duration_ms: Some(30),
+                    composition_mode: KittyFrameCompositionMode::Overwrite,
+                    background_pixel: None,
+                },
+                KittyImageVerbosity::Quiet,
+            )
+            .unwrap();
+        assert_embedded_hashes_match_pixels(&animation);
+
+        terminal
+            .kitty_frame_transmit(
+                rgba_transmit(Some(7), None, 1, 1, vec![31, 32, 33, 255]),
+                KittyImageFrame {
+                    x: Some(1),
+                    y: Some(0),
+                    base_frame: None,
+                    frame_number: Some(2),
+                    duration_ms: Some(40),
+                    composition_mode: KittyFrameCompositionMode::Overwrite,
+                    background_pixel: None,
+                },
+                KittyImageVerbosity::Quiet,
+            )
+            .unwrap();
+        assert_embedded_hashes_match_pixels(&animation);
     }
 
     #[test]
@@ -2255,6 +2798,7 @@ mod tests {
             .unwrap();
         record_test_placement(&mut terminal, 7, None, 0, 1);
         let old_revision = image.current_content_hash();
+        let (validated_revision, validated_summary) = seed_validation_authority(&image);
         let baseline = begin_dirty_tracking(&mut terminal);
 
         let err = terminal
@@ -2276,6 +2820,7 @@ mod tests {
         assert!(err.to_string().contains("exceeding per-image budget"));
         assert_eq!(terminal.kitty_img.used_memory, 8);
         assert_eq!(image.current_content_hash(), old_revision);
+        assert_validation_authority(&image, validated_revision, validated_summary);
         assert!(matches!(&*image.data(), ImageDataType::Rgba8 { .. }));
         assert!(dirty_rows_since(&terminal, baseline).is_empty());
     }
@@ -2298,6 +2843,7 @@ mod tests {
             .kitty_img
             .record_id_to_data(7, Arc::clone(&animation))
             .unwrap();
+        let (validated_revision, validated_summary) = seed_validation_authority(&animation);
 
         let err = terminal
             .kitty_frame_transmit(
@@ -2317,6 +2863,7 @@ mod tests {
 
         assert!(err.to_string().contains("frame count would exceed"));
         assert_eq!(terminal.kitty_img.used_memory, resident_bytes);
+        assert_validation_authority(&animation, validated_revision, validated_summary);
         let data = animation.data();
         let ImageDataType::AnimRgba8 { frames, .. } = &*data else {
             panic!("animation changed variant after rejected append");

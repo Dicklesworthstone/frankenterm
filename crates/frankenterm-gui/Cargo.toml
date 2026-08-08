@@ -12,7 +12,7 @@ build = "build.rs"
 
 [[bin]]
 name = "frankenterm-gui"
-path = "src/main.rs"
+path = "src/gui_main_target.rs"
 test = false
 
 [lib]
@@ -39,11 +39,13 @@ path = "src/native_bridge.rs"
 # `glyphcache` is binary-owned while the production binary intentionally keeps
 # `test = false`. This opt-in harness compiles the same `src/main.rs` module
 # graph under Rust's test runner; the generated harness replaces the application
-# entry point, so it neither calls `main` nor creates a GUI window. Keep it
-# feature-gated so ordinary workspace tests retain their existing target graph.
+# entry point, so the target itself does not call `main`. Individual included
+# tests can still initialize GUI state, so automation must run only exact test
+# bodies audited as frontend/window/event-loop free. Keep it feature-gated so
+# ordinary workspace tests retain their existing target graph.
 [[test]]
 name = "glyphcache_unit"
-path = "src/main.rs"
+path = "src/glyphcache_test_target.rs"
 required-features = ["internal-glyphcache-test-harness"]
 
 [[test]]
@@ -82,7 +84,7 @@ fail-on-cell-mismatch = ["debug-cell-crc", "debug-cell-diff"]
 # Keep the SSIM corpus proof available through the lib test harness on workers
 # that intentionally lack XCB/xkb runtime development packages.
 gui-system-libs = []
-# Empty opt-in gate for the nonlaunching binary-owned unit-test harness above.
+# Empty opt-in gate for the binary-owned unit-test harness above.
 internal-glyphcache-test-harness = []
 
 [build-dependencies]

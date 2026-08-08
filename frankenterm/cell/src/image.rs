@@ -1007,6 +1007,12 @@ pub enum ImageDataValidationError {
     #[error("animation speed factor must be finite and greater than zero")]
     InvalidAnimationSpeedFactor,
 
+    #[error("reserving adjusted animation timing metadata failed: {source}")]
+    AnimationTimingAllocationFailed {
+        #[source]
+        source: std::collections::TryReserveError,
+    },
+
     #[error("animation frame {frame_index} duration overflows after speed adjustment")]
     AdjustedFrameDurationOutOfRange { frame_index: usize },
 
@@ -1850,29 +1856,68 @@ impl ImageDataType {
     /// Divide animation frame durations by `speed_factor`; a factor of 2 halves
     /// each duration. Invalid or overflowing factors fail without partially
     /// mutating the animation.
+    fn adjusted_frame_duration(
+        duration: Duration,
+        speed_factor: f32,
+        frame_index: usize,
+        now: std::time::Instant,
+    ) -> Result<Duration, ImageDataValidationError> {
+        let adjusted = Duration::try_from_secs_f64(
+            duration.as_secs_f64() / f64::from(speed_factor),
+        )
+        .map_err(|_| ImageDataValidationError::AdjustedFrameDurationOutOfRange {
+            frame_index,
+        })?;
+        let max_frame_duration = Duration::from_millis(u64::from(u32::MAX));
+        if adjusted > max_frame_duration || now.checked_add(adjusted).is_none() {
+            return Err(ImageDataValidationError::AdjustedFrameDurationOutOfRange {
+                frame_index,
+            });
+        }
+        Ok(adjusted)
+    }
+
+    fn validate_speed_factor(speed_factor: f32) -> Result<(), ImageDataValidationError> {
+        if !speed_factor.is_finite() || speed_factor <= 0.0 {
+            return Err(ImageDataValidationError::InvalidAnimationSpeedFactor);
+        }
+        Ok(())
+    }
+
+    fn validate_speed_adjustment(
+        &self,
+        speed_factor: f32,
+    ) -> Result<(), ImageDataValidationError> {
+        Self::validate_speed_factor(speed_factor)?;
+        if let Self::AnimRgba8 { durations, .. } = self {
+            let now = std::time::Instant::now();
+            for (frame_index, duration) in durations.iter().copied().enumerate() {
+                Self::adjusted_frame_duration(duration, speed_factor, frame_index, now)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn adjust_speed(
         &mut self,
         speed_factor: f32,
     ) -> Result<(), ImageDataValidationError> {
-        if !speed_factor.is_finite() || speed_factor <= 0.0 {
-            return Err(ImageDataValidationError::InvalidAnimationSpeedFactor);
-        }
+        Self::validate_speed_factor(speed_factor)?;
         match self {
             Self::AnimRgba8 { durations, .. } => {
-                let adjusted = durations
-                    .iter()
-                    .enumerate()
-                    .map(|(frame_index, duration)| {
-                        Duration::try_from_secs_f64(
-                            duration.as_secs_f64() / f64::from(speed_factor),
-                        )
-                        .map_err(|_| {
-                            ImageDataValidationError::AdjustedFrameDurationOutOfRange {
-                                frame_index,
-                            }
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut adjusted = Vec::new();
+                adjusted.try_reserve_exact(durations.len()).map_err(|source| {
+                    ImageDataValidationError::AnimationTimingAllocationFailed { source }
+                })?;
+                let now = std::time::Instant::now();
+                for (frame_index, duration) in durations.iter().copied().enumerate() {
+                    adjusted.push(Self::adjusted_frame_duration(
+                        duration,
+                        speed_factor,
+                        frame_index,
+                        now,
+                    )?);
+                }
                 *durations = adjusted;
             }
             _ => {}
@@ -2009,10 +2054,301 @@ impl Deref for ImageDataReadGuard<'_> {
 
 /// Exclusive mutable image payload access that invalidates the cached content
 /// revision before mutation and republishes it while still holding the data
-/// lock on drop.
+/// lock on drop. General mutable access refreshes all embedded pixel hashes;
+/// the private metadata-only path may skip that scan only for a proven
+/// pixel-preserving operation.
 pub struct ImageDataMutGuard<'a> {
     data: MutexGuard<'a, ImageDataType>,
     current_revision: &'a Mutex<Option<[u8; 32]>>,
+    validation_authority: &'a Mutex<Option<ImageDataValidationAuthority>>,
+    refresh_embedded_hashes: bool,
+    validated_summary: Option<ImageDataValidationSummary>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ImageDataFrameMutationError {
+    #[error("encoded image data has no decoded frame buffer")]
+    EncodedData,
+
+    #[error("decoded frame index {requested} is outside the {available}-frame image")]
+    FrameIndexOutOfRange { requested: usize, available: usize },
+
+    #[error(
+        "animation metadata cardinality mismatch during frame mutation: {frames} frames, {durations} durations, {hashes} hashes"
+    )]
+    AnimationCardinalityMismatch {
+        frames: usize,
+        durations: usize,
+        hashes: usize,
+    },
+
+    #[error(
+        "decoded frame byte length does not match {width}x{height}: expected {expected}, got {actual}"
+    )]
+    FrameByteLengthMismatch {
+        width: u32,
+        height: u32,
+        expected: usize,
+        actual: usize,
+    },
+
+    #[error("decoded frame dimensions are invalid or unaddressable: {width}x{height}")]
+    InvalidDimensions { width: u32, height: u32 },
+
+    #[error("appending a frame would exceed the {limit}-frame image limit")]
+    FrameCountLimitExceeded { limit: usize },
+
+    #[error("reserving decoded animation metadata failed: {source}")]
+    AllocationFailed {
+        #[source]
+        source: std::collections::TryReserveError,
+    },
+
+    #[error("decoded image validation failed before targeted mutation: {source}")]
+    ValidationFailed {
+        #[source]
+        source: ImageDataValidationError,
+    },
+
+    #[error("decoded frame byte accounting overflowed during append")]
+    DecodedByteLengthOverflow,
+
+    #[error("decoded frame count overflowed during append")]
+    FrameCountOverflow,
+}
+
+#[derive(Clone, Copy)]
+enum ImageDataFrameSlot {
+    Static,
+    Animation(usize),
+}
+
+struct PreparedStaticAnimationMetadata {
+    frames: Vec<Vec<u8>>,
+    durations: Vec<Duration>,
+    hashes: Vec<[u8; 32]>,
+}
+
+fn expected_frame_mutation_bytes(
+    width: u32,
+    height: u32,
+) -> Result<usize, ImageDataFrameMutationError> {
+    if width == 0 || height == 0 {
+        return Err(ImageDataFrameMutationError::InvalidDimensions { width, height });
+    }
+    usize::try_from(u128::from(width) * u128::from(height) * 4)
+        .map_err(|_| ImageDataFrameMutationError::InvalidDimensions { width, height })
+}
+
+/// Exclusive access to exactly one decoded pixel buffer.
+///
+/// The guard cannot change dimensions, variants, timing, or frame cardinality,
+/// so drop needs to hash only the exposed frame before publishing the new outer
+/// revision. This is the safe mutation surface for large Kitty animations.
+pub struct ImageDataFrameMutGuard<'a> {
+    data: MutexGuard<'a, ImageDataType>,
+    current_revision: &'a Mutex<Option<[u8; 32]>>,
+    validation_authority: &'a Mutex<Option<ImageDataValidationAuthority>>,
+    summary: ImageDataValidationSummary,
+    slot: ImageDataFrameSlot,
+}
+
+/// A decoded-frame append whose validation, hashing, and vector reservations
+/// have completed, but whose image payload has not yet changed.
+///
+/// Callers that maintain a separate resource ledger may perform that ledger's
+/// fallible admission while this value holds the image payload stable, then
+/// call [`Self::commit`]. Dropping the value without committing leaves image
+/// content, revision, and validation authority unchanged.
+pub struct PreparedImageDataFrameAppend<'a> {
+    data: MutexGuard<'a, ImageDataType>,
+    current_revision: &'a Mutex<Option<[u8; 32]>>,
+    validation_authority: &'a Mutex<Option<ImageDataValidationAuthority>>,
+    frame: Vec<u8>,
+    duration: Duration,
+    frame_hash: [u8; 32],
+    existing_decoded_bytes: usize,
+    summary: ImageDataValidationSummary,
+    static_metadata: Option<PreparedStaticAnimationMetadata>,
+}
+
+impl ImageDataFrameMutGuard<'_> {
+    pub fn image_dimensions(&self) -> (u32, u32) {
+        match &*self.data {
+            ImageDataType::Rgba8 { width, height, .. }
+            | ImageDataType::AnimRgba8 { width, height, .. } => (*width, *height),
+            ImageDataType::EncodedFile(_) | ImageDataType::EncodedLease(_) => {
+                unreachable!("decoded-frame mutation guard cannot contain encoded data")
+            }
+        }
+    }
+}
+
+impl Deref for ImageDataFrameMutGuard<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match (&*self.data, self.slot) {
+            (ImageDataType::Rgba8 { data, .. }, ImageDataFrameSlot::Static) => data,
+            (ImageDataType::AnimRgba8 { frames, .. }, ImageDataFrameSlot::Animation(index)) => {
+                &frames[index]
+            }
+            _ => unreachable!("decoded-frame mutation slot changed while locked"),
+        }
+    }
+}
+
+impl DerefMut for ImageDataFrameMutGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match (&mut *self.data, self.slot) {
+            (ImageDataType::Rgba8 { data, .. }, ImageDataFrameSlot::Static) => data,
+            (ImageDataType::AnimRgba8 { frames, .. }, ImageDataFrameSlot::Animation(index)) => {
+                &mut frames[index]
+            }
+            _ => unreachable!("decoded-frame mutation slot changed while locked"),
+        }
+    }
+}
+
+impl Drop for ImageDataFrameMutGuard<'_> {
+    fn drop(&mut self) {
+        match (&mut *self.data, self.slot) {
+            (ImageDataType::Rgba8 { data, hash, .. }, ImageDataFrameSlot::Static) => {
+                *hash = ImageDataType::hash_bytes(data);
+            }
+            (
+                ImageDataType::AnimRgba8 { frames, hashes, .. },
+                ImageDataFrameSlot::Animation(index),
+            ) => {
+                hashes[index] = ImageDataType::hash_bytes(&frames[index]);
+            }
+            _ => unreachable!("decoded-frame mutation slot changed while locked"),
+        }
+        let revision = self.data.compute_hash();
+        let mut cached = self.current_revision.lock().unwrap_or_else(|poisoned| {
+            self.current_revision.clear_poison();
+            poisoned.into_inner()
+        });
+        *cached = Some(revision);
+        let mut authority = self
+            .validation_authority
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                self.validation_authority.clear_poison();
+                poisoned.into_inner()
+            });
+        *authority = Some(ImageDataValidationAuthority {
+            revision,
+            summary: self.summary,
+        });
+    }
+}
+
+impl PreparedImageDataFrameAppend<'_> {
+    /// Exact number of decoded pixel bytes added by this append.
+    #[must_use]
+    pub fn additional_decoded_bytes(&self) -> usize {
+        self.frame.len()
+    }
+
+    /// Exact decoded-byte footprint of the target revision before this append.
+    #[must_use]
+    pub fn existing_decoded_bytes(&self) -> usize {
+        self.existing_decoded_bytes
+    }
+
+    /// Commit the already-prepared append.
+    ///
+    /// Every allocation and validation step completed in
+    /// [`ImageData::prepare_decoded_frame_append`], so this operation has no
+    /// recoverable failure path. It publishes the new revision and a matching
+    /// local validation authority before releasing the payload lock.
+    pub fn commit(mut self) {
+        {
+            let mut cached = self.current_revision.lock().unwrap_or_else(|poisoned| {
+                self.current_revision.clear_poison();
+                poisoned.into_inner()
+            });
+            *cached = None;
+        }
+        {
+            let mut authority = self
+                .validation_authority
+                .lock()
+                .unwrap_or_else(|poisoned| {
+                    self.validation_authority.clear_poison();
+                    poisoned.into_inner()
+                });
+            *authority = None;
+        }
+
+        let frame = std::mem::take(&mut self.frame);
+        match &mut *self.data {
+            ImageDataType::Rgba8 {
+                data: root,
+                width,
+                height,
+                hash: root_hash,
+            } => {
+                let width = *width;
+                let height = *height;
+                let root_hash = *root_hash;
+                let PreparedStaticAnimationMetadata {
+                    mut frames,
+                    mut durations,
+                    mut hashes,
+                } = self
+                    .static_metadata
+                    .take()
+                    .expect("static append reserved exact metadata capacity");
+                frames.push(std::mem::take(root));
+                frames.push(frame);
+                durations.push(Duration::ZERO);
+                durations.push(self.duration);
+                hashes.push(root_hash);
+                hashes.push(self.frame_hash);
+                *self.data = ImageDataType::AnimRgba8 {
+                    width,
+                    height,
+                    durations,
+                    frames,
+                    hashes,
+                };
+            }
+            ImageDataType::AnimRgba8 {
+                frames,
+                durations,
+                hashes,
+                ..
+            } => {
+                frames.push(frame);
+                durations.push(self.duration);
+                hashes.push(self.frame_hash);
+            }
+            ImageDataType::EncodedFile(_) | ImageDataType::EncodedLease(_) => {
+                unreachable!("prepared decoded-frame append changed image variant")
+            }
+        }
+
+        let revision = self.data.compute_hash();
+        let mut cached = self.current_revision.lock().unwrap_or_else(|poisoned| {
+            self.current_revision.clear_poison();
+            poisoned.into_inner()
+        });
+        *cached = Some(revision);
+        let mut authority = self
+            .validation_authority
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                self.validation_authority.clear_poison();
+                poisoned.into_inner()
+            });
+        *authority = Some(ImageDataValidationAuthority {
+            revision,
+            summary: self.summary,
+        });
+    }
 }
 
 impl Deref for ImageDataMutGuard<'_> {
@@ -2031,13 +2367,25 @@ impl DerefMut for ImageDataMutGuard<'_> {
 
 impl Drop for ImageDataMutGuard<'_> {
     fn drop(&mut self) {
-        self.data.refresh_embedded_hashes();
+        if self.refresh_embedded_hashes {
+            self.data.refresh_embedded_hashes();
+        }
         let revision = self.data.compute_hash();
         let mut cached = self.current_revision.lock().unwrap_or_else(|poisoned| {
             self.current_revision.clear_poison();
             poisoned.into_inner()
         });
         *cached = Some(revision);
+        if let Some(summary) = self.validated_summary {
+            let mut authority = self
+                .validation_authority
+                .lock()
+                .unwrap_or_else(|poisoned| {
+                    self.validation_authority.clear_poison();
+                    poisoned.into_inner()
+                });
+            *authority = Some(ImageDataValidationAuthority { revision, summary });
+        }
     }
 }
 
@@ -2194,6 +2542,45 @@ impl ImageData {
             *cached = Some(revision);
             revision
         }
+    }
+
+    /// Return a revision-bound full-validation proof for a payload that the
+    /// caller already holds locked, deriving and publishing it when absent.
+    ///
+    /// Targeted mutation relies on all *unexposed* frame hashes remaining
+    /// authoritative. Consequently a missing proof must perform the complete
+    /// structural and pixel-hash scan before any mutable slice is returned.
+    fn ensure_validation_authority_for_locked_data(
+        &self,
+        data: &ImageDataType,
+    ) -> Result<([u8; 32], ImageDataValidationSummary), ImageDataValidationError> {
+        let revision = self.revision_for_locked_data(data);
+        {
+            let authority = self
+                .validation_authority
+                .lock()
+                .unwrap_or_else(|poisoned| {
+                    self.validation_authority.clear_poison();
+                    poisoned.into_inner()
+                });
+            if let Some(authority) = *authority
+                && authority.revision == revision
+            {
+                return Ok((revision, authority.summary));
+            }
+        }
+        // A proof for any other revision is not usable and should not linger
+        // if full validation below rejects the current payload.
+        self.clear_validation_authority();
+
+        let summary = data.validate_decoded_structure_with_limits_and_cancellation(
+            ImageDataValidationLimits::UNBOUNDED,
+            &|| false,
+        )?;
+        // `data` remains locked throughout validation and publication, so no
+        // writer can invalidate the proof in between.
+        self.publish_validation_authority(revision, summary);
+        Ok((revision, summary))
     }
 
     pub fn with_data(data: ImageDataType) -> Self {
@@ -2484,9 +2871,263 @@ impl ImageData {
         (width <= limits.max_width && height <= limits.max_height).then_some(authority.summary)
     }
 
+    /// Mutably borrow exactly one decoded frame and refresh only that frame's
+    /// embedded hash when the guard is dropped.
+    ///
+    /// Unlike [`Self::data_mut`], this guard cannot alter image structure or any
+    /// other frame. It therefore keeps a one-frame Kitty edit O(changed frame)
+    /// rather than O(total animation bytes) without trusting the caller to
+    /// maintain redundant hash metadata.
+    pub fn decoded_frame_mut(
+        &self,
+        frame_index: usize,
+    ) -> Result<ImageDataFrameMutGuard<'_>, ImageDataFrameMutationError> {
+        let data = self.data.lock().unwrap_or_else(|poisoned| {
+            #[cfg(feature = "use_image")]
+            log::warn!(
+                "recovering poisoned decoded-frame ImageData lock for image hash {:x?}",
+                self.hash
+            );
+            self.data.clear_poison();
+            poisoned.into_inner()
+        });
+        let (slot, width, height, actual) = match &*data {
+            ImageDataType::EncodedFile(_) | ImageDataType::EncodedLease(_) => {
+                return Err(ImageDataFrameMutationError::EncodedData);
+            }
+            ImageDataType::Rgba8 {
+                data,
+                width,
+                height,
+                ..
+            } => {
+                if frame_index != 0 {
+                    return Err(ImageDataFrameMutationError::FrameIndexOutOfRange {
+                        requested: frame_index,
+                        available: 1,
+                    });
+                }
+                (ImageDataFrameSlot::Static, *width, *height, data.len())
+            }
+            ImageDataType::AnimRgba8 {
+                frames,
+                durations,
+                hashes,
+                width,
+                height,
+            } => {
+                if frames.len() != durations.len() || frames.len() != hashes.len() {
+                    return Err(
+                        ImageDataFrameMutationError::AnimationCardinalityMismatch {
+                            frames: frames.len(),
+                            durations: durations.len(),
+                            hashes: hashes.len(),
+                        },
+                    );
+                }
+                let Some(frame) = frames.get(frame_index) else {
+                    return Err(ImageDataFrameMutationError::FrameIndexOutOfRange {
+                        requested: frame_index,
+                        available: frames.len(),
+                    });
+                };
+                (
+                    ImageDataFrameSlot::Animation(frame_index),
+                    *width,
+                    *height,
+                    frame.len(),
+                )
+            }
+        };
+        let expected = expected_frame_mutation_bytes(width, height)?;
+        if actual != expected {
+            return Err(ImageDataFrameMutationError::FrameByteLengthMismatch {
+                width,
+                height,
+                expected,
+                actual,
+            });
+        }
+        let (_, summary) = self
+            .ensure_validation_authority_for_locked_data(&data)
+            .map_err(|source| ImageDataFrameMutationError::ValidationFailed { source })?;
+
+        // `data` is already locked, so clearing these authorities before the
+        // frame slice is exposed is atomic with respect to every payload reader.
+        {
+            let mut cached = self.current_revision.lock().unwrap_or_else(|poisoned| {
+                self.current_revision.clear_poison();
+                poisoned.into_inner()
+            });
+            *cached = None;
+        }
+        self.clear_validation_authority();
+        Ok(ImageDataFrameMutGuard {
+            data,
+            current_revision: &self.current_revision,
+            validation_authority: &self.validation_authority,
+            summary,
+            slot,
+        })
+    }
+
+    /// Prepare a fully materialized decoded-frame append without changing the
+    /// image payload.
+    ///
+    /// Existing pixels are fully validated once per revision, the new frame is
+    /// hashed, and all destination vectors reserve their final capacity before
+    /// this returns. A caller may then perform a separate fallible resource
+    /// admission and call [`PreparedImageDataFrameAppend::commit`], which has
+    /// no recoverable failure path. A static image is promoted on commit to the
+    /// Kitty animation convention with a zero-duration root frame.
+    pub fn prepare_decoded_frame_append(
+        &self,
+        frame: Vec<u8>,
+        duration: Duration,
+        max_frame_count: usize,
+    ) -> Result<PreparedImageDataFrameAppend<'_>, ImageDataFrameMutationError> {
+        let validate_target = |data: &ImageDataType| {
+            let (width, height, frame_count, durations, hashes) = match data {
+                ImageDataType::EncodedFile(_) | ImageDataType::EncodedLease(_) => {
+                    return Err(ImageDataFrameMutationError::EncodedData);
+                }
+                ImageDataType::Rgba8 { width, height, .. } => (*width, *height, 1, 1, 1),
+                ImageDataType::AnimRgba8 {
+                    width,
+                    height,
+                    frames,
+                    durations,
+                    hashes,
+                } => (*width, *height, frames.len(), durations.len(), hashes.len()),
+            };
+            if frame_count != durations || frame_count != hashes {
+                return Err(
+                    ImageDataFrameMutationError::AnimationCardinalityMismatch {
+                        frames: frame_count,
+                        durations,
+                        hashes,
+                    },
+                );
+            }
+            if frame_count >= max_frame_count {
+                return Err(ImageDataFrameMutationError::FrameCountLimitExceeded {
+                    limit: max_frame_count,
+                });
+            }
+            let expected = expected_frame_mutation_bytes(width, height)?;
+            if frame.len() != expected {
+                return Err(ImageDataFrameMutationError::FrameByteLengthMismatch {
+                    width,
+                    height,
+                    expected,
+                    actual: frame.len(),
+                });
+            }
+            Ok(frame_count)
+        };
+
+        // Reject target shape, frame-count, and timing errors before hashing
+        // either the new buffer or any existing frame. Revalidate after
+        // reacquiring the lock so a concurrent structural change cannot
+        // publish against stale geometry.
+        let new_frame_index = {
+            let data = self.data();
+            validate_target(&data)?
+        };
+        let max_frame_duration = Duration::from_millis(u64::from(u32::MAX));
+        if duration > max_frame_duration || std::time::Instant::now().checked_add(duration).is_none()
+        {
+            return Err(ImageDataFrameMutationError::ValidationFailed {
+                source: ImageDataValidationError::AnimationFrameDurationOutOfRange {
+                    frame_index: new_frame_index,
+                },
+            });
+        }
+        let frame_hash = ImageDataType::hash_bytes(&frame);
+        let mut data = self.data.lock().unwrap_or_else(|poisoned| {
+            #[cfg(feature = "use_image")]
+            log::warn!(
+                "recovering poisoned append-frame ImageData lock for image hash {:x?}",
+                self.hash
+            );
+            self.data.clear_poison();
+            poisoned.into_inner()
+        });
+        validate_target(&data)?;
+        let (_, validated_summary) = self
+            .ensure_validation_authority_for_locked_data(&data)
+            .map_err(|source| ImageDataFrameMutationError::ValidationFailed { source })?;
+        let summary = ImageDataValidationSummary {
+            decoded_bytes: validated_summary
+                .decoded_bytes
+                .checked_add(frame.len())
+                .ok_or(ImageDataFrameMutationError::DecodedByteLengthOverflow)?,
+            frame_count: validated_summary
+                .frame_count
+                .checked_add(1)
+                .ok_or(ImageDataFrameMutationError::FrameCountOverflow)?,
+        };
+
+        let static_metadata = if matches!(&*data, ImageDataType::Rgba8 { .. }) {
+            let mut frames = Vec::new();
+            let mut durations = Vec::new();
+            let mut hashes = Vec::new();
+            frames
+                .try_reserve_exact(2)
+                .map_err(|source| ImageDataFrameMutationError::AllocationFailed { source })?;
+            durations
+                .try_reserve_exact(2)
+                .map_err(|source| ImageDataFrameMutationError::AllocationFailed { source })?;
+            hashes
+                .try_reserve_exact(2)
+                .map_err(|source| ImageDataFrameMutationError::AllocationFailed { source })?;
+            Some(PreparedStaticAnimationMetadata {
+                frames,
+                durations,
+                hashes,
+            })
+        } else {
+            None
+        };
+        match &mut *data {
+            ImageDataType::Rgba8 { .. } => {}
+            ImageDataType::AnimRgba8 {
+                frames,
+                durations,
+                hashes,
+                ..
+            } => {
+                frames
+                    .try_reserve(1)
+                    .map_err(|source| ImageDataFrameMutationError::AllocationFailed { source })?;
+                durations
+                    .try_reserve(1)
+                    .map_err(|source| ImageDataFrameMutationError::AllocationFailed { source })?;
+                hashes
+                    .try_reserve(1)
+                    .map_err(|source| ImageDataFrameMutationError::AllocationFailed { source })?;
+            }
+            ImageDataType::EncodedFile(_) | ImageDataType::EncodedLease(_) => unreachable!(),
+        }
+
+        Ok(PreparedImageDataFrameAppend {
+            data,
+            current_revision: &self.current_revision,
+            validation_authority: &self.validation_authority,
+            frame,
+            duration,
+            frame_hash,
+            existing_decoded_bytes: validated_summary.decoded_bytes,
+            summary,
+            static_metadata,
+        })
+    }
+
     /// Mutably access image pixels or animation metadata while maintaining the
     /// O(1) content-revision cache used by remote hydration and shape caching.
     pub fn data_mut(&self) -> ImageDataMutGuard<'_> {
+        // Clear before waiting for the payload lock so independently owned
+        // renderer snapshots cannot retain authority while a writer is queued.
         {
             let mut cached = self.current_revision.lock().unwrap_or_else(|poisoned| {
                 self.current_revision.clear_poison();
@@ -2518,7 +3159,71 @@ impl ImageData {
         ImageDataMutGuard {
             data,
             current_revision: &self.current_revision,
+            validation_authority: &self.validation_authority,
+            refresh_embedded_hashes: true,
+            validated_summary: None,
         }
+    }
+
+    /// Adjust animation timing without rescanning immutable pixel buffers.
+    ///
+    /// The inner operation is transactional and changes only `durations`; the
+    /// embedded hashes therefore remain authoritative. The mutation guard still
+    /// republishes the outer revision before releasing the payload lock. Static
+    /// images and an identity speed factor are exact no-ops that retain their
+    /// existing revision-bound validation authority.
+    pub fn adjust_speed(&self, speed_factor: f32) -> Result<(), ImageDataValidationError> {
+        if !speed_factor.is_finite() || speed_factor <= 0.0 {
+            return Err(ImageDataValidationError::InvalidAnimationSpeedFactor);
+        }
+        if speed_factor == 1.0 {
+            return Ok(());
+        }
+        {
+            let data = self.data();
+            if !matches!(&*data, ImageDataType::AnimRgba8 { .. }) {
+                return Ok(());
+            }
+            // Timing-only preflight rejects pathological finite factors before
+            // a missing authority can trigger a full pixel-hash scan. The
+            // transactional mutation repeats this check after reacquiring the
+            // exclusive guard to close a concurrent-change race.
+            data.validate_speed_adjustment(speed_factor)?;
+        }
+        self.validated_metadata_mut()?.adjust_speed(speed_factor)
+    }
+
+    /// Acquire a guard for a proven structure-preserving metadata mutation.
+    /// Pixel hashes may be retained only after full validation of this exact
+    /// revision; the guard republishes that authority on every exit path.
+    fn validated_metadata_mut(
+        &self,
+    ) -> Result<ImageDataMutGuard<'_>, ImageDataValidationError> {
+        let data = self.data.lock().unwrap_or_else(|poisoned| {
+            #[cfg(feature = "use_image")]
+            log::warn!(
+                "recovering poisoned metadata-only ImageData lock for image hash {:x?}",
+                self.hash
+            );
+            self.data.clear_poison();
+            poisoned.into_inner()
+        });
+        let (_, summary) = self.ensure_validation_authority_for_locked_data(&data)?;
+        {
+            let mut cached = self.current_revision.lock().unwrap_or_else(|poisoned| {
+                self.current_revision.clear_poison();
+                poisoned.into_inner()
+            });
+            *cached = None;
+        }
+        self.clear_validation_authority();
+        Ok(ImageDataMutGuard {
+            data,
+            current_revision: &self.current_revision,
+            validation_authority: &self.validation_authority,
+            refresh_embedded_hashes: false,
+            validated_summary: Some(summary),
+        })
     }
 
     /// Consume this uniquely owned wrapper and return its payload without
@@ -2742,6 +3447,28 @@ mod tests {
             Err(ImageDataValidationError::InvalidAnimationSpeedFactor)
         ));
         assert_eq!(image, before, "a rejected speed must not partially mutate");
+
+        let boundary_frame = vec![0x44; 4];
+        let mut boundary = ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![Duration::from_millis(u64::from(u32::MAX))],
+            hashes: vec![ImageDataType::hash_bytes(&boundary_frame)],
+            frames: vec![boundary_frame],
+        };
+        boundary
+            .adjust_speed(1.0)
+            .expect("the renderer's exact maximum duration remains valid");
+
+        let before = boundary.clone();
+        assert!(matches!(
+            boundary.adjust_speed(f32::MIN_POSITIVE),
+            Err(ImageDataValidationError::AdjustedFrameDurationOutOfRange { frame_index: 0 })
+        ));
+        assert_eq!(
+            boundary, before,
+            "a tiny positive factor that exceeds scheduler bounds must roll back"
+        );
     }
 
     #[test]
@@ -3411,6 +4138,357 @@ mod tests {
         assert!(
             image.validate_decoded_structure().is_ok(),
             "the mutation guard must restore hash cardinality and recompute every frame digest"
+        );
+    }
+
+    #[test]
+    fn targeted_frame_mutation_rejects_counterfeit_unexposed_hash_before_mutable_access() {
+        let first = vec![1, 2, 3, 4];
+        let second = vec![5, 6, 7, 8];
+        let image = ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![Duration::ZERO, Duration::from_millis(20)],
+            hashes: vec![ImageDataType::hash_bytes(&first), [0xa5; 32]],
+            frames: vec![first.clone(), second.clone()],
+        });
+        let counterfeit_revision = image.current_content_hash();
+
+        let error = match image.decoded_frame_mut(0) {
+            Ok(_) => panic!("an unvalidated untouched frame hash must never become authoritative"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ImageDataFrameMutationError::ValidationFailed {
+                source: ImageDataValidationError::AnimationFrameHashMismatch { frame_index: 1 }
+            }
+        ));
+        assert_eq!(image.current_content_hash(), counterfeit_revision);
+        let data = image.data();
+        let ImageDataType::AnimRgba8 { frames, hashes, .. } = &*data else {
+            panic!("expected animation payload");
+        };
+        assert_eq!(frames, &[first, second]);
+        assert_eq!(hashes[1], [0xa5; 32]);
+        drop(data);
+        assert!(
+            image
+                .validated_summary_for_content_revision(
+                    counterfeit_revision,
+                    ImageDataValidationLimits::UNBOUNDED,
+                )
+                .is_none(),
+            "failed validation must not publish local authority"
+        );
+    }
+
+    #[test]
+    fn targeted_frame_mutation_hashes_only_exposed_frame_and_rebinds_authority() {
+        let first = vec![1, 2, 3, 4];
+        let second = vec![5, 6, 7, 8];
+        let first_hash = ImageDataType::hash_bytes(&first);
+        let second_hash = ImageDataType::hash_bytes(&second);
+        let image = ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![Duration::ZERO, Duration::from_millis(20)],
+            hashes: vec![first_hash, second_hash],
+            frames: vec![first, second],
+        });
+        let before = image.current_content_hash();
+
+        {
+            let mut target = image
+                .decoded_frame_mut(1)
+                .expect("valid animation grants targeted mutation");
+            target[0] = 0xcc;
+        }
+
+        let after = image.current_content_hash();
+        assert_ne!(after, before);
+        let data = image.data();
+        let ImageDataType::AnimRgba8 { frames, hashes, .. } = &*data else {
+            panic!("expected animation payload");
+        };
+        assert_eq!(hashes[0], first_hash, "the untouched hash is preserved");
+        assert_eq!(hashes[1], ImageDataType::hash_bytes(&frames[1]));
+        drop(data);
+        assert_eq!(
+            image.validated_summary_for_content_revision(
+                after,
+                ImageDataValidationLimits::UNBOUNDED,
+            ),
+            Some(ImageDataValidationSummary {
+                decoded_bytes: 8,
+                frame_count: 2,
+            }),
+            "targeted mutation must carry full validation authority to its new revision"
+        );
+    }
+
+    #[test]
+    fn prepared_frame_append_is_rollback_safe_and_commit_rebinds_authority() {
+        let root = vec![1, 2, 3, 4];
+        let image = ImageData::with_data(ImageDataType::new_single_frame(1, 1, root.clone()));
+        let revision = image.current_content_hash();
+        let summary = image
+            .normalize_for_content_revision_with_limits(
+                revision,
+                0,
+                ImageDataValidationLimits::UNBOUNDED,
+                &|| false,
+            )
+            .expect("seed exact local validation authority")
+            .summary;
+
+        let abandoned = image
+            .prepare_decoded_frame_append(
+                vec![5, 6, 7, 8],
+                Duration::from_millis(20),
+                4,
+            )
+            .expect("valid append prepares");
+        assert_eq!(abandoned.additional_decoded_bytes(), 4);
+        drop(abandoned);
+        assert_eq!(image.current_content_hash(), revision);
+        assert_eq!(
+            image.validated_summary_for_content_revision(
+                revision,
+                ImageDataValidationLimits::UNBOUNDED,
+            ),
+            Some(summary),
+            "dropping an uncommitted append must preserve validation authority"
+        );
+        assert!(matches!(&*image.data(), ImageDataType::Rgba8 { .. }));
+
+        image
+            .prepare_decoded_frame_append(
+                vec![9, 10, 11, 12],
+                Duration::from_millis(30),
+                4,
+            )
+            .expect("second valid append prepares")
+            .commit();
+        let committed_revision = image.current_content_hash();
+        assert_ne!(committed_revision, revision);
+        let data = image.data();
+        let ImageDataType::AnimRgba8 {
+            frames,
+            durations,
+            hashes,
+            ..
+        } = &*data
+        else {
+            panic!("static append must promote to animation");
+        };
+        assert_eq!(frames, &[root, vec![9, 10, 11, 12]]);
+        assert_eq!(durations, &[Duration::ZERO, Duration::from_millis(30)]);
+        assert_eq!(hashes[0], ImageDataType::hash_bytes(&frames[0]));
+        assert_eq!(hashes[1], ImageDataType::hash_bytes(&frames[1]));
+        drop(data);
+        assert_eq!(
+            image.validated_summary_for_content_revision(
+                committed_revision,
+                ImageDataValidationLimits::UNBOUNDED,
+            ),
+            Some(ImageDataValidationSummary {
+                decoded_bytes: 8,
+                frame_count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_append_duration_rejects_before_full_pixel_hash_validation() {
+        let image = ImageData::with_data(ImageDataType::Rgba8 {
+            data: vec![1, 2, 3, 4],
+            width: 1,
+            height: 1,
+            // Deliberately counterfeit: full validation would report a hash
+            // mismatch if the cheap timing rejection did not run first.
+            hash: [0xa5; 32],
+        });
+        let revision = image.current_content_hash();
+        let invalid_duration = Duration::from_millis(u64::from(u32::MAX) + 1);
+
+        let error = match image.prepare_decoded_frame_append(
+            vec![5, 6, 7, 8],
+            invalid_duration,
+            4,
+        ) {
+            Ok(_) => panic!("an out-of-range frame duration must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ImageDataFrameMutationError::ValidationFailed {
+                source: ImageDataValidationError::AnimationFrameDurationOutOfRange {
+                    frame_index: 1
+                }
+            }
+        ));
+        assert_eq!(image.current_content_hash(), revision);
+        assert!(
+            image
+                .validated_summary_for_content_revision(
+                    revision,
+                    ImageDataValidationLimits::UNBOUNDED,
+                )
+                .is_none(),
+            "invalid append timing must not publish authority for counterfeit pixels"
+        );
+    }
+
+    #[test]
+    fn metadata_speed_adjustment_preserves_pixel_hashes_and_rebinds_authority() {
+        let first = vec![1, 2, 3, 4];
+        let second = vec![5, 6, 7, 8];
+        let hashes = vec![
+            ImageDataType::hash_bytes(&first),
+            ImageDataType::hash_bytes(&second),
+        ];
+        let image = ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![Duration::ZERO, Duration::from_millis(80)],
+            hashes: hashes.clone(),
+            frames: vec![first, second],
+        });
+        let before = image.current_content_hash();
+
+        image.adjust_speed(2.0).expect("valid speed adjustment");
+
+        let after = image.current_content_hash();
+        assert_ne!(after, before);
+        let data = image.data();
+        let ImageDataType::AnimRgba8 {
+            durations,
+            hashes: adjusted_hashes,
+            ..
+        } = &*data
+        else {
+            panic!("expected animation payload");
+        };
+        assert_eq!(durations, &[Duration::ZERO, Duration::from_millis(40)]);
+        assert_eq!(adjusted_hashes, &hashes);
+        drop(data);
+        assert_eq!(
+            image.validated_summary_for_content_revision(
+                after,
+                ImageDataValidationLimits::UNBOUNDED,
+            ),
+            Some(ImageDataValidationSummary {
+                decoded_bytes: 8,
+                frame_count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn oversized_speed_adjustment_rolls_back_and_republishes_original_authority() {
+        let frame = vec![1, 2, 3, 4];
+        let image = ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![Duration::from_millis(1)],
+            hashes: vec![ImageDataType::hash_bytes(&frame)],
+            frames: vec![frame],
+        });
+        let revision = image.current_content_hash();
+        let summary = image
+            .normalize_for_content_revision_with_limits(
+                revision,
+                0,
+                ImageDataValidationLimits::UNBOUNDED,
+                &|| false,
+            )
+            .expect("seed exact local validation authority")
+            .summary;
+
+        assert!(matches!(
+            image.adjust_speed(f32::MIN_POSITIVE),
+            Err(ImageDataValidationError::AdjustedFrameDurationOutOfRange { frame_index: 0 })
+        ));
+        assert_eq!(image.current_content_hash(), revision);
+        let data = image.data();
+        let ImageDataType::AnimRgba8 { durations, .. } = &*data else {
+            panic!("expected animation payload");
+        };
+        assert_eq!(durations, &[Duration::from_millis(1)]);
+        drop(data);
+        assert_eq!(
+            image.validated_summary_for_content_revision(
+                revision,
+                ImageDataValidationLimits::UNBOUNDED,
+            ),
+            Some(summary),
+            "failed metadata-only adjustment must restore the exact prior authority"
+        );
+    }
+
+    #[test]
+    fn invalid_speed_preflight_rejects_before_full_pixel_hash_validation() {
+        let frame = vec![1, 2, 3, 4];
+        let image = ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![Duration::from_millis(1)],
+            // Deliberately counterfeit: reaching full payload validation would
+            // produce AnimationFrameHashMismatch instead of the timing error.
+            hashes: vec![[0xa5; 32]],
+            frames: vec![frame],
+        });
+        let revision = image.current_content_hash();
+
+        assert!(matches!(
+            image.adjust_speed(f32::MIN_POSITIVE),
+            Err(ImageDataValidationError::AdjustedFrameDurationOutOfRange { frame_index: 0 })
+        ));
+        assert_eq!(image.current_content_hash(), revision);
+        assert!(
+            image
+                .validated_summary_for_content_revision(
+                    revision,
+                    ImageDataValidationLimits::UNBOUNDED,
+                )
+                .is_none(),
+            "timing preflight must not publish authority for counterfeit pixels"
+        );
+    }
+
+    #[test]
+    fn speed_noop_and_rejection_preserve_revision_and_validation_authority() {
+        let image = ImageData::with_data(ImageDataType::new_single_frame(
+            1,
+            1,
+            vec![1, 2, 3, 4],
+        ));
+        let revision = image.current_content_hash();
+        let summary = image
+            .normalize_for_content_revision_with_limits(
+                revision,
+                0,
+                ImageDataValidationLimits::UNBOUNDED,
+                &|| false,
+            )
+            .expect("seed exact local validation authority")
+            .summary;
+
+        image.adjust_speed(2.0).expect("static speed is a no-op");
+        image.adjust_speed(1.0).expect("identity speed is a no-op");
+        assert!(matches!(
+            image.adjust_speed(f32::NAN),
+            Err(ImageDataValidationError::InvalidAnimationSpeedFactor)
+        ));
+        assert_eq!(image.current_content_hash(), revision);
+        assert_eq!(
+            image.validated_summary_for_content_revision(
+                revision,
+                ImageDataValidationLimits::UNBOUNDED,
+            ),
+            Some(summary),
+            "no-op and rejected speed commands must not disturb authority"
         );
     }
 

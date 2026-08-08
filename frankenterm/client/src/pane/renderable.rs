@@ -21,7 +21,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
-use termwiz::cell::{Cell, CellAttributes, Underline};
+use termwiz::cell::{Cell, CellAttributes, Underline, grapheme_column_width};
 use termwiz::color::AnsiColor;
 use termwiz::hyperlink::Rule;
 use termwiz::image::{
@@ -767,18 +767,20 @@ impl RenderableInner {
                 }
             }
             KeyCode::Char(c) => {
+                let mut encoded = [0_u8; 4];
+                let scalar_width = grapheme_column_width(c.encode_utf8(&mut encoded), None);
+                // A control scalar or zero-width scalar is stateful: it may
+                // move the cursor, alter terminal state, or combine with an
+                // adjacent glyph. Check the original scalar before `Cell`
+                // compact storage normalizes width zero to one.
+                if c.is_control() || scalar_width == 0 {
+                    self.suppress_prediction_after_local_failure();
+                    return;
+                }
                 // Store the plain glyph; the underline uncertainty cue is applied at
                 // render time only while confidence is low (glitchless, 3d).
                 let cell = Cell::new(c, CellAttributes::default());
                 let width = cell.width();
-                // A control scalar or zero-width scalar is stateful: it may move the
-                // cursor, alter terminal state, or combine with an adjacent glyph.
-                // This overlay owns none of that context, so publishing it as a
-                // standalone cell would be visibly wrong.
-                if c.is_control() || width == 0 {
-                    self.suppress_prediction_after_local_failure();
-                    return;
-                }
                 let row = self.cursor_position.y;
                 let col = self.cursor_position.x;
                 let Some(next_col) = col.checked_add(width) else {
@@ -934,10 +936,15 @@ impl RenderableInner {
         let mut final_columns = Vec::with_capacity(lines.len());
         for (idx, line) in lines.iter().enumerate() {
             let starting_col = if idx == 0 { original_cursor.x } else { 0 };
-            if line.visible_cells().any(|cell| cell.width() == 0) {
+            if line
+                .visible_cells()
+                .any(|cell| grapheme_column_width(cell.str(), None) == 0)
+            {
                 // A leading/non-composed combining cell depends on neighboring
-                // terminal state. Do not advance the synthetic cursor while
-                // omitting a cell that this overlay cannot represent exactly.
+                // terminal state. Inspect the original grapheme because compact
+                // `Cell` storage intentionally normalizes width zero to one; do
+                // not advance the synthetic cursor while omitting context that
+                // this overlay cannot represent exactly.
                 self.suppress_prediction_after_local_failure();
                 return;
             }
@@ -2019,31 +2026,71 @@ lazy_static::lazy_static! {
 static IMAGE_VALIDATION_JOBS: AtomicUsize = AtomicUsize::new(0);
 static IMAGE_HYDRATION_RESERVED_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// Atomically reserve `amount` without wrapping and without crossing the
+/// caller-owned resource ceiling. A failed or contended compare/exchange
+/// retries from the observed value so overflow and saturation are checked
+/// against the state that actually won the race.
+fn try_reserve_bounded_atomic(counter: &AtomicUsize, amount: usize, limit: usize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current
+            .checked_add(amount)
+            .filter(|next| *next <= limit)
+        else {
+            return false;
+        };
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Release exactly `amount` while leaving the counter unchanged on an
+/// invariant-breaking underflow instead of wrapping into counterfeit budget.
+fn try_release_atomic(counter: &AtomicUsize, amount: usize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_sub(amount) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 struct ImageHydrationBytePermit {
     bytes: usize,
 }
 
 impl ImageHydrationBytePermit {
     fn try_acquire(bytes: usize) -> Option<Self> {
-        IMAGE_HYDRATION_RESERVED_BYTES
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
-                let next = reserved.checked_add(bytes)?;
-                (next <= MAX_GLOBAL_IMAGE_HYDRATION_WORKING_SET_BYTES).then_some(next)
-            })
-            .ok()
-            .map(|_| Self { bytes })
+        try_reserve_bounded_atomic(
+            &IMAGE_HYDRATION_RESERVED_BYTES,
+            bytes,
+            MAX_GLOBAL_IMAGE_HYDRATION_WORKING_SET_BYTES,
+        )
+        .then_some(Self { bytes })
     }
 }
 
 impl Drop for ImageHydrationBytePermit {
     fn drop(&mut self) {
         let bytes = self.bytes;
-        let released = IMAGE_HYDRATION_RESERVED_BYTES.try_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |reserved| reserved.checked_sub(bytes),
-        );
-        debug_assert!(released.is_ok());
+        let released = try_release_atomic(&IMAGE_HYDRATION_RESERVED_BYTES, bytes);
+        debug_assert!(released);
     }
 }
 
@@ -2051,23 +2098,15 @@ struct ImageValidationJobPermit;
 
 impl ImageValidationJobPermit {
     fn try_acquire() -> Option<Self> {
-        IMAGE_VALIDATION_JOBS
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_PENDING_IMAGE_VALIDATIONS).then_some(active + 1)
-            })
-            .ok()
-            .map(|_| Self)
+        try_reserve_bounded_atomic(&IMAGE_VALIDATION_JOBS, 1, MAX_PENDING_IMAGE_VALIDATIONS)
+            .then_some(Self)
     }
 }
 
 impl Drop for ImageValidationJobPermit {
     fn drop(&mut self) {
-        let released = IMAGE_VALIDATION_JOBS.try_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |active| active.checked_sub(1),
-        );
-        debug_assert!(released.is_ok());
+        let released = try_release_atomic(&IMAGE_VALIDATION_JOBS, 1);
+        debug_assert!(released);
     }
 }
 
@@ -3432,6 +3471,7 @@ mod tests {
         reconcile_predictions_after_cached_terminal_change,
         reconcile_predictions_after_terminal_change, render_line_cache_capacity_for_values,
         reset_prediction_state, rows_requiring_image_retry, should_apply_unilateral_delta,
+        try_release_atomic, try_reserve_bounded_atomic,
         CachedImageFailure, FetchToken, ImageLru, LineEntry, OrdinaryImageBatchAdmission,
         Prediction, PredictionReconciliation, ValidatedImageData,
         IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES,
@@ -3451,6 +3491,7 @@ mod tests {
     use mux::MuxSessionIncarnation;
     use std::collections::{HashMap, HashSet};
     use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use termwiz::cell::{Cell, CellAttributes};
@@ -3459,6 +3500,37 @@ mod tests {
     use wezterm_term::{KeyCode, KeyModifiers};
     use termwiz::surface::{SequenceNo, SEQ_ZERO};
     use wezterm_term::Line;
+
+    #[test]
+    fn bounded_atomic_reservation_preserves_limit_overflow_and_release_boundaries() {
+        let counter = AtomicUsize::new(0);
+
+        assert!(try_reserve_bounded_atomic(&counter, 2, 2));
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        assert!(
+            !try_reserve_bounded_atomic(&counter, 1, 2),
+            "a counter already at its limit must reject another reservation"
+        );
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        assert!(
+            !try_release_atomic(&counter, 3),
+            "an underflowing release must fail without wrapping"
+        );
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        assert!(try_release_atomic(&counter, 2));
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+
+        assert!(try_reserve_bounded_atomic(&counter, 0, 0));
+        assert!(try_release_atomic(&counter, 0));
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+
+        counter.store(usize::MAX, Ordering::Release);
+        assert!(
+            !try_reserve_bounded_atomic(&counter, 1, usize::MAX),
+            "checked addition must reject arithmetic overflow"
+        );
+        assert_eq!(counter.load(Ordering::Acquire), usize::MAX);
+    }
 
     fn test_renderable_state_with_echo_threshold(
         local_echo_threshold_ms: Option<u64>,
@@ -3754,6 +3826,24 @@ mod tests {
         assert!(inner.predictions.is_empty());
         assert_eq!(inner.cursor_position, original_cursor);
         assert_eq!(inner.prediction_score, super::PREDICT_SUPPRESS_SCORE);
+    }
+
+    #[test]
+    fn paste_prediction_accepts_combining_mark_attached_to_visible_base() {
+        let renderable = test_renderable_state_with_echo_threshold(Some(0));
+        let state = renderable.lock();
+        let mut inner = state.inner.borrow_mut();
+        inner.last_input_rtt = 1;
+        inner
+            .lines
+            .put(0, LineEntry::Line(Line::from("ordinary prompt")));
+
+        inner.predict_from_paste("e\u{0301}");
+
+        assert_eq!(inner.predictions.len(), 1);
+        assert_eq!(inner.predictions[0].predicted.str(), "e\u{0301}");
+        assert_eq!(inner.cursor_position.x, 1);
+        assert_eq!(inner.cursor_position.y, 0);
     }
 
     #[test]

@@ -8962,11 +8962,12 @@ mod tests {
             .rpc_transport
             .active_generation()
             .expect("local-gate test transport starts live");
+        let synthetic_agreed = <ListPanesTabStacks as PduWireIdent>::WIRE_SPEC
+            .min_codec_version
+            .checked_sub(1)
+            .expect("tab-stack request has a nonzero dialect floor");
         client.rpc_transport.lifecycle.lock().protocol = Some(
-            RpcProtocolAuthority::established_for_test(
-                generation,
-                codec::CODEC_VERSION_MIN_SUPPORTED,
-            ),
+            RpcProtocolAuthority::established_for_test(generation, synthetic_agreed),
         );
         let serial_before = client
             .rpc_transport
@@ -8990,11 +8991,13 @@ mod tests {
             above_dialect.downcast_ref::<OrdinaryMuxProtocolError>(),
             Some(OrdinaryMuxProtocolError::DialectViolation {
                 ident,
-                required: 47,
+                required,
                 agreed,
                 ..
             }) if *ident == <ListPanesTabStacks as PduWireIdent>::IDENT
-                && *agreed == codec::CODEC_VERSION_MIN_SUPPORTED
+                && *required
+                    == <ListPanesTabStacks as PduWireIdent>::WIRE_SPEC.min_codec_version
+                && *agreed == synthetic_agreed
         ));
         assert!(matches!(
             receiver.try_recv(),
@@ -12098,11 +12101,12 @@ mod tests {
             );
         }
 
+        let synthetic_agreed = <ListPanesTabStacksResponse as PduWireIdent>::WIRE_SPEC
+            .min_codec_version
+            .checked_sub(1)
+            .expect("tab-stack response has a nonzero dialect floor");
         rpc_transport.lifecycle.lock().protocol = Some(
-            RpcProtocolAuthority::established_for_test(
-                generation,
-                codec::CODEC_VERSION_MIN_SUPPORTED,
-            ),
+            RpcProtocolAuthority::established_for_test(generation, synthetic_agreed),
         );
         for (ident, unknown) in [
             (5, true),
@@ -12144,7 +12148,7 @@ mod tests {
                         agreed,
                         ..
                     } if *observed_ident == ident
-                        && *agreed == codec::CODEC_VERSION_MIN_SUPPORTED
+                        && *agreed == synthetic_agreed
                 ));
             }
             assert_eq!(
@@ -12628,8 +12632,10 @@ mod tests {
     #[test]
     fn above_dialect_reply_retires_exact_transport_without_body_or_successor() {
         let ident = <ListPanesTabStacksResponse as PduWireIdent>::IDENT;
-        let agreed = codec::CODEC_VERSION_MIN_SUPPORTED;
-        assert!(<ListPanesTabStacksResponse as PduWireIdent>::WIRE_SPEC.min_codec_version > agreed);
+        let agreed = <ListPanesTabStacksResponse as PduWireIdent>::WIRE_SPEC
+            .min_codec_version
+            .checked_sub(1)
+            .expect("tab-stack response has a nonzero dialect floor");
         let (reader_error, caller_error) =
             run_inbound_protocol_transport_rejection(ident, true, true, agreed);
         assert!(matches!(
@@ -13421,10 +13427,18 @@ mod tests {
     }
 
     #[test]
-    fn topology_fence_version_gate_rejects_before_identity_topology_or_readiness() {
+    fn unsupported_codec_rejects_before_identity_topology_or_readiness() {
         let (client, receiver) = client_with_bootstrap_rpc_queue();
         let ui = ConnectionUI::new_headless();
-        let rejected_codec_version = TOPOLOGY_FENCE_MIN_CODEC_VERSION - 1;
+        const {
+            assert!(
+                codec::CODEC_VERSION_MIN_SUPPORTED >= TOPOLOGY_FENCE_MIN_CODEC_VERSION,
+                "the supported codec window must not admit a pre-topology-fence peer"
+            );
+        }
+        let rejected_codec_version = codec::CODEC_VERSION_MIN_SUPPORTED
+            .checked_sub(1)
+            .expect("the supported codec floor is nonzero");
         let rejected_generation = client
             .rpc_transport
             .active_generation()
@@ -13455,10 +13469,10 @@ mod tests {
                     .send(Ok(Pdu::GetCodecVersionResponse(
                         GetCodecVersionResponse {
                             codec_vers: rejected_codec_version,
-                            version_string: "pre-topology-fence-peer".to_string(),
+                            version_string: "below-supported-window-peer".to_string(),
                             executable_path: PathBuf::from("/test/old-ft"),
                             config_file_path: None,
-                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                            min_supported: rejected_codec_version,
                         },
                     )))
                     .await
@@ -13473,15 +13487,11 @@ mod tests {
             futures::future::join(verify, peer).await
         });
 
-        let error = result.expect_err("a codec-v48 peer must fail the topology-fence gate");
+        let error = result.expect_err("a peer below the supported codec floor must be rejected");
         let rejection = error
-            .downcast_ref::<MissingTopologyFenceProtocolError>()
-            .expect("version gate must retain its typed rejection");
-        assert_eq!(rejection.remote_codec_version, rejected_codec_version);
-        assert_eq!(
-            rejection.minimum_codec_version,
-            TOPOLOGY_FENCE_MIN_CODEC_VERSION
-        );
+            .downcast_ref::<IncompatibleVersionError>()
+            .expect("codec-window rejection must retain its typed error");
+        assert_eq!(rejection.codec_vers, rejected_codec_version);
         assert_eq!(transcript, ["GetCodecVersion"]);
         assert_eq!(
             rejected_reader_abort.cause(),
@@ -13499,7 +13509,7 @@ mod tests {
                 .rpc_transport
                 .codec_authority(rejected_generation),
             None,
-            "a compatible-but-pre-fence peer must be rejected before codec authority is retained"
+            "an unsupported peer must be rejected before codec authority is retained"
         );
         assert_eq!(
             client
