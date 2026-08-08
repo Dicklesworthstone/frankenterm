@@ -5,7 +5,9 @@ use xkbcommon::xkb::CONTEXT_NO_FLAGS;
 
 use crate::x11::KeyboardWithFallback;
 
-use super::state::WaylandState;
+use super::state::{
+    clear_surface_authority_if_matches, replace_surface_authority, WaylandState,
+};
 use super::SurfaceUserData;
 
 fn cancel_window_key_repeat(state: &WaylandState, window_id: usize) {
@@ -50,15 +52,36 @@ fn route_keyboard_leave(
     currently_focused: Option<usize>,
     left: Option<usize>,
 ) -> KeyboardFocusRoute {
-    // Focus and modifier state are global to this wl_keyboard. If a malformed
-    // or stale Leave names a different surface, fail closed by retiring the
-    // currently focused window rather than preserving focus while disabling
-    // its shared IME and mapper state.
+    // The caller has already established that this Leave names the active
+    // keyboard surface.  Prefer the current window identity if surface user
+    // data disappeared during destruction.
     let dispatch_to = currently_focused.or(left);
     KeyboardFocusRoute {
         dispatch_to,
         focused: None,
         cancel_repeat_for: dispatch_to,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModifierRoute {
+    UpdateMapperOnly,
+    DispatchToWindow(usize),
+}
+
+fn route_modifiers(focused_window: Option<usize>) -> ModifierRoute {
+    focused_window.map_or(ModifierRoute::UpdateMapperOnly, ModifierRoute::DispatchToWindow)
+}
+
+fn update_unfocused_modifier_state(
+    mapper: Option<&mut KeyboardWithFallback>,
+    mods_depressed: u32,
+    mods_latched: u32,
+    mods_locked: u32,
+    group: u32,
+) {
+    if let Some(mapper) = mapper {
+        mapper.update_modifier_state(mods_depressed, mods_latched, mods_locked, group);
     }
 }
 
@@ -81,7 +104,10 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
                 *state.last_serial.borrow_mut() = *serial;
                 let entered_window_id =
                     SurfaceUserData::try_from_wl(surface).map(|data| data.window_id);
-                *state.active_surface_id.borrow_mut() = entered_window_id.map(|_| surface.id());
+                replace_surface_authority(
+                    &mut state.keyboard_active_surface_id.borrow_mut(),
+                    surface.id(),
+                );
                 let route = route_keyboard_enter(state.keyboard_window_id, entered_window_id);
                 if let Some(window_id) = route.cancel_repeat_for {
                     cancel_window_key_repeat(state, window_id);
@@ -114,6 +140,16 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
                 serial, surface, ..
             } => {
                 *state.last_serial.borrow_mut() = *serial;
+                let left_surface_id = surface.id();
+                if !clear_surface_authority_if_matches(
+                    &mut state.keyboard_active_surface_id.borrow_mut(),
+                    &left_surface_id,
+                ) {
+                    log::warn!(
+                        "Ignoring stale Wayland keyboard Leave for surface {left_surface_id:?}"
+                    );
+                    return;
+                }
                 let surface_window_id =
                     SurfaceUserData::try_from_wl(surface).map(|data| data.window_id);
                 if let (Some(current), Some(left)) = (state.keyboard_window_id, surface_window_id) {
@@ -131,9 +167,33 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
                 event_window_id = route.dispatch_to;
                 disable_text_input_for_keyboard(state, keyboard);
             }
-            WlKeyboardEvent::Key { serial, .. } | WlKeyboardEvent::Modifiers { serial, .. } => {
+            WlKeyboardEvent::Key { serial, .. } => {
                 *state.last_serial.borrow_mut() = *serial;
                 event_window_id = state.keyboard_window_id;
+            }
+            WlKeyboardEvent::Modifiers {
+                serial,
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+            } => {
+                *state.last_serial.borrow_mut() = *serial;
+                match route_modifiers(state.keyboard_window_id) {
+                    ModifierRoute::DispatchToWindow(window_id) => {
+                        event_window_id = Some(window_id);
+                    }
+                    ModifierRoute::UpdateMapperOnly => {
+                        update_unfocused_modifier_state(
+                            state.keyboard_mapper.as_mut(),
+                            *mods_depressed,
+                            *mods_latched,
+                            *mods_locked,
+                            *group,
+                        );
+                        return;
+                    }
+                }
             }
             WlKeyboardEvent::RepeatInfo { rate, delay } => {
                 state.key_repeat_rate = *rate;
@@ -242,7 +302,10 @@ pub(super) struct KeyboardData {}
 
 #[cfg(test)]
 mod tests {
-    use super::{route_keyboard_enter, route_keyboard_leave, KeyboardFocusRoute};
+    use super::{
+        route_keyboard_enter, route_keyboard_leave, route_modifiers, KeyboardFocusRoute,
+        ModifierRoute,
+    };
 
     #[test]
     fn leave_routes_to_current_window_before_clearing_focus() {
@@ -293,6 +356,15 @@ mod tests {
                 focused: None,
                 cancel_repeat_for: Some(7),
             }
+        );
+    }
+
+    #[test]
+    fn modifiers_without_surface_focus_still_update_the_global_mapper() {
+        assert_eq!(route_modifiers(None), ModifierRoute::UpdateMapperOnly);
+        assert_eq!(
+            route_modifiers(Some(9)),
+            ModifierRoute::DispatchToWindow(9)
         );
     }
 }
