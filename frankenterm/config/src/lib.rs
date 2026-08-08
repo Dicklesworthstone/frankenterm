@@ -597,6 +597,36 @@ struct ConfigInner {
     subscribers: HashMap<usize, Box<dyn Fn() -> bool + Send>>,
 }
 
+#[track_caller]
+fn next_unique_config_subscription_id(counter: &AtomicUsize) -> usize {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = current.checked_add(1) else {
+            panic!(
+                "config subscription id space exhausted; refusing to replace an existing subscriber"
+            );
+        };
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return current,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[track_caller]
+fn next_config_generation(current: usize) -> usize {
+    current.checked_add(1).unwrap_or_else(|| {
+        panic!(
+            "config generation space exhausted; refusing to publish a configuration under a reused generation"
+        )
+    })
+}
+
 impl ConfigInner {
     fn new() -> Self {
         Self {
@@ -614,7 +644,7 @@ impl ConfigInner {
         F: Fn() -> bool + 'static + Send,
     {
         static SUB_ID: AtomicUsize = AtomicUsize::new(0);
-        let sub_id = SUB_ID.fetch_add(1, Ordering::Relaxed);
+        let sub_id = next_unique_config_subscription_id(&SUB_ID);
         self.subscribers.insert(sub_id, Box::new(subscriber));
         sub_id
     }
@@ -625,6 +655,16 @@ impl ConfigInner {
 
     fn notify(&mut self) {
         self.subscribers.retain(|_, notify| notify());
+    }
+
+    fn install_config(&mut self, config: Config, warnings: Option<Vec<String>>) {
+        let generation = next_config_generation(self.generation);
+        if let Some(warnings) = warnings {
+            self.warnings = warnings;
+        }
+        self.config = Arc::new(config);
+        self.error.take();
+        self.generation = generation;
     }
 
     fn watch_path(&mut self, path: PathBuf) {
@@ -743,8 +783,6 @@ impl ConfigInner {
             warnings,
         } = Config::load();
 
-        self.warnings = warnings;
-
         // Before we process the success/failure, extract and update
         // any paths that we should be watching
         let mut watch_paths = vec![];
@@ -768,9 +806,7 @@ impl ConfigInner {
 
         match config {
             Ok(config) => {
-                self.config = Arc::new(config);
-                self.error.take();
-                self.generation += 1;
+                self.install_config(config, Some(warnings));
 
                 // If we loaded a user config, publish this latest version of
                 // the lua state to the LUA_PIPE.  This allows a subsequent
@@ -783,6 +819,7 @@ impl ConfigInner {
                 log::debug!("Reloaded configuration! generation={}", self.generation);
             }
             Err(err) => {
+                self.warnings = warnings;
                 let err = format!("{:#}", err);
                 if self.generation > 0 {
                     // Only generate the message for an actual reload
@@ -804,15 +841,11 @@ impl ConfigInner {
     /// error message; replace them with the default
     /// configuration
     fn use_defaults(&mut self) {
-        self.config = Arc::new(Config::default_config());
-        self.error.take();
-        self.generation += 1;
+        self.install_config(Config::default_config(), None);
     }
 
     fn use_this_config(&mut self, cfg: Config) {
-        self.config = Arc::new(cfg);
-        self.error.take();
-        self.generation += 1;
+        self.install_config(cfg, None);
     }
 
     fn overridden(
@@ -842,9 +875,7 @@ impl ConfigInner {
         // that we have consistent values regardless of the
         // operating system that we're running tests on
         config.dpi.replace(96.0);
-        self.config = Arc::new(config);
-        self.error.take();
-        self.generation += 1;
+        self.install_config(config, None);
     }
 }
 
@@ -1013,6 +1044,64 @@ fn default_true() -> bool {
 mod tests {
     use super::*;
     use std::panic::AssertUnwindSafe;
+
+    #[test]
+    fn config_subscription_allocator_uses_the_last_unreserved_identity_once() {
+        let counter = AtomicUsize::new(usize::MAX - 1);
+
+        assert_eq!(
+            next_unique_config_subscription_id(&counter),
+            usize::MAX - 1
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "config subscription id space exhausted; refusing to replace an existing subscriber"
+    )]
+    fn config_subscription_allocator_fails_closed_at_exhaustion() {
+        let counter = AtomicUsize::new(usize::MAX);
+        let _ = next_unique_config_subscription_id(&counter);
+    }
+
+    #[test]
+    fn config_install_publishes_the_terminal_generation_once() {
+        let mut inner = ConfigInner::new();
+        inner.generation = usize::MAX - 1;
+        inner.error = Some("stale error".to_string());
+
+        inner.install_config(
+            Config::default_config(),
+            Some(vec!["current warning".to_string()]),
+        );
+
+        assert_eq!(inner.generation, usize::MAX);
+        assert!(inner.error.is_none());
+        assert_eq!(inner.warnings, ["current warning"]);
+    }
+
+    #[test]
+    fn config_generation_exhaustion_rejects_install_transactionally() {
+        let mut inner = ConfigInner::new();
+        inner.generation = usize::MAX;
+        inner.error = Some("retained error".to_string());
+        inner.warnings = vec!["retained warning".to_string()];
+        let retained_config = Arc::clone(&inner.config);
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            inner.install_config(
+                Config::default_config(),
+                Some(vec!["must not publish".to_string()]),
+            );
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(inner.generation, usize::MAX);
+        assert!(Arc::ptr_eq(&inner.config, &retained_config));
+        assert_eq!(inner.error.as_deref(), Some("retained error"));
+        assert_eq!(inner.warnings, ["retained warning"]);
+    }
 
     #[test]
     fn toml_table_numeric_keys_with_all_numeric() {

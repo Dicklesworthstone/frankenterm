@@ -7,7 +7,7 @@ use crate::types::Action;
 use anyhow::{Result, bail};
 use frankenterm_dynamic::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Opaque handle for a registered keybinding.
@@ -170,7 +170,9 @@ impl KeybindingRegistry {
     where
         F: Fn(&Value) -> Result<Vec<Action>> + Send + Sync + 'static,
     {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = crate::try_next_unique_id(&self.next_id).unwrap_or_else(|| {
+            panic!("keybinding id space exhausted; refusing to reuse a binding identity")
+        });
         let canonical = combo.to_string_repr();
 
         let binding = RegisteredBinding {
@@ -279,6 +281,22 @@ impl KeybindingRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn exhausted_keybinding_ids_fail_before_registration() {
+        let registry = KeybindingRegistry::new();
+        registry.next_id.store(u64::MAX, Ordering::Release);
+        let combo = KeyCombo::parse("ctrl+x").unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.register(combo, "test-extension", |_| Ok(Vec::new()))
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(registry.count(), 0);
+        assert!(registry.bound_combos().is_empty());
+    }
 
     #[test]
     fn parse_key_combo() {

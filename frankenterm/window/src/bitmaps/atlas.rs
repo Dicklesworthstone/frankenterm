@@ -30,6 +30,8 @@ pub enum AtlasAllocationFailure {
     ArithmeticOverflow,
     #[error("texture allocation exceeds the configured memory budget")]
     MemoryBudget,
+    #[error("atlas modification version space is exhausted")]
+    VersionExhausted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -131,6 +133,15 @@ impl Atlas {
     #[inline]
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::Acquire)
+    }
+
+    fn next_version(&self) -> Option<u64> {
+        self.version.load(Ordering::Acquire).checked_add(1)
+    }
+
+    fn publish_version(&self, version: u64) {
+        debug_assert_eq!(self.version.load(Ordering::Relaxed).checked_add(1), Some(version));
+        self.version.store(version, Ordering::Release);
     }
 
     /// Reserve space for a sprite of the given size
@@ -249,6 +260,16 @@ impl Atlas {
             failure: AtlasAllocationFailure::InvalidDimensions,
         })?;
 
+        // Preflight the mutation witness before either the packer or texture is
+        // changed. Once the terminal version has been published, mutating while
+        // retaining that version would make stale sprites indistinguishable
+        // from current ones.
+        let next_version = self.next_version().ok_or(OutOfTextureSpace {
+            size: None,
+            current_size: self.side,
+            failure: AtlasAllocationFailure::VersionExhausted,
+        })?;
+
         let res = if let AllocationOutcome::Placed(allocation) = self.allocator.try_alloc(glyph) {
             let left = isize::try_from(allocation.x).map_err(|_| OutOfTextureSpace {
                 size: None,
@@ -293,14 +314,14 @@ impl Atlas {
 
             // Bump after the texture write so readers that observe the
             // post-bump version always see the sprite's bytes.
-            let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
+            self.publish_version(next_version);
 
             metrics::histogram!("window.atlas.allocate.success.rate").record(1.);
             metrics::counter!("window.atlas.uploads.total").increment(1);
             Ok(Sprite {
                 texture: Rc::clone(&self.texture),
                 coords: rect,
-                version,
+                version: next_version,
             })
         } else {
             // It's not possible to satisfy that request
@@ -346,6 +367,9 @@ impl Atlas {
     /// returned by `allocate*` is now stale (its stamped version
     /// predates the post-clear version).
     pub fn clear(&mut self) {
+        let next_version = self.next_version().unwrap_or_else(|| {
+            panic!("atlas modification version space exhausted; refusing an unversioned clear")
+        });
         let iside = self.side as isize;
         let image = crate::Image::new(self.side, self.side);
         let rect = Rect::new(Point::new(0, 0), Size::new(iside, iside));
@@ -354,7 +378,7 @@ impl Atlas {
         self.packing_stats = PackingStats::default();
         self.packing_stats.record_atlas_size(self.allocator.size());
         self.record_packing_metrics();
-        self.version.fetch_add(1, Ordering::AcqRel);
+        self.publish_version(next_version);
         metrics::counter!("window.atlas.rebuilds.total").increment(1);
     }
 
@@ -389,6 +413,11 @@ impl Atlas {
             new_texture.width(),
             self.side
         );
+        let next_version = self.next_version().ok_or_else(|| {
+            anyhow::anyhow!(
+                "atlas modification version space exhausted; refusing an unversioned grow"
+            )
+        })?;
         let new_side = new_texture.width();
         let iside = new_side as isize;
         let image = crate::Image::new(new_side, new_side);
@@ -405,7 +434,7 @@ impl Atlas {
         self.packing_stats = PackingStats::default();
         self.packing_stats.record_atlas_size(atlas_size);
         self.record_packing_metrics();
-        self.version.fetch_add(1, Ordering::AcqRel);
+        self.publish_version(next_version);
 
         let bytes_estimate = (new_side as u64)
             .saturating_mul(new_side as u64)
@@ -633,6 +662,54 @@ mod tests {
         assert!(sprite_b.version() > sprite_a.version());
         assert!(atlas.packing_efficiency_pct() > 0);
         assert!(atlas.fragmentation_pct() < 100);
+    }
+
+    #[test]
+    fn terminal_version_is_published_once_then_allocation_fails_before_mutation() {
+        let mut atlas = fresh_atlas(64);
+        atlas.version.store(u64::MAX - 1, Ordering::Release);
+
+        let terminal = atlas
+            .allocate(&cell(8, 8, 0x20))
+            .expect("the terminal atlas version remains uniquely available");
+        assert_eq!(terminal.version(), u64::MAX);
+        let efficiency = atlas.packing_efficiency_pct();
+
+        let error = atlas
+            .allocate(&cell(8, 8, 0x30))
+            .expect_err("allocation must fail once no unique version remains");
+        assert_eq!(error.failure, AtlasAllocationFailure::VersionExhausted);
+        assert_eq!(atlas.version(), u64::MAX);
+        assert_eq!(atlas.packing_efficiency_pct(), efficiency);
+    }
+
+    #[test]
+    fn version_exhaustion_rejects_clear_before_resetting_the_atlas() {
+        let mut atlas = fresh_atlas(64);
+        let _ = atlas.allocate(&cell(8, 8, 0x20)).expect("allocate");
+        let efficiency = atlas.packing_efficiency_pct();
+        atlas.version.store(u64::MAX, Ordering::Release);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| atlas.clear()));
+
+        assert!(result.is_err());
+        assert_eq!(atlas.version(), u64::MAX);
+        assert_eq!(atlas.packing_efficiency_pct(), efficiency);
+    }
+
+    #[test]
+    fn version_exhaustion_rejects_grow_before_replacing_the_texture() {
+        let mut atlas = fresh_atlas(64);
+        atlas.version.store(u64::MAX, Ordering::Release);
+        let larger: Rc<dyn Texture2d> = Rc::new(ImageTexture::new(128, 128));
+
+        let error = atlas
+            .grow(&larger)
+            .expect_err("grow must fail once no unique version remains");
+
+        assert!(error.to_string().contains("version space exhausted"));
+        assert_eq!(atlas.version(), u64::MAX);
+        assert_eq!(atlas.size(), 64);
     }
 
     #[test]

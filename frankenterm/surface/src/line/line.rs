@@ -1112,9 +1112,9 @@ impl Line {
         self.set_cell(idx, Cell::new_grapheme_with_width(text, width, attr), seqno);
     }
 
-    /// Assign a contiguous width-1 ASCII run when it can be represented as a
-    /// single append to clustered storage. Returns false if the caller must
-    /// fall back to the normal per-cell assignment path.
+    /// Assign a contiguous printable width-1 ASCII run when it can be
+    /// represented as a single append to clustered storage. Returns false for
+    /// control bytes or whenever the caller must use normal per-cell assignment.
     pub fn append_ascii_cell_run(
         &mut self,
         idx: usize,
@@ -1122,11 +1122,15 @@ impl Line {
         attr: CellAttributes,
         seqno: SequenceNo,
     ) -> bool {
-        debug_assert!(text.is_ascii());
         if text.is_empty() {
             return true;
         }
-        if !text.is_ascii() || checked_materialized_end(idx, text.len()).is_none() {
+        if !text
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == b' ' || byte.is_ascii_graphic())
+            || checked_materialized_end(idx, text.len()).is_none()
+        {
             return false;
         }
 
@@ -1358,7 +1362,15 @@ impl Line {
         let new_len = cells
             .iter()
             .rposition(|c| c.str() != " " || c.attrs() != &def_attr)
-            .map_or(0, |end_idx| end_idx + 1);
+            .map_or(0, |end_idx| {
+                // A visible wide grapheme owns its following placeholder
+                // column(s).  Those placeholders are ordinary default blank
+                // cells, but pruning them would make VecStorage::len disagree
+                // with clustered storage and under-report the visual width.
+                end_idx
+                    .saturating_add(normalize_cell_width(cells[end_idx].width()))
+                    .min(cells.len())
+            });
         if new_len < cells.len() {
             cells.resize_with(new_len, Cell::blank);
             self.update_last_change_seqno(seqno);
@@ -1368,6 +1380,30 @@ impl Line {
 
     pub fn fill_range(&mut self, cols: Range<usize>, cell: &Cell, seqno: SequenceNo) {
         if cols.start >= cols.end {
+            return;
+        }
+
+        // A cell wider than one column cannot be duplicated with a slice fill:
+        // each successive assignment must first invalidate the wide cell that
+        // the preceding assignment placed.  Retain the established per-column
+        // semantics for that unusual public-API case; terminal erase/fill hot
+        // paths use width-one cells and continue through the batched path below.
+        let cell_width = normalize_cell_width(cell.width());
+        if cell_width > 1 {
+            // `set_cell_impl` rejects starts whose materialized cell would
+            // exceed the u32-backed line limit.  Do not nevertheless walk a
+            // pointer-width tail of individually rejected indices.
+            let valid_start_end = MAX_MATERIALIZED_LINE_LEN
+                .saturating_sub(cell_width)
+                .saturating_add(1);
+            let bounded_end = cols.end.min(valid_start_end);
+            if cols.start >= bounded_end {
+                return;
+            }
+            for x in cols.start..bounded_end {
+                self.set_cell_impl(x, cell.clone(), true, seqno);
+            }
+            self.prune_trailing_blanks(seqno);
             return;
         }
 
@@ -2760,6 +2796,55 @@ mod tests {
         assert_eq!(line.as_str().as_ref(), "abc");
     }
 
+    #[test]
+    fn clustered_ascii_run_rejects_non_ascii_without_mutating_or_panicking() {
+        let mut line: Line = "abc".into();
+        line.compress_for_scrollback();
+        let before = line.clone();
+
+        assert!(!line.append_ascii_cell_run(
+            line.len(),
+            "é",
+            CellAttributes::default(),
+            1,
+        ));
+        assert_eq!(line, before);
+
+        assert!(!line.append_ascii_cell_run(
+            line.len(),
+            "\r\n",
+            CellAttributes::default(),
+            1,
+        ));
+        assert_eq!(line, before, "a CRLF grapheme is not two width-1 cells");
+    }
+
+    #[test]
+    fn clustered_ascii_run_preserves_prior_double_width_geometry() {
+        let mut line: Line = "中".into();
+        line.compress_for_scrollback();
+
+        assert!(line.append_ascii_cell_run(
+            line.len(),
+            "abc",
+            CellAttributes::default(),
+            1,
+        ));
+        assert_eq!(line.as_str().as_ref(), "中abc");
+        assert_eq!(line.len(), 5);
+        assert_eq!(
+            line.visible_cells()
+                .map(|cell| (cell.cell_index(), cell.width(), cell.str().to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 2, "中".to_string()),
+                (2, 1, "a".to_string()),
+                (3, 1, "b".to_string()),
+                (4, 1, "c".to_string()),
+            ],
+        );
+    }
+
     // ── Line wrap ──────────────────────────────────────────
 
     #[test]
@@ -3682,11 +3767,65 @@ mod tests {
     }
 
     #[test]
+    fn line_prune_trailing_blanks_preserves_wide_grapheme_placeholder() {
+        let mut line = Line::with_width(2, SEQ_ZERO);
+        line.set_cell(
+            0,
+            Cell::new_grapheme_with_width("\u{4e2d}", 2, CellAttributes::default()),
+            1,
+        );
+        assert_eq!(line.len(), 2);
+
+        line.prune_trailing_blanks(2);
+
+        assert_eq!(line.len(), 2);
+        assert_eq!(line.as_str().as_ref(), "\u{4e2d}");
+        assert_eq!(line.current_seqno(), 1, "retaining geometry is a no-op");
+    }
+
+    #[test]
     fn line_fill_range() {
         let mut line = Line::with_width(5, SEQ_ZERO);
         let cell = Cell::new('X', CellAttributes::default());
         line.fill_range(1..4, &cell, 1);
         assert_eq!(line.columns_as_str(1..4), "XXX");
+    }
+
+    #[test]
+    fn line_fill_range_preserves_sequential_wide_cell_assignment() {
+        let mut line = Line::with_width(4, SEQ_ZERO);
+        let wide = Cell::new_grapheme_with_width("\u{4e2d}", 2, CellAttributes::default());
+
+        line.fill_range(0..3, &wide, 1);
+
+        assert_eq!(line.len(), 4);
+        assert_eq!(line.columns_as_str(0..4), "  \u{4e2d}");
+        assert_eq!(
+            line.visible_cells()
+                .map(|cell| (cell.cell_index(), cell.width(), cell.str().to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 1, " ".to_string()),
+                (1, 1, " ".to_string()),
+                (2, 2, "\u{4e2d}".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn line_fill_range_wide_cell_returns_promptly_at_or_beyond_materialized_cap() {
+        let wide = Cell::new_grapheme_with_width("\u{4e2d}", 2, CellAttributes::default());
+        let mut line = Line::with_width(4, SEQ_ZERO);
+        let before = line.clone();
+
+        // The last possible single-column start cannot fit a two-column cell;
+        // it must be rejected before iteration or trailing-blank pruning.
+        line.fill_range(MAX_MATERIALIZED_LINE_LEN - 1..usize::MAX, &wide, 1);
+        assert_eq!(line, before);
+
+        // Starts at the exclusive line-length cap must not iterate at all.
+        line.fill_range(MAX_MATERIALIZED_LINE_LEN..usize::MAX, &wide, 2);
+        assert_eq!(line, before);
     }
 
     #[test]

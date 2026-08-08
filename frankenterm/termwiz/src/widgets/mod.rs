@@ -142,8 +142,13 @@ impl From<DirtyRegionMode> for RenderUploadMode {
     }
 }
 
-static GLOBAL_RENDER_UPLOAD_SNAPSHOT: OnceLock<RwLock<Option<RenderUploadSnapshot>>> =
-    OnceLock::new();
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GlobalRenderUploadState {
+    generation: u64,
+    snapshot: Option<RenderUploadSnapshot>,
+}
+
+static GLOBAL_RENDER_UPLOAD_SNAPSHOT: OnceLock<RwLock<GlobalRenderUploadState>> = OnceLock::new();
 
 /// UpdateArgs provides access to the widget and UI state during
 /// a call to `Widget::update_state`
@@ -218,10 +223,12 @@ impl ScreenRelativeCoords {
 
 static WIDGET_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 
-fn next_saturating_widget_id(counter: &::std::sync::atomic::AtomicUsize) -> usize {
+fn next_unique_widget_id(counter: &::std::sync::atomic::AtomicUsize) -> usize {
     let mut current = counter.load(::std::sync::atomic::Ordering::Relaxed);
     loop {
-        let next = current.saturating_add(1);
+        let Some(next) = current.checked_add(1) else {
+            panic!("WidgetId space exhausted; refusing to reuse an existing identifier");
+        };
         match counter.compare_exchange_weak(
             current,
             next,
@@ -235,7 +242,7 @@ fn next_saturating_widget_id(counter: &::std::sync::atomic::AtomicUsize) -> usiz
 }
 
 fn next_widget_id() -> usize {
-    next_saturating_widget_id(&WIDGET_ID)
+    next_unique_widget_id(&WIDGET_ID)
 }
 
 /// The `WidgetId` uniquely describes an instance of a widget.
@@ -346,6 +353,7 @@ pub struct Ui<'widget> {
     focused: Option<WidgetId>,
     last_render_telemetry: RenderTelemetry,
     last_render_upload_snapshot: Option<RenderUploadSnapshot>,
+    last_render_upload_generation: u64,
 }
 
 impl<'widget> Ui<'widget> {
@@ -725,7 +733,8 @@ impl<'widget> Ui<'widget> {
             screen.add_changes(diff);
             let upload_snapshot = RenderUploadSnapshot::from_telemetry(telemetry, mode);
             self.last_render_upload_snapshot = Some(upload_snapshot);
-            update_global_render_upload_snapshot(upload_snapshot);
+            self.last_render_upload_generation =
+                update_global_render_upload_snapshot(upload_snapshot);
         }
         telemetry.widget_gc_cycles = 1;
         telemetry.widget_gc_freed = self.garbage_collect_unreachable_widgets();
@@ -800,6 +809,13 @@ impl<'widget> Ui<'widget> {
         self.last_render_upload_snapshot
     }
 
+    /// Monotonic process-global publication generation assigned to this UI's
+    /// most recent completed render/upload snapshot. Zero means that no
+    /// snapshot was published, including fail-closed generation exhaustion.
+    pub fn last_render_upload_generation(&self) -> u64 {
+        self.last_render_upload_generation
+    }
+
     fn coord_walk<F: Fn(usize, usize) -> usize>(
         &self,
         widget: WidgetId,
@@ -843,21 +859,47 @@ impl<'widget> Ui<'widget> {
     }
 }
 
-fn update_global_render_upload_snapshot(snapshot: RenderUploadSnapshot) {
-    let lock = GLOBAL_RENDER_UPLOAD_SNAPSHOT.get_or_init(|| RwLock::new(None));
+fn update_global_render_upload_snapshot(snapshot: RenderUploadSnapshot) -> u64 {
+    let lock = GLOBAL_RENDER_UPLOAD_SNAPSHOT
+        .get_or_init(|| RwLock::new(GlobalRenderUploadState::default()));
     let mut guard = render_upload_snapshot_write_guard(lock);
-    *guard = Some(snapshot);
+    publish_render_upload_snapshot(&mut guard, snapshot)
+}
+
+fn publish_render_upload_snapshot(
+    state: &mut GlobalRenderUploadState,
+    snapshot: RenderUploadSnapshot,
+) -> u64 {
+    let Some(generation) = state.generation.checked_add(1) else {
+        // Zero is the unpublished sentinel retained by the originating Ui.
+        // Keep the last uniquely witnessed global snapshot intact rather than
+        // assigning one generation to two different render passes.
+        return 0;
+    };
+    state.generation = generation;
+    state.snapshot = Some(snapshot);
+    generation
+}
+
+fn global_render_upload_state() -> GlobalRenderUploadState {
+    let lock = GLOBAL_RENDER_UPLOAD_SNAPSHOT
+        .get_or_init(|| RwLock::new(GlobalRenderUploadState::default()));
+    *render_upload_snapshot_read_guard(lock)
 }
 
 /// Most recent render/upload snapshot recorded by any Ui in this process.
 pub fn global_render_upload_snapshot() -> Option<RenderUploadSnapshot> {
-    let lock = GLOBAL_RENDER_UPLOAD_SNAPSHOT.get_or_init(|| RwLock::new(None));
-    *render_upload_snapshot_read_guard(lock)
+    global_render_upload_state().snapshot
 }
 
-fn render_upload_snapshot_read_guard(
-    lock: &RwLock<Option<RenderUploadSnapshot>>,
-) -> std::sync::RwLockReadGuard<'_, Option<RenderUploadSnapshot>> {
+/// Atomically read the process-global render/upload publication generation
+/// together with its corresponding snapshot.
+pub fn global_render_upload_snapshot_with_generation() -> (u64, Option<RenderUploadSnapshot>) {
+    let state = global_render_upload_state();
+    (state.generation, state.snapshot)
+}
+
+fn render_upload_snapshot_read_guard<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     match lock.read() {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -867,9 +909,7 @@ fn render_upload_snapshot_read_guard(
     }
 }
 
-fn render_upload_snapshot_write_guard(
-    lock: &RwLock<Option<RenderUploadSnapshot>>,
-) -> std::sync::RwLockWriteGuard<'_, Option<RenderUploadSnapshot>> {
+fn render_upload_snapshot_write_guard<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     match lock.write() {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -896,14 +936,21 @@ mod test {
     }
 
     #[test]
-    fn widget_id_allocator_saturates_without_wrapping() {
-        let counter = ::std::sync::atomic::AtomicUsize::new(usize::MAX);
+    fn widget_id_allocator_uses_the_last_unreserved_identifier_once() {
+        let counter = ::std::sync::atomic::AtomicUsize::new(usize::MAX - 1);
 
-        assert_eq!(next_saturating_widget_id(&counter), usize::MAX);
+        assert_eq!(next_unique_widget_id(&counter), usize::MAX - 1);
         assert_eq!(
             counter.load(::std::sync::atomic::Ordering::Relaxed),
             usize::MAX
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "WidgetId space exhausted; refusing to reuse an existing identifier")]
+    fn widget_id_allocator_fails_closed_instead_of_reusing_the_saturated_id() {
+        let counter = ::std::sync::atomic::AtomicUsize::new(usize::MAX);
+        let _ = next_unique_widget_id(&counter);
     }
 
     #[test]
@@ -1182,7 +1229,7 @@ mod test {
     }
 
     #[test]
-    fn global_render_upload_snapshot_tracks_latest_render_pass() {
+    fn global_render_upload_snapshot_publication_has_a_monotonic_witness() {
         let mut ui = Ui::new();
         ui.set_root(PaintCell);
         let mut surface = Surface::new(4, 4);
@@ -1190,17 +1237,55 @@ mod test {
         ui.render_to_screen_with_dirty_tiles(&mut surface, 2, 2)
             .unwrap();
 
-        let global = global_render_upload_snapshot()
-            .expect("global render/upload snapshot should be populated after render");
-        assert_eq!(
-            global.mode,
-            RenderUploadMode::Tiles {
-                tile_width: 2,
-                tile_height: 2
-            }
+        let own_snapshot = ui
+            .last_render_upload_snapshot()
+            .expect("render pass should retain its local upload snapshot");
+        let own_generation = ui.last_render_upload_generation();
+        let (global_generation, global_snapshot) =
+            global_render_upload_snapshot_with_generation();
+        assert!(own_generation > 0);
+        assert!(
+            global_generation >= own_generation,
+            "the process-global publication cannot precede this Ui's completed write"
         );
-        assert!(global.frame_regions >= 1);
-        assert!(global.frame_cells >= 1);
+        let observed = global_snapshot
+            .expect("global render/upload snapshot should be populated after render");
+        if global_generation == own_generation {
+            assert_eq!(observed, own_snapshot);
+        }
+        assert!(observed.widget_regions <= observed.widget_cells);
+        assert!(observed.frame_regions <= observed.frame_cells);
+    }
+
+    #[test]
+    fn global_render_upload_generation_exhaustion_preserves_last_unique_witness() {
+        let retained = RenderUploadSnapshot {
+            mode: RenderUploadMode::Rects,
+            widget_regions: 1,
+            widget_cells: 4,
+            frame_regions: 1,
+            frame_cells: 4,
+        };
+        let rejected = RenderUploadSnapshot {
+            mode: RenderUploadMode::Tiles {
+                tile_width: 2,
+                tile_height: 2,
+            },
+            widget_regions: 2,
+            widget_cells: 8,
+            frame_regions: 2,
+            frame_cells: 8,
+        };
+        let mut state = GlobalRenderUploadState {
+            generation: u64::MAX - 1,
+            snapshot: None,
+        };
+
+        assert_eq!(publish_render_upload_snapshot(&mut state, retained), u64::MAX);
+        assert_eq!(state.snapshot, Some(retained));
+        assert_eq!(publish_render_upload_snapshot(&mut state, rejected), 0);
+        assert_eq!(state.generation, u64::MAX);
+        assert_eq!(state.snapshot, Some(retained));
     }
 
     #[test]

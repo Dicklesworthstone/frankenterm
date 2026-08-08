@@ -286,6 +286,25 @@ impl PaneArenaState {
     }
 }
 
+#[track_caller]
+fn next_unique_arena_id(counter: &AtomicU32) -> ArenaId {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = current.checked_add(1) else {
+            panic!("pane arena id space exhausted; refusing to reuse an arena identity");
+        };
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return ArenaId(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 impl PaneArenaRegistry {
     /// Create an empty registry.
     #[must_use]
@@ -382,9 +401,7 @@ impl PaneArenaRegistry {
     }
 
     fn allocate_arena_id(&self) -> ArenaId {
-        let raw = self.next_arena_id.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(raw, 0, "pane arena id space exhausted");
-        ArenaId(raw)
+        next_unique_arena_id(&self.next_arena_id)
     }
 }
 
@@ -532,6 +549,26 @@ mod tests {
     fn arena_id_raw_returns_inner_value() {
         let id = ArenaId(42);
         assert_eq!(id.raw(), 42);
+    }
+
+    #[test]
+    fn arena_id_allocator_uses_the_last_unreserved_identity_once() {
+        let counter = AtomicU32::new(u32::MAX - 1);
+
+        assert_eq!(
+            next_unique_arena_id(&counter),
+            ArenaId(u32::MAX - 1)
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), u32::MAX);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "pane arena id space exhausted; refusing to reuse an arena identity"
+    )]
+    fn arena_id_allocator_fails_closed_at_exhaustion() {
+        let counter = AtomicU32::new(u32::MAX);
+        let _ = next_unique_arena_id(&counter);
     }
 
     #[test]

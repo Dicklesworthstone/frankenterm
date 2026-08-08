@@ -8,7 +8,7 @@ use crate::types::Action;
 use anyhow::Result;
 use frankenterm_dynamic::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Well-known event types that FrankenTerm fires.
@@ -114,7 +114,9 @@ impl EventBus {
     where
         F: Fn(&str, &Value) -> Result<Vec<Action>> + Send + Sync + 'static,
     {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = crate::try_next_unique_id(&self.next_id).unwrap_or_else(|| {
+            panic!("event hook id space exhausted; refusing to reuse a hook identity")
+        });
         let hook = RegisteredHook {
             id,
             event_pattern: event_pattern.to_string(),
@@ -224,6 +226,22 @@ fn matches_event(pattern: &str, event: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn exhausted_event_hook_ids_fail_before_registration() {
+        let bus = EventBus::new();
+        bus.next_id.store(u64::MAX, Ordering::Release);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bus.register("evt", DispatchTier::Native, 0, None, |_, _| {
+                Ok(Vec::new())
+            })
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(bus.hook_count(), 0);
+    }
 
     #[test]
     fn register_and_fire() {

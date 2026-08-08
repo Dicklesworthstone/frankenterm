@@ -1844,11 +1844,13 @@ mod test {
         let rendered = String::from_utf8(out.write.buf).unwrap();
         assert!(
             rendered.contains("\u{1b}[1A"),
-            "two painted rows descend once and must move up exactly once: {rendered:?}"
+            "two painted rows descend once and must move up exactly once: {:?}",
+            rendered,
         );
         assert!(
             !rendered.contains("\u{1b}[2A"),
-            "the fallback must not move one row above its starting position: {rendered:?}"
+            "the fallback must not move one row above its starting position: {:?}",
+            rendered,
         );
     }
 

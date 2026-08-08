@@ -15,6 +15,35 @@
 use anyhow::Result;
 use std::path::Path;
 
+/// Reserve one process-local scripting identity without ever wrapping into an
+/// already-issued value. `u64::MAX` is retained as the exhausted sentinel.
+#[must_use]
+pub(crate) fn try_next_unique_id(counter: &std::sync::atomic::AtomicU64) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1)?;
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Reserve one identity from a mutex-protected, non-atomic scripting counter.
+#[must_use]
+pub(crate) fn try_next_unique_id_value(counter: &mut u64) -> Option<u64> {
+    let current = *counter;
+    *counter = current.checked_add(1)?;
+    Some(current)
+}
+
 pub mod audit;
 mod dispatcher;
 pub mod events;

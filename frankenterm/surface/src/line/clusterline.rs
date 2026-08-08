@@ -347,23 +347,47 @@ impl ClusteredLine {
         let blank = CellAttributes::blank();
         let mut pruned = false;
         for _ in 0..num_spaces {
-            let mut need_pop = false;
-            if let Some(cluster) = self.clusters.last_mut() {
-                if cluster.attrs != blank {
-                    break;
-                }
-                cluster.cell_width -= 1;
-                self.text.pop();
-                self.len -= 1;
-                self.last_cell_width.take();
-                pruned = true;
-                if cluster.cell_width == 0 {
-                    need_pop = true;
+            let current_len = self.len as usize;
+            let cell_width = if current_len >= 2 && self.is_double_wide(current_len - 2) {
+                2
+            } else {
+                1
+            };
+            let Some(new_len) = current_len.checked_sub(cell_width) else {
+                break;
+            };
+            if self.text.as_bytes().last() != Some(&b' ') {
+                break;
+            }
+            let Some(cluster) = self.clusters.last_mut() else {
+                break;
+            };
+            if cluster.attrs != blank || cluster.cell_width < cell_width as u16 {
+                break;
+            }
+
+            cluster.cell_width -= cell_width as u16;
+            let need_pop = cluster.cell_width == 0;
+            self.text.pop();
+            self.len -= cell_width as u32;
+            if cell_width == 2 {
+                if let Some(bitset) = self.is_double_wide.as_mut() {
+                    bitset.set(new_len, false);
                 }
             }
+            self.last_cell_width.take();
+            pruned = true;
             if need_pop {
                 self.clusters.pop();
             }
+        }
+
+        if self
+            .is_double_wide
+            .as_ref()
+            .is_some_and(|bitset| bitset.is_clear())
+        {
+            self.is_double_wide.take();
         }
 
         pruned
@@ -499,5 +523,40 @@ mod test {
             line.iter().map(|cell| cell.width()).sum::<usize>(),
             line.len()
         );
+    }
+
+    #[test]
+    fn prune_trailing_blanks_removes_the_full_width_of_a_wide_space() {
+        let mut line = ClusteredLine::new();
+        line.append_grapheme("\u{4e2d}", 2, CellAttributes::default());
+        line.append_grapheme(" ", 2, CellAttributes::default());
+        assert_eq!(line.len(), 4);
+
+        assert!(line.prune_trailing_blanks());
+
+        assert_eq!(line.len(), 2);
+        assert_eq!(line.text, "\u{4e2d}");
+        assert_eq!(
+            line.iter()
+                .map(|cell| (cell.cell_index(), cell.str().to_string(), cell.width()))
+                .collect::<Vec<_>>(),
+            vec![(0, "\u{4e2d}".to_string(), 2)],
+        );
+        assert_eq!(line.clusters[0].cell_width, 2);
+        assert_eq!(
+            line.is_double_wide
+                .as_ref()
+                .map(|bitset| bitset.ones().collect::<Vec<_>>()),
+            Some(vec![0]),
+        );
+
+        let mut only_wide_space = ClusteredLine::new();
+        only_wide_space.append_grapheme(" ", 2, CellAttributes::default());
+        assert!(only_wide_space.prune_trailing_blanks());
+        assert_eq!(only_wide_space.len(), 0);
+        assert!(only_wide_space.text.is_empty());
+        assert!(only_wide_space.clusters.is_empty());
+        assert!(only_wide_space.is_double_wide.is_none());
+        assert_eq!(only_wide_space.iter().count(), 0);
     }
 }

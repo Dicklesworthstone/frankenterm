@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use frankenterm_dynamic::Value;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 struct LoadedExtension {
@@ -99,6 +99,11 @@ impl ScriptingEngine for ScriptingDispatcher {
     }
 
     fn register_hook(&self, event: &str, handler: HookHandler) -> Result<HookId> {
+        let hook_id = crate::try_next_unique_id(&self.next_hook_id).ok_or_else(|| {
+            anyhow!(
+                "scripting dispatcher hook id space exhausted; refusing to reuse a hook identity"
+            )
+        })?;
         let mut registrations = Vec::with_capacity(self.engines.len());
 
         for (idx, engine) in self.engines.iter().enumerate() {
@@ -119,7 +124,6 @@ impl ScriptingEngine for ScriptingDispatcher {
             }
         }
 
-        let hook_id = self.next_hook_id.fetch_add(1, Ordering::Relaxed);
         self.hook_registrations_guard()
             .insert(hook_id, registrations);
         Ok(hook_id)
@@ -168,11 +172,15 @@ impl ScriptingEngine for ScriptingDispatcher {
     }
 
     fn load_extension(&self, manifest: &ExtensionManifest) -> Result<ExtensionId> {
+        let extension_id = crate::try_next_unique_id(&self.next_extension_id).ok_or_else(|| {
+            anyhow!(
+                "scripting dispatcher extension id space exhausted; refusing to reuse an extension identity"
+            )
+        })?;
         let mut errors = Vec::new();
         for idx in self.ordered_engine_indices() {
             match self.engines[idx].load_extension(manifest) {
                 Ok(engine_extension_id) => {
-                    let extension_id = self.next_extension_id.fetch_add(1, Ordering::Relaxed);
                     self.loaded_extensions_guard().insert(
                         extension_id,
                         LoadedExtension {
@@ -274,7 +282,8 @@ mod tests {
         }
 
         fn register_hook(&self, event: &str, handler: HookHandler) -> Result<HookId> {
-            let hook_id = self.next_hook_id.fetch_add(1, Ordering::Relaxed);
+            let hook_id = crate::try_next_unique_id(&self.next_hook_id)
+                .ok_or_else(|| anyhow!("mock hook id space exhausted"))?;
             self.hooks
                 .lock()
                 .map_err(|_| anyhow!("hook lock poisoned"))?
@@ -313,7 +322,8 @@ mod tests {
             if self.fail_load_extension {
                 bail!("{} rejected extension", self.name);
             }
-            let extension_id = self.next_extension_id.fetch_add(1, Ordering::Relaxed);
+            let extension_id = crate::try_next_unique_id(&self.next_extension_id)
+                .ok_or_else(|| anyhow!("mock extension id space exhausted"))?;
             self.loaded_extensions
                 .lock()
                 .map_err(|_| anyhow!("extension lock poisoned"))?
@@ -361,6 +371,54 @@ mod tests {
         let config = dispatcher.eval_config(Path::new("test.lua")).unwrap();
 
         assert_eq!(config, Value::String("ok".to_string()));
+    }
+
+    #[test]
+    fn exhausted_dispatcher_hook_ids_fail_before_engine_registration() {
+        let engine = Arc::new(MockEngine::new(
+            "mock",
+            Ok(Value::Null),
+            false,
+            EngineCapabilities::default(),
+        ));
+        let dispatcher = ScriptingDispatcher::new(vec![engine.clone()], 0).unwrap();
+        dispatcher.next_hook_id.store(u64::MAX, Ordering::Release);
+        let handler = HookHandler::new(0, None, |_event, _payload| Ok(Vec::new()));
+
+        let error = dispatcher
+            .register_hook("pane-output", handler)
+            .expect_err("exhausted dispatcher identities must reject registration");
+
+        assert!(error.to_string().contains("hook id space exhausted"));
+        assert!(engine.hooks.lock().unwrap().is_empty());
+        assert!(dispatcher.hook_registrations_guard().is_empty());
+    }
+
+    #[test]
+    fn exhausted_dispatcher_extension_ids_fail_before_engine_load() {
+        let engine = Arc::new(MockEngine::new(
+            "mock",
+            Ok(Value::Null),
+            false,
+            EngineCapabilities::default(),
+        ));
+        let dispatcher = ScriptingDispatcher::new(vec![engine.clone()], 0).unwrap();
+        dispatcher
+            .next_extension_id
+            .store(u64::MAX, Ordering::Release);
+        let manifest = ExtensionManifest {
+            id: "must-not-load".to_string(),
+            version: "1.0.0".to_string(),
+            ..ExtensionManifest::default()
+        };
+
+        let error = dispatcher
+            .load_extension(&manifest)
+            .expect_err("exhausted dispatcher identities must reject extension load");
+
+        assert!(error.to_string().contains("extension id space exhausted"));
+        assert!(engine.loaded_extensions.lock().unwrap().is_empty());
+        assert!(dispatcher.loaded_extensions_guard().is_empty());
     }
 
     #[test]

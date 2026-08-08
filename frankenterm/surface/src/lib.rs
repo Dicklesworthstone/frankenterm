@@ -242,13 +242,14 @@ impl DiffState {
 impl Surface {
     /// Create a new Surface with the specified width and height.
     pub fn new(width: usize, height: usize) -> Self {
-        let mut scr = Surface {
+        let mut lines = Vec::new();
+        lines.resize_with(height, || Line::with_width(width, SEQ_ZERO));
+        Surface {
             width,
             height,
+            lines,
             ..Default::default()
-        };
-        scr.resize(width, height);
-        scr
+        }
     }
 
     /// Returns the (width, height) of the surface
@@ -277,29 +278,40 @@ impl Surface {
     /// columns are truncated.  If the width and/or height are larger than
     /// previously then an appropriate number of cells are added to the
     /// buffer and filled with default attributes.
-    /// The resize event invalidates the change stream, discarding it and
-    /// causing a subsequent `get_changes` call to yield a full repaint.
+    /// An actual dimension change invalidates the change stream, discarding it
+    /// and causing a subsequent `get_changes` call to yield a full repaint.
+    /// Requesting the current dimensions is a no-op.
     /// If the cursor position would be outside the bounds of the newly resized
     /// screen, it will be moved to be within the new bounds.
     pub fn resize(&mut self, width: usize, height: usize) {
-        // We need to invalidate the change stream prior to this
-        // event, so we nominally generate an entry for the resize
-        // here.  Since rendering a resize doesn't make sense, we
-        // don't record a Change entry.  Instead what we do is
-        // increment the sequence number and then flush the whole
-        // stream.  The next call to get_changes() will perform a
-        // full repaint, and that is what we want.
-        // We only do this if we have any changes buffered.
-        if !self.changes.is_empty() {
-            self.seqno = self.seqno.saturating_add(1);
-            self.changes.clear();
+        if self.width == width && self.height == height {
+            return;
         }
 
-        self.lines
-            .resize(height, Line::with_width(width, self.seqno));
+        // Invalidate the change stream before an actual dimension change.
+        // Rendering a resize as a Change doesn't make sense, so advance the
+        // sequence without recording an entry and flush the journal. This is
+        // required even when the journal is already empty: a consumer holding
+        // the current token must still observe the resize and request a full
+        // repaint. A same-dimension resize is a genuine no-op.
+        let next_seqno = self
+            .seqno
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("surface change sequence exhausted during resize"));
+        self.seqno = next_seqno;
+        self.changes.clear();
+
+        // Drop discarded rows before resizing retained rows, then construct
+        // only genuinely new rows at their final width. `Vec::resize` would
+        // eagerly allocate a full-width template even when height is unchanged
+        // or shrinking, and growing first would resize each new row twice.
+        self.lines.truncate(height);
         for line in &mut self.lines {
             line.resize(width, self.seqno);
         }
+        let seqno = self.seqno;
+        self.lines
+            .resize_with(height, || Line::with_width(width, seqno));
         self.width = width;
         self.height = height;
 
@@ -311,7 +323,17 @@ impl Surface {
     /// Efficiently apply a series of changes
     /// Returns the sequence number at the end of the change.
     pub fn add_changes(&mut self, mut changes: Vec<Change>) -> SequenceNo {
+        // Preflight the complete batch before changing either the modeled
+        // screen or its journal. Reusing a saturated sequence number would
+        // make later mutations invisible to a consumer holding that token.
+        let next_seqno = self.seqno.checked_add(changes.len()).unwrap_or_else(|| {
+            panic!("surface change sequence exhausted while applying a batch")
+        });
         let seq = self.seqno.saturating_sub(1).saturating_add(changes.len());
+        // Stamp every affected Line with the committed batch frontier. Keeping
+        // the old frontier during apply would make `changed_since(old)` miss
+        // rows that this batch actually mutated.
+        self.seqno = next_seqno;
 
         for change in &mut changes {
             let original = core::mem::replace(change, Change::Text(String::new()));
@@ -319,7 +341,6 @@ impl Surface {
             self.apply_change(change);
         }
 
-        self.seqno = self.seqno.saturating_add(changes.len());
         self.changes.append(&mut changes);
 
         seq
@@ -328,7 +349,11 @@ impl Surface {
     /// Apply a change and return the sequence number at the end of the change.
     pub fn add_change<C: Into<Change>>(&mut self, change: C) -> SequenceNo {
         let seq = self.seqno;
-        self.seqno = self.seqno.saturating_add(1);
+        let next_seqno = self
+            .seqno
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("surface change sequence exhausted"));
+        self.seqno = next_seqno;
         let change = self.canonicalize_change(change.into());
         self.apply_change(&change);
         self.changes.push(change);
@@ -1616,6 +1641,25 @@ mod test {
     }
 
     #[test]
+    fn add_changes_stamps_mutated_lines_with_the_committed_frontier() {
+        let mut s = Surface::new(2, 1);
+        s.add_change("a");
+        let prior_frontier = s.current_seqno();
+
+        s.add_changes(vec![
+            Change::CursorPosition {
+                x: Position::Absolute(0),
+                y: Position::Absolute(0),
+            },
+            Change::Text("b".to_string()),
+        ]);
+
+        assert_eq!(s.current_seqno(), prior_frontier + 2);
+        assert_eq!(s.lines[0].current_seqno(), s.current_seqno());
+        assert!(s.lines[0].changed_since(prior_frontier));
+    }
+
+    #[test]
     fn resize_delta_flush() {
         let mut s = Surface::new(4, 3);
         s.add_change("a");
@@ -2755,20 +2799,46 @@ mod test {
     }
 
     #[test]
-    fn surface_seqno_saturates_at_max_when_adding_changes() {
+    fn surface_seqno_exhaustion_fails_before_reusing_a_change_token() {
         let mut s = Surface::new(2, 1);
-        s.seqno = SequenceNo::MAX;
+        s.seqno = SequenceNo::MAX - 1;
 
         let seq = s.add_change("a");
-        assert_eq!(seq, SequenceNo::MAX);
+        assert_eq!(seq, SequenceNo::MAX - 1);
         assert_eq!(s.current_seqno(), SequenceNo::MAX);
+        let before_screen = s.screen_chars_to_string();
+        let before_cursor = s.cursor_position();
+        let before_change_count = s.changes.len();
 
-        let seq = s.add_changes(vec![Change::CursorPosition {
-            x: Position::Absolute(1),
-            y: Position::Absolute(0),
-        }]);
-        assert_eq!(seq, SequenceNo::MAX);
+        let exhausted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            s.add_change("b");
+        }));
+        assert!(exhausted.is_err());
         assert_eq!(s.current_seqno(), SequenceNo::MAX);
+        assert_eq!(s.screen_chars_to_string(), before_screen);
+        assert_eq!(s.cursor_position(), before_cursor);
+        assert_eq!(s.changes.len(), before_change_count);
+    }
+
+    #[test]
+    fn surface_batch_seqno_exhaustion_fails_before_any_change_is_applied() {
+        let mut s = Surface::new(2, 1);
+        s.seqno = SequenceNo::MAX - 1;
+
+        let exhausted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            s.add_changes(vec![
+                Change::Text("a".to_string()),
+                Change::CursorPosition {
+                    x: Position::Absolute(1),
+                    y: Position::Absolute(0),
+                },
+            ]);
+        }));
+        assert!(exhausted.is_err());
+        assert_eq!(s.current_seqno(), SequenceNo::MAX - 1);
+        assert_eq!(s.screen_chars_to_string(), "  \n");
+        assert_eq!(s.cursor_position(), (0, 0));
+        assert!(s.changes.is_empty());
     }
 
     #[test]
@@ -3055,29 +3125,40 @@ mod test {
     fn resize_to_same_dimensions_is_noop() {
         let mut s = Surface::new(4, 3);
         s.add_change("hello");
+        s.lines[0].compress_for_scrollback();
         let before = s.screen_chars_to_string();
+        let before_line = s.lines[0].clone();
+        // Keep the Surface frontier deliberately ahead of this line so the
+        // assertion detects both a storage coercion and an otherwise hidden
+        // Line::resize sequence update.
+        s.seqno = 17;
+        let before_seqno = s.current_seqno();
+        let before_change_count = s.changes.len();
         s.resize(4, 3);
         assert_eq!(s.dimensions(), (4, 3));
         assert_eq!(s.screen_chars_to_string(), before);
+        assert_eq!(s.lines[0], before_line);
+        assert_eq!(s.current_seqno(), before_seqno);
+        assert_eq!(s.changes.len(), before_change_count);
     }
 
     #[test]
-    fn resize_seqno_increments_only_when_changes_buffered() {
+    fn resize_dimension_change_invalidates_an_empty_change_journal() {
         let mut s = Surface::new(4, 3);
-        // No changes buffered yet — resize should NOT increment seqno
-        let seq_before = s.add_change("a");
-        let (seq_after_change, _) = s.get_changes(0);
-        // Now flush so changes are consumed
+        s.add_change("a");
+        let seq_after_change = s.current_seqno();
         s.flush_changes_older_than(seq_after_change);
+        assert!(s.changes.is_empty());
 
-        // Resize with empty change buffer should not bump seqno
-        let (seq_pre_resize, _) = s.get_changes(0);
-        s.resize(4, 3);
-        // After resize with no buffered changes, get_changes returns repaint
-        // but the seqno shouldn't have been bumped by the resize itself
-        let _ = seq_before;
-        let _ = seq_pre_resize;
-        assert_eq!(s.dimensions(), (4, 3));
+        s.resize(3, 2);
+
+        assert_eq!(s.current_seqno(), seq_after_change + 1);
+        let (_, changes) = s.get_changes(seq_after_change);
+        assert!(matches!(
+            changes.first(),
+            Some(Change::CursorVisibility(CursorVisibility::Hidden))
+        ));
+        assert!(matches!(changes.get(1), Some(Change::ClearScreen(_))));
     }
 
     #[test]
@@ -3102,15 +3183,23 @@ mod test {
     }
 
     #[test]
-    fn resize_with_buffered_changes_saturates_seqno() {
+    fn resize_with_buffered_changes_fails_before_reusing_a_sequence_token() {
         let mut s = Surface::new(2, 1);
         s.seqno = SequenceNo::MAX;
         s.changes
             .push(Change::CursorVisibility(CursorVisibility::Hidden));
 
-        s.resize(2, 1);
+        let exhausted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            s.resize(1, 2);
+        }));
+        assert!(exhausted.is_err());
         assert_eq!(s.current_seqno(), SequenceNo::MAX);
-        assert!(s.changes.is_empty());
+        assert_eq!(s.dimensions(), (2, 1));
+        assert_eq!(s.changes.len(), 1);
+        assert!(matches!(
+            s.changes[0],
+            Change::CursorVisibility(CursorVisibility::Hidden)
+        ));
     }
 
     #[test]

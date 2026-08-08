@@ -54,8 +54,7 @@ impl Connection {
     }
 
     pub(crate) fn next_window_id(&self) -> usize {
-        self.next_window_id
-            .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
+        crate::connection::next_unique_window_id(&self.next_window_id)
     }
 
     pub(crate) fn window_by_id(&self, window_id: usize) -> Option<Rc<RefCell<WindowInner>>> {

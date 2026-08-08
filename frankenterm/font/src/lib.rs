@@ -51,8 +51,51 @@ pub struct ClearShapeCache {}
 
 static FONT_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type LoadedFontId = usize;
+
+#[track_caller]
+fn next_unique_font_id(counter: &::std::sync::atomic::AtomicUsize) -> LoadedFontId {
+    let mut current = counter.load(::std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let Some(next) = current.checked_add(1) else {
+            panic!("loaded font id space exhausted; refusing to reuse a font identity");
+        };
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            ::std::sync::atomic::Ordering::Relaxed,
+            ::std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return current,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 pub fn alloc_font_id() -> LoadedFontId {
-    FONT_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
+    next_unique_font_id(&FONT_ID)
+}
+
+#[cfg(test)]
+mod font_id_tests {
+    use super::next_unique_font_id;
+
+    #[test]
+    fn font_id_allocator_uses_the_last_unreserved_identity_once() {
+        let counter = ::std::sync::atomic::AtomicUsize::new(usize::MAX - 1);
+
+        assert_eq!(next_unique_font_id(&counter), usize::MAX - 1);
+        assert_eq!(
+            counter.load(::std::sync::atomic::Ordering::Relaxed),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "loaded font id space exhausted; refusing to reuse a font identity")]
+    fn font_id_allocator_fails_closed_at_exhaustion() {
+        let counter = ::std::sync::atomic::AtomicUsize::new(usize::MAX);
+        let _ = next_unique_font_id(&counter);
+    }
 }
 
 lazy_static::lazy_static! {
