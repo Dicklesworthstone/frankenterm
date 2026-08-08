@@ -551,13 +551,16 @@ entry = "main.wasm"
         lifecycle.install(&ftx).unwrap();
 
         // Register a hook via the event bus
-        let hook_id = lifecycle.event_bus.register(
-            "pane.focus",
-            DispatchTier::Wasm,
-            0,
-            Some("hooked"),
-            |_, _| Ok(vec![]),
-        );
+        let hook_id = lifecycle
+            .event_bus
+            .register(
+                "pane.focus",
+                DispatchTier::Wasm,
+                0,
+                Some("hooked"),
+                |_, _| Ok(vec![]),
+            )
+            .unwrap();
 
         lifecycle.mark_loaded("hooked", vec![hook_id]).unwrap();
         assert_eq!(lifecycle.event_bus.hook_count(), 1);

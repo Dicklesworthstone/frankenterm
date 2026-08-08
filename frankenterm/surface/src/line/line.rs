@@ -2802,20 +2802,10 @@ mod tests {
         line.compress_for_scrollback();
         let before = line.clone();
 
-        assert!(!line.append_ascii_cell_run(
-            line.len(),
-            "é",
-            CellAttributes::default(),
-            1,
-        ));
+        assert!(!line.append_ascii_cell_run(line.len(), "é", CellAttributes::default(), 1,));
         assert_eq!(line, before);
 
-        assert!(!line.append_ascii_cell_run(
-            line.len(),
-            "\r\n",
-            CellAttributes::default(),
-            1,
-        ));
+        assert!(!line.append_ascii_cell_run(line.len(), "\r\n", CellAttributes::default(), 1,));
         assert_eq!(line, before, "a CRLF grapheme is not two width-1 cells");
     }
 
@@ -2824,12 +2814,7 @@ mod tests {
         let mut line: Line = "中".into();
         line.compress_for_scrollback();
 
-        assert!(line.append_ascii_cell_run(
-            line.len(),
-            "abc",
-            CellAttributes::default(),
-            1,
-        ));
+        assert!(line.append_ascii_cell_run(line.len(), "abc", CellAttributes::default(), 1,));
         assert_eq!(line.as_str().as_ref(), "中abc");
         assert_eq!(line.len(), 5);
         assert_eq!(
@@ -3303,7 +3288,12 @@ mod tests {
                 "cached case {} must be a hit",
                 name
             );
-            assert_eq!(scratch.capacity(), retained_capacity, "cached case {}", name);
+            assert_eq!(
+                scratch.capacity(),
+                retained_capacity,
+                "cached case {}",
+                name
+            );
         }
 
         #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]

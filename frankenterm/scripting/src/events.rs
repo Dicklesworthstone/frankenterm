@@ -5,7 +5,7 @@
 //! native (Rust) → WASM → Lua, with priority ordering within each tier.
 
 use crate::types::Action;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use frankenterm_dynamic::Value;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
@@ -103,6 +103,12 @@ impl EventBus {
     ///
     /// The pattern can be an exact event name or `"*"` for a catch-all.
     /// Returns a handle that can be used to unregister the hook.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after the process-local hook identity space is
+    /// exhausted. Exhaustion fails closed instead of panicking or reusing an
+    /// identity that may still be registered.
     pub fn register<F>(
         &self,
         event_pattern: &str,
@@ -110,13 +116,13 @@ impl EventBus {
         priority: i32,
         extension_id: Option<&str>,
         handler: F,
-    ) -> EventHookId
+    ) -> Result<EventHookId>
     where
         F: Fn(&str, &Value) -> Result<Vec<Action>> + Send + Sync + 'static,
     {
-        let id = crate::try_next_unique_id(&self.next_id).unwrap_or_else(|| {
-            panic!("event hook id space exhausted; refusing to reuse a hook identity")
-        });
+        let id = crate::try_next_unique_id(&self.next_id).ok_or_else(|| {
+            anyhow!("event hook id space exhausted; refusing to reuse a hook identity")
+        })?;
         let hook = RegisteredHook {
             id,
             event_pattern: event_pattern.to_string(),
@@ -128,7 +134,7 @@ impl EventBus {
 
         self.hooks_guard().push(hook);
 
-        id
+        Ok(id)
     }
 
     /// Unregister a hook by its handle.
@@ -159,7 +165,8 @@ impl EventBus {
         {
             let mut counts = self.fire_counts_guard();
             if counts.contains_key(event) || counts.len() < Self::MAX_FIRE_COUNT_ENTRIES {
-                *counts.entry(event.to_string()).or_default() += 1;
+                let count = counts.entry(event.to_string()).or_default();
+                *count = count.saturating_add(1);
             }
         }
 
@@ -233,13 +240,11 @@ mod tests {
         let bus = EventBus::new();
         bus.next_id.store(u64::MAX, Ordering::Release);
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            bus.register("evt", DispatchTier::Native, 0, None, |_, _| {
-                Ok(Vec::new())
-            })
-        }));
+        let error = bus
+            .register("evt", DispatchTier::Native, 0, None, |_, _| Ok(Vec::new()))
+            .expect_err("exhausted event hook identities must reject registration");
 
-        assert!(result.is_err());
+        assert!(error.to_string().contains("hook id space exhausted"));
         assert_eq!(bus.hook_count(), 0);
     }
 
@@ -257,7 +262,8 @@ mod tests {
                     message: "focused".to_string(),
                 }])
             },
-        );
+        )
+        .unwrap();
 
         let actions = bus.fire(event_types::PANE_FOCUS, &Value::Null).unwrap();
         assert_eq!(actions.len(), 1);
@@ -272,12 +278,14 @@ mod tests {
         }));
         assert!(poison.is_err());
 
-        let id = bus.register("evt", DispatchTier::Native, 0, Some("ext"), |_, _| {
-            Ok(vec![Action::Log {
-                level: crate::types::LogLevel::Info,
-                message: "recovered".to_string(),
-            }])
-        });
+        let id = bus
+            .register("evt", DispatchTier::Native, 0, Some("ext"), |_, _| {
+                Ok(vec![Action::Log {
+                    level: crate::types::LogLevel::Info,
+                    message: "recovered".to_string(),
+                }])
+            })
+            .unwrap();
 
         assert_eq!(bus.hook_count(), 1);
         assert_eq!(bus.hooks_for_event("evt"), 1);
@@ -304,13 +312,15 @@ mod tests {
     #[test]
     fn unregister_removes_hook() {
         let bus = EventBus::new();
-        let id = bus.register(
-            event_types::PANE_FOCUS,
-            DispatchTier::Native,
-            0,
-            None,
-            |_, _| Ok(vec![]),
-        );
+        let id = bus
+            .register(
+                event_types::PANE_FOCUS,
+                DispatchTier::Native,
+                0,
+                None,
+                |_, _| Ok(vec![]),
+            )
+            .unwrap();
 
         assert_eq!(bus.hook_count(), 1);
         assert!(bus.unregister(id));
@@ -320,9 +330,12 @@ mod tests {
     #[test]
     fn unregister_extension_removes_all() {
         let bus = EventBus::new();
-        bus.register("a", DispatchTier::Wasm, 0, Some("ext-1"), |_, _| Ok(vec![]));
-        bus.register("b", DispatchTier::Wasm, 0, Some("ext-1"), |_, _| Ok(vec![]));
-        bus.register("c", DispatchTier::Wasm, 0, Some("ext-2"), |_, _| Ok(vec![]));
+        bus.register("a", DispatchTier::Wasm, 0, Some("ext-1"), |_, _| Ok(vec![]))
+            .unwrap();
+        bus.register("b", DispatchTier::Wasm, 0, Some("ext-1"), |_, _| Ok(vec![]))
+            .unwrap();
+        bus.register("c", DispatchTier::Wasm, 0, Some("ext-2"), |_, _| Ok(vec![]))
+            .unwrap();
 
         assert_eq!(bus.hook_count(), 3);
         let removed = bus.unregister_extension("ext-1");
@@ -339,19 +352,22 @@ mod tests {
         bus.register("evt", DispatchTier::Lua, 0, None, move |_, _| {
             o.lock().unwrap().push("lua");
             Ok(vec![])
-        });
+        })
+        .unwrap();
 
         let o = Arc::clone(&order);
         bus.register("evt", DispatchTier::Native, 0, None, move |_, _| {
             o.lock().unwrap().push("native");
             Ok(vec![])
-        });
+        })
+        .unwrap();
 
         let o = Arc::clone(&order);
         bus.register("evt", DispatchTier::Wasm, 0, None, move |_, _| {
             o.lock().unwrap().push("wasm");
             Ok(vec![])
-        });
+        })
+        .unwrap();
 
         bus.fire("evt", &Value::Null).unwrap();
 
@@ -368,19 +384,22 @@ mod tests {
         bus.register("evt", DispatchTier::Native, 10, None, move |_, _| {
             o.lock().unwrap().push("low");
             Ok(vec![])
-        });
+        })
+        .unwrap();
 
         let o = Arc::clone(&order);
         bus.register("evt", DispatchTier::Native, 0, None, move |_, _| {
             o.lock().unwrap().push("high");
             Ok(vec![])
-        });
+        })
+        .unwrap();
 
         let o = Arc::clone(&order);
         bus.register("evt", DispatchTier::Native, 5, None, move |_, _| {
             o.lock().unwrap().push("mid");
             Ok(vec![])
-        });
+        })
+        .unwrap();
 
         bus.fire("evt", &Value::Null).unwrap();
 
@@ -397,7 +416,8 @@ mod tests {
         bus.register("*", DispatchTier::Native, 0, None, move |_, _| {
             c.fetch_add(1, Ordering::Relaxed);
             Ok(vec![])
-        });
+        })
+        .unwrap();
 
         bus.fire("pane.focus", &Value::Null).unwrap();
         bus.fire("config.reload", &Value::Null).unwrap();
@@ -415,7 +435,8 @@ mod tests {
         bus.register("pane.*", DispatchTier::Native, 0, None, move |_, _| {
             c.fetch_add(1, Ordering::Relaxed);
             Ok(vec![])
-        });
+        })
+        .unwrap();
 
         bus.fire("pane.focus", &Value::Null).unwrap();
         bus.fire("pane.closed", &Value::Null).unwrap();
@@ -438,7 +459,8 @@ mod tests {
                     message: "fired".to_string(),
                 }])
             },
-        );
+        )
+        .unwrap();
 
         let actions = bus.fire(event_types::TAB_CREATED, &Value::Null).unwrap();
         assert!(actions.is_empty());
@@ -457,15 +479,29 @@ mod tests {
     }
 
     #[test]
+    fn fire_count_saturates_without_panicking_or_rolling_backwards() {
+        let bus = EventBus::new();
+        bus.fire_counts_guard()
+            .insert("pane.focus".to_string(), u64::MAX);
+
+        bus.fire("pane.focus", &Value::Null).unwrap();
+
+        assert_eq!(bus.fire_counts().get("pane.focus"), Some(&u64::MAX));
+    }
+
+    #[test]
     fn hooks_for_extension() {
         let bus = EventBus::new();
         bus.register("a", DispatchTier::Wasm, 0, Some("my-ext"), |_, _| {
             Ok(vec![])
-        });
+        })
+        .unwrap();
         bus.register("b", DispatchTier::Wasm, 0, Some("my-ext"), |_, _| {
             Ok(vec![])
-        });
-        bus.register("c", DispatchTier::Wasm, 0, Some("other"), |_, _| Ok(vec![]));
+        })
+        .unwrap();
+        bus.register("c", DispatchTier::Wasm, 0, Some("other"), |_, _| Ok(vec![]))
+            .unwrap();
 
         assert_eq!(bus.hooks_for_extension("my-ext").len(), 2);
         assert_eq!(bus.hooks_for_extension("other").len(), 1);
@@ -563,7 +599,8 @@ mod tests {
                     0,
                     None,
                     |_, _| Ok(vec![]),
-                );
+                )
+                .unwrap();
                 ids.push(id);
             }
             prop_assert_eq!(bus.hook_count(), n_register);
@@ -606,10 +643,10 @@ mod tests {
         ) {
             let bus = EventBus::new();
             for i in 0..n_target {
-                bus.register(&format!("e.{i}"), DispatchTier::Wasm, 0, Some("target"), |_, _| Ok(vec![]));
+                bus.register(&format!("e.{i}"), DispatchTier::Wasm, 0, Some("target"), |_, _| Ok(vec![])).unwrap();
             }
             for i in 0..n_other {
-                bus.register(&format!("e.{i}"), DispatchTier::Wasm, 0, Some("other"), |_, _| Ok(vec![]));
+                bus.register(&format!("e.{i}"), DispatchTier::Wasm, 0, Some("other"), |_, _| Ok(vec![])).unwrap();
             }
 
             let removed = bus.unregister_extension("target");
@@ -625,10 +662,10 @@ mod tests {
         ) {
             let bus = EventBus::new();
             for i in 0..n_ext {
-                bus.register(&format!("e.{i}"), DispatchTier::Wasm, 0, Some("my-ext"), |_, _| Ok(vec![]));
+                bus.register(&format!("e.{i}"), DispatchTier::Wasm, 0, Some("my-ext"), |_, _| Ok(vec![])).unwrap();
             }
             for i in 0..n_other {
-                bus.register(&format!("e.{i}"), DispatchTier::Native, 0, Some("other"), |_, _| Ok(vec![]));
+                bus.register(&format!("e.{i}"), DispatchTier::Native, 0, Some("other"), |_, _| Ok(vec![])).unwrap();
             }
 
             prop_assert_eq!(bus.hooks_for_extension("my-ext").len(), n_ext);
@@ -643,10 +680,10 @@ mod tests {
         ) {
             let bus = EventBus::new();
             for _ in 0..n_matching {
-                bus.register("target.event", DispatchTier::Native, 0, None, |_, _| Ok(vec![]));
+                bus.register("target.event", DispatchTier::Native, 0, None, |_, _| Ok(vec![])).unwrap();
             }
             for _ in 0..n_other {
-                bus.register("other.event", DispatchTier::Native, 0, None, |_, _| Ok(vec![]));
+                bus.register("other.event", DispatchTier::Native, 0, None, |_, _| Ok(vec![])).unwrap();
             }
 
             prop_assert_eq!(bus.hooks_for_event("target.event"), n_matching);

@@ -48,19 +48,14 @@ pub(crate) fn fail_window_op_for_destroyed_window<T>(
 }
 
 #[track_caller]
-pub(crate) fn next_unique_window_id(counter: &AtomicUsize) -> usize {
+pub(crate) fn next_unique_window_id(counter: &AtomicUsize) -> Fallible<usize> {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
-        let Some(next) = current.checked_add(1) else {
-            panic!("window id space exhausted; refusing to reuse a live window identity");
-        };
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return current,
+        let next = current.checked_add(1).ok_or_else(|| {
+            anyhow!("window id space exhausted; refusing to reuse a live window identity")
+        })?;
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(current),
             Err(observed) => current = observed,
         }
     }
@@ -226,9 +221,9 @@ pub trait ConnectionOps {
 #[cfg(test)]
 mod tests {
     use super::{
-        fail_window_op_for_destroyed_window, new_window_op_promise, nop_event_handler,
-        next_unique_window_id, ApplicationEvent, ConnectionOps, Fallible,
-        RequestedWindowGeometry, EVENT_HANDLER,
+        fail_window_op_for_destroyed_window, new_window_op_promise, next_unique_window_id,
+        nop_event_handler, ApplicationEvent, ConnectionOps, Fallible, RequestedWindowGeometry,
+        EVENT_HANDLER,
     };
     use crate::screen::{ScreenInfo, Screens};
     use config::{Dimension, GeometryOrigin};
@@ -244,15 +239,17 @@ mod tests {
     fn window_id_allocator_uses_the_last_unreserved_identity_once() {
         let counter = std::sync::atomic::AtomicUsize::new(usize::MAX - 1);
 
-        assert_eq!(next_unique_window_id(&counter), usize::MAX - 1);
+        assert_eq!(next_unique_window_id(&counter).unwrap(), usize::MAX - 1);
         assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
     }
 
     #[test]
-    #[should_panic(expected = "window id space exhausted; refusing to reuse a live window identity")]
     fn window_id_allocator_fails_closed_at_exhaustion() {
         let counter = std::sync::atomic::AtomicUsize::new(usize::MAX);
-        let _ = next_unique_window_id(&counter);
+        let error = next_unique_window_id(&counter)
+            .expect_err("window identity exhaustion must be a typed error");
+        assert!(error.to_string().contains("window id space exhausted"));
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
     }
 
     struct TestConnection;

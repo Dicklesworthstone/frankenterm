@@ -140,10 +140,7 @@ impl GetTcapBuilder {
             self.current.clear();
             return;
         }
-        let Some(next_total) = self
-            .accepted_raw_name_bytes
-            .checked_add(self.current.len())
-        else {
+        let Some(next_total) = self.accepted_raw_name_bytes.checked_add(self.current.len()) else {
             log::warn!(
                 "XtGetTcap aggregate name input overflowed its byte counter; discarding further names"
             );
@@ -783,7 +780,10 @@ mod test {
     fn print_batching_default_policy_is_on_unless_either_gate_is_falsey() {
         assert!(print_batching_default_for_values(None, None));
         assert!(print_batching_default_for_values(Some("true"), Some("on")));
-        assert!(print_batching_default_for_values(Some("future-value"), Some("1")));
+        assert!(print_batching_default_for_values(
+            Some("future-value"),
+            Some("1")
+        ));
 
         for falsey in ["", "0", "false", "FALSE", " off ", "No"] {
             assert!(!print_batching_default_for_values(Some(falsey), None));

@@ -413,12 +413,13 @@ impl ScopedExecutor {
                     };
                 }
                 (Some(_), Some(_)) => {
-                    registry = SCOPED_EXECUTOR_AVAILABLE
-                        .wait(registry)
-                        .unwrap_or_else(|poisoned| {
-                            SCOPED_EXECUTOR.clear_poison();
-                            poisoned.into_inner()
-                        });
+                    registry =
+                        SCOPED_EXECUTOR_AVAILABLE
+                            .wait(registry)
+                            .unwrap_or_else(|poisoned| {
+                                SCOPED_EXECUTOR.clear_poison();
+                                poisoned.into_inner()
+                            });
                 }
                 (None, None) => {
                     let executor = Arc::new(Executor::new());

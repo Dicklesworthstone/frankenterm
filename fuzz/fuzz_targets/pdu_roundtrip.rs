@@ -15,10 +15,10 @@
 
 use codec::{
     ErrorResponse, GetCodecVersion, GetCodecVersionResponse, InputSerial, KillPane,
-    LivenessResponse, PaneFocused, PaneRemoved, Pdu, Ping, Pong, RenameWorkspace, Resize, SendPaste,
-    SetActiveWorkspace, SetFocusedPane, SetPaneZoomed, SetWindowWorkspace, TabAddedToWindow,
-    StreamingPduBuffer, TabResized, TabTitleChanged, UnitResponse, WindowTitleChanged,
-    WindowWorkspaceChanged, WriteToPane,
+    LivenessResponse, PaneFocused, PaneRemoved, Pdu, Ping, Pong, RenameWorkspace, Resize,
+    SendPaste, SetActiveWorkspace, SetFocusedPane, SetPaneZoomed, SetWindowWorkspace,
+    StreamingPduBuffer, TabAddedToWindow, TabResized, TabTitleChanged, UnitResponse,
+    WindowTitleChanged, WindowWorkspaceChanged, WriteToPane,
 };
 use frankenterm_term::TerminalSize;
 use libfuzzer_sys::arbitrary::{Arbitrary, Unstructured};

@@ -81,8 +81,7 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
                 *state.last_serial.borrow_mut() = *serial;
                 let entered_window_id =
                     SurfaceUserData::try_from_wl(surface).map(|data| data.window_id);
-                *state.active_surface_id.borrow_mut() =
-                    entered_window_id.map(|_| surface.id());
+                *state.active_surface_id.borrow_mut() = entered_window_id.map(|_| surface.id());
                 let route = route_keyboard_enter(state.keyboard_window_id, entered_window_id);
                 if let Some(window_id) = route.cancel_repeat_for {
                     cancel_window_key_repeat(state, window_id);
@@ -117,9 +116,7 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
                 *state.last_serial.borrow_mut() = *serial;
                 let surface_window_id =
                     SurfaceUserData::try_from_wl(surface).map(|data| data.window_id);
-                if let (Some(current), Some(left)) =
-                    (state.keyboard_window_id, surface_window_id)
-                {
+                if let (Some(current), Some(left)) = (state.keyboard_window_id, surface_window_id) {
                     if current != left {
                         log::warn!(
                             "Wayland keyboard Leave for stale window {left}; clearing current window {current}"

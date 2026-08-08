@@ -3,8 +3,7 @@ use frankenterm_core::network_calculus_bound::{
     pipeline_delay_bound,
 };
 use frankenterm_gui::renderer_slo::{
-    InputToPhotonInputClass, InputToPhotonTrace,
-    classified_input_proxy_trace_from_stage_durations,
+    InputToPhotonInputClass, InputToPhotonTrace, classified_input_proxy_trace_from_stage_durations,
     summarize_input_to_photon_traces,
 };
 

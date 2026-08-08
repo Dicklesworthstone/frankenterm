@@ -39,7 +39,7 @@ use crate::types::{
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use wasmtime::*;
@@ -274,7 +274,9 @@ impl ScriptingEngine for WasmEngine {
     }
 
     fn register_hook(&self, event: &str, handler: HookHandler) -> Result<HookId> {
-        let id = self.next_hook_id.fetch_add(1, Ordering::Relaxed);
+        let id = crate::try_next_unique_id(&self.next_hook_id).ok_or_else(|| {
+            anyhow!("WASM hook id space exhausted; refusing to reuse a hook identity")
+        })?;
         self.hooks_guard().insert(id, (event.to_string(), handler));
         Ok(id)
     }
@@ -304,6 +306,13 @@ impl ScriptingEngine for WasmEngine {
     }
 
     fn load_extension(&self, manifest: &ExtensionManifest) -> Result<ExtensionId> {
+        if self
+            .next_extension_id
+            .load(std::sync::atomic::Ordering::Acquire)
+            == u64::MAX
+        {
+            bail!("WASM extension id space exhausted; refusing to reuse an extension identity");
+        }
         let entrypoint = manifest
             .entrypoint
             .as_deref()
@@ -313,7 +322,9 @@ impl ScriptingEngine for WasmEngine {
             .with_context(|| format!("failed to read WASM extension from {entrypoint}"))?;
 
         let module = self.compile_module(&bytes)?;
-        let id = self.next_extension_id.fetch_add(1, Ordering::Relaxed);
+        let id = crate::try_next_unique_id(&self.next_extension_id).ok_or_else(|| {
+            anyhow!("WASM extension id space exhausted; refusing to reuse an extension identity")
+        })?;
 
         self.extensions_guard().insert(
             id,
@@ -402,6 +413,7 @@ fn json_to_dynamic(json: &serde_json::Value) -> Result<frankenterm_dynamic::Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     const WASI_SNAPSHOT_PREVIEW1: &str = "wasi_snapshot_preview1";
     const FD_WRITE: &str = "fd_write";
@@ -528,6 +540,39 @@ mod tests {
     fn engine_creates_successfully() {
         let engine = WasmEngine::with_defaults().unwrap();
         assert_eq!(engine.engine_name(), "wasmtime-45");
+    }
+
+    #[test]
+    fn exhausted_wasm_hook_ids_fail_before_registration() {
+        let engine = WasmEngine::with_defaults().unwrap();
+        engine.next_hook_id.store(u64::MAX, Ordering::Release);
+        let handler = HookHandler::new(0, None, |_event, _payload| Ok(Vec::new()));
+
+        let error = engine
+            .register_hook("test-event", handler)
+            .expect_err("exhausted WASM hook identities must reject registration");
+
+        assert!(error.to_string().contains("hook id space exhausted"));
+        assert!(engine.hooks_guard().is_empty());
+    }
+
+    #[test]
+    fn exhausted_wasm_extension_ids_fail_before_entrypoint_io() {
+        let engine = WasmEngine::with_defaults().unwrap();
+        engine.next_extension_id.store(u64::MAX, Ordering::Release);
+        let manifest = ExtensionManifest {
+            id: "must-not-load".to_string(),
+            version: "1.0.0".to_string(),
+            entrypoint: Some("/path/that/must/not/be/read.wasm".to_string()),
+            ..ExtensionManifest::default()
+        };
+
+        let error = engine
+            .load_extension(&manifest)
+            .expect_err("exhausted WASM extension identities must reject before I/O");
+
+        assert!(error.to_string().contains("extension id space exhausted"));
+        assert!(engine.extensions_guard().is_empty());
     }
 
     #[test]

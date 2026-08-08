@@ -24,12 +24,7 @@ pub(crate) fn try_next_unique_id(counter: &std::sync::atomic::AtomicU64) -> Opti
     let mut current = counter.load(Ordering::Acquire);
     loop {
         let next = current.checked_add(1)?;
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return Some(current),
             Err(observed) => current = observed,
         }
@@ -37,6 +32,7 @@ pub(crate) fn try_next_unique_id(counter: &std::sync::atomic::AtomicU64) -> Opti
 }
 
 /// Reserve one identity from a mutex-protected, non-atomic scripting counter.
+#[cfg(feature = "lua")]
 #[must_use]
 pub(crate) fn try_next_unique_id_value(counter: &mut u64) -> Option<u64> {
     let current = *counter;

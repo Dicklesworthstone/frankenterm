@@ -1241,8 +1241,7 @@ mod test {
             .last_render_upload_snapshot()
             .expect("render pass should retain its local upload snapshot");
         let own_generation = ui.last_render_upload_generation();
-        let (global_generation, global_snapshot) =
-            global_render_upload_snapshot_with_generation();
+        let (global_generation, global_snapshot) = global_render_upload_snapshot_with_generation();
         assert!(own_generation > 0);
         assert!(
             global_generation >= own_generation,
@@ -1281,7 +1280,10 @@ mod test {
             snapshot: None,
         };
 
-        assert_eq!(publish_render_upload_snapshot(&mut state, retained), u64::MAX);
+        assert_eq!(
+            publish_render_upload_snapshot(&mut state, retained),
+            u64::MAX
+        );
         assert_eq!(state.snapshot, Some(retained));
         assert_eq!(publish_render_upload_snapshot(&mut state, rejected), 0);
         assert_eq!(state.generation, u64::MAX);

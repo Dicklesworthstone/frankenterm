@@ -191,11 +191,15 @@ fn battery() -> Vec<(&'static str, Vec<u8>)> {
 }
 
 fn collect_hex_paths(root: &Path, dir: &Path, paths: &mut Vec<(String, PathBuf)>) -> TestResult {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|err| format!("failed to read required corpus directory {}: {err}", dir.display()))?;
+    let entries = std::fs::read_dir(dir).map_err(|err| {
+        format!(
+            "failed to read required corpus directory {}: {err}",
+            dir.display()
+        )
+    })?;
     for entry in entries {
-        let entry = entry
-            .map_err(|err| format!("failed to read an entry in {}: {err}", dir.display()))?;
+        let entry =
+            entry.map_err(|err| format!("failed to read an entry in {}: {err}", dir.display()))?;
         let path = entry.path();
         let file_type = entry
             .file_type()
@@ -227,7 +231,10 @@ fn collect_hex_paths(root: &Path, dir: &Path, paths: &mut Vec<(String, PathBuf)>
 fn validate_corpus_paths(mut actual: Vec<String>) -> TestResult<Vec<String>> {
     actual.sort_unstable();
     let actual_set = actual.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    let expected_set = EXPECTED_CORPUS_PATHS.iter().copied().collect::<BTreeSet<_>>();
+    let expected_set = EXPECTED_CORPUS_PATHS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
     let missing = expected_set
         .difference(&actual_set)
         .copied()
@@ -251,10 +258,7 @@ fn corpus_inputs_from_root(root: &Path) -> TestResult<Vec<(String, Vec<u8>)>> {
         collect_hex_paths(root, &root.join(required_subdir), &mut paths)?;
     }
     paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-    let names = paths
-        .iter()
-        .map(|(relative, _)| relative.clone())
-        .collect();
+    let names = paths.iter().map(|(relative, _)| relative.clone()).collect();
     let names = validate_corpus_paths(names)?;
 
     paths
@@ -306,10 +310,7 @@ fn decode_hex(text: &str, label: &str) -> TestResult<Vec<u8>> {
     };
     let mut out = Vec::with_capacity(clean.len() / 2);
     for (pair_index, pair) in clean.chunks_exact(2).enumerate() {
-        out.push(
-            (nibble(pair[0], pair_index, "high")? << 4)
-                | nibble(pair[1], pair_index, "low")?,
-        );
+        out.push((nibble(pair[0], pair_index, "high")? << 4) | nibble(pair[1], pair_index, "low")?);
     }
     Ok(out)
 }
@@ -345,7 +346,10 @@ fn corpus_path_contract_is_exact_and_deterministic() -> TestResult {
     unexpected.push("transcripts/unexpected.hex".to_owned());
     let error =
         validate_corpus_paths(unexpected).expect_err("an unexpected fixture must fail closed");
-    assert!(error.contains("unexpected.hex"), "unexpected error: {error}");
+    assert!(
+        error.contains("unexpected.hex"),
+        "unexpected error: {error}"
+    );
     Ok(())
 }
 
@@ -375,15 +379,17 @@ fn corpus_hex_decoder_rejects_odd_and_invalid_text() {
     let odd = decode_hex("0a f", "odd.hex").expect_err("odd-length hex must fail closed");
     assert!(odd.contains("odd-length hex"), "unexpected error: {odd}");
 
-    let invalid =
-        decode_hex("0g", "invalid.hex").expect_err("invalid hex must fail closed");
+    let invalid = decode_hex("0g", "invalid.hex").expect_err("invalid hex must fail closed");
     assert!(
         invalid.contains("invalid low hex nibble"),
         "unexpected error: {invalid}"
     );
 
     let empty = decode_hex(" \n\t", "empty.hex").expect_err("empty hex must fail closed");
-    assert!(empty.contains("empty hex input"), "unexpected error: {empty}");
+    assert!(
+        empty.contains("empty hex input"),
+        "unexpected error: {empty}"
+    );
 }
 
 /// Assert the whole-buffer scalar and batched parses are print-equivalent for

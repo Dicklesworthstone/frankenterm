@@ -95,11 +95,11 @@ Lock-order graph is acyclic for the dominant pair. ✓
 - `child()` (line 332): acquires `parent.children`, then conditionally
   acquires `child.reason` on a *different* node. Both critical sections
   hold sync state only — no `.await` calls inside.
-- `propagate_inner()` (line 395): acquires `inner.reason` (line 401),
-  drops at `;`, then acquires `inner.children` to `.clone()` (line 406),
-  releases, then iterates over the cloned vec calling
-  `propagate_inner(child, …)` recursively *outside* the lock. Lock-free
-  recursion. ✓
+- `propagate_to_children()`: iteratively pops one cloned child from a local
+  stack, acquires `inner.reason`, drops that guard, then acquires
+  `inner.children` only long enough to clone it before pushing descendants.
+  No node lock is retained across traversal, and deep trees do not consume the
+  Rust call stack. ✓
 - `cancel()`, `reason()`, `child_count()`, `prune_dead_children()` —
   all hold sync mutex briefly for plain reads/writes, no awaits.
 

@@ -3229,10 +3229,7 @@ mod tests {
 
     #[test]
     fn frame_interval_is_nonzero_for_valid_and_defensive_inputs() {
-        assert_eq!(
-            frame_interval_for_max_fps(0),
-            Duration::from_millis(1_000)
-        );
+        assert_eq!(frame_interval_for_max_fps(0), Duration::from_millis(1_000));
         assert_eq!(
             frame_interval_for_max_fps(MIN_MAX_FPS),
             Duration::from_millis(1_000)
@@ -3241,14 +3238,8 @@ mod tests {
             frame_interval_for_max_fps(default_max_fps()),
             Duration::from_millis(17)
         );
-        assert_eq!(
-            frame_interval_for_max_fps(3),
-            Duration::from_millis(334)
-        );
-        assert_eq!(
-            frame_interval_for_max_fps(999),
-            Duration::from_millis(2)
-        );
+        assert_eq!(frame_interval_for_max_fps(3), Duration::from_millis(334));
+        assert_eq!(frame_interval_for_max_fps(999), Duration::from_millis(2));
         assert_eq!(
             frame_interval_for_max_fps(MAX_MAX_FPS),
             Duration::from_millis(1)
@@ -3599,9 +3590,8 @@ mod tests {
     fn config_from_dynamic_rejects_zero_max_fps() {
         let mut obj = std::collections::BTreeMap::new();
         obj.insert(Value::String("max_fps".into()), Value::U64(0));
-        let error =
-            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
-                .expect_err("zero max_fps must be rejected");
+        let error = Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+            .expect_err("zero max_fps must be rejected");
         let message = error.to_string();
         assert!(message.contains("max_fps"), "unexpected error: {}", message);
         assert!(
@@ -3609,30 +3599,18 @@ mod tests {
             "unexpected error: {}",
             message
         );
-        assert!(
-            message.contains("got 0"),
-            "unexpected error: {}",
-            message
-        );
+        assert!(message.contains("got 0"), "unexpected error: {}", message);
     }
 
     #[test]
     fn config_from_dynamic_rejects_max_fps_above_timer_resolution() {
         let mut obj = std::collections::BTreeMap::new();
-        obj.insert(
-            Value::String("max_fps".into()),
-            Value::U64(MAX_MAX_FPS + 1),
-        );
+        obj.insert(Value::String("max_fps".into()), Value::U64(MAX_MAX_FPS + 1));
         let invalid_value = MAX_MAX_FPS + 1;
-        let error =
-            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
-                .expect_err("max_fps above timer resolution must be rejected");
+        let error = Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+            .expect_err("max_fps above timer resolution must be rejected");
         let message = error.to_string();
-        assert!(
-            message.contains("max_fps"),
-            "unexpected error: {}",
-            message
-        );
+        assert!(message.contains("max_fps"), "unexpected error: {}", message);
         assert!(
             message.contains("1..=1000"),
             "unexpected error: {}",

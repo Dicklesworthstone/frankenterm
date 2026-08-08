@@ -13,9 +13,9 @@ fn append_stripped_action(output: &mut Vec<u8>, action: Action) {
         }
         Action::PrintString(text) => output.extend_from_slice(text.as_bytes()),
         Action::Control(c) => match c {
-            ControlCode::HorizontalTab
-            | ControlCode::LineFeed
-            | ControlCode::CarriageReturn => output.push(c as u8),
+            ControlCode::HorizontalTab | ControlCode::LineFeed | ControlCode::CarriageReturn => {
+                output.push(c as u8)
+            }
             _ => {}
         },
         _ => {}
@@ -51,10 +51,7 @@ mod tests {
     fn preserves_batched_print_strings_and_allowed_controls() {
         let mut output = Vec::new();
         append_stripped_action(&mut output, Action::PrintString("batched text".to_string()));
-        append_stripped_action(
-            &mut output,
-            Action::Control(ControlCode::HorizontalTab),
-        );
+        append_stripped_action(&mut output, Action::Control(ControlCode::HorizontalTab));
         append_stripped_action(&mut output, Action::Print('λ'));
         append_stripped_action(&mut output, Action::Control(ControlCode::LineFeed));
         append_stripped_action(&mut output, Action::Control(ControlCode::Bell));

@@ -606,12 +606,7 @@ fn next_unique_config_subscription_id(counter: &AtomicUsize) -> usize {
                 "config subscription id space exhausted; refusing to replace an existing subscriber"
             );
         };
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return current,
             Err(observed) => current = observed,
         }
@@ -1049,10 +1044,7 @@ mod tests {
     fn config_subscription_allocator_uses_the_last_unreserved_identity_once() {
         let counter = AtomicUsize::new(usize::MAX - 1);
 
-        assert_eq!(
-            next_unique_config_subscription_id(&counter),
-            usize::MAX - 1
-        );
+        assert_eq!(next_unique_config_subscription_id(&counter), usize::MAX - 1);
         assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
     }
 

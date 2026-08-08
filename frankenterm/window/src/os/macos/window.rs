@@ -559,7 +559,7 @@ impl Window {
                 NSSize::new(width as f64, height as f64),
             );
 
-            let window_id = conn.next_window_id();
+            let window_id = conn.next_window_id()?;
             let events = WindowEventSender::new(event_handler);
 
             let inner = Rc::new(RefCell::new(Inner {

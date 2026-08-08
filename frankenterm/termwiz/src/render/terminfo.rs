@@ -97,7 +97,9 @@ fn crop_rgba_region(
         .ok_or_else(|| crate::error::StringWrap("RGBA crop length overflow".to_string()))?;
     let mut cropped = Vec::new();
     cropped.try_reserve_exact(crop_len).map_err(|err| {
-        crate::error::StringWrap(format!("unable to reserve {crop_len} RGBA crop bytes: {err}"))
+        crate::error::StringWrap(format!(
+            "unable to reserve {crop_len} RGBA crop bytes: {err}"
+        ))
     })?;
     let left_byte = (left as usize)
         .checked_mul(4)
@@ -107,9 +109,9 @@ fn crop_rgba_region(
             .checked_mul(source_stride)
             .and_then(|offset| offset.checked_add(left_byte))
             .ok_or_else(|| crate::error::StringWrap("RGBA crop row offset overflow".to_string()))?;
-        let row_end = row_start
-            .checked_add(crop_stride)
-            .ok_or_else(|| crate::error::StringWrap("RGBA crop row endpoint overflow".to_string()))?;
+        let row_end = row_start.checked_add(crop_stride).ok_or_else(|| {
+            crate::error::StringWrap("RGBA crop row endpoint overflow".to_string())
+        })?;
         cropped.extend_from_slice(&data[row_start..row_end]);
     }
 
@@ -162,17 +164,17 @@ fn encode_iterm_inline_image(
             let data = data.clone();
             drop(image_data);
             match ImageDataType::EncodedFile(data).decode() {
-            ImageDataType::EncodedFile(_) | ImageDataType::EncodedLease(_) => {
-                crate::bail!("cannot crop encoded image data unless the format is decodable")
-            }
-            decoded => encode_iterm_inline_image(
-                &crate::surface::Image {
-                    image: std::sync::Arc::new(ImageData::with_data(decoded)),
-                    ..image.clone()
-                },
-                top_left,
-                bottom_right,
-            ),
+                ImageDataType::EncodedFile(_) | ImageDataType::EncodedLease(_) => {
+                    crate::bail!("cannot crop encoded image data unless the format is decodable")
+                }
+                decoded => encode_iterm_inline_image(
+                    &crate::surface::Image {
+                        image: std::sync::Arc::new(ImageData::with_data(decoded)),
+                        ..image.clone()
+                    },
+                    top_left,
+                    bottom_right,
+                ),
             }
         }
         ImageDataType::EncodedLease(lease) => {
@@ -1000,9 +1002,10 @@ impl TerminfoRenderer {
                                 self.cursor_left(Self::term_count_from_usize(image.width), out)?;
                             }
                         }
-                        self.cursor_up(Self::term_count_from_usize(
-                            image.height.saturating_sub(1),
-                        ), out)?;
+                        self.cursor_up(
+                            Self::term_count_from_usize(image.height.saturating_sub(1)),
+                            out,
+                        )?;
                     }
                     self.cursor_position = None;
                 }
@@ -1818,13 +1821,15 @@ mod test {
     #[cfg(feature = "use_image")]
     #[test]
     fn text_image_fallback_restores_only_rows_it_descended() {
-        let one_row_image = || Change::Image(Image {
-            width: 2,
-            height: 1,
-            top_left: TextureCoordinate::new_f32(0.0, 0.0),
-            bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
-            image: Arc::new(ImageData::with_raw_data(vec![])),
-        });
+        let one_row_image = || {
+            Change::Image(Image {
+                width: 2,
+                height: 1,
+                top_left: TextureCoordinate::new_f32(0.0, 0.0),
+                bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+                image: Arc::new(ImageData::with_raw_data(vec![])),
+            })
+        };
         let mut one_row = FakeTerm::new(xterm_terminfo());
         one_row.render(&[one_row_image()]).unwrap();
         let one_row_rendered = String::from_utf8(one_row.write.buf).unwrap();

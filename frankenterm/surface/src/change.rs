@@ -896,11 +896,7 @@ impl Image {
     /// allows both the surface change journal and direct terminal renderers to
     /// apply the same bounded geometry before doing work proportional to the
     /// cell dimensions.
-    pub fn clipped_to_cell_bounds(
-        &self,
-        max_width: usize,
-        max_height: usize,
-    ) -> Option<Self> {
+    pub fn clipped_to_cell_bounds(&self, max_width: usize, max_height: usize) -> Option<Self> {
         if self.width == 0 || self.height == 0 || max_width == 0 || max_height == 0 {
             return None;
         }
@@ -927,18 +923,10 @@ impl Image {
         let height = self.height.min(max_height);
         let skipped_rows = self.height.saturating_sub(height);
 
-        let clipped_right = interpolate_texture_axis(
-            top_left_x,
-            bottom_right_x,
-            width,
-            self.width,
-        )?;
-        let clipped_top = interpolate_texture_axis(
-            top_left_y,
-            bottom_right_y,
-            skipped_rows,
-            self.height,
-        )?;
+        let clipped_right =
+            interpolate_texture_axis(top_left_x, bottom_right_x, width, self.width)?;
+        let clipped_top =
+            interpolate_texture_axis(top_left_y, bottom_right_y, skipped_rows, self.height)?;
 
         // Extremely disproportionate, attacker-controlled cell spans can map
         // a retained slice below f32 texture-coordinate resolution. Treat that

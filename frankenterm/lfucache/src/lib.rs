@@ -1377,16 +1377,17 @@ mod test {
 
     #[test]
     fn remove_keys_where_also_purges_s3fifo_ghost_identity() {
-        let mut cache = LfuCacheU64::<&'static str>::with_capacity_and_policy(
-            5,
-            CacheEvictionPolicy::S3Fifo,
-        );
+        let mut cache =
+            LfuCacheU64::<&'static str>::with_capacity_and_policy(5, CacheEvictionPolicy::S3Fifo);
         cache.put(10, "retired");
         cache.put(20, "live");
         cache.s3_ghost.push_back(10);
         cache.s3_ghost.push_back(30);
 
-        assert_eq!(cache.remove_keys_where(|key| *key == 10), vec![(10, "retired")]);
+        assert_eq!(
+            cache.remove_keys_where(|key| *key == 10),
+            vec![(10, "retired")]
+        );
         assert_eq!(cache.s3_ghost.iter().copied().collect::<Vec<_>>(), vec![30]);
         assert!(cache.get(&20).is_some());
     }

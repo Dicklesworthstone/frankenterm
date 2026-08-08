@@ -126,9 +126,7 @@ fn key_repeat_timer_plan(
         return Some(KeyRepeatTimerPlan::Wait(next_due - elapsed));
     };
     let overdue_nanos = overdue.as_nanos();
-    let due = overdue_nanos
-        .checked_div(gap_nanos)?
-        .saturating_add(1);
+    let due = overdue_nanos.checked_div(gap_nanos)?.saturating_add(1);
     let repeat_count = u16::try_from(due).unwrap_or(u16::MAX);
     let remainder_nanos = overdue_nanos % gap_nanos;
     let until_next_nanos = gap_nanos.checked_sub(remainder_nanos)?;
@@ -150,9 +148,7 @@ fn key_repeat_first_due(
         return None;
     }
     match last_dispatch {
-        Some(last_dispatch) => last_dispatch
-            .checked_add(gap)
-            .map(|due| due.max(elapsed)),
+        Some(last_dispatch) => last_dispatch.checked_add(gap).map(|due| due.max(elapsed)),
         None if elapsed >= delay => Some(elapsed),
         None => Some(delay),
     }
@@ -254,9 +250,7 @@ async fn run_key_repeat(
     let mut next_due = initial_due;
     loop {
         let Some(plan) = key_repeat_timer_plan(origin.elapsed(), next_due, gap) else {
-            log::warn!(
-                "Stopping Wayland key repeat for window {window_id}: invalid timer state"
-            );
+            log::warn!("Stopping Wayland key repeat for window {window_id}: invalid timer state");
             return;
         };
 
@@ -403,7 +397,7 @@ impl WaylandWindow {
             })?
             .wayland();
 
-        let window_id = conn.next_window_id();
+        let window_id = conn.next_window_id()?;
         let pending_event = Arc::new(Mutex::new(PendingEvent::default()));
 
         let (pending_first_configure, wait_configure) = new_pending_first_configure();
@@ -973,14 +967,7 @@ impl WaylandWindowInner {
         });
         promise::spawn::spawn_into_main_thread(async move {
             let _ = Abortable::new(
-                run_key_repeat(
-                    window_id,
-                    seed,
-                    task_identity,
-                    origin,
-                    initial_due,
-                    gap,
-                ),
+                run_key_repeat(window_id, seed, task_identity, origin, initial_due, gap),
                 registration,
             )
             .await;
@@ -1589,11 +1576,7 @@ impl WaylandWindowInner {
         }
     }
 
-    pub(crate) fn emit_focus(
-        &mut self,
-        mapper: Option<&mut KeyboardWithFallback>,
-        focused: bool,
-    ) {
+    pub(crate) fn emit_focus(&mut self, mapper: Option<&mut KeyboardWithFallback>, focused: bool) {
         // Clear the modifiers when we change focus, otherwise weird
         // things can happen.  For instance, if we lost focus because
         // CTRL+SHIFT+N was pressed to spawn a new window, we'd be
@@ -1722,12 +1705,7 @@ impl WaylandWindowInner {
                 } else if let Some(seed) =
                     mapper.process_wayland_key(key, pressed, &mut self.events)
                 {
-                    self.replace_key_repeat(
-                        seed,
-                        window_id,
-                        key_repeat_rate,
-                        key_repeat_delay,
-                    );
+                    self.replace_key_repeat(seed, window_id, key_repeat_rate, key_repeat_delay);
                 } else if let Some(active) = self.key_repeat.as_ref() {
                     // important to check that it's the same key, because the release of the previously
                     // repeated key can come right after the press of the newly held key
@@ -1737,11 +1715,7 @@ impl WaylandWindowInner {
                 }
             }
             WlKeyboardEvent::RepeatInfo { .. } => {
-                self.refresh_key_repeat_timing(
-                    window_id,
-                    key_repeat_rate,
-                    key_repeat_delay,
-                );
+                self.refresh_key_repeat_timing(window_id, key_repeat_rate, key_repeat_delay);
             }
             WlKeyboardEvent::Modifiers {
                 mods_depressed,
@@ -2164,10 +2138,10 @@ impl HasWindowHandle for WaylandWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompositorRepeatTransition, KeyRepeatAbort, KeyRepeatTimerPlan,
         compositor_repeat_transition, key_repeat_first_due, key_repeat_timer_plan,
         key_repeat_timing, key_repeat_window_event, new_pending_first_configure,
-        read_pipe_with_timeout, resolve_pending_first_configure,
+        read_pipe_with_timeout, resolve_pending_first_configure, CompositorRepeatTransition,
+        KeyRepeatAbort, KeyRepeatTimerPlan,
     };
     use crate::{Handled, KeyCode, KeyEvent, Modifiers, RawKeyEvent, WindowEvent, WindowKeyEvent};
     use futures_util::future::Abortable;
@@ -2231,13 +2205,8 @@ mod tests {
             Duration::from_millis(u64::try_from(i32::MAX).expect("maximum delay is positive"))
         );
 
-        for (rate, expected_gap_ms) in [
-            (1, 1_000),
-            (25, 40),
-            (1_000, 1),
-            (1_001, 1),
-            (i32::MAX, 1),
-        ] {
+        for (rate, expected_gap_ms) in [(1, 1_000), (25, 40), (1_000, 1), (1_001, 1), (i32::MAX, 1)]
+        {
             let (delay, gap) = key_repeat_timing(rate, 0).expect("positive rate must be enabled");
             assert_eq!(delay, Duration::ZERO);
             assert_eq!(gap, Duration::from_millis(expected_gap_ms));
@@ -2255,33 +2224,21 @@ mod tests {
             Some(KeyRepeatTimerPlan::Wait(Duration::from_millis(400)))
         );
         assert_eq!(
-            key_repeat_timer_plan(
-                Duration::from_millis(400),
-                Duration::from_millis(400),
-                gap,
-            ),
+            key_repeat_timer_plan(Duration::from_millis(400), Duration::from_millis(400), gap,),
             Some(KeyRepeatTimerPlan::Dispatch {
                 repeat_count: 1,
                 next_due: Duration::from_millis(440),
             })
         );
         assert_eq!(
-            key_repeat_timer_plan(
-                Duration::from_millis(450),
-                Duration::from_millis(440),
-                gap,
-            ),
+            key_repeat_timer_plan(Duration::from_millis(450), Duration::from_millis(440), gap,),
             Some(KeyRepeatTimerPlan::Dispatch {
                 repeat_count: 1,
                 next_due: Duration::from_millis(480),
             })
         );
         assert_eq!(
-            key_repeat_timer_plan(
-                Duration::from_millis(520),
-                Duration::from_millis(480),
-                gap,
-            ),
+            key_repeat_timer_plan(Duration::from_millis(520), Duration::from_millis(480), gap,),
             Some(KeyRepeatTimerPlan::Dispatch {
                 repeat_count: 2,
                 next_due: Duration::from_millis(560),
@@ -2305,11 +2262,7 @@ mod tests {
             }
         ));
         assert_eq!(
-            key_repeat_timer_plan(
-                Duration::from_secs(1),
-                Duration::ZERO,
-                Duration::ZERO,
-            ),
+            key_repeat_timer_plan(Duration::from_secs(1), Duration::ZERO, Duration::ZERO,),
             None
         );
     }
@@ -2364,30 +2317,15 @@ mod tests {
             Some(elapsed)
         );
         assert_eq!(
-            key_repeat_first_due(
-                elapsed,
-                delay,
-                faster_gap,
-                Some(Duration::from_millis(740)),
-            ),
+            key_repeat_first_due(elapsed, delay, faster_gap, Some(Duration::from_millis(740)),),
             Some(Duration::from_millis(760))
         );
         assert_eq!(
-            key_repeat_first_due(
-                elapsed,
-                delay,
-                faster_gap,
-                Some(Duration::from_millis(400)),
-            ),
+            key_repeat_first_due(elapsed, delay, faster_gap, Some(Duration::from_millis(400)),),
             Some(elapsed)
         );
         assert_eq!(
-            key_repeat_first_due(
-                Duration::from_millis(250),
-                delay,
-                faster_gap,
-                None,
-            ),
+            key_repeat_first_due(Duration::from_millis(250), delay, faster_gap, None,),
             Some(delay)
         );
         // Once any repeat has been dispatched, a later repeat_info delay is
@@ -2407,10 +2345,7 @@ mod tests {
     #[test]
     fn key_repeat_abort_cancels_a_pending_detached_wait_without_sleeping() {
         let (abort, registration) = KeyRepeatAbort::new_pair();
-        let mut pending = Box::pin(Abortable::new(
-            std::future::pending::<()>(),
-            registration,
-        ));
+        let mut pending = Box::pin(Abortable::new(std::future::pending::<()>(), registration));
         let waker = Waker::noop().clone();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Pending));

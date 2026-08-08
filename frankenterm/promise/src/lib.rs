@@ -383,8 +383,7 @@ mod tests {
     #[cfg(panic = "unwind")]
     impl Drop for PanicOnFinalDrop {
         fn drop(&mut self) {
-            self.drops
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             panic!("synthetic caller waker final-drop panic");
         }
     }
@@ -397,8 +396,7 @@ mod tests {
     #[cfg(panic = "unwind")]
     impl Drop for PanicOnPayloadDrop {
         fn drop(&mut self) {
-            self.drops
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             panic!("synthetic retained promise payload drop panic");
         }
     }
@@ -851,8 +849,7 @@ mod tests {
 
         impl Wake for CountWake {
             fn wake(self: Arc<Self>) {
-                self.0
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         }
 
@@ -902,7 +899,9 @@ mod tests {
     #[test]
     fn promise_clears_core_poison_after_recovery() {
         static TEST_LOCK: Mutex<()> = Mutex::new(());
-        let _test_guard = TEST_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _test_guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         reset_core_lock_poisoned_count_for_test();
         let mut p: Promise<i32> = Promise::new();
         let mut fut = p.get_future().unwrap();

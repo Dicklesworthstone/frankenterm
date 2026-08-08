@@ -166,13 +166,24 @@ impl KeybindingRegistry {
     }
 
     /// Register a keybinding for an extension.
-    pub fn register<F>(&self, combo: KeyCombo, extension_id: &str, handler: F) -> KeybindingId
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after the process-local binding identity space is
+    /// exhausted. Exhaustion fails closed instead of panicking or reusing an
+    /// identity that may still be registered.
+    pub fn register<F>(
+        &self,
+        combo: KeyCombo,
+        extension_id: &str,
+        handler: F,
+    ) -> Result<KeybindingId>
     where
         F: Fn(&Value) -> Result<Vec<Action>> + Send + Sync + 'static,
     {
-        let id = crate::try_next_unique_id(&self.next_id).unwrap_or_else(|| {
-            panic!("keybinding id space exhausted; refusing to reuse a binding identity")
-        });
+        let id = crate::try_next_unique_id(&self.next_id).ok_or_else(|| {
+            anyhow::anyhow!("keybinding id space exhausted; refusing to reuse a binding identity")
+        })?;
         let canonical = combo.to_string_repr();
 
         let binding = RegisteredBinding {
@@ -185,7 +196,7 @@ impl KeybindingRegistry {
         self.bindings_guard().push(binding);
         self.lookup_guard().entry(canonical).or_default().push(id);
 
-        id
+        Ok(id)
     }
 
     /// Unregister a keybinding by handle.
@@ -289,11 +300,11 @@ mod tests {
         registry.next_id.store(u64::MAX, Ordering::Release);
         let combo = KeyCombo::parse("ctrl+x").unwrap();
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            registry.register(combo, "test-extension", |_| Ok(Vec::new()))
-        }));
+        let error = registry
+            .register(combo, "test-extension", |_| Ok(Vec::new()))
+            .expect_err("exhausted keybinding identities must reject registration");
 
-        assert!(result.is_err());
+        assert!(error.to_string().contains("keybinding id space exhausted"));
         assert_eq!(registry.count(), 0);
         assert!(registry.bound_combos().is_empty());
     }
@@ -362,12 +373,14 @@ mod tests {
         let registry = KeybindingRegistry::new();
         let combo = KeyCombo::parse("ctrl+t").unwrap();
 
-        registry.register(combo.clone(), "my-ext", |_payload| {
-            Ok(vec![Action::Log {
-                level: crate::types::LogLevel::Info,
-                message: "keybinding fired".to_string(),
-            }])
-        });
+        registry
+            .register(combo.clone(), "my-ext", |_payload| {
+                Ok(vec![Action::Log {
+                    level: crate::types::LogLevel::Info,
+                    message: "keybinding fired".to_string(),
+                }])
+            })
+            .unwrap();
 
         let actions = registry.dispatch(&combo, &Value::Null).unwrap();
         assert_eq!(actions.len(), 1);
@@ -379,7 +392,7 @@ mod tests {
         let combo = KeyCombo::parse("ctrl+t").unwrap();
         let other = KeyCombo::parse("ctrl+n").unwrap();
 
-        registry.register(combo, "my-ext", |_| Ok(vec![]));
+        registry.register(combo, "my-ext", |_| Ok(vec![])).unwrap();
 
         let actions = registry.dispatch(&other, &Value::Null).unwrap();
         assert!(actions.is_empty());
@@ -390,7 +403,7 @@ mod tests {
         let registry = KeybindingRegistry::new();
         let combo = KeyCombo::parse("ctrl+t").unwrap();
 
-        let id = registry.register(combo, "my-ext", |_| Ok(vec![]));
+        let id = registry.register(combo, "my-ext", |_| Ok(vec![])).unwrap();
         assert_eq!(registry.count(), 1);
 
         assert!(registry.unregister(id));
@@ -401,9 +414,15 @@ mod tests {
     fn unregister_extension() {
         let registry = KeybindingRegistry::new();
 
-        registry.register(KeyCombo::parse("ctrl+a").unwrap(), "ext-1", |_| Ok(vec![]));
-        registry.register(KeyCombo::parse("ctrl+b").unwrap(), "ext-1", |_| Ok(vec![]));
-        registry.register(KeyCombo::parse("ctrl+c").unwrap(), "ext-2", |_| Ok(vec![]));
+        registry
+            .register(KeyCombo::parse("ctrl+a").unwrap(), "ext-1", |_| Ok(vec![]))
+            .unwrap();
+        registry
+            .register(KeyCombo::parse("ctrl+b").unwrap(), "ext-1", |_| Ok(vec![]))
+            .unwrap();
+        registry
+            .register(KeyCombo::parse("ctrl+c").unwrap(), "ext-2", |_| Ok(vec![]))
+            .unwrap();
 
         let removed = registry.unregister_extension("ext-1");
         assert_eq!(removed, 2);
@@ -415,19 +434,23 @@ mod tests {
         let registry = KeybindingRegistry::new();
         let combo = KeyCombo::parse("ctrl+t").unwrap();
 
-        registry.register(combo.clone(), "ext-1", |_| {
-            Ok(vec![Action::Log {
-                level: crate::types::LogLevel::Info,
-                message: "handler-1".to_string(),
-            }])
-        });
+        registry
+            .register(combo.clone(), "ext-1", |_| {
+                Ok(vec![Action::Log {
+                    level: crate::types::LogLevel::Info,
+                    message: "handler-1".to_string(),
+                }])
+            })
+            .unwrap();
 
-        registry.register(combo.clone(), "ext-2", |_| {
-            Ok(vec![Action::Log {
-                level: crate::types::LogLevel::Info,
-                message: "handler-2".to_string(),
-            }])
-        });
+        registry
+            .register(combo.clone(), "ext-2", |_| {
+                Ok(vec![Action::Log {
+                    level: crate::types::LogLevel::Info,
+                    message: "handler-2".to_string(),
+                }])
+            })
+            .unwrap();
 
         let actions = registry.dispatch(&combo, &Value::Null).unwrap();
         assert_eq!(actions.len(), 2);
@@ -446,12 +469,14 @@ mod tests {
         assert!(poisoned.is_err());
         assert!(registry.bindings.is_poisoned());
 
-        registry.register(combo.clone(), "ext", |_| {
-            Ok(vec![Action::Log {
-                level: crate::types::LogLevel::Info,
-                message: "recovered binding".to_string(),
-            }])
-        });
+        registry
+            .register(combo.clone(), "ext", |_| {
+                Ok(vec![Action::Log {
+                    level: crate::types::LogLevel::Info,
+                    message: "recovered binding".to_string(),
+                }])
+            })
+            .unwrap();
 
         assert!(!registry.bindings.is_poisoned());
         assert_eq!(registry.count(), 1);
@@ -463,7 +488,9 @@ mod tests {
     fn registry_recovers_poisoned_lookup_lock() {
         let registry = KeybindingRegistry::new();
         let combo = KeyCombo::parse("ctrl+l").unwrap();
-        let id = registry.register(combo.clone(), "ext", |_| Ok(vec![]));
+        let id = registry
+            .register(combo.clone(), "ext", |_| Ok(vec![]))
+            .unwrap();
 
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = registry.lookup.lock().unwrap();
@@ -565,7 +592,7 @@ mod tests {
                     key: format!("k{i}"),
                     modifiers: Modifiers::NONE,
                 };
-                let id = registry.register(combo, "ext", |_| Ok(vec![]));
+                let id = registry.register(combo, "ext", |_| Ok(vec![])).unwrap();
                 ids.push(id);
             }
             prop_assert_eq!(registry.count(), n_register);
@@ -589,14 +616,14 @@ mod tests {
                     key: format!("a{i}"),
                     modifiers: Modifiers::NONE,
                 };
-                registry.register(combo, "target-ext", |_| Ok(vec![]));
+                registry.register(combo, "target-ext", |_| Ok(vec![])).unwrap();
             }
             for i in 0..n_other {
                 let combo = KeyCombo {
                     key: format!("b{i}"),
                     modifiers: Modifiers::NONE,
                 };
-                registry.register(combo, "other-ext", |_| Ok(vec![]));
+                registry.register(combo, "other-ext", |_| Ok(vec![])).unwrap();
             }
 
             let removed = registry.unregister_extension("target-ext");
@@ -636,7 +663,7 @@ mod tests {
                     key: format!("unique{i}"),
                     modifiers: Modifiers::NONE,
                 };
-                registry.register(combo, "ext", |_| Ok(vec![]));
+                registry.register(combo, "ext", |_| Ok(vec![])).unwrap();
             }
             let combos = registry.bound_combos();
             prop_assert_eq!(combos.len(), n);

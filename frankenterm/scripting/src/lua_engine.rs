@@ -109,8 +109,10 @@ impl ScriptingEngine for LuaEngine {
 
     fn register_hook(&self, event: &str, handler: HookHandler) -> Result<HookId> {
         let mut state = self.state_guard();
-        let hook_id = state.next_hook_id;
-        state.next_hook_id = state.next_hook_id.saturating_add(1);
+        let hook_id =
+            crate::try_next_unique_id_value(&mut state.next_hook_id).ok_or_else(|| {
+                anyhow!("Lua hook id space exhausted; refusing to reuse a hook identity")
+            })?;
         state.hooks.insert(hook_id, (event.to_string(), handler));
         Ok(hook_id)
     }
@@ -176,6 +178,9 @@ impl ScriptingEngine for LuaEngine {
             .entrypoint
             .as_deref()
             .ok_or_else(|| anyhow!("Lua extension {} missing entrypoint", manifest.id))?;
+        if self.state_guard().next_extension_id == u64::MAX {
+            bail!("Lua extension id space exhausted; refusing to reuse an extension identity");
+        }
         let path = PathBuf::from(entrypoint);
         if !path.exists() {
             bail!(
@@ -188,6 +193,10 @@ impl ScriptingEngine for LuaEngine {
             .with_context(|| format!("failed to read extension script {}", path.display()))?;
 
         let mut state = self.state_guard();
+        let extension_id = crate::try_next_unique_id_value(&mut state.next_extension_id)
+            .ok_or_else(|| {
+                anyhow!("Lua extension id space exhausted; refusing to reuse an extension identity")
+            })?;
         if state.lua.is_none() {
             state.lua =
                 Some(make_lua_context(&path).with_context(|| {
@@ -206,8 +215,6 @@ impl ScriptingEngine for LuaEngine {
             .exec()
             .with_context(|| format!("executing lua extension {}", path.display()))?;
 
-        let extension_id = state.next_extension_id;
-        state.next_extension_id = state.next_extension_id.saturating_add(1);
         state.extensions.insert(extension_id, manifest.clone());
         Ok(extension_id)
     }
@@ -293,6 +300,39 @@ mod tests {
         assert!(caps.supports_filesystem);
         assert!(caps.supports_network);
         assert!(!caps.sandboxed);
+    }
+
+    #[test]
+    fn exhausted_lua_hook_ids_fail_before_registration() {
+        let engine = LuaEngine::new();
+        engine.state_guard().next_hook_id = u64::MAX;
+        let handler = HookHandler::new(0, None, |_event, _payload| Ok(Vec::new()));
+
+        let error = engine
+            .register_hook("evt", handler)
+            .expect_err("exhausted Lua hook identities must reject registration");
+
+        assert!(error.to_string().contains("hook id space exhausted"));
+        assert!(engine.state_guard().hooks.is_empty());
+    }
+
+    #[test]
+    fn exhausted_lua_extension_ids_fail_before_entrypoint_io() {
+        let engine = LuaEngine::new();
+        engine.state_guard().next_extension_id = u64::MAX;
+        let manifest = ExtensionManifest {
+            id: "must-not-load".to_string(),
+            version: "1.0.0".to_string(),
+            entrypoint: Some("/path/that/must/not/be/read.lua".to_string()),
+            ..ExtensionManifest::default()
+        };
+
+        let error = engine
+            .load_extension(&manifest)
+            .expect_err("exhausted Lua extension identities must reject before I/O");
+
+        assert!(error.to_string().contains("extension id space exhausted"));
+        assert!(engine.state_guard().extensions.is_empty());
     }
 
     #[test]

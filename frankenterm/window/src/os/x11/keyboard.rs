@@ -262,13 +262,8 @@ impl KeyboardWithFallback {
         let xcode = xkb::Keycode::new(code.checked_add(8)?);
         let want_repeat = self.selected.wayland_key_repeats(code);
         let raw_modifiers = self.get_key_modifiers();
-        let repeat = self.process_key_event_impl(
-            xcode,
-            raw_modifiers,
-            pressed,
-            events,
-            want_repeat,
-        )?;
+        let repeat =
+            self.process_key_event_impl(xcode, raw_modifiers, pressed, events, want_repeat)?;
         match (repeat.provenance, repeat.event) {
             (RepeatProvenance::RawHandled, WindowKeyEvent::RawKeyEvent(_)) => {
                 Some(WaylandRepeatSeed::RawHandled { key: code })
@@ -305,13 +300,8 @@ impl KeyboardWithFallback {
         let xcode = xkb::Keycode::new(code.checked_add(8)?);
         let raw_modifiers = self.get_key_modifiers();
         let leds = self.get_led_status();
-        let raw_key_event = self.wayland_raw_key_event(
-            xcode,
-            raw_modifiers,
-            leds,
-            true,
-            Handled::new(),
-        );
+        let raw_key_event =
+            self.wayland_raw_key_event(xcode, raw_modifiers, leds, true, Handled::new());
 
         if matches!(seed, WaylandRepeatSeed::RawHandled { .. }) {
             return Some(WindowKeyEvent::RawKeyEvent(raw_key_event));
@@ -320,16 +310,11 @@ impl KeyboardWithFallback {
         let xsym = self.selected.state.borrow().key_get_one_sym(xcode);
         let utf8 = self.selected.state.borrow().key_get_utf8(xcode);
         let fallback_xsym = self.fallback.state.borrow().key_get_one_sym(xcode);
-        let (key, ksym) = resolve_uncomposed_key(
-            &utf8,
-            xsym,
-            xsym,
-            Some(fallback_xsym),
-            raw_modifiers,
-        );
-        let Some(key) = key.or_else(|| {
-            keysym_to_keycode(ksym.into()).or_else(|| keysym_to_keycode(xsym.into()))
-        }) else {
+        let (key, ksym) =
+            resolve_uncomposed_key(&utf8, xsym, xsym, Some(fallback_xsym), raw_modifiers);
+        let Some(key) = key
+            .or_else(|| keysym_to_keycode(ksym.into()).or_else(|| keysym_to_keycode(xsym.into())))
+        else {
             return Some(WindowKeyEvent::RawKeyEvent(raw_key_event));
         };
 
@@ -532,13 +517,8 @@ impl KeyboardWithFallback {
                         FeedResult::Nothing(_, fallback_sym) => Some(fallback_sym),
                         _ => None,
                     };
-                    let (resolved_key, resolved_sym) = resolve_uncomposed_key(
-                        &utf8,
-                        sym,
-                        xsym,
-                        fallback_sym,
-                        raw_modifiers,
-                    );
+                    let (resolved_key, resolved_sym) =
+                        resolve_uncomposed_key(&utf8, sym, xsym, fallback_sym, raw_modifiers);
                     kc = resolved_key;
                     resolved_sym
                 }
@@ -843,9 +823,7 @@ impl Keyboard {
         let Some(code) = code.checked_add(8) else {
             return false;
         };
-        self.keymap
-            .borrow()
-            .key_repeats(xkb::Keycode::new(code))
+        self.keymap.borrow().key_repeats(xkb::Keycode::new(code))
     }
 
     pub fn get_device_id(&self) -> i32 {
@@ -1112,21 +1090,18 @@ mod tests {
             xkb::KEYMAP_COMPILE_NO_FLAGS,
         )
         .ok_or_else(|| anyhow::anyhow!("failed to construct deterministic US keymap"))?;
-        KeyboardWithFallback::new_from_string(
-            keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1),
-        )
+        KeyboardWithFallback::new_from_string(keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1))
     }
 
     #[cfg(feature = "wayland")]
     #[test]
-    fn wayland_repeat_translation_tracks_shift_and_uses_fresh_handled_state() -> anyhow::Result<()> {
+    fn wayland_repeat_translation_tracks_shift_and_uses_fresh_handled_state() -> anyhow::Result<()>
+    {
         let keyboard = us_keyboard()?;
         let uncomposed = WaylandRepeatSeed::Uncomposed { key: 30 };
-        assert!(
-            keyboard
-                .translate_wayland_repeat(&WaylandRepeatSeed::Uncomposed { key: u32::MAX })
-                .is_none()
-        );
+        assert!(keyboard
+            .translate_wayland_repeat(&WaylandRepeatSeed::Uncomposed { key: u32::MAX })
+            .is_none());
         // Linux evdev KEY_A. Wayland keycodes omit the XKB offset of eight.
         let WindowKeyEvent::KeyEvent(unshifted) = keyboard
             .translate_wayland_repeat(&uncomposed)
@@ -1170,12 +1145,10 @@ mod tests {
             panic!("uncomposed repeat must translate to a mapped key event");
         };
         assert_eq!(shifted.key, KeyCode::Char('A'));
-        assert!(
-            shifted
-                .raw
-                .as_ref()
-                .is_some_and(|raw| raw.modifiers.contains(Modifiers::SHIFT))
-        );
+        assert!(shifted
+            .raw
+            .as_ref()
+            .is_some_and(|raw| raw.modifiers.contains(Modifiers::SHIFT)));
         Ok(())
     }
 
@@ -1237,13 +1210,8 @@ mod tests {
         let selected = xkb::Keysym::new(xkb::keysyms::KEY_Cyrillic_es);
         let fallback = xkb::Keysym::new(xkb::keysyms::KEY_c);
 
-        let (key, resolved) = resolve_uncomposed_key(
-            "с",
-            selected,
-            selected,
-            Some(fallback),
-            Modifiers::CTRL,
-        );
+        let (key, resolved) =
+            resolve_uncomposed_key("с", selected, selected, Some(fallback), Modifiers::CTRL);
 
         assert_eq!(key, None);
         assert_eq!(resolved, fallback);

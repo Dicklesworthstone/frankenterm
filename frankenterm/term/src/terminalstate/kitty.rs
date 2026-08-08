@@ -1159,16 +1159,8 @@ impl TerminalState {
                         "target_frame {} is out of range",
                         target_frame
                     );
-                    ensure_kitty_frame_buffer_len(
-                        *width,
-                        *height,
-                        frames[src_frame - 1].len(),
-                    )?;
-                    ensure_kitty_frame_buffer_len(
-                        *width,
-                        *height,
-                        frames[target_frame - 1].len(),
-                    )?;
+                    ensure_kitty_frame_buffer_len(*width, *height, frames[src_frame - 1].len())?;
+                    ensure_kitty_frame_buffer_len(*width, *height, frames[target_frame - 1].len())?;
                     (*width, *height)
                 }
             }
@@ -1238,13 +1230,7 @@ impl TerminalState {
         let mut dest: ImageBuffer<Rgba<u8>, &mut [u8]> =
             ImageBuffer::from_raw(width, height, &mut *target)
                 .ok_or_else(|| anyhow::anyhow!("ill formed image"))?;
-        blit(
-            &mut dest,
-            &src,
-            dest_x,
-            dest_y,
-            frame.composition_mode,
-        )?;
+        blit(&mut dest, &src, dest_x, dest_y, frame.composition_mode)?;
         drop(dest);
         drop(target);
         self.kitty_mark_image_placements_dirty(image_id);
@@ -1464,20 +1450,16 @@ impl TerminalState {
                             None => RgbaImage::from_pixel(*width, *height, background_pixel),
                             Some(base_frame) => {
                                 let base_frame = base_frame as usize;
-                                RgbaImage::from_vec(
-                                    *width,
-                                    *height,
-                                    frames[base_frame - 1].clone(),
-                                )
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "kitty frame {} data size mismatch: {}x{} vs {} bytes",
-                                        base_frame,
-                                        width,
-                                        height,
-                                        frames[base_frame - 1].len()
-                                    )
-                                })?
+                                RgbaImage::from_vec(*width, *height, frames[base_frame - 1].clone())
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "kitty frame {} data size mismatch: {}x{} vs {} bytes",
+                                            base_frame,
+                                            width,
+                                            height,
+                                            frames[base_frame - 1].len()
+                                        )
+                                    })?
                             }
                         };
                         blit(&mut new_frame, &img, x, y, frame.composition_mode)?;
@@ -1514,11 +1496,7 @@ impl TerminalState {
             PreparedFrameMutation::Append(new_frame) => {
                 let growth = new_frame.len();
                 let prepared = anim
-                    .prepare_decoded_frame_append(
-                        new_frame,
-                        frame_gap,
-                        MAX_KITTY_ANIMATION_FRAMES,
-                    )
+                    .prepare_decoded_frame_append(new_frame, frame_gap, MAX_KITTY_ANIMATION_FRAMES)
                     .context("preparing Kitty animation frame append")?;
                 anyhow::ensure!(
                     prepared.additional_decoded_bytes() == growth,
@@ -1848,9 +1826,7 @@ mod tests {
     use super::*;
     use crate::color::ColorPalette;
     use crate::{AlertHandler, TerminalConfiguration, TerminalSize};
-    use frankenterm_cell::image::{
-        ImageDataValidationLimits, ImageDataValidationSummary,
-    };
+    use frankenterm_cell::image::{ImageDataValidationLimits, ImageDataValidationSummary};
     use serde_json::Value;
     use std::sync::Mutex;
 
@@ -1929,9 +1905,7 @@ mod tests {
         }
     }
 
-    fn seed_validation_authority(
-        image: &ImageData,
-    ) -> ([u8; 32], ImageDataValidationSummary) {
+    fn seed_validation_authority(image: &ImageData) -> ([u8; 32], ImageDataValidationSummary) {
         let revision = image.current_content_hash();
         let validated = image
             .normalize_for_content_revision_with_limits(

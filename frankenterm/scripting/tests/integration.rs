@@ -285,13 +285,16 @@ fn full_extension_lifecycle_install_to_remove() {
     );
 
     // Register hook
-    let hook_id = lifecycle.event_bus.register(
-        "pane.focus",
-        DispatchTier::Native,
-        0,
-        Some("full-test"),
-        |_, _| Ok(vec![]),
-    );
+    let hook_id = lifecycle
+        .event_bus
+        .register(
+            "pane.focus",
+            DispatchTier::Native,
+            0,
+            Some("full-test"),
+            |_, _| Ok(vec![]),
+        )
+        .unwrap();
 
     // Mark loaded
     lifecycle.mark_loaded("full-test", vec![hook_id]).unwrap();
@@ -364,9 +367,11 @@ fn event_bus_many_handlers() {
 
     // Register 100 handlers
     for i in 0..100 {
-        let id = bus.register("stress.event", DispatchTier::Native, i, None, |_, _| {
-            Ok(vec![])
-        });
+        let id = bus
+            .register("stress.event", DispatchTier::Native, i, None, |_, _| {
+                Ok(vec![])
+            })
+            .unwrap();
         hook_ids.push(id);
     }
 
@@ -399,7 +404,8 @@ fn event_bus_wildcard_and_prefix_stress() {
     bus.register("*", DispatchTier::Native, 0, None, move |_, _| {
         counter_clone.fetch_add(1, Ordering::SeqCst);
         Ok(vec![])
-    });
+    })
+    .unwrap();
 
     // Register prefix handler
     let prefix_counter = Arc::new(AtomicUsize::new(0));
@@ -407,7 +413,8 @@ fn event_bus_wildcard_and_prefix_stress() {
     bus.register("pane.*", DispatchTier::Native, 0, None, move |_, _| {
         prefix_clone.fetch_add(1, Ordering::SeqCst);
         Ok(vec![])
-    });
+    })
+    .unwrap();
 
     // Fire various events
     for event in &[
@@ -436,21 +443,25 @@ fn keybinding_multi_extension_registration() {
 
     // Extension A registers some bindings
     let combo_a = KeyCombo::parse("ctrl+t").unwrap();
-    registry.register(combo_a, "ext-a", |_payload| {
-        Ok(vec![Action::Log {
-            level: LogLevel::Info,
-            message: "open_tab".into(),
-        }])
-    });
+    registry
+        .register(combo_a, "ext-a", |_payload| {
+            Ok(vec![Action::Log {
+                level: LogLevel::Info,
+                message: "open_tab".into(),
+            }])
+        })
+        .unwrap();
 
     // Extension B registers different bindings
     let combo_b = KeyCombo::parse("ctrl+w").unwrap();
-    registry.register(combo_b, "ext-b", |_payload| {
-        Ok(vec![Action::Log {
-            level: LogLevel::Info,
-            message: "close_tab".into(),
-        }])
-    });
+    registry
+        .register(combo_b, "ext-b", |_payload| {
+            Ok(vec![Action::Log {
+                level: LogLevel::Info,
+                message: "close_tab".into(),
+            }])
+        })
+        .unwrap();
 
     assert_eq!(registry.count(), 2);
 
@@ -582,19 +593,22 @@ fn event_dispatch_respects_tier_ordering() {
     bus.register("test.event", DispatchTier::Lua, 0, None, move |_, _| {
         o1.lock().unwrap().push("lua");
         Ok(vec![])
-    });
+    })
+    .unwrap();
 
     let o2 = order.clone();
     bus.register("test.event", DispatchTier::Native, 0, None, move |_, _| {
         o2.lock().unwrap().push("native");
         Ok(vec![])
-    });
+    })
+    .unwrap();
 
     let o3 = order.clone();
     bus.register("test.event", DispatchTier::Wasm, 0, None, move |_, _| {
         o3.lock().unwrap().push("wasm");
         Ok(vec![])
-    });
+    })
+    .unwrap();
 
     bus.fire("test.event", &frankenterm_dynamic::Value::Null)
         .unwrap();

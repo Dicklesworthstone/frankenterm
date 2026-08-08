@@ -257,8 +257,8 @@ impl KittyImageData {
                 }
                 let decoded = base64_decode(data).or_else(|err| {
                     Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("base64 decode: {err:#}"),
+                        std::io::ErrorKind::InvalidInput,
+                        format!("base64 decode: {err:#}"),
                     ))
                 })?;
                 if decoded.len() > max_bytes {

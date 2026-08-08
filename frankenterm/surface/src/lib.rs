@@ -326,9 +326,10 @@ impl Surface {
         // Preflight the complete batch before changing either the modeled
         // screen or its journal. Reusing a saturated sequence number would
         // make later mutations invisible to a consumer holding that token.
-        let next_seqno = self.seqno.checked_add(changes.len()).unwrap_or_else(|| {
-            panic!("surface change sequence exhausted while applying a batch")
-        });
+        let next_seqno = self
+            .seqno
+            .checked_add(changes.len())
+            .unwrap_or_else(|| panic!("surface change sequence exhausted while applying a batch"));
         let seq = self.seqno.saturating_sub(1).saturating_add(changes.len());
         // Stamp every affected Line with the committed batch frontier. Keeping
         // the old frontier during apply would make `changed_since(old)` miss
@@ -413,11 +414,7 @@ impl Surface {
 
     #[cfg(feature = "use_image")]
     fn add_image(&mut self, image: &Image) {
-        if image.width == 0
-            || image.height == 0
-            || self.width == 0
-            || self.height == 0
-        {
+        if image.width == 0 || image.height == 0 || self.width == 0 || self.height == 0 {
             return;
         }
         let top_left_x = image.top_left.x.into_inner();
@@ -449,14 +446,14 @@ impl Surface {
             let texture_top = if source_y == 0 {
                 top_left_y
             } else {
-                (f64::from(top_left_y)
-                    + yspan * source_y as f64 / image.height as f64) as f32
+                (f64::from(top_left_y) + yspan * source_y as f64 / image.height as f64) as f32
             };
             let texture_bottom = if source_y.saturating_add(1) == image.height {
                 bottom_right_y
             } else {
                 (f64::from(top_left_y)
-                    + yspan * source_y.saturating_add(1) as f64 / image.height as f64) as f32
+                    + yspan * source_y.saturating_add(1) as f64 / image.height as f64)
+                    as f32
             };
             if texture_top >= texture_bottom {
                 continue;
@@ -2456,9 +2453,18 @@ mod test {
             .and_then(|images| images.into_iter().next())
             .expect("the last visible row must retain the final source slice");
         assert_eq!(top_image.top_left(), TextureCoordinate::new_f32(0.0, 0.5));
-        assert_eq!(top_image.bottom_right(), TextureCoordinate::new_f32(1.0, 0.75));
-        assert_eq!(bottom_image.top_left(), TextureCoordinate::new_f32(0.0, 0.75));
-        assert_eq!(bottom_image.bottom_right(), TextureCoordinate::new_f32(1.0, 1.0));
+        assert_eq!(
+            top_image.bottom_right(),
+            TextureCoordinate::new_f32(1.0, 0.75)
+        );
+        assert_eq!(
+            bottom_image.top_left(),
+            TextureCoordinate::new_f32(0.0, 0.75)
+        );
+        assert_eq!(
+            bottom_image.bottom_right(),
+            TextureCoordinate::new_f32(1.0, 1.0)
+        );
     }
 
     #[cfg(feature = "use_image")]

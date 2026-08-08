@@ -124,7 +124,7 @@ impl WaylandConnection {
         Ok(())
     }
 
-    pub(crate) fn next_window_id(&self) -> usize {
+    pub(crate) fn next_window_id(&self) -> anyhow::Result<usize> {
         crate::connection::next_unique_window_id(&self.next_window_id)
     }
 

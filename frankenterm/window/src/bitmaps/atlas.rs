@@ -140,7 +140,10 @@ impl Atlas {
     }
 
     fn publish_version(&self, version: u64) {
-        debug_assert_eq!(self.version.load(Ordering::Relaxed).checked_add(1), Some(version));
+        debug_assert_eq!(
+            self.version.load(Ordering::Relaxed).checked_add(1),
+            Some(version)
+        );
         self.version.store(version, Ordering::Release);
     }
 

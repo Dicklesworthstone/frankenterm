@@ -1647,10 +1647,7 @@ mod tests {
     fn gate_corpus() -> Vec<(&'static str, Vec<u8>)> {
         let mut cases = vec![
             ("pure_ascii_short", b"simple printable ascii run".to_vec()),
-            (
-                "pure_ascii_long",
-                std::iter::repeat_n(b'x', 96).collect(),
-            ),
+            ("pure_ascii_long", std::iter::repeat_n(b'x', 96).collect()),
             ("ascii_control_mix", b"abc\r\ndef\tghi\x08!".to_vec()),
             (
                 "utf8_multibyte",

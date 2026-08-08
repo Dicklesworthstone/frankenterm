@@ -515,8 +515,10 @@ impl WindowsConsoleRenderer {
                 Change::CursorVisibility(_visibility) => {}
                 #[cfg(feature = "use_image")]
                 Change::Image(image) => {
-                    let available_cols = buffer.cols.saturating_sub(buffer.cursor_x.min(buffer.cols));
-                    let available_rows = buffer.rows.saturating_sub(buffer.cursor_y.min(buffer.rows));
+                    let available_cols =
+                        buffer.cols.saturating_sub(buffer.cursor_x.min(buffer.cols));
+                    let available_rows =
+                        buffer.rows.saturating_sub(buffer.cursor_y.min(buffer.rows));
                     let Some(image) = image.clipped_to_cell_bounds(available_cols, available_rows)
                     else {
                         continue;

@@ -176,8 +176,8 @@ impl TerminalState {
         // clipped to the visible row. A scrolling vertical placement retains
         // the final viewport of output cells, while a fixed-cursor placement
         // retains the leading rows that fit below the cursor.
-        let width_in_cells = requested_width_in_cells
-            .min(physical_cols.saturating_sub(cursor_x.min(physical_cols)));
+        let width_in_cells =
+            requested_width_in_cells.min(physical_cols.saturating_sub(cursor_x.min(physical_cols)));
         let available_fixed_rows = remaining_rows_from_cursor(physical_rows, self.cursor.y);
         let height_in_cells = if params.do_not_move_cursor {
             requested_height_in_cells.min(available_fixed_rows)
@@ -225,7 +225,8 @@ impl TerminalState {
                 cell_pixel_height,
                 cell_padding_top as usize,
                 target_pixel_height,
-            )? else {
+            )?
+            else {
                 continue;
             };
             let texture_top = normalized_texture_position(
@@ -263,7 +264,8 @@ impl TerminalState {
                     cell_pixel_width,
                     cell_padding_left as usize,
                     target_pixel_width,
-                )? else {
+                )?
+                else {
                     continue;
                 };
                 let texture_left = normalized_texture_position(
@@ -440,9 +442,9 @@ fn normalized_texture_position(
             "image placement {axis} consumed pixels {consumed_target_pixels} exceed target {total_target_pixels}"
         );
     }
-    let source_end = source_origin.checked_add(draw_pixels).ok_or_else(|| {
-        anyhow::anyhow!("image placement {axis} source endpoint overflowed")
-    })?;
+    let source_end = source_origin
+        .checked_add(draw_pixels)
+        .ok_or_else(|| anyhow::anyhow!("image placement {axis} source endpoint overflowed"))?;
     if source_end > image_pixels {
         anyhow::bail!(
             "image placement {axis} source endpoint {source_end} exceeds image size {image_pixels}"
@@ -458,8 +460,7 @@ fn normalized_texture_position(
         f64::from(source_end)
     } else {
         f64::from(source_origin)
-            + f64::from(draw_pixels)
-                * (consumed_target_pixels as f64 / total_target_pixels as f64)
+            + f64::from(draw_pixels) * (consumed_target_pixels as f64 / total_target_pixels as f64)
     };
     let normalized = (source_position / f64::from(image_pixels)) as f32;
     Ok(normalized.clamp(0.0, 1.0))
@@ -514,15 +515,15 @@ fn image_cell_slice(
     if cell_pixels == 0 || content_pixels == 0 {
         anyhow::bail!("image placement {axis} cell slice has a zero extent");
     }
-    let cell_start = cell_index.checked_mul(cell_pixels).ok_or_else(|| {
-        anyhow::anyhow!("image placement {axis} cell offset overflows")
-    })?;
-    let cell_end = cell_start.checked_add(cell_pixels).ok_or_else(|| {
-        anyhow::anyhow!("image placement {axis} cell endpoint overflows")
-    })?;
-    let content_end = content_offset.checked_add(content_pixels).ok_or_else(|| {
-        anyhow::anyhow!("image placement {axis} content endpoint overflows")
-    })?;
+    let cell_start = cell_index
+        .checked_mul(cell_pixels)
+        .ok_or_else(|| anyhow::anyhow!("image placement {axis} cell offset overflows"))?;
+    let cell_end = cell_start
+        .checked_add(cell_pixels)
+        .ok_or_else(|| anyhow::anyhow!("image placement {axis} cell endpoint overflows"))?;
+    let content_end = content_offset
+        .checked_add(content_pixels)
+        .ok_or_else(|| anyhow::anyhow!("image placement {axis} content endpoint overflows"))?;
     let intersection_start = cell_start.max(content_offset);
     let intersection_end = cell_end.min(content_end);
     if intersection_start >= intersection_end {
@@ -973,5 +974,4 @@ mod tests {
         let err = check_image_dimensions(u32::MAX, u32::MAX).unwrap_err();
         assert!(err.to_string().contains("Ignoring image data"));
     }
-
 }
