@@ -313,8 +313,14 @@ impl PolicyController {
         };
         let current_loss = all_losses[current_idx];
         let improvement = current_loss - best_loss;
+        // Compare the relative improvement instead of multiplying the current
+        // loss by an operator-provided fraction.  The quotient is bounded by
+        // one because `best_loss <= current_loss`; the product could overflow
+        // for an otherwise finite configuration.  A zero-loss tie is also not
+        // an improvement, so retain the current action rather than flapping to
+        // the enum-order winner.
         let hysteresis_applied = best_action != self.current_action
-            && improvement < self.config.hysteresis * current_loss;
+            && (current_loss == 0.0 || improvement / current_loss <= self.config.hysteresis);
 
         let rate_limit_applied = !hysteresis_applied
             && best_action != self.current_action
@@ -684,6 +690,23 @@ mod tests {
             .expect("decision is retained");
         assert!(decision.all_losses.iter().all(|loss| loss.is_finite()));
         assert!(decision.expected_loss.is_finite());
+    }
+
+    #[test]
+    fn extreme_hysteresis_remains_finite_and_suppresses_a_switch() {
+        let mut controller = PolicyController::with_defaults();
+        controller.set_hysteresis(f64::MAX);
+
+        let action = controller.decide([0.0, 0.0, 0.0, 1.0], 1);
+
+        assert_eq!(action, PolicyAction::Hold);
+        let decision = controller
+            .recent_decisions(1)
+            .into_iter()
+            .next()
+            .expect("decision is retained");
+        assert!(decision.hysteresis_applied);
+        assert!(decision.all_losses.iter().all(|loss| loss.is_finite()));
     }
 
     #[test]
