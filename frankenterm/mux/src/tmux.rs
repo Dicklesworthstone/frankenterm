@@ -5,15 +5,12 @@ use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
     DetachClient, ListAllPanes, ListAllWindows, ListCommands, SplitPane, TmuxCommand,
-    TmuxCommandClass, TmuxCommandPreparation, TmuxConditionalCommit,
-    TmuxConditionalCommitIntent, TmuxConditionalCommitLease, TmuxConditionalCommitTarget,
-    TmuxPreparationPrerequisite,
+    TmuxCommandClass, TmuxCommandPreparation, TmuxConditionalCommit, TmuxConditionalCommitIntent,
+    TmuxConditionalCommitLease, TmuxConditionalCommitTarget, TmuxPreparationPrerequisite,
 };
 use crate::tmux_pty::TmuxChildState;
 use crate::window::WindowId;
-use crate::{
-    Mux, MuxWindowBuilder, PaneOperationGuard, SplitCommitReceipt, TopologyRevision,
-};
+use crate::{Mux, MuxWindowBuilder, PaneOperationGuard, SplitCommitReceipt, TopologyRevision};
 use anyhow::Context;
 use async_trait::async_trait;
 use config::configuration;
@@ -653,11 +650,7 @@ impl TmuxPaneOutputLimits {
     }
 
     #[cfg(test)]
-    fn new(
-        bytes_per_pane: usize,
-        items_per_pane: usize,
-        write_quantum_bytes: usize,
-    ) -> Self {
+    fn new(bytes_per_pane: usize, items_per_pane: usize, write_quantum_bytes: usize) -> Self {
         Self {
             bytes_per_pane,
             items_per_pane,
@@ -887,12 +880,7 @@ fn alloc_nonwrapping_atomic_u64(counter: &AtomicU64) -> Option<u64> {
     let mut current = counter.load(Ordering::Acquire);
     loop {
         let next = current.checked_add(1)?;
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(allocated) => return Some(allocated),
             Err(observed) => current = observed,
         }
@@ -992,8 +980,7 @@ fn run_tmux_pane_output_lane(
         if blocked.is_empty() {
             ready_quanta_since_blocked_retry = 0;
         } else {
-            ready_quanta_since_blocked_retry =
-                ready_quanta_since_blocked_retry.saturating_add(1);
+            ready_quanta_since_blocked_retry = ready_quanta_since_blocked_retry.saturating_add(1);
         }
     }
 }
@@ -1078,11 +1065,7 @@ impl TmuxMirrorIndex {
         &mut self,
         remote_window_id: TmuxWindowId,
     ) -> anyhow::Result<Option<TabId>> {
-        let Some(local_tab_id) = self
-            .tab_by_remote_window
-            .get(&remote_window_id)
-            .copied()
-        else {
+        let Some(local_tab_id) = self.tab_by_remote_window.get(&remote_window_id).copied() else {
             anyhow::ensure!(
                 !self
                     .window_by_local_tab
@@ -1128,10 +1111,7 @@ impl TmuxMirrorIndex {
         Ok(Some(local_pane_id))
     }
 
-    pub(crate) fn remote_window_for_local_tab(
-        &self,
-        local_tab_id: TabId,
-    ) -> Option<TmuxWindowId> {
+    pub(crate) fn remote_window_for_local_tab(&self, local_tab_id: TabId) -> Option<TmuxWindowId> {
         self.window_by_local_tab.get(&local_tab_id).copied()
     }
 
@@ -1351,9 +1331,7 @@ impl TmuxNotificationIntentState {
         }
     }
 
-    pub(crate) fn take_ordered_batch(
-        &mut self,
-    ) -> [Option<SequencedTmuxNotificationIntent>; 2] {
+    pub(crate) fn take_ordered_batch(&mut self) -> [Option<SequencedTmuxNotificationIntent>; 2] {
         debug_assert!(self.runnable_scheduled);
         debug_assert!(!self.waiting_for_capacity);
         let mut batch = [
@@ -1406,8 +1384,7 @@ impl TmuxNotificationIntentState {
         }
         let mut superseded = u64::from(!self.restore_if_current(failed));
         if let Some(remaining) = remaining {
-            superseded =
-                superseded.saturating_add(u64::from(!self.restore_if_current(remaining)));
+            superseded = superseded.saturating_add(u64::from(!self.restore_if_current(remaining)));
         }
         self.runnable_scheduled = false;
         self.waiting_for_capacity =
@@ -1450,8 +1427,7 @@ impl TmuxNotificationIntentState {
     pub(crate) fn cancel_scheduled_runnable(&mut self) -> bool {
         self.runnable_scheduled = false;
         !self.closed
-            && (self.pending_pane_focus.is_some()
-                || self.pending_window_invalidation.is_some())
+            && (self.pending_pane_focus.is_some() || self.pending_window_invalidation.is_some())
     }
 
     pub(crate) fn close(&mut self) {
@@ -1611,8 +1587,7 @@ pub(crate) struct TmuxCmdQueue {
     retry_deferred_durable: VecDeque<DeferredTmuxCommand>,
     retry_deferred_intent_head: Option<TmuxConditionalCommitTarget>,
     retry_deferred_intent_tail: Option<TmuxConditionalCommitTarget>,
-    retry_deferred_intents:
-        HashMap<TmuxConditionalCommitTarget, DeferredTmuxCommand>,
+    retry_deferred_intents: HashMap<TmuxConditionalCommitTarget, DeferredTmuxCommand>,
     ready_retry_deferred_intents: VecDeque<TmuxConditionalCommitTarget>,
     in_flight: Option<InFlightTmuxCommand>,
     preparing: Option<PreparingTmuxCommand>,
@@ -1627,8 +1602,7 @@ pub(crate) struct TmuxCmdQueue {
     rejected_commands: u64,
     merged_commands: u64,
     next_conditional_commit_generation: u64,
-    latest_conditional_commits:
-        HashMap<TmuxConditionalCommitTarget, TmuxConditionalCommitLease>,
+    latest_conditional_commits: HashMap<TmuxConditionalCommitTarget, TmuxConditionalCommitLease>,
     queued_conditional_commits:
         HashMap<TmuxConditionalCommitTarget, VecDeque<TmuxConditionalCommitLease>>,
     uncertain_remote_pane_sizes: HashSet<TmuxPaneId>,
@@ -1665,8 +1639,7 @@ pub(crate) struct TmuxCmdQueueTeardown {
     retry_deferred_intents: HashMap<TmuxConditionalCommitTarget, DeferredTmuxCommand>,
     in_flight: Option<InFlightTmuxCommand>,
     preparing: Option<PreparingTmuxCommand>,
-    latest_conditional_commits:
-        HashMap<TmuxConditionalCommitTarget, TmuxConditionalCommitLease>,
+    latest_conditional_commits: HashMap<TmuxConditionalCommitTarget, TmuxConditionalCommitLease>,
     queued_conditional_commits:
         HashMap<TmuxConditionalCommitTarget, VecDeque<TmuxConditionalCommitLease>>,
     uncertain_remote_pane_sizes: HashSet<TmuxPaneId>,
@@ -1841,14 +1814,10 @@ pub(crate) enum TmuxScheduleError {
 impl fmt::Display for TmuxScheduleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SchedulerUnavailable => {
-                f.write_str("the main-thread scheduler is unavailable")
-            }
+            Self::SchedulerUnavailable => f.write_str("the main-thread scheduler is unavailable"),
             Self::MuxUnavailable => f.write_str("the active mux is unavailable"),
             Self::DomainUnavailable => f.write_str("the tmux domain is not registered"),
-            Self::WrongDomainType => {
-                f.write_str("the registered domain is not a tmux domain")
-            }
+            Self::WrongDomainType => f.write_str("the registered domain is not a tmux domain"),
             Self::ReplacedDomain => {
                 f.write_str("the registered tmux domain is a replacement instance")
             }
@@ -1929,17 +1898,13 @@ impl TmuxCmdQueue {
                     target = deferred.retry_intent_next;
                     if deferred.retry_prerequisite == prerequisite && !deferred.retry_ready {
                         deferred.retry_ready = true;
-                        self.ready_retry_deferred_intents
-                            .push_back(current_target);
+                        self.ready_retry_deferred_intents.push_back(current_target);
                     }
                 }
             }
             TmuxPreparationPrerequisite::Pane(pane_id) => {
                 let target = TmuxConditionalCommitTarget::PaneSize(pane_id);
-                if let Some(deferred) = self
-                    .retry_deferred_intents
-                    .get_mut(&target)
-                {
+                if let Some(deferred) = self.retry_deferred_intents.get_mut(&target) {
                     if deferred.retry_prerequisite == prerequisite && !deferred.retry_ready {
                         deferred.retry_ready = true;
                         self.ready_retry_deferred_intents.push_back(target);
@@ -1949,10 +1914,7 @@ impl TmuxCmdQueue {
         }
     }
 
-    fn publish_conditional_commit_lease(
-        &mut self,
-        lease: Option<TmuxConditionalCommitLease>,
-    ) {
+    fn publish_conditional_commit_lease(&mut self, lease: Option<TmuxConditionalCommitLease>) {
         if let Some(lease) = lease {
             self.latest_conditional_commits
                 .insert(lease.intent.target(), lease);
@@ -1996,19 +1958,11 @@ impl TmuxCmdQueue {
         lease
     }
 
-    pub(crate) fn conditional_commit_is_current(
-        &self,
-        lease: &TmuxConditionalCommitLease,
-    ) -> bool {
-        self.latest_conditional_commits
-            .get(&lease.intent.target())
-            == Some(lease)
+    pub(crate) fn conditional_commit_is_current(&self, lease: &TmuxConditionalCommitLease) -> bool {
+        self.latest_conditional_commits.get(&lease.intent.target()) == Some(lease)
     }
 
-    fn retire_conditional_commit_if_current(
-        &mut self,
-        lease: &TmuxConditionalCommitLease,
-    ) -> bool {
+    fn retire_conditional_commit_if_current(&mut self, lease: &TmuxConditionalCommitLease) -> bool {
         if !self.conditional_commit_is_current(lease) {
             return false;
         }
@@ -2020,10 +1974,7 @@ impl TmuxCmdQueue {
     /// Cached pane dimensions are suppression authority only while no resize
     /// for this remote pane may have reached tmux without an exact matching
     /// success being committed locally.
-    pub(crate) fn pane_size_suppression_is_trustworthy(
-        &self,
-        pane_id: TmuxPaneId,
-    ) -> bool {
+    pub(crate) fn pane_size_suppression_is_trustworthy(&self, pane_id: TmuxPaneId) -> bool {
         !self.uncertain_remote_pane_sizes.contains(&pane_id)
     }
 
@@ -2093,8 +2044,8 @@ impl TmuxCmdQueue {
         }
 
         let class = cmd.mailbox_class();
-        let conditional_commit = self
-            .allocate_conditional_commit_lease(cmd.conditional_commit_intent(), class)?;
+        let conditional_commit =
+            self.allocate_conditional_commit_lease(cmd.conditional_commit_intent(), class)?;
         let incoming_payload_bytes = cmd.mailbox_payload_bytes();
         let Some(next_payload_bytes) = self.payload_bytes.checked_add(incoming_payload_bytes)
         else {
@@ -2240,10 +2191,7 @@ impl TmuxCmdQueue {
             );
         };
         if next_payload_bytes > CMD_QUEUE_MAX_PAYLOAD_BYTES {
-            return self.reject_full(
-                TmuxCommandClass::TerminalControl,
-                "detach payload byte cap",
-            );
+            return self.reject_full(TmuxCommandClass::TerminalControl, "detach payload byte cap");
         }
         if !self.can_admit_count(TmuxCommandClass::TerminalControl, 1) {
             return self.reject_full(
@@ -2252,9 +2200,8 @@ impl TmuxCmdQueue {
             );
         }
         self.durable_entries.push_front(command);
-        self.retained_by_class[TmuxCommandClass::TerminalControl.index()] = self.retained_by_class
-            [TmuxCommandClass::TerminalControl.index()]
-        .saturating_add(1);
+        self.retained_by_class[TmuxCommandClass::TerminalControl.index()] =
+            self.retained_by_class[TmuxCommandClass::TerminalControl.index()].saturating_add(1);
         self.payload_bytes = next_payload_bytes;
         self.terminal_barrier = true;
         metrics::counter!(
@@ -2439,21 +2386,13 @@ impl TmuxCmdQueue {
             durable_entries: std::mem::take(&mut self.durable_entries),
             intent_entries: std::mem::take(&mut self.intent_entries),
             retry_deferred_durable: std::mem::take(&mut self.retry_deferred_durable),
-            ready_retry_deferred_intents: std::mem::take(
-                &mut self.ready_retry_deferred_intents,
-            ),
+            ready_retry_deferred_intents: std::mem::take(&mut self.ready_retry_deferred_intents),
             retry_deferred_intents: std::mem::take(&mut self.retry_deferred_intents),
             in_flight: self.in_flight.take(),
             preparing: self.preparing.take(),
-            latest_conditional_commits: std::mem::take(
-                &mut self.latest_conditional_commits,
-            ),
-            queued_conditional_commits: std::mem::take(
-                &mut self.queued_conditional_commits,
-            ),
-            uncertain_remote_pane_sizes: std::mem::take(
-                &mut self.uncertain_remote_pane_sizes,
-            ),
+            latest_conditional_commits: std::mem::take(&mut self.latest_conditional_commits),
+            queued_conditional_commits: std::mem::take(&mut self.queued_conditional_commits),
+            uncertain_remote_pane_sizes: std::mem::take(&mut self.uncertain_remote_pane_sizes),
         }
     }
 
@@ -2529,9 +2468,8 @@ impl TmuxCmdQueue {
                 self.fresh_intents_since_retry_deferred_intent = 0;
             }
             if !self.retry_deferred_durable.is_empty() {
-                self.intents_since_retry_deferred_durable = self
-                    .intents_since_retry_deferred_durable
-                    .saturating_add(1);
+                self.intents_since_retry_deferred_durable =
+                    self.intents_since_retry_deferred_durable.saturating_add(1);
             }
             command
         } else {
@@ -2595,10 +2533,7 @@ impl TmuxCmdQueue {
         if preparing.superseded {
             return false;
         }
-        match (
-            preparing.conditional_commit.as_ref(),
-            conditional_commit,
-        ) {
+        match (preparing.conditional_commit.as_ref(), conditional_commit) {
             (None, None) => true,
             (Some(lease), Some(commit)) => {
                 commit.io_generation() == generation
@@ -2748,8 +2683,7 @@ impl TmuxCmdQueue {
             .is_some_and(|deferred| self.retry_deferred_is_ready(deferred));
         let take_durable = durable_ready
             && (!intent_ready
-                || self.intents_since_retry_deferred_durable
-                    >= CMD_QUEUE_DURABLE_SERVICE_QUANTUM);
+                || self.intents_since_retry_deferred_durable >= CMD_QUEUE_DURABLE_SERVICE_QUANTUM);
         if !intent_ready && !take_durable {
             return None;
         }
@@ -2768,9 +2702,8 @@ impl TmuxCmdQueue {
     ) -> Option<Result<Box<dyn TmuxCommand>, Box<dyn TmuxCommand>>> {
         let target = self.ready_retry_deferred_intents.pop_front()?;
         if !self.retry_deferred_durable.is_empty() {
-            self.intents_since_retry_deferred_durable = self
-                .intents_since_retry_deferred_durable
-                .saturating_add(1);
+            self.intents_since_retry_deferred_durable =
+                self.intents_since_retry_deferred_durable.saturating_add(1);
         }
         self.fresh_intents_since_retry_deferred_intent = 0;
         self.durable_since_intent = 0;
@@ -2821,9 +2754,7 @@ impl TmuxCmdQueue {
 
     fn release_prepared(&mut self) {
         if let Some(preparing) = self.preparing.take() {
-            self.payload_bytes = self
-                .payload_bytes
-                .saturating_sub(preparing.payload_bytes);
+            self.payload_bytes = self.payload_bytes.saturating_sub(preparing.payload_bytes);
             self.retained_by_class[preparing.class.index()] =
                 self.retained_by_class[preparing.class.index()].saturating_sub(1);
         }
@@ -2840,10 +2771,9 @@ impl TmuxCmdQueue {
             false
         } else {
             debug_assert_eq!(
-                self.preparing.as_ref().map(|preparing| (
-                    preparing.class,
-                    preparing.payload_bytes
-                )),
+                self.preparing
+                    .as_ref()
+                    .map(|preparing| (preparing.class, preparing.payload_bytes)),
                 Some((cmd.mailbox_class(), cmd.mailbox_payload_bytes()))
             );
             debug_assert_eq!(
@@ -2857,12 +2787,9 @@ impl TmuxCmdQueue {
             debug_assert!(conditional_commit
                 .as_ref()
                 .is_none_or(|commit| commit.io_generation() == generation));
-            if let Some(TmuxConditionalCommit::PaneSize { lease, .. }) =
-                conditional_commit.as_ref()
+            if let Some(TmuxConditionalCommit::PaneSize { lease, .. }) = conditional_commit.as_ref()
             {
-                if let TmuxConditionalCommitIntent::PaneSize { pane_id, .. } =
-                    &lease.intent
-                {
+                if let TmuxConditionalCommitIntent::PaneSize { pane_id, .. } = &lease.intent {
                     // From this linearization point onward the command may
                     // reach tmux. Cached dimensions cannot suppress another
                     // resize until this exact current lease succeeds and its
@@ -3027,8 +2954,12 @@ enum TmuxIoControl {
     InitialGuardReady,
     #[cfg(test)]
     TestInitialGuardDeadline(Duration),
-    Response { generation: u64 },
-    Terminal { clean_exit: bool },
+    Response {
+        generation: u64,
+    },
+    Terminal {
+        clean_exit: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -3113,10 +3044,7 @@ struct TmuxIoLane {
 }
 
 impl TmuxIoLane {
-    fn new(
-        domain_id: DomainId,
-        owner: Weak<TmuxDomainState>,
-    ) -> std::io::Result<Self> {
+    fn new(domain_id: DomainId, owner: Weak<TmuxDomainState>) -> std::io::Result<Self> {
         let (control_tx, control_rx) = bounded(TMUX_IO_CONTROL_CAPACITY);
         let thread_name = format!("tmux-io-supervisor-{domain_id}");
         let failure_owner = owner.clone();
@@ -3282,10 +3210,7 @@ fn execute_tmux_io_write(
     let Some(command) = job.command.as_ref() else {
         return TmuxIoWriteOutcome::Io {
             error_kind: std::io::ErrorKind::InvalidInput,
-            message: format!(
-                "tmux {} I/O job had no command payload",
-                job.kind.label()
-            ),
+            message: format!("tmux {} I/O job had no command payload", job.kind.label()),
         };
     };
 
@@ -3346,10 +3271,7 @@ fn recv_tmux_io_progress(
     }
 }
 
-fn run_tmux_io_supervisor(
-    owner: Weak<TmuxDomainState>,
-    control: Receiver<TmuxIoControl>,
-) {
+fn run_tmux_io_supervisor(owner: Weak<TmuxDomainState>, control: Receiver<TmuxIoControl>) {
     let Some(initial_owner) = owner.upgrade() else {
         return;
     };
@@ -3361,10 +3283,8 @@ fn run_tmux_io_supervisor(
     let mut writer: Option<TmuxIoWriter> = None;
     loop {
         let message = if awaiting_initial_guard {
-            let Some(remaining) = remaining_deadline(
-                initial_guard_started.get(),
-                initial_guard_budget.get(),
-            )
+            let Some(remaining) =
+                remaining_deadline(initial_guard_started.get(), initial_guard_budget.get())
             else {
                 let Some(domain) = owner.upgrade() else {
                     return;
@@ -3425,11 +3345,7 @@ fn run_tmux_io_supervisor(
                     continue;
                 }
                 if remaining_deadline(start.admitted_at, start.deadlines.start).is_none() {
-                    domain.fail_tmux_io_operation(
-                        start.kind,
-                        start.generation,
-                        "start_timeout",
-                    );
+                    domain.fail_tmux_io_operation(start.kind, start.generation, "start_timeout");
                     return;
                 };
                 if writer.is_none() {
@@ -3452,11 +3368,7 @@ fn run_tmux_io_supervisor(
                 let Some(remaining_start) =
                     remaining_deadline(start.admitted_at, start.deadlines.start)
                 else {
-                    domain.fail_tmux_io_operation(
-                        start.kind,
-                        start.generation,
-                        "start_timeout",
-                    );
+                    domain.fail_tmux_io_operation(start.kind, start.generation, "start_timeout");
                     return;
                 };
                 let writer_ref = writer.as_ref().expect("tmux writer initialized");
@@ -3475,11 +3387,7 @@ fn run_tmux_io_supervisor(
                 }
                 let Some(started) = recv_tmux_io_progress(&writer_ref.progress, remaining_start)
                 else {
-                    domain.fail_tmux_io_operation(
-                        start.kind,
-                        start.generation,
-                        "start_timeout",
-                    );
+                    domain.fail_tmux_io_operation(start.kind, start.generation, "start_timeout");
                     return;
                 };
                 if !matches!(
@@ -3499,11 +3407,7 @@ fn run_tmux_io_supervisor(
                 let Some(finished) =
                     recv_tmux_io_progress(&writer_ref.progress, start.deadlines.write)
                 else {
-                    domain.fail_tmux_io_operation(
-                        start.kind,
-                        start.generation,
-                        "write_timeout",
-                    );
+                    domain.fail_tmux_io_operation(start.kind, start.generation, "write_timeout");
                     return;
                 };
                 let TmuxIoWriteProgress::Finished {
@@ -3583,8 +3487,7 @@ fn run_tmux_io_supervisor(
                     match control.recv_timeout(remaining) {
                         Ok(TmuxIoControl::Response {
                             generation: response_generation,
-                        }) if response_generation == generation && !guarded_response_received =>
-                        {
+                        }) if response_generation == generation && !guarded_response_received => {
                             metrics::histogram!(
                                 "mux.tmux.io.response_seconds",
                                 "operation" => kind.label(),
@@ -3598,10 +3501,8 @@ fn run_tmux_io_supervisor(
                         Ok(TmuxIoControl::Terminal { clean_exit: true })
                             if kind == TmuxIoOperationKind::Detach =>
                         {
-                            metrics::histogram!(
-                                "mux.tmux.io.clean_exit_seconds",
-                            )
-                            .record(response_started.elapsed().as_secs_f64());
+                            metrics::histogram!("mux.tmux.io.clean_exit_seconds",)
+                                .record(response_started.elapsed().as_secs_f64());
                             return;
                         }
                         Ok(TmuxIoControl::Terminal { .. }) => return,
@@ -3613,11 +3514,7 @@ fn run_tmux_io_supervisor(
                             .increment(1);
                         }
                         Ok(TmuxIoControl::Start(_)) => {
-                            domain.fail_tmux_io_operation(
-                                kind,
-                                generation,
-                                "overlapping_start",
-                            );
+                            domain.fail_tmux_io_operation(kind, generation, "overlapping_start");
                             return;
                         }
                         Ok(TmuxIoControl::InitialGuardReady) => {
@@ -4015,9 +3912,11 @@ impl TmuxDomainState {
                 return TmuxPaneDrainDisposition::Complete;
             };
             let remaining_quantum = limits.write_quantum_bytes - drained;
-            let end = front
-                .len()
-                .min(output_ingress.front_offset.saturating_add(remaining_quantum));
+            let end = front.len().min(
+                output_ingress
+                    .front_offset
+                    .saturating_add(remaining_quantum),
+            );
             let write_result = output_write.write(&front[output_ingress.front_offset..end]);
             writes += 1;
             match write_result {
@@ -4194,11 +4093,7 @@ impl TmuxDomainState {
             })
     }
 
-    fn install_io_operation(
-        &self,
-        kind: TmuxIoOperationKind,
-        generation: u64,
-    ) -> bool {
+    fn install_io_operation(&self, kind: TmuxIoOperationKind, generation: u64) -> bool {
         let mut lifecycle = self.lifecycle.lock();
         if lifecycle.terminal || lifecycle.io_operation.is_some() {
             return false;
@@ -4211,11 +4106,7 @@ impl TmuxDomainState {
         true
     }
 
-    fn claim_io_response(
-        &self,
-        kind: TmuxIoOperationKind,
-        generation: u64,
-    ) -> bool {
+    fn claim_io_response(&self, kind: TmuxIoOperationKind, generation: u64) -> bool {
         let mut lifecycle = self.lifecycle.lock();
         let Some(operation) = lifecycle.io_operation else {
             return false;
@@ -4300,9 +4191,8 @@ impl TmuxDomainState {
     }
 
     fn fail_initial_guard(&self, reason: &'static str) {
-        if !self.try_claim_failure_terminal(|_lifecycle, state| {
-            state == State::WaitForInitialGuard
-        }) {
+        if !self.try_claim_failure_terminal(|_lifecycle, state| state == State::WaitForInitialGuard)
+        {
             return;
         }
         metrics::counter!(
@@ -4605,11 +4495,7 @@ impl TmuxDomainState {
         }
     }
 
-    fn finalize_launcher_tmux_binding(
-        &self,
-        mux: &Arc<Mux>,
-        should_invalidate_launcher: bool,
-    ) {
+    fn finalize_launcher_tmux_binding(&self, mux: &Arc<Mux>, should_invalidate_launcher: bool) {
         let Some(pane) = mux.get_pane(self.pane_id) else {
             log::error!(
                 "tmux terminal cleanup cannot find launcher pane {} for domain {}",
@@ -5095,12 +4981,7 @@ impl TmuxDomainState {
                 barrier_lease.completed = true;
                 return;
             }
-            expected_inner.complete_command_response(
-                cmd,
-                &resp,
-                generation,
-                conditional_commit,
-            );
+            expected_inner.complete_command_response(cmd, &resp, generation, conditional_commit);
             barrier_lease.completed = true;
         })
         .detach();
@@ -5264,14 +5145,11 @@ impl TmuxDomainState {
                         }
                         pane.pane_width = u64::from(cols);
                         pane.pane_height = u64::from(rows);
-                        let retired =
-                            cmd_queue.retire_conditional_commit_if_current(&lease);
+                        let retired = cmd_queue.retire_conditional_commit_if_current(&lease);
                         if !retired {
                             return false;
                         }
-                        cmd_queue
-                            .uncertain_remote_pane_sizes
-                            .remove(&pane_id);
+                        cmd_queue.uncertain_remote_pane_sizes.remove(&pane_id);
                         true
                     }
                 }
@@ -5301,11 +5179,12 @@ impl TmuxDomainState {
         let Some(_active_operation) = self.begin_active_operation() else {
             return false;
         };
-        let conditional_result_is_stale = conditional_commit
-            .as_ref()
-            .is_some_and(|conditional_commit| {
-                !self.conditional_result_is_current(generation, conditional_commit)
-            });
+        let conditional_result_is_stale =
+            conditional_commit
+                .as_ref()
+                .is_some_and(|conditional_commit| {
+                    !self.conditional_result_is_current(generation, conditional_commit)
+                });
         if conditional_result_is_stale && !response.error {
             if let Some(conditional_commit) = conditional_commit.as_ref() {
                 if conditional_commit.io_generation() == generation {
@@ -5561,11 +5440,8 @@ impl TmuxDomainState {
             #[cfg(test)]
             self.test_command_preparations
                 .fetch_add(1, Ordering::Relaxed);
-            let preparation = prepared_command.prepare(
-                self.domain_id,
-                generation,
-                conditional_commit_lease,
-            );
+            let preparation =
+                prepared_command.prepare(self.domain_id, generation, conditional_commit_lease);
             match preparation {
                 TmuxCommandPreparation::Ready {
                     command,
@@ -5590,9 +5466,7 @@ impl TmuxDomainState {
                             "reason" => "stale_before_install",
                         )
                         .increment(1);
-                        TmuxDomainState::wake_notification_intent_capacity(
-                            self.domain_id,
-                        );
+                        TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
                         continue;
                     }
                     if !self.transition_state(State::Sending, State::WaitingForResponse) {
@@ -5600,9 +5474,7 @@ impl TmuxDomainState {
                         drop(cmd_queue);
                         drop(prepared_command);
                         drop(command);
-                        TmuxDomainState::wake_notification_intent_capacity(
-                            self.domain_id,
-                        );
+                        TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
                         return Ok(());
                     }
                     if !cmd_queue.install_in_flight(
@@ -5634,15 +5506,12 @@ impl TmuxDomainState {
                 }
                 TmuxCommandPreparation::Retryable { prerequisite } => {
                     let mut cmd_queue = self.cmd_queue.lock();
-                    let retry_is_current = retry_lease.as_ref().is_none_or(|lease| {
-                        cmd_queue.conditional_commit_is_current(lease)
-                    });
+                    let retry_is_current = retry_lease
+                        .as_ref()
+                        .is_none_or(|lease| cmd_queue.conditional_commit_is_current(lease));
                     if retry_is_current {
                         anyhow::ensure!(
-                            cmd_queue.restore_prepared_for_retry(
-                                prepared_command,
-                                prerequisite,
-                            ),
+                            cmd_queue.restore_prepared_for_retry(prepared_command, prerequisite,),
                             "tmux retryable preparation lost its mailbox reservation"
                         );
                     } else {
@@ -5664,9 +5533,7 @@ impl TmuxDomainState {
             _operation: active_operation,
         };
         self.start_io_operation(start).with_context(|| {
-            format!(
-                "admitting tmux command generation {generation} to the bounded I/O lane"
-            )
+            format!("admitting tmux command generation {generation} to the bounded I/O lane")
         })?;
         metrics::counter!(
             "mux.tmux.io.admitted",
@@ -5823,10 +5690,7 @@ impl TmuxDomainState {
             self.domain_id
         );
         let pane_id = target.pane_id();
-        let tmux_pane_id = self
-            .mirror_index
-            .lock()
-            .remote_pane_for_local(pane_id);
+        let tmux_pane_id = self.mirror_index.lock().remote_pane_for_local(pane_id);
 
         if let Some(id) = tmux_pane_id {
             let enqueued = {
@@ -5961,7 +5825,6 @@ impl TmuxDomain {
              materialize asynchronously from tmux events rather than returning an immediate local handle"
         )
     }
-
 }
 
 #[async_trait(?Send)]
@@ -6033,9 +5896,7 @@ impl Domain for TmuxDomain {
         _source: &PaneOperationGuard,
         _split_request: SplitRequest,
     ) -> anyhow::Result<SplitCommitReceipt> {
-        anyhow::bail!(
-            "moving an existing pane into a tmux control-mode split is unsupported"
-        )
+        anyhow::bail!("moving an existing pane into a tmux control-mode split is unsupported")
     }
 
     async fn spawn_pane(
@@ -6142,9 +6003,7 @@ mod tests {
     use crate::pane::{CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, WithPaneLines};
     use crate::renderable::{RenderableDimensions, StableCursorPosition};
     use crate::tab::SplitDirection;
-    use crate::tmux_commands::{
-        Resize, SendKeys, SplitPane, TmuxCommand, TmuxCommandClass,
-    };
+    use crate::tmux_commands::{Resize, SendKeys, SplitPane, TmuxCommand, TmuxCommandClass};
     use frankenterm_term::color::ColorPalette;
     use frankenterm_term::{KeyCode, KeyModifiers};
     use parking_lot::{MappedMutexGuard, MutexGuard};
@@ -6290,10 +6149,7 @@ mod tests {
             "test_late_deadline",
         );
 
-        assert_eq!(
-            *tmux_domain.inner.state.lock(),
-            State::ProcessingResponse
-        );
+        assert_eq!(*tmux_domain.inner.state.lock(), State::ProcessingResponse);
         let lifecycle = tmux_domain.inner.lifecycle.lock();
         assert!(!lifecycle.terminal);
         assert!(lifecycle.io_operation.is_none());
@@ -6348,11 +6204,7 @@ mod tests {
             .checked_add(Duration::from_secs(5))
             .expect("test deadline should fit Instant");
         while !predicate() {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for {}",
-                label
-            );
+            assert!(Instant::now() < deadline, "timed out waiting for {}", label);
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -6510,11 +6362,7 @@ mod tests {
             }
         }
 
-        fn process_result(
-            &self,
-            _domain_id: DomainId,
-            _result: &Guarded,
-        ) -> anyhow::Result<()> {
+        fn process_result(&self, _domain_id: DomainId, _result: &Guarded) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -6528,11 +6376,7 @@ mod tests {
             format!("test-{}\n", self.sequence)
         }
 
-        fn process_result(
-            &self,
-            _domain_id: DomainId,
-            _result: &Guarded,
-        ) -> anyhow::Result<()> {
+        fn process_result(&self, _domain_id: DomainId, _result: &Guarded) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -6557,11 +6401,7 @@ mod tests {
             }
         }
 
-        fn process_result(
-            &self,
-            _domain_id: DomainId,
-            _result: &Guarded,
-        ) -> anyhow::Result<()> {
+        fn process_result(&self, _domain_id: DomainId, _result: &Guarded) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -6584,11 +6424,7 @@ mod tests {
             TmuxCommandPreparation::Discarded
         }
 
-        fn process_result(
-            &self,
-            _domain_id: DomainId,
-            _result: &Guarded,
-        ) -> anyhow::Result<()> {
+        fn process_result(&self, _domain_id: DomainId, _result: &Guarded) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -6647,11 +6483,7 @@ mod tests {
             "terminalized-during-preparation\n".to_string()
         }
 
-        fn process_result(
-            &self,
-            _domain_id: DomainId,
-            _result: &Guarded,
-        ) -> anyhow::Result<()> {
+        fn process_result(&self, _domain_id: DomainId, _result: &Guarded) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -6946,8 +6778,7 @@ mod tests {
     #[test]
     fn tmux_backlog_item_cap_records_a_gap_without_retaining_a_suffix() {
         let mut backlog = TmuxBacklog::default();
-        let limits =
-            TmuxBacklogLimits::with_item_expiry(32, 128, 8, 2, Duration::MAX);
+        let limits = TmuxBacklogLimits::with_item_expiry(32, 128, 8, 2, Duration::MAX);
         backlog.append_owned_with_limits(1, b"A".to_vec(), limits);
         backlog.append_owned_with_limits(1, b"B".to_vec(), limits);
         backlog.append_owned_with_limits(2, b"C".to_vec(), limits);
@@ -6968,8 +6799,7 @@ mod tests {
     #[test]
     fn tmux_backlog_expiry_promotes_to_global_authoritative_recovery() {
         let mut backlog = TmuxBacklog::default();
-        let limits =
-            TmuxBacklogLimits::with_item_expiry(32, 128, 8, 8, Duration::from_millis(10));
+        let limits = TmuxBacklogLimits::with_item_expiry(32, 128, 8, 8, Duration::from_millis(10));
         let started = Instant::now();
         backlog.append_owned_with_limits_at(1, b"old".to_vec(), limits, started);
         backlog.append_owned_with_limits_at(
@@ -7023,10 +6853,7 @@ mod tests {
             .push_back(b"C".to_vec(), limits)
             .expect("queue post-publication byte");
         ingress
-            .prepend(
-                VecDeque::from([b"A".to_vec(), b"B".to_vec()]),
-                limits,
-            )
+            .prepend(VecDeque::from([b"A".to_vec(), b"B".to_vec()]), limits)
             .expect("prepend complete pre-publication stream");
         let ordered = ingress
             .chunks
@@ -7155,10 +6982,7 @@ mod tests {
         wait_until("ordered tmux detach clean exit", || {
             *tmux_domain.inner.state.lock() == State::Exit
         });
-        assert_eq!(
-            launcher.recorded_writes(),
-            b"count\ndetach\n".to_vec()
-        );
+        assert_eq!(launcher.recorded_writes(), b"count\ndetach\n".to_vec());
     }
 
     #[test]
@@ -7618,9 +7442,9 @@ mod tests {
         });
         assert_eq!(launcher.recorded_writes(), b"list-commands\n".to_vec());
 
-        tmux_domain
-            .inner
-            .advance(Box::new(vec![Event::Guarded(successful_guarded_response())]));
+        tmux_domain.inner.advance(Box::new(vec![
+            Event::Guarded(successful_guarded_response()),
+        ]));
         assert_eq!(
             *tmux_domain.inner.state.lock(),
             State::Exit,
@@ -7812,12 +7636,7 @@ mod tests {
         ),
     ) {
         let (command, response, generation, conditional_commit) = completed;
-        inner.complete_command_response(
-            command,
-            &response,
-            generation,
-            conditional_commit,
-        );
+        inner.complete_command_response(command, &response, generation, conditional_commit);
     }
 
     #[test]
@@ -8257,9 +8076,7 @@ mod tests {
         let newer = state
             .observe_topology_event(
                 TopologyRevision::new(2),
-                TmuxTopologyBarrierEvent::Intent(
-                    TmuxNotificationIntent::WindowInvalidated(20),
-                ),
+                TmuxTopologyBarrierEvent::Intent(TmuxNotificationIntent::WindowInvalidated(20)),
             )
             .expect("buffer newer revision");
         assert!(!newer.schedule);
@@ -8314,10 +8131,7 @@ mod tests {
         );
 
         let advanced = state
-            .observe_topology_event(
-                TopologyRevision::new(5),
-                TmuxTopologyBarrierEvent::Barrier,
-            )
+            .observe_topology_event(TopologyRevision::new(5), TmuxTopologyBarrierEvent::Barrier)
             .expect("irrelevant revision closes the gap");
         assert!(advanced.schedule);
         assert_eq!(
@@ -8445,7 +8259,10 @@ mod tests {
         assert!(index.register_window(22, 203).is_err());
         assert!(index.register_window(23, 202).is_err());
 
-        assert_eq!(index.unregister_pane(101).expect("unregister pane"), Some(11));
+        assert_eq!(
+            index.unregister_pane(101).expect("unregister pane"),
+            Some(11)
+        );
         assert_eq!(
             index.unregister_window(202).expect("unregister window"),
             Some(22)
@@ -8785,10 +8602,7 @@ mod tests {
             let command = queue
                 .take_next_for_preparation()
                 .expect("high-water intent enters preparation");
-            assert!(queue.restore_prepared_for_retry(
-                command,
-                TmuxPreparationPrerequisite::Attach,
-            ));
+            assert!(queue.restore_prepared_for_retry(command, TmuxPreparationPrerequisite::Attach,));
         }
         queue.advance_preparation_prerequisite(TmuxPreparationPrerequisite::Attach);
         queue.uncertain_remote_pane_sizes.extend(1..=128);
@@ -8859,8 +8673,7 @@ mod tests {
             "bulk input must not consume required-control progress authority",
         );
 
-        let required_count =
-            CMD_QUEUE_CONTROL_RESERVED_SLOTS - CMD_QUEUE_TERMINAL_RESERVED_SLOTS;
+        let required_count = CMD_QUEUE_CONTROL_RESERVED_SLOTS - CMD_QUEUE_TERMINAL_RESERVED_SLOTS;
         let required_batch: Vec<Box<dyn TmuxCommand>> = (0..required_count)
             .map(|sequence| {
                 Box::new(ClassedTestCommand {
@@ -8939,10 +8752,10 @@ mod tests {
             "one latest-intent command must run after the bounded durable quantum",
         );
         let next_lossless = complete_next_mailbox_command(&mut queue);
-        assert_eq!(next_lossless.get_command(0), format!(
-            "test-{}\n",
-            CMD_QUEUE_DURABLE_SERVICE_QUANTUM
-        ));
+        assert_eq!(
+            next_lossless.get_command(0),
+            format!("test-{}\n", CMD_QUEUE_DURABLE_SERVICE_QUANTUM)
+        );
     }
 
     #[test]
@@ -8971,10 +8784,7 @@ mod tests {
             retryable.prepare(0, 1, None),
             TmuxCommandPreparation::Retryable { .. }
         ));
-        assert!(queue.restore_prepared_for_retry(
-            retryable,
-            TmuxPreparationPrerequisite::Attach,
-        ));
+        assert!(queue.restore_prepared_for_retry(retryable, TmuxPreparationPrerequisite::Attach,));
 
         let intent = queue
             .take_next_for_preparation_with_policy(false)
@@ -8983,9 +8793,7 @@ mod tests {
         queue.release_prepared();
         drop(intent);
         assert!(
-            queue
-                .take_next_for_preparation_with_policy(false)
-                .is_none(),
+            queue.take_next_for_preparation_with_policy(false).is_none(),
             "later durable work must not overtake the parked FIFO head",
         );
         assert!(
@@ -9024,10 +8832,7 @@ mod tests {
             head.prepare(0, 1, None),
             TmuxCommandPreparation::Retryable { .. }
         ));
-        assert!(queue.restore_prepared_for_retry(
-            head,
-            TmuxPreparationPrerequisite::Attach,
-        ));
+        assert!(queue.restore_prepared_for_retry(head, TmuxPreparationPrerequisite::Attach,));
         queue.advance_preparation_prerequisite(TmuxPreparationPrerequisite::Attach);
 
         for sequence in 0..CMD_QUEUE_RETRY_INTENT_SERVICE_QUANTUM {
@@ -9084,10 +8889,7 @@ mod tests {
             .take_next_for_sender_preparation()
             .expect("resize selection")
             .expect("resize lease is current");
-        assert!(queue.restore_prepared_for_retry(
-            retryable,
-            TmuxPreparationPrerequisite::Attach,
-        ));
+        assert!(queue.restore_prepared_for_retry(retryable, TmuxPreparationPrerequisite::Attach,));
         queue.advance_preparation_prerequisite(TmuxPreparationPrerequisite::Attach);
 
         for sequence in 0..CMD_QUEUE_DURABLE_SERVICE_QUANTUM {
@@ -9115,17 +8917,17 @@ mod tests {
             .take_next_for_sender_preparation()
             .expect("ready retryable intent receives bounded service")
             .expect("retryable intent lease remains current");
-        assert_eq!(
-            retried.as_resize().map(|(pane_id, _)| pane_id),
-            Some(77),
-        );
+        assert_eq!(retried.as_resize().map(|(pane_id, _)| pane_id), Some(77),);
         queue.release_prepared();
 
         let fresh_after_retry = queue
             .take_next_for_sender_preparation()
             .expect("fresh intent remains queued after forced retry")
             .expect("fresh intent is not stale");
-        assert_eq!(fresh_after_retry.get_command(0), format!("test-{}\n", usize::MAX));
+        assert_eq!(
+            fresh_after_retry.get_command(0),
+            format!("test-{}\n", usize::MAX)
+        );
         queue.release_prepared();
     }
 
@@ -9151,7 +8953,9 @@ mod tests {
             .prepared_conditional_commit()
             .expect("older exact resize lease");
 
-        queue.push_back(resize()).expect("identical newer resize admission");
+        queue
+            .push_back(resize())
+            .expect("identical newer resize admission");
         assert!(
             !queue.conditional_commit_is_current(&older_lease),
             "an identical later request must still supersede the older generation",
@@ -9192,7 +8996,9 @@ mod tests {
             .get(&target)
             .expect("older lease")
             .clone();
-        queue.push_back(resize(40, 120)).expect("merged newer resize");
+        queue
+            .push_back(resize(40, 120))
+            .expect("merged newer resize");
         let replacement_lease = queue
             .latest_conditional_commits
             .get(&target)
@@ -9438,10 +9244,8 @@ mod tests {
             let command = queue
                 .take_next_for_preparation()
                 .expect("resize enters preparation");
-            assert!(queue.restore_prepared_for_retry(
-                command,
-                TmuxPreparationPrerequisite::Pane(pane_id),
-            ));
+            assert!(queue
+                .restore_prepared_for_retry(command, TmuxPreparationPrerequisite::Pane(pane_id),));
         }
         assert_eq!(
             queue.retry_deferred_intent_head,
@@ -9982,9 +9786,7 @@ mod tests {
         assert!(!command.is_empty());
 
         let mut success = successful_guarded_response();
-        success.output = format!(
-            "$1 @83 %{retained_pane_id} 0 0 0 80 24 0 0 1\n"
-        );
+        success.output = format!("$1 @83 %{retained_pane_id} 0 0 0 80 24 0 0 1\n");
 
         let (command, response, generation, conditional_commit) = tmux_domain
             .inner
@@ -10117,11 +9919,8 @@ mod tests {
             Arc::new(LocalDomain::new("tmux-conditional-partial-write").expect("local domain"));
         let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
         let _guard = ScopedMux::install(Arc::clone(&mux));
-        let launcher = RecordingPane::new_with_partial_then_failing_writer(
-            248,
-            default_domain.domain_id(),
-            3,
-        );
+        let launcher =
+            RecordingPane::new_with_partial_then_failing_writer(248, default_domain.domain_id(), 3);
         let launcher_dyn: Arc<dyn Pane> = launcher.clone();
         mux.add_pane(&launcher_dyn).expect("add partial writer");
         let tmux_domain = Arc::new(new_tmux_domain(248));
@@ -10490,7 +10289,9 @@ mod tests {
         {
             let queue = tmux_domain.inner.cmd_queue.lock();
             assert_eq!(queue.len(), 1, "retryable preparation must remain admitted");
-            assert!(queue.front().is_some_and(|command| command.as_resize().is_some()));
+            assert!(queue
+                .front()
+                .is_some_and(|command| command.as_resize().is_some()));
             assert!(queue.preparing.is_none());
             assert!(queue.intent_entries.is_empty());
             assert_eq!(queue.retry_deferred_intents.len(), 1);
@@ -10500,7 +10301,15 @@ mod tests {
             );
         }
         tmux_domain.inner.send_next_command();
-        assert_eq!(tmux_domain.inner.cmd_queue.lock().retry_deferred_intents.len(), 1);
+        assert_eq!(
+            tmux_domain
+                .inner
+                .cmd_queue
+                .lock()
+                .retry_deferred_intents
+                .len(),
+            1
+        );
         assert_eq!(*tmux_domain.inner.state.lock(), State::Idle);
         let pane = tmux_domain.inner.remote_panes.lock();
         let pane = pane.get(&83).expect("test pane").lock();
@@ -10570,8 +10379,7 @@ mod tests {
         let registered: Arc<dyn Domain> = tmux_domain.clone();
         mux.add_domain(&registered)
             .expect("register direct-retirement test domain");
-        let local_tab_id =
-            install_conditional_test_tab(&mux, &tmux_domain.inner, 90, "same");
+        let local_tab_id = install_conditional_test_tab(&mux, &tmux_domain.inner, 90, "same");
         tmux_domain
             .inner
             .mirror_index
@@ -10607,12 +10415,14 @@ mod tests {
         {
             let queue = tmux_domain.inner.cmd_queue.lock();
             assert_eq!(queue.retry_deferred_intents.len(), 1);
-            assert!(!queue
-                .retry_deferred_intents
-                .values()
-                .next()
-                .expect("parked resize")
-                .retry_ready);
+            assert!(
+                !queue
+                    .retry_deferred_intents
+                    .values()
+                    .next()
+                    .expect("parked resize")
+                    .retry_ready
+            );
             assert!(!queue.has_pending());
         }
 
@@ -10626,12 +10436,14 @@ mod tests {
         assert!(tmux_domain.inner.retired_panes.lock().contains(&900));
         {
             let queue = tmux_domain.inner.cmd_queue.lock();
-            assert!(queue
-                .retry_deferred_intents
-                .values()
-                .next()
-                .expect("retirement-woken resize")
-                .retry_ready);
+            assert!(
+                queue
+                    .retry_deferred_intents
+                    .values()
+                    .next()
+                    .expect("retirement-woken resize")
+                    .retry_ready
+            );
             assert!(queue.has_pending());
         }
 
@@ -10739,11 +10551,7 @@ mod tests {
         let TmuxCommandPreparation::Ready {
             conditional_commit: Some(replacement_commit),
             ..
-        } = replacement_fenced.prepare(
-            tmux_domain.domain_id(),
-            53,
-            Some(replacement_lease),
-        )
+        } = replacement_fenced.prepare(tmux_domain.domain_id(), 53, Some(replacement_lease))
         else {
             panic!("replacement-fenced resize should prepare");
         };
@@ -10806,7 +10614,9 @@ mod tests {
 
         let (resize_b, resize_b_lease) = {
             let mut queue = tmux_domain.inner.cmd_queue.lock();
-            queue.push_back(resize(40, 120)).expect("resize B admission");
+            queue
+                .push_back(resize(40, 120))
+                .expect("resize B admission");
             let command = queue
                 .take_next_for_preparation()
                 .expect("resize B enters preparation");
@@ -10825,10 +10635,7 @@ mod tests {
         assert!(!resize_b_bytes.is_empty());
         {
             let mut queue = tmux_domain.inner.cmd_queue.lock();
-            assert!(queue.prepared_install_authority_is_current(
-                71,
-                Some(&resize_b_commit),
-            ));
+            assert!(queue.prepared_install_authority_is_current(71, Some(&resize_b_commit),));
             assert!(queue.install_in_flight(resize_b, 71, Some(resize_b_commit)));
             assert!(!queue.pane_size_suppression_is_trustworthy(804));
             queue
@@ -10885,10 +10692,7 @@ mod tests {
         assert!(resize_a_text.contains("resize-pane -x 80 -y 24 -t %804"));
         {
             let mut queue = tmux_domain.inner.cmd_queue.lock();
-            assert!(queue.prepared_install_authority_is_current(
-                72,
-                Some(&resize_a_commit),
-            ));
+            assert!(queue.prepared_install_authority_is_current(72, Some(&resize_a_commit),));
             assert!(queue.install_in_flight(resize_a, 72, Some(resize_a_commit)));
             assert!(!queue.pane_size_suppression_is_trustworthy(804));
         }

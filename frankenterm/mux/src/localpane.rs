@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
 use config::{configuration, ExitBehavior, ExitBehaviorMessaging};
 use fancy_regex::Regex;
-use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_dynamic::Value;
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{
     Alert, AlertHandler, Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress,
@@ -110,8 +110,8 @@ impl Drop for ProcListWarmPendingGuard {
 #[derive(Default)]
 struct ChildExitPruneTracker {
     child_exited: bool,
-    next_intent: u64,
-    completed_intent: u64,
+    current_intent: Option<Arc<()>>,
+    completed_intent: Option<Arc<()>>,
     scheduled: bool,
     failed_registration: Option<PaneRegistrationHandle>,
 }
@@ -119,7 +119,7 @@ struct ChildExitPruneTracker {
 impl ChildExitPruneTracker {
     fn record_child_exit(&mut self) {
         self.child_exited = true;
-        self.next_intent = self.next_intent.saturating_add(1);
+        self.current_intent = Some(Arc::new(()));
         self.failed_registration = None;
     }
 
@@ -128,16 +128,20 @@ impl ChildExitPruneTracker {
         if !self.child_exited {
             return false;
         }
-        self.next_intent = self.next_intent.saturating_add(1);
+        self.current_intent = Some(Arc::new(()));
         true
     }
 
     fn has_pending_intent(&self) -> bool {
-        self.completed_intent < self.next_intent
+        self.current_intent.as_ref().is_some_and(|current| {
+            self.completed_intent
+                .as_ref()
+                .is_none_or(|completed| !Arc::ptr_eq(current, completed))
+        })
     }
 
-    fn record_success(&mut self, target_intent: u64) {
-        self.completed_intent = self.completed_intent.max(target_intent);
+    fn record_success(&mut self, target_intent: &Arc<()>) {
+        self.completed_intent = Some(Arc::clone(target_intent));
         self.failed_registration = None;
     }
 }
@@ -149,9 +153,10 @@ impl ChildExitPruneTracker {
 /// nudge forever. This state records the exit independently and lets the
 /// post-publication hook schedule it once an exact registration exists.
 ///
-/// Intents are sequenced because the same pane object may be registered again
-/// after its prior generation retires. A prune accepted for generation N must
-/// not consume a concurrent bind intent for generation N+1.
+/// Intents carry allocation identities because the same pane object may be
+/// registered again after its prior generation retires. A prune accepted for
+/// one generation must not consume a concurrent bind intent for its successor;
+/// pointer identity avoids finite counter wraparound in very long sessions.
 struct ChildExitPruneState {
     mux_registration: Arc<PaneRegistrationSlot>,
     tracker: Mutex<ChildExitPruneTracker>,
@@ -204,8 +209,15 @@ impl ChildExitPruneState {
             {
                 return;
             }
+            let Some(target_intent) = tracker.current_intent.as_ref().map(Arc::clone) else {
+                // `has_pending_intent` above makes this unreachable under the
+                // tracker invariant, but scheduling is a background recovery
+                // path and must fail closed rather than panic if future edits
+                // ever violate that invariant.
+                return;
+            };
             tracker.scheduled = true;
-            tracker.next_intent
+            target_intent
         };
 
         let dispatch = ChildExitPruneDispatch {
@@ -222,7 +234,7 @@ impl ChildExitPruneState {
 
     fn finish_dispatch(
         self: &Arc<Self>,
-        target_intent: u64,
+        target_intent: &Arc<()>,
         registration: &PaneRegistrationHandle,
         pruned: bool,
     ) {
@@ -263,7 +275,7 @@ impl ChildExitPruneState {
 struct ChildExitPruneDispatch {
     state: Arc<ChildExitPruneState>,
     registration: Option<PaneRegistrationHandle>,
-    target_intent: u64,
+    target_intent: Arc<()>,
     finished: bool,
 }
 
@@ -279,7 +291,7 @@ impl ChildExitPruneDispatch {
             })
             .is_some();
         self.state
-            .finish_dispatch(self.target_intent, &registration, pruned);
+            .finish_dispatch(&self.target_intent, &registration, pruned);
         self.finished = true;
     }
 }
@@ -608,11 +620,9 @@ fn catch_resize_intent<T>(
         AssertUnwindSafe(apply),
     ) {
         Ok(result) => Ok(result),
-        Err(_) => Err(
-            resize_queue
-                .lock()
-                .recover_failed_intent(pending, ResizeFailureKind::RecoverablePanic),
-        ),
+        Err(_) => Err(resize_queue
+            .lock()
+            .recover_failed_intent(pending, ResizeFailureKind::RecoverablePanic)),
     }
 }
 
@@ -772,9 +782,7 @@ fn retry_with_backoff<T, E, F>(
 where
     F: FnMut(usize) -> Result<T, E>,
 {
-    retry_with_backoff_controlled(policy, |attempt| {
-        op(attempt).map_err(RetryStepError::Retry)
-    })
+    retry_with_backoff_controlled(policy, |attempt| op(attempt).map_err(RetryStepError::Retry))
 }
 
 pub struct LocalPane {
@@ -883,10 +891,8 @@ impl Pane for LocalPane {
     ) -> (SequenceNo, RangeSet<StableRowIndex>) {
         let mut terminal = self.locked_terminal();
         let source_end = terminal.current_seqno();
-        let baseline = crate::pane::changed_since_query_baseline(
-            last_observed_source_end,
-            source_end,
-        );
+        let baseline =
+            crate::pane::changed_since_query_baseline(last_observed_source_end, source_end);
         let changed = terminal_get_dirty_lines(&mut terminal, lines, baseline);
         (source_end, changed)
     }
@@ -2128,9 +2134,8 @@ impl LocalPane {
                     token,
                 )
             });
-            let settled_apply_result = apply_result.map(|result| {
-                recover_resize_apply_error(resize_queue.as_ref(), pending, result)
-            });
+            let settled_apply_result = apply_result
+                .map(|result| recover_resize_apply_error(resize_queue.as_ref(), pending, result));
             match settled_apply_result {
                 Ok(Ok(metrics)) => {
                     if metrics.cancelled {
@@ -2344,18 +2349,18 @@ impl LocalPane {
             let policy = pty_resize_retry_policy();
             let retry_result = retry_with_backoff_controlled(policy, |attempt| {
                 if let Some(by_seq) = resize_queue.lock().superseded_by(token) {
-                    return Err(RetryStepError::Stop(
-                        PtyResizeAttemptFailure::Superseded { by_seq },
-                    ));
+                    return Err(RetryStepError::Stop(PtyResizeAttemptFailure::Superseded {
+                        by_seq,
+                    }));
                 }
                 let pty_lock_start = Instant::now();
                 let pty = pty.lock();
                 pty_lock_wait += pty_lock_start.elapsed();
                 if let Some(by_seq) = resize_queue.lock().superseded_by(token) {
                     drop(pty);
-                    return Err(RetryStepError::Stop(
-                        PtyResizeAttemptFailure::Superseded { by_seq },
-                    ));
+                    return Err(RetryStepError::Stop(PtyResizeAttemptFailure::Superseded {
+                        by_seq,
+                    }));
                 }
                 let pty_resize_start = Instant::now();
                 let result = pty.resize(pty_size);
@@ -2371,9 +2376,7 @@ impl LocalPane {
                         size.rows,
                         err
                     );
-                    return Err(RetryStepError::Retry(PtyResizeAttemptFailure::Apply(
-                        err,
-                    )));
+                    return Err(RetryStepError::Retry(PtyResizeAttemptFailure::Apply(err)));
                 }
                 Ok(())
             });
@@ -2436,18 +2439,15 @@ impl LocalPane {
         #[cfg(feature = "disruptor-pane-io")]
         Self::drain_action_ring_into(action_ring, &mut terminal);
         let terminal_apply_lock_wait = terminal_apply_lock_start.elapsed();
-        let (commit_decision, swap_barrier_wait) = with_resize_commit_barrier(
-            resize_queue,
-            token,
-            || {
+        let (commit_decision, swap_barrier_wait) =
+            with_resize_commit_barrier(resize_queue, token, || {
                 if terminal.get_size() == size {
                     return Duration::default();
                 }
                 let terminal_resize_start = Instant::now();
                 terminal.resize(size);
                 terminal_resize_start.elapsed()
-            },
-        );
+            });
         let terminal_resize_elapsed = match commit_decision {
             ResizeCommitDecision::Committed(elapsed) => elapsed,
             ResizeCommitDecision::Superseded {
@@ -2897,8 +2897,8 @@ mod tests {
             tracker.record_registration_bound(),
             "binding after exit must request a prune"
         );
-        let post_bind_intent = tracker.next_intent;
-        tracker.record_success(post_bind_intent);
+        let post_bind_intent = Arc::clone(tracker.current_intent.as_ref().unwrap());
+        tracker.record_success(&post_bind_intent);
         assert!(
             !tracker.has_pending_intent(),
             "a prune for the post-bind intent must consume the earlier exit"
@@ -2926,17 +2926,21 @@ mod tests {
     fn child_exit_prune_tracker_does_not_consume_concurrent_rebind() {
         let mut tracker = ChildExitPruneTracker::default();
         tracker.record_child_exit();
-        let first_generation_intent = tracker.next_intent;
+        let first_generation_intent = Arc::clone(tracker.current_intent.as_ref().unwrap());
 
         assert!(tracker.record_registration_bound());
-        let replacement_generation_intent = tracker.next_intent;
-        tracker.record_success(first_generation_intent);
+        let replacement_generation_intent = Arc::clone(tracker.current_intent.as_ref().unwrap());
+        assert!(!Arc::ptr_eq(
+            &first_generation_intent,
+            &replacement_generation_intent
+        ));
+        tracker.record_success(&first_generation_intent);
 
         assert!(
             tracker.has_pending_intent(),
             "completion for an old generation must preserve a newer bind intent"
         );
-        tracker.record_success(replacement_generation_intent);
+        tracker.record_success(&replacement_generation_intent);
         assert!(!tracker.has_pending_intent());
     }
 
@@ -2953,7 +2957,7 @@ mod tests {
         drop(ChildExitPruneDispatch {
             state: Arc::clone(&state),
             registration: None,
-            target_intent: 1,
+            target_intent: Arc::new(()),
             finished: false,
         });
 
@@ -3162,11 +3166,9 @@ mod tests {
                 }
                 simulated_pty_calls += 1;
                 if attempt == 1 {
-                    queue.lock().enqueue(
-                        term_size(120, 40),
-                        pty_size(120, 40),
-                        Instant::now(),
-                    );
+                    queue
+                        .lock()
+                        .enqueue(term_size(120, 40), pty_size(120, 40), Instant::now());
                     return Err(RetryStepError::Retry("transient apply failure"));
                 }
                 Ok(())
@@ -3176,7 +3178,10 @@ mod tests {
         assert_eq!(err, "superseded");
         assert_eq!(stats.attempts, 2);
         assert_eq!(simulated_pty_calls, 1);
-        assert_eq!(queue.lock().pending.as_ref().map(|intent| intent.seq), Some(2));
+        assert_eq!(
+            queue.lock().pending.as_ref().map(|intent| intent.seq),
+            Some(2)
+        );
     }
 
     #[test]
@@ -4021,9 +4026,7 @@ mod tests {
 
         assert_eq!(
             queue.recover_failed_intent(panicked, ResizeFailureKind::RecoverablePanic),
-            ResizeFailureRecovery::Superseded {
-                by_seq: newer.seq,
-            },
+            ResizeFailureRecovery::Superseded { by_seq: newer.seq },
         );
         let retained = queue
             .pending
@@ -4134,17 +4137,14 @@ mod tests {
             .enqueue(term_size(120, 40), pty_size(120, 40), Instant::now());
         let committed = AtomicBool::new(false);
 
-        let (decision, _) = with_resize_commit_barrier(
-            &queue,
-            ResizeCancellationToken::new(first.seq),
-            || committed.store(true, Ordering::Release),
-        );
+        let (decision, _) =
+            with_resize_commit_barrier(&queue, ResizeCancellationToken::new(first.seq), || {
+                committed.store(true, Ordering::Release)
+            });
 
         assert_eq!(
             decision,
-            ResizeCommitDecision::Superseded {
-                by_seq: newer.seq,
-            },
+            ResizeCommitDecision::Superseded { by_seq: newer.seq },
         );
         assert!(
             !committed.load(Ordering::Acquire),

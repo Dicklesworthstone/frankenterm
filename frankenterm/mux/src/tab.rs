@@ -375,9 +375,7 @@ fn admit_ordered_pane_census_work(
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("tab {tab_id} ordered pane census work overflows usize"))?;
     if *work > max_census_work {
-        anyhow::bail!(
-            "tab {tab_id} ordered pane census exceeds {max_census_work} carrier entries"
-        );
+        anyhow::bail!("tab {tab_id} ordered pane census exceeds {max_census_work} carrier entries");
     }
     Ok(())
 }
@@ -406,14 +404,12 @@ fn push_bounded_callback_free_pane(
     owners
         .try_reserve(1)
         .map_err(|error| anyhow::anyhow!("reserve ordered pane census owners: {error}"))?;
-    reserve_pane_arena_stack_push(
-        panes,
-        1,
-        max_census_panes,
-        "ordered pane census entries",
-    )?;
+    reserve_pane_arena_stack_push(panes, 1, max_census_panes, "ordered pane census entries")?;
     let prior = owners.insert(identity, owner);
-    debug_assert!(prior.is_none(), "ordered pane census identity changed under tab lock");
+    debug_assert!(
+        prior.is_none(),
+        "ordered pane census identity changed under tab lock"
+    );
     panes.push(Arc::clone(pane));
     Ok(None)
 }
@@ -669,14 +665,12 @@ impl DeferredTabCallbacks {
         if !self.changed {
             return;
         }
-        self.topology_notifications.push(
-            mux.envelope_notification(MuxNotification::TabResized(tab_id)),
-        );
+        self.topology_notifications
+            .push(mux.envelope_notification(MuxNotification::TabResized(tab_id)));
         if self.focus_changed() {
             if let Some(pane_id) = self.current_focus_id {
-                self.topology_notifications.push(
-                    mux.envelope_notification(MuxNotification::PaneFocused(pane_id)),
-                );
+                self.topology_notifications
+                    .push(mux.envelope_notification(MuxNotification::PaneFocused(pane_id)));
             }
         }
     }
@@ -1167,12 +1161,7 @@ fn capture_pane_arena_tree(
     tasks
         .try_reserve_exact(max_depth.saturating_mul(2).min(256).min(remaining))
         .map_err(|error| anyhow::anyhow!("reserve callback-free pane traversal: {error}"))?;
-    reserve_pane_arena_stack_push(
-        &mut tasks,
-        1,
-        remaining,
-        "callback-free pane traversal",
-    )?;
+    reserve_pane_arena_stack_push(&mut tasks, 1, remaining, "callback-free pane traversal")?;
     tasks.push(CapturePaneArenaTask::Visit {
         tree,
         depth: 1,
@@ -1194,9 +1183,7 @@ fn capture_pane_arena_tree(
                     );
                 }
                 if captured.len() == remaining {
-                    anyhow::bail!(
-                        "ordered pane arena exceeds total node limit {max_total_nodes}"
-                    );
+                    anyhow::bail!("ordered pane arena exceeds total node limit {max_total_nodes}");
                 }
                 reserve_pane_arena_stack_push(
                     &mut captured,
@@ -1284,13 +1271,10 @@ fn capture_pane_arena_tree(
             } => {
                 let right = captured.len();
                 let Some(CapturedPaneArenaNode::Split {
-                    right: split_right,
-                    ..
+                    right: split_right, ..
                 }) = captured.get_mut(split_index)
                 else {
-                    anyhow::bail!(
-                        "ordered pane traversal lost split placeholder {split_index}"
-                    );
+                    anyhow::bail!("ordered pane traversal lost split placeholder {split_index}");
                 };
                 *split_right = right;
                 reserve_pane_arena_stack_push(
@@ -1420,19 +1404,17 @@ fn pane_tree(
                 node: data,
             }
         }
-        Tree::Leaf(pane) => {
-            PaneNode::Leaf(pane_entry(
-                pane,
-                pane.pane_id(),
-                tab_id,
-                window_id,
-                active,
-                zoomed,
-                workspace,
-                left_col,
-                top_row,
-            ))
-        }
+        Tree::Leaf(pane) => PaneNode::Leaf(pane_entry(
+            pane,
+            pane.pane_id(),
+            tab_id,
+            window_id,
+            active,
+            zoomed,
+            workspace,
+            left_col,
+            top_row,
+        )),
     }
 }
 
@@ -1784,8 +1766,7 @@ where
     // from causing a partial topology mutation even though the codec normally
     // supplies already-validated arenas.
     let validation = &mut scratch.validation;
-    if reserve_pane_arena_stack_push(validation, 1, node_count, "pane arena validation stack")?
-    {
+    if reserve_pane_arena_stack_push(validation, 1, node_count, "pane arena validation stack")? {
         scratch.stats.validation_stack_growth_events = scratch
             .stats
             .validation_stack_growth_events
@@ -1927,8 +1908,7 @@ where
                 if is_active_pane {
                     active.replace(Arc::clone(&pane));
                 }
-                scratch.stats.leaf_resolutions =
-                    scratch.stats.leaf_resolutions.saturating_add(1);
+                scratch.stats.leaf_resolutions = scratch.stats.leaf_resolutions.saturating_add(1);
                 if application_try!(reserve_pane_arena_stack_push(
                     stack,
                     1,
@@ -1942,11 +1922,7 @@ where
                 }
                 stack.push((node_index, Tree::Leaf(pane)));
             }
-            PaneArenaNode::Split {
-                left,
-                right,
-                node,
-            } => {
+            PaneArenaNode::Split { left, right, node } => {
                 let expected_left = node_index
                     .checked_add(1)
                     .ok_or_else(|| anyhow::anyhow!("pane arena left-child index overflows"));
@@ -2028,9 +2004,7 @@ where
         .ok_or_else(|| anyhow::anyhow!("pane arena application lost its root"));
     let (root_index, tree) = application_try!(root);
     if root_index != arena_start {
-        anyhow::bail!(
-            "pane arena application produced root {root_index}, expected {arena_start}"
-        );
+        anyhow::bail!("pane arena application produced root {root_index}, expected {arena_start}");
     }
     scratch.stats.trees_completed = scratch.stats.trees_completed.saturating_add(1);
     Ok(PreparedPaneTree {
@@ -2991,12 +2965,8 @@ impl Tab {
         log::debug!("sync_with_pane_tree with size {:?}", size);
         // `make_pane` is caller-supplied and may re-enter the mux. Build the
         // complete replacement tree before acquiring the tab topology lock.
-        let tree = build_from_pane_tree(
-            root.into_tree(),
-            &mut active,
-            &mut zoomed,
-            &mut make_pane,
-        )?;
+        let tree =
+            build_from_pane_tree(root.into_tree(), &mut active, &mut zoomed, &mut make_pane)?;
         self.sync_with_prepared_pane_tree(
             size,
             PreparedPaneTree {
@@ -3013,11 +2983,7 @@ impl Tab {
     /// Preparation may happen in reverse arena order while a client consumes
     /// one global node vector; installation can then remain in the snapshot's
     /// forward tab order.
-    pub fn sync_with_prepared_pane_tree(
-        &self,
-        size: TerminalSize,
-        prepared: PreparedPaneTree,
-    ) {
+    pub fn sync_with_prepared_pane_tree(&self, size: TerminalSize, prepared: PreparedPaneTree) {
         let mux = Mux::try_get();
         let callbacks = {
             let mut inner = self.inner.lock();
@@ -3114,14 +3080,11 @@ impl Tab {
         })?;
 
         for _ in 0..SNAPSHOT_ATTEMPTS {
-            let callback_free_snapshot = self
-                .inner
-                .lock()
-                .snapshot_panes_callback_free_bounded(
-                    max_depth,
-                    max_tree_nodes,
-                    max_census_work,
-                )?;
+            let callback_free_snapshot = self.inner.lock().snapshot_panes_callback_free_bounded(
+                max_depth,
+                max_tree_nodes,
+                max_census_work,
+            )?;
             let BoundedCallbackFreePaneCensus {
                 panes,
                 tree_leaf_count,
@@ -3372,8 +3335,7 @@ impl Tab {
         let mux = Mux::try_get();
         let (positioned, callbacks) = {
             let mut inner = self.inner.lock();
-            let (positioned, mut callbacks) =
-                inner.prepare_set_floating_pane_rect(pane_id, rect);
+            let (positioned, mut callbacks) = inner.prepare_set_floating_pane_rect(pane_id, rect);
             if let Some(mux) = mux.as_deref() {
                 callbacks.reserve_topology_notifications(mux, self.tab_id);
             }
@@ -3529,11 +3491,7 @@ impl Tab {
         let (updated, callbacks) = {
             let mut inner = self.inner.lock();
             let (updated, mut callbacks) = inner.prepare_update_pane_constraints(
-                pane_id,
-                min_width,
-                max_width,
-                min_height,
-                max_height,
+                pane_id, min_width, max_width, min_height, max_height,
             );
             if let Some(mux) = mux.as_deref() {
                 callbacks.reserve_topology_notifications(mux, self.tab_id);
@@ -3672,9 +3630,9 @@ impl Tab {
     ) -> Option<R> {
         let mut lock_order = tabs.iter().enumerate().collect::<Vec<_>>();
         lock_order.sort_unstable_by_key(|(_, tab)| Arc::as_ptr(tab) as usize);
-        debug_assert!(lock_order.windows(2).all(|pair| {
-            !Arc::ptr_eq(pair[0].1, pair[1].1)
-        }));
+        debug_assert!(lock_order
+            .windows(2)
+            .all(|pair| { !Arc::ptr_eq(pair[0].1, pair[1].1) }));
 
         let guards = lock_order
             .iter()
@@ -3686,9 +3644,7 @@ impl Tab {
         }
 
         if let Some((expected_tab, operation)) = expected {
-            let expected_index = tabs
-                .iter()
-                .position(|tab| Arc::ptr_eq(tab, expected_tab))?;
+            let expected_index = tabs.iter().position(|tab| Arc::ptr_eq(tab, expected_tab))?;
             if !snapshots[expected_index]
                 .iter()
                 .any(|pane| operation.is_same_pane(pane))
@@ -3796,8 +3752,7 @@ impl Tab {
                 .collect::<Vec<_>>();
 
             let mut inner = self.inner.lock();
-            let mut callbacks =
-                inner.remove_exact_panes_callback_free(observed, &authorized);
+            let mut callbacks = inner.remove_exact_panes_callback_free(observed, &authorized);
             callbacks.reserve_topology_notifications(mux, self.tab_id);
             let registrations = authorized
                 .iter()
@@ -3884,13 +3839,11 @@ impl Tab {
                     match catch_recoverable(
                         RecoverablePanicSite::MuxPaneCallback,
                         AssertUnwindSafe(|| {
-                            observed
-                                .pane
-                                .mux_registration_slot()
-                                .load()
-                                .is_some_and(|registration| {
+                            observed.pane.mux_registration_slot().load().is_some_and(
+                                |registration| {
                                     registration.guards_detached_topology(mux, &observed.pane)
-                                })
+                                },
+                            )
                         }),
                     ) {
                         Ok(in_flight) => in_flight,
@@ -4259,11 +4212,7 @@ impl TabInner {
             }
         }
 
-        log::debug!(
-            "sync tab: {:#?} zoomed: {}",
-            size,
-            self.zoomed.is_some(),
-        );
+        log::debug!("sync tab: {:#?} zoomed: {}", size, self.zoomed.is_some(),);
         assert!(self.pane.is_some());
         callbacks
     }
@@ -4533,8 +4482,8 @@ impl TabInner {
         };
         self.floating_panes.push(floating);
         self.floating_focus = Some(pane_id);
-        let positioned = self
-            .positioned_floating_pane(self.floating_panes.last().expect("floating pane added"));
+        let positioned =
+            self.positioned_floating_pane(self.floating_panes.last().expect("floating pane added"));
         let mut callbacks = DeferredTabCallbacks {
             changed: true,
             prior_focus: prior,
@@ -4596,7 +4545,9 @@ impl TabInner {
             changed: true,
             ..DeferredTabCallbacks::default()
         };
-        callbacks.resize_work.push((Arc::clone(&floating.pane), size));
+        callbacks
+            .resize_work
+            .push((Arc::clone(&floating.pane), size));
         (Some(positioned), callbacks)
     }
 
@@ -5238,7 +5189,10 @@ impl TabInner {
                 );
             }
             tree_nodes = tree_nodes.checked_add(1).ok_or_else(|| {
-                anyhow::anyhow!("tab {} ordered pane tree node count overflows usize", self.id)
+                anyhow::anyhow!(
+                    "tab {} ordered pane tree node count overflows usize",
+                    self.id
+                )
             })?;
             if tree_nodes > max_tree_nodes {
                 anyhow::bail!(
@@ -5257,11 +5211,7 @@ impl TabInner {
                 Tree::Empty => tree_coherence.push(OrderedPaneTreeCoherenceNode::Empty),
                 Tree::Leaf(pane) => {
                     tree_coherence.push(OrderedPaneTreeCoherenceNode::Leaf(pane_identity(pane)));
-                    admit_ordered_pane_census_work(
-                        &mut census_work,
-                        max_census_work,
-                        self.id,
-                    )?;
+                    admit_ordered_pane_census_work(&mut census_work, max_census_work, self.id)?;
                     let leaf_index = tree_leaf_identities.len();
                     if push_bounded_callback_free_pane(
                         &mut owners,
@@ -5286,11 +5236,7 @@ impl TabInner {
                     )?;
                     tree_leaf_identities.push(pane_identity(pane));
                 }
-                Tree::Node {
-                    left,
-                    right,
-                    data,
-                } => {
+                Tree::Node { left, right, data } => {
                     let node = data.ok_or_else(|| {
                         anyhow::anyhow!(
                             "tab {} ordered pane tree has an uninitialized split node",
@@ -5335,22 +5281,20 @@ impl TabInner {
         }
 
         if tree_leaf_identities.is_empty() {
-            anyhow::bail!(
-                "tab {} ordered pane tree contains no pane leaves",
-                self.id
-            );
+            anyhow::bail!("tab {} ordered pane tree contains no pane leaves", self.id);
         }
-        let active_identity = tree_leaf_identities.get(self.active).copied().ok_or_else(|| {
-            anyhow::anyhow!(
-                "tab {} ordered active pane index {} is beyond {} tree leaves",
-                self.id,
-                self.active,
-                tree_leaf_identities.len()
-            )
-        })?;
-        if owners.get(&active_identity)
-            != Some(&CallbackFreePaneOwner::TreeLeaf(self.active))
-        {
+        let active_identity = tree_leaf_identities
+            .get(self.active)
+            .copied()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "tab {} ordered active pane index {} is beyond {} tree leaves",
+                    self.id,
+                    self.active,
+                    tree_leaf_identities.len()
+                )
+            })?;
+        if owners.get(&active_identity) != Some(&CallbackFreePaneOwner::TreeLeaf(self.active)) {
             anyhow::bail!(
                 "tab {} ordered active pane index {} does not own its tree leaf",
                 self.id,
@@ -5371,11 +5315,7 @@ impl TabInner {
             .try_reserve(self.pane_stacks.len().min(max_census_work))
             .map_err(|error| anyhow::anyhow!("reserve ordered pane stack coherence: {error}"))?;
         for (slot_index, stack) in &self.pane_stacks {
-            admit_ordered_pane_census_work(
-                &mut census_work,
-                max_census_work,
-                self.id,
-            )?;
+            admit_ordered_pane_census_work(&mut census_work, max_census_work, self.id)?;
             if stack.is_empty() {
                 anyhow::bail!(
                     "tab {} ordered pane census contains an empty stack at slot {slot_index}",
@@ -5390,12 +5330,16 @@ impl TabInner {
                     stack.len()
                 );
             }
-            let expected_active = tree_leaf_identities.get(*slot_index).copied().ok_or_else(|| {
-                anyhow::anyhow!(
+            let expected_active =
+                tree_leaf_identities
+                    .get(*slot_index)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
                     "tab {} ordered pane stack slot {slot_index} has no corresponding tree leaf",
                     self.id
                 )
-            })?;
+                    })?;
             let mut members = Vec::new();
             members
                 .try_reserve_exact(stack.len().min(max_census_work))
@@ -5406,11 +5350,7 @@ impl TabInner {
                 })?;
 
             for (stack_index, pane) in stack.panes().iter().enumerate() {
-                admit_ordered_pane_census_work(
-                    &mut census_work,
-                    max_census_work,
-                    self.id,
-                )?;
+                admit_ordered_pane_census_work(&mut census_work, max_census_work, self.id)?;
                 let identity = pane_identity(pane);
                 reserve_pane_arena_stack_push(
                     &mut members,
@@ -5466,11 +5406,7 @@ impl TabInner {
             .try_reserve_exact(self.floating_panes.len().min(max_census_work))
             .map_err(|error| anyhow::anyhow!("reserve ordered floating pane coherence: {error}"))?;
         for floating in &self.floating_panes {
-            admit_ordered_pane_census_work(
-                &mut census_work,
-                max_census_work,
-                self.id,
-            )?;
+            admit_ordered_pane_census_work(&mut census_work, max_census_work, self.id)?;
             reserve_pane_arena_stack_push(
                 &mut floating_coherence,
                 1,
@@ -5500,11 +5436,7 @@ impl TabInner {
             }
         }
         if let Some(zoomed) = &self.zoomed {
-            admit_ordered_pane_census_work(
-                &mut census_work,
-                max_census_work,
-                self.id,
-            )?;
+            admit_ordered_pane_census_work(&mut census_work, max_census_work, self.id)?;
             match owners.get(&pane_identity(zoomed)) {
                 Some(CallbackFreePaneOwner::TreeLeaf(_) | CallbackFreePaneOwner::Floating) => {}
                 Some(CallbackFreePaneOwner::HiddenStack) => anyhow::bail!(
@@ -6189,7 +6121,9 @@ impl TabInner {
 
             // And then resize the individual panes to match
             collect_pane_resize_work(
-                self.pane.as_ref().expect("pane tree retained during resize"),
+                self.pane
+                    .as_ref()
+                    .expect("pane tree retained during resize"),
                 &size,
                 &mut callbacks.resize_work,
             );
@@ -7938,9 +7872,7 @@ mod test {
         }
 
         fn get_cursor_position(&self) -> StableCursorPosition {
-            self.panic_if_ordered_observation_callback(
-                OrderedObservationCallback::CursorPosition,
-            );
+            self.panic_if_ordered_observation_callback(OrderedObservationCallback::CursorPosition);
             StableCursorPosition::default()
         }
 
@@ -8769,11 +8701,7 @@ mod test {
         let left_leaves = leaf_count.div_ceil(2);
         let right_leaves = leaf_count - left_leaves;
         Tree::Node {
-            left: Box::new(balanced_mux_tree_for_capture(
-                first_pane,
-                left_leaves,
-                size,
-            )),
+            left: Box::new(balanced_mux_tree_for_capture(first_pane, left_leaves, size)),
             right: Box::new(balanced_mux_tree_for_capture(
                 first_pane + left_leaves,
                 right_leaves,
@@ -8810,10 +8738,7 @@ mod test {
                     leaf_count,
                 )
                 .unwrap_or_else(|error| {
-                    panic!(
-                        "q={} full flat append failed: {:#}",
-                        leaf_count, error
-                    )
+                    panic!("q={} full flat append failed: {:#}", leaf_count, error)
                 });
             assert_eq!(arena.len(), node_count);
             assert_eq!(descriptor.root_index, Some(0));
@@ -8825,10 +8750,7 @@ mod test {
         }
     }
 
-    fn flatten_legacy_pane_node_for_test(
-        node: &PaneNode,
-        arena: &mut Vec<PaneArenaNode>,
-    ) -> u32 {
+    fn flatten_legacy_pane_node_for_test(node: &PaneNode, arena: &mut Vec<PaneArenaNode>) -> u32 {
         let index = u32::try_from(arena.len()).expect("test arena fits u32");
         arena.push(PaneArenaNode::Empty);
         arena[usize::try_from(index).expect("u32 fits usize")] = match node {
@@ -8960,27 +8882,13 @@ mod test {
 
         let mut empty_prefix = Vec::new();
         let first = tab
-            .append_codec_pane_arena_in_window(
-                96,
-                "prefix-invariant",
-                &mut empty_prefix,
-                64,
-                1,
-                2,
-            )
+            .append_codec_pane_arena_in_window(96, "prefix-invariant", &mut empty_prefix, 64, 1, 2)
             .expect("tab must fit at the start of an arena");
 
         let prefix = PaneArenaNode::Leaf(pane_arena_test_entry(997, false, false));
         let mut later_prefix = vec![prefix.clone(); 9];
         let second = tab
-            .append_codec_pane_arena_in_window(
-                96,
-                "prefix-invariant",
-                &mut later_prefix,
-                64,
-                10,
-                2,
-            )
+            .append_codec_pane_arena_in_window(96, "prefix-invariant", &mut later_prefix, 64, 10, 2)
             .expect("the same tab must fit with the same remaining node budget");
 
         assert_eq!(first.node_count, 1);
@@ -9125,21 +9033,9 @@ mod test {
                 callback_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             })
         };
-        let visible = FakePane::new_with_pane_id_probe(
-            800,
-            size,
-            Arc::clone(&callback_probe),
-        );
-        let hidden = FakePane::new_with_pane_id_probe(
-            801,
-            size,
-            Arc::clone(&callback_probe),
-        );
-        let floating = FakePane::new_with_pane_id_probe(
-            802,
-            size,
-            Arc::clone(&callback_probe),
-        );
+        let visible = FakePane::new_with_pane_id_probe(800, size, Arc::clone(&callback_probe));
+        let hidden = FakePane::new_with_pane_id_probe(801, size, Arc::clone(&callback_probe));
+        let floating = FakePane::new_with_pane_id_probe(802, size, Arc::clone(&callback_probe));
         let tab = Tab::new(&size);
         {
             let mut inner = tab.inner.lock();
@@ -9169,14 +9065,7 @@ mod test {
         let mut arena = vec![prefix.clone()];
         let prior_capacity = arena.capacity();
         let error = tab
-            .append_codec_pane_arena_in_window(
-                92,
-                "census-workspace",
-                &mut arena,
-                64,
-                16,
-                5,
-            )
+            .append_codec_pane_arena_in_window(92, "census-workspace", &mut arena, 64, 16, 5)
             .expect_err("six raw pane carriers must exceed a five-entry census");
 
         assert!(format!("{error:#}").contains("exceeds 5 carrier entries"));
@@ -9217,9 +9106,7 @@ mod test {
                 TEST_ORDERED_PANE_CENSUS_WORK,
             )
             .expect_err("one exact pane identity cannot occupy two tree leaves");
-        assert!(
-            format!("{exact_error:#}").contains("exact pane identity appears more than once")
-        );
+        assert!(format!("{exact_error:#}").contains("exact pane identity appears more than once"));
         assert_eq!(exact_arena.as_slice(), std::slice::from_ref(&prefix));
 
         let duplicate_numeric = Tab::new(&size);
@@ -9239,10 +9126,8 @@ mod test {
                 TEST_ORDERED_PANE_CENSUS_WORK,
             )
             .expect_err("one numeric pane id cannot identify two exact pane objects");
-        assert!(
-            format!("{numeric_error:#}")
-                .contains("pane id 901 belongs to more than one exact pane identity")
-        );
+        assert!(format!("{numeric_error:#}")
+            .contains("pane id 901 belongs to more than one exact pane identity"));
         assert_eq!(numeric_arena, [prefix]);
     }
 
@@ -9289,10 +9174,9 @@ mod test {
         {
             let mut inner = cross_owner.inner.lock();
             inner.pane = Some(Tree::Leaf(Arc::clone(&visible)));
-            inner.pane_stacks.insert(
-                0,
-                PaneStack::new(vec![visible, Arc::clone(&shared)]),
-            );
+            inner
+                .pane_stacks
+                .insert(0, PaneStack::new(vec![visible, Arc::clone(&shared)]));
             inner.floating_panes.push(FloatingPane {
                 pane: shared,
                 pane_id: 913,
@@ -9310,14 +9194,7 @@ mod test {
         }
         let mut cross_arena = Vec::new();
         let cross_error = cross_owner
-            .append_codec_pane_arena_in_window(
-                98,
-                "cross-owner",
-                &mut cross_arena,
-                64,
-                16,
-                16,
-            )
+            .append_codec_pane_arena_in_window(98, "cross-owner", &mut cross_arena, 64, 16, 16)
             .expect_err("hidden and floating ownership cannot alias");
         assert!(format!("{cross_error:#}").contains("aliases HiddenStack"));
         assert!(cross_arena.is_empty());
@@ -9397,14 +9274,7 @@ mod test {
             inner.active = 1;
         }
         let error = invalid_active
-            .append_codec_pane_arena_in_window(
-                101,
-                "invalid-active",
-                &mut arena,
-                64,
-                16,
-                16,
-            )
+            .append_codec_pane_arena_in_window(101, "invalid-active", &mut arena, 64, 16, 16)
             .expect_err("an out-of-range active index must fail preflight");
         assert!(format!("{error:#}").contains("active pane index 1 is beyond 1 tree leaves"));
         assert!(arena.is_empty());
@@ -9524,11 +9394,8 @@ mod test {
 
         assert_eq!(getter_calls.load(std::sync::atomic::Ordering::Acquire), 2);
         assert_eq!(descriptor.node_count, 3);
-        let [
-            PaneArenaNode::Split { .. },
-            PaneArenaNode::Leaf(first),
-            PaneArenaNode::Leaf(second),
-        ] = arena.as_slice()
+        let [PaneArenaNode::Split { .. }, PaneArenaNode::Leaf(first), PaneArenaNode::Leaf(second)] =
+            arena.as_slice()
         else {
             panic!("retried split snapshot must retain canonical preorder");
         };
@@ -9617,11 +9484,8 @@ mod test {
 
         assert_eq!(callback_calls.load(std::sync::atomic::Ordering::Acquire), 2);
         assert_eq!(descriptor.node_count, 3);
-        let [
-            PaneArenaNode::Split { .. },
-            PaneArenaNode::Leaf(first),
-            PaneArenaNode::Leaf(second),
-        ] = arena.as_slice()
+        let [PaneArenaNode::Split { .. }, PaneArenaNode::Leaf(first), PaneArenaNode::Leaf(second)] =
+            arena.as_slice()
         else {
             panic!("retried identity snapshot must retain canonical preorder");
         };
@@ -9719,10 +9583,7 @@ mod test {
             }));
             let error = result
                 .unwrap_or_else(|_| {
-                    panic!(
-                        "{:?} panic escaped the mux observation boundary",
-                        callback
-                    )
+                    panic!("{:?} panic escaped the mux observation boundary", callback)
                 })
                 .expect_err("a panicking pane callback must fail the ordered snapshot");
 
@@ -9734,11 +9595,7 @@ mod test {
                 ),
                 "unexpected contained error for {callback:?}"
             );
-            assert_eq!(
-                arena,
-                [prefix],
-                "arena changed after {callback:?} panic"
-            );
+            assert_eq!(arena, [prefix], "arena changed after {callback:?} panic");
             assert_eq!(
                 arena.capacity(),
                 prior_capacity,
@@ -10637,7 +10494,10 @@ mod test {
 
         let observed = observed.lock();
         assert_eq!(
-            observed.iter().map(|(pane_id, _)| *pane_id).collect::<Vec<_>>(),
+            observed
+                .iter()
+                .map(|(pane_id, _)| *pane_id)
+                .collect::<Vec<_>>(),
             (1..=16).collect::<Vec<_>>(),
             "resize effects must preserve the prepared tree order",
         );
@@ -11445,12 +11305,8 @@ mod test {
         let right_slots = slots - left_slots;
         let left_empty_slots = empty_slots.min(left_slots);
         let right_empty_slots = empty_slots - left_empty_slots;
-        let left = append_balanced_pane_arena_slots(
-            nodes,
-            first_leaf,
-            left_slots,
-            left_empty_slots,
-        );
+        let left =
+            append_balanced_pane_arena_slots(nodes, first_leaf, left_slots, left_empty_slots);
         let left_leaves = left_slots - left_empty_slots;
         let right = append_balanced_pane_arena_slots(
             nodes,
@@ -11614,15 +11470,13 @@ mod test {
             PaneArenaNode::Leaf(pane_arena_test_entry(72, false, false)),
         ];
         let mut scratch = PaneArenaPreparationScratch::default();
-        let error = match prepare_pane_tree_from_arena_with_scratch(
-            &mut arena,
-            3,
-            &mut scratch,
-            |entry| Ok(FakePane::new(entry.pane_id, entry.size)),
-        ) {
-            Ok(_) => panic!("malformed pane arena must fail during preflight"),
-            Err(error) => error,
-        };
+        let error =
+            match prepare_pane_tree_from_arena_with_scratch(&mut arena, 3, &mut scratch, |entry| {
+                Ok(FakePane::new(entry.pane_id, entry.size))
+            }) {
+                Ok(_) => panic!("malformed pane arena must fail during preflight"),
+                Err(error) => error,
+            };
         assert!(format!("{error:#}").contains("non-canonical children"));
         assert_eq!(arena.len(), 3);
         assert_eq!(scratch.stats().trees_started, 1);
@@ -11667,7 +11521,10 @@ mod test {
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("injected pane factory failure"));
-        assert!(arena.is_empty(), "the failed tree range must be consumed once");
+        assert!(
+            arena.is_empty(),
+            "the failed tree range must be consumed once"
+        );
         assert!(
             prepared_pane
                 .expect("the reverse traversal prepares pane 82 first")
@@ -11717,7 +11574,10 @@ mod test {
             );
         }));
         assert!(result.is_err(), "the injected factory panic must propagate");
-        assert!(arena.is_empty(), "the failed tree range must be consumed once");
+        assert!(
+            arena.is_empty(),
+            "the failed tree range must be consumed once"
+        );
         assert!(
             prepared_pane
                 .expect("the reverse traversal prepares pane 92 first")

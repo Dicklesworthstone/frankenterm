@@ -34,8 +34,8 @@ use url::Url;
 use wezterm_dynamic::Value;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
-    Alert, Clipboard, KeyCode, KeyModifiers, Line, MouseEvent, Progress, StableRowIndex,
-    SemanticZone, TerminalConfiguration, TerminalSize,
+    Alert, Clipboard, KeyCode, KeyModifiers, Line, MouseEvent, Progress, SemanticZone,
+    StableRowIndex, TerminalConfiguration, TerminalSize,
 };
 
 const MAX_RENDER_APPLICATION_IMAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -221,8 +221,7 @@ impl ClientRenderApplicationState {
         self.applied_state = None;
         self.last_applied = None;
         if self.applying.take().is_some() {
-            self.counters.cancelled_attempts =
-                self.counters.cancelled_attempts.saturating_add(1);
+            self.counters.cancelled_attempts = self.counters.cancelled_attempts.saturating_add(1);
         }
         true
     }
@@ -259,8 +258,7 @@ impl ClientRenderApplicationState {
             };
         }
         if self.active_connection_identity != Some(connection_identity)
-            || self.active_connection_generation
-                != Some(identity.token.connection_generation)
+            || self.active_connection_generation != Some(identity.token.connection_generation)
         {
             return ClientRenderApplicationBegin::Nack {
                 reason: RenderApplicationNackReason::GenerationMismatch,
@@ -292,8 +290,7 @@ impl ClientRenderApplicationState {
 
         if self.applied_state.is_some()
             && (self.applied_connection_identity != Some(connection_identity)
-                || self.applied_connection_generation
-                    != Some(identity.token.connection_generation))
+                || self.applied_connection_generation != Some(identity.token.connection_generation))
             && identity.kind == RenderApplicationKind::Delta
         {
             return ClientRenderApplicationBegin::Nack {
@@ -360,8 +357,7 @@ impl ClientRenderApplicationState {
         }
 
         self.applying = Some(logical_identity);
-        self.counters.applications_started =
-            self.counters.applications_started.saturating_add(1);
+        self.counters.applications_started = self.counters.applications_started.saturating_add(1);
         ClientRenderApplicationBegin::Apply
     }
 }
@@ -399,14 +395,12 @@ impl<'a> ClientRenderApplicationGuard<'a> {
             && state.active_connection_identity == Some(self.identity.connection_identity)
             && state.active_connection_generation == Some(self.identity.connection_generation)
         {
-            state.applied_connection_generation =
-                Some(self.identity.connection_generation);
+            state.applied_connection_generation = Some(self.identity.connection_generation);
             state.applied_connection_identity = Some(self.identity.connection_identity);
             state.applied_state = Some(self.identity.resulting_state);
             state.last_applied = Some(self.identity);
             state.applying = None;
-            state.counters.acknowledgements =
-                state.counters.acknowledgements.saturating_add(1);
+            state.counters.acknowledgements = state.counters.acknowledgements.saturating_add(1);
         }
         self.armed = false;
     }
@@ -429,8 +423,7 @@ impl Drop for ClientRenderApplicationGuard<'_> {
         let mut state = self.state.lock();
         if state.applying == Some(self.identity) {
             state.applying = None;
-            state.counters.cancelled_attempts =
-                state.counters.cancelled_attempts.saturating_add(1);
+            state.counters.cancelled_attempts = state.counters.cancelled_attempts.saturating_add(1);
         }
     }
 }
@@ -703,19 +696,15 @@ fn validate_render_application_resources(
                 limits.semantic_zones,
             ));
         }
-        let semantic_text_bytes =
-            semantic
-                .zone_texts
-                .iter()
-                .try_fold(0usize, |total, text| {
-                    total.checked_add(text.len()).ok_or_else(|| {
-                        bounded_resource_rejection(
-                            RenderApplicationResource::SemanticZones,
-                            usize::MAX,
-                            limits.semantic_text_bytes,
-                        )
-                    })
-                })?;
+        let semantic_text_bytes = semantic.zone_texts.iter().try_fold(0usize, |total, text| {
+            total.checked_add(text.len()).ok_or_else(|| {
+                bounded_resource_rejection(
+                    RenderApplicationResource::SemanticZones,
+                    usize::MAX,
+                    limits.semantic_text_bytes,
+                )
+            })
+        })?;
         if semantic_text_bytes > limits.semantic_text_bytes {
             return Err(bounded_resource_rejection(
                 RenderApplicationResource::SemanticZones,
@@ -724,8 +713,7 @@ fn validate_render_application_resources(
             ));
         }
         if semantic.zones.iter().any(|zone| {
-            zone.start_y > zone.end_y
-                || (zone.start_y == zone.end_y && zone.start_x > zone.end_x)
+            zone.start_y > zone.end_y || (zone.start_y == zone.end_y && zone.start_x > zone.end_x)
         }) {
             return Err(RenderApplicationNackReason::MalformedOrIncomplete {
                 component: RenderApplicationComponent::SemanticZones,
@@ -843,14 +831,10 @@ impl ClientPane {
             .connection_generation()
             .ok_or_else(|| anyhow::anyhow!("render bootstrap has no exact RPC generation"))?
             .get();
-        let connection_identity = rpc
-            .render_connection_identity()
-            .ok_or_else(|| {
-                anyhow::anyhow!("render bootstrap has no committed connection identity")
-            })?;
-        connection_identity
-            .validate()
-            .map_err(anyhow::Error::new)?;
+        let connection_identity = rpc.render_connection_identity().ok_or_else(|| {
+            anyhow::anyhow!("render bootstrap has no committed connection identity")
+        })?;
+        connection_identity.validate().map_err(anyhow::Error::new)?;
         Ok(self
             .render_application_state
             .lock()
@@ -1721,7 +1705,11 @@ impl Pane for ClientPane {
 
     fn get_text_from_semantic_zone(&self, zone: SemanticZone) -> anyhow::Result<String> {
         let semantic = self.semantic_state.lock();
-        if let Some(index) = semantic.zones.iter().position(|candidate| *candidate == zone) {
+        if let Some(index) = semantic
+            .zones
+            .iter()
+            .position(|candidate| *candidate == zone)
+        {
             return Ok(semantic.zone_texts[index].clone());
         }
         drop(semantic);
@@ -1831,11 +1819,7 @@ mod tests {
         let serial = InputSerial::now();
 
         assert!(!should_process_unilateral_render_delta(11, 10, None));
-        assert!(should_process_unilateral_render_delta(
-            11,
-            10,
-            Some(serial)
-        ));
+        assert!(should_process_unilateral_render_delta(11, 10, Some(serial)));
         assert!(should_process_unilateral_render_delta(11, 11, None));
         assert!(should_process_unilateral_render_delta(11, 12, None));
     }
@@ -1889,7 +1873,10 @@ mod tests {
             .expect_err("closed test transport must reject input during exact admission");
 
         let after = pane.renderable.lock().inner.borrow().input_serial;
-        assert_eq!(after, before, "rejected input must not advance prediction authority");
+        assert_eq!(
+            after, before,
+            "rejected input must not advance prediction authority"
+        );
 
         pane.send_paste("paste")
             .expect_err("closed test transport must reject paste during exact admission");
@@ -1917,12 +1904,7 @@ mod tests {
             (0isize..24)
                 .map(|row| {
                     let line = if row == 0 {
-                        Line::from_text(
-                            "ready",
-                            &CellAttributes::default(),
-                            surface_sequence,
-                            None,
-                        )
+                        Line::from_text("ready", &CellAttributes::default(), surface_sequence, None)
                     } else {
                         Line::with_width(80, surface_sequence)
                     };
@@ -1932,12 +1914,7 @@ mod tests {
         } else {
             vec![(
                 0,
-                Line::from_text(
-                    "ready",
-                    &CellAttributes::default(),
-                    surface_sequence,
-                    None,
-                ),
+                Line::from_text("ready", &CellAttributes::default(), surface_sequence, None),
             )]
         };
         RenderApplicationUpdate {
@@ -2013,16 +1990,17 @@ mod tests {
         }
     }
 
-    fn settlement(
-        disposition: ClientRenderApplicationDisposition,
-    ) -> RenderApplicationResult {
+    fn settlement(disposition: ClientRenderApplicationDisposition) -> RenderApplicationResult {
         match disposition {
             ClientRenderApplicationDisposition::Settlement(result) => result,
             ClientRenderApplicationDisposition::DuplicateInProgress => {
                 panic!("test expected a terminal render-application settlement")
             }
             ClientRenderApplicationDisposition::ProtocolViolation(error) => {
-                panic!("test expected a settlement, got protocol violation: {}", error)
+                panic!(
+                    "test expected a settlement, got protocol violation: {}",
+                    error
+                )
             }
         }
     }
@@ -2111,13 +2089,12 @@ mod tests {
             end_x: 5,
             semantic_type: SemanticType::Prompt,
         };
-        update.semantic_zones =
-            RenderComponentUpdate::Replace(GetSemanticZonesResponse {
-                pane_id: pane.remote_pane_id,
-                zones: vec![semantic_zone],
-                zone_texts: vec!["ready".to_string()],
-                last_exit_code: Some(0),
-            });
+        update.semantic_zones = RenderComponentUpdate::Replace(GetSemanticZonesResponse {
+            pane_id: pane.remote_pane_id,
+            zones: vec![semantic_zone],
+            zone_texts: vec!["ready".to_string()],
+            last_exit_code: Some(0),
+        });
         let application_palette = ColorPalette::default();
         update.palette = RenderComponentUpdate::Replace(SetPalette {
             pane_id: pane.remote_pane_id,
@@ -2260,23 +2237,17 @@ mod tests {
             "the first committed connection must require an authoritative snapshot"
         );
         assert!(matches!(
-            state
-                .lock()
-                .begin(
-                    Some(TEST_RENDER_CONNECTION_IDENTITY),
-                    Some(connection_generation),
-                    pane_id,
-                    snapshot.connection_identity,
-                    snapshot.identity,
-                ),
+            state.lock().begin(
+                Some(TEST_RENDER_CONNECTION_IDENTITY),
+                Some(connection_generation),
+                pane_id,
+                snapshot.connection_identity,
+                snapshot.identity,
+            ),
             ClientRenderApplicationBegin::Apply
         ));
-        ClientRenderApplicationGuard::new(
-            &state,
-            snapshot.connection_identity,
-            snapshot.identity,
-        )
-        .acknowledge();
+        ClientRenderApplicationGuard::new(&state, snapshot.connection_identity, snapshot.identity)
+            .acknowledge();
 
         let gap = test_render_application_update(
             connection_generation,
@@ -2291,23 +2262,19 @@ mod tests {
             7,
         );
         assert!(matches!(
-            state
-                .lock()
-                .begin(
-                    Some(TEST_RENDER_CONNECTION_IDENTITY),
-                    Some(connection_generation),
-                    pane_id,
-                    gap.connection_identity,
-                    gap.identity,
-                ),
+            state.lock().begin(
+                Some(TEST_RENDER_CONNECTION_IDENTITY),
+                Some(connection_generation),
+                pane_id,
+                gap.connection_identity,
+                gap.identity,
+            ),
             ClientRenderApplicationBegin::Nack {
                 reason: RenderApplicationNackReason::DetectedGap,
-                observed_state: RenderApplicationObservedState::Applied(
-                    RenderStateIdentity {
-                        render_generation: 101,
-                        state_sequence: 4,
-                    }
-                ),
+                observed_state: RenderApplicationObservedState::Applied(RenderStateIdentity {
+                    render_generation: 101,
+                    state_sequence: 4,
+                }),
             }
         ));
 
@@ -2324,23 +2291,19 @@ mod tests {
             5,
         );
         assert!(matches!(
-            state
-                .lock()
-                .begin(
-                    Some(TEST_RENDER_CONNECTION_IDENTITY),
-                    Some(connection_generation),
-                    pane_id,
-                    stale.connection_identity,
-                    stale.identity,
-                ),
+            state.lock().begin(
+                Some(TEST_RENDER_CONNECTION_IDENTITY),
+                Some(connection_generation),
+                pane_id,
+                stale.connection_identity,
+                stale.identity,
+            ),
             ClientRenderApplicationBegin::Nack {
                 reason: RenderApplicationNackReason::BaseMismatch,
-                observed_state: RenderApplicationObservedState::Applied(
-                    RenderStateIdentity {
-                        render_generation: 101,
-                        state_sequence: 4,
-                    }
-                ),
+                observed_state: RenderApplicationObservedState::Applied(RenderStateIdentity {
+                    render_generation: 101,
+                    state_sequence: 4,
+                }),
             }
         ));
 
@@ -2354,15 +2317,13 @@ mod tests {
             5,
         );
         assert!(matches!(
-            state
-                .lock()
-                .begin(
-                    Some(TEST_RENDER_CONNECTION_IDENTITY),
-                    Some(connection_generation + 1),
-                    pane_id,
-                    next.connection_identity,
-                    next.identity,
-                ),
+            state.lock().begin(
+                Some(TEST_RENDER_CONNECTION_IDENTITY),
+                Some(connection_generation + 1),
+                pane_id,
+                next.connection_identity,
+                next.identity,
+            ),
             ClientRenderApplicationBegin::Nack {
                 reason: RenderApplicationNackReason::GenerationMismatch,
                 ..
@@ -2382,15 +2343,13 @@ mod tests {
             }
         ));
         assert!(matches!(
-            state
-                .lock()
-                .begin(
-                    Some(TEST_RENDER_CONNECTION_IDENTITY),
-                    Some(connection_generation),
-                    pane_id + 1,
-                    next.connection_identity,
-                    next.identity,
-                ),
+            state.lock().begin(
+                Some(TEST_RENDER_CONNECTION_IDENTITY),
+                Some(connection_generation),
+                pane_id + 1,
+                next.connection_identity,
+                next.identity,
+            ),
             ClientRenderApplicationBegin::Nack {
                 reason: RenderApplicationNackReason::MalformedOrIncomplete {
                     component: RenderApplicationComponent::Surface,
@@ -2492,29 +2451,25 @@ mod tests {
             connection_generation,
         ));
         assert!(matches!(
-            state
-                .lock()
-                .begin(
-                    Some(TEST_RENDER_CONNECTION_IDENTITY),
-                    Some(connection_generation),
-                    pane_id,
-                    first.connection_identity,
-                    first.identity,
-                ),
+            state.lock().begin(
+                Some(TEST_RENDER_CONNECTION_IDENTITY),
+                Some(connection_generation),
+                pane_id,
+                first.connection_identity,
+                first.identity,
+            ),
             ClientRenderApplicationBegin::Apply
         ));
         let guard =
             ClientRenderApplicationGuard::new(&state, first.connection_identity, first.identity);
         assert!(matches!(
-            state
-                .lock()
-                .begin(
-                    Some(TEST_RENDER_CONNECTION_IDENTITY),
-                    Some(connection_generation),
-                    pane_id,
-                    retry.connection_identity,
-                    retry.identity,
-                ),
+            state.lock().begin(
+                Some(TEST_RENDER_CONNECTION_IDENTITY),
+                Some(connection_generation),
+                pane_id,
+                retry.connection_identity,
+                retry.identity,
+            ),
             ClientRenderApplicationBegin::DuplicateInProgress
         ));
         drop(guard);
@@ -2527,15 +2482,13 @@ mod tests {
             assert_eq!(state.counters.cancelled_attempts, 1);
         }
         assert!(matches!(
-            state
-                .lock()
-                .begin(
-                    Some(TEST_RENDER_CONNECTION_IDENTITY),
-                    Some(connection_generation),
-                    pane_id,
-                    retry.connection_identity,
-                    retry.identity,
-                ),
+            state.lock().begin(
+                Some(TEST_RENDER_CONNECTION_IDENTITY),
+                Some(connection_generation),
+                pane_id,
+                retry.connection_identity,
+                retry.identity,
+            ),
             ClientRenderApplicationBegin::Apply
         ));
     }
@@ -2555,10 +2508,9 @@ mod tests {
             1,
         );
         let state = Mutex::new(ClientRenderApplicationState::default());
-        assert!(state.lock().prepare_authoritative_bootstrap(
-            TEST_RENDER_CONNECTION_IDENTITY,
-            first_generation,
-        ));
+        assert!(state
+            .lock()
+            .prepare_authoritative_bootstrap(TEST_RENDER_CONNECTION_IDENTITY, first_generation,));
         assert!(matches!(
             state.lock().begin(
                 Some(TEST_RENDER_CONNECTION_IDENTITY),
@@ -2627,7 +2579,10 @@ mod tests {
         );
         successor_guard.acknowledge();
         let state = state.lock();
-        assert_eq!(state.applied_state, Some(successor.identity.resulting_state));
+        assert_eq!(
+            state.applied_state,
+            Some(successor.identity.resulting_state)
+        );
         assert_eq!(state.counters.cancelled_attempts, 1);
         assert_eq!(state.counters.acknowledgements, 1);
     }
@@ -2660,12 +2615,8 @@ mod tests {
             ),
             ClientRenderApplicationBegin::Apply
         ));
-        ClientRenderApplicationGuard::new(
-            &state,
-            first.connection_identity,
-            first.identity,
-        )
-        .acknowledge();
+        ClientRenderApplicationGuard::new(&state, first.connection_identity, first.identity)
+            .acknowledge();
 
         assert!(state.lock().prepare_authoritative_bootstrap(
             ROUTE_FAILOVER_RENDER_CONNECTION_IDENTITY,
@@ -2685,8 +2636,7 @@ mod tests {
             None,
             1,
         );
-        abandoned_route_snapshot.connection_identity =
-            ROUTE_FAILOVER_RENDER_CONNECTION_IDENTITY;
+        abandoned_route_snapshot.connection_identity = ROUTE_FAILOVER_RENDER_CONNECTION_IDENTITY;
         assert!(matches!(
             state.lock().begin(
                 Some(ROUTE_FAILOVER_RENDER_CONNECTION_IDENTITY),
@@ -2758,8 +2708,7 @@ mod tests {
             None,
             1,
         );
-        restarted_server_snapshot.connection_identity =
-            SERVER_RESTART_RENDER_CONNECTION_IDENTITY;
+        restarted_server_snapshot.connection_identity = SERVER_RESTART_RENDER_CONNECTION_IDENTITY;
         assert!(matches!(
             state.lock().begin(
                 Some(SERVER_RESTART_RENDER_CONNECTION_IDENTITY),
@@ -2840,19 +2789,18 @@ mod tests {
         );
 
         let mut semantic = update.clone();
-        semantic.semantic_zones =
-            RenderComponentUpdate::Replace(GetSemanticZonesResponse {
-                pane_id: 29,
-                zones: vec![SemanticZone {
-                    start_y: 0,
-                    start_x: 0,
-                    end_y: 0,
-                    end_x: 5,
-                    semantic_type: SemanticType::Output,
-                }],
-                zone_texts: Vec::new(),
-                last_exit_code: None,
-            });
+        semantic.semantic_zones = RenderComponentUpdate::Replace(GetSemanticZonesResponse {
+            pane_id: 29,
+            zones: vec![SemanticZone {
+                start_y: 0,
+                start_x: 0,
+                end_y: 0,
+                end_x: 5,
+                semantic_type: SemanticType::Output,
+            }],
+            zone_texts: Vec::new(),
+            last_exit_code: None,
+        });
         assert_eq!(
             validate_render_application_resources(
                 &semantic,
@@ -2943,9 +2891,11 @@ mod tests {
             )
         );
 
-        let result = settlement(promise::spawn::block_on(
-            pane_a.apply_render_application(&pane_b_registration, &rpc, update.clone()),
-        ));
+        let result = settlement(promise::spawn::block_on(pane_a.apply_render_application(
+            &pane_b_registration,
+            &rpc,
+            update.clone(),
+        )));
         assert_eq!(
             result.outcome,
             RenderApplicationOutcome::Nack(RenderApplicationNack {

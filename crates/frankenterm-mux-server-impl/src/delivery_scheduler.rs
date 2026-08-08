@@ -533,12 +533,7 @@ where
             .expect("retired membership charges one slot");
     }
 
-    fn relink_neighbors(
-        &mut self,
-        previous: Option<usize>,
-        next: Option<usize>,
-        active: bool,
-    ) {
+    fn relink_neighbors(&mut self, previous: Option<usize>, next: Option<usize>, active: bool) {
         if let Some(previous) = previous {
             self.slots[previous]
                 .as_mut()
@@ -684,10 +679,7 @@ where
         }
         let mut free = HashSet::with_capacity(self.free.len());
         for index in &self.free {
-            if *index >= self.slots.len()
-                || self.slots[*index].is_some()
-                || !free.insert(*index)
-            {
+            if *index >= self.slots.len() || self.slots[*index].is_some() || !free.insert(*index) {
                 return Err("free list references an occupied, absent, or duplicate slot");
             }
         }
@@ -1196,8 +1188,7 @@ fn mint_scheduler_generation(
     if ordinal == 0 {
         return Err(SchedulerGenerationError::ZeroOrdinal);
     }
-    let instance =
-        allocate_scheduler_generation_instance(&NEXT_SCHEDULER_GENERATION_INSTANCE)?;
+    let instance = allocate_scheduler_generation_instance(&NEXT_SCHEDULER_GENERATION_INSTANCE)?;
     Ok(SchedulerGeneration {
         connection_identity,
         ordinal,
@@ -1763,9 +1754,7 @@ fn allocate_coordinator_instance(
         if current == 0 {
             return Err(CoordinatorInstanceExhausted);
         }
-        let next = current
-            .checked_add(1)
-            .ok_or(CoordinatorInstanceExhausted)?;
+        let next = current.checked_add(1).ok_or(CoordinatorInstanceExhausted)?;
         match counter.compare_exchange_weak(
             current,
             next,
@@ -2224,11 +2213,7 @@ impl RenderApplicationSettlementTracker {
         update
             .validate()
             .map_err(RenderApplicationBeginError::Contract)?;
-        validate_render_claim_binding(
-            claim,
-            update,
-            self.retry.map(|retry| retry.identity.kind),
-        )?;
+        validate_render_claim_binding(claim, update, self.retry.map(|retry| retry.identity.kind))?;
 
         let advertised_deadline = now_millis
             .checked_add(u64::from(update.retry_budget.remaining_millis))
@@ -2428,9 +2413,7 @@ impl RenderApplicationSettlementTracker {
         self.retry = None;
         self.closed = true;
         increment(&mut self.counters.deadline_expirations);
-        Some(RenderApplicationSettleOutcome::DeadlineExpired {
-            coordinator,
-        })
+        Some(RenderApplicationSettleOutcome::DeadlineExpired { coordinator })
     }
 
     /// Terminally close all admitted work on disconnect or shutdown.
@@ -3469,10 +3452,7 @@ impl DeliveryCoordinator {
         }
         let mut free = HashSet::with_capacity(self.queue_free.len());
         for index in &self.queue_free {
-            if *index >= self.queue.len()
-                || self.queue[*index].is_some()
-                || !free.insert(*index)
-            {
+            if *index >= self.queue.len() || self.queue[*index].is_some() || !free.insert(*index) {
                 return Err(
                     "coordinator free list references an occupied, absent, or duplicate slot",
                 );
@@ -4368,12 +4348,11 @@ mod hardened_tests {
             render_generation: authority.ledger_generation(),
             state_sequence: authority.source_version(),
         };
-        let base_state = (kind == RenderApplicationKind::Delta).then_some(
-            codec::RenderStateIdentity {
+        let base_state =
+            (kind == RenderApplicationKind::Delta).then_some(codec::RenderStateIdentity {
                 render_generation: authority.ledger_generation(),
                 state_sequence: authority.source_version().saturating_sub(1),
-            },
-        );
+            });
         let surface_sequence = usize::try_from(resulting_state.state_sequence)
             .expect("test render sequence should fit usize");
         let bonus_lines = if kind == RenderApplicationKind::Snapshot {
@@ -4564,9 +4543,8 @@ mod hardened_tests {
 
         let origin = DeliveryCoordinator::try_new(CONNECTION_IDENTITY, 41, broad_limits())
             .expect("first production scheduler generation should mint");
-        let mut replacement =
-            DeliveryCoordinator::try_new(CONNECTION_IDENTITY, 41, broad_limits())
-                .expect("same numeric ordinal should mint a distinct scheduler instance");
+        let mut replacement = DeliveryCoordinator::try_new(CONNECTION_IDENTITY, 41, broad_limits())
+            .expect("same numeric ordinal should mint a distinct scheduler instance");
         assert_eq!(origin.generation().get(), replacement.generation().get());
         assert_eq!(
             origin.generation().connection_identity(),
@@ -4761,10 +4739,7 @@ mod hardened_tests {
         );
         assert_eq!(tracker.deadline_millis(), Some(1_100));
         assert_eq!(coordinator.capacity().ready_plans, 1);
-        assert_eq!(
-            tracker.expire_deadline(&mut coordinator, 1_099),
-            None
-        );
+        assert_eq!(tracker.expire_deadline(&mut coordinator, 1_099), None);
         assert_eq!(
             tracker.expire_deadline(&mut coordinator, 1_100),
             Some(RenderApplicationSettleOutcome::DeadlineExpired {
@@ -5368,7 +5343,10 @@ mod hardened_tests {
         let mut tokens = Vec::with_capacity(PLANS);
 
         for index in 0..PLANS {
-            let plan = event_plan(u64::try_from(index).expect("test index is representable"), 1);
+            let plan = event_plan(
+                u64::try_from(index).expect("test index is representable"),
+                1,
+            );
             let token = match coordinator.reserve_plan(&plan) {
                 ReservationAdmission::Reserved(token) => token,
                 other => panic!("expected large reservation admission, got {other:?}"),
@@ -5397,7 +5375,10 @@ mod hardened_tests {
             let token = tokens[index]
                 .take()
                 .expect("even reservation token remains available");
-            let plan = event_plan(u64::try_from(index).expect("test index is representable"), 1);
+            let plan = event_plan(
+                u64::try_from(index).expect("test index is representable"),
+                1,
+            );
             assert!(matches!(
                 coordinator.commit_reservation(token, plan),
                 ReservationCommit::Committed { .. }

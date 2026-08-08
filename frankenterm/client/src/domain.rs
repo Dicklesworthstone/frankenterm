@@ -18,8 +18,8 @@ use mux::tab::{
 };
 use mux::window::WindowId;
 use mux::{
-    CurrentPane, MoveCommitReceipt, Mux, MuxNotification, PaneOperationGuard,
-    MuxWindowBuilder, PaneRegistrationHandle, SplitCommitReceipt,
+    CurrentPane, MoveCommitReceipt, Mux, MuxNotification, MuxWindowBuilder, PaneOperationGuard,
+    PaneRegistrationHandle, SplitCommitReceipt,
 };
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
@@ -199,9 +199,9 @@ fn preflight_pane_arena(panes: &PaneArena) -> anyhow::Result<PaneArenaPreflight>
         let node_count = usize::try_from(descriptor.node_count).with_context(|| {
             format!("ordered pane arena tree {tree_index} node count does not fit usize")
         })?;
-        let root_index = descriptor.root_index.ok_or_else(|| {
-            anyhow!("ordered pane arena tree {tree_index} has no root index")
-        })?;
+        let root_index = descriptor
+            .root_index
+            .ok_or_else(|| anyhow!("ordered pane arena tree {tree_index} has no root index"))?;
         let root_index = usize::try_from(root_index).with_context(|| {
             format!("ordered pane arena tree {tree_index} root index does not fit usize")
         })?;
@@ -211,9 +211,9 @@ fn preflight_pane_arena(panes: &PaneArena) -> anyhow::Result<PaneArenaPreflight>
                  nodes; expected one non-empty range rooted at {cursor}"
             );
         }
-        let arena_end = cursor.checked_add(node_count).ok_or_else(|| {
-            anyhow!("ordered pane arena tree {tree_index} range overflows usize")
-        })?;
+        let arena_end = cursor
+            .checked_add(node_count)
+            .ok_or_else(|| anyhow!("ordered pane arena tree {tree_index} range overflows usize"))?;
         if arena_end > panes.nodes().len() {
             bail!(
                 "ordered pane arena tree {tree_index} ends at {arena_end}, beyond {} nodes",
@@ -268,9 +268,8 @@ fn preflight_pane_arena(panes: &PaneArena) -> anyhow::Result<PaneArenaPreflight>
                 remote_pane_tabs.push((entry.pane_id, entry.tab_id));
             }
         }
-        let (remote_window_id, remote_tab_id) = tree_identity.ok_or_else(|| {
-            anyhow!("ordered pane arena tree {tree_index} has no pane identity")
-        })?;
+        let (remote_window_id, remote_tab_id) = tree_identity
+            .ok_or_else(|| anyhow!("ordered pane arena tree {tree_index} has no pane identity"))?;
         if !seen_remote_tab_ids.insert(remote_tab_id) {
             bail!("ordered pane arena remote tab {remote_tab_id} appears more than once");
         }
@@ -323,9 +322,7 @@ fn preflight_pane_arena(panes: &PaneArena) -> anyhow::Result<PaneArenaPreflight>
         window_ids.push(remote_window_id);
     }
     if !seen_remote_window_ids.is_subset(&title_window_ids) {
-        bail!(
-            "ordered pane arena has a pane-tree window without matching title authority"
-        );
+        bail!("ordered pane arena has a pane-tree window without matching title authority");
     }
 
     Ok(PaneArenaPreflight {
@@ -448,8 +445,7 @@ fn ensure_pane_arena_append_order_is_sound(
             anyhow!("local window {local_window_id} disappeared while indexing tab parents")
         })?;
         for tab in window.iter() {
-            if let Some(prior_window_id) =
-                parent_by_local_tab.insert(tab.tab_id(), local_window_id)
+            if let Some(prior_window_id) = parent_by_local_tab.insert(tab.tab_id(), local_window_id)
             {
                 bail!(
                     "local tab {} is attached to windows {prior_window_id} and {local_window_id}",
@@ -471,7 +467,8 @@ fn ensure_pane_arena_append_order_is_sound(
             continue;
         }
         let remote_pane_id = client_pane.remote_pane_id();
-        if let Some(prior_local_pane_id) = live_remote_panes.insert(remote_pane_id, pane.pane_id()) {
+        if let Some(prior_local_pane_id) = live_remote_panes.insert(remote_pane_id, pane.pane_id())
+        {
             bail!(
                 "remote pane {remote_pane_id} is mirrored by local panes \
                  {prior_local_pane_id} and {}",
@@ -517,9 +514,7 @@ fn ensure_pane_arena_append_order_is_sound(
                      containing a non-client pane"
                 );
             };
-            if !client_pane.belongs_to_client(inner)
-                || client_pane.remote_tab_id != remote_tab_id
-            {
+            if !client_pane.belongs_to_client(inner) || client_pane.remote_tab_id != remote_tab_id {
                 bail!(
                     "ordered pane arena mapping {remote_tab_id}->{local_tab_id} does not belong \
                      exactly to this client and remote tab"
@@ -577,9 +572,9 @@ fn ensure_pane_arena_append_order_is_sound(
             continue;
         };
 
-        let window = mux
-            .get_window(local_window_id)
-            .ok_or_else(|| anyhow!("local window {local_window_id} disappeared during preflight"))?;
+        let window = mux.get_window(local_window_id).ok_or_else(|| {
+            anyhow!("local window {local_window_id} disappeared during preflight")
+        })?;
         if window.len() > desired_remote_tabs.len() {
             bail!(
                 "ordered pane arena window {remote_window_id} requires an atomic existing-window \
@@ -589,16 +584,17 @@ fn ensure_pane_arena_append_order_is_sound(
             );
         }
         for (index, tab) in window.iter().enumerate() {
-            let attached_remote_tab = local_to_remote_tab
-                .get(&tab.tab_id())
-                .copied()
-                .ok_or_else(|| {
-                    anyhow!(
+            let attached_remote_tab =
+                local_to_remote_tab
+                    .get(&tab.tab_id())
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow!(
                         "ordered pane arena mapped window {remote_window_id} contains unmapped or \
                          foreign local tab {}",
                         tab.tab_id()
                     )
-                })?;
+                    })?;
             if desired_remote_tabs[index] != attached_remote_tab {
                 bail!(
                     "ordered pane arena window {remote_window_id} requires an atomic existing-window \
@@ -647,11 +643,13 @@ fn resolve_pane_arena_entry(
     let pane = if let Some(local_pane_id) = local_pane_ids_by_remote.get(&entry.pane_id).copied() {
         match mux.get_pane(local_pane_id) {
             Some(pane)
-                if pane.downcast_ref::<ClientPane>().is_some_and(|client_pane| {
-                    client_pane.belongs_to_client(inner)
-                        && client_pane.remote_pane_id() == entry.pane_id
-                        && client_pane.remote_tab_id == entry.tab_id
-                }) =>
+                if pane
+                    .downcast_ref::<ClientPane>()
+                    .is_some_and(|client_pane| {
+                        client_pane.belongs_to_client(inner)
+                            && client_pane.remote_pane_id() == entry.pane_id
+                            && client_pane.remote_tab_id == entry.tab_id
+                    }) =>
             {
                 pending
                     .existing_sync
@@ -659,9 +657,8 @@ fn resolve_pane_arena_entry(
                 pane
             }
             Some(_) | None => {
-                let local_pane_id = reserved_local_pane_ids
-                    .take(entry.pane_id)
-                    .ok_or_else(|| {
+                let local_pane_id =
+                    reserved_local_pane_ids.take(entry.pane_id).ok_or_else(|| {
                         anyhow!(
                             "remote pane {} needs a local identifier, but no identifier was \
                              reserved",
@@ -678,21 +675,17 @@ fn resolve_pane_arena_entry(
                     entry.alt_screen_active,
                 ));
                 local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
-                pending
-                    .new_panes
-                    .push((entry.pane_id, Arc::clone(&pane)));
+                pending.new_panes.push((entry.pane_id, Arc::clone(&pane)));
                 pane
             }
         }
     } else {
-        let local_pane_id = reserved_local_pane_ids
-            .take(entry.pane_id)
-            .ok_or_else(|| {
-                anyhow!(
-                    "remote pane {} needs a local identifier, but no identifier was reserved",
-                    entry.pane_id
-                )
-            })?;
+        let local_pane_id = reserved_local_pane_ids.take(entry.pane_id).ok_or_else(|| {
+            anyhow!(
+                "remote pane {} needs a local identifier, but no identifier was reserved",
+                entry.pane_id
+            )
+        })?;
         let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
             inner,
             local_pane_id,
@@ -703,9 +696,7 @@ fn resolve_pane_arena_entry(
             entry.alt_screen_active,
         ));
         local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
-        pending
-            .new_panes
-            .push((entry.pane_id, Arc::clone(&pane)));
+        pending.new_panes.push((entry.pane_id, Arc::clone(&pane)));
         pane
     };
     Ok(pane)
@@ -1012,7 +1003,6 @@ impl ClientInner {
     fn mark_detached(&self) {
         self.detached.store(true, Ordering::Release);
     }
-
 }
 
 pub struct ClientDomain {
@@ -1739,12 +1729,9 @@ impl ClientDomain {
         role: &str,
     ) -> anyhow::Result<PaneId> {
         guard.with_pane(|pane| {
-            let pane = pane.downcast_ref::<ClientPane>().ok_or_else(|| {
-                anyhow!(
-                    "{role} pane_id {} is not a ClientPane",
-                    guard.pane_id()
-                )
-            })?;
+            let pane = pane
+                .downcast_ref::<ClientPane>()
+                .ok_or_else(|| anyhow!("{role} pane_id {} is not a ClientPane", guard.pane_id()))?;
             if !pane.belongs_to_client(inner) {
                 bail!(
                     "{role} pane_id {} belongs to a different client attachment",
@@ -1809,8 +1796,7 @@ impl ClientDomain {
 
         let size = result.size;
         rpc.commit_sync(RpcConsumerKind::SplitResolution, || {
-            let (tab, pane, window_id) =
-                Self::resolve_remote_spawn_entities(mux, &inner, result)?;
+            let (tab, pane, window_id) = Self::resolve_remote_spawn_entities(mux, &inner, result)?;
             if let Some(source) = moved {
                 anyhow::ensure!(
                     source.is_same_pane(&pane),
@@ -1860,9 +1846,10 @@ impl ClientDomain {
             );
         }
 
-        let mut reserved_local_pane_ids = inner
-            .reserve_local_pane_ids(preflight.remote_pane_ids)
-            .context("reserve local pane identifiers for ordered remote topology")?;
+        let mut reserved_local_pane_ids =
+            inner
+                .reserve_local_pane_ids(preflight.remote_pane_ids)
+                .context("reserve local pane identifiers for ordered remote topology")?;
         let live_panes = mux.iter_panes();
         let mut local_pane_ids_by_remote = HashMap::new();
         local_pane_ids_by_remote
@@ -1885,8 +1872,7 @@ impl ClientDomain {
         }
         let mut remote_windows_to_forget = HashSet::new();
         {
-            let mappings =
-                lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window");
+            let mappings = lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window");
             remote_windows_to_forget
                 .try_reserve(mappings.len())
                 .context("reserve ordered pane stale-window marks")?;
@@ -1930,11 +1916,7 @@ impl ClientDomain {
             .try_reserve_exact(local_pane_ids_by_remote.len())
             .context("reserve pending ordered pane state updates")?;
         let mut preparation_scratch = PaneArenaPreparationScratch::default();
-        for (descriptor, plan) in descriptors
-            .into_iter()
-            .zip(preflight.tabs)
-            .rev()
-        {
+        for (descriptor, plan) in descriptors.into_iter().zip(preflight.tabs).rev() {
             if usize::try_from(descriptor.node_count).ok() != Some(plan.node_count) {
                 bail!("ordered pane arena descriptor changed after preflight");
             }
@@ -2030,9 +2012,8 @@ impl ClientDomain {
                 .and_then(|local_tab_id| mux.get_tab(local_tab_id))
                 .unwrap_or_else(|| Arc::new(Tab::new(&prepared.plan.root_size)));
             if mux.get_tab(tab.tab_id()).is_none() {
-                mux.add_tab_no_panes(&tab).with_context(|| {
-                    format!("stage ordered remote tab {remote_tab_id} in mux")
-                })?;
+                mux.add_tab_no_panes(&tab)
+                    .with_context(|| format!("stage ordered remote tab {remote_tab_id} in mux"))?;
                 publication.new_tabs.push(Arc::clone(&tab));
             }
             local_tabs_by_remote.insert(remote_tab_id, Arc::clone(&tab));
@@ -2044,8 +2025,7 @@ impl ClientDomain {
             .try_reserve(preflight.window_ids.len())
             .context("reserve ordered pane staged window identities")?;
         let existing_window_mappings = {
-            let mappings =
-                lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window");
+            let mappings = lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window");
             let mut snapshot = Vec::new();
             snapshot
                 .try_reserve_exact(mappings.len())
@@ -2060,7 +2040,11 @@ impl ClientDomain {
         }
         let mut attached_tabs = HashSet::new();
         attached_tabs
-            .try_reserve(existing_tab_mappings.len().saturating_add(staged_tabs.len()))
+            .try_reserve(
+                existing_tab_mappings
+                    .len()
+                    .saturating_add(staged_tabs.len()),
+            )
             .context("reserve ordered pane attachment index")?;
         for &local_window_id in local_windows_by_remote.values() {
             let window = mux.get_window(local_window_id).ok_or_else(|| {
@@ -2081,9 +2065,8 @@ impl ClientDomain {
             remote_windows_to_forget.remove(&plan.remote_window_id);
             remote_tabs_to_forget.remove(&plan.remote_tab_id);
 
-            if let Some(local_window_id) = local_windows_by_remote
-                .get(&plan.remote_window_id)
-                .copied()
+            if let Some(local_window_id) =
+                local_windows_by_remote.get(&plan.remote_window_id).copied()
             {
                 if attached_tabs.insert((local_window_id, staged.tab.tab_id())) {
                     mux.add_tab_to_window(&staged.tab, local_window_id)
@@ -2097,10 +2080,8 @@ impl ClientDomain {
                 continue;
             }
 
-            let window_builder = mux.new_empty_window(
-                Some(std::mem::take(&mut staged.prepared.workspace)),
-                None,
-            );
+            let window_builder =
+                mux.new_empty_window(Some(std::mem::take(&mut staged.prepared.workspace)), None);
             let local_window_id = *window_builder;
             publication.new_windows.push(window_builder);
             local_windows_by_remote.insert(plan.remote_window_id, local_window_id);
@@ -2153,8 +2134,7 @@ impl ClientDomain {
         }
         publication.commit();
 
-        for (window_title, remote_window_id) in
-            window_titles.into_iter().zip(preflight.window_ids)
+        for (window_title, remote_window_id) in window_titles.into_iter().zip(preflight.window_ids)
         {
             remote_windows_to_forget.remove(&remote_window_id);
             if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
@@ -2421,11 +2401,7 @@ impl ClientDomain {
                 if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
                     let needs_attach = mux
                         .get_window(local_window_id)
-                        .map(|window| {
-                            window
-                                .iter()
-                                .all(|candidate| !Arc::ptr_eq(candidate, &tab))
-                        });
+                        .map(|window| window.iter().all(|candidate| !Arc::ptr_eq(candidate, &tab)));
                     if let Some(needs_attach) = needs_attach {
                         if needs_attach {
                             log::debug!(
@@ -2812,11 +2788,9 @@ impl Domain for ClientDomain {
         }
 
         rpc.commit_sync(RpcConsumerKind::MoveResolution, || {
-            let local_tab_id = inner
-                .remote_to_local_tab_id(result.tab_id)
-                .ok_or_else(|| {
-                    anyhow!("remote tab {} didn't resolve after resync", result.tab_id)
-                })?;
+            let local_tab_id = inner.remote_to_local_tab_id(result.tab_id).ok_or_else(|| {
+                anyhow!("remote tab {} didn't resolve after resync", result.tab_id)
+            })?;
 
             let local_win_id = inner
                 .remote_to_local_window(result.window_id)
@@ -2831,9 +2805,7 @@ impl Domain for ClientDomain {
                 .get_tab(local_tab_id)
                 .ok_or_else(|| anyhow!("local tab {local_tab_id} is invalid"))?;
 
-            pane_guard
-                .capture_move_receipt(tab, local_win_id)
-                .map(Some)
+            pane_guard.capture_move_receipt(tab, local_win_id).map(Some)
         })
         .map_err(anyhow::Error::new)?
     }
@@ -2891,15 +2863,8 @@ impl Domain for ClientDomain {
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
     ) -> anyhow::Result<SplitCommitReceipt> {
-        self.split_exact(
-            mux,
-            target,
-            None,
-            split_request,
-            command,
-            command_dir,
-        )
-        .await
+        self.split_exact(mux, target, None, split_request, command, command_dir)
+            .await
     }
 
     async fn split_pane_moved(
@@ -2909,15 +2874,8 @@ impl Domain for ClientDomain {
         source: &PaneOperationGuard,
         split_request: SplitRequest,
     ) -> anyhow::Result<SplitCommitReceipt> {
-        self.split_exact(
-            mux,
-            target,
-            Some(source),
-            split_request,
-            None,
-            None,
-        )
-        .await
+        self.split_exact(mux, target, Some(source), split_request, None, None)
+            .await
     }
 
     async fn attach(
@@ -2981,9 +2939,7 @@ impl Domain for ClientDomain {
                 let result = with_mux_rpc_bootstrap_timeout(async {
                     client.verify_version_compat_with_scope(&ui, &rpc).await?;
 
-                    ui.output_str(
-                        "Version check OK!  Requesting coherent topology snapshot...\n",
-                    );
+                    ui.output_str("Version check OK!  Requesting coherent topology snapshot...\n");
                     ClientDomain::finish_attach(
                         &mux,
                         domain_id,
@@ -3548,13 +3504,8 @@ mod tests {
         lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab")
             .insert(52, first_local_tab);
 
-        let error = ClientDomain::process_pane_arena(
-            &mux,
-            Arc::clone(&inner),
-            snapshot,
-            None,
-        )
-        .expect_err("aliased remote tab mappings must fail before mutation");
+        let error = ClientDomain::process_pane_arena(&mux, Arc::clone(&inner), snapshot, None)
+            .expect_err("aliased remote tab mappings must fail before mutation");
         assert!(
             format!("{error:#}").contains("mappings alias remote tabs"),
             "unexpected error: {error:#}",
@@ -3581,18 +3532,12 @@ mod tests {
         let owner_window = owner
             .remote_to_local_window(41)
             .expect("owner window should map locally");
-        lock_or_recover(&foreign.remote_to_local_tab, "remote_to_local_tab")
-            .insert(51, owner_tab);
+        lock_or_recover(&foreign.remote_to_local_tab, "remote_to_local_tab").insert(51, owner_tab);
         lock_or_recover(&foreign.remote_to_local_window, "remote_to_local_window")
             .insert(41, owner_window);
 
-        let error = ClientDomain::process_pane_arena(
-            &mux,
-            Arc::clone(&foreign),
-            snapshot,
-            None,
-        )
-        .expect_err("foreign live topology mappings must fail before mutation");
+        let error = ClientDomain::process_pane_arena(&mux, Arc::clone(&foreign), snapshot, None)
+            .expect_err("foreign live topology mappings must fail before mutation");
         assert!(
             format!("{error:#}").contains("does not belong exactly to this client"),
             "unexpected error: {error:#}",
@@ -3642,8 +3587,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let inner = test_client_inner(91_011);
-        let (trees, nodes, mut window_titles) =
-            sample_remote_pane_arena(&[(51, 61)]).into_parts();
+        let (trees, nodes, mut window_titles) = sample_remote_pane_arena(&[(51, 61)]).into_parts();
         window_titles[0].window_id = u64::MAX;
 
         let error = ClientDomain::process_pane_arena(
@@ -3668,21 +3612,15 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let inner = test_client_inner(91_007);
-        let (trees, nodes, mut window_titles) =
-            sample_remote_pane_arena(&[(51, 61)]).into_parts();
+        let (trees, nodes, mut window_titles) = sample_remote_pane_arena(&[(51, 61)]).into_parts();
         window_titles.push(mux::tab::PaneArenaWindowTitle {
             window_id: 42,
             title: "empty remote window".to_string(),
         });
         let panes = PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
 
-        let error = ClientDomain::process_pane_arena(
-            &mux,
-            Arc::clone(&inner),
-            panes,
-            None,
-        )
-        .expect_err("a new empty window without workspace authority must fail closed");
+        let error = ClientDomain::process_pane_arena(&mux, Arc::clone(&inner), panes, None)
+            .expect_err("a new empty window without workspace authority must fail closed");
         assert!(
             format!("{error:#}")
                 .contains("requires exact ordered workspace and client ownership authority"),
@@ -3730,8 +3668,7 @@ mod tests {
         lock_or_recover(&owner.remote_to_local_window, "remote_to_local_window")
             .insert(42, foreign_window_id);
 
-        let (trees, nodes, mut window_titles) =
-            sample_remote_pane_arena(&[(51, 61)]).into_parts();
+        let (trees, nodes, mut window_titles) = sample_remote_pane_arena(&[(51, 61)]).into_parts();
         window_titles.push(mux::tab::PaneArenaWindowTitle {
             window_id: 42,
             title: "must not replace owned title".to_string(),
@@ -4022,11 +3959,8 @@ mod tests {
         mux.subscribe(move |notification| {
             if let MuxNotification::TabAddedToWindow { tab_id, window_id } = notification {
                 if window_id == local_window_id {
-                    lock_or_recover(
-                        &observed_additions_for_subscriber,
-                        "observed_tab_additions",
-                    )
-                    .push(tab_id);
+                    lock_or_recover(&observed_additions_for_subscriber, "observed_tab_additions")
+                        .push(tab_id);
                 }
             }
             true

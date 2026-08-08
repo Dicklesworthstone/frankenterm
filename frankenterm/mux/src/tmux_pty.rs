@@ -43,9 +43,7 @@ fn schedule_admitted_command(
         drop(abandoned);
         return Err(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
-            format!(
-                "tmux domain {domain_id} disappeared after durable admission during {context}"
-            ),
+            format!("tmux domain {domain_id} disappeared after durable admission during {context}"),
         ));
     };
     owner
@@ -274,9 +272,8 @@ impl ChildKiller for TmuxChildKiller {
                     self.domain_id,
                     "kill-pane control",
                 ) {
-                    self.child_state.mark_exited(ExitStatus::with_signal(
-                        "tmux kill-pane scheduling failed",
-                    ));
+                    self.child_state
+                        .mark_exited(ExitStatus::with_signal("tmux kill-pane scheduling failed"));
                     return Err(err);
                 }
                 Ok(())
@@ -330,15 +327,13 @@ impl MasterPty for TmuxPty {
             cmd_queue.push_back(Box::new(Resize { size, pane_id }))
         };
         match enqueue_result {
-            Ok(()) => {
-                schedule_admitted_command(
-                    &self.owner,
-                    &self.cmd_queue,
-                    self.domain_id,
-                    "PTY resize intent",
-                )
-                .map_err(anyhow::Error::from)
-            }
+            Ok(()) => schedule_admitted_command(
+                &self.owner,
+                &self.cmd_queue,
+                self.domain_id,
+                "PTY resize intent",
+            )
+            .map_err(anyhow::Error::from),
             Err(err) => Err(anyhow::anyhow!(
                 "cannot resize pane in tmux domain {}: {}",
                 self.domain_id,
@@ -453,9 +448,8 @@ mod tests {
     fn install_tmux_domain(pane_id: crate::pane::PaneId) -> (ScopedMux, StdArc<TmuxDomain>) {
         let mux = StdArc::new(Mux::new(None));
         let guard = ScopedMux::install(StdArc::clone(&mux));
-        let domain = StdArc::new(
-            TmuxDomain::new(pane_id).expect("start tmux test domain I/O supervisor"),
-        );
+        let domain =
+            StdArc::new(TmuxDomain::new(pane_id).expect("start tmux test domain I/O supervisor"));
         let registered: StdArc<dyn Domain> = domain.clone();
         mux.add_domain(&registered)
             .expect("register tmux test domain");

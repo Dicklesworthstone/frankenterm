@@ -212,13 +212,13 @@ fn arb_wire_framing_pdu() -> impl Strategy<Value = WireFramingPdu> {
             proptest::collection::vec(any::<u8>(), 0..128)
         )
             .prop_map(|(pane_id, data)| WireFramingPdu::WriteToPane { pane_id, data }),
-        (0usize..=4096, arb_small_string(), any::<u64>()).prop_map(
-            |(pane_id, data, millis)| WireFramingPdu::SendPaste {
+        (0usize..=4096, arb_small_string(), any::<u64>()).prop_map(|(pane_id, data, millis)| {
+            WireFramingPdu::SendPaste {
                 pane_id,
                 data,
                 input_serial: InputSerial::from_millis_since_epoch(millis),
-            },
-        ),
+            }
+        },),
         (
             0usize..=4096,
             prop::option::of(arb_small_string()),

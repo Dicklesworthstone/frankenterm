@@ -398,17 +398,13 @@ fn bench_delivery_scheduler_hot_paths(c: &mut Criterion) {
                 b.iter(|| black_box(scheduler.admit_render(key, key)));
             },
         );
-        group.bench_with_input(
-            BenchmarkId::new("next_ready", keys),
-            &keys,
-            |b, &keys| {
-                b.iter_batched_ref(
-                    || populated_render_scheduler(keys),
-                    |scheduler| scheduler.pop_next(),
-                    BatchSize::LargeInput,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("next_ready", keys), &keys, |b, &keys| {
+            b.iter_batched_ref(
+                || populated_render_scheduler(keys),
+                |scheduler| scheduler.pop_next(),
+                BatchSize::LargeInput,
+            );
+        });
         group.bench_with_input(
             BenchmarkId::new("resync_select", keys),
             &keys,

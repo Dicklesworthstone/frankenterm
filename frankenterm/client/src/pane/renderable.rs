@@ -21,12 +21,10 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
-use termwiz::cell::{Cell, CellAttributes, Underline, grapheme_column_width};
+use termwiz::cell::{grapheme_column_width, Cell, CellAttributes, Underline};
 use termwiz::color::AnsiColor;
 use termwiz::hyperlink::Rule;
-use termwiz::image::{
-    ImageCell, ImageData, ImageDataValidationError, ImageDataValidationLimits,
-};
+use termwiz::image::{ImageCell, ImageData, ImageDataValidationError, ImageDataValidationLimits};
 use termwiz::surface::{SequenceNo, SEQ_ZERO};
 use url::Url;
 use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
@@ -160,9 +158,7 @@ impl LineEntry {
         match self {
             Self::Line(_) => ("Line", None),
             Self::Fetching(token) => ("Fetching", Some(token.started_at())),
-            Self::LineAndFetching(_, token) => {
-                ("LineAndFetching", Some(token.started_at()))
-            }
+            Self::LineAndFetching(_, token) => ("LineAndFetching", Some(token.started_at())),
             Self::Stale(_) => ("Stale", None),
         }
     }
@@ -171,11 +167,7 @@ impl LineEntry {
 fn fresh_cached_line(entry: Option<&LineEntry>) -> Option<&Line> {
     match entry {
         Some(LineEntry::Line(line)) => Some(line),
-        Some(
-            LineEntry::Fetching(_)
-            | LineEntry::LineAndFetching(_, _)
-            | LineEntry::Stale(_),
-        )
+        Some(LineEntry::Fetching(_) | LineEntry::LineAndFetching(_, _) | LineEntry::Stale(_))
         | None => None,
     }
 }
@@ -193,9 +185,9 @@ fn rebuild_cache_as_stale(lines: &mut LruCache<StableRowIndex, LineEntry>, capac
     let mut stale_lines = LruCache::new(capacity);
     while let Some((stable_row, entry)) = lines.pop_lru() {
         let entry = match entry {
-            LineEntry::Stale(old)
-            | LineEntry::Line(old)
-            | LineEntry::LineAndFetching(old, _) => Some(LineEntry::Stale(old)),
+            LineEntry::Stale(old) | LineEntry::Line(old) | LineEntry::LineAndFetching(old, _) => {
+                Some(LineEntry::Stale(old))
+            }
             // A geometry epoch change invalidates the request identity. A late
             // old-width completion must find no matching token and be dropped.
             LineEntry::Fetching(_) => None,
@@ -270,11 +262,7 @@ fn reconcile_predictions_after_cached_terminal_change(
     reconcile_predictions_with_authoritative_lines(predictions, terminal_seqno, |row| {
         match lines.peek(&row) {
             Some(LineEntry::Line(line)) => Some(line),
-            Some(
-                LineEntry::Fetching(_)
-                | LineEntry::LineAndFetching(..)
-                | LineEntry::Stale(_),
-            )
+            Some(LineEntry::Fetching(_) | LineEntry::LineAndFetching(..) | LineEntry::Stale(_))
             | None => None,
         }
     })
@@ -328,11 +316,7 @@ fn reconcile_predictions_with_authoritative_lines<'a>(
     reconciliation
 }
 
-fn expire_predictions(
-    predictions: &mut Vec<Prediction>,
-    now: Instant,
-    ttl: Duration,
-) -> usize {
+fn expire_predictions(predictions: &mut Vec<Prediction>, now: Instant, ttl: Duration) -> usize {
     let before = predictions.len();
     predictions.retain(|prediction| now.saturating_duration_since(prediction.born) < ttl);
     before.saturating_sub(predictions.len())
@@ -343,10 +327,7 @@ fn reset_prediction_state(predictions: &mut Vec<Prediction>, prediction_score: &
     *prediction_score = 0;
 }
 
-fn push_bounded_prediction(
-    predictions: &mut Vec<Prediction>,
-    prediction: Prediction,
-) -> bool {
+fn push_bounded_prediction(predictions: &mut Vec<Prediction>, prediction: Prediction) -> bool {
     if predictions.len() >= MAX_PENDING_PREDICTIONS {
         return false;
     }
@@ -601,20 +582,12 @@ impl RenderableInner {
     /// There are bound to be a number of other edge cases that we should
     /// handle.
     /// Record an overlay prediction for the plain glyph `predicted` at (row, col).
-    fn record_prediction(
-        &mut self,
-        row: StableRowIndex,
-        col: usize,
-        predicted: Cell,
-    ) -> bool {
+    fn record_prediction(&mut self, row: StableRowIndex, col: usize, predicted: Cell) -> bool {
         let Some(end_col) = col.checked_add(predicted.width()) else {
             self.suppress_prediction_after_local_failure();
             return false;
         };
-        if predicted.width() == 0
-            || col >= self.dimensions.cols
-            || end_col > self.dimensions.cols
-        {
+        if predicted.width() == 0 || col >= self.dimensions.cols || end_col > self.dimensions.cols {
             // A prediction is eventually painted with `Line::set_cell`, which
             // can materialize storage up to the requested column. Never let a
             // malformed cursor or a wide glyph past the right edge turn local
@@ -623,14 +596,17 @@ impl RenderableInner {
             return false;
         }
         let now = Instant::now();
-        let admitted = push_bounded_prediction(&mut self.predictions, Prediction {
-            row,
-            col,
-            predicted,
-            input_serial: self.input_serial,
-            dispatch_seqno: None,
-            born: now,
-        });
+        let admitted = push_bounded_prediction(
+            &mut self.predictions,
+            Prediction {
+                row,
+                col,
+                predicted,
+                input_serial: self.input_serial,
+                dispatch_seqno: None,
+                born: now,
+            },
+        );
         if !admitted {
             self.prediction_score = PREDICT_SUPPRESS_SCORE;
             self.last_prediction_miss = now;
@@ -643,11 +619,7 @@ impl RenderableInner {
     ///
     /// This is intentionally not prediction settlement: `pane.key_down` can
     /// return before the PTY or application emits any output.
-    fn record_input_dispatch(
-        &mut self,
-        serial: InputSerial,
-        dispatch_seqno: SequenceNo,
-    ) {
+    fn record_input_dispatch(&mut self, serial: InputSerial, dispatch_seqno: SequenceNo) {
         mark_predictions_dispatched(&mut self.predictions, serial, dispatch_seqno);
     }
 
@@ -688,9 +660,7 @@ impl RenderableInner {
     }
 
     fn prediction_ttl(&self) -> Duration {
-        Duration::from_millis(250).max(Duration::from_millis(
-            self.last_input_rtt.saturating_mul(4),
-        ))
+        Duration::from_millis(250).max(Duration::from_millis(self.last_input_rtt.saturating_mul(4)))
     }
 
     fn expire_stale_predictions(&mut self, now: Instant) -> RangeSet<StableRowIndex> {
@@ -756,8 +726,7 @@ impl RenderableInner {
             KeyCode::Delete => {
                 let row = self.cursor_position.y;
                 let col = self.cursor_position.x;
-                let _ =
-                    self.record_prediction(row, col, Cell::new(' ', CellAttributes::default()));
+                let _ = self.record_prediction(row, col, Cell::new(' ', CellAttributes::default()));
             }
             KeyCode::Backspace if self.cursor_position.x > 0 => {
                 let row = self.cursor_position.y;
@@ -1208,9 +1177,7 @@ impl RenderableInner {
                     Some(LineEntry::Fetching(_)) | None => LineEntry::Fetching(fetch_token),
                     Some(LineEntry::LineAndFetching(old, ..))
                     | Some(LineEntry::Stale(old))
-                    | Some(LineEntry::Line(old)) => {
-                        LineEntry::LineAndFetching(old, fetch_token)
-                    }
+                    | Some(LineEntry::Line(old)) => LineEntry::LineAndFetching(old, fetch_token),
                 };
                 log::trace!(
                     "row {} {:?} -> {:?} due to dirty and IN viewport",
@@ -1271,9 +1238,7 @@ impl RenderableInner {
         for range in requested.iter() {
             for stable_row in range.clone() {
                 let replacement = match self.lines.pop(&stable_row) {
-                    Some(LineEntry::Fetching(current))
-                        if fetch_token.same_request(&current) =>
-                    {
+                    Some(LineEntry::Fetching(current)) if fetch_token.same_request(&current) => {
                         None
                     }
                     Some(LineEntry::LineAndFetching(line, current))
@@ -1376,8 +1341,7 @@ impl RenderableInner {
             }
         }
 
-        let mut line_refs: Vec<&mut Line> =
-            extracted.iter_mut().map(|(_, line)| line).collect();
+        let mut line_refs: Vec<&mut Line> = extracted.iter_mut().map(|(_, line)| line).collect();
         Line::apply_hyperlink_rules(rules, &mut line_refs);
         drop(line_refs);
 
@@ -1792,8 +1756,7 @@ const ORDINARY_IMAGE_HYDRATION_TIMEOUT: Duration = Duration::from_secs(2);
 // large replies on the connection reader and bounds damage until image transfer
 // moves to a cancellable out-of-band channel.
 const IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES: usize =
-    MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES * 2
-        + MAX_IMAGE_HYDRATION_DECODED_BYTES * 2;
+    MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES * 2 + MAX_IMAGE_HYDRATION_DECODED_BYTES * 2;
 const MAX_GLOBAL_IMAGE_HYDRATION_WORKING_SET_BYTES: usize =
     IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES;
 
@@ -2033,18 +1996,10 @@ static IMAGE_HYDRATION_RESERVED_BYTES: AtomicUsize = AtomicUsize::new(0);
 fn try_reserve_bounded_atomic(counter: &AtomicUsize, amount: usize, limit: usize) -> bool {
     let mut current = counter.load(Ordering::Acquire);
     loop {
-        let Some(next) = current
-            .checked_add(amount)
-            .filter(|next| *next <= limit)
-        else {
+        let Some(next) = current.checked_add(amount).filter(|next| *next <= limit) else {
             return false;
         };
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return true,
             Err(observed) => current = observed,
         }
@@ -2059,12 +2014,7 @@ fn try_release_atomic(counter: &AtomicUsize, amount: usize) -> bool {
         let Some(next) = current.checked_sub(amount) else {
             return false;
         };
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return true,
             Err(observed) => current = observed,
         }
@@ -2196,9 +2146,9 @@ fn cache_and_admit_ordinary_image(
     accepted_decoded_bytes: usize,
     validated: &ValidatedImageData,
 ) -> OrdinaryImageBatchAdmission {
-    if connection.is_some_and(|identity| {
-        !put_cached_validated_image(identity, pane_id, validated.clone())
-    }) {
+    if connection
+        .is_some_and(|identity| !put_cached_validated_image(identity, pane_id, validated.clone()))
+    {
         return OrdinaryImageBatchAdmission::RevisionChangedBeforeCachePublish;
     }
     let Some(next_decoded_bytes) = accepted_decoded_bytes.checked_add(validated.decoded_bytes)
@@ -2277,9 +2227,9 @@ async fn acquire_image_hydration_bytes_until(
     deadline: Instant,
 ) -> Option<ImageHydrationBytePermit> {
     loop {
-        if let Some(permit) = ImageHydrationBytePermit::try_acquire(
-            IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES,
-        ) {
+        if let Some(permit) =
+            ImageHydrationBytePermit::try_acquire(IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES)
+        {
             return Some(permit);
         }
         let remaining = deadline.checked_duration_since(Instant::now())?;
@@ -2295,13 +2245,11 @@ async fn validate_image_off_main_thread(
     expected_revision: [u8; 32],
     limits: ImageDataValidationLimits,
 ) -> Result<ValidatedImageData, ImageValidationFailure> {
-    let pool = IMAGE_VALIDATION_POOL
-        .as_ref()
-        .map_err(|error| {
-            ImageValidationFailure::Unavailable(format!(
-                "image validation pool is unavailable: {error}"
-            ))
-        })?;
+    let pool = IMAGE_VALIDATION_POOL.as_ref().map_err(|error| {
+        ImageValidationFailure::Unavailable(format!(
+            "image validation pool is unavailable: {error}"
+        ))
+    })?;
     let permit = ImageValidationJobPermit::try_acquire().ok_or_else(|| {
         ImageValidationFailure::Unavailable(format!(
             "image validation queue is full ({MAX_PENDING_IMAGE_VALIDATIONS} running or pending jobs)"
@@ -2328,17 +2276,13 @@ async fn validate_image_off_main_thread(
                     // revision authority survives into the renderer; rebuilding
                     // it from `into_data()` would discard that proof and force a
                     // second full-buffer hash pass on the GUI thread.
-                    let owned = Arc::try_unwrap(data).map_err(|_| {
-                        ImageDataValidationError::SharedMutablePayload
-                    })?;
+                    let owned = Arc::try_unwrap(data)
+                        .map_err(|_| ImageDataValidationError::SharedMutablePayload)?;
                     Arc::new(owned)
                 }
             };
             debug_assert_eq!(
-                immutable_data.validated_summary_for_content_revision(
-                    expected_revision,
-                    limits
-                ),
+                immutable_data.validated_summary_for_content_revision(expected_revision, limits),
                 Some(normalized.summary),
                 "validated image rewrap must preserve local renderer authority"
             );
@@ -2348,34 +2292,30 @@ async fn validate_image_off_main_thread(
                 source_revision: expected_revision,
             })
         })()
-            .map_err(|error| match error {
-                ImageDataValidationError::DecodeCancelled => {
-                    ImageValidationFailure::Unavailable("image validation was cancelled".into())
-                }
-                ImageDataValidationError::SharedMutablePayload => {
-                    ImageValidationFailure::Unavailable(
-                        "validated image payload remained externally shared and mutable".into(),
-                    )
-                }
-                error @ (ImageDataValidationError::EncodedResourceIo { .. }
-                | ImageDataValidationError::EncodedLeaseUnavailable { .. }) => {
-                    // A blob lease or its backing store can become available
-                    // again without the requested image revision changing.
-                    // Never permanently poison that revision in the negative
-                    // cache merely because one resource read failed.
-                    ImageValidationFailure::Unavailable(error.to_string())
-                }
-                error => ImageValidationFailure::Invalid(error),
-            });
+        .map_err(|error| match error {
+            ImageDataValidationError::DecodeCancelled => {
+                ImageValidationFailure::Unavailable("image validation was cancelled".into())
+            }
+            ImageDataValidationError::SharedMutablePayload => ImageValidationFailure::Unavailable(
+                "validated image payload remained externally shared and mutable".into(),
+            ),
+            error @ (ImageDataValidationError::EncodedResourceIo { .. }
+            | ImageDataValidationError::EncodedLeaseUnavailable { .. }) => {
+                // A blob lease or its backing store can become available
+                // again without the requested image revision changing.
+                // Never permanently poison that revision in the negative
+                // cache merely because one resource read failed.
+                ImageValidationFailure::Unavailable(error.to_string())
+            }
+            error => ImageValidationFailure::Invalid(error),
+        });
         let _ = sender.send(result);
     });
-    let result = receiver
-        .await
-        .map_err(|_| {
-            ImageValidationFailure::Unavailable(
-                "image validation worker exited without a result".to_string(),
-            )
-        })?;
+    let result = receiver.await.map_err(|_| {
+        ImageValidationFailure::Unavailable(
+            "image validation worker exited without a result".to_string(),
+        )
+    })?;
     cancel_on_drop.disarm();
     result
 }
@@ -2394,12 +2334,7 @@ impl HydratedLines {
         }
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Vec<(StableRowIndex, Line)>,
-        HashSet<StableRowIndex>,
-    ) {
+    pub(crate) fn into_parts(self) -> (Vec<(StableRowIndex, Line)>, HashSet<StableRowIndex>) {
         (self.lines, self.incomplete_rows)
     }
 }
@@ -2422,9 +2357,7 @@ pub(crate) async fn hydrate_lines(
         || counts.images > MAX_RENDER_APPLICATION_IMAGE_REFERENCES
     {
         record_image_hydration_rejection("serialized_resource_limit");
-        anyhow::bail!(
-            "GetLines payload exceeds bounded render resources: {counts:?}"
-        );
+        anyhow::bail!("GetLines payload exceeds bounded render resources: {counts:?}");
     }
     // The payload cannot change between validation and extraction because it
     // is consumed here. Avoid a second O(lines + cells + references) pass on
@@ -2750,13 +2683,13 @@ pub(crate) async fn hydrate_render_application_lines(
                 RenderApplicationComponent::Images
             }
             SerializedLinesStructureError::DuplicateStableRow
-            | SerializedLinesStructureError::CellCountOverflow => {
-                RenderApplicationComponent::Lines
-            }
+            | SerializedLinesStructureError::CellCountOverflow => RenderApplicationComponent::Lines,
         };
         RenderApplicationNackReason::MalformedOrIncomplete { component }
     };
-    let counts = serialized_lines.validate_structure().map_err(structure_error)?;
+    let counts = serialized_lines
+        .validate_structure()
+        .map_err(structure_error)?;
     let bounded_resource = |resource, requested: usize, limit: usize| {
         RenderApplicationNackReason::BoundedResourceRejected {
             resource,
@@ -2928,59 +2861,54 @@ pub(crate) async fn hydrate_render_application_lines(
                     let Some(data) = response.data else {
                         continue;
                     };
-                    let validated = match validate_image_off_main_thread(
-                        data,
-                        hash,
-                        validation_limits,
-                    )
-                    .await
-                    {
-                        Ok(validated) => validated,
-                        Err(ImageValidationFailure::Invalid(
-                            ImageDataValidationError::ContentRevisionMismatch,
-                        )) => continue,
-                        Err(ImageValidationFailure::Invalid(
-                            ImageDataValidationError::DecodedByteLimitExceeded {
-                                requested,
-                                limit,
+                    let validated =
+                        match validate_image_off_main_thread(data, hash, validation_limits).await {
+                            Ok(validated) => validated,
+                            Err(ImageValidationFailure::Invalid(
+                                ImageDataValidationError::ContentRevisionMismatch,
+                            )) => continue,
+                            Err(ImageValidationFailure::Invalid(
+                                ImageDataValidationError::DecodedByteLimitExceeded {
+                                    requested,
+                                    limit,
+                                }
+                                | ImageDataValidationError::EncodedByteLimitExceeded {
+                                    requested,
+                                    limit,
+                                }
+                                | ImageDataValidationError::FrameCountLimitExceeded {
+                                    requested,
+                                    limit,
+                                },
+                            )) => {
+                                return Err((
+                                    RenderApplicationNackReason::BoundedResourceRejected {
+                                        resource: RenderApplicationResource::Images,
+                                        requested: u64::try_from(requested).unwrap_or(u64::MAX),
+                                        limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                                    },
+                                    CachedImageFailure::Permanent,
+                                ));
                             }
-                            | ImageDataValidationError::EncodedByteLimitExceeded {
-                                requested,
-                                limit,
+                            Err(ImageValidationFailure::Invalid(_)) => {
+                                return Err((
+                                    RenderApplicationNackReason::MalformedOrIncomplete {
+                                        component: RenderApplicationComponent::Images,
+                                    },
+                                    CachedImageFailure::Permanent,
+                                ));
                             }
-                            | ImageDataValidationError::FrameCountLimitExceeded {
-                                requested,
-                                limit,
-                            },
-                        )) => {
-                            return Err((
-                                RenderApplicationNackReason::BoundedResourceRejected {
-                                    resource: RenderApplicationResource::Images,
-                                    requested: u64::try_from(requested).unwrap_or(u64::MAX),
-                                    limit: u64::try_from(limit).unwrap_or(u64::MAX),
-                                },
-                                CachedImageFailure::Permanent,
-                            ));
-                        }
-                        Err(ImageValidationFailure::Invalid(_)) => {
-                            return Err((
-                                RenderApplicationNackReason::MalformedOrIncomplete {
-                                    component: RenderApplicationComponent::Images,
-                                },
-                                CachedImageFailure::Permanent,
-                            ));
-                        }
-                        Err(ImageValidationFailure::Unavailable(_)) => {
-                            return Err((
-                                RenderApplicationNackReason::ApplicationFailure {
-                                    stage: RenderApplicationStage::Hydrate,
-                                },
-                                CachedImageFailure::Transient {
-                                    retry_after: Instant::now() + Duration::from_millis(500),
-                                },
-                            ));
-                        }
-                    };
+                            Err(ImageValidationFailure::Unavailable(_)) => {
+                                return Err((
+                                    RenderApplicationNackReason::ApplicationFailure {
+                                        stage: RenderApplicationStage::Hydrate,
+                                    },
+                                    CachedImageFailure::Transient {
+                                        retry_after: Instant::now() + Duration::from_millis(500),
+                                    },
+                                ));
+                            }
+                        };
                     return Ok(validated);
                 }
                 Err((
@@ -2999,7 +2927,8 @@ pub(crate) async fn hydrate_render_application_lines(
     let mut hydration = Box::pin(hydration);
     let mut fetched = Vec::new();
     loop {
-        let Some(next) = await_image_work_until(hydration.next(), application_deadline).await else {
+        let Some(next) = await_image_work_until(hydration.next(), application_deadline).await
+        else {
             if let Some(identity) = connection_identity {
                 for hash in unresolved_hashes {
                     lock_image_lru().record_failure(
@@ -3381,10 +3310,8 @@ impl RenderableState {
         let mut inner = self.inner.borrow_mut();
         Self::poll_before_changed_query(&mut inner);
         let source_end = inner.seqno;
-        let baseline = mux::pane::changed_since_query_baseline(
-            last_observed_source_end,
-            source_end,
-        );
+        let baseline =
+            mux::pane::changed_since_query_baseline(last_observed_source_end, source_end);
         let changed = Self::collect_changed_since(&mut inner, lines, baseline);
         (source_end, changed)
     }
@@ -3457,29 +3384,26 @@ impl RenderableState {
     pub fn get_tiered_scrollback_status(&self) -> Option<PaneTieredScrollbackStatus> {
         self.inner.borrow().tiered_scrollback_status
     }
-
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::client::TEST_RENDER_CONNECTION_IDENTITY;
     use super::{
-        apply_prediction_reconciliation_to_score, base_poll_interval, expire_predictions,
-        cache_and_admit_ordinary_image, get_cached_validated_image, initial_last_poll,
-        mark_predictions_dispatched, paste_fits_prediction_budget, push_bounded_prediction,
-        push_image_locator, rebuild_cache_as_stale,
+        apply_prediction_reconciliation_to_score, base_poll_interval,
+        cache_and_admit_ordinary_image, expire_predictions, get_cached_validated_image,
+        initial_last_poll, mark_predictions_dispatched, paste_fits_prediction_budget,
+        push_bounded_prediction, push_image_locator, rebuild_cache_as_stale,
         reconcile_predictions_after_cached_terminal_change,
         reconcile_predictions_after_terminal_change, render_line_cache_capacity_for_values,
         reset_prediction_state, rows_requiring_image_retry, should_apply_unilateral_delta,
-        try_release_atomic, try_reserve_bounded_atomic,
-        CachedImageFailure, FetchToken, ImageLru, LineEntry, OrdinaryImageBatchAdmission,
-        Prediction, PredictionReconciliation, ValidatedImageData,
-        IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES,
-        MAX_GLOBAL_IMAGE_HYDRATION_WORKING_SET_BYTES,
-        MAX_IMAGE_LOCATOR_ATTEMPTS_PER_REVISION, MAX_ORDINARY_IMAGE_BATCH_BYTES,
-        MAX_PENDING_PREDICTIONS, PREDICT_CONFIDENT_SCORE,
+        try_release_atomic, try_reserve_bounded_atomic, CachedImageFailure, FetchToken, ImageLru,
+        LineEntry, OrdinaryImageBatchAdmission, Prediction, PredictionReconciliation,
+        ValidatedImageData, IMAGE_HYDRATION_WORKING_SET_RESERVATION_BYTES,
+        MAX_GLOBAL_IMAGE_HYDRATION_WORKING_SET_BYTES, MAX_IMAGE_LOCATOR_ATTEMPTS_PER_REVISION,
+        MAX_ORDINARY_IMAGE_BATCH_BYTES, MAX_PENDING_PREDICTIONS, PREDICT_CONFIDENT_SCORE,
     };
     use crate::client::Client;
+    use crate::client::TEST_RENDER_CONNECTION_IDENTITY;
     use crate::domain::{ClientDomainConfig, ClientInner};
     use crate::pane::ClientPane;
     use codec::{
@@ -3497,9 +3421,9 @@ mod tests {
     use termwiz::cell::{Cell, CellAttributes};
     use termwiz::hyperlink::Rule;
     use termwiz::image::{ImageData, ImageDataType};
-    use wezterm_term::{KeyCode, KeyModifiers};
     use termwiz::surface::{SequenceNo, SEQ_ZERO};
     use wezterm_term::Line;
+    use wezterm_term::{KeyCode, KeyModifiers};
 
     #[test]
     fn bounded_atomic_reservation_preserves_limit_overflow_and_release_boundaries() {
@@ -3542,10 +3466,7 @@ mod tests {
         };
         let client = Arc::new(ClientInner::new(
             domain_id,
-            Client::new_test_client(
-                Some(domain_id),
-                ClientDomainConfig::Unix(unix),
-            ),
+            Client::new_test_client(Some(domain_id), ClientDomainConfig::Unix(unix)),
             None,
             local_echo_threshold_ms,
             false,
@@ -3849,12 +3770,10 @@ mod tests {
     #[test]
     fn cached_hyperlinks_wait_for_complete_logical_group_and_honor_exact_rules() {
         let renderable = test_renderable_state();
-        let first_rules = vec![
-            Rule::new(r"https://example\.com", "first:$0").expect("valid hyperlink rule"),
-        ];
-        let second_rules = vec![
-            Rule::new(r"https://example\.com", "second:$0").expect("valid hyperlink rule"),
-        ];
+        let first_rules =
+            vec![Rule::new(r"https://example\.com", "first:$0").expect("valid hyperlink rule")];
+        let second_rules =
+            vec![Rule::new(r"https://example\.com", "second:$0").expect("valid hyperlink rule")];
 
         {
             let state = renderable.lock();
@@ -3883,12 +3802,7 @@ mod tests {
         {
             let state = renderable.lock();
             let mut inner = state.inner.borrow_mut();
-            let second = Line::from_text(
-                "ple.com",
-                &CellAttributes::default(),
-                inner.seqno,
-                None,
-            );
+            let second = Line::from_text("ple.com", &CellAttributes::default(), inner.seqno, None);
             assert!(inner.put_line(1, second, None));
         }
 
@@ -3932,9 +3846,8 @@ mod tests {
     #[test]
     fn switching_implicit_hyperlink_rules_to_empty_clears_cached_shape_appdata() {
         let renderable = test_renderable_state();
-        let rules = vec![
-            Rule::new(r"https://example\.com", "linked:$0").expect("valid hyperlink rule"),
-        ];
+        let rules =
+            vec![Rule::new(r"https://example\.com", "linked:$0").expect("valid hyperlink rule")];
         {
             let state = renderable.lock();
             let mut inner = state.inner.borrow_mut();
@@ -3983,12 +3896,10 @@ mod tests {
     #[test]
     fn rule_change_clears_appdata_when_wrapped_group_is_temporarily_incomplete() {
         let renderable = test_renderable_state();
-        let first_rules = vec![
-            Rule::new(r"https://example\.com", "first:$0").expect("valid hyperlink rule"),
-        ];
-        let second_rules = vec![
-            Rule::new(r"https://example\.com", "second:$0").expect("valid hyperlink rule"),
-        ];
+        let first_rules =
+            vec![Rule::new(r"https://example\.com", "first:$0").expect("valid hyperlink rule")];
+        let second_rules =
+            vec![Rule::new(r"https://example\.com", "second:$0").expect("valid hyperlink rule")];
         let cached_shape = Arc::new([0x5a_u8; 16]);
 
         {
@@ -4006,22 +3917,14 @@ mod tests {
             assert!(inner.put_line(0, first, None));
             assert!(inner.put_line(
                 1,
-                Line::from_text(
-                    "ple.com",
-                    &CellAttributes::default(),
-                    seqno,
-                    None,
-                ),
+                Line::from_text("ple.com", &CellAttributes::default(), seqno, None,),
                 None,
             ));
             inner.normalize_implicit_hyperlinks_for_request(0..2, &first_rules);
 
             for stable_row in 0..2 {
                 let Some(LineEntry::Line(line)) = inner.lines.get_mut(&stable_row) else {
-                    panic!(
-                        "complete logical group row {} must be fresh",
-                        stable_row
-                    );
+                    panic!("complete logical group row {} must be fresh", stable_row);
                 };
                 assert!(line.has_hyperlink());
                 line.set_appdata(Arc::clone(&cached_shape));
@@ -4238,28 +4141,17 @@ mod tests {
         let mut lines = LruCache::new(NonZeroUsize::new(1).unwrap());
         lines.put(
             0,
-            LineEntry::Line(Line::from_text(
-                "x",
-                &CellAttributes::default(),
-                11,
-                None,
-            )),
+            LineEntry::Line(Line::from_text("x", &CellAttributes::default(), 11, None)),
         );
 
-        let before_ack = reconcile_predictions_after_cached_terminal_change(
-            &mut predictions,
-            11,
-            &lines,
-        );
+        let before_ack =
+            reconcile_predictions_after_cached_terminal_change(&mut predictions, 11, &lines);
         assert_eq!(before_ack, PredictionReconciliation::default());
         assert_eq!(predictions.len(), 1);
 
         mark_predictions_dispatched(&mut predictions, serial, 10);
-        let after_ack = reconcile_predictions_after_cached_terminal_change(
-            &mut predictions,
-            11,
-            &lines,
-        );
+        let after_ack =
+            reconcile_predictions_after_cached_terminal_change(&mut predictions, 11, &lines);
         assert_eq!(
             after_ack,
             PredictionReconciliation {
@@ -4279,19 +4171,11 @@ mod tests {
         let mut lines = LruCache::new(NonZeroUsize::new(1).unwrap());
         lines.put(
             0,
-            LineEntry::Line(Line::from_text(
-                "x",
-                &CellAttributes::default(),
-                10,
-                None,
-            )),
+            LineEntry::Line(Line::from_text("x", &CellAttributes::default(), 10, None)),
         );
 
-        let reconciliation = reconcile_predictions_after_cached_terminal_change(
-            &mut predictions,
-            11,
-            &lines,
-        );
+        let reconciliation =
+            reconcile_predictions_after_cached_terminal_change(&mut predictions, 11, &lines);
 
         assert_eq!(reconciliation, PredictionReconciliation::default());
         assert_eq!(predictions.len(), 1);
@@ -4356,10 +4240,7 @@ mod tests {
             MAX_PENDING_PREDICTIONS - 3,
             "abcd"
         ));
-        assert!(!paste_fits_prediction_budget(
-            MAX_PENDING_PREDICTIONS,
-            "x"
-        ));
+        assert!(!paste_fits_prediction_budget(MAX_PENDING_PREDICTIONS, "x"));
     }
 
     #[test]
@@ -4532,11 +4413,7 @@ mod tests {
 
         let mut forged_accounting = validated_test_image(2, 2, 4);
         forged_accounting.decoded_bytes = 17;
-        cache.put(
-            TEST_RENDER_CONNECTION_IDENTITY,
-            pane_id,
-            forged_accounting,
-        );
+        cache.put(TEST_RENDER_CONNECTION_IDENTITY, pane_id, forged_accounting);
 
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.retained_bytes(), 16);
@@ -4576,11 +4453,7 @@ mod tests {
         *mutable_data.data_mut() = ImageDataType::new_single_frame(2, 2, vec![0x55; 16]);
         assert!(
             cache
-                .get(
-                    TEST_RENDER_CONNECTION_IDENTITY,
-                    pane_id,
-                    &cached_revision,
-                )
+                .get(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &cached_revision,)
                 .is_none(),
             "a cache hit must fail closed after the mutable payload changes"
         );
@@ -4644,10 +4517,7 @@ mod tests {
 
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].0, first_hash);
-        assert_eq!(
-            requests[0].1.len(),
-            MAX_IMAGE_LOCATOR_ATTEMPTS_PER_REVISION
-        );
+        assert_eq!(requests[0].1.len(), MAX_IMAGE_LOCATOR_ATTEMPTS_PER_REVISION);
         assert_eq!(requests[1].0, second_hash);
     }
 
@@ -4677,24 +4547,17 @@ mod tests {
             CachedImageFailure::Permanent,
         );
         assert_eq!(
-            cache.get_failure(
-                TEST_RENDER_CONNECTION_IDENTITY,
-                pane_id,
-                &revision,
-                now,
-            ),
+            cache.get_failure(TEST_RENDER_CONNECTION_IDENTITY, pane_id, &revision, now,),
             Some(CachedImageFailure::Permanent)
         );
-        assert!(
-            cache
-                .get_failure(
-                    TEST_RENDER_CONNECTION_IDENTITY,
-                    pane_id,
-                    &other_revision,
-                    now,
-                )
-                .is_none()
-        );
+        assert!(cache
+            .get_failure(
+                TEST_RENDER_CONNECTION_IDENTITY,
+                pane_id,
+                &other_revision,
+                now,
+            )
+            .is_none());
 
         cache.record_failure(
             TEST_RENDER_CONNECTION_IDENTITY,

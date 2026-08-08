@@ -4,10 +4,9 @@ use crate::dispatch::EstablishedOrderedWindowAuthority;
 #[cfg(test)]
 use crate::dispatch::established_ordered_window_authority_for_test;
 use anyhow::{Context, anyhow};
-use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use codec::{
-    ActivatePaneDirection, AdjustPaneSize, CODEC_VERSION, CreateFloatingPane, CycleStack,
-    CoherentPaneSnapshot, DecodedPdu, EraseScrollbackRequest, ErrorResponse, GetClientList,
+    ActivatePaneDirection, AdjustPaneSize, CODEC_VERSION, CoherentPaneSnapshot, CreateFloatingPane,
+    CycleStack, DecodedPdu, EraseScrollbackRequest, ErrorResponse, GetClientList,
     GetClientListResponse, GetCodecVersionResponse, GetImageCell, GetImageCellResponse, GetLines,
     GetLinesResponse, GetPaneDirection, GetPaneDirectionResponse, GetPaneRenderChanges,
     GetPaneRenderChangesResponse, GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse,
@@ -22,6 +21,7 @@ use codec::{
     TabTitleChanged, ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
     UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mux::client::ClientId;
 use mux::pane::{CachePolicy, PaneId};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
@@ -88,7 +88,10 @@ mod ordered_window_adapter {
                 ),
                 Self::CodecContract(error) => std::fmt::Display::fmt(error, formatter),
                 Self::ReservedWireId { field, value } => {
-                    write!(formatter, "ordered-window {field} uses reserved value {value}")
+                    write!(
+                        formatter,
+                        "ordered-window {field} uses reserved value {value}"
+                    )
                 }
                 Self::MuxIdDoesNotFitU64 { field, value } => write!(
                     formatter,
@@ -138,10 +141,7 @@ mod ordered_window_adapter {
         Ok(())
     }
 
-    fn mux_id_to_wire(
-        field: &'static str,
-        value: usize,
-    ) -> Result<u64, OrderedWindowAdapterError> {
+    fn mux_id_to_wire(field: &'static str, value: usize) -> Result<u64, OrderedWindowAdapterError> {
         let wire_value = u64::try_from(value)
             .map_err(|_| OrderedWindowAdapterError::MuxIdDoesNotFitU64 { field, value })?;
         if wire_value == u64::MAX {
@@ -189,9 +189,7 @@ mod ordered_window_adapter {
     fn mux_tab_id_to_remote(
         tab_id: mux::tab::TabId,
     ) -> Result<codec::RemoteTabId, OrderedWindowAdapterError> {
-        Ok(codec::RemoteTabId::new(mux_id_to_wire(
-            "tab_id", tab_id,
-        )?))
+        Ok(codec::RemoteTabId::new(mux_id_to_wire("tab_id", tab_id)?))
     }
 
     fn codec_revision_to_mux(
@@ -364,9 +362,9 @@ mod ordered_window_adapter {
         result: &mux::ReorderWindowTabsResult,
     ) -> Result<codec::ReorderWindowTabsV1Outcome, OrderedWindowAdapterError> {
         Ok(match result {
-            mux::ReorderWindowTabsResult::Decision(
-                mux::WindowReorderTerminalOutcome::Applied(commit),
-            ) => codec::ReorderWindowTabsV1Outcome::Applied(mux_commit_to_codec(commit)?),
+            mux::ReorderWindowTabsResult::Decision(mux::WindowReorderTerminalOutcome::Applied(
+                commit,
+            )) => codec::ReorderWindowTabsV1Outcome::Applied(mux_commit_to_codec(commit)?),
             mux::ReorderWindowTabsResult::Decision(
                 mux::WindowReorderTerminalOutcome::Conflict(commit),
             ) => codec::ReorderWindowTabsV1Outcome::Conflict(mux_commit_to_codec(commit)?),
@@ -429,18 +427,12 @@ mod ordered_window_adapter {
                 remote_window_id_to_mux(codec::RemoteWindowId::new(0)),
                 Ok(0)
             );
-            assert_eq!(
-                remote_tab_id_to_mux(codec::RemoteTabId::new(0)),
-                Ok(0)
-            );
+            assert_eq!(remote_tab_id_to_mux(codec::RemoteTabId::new(0)), Ok(0));
             assert_eq!(
                 mux_window_id_to_remote(0),
                 Ok(codec::RemoteWindowId::new(0))
             );
-            assert_eq!(
-                mux_tab_id_to_remote(0),
-                Ok(codec::RemoteTabId::new(0))
-            );
+            assert_eq!(mux_tab_id_to_remote(0), Ok(codec::RemoteTabId::new(0)));
             assert_eq!(
                 remote_window_id_to_mux(codec::RemoteWindowId::new(u64::MAX)),
                 Err(OrderedWindowAdapterError::ReservedWireId {
@@ -590,19 +582,15 @@ mod ordered_window_adapter {
                 mux::WindowReorderTerminalOutcome::MissingWindow { window_id: 71 },
             ))
             .expect("missing windows collapse to stale incarnation on v1 wire");
-            assert_eq!(
-                missing,
-                codec::ReorderWindowTabsV1Outcome::StaleIncarnation
-            );
+            assert_eq!(missing, codec::ReorderWindowTabsV1Outcome::StaleIncarnation);
 
-            let malformed = mux_reorder_result_to_codec(
-                &mux::ReorderWindowTabsResult::Equivocation {
+            let malformed =
+                mux_reorder_result_to_codec(&mux::ReorderWindowTabsResult::Equivocation {
                     mutation_id: mux::WindowOrderMutationId::new([0x55; 16], 2),
                     retained_digest: mux::WindowReorderDigest::from_bytes([0x66; 32]),
                     attempted_digest: mux::WindowReorderDigest::from_bytes([0x77; 32]),
-                },
-            )
-            .expect("equivocation has a finite malformed wire outcome");
+                })
+                .expect("equivocation has a finite malformed wire outcome");
             assert_eq!(malformed, codec::ReorderWindowTabsV1Outcome::Malformed);
         }
 
@@ -907,8 +895,7 @@ struct PendingPaneRenderCommit {
 /// connection closed. The protected prefix is never mutated before its exact
 /// application ACK or NACK.
 const MAX_PENDING_PANE_ALERTS: usize = codec::MAX_RENDER_APPLICATION_ALERTS * 2;
-const MAX_PENDING_PANE_ALERT_TEXT_BYTES: usize =
-    codec::MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES * 2;
+const MAX_PENDING_PANE_ALERT_TEXT_BYTES: usize = codec::MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES * 2;
 
 fn pane_alert_text_bytes(alert: &Alert) -> Option<usize> {
     match alert {
@@ -935,8 +922,10 @@ fn pane_alert_text_bytes(alert: &Alert) -> Option<usize> {
 fn pane_alerts_coalesce(existing: &Alert, incoming: &Alert) -> bool {
     matches!(
         (existing, incoming),
-        (Alert::CurrentWorkingDirectoryChanged, Alert::CurrentWorkingDirectoryChanged)
-            | (Alert::PaletteChanged, Alert::PaletteChanged)
+        (
+            Alert::CurrentWorkingDirectoryChanged,
+            Alert::CurrentWorkingDirectoryChanged
+        ) | (Alert::PaletteChanged, Alert::PaletteChanged)
             | (Alert::OutputSinceFocusLost, Alert::OutputSinceFocusLost)
             | (Alert::Progress(_), Alert::Progress(_))
             | (Alert::IconTitleChanged(_), Alert::IconTitleChanged(_))
@@ -1026,8 +1015,8 @@ impl PendingPaneAlerts {
 
     pub(crate) fn push(&mut self, alert: Alert) -> Result<(), PaneAlertBacklogError> {
         self.validate_accounting()?;
-        let incoming_bytes = pane_alert_text_bytes(&alert)
-            .ok_or(PaneAlertBacklogError::TextAccountingOverflow)?;
+        let incoming_bytes =
+            pane_alert_text_bytes(&alert).ok_or(PaneAlertBacklogError::TextAccountingOverflow)?;
         if incoming_bytes > codec::MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES {
             metrics::counter!(
                 "mux.server.pane_alert_backlog_rejected",
@@ -1073,8 +1062,8 @@ impl PendingPaneAlerts {
             let protected_prefix_len = self.protected_prefix_len;
             let mut index = 0usize;
             self.entries.retain(|existing| {
-                let retain = index < protected_prefix_len
-                    || !pane_alerts_coalesce(existing, &alert);
+                let retain =
+                    index < protected_prefix_len || !pane_alerts_coalesce(existing, &alert);
                 index += 1;
                 retain
             });
@@ -1246,7 +1235,9 @@ enum LegacyRenderEnqueuePhase {
     Idle,
     /// A speculative surface baseline owns this exact revision until enqueue
     /// admission is acknowledged or rolled back.
-    InFlight { installed_revision: u64 },
+    InFlight {
+        installed_revision: u64,
+    },
     /// A protected alert prefix owns delivery until every admitted element is
     /// acknowledged or the undelivered suffix is released.
     NotificationsInFlight,
@@ -1472,8 +1463,7 @@ impl PaneRenderBaseline {
             changed = true;
         }
 
-        let Some(viewport_range) =
-            stable_row_range_from_len(dims.physical_top, dims.viewport_rows)
+        let Some(viewport_range) = stable_row_range_from_len(dims.physical_top, dims.viewport_rows)
         else {
             return SurfacePreparation::StableRowRangeUnrepresentable;
         };
@@ -1521,8 +1511,8 @@ impl PaneRenderBaseline {
         }
         if let Some(mut cursor_line) = lines.into_iter().next() {
             cursor_line.compress_for_scrollback();
-            if let Err(insertion_idx) = bonus_lines
-                .binary_search_by_key(&cursor_line_idx, |(stable_row, _)| *stable_row)
+            if let Err(insertion_idx) =
+                bonus_lines.binary_search_by_key(&cursor_line_idx, |(stable_row, _)| *stable_row)
             {
                 // Preserve the stable-row ordering established by the viewport
                 // walk even for a defensive backend whose reported cursor row
@@ -1576,11 +1566,10 @@ impl PerPane {
         pane: &CurrentPane<'_>,
         force_with_input_dispatch_serial: Option<InputSerial>,
     ) -> Result<Option<GetPaneRenderChangesResponse>, PaneRenderPreparationError> {
-        match self.baseline.prepare_surface_changes(
-            pane,
-            force_with_input_dispatch_serial,
-            false,
-        ) {
+        match self
+            .baseline
+            .prepare_surface_changes(pane, force_with_input_dispatch_serial, false)
+        {
             SurfacePreparation::StableRowRangeUnrepresentable => {
                 self.mark_transactional_dirty();
                 Err(PaneRenderPreparationError::StableRowRangeUnrepresentable)
@@ -1611,31 +1600,17 @@ fn prepare_legacy_render_enqueue(
     pane: &CurrentPane<'_>,
     per_pane: &Arc<Mutex<PerPane>>,
     force_with_input_dispatch_serial: Option<InputSerial>,
-) -> anyhow::Result<
-    Option<(
-        GetPaneRenderChangesResponse,
-        LegacyRenderEnqueueGuard,
-    )>,
-> {
+) -> anyhow::Result<Option<(GetPaneRenderChangesResponse, LegacyRenderEnqueueGuard)>> {
     let pane_id = pane.pane_id();
     let (prior_baseline, prior_revision) = {
-        let mut state = lock_per_pane_or_retire(
-            per_pane,
-            "preparing the legacy render baseline",
-        )?;
+        let mut state = lock_per_pane_or_retire(per_pane, "preparing the legacy render baseline")?;
         state.ensure_legacy_transport_idle()?;
         (state.baseline.clone(), state.baseline_revision)
     };
-    let surface = prior_baseline.prepare_surface_changes(
-        pane,
-        force_with_input_dispatch_serial,
-        false,
-    );
+    let surface =
+        prior_baseline.prepare_surface_changes(pane, force_with_input_dispatch_serial, false);
 
-    let mut state = lock_per_pane_or_retire(
-        per_pane,
-        "publishing the legacy render baseline",
-    )?;
+    let mut state = lock_per_pane_or_retire(per_pane, "publishing the legacy render baseline")?;
     state.ensure_legacy_transport_idle()?;
     if state.baseline != prior_baseline || state.baseline_revision != prior_revision {
         state.mark_transactional_dirty();
@@ -1678,9 +1653,7 @@ fn prepare_legacy_render_enqueue(
             if state.baseline.seqno != source_query {
                 let Some(next_revision) = prior_revision.checked_add(1) else {
                     state.retire_render_authority();
-                    return Err(
-                        PaneRenderPreparationError::LegacyAttemptIdentityExhausted.into(),
-                    );
+                    return Err(PaneRenderPreparationError::LegacyAttemptIdentityExhausted.into());
                 };
                 state.baseline.seqno = source_query;
                 state.baseline_revision = next_revision;
@@ -1697,9 +1670,7 @@ fn prepare_legacy_render_enqueue(
             };
             state.baseline = baseline;
             state.baseline_revision = installed_revision;
-            state.legacy_enqueue_phase = LegacyRenderEnqueuePhase::InFlight {
-                installed_revision,
-            };
+            state.legacy_enqueue_phase = LegacyRenderEnqueuePhase::InFlight { installed_revision };
             drop(state);
             let rollback = LegacyRenderEnqueueGuard::new(
                 Arc::clone(per_pane),
@@ -1786,10 +1757,7 @@ impl PerPane {
         self.transactional_dirty = true;
     }
 
-    pub(crate) fn push_notification(
-        &mut self,
-        alert: Alert,
-    ) -> Result<(), PaneAlertBacklogError> {
+    pub(crate) fn push_notification(&mut self, alert: Alert) -> Result<(), PaneAlertBacklogError> {
         self.notifications.push(alert)?;
         self.mark_transactional_dirty();
         Ok(())
@@ -1873,14 +1841,14 @@ impl PerPane {
             .take(covered_notifications_len)
             .cloned()
             .collect::<Vec<_>>();
-        let has_uncovered_notifications =
-            covered_notifications.len() < self.notifications.len();
+        let has_uncovered_notifications = covered_notifications.len() < self.notifications.len();
         self.transactional_dirty = false;
         self.transaction_phase = PaneRenderTransactionPhase::Preparing {
             token,
             redirtied: false,
         };
-        self.notifications.protect_prefix(covered_notifications.len());
+        self.notifications
+            .protect_prefix(covered_notifications.len());
         Ok(PaneRenderBeginSnapshot {
             token,
             baseline: self.baseline.clone(),
@@ -1932,10 +1900,7 @@ impl PerPane {
         PaneRenderSettlement::Closed
     }
 
-    fn settle_no_change(
-        &mut self,
-        token: PaneRenderAttemptToken,
-    ) -> PaneRenderSettlement {
+    fn settle_no_change(&mut self, token: PaneRenderAttemptToken) -> PaneRenderSettlement {
         let phase = std::mem::replace(
             &mut self.transaction_phase,
             PaneRenderTransactionPhase::Closed,
@@ -1985,8 +1950,7 @@ impl PerPane {
             return Err(PaneRenderPreparationError::StaleAttempt);
         };
         if token != snapshot.token || self.baseline != snapshot.baseline {
-            self.transaction_phase =
-                PaneRenderTransactionPhase::Preparing { token, redirtied };
+            self.transaction_phase = PaneRenderTransactionPhase::Preparing { token, redirtied };
             return Err(PaneRenderPreparationError::StaleAttempt);
         }
         if self
@@ -2015,19 +1979,12 @@ impl PerPane {
         Ok(())
     }
 
-    fn acknowledge_prepared(
-        &mut self,
-        token: PaneRenderAttemptToken,
-    ) -> PaneRenderSettlement {
+    fn acknowledge_prepared(&mut self, token: PaneRenderAttemptToken) -> PaneRenderSettlement {
         let phase = std::mem::replace(
             &mut self.transaction_phase,
             PaneRenderTransactionPhase::Closed,
         );
-        let PaneRenderTransactionPhase::InFlight {
-            pending,
-            redirtied,
-        } = phase
-        else {
+        let PaneRenderTransactionPhase::InFlight { pending, redirtied } = phase else {
             self.transaction_phase = phase;
             return if matches!(self.transaction_phase, PaneRenderTransactionPhase::Closed) {
                 PaneRenderSettlement::Closed
@@ -2036,8 +1993,7 @@ impl PerPane {
             };
         };
         if pending.token != token {
-            self.transaction_phase =
-                PaneRenderTransactionPhase::InFlight { pending, redirtied };
+            self.transaction_phase = PaneRenderTransactionPhase::InFlight { pending, redirtied };
             return PaneRenderSettlement::StaleOrDuplicate;
         }
         if self
@@ -2151,10 +2107,7 @@ impl std::fmt::Debug for PreparedPaneRender {
     }
 }
 
-fn normalize_prepared_alerts(
-    pane_id: PaneId,
-    notifications: &[Alert],
-) -> (bool, Vec<NotifyAlert>) {
+fn normalize_prepared_alerts(pane_id: PaneId, notifications: &[Alert]) -> (bool, Vec<NotifyAlert>) {
     let mut palette_changed = false;
     let mut unseen_output = false;
     let mut latest_progress = None;
@@ -2198,10 +2151,7 @@ fn begin_transactional_pane_render(
 ) -> Result<PaneRenderPreparation, PaneRenderPreparationError> {
     let snapshot = match state.lock() {
         Ok(mut per_pane) => {
-            per_pane.begin_transactional_preparation(
-                pane_id,
-                force_with_input_dispatch_serial,
-            )?
+            per_pane.begin_transactional_preparation(pane_id, force_with_input_dispatch_serial)?
         }
         Err(poison) => {
             retire_poisoned_pane_render(&state, poison);
@@ -2257,13 +2207,11 @@ impl PaneRenderPreparation {
                 source_query,
                 source_end,
             } => (*source_start, *source_query, *source_end),
-            SurfacePreparation::Changes(prepared) => {
-                (
-                    prepared.source_start,
-                    prepared.source_query,
-                    prepared.source_end,
-                )
-            }
+            SurfacePreparation::Changes(prepared) => (
+                prepared.source_start,
+                prepared.source_query,
+                prepared.source_end,
+            ),
         };
         if source_start == SequenceNo::MAX
             || source_query == SequenceNo::MAX
@@ -2336,11 +2284,9 @@ impl PaneRenderPreparation {
             response, baseline, ..
         } = *surface;
         let install_result = match self.state.lock() {
-            Ok(mut state) => state.install_prepared(
-                &self.snapshot,
-                baseline,
-                redirtied_after_snapshot,
-            ),
+            Ok(mut state) => {
+                state.install_prepared(&self.snapshot, baseline, redirtied_after_snapshot)
+            }
             Err(poison) => {
                 retire_poisoned_pane_render(&self.state, poison);
                 return Err(PaneRenderPreparationError::StateLockPoisoned);
@@ -2348,8 +2294,8 @@ impl PaneRenderPreparation {
         };
         install_result?;
         self.armed = false;
-        Ok(PaneRenderPreparationOutcome::Prepared(
-            Box::new(PreparedPaneRender {
+        Ok(PaneRenderPreparationOutcome::Prepared(Box::new(
+            PreparedPaneRender {
                 state: Arc::clone(&self.state),
                 token: self.snapshot.token,
                 surface: response,
@@ -2357,8 +2303,8 @@ impl PaneRenderPreparation {
                 palette,
                 alerts,
                 armed: true,
-            }),
-        ))
+            },
+        )))
     }
 }
 
@@ -2411,9 +2357,7 @@ impl PreparedPaneRender {
         let outcome = match self.state.lock() {
             Ok(mut state) => state.retry_prepared(self.token),
             Err(err) => {
-                log::error!(
-                    "failed to retry pane render application after lock poison: {err}"
-                );
+                log::error!("failed to retry pane render application after lock poison: {err}");
                 retire_poisoned_pane_render(&self.state, err);
                 PaneRenderSettlement::FailedClosed
             }
@@ -2582,17 +2526,13 @@ impl UnsentNotificationsGuard {
             .notifications
             .get(self.next_unsent)
             .ok_or_else(|| anyhow!("no protected pane notification remains to acknowledge"))?;
-        let mut state = lock_per_pane_or_retire(
-            &self.per_pane,
-            "committing a legacy pane notification",
-        )?;
+        let mut state =
+            lock_per_pane_or_retire(&self.per_pane, "committing a legacy pane notification")?;
         if !matches!(
             state.legacy_enqueue_phase,
             LegacyRenderEnqueuePhase::NotificationsInFlight
-        ) || !matches!(
-            state.transaction_phase,
-            PaneRenderTransactionPhase::Idle
-        ) {
+        ) || !matches!(state.transaction_phase, PaneRenderTransactionPhase::Idle)
+        {
             state.retire_render_authority();
             return Err(PaneRenderPreparationError::LegacyDeliveryAuthorityChanged.into());
         }
@@ -2612,18 +2552,13 @@ impl UnsentNotificationsGuard {
         if self.next_unsent != self.notifications.len() {
             anyhow::bail!("pane notification batch is not completely acknowledged");
         }
-        let mut state = lock_per_pane_or_retire(
-            &self.per_pane,
-            "settling a legacy pane notification batch",
-        )?;
+        let mut state =
+            lock_per_pane_or_retire(&self.per_pane, "settling a legacy pane notification batch")?;
         if !matches!(
             state.legacy_enqueue_phase,
             LegacyRenderEnqueuePhase::NotificationsInFlight
         ) || state.notifications.protected_prefix_len != 0
-            || !matches!(
-                state.transaction_phase,
-                PaneRenderTransactionPhase::Idle
-            )
+            || !matches!(state.transaction_phase, PaneRenderTransactionPhase::Idle)
         {
             state.retire_render_authority();
             return Err(PaneRenderPreparationError::LegacyDeliveryAuthorityChanged.into());
@@ -2660,14 +2595,10 @@ impl UnsentNotificationsGuard {
                 if !matches!(
                     state.legacy_enqueue_phase,
                     LegacyRenderEnqueuePhase::NotificationsInFlight
-                ) || !matches!(
-                    state.transaction_phase,
-                    PaneRenderTransactionPhase::Idle
-                ) {
+                ) || !matches!(state.transaction_phase, PaneRenderTransactionPhase::Idle)
+                {
                     state.retire_render_authority();
-                    return Err(
-                        PaneRenderPreparationError::LegacyDeliveryAuthorityChanged.into(),
-                    );
+                    return Err(PaneRenderPreparationError::LegacyDeliveryAuthorityChanged.into());
                 }
                 if let Err(error) = state.notifications.release_protected_prefix(unsent) {
                     state.retire_render_authority();
@@ -2800,8 +2731,7 @@ fn acknowledge_legacy_render_enqueue(
     pane_id: PaneId,
     installed_revision: u64,
 ) -> anyhow::Result<()> {
-    let mut state =
-        lock_per_pane_or_retire(per_pane, "acknowledging a legacy pane render")?;
+    let mut state = lock_per_pane_or_retire(per_pane, "acknowledging a legacy pane render")?;
     #[cfg(test)]
     assert!(
         !std::mem::take(&mut state.panic_next_legacy_enqueue_ack),
@@ -2829,9 +2759,7 @@ fn maybe_push_pane_changes(
     sender: PduSender,
     per_pane: Arc<Mutex<PerPane>>,
 ) -> anyhow::Result<()> {
-    if let Some((resp, rollback_guard)) =
-        prepare_legacy_render_enqueue(pane, &per_pane, None)?
-    {
+    if let Some((resp, rollback_guard)) = prepare_legacy_render_enqueue(pane, &per_pane, None)? {
         let send_result = sender.send_bulk(DecodedPdu {
             pdu: Pdu::GetPaneRenderChangesResponse(resp),
             serial: 0,
@@ -2851,10 +2779,8 @@ fn maybe_push_pane_changes(
 
     let config_generation = config::configuration().generation();
     let (mut notifications_remaining, first_notification_batch) = {
-        let mut per_pane = lock_per_pane_or_retire(
-            &per_pane,
-            "preparing legacy pane notifications",
-        )?;
+        let mut per_pane =
+            lock_per_pane_or_retire(&per_pane, "preparing legacy pane notifications")?;
         per_pane.ensure_legacy_transport_idle()?;
         if per_pane.baseline.config_generation != config_generation {
             // If the config changed, it may have changed colors
@@ -2882,8 +2808,7 @@ fn maybe_push_pane_changes(
             .protected_batch_up_to(notifications_remaining)
             .map_err(anyhow::Error::from)?;
         if notifications_remaining != 0 {
-            per_pane.legacy_enqueue_phase =
-                LegacyRenderEnqueuePhase::NotificationsInFlight;
+            per_pane.legacy_enqueue_phase = LegacyRenderEnqueuePhase::NotificationsInFlight;
         }
         (notifications_remaining, batch)
     };
@@ -2956,8 +2881,7 @@ fn maybe_push_pane_changes(
                     .notifications
                     .protected_batch_up_to(notifications_remaining)
                     .map_err(anyhow::Error::from)?;
-                state.legacy_enqueue_phase =
-                    LegacyRenderEnqueuePhase::NotificationsInFlight;
+                state.legacy_enqueue_phase = LegacyRenderEnqueuePhase::NotificationsInFlight;
                 batch
             };
             next_notification_batch = Some(batch);
@@ -3025,9 +2949,7 @@ fn push_input_dispatch_changes_after_committed_input(
     // PTY or application has echoed the input.
     let prepared = catch_recoverable(
         RecoverablePanicSite::MuxPaneCallback,
-        AssertUnwindSafe(|| {
-            prepare_legacy_render_enqueue(pane, &per_pane, Some(input_serial))
-        }),
+        AssertUnwindSafe(|| prepare_legacy_render_enqueue(pane, &per_pane, Some(input_serial))),
     );
 
     let (response, rollback) = match prepared {
@@ -3150,17 +3072,12 @@ fn collect_list_panes_snapshot_with_stage_observer(
 }
 
 fn collect_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesResponse> {
-    collect_list_panes_snapshot_with_stage_observer(
-        mux,
-        &mut ignore_list_panes_snapshot_stage,
-    )
+    collect_list_panes_snapshot_with_stage_observer(mux, &mut ignore_list_panes_snapshot_stage)
 }
 
 const COHERENT_SNAPSHOT_ATTEMPTS: u8 = 3;
 
-fn collect_coherent_list_panes_snapshot(
-    mux: &Mux,
-) -> anyhow::Result<ListPanesCoherentOutcome> {
+fn collect_coherent_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesCoherentOutcome> {
     collect_coherent_list_panes_snapshot_with_stage_observer(
         mux,
         &mut ignore_list_panes_snapshot_stage,
@@ -3326,11 +3243,7 @@ pub(crate) fn validate_ordered_snapshot_projection(
 
     let mut total_tabs = 0usize;
     let mut prior_window_id = None;
-    for (window, pane_window_title) in snapshot
-        .ordered_windows
-        .iter()
-        .zip(pane_window_titles)
-    {
+    for (window, pane_window_title) in snapshot.ordered_windows.iter().zip(pane_window_titles) {
         if prior_window_id.is_some_and(|prior| prior >= window.window_id) {
             return Err(anyhow!(
                 "PDU87 ordered windows are not in strictly increasing window-id order"
@@ -3343,10 +3256,7 @@ pub(crate) fn validate_ordered_snapshot_projection(
                 window.window_id.get()
             ));
         }
-        total_tabs = checked_ordered_snapshot_tab_total(
-            total_tabs,
-            window.ordered_tab_ids.len(),
-        )?;
+        total_tabs = checked_ordered_snapshot_tab_total(total_tabs, window.ordered_tab_ids.len())?;
     }
     let pane_trees = snapshot.panes.trees();
     let pane_nodes = snapshot.panes.nodes();
@@ -3373,13 +3283,13 @@ pub(crate) fn validate_ordered_snapshot_projection(
             let tree = pane_trees.get(pane_index).ok_or_else(|| {
                 anyhow!("PDU87 pane tree vector ended before ordered tab {pane_index}")
             })?;
-            let root_index = tree.root_index.ok_or_else(|| {
-                anyhow!("PDU87 pane tree {pane_index} has no root identity")
-            })?;
-            let tree_start = usize::try_from(root_index)
-                .context("narrowing PDU87 pane-tree root index")?;
-            let node_count = usize::try_from(tree.node_count)
-                .context("narrowing PDU87 pane-tree node count")?;
+            let root_index = tree
+                .root_index
+                .ok_or_else(|| anyhow!("PDU87 pane tree {pane_index} has no root identity"))?;
+            let tree_start =
+                usize::try_from(root_index).context("narrowing PDU87 pane-tree root index")?;
+            let node_count =
+                usize::try_from(tree.node_count).context("narrowing PDU87 pane-tree node count")?;
             let tree_end = tree_start
                 .checked_add(node_count)
                 .ok_or_else(|| anyhow!("PDU87 pane tree {pane_index} range overflows usize"))?;
@@ -3471,13 +3381,10 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
                 // final authority read rejects this partial attempt.
                 continue;
             };
-            let frozen = frozen.with_context(|| {
-                format!("freezing ordered state for mux window {window_id}")
-            })?;
-            total_tabs = checked_ordered_snapshot_tab_total(
-                total_tabs,
-                frozen.order.ordered_tabs().len(),
-            )?;
+            let frozen = frozen
+                .with_context(|| format!("freezing ordered state for mux window {window_id}"))?;
+            total_tabs =
+                checked_ordered_snapshot_tab_total(total_tabs, frozen.order.ordered_tabs().len())?;
             frozen_windows.push(frozen);
         }
         observer(ListPanesSnapshotStage::OrderedWindowsFrozen);
@@ -3619,9 +3526,7 @@ fn authorize_reorder_identity(
     established: EstablishedOrderedWindowAuthority,
 ) -> ReorderAuthorization {
     if request.session_incarnation != established.session_incarnation() {
-        return ReorderAuthorization::Terminal(
-            codec::ReorderWindowTabsV1Outcome::StaleIncarnation,
-        );
+        return ReorderAuthorization::Terminal(codec::ReorderWindowTabsV1Outcome::StaleIncarnation);
     }
     if request.domain_binding_id != established.domain_binding_id() {
         return ReorderAuthorization::Terminal(codec::ReorderWindowTabsV1Outcome::Malformed);
@@ -3690,9 +3595,7 @@ fn process_reorder_window_tabs_request(
                         | mux::WindowReorderTerminalOutcome::Exhausted
                 )
             );
-            if counts_as_client_activity
-                && let Some(client_id) = client_id
-            {
+            if counts_as_client_activity && let Some(client_id) = client_id {
                 let _ = mux.client_had_input_if_same(client_id);
             }
             ordered_window_adapter::mux_reorder_result_to_codec(&result)
@@ -3768,8 +3671,7 @@ impl SessionHandler {
     }
 
     pub(crate) fn new_for_session(to_write_tx: PduSender, owner: SessionOwner) -> Self {
-        let topology_stream_id =
-            TopologyStreamId::from_bytes(*uuid::Uuid::new_v4().as_bytes());
+        let topology_stream_id = TopologyStreamId::from_bytes(*uuid::Uuid::new_v4().as_bytes());
         Self::new_for_session_with_topology_stream(to_write_tx, owner, topology_stream_id)
     }
 
@@ -3912,12 +3814,7 @@ impl SessionHandler {
             let result = authority.try_run(|| {
                 registration
                     .try_with_current(|pane| maybe_push_pane_changes(&pane, sender, per_pane))
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "pane registration {} is no longer current",
-                            pane_id
-                        )
-                    })?
+                    .ok_or_else(|| anyhow!("pane registration {} is no longer current", pane_id))?
             });
             match result {
                 Ok(Ok(())) => {}
@@ -3943,9 +3840,7 @@ impl SessionHandler {
         let serial = decoded.serial;
 
         if let Some(client_id) = &self.client_id {
-            if decoded.pdu.is_user_input()
-                && !matches!(&decoded.pdu, Pdu::ReorderWindowTabsV1(_))
-            {
+            if decoded.pdu.is_user_input() && !matches!(&decoded.pdu, Pdu::ReorderWindowTabsV1(_)) {
                 // PDU88 is marked only inside its handler, after the exact
                 // stream/session/capability/domain checks. An unauthorized
                 // reorder must not mutate even client-activity bookkeeping.
@@ -3980,8 +3875,7 @@ impl SessionHandler {
                 }),
             };
             log::trace!("{} processing time {:?}", serial, start.elapsed());
-            let _ = response_authority
-                .try_run(|| sender.send_control(DecodedPdu { pdu, serial }));
+            let _ = response_authority.try_run(|| sender.send_control(DecodedPdu { pdu, serial }));
         };
 
         fn catch<F, SND>(f: F, send_response: SND)
@@ -4193,13 +4087,11 @@ impl SessionHandler {
                                     supported: TopologyCapabilities::SERVER_SUPPORTED,
                                 }
                             };
-                            Ok(Pdu::ListPanesCoherentResponse(
-                                ListPanesCoherentResponse {
-                                    negotiated,
-                                    stream_id,
-                                    outcome,
-                                },
-                            ))
+                            Ok(Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                                negotiated,
+                                stream_id,
+                                outcome,
+                            }))
                         },
                         send_response,
                     );
@@ -4315,10 +4207,7 @@ impl SessionHandler {
                             with_current_pane(&authority, &registration, |pane| {
                                 pane.write_all(&data)?;
                                 push_pane_changes_after_committed_input(
-                                    pane,
-                                    sender,
-                                    per_pane,
-                                    "write",
+                                    pane, sender, per_pane, "write",
                                 );
                                 Ok(Pdu::UnitResponse(UnitResponse {}))
                             })
@@ -5970,9 +5859,7 @@ mod tests {
             .get(tree_start..tree_end)?
             .iter()
             .find_map(|node| match node {
-                mux::tab::PaneArenaNode::Leaf(entry) => {
-                    Some((entry.window_id, entry.tab_id))
-                }
+                mux::tab::PaneArenaNode::Leaf(entry) => Some((entry.window_id, entry.tab_id)),
                 mux::tab::PaneArenaNode::Empty | mux::tab::PaneArenaNode::Split { .. } => None,
             })
     }
@@ -6635,8 +6522,7 @@ mod tests {
             other => panic!("expected ErrorResponse for forbidden SetClipboard, got {other:?}"),
         }
         assert_eq!(
-            handler.client_input_activity_updates,
-            0,
+            handler.client_input_activity_updates, 0,
             "a rejected server-unilateral PDU must not refresh client activity"
         );
 
@@ -6648,8 +6534,7 @@ mod tests {
             }),
         });
         assert_eq!(
-            handler.client_input_activity_updates,
-            1,
+            handler.client_input_activity_updates, 1,
             "one accepted client-input request must record exactly one activity update"
         );
 
@@ -7023,10 +6908,7 @@ mod tests {
                     && max == codec::MAX_ORDERED_WINDOWS_PER_SNAPSHOT
         ));
         assert_eq!(
-            checked_ordered_snapshot_tab_total(
-                codec::MAX_ORDERED_TABS_PER_SNAPSHOT - 1,
-                1,
-            ),
+            checked_ordered_snapshot_tab_total(codec::MAX_ORDERED_TABS_PER_SNAPSHOT - 1, 1,),
             Ok(codec::MAX_ORDERED_TABS_PER_SNAPSHOT)
         );
         assert!(matches!(
@@ -7048,8 +6930,7 @@ mod tests {
         );
         assert_eq!(
             ordered_snapshot_tab_node_ceiling(
-                codec::MAX_ORDERED_PANE_NODES_PER_SNAPSHOT
-                    - codec::MAX_ORDERED_PANE_NODES_PER_TREE
+                codec::MAX_ORDERED_PANE_NODES_PER_SNAPSHOT - codec::MAX_ORDERED_PANE_NODES_PER_TREE
                     + 1,
             ),
             Ok(codec::MAX_ORDERED_PANE_NODES_PER_SNAPSHOT)
@@ -7070,14 +6951,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let mux = Arc::new(Mux::new(None));
-        let first_tab = register_snapshot_tab(
-            &mux,
-            Arc::new(FakePane::new_with_id(7_501, None)),
-        );
-        let second_tab = register_snapshot_tab(
-            &mux,
-            Arc::new(FakePane::new_with_id(7_502, None)),
-        );
+        let first_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_501, None)));
+        let second_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_502, None)));
         let first_window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
         let second_window_id = attach_snapshot_tab_to_new_window(&mux, &second_tab);
         assert!(mux.set_window_title(first_window_id, "first-ordered-window"));
@@ -7129,7 +7004,10 @@ mod tests {
         assert_eq!(pane_pairs, ordered_pairs);
         assert_eq!(snapshot.panes.trees().len(), ordered_pairs.len());
         for window in &snapshot.ordered_windows {
-            assert_eq!(window.ordered_tab_ids.as_slice(), &[window.active_tab_id.unwrap()]);
+            assert_eq!(
+                window.ordered_tab_ids.as_slice(),
+                &[window.active_tab_id.unwrap()]
+            );
         }
 
         let mut missing_tree = snapshot.clone();
@@ -7194,8 +7072,7 @@ mod tests {
                     .expect("test pane-tree root adjustment fits u32")
             });
         }
-        mixed_leaf.panes =
-            mux::tab::PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
+        mixed_leaf.panes = mux::tab::PaneArena::from_unvalidated_parts(trees, nodes, window_titles);
         mixed_leaf
             .validate()
             .expect("the mixed-identity pane arena remains schema-valid");
@@ -7233,14 +7110,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let mux = Arc::new(Mux::new(None));
-        let first_tab = register_snapshot_tab(
-            &mux,
-            Arc::new(FakePane::new_with_id(7_551, None)),
-        );
-        let second_tab = register_snapshot_tab(
-            &mux,
-            Arc::new(FakePane::new_with_id(7_552, None)),
-        );
+        let first_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_551, None)));
+        let second_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_552, None)));
         let window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
         mux.add_tab_to_window(&second_tab, window_id)
             .expect("second authority-cut tab attaches exactly once");
@@ -7268,26 +7139,25 @@ mod tests {
 
         let barrier_for_collector = Arc::clone(&barrier);
         let mut completed_attempts = 0usize;
-        let outcome = collect_ordered_list_panes_snapshot_with_stage_observer(
-            &mux,
-            &mut |stage| match stage {
-                ListPanesSnapshotStage::BeforeOrderedAuthorityRead => {
-                    barrier_for_collector.collector_arrive();
-                }
-                ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
-                ListPanesSnapshotStage::WindowsEnumerated
-                | ListPanesSnapshotStage::OrderedWindowsFrozen
-                | ListPanesSnapshotStage::TabTreeCaptured => {}
-            },
-        );
+        let outcome =
+            collect_ordered_list_panes_snapshot_with_stage_observer(
+                &mux,
+                &mut |stage| match stage {
+                    ListPanesSnapshotStage::BeforeOrderedAuthorityRead => {
+                        barrier_for_collector.collector_arrive();
+                    }
+                    ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
+                    ListPanesSnapshotStage::WindowsEnumerated
+                    | ListPanesSnapshotStage::OrderedWindowsFrozen
+                    | ListPanesSnapshotStage::TabTreeCaptured => {}
+                },
+            );
         let reorder_result = mutator
             .join()
             .expect("before-authority-cut mutator must not panic");
         assert!(matches!(
             reorder_result,
-            mux::ReorderWindowTabsResult::Decision(
-                mux::WindowReorderTerminalOutcome::Applied(_)
-            )
+            mux::ReorderWindowTabsResult::Decision(mux::WindowReorderTerminalOutcome::Applied(_))
         ));
         let snapshot = expect_current_ordered_snapshot(
             &mux,
@@ -7324,14 +7194,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let mux = Arc::new(Mux::new(None));
-        let first_tab = register_snapshot_tab(
-            &mux,
-            Arc::new(FakePane::new_with_id(7_571, None)),
-        );
-        let second_tab = register_snapshot_tab(
-            &mux,
-            Arc::new(FakePane::new_with_id(7_572, None)),
-        );
+        let first_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_571, None)));
+        let second_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_572, None)));
         let window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
         mux.add_tab_to_window(&second_tab, window_id)
             .expect("second frozen-cut tab attaches exactly once");
@@ -7359,26 +7223,25 @@ mod tests {
 
         let barrier_for_collector = Arc::clone(&barrier);
         let mut completed_attempts = 0usize;
-        let outcome = collect_ordered_list_panes_snapshot_with_stage_observer(
-            &mux,
-            &mut |stage| match stage {
-                ListPanesSnapshotStage::OrderedWindowsFrozen => {
-                    barrier_for_collector.collector_arrive();
-                }
-                ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
-                ListPanesSnapshotStage::BeforeOrderedAuthorityRead
-                | ListPanesSnapshotStage::WindowsEnumerated
-                | ListPanesSnapshotStage::TabTreeCaptured => {}
-            },
-        );
+        let outcome =
+            collect_ordered_list_panes_snapshot_with_stage_observer(
+                &mux,
+                &mut |stage| match stage {
+                    ListPanesSnapshotStage::OrderedWindowsFrozen => {
+                        barrier_for_collector.collector_arrive();
+                    }
+                    ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
+                    ListPanesSnapshotStage::BeforeOrderedAuthorityRead
+                    | ListPanesSnapshotStage::WindowsEnumerated
+                    | ListPanesSnapshotStage::TabTreeCaptured => {}
+                },
+            );
         let reorder_result = mutator
             .join()
             .expect("post-frozen-window-cut mutator must not panic");
         assert!(matches!(
             reorder_result,
-            mux::ReorderWindowTabsResult::Decision(
-                mux::WindowReorderTerminalOutcome::Applied(_)
-            )
+            mux::ReorderWindowTabsResult::Decision(mux::WindowReorderTerminalOutcome::Applied(_))
         ));
         let snapshot = expect_current_ordered_snapshot(
             &mux,
@@ -7415,39 +7278,33 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let mux = Arc::new(Mux::new(None));
-        let first_tab = register_snapshot_tab(
-            &mux,
-            Arc::new(FakePane::new_with_id(7_601, None)),
-        );
-        let second_tab = register_snapshot_tab(
-            &mux,
-            Arc::new(FakePane::new_with_id(7_602, None)),
-        );
+        let first_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_601, None)));
+        let second_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_602, None)));
         let window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
         let barrier = NoSleepSnapshotBarrier::shared();
         let barrier_for_mutator = Arc::clone(&barrier);
         let mux_for_mutator = Arc::clone(&mux);
         let second_tab_for_mutator = Arc::clone(&second_tab);
         let mutator = thread::spawn(move || {
-            barrier_for_mutator.mutate(|| {
-                mux_for_mutator.add_tab_to_window(&second_tab_for_mutator, window_id)
-            })
+            barrier_for_mutator
+                .mutate(|| mux_for_mutator.add_tab_to_window(&second_tab_for_mutator, window_id))
         });
 
         let barrier_for_collector = Arc::clone(&barrier);
         let mut completed_attempts = 0usize;
-        let outcome = collect_ordered_list_panes_snapshot_with_stage_observer(
-            &mux,
-            &mut |stage| match stage {
-                ListPanesSnapshotStage::TabTreeCaptured => {
-                    barrier_for_collector.collector_arrive();
-                }
-                ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
-                ListPanesSnapshotStage::BeforeOrderedAuthorityRead
-                | ListPanesSnapshotStage::WindowsEnumerated
-                | ListPanesSnapshotStage::OrderedWindowsFrozen => {}
-            },
-        );
+        let outcome =
+            collect_ordered_list_panes_snapshot_with_stage_observer(
+                &mux,
+                &mut |stage| match stage {
+                    ListPanesSnapshotStage::TabTreeCaptured => {
+                        barrier_for_collector.collector_arrive();
+                    }
+                    ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
+                    ListPanesSnapshotStage::BeforeOrderedAuthorityRead
+                    | ListPanesSnapshotStage::WindowsEnumerated
+                    | ListPanesSnapshotStage::OrderedWindowsFrozen => {}
+                },
+            );
         mutator
             .join()
             .expect("ordered snapshot mutator must not panic")
@@ -7457,7 +7314,10 @@ mod tests {
             outcome.expect("ordered snapshot retry must remain collectable"),
         );
 
-        assert_eq!(completed_attempts, 2, "the stale first attempt must be retried");
+        assert_eq!(
+            completed_attempts, 2,
+            "the stale first attempt must be retried"
+        );
         assert_eq!(snapshot.ordered_windows.len(), 1);
         assert_eq!(snapshot.ordered_windows[0].ordered_tab_ids.len(), 2);
         assert_eq!(snapshot.panes.trees().len(), 2);
@@ -7518,14 +7378,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let mux = Arc::new(Mux::new(None));
-        let first_tab = register_snapshot_tab(
-            &mux,
-            Arc::new(FakePane::new_with_id(7_701, None)),
-        );
-        let second_tab = register_snapshot_tab(
-            &mux,
-            Arc::new(FakePane::new_with_id(7_702, None)),
-        );
+        let first_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_701, None)));
+        let second_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_702, None)));
         let window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
         mux.add_tab_to_window(&second_tab, window_id)
             .expect("second test tab attaches to reorder window");
@@ -7559,13 +7413,12 @@ mod tests {
             ordered_window_capabilities(false),
         );
         let mut foreign_stream_without_capability = request.clone();
-        foreign_stream_without_capability.stream_id =
-            TopologyStreamId::from_bytes([0x87; 16]);
+        foreign_stream_without_capability.stream_id = TopologyStreamId::from_bytes([0x87; 16]);
         let error = admit_reorder_transport(
             &foreign_stream_without_capability,
             capability_only_authority,
         )
-            .expect_err("missing capability must outrank foreign stream identity");
+        .expect_err("missing capability must outrank foreign stream identity");
         assert!(format!("{error:#}").contains("capability is not established"));
 
         let applied =
@@ -7669,8 +7522,7 @@ mod tests {
         let mut foreign_stream_request = foreign_domain_request;
         foreign_stream_request.domain_binding_id = domain_binding_id;
         foreign_stream_request.stream_id = TopologyStreamId::from_bytes([0x89; 16]);
-        foreign_stream_request.mutation_id =
-            codec::WindowOrderMutationId::new([0x9d; 16], 4);
+        foreign_stream_request.mutation_id = codec::WindowOrderMutationId::new([0x9d; 16], 4);
         foreign_stream_request = foreign_stream_request.with_computed_digest();
         let error = process_reorder_window_tabs_request(
             &mux,
@@ -7775,24 +7627,16 @@ mod tests {
             7,
             vec![first_tab.tab_id(), first_tab.tab_id()],
         );
-        let bound_malformed_response = process_reorder_window_tabs_request(
-            &mux,
-            &bound_malformed,
-            immutable_authority,
-            None,
-        )
-        .expect("correctly bound semantic malformed request receives a typed response");
+        let bound_malformed_response =
+            process_reorder_window_tabs_request(&mux, &bound_malformed, immutable_authority, None)
+                .expect("correctly bound semantic malformed request receives a typed response");
         assert_eq!(
             bound_malformed_response.outcome,
             codec::ReorderWindowTabsV1Outcome::Malformed
         );
-        let replay_malformed = process_reorder_window_tabs_request(
-            &mux,
-            &bound_malformed,
-            immutable_authority,
-            None,
-        )
-        .expect("exact semantic-malformed retry must remain replayable");
+        let replay_malformed =
+            process_reorder_window_tabs_request(&mux, &bound_malformed, immutable_authority, None)
+                .expect("exact semantic-malformed retry must remain replayable");
         assert!(matches!(
             replay_malformed.outcome,
             codec::ReorderWindowTabsV1Outcome::Replay(
@@ -7807,14 +7651,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let mux = Arc::new(Mux::new(None));
-        let first_tab = register_snapshot_tab(
-            &mux,
-            Arc::new(FakePane::new_with_id(7_101, None)),
-        );
-        let second_tab = register_snapshot_tab(
-            &mux,
-            Arc::new(FakePane::new_with_id(7_102, None)),
-        );
+        let first_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_101, None)));
+        let second_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_102, None)));
         let first_window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
         let barrier = NoSleepSnapshotBarrier::shared();
         let barrier_for_mutator = Arc::clone(&barrier);
@@ -7882,23 +7720,16 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let mux = Arc::new(Mux::new(None));
-        let first_tab = register_snapshot_tab(
-            &mux,
-            Arc::new(FakePane::new_with_id(7_201, None)),
-        );
-        let second_tab = register_snapshot_tab(
-            &mux,
-            Arc::new(FakePane::new_with_id(7_202, None)),
-        );
+        let first_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_201, None)));
+        let second_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_202, None)));
         let window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
         let barrier = NoSleepSnapshotBarrier::shared();
         let barrier_for_mutator = Arc::clone(&barrier);
         let mux_for_mutator = Arc::clone(&mux);
         let second_tab_for_mutator = Arc::clone(&second_tab);
         let mutator = thread::spawn(move || {
-            barrier_for_mutator.mutate(|| {
-                mux_for_mutator.add_tab_to_window(&second_tab_for_mutator, window_id)
-            })
+            barrier_for_mutator
+                .mutate(|| mux_for_mutator.add_tab_to_window(&second_tab_for_mutator, window_id))
         });
 
         let barrier_for_collector = Arc::clone(&barrier);
@@ -7969,21 +7800,18 @@ mod tests {
         let barrier_for_mutator = Arc::clone(&barrier);
         let mux_for_mutator = Arc::clone(&mux);
         let mutator = thread::spawn(move || {
-            barrier_for_mutator.mutate(|| {
-                mux_for_mutator.set_window_title(window_id, "after-pane-callback-cut")
-            })
+            barrier_for_mutator
+                .mutate(|| mux_for_mutator.set_window_title(window_id, "after-pane-callback-cut"))
         });
 
         armed.store(1, Ordering::Release);
         let mut completed_attempts = 0usize;
-        let outcome = collect_coherent_list_panes_snapshot_with_stage_observer(
-            &mux,
-            &mut |stage| {
+        let outcome =
+            collect_coherent_list_panes_snapshot_with_stage_observer(&mux, &mut |stage| {
                 if stage == ListPanesSnapshotStage::TitlesCaptured {
                     completed_attempts += 1;
                 }
-            },
-        );
+            });
         armed.store(0, Ordering::Release);
         let title_changed = mutator
             .join()
@@ -8013,32 +7841,26 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let mux = Arc::new(Mux::new(None));
-        let tab = register_snapshot_tab(
-            &mux,
-            Arc::new(FakePane::new_with_id(7_401, None)),
-        );
+        let tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_401, None)));
         let window_id = attach_snapshot_tab_to_new_window(&mux, &tab);
         assert!(mux.set_window_title(window_id, "before-title-capture-cut"));
         let barrier = NoSleepSnapshotBarrier::shared();
         let barrier_for_mutator = Arc::clone(&barrier);
         let mux_for_mutator = Arc::clone(&mux);
         let mutator = thread::spawn(move || {
-            barrier_for_mutator.mutate(|| {
-                mux_for_mutator.set_window_title(window_id, "after-title-capture-cut")
-            })
+            barrier_for_mutator
+                .mutate(|| mux_for_mutator.set_window_title(window_id, "after-title-capture-cut"))
         });
 
         let barrier_for_collector = Arc::clone(&barrier);
         let mut completed_attempts = 0usize;
-        let outcome = collect_coherent_list_panes_snapshot_with_stage_observer(
-            &mux,
-            &mut |stage| {
+        let outcome =
+            collect_coherent_list_panes_snapshot_with_stage_observer(&mux, &mut |stage| {
                 if stage == ListPanesSnapshotStage::TitlesCaptured {
                     completed_attempts += 1;
                     barrier_for_collector.collector_arrive();
                 }
-            },
-        );
+            });
         let title_changed = mutator
             .join()
             .expect("title-capture mutator must finish without panic");
@@ -8074,8 +7896,7 @@ mod tests {
                 mux.notify(mux::MuxNotification::Empty);
             }
         });
-        let pane: Arc<dyn Pane> =
-            Arc::new(FakePane::new_with_callback_probe(7_008, probe));
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(7_008, probe));
         let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
         tab.assign_pane(&pane);
         mux.add_tab_and_active_pane(&tab)
@@ -8334,16 +8155,14 @@ mod tests {
 
         handler.process_one(DecodedPdu {
             serial: 203,
-            pdu: Pdu::GetPaneRenderDeliveryV1Response(
-                codec::GetPaneRenderDeliveryV1Response {
-                    protocol_version: codec::EXACT_RENDER_DELIVERY_PROTOCOL_VERSION,
-                    request_identity: request.identity,
-                    request_digest: request.request_digest,
-                    outcome: codec::ExactRenderDeliveryOutcomeV1::PaneRemoved {
-                        last_pane_generation: None,
-                    },
+            pdu: Pdu::GetPaneRenderDeliveryV1Response(codec::GetPaneRenderDeliveryV1Response {
+                protocol_version: codec::EXACT_RENDER_DELIVERY_PROTOCOL_VERSION,
+                request_identity: request.identity,
+                request_digest: request.request_digest,
+                outcome: codec::ExactRenderDeliveryOutcomeV1::PaneRemoved {
+                    last_pane_generation: None,
                 },
-            ),
+            }),
         });
 
         let response = take_response(&captured);
@@ -10598,9 +10417,7 @@ mod tests {
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
 
         let result = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current");
         let error = match result {
             Err(error) => error,
@@ -10626,9 +10443,7 @@ mod tests {
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
 
         let result = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current");
         let error = match result {
             Err(error) => error,
@@ -10690,9 +10505,7 @@ mod tests {
         per_pane.lock().unwrap().baseline_revision = u64::MAX;
 
         let result = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current");
         let error = match result {
             Err(error) => error,
@@ -10719,9 +10532,7 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane_dyn);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
         let (_, first) = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current")
             .expect("initial legacy render preparation succeeds")
             .expect("initial pane state produces a render");
@@ -10737,9 +10548,7 @@ mod tests {
         }
 
         let result = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current");
         let error = match result {
             Err(error) => error,
@@ -10843,13 +10652,15 @@ mod tests {
                     .expect("nested registration remains exact");
                 let nested_error = match nested_result {
                     Err(error) => error,
-                    Ok(_) => panic!(
-                        "an undelivered baseline must retain exclusive enqueue authority"
-                    ),
+                    Ok(_) => {
+                        panic!("an undelivered baseline must retain exclusive enqueue authority")
+                    }
                 };
                 assert!(nested_error.to_string().contains("already active"));
                 nested_rejected.store(true, Ordering::Relaxed);
-                Err(anyhow!("outer enqueue failed after nested render was rejected"))
+                Err(anyhow!(
+                    "outer enqueue failed after nested render was rejected"
+                ))
             }
         });
 
@@ -10896,9 +10707,7 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
         let (_, rollback) = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current")
             .expect("initial render preparation succeeds")
             .expect("initial pane state produces a render");
@@ -10929,9 +10738,7 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
         let (_, guard) = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current")
             .expect("initial render preparation succeeds")
             .expect("initial pane state produces a render");
@@ -10952,9 +10759,7 @@ mod tests {
             assert!(state.transactional_dirty);
         }
         let (_, retry_guard) = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current")
             .expect("abandoned authority must permit an exact retry")
             .expect("rolled-back surface must be prepared again");
@@ -10971,9 +10776,7 @@ mod tests {
         poison_per_pane_lock(&per_pane);
 
         let result = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current");
         let error = match result {
             Err(error) => error,
@@ -10999,9 +10802,7 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
         let (_, guard) = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current")
             .expect("initial render preparation succeeds")
             .expect("initial pane state produces a render");
@@ -11030,20 +10831,15 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
         let (_, guard) = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current")
             .expect("initial render preparation succeeds")
             .expect("initial pane state produces a render");
         per_pane.lock().unwrap().baseline_revision = 2;
 
-        let error = acknowledge_legacy_render_enqueue(
-            &per_pane,
-            pane.pane_id(),
-            guard.installed_revision,
-        )
-        .expect_err("mismatched enqueue acknowledgement must fail closed");
+        let error =
+            acknowledge_legacy_render_enqueue(&per_pane, pane.pane_id(), guard.installed_revision)
+                .expect_err("mismatched enqueue acknowledgement must fail closed");
         assert!(error.to_string().contains("ownership changed"));
         {
             let state = per_pane.lock().unwrap();
@@ -11064,9 +10860,7 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
         let (_, guard) = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current")
             .expect("initial render preparation succeeds")
             .expect("initial pane state produces a render");
@@ -11094,9 +10888,7 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
         let (_, guard) = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current")
             .expect("initial render preparation succeeds")
             .expect("initial pane state produces a render");
@@ -11124,9 +10916,7 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
         let (_, guard) = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current")
             .expect("initial render preparation succeeds")
             .expect("initial pane state produces a render");
@@ -11150,16 +10940,11 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
         let (_, guard) = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current")
             .expect("initial render preparation succeeds")
             .expect("initial pane state produces a render");
-        per_pane
-            .lock()
-            .unwrap()
-            .panic_next_legacy_enqueue_recovery = true;
+        per_pane.lock().unwrap().panic_next_legacy_enqueue_recovery = true;
 
         let error = guard
             .rollback()
@@ -11179,16 +10964,11 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
         let (_, guard) = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current")
             .expect("initial render preparation succeeds")
             .expect("initial pane state produces a render");
-        per_pane
-            .lock()
-            .unwrap()
-            .panic_next_legacy_enqueue_recovery = true;
+        per_pane.lock().unwrap().panic_next_legacy_enqueue_recovery = true;
 
         drop(guard);
 
@@ -11230,10 +11010,7 @@ mod tests {
             state.transactional_dirty,
             "an enqueue panic must preserve explicit terminal dirtiness"
         );
-        assert_eq!(
-            state.legacy_enqueue_phase,
-            LegacyRenderEnqueuePhase::Closed
-        );
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
         assert!(matches!(
             state.transaction_phase,
             PaneRenderTransactionPhase::Closed
@@ -11332,10 +11109,7 @@ mod tests {
         assert_eq!(state.notifications, vec![Alert::PaletteChanged]);
         assert!(state.transactional_dirty);
         assert_eq!(state.notifications.protected_prefix_len, 0);
-        assert_eq!(
-            state.legacy_enqueue_phase,
-            LegacyRenderEnqueuePhase::Closed
-        );
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
         assert!(matches!(
             state.transaction_phase,
             PaneRenderTransactionPhase::Closed
@@ -11380,10 +11154,7 @@ mod tests {
         assert_eq!(state.notifications, vec![Alert::PaletteChanged]);
         assert_eq!(state.notifications.protected_prefix_len, 0);
         assert!(state.transactional_dirty);
-        assert_eq!(
-            state.legacy_enqueue_phase,
-            LegacyRenderEnqueuePhase::Closed
-        );
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
         assert!(matches!(
             state.transaction_phase,
             PaneRenderTransactionPhase::Closed
@@ -11481,8 +11252,7 @@ mod tests {
                 .notifications
                 .protected_batch_up_to(1)
                 .expect("protect exact notification batch");
-            state.legacy_enqueue_phase =
-                LegacyRenderEnqueuePhase::NotificationsInFlight;
+            state.legacy_enqueue_phase = LegacyRenderEnqueuePhase::NotificationsInFlight;
             batch
         };
         let guard = UnsentNotificationsGuard::new(Arc::clone(&per_pane), batch);
@@ -11495,10 +11265,7 @@ mod tests {
         assert_eq!(state.notifications, vec![Alert::Bell]);
         assert_eq!(state.notifications.protected_prefix_len, 0);
         assert!(state.transactional_dirty);
-        assert_eq!(
-            state.legacy_enqueue_phase,
-            LegacyRenderEnqueuePhase::Closed
-        );
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
         assert!(matches!(
             state.transaction_phase,
             PaneRenderTransactionPhase::Closed
@@ -11517,8 +11284,7 @@ mod tests {
                 .notifications
                 .protected_batch_up_to(1)
                 .expect("protect exact notification batch");
-            state.legacy_enqueue_phase =
-                LegacyRenderEnqueuePhase::NotificationsInFlight;
+            state.legacy_enqueue_phase = LegacyRenderEnqueuePhase::NotificationsInFlight;
             batch
         };
         let mut guard = UnsentNotificationsGuard::new(Arc::clone(&per_pane), batch);
@@ -11556,8 +11322,7 @@ mod tests {
                 .notifications
                 .protected_batch_up_to(1)
                 .expect("protect exact notification batch");
-            state.legacy_enqueue_phase =
-                LegacyRenderEnqueuePhase::NotificationsInFlight;
+            state.legacy_enqueue_phase = LegacyRenderEnqueuePhase::NotificationsInFlight;
             batch
         };
         let mut guard = UnsentNotificationsGuard::new(Arc::clone(&per_pane), batch);
@@ -11732,10 +11497,7 @@ mod tests {
             .iter()
             .filter(|decoded| matches!(&decoded.pdu, Pdu::NotifyAlert(_)))
             .count();
-        assert_eq!(
-            total_alert_count,
-            codec::MAX_RENDER_APPLICATION_ALERTS + 2
-        );
+        assert_eq!(total_alert_count, codec::MAX_RENDER_APPLICATION_ALERTS + 2);
         let state = per_pane.lock().unwrap();
         assert!(state.notifications.is_empty());
         assert_eq!(state.notifications.protected_prefix_len, 0);
@@ -11750,11 +11512,7 @@ mod tests {
         let (bootstrap_sender, _) = capturing_sender();
         registration
             .try_with_current(|current| {
-                maybe_push_pane_changes(
-                    &current,
-                    bootstrap_sender,
-                    Arc::clone(&per_pane),
-                )
+                maybe_push_pane_changes(&current, bootstrap_sender, Arc::clone(&per_pane))
             })
             .expect("test pane registration remains current")
             .expect("bootstrap render and palette settle");
@@ -11783,8 +11541,8 @@ mod tests {
                             )
                         })
                         .expect("nested pane registration remains current");
-                    let error = nested
-                        .expect_err("the active notification batch must retain authority");
+                    let error =
+                        nested.expect_err("the active notification batch must retain authority");
                     assert!(error.to_string().contains("already active"));
                 }
                 Ok(())
@@ -11868,12 +11626,8 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
 
         let prepared = expect_prepared(
-            prepare_transactional_for_registration(
-                Arc::clone(&per_pane),
-                &registration,
-                None,
-            )
-            .expect("transactional render preparation"),
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None)
+                .expect("transactional render preparation"),
         );
         assert_eq!(callback_count.load(Ordering::Relaxed), 1);
         assert_eq!(prepared.surface.seqno, 11);
@@ -11919,12 +11673,8 @@ mod tests {
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
 
         let prepared = expect_prepared(
-            prepare_transactional_for_registration(
-                Arc::clone(&per_pane),
-                &registration,
-                None,
-            )
-            .unwrap(),
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None)
+                .unwrap(),
         );
         let token = prepared.token();
         let wrong = PaneRenderAttemptToken {
@@ -11952,12 +11702,8 @@ mod tests {
         }
         per_pane.lock().unwrap().mark_transactional_dirty();
         let abandoned = expect_prepared(
-            prepare_transactional_for_registration(
-                Arc::clone(&per_pane),
-                &registration,
-                None,
-            )
-            .unwrap(),
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None)
+                .unwrap(),
         );
         let abandoned_token = abandoned.token();
         assert_eq!(
@@ -11987,12 +11733,8 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
         let prepared = expect_prepared(
-            prepare_transactional_for_registration(
-                Arc::clone(&per_pane),
-                &registration,
-                None,
-            )
-            .expect("prepare transactional render"),
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None)
+                .expect("prepare transactional render"),
         );
 
         let result = catch_recoverable(
@@ -12023,17 +11765,10 @@ mod tests {
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
 
         let first = expect_prepared(
-            prepare_transactional_for_registration(
-                Arc::clone(&per_pane),
-                &registration,
-                None,
-            )
-            .expect("prepare first transactional render"),
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None)
+                .expect("prepare first transactional render"),
         );
-        assert_eq!(
-            first.acknowledge(),
-            PaneRenderSettlement::AcknowledgedClean
-        );
+        assert_eq!(first.acknowledge(), PaneRenderSettlement::AcknowledgedClean);
         assert_eq!(per_pane.lock().unwrap().baseline_revision, 1);
 
         {
@@ -12049,10 +11784,7 @@ mod tests {
             )
             .expect("prepare render before shared baseline identity exhaustion"),
         );
-        assert_eq!(
-            exhausted.acknowledge(),
-            PaneRenderSettlement::FailedClosed
-        );
+        assert_eq!(exhausted.acknowledge(), PaneRenderSettlement::FailedClosed);
         let state = per_pane.lock().unwrap();
         assert!(matches!(
             state.transaction_phase,
@@ -12074,17 +11806,12 @@ mod tests {
             .unwrap()
             .push_notification(Alert::Bell)
             .expect("retain exact event before transaction");
-        let preparation = begin_transactional_pane_render(
-            Arc::clone(&per_pane),
-            pane.pane_id(),
-            None,
-        )
-        .expect("transactional preparation owns the pane");
+        let preparation =
+            begin_transactional_pane_render(Arc::clone(&per_pane), pane.pane_id(), None)
+                .expect("transactional preparation owns the pane");
 
         let result = registration
-            .try_with_current(|current| {
-                prepare_legacy_render_enqueue(&current, &per_pane, None)
-            })
+            .try_with_current(|current| prepare_legacy_render_enqueue(&current, &per_pane, None))
             .expect("test pane registration remains current");
         let error = match result {
             Err(error) => error,
@@ -12126,10 +11853,7 @@ mod tests {
             state.transaction_phase,
             PaneRenderTransactionPhase::Closed
         ));
-        assert_eq!(
-            state.legacy_enqueue_phase,
-            LegacyRenderEnqueuePhase::Closed
-        );
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
         assert_eq!(state.notifications.protected_prefix_len, 0);
         assert!(state.transactional_dirty);
     }
@@ -12182,18 +11906,18 @@ mod tests {
         let pane_dyn: Arc<dyn Pane> = pane;
         let (_mux, registration) = register_test_pane(&pane_dyn);
         let state = Arc::new(Mutex::new(PerPane::default()));
-        let preparation = begin_transactional_pane_render(
-            Arc::clone(&state),
-            registration.pane_id(),
-            None,
-        )
-        .expect("transactional preparation owns the state");
+        let preparation =
+            begin_transactional_pane_render(Arc::clone(&state), registration.pane_id(), None)
+                .expect("transactional preparation owns the state");
         poison_per_pane_lock(&state);
 
         let result = registration
             .try_with_current(move |pane| preparation.prepare(&pane))
             .expect("test pane registration remains current");
-        assert_eq!(result.unwrap_err(), PaneRenderPreparationError::StateLockPoisoned);
+        assert_eq!(
+            result.unwrap_err(),
+            PaneRenderPreparationError::StateLockPoisoned
+        );
 
         let state = state
             .lock()
@@ -12215,12 +11939,8 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane_dyn);
         let state = Arc::new(Mutex::new(PerPane::default()));
         let initial = expect_prepared(
-            prepare_transactional_for_registration(
-                Arc::clone(&state),
-                &registration,
-                None,
-            )
-            .expect("prepare initial transactional render"),
+            prepare_transactional_for_registration(Arc::clone(&state), &registration, None)
+                .expect("prepare initial transactional render"),
         );
         assert_eq!(
             initial.acknowledge(),
@@ -12228,18 +11948,18 @@ mod tests {
         );
         pane.state.lock().unwrap().seqno = 12;
         state.lock().unwrap().mark_transactional_dirty();
-        let preparation = begin_transactional_pane_render(
-            Arc::clone(&state),
-            registration.pane_id(),
-            None,
-        )
-        .expect("transactional preparation owns the state");
+        let preparation =
+            begin_transactional_pane_render(Arc::clone(&state), registration.pane_id(), None)
+                .expect("transactional preparation owns the state");
         poison_per_pane_lock(&state);
 
         let result = registration
             .try_with_current(move |pane| preparation.prepare(&pane))
             .expect("test pane registration remains current");
-        assert_eq!(result.unwrap_err(), PaneRenderPreparationError::StateLockPoisoned);
+        assert_eq!(
+            result.unwrap_err(),
+            PaneRenderPreparationError::StateLockPoisoned
+        );
 
         let state = state
             .lock()
@@ -12260,18 +11980,18 @@ mod tests {
         let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
         let (_mux, registration) = register_test_pane(&pane);
         let state = Arc::new(Mutex::new(PerPane::default()));
-        let preparation = begin_transactional_pane_render(
-            Arc::clone(&state),
-            registration.pane_id(),
-            None,
-        )
-        .expect("transactional preparation owns the state");
+        let preparation =
+            begin_transactional_pane_render(Arc::clone(&state), registration.pane_id(), None)
+                .expect("transactional preparation owns the state");
         poison_per_pane_lock(&state);
 
         let result = registration
             .try_with_current(move |pane| preparation.prepare(&pane))
             .expect("test pane registration remains current");
-        assert_eq!(result.unwrap_err(), PaneRenderPreparationError::StateLockPoisoned);
+        assert_eq!(
+            result.unwrap_err(),
+            PaneRenderPreparationError::StateLockPoisoned
+        );
 
         let state = state
             .lock()
@@ -12302,10 +12022,7 @@ mod tests {
             state.transaction_phase,
             PaneRenderTransactionPhase::Closed
         ));
-        assert_eq!(
-            state.legacy_enqueue_phase,
-            LegacyRenderEnqueuePhase::Closed
-        );
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
         assert_eq!(state.notifications.protected_prefix_len, 0);
         assert!(state.transactional_dirty);
     }
@@ -12316,12 +12033,8 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         let state = Arc::new(Mutex::new(PerPane::default()));
         let prepared = expect_prepared(
-            prepare_transactional_for_registration(
-                Arc::clone(&state),
-                &registration,
-                None,
-            )
-            .expect("prepare transactional render"),
+            prepare_transactional_for_registration(Arc::clone(&state), &registration, None)
+                .expect("prepare transactional render"),
         );
         poison_per_pane_lock(&state);
 
@@ -12333,10 +12046,7 @@ mod tests {
             state.transaction_phase,
             PaneRenderTransactionPhase::Closed
         ));
-        assert_eq!(
-            state.legacy_enqueue_phase,
-            LegacyRenderEnqueuePhase::Closed
-        );
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
         assert_eq!(state.baseline, PaneRenderBaseline::default());
         assert!(state.transactional_dirty);
     }
@@ -12347,12 +12057,8 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         let state = Arc::new(Mutex::new(PerPane::default()));
         let prepared = expect_prepared(
-            prepare_transactional_for_registration(
-                Arc::clone(&state),
-                &registration,
-                None,
-            )
-            .expect("prepare transactional render"),
+            prepare_transactional_for_registration(Arc::clone(&state), &registration, None)
+                .expect("prepare transactional render"),
         );
         poison_per_pane_lock(&state);
 
@@ -12364,10 +12070,7 @@ mod tests {
             state.transaction_phase,
             PaneRenderTransactionPhase::Closed
         ));
-        assert_eq!(
-            state.legacy_enqueue_phase,
-            LegacyRenderEnqueuePhase::Closed
-        );
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
         assert_eq!(state.baseline, PaneRenderBaseline::default());
         assert!(state.transactional_dirty);
     }
@@ -12378,12 +12081,8 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         let state = Arc::new(Mutex::new(PerPane::default()));
         let prepared = expect_prepared(
-            prepare_transactional_for_registration(
-                Arc::clone(&state),
-                &registration,
-                None,
-            )
-            .expect("prepare transactional render"),
+            prepare_transactional_for_registration(Arc::clone(&state), &registration, None)
+                .expect("prepare transactional render"),
         );
         poison_per_pane_lock(&state);
 
@@ -12396,10 +12095,7 @@ mod tests {
             state.transaction_phase,
             PaneRenderTransactionPhase::Closed
         ));
-        assert_eq!(
-            state.legacy_enqueue_phase,
-            LegacyRenderEnqueuePhase::Closed
-        );
+        assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Closed);
         assert_eq!(state.baseline, PaneRenderBaseline::default());
         assert!(state.transactional_dirty);
     }
@@ -12450,12 +12146,8 @@ mod tests {
         }
 
         let first = expect_prepared(
-            prepare_transactional_for_registration(
-                Arc::clone(&per_pane),
-                &registration,
-                None,
-            )
-            .unwrap(),
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None)
+                .unwrap(),
         );
         assert!(first.palette.is_some());
         assert_eq!(
@@ -12474,12 +12166,18 @@ mod tests {
                 .count(),
             1
         );
-        assert!(first.alerts.iter().any(|alert| {
-            alert.alert == Alert::Progress(Progress::Percentage(50))
-        }));
-        assert!(!first.alerts.iter().any(|alert| {
-            alert.alert == Alert::Progress(Progress::Percentage(25))
-        }));
+        assert!(
+            first
+                .alerts
+                .iter()
+                .any(|alert| { alert.alert == Alert::Progress(Progress::Percentage(50)) })
+        );
+        assert!(
+            !first
+                .alerts
+                .iter()
+                .any(|alert| { alert.alert == Alert::Progress(Progress::Percentage(25)) })
+        );
         assert_eq!(first.nack(), PaneRenderSettlement::Retried);
         assert_eq!(
             per_pane.lock().unwrap().notifications.len(),
@@ -12488,12 +12186,8 @@ mod tests {
         );
 
         let retry = expect_prepared(
-            prepare_transactional_for_registration(
-                Arc::clone(&per_pane),
-                &registration,
-                None,
-            )
-            .unwrap(),
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None)
+                .unwrap(),
         );
         per_pane
             .lock()
@@ -12525,17 +12219,10 @@ mod tests {
         }
 
         let prepared = expect_prepared(
-            prepare_transactional_for_registration(
-                Arc::clone(&per_pane),
-                &registration,
-                None,
-            )
-            .unwrap(),
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None)
+                .unwrap(),
         );
-        assert_eq!(
-            prepared.alerts.len(),
-            codec::MAX_RENDER_APPLICATION_ALERTS
-        );
+        assert_eq!(prepared.alerts.len(), codec::MAX_RENDER_APPLICATION_ALERTS);
         assert_eq!(
             prepared.acknowledge(),
             PaneRenderSettlement::AcknowledgedRedirtied
@@ -12561,12 +12248,8 @@ mod tests {
         }
 
         let prepared = expect_prepared(
-            prepare_transactional_for_registration(
-                Arc::clone(&per_pane),
-                &registration,
-                None,
-            )
-            .expect("bounded backlog should prepare its exact first wire prefix"),
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None)
+                .expect("bounded backlog should prepare its exact first wire prefix"),
         );
         assert_eq!(prepared.alerts.len(), codec::MAX_RENDER_APPLICATION_ALERTS);
 
@@ -12579,14 +12262,15 @@ mod tests {
                     focus: false,
                 })
                 .expect_err("a full exact-event backlog must reject before mutation");
-            assert_eq!(
-                error,
-                PaneAlertBacklogError::ExactEventCapacityExhausted
-            );
+            assert_eq!(error, PaneAlertBacklogError::ExactEventCapacityExhausted);
             assert_eq!(state.notifications.len(), MAX_PENDING_PANE_ALERTS);
-            assert!(state.notifications.as_slice()
-                .iter()
-                .all(|alert| *alert == Alert::Bell));
+            assert!(
+                state
+                    .notifications
+                    .as_slice()
+                    .iter()
+                    .all(|alert| *alert == Alert::Bell)
+            );
         }
 
         assert_eq!(
@@ -12598,11 +12282,13 @@ mod tests {
             state.notifications.len(),
             codec::MAX_RENDER_APPLICATION_ALERTS
         );
-        assert!(state
-            .notifications
-            .as_slice()
-            .iter()
-            .all(|alert| *alert == Alert::Bell));
+        assert!(
+            state
+                .notifications
+                .as_slice()
+                .iter()
+                .all(|alert| *alert == Alert::Bell)
+        );
     }
 
     #[test]
@@ -12610,9 +12296,9 @@ mod tests {
         let mut alerts = PendingPaneAlerts::default();
         assert_eq!(
             alerts
-                .push(Alert::WindowTitleChanged("x".repeat(
-                    codec::MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES + 1,
-                )))
+                .push(Alert::WindowTitleChanged(
+                    "x".repeat(codec::MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES + 1,)
+                ))
                 .expect_err("an individually unencodable alert must be rejected"),
             PaneAlertBacklogError::SingleAlertTextLimit
         );
@@ -12634,9 +12320,9 @@ mod tests {
         assert_eq!(
             alerts
                 .push(Alert::ToastNotification {
-                title: None,
-                body: format!("2{}", "x".repeat(chunk_len - 1)),
-                focus: false,
+                    title: None,
+                    body: format!("2{}", "x".repeat(chunk_len - 1)),
+                    focus: false,
                 })
                 .expect_err("aggregate overflow must reject without eviction"),
             PaneAlertBacklogError::ExactEventCapacityExhausted
@@ -12788,10 +12474,7 @@ mod tests {
         );
         let first_token = first.token();
         assert_eq!(first.surface.input_serial, Some(serial));
-        assert_eq!(
-            first.acknowledge(),
-            PaneRenderSettlement::AcknowledgedClean
-        );
+        assert_eq!(first.acknowledge(), PaneRenderSettlement::AcknowledgedClean);
 
         per_pane.lock().unwrap().mark_transactional_dirty();
         let second = expect_prepared(
@@ -12823,12 +12506,8 @@ mod tests {
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
 
         let initial = expect_prepared(
-            prepare_transactional_for_registration(
-                Arc::clone(&per_pane),
-                &registration,
-                None,
-            )
-            .unwrap(),
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None)
+                .unwrap(),
         );
         assert_eq!(
             initial.acknowledge(),
@@ -12837,17 +12516,12 @@ mod tests {
         pane.state.lock().unwrap().seqno = 12;
         per_pane.lock().unwrap().mark_transactional_dirty();
 
-        let outcome = prepare_transactional_for_registration(
-            Arc::clone(&per_pane),
-            &registration,
-            None,
-        )
-        .unwrap();
+        let outcome =
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None)
+                .unwrap();
         assert!(matches!(
             outcome,
-            PaneRenderPreparationOutcome::NoChange(
-                PaneRenderSettlement::SettledNoChangeClean
-            )
+            PaneRenderPreparationOutcome::NoChange(PaneRenderSettlement::SettledNoChangeClean)
         ));
         let state = per_pane.lock().unwrap();
         assert_eq!(
@@ -12867,12 +12541,8 @@ mod tests {
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
 
         assert_eq!(
-            prepare_transactional_for_registration(
-                Arc::clone(&per_pane),
-                &registration,
-                None,
-            )
-            .unwrap_err(),
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None,)
+                .unwrap_err(),
             PaneRenderPreparationError::SourceChanged
         );
         let state = per_pane.lock().unwrap();
@@ -12894,12 +12564,8 @@ mod tests {
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
 
         assert_eq!(
-            prepare_transactional_for_registration(
-                Arc::clone(&per_pane),
-                &registration,
-                None,
-            )
-            .unwrap_err(),
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None,)
+                .unwrap_err(),
             PaneRenderPreparationError::StableRowRangeUnrepresentable
         );
         let state = per_pane.lock().unwrap();
@@ -12921,12 +12587,8 @@ mod tests {
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
 
         assert_eq!(
-            prepare_transactional_for_registration(
-                Arc::clone(&per_pane),
-                &registration,
-                None,
-            )
-            .unwrap_err(),
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None,)
+                .unwrap_err(),
             PaneRenderPreparationError::TerminalSequenceExhausted
         );
         assert!(matches!(
@@ -12963,10 +12625,7 @@ mod tests {
             ..PerPane::default()
         };
         assert!(matches!(
-            input_exhausted.begin_transactional_preparation(
-                1,
-                Some(InputSerial::empty())
-            ),
+            input_exhausted.begin_transactional_preparation(1, Some(InputSerial::empty())),
             Err(PaneRenderPreparationError::InputIdentityExhausted)
         ));
         assert!(matches!(
@@ -13001,12 +12660,8 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
         let prepared = expect_prepared(
-            prepare_transactional_for_registration(
-                Arc::clone(&per_pane),
-                &registration,
-                None,
-            )
-            .unwrap(),
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None)
+                .unwrap(),
         );
         let token = prepared.token();
         per_pane.lock().unwrap().close_transaction();
@@ -13143,7 +12798,8 @@ mod tests {
         let pane = Arc::new(FakePane::new(None));
         pane.state.lock().unwrap().dimensions.physical_top = StableRowIndex::MAX;
         let pane_dyn: Arc<dyn Pane> = pane.clone();
-        mux.add_pane(&pane_dyn).expect("register input ACK test pane");
+        mux.add_pane(&pane_dyn)
+            .expect("register input ACK test pane");
         let (sender, captured) = capturing_sender();
         let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
 
@@ -13163,7 +12819,11 @@ mod tests {
         let response = take_response(&captured);
         assert_eq!(response.serial, 9_701);
         assert_eq!(response.pdu, Pdu::UnitResponse(UnitResponse {}));
-        assert_eq!(pane.key_down_count(), 1, "the key must be applied exactly once");
+        assert_eq!(
+            pane.key_down_count(),
+            1,
+            "the key must be applied exactly once"
+        );
         let per_pane = handler
             .per_pane_if_present(pane.pane_id())
             .expect("key-down should retain per-pane state");
@@ -13223,7 +12883,11 @@ mod tests {
                 pdu: Pdu::UnitResponse(UnitResponse {}),
             }
         );
-        assert_eq!(pane.paste_count(), 1, "the paste must be applied exactly once");
+        assert_eq!(
+            pane.paste_count(),
+            1,
+            "the paste must be applied exactly once"
+        );
     }
 
     #[test]
@@ -13253,7 +12917,11 @@ mod tests {
         let response = take_response(&captured);
         assert_eq!(response.serial, 9_703);
         assert_eq!(response.pdu, Pdu::UnitResponse(UnitResponse {}));
-        assert_eq!(pane.paste_count(), 1, "the paste must be applied exactly once");
+        assert_eq!(
+            pane.paste_count(),
+            1,
+            "the paste must be applied exactly once"
+        );
         let per_pane = handler
             .per_pane_if_present(pane.pane_id())
             .expect("paste should retain per-pane state");

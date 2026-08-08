@@ -9,22 +9,18 @@ const MAX_CONTAINER_ITEMS: usize = 1_000_000;
 /// Zero-wire serde newtype names used by the exact-render schema to select a
 /// tighter raw byte-buffer admission limit before allocation. The names are
 /// serializer metadata only: varbincode does not write newtype names.
-pub(crate) const EXACT_RENDER_ROW_UTF8_V1_NEWTYPE: &str =
-    "frankenterm.codec.ExactRenderRowUtf8V1";
+pub(crate) const EXACT_RENDER_ROW_UTF8_V1_NEWTYPE: &str = "frankenterm.codec.ExactRenderRowUtf8V1";
 pub(crate) const EXACT_RENDER_METADATA_UTF8_V1_NEWTYPE: &str =
     "frankenterm.codec.ExactRenderMetadataUtf8V1";
 pub(crate) const ORDERED_WINDOW_SECTION_V1_NEWTYPE: &str =
     "frankenterm.codec.OrderedWindowSectionV1";
 pub(crate) const ORDERED_PANE_TREE_DESCRIPTORS_V1_NEWTYPE: &str =
     "frankenterm.codec.OrderedPaneTreeDescriptorsV1";
-pub(crate) const ORDERED_PANE_NODES_V1_NEWTYPE: &str =
-    "frankenterm.codec.OrderedPaneNodesV1";
+pub(crate) const ORDERED_PANE_NODES_V1_NEWTYPE: &str = "frankenterm.codec.OrderedPaneNodesV1";
 pub(crate) const ORDERED_PANE_WINDOW_TITLES_V1_NEWTYPE: &str =
     "frankenterm.codec.OrderedPaneWindowTitlesV1";
-pub(crate) const ORDERED_WINDOWS_V1_NEWTYPE: &str =
-    "frankenterm.codec.OrderedWindowsV1";
-pub(crate) const ORDERED_TAB_IDS_V1_NEWTYPE: &str =
-    "frankenterm.codec.OrderedTabIdsV1";
+pub(crate) const ORDERED_WINDOWS_V1_NEWTYPE: &str = "frankenterm.codec.OrderedWindowsV1";
+pub(crate) const ORDERED_TAB_IDS_V1_NEWTYPE: &str = "frankenterm.codec.OrderedTabIdsV1";
 pub(crate) const SERIALIZED_LINE_ENTRIES_V1_NEWTYPE: &str =
     "frankenterm.codec.SerializedLineEntriesV1";
 pub(crate) const SERIALIZED_HYPERLINKS_V1_NEWTYPE: &str =
@@ -33,8 +29,7 @@ pub(crate) const SERIALIZED_HYPERLINK_COORDINATES_V1_NEWTYPE: &str =
     "frankenterm.codec.SerializedHyperlinkCoordinatesV1";
 pub(crate) const SERIALIZED_IMAGE_REFERENCES_V1_NEWTYPE: &str =
     "frankenterm.codec.SerializedImageReferencesV1";
-pub(crate) const IMAGE_WIRE_BYTES_V1_NEWTYPE: &str =
-    termwiz::image::IMAGE_WIRE_BYTES_V1_NEWTYPE;
+pub(crate) const IMAGE_WIRE_BYTES_V1_NEWTYPE: &str = termwiz::image::IMAGE_WIRE_BYTES_V1_NEWTYPE;
 pub(crate) const EXACT_RENDER_ROW_UTF8_V1_MAX_BYTES: usize = 1_000_000;
 pub(crate) const EXACT_RENDER_METADATA_UTF8_V1_MAX_BYTES: usize = 65_536;
 pub(crate) const ORDERED_WINDOW_SECTION_V1_MAX_BYTES: usize = 512 * 1024;
@@ -43,16 +38,14 @@ pub(crate) const ORDERED_PANE_NODES_V1_MAX_ITEMS: usize = 32_767;
 pub(crate) const ORDERED_PANE_WINDOW_TITLES_V1_MAX_ITEMS: usize = 4_096;
 pub(crate) const ORDERED_WINDOWS_V1_MAX_ITEMS: usize = 4_096;
 pub(crate) const ORDERED_TAB_IDS_V1_MAX_ITEMS: usize = 4_096;
-pub(crate) const SERIALIZED_LINE_ENTRIES_V1_MAX_ITEMS: usize =
-    super::MAX_RENDER_APPLICATION_LINES;
+pub(crate) const SERIALIZED_LINE_ENTRIES_V1_MAX_ITEMS: usize = super::MAX_RENDER_APPLICATION_LINES;
 pub(crate) const SERIALIZED_HYPERLINKS_V1_MAX_ITEMS: usize =
     super::MAX_RENDER_APPLICATION_HYPERLINK_SPANS;
 pub(crate) const SERIALIZED_HYPERLINK_COORDINATES_V1_MAX_ITEMS: usize =
     super::MAX_RENDER_APPLICATION_HYPERLINK_SPANS;
 pub(crate) const SERIALIZED_IMAGE_REFERENCES_V1_MAX_ITEMS: usize =
     super::MAX_RENDER_APPLICATION_IMAGE_REFERENCES;
-pub(crate) const IMAGE_WIRE_BYTES_V1_MAX_BYTES: usize =
-    super::MAX_IMAGE_HYDRATION_DECODED_BYTES;
+pub(crate) const IMAGE_WIRE_BYTES_V1_MAX_BYTES: usize = super::MAX_IMAGE_HYDRATION_DECODED_BYTES;
 
 /// Default hard byte budget for an unmarked varbincode container or byte
 /// buffer. Attacker-controlled leb128 lengths get clamped before they reach
@@ -217,11 +210,7 @@ impl<'a, R: Read> Deserializer<'a, R> {
             .map_err(|_| Error::custom(format!("{kind} length {raw_len} does not fit in usize")))
     }
 
-    fn read_container_len(
-        &mut self,
-        kind: &str,
-        admission: ContainerAdmission,
-    ) -> Result<usize> {
+    fn read_container_len(&mut self, kind: &str, admission: ContainerAdmission) -> Result<usize> {
         let len = self.read_len_prefix(kind)?;
         if len > admission.maximum {
             return Err(Error::custom(format!(
@@ -617,10 +606,7 @@ impl<'de, 'a, 'b, R: Read> de::SeqAccess<'de> for Access<'a, 'b, R> {
         // length prefix has passed the correspondingly tighter hard ceiling,
         // allowing known q=16384 snapshots to allocate once without allowing
         // arbitrary wire lengths to become allocation requests.
-        Some(
-            self.len
-                .min(self.preallocation_maximum),
-        )
+        Some(self.len.min(self.preallocation_maximum))
     }
 }
 
@@ -648,10 +634,7 @@ impl<'de, 'a, 'b, R: Read> de::MapAccess<'de> for Access<'a, 'b, R> {
     }
 
     fn size_hint(&self) -> Option<usize> {
-        Some(
-            self.len
-                .min(self.preallocation_maximum),
-        )
+        Some(self.len.min(self.preallocation_maximum))
     }
 }
 
@@ -738,10 +721,8 @@ mod tests {
         where
             D: serde::Deserializer<'de>,
         {
-            deserializer.deserialize_newtype_struct(
-                ORDERED_TAB_IDS_V1_NEWTYPE,
-                OrderedTabSequenceVisitor,
-            )
+            deserializer
+                .deserialize_newtype_struct(ORDERED_TAB_IDS_V1_NEWTYPE, OrderedTabSequenceVisitor)
         }
     }
 
@@ -773,10 +754,8 @@ mod tests {
         where
             D: serde::Deserializer<'de>,
         {
-            deserializer.deserialize_newtype_struct(
-                ORDERED_TAB_IDS_V1_NEWTYPE,
-                OrderedTabVectorVisitor,
-            )
+            deserializer
+                .deserialize_newtype_struct(ORDERED_TAB_IDS_V1_NEWTYPE, OrderedTabVectorVisitor)
         }
     }
 
@@ -806,9 +785,7 @@ mod tests {
             }
 
             impl<'de> Deserialize<'de> for $type_name {
-                fn deserialize<D>(
-                    deserializer: D,
-                ) -> std::result::Result<Self, D::Error>
+                fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
                 where
                     D: serde::Deserializer<'de>,
                 {
@@ -871,10 +848,7 @@ mod tests {
             formatter.write_str("an image byte buffer")
         }
 
-        fn visit_byte_buf<E>(
-            self,
-            value: Vec<u8>,
-        ) -> std::result::Result<Self::Value, E>
+        fn visit_byte_buf<E>(self, value: Vec<u8>) -> std::result::Result<Self::Value, E>
         where
             E: serde::de::Error,
         {
@@ -887,10 +861,8 @@ mod tests {
         where
             D: serde::Deserializer<'de>,
         {
-            deserializer.deserialize_newtype_struct(
-                IMAGE_WIRE_BYTES_V1_NEWTYPE,
-                ImageWireBytesVisitor,
-            )
+            deserializer
+                .deserialize_newtype_struct(IMAGE_WIRE_BYTES_V1_NEWTYPE, ImageWireBytesVisitor)
         }
     }
 

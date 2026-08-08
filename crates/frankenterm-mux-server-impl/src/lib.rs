@@ -495,7 +495,10 @@ mod tests {
             panic!("deliberately poison the private test lock");
         })
         .join();
-        assert!(result.is_err(), "the poisoner must exercise unwind recovery");
+        assert!(
+            result.is_err(),
+            "the poisoner must exercise unwind recovery"
+        );
 
         let _guard = lock
             .lock()

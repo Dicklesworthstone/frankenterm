@@ -23,12 +23,12 @@ use frankenterm_term::{Alert, ClipboardSelection, SemanticZone, StableRowIndex, 
 use mux::client::{ClientId, ClientInfo};
 use mux::pane::PaneId;
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
+#[cfg(test)]
+use mux::tab::PaneEntry;
 use mux::tab::{
     FloatingPaneRect, PaneArena, PaneArenaNode, PaneArenaTree, PaneArenaWindowTitle, PaneNode,
     SerdeUrl, SplitRequest, TabId, TabStackId,
 };
-#[cfg(test)]
-use mux::tab::PaneEntry;
 use mux::window::WindowId;
 use mux::{MuxSessionIncarnation, TopologyRevision};
 use portable_pty::CommandBuilder;
@@ -837,8 +837,7 @@ fn prepend_frame_header_to_owned_payload(
         .checked_add(encoded_length(ident))
         .and_then(|len| len.checked_add(encoded_length(serial)))
         .context("encoded PDU body length overflow")?;
-    let body_len_u64 =
-        u64::try_from(body_len).context("encoded PDU length does not fit in u64")?;
+    let body_len_u64 = u64::try_from(body_len).context("encoded PDU length does not fit in u64")?;
     let masked_len = if is_compressed {
         body_len_u64 | COMPRESSED_MASK
     } else {
@@ -1505,21 +1504,20 @@ async fn discard_raw_body_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     let mut max_chunk_bytes = 0_usize;
 
     while consumed < header.data_len {
-        let read_len = header
-            .data_len
-            .saturating_sub(consumed)
-            .min(scratch.len());
-        r.read_exact(&mut scratch[..read_len]).await.with_context(|| {
-            format!(
-                "discarding bytes {}..{} of {} for abandoned PDU body \
+        let read_len = header.data_len.saturating_sub(consumed).min(scratch.len());
+        r.read_exact(&mut scratch[..read_len])
+            .await
+            .with_context(|| {
+                format!(
+                    "discarding bytes {}..{} of {} for abandoned PDU body \
                  with serial={} ident={}",
-                consumed,
-                consumed.saturating_add(read_len),
-                header.data_len,
-                header.serial,
-                header.ident,
-            )
-        })?;
+                    consumed,
+                    consumed.saturating_add(read_len),
+                    header.data_len,
+                    header.serial,
+                    header.ident,
+                )
+            })?;
         consumed = consumed
             .checked_add(read_len)
             .context("discarded PDU payload length overflow")?;
@@ -1863,12 +1861,8 @@ fn serialize_pdu_payload<T: serde::Serialize>(
     let max_uncompressed_bytes = wire_spec
         .encoded_body_limit
         .maximum_encoded_payload_bytes(false);
-    let uncompressed = serialize_uncompressed_bounded(
-        value,
-        max_uncompressed_bytes,
-        serial,
-        wire_spec.ident,
-    )?;
+    let uncompressed =
+        serialize_uncompressed_bounded(value, max_uncompressed_bytes, serial, wire_spec.ident)?;
     // This defense-in-depth check uses the real retained serialization length;
     // the bounded writer already stopped serialization at the same
     // schema-specific ceiling before zstd or final-frame work.
@@ -1878,12 +1872,7 @@ fn serialize_pdu_payload<T: serde::Serialize>(
         debug_assert_eq!(serialized.uncompressed_len, serialized.data.len());
     }
     if serialized.is_compressed {
-        validate_encoded_body_admission(
-            serialized.data.len(),
-            serial,
-            wire_spec.ident,
-            true,
-        )?;
+        validate_encoded_body_admission(serialized.data.len(), serial, wire_spec.ident, true)?;
     }
     Ok(serialized)
 }
@@ -1892,8 +1881,7 @@ fn serialize_with_mode<T: serde::Serialize>(
     t: &T,
     compression_mode: CompressionMode,
 ) -> Result<(Vec<u8>, bool), Error> {
-    let serialized =
-        finish_serialized_payload(serialize_uncompressed(t)?, compression_mode)?;
+    let serialized = finish_serialized_payload(serialize_uncompressed(t)?, compression_mode)?;
     Ok((serialized.data, serialized.is_compressed))
 }
 
@@ -1925,8 +1913,8 @@ fn deserialize_with_retention_payload_len<T: serde::de::DeserializeOwned>(
     // compatible additive tails without allocating a second full payload.
     let read_limit = max_pdu_read_limit()?;
     let decoder = zstd::Decoder::with_buffer(data)?;
-    let recommended_output_size = zstd::Decoder::<&[u8]>::recommended_output_size()
-        .max(MIN_EXACT_ZSTD_DECODE_BUFFER_SIZE);
+    let recommended_output_size =
+        zstd::Decoder::<&[u8]>::recommended_output_size().max(MIN_EXACT_ZSTD_DECODE_BUFFER_SIZE);
     let output_buffer_size = data
         .len()
         .clamp(MIN_EXACT_ZSTD_DECODE_BUFFER_SIZE, recommended_output_size);
@@ -3287,13 +3275,9 @@ impl Pdu {
         )
     }
 
-    pub fn stream_decode(
-        buffer: &mut StreamingPduBuffer,
-    ) -> anyhow::Result<Option<DecodedPdu>> {
-        Ok(
-            Self::stream_decode_with_options(buffer, usize::MAX, false)?
-                .map(|decoded| decoded.into_parts().0),
-        )
+    pub fn stream_decode(buffer: &mut StreamingPduBuffer) -> anyhow::Result<Option<DecodedPdu>> {
+        Ok(Self::stream_decode_with_options(buffer, usize::MAX, false)?
+            .map(|decoded| decoded.into_parts().0))
     }
 
     /// Decode one streaming frame while enforcing a cap on that frame's
@@ -3330,8 +3314,7 @@ impl Pdu {
         max_frame_bytes: usize,
         collect_retention_metadata: bool,
     ) -> anyhow::Result<Option<DecodedPduWithRetentionMetadata>> {
-        let Some(frame_len) =
-            buffered_frame_len_with_limit(buffer.as_slice(), max_frame_bytes)?
+        let Some(frame_len) = buffered_frame_len_with_limit(buffer.as_slice(), max_frame_bytes)?
         else {
             return Ok(None);
         };
@@ -3614,8 +3597,8 @@ fn deserialize_exact_payload_with_limit<T: serde::de::DeserializeOwned>(
     // The already-materialized, outer-frame-bounded compressed length is only
     // a performance hint. Both ends are clamped, so hostile input cannot pick
     // an unbounded output allocation and small topology events stay small.
-    let recommended_output_size = zstd::Decoder::<&[u8]>::recommended_output_size()
-        .max(MIN_EXACT_ZSTD_DECODE_BUFFER_SIZE);
+    let recommended_output_size =
+        zstd::Decoder::<&[u8]>::recommended_output_size().max(MIN_EXACT_ZSTD_DECODE_BUFFER_SIZE);
     let output_buffer_size = data
         .len()
         .clamp(MIN_EXACT_ZSTD_DECODE_BUFFER_SIZE, recommended_output_size);
@@ -3670,10 +3653,7 @@ fn deserialize_list_panes_coherent_response(
     deserialize_exact_payload(data, is_compressed, "ListPanesCoherentResponse")
 }
 
-fn deserialize_topology_event(
-    data: &[u8],
-    is_compressed: bool,
-) -> Result<TopologyEvent, Error> {
+fn deserialize_topology_event(data: &[u8], is_compressed: bool) -> Result<TopologyEvent, Error> {
     deserialize_exact_payload(data, is_compressed, "TopologyEvent")
 }
 
@@ -3724,11 +3704,8 @@ fn deserialize_reorder_window_tabs_v1_response(
     data: &[u8],
     is_compressed: bool,
 ) -> Result<ReorderWindowTabsV1Response, Error> {
-    let response: ReorderWindowTabsV1Response = deserialize_exact_payload(
-        data,
-        is_compressed,
-        "ReorderWindowTabsV1Response",
-    )?;
+    let response: ReorderWindowTabsV1Response =
+        deserialize_exact_payload(data, is_compressed, "ReorderWindowTabsV1Response")?;
     response.validate()?;
     Ok(response)
 }
@@ -3748,11 +3725,7 @@ fn deserialize_get_pane_render_delivery_v1(
     if !reader.is_empty() {
         bail!("GetPaneRenderDeliveryV1 payload has trailing schema bytes");
     }
-    ensure_exact_render_canonical_payload(
-        &request,
-        payload.as_ref(),
-        "GetPaneRenderDeliveryV1",
-    )?;
+    ensure_exact_render_canonical_payload(&request, payload.as_ref(), "GetPaneRenderDeliveryV1")?;
     request.validate()?;
     Ok(request)
 }
@@ -4001,8 +3974,7 @@ impl TopologyCapabilities {
                 bits: self.bits(),
             });
         }
-        if self.contains(Self::EXACT_RENDER_DELIVERY_V1)
-            && !self.contains(Self::FENCED_SNAPSHOT_V1)
+        if self.contains(Self::EXACT_RENDER_DELIVERY_V1) && !self.contains(Self::FENCED_SNAPSHOT_V1)
         {
             return Err(
                 TopologyCapabilitiesError::ExactRenderDeliveryWithoutFencedSnapshot {
@@ -4030,9 +4002,7 @@ pub enum TopologyCapabilitiesError {
 ///
 /// It is server-owned, rotates on reconnect or any loss-terminal transition,
 /// and is bound to a mux-session incarnation by a coherent snapshot.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct TopologyStreamId([u8; 16]);
 
 impl TopologyStreamId {
@@ -4054,9 +4024,7 @@ impl TopologyStreamId {
 /// unpredictable mux-session incarnation makes a stale render unit
 /// unambiguously foreign across reconnect, client restart, server restart, and
 /// route failover.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct RenderConnectionIdentity {
     pub stream_id: TopologyStreamId,
     pub session_incarnation: MuxSessionIncarnation,
@@ -4075,9 +4043,7 @@ impl RenderConnectionIdentity {
     }
 
     pub fn validate(self) -> Result<(), RenderApplicationContractError> {
-        if self.stream_id.as_bytes() == [0; 16]
-            || self.session_incarnation.as_bytes() == [0; 16]
-        {
+        if self.stream_id.as_bytes() == [0; 16] || self.session_incarnation.as_bytes() == [0; 16] {
             return Err(RenderApplicationContractError::ReservedConnectionIdentity);
         }
         Ok(())
@@ -4223,34 +4189,27 @@ const _: () = assert!(
     MAX_STRUCTURALLY_VALID_ORDERED_WINDOW_SECTION_BYTES <= MAX_ORDERED_WINDOW_SECTION_BYTES
 );
 const _: () = assert!(
-    MAX_ORDERED_WINDOW_SECTION_BYTES
-        == bounded_varbincode::ORDERED_WINDOW_SECTION_V1_MAX_BYTES
+    MAX_ORDERED_WINDOW_SECTION_BYTES == bounded_varbincode::ORDERED_WINDOW_SECTION_V1_MAX_BYTES
 );
 const _: () = assert!(
-    MAX_ORDERED_TABS_PER_SNAPSHOT
-        == bounded_varbincode::ORDERED_PANE_TREE_DESCRIPTORS_V1_MAX_ITEMS
+    MAX_ORDERED_TABS_PER_SNAPSHOT == bounded_varbincode::ORDERED_PANE_TREE_DESCRIPTORS_V1_MAX_ITEMS
 );
 const _: () = assert!(
-    MAX_ORDERED_PANE_NODES_PER_SNAPSHOT
-        == bounded_varbincode::ORDERED_PANE_NODES_V1_MAX_ITEMS
+    MAX_ORDERED_PANE_NODES_PER_SNAPSHOT == bounded_varbincode::ORDERED_PANE_NODES_V1_MAX_ITEMS
 );
 const _: () = assert!(
-    MAX_ORDERED_WINDOWS_PER_SNAPSHOT
-        == bounded_varbincode::ORDERED_PANE_WINDOW_TITLES_V1_MAX_ITEMS
+    MAX_ORDERED_WINDOWS_PER_SNAPSHOT == bounded_varbincode::ORDERED_PANE_WINDOW_TITLES_V1_MAX_ITEMS
 );
-const _: () = assert!(
-    MAX_ORDERED_WINDOWS_PER_SNAPSHOT == bounded_varbincode::ORDERED_WINDOWS_V1_MAX_ITEMS
-);
-const _: () = assert!(
-    MAX_ORDERED_TABS_PER_WINDOW == bounded_varbincode::ORDERED_TAB_IDS_V1_MAX_ITEMS
-);
+const _: () =
+    assert!(MAX_ORDERED_WINDOWS_PER_SNAPSHOT == bounded_varbincode::ORDERED_WINDOWS_V1_MAX_ITEMS);
+const _: () =
+    assert!(MAX_ORDERED_TABS_PER_WINDOW == bounded_varbincode::ORDERED_TAB_IDS_V1_MAX_ITEMS);
 /// Total decompressed body ceiling for PDU 87, including the pane snapshot and
 /// ordered-window section. Sixteen MiB admits the pinned representative
 /// 4,096-window/16,384-tab fixture without inheriting the global 256 MiB PDU
 /// allocation envelope. Structurally valid snapshots with unusually large
 /// pane metadata can still exceed this explicit wire budget and fail closed.
-pub const MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES: usize =
-    16 * 1024 * 1024;
+pub const MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 /// Frozen zstd `compressBound` result for a legal PDU 87 body. At sixteen MiB
 /// the small-input term is zero, leaving `input + input / 256`.
 pub const MAX_LIST_PANES_ORDERED_V1_RESPONSE_ZSTD_ENCODED_BYTES: usize =
@@ -4387,9 +4346,7 @@ impl WindowOrderRevision {
 
 /// Client-owned durable binding identity. It is routing and audit context, not
 /// proof of the server session reached by a connection.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct DomainBindingId([u8; 16]);
 
 impl DomainBindingId {
@@ -4403,9 +4360,7 @@ impl DomainBindingId {
 }
 
 /// Idempotency identity unique inside one random client mutation namespace.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct WindowOrderMutationId {
     pub namespace: [u8; 16],
     pub sequence: u64,
@@ -4436,9 +4391,7 @@ impl WindowOrderMutationId {
 }
 
 /// SHA-256 binding of one frozen reorder intent.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct WindowReorderDigest([u8; 32]);
 
 impl WindowReorderDigest {
@@ -4493,10 +4446,7 @@ pub struct OrderedPaneSnapshotV1 {
 
 impl OrderedPaneSnapshotV1 {
     fn validate_envelope(&self) -> Result<(), OrderedWindowProtocolError> {
-        validate_nonzero_identity(
-            "session_incarnation",
-            self.session_incarnation.as_bytes(),
-        )?;
+        validate_nonzero_identity("session_incarnation", self.session_incarnation.as_bytes())?;
         validate_topology_revision(self.topology_revision)
     }
 
@@ -4727,8 +4677,11 @@ impl ValidatedListPanesOrderedV1Response {
     /// proof owner. Untrusted values must use the public validation/encoding
     /// entry points or first acquire this proof from the exact PDU 86 request.
     pub fn encode_frame(self, serial: u64) -> Result<Vec<u8>, Error> {
-        Pdu::ListPanesOrderedV1Response(self.response)
-            .encode_frame_with_mode_after_validation(serial, CompressionMode::Auto, true)
+        Pdu::ListPanesOrderedV1Response(self.response).encode_frame_with_mode_after_validation(
+            serial,
+            CompressionMode::Auto,
+            true,
+        )
     }
 }
 
@@ -4799,8 +4752,7 @@ fn ordered_pane_arena_has_serialization_proof(panes: &PaneArena) -> bool {
 fn ordered_windows_have_serialization_proof(windows: &[OrderedWindowStateV1]) -> bool {
     VALIDATED_ORDERED_SNAPSHOT_SERIALIZATION.with(|active| {
         active.get().is_some_and(|target| {
-            target.windows_len == windows.len()
-                && std::ptr::eq(target.windows, windows.as_ptr())
+            target.windows_len == windows.len() && std::ptr::eq(target.windows, windows.as_ptr())
         })
     })
 }
@@ -4859,10 +4811,7 @@ impl ReorderWindowTabsV1 {
         validate_protocol_version(self.protocol_version)?;
         validate_nonzero_identity("domain_binding_id", self.domain_binding_id.as_bytes())?;
         validate_nonzero_identity("stream_id", self.stream_id.as_bytes())?;
-        validate_nonzero_identity(
-            "session_incarnation",
-            self.session_incarnation.as_bytes(),
-        )?;
+        validate_nonzero_identity("session_incarnation", self.session_incarnation.as_bytes())?;
         validate_remote_wire_id("window_id", self.window_id.get())?;
         validate_window_order_revision(self.expected_order_revision)?;
         self.mutation_id.validate()?;
@@ -4955,10 +4904,7 @@ impl ReorderWindowTabsV1Response {
     pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
         validate_protocol_version(self.protocol_version)?;
         validate_nonzero_identity("stream_id", self.stream_id.as_bytes())?;
-        validate_nonzero_identity(
-            "session_incarnation",
-            self.session_incarnation.as_bytes(),
-        )?;
+        validate_nonzero_identity("session_incarnation", self.session_incarnation.as_bytes())?;
         self.mutation_id.validate()?;
         self.outcome.validate()
     }
@@ -4983,10 +4929,7 @@ impl WindowOrderEventV1 {
     pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
         validate_protocol_version(self.protocol_version)?;
         validate_nonzero_identity("stream_id", self.stream_id.as_bytes())?;
-        validate_nonzero_identity(
-            "session_incarnation",
-            self.session_incarnation.as_bytes(),
-        )?;
+        validate_nonzero_identity("session_incarnation", self.session_incarnation.as_bytes())?;
         validate_topology_revision(self.topology_revision)?;
         if self.windows.len() > MAX_ORDERED_WINDOWS_PER_EVENT {
             return Err(OrderedWindowProtocolError::TooManyEventWindows {
@@ -5000,9 +4943,7 @@ impl WindowOrderEventV1 {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum OrderedWindowProtocolError {
-    #[error(
-        "ordered-window protocol version {actual} is unsupported; expected {expected}"
-    )]
+    #[error("ordered-window protocol version {actual} is unsupported; expected {expected}")]
     UnsupportedProtocolVersion { actual: u16, expected: u16 },
     #[error(transparent)]
     InvalidCapabilities(#[from] TopologyCapabilitiesError),
@@ -5018,9 +4959,7 @@ pub enum OrderedWindowProtocolError {
         "ordered-window snapshot negotiated bits {negotiated:#x} are missing authority bits {missing:#x}"
     )]
     MissingNegotiatedCapabilities { negotiated: u64, missing: u64 },
-    #[error(
-        "ordered-window PDU87 binding {actual:?} does not echo PDU86 binding {expected:?}"
-    )]
+    #[error("ordered-window PDU87 binding {actual:?} does not echo PDU86 binding {expected:?}")]
     DomainBindingEchoMismatch {
         expected: DomainBindingId,
         actual: DomainBindingId,
@@ -5047,17 +4986,13 @@ pub enum OrderedWindowProtocolError {
     TooManyPaneTabTitles { count: usize, max: usize },
     #[error("ordered-window pane snapshot has {count} window titles; maximum is {max}")]
     TooManyPaneWindowTitles { count: usize, max: usize },
-    #[error(
-        "ordered-window pane snapshot has {trees} tab trees but {titles} tab titles"
-    )]
+    #[error("ordered-window pane snapshot has {trees} tab trees but {titles} tab titles")]
     PaneTreeTitleCardinalityMismatch { trees: usize, titles: usize },
     #[error("ordered-window pane snapshot has {count} arena nodes; maximum is {max}")]
     TooManyPaneNodes { count: usize, max: usize },
     #[error("ordered-window pane snapshot has {count} pane leaves; maximum is {max}")]
     TooManyPaneLeaves { count: usize, max: usize },
-    #[error(
-        "ordered-window pane tree {tree_index} has {count} {resource}; maximum is {max}"
-    )]
+    #[error("ordered-window pane tree {tree_index} has {count} {resource}; maximum is {max}")]
     PaneTreeResourceLimit {
         tree_index: usize,
         resource: &'static str,
@@ -5069,9 +5004,7 @@ pub enum OrderedWindowProtocolError {
         tree_index: usize,
         detail: &'static str,
     },
-    #[error(
-        "ordered-window pane tree {tree_index} node {node_index} is invalid: {detail}"
-    )]
+    #[error("ordered-window pane tree {tree_index} node {node_index} is invalid: {detail}")]
     InvalidPaneArenaNode {
         tree_index: usize,
         node_index: usize,
@@ -5081,9 +5014,7 @@ pub enum OrderedWindowProtocolError {
     PaneArenaCardinalityMismatch { referenced: usize, total: usize },
     #[error("ordered-window pane arena allocation failed within its admitted bounds")]
     PaneArenaAllocation,
-    #[error(
-        "ordered-window pane window titles are not in strictly increasing window-id order"
-    )]
+    #[error("ordered-window pane window titles are not in strictly increasing window-id order")]
     NonCanonicalPaneWindowTitleOrder,
     #[error("ordered-window event has {count} windows; maximum is {max}")]
     TooManyEventWindows { count: usize, max: usize },
@@ -5106,10 +5037,7 @@ pub enum OrderedWindowProtocolError {
     #[error("non-empty window {window_id} has no authoritative active tab")]
     ActiveTabRequired { window_id: u64 },
     #[error("window {window_id} names non-member active tab {active_tab_id}")]
-    ActiveTabNotInWindow {
-        window_id: u64,
-        active_tab_id: u64,
-    },
+    ActiveTabNotInWindow { window_id: u64, active_tab_id: u64 },
     #[error("encoded ordered-window section has {bytes} bytes; maximum is {max}")]
     OrderSectionTooLarge { bytes: usize, max: usize },
     #[error("ordered-window section could not be canonically measured")]
@@ -5431,10 +5359,7 @@ where
             };
             values.push(value);
         }
-        if sequence
-            .next_element::<serde::de::IgnoredAny>()?
-            .is_some()
-        {
+        if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
             return Err(serde::de::Error::custom(format_args!(
                 "{} length exceeds maximum {MAX}",
                 self.label
@@ -5463,8 +5388,7 @@ struct BoundedNewtypeVecVisitor<T, const MAX: usize> {
     marker: std::marker::PhantomData<T>,
 }
 
-impl<'de, T, const MAX: usize> serde::de::Visitor<'de>
-    for BoundedNewtypeVecVisitor<T, MAX>
+impl<'de, T, const MAX: usize> serde::de::Visitor<'de> for BoundedNewtypeVecVisitor<T, MAX>
 where
     T: Deserialize<'de>,
 {
@@ -5505,8 +5429,7 @@ struct BoundedMapVisitor<K, V, const MAX: usize> {
     marker: std::marker::PhantomData<(K, V)>,
 }
 
-impl<'de, K, V, const MAX: usize> serde::de::Visitor<'de>
-    for BoundedMapVisitor<K, V, MAX>
+impl<'de, K, V, const MAX: usize> serde::de::Visitor<'de> for BoundedMapVisitor<K, V, MAX>
 where
     K: Deserialize<'de> + Eq + std::hash::Hash,
     V: Deserialize<'de>,
@@ -5575,10 +5498,7 @@ where
     })
 }
 
-fn serialize_ordered_panes<S>(
-    panes: &PaneArena,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
+fn serialize_ordered_panes<S>(panes: &PaneArena, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
@@ -5614,10 +5534,8 @@ impl Serialize for PaneArenaNodesWire<'_> {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_newtype_struct(
-            bounded_varbincode::ORDERED_PANE_NODES_V1_NEWTYPE,
-            self.0,
-        )
+        serializer
+            .serialize_newtype_struct(bounded_varbincode::ORDERED_PANE_NODES_V1_NEWTYPE, self.0)
     }
 }
 
@@ -5754,7 +5672,8 @@ fn flatten_ordered_panes(
         if matches!(tree, PaneNode::Empty) {
             return Err(OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
                 tree_index,
-                detail: "ordered pane snapshots cannot recreate an empty tab without size authority",
+                detail:
+                    "ordered pane snapshots cannot recreate an empty tab without size authority",
             });
         }
 
@@ -5817,12 +5736,12 @@ fn flatten_ordered_panes(
                             {
                                 stats.leaf_visits += 1;
                             }
-                            tree_leaves = tree_leaves.checked_add(1).ok_or(
-                                OrderedWindowProtocolError::CountOverflow,
-                            )?;
-                            total_leaves = total_leaves.checked_add(1).ok_or(
-                                OrderedWindowProtocolError::CountOverflow,
-                            )?;
+                            tree_leaves = tree_leaves
+                                .checked_add(1)
+                                .ok_or(OrderedWindowProtocolError::CountOverflow)?;
+                            total_leaves = total_leaves
+                                .checked_add(1)
+                                .ok_or(OrderedWindowProtocolError::CountOverflow)?;
                             if tree_leaves > MAX_ORDERED_PANE_LEAVES_PER_TREE {
                                 return Err(OrderedWindowProtocolError::PaneTreeResourceLimit {
                                     tree_index,
@@ -5848,21 +5767,22 @@ fn flatten_ordered_panes(
                                     max: MAX_ORDERED_PANE_TREE_DEPTH,
                                 });
                             }
-                            let left_index = u32::try_from(node_index.saturating_add(1)).map_err(
-                                |_| OrderedWindowProtocolError::InvalidPaneArenaNode {
-                                    tree_index,
-                                    node_index,
-                                    detail: "left child index does not fit u32",
-                                },
-                            )?;
+                            let left_index =
+                                u32::try_from(node_index.saturating_add(1)).map_err(|_| {
+                                    OrderedWindowProtocolError::InvalidPaneArenaNode {
+                                        tree_index,
+                                        node_index,
+                                        detail: "left child index does not fit u32",
+                                    }
+                                })?;
                             nodes.push(PaneArenaNode::Split {
                                 left: left_index,
                                 right: u32::MAX,
                                 node,
                             });
-                            let child_depth = depth.checked_add(1).ok_or(
-                                OrderedWindowProtocolError::CountOverflow,
-                            )?;
+                            let child_depth = depth
+                                .checked_add(1)
+                                .ok_or(OrderedWindowProtocolError::CountOverflow)?;
                             tasks.push(FlattenPaneTask::VisitRight {
                                 split_index: node_index,
                                 right: *right,
@@ -5875,7 +5795,8 @@ fn flatten_ordered_panes(
                             #[cfg(test)]
                             {
                                 stats.task_pushes += 2;
-                                stats.peak_pending_tasks = stats.peak_pending_tasks.max(tasks.len());
+                                stats.peak_pending_tasks =
+                                    stats.peak_pending_tasks.max(tasks.len());
                             }
                         }
                     }
@@ -6030,9 +5951,7 @@ where
     )
 }
 
-fn deserialize_ordered_pane_nodes<'de, D>(
-    deserializer: D,
-) -> Result<Vec<PaneArenaNode>, D::Error>
+fn deserialize_ordered_pane_nodes<'de, D>(deserializer: D) -> Result<Vec<PaneArenaNode>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -6070,9 +5989,7 @@ struct OrderedPanesFlatWireOwned {
 /// Direct application seams must call this before allocating work from arena
 /// counts because [`PaneArena::from_unvalidated_parts`] is intentionally public
 /// at the dependency-lower mux layer.
-pub fn validate_ordered_pane_arena(
-    panes: &PaneArena,
-) -> Result<(), OrderedWindowProtocolError> {
+pub fn validate_ordered_pane_arena(panes: &PaneArena) -> Result<(), OrderedWindowProtocolError> {
     #[cfg(debug_assertions)]
     debug_record_ordered_pane_arena_validation_pass();
 
@@ -6124,7 +6041,8 @@ pub fn validate_ordered_pane_arena(
             (None, 0) => {
                 return Err(OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
                     tree_index,
-                    detail: "ordered pane snapshots cannot recreate an empty tab without size authority",
+                    detail:
+                        "ordered pane snapshots cannot recreate an empty tab without size authority",
                 });
             }
             (None, _) => {
@@ -6160,9 +6078,9 @@ pub fn validate_ordered_pane_arena(
                         max: MAX_ORDERED_PANE_NODES_PER_TREE,
                     });
                 }
-                let end = cursor.checked_add(node_count).ok_or(
-                    OrderedWindowProtocolError::CountOverflow,
-                )?;
+                let end = cursor
+                    .checked_add(node_count)
+                    .ok_or(OrderedWindowProtocolError::CountOverflow)?;
                 if end > nodes.len() {
                     return Err(OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
                         tree_index,
@@ -6197,24 +6115,24 @@ pub fn validate_ordered_pane_arena(
                             detail: "child index violates contiguous preorder",
                         });
                     }
-                    expected = expected.checked_add(1).ok_or(
-                        OrderedWindowProtocolError::CountOverflow,
-                    )?;
+                    expected = expected
+                        .checked_add(1)
+                        .ok_or(OrderedWindowProtocolError::CountOverflow)?;
                     match &nodes[node_index] {
                         PaneArenaNode::Empty => {}
                         PaneArenaNode::Leaf(entry) => {
-                            tree_leaves = tree_leaves.checked_add(1).ok_or(
-                                OrderedWindowProtocolError::CountOverflow,
-                            )?;
+                            tree_leaves = tree_leaves
+                                .checked_add(1)
+                                .ok_or(OrderedWindowProtocolError::CountOverflow)?;
                             active_leaves = active_leaves
                                 .checked_add(usize::from(entry.is_active_pane))
                                 .ok_or(OrderedWindowProtocolError::CountOverflow)?;
                             zoomed_leaves = zoomed_leaves
                                 .checked_add(usize::from(entry.is_zoomed_pane))
                                 .ok_or(OrderedWindowProtocolError::CountOverflow)?;
-                            total_leaves = total_leaves.checked_add(1).ok_or(
-                                OrderedWindowProtocolError::CountOverflow,
-                            )?;
+                            total_leaves = total_leaves
+                                .checked_add(1)
+                                .ok_or(OrderedWindowProtocolError::CountOverflow)?;
                             if tree_leaves > MAX_ORDERED_PANE_LEAVES_PER_TREE {
                                 return Err(OrderedWindowProtocolError::PaneTreeResourceLimit {
                                     tree_index,
@@ -6267,9 +6185,9 @@ pub fn validate_ordered_pane_arena(
                                     detail: "right child is outside the remaining tree range",
                                 });
                             }
-                            let child_depth = depth.checked_add(1).ok_or(
-                                OrderedWindowProtocolError::CountOverflow,
-                            )?;
+                            let child_depth = depth
+                                .checked_add(1)
+                                .ok_or(OrderedWindowProtocolError::CountOverflow)?;
                             work.push((right, child_depth));
                             work.push((left, child_depth));
                         }
@@ -6321,10 +6239,7 @@ where
     Ok(panes)
 }
 
-fn serialize_ordered_tab_ids<S>(
-    values: &[RemoteTabId],
-    serializer: S,
-) -> Result<S::Ok, S::Error>
+fn serialize_ordered_tab_ids<S>(values: &[RemoteTabId], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
@@ -6335,10 +6250,7 @@ where
             MAX_ORDERED_TABS_PER_WINDOW,
         )));
     }
-    serializer.serialize_newtype_struct(
-        bounded_varbincode::ORDERED_TAB_IDS_V1_NEWTYPE,
-        values,
-    )
+    serializer.serialize_newtype_struct(bounded_varbincode::ORDERED_TAB_IDS_V1_NEWTYPE, values)
 }
 
 struct OrderedTabIdsNewtypeVisitor;
@@ -6385,10 +6297,7 @@ where
             MAX_ORDERED_WINDOWS_PER_SNAPSHOT,
         )));
     }
-    serializer.serialize_newtype_struct(
-        bounded_varbincode::ORDERED_WINDOWS_V1_NEWTYPE,
-        values,
-    )
+    serializer.serialize_newtype_struct(bounded_varbincode::ORDERED_WINDOWS_V1_NEWTYPE, values)
 }
 
 struct OrderedWindowsNewtypeVisitor;
@@ -6496,7 +6405,9 @@ impl<'de> serde::de::Visitor<'de> for OrderedWindowSectionBytesVisitor {
             )));
         }
         let mut value = Vec::new();
-        value.try_reserve(hinted).map_err(serde::de::Error::custom)?;
+        value
+            .try_reserve(hinted)
+            .map_err(serde::de::Error::custom)?;
         while let Some(byte) = sequence.next_element()? {
             if value.len() == MAX_ORDERED_WINDOW_SECTION_BYTES {
                 return Err(serde::de::Error::custom(format_args!(
@@ -6546,8 +6457,7 @@ where
     if section.exceeded {
         return Err(serde::ser::Error::custom(format_args!(
             "ordered-window section length {} exceeds maximum {}",
-            section.logical_len,
-            MAX_ORDERED_WINDOW_SECTION_BYTES
+            section.logical_len, MAX_ORDERED_WINDOW_SECTION_BYTES
         )));
     }
     serialize_result.map_err(serde::ser::Error::custom)?;
@@ -6565,8 +6475,7 @@ where
 {
     #[derive(Deserialize)]
     struct OrderedWindowsWire(
-        #[serde(deserialize_with = "deserialize_ordered_windows")]
-        Vec<OrderedWindowStateV1>,
+        #[serde(deserialize_with = "deserialize_ordered_windows")] Vec<OrderedWindowStateV1>,
     );
 
     let section = deserializer.deserialize_newtype_struct(
@@ -6646,10 +6555,8 @@ pub const MAX_EXACT_RENDER_BATCH_ROWS: u64 = 262_144;
 /// of the much smaller bytes/rows physically present in a batch of manifest or
 /// chunk responses: every distinct manifest reserves its complete backing
 /// snapshot exactly once.
-pub const MAX_EXACT_RENDER_BACKING_DISTINCT_SNAPSHOTS: u64 =
-    MAX_EXACT_RENDER_BATCH_MEMBERS;
-pub const MAX_EXACT_RENDER_BACKING_TEXT_BYTES: u64 =
-    MAX_EXACT_RENDER_SNAPSHOT_TEXT_BYTES;
+pub const MAX_EXACT_RENDER_BACKING_DISTINCT_SNAPSHOTS: u64 = MAX_EXACT_RENDER_BATCH_MEMBERS;
+pub const MAX_EXACT_RENDER_BACKING_TEXT_BYTES: u64 = MAX_EXACT_RENDER_SNAPSHOT_TEXT_BYTES;
 pub const MAX_EXACT_RENDER_BACKING_ROWS: u64 = MAX_EXACT_RENDER_SNAPSHOT_ROWS;
 pub const MAX_EXACT_RENDER_BACKING_CHUNKS: u64 = MAX_EXACT_RENDER_SNAPSHOT_CHUNKS;
 pub const MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES: usize =
@@ -6660,10 +6567,8 @@ const MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES_U64: u64 = 64 * 1024;
 const MAX_EXACT_RENDER_PROJECTION_WORKING_DIR_BYTES_U64: u64 = 64 * 1024;
 pub const MAX_EXACT_RENDER_PROJECTION_VIEWPORT_CELLS: u64 = 4 * 1024 * 1024;
 
-const EXACT_RENDER_DELTA_DIGEST_DOMAIN_V1: &[u8] =
-    b"frankenterm.exact-render-delta.v1\0";
-const EXACT_RENDER_SNAPSHOT_DIGEST_DOMAIN_V1: &[u8] =
-    b"frankenterm.exact-render-snapshot.v1\0";
+const EXACT_RENDER_DELTA_DIGEST_DOMAIN_V1: &[u8] = b"frankenterm.exact-render-delta.v1\0";
+const EXACT_RENDER_SNAPSHOT_DIGEST_DOMAIN_V1: &[u8] = b"frankenterm.exact-render-snapshot.v1\0";
 const EXACT_RENDER_SNAPSHOT_MANIFEST_DIGEST_DOMAIN_V1: &[u8] =
     b"frankenterm.exact-render-snapshot-manifest.v1\0";
 const EXACT_RENDER_SNAPSHOT_CHUNK_DIGEST_DOMAIN_V1: &[u8] =
@@ -6671,8 +6576,7 @@ const EXACT_RENDER_SNAPSHOT_CHUNK_DIGEST_DOMAIN_V1: &[u8] =
 /// Domain-separated canonical digest grammar for one complete exact-render
 /// request body. This binds retry identity to intent without conflating the
 /// independently useful request sequence with its contents.
-pub const EXACT_RENDER_REQUEST_DIGEST_DOMAIN_V1: &[u8] =
-    b"frankenterm.exact-render-request.v1\0";
+pub const EXACT_RENDER_REQUEST_DIGEST_DOMAIN_V1: &[u8] = b"frankenterm.exact-render-request.v1\0";
 
 macro_rules! exact_render_nonzero_wire_id {
     ($name:ident, $field:literal) => {
@@ -6695,9 +6599,10 @@ macro_rules! exact_render_nonzero_wire_id {
 
             pub fn checked_next(self) -> Result<Self, ExactRenderDeliveryProtocolError> {
                 self.validate()?;
-                self.0.checked_add(1).map(Self).ok_or(
-                    ExactRenderDeliveryProtocolError::AuthorityExhausted { field: $field },
-                )
+                self.0
+                    .checked_add(1)
+                    .map(Self)
+                    .ok_or(ExactRenderDeliveryProtocolError::AuthorityExhausted { field: $field })
             }
 
             fn validate(self) -> Result<(), ExactRenderDeliveryProtocolError> {
@@ -6721,9 +6626,7 @@ exact_render_nonzero_wire_id!(ExactRenderRequestSequence, "request_sequence");
 /// Architecture-independent exact-delivery pane identity. Pane zero is valid:
 /// the mux allocator starts at zero, so absence must be represented by an
 /// enclosing enum/option rather than a numeric sentinel.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ExactRenderPaneId(u64);
 
 impl ExactRenderPaneId {
@@ -6739,8 +6642,7 @@ impl ExactRenderPaneId {
     }
 
     pub fn try_into_mux(self) -> Result<PaneId, ExactRenderDeliveryProtocolError> {
-        PaneId::try_from(self.0)
-            .map_err(|_| ExactRenderDeliveryProtocolError::PaneIdOutOfRange)
+        PaneId::try_from(self.0).map_err(|_| ExactRenderDeliveryProtocolError::PaneIdOutOfRange)
     }
 
     #[must_use]
@@ -6751,9 +6653,7 @@ impl ExactRenderPaneId {
 
 /// Explicit delivery baseline. Terminal mutation sequence is deliberately not
 /// part of this identity and cannot establish continuity.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ExactRenderDeliveryCursor {
     pub pane_generation: ExactRenderPaneGeneration,
     pub delivery_generation: ExactRenderDeliveryGeneration,
@@ -6793,9 +6693,7 @@ impl ExactRenderAppliedBaseline {
 }
 
 /// SHA-256 identity of one exact delivery unit or immutable snapshot.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ExactRenderDigest([u8; 32]);
 
 impl ExactRenderDigest {
@@ -7135,9 +7033,7 @@ impl<'de, const MAX: usize> serde::de::Visitor<'de> for ExactRenderUtf8NewtypeVi
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_byte_buf(ExactRenderUtf8BytesVisitor::<MAX> {
-            label: self.label,
-        })
+        deserializer.deserialize_byte_buf(ExactRenderUtf8BytesVisitor::<MAX> { label: self.label })
     }
 }
 
@@ -7151,10 +7047,8 @@ impl<const MAX: usize> Serialize for ExactRenderUtf8V1<MAX> {
                 "unsupported exact render UTF-8 schema maximum {MAX}",
             )));
         };
-        serializer.serialize_newtype_struct(
-            newtype_name,
-            &ExactRenderUtf8WireBytes(self.as_bytes()),
-        )
+        serializer
+            .serialize_newtype_struct(newtype_name, &ExactRenderUtf8WireBytes(self.as_bytes()))
     }
 }
 
@@ -7177,10 +7071,8 @@ impl<'de, const MAX: usize> Deserialize<'de> for ExactRenderUtf8V1<MAX> {
     }
 }
 
-pub type ExactRenderRowTextV1 =
-    ExactRenderUtf8V1<MAX_EXACT_RENDER_ROW_TEXT_BYTES>;
-pub type ExactRenderTitleV1 =
-    ExactRenderUtf8V1<MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES>;
+pub type ExactRenderRowTextV1 = ExactRenderUtf8V1<MAX_EXACT_RENDER_ROW_TEXT_BYTES>;
+pub type ExactRenderTitleV1 = ExactRenderUtf8V1<MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES>;
 pub type ExactRenderWorkingDirectoryV1 =
     ExactRenderUtf8V1<MAX_EXACT_RENDER_PROJECTION_WORKING_DIR_BYTES>;
 
@@ -7389,16 +7281,18 @@ impl ExactRenderProjectionV1 {
             .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
                 field: "projection_viewport_end",
             })?;
-        let history_rows = dimensions.physical_top.checked_sub(dimensions.scrollback_top).ok_or(
-            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+        let history_rows = dimensions
+            .physical_top
+            .checked_sub(dimensions.scrollback_top)
+            .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
                 field: "projection_history_rows",
-            },
-        )?;
-        let viewport_cells = dimensions.cols.checked_mul(dimensions.viewport_rows).ok_or(
-            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+            })?;
+        let viewport_cells = dimensions
+            .cols
+            .checked_mul(dimensions.viewport_rows)
+            .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
                 field: "projection_viewport_cells",
-            },
-        )?;
+            })?;
         if dimensions.cols == 0
             || dimensions.viewport_rows == 0
             || viewport_cells > MAX_EXACT_RENDER_PROJECTION_VIEWPORT_CELLS
@@ -7561,9 +7455,7 @@ where
     )
 }
 
-fn deserialize_exact_render_rows<'de, D>(
-    deserializer: D,
-) -> Result<Vec<ExactRenderRowV1>, D::Error>
+fn deserialize_exact_render_rows<'de, D>(deserializer: D) -> Result<Vec<ExactRenderRowV1>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -7632,8 +7524,7 @@ impl ExactRenderDeliverySettlement {
     fn validate(self) -> Result<(), ExactRenderDeliveryProtocolError> {
         self.delivery.validate()?;
         if let ExactRenderDeliverySettlementOutcome::Nack {
-            observed_baseline,
-            ..
+            observed_baseline, ..
         } = self.outcome
         {
             observed_baseline.validate()?;
@@ -7792,8 +7683,7 @@ impl GetPaneRenderDeliveryV1 {
                     return Err(ExactRenderDeliveryProtocolError::SettlementBaselineMismatch);
                 }
                 ExactRenderDeliverySettlementOutcome::Nack {
-                    observed_baseline,
-                    ..
+                    observed_baseline, ..
                 } if observed_baseline != self.applied_baseline => {
                     return Err(ExactRenderDeliveryProtocolError::SettlementBaselineMismatch);
                 }
@@ -7969,10 +7859,12 @@ impl ExactRenderDeltaV1 {
                     field: "patch_replacement_end",
                 })?;
             if replacement_end > row_count {
-                return Err(ExactRenderDeliveryProtocolError::PatchReplacementOutOfRange {
-                    end: replacement_end,
-                    row_count,
-                });
+                return Err(
+                    ExactRenderDeliveryProtocolError::PatchReplacementOutOfRange {
+                        end: replacement_end,
+                        row_count,
+                    },
+                );
             }
             if prior_patch_start.is_some_and(|prior| patch.start_stable_row <= prior) {
                 return Err(ExactRenderDeliveryProtocolError::PatchOrderInvalid);
@@ -8103,9 +7995,7 @@ impl ExactRenderDeltaV1 {
         Ok(ExactRenderDigest::from_bytes(hasher.finalize().into()))
     }
 
-    pub fn with_computed_digest(
-        mut self,
-    ) -> Result<Self, ExactRenderDeliveryProtocolError> {
+    pub fn with_computed_digest(mut self) -> Result<Self, ExactRenderDeliveryProtocolError> {
         self.delivery.content_digest = self.canonical_digest()?;
         Ok(self)
     }
@@ -8137,9 +8027,7 @@ impl ExactRenderSnapshotManifestV1 {
     /// per-chunk text envelopes. Exact feasibility for the immutable,
     /// indivisible row sequence is checked by [`Self::computed_content_digest`]
     /// once those rows are available.
-    fn validated_retained_text_bytes(
-        &self,
-    ) -> Result<u64, ExactRenderDeliveryProtocolError> {
+    fn validated_retained_text_bytes(&self) -> Result<u64, ExactRenderDeliveryProtocolError> {
         self.projection.validate()?;
         let projection_text_bytes = self.projection.text_bytes()?;
         let retained_text_bytes = self
@@ -8193,9 +8081,7 @@ impl ExactRenderSnapshotManifestV1 {
             .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
                 field: "snapshot_chunk_text_capacity",
             })?;
-        if self.total_rows > chunk_row_capacity
-            || self.total_text_bytes > chunk_text_capacity
-        {
+        if self.total_rows > chunk_row_capacity || self.total_text_bytes > chunk_text_capacity {
             return Err(ExactRenderDeliveryProtocolError::SnapshotChunkCountInvalid);
         }
         Ok(retained_text_bytes)
@@ -8270,11 +8156,11 @@ impl ExactRenderSnapshotManifestV1 {
             if row_text_bytes > chunk_text_capacity {
                 return Err(ExactRenderDeliveryProtocolError::SnapshotChunkCountInvalid);
             }
-            let combined_text_bytes = current_chunk_text_bytes
-                .checked_add(row_text_bytes)
-                .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+            let combined_text_bytes = current_chunk_text_bytes.checked_add(row_text_bytes).ok_or(
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
                     field: "snapshot_chunk_text_bytes",
-                })?;
+                },
+            )?;
             if current_chunk_rows != 0
                 && (current_chunk_rows == MAX_EXACT_RENDER_DELIVERY_ROWS_U64
                     || combined_text_bytes > chunk_text_capacity)
@@ -8292,11 +8178,11 @@ impl ExactRenderSnapshotManifestV1 {
                     field: "snapshot_chunk_rows",
                 },
             )?;
-            current_chunk_text_bytes = current_chunk_text_bytes
-                .checked_add(row_text_bytes)
-                .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+            current_chunk_text_bytes = current_chunk_text_bytes.checked_add(row_text_bytes).ok_or(
+                ExactRenderDeliveryProtocolError::ArithmeticOverflow {
                     field: "snapshot_chunk_text_bytes",
-                })?;
+                },
+            )?;
             expected = expected.checked_add(1).ok_or(
                 ExactRenderDeliveryProtocolError::ArithmeticOverflow {
                     field: "snapshot_stable_row",
@@ -8433,25 +8319,22 @@ impl ExactRenderSnapshotChunkV1 {
                 },
             )?;
         }
-        let row_end = self
-            .first_row_ordinal
-            .checked_add(usage.rows)
-            .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+        let row_end = self.first_row_ordinal.checked_add(usage.rows).ok_or(
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
                 field: "snapshot_chunk_row_end",
-            })?;
-        let text_end = self
-            .first_text_byte
-            .checked_add(usage.text_bytes)
-            .ok_or(ExactRenderDeliveryProtocolError::ArithmeticOverflow {
+            },
+        )?;
+        let text_end = self.first_text_byte.checked_add(usage.text_bytes).ok_or(
+            ExactRenderDeliveryProtocolError::ArithmeticOverflow {
                 field: "snapshot_chunk_text_end",
-            })?;
+            },
+        )?;
         let is_last = self.ordinal + 1 == manifest.chunk_count;
         if self.first_row_ordinal >= manifest.total_rows
             || row_end > manifest.total_rows
             || self.first_text_byte > manifest.total_text_bytes
             || text_end > manifest.total_text_bytes
-            || (self.ordinal == 0
-                && (self.first_row_ordinal != 0 || self.first_text_byte != 0))
+            || (self.ordinal == 0 && (self.first_row_ordinal != 0 || self.first_text_byte != 0))
             || (is_last
                 && (row_end != manifest.total_rows || text_end != manifest.total_text_bytes))
             || (!is_last && row_end >= manifest.total_rows)
@@ -8641,9 +8524,7 @@ impl ExactRenderDeliveryOutcomeV1 {
                 }
                 Ok(ExactRenderDeliveryResourceUsage::default())
             }
-            Self::AuthorityExhausted { .. } => {
-                Ok(ExactRenderDeliveryResourceUsage::default())
-            }
+            Self::AuthorityExhausted { .. } => Ok(ExactRenderDeliveryResourceUsage::default()),
             Self::LimitsExceeded {
                 required, limit, ..
             } => {
@@ -8778,10 +8659,12 @@ impl GetPaneRenderDeliveryV1Response {
             return Err(ExactRenderDeliveryProtocolError::ReplyRequestMismatch);
         }
         if self.request_digest != request.request_digest {
-            return Err(ExactRenderDeliveryProtocolError::ReplyRequestDigestMismatch {
-                expected: request.request_digest,
-                actual: self.request_digest,
-            });
+            return Err(
+                ExactRenderDeliveryProtocolError::ReplyRequestDigestMismatch {
+                    expected: request.request_digest,
+                    actual: self.request_digest,
+                },
+            );
         }
         if let Some(token) = self.outcome.delivery_token() {
             if token.connection_identity != request.identity.connection_identity
@@ -8809,8 +8692,7 @@ impl GetPaneRenderDeliveryV1Response {
                     return Err(ExactRenderDeliveryProtocolError::ForceFullReturnedDelta);
                 }
                 if request.continuation.is_some()
-                    || request.applied_baseline
-                        != ExactRenderAppliedBaseline::Applied(delta.base)
+                    || request.applied_baseline != ExactRenderAppliedBaseline::Applied(delta.base)
                 {
                     return Err(ExactRenderDeliveryProtocolError::DeltaBaseMismatch);
                 }
@@ -8849,8 +8731,7 @@ impl GetPaneRenderDeliveryV1Response {
             ExactRenderDeliveryOutcomeV1::BaselineTooOld { requested, .. } => {
                 if request.mode != ExactRenderDeliveryMode::Incremental
                     || request.continuation.is_some()
-                    || request.applied_baseline
-                        != ExactRenderAppliedBaseline::Applied(*requested)
+                    || request.applied_baseline != ExactRenderAppliedBaseline::Applied(*requested)
                 {
                     return Err(ExactRenderDeliveryProtocolError::OutcomeModeMismatch);
                 }
@@ -8946,11 +8827,13 @@ fn validate_response_cap(
     limit: u64,
 ) -> Result<(), ExactRenderDeliveryProtocolError> {
     if requested > limit {
-        return Err(ExactRenderDeliveryProtocolError::ResponseExceedsReceiverCap {
-            resource,
-            requested,
-            limit,
-        });
+        return Err(
+            ExactRenderDeliveryProtocolError::ResponseExceedsReceiverCap {
+                resource,
+                requested,
+                limit,
+            },
+        );
     }
     Ok(())
 }
@@ -8994,11 +8877,7 @@ impl ExactRenderDeliveryAggregateCaps {
             self.max_text_bytes,
             MAX_EXACT_RENDER_BATCH_TEXT_BYTES,
         )?;
-        validate_exact_render_cap(
-            "aggregate_rows",
-            self.max_rows,
-            MAX_EXACT_RENDER_BATCH_ROWS,
-        )
+        validate_exact_render_cap("aggregate_rows", self.max_rows, MAX_EXACT_RENDER_BATCH_ROWS)
     }
 }
 
@@ -9183,9 +9062,7 @@ pub fn validate_exact_render_backing_reservations(
         let snapshot_identity = ExactRenderSnapshotBackingIdentity::from(manifest.snapshot);
         if let Some(retained_digest) = manifest_by_snapshot.get(&snapshot_identity) {
             if *retained_digest != manifest_digest {
-                return Err(
-                    ExactRenderDeliveryProtocolError::SnapshotManifestEquivocation,
-                );
+                return Err(ExactRenderDeliveryProtocolError::SnapshotManifestEquivocation);
             }
             continue;
         }
@@ -9222,11 +9099,7 @@ pub fn validate_exact_render_backing_reservations(
             caps.max_total_text_bytes,
         )?;
         validate_backing_reservation_cap("rows", usage.total_rows, caps.max_total_rows)?;
-        validate_backing_reservation_cap(
-            "chunks",
-            usage.total_chunks,
-            caps.max_total_chunks,
-        )?;
+        validate_backing_reservation_cap("chunks", usage.total_chunks, caps.max_total_chunks)?;
     }
     Ok(usage)
 }
@@ -9472,20 +9345,12 @@ fn hash_exact_render_request_identity(
     identity: ExactRenderDeliveryRequestIdentity,
 ) {
     hasher.update(identity.connection_identity.stream_id.as_bytes());
-    hasher.update(
-        identity
-            .connection_identity
-            .session_incarnation
-            .as_bytes(),
-    );
+    hasher.update(identity.connection_identity.session_incarnation.as_bytes());
     hasher.update(identity.pane_id.get().to_be_bytes());
     hasher.update(identity.request_sequence.get().to_be_bytes());
 }
 
-fn hash_exact_render_applied_baseline(
-    hasher: &mut Sha256,
-    baseline: ExactRenderAppliedBaseline,
-) {
+fn hash_exact_render_applied_baseline(hasher: &mut Sha256, baseline: ExactRenderAppliedBaseline) {
     match baseline {
         ExactRenderAppliedBaseline::Uninitialized => hasher.update([0]),
         ExactRenderAppliedBaseline::Applied(cursor) => {
@@ -9713,8 +9578,7 @@ pub struct SendKeyUp {
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, PartialOrd, Ord)]
 pub struct InputSerial(u64);
 
-static LAST_INPUT_SERIAL: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static LAST_INPUT_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl InputSerial {
     pub const fn empty() -> Self {
@@ -9745,10 +9609,7 @@ impl InputSerial {
     }
 }
 
-fn next_input_serial(
-    counter: &std::sync::atomic::AtomicU64,
-    wall_clock: u64,
-) -> Option<u64> {
+fn next_input_serial(counter: &std::sync::atomic::AtomicU64, wall_clock: u64) -> Option<u64> {
     use std::sync::atomic::Ordering;
 
     let mut observed = counter.load(Ordering::Relaxed);
@@ -10317,16 +10178,14 @@ impl RenderApplicationUpdate {
             return Err(RenderApplicationContractError::ResourceLimitExceeded {
                 resource: RenderApplicationResource::Alerts,
                 requested: u64::MAX,
-                limit: u64::try_from(MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES)
-                    .unwrap_or(u64::MAX),
+                limit: u64::try_from(MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES).unwrap_or(u64::MAX),
             });
         };
         if alert_text_bytes > MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES {
             return Err(RenderApplicationContractError::ResourceLimitExceeded {
                 resource: RenderApplicationResource::Alerts,
                 requested: u64::try_from(alert_text_bytes).unwrap_or(u64::MAX),
-                limit: u64::try_from(MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES)
-                    .unwrap_or(u64::MAX),
+                limit: u64::try_from(MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES).unwrap_or(u64::MAX),
             });
         }
         let mut has_unseen_output = false;
@@ -10430,8 +10289,7 @@ impl RenderApplicationUpdate {
         if self.surface.bonus_lines.line_count() > MAX_RENDER_APPLICATION_LINES {
             return Err(RenderApplicationContractError::ResourceLimitExceeded {
                 resource: RenderApplicationResource::Lines,
-                requested: u64::try_from(self.surface.bonus_lines.line_count())
-                    .unwrap_or(u64::MAX),
+                requested: u64::try_from(self.surface.bonus_lines.line_count()).unwrap_or(u64::MAX),
                 limit: u64::try_from(MAX_RENDER_APPLICATION_LINES).unwrap_or(u64::MAX),
             });
         }
@@ -10539,13 +10397,13 @@ impl RenderApplicationUpdate {
                     component: RenderApplicationComponent::Lines,
                 });
             }
-            dirty_rows = dirty_rows
-                .checked_add(span)
-                .ok_or(RenderApplicationContractError::ResourceLimitExceeded {
+            dirty_rows = dirty_rows.checked_add(span).ok_or(
+                RenderApplicationContractError::ResourceLimitExceeded {
                     resource: RenderApplicationResource::Lines,
                     requested: u64::MAX,
                     limit: u64::try_from(MAX_RENDER_APPLICATION_LINES).unwrap_or(u64::MAX),
-                })?;
+                },
+            )?;
             if dirty_rows > MAX_RENDER_APPLICATION_LINES {
                 return Err(RenderApplicationContractError::ResourceLimitExceeded {
                     resource: RenderApplicationResource::Lines,
@@ -10567,8 +10425,9 @@ impl RenderApplicationUpdate {
         if self.surface.bonus_lines.lines().any(|(row, line)| {
             *row < dimensions.scrollback_top
                 || *row >= viewport_end
-                || u64::try_from(line.current_seqno())
-                    .map_or(true, |seqno| seqno > self.identity.resulting_state.state_sequence)
+                || u64::try_from(line.current_seqno()).map_or(true, |seqno| {
+                    seqno > self.identity.resulting_state.state_sequence
+                })
         }) {
             return Err(RenderApplicationContractError::MalformedSurfaceComponent {
                 component: RenderApplicationComponent::Lines,
@@ -10585,14 +10444,13 @@ impl RenderApplicationUpdate {
                 return Err(RenderApplicationContractError::ResourceLimitExceeded {
                     resource: RenderApplicationResource::SemanticZones,
                     requested: u64::try_from(semantic.zones.len()).unwrap_or(u64::MAX),
-                    limit: u64::try_from(MAX_RENDER_APPLICATION_SEMANTIC_ZONES)
-                        .unwrap_or(u64::MAX),
+                    limit: u64::try_from(MAX_RENDER_APPLICATION_SEMANTIC_ZONES).unwrap_or(u64::MAX),
                 });
             }
-            let semantic_text_bytes = semantic.zone_texts.iter().try_fold(
-                0usize,
-                |total, text| total.checked_add(text.len()),
-            );
+            let semantic_text_bytes = semantic
+                .zone_texts
+                .iter()
+                .try_fold(0usize, |total, text| total.checked_add(text.len()));
             let Some(semantic_text_bytes) = semantic_text_bytes else {
                 return Err(RenderApplicationContractError::ResourceLimitExceeded {
                     resource: RenderApplicationResource::SemanticZones,
@@ -10777,9 +10635,7 @@ impl RenderApplicationObservedState {
 /// Client disposition emitted only after validation and complete application.
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
 pub enum RenderApplicationOutcome {
-    Applied {
-        applied_state: RenderStateIdentity,
-    },
+    Applied { applied_state: RenderStateIdentity },
     Nack(RenderApplicationNack),
 }
 
@@ -11045,10 +10901,7 @@ where
     )
 }
 
-fn serialize_line_hyperlinks<S>(
-    values: &[LineHyperlink],
-    serializer: S,
-) -> Result<S::Ok, S::Error>
+fn serialize_line_hyperlinks<S>(values: &[LineHyperlink], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
@@ -11106,9 +10959,7 @@ impl<'de> serde::de::Visitor<'de> for BoundedLineHyperlinksVisitor {
             total_spans = total_spans
                 .checked_add(hyperlink.coords.len())
                 .ok_or_else(|| {
-                    serde::de::Error::custom(
-                        "serialized hyperlink span accounting overflowed",
-                    )
+                    serde::de::Error::custom("serialized hyperlink span accounting overflowed")
                 })?;
             if total_spans > MAX_RENDER_APPLICATION_HYPERLINK_SPANS {
                 return Err(serde::de::Error::custom(format_args!(
@@ -11117,10 +10968,7 @@ impl<'de> serde::de::Visitor<'de> for BoundedLineHyperlinksVisitor {
             }
             hyperlinks.push(hyperlink);
         }
-        if sequence
-            .next_element::<serde::de::IgnoredAny>()?
-            .is_some()
-        {
+        if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
             return Err(serde::de::Error::custom(format_args!(
                 "serialized hyperlinks length exceeds maximum {MAX_RENDER_APPLICATION_HYPERLINK_SPANS}"
             )));
@@ -11146,9 +10994,7 @@ impl<'de> serde::de::Visitor<'de> for BoundedLineHyperlinksNewtypeVisitor {
     }
 }
 
-fn deserialize_line_hyperlinks<'de, D>(
-    deserializer: D,
-) -> Result<Vec<LineHyperlink>, D::Error>
+fn deserialize_line_hyperlinks<'de, D>(deserializer: D) -> Result<Vec<LineHyperlink>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -11221,10 +11067,7 @@ pub struct SerializedLinesResourceCounts {
 }
 
 /// Reconstituted line payload plus image references awaiting hydration.
-pub type ExtractedSerializedLines = (
-    Vec<(StableRowIndex, Line)>,
-    Vec<SerializedImageCell>,
-);
+pub type ExtractedSerializedLines = (Vec<(StableRowIndex, Line)>, Vec<SerializedImageCell>);
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum SerializedLinesStructureError {
@@ -11240,7 +11083,9 @@ pub enum SerializedLinesStructureError {
     ImageLineMissing,
     #[error("serialized image references a missing cell")]
     ImageCellOutOfRange,
-    #[error("serialized image has non-finite, reversed, empty, or out-of-range texture coordinates")]
+    #[error(
+        "serialized image has non-finite, reversed, empty, or out-of-range texture coordinates"
+    )]
     ImageTextureCoordinatesInvalid,
 }
 
@@ -11436,10 +11281,8 @@ impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
                             *revision
                         } else {
                             let revision = image_data.current_content_hash();
-                            image_revision_by_identity.insert(
-                                image_identity,
-                                (Arc::clone(image_data), revision),
-                            );
+                            image_revision_by_identity
+                                .insert(image_identity, (Arc::clone(image_data), revision));
                             revision
                         };
                         let (padding_left, padding_top, padding_right, padding_bottom) =
@@ -11561,11 +11404,9 @@ mod test {
     fn bounded_visitors_do_not_materialize_the_first_overflow_value() {
         BOUNDED_OVERFLOW_VALUE_DESERIALIZATIONS.with(|count| count.set(0));
         let mut sequence = serde_json::Deserializer::from_str("[1,2,3]");
-        let sequence_error = deserialize_bounded_vec::<_, CountedBoundedValue, 2>(
-            &mut sequence,
-            "counted sequence",
-        )
-        .expect_err("the third sequence value must exceed the bound");
+        let sequence_error =
+            deserialize_bounded_vec::<_, CountedBoundedValue, 2>(&mut sequence, "counted sequence")
+                .expect_err("the third sequence value must exceed the bound");
         assert!(
             sequence_error.to_string().contains("maximum 2"),
             "unexpected sequence admission error: {}",
@@ -11581,11 +11422,9 @@ mod test {
         });
 
         let mut map = serde_json::Deserializer::from_str(r#"{"a":1,"b":2,"c":3}"#);
-        let map_error = deserialize_bounded_map::<_, String, CountedBoundedValue, 2>(
-            &mut map,
-            "counted map",
-        )
-        .expect_err("the third map value must exceed the bound");
+        let map_error =
+            deserialize_bounded_map::<_, String, CountedBoundedValue, 2>(&mut map, "counted map")
+                .expect_err("the third map value must exceed the bound");
         assert!(
             map_error.to_string().contains("maximum 2"),
             "unexpected map admission error: {}",
@@ -11610,8 +11449,8 @@ mod test {
             .checked_add(encoded_length(serial))
             .and_then(|len| len.checked_add(encoded_length(ident)))
             .expect("test frame-body length must fit usize");
-        let frame_body_bytes = u64::try_from(frame_body_bytes)
-            .expect("test frame-body length must fit u64");
+        let frame_body_bytes =
+            u64::try_from(frame_body_bytes).expect("test frame-body length must fit u64");
         let tagged_len = if is_compressed {
             frame_body_bytes | COMPRESSED_MASK
         } else {
@@ -11898,14 +11737,9 @@ mod test {
                         .map(|ordinal| ordinal.wrapping_mul(131) as u8)
                         .collect::<Vec<_>>();
                     for is_compressed in [false, true] {
-                        let expected = encode_raw_as_vec_impl(
-                            ident,
-                            serial,
-                            &payload,
-                            is_compressed,
-                            false,
-                        )
-                        .expect("borrowed framing must succeed");
+                        let expected =
+                            encode_raw_as_vec_impl(ident, serial, &payload, is_compressed, false)
+                                .expect("borrowed framing must succeed");
                         let actual = prepend_frame_header_to_owned_payload(
                             ident,
                             serial,
@@ -11941,7 +11775,9 @@ mod test {
         reset_test_bounded_serialize_growth_events();
         let error = serialize_uncompressed_bounded(&payload, payload.len() - 1, 92, 87)
             .expect_err("an over-limit payload must fail before exceeding its ceiling");
-        assert!(error.downcast_ref::<PduEncodedBodyLimitExceeded>().is_some());
+        assert!(error
+            .downcast_ref::<PduEncodedBodyLimitExceeded>()
+            .is_some());
     }
 
     #[test]
@@ -12165,8 +12001,7 @@ mod test {
             let mut encoded = Vec::new();
             pdu.encode(&mut encoded, millis)
                 .expect("edge input serial should encode");
-            let decoded = Pdu::decode(encoded.as_slice())
-                .expect("edge input serial should decode");
+            let decoded = Pdu::decode(encoded.as_slice()).expect("edge input serial should decode");
             assert_eq!(decoded.serial, millis);
             assert_eq!(decoded.pdu, pdu);
         }
@@ -12460,13 +12295,19 @@ mod test {
     }
 
     fn broad_pane_tree(leaves: usize) -> PaneNode {
-        assert!(leaves.is_power_of_two(), "test leaf count must be a power of two");
+        assert!(
+            leaves.is_power_of_two(),
+            "test leaf count must be a power of two"
+        );
         pane_tree_with_slots(leaves, 0, 0)
     }
 
     fn pane_tree_with_slots(slots: usize, empty_slots: usize, ordinal_base: usize) -> PaneNode {
         assert!(slots > 0, "test pane tree must have at least one slot");
-        assert!(empty_slots < slots, "test pane tree must retain at least one pane leaf");
+        assert!(
+            empty_slots < slots,
+            "test pane tree must retain at least one pane leaf"
+        );
         let mut level = (0..slots)
             .map(|offset| {
                 if offset < empty_slots {
@@ -12626,29 +12467,26 @@ mod test {
                 let mut panes = sample_flat_wire();
                 match self.0 {
                     HostileOrderedSnapshotField::DuplicatePaneChildIndex => {
-                        let PaneArenaNode::Split { right, .. } = &mut panes.nodes[0]
-                        else {
+                        let PaneArenaNode::Split { right, .. } = &mut panes.nodes[0] else {
                             unreachable!("hostile control root is split");
                         };
                         *right = 1;
                     }
                     HostileOrderedSnapshotField::PaneBackEdge => {
-                        let PaneArenaNode::Split { right, .. } = &mut panes.nodes[0]
-                        else {
+                        let PaneArenaNode::Split { right, .. } = &mut panes.nodes[0] else {
                             unreachable!("hostile control root is split");
                         };
                         *right = 0;
                     }
                     HostileOrderedSnapshotField::PaneChildOutOfRange => {
-                        let PaneArenaNode::Split { right, .. } = &mut panes.nodes[0]
-                        else {
+                        let PaneArenaNode::Split { right, .. } = &mut panes.nodes[0] else {
                             unreachable!("hostile control root is split");
                         };
                         *right = 3;
                     }
-                    HostileOrderedSnapshotField::TrailingPaneArenaNode => panes
-                        .nodes
-                        .push(PaneArenaNode::Leaf(sample_pane_entry(2))),
+                    HostileOrderedSnapshotField::TrailingPaneArenaNode => {
+                        panes.nodes.push(PaneArenaNode::Leaf(sample_pane_entry(2)))
+                    }
                     _ => unreachable!("malformed pane variant was exhaustively matched"),
                 }
                 return panes.serialize(serializer);
@@ -12690,7 +12528,11 @@ mod test {
                     )?;
                 }
                 _ => {
-                    serde::ser::SerializeStruct::serialize_field(&mut state, "window_titles", empty)?;
+                    serde::ser::SerializeStruct::serialize_field(
+                        &mut state,
+                        "window_titles",
+                        empty,
+                    )?;
                 }
             }
             serde::ser::SerializeStruct::end(state)
@@ -12776,20 +12618,18 @@ mod test {
     fn hostile_ordered_snapshot_response_body(field: HostileOrderedSnapshotField) -> Vec<u8> {
         let ordered_section = match field {
             HostileOrderedSnapshotField::OrderedWindows => {
-                serialize_uncompressed(&DeclaredEmptySequence(
-                    MAX_ORDERED_WINDOWS_PER_SNAPSHOT + 1,
-                ))
-                .expect("encode prefix-only hostile ordered-window collection")
+                serialize_uncompressed(&DeclaredEmptySequence(MAX_ORDERED_WINDOWS_PER_SNAPSHOT + 1))
+                    .expect("encode prefix-only hostile ordered-window collection")
             }
-            HostileOrderedSnapshotField::OrderedTabIds => serialize_uncompressed(&vec![
-                UncheckedOrderedWindowWithDeclaredTabs {
+            HostileOrderedSnapshotField::OrderedTabIds => {
+                serialize_uncompressed(&vec![UncheckedOrderedWindowWithDeclaredTabs {
                     window_id: RemoteWindowId::new(1),
                     order_revision: WindowOrderRevision::INITIAL,
                     ordered_tab_ids: DeclaredEmptySequence(MAX_ORDERED_TABS_PER_WINDOW + 1),
                     active_tab_id: None,
-                },
-            ])
-            .expect("encode prefix-only hostile ordered-tab collection"),
+                }])
+                .expect("encode prefix-only hostile ordered-tab collection")
+            }
             _ => serialize_uncompressed(&Vec::<OrderedWindowStateV1>::new())
                 .expect("encode legal empty ordered-window section"),
         };
@@ -12823,10 +12663,7 @@ mod test {
         .with_computed_digest()
     }
 
-    fn encode_reorder_window_tabs_unchecked(
-        request: &ReorderWindowTabsV1,
-        serial: u64,
-    ) -> Vec<u8> {
+    fn encode_reorder_window_tabs_unchecked(request: &ReorderWindowTabsV1, serial: u64) -> Vec<u8> {
         let (payload, compressed) = serialize_with_mode(
             &(
                 request.protocol_version,
@@ -13073,8 +12910,8 @@ mod test {
         }
         .with_computed_content_digest(&rows)
         .expect("sample snapshot content digest must compute");
-        let first_text_bytes = u64::try_from(rows[0].text.len())
-            .expect("sample row text length fits u64");
+        let first_text_bytes =
+            u64::try_from(rows[0].text.len()).expect("sample row text length fits u64");
         let first = ExactRenderSnapshotChunkV1 {
             source_version: manifest.source_version,
             ordinal: 0,
@@ -13123,7 +12960,10 @@ mod test {
             TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
                 | TopologyCapabilities::EXACT_RENDER_DELIVERY_V1.bits(),
         );
-        assert_eq!(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1.bits(), 1 << 3);
+        assert_eq!(
+            TopologyCapabilities::EXACT_RENDER_DELIVERY_V1.bits(),
+            1 << 3
+        );
         assert!(exact_render.validate().is_ok());
         assert_eq!(
             TopologyCapabilities::EXACT_RENDER_DELIVERY_V1.validate(),
@@ -13143,10 +12983,7 @@ mod test {
             Pdu::wire_spec_for_ident(91).expect("exact render request ID must be assigned");
         assert_eq!(request_spec.min_codec_version, 52);
         assert!(request_spec.authorizes(PduProducer::Client, PduWireRole::Request));
-        assert!(!request_spec.authorizes(
-            PduProducer::Server,
-            PduWireRole::CorrelatedReply
-        ));
+        assert!(!request_spec.authorizes(PduProducer::Server, PduWireRole::CorrelatedReply));
         assert_eq!(
             request_spec.capability,
             PduCapabilityUse::Requires(exact_render)
@@ -13183,10 +13020,7 @@ mod test {
         let response_spec =
             Pdu::wire_spec_for_ident(92).expect("exact render response ID must be assigned");
         assert_eq!(response_spec.min_codec_version, 52);
-        assert!(response_spec.authorizes(
-            PduProducer::Server,
-            PduWireRole::CorrelatedReply
-        ));
+        assert!(response_spec.authorizes(PduProducer::Server, PduWireRole::CorrelatedReply));
         assert!(!response_spec.authorizes(PduProducer::Server, PduWireRole::Unilateral));
         assert_eq!(
             response_spec.capability,
@@ -13245,8 +13079,7 @@ mod test {
                     .encoded_body_limit
                     .maximum_encoded_payload_bytes(is_compressed);
 
-                let exact_header =
-                    declared_pdu_frame_header(ident, 17, limit, is_compressed);
+                let exact_header = declared_pdu_frame_header(ident, 17, limit, is_compressed);
                 let exact_error = decode_raw(exact_header.as_slice())
                     .expect_err("admitted header without its declared body must reach body read");
                 assert!(
@@ -13258,8 +13091,7 @@ mod test {
                 );
 
                 let plus = limit.checked_add(1).expect("exact body limit has headroom");
-                let plus_header =
-                    declared_pdu_frame_header(ident, 17, plus, is_compressed);
+                let plus_header = declared_pdu_frame_header(ident, 17, plus, is_compressed);
                 let plus_error = decode_raw(plus_header.as_slice())
                     .expect_err("limit-plus-one header must fail before body allocation");
                 let exceeded = plus_error
@@ -13346,8 +13178,7 @@ mod test {
                 let limit = spec
                     .encoded_body_limit
                     .maximum_encoded_payload_bytes(is_compressed);
-                let exact_header =
-                    declared_pdu_frame_header(ident, 23, limit, is_compressed);
+                let exact_header = declared_pdu_frame_header(ident, 23, limit, is_compressed);
                 let mut exact_buffer = StreamingPduBuffer::from(exact_header.clone());
                 assert_eq!(
                     Pdu::stream_decode(&mut exact_buffer)
@@ -13357,8 +13188,7 @@ mod test {
                 assert_eq!(exact_buffer.as_slice(), exact_header.as_slice());
 
                 let plus = limit.checked_add(1).expect("exact body limit has headroom");
-                let plus_header =
-                    declared_pdu_frame_header(ident, 23, plus, is_compressed);
+                let plus_header = declared_pdu_frame_header(ident, 23, plus, is_compressed);
                 let mut plus_buffer = StreamingPduBuffer::from(plus_header.clone());
                 let error = Pdu::stream_decode(&mut plus_buffer)
                     .expect_err("limit-plus-one stream must fail before body accumulation");
@@ -13381,7 +13211,10 @@ mod test {
         let mut tagged_len = Vec::new();
         leb128::write::unsigned(&mut tagged_len, 4).expect("encode test frame body length");
         buffer.extend_from_slice(&tagged_len);
-        assert_eq!(Pdu::stream_decode(&mut buffer).expect("length prefix"), None);
+        assert_eq!(
+            Pdu::stream_decode(&mut buffer).expect("length prefix"),
+            None
+        );
         assert_eq!(buffer.as_slice(), tagged_len.as_slice());
 
         for byte in [0x80, 0x01, 0x81] {
@@ -13437,15 +13270,12 @@ mod test {
             },
             ExactRenderDeliveryOutcomeV1::GenerationChanged {
                 requested: exact_render_cursor(7),
-                current_pane_generation: ExactRenderPaneGeneration::try_new(2)
-                    .expect("nonzero"),
+                current_pane_generation: ExactRenderPaneGeneration::try_new(2).expect("nonzero"),
                 current_delivery_generation: ExactRenderDeliveryGeneration::try_new(1)
                     .expect("nonzero"),
             },
             ExactRenderDeliveryOutcomeV1::PaneRemoved {
-                last_pane_generation: Some(
-                    ExactRenderPaneGeneration::try_new(1).expect("nonzero"),
-                ),
+                last_pane_generation: Some(ExactRenderPaneGeneration::try_new(1).expect("nonzero")),
             },
             ExactRenderDeliveryOutcomeV1::AuthorityExhausted {
                 authority: ExactRenderAuthority::DeliverySequence,
@@ -13475,9 +13305,9 @@ mod test {
                 request
             );
             for outcome in &outcomes {
-                let pdu = Pdu::GetPaneRenderDeliveryV1Response(
-                    sample_exact_render_response(outcome.clone()),
-                );
+                let pdu = Pdu::GetPaneRenderDeliveryV1Response(sample_exact_render_response(
+                    outcome.clone(),
+                ));
                 let frame = pdu
                     .encode_frame_with_mode(0x52, mode)
                     .expect("closed exact render outcome must encode");
@@ -13520,8 +13350,7 @@ mod test {
         } else {
             assert_eq!(widest.try_into_mux(), Ok(usize::MAX));
         }
-        let mut zero_connection =
-            sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
+        let mut zero_connection = sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
         zero_connection.identity.connection_identity = RenderConnectionIdentity::new(
             TopologyStreamId::from_bytes([0; 16]),
             MuxSessionIncarnation::from_bytes([0; 16]),
@@ -13563,7 +13392,14 @@ mod test {
                 field: "request_sequence",
             })
         );
-        assert_eq!(exact_render_cursor(7).checked_next().expect("7 advances").sequence.get(), 8);
+        assert_eq!(
+            exact_render_cursor(7)
+                .checked_next()
+                .expect("7 advances")
+                .sequence
+                .get(),
+            8
+        );
 
         let mut uninitialized_incremental =
             sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
@@ -13584,9 +13420,9 @@ mod test {
     #[test]
     fn exact_render_request_digest_has_frozen_architecture_independent_preimage() {
         const REQUEST_GOLDEN: ExactRenderDigest = ExactRenderDigest::from_bytes([
-            0x59, 0x80, 0x36, 0x25, 0x12, 0xf4, 0xe3, 0x2d, 0x18, 0x82, 0xb7, 0x66, 0xb5,
-            0x7d, 0x62, 0x1a, 0x1f, 0x14, 0x6b, 0x40, 0x14, 0x41, 0x62, 0xd5, 0xf8, 0xd5,
-            0xc3, 0xc2, 0x43, 0xb3, 0x45, 0xe4,
+            0x59, 0x80, 0x36, 0x25, 0x12, 0xf4, 0xe3, 0x2d, 0x18, 0x82, 0xb7, 0x66, 0xb5, 0x7d,
+            0x62, 0x1a, 0x1f, 0x14, 0x6b, 0x40, 0x14, 0x41, 0x62, 0xd5, 0xf8, 0xd5, 0xc3, 0xc2,
+            0x43, 0xb3, 0x45, 0xe4,
         ]);
         let connection = RenderConnectionIdentity::new(
             TopologyStreamId::from_bytes([0x01; 16]),
@@ -13855,8 +13691,10 @@ mod test {
         );
 
         let mut wrong_generation = sample_exact_render_delta(5);
-        wrong_generation.delivery.resulting_baseline.delivery_generation =
-            ExactRenderDeliveryGeneration::try_new(2).expect("nonzero");
+        wrong_generation
+            .delivery
+            .resulting_baseline
+            .delivery_generation = ExactRenderDeliveryGeneration::try_new(2).expect("nonzero");
         wrong_generation = wrong_generation
             .with_computed_digest()
             .expect("wrong-generation fixture digest must still compute");
@@ -13992,8 +13830,7 @@ mod test {
         let mut wrong_generation = request.clone();
         wrong_generation.applied_baseline =
             ExactRenderAppliedBaseline::Applied(ExactRenderDeliveryCursor {
-                delivery_generation: ExactRenderDeliveryGeneration::try_new(2)
-                    .expect("nonzero"),
+                delivery_generation: ExactRenderDeliveryGeneration::try_new(2).expect("nonzero"),
                 ..delta.delivery.resulting_baseline
             });
         assert_eq!(
@@ -14224,7 +14061,9 @@ mod test {
         let mut request = sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
         let outcome = ExactRenderDeliveryOutcomeV1::ExactDelta(sample_exact_render_delta(88));
         let response = sample_exact_render_response(outcome.clone());
-        let usage = response.resource_usage().expect("sample usage must measure");
+        let usage = response
+            .resource_usage()
+            .expect("sample usage must measure");
         request.receiver_caps.max_text_bytes = usage.text_bytes - 1;
         request = request
             .with_computed_request_digest()
@@ -14253,8 +14092,7 @@ mod test {
             .validated_retained_text_bytes()
             .expect("sample retained snapshot text must measure");
         assert!(retained_snapshot_text > manifest.total_text_bytes);
-        let mut text_bounded_full =
-            sample_exact_render_request(ExactRenderDeliveryMode::ForceFull);
+        let mut text_bounded_full = sample_exact_render_request(ExactRenderDeliveryMode::ForceFull);
         text_bounded_full.receiver_caps.max_snapshot_text_bytes = retained_snapshot_text - 1;
         text_bounded_full = text_bounded_full
             .with_computed_request_digest()
@@ -14286,7 +14124,7 @@ mod test {
                 &bounded_full,
                 ExactRenderDeliveryOutcomeV1::FullManifest(manifest),
             )
-                .validate_for(&bounded_full),
+            .validate_for(&bounded_full),
             Err(
                 ExactRenderDeliveryProtocolError::ResponseExceedsReceiverCap {
                     resource: "snapshot_rows",
@@ -14352,12 +14190,11 @@ mod test {
         let manifest_response = sample_exact_render_response(
             ExactRenderDeliveryOutcomeV1::FullManifest(manifest.clone()),
         );
-        let chunk_response = sample_exact_render_response(
-            ExactRenderDeliveryOutcomeV1::FullChunk {
+        let chunk_response =
+            sample_exact_render_response(ExactRenderDeliveryOutcomeV1::FullChunk {
                 manifest: manifest.clone(),
                 chunk: first,
-            },
-        );
+            });
         let repeated = [manifest_response.clone(), chunk_response];
         let retained_text_bytes = manifest
             .total_text_bytes
@@ -14566,9 +14403,7 @@ mod test {
         let mut row_text_inconsistent = manifest;
         row_text_inconsistent.total_rows = 1;
         row_text_inconsistent.total_text_bytes =
-            u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES)
-                .expect("row text ceiling fits u64")
-                + 1;
+            u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES).expect("row text ceiling fits u64") + 1;
         row_text_inconsistent.chunk_count = 1;
         row_text_inconsistent.projection.row_count = 1;
         row_text_inconsistent.projection.first_stable_row = -1;
@@ -14683,14 +14518,12 @@ mod test {
     #[test]
     fn exact_render_delta_rechecks_text_limit_after_projection_metadata() {
         let mut delta = sample_exact_render_delta(101);
-        delta.rows[0].text = ExactRenderRowTextV1::try_from_string(
-            "a".repeat(MAX_EXACT_RENDER_ROW_TEXT_BYTES),
-        )
-        .expect("first maximum-size row must be representable");
-        delta.rows[1].text = ExactRenderRowTextV1::try_from_string(
-            "b".repeat(MAX_EXACT_RENDER_ROW_TEXT_BYTES),
-        )
-        .expect("second maximum-size row must be representable");
+        delta.rows[0].text =
+            ExactRenderRowTextV1::try_from_string("a".repeat(MAX_EXACT_RENDER_ROW_TEXT_BYTES))
+                .expect("first maximum-size row must be representable");
+        delta.rows[1].text =
+            ExactRenderRowTextV1::try_from_string("b".repeat(MAX_EXACT_RENDER_ROW_TEXT_BYTES))
+                .expect("second maximum-size row must be representable");
         delta.resulting_projection.title = ExactRenderTitleV1::try_from_string(
             "t".repeat(MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES),
         )
@@ -14706,8 +14539,7 @@ mod test {
             .expect("oversized aggregate fixture digest must compute");
         let requested = 2_u64
             .checked_mul(
-                u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES)
-                    .expect("row text ceiling fits u64"),
+                u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES).expect("row text ceiling fits u64"),
             )
             .and_then(|bytes| {
                 bytes.checked_add(
@@ -14763,8 +14595,7 @@ mod test {
     #[test]
     fn exact_render_minimum_envelope_can_report_every_zero_content_terminal_outcome() {
         let mut request = sample_exact_render_request(ExactRenderDeliveryMode::Incremental);
-        request.receiver_caps.max_decompressed_bytes =
-            MIN_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES;
+        request.receiver_caps.max_decompressed_bytes = MIN_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES;
         request.receiver_caps.max_text_bytes = 1;
         request = request
             .with_computed_request_digest()
@@ -14793,15 +14624,12 @@ mod test {
             },
             ExactRenderDeliveryOutcomeV1::GenerationChanged {
                 requested: exact_render_cursor(7),
-                current_pane_generation: ExactRenderPaneGeneration::try_new(2)
-                    .expect("nonzero"),
+                current_pane_generation: ExactRenderPaneGeneration::try_new(2).expect("nonzero"),
                 current_delivery_generation: ExactRenderDeliveryGeneration::try_new(1)
                     .expect("nonzero"),
             },
             ExactRenderDeliveryOutcomeV1::PaneRemoved {
-                last_pane_generation: Some(
-                    ExactRenderPaneGeneration::try_new(1).expect("nonzero"),
-                ),
+                last_pane_generation: Some(ExactRenderPaneGeneration::try_new(1).expect("nonzero")),
             },
             ExactRenderDeliveryOutcomeV1::AuthorityExhausted {
                 authority: ExactRenderAuthority::DeliverySequence,
@@ -14832,8 +14660,7 @@ mod test {
         }
 
         let mut impossible = request.receiver_caps;
-        impossible.max_decompressed_bytes =
-            MIN_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES - 1;
+        impossible.max_decompressed_bytes = MIN_EXACT_RENDER_DELIVERY_DECOMPRESSED_BYTES - 1;
         assert_eq!(
             impossible.validate(),
             Err(ExactRenderDeliveryProtocolError::InvalidReceiverCap {
@@ -14876,9 +14703,8 @@ mod test {
         );
 
         let mut changed_title = manifest.clone();
-        changed_title.projection.title =
-            ExactRenderTitleV1::try_from_str("sample exact render!")
-                .expect("changed title remains bounded");
+        changed_title.projection.title = ExactRenderTitleV1::try_from_str("sample exact render!")
+            .expect("changed title remains bounded");
         assert_eq!(
             changed_title.validate_complete_rows(&rows),
             Err(ExactRenderDeliveryProtocolError::DigestMismatch {
@@ -14949,8 +14775,7 @@ mod test {
                 limit: MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES_U64,
             })
         );
-        let oversized_borrowed_title =
-            "x".repeat(MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES + 1);
+        let oversized_borrowed_title = "x".repeat(MAX_EXACT_RENDER_PROJECTION_TITLE_BYTES + 1);
         assert_eq!(
             ExactRenderTitleV1::try_from_str(&oversized_borrowed_title),
             Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
@@ -14973,9 +14798,7 @@ mod test {
         assert!(
             title_error
                 .to_string()
-                .contains(
-                    "exact render metadata UTF-8 bytes length 65537 exceeds maximum 65536"
-                ),
+                .contains("exact render metadata UTF-8 bytes length 65537 exceeds maximum 65536"),
             "unexpected schema-specific title bound: {title_error}",
             title_error = title_error,
         );
@@ -14983,8 +14806,7 @@ mod test {
         let mut hostile_row_prefix = Vec::new();
         leb128::write::unsigned(
             &mut hostile_row_prefix,
-            u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES + 1)
-                .expect("row text ceiling fits u64"),
+            u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES + 1).expect("row text ceiling fits u64"),
         )
         .expect("hostile row length prefix must encode");
         let row_error = bounded_varbincode::deserialize::<ExactRenderRowTextV1, _>(
@@ -14994,16 +14816,13 @@ mod test {
         assert!(
             row_error
                 .to_string()
-                .contains(
-                    "exact render row UTF-8 bytes length 1000001 exceeds maximum 1000000"
-                ),
+                .contains("exact render row UTF-8 bytes length 1000001 exceeds maximum 1000000"),
             "unexpected schema-specific row bound: {row_error}",
             row_error = row_error,
         );
-        let exact_row = ExactRenderRowTextV1::try_from_string(
-            "x".repeat(MAX_EXACT_RENDER_ROW_TEXT_BYTES),
-        )
-        .expect("the exact per-row UTF-8 ceiling must be constructible");
+        let exact_row =
+            ExactRenderRowTextV1::try_from_string("x".repeat(MAX_EXACT_RENDER_ROW_TEXT_BYTES))
+                .expect("the exact per-row UTF-8 ceiling must be constructible");
         let (exact_row_payload, exact_row_compressed) =
             serialize_with_mode(&exact_row, CompressionMode::Never)
                 .expect("the exact per-row ceiling must serialize");
@@ -15011,8 +14830,7 @@ mod test {
         let mut expected_row_payload = Vec::new();
         leb128::write::unsigned(
             &mut expected_row_payload,
-            u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES)
-                .expect("row text ceiling fits u64"),
+            u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES).expect("row text ceiling fits u64"),
         )
         .expect("row text length prefix must encode");
         expected_row_payload.extend_from_slice(exact_row.as_bytes());
@@ -15053,9 +14871,7 @@ mod test {
         .expect("metadata byte cap must be restored after its marked newtype");
         assert!(decoded_legacy_string == legacy_string);
         assert_eq!(
-            ExactRenderRowTextV1::try_from_string(
-                "x".repeat(MAX_EXACT_RENDER_ROW_TEXT_BYTES + 1),
-            ),
+            ExactRenderRowTextV1::try_from_string("x".repeat(MAX_EXACT_RENDER_ROW_TEXT_BYTES + 1),),
             Err(ExactRenderDeliveryProtocolError::ResourceLimitExceeded {
                 resource: "exact_render_utf8_bytes",
                 requested: u64::try_from(MAX_EXACT_RENDER_ROW_TEXT_BYTES + 1)
@@ -15077,24 +14893,24 @@ mod test {
     #[test]
     fn exact_render_v1_authority_digests_match_frozen_golden_preimages() {
         const DELTA_GOLDEN: ExactRenderDigest = ExactRenderDigest::from_bytes([
-            0xad, 0x7f, 0x05, 0x21, 0xc7, 0x59, 0x6e, 0x6e, 0xad, 0x37, 0xb3, 0x1d, 0x15,
-            0x67, 0xdb, 0xdb, 0x85, 0x49, 0xc6, 0xc4, 0xcb, 0xe1, 0x14, 0x47, 0xba, 0xa2,
-            0x3f, 0x9f, 0x26, 0xe7, 0xd0, 0xad,
+            0xad, 0x7f, 0x05, 0x21, 0xc7, 0x59, 0x6e, 0x6e, 0xad, 0x37, 0xb3, 0x1d, 0x15, 0x67,
+            0xdb, 0xdb, 0x85, 0x49, 0xc6, 0xc4, 0xcb, 0xe1, 0x14, 0x47, 0xba, 0xa2, 0x3f, 0x9f,
+            0x26, 0xe7, 0xd0, 0xad,
         ]);
         const SNAPSHOT_GOLDEN: ExactRenderDigest = ExactRenderDigest::from_bytes([
-            0x4f, 0x3b, 0x1c, 0xce, 0xb7, 0x99, 0x41, 0x18, 0xf6, 0xfc, 0x88, 0xe5, 0xe2,
-            0x7e, 0x4a, 0xdb, 0x5c, 0xa1, 0x48, 0x79, 0x21, 0xf4, 0xb3, 0x18, 0xb1, 0x9f,
-            0xea, 0xdf, 0x80, 0xa2, 0x03, 0xac,
+            0x4f, 0x3b, 0x1c, 0xce, 0xb7, 0x99, 0x41, 0x18, 0xf6, 0xfc, 0x88, 0xe5, 0xe2, 0x7e,
+            0x4a, 0xdb, 0x5c, 0xa1, 0x48, 0x79, 0x21, 0xf4, 0xb3, 0x18, 0xb1, 0x9f, 0xea, 0xdf,
+            0x80, 0xa2, 0x03, 0xac,
         ]);
         const MANIFEST_GOLDEN: ExactRenderDigest = ExactRenderDigest::from_bytes([
-            0x2e, 0x85, 0xad, 0x8d, 0x7c, 0x6d, 0x67, 0xfe, 0x80, 0x76, 0xdd, 0x22, 0xfe,
-            0xda, 0x20, 0x05, 0x94, 0x91, 0x6e, 0x94, 0x28, 0x11, 0xbb, 0xfc, 0xa1, 0x88,
-            0x94, 0xb1, 0xc3, 0xae, 0xfc, 0x8f,
+            0x2e, 0x85, 0xad, 0x8d, 0x7c, 0x6d, 0x67, 0xfe, 0x80, 0x76, 0xdd, 0x22, 0xfe, 0xda,
+            0x20, 0x05, 0x94, 0x91, 0x6e, 0x94, 0x28, 0x11, 0xbb, 0xfc, 0xa1, 0x88, 0x94, 0xb1,
+            0xc3, 0xae, 0xfc, 0x8f,
         ]);
         const CHUNK_GOLDEN: ExactRenderDigest = ExactRenderDigest::from_bytes([
-            0xd2, 0x58, 0x8c, 0x96, 0xe2, 0x46, 0x8b, 0x28, 0x4b, 0x3c, 0x46, 0x78, 0x1e,
-            0x95, 0x8d, 0xe9, 0x62, 0xd8, 0xd4, 0x36, 0xff, 0xf4, 0x15, 0x9a, 0x15, 0xa1,
-            0x63, 0xa1, 0x53, 0x9f, 0x14, 0xca,
+            0xd2, 0x58, 0x8c, 0x96, 0xe2, 0x46, 0x8b, 0x28, 0x4b, 0x3c, 0x46, 0x78, 0x1e, 0x95,
+            0x8d, 0xe9, 0x62, 0xd8, 0xd4, 0x36, 0xff, 0xf4, 0x15, 0x9a, 0x15, 0xa1, 0x63, 0xa1,
+            0x53, 0x9f, 0x14, 0xca,
         ]);
 
         let connection = RenderConnectionIdentity::new(
@@ -15273,8 +15089,7 @@ mod test {
 
         let mut token = token_context.clone();
         token.extend_from_slice(&SNAPSHOT_GOLDEN.as_bytes());
-        let mut manifest_preimage =
-            b"frankenterm.exact-render-snapshot-manifest.v1\0".to_vec();
+        let mut manifest_preimage = b"frankenterm.exact-render-snapshot-manifest.v1\0".to_vec();
         manifest_preimage.extend_from_slice(&token);
         manifest_preimage.extend_from_slice(&8_u64.to_be_bytes());
         manifest_preimage.extend_from_slice(&projection_preimage);
@@ -15287,8 +15102,7 @@ mod test {
             MANIFEST_GOLDEN,
         );
 
-        let mut chunk_preimage =
-            b"frankenterm.exact-render-snapshot-chunk.v1\0".to_vec();
+        let mut chunk_preimage = b"frankenterm.exact-render-snapshot-chunk.v1\0".to_vec();
         chunk_preimage.extend_from_slice(&token);
         chunk_preimage.extend_from_slice(&8_u64.to_be_bytes());
         chunk_preimage.extend_from_slice(&0_u64.to_be_bytes());
@@ -15321,9 +15135,8 @@ mod test {
         assert!(format!("{byte_error:#}").contains("byte mismatch at offset"));
 
         let canonical_longer = &canonical[..canonical.len() - 1];
-        let longer_error =
-            ensure_exact_render_canonical_payload(&value, canonical_longer, "test")
-                .expect_err("canonical serialization longer than payload must fail");
+        let longer_error = ensure_exact_render_canonical_payload(&value, canonical_longer, "test")
+            .expect_err("canonical serialization longer than payload must fail");
         assert!(format!("{longer_error:#}").contains("canonical serialization is longer"));
 
         let mut canonical_shorter = canonical;
@@ -15354,9 +15167,8 @@ mod test {
                 let error = Pdu::decode(frame.as_slice())
                     .expect_err("closed exact render schema must reject trailing bytes");
                 assert!(
-                    format!("{error:#}").contains(&format!(
-                        "{name} payload has trailing schema bytes"
-                    )),
+                    format!("{error:#}")
+                        .contains(&format!("{name} payload has trailing schema bytes")),
                     "unexpected trailing-byte rejection for {}: {:#}",
                     name,
                     error,
@@ -15367,21 +15179,11 @@ mod test {
         for (name, frame) in [
             (
                 "GetPaneRenderDeliveryV1",
-                encode_authority_payload_with_compressed_suffix(
-                    91,
-                    3,
-                    &request,
-                    &[0xde, 0xad],
-                ),
+                encode_authority_payload_with_compressed_suffix(91, 3, &request, &[0xde, 0xad]),
             ),
             (
                 "GetPaneRenderDeliveryV1Response",
-                encode_authority_payload_with_compressed_suffix(
-                    92,
-                    4,
-                    &response,
-                    &[0xbe, 0xef],
-                ),
+                encode_authority_payload_with_compressed_suffix(92, 4, &response, &[0xbe, 0xef]),
             ),
         ] {
             let error = Pdu::decode(frame.as_slice())
@@ -15394,12 +15196,10 @@ mod test {
             );
         }
 
-        let truncated_request =
-            encode_authority_payload_with_truncated_zstd(91, 5, &request);
+        let truncated_request = encode_authority_payload_with_truncated_zstd(91, 5, &request);
         Pdu::decode(truncated_request.as_slice())
             .expect_err("checksum-truncated compressed request must fail closed");
-        let truncated_response =
-            encode_authority_payload_with_truncated_zstd(92, 6, &response);
+        let truncated_response = encode_authority_payload_with_truncated_zstd(92, 6, &response);
         Pdu::decode(truncated_response.as_slice())
             .expect_err("checksum-truncated compressed response must fail closed");
 
@@ -15444,9 +15244,8 @@ mod test {
             let error = Pdu::decode(frame.as_slice())
                 .expect_err("non-minimal LEB authority must fail canonical decode");
             assert!(
-                format!("{error:#}").contains(&format!(
-                    "{name} payload is not canonical varbincode"
-                )),
+                format!("{error:#}")
+                    .contains(&format!("{name} payload is not canonical varbincode")),
                 "unexpected noncanonical authority rejection for {}: {:#}",
                 name,
                 error,
@@ -15461,11 +15260,8 @@ mod test {
             for (payload, compressed) in [
                 (oversized.clone(), false),
                 (
-                    zstd::stream::encode_all(
-                        oversized.as_slice(),
-                        zstd::DEFAULT_COMPRESSION_LEVEL,
-                    )
-                    .expect("oversized exact render fixture should compress"),
+                    zstd::stream::encode_all(oversized.as_slice(), zstd::DEFAULT_COMPRESSION_LEVEL)
+                        .expect("oversized exact render fixture should compress"),
                     true,
                 ),
             ] {
@@ -15475,8 +15271,7 @@ mod test {
                 let error = Pdu::decode(frame.as_slice())
                     .expect_err("schema-specific decompressed ceiling must fail closed");
                 assert!(
-                    format!("{error:#}")
-                        .contains(&format!("exceeds maximum {maximum}")),
+                    format!("{error:#}").contains(&format!("exceeds maximum {maximum}")),
                     "unexpected PDU {ident} decompressed-cap rejection: {error:#}",
                     ident = ident,
                     error = error,
@@ -15547,10 +15342,7 @@ mod test {
             TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
             1 << 1
         );
-        assert_eq!(
-            TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits(),
-            1 << 2
-        );
+        assert_eq!(TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits(), 1 << 2);
         assert_eq!(
             TopologyCapabilities::SERVER_SUPPORTED,
             TopologyCapabilities::FENCED_SNAPSHOT_V1,
@@ -15559,9 +15351,7 @@ mod test {
         assert!(ordered_window_all_capabilities().validate().is_ok());
         assert_eq!(
             TopologyCapabilities::WINDOW_REORDER_CAS_V1.validate(),
-            Err(TopologyCapabilitiesError::ReorderCasWithoutOrderedStream {
-                bits: 1 << 2,
-            })
+            Err(TopologyCapabilitiesError::ReorderCasWithoutOrderedStream { bits: 1 << 2 })
         );
         let reorder_body_limit = PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES,
@@ -15572,13 +15362,11 @@ mod test {
                 .expect("reorder request and response IDs must be assigned");
             assert_eq!(spec.encoded_body_limit, reorder_body_limit);
             assert_eq!(
-                spec.encoded_body_limit
-                    .maximum_encoded_payload_bytes(false),
+                spec.encoded_body_limit.maximum_encoded_payload_bytes(false),
                 MAX_REORDER_WINDOW_TABS_DECOMPRESSED_BYTES,
             );
             assert_eq!(
-                spec.encoded_body_limit
-                    .maximum_encoded_payload_bytes(true),
+                spec.encoded_body_limit.maximum_encoded_payload_bytes(true),
                 MAX_REORDER_WINDOW_TABS_ZSTD_ENCODED_BYTES,
             );
         }
@@ -15626,9 +15414,7 @@ mod test {
         );
         assert_eq!(
             MAX_LIST_PANES_ORDERED_V1_RESPONSE_ZSTD_ENCODED_BYTES,
-            zstd::zstd_safe::compress_bound(
-                MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,
-            ),
+            zstd::zstd_safe::compress_bound(MAX_LIST_PANES_ORDERED_V1_RESPONSE_DECOMPRESSED_BYTES,),
             "frozen PDU 87 ceiling must continue to admit the pinned zstd encoder bound",
         );
         assert_eq!(
@@ -15788,8 +15574,7 @@ mod test {
             let limit = spec
                 .encoded_body_limit
                 .maximum_encoded_payload_bytes(is_compressed);
-            let exact_header =
-                declared_pdu_frame_header(87, 29, limit, is_compressed);
+            let exact_header = declared_pdu_frame_header(87, 29, limit, is_compressed);
             let exact_error = decode_raw(exact_header.as_slice())
                 .expect_err("admitted PDU 87 header without its body must reach the body read");
             assert!(
@@ -15873,14 +15658,13 @@ mod test {
                 response,
             );
 
-            let error =
-                deserialize_exact_payload_with_limit::<ListPanesOrderedV1Response>(
-                    &payload,
-                    is_compressed,
-                    "ListPanesOrderedV1Response",
-                    too_small_limit,
-                )
-                .expect_err("one byte below a legal PDU 87 body must fail closed");
+            let error = deserialize_exact_payload_with_limit::<ListPanesOrderedV1Response>(
+                &payload,
+                is_compressed,
+                "ListPanesOrderedV1Response",
+                too_small_limit,
+            )
+            .expect_err("one byte below a legal PDU 87 body must fail closed");
             assert!(
                 format!("{error:#}").contains(&format!("maximum {too_small_limit}")),
                 "unexpected bounded PDU 87 rejection under {:?}: {:#}",
@@ -15944,9 +15728,8 @@ mod test {
             .expect("serialize legacy ordered-window section");
         let legacy_section_wire =
             serialize_uncompressed(&section).expect("serialize legacy section byte vector");
-        let marked_section_wire =
-            serialize_uncompressed(&OrderedWindowSectionTestWire(&windows))
-                .expect("serialize schema-marked section bytes");
+        let marked_section_wire = serialize_uncompressed(&OrderedWindowSectionTestWire(&windows))
+            .expect("serialize schema-marked section bytes");
         assert_eq!(
             marked_section_wire, legacy_section_wire,
             "serde newtype admission markers must add no section wire bytes",
@@ -15964,16 +15747,16 @@ mod test {
             tab_titles: vec!["golden-tab".to_string()],
             window_titles: HashMap::from([(1, "golden-window".to_string())]),
         };
-        let arena = ordered_pane_arena_from_list_panes(panes)
-            .expect("convert v54 split-tree golden body");
+        let arena =
+            ordered_pane_arena_from_list_panes(panes).expect("convert v54 split-tree golden body");
         let encoded = serialize_uncompressed(&OrderedPanesTestWire(&arena))
             .expect("serialize v54 split-tree golden body");
         let digest: [u8; 32] = Sha256::digest(&encoded).into();
         assert_eq!(
             digest,
             [
-                5, 105, 80, 21, 39, 242, 241, 54, 63, 62, 77, 47, 13, 44, 132, 181, 19, 99,
-                69, 88, 146, 84, 162, 57, 142, 211, 77, 188, 7, 196, 84, 219,
+                5, 105, 80, 21, 39, 242, 241, 54, 63, 62, 77, 47, 13, 44, 132, 181, 19, 99, 69, 88,
+                146, 84, 162, 57, 142, 211, 77, 188, 7, 196, 84, 219,
             ],
             "v54 flat ordered-pane bytes changed without an explicit codec-version review",
         );
@@ -15997,10 +15780,12 @@ mod test {
         let encoded = serialize_uncompressed(&OrderedPanesTestWire(&arena))
             .expect("maximum admitted pane-tree depth must serialize");
         let mut reader = encoded.as_slice();
-        let OrderedPanesTestOwned(decoded) =
-            bounded_varbincode::deserialize(&mut reader)
-                .expect("maximum admitted pane-tree depth must decode iteratively");
-        assert!(reader.is_empty(), "flat pane DTO must consume its exact bytes");
+        let OrderedPanesTestOwned(decoded) = bounded_varbincode::deserialize(&mut reader)
+            .expect("maximum admitted pane-tree depth must decode iteratively");
+        assert!(
+            reader.is_empty(),
+            "flat pane DTO must consume its exact bytes"
+        );
         assert_eq!(decoded, arena);
 
         let too_deep = ListPanesResponse {
@@ -16043,9 +15828,8 @@ mod test {
         let encoded = serialize_uncompressed(&OrderedPanesTestWire(&flat.panes))
             .expect("exact broad-tree resource boundaries must serialize");
         let mut reader = encoded.as_slice();
-        let OrderedPanesTestOwned(decoded) =
-            bounded_varbincode::deserialize(&mut reader)
-                .expect("exact broad-tree resource boundaries must decode");
+        let OrderedPanesTestOwned(decoded) = bounded_varbincode::deserialize(&mut reader)
+            .expect("exact broad-tree resource boundaries must decode");
         assert!(reader.is_empty());
         assert_eq!(decoded, flat.panes);
     }
@@ -16107,8 +15891,7 @@ mod test {
         validate_ordered_pane_arena(&valid).expect("control flat tree must be canonical");
 
         let (trees, mut nodes, window_titles) = sample_flat_tree().into_parts();
-        let PaneArenaNode::Split { right, .. } = &mut nodes[0]
-        else {
+        let PaneArenaNode::Split { right, .. } = &mut nodes[0] else {
             unreachable!("control root is split");
         };
         *right = 1;
@@ -16119,8 +15902,7 @@ mod test {
         ));
 
         let (trees, mut nodes, window_titles) = sample_flat_tree().into_parts();
-        let PaneArenaNode::Split { right, .. } = &mut nodes[0]
-        else {
+        let PaneArenaNode::Split { right, .. } = &mut nodes[0] else {
             unreachable!("control root is split");
         };
         *right = 0;
@@ -16131,8 +15913,7 @@ mod test {
         ));
 
         let (trees, mut nodes, window_titles) = sample_flat_tree().into_parts();
-        let PaneArenaNode::Split { right, .. } = &mut nodes[0]
-        else {
+        let PaneArenaNode::Split { right, .. } = &mut nodes[0] else {
             unreachable!("control root is split");
         };
         *right = 3;
@@ -16425,8 +16206,7 @@ mod test {
             windows.push(OrderedWindowStateV1 {
                 window_id: RemoteWindowId::new(
                     (u64::MAX - 1)
-                        - u64::try_from(window_offset)
-                            .expect("bounded window ordinal fits in u64"),
+                        - u64::try_from(window_offset).expect("bounded window ordinal fits in u64"),
                 ),
                 order_revision: WindowOrderRevision::new(u64::MAX - 1),
                 active_tab_id: ordered_tab_ids.first().copied(),
@@ -16692,8 +16472,8 @@ mod test {
             "dense PDU 87 body exceeded its schema ceiling",
         );
         drop(raw);
-        let decoded = Pdu::decode(frame.as_slice())
-            .expect("roundtrip dense maximum-cardinality PDU 87");
+        let decoded =
+            Pdu::decode(frame.as_slice()).expect("roundtrip dense maximum-cardinality PDU 87");
         let Pdu::ListPanesOrderedV1Response(expected) = pdu else {
             unreachable!("fixture was constructed as PDU 87");
         };
@@ -16714,7 +16494,10 @@ mod test {
         assert_eq!(actual.session_incarnation, expected.session_incarnation);
         assert_eq!(actual.topology_revision, expected.topology_revision);
         assert_eq!(actual.panes, expected.panes);
-        assert!(actual.ordered_windows.iter().eq(expected.ordered_windows.iter()));
+        assert!(actual
+            .ordered_windows
+            .iter()
+            .eq(expected.ordered_windows.iter()));
     }
 
     #[test]
@@ -16814,18 +16597,14 @@ mod test {
         };
         let outcomes = vec![
             ReorderWindowTabsV1Outcome::Applied(commit.clone()),
-            ReorderWindowTabsV1Outcome::Replay(
-                WindowReorderTerminalOutcomeV1::Applied(commit.clone()),
-            ),
-            ReorderWindowTabsV1Outcome::Replay(
-                WindowReorderTerminalOutcomeV1::Conflict(commit.clone()),
-            ),
-            ReorderWindowTabsV1Outcome::Replay(
-                WindowReorderTerminalOutcomeV1::StaleIncarnation,
-            ),
-            ReorderWindowTabsV1Outcome::Replay(
-                WindowReorderTerminalOutcomeV1::Malformed,
-            ),
+            ReorderWindowTabsV1Outcome::Replay(WindowReorderTerminalOutcomeV1::Applied(
+                commit.clone(),
+            )),
+            ReorderWindowTabsV1Outcome::Replay(WindowReorderTerminalOutcomeV1::Conflict(
+                commit.clone(),
+            )),
+            ReorderWindowTabsV1Outcome::Replay(WindowReorderTerminalOutcomeV1::StaleIncarnation),
+            ReorderWindowTabsV1Outcome::Replay(WindowReorderTerminalOutcomeV1::Malformed),
             ReorderWindowTabsV1Outcome::Replay(WindowReorderTerminalOutcomeV1::Exhausted),
             ReorderWindowTabsV1Outcome::Conflict(commit),
             ReorderWindowTabsV1Outcome::StaleIncarnation,
@@ -16863,10 +16642,9 @@ mod test {
         assert_eq!(
             request.digest.as_bytes(),
             [
-                0x19, 0x77, 0xaf, 0x8b, 0x79, 0xde, 0xaf, 0x45,
-                0x80, 0x8f, 0xef, 0x59, 0x9b, 0xee, 0x58, 0xe4,
-                0xc7, 0xc2, 0xcd, 0xe0, 0x28, 0x6f, 0x2f, 0xdf,
-                0xd6, 0x12, 0x0a, 0x0d, 0x2c, 0x4d, 0xde, 0xf2,
+                0x19, 0x77, 0xaf, 0x8b, 0x79, 0xde, 0xaf, 0x45, 0x80, 0x8f, 0xef, 0x59, 0x9b, 0xee,
+                0x58, 0xe4, 0xc7, 0xc2, 0xcd, 0xe0, 0x28, 0x6f, 0x2f, 0xdf, 0xd6, 0x12, 0x0a, 0x0d,
+                0x2c, 0x4d, 0xde, 0xf2,
             ]
         );
 
@@ -17009,10 +16787,7 @@ mod test {
             assert_eq!(
                 Pdu::decode(frame.as_slice())
                     .unwrap_or_else(|error| {
-                        panic!(
-                            "{} must survive bounded wire admission: {:#}",
-                            name, error
-                        )
+                        panic!("{} must survive bounded wire admission: {:#}", name, error)
                     })
                     .pdu,
                 pdu,
@@ -17045,8 +16820,8 @@ mod test {
         let mut digest_mismatch = valid;
         digest_mismatch.digest = WindowReorderDigest::from_bytes([0xaa; 32]);
         let frame = encode_reorder_window_tabs_unchecked(&digest_mismatch, 8);
-        let error = Pdu::decode(frame.as_slice())
-            .expect_err("digest mismatch must fail during decode");
+        let error =
+            Pdu::decode(frame.as_slice()).expect_err("digest mismatch must fail during decode");
         assert!(format!("{error:#}").contains("digest mismatch"));
 
         let first = sample_ordered_window();
@@ -17063,10 +16838,9 @@ mod test {
                 .is_err(),
             "duplicate windows must fail sender validation"
         );
-        let error = Pdu::decode(
-            encode_window_order_event_unchecked(&duplicate_window, 9).as_slice(),
-        )
-        .expect_err("duplicate windows must fail receiver validation");
+        let error =
+            Pdu::decode(encode_window_order_event_unchecked(&duplicate_window, 9).as_slice())
+                .expect_err("duplicate windows must fail receiver validation");
         assert!(format!("{error:#}").contains("repeats window id"));
 
         let mut second = first.clone();
@@ -17075,10 +16849,8 @@ mod test {
             windows: vec![first, second],
             ..duplicate_window
         };
-        let error = Pdu::decode(
-            encode_window_order_event_unchecked(&duplicate_tab, 10).as_slice(),
-        )
-        .expect_err("a tab cannot appear in two ordered windows");
+        let error = Pdu::decode(encode_window_order_event_unchecked(&duplicate_tab, 10).as_slice())
+            .expect_err("a tab cannot appear in two ordered windows");
         assert!(format!("{error:#}").contains("repeats tab id"));
     }
 
@@ -17088,29 +16860,19 @@ mod test {
             for (ident, pdu) in sample_ordered_window_pdus() {
                 let frame = match &pdu {
                     Pdu::ListPanesOrderedV1(value) => {
-                        encode_authority_payload_with_trailing_schema_byte(
-                            ident, 1, value, mode,
-                        )
+                        encode_authority_payload_with_trailing_schema_byte(ident, 1, value, mode)
                     }
                     Pdu::ListPanesOrderedV1Response(value) => {
-                        encode_authority_payload_with_trailing_schema_byte(
-                            ident, 1, value, mode,
-                        )
+                        encode_authority_payload_with_trailing_schema_byte(ident, 1, value, mode)
                     }
                     Pdu::ReorderWindowTabsV1(value) => {
-                        encode_authority_payload_with_trailing_schema_byte(
-                            ident, 1, value, mode,
-                        )
+                        encode_authority_payload_with_trailing_schema_byte(ident, 1, value, mode)
                     }
                     Pdu::ReorderWindowTabsV1Response(value) => {
-                        encode_authority_payload_with_trailing_schema_byte(
-                            ident, 1, value, mode,
-                        )
+                        encode_authority_payload_with_trailing_schema_byte(ident, 1, value, mode)
                     }
                     Pdu::WindowOrderEventV1(value) => {
-                        encode_authority_payload_with_trailing_schema_byte(
-                            ident, 1, value, mode,
-                        )
+                        encode_authority_payload_with_trailing_schema_byte(ident, 1, value, mode)
                     }
                     _ => unreachable!("sample contains only ordered-window authority PDUs"),
                 };
@@ -17156,9 +16918,7 @@ mod test {
         );
 
         let mut over_request = max_request;
-        over_request
-            .desired_tab_ids
-            .push(RemoteTabId::new(50_000));
+        over_request.desired_tab_ids.push(RemoteTabId::new(50_000));
         over_request = over_request.with_computed_digest();
         let (payload, compressed) = serialize_with_mode(
             &(
@@ -17194,21 +16954,19 @@ mod test {
                 active_tab_id: None,
             })
             .collect();
-        let snapshot_at_limit = Pdu::ListPanesOrderedV1Response(
-            ListPanesOrderedV1Response {
-                protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
-                domain_binding_id: DomainBindingId::from_bytes([0x70; 16]),
-                negotiated: ordered_window_foundation_capabilities(),
-                stream_id: TopologyStreamId::from_bytes([0x71; 16]),
-                outcome: ListPanesOrderedV1Outcome::Snapshot(OrderedPaneSnapshotV1 {
-                    session_incarnation: MuxSessionIncarnation::from_bytes([0x72; 16]),
-                    topology_revision: TopologyRevision::new(1),
-                    panes: ordered_pane_arena_from_list_panes(empty_pane_list())
-                        .expect("empty ordered-pane arena must be valid"),
-                    ordered_windows: windows_at_limit.clone(),
-                }),
-            },
-        );
+        let snapshot_at_limit = Pdu::ListPanesOrderedV1Response(ListPanesOrderedV1Response {
+            protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+            domain_binding_id: DomainBindingId::from_bytes([0x70; 16]),
+            negotiated: ordered_window_foundation_capabilities(),
+            stream_id: TopologyStreamId::from_bytes([0x71; 16]),
+            outcome: ListPanesOrderedV1Outcome::Snapshot(OrderedPaneSnapshotV1 {
+                session_incarnation: MuxSessionIncarnation::from_bytes([0x72; 16]),
+                topology_revision: TopologyRevision::new(1),
+                panes: ordered_pane_arena_from_list_panes(empty_pane_list())
+                    .expect("empty ordered-pane arena must be valid"),
+                ordered_windows: windows_at_limit.clone(),
+            }),
+        });
         let frame = snapshot_at_limit
             .encode_frame_with_mode(22, CompressionMode::Never)
             .expect("exact ordered-window count limit should encode");
@@ -17254,14 +17012,11 @@ mod test {
             .map(|window_offset| {
                 let first = window_offset * MAX_ORDERED_TABS_PER_WINDOW + 1;
                 let tabs: Vec<_> = (first..first + MAX_ORDERED_TABS_PER_WINDOW)
-                    .map(|id| {
-                        RemoteTabId::new(u64::try_from(id).expect("bounded tab id fits u64"))
-                    })
+                    .map(|id| RemoteTabId::new(u64::try_from(id).expect("bounded tab id fits u64")))
                     .collect();
                 OrderedWindowStateV1 {
                     window_id: RemoteWindowId::new(
-                        u64::try_from(window_offset + 1)
-                            .expect("bounded window id fits u64"),
+                        u64::try_from(window_offset + 1).expect("bounded window id fits u64"),
                     ),
                     order_revision: WindowOrderRevision::new(1),
                     active_tab_id: tabs.first().copied(),
@@ -17297,12 +17052,8 @@ mod test {
         let one_window = [sample_ordered_window()];
         let exact_section_bytes = encoded_ordered_window_section_len(&one_window)
             .expect("sample order section should have a canonical length");
-        validate_ordered_windows_with_section_limit(
-            &one_window,
-            false,
-            exact_section_bytes,
-        )
-        .expect("exact injected section byte limit should validate");
+        validate_ordered_windows_with_section_limit(&one_window, false, exact_section_bytes)
+            .expect("exact injected section byte limit should validate");
         assert_eq!(
             validate_ordered_windows_with_section_limit(
                 &one_window,
@@ -17339,8 +17090,7 @@ mod test {
             );
         }
 
-        let oversized_compressed_body =
-            vec![0_u8; MAX_REORDER_WINDOW_TABS_ZSTD_ENCODED_BYTES + 1];
+        let oversized_compressed_body = vec![0_u8; MAX_REORDER_WINDOW_TABS_ZSTD_ENCODED_BYTES + 1];
         let mut oversized_compressed_frame = Vec::new();
         encode_raw(
             88,
@@ -17462,9 +17212,8 @@ mod test {
         value: &T,
         suffix: &[u8],
     ) -> Vec<u8> {
-        let (mut payload, is_compressed) =
-            serialize_with_mode(value, CompressionMode::Always)
-                .expect("authority payload should compress");
+        let (mut payload, is_compressed) = serialize_with_mode(value, CompressionMode::Always)
+            .expect("authority payload should compress");
         assert!(is_compressed);
         payload.extend_from_slice(suffix);
         let mut frame = Vec::new();
@@ -17513,9 +17262,7 @@ mod test {
                     .expect_err("topology authority payload must reject trailing schema bytes");
                 let message = format!("{err:#}");
                 assert!(
-                    message.contains(&format!(
-                        "{payload_name} payload has trailing schema bytes"
-                    )),
+                    message.contains(&format!("{payload_name} payload has trailing schema bytes")),
                     "unexpected {} rejection under {:?}: {}",
                     payload_name,
                     mode,
@@ -17524,17 +17271,14 @@ mod test {
 
                 let async_err = runtime::block_on(async {
                     let mut reader = runtime::Cursor::new(frame);
-                    Pdu::decode_async(&mut reader, None)
-                        .await
-                        .expect_err(
-                            "async topology authority payload must reject trailing schema bytes",
-                        )
+                    Pdu::decode_async(&mut reader, None).await.expect_err(
+                        "async topology authority payload must reject trailing schema bytes",
+                    )
                 });
                 let async_message = format!("{async_err:#}");
                 assert!(
-                    async_message.contains(&format!(
-                        "{payload_name} payload has trailing schema bytes"
-                    )),
+                    async_message
+                        .contains(&format!("{payload_name} payload has trailing schema bytes")),
                     "unexpected async {} rejection under {:?}: {}",
                     payload_name,
                     mode,
@@ -17579,11 +17323,9 @@ mod test {
         for (authority_index, (authority_name, authority)) in
             IntoIterator::into_iter(authority_pdus).enumerate()
         {
-            for (mode_index, mode) in IntoIterator::into_iter([
-                CompressionMode::Never,
-                CompressionMode::Always,
-            ])
-            .enumerate()
+            for (mode_index, mode) in
+                IntoIterator::into_iter([CompressionMode::Never, CompressionMode::Always])
+                    .enumerate()
             {
                 let first_serial = 11_u64
                     + u64::try_from(authority_index * 2 + mode_index)
@@ -17599,8 +17341,8 @@ mod test {
                 concatenated.extend_from_slice(&next_frame);
 
                 let mut sync_reader = Cursor::new(concatenated.clone());
-                let decoded = Pdu::decode(&mut sync_reader)
-                    .expect("sync decode first authority frame");
+                let decoded =
+                    Pdu::decode(&mut sync_reader).expect("sync decode first authority frame");
                 assert_eq!(decoded.serial, first_serial);
                 assert_eq!(
                     decoded.pdu, authority,
@@ -17612,8 +17354,8 @@ mod test {
                     first_frame.len(),
                     "sync {authority_name} under {mode:?} must stop at its outer boundary"
                 );
-                let decoded = Pdu::decode(&mut sync_reader)
-                    .expect("sync decode preserved next outer frame");
+                let decoded =
+                    Pdu::decode(&mut sync_reader).expect("sync decode preserved next outer frame");
                 assert_eq!(decoded.serial, next_serial);
                 assert_eq!(decoded.pdu, next_outer);
                 assert_eq!(
@@ -17650,7 +17392,8 @@ mod test {
                     "stream {authority_name} under {mode:?}"
                 );
                 assert_eq!(
-                    buffered.as_slice(), next_frame.as_slice(),
+                    buffered.as_slice(),
+                    next_frame.as_slice(),
                     "stream {authority_name} under {mode:?} must preserve the exact next frame"
                 );
 
@@ -17675,9 +17418,8 @@ mod test {
         let sync_error = Pdu::decode(frame.as_slice())
             .expect_err("sync authority decode must reject truncated zstd termination");
         assert!(
-            format!("{sync_error:#}").contains(
-                "validating ListPanesCoherent compressed payload termination"
-            ),
+            format!("{sync_error:#}")
+                .contains("validating ListPanesCoherent compressed payload termination"),
             "sync truncated-zstd rejection should come from the post-value EOF probe: {:#}",
             sync_error
         );
@@ -17689,9 +17431,8 @@ mod test {
                 .expect_err("async authority decode must reject truncated zstd termination")
         });
         assert!(
-            format!("{async_error:#}").contains(
-                "validating ListPanesCoherent compressed payload termination"
-            ),
+            format!("{async_error:#}")
+                .contains("validating ListPanesCoherent compressed payload termination"),
             "async truncated-zstd rejection should come from the post-value EOF probe: {:#}",
             async_error
         );
@@ -17703,11 +17444,9 @@ mod test {
             supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
             required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
         };
-        let empty_frame = zstd::stream::encode_all(
-            std::io::empty(),
-            zstd::DEFAULT_COMPRESSION_LEVEL,
-        )
-        .expect("empty zstd frame should encode");
+        let empty_frame =
+            zstd::stream::encode_all(std::io::empty(), zstd::DEFAULT_COMPRESSION_LEVEL)
+                .expect("empty zstd frame should encode");
         let empty_skippable_frame = [
             0x50, 0x2a, 0x4d, 0x18, // skippable-frame magic, little endian
             0x00, 0x00, 0x00, 0x00, // zero-byte payload length
@@ -17717,8 +17456,7 @@ mod test {
             ("empty zstd frame", empty_frame.as_slice()),
             ("empty skippable frame", empty_skippable_frame.as_slice()),
         ] {
-            let frame =
-                encode_authority_payload_with_compressed_suffix(81, 14, &request, suffix);
+            let frame = encode_authority_payload_with_compressed_suffix(81, 14, &request, suffix);
             let sync_error = Pdu::decode(frame.as_slice())
                 .expect_err("sync authority decode must reject a compressed frame suffix");
             assert!(
@@ -17901,7 +17639,8 @@ mod test {
             "malformed complete frame should return a useful error"
         );
         assert_eq!(
-            buffer.as_slice(), original.as_slice(),
+            buffer.as_slice(),
+            original.as_slice(),
             "malformed complete frame must remain available for quarantine"
         );
     }
@@ -17932,7 +17671,8 @@ mod test {
             message = message,
         );
         assert_eq!(
-            buffer.as_slice(), original.as_slice(),
+            buffer.as_slice(),
+            original.as_slice(),
             "malformed frame must remain available for quarantine"
         );
     }
@@ -17957,7 +17697,8 @@ mod test {
             "partial compressed frame should not decode"
         );
         assert_eq!(
-            partial.as_slice(), prefix,
+            partial.as_slice(),
+            prefix,
             "partial compressed bytes should remain buffered"
         );
 
@@ -18193,13 +17934,7 @@ mod test {
         let mut serialized = Vec::new();
         let mut by_identity = HashMap::new();
 
-        record_serialized_hyperlink_span(
-            &mut serialized,
-            &mut by_identity,
-            &first,
-            0,
-            0..1,
-        );
+        record_serialized_hyperlink_span(&mut serialized, &mut by_identity, &first, 0, 0..1);
         assert_eq!(Arc::strong_count(&first), 2);
         drop(first);
 
@@ -18214,13 +17949,7 @@ mod test {
         );
 
         let second = Arc::new(Hyperlink::new_implicit("https://second.example"));
-        record_serialized_hyperlink_span(
-            &mut serialized,
-            &mut by_identity,
-            &second,
-            1,
-            0..1,
-        );
+        record_serialized_hyperlink_span(&mut serialized, &mut by_identity, &second, 1, 0..1);
         assert_eq!(serialized.len(), 2);
     }
 
@@ -18241,15 +17970,12 @@ mod test {
             .expect("GetImageCellResponse must remain registered");
         assert_eq!(spec.encoded_body_limit, expected);
         assert_eq!(
-            spec.encoded_body_limit
-                .maximum_encoded_payload_bytes(false),
+            spec.encoded_body_limit.maximum_encoded_payload_bytes(false),
             MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES
         );
         assert!(
             MAX_GET_IMAGE_CELL_RESPONSE_ZSTD_ENCODED_BYTES
-                >= zstd::zstd_safe::compress_bound(
-                    MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES
-                ),
+                >= zstd::zstd_safe::compress_bound(MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES),
             "the encoded ceiling must admit zstd's worst-case legal output"
         );
         const {
@@ -18405,10 +18131,7 @@ mod test {
             assert!(spec.min_codec_version <= CODEC_VERSION);
         }
 
-        assert_eq!(
-            Pdu::Ping(Ping {}).minimum_codec_version(),
-            Some(46),
-        );
+        assert_eq!(Pdu::Ping(Ping {}).minimum_codec_version(), Some(46),);
         assert_eq!(Pdu::Invalid { ident: 5 }.minimum_codec_version(), None);
         assert_eq!(<SendPaste as PduWireIdent>::WIRE_SPEC.min_codec_version, 56);
         assert_eq!(
@@ -18430,13 +18153,12 @@ mod test {
     #[test]
     fn pdu_wire_registry_authorizes_the_exact_dispatch_matrix() {
         const CLIENT_REQUESTS: &[u64] = &[
-            1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43,
-            45, 46, 48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70,
-            71, 72, 73, 74, 75, 77, 80, 81, 85, 86, 88, 91,
+            1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
+            48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
+            77, 80, 81, 85, 86, 88, 91,
         ];
         const SERVER_REPLIES: &[u64] = &[
-            0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87,
-            89, 92,
+            0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92,
         ];
         const SERVER_UNILATERALS: &[u64] = &[
             20, 25, 37, 38, 39, 44, 53, 54, 55, 56, 57, 58, 79, 83, 84, 90,
@@ -18472,8 +18194,7 @@ mod test {
 
             let expected_producer = match (
                 CLIENT_REQUESTS.contains(&spec.ident),
-                SERVER_REPLIES.contains(&spec.ident)
-                    || SERVER_UNILATERALS.contains(&spec.ident),
+                SERVER_REPLIES.contains(&spec.ident) || SERVER_UNILATERALS.contains(&spec.ident),
             ) {
                 (true, true) => PduProducer::Bidirectional,
                 (true, false) => PduProducer::Client,
@@ -18484,7 +18205,10 @@ mod test {
         }
 
         assert_eq!(
-            Pdu::wire_spec_for_ident(25).expect("PDU 25 assigned").authorities.len(),
+            Pdu::wire_spec_for_ident(25)
+                .expect("PDU 25 assigned")
+                .authorities
+                .len(),
             2,
             "render changes are both a correlated reply and a unilateral sideband",
         );
@@ -18583,9 +18307,8 @@ mod test {
             executable_path: PathBuf::from("/usr/local/bin/frankenterm"),
             config_file_path: None,
         };
-        let (mut payload, is_compressed) =
-            serialize_with_mode(&legacy, CompressionMode::Never)
-                .expect("legacy response should serialize");
+        let (mut payload, is_compressed) = serialize_with_mode(&legacy, CompressionMode::Never)
+            .expect("legacy response should serialize");
         assert!(!is_compressed);
         payload.extend_from_slice(&[0, 0]);
         let mut frame = Vec::new();
@@ -19157,17 +18880,13 @@ mod test {
                     .expect("encode live successor");
                 let mut reader = runtime::Cursor::new(wire);
 
-                let discarded = Pdu::decode_async_with_selector(
-                    &mut reader,
-                    Some(2),
-                    |header| {
-                        assert_eq!(header.serial(), 1);
-                        assert_eq!(header.ident(), 99);
-                        assert_eq!(header.encoded_payload_len(), data_len);
-                        assert!(!header.is_compressed());
-                        Ok(PduBodyDisposition::Discard)
-                    },
-                )
+                let discarded = Pdu::decode_async_with_selector(&mut reader, Some(2), |header| {
+                    assert_eq!(header.serial(), 1);
+                    assert_eq!(header.ident(), 99);
+                    assert_eq!(header.encoded_payload_len(), data_len);
+                    assert!(!header.is_compressed());
+                    Ok(PduBodyDisposition::Discard)
+                })
                 .await
                 .expect("discard exact body");
                 let AsyncPduDecode::Discarded {
@@ -19233,8 +18952,7 @@ mod test {
     fn async_selector_truncated_discard_fails_closed() {
         runtime::block_on(async {
             let mut wire = Vec::new();
-            encode_raw(99, 1, &[0x41; 128], false, &mut wire)
-                .expect("encode discard candidate");
+            encode_raw(99, 1, &[0x41; 128], false, &mut wire).expect("encode discard candidate");
             wire.pop().expect("encoded frame has a payload byte");
             let mut reader = runtime::Cursor::new(wire);
 
@@ -19244,7 +18962,9 @@ mod test {
             .await
             .expect_err("truncated discarded body must fail closed");
             assert!(
-                error.to_string().contains("discarding an abandoned PDU body"),
+                error
+                    .to_string()
+                    .contains("discarding an abandoned PDU body"),
                 "unexpected truncated-discard error: {:#}",
                 error
             );
@@ -19269,7 +18989,9 @@ mod test {
             .await
             .expect_err("compressed discard without zstd validation must fail closed");
             assert!(
-                error.to_string().contains("refusing to discard compressed PDU body"),
+                error
+                    .to_string()
+                    .contains("refusing to discard compressed PDU body"),
                 "unexpected compressed-discard error: {:#}",
                 error
             );
@@ -19544,14 +19266,12 @@ mod test {
 
     #[test]
     fn server_unilateral_clipboard_is_not_client_input() {
-        assert!(
-            !Pdu::SetClipboard(SetClipboard {
-                pane_id: 55,
-                clipboard: Some("copied".to_string()),
-                selection: ClipboardSelection::Clipboard,
-            })
-            .is_user_input()
-        );
+        assert!(!Pdu::SetClipboard(SetClipboard {
+            pane_id: 55,
+            clipboard: Some("copied".to_string()),
+            selection: ClipboardSelection::Clipboard,
+        })
+        .is_user_input());
     }
 
     // --- Additional encode/decode edge cases ---
@@ -19767,9 +19487,7 @@ mod test {
 
     #[test]
     fn render_retention_metadata_matches_canonical_frame_in_both_compression_modes() {
-        let pdu = Pdu::GetPaneRenderChangesResponse(
-            sample_retention_metadata_render_change(),
-        );
+        let pdu = Pdu::GetPaneRenderChangesResponse(sample_retention_metadata_render_change());
         let expected_retained_bytes = pdu
             .encode_retained_frame(0)
             .expect("encode canonical retained render frame")
@@ -19794,9 +19512,8 @@ mod test {
         }
 
         let ping = Pdu::Ping(Ping {});
-        let mut buffer = StreamingPduBuffer::from(
-            ping.encode_frame(9).expect("encode non-render frame"),
-        );
+        let mut buffer =
+            StreamingPduBuffer::from(ping.encode_frame(9).expect("encode non-render frame"));
         let decoded = Pdu::stream_decode_with_retention_metadata(&mut buffer)
             .expect("decode non-render frame")
             .expect("complete non-render frame");
@@ -19807,9 +19524,8 @@ mod test {
     #[test]
     fn render_retention_metadata_conservatively_charges_additive_payload_tails() {
         let payload = sample_retention_metadata_render_change();
-        let (known_payload, compressed) =
-            serialize_with_mode(&payload, CompressionMode::Never)
-                .expect("serialize known render schema");
+        let (known_payload, compressed) = serialize_with_mode(&payload, CompressionMode::Never)
+            .expect("serialize known render schema");
         assert!(!compressed);
         let known_frame_bytes = encoded_frame_len(
             <GetPaneRenderChangesResponse as PduWireIdent>::IDENT,
@@ -19836,27 +19552,18 @@ mod test {
             zstd::DEFAULT_COMPRESSION_LEVEL,
         )
         .expect("compress render payload with additive tail");
-        let mut concatenated_compressed = zstd::stream::encode_all(
-            known_payload.as_slice(),
-            zstd::DEFAULT_COMPRESSION_LEVEL,
-        )
-        .expect("compress known render payload");
+        let mut concatenated_compressed =
+            zstd::stream::encode_all(known_payload.as_slice(), zstd::DEFAULT_COMPRESSION_LEVEL)
+                .expect("compress known render payload");
         concatenated_compressed.extend_from_slice(
-            &zstd::stream::encode_all(
-                additive_tail.as_slice(),
-                zstd::DEFAULT_COMPRESSION_LEVEL,
-            )
-            .expect("compress additive render tail as a second frame"),
+            &zstd::stream::encode_all(additive_tail.as_slice(), zstd::DEFAULT_COMPRESSION_LEVEL)
+                .expect("compress additive render tail as a second frame"),
         );
 
         for (encoded_payload, is_compressed, case) in [
             (payload_with_tail, false, "uncompressed"),
             (compressed_with_tail, true, "compressed"),
-            (
-                concatenated_compressed,
-                true,
-                "concatenated-compressed",
-            ),
+            (concatenated_compressed, true, "concatenated-compressed"),
         ] {
             let frame = encode_raw_as_vec(
                 <GetPaneRenderChangesResponse as PduWireIdent>::IDENT,
@@ -19886,15 +19593,12 @@ mod test {
     #[test]
     fn charged_stream_decode_rejects_invalid_compressed_tail_without_consuming_prefix() {
         let payload = sample_retention_metadata_render_change();
-        let (known_payload, compressed) =
-            serialize_with_mode(&payload, CompressionMode::Never)
-                .expect("serialize known render schema");
+        let (known_payload, compressed) = serialize_with_mode(&payload, CompressionMode::Never)
+            .expect("serialize known render schema");
         assert!(!compressed);
-        let mut encoded_payload = zstd::stream::encode_all(
-            known_payload.as_slice(),
-            zstd::DEFAULT_COMPRESSION_LEVEL,
-        )
-        .expect("compress known render payload");
+        let mut encoded_payload =
+            zstd::stream::encode_all(known_payload.as_slice(), zstd::DEFAULT_COMPRESSION_LEVEL)
+                .expect("compress known render payload");
         encoded_payload.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
         let frame = encode_raw_as_vec(
             <GetPaneRenderChangesResponse as PduWireIdent>::IDENT,
@@ -19912,9 +19616,7 @@ mod test {
 
     #[test]
     fn per_frame_limit_accepts_coalesced_render_and_following_frame() {
-        let render = Pdu::GetPaneRenderChangesResponse(
-            sample_retention_metadata_render_change(),
-        );
+        let render = Pdu::GetPaneRenderChangesResponse(sample_retention_metadata_render_change());
         let render_frame = render
             .encode_frame_with_mode(0, CompressionMode::Never)
             .expect("encode render frame");
@@ -20081,10 +19783,7 @@ mod test {
         let decoded =
             Pdu::decode(legacy_frame.as_slice()).expect("v50 must retain the v1 PDU 79 schema");
         assert_eq!(decoded.serial, 17);
-        assert_eq!(
-            decoded.pdu,
-            Pdu::RenderApplicationUpdateV1(legacy_update)
-        );
+        assert_eq!(decoded.pdu, Pdu::RenderApplicationUpdateV1(legacy_update));
 
         let mut current_frame = Vec::new();
         Pdu::RenderApplicationUpdate(update.clone())
@@ -20173,8 +19872,7 @@ mod test {
         result_pdu
             .encode(&mut encoded_result, 43)
             .expect("render result encodes");
-        let decoded_result =
-            Pdu::decode(encoded_result.as_slice()).expect("render result decodes");
+        let decoded_result = Pdu::decode(encoded_result.as_slice()).expect("render result decodes");
         assert_eq!(decoded_result.serial, 43);
         assert_eq!(decoded_result.pdu.pane_id(), Some(7));
         assert_eq!(decoded_result.pdu, result_pdu);
@@ -20214,8 +19912,7 @@ mod test {
             Err(RenderApplicationContractError::ResourceLimitExceeded {
                 resource: RenderApplicationResource::Lines,
                 requested: u64::try_from(over_limit).expect("test limit fits u64"),
-                limit: u64::try_from(MAX_RENDER_APPLICATION_LINES)
-                    .expect("test limit fits u64"),
+                limit: u64::try_from(MAX_RENDER_APPLICATION_LINES).expect("test limit fits u64"),
             })
         );
     }
@@ -20244,13 +19941,12 @@ mod test {
             })
         );
 
-        snapshot.semantic_zones =
-            RenderComponentUpdate::Replace(GetSemanticZonesResponse {
-                pane_id: snapshot.identity.pane_id,
-                zones: Vec::new(),
-                zone_texts: Vec::new(),
-                last_exit_code: None,
-            });
+        snapshot.semantic_zones = RenderComponentUpdate::Replace(GetSemanticZonesResponse {
+            pane_id: snapshot.identity.pane_id,
+            zones: Vec::new(),
+            zone_texts: Vec::new(),
+            last_exit_code: None,
+        });
         assert_eq!(
             snapshot.validate(),
             Err(RenderApplicationContractError::MalformedSurfaceComponent {
@@ -20471,14 +20167,7 @@ mod test {
 
     #[test]
     fn render_application_serialized_lines_reject_corrupt_internal_references() {
-        let line = || {
-            Line::from_text(
-                "x",
-                &termwiz::cell::CellAttributes::default(),
-                1,
-                None,
-            )
-        };
+        let line = || Line::from_text("x", &termwiz::cell::CellAttributes::default(), 1, None);
         let duplicate_row = SerializedLines {
             lines: vec![(0, line()), (0, line())],
             hyperlinks: Vec::new(),
@@ -20616,8 +20305,7 @@ mod test {
             }],
         };
         assert!(rounded_geometry.validate_structure().is_ok());
-        let (top_left, bottom_right) =
-            rounded_geometry.images[0].canonical_texture_coordinates();
+        let (top_left, bottom_right) = rounded_geometry.images[0].canonical_texture_coordinates();
         assert_eq!(top_left, TextureCoordinate::new_f32(0.0, 0.0));
         assert_eq!(bottom_right, TextureCoordinate::new_f32(1.0, 1.0));
     }
@@ -20721,16 +20409,13 @@ mod test {
             Some(17),
         )));
 
-        let serialized = SerializedLines::from(vec![(
-            5,
-            Line::from_text("x", &attrs, 1, None),
-        )]);
+        let serialized = SerializedLines::from(vec![(5, Line::from_text("x", &attrs, 1, None))]);
         assert_eq!(serialized.validate_structure().unwrap().images, 2);
         let (_, images) = serialized.extract_data_checked().unwrap();
         assert_eq!(images.len(), 2);
-        assert!(images.iter().all(|image| {
-            image.line_idx == 5 && image.cell_idx == 0
-        }));
+        assert!(images
+            .iter()
+            .all(|image| { image.line_idx == 5 && image.cell_idx == 0 }));
         assert_eq!(
             images.iter().map(|image| image.z_index).collect::<Vec<_>>(),
             vec![-1, 2],

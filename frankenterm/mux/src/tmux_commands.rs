@@ -4,10 +4,9 @@ use crate::pane::{alloc_pane_id, PaneId};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use crate::tmux::{
     AttachState, TmuxBacklogDrain, TmuxBacklogLimits, TmuxDomain, TmuxDomainState,
-    TmuxEnqueueError, TmuxNotificationIntent,
-    TmuxNotificationIntentRunDisposition, TmuxPaneOutputIngress, TmuxPaneOutputLimits,
-    TmuxPaneOutputState, TmuxRemotePane, TmuxTab, TmuxTopologyBarrierEvent,
-    NOTIFICATION_INTENT_DRAIN_QUANTUM,
+    TmuxEnqueueError, TmuxNotificationIntent, TmuxNotificationIntentRunDisposition,
+    TmuxPaneOutputIngress, TmuxPaneOutputLimits, TmuxPaneOutputState, TmuxRemotePane, TmuxTab,
+    TmuxTopologyBarrierEvent, NOTIFICATION_INTENT_DRAIN_QUANTUM,
 };
 use crate::tmux_pty::{TmuxChild, TmuxChildState, TmuxPty};
 use crate::{
@@ -127,8 +126,9 @@ pub(crate) enum TmuxConditionalCommit {
 impl TmuxConditionalCommit {
     pub(crate) const fn io_generation(&self) -> u64 {
         match self {
-            Self::WindowLayout { io_generation, .. }
-            | Self::PaneSize { io_generation, .. } => *io_generation,
+            Self::WindowLayout { io_generation, .. } | Self::PaneSize { io_generation, .. } => {
+                *io_generation
+            }
         }
     }
 
@@ -564,9 +564,7 @@ impl TmuxDomainState {
         let mut cmd_queue = self.cmd_queue.lock();
         for pane_id in &to_remove {
             cmd_queue.retire_pane_size_suppression_target(*pane_id);
-            cmd_queue.advance_preparation_prerequisite(TmuxPreparationPrerequisite::Pane(
-                *pane_id,
-            ));
+            cmd_queue.advance_preparation_prerequisite(TmuxPreparationPrerequisite::Pane(*pane_id));
         }
 
         Ok(())
@@ -610,9 +608,7 @@ impl TmuxDomainState {
         let mut cmd_queue = self.cmd_queue.lock();
         for pane_id in detached_panes {
             cmd_queue.retire_pane_size_suppression_target(pane_id);
-            cmd_queue.advance_preparation_prerequisite(TmuxPreparationPrerequisite::Pane(
-                pane_id,
-            ));
+            cmd_queue.advance_preparation_prerequisite(TmuxPreparationPrerequisite::Pane(pane_id));
         }
 
         Ok(())
@@ -1336,10 +1332,7 @@ impl TmuxDomainState {
         }
     }
 
-    fn ingest_mux_notification(
-        self: &Arc<Self>,
-        envelope: MuxNotificationEnvelope,
-    ) -> bool {
+    fn ingest_mux_notification(self: &Arc<Self>, envelope: MuxNotificationEnvelope) -> bool {
         self.notification_intent_telemetry.record_received();
         let MuxNotificationEnvelope {
             notification,
@@ -1410,10 +1403,8 @@ impl TmuxDomainState {
                 {
                     Ok(observation) => observation,
                     Err(err) => {
-                        metrics::counter!(
-                            "mux.tmux.notification_intent.ordering_failures"
-                        )
-                        .increment(1);
+                        metrics::counter!("mux.tmux.notification_intent.ordering_failures")
+                            .increment(1);
                         log::error!(
                             "tmux domain {} failed to order mux topology revision {}: {err:#}; \
                              detaching",
@@ -1469,9 +1460,7 @@ impl TmuxDomainState {
         .detach();
     }
 
-    fn run_notification_intent_runnable(
-        self: &Arc<Self>,
-    ) -> TmuxNotificationIntentRunDisposition {
+    fn run_notification_intent_runnable(self: &Arc<Self>) -> TmuxNotificationIntentRunDisposition {
         let Some(mux) = Mux::try_get() else {
             self.transition_to_exit_and_schedule_detach();
             return TmuxNotificationIntentRunDisposition::Closed;
@@ -1533,10 +1522,7 @@ impl TmuxDomainState {
         }
     }
 
-    fn drain_notification_intents(
-        &self,
-        mux: &Arc<Mux>,
-    ) -> TmuxNotificationIntentRunDisposition {
+    fn drain_notification_intents(&self, mux: &Arc<Mux>) -> TmuxNotificationIntentRunDisposition {
         let mut consumed = 0usize;
         while consumed < NOTIFICATION_INTENT_DRAIN_QUANTUM {
             let batch = self.notification_intents.lock().take_ordered_batch();
@@ -1554,8 +1540,7 @@ impl TmuxDomainState {
                     continue;
                 }
 
-                let Some(command) =
-                    self.resolve_notification_intent_command(mux, sequenced.intent)
+                let Some(command) = self.resolve_notification_intent_command(mux, sequenced.intent)
                 else {
                     self.notification_intent_telemetry.record_dropped_stale();
                     continue;
@@ -1881,7 +1866,10 @@ pub(crate) struct ListAllPanes {
 }
 
 enum ListAllPanesPreparation {
-    Ready { command: String, local_tab_id: TabId },
+    Ready {
+        command: String,
+        local_tab_id: TabId,
+    },
     Suppressed,
     Discarded,
 }
@@ -2028,9 +2016,9 @@ impl TmuxCommand for ListAllPanes {
                 }
                 let mut cmd_queue = tmux_domain.inner.cmd_queue.lock();
                 for pane_id in pane_set {
-                    cmd_queue.advance_preparation_prerequisite(
-                        TmuxPreparationPrerequisite::Pane(pane_id),
-                    );
+                    cmd_queue.advance_preparation_prerequisite(TmuxPreparationPrerequisite::Pane(
+                        pane_id,
+                    ));
                 }
                 return Ok(());
             }
@@ -2157,13 +2145,18 @@ impl Resize {
             let remote_panes = tmux_domain.inner.remote_panes.lock();
             match remote_panes.get(&self.pane_id).cloned() {
                 Some(remote_pane) => remote_pane,
-                None if tmux_domain.inner.retired_panes.lock().contains(&self.pane_id) => {
+                None if tmux_domain
+                    .inner
+                    .retired_panes
+                    .lock()
+                    .contains(&self.pane_id) =>
+                {
                     return ResizePreparation::Discarded;
                 }
                 None => {
-                    return ResizePreparation::Retryable(
-                        TmuxPreparationPrerequisite::Pane(self.pane_id),
-                    );
+                    return ResizePreparation::Retryable(TmuxPreparationPrerequisite::Pane(
+                        self.pane_id,
+                    ));
                 }
             }
         };
@@ -2181,16 +2174,14 @@ impl Resize {
         let local_tab_id = {
             let gui_tabs = tmux_domain.inner.gui_tabs.lock();
             let Some(local_tab) = gui_tabs.get(&remote_window_id) else {
-                return ResizePreparation::Retryable(
-                    TmuxPreparationPrerequisite::Pane(self.pane_id),
-                );
+                return ResizePreparation::Retryable(TmuxPreparationPrerequisite::Pane(
+                    self.pane_id,
+                ));
             };
             local_tab.tab_id
         };
         let Some(local_tab) = mux.get_tab(local_tab_id) else {
-            return ResizePreparation::Retryable(
-                TmuxPreparationPrerequisite::Pane(self.pane_id),
-            );
+            return ResizePreparation::Retryable(TmuxPreparationPrerequisite::Pane(self.pane_id));
         };
         let window_size = local_tab.get_size();
 
@@ -2376,9 +2367,7 @@ impl TmuxCommand for CapturePane {
             let pane_map = tmux_domain.inner.remote_panes.lock();
             pane_map.get(&self.pane_id).cloned()
         }
-        .with_context(|| {
-            format!("capture result targeted missing tmux pane {}", self.pane_id)
-        })?;
+        .with_context(|| format!("capture result targeted missing tmux pane {}", self.pane_id))?;
         let mut pane = pane.lock();
         if pane.output_state != TmuxPaneOutputState::AwaitingCapture {
             anyhow::bail!(
@@ -2848,10 +2837,7 @@ mod tests {
         );
     }
 
-    fn read_exact_with_timeout(
-        reader: &mut FileDescriptor,
-        expected_len: usize,
-    ) -> Vec<u8> {
+    fn read_exact_with_timeout(reader: &mut FileDescriptor, expected_len: usize) -> Vec<u8> {
         reader
             .set_non_blocking(true)
             .expect("make test tmux output reader nonblocking");
@@ -3143,8 +3129,7 @@ mod tests {
     fn backpressured_pane_does_not_stall_an_independent_ready_pane() {
         let (_guard, tmux_domain) = install_tmux_domain();
         let (slow_read, slow_write) = filedescriptor::socketpair().expect("slow socketpair");
-        let (mut fast_read, fast_write) =
-            filedescriptor::socketpair().expect("fast socketpair");
+        let (mut fast_read, fast_write) = filedescriptor::socketpair().expect("fast socketpair");
         let slow_gate = Arc::new(Mutex::new(TmuxRemotePane {
             local_pane_id: 151,
             output_write: slow_write,
@@ -3220,8 +3205,7 @@ mod tests {
         let mut readers = Vec::with_capacity(PANE_COUNT);
         let mut events = Vec::with_capacity(PANE_COUNT);
         for index in 0..PANE_COUNT {
-            let remote_pane_id =
-                1_000 + u64::try_from(index).expect("test pane index fits u64");
+            let remote_pane_id = 1_000 + u64::try_from(index).expect("test pane index fits u64");
             let local_pane_id = 2_000 + index;
             let (output_read, output_write) =
                 filedescriptor::socketpair().expect("many-pane socketpair");
@@ -3308,7 +3292,9 @@ mod tests {
                 },
             )
             .expect_err("capture/live-output race must fail closed");
-        assert!(err.to_string().contains("capture-time stream authority is ambiguous"));
+        assert!(err
+            .to_string()
+            .contains("capture-time stream authority is ambiguous"));
         {
             let pane = pane_gate.lock();
             assert!(pane.output_ingress.capture_raced());
@@ -3353,15 +3339,11 @@ mod tests {
                 output_ingress: TmuxPaneOutputIngress::default(),
             })),
         );
-        tmux_domain
-            .inner
-            .backlog
-            .lock()
-            .append_owned_with_limits(
-                32,
-                b"AB".to_vec(),
-                crate::tmux::TmuxBacklogLimits::new(1, 8, 8),
-            );
+        tmux_domain.inner.backlog.lock().append_owned_with_limits(
+            32,
+            b"AB".to_vec(),
+            crate::tmux::TmuxBacklogLimits::new(1, 8, 8),
+        );
 
         assert!(tmux_domain.inner.finish_fresh_split(32).is_err());
         assert_eq!(
@@ -3399,11 +3381,7 @@ mod tests {
             output_state: TmuxPaneOutputState::Ready,
             output_ingress: TmuxPaneOutputIngress::default(),
         }));
-        insert_test_remote_pane(
-            &tmux_domain,
-            41,
-            Arc::clone(&remote_gate),
-        );
+        insert_test_remote_pane(&tmux_domain, 41, Arc::clone(&remote_gate));
         remote_gate
             .lock()
             .output_ingress
@@ -3470,12 +3448,12 @@ mod tests {
         *tmux_domain.inner.attach_state.lock() = AttachState::Done;
 
         for _ in 0..10_000 {
-            assert!(tmux_domain.inner.ingest_mux_notification(
-                MuxNotificationEnvelope {
+            assert!(tmux_domain
+                .inner
+                .ingest_mux_notification(MuxNotificationEnvelope {
                     notification: MuxNotification::PaneOutput(77),
                     topology: MuxTopologyStamp::NonTopology,
-                }
-            ));
+                }));
         }
 
         let telemetry = tmux_domain.inner.notification_intent_telemetry.snapshot();
@@ -3483,7 +3461,10 @@ mod tests {
         assert_eq!(telemetry.prefiltered, 10_000);
         assert_eq!(telemetry.scheduled, 0);
         assert_eq!(telemetry.applied, 0);
-        assert_eq!(tmux_domain.inner.notification_intents.lock().pending_len(), 0);
+        assert_eq!(
+            tmux_domain.inner.notification_intents.lock().pending_len(),
+            0
+        );
     }
 
     #[test]

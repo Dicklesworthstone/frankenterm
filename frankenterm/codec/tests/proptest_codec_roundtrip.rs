@@ -1,22 +1,21 @@
 use chrono::TimeZone;
 use codec::{
-    ActivatePaneDirection, AdjustPaneSize, CreateFloatingPane, CycleStack, EraseScrollbackRequest,
-    ErrorResponse, GetClientList, GetClientListResponse, GetCodecVersion, GetCodecVersionResponse,
-    GetImageCell, GetImageCellResponse, GetLines, GetLinesResponse, GetPaneDirection,
-    GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
-    DomainBindingId, GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetTlsCreds,
+    ActivatePaneDirection, AdjustPaneSize, CreateFloatingPane, CycleStack, DomainBindingId,
+    EraseScrollbackRequest, ErrorResponse, GetClientList, GetClientListResponse, GetCodecVersion,
+    GetCodecVersionResponse, GetImageCell, GetImageCellResponse, GetLines, GetLinesResponse,
+    GetPaneDirection, GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
+    GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetTlsCreds,
     GetTlsCredsResponse, InputSerial, KillPane, ListPanes, ListPanesResponse,
     ListPanesTabStackEntry, ListPanesTabStacks, ListPanesTabStacksResponse, LivenessResponse,
     MoveFloatingPane, MovePaneToNewTabResponse, NotifyAlert, PaneFocused, PaneRemoved, Pdu, Ping,
-    Pong, RemoteTabId, RemoteWindowId, RemoveFloatingPane, RenameWorkspace,
-    ReorderWindowTabsV1, Resize, SearchScrollbackRequest,
-    SearchScrollbackResponse, SelectStackPane, SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste,
-    SerializedLines, SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ,
-    SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed, SetWindowWorkspace, SpawnResponse,
-    SpawnV2, SplitPane, SwapToLayout, TabAddedToWindow, TabResized, TabTitleChanged,
-    ToggleFloatingPane, TopologyStreamId, UnitResponse, UpdatePaneConstraints,
-    WindowOrderMutationId, WindowOrderRevision, WindowReorderDigest, WindowTitleChanged,
-    WindowWorkspaceChanged, WriteToPane, ORDERED_WINDOW_PROTOCOL_VERSION,
+    Pong, RemoteTabId, RemoteWindowId, RemoveFloatingPane, RenameWorkspace, ReorderWindowTabsV1,
+    Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane, SendKeyDown,
+    SendKeyUp, SendMouseEvent, SendPaste, SerializedLines, SetActiveWorkspace, SetClientId,
+    SetClipboard, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed,
+    SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout, TabAddedToWindow,
+    TabResized, TabTitleChanged, ToggleFloatingPane, TopologyStreamId, UnitResponse,
+    UpdatePaneConstraints, WindowOrderMutationId, WindowOrderRevision, WindowReorderDigest,
+    WindowTitleChanged, WindowWorkspaceChanged, WriteToPane, ORDERED_WINDOW_PROTOCOL_VERSION,
 };
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode, SpawnTabDomain};
 use frankenterm_term::color::ColorPalette;
@@ -994,19 +993,12 @@ fn arb_reorder_window_tabs_v1() -> impl Strategy<Value = ReorderWindowTabsV1> {
                     protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
                     domain_binding_id: DomainBindingId::from_bytes(domain_binding_id),
                     stream_id: TopologyStreamId::from_bytes(stream_id),
-                    session_incarnation: MuxSessionIncarnation::from_bytes(
-                        session_incarnation,
-                    ),
+                    session_incarnation: MuxSessionIncarnation::from_bytes(session_incarnation),
                     window_id: RemoteWindowId::new(window_id),
-                    expected_order_revision: WindowOrderRevision::new(
-                        expected_order_revision,
-                    ),
+                    expected_order_revision: WindowOrderRevision::new(expected_order_revision),
                     desired_tab_ids,
                     desired_active_tab_id,
-                    mutation_id: WindowOrderMutationId::new(
-                        mutation_namespace,
-                        mutation_sequence,
-                    ),
+                    mutation_id: WindowOrderMutationId::new(mutation_namespace, mutation_sequence),
                     digest: WindowReorderDigest::ZERO,
                 }
                 .with_computed_digest()

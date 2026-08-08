@@ -27,8 +27,7 @@ const PANE_IO_BATCH_COUNT: usize = 256;
 
 fn bench_timestamp(monotonic_ns: u64) -> EventTimestamp {
     EventTimestamp::from_parts(
-        EventClockDomain::new(Uuid::from_u128(1), 1)
-            .expect("benchmark clock domain is non-nil"),
+        EventClockDomain::new(Uuid::from_u128(1), 1).expect("benchmark clock domain is non-nil"),
         monotonic_ns,
         None,
     )

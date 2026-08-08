@@ -335,7 +335,8 @@ where
         assert_eq!(streamed.serial, serial, "{label}: streamed serial drifted");
         assert_eq!(streamed.pdu, make_pdu(), "{label}: streamed PDU drifted");
         assert_eq!(
-            streaming.as_slice(), b"NEXT",
+            streaming.as_slice(),
+            b"NEXT",
             "{label}: stream_decode must leave trailing bytes for the next frame"
         );
     }
@@ -549,7 +550,8 @@ fn conformance_trailing_garbage_leaves_remainder_in_buffer() {
         }
     );
     assert_eq!(
-        stream.as_slice(), b"GARBAGE",
+        stream.as_slice(),
+        b"GARBAGE",
         "stream_decode must consume exactly {consumed_len} bytes and leave the rest"
     );
 }
@@ -565,7 +567,9 @@ fn conformance_two_back_to_back_pdus_decode_cleanly() {
     Pdu::Ping(Ping {}).encode(&mut wire, 22).unwrap();
     let mut stream = StreamingPduBuffer::from(wire);
 
-    let first = Pdu::stream_decode(&mut stream).unwrap().expect("first frame");
+    let first = Pdu::stream_decode(&mut stream)
+        .unwrap()
+        .expect("first frame");
     assert_eq!(first.serial, 11);
     let second = Pdu::stream_decode(&mut stream)
         .unwrap()
@@ -796,7 +800,8 @@ fn conformance_stream_decode_preserves_malformed_complete_frame() {
         msg = msg,
     );
     assert_eq!(
-        stream.as_slice(), original.as_slice(),
+        stream.as_slice(),
+        original.as_slice(),
         "stream_decode must preserve bytes when a complete frame is malformed"
     );
 }
@@ -850,7 +855,8 @@ fn conformance_stream_decode_is_whole_frame_or_nothing() {
                 total_len
             );
             assert_eq!(
-                growing.as_slice(), before.as_slice(),
+                growing.as_slice(),
+                before.as_slice(),
                 "stream_decode must not mutate the buffer on a partial read"
             );
         }

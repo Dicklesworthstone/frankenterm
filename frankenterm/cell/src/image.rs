@@ -77,7 +77,11 @@ where
         type Value = Vec<T>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(formatter, "at most {MAX_IMAGE_WIRE_FRAMES} image {}", self.label)
+            write!(
+                formatter,
+                "at most {MAX_IMAGE_WIRE_FRAMES} image {}",
+                self.label
+            )
         }
 
         fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
@@ -200,10 +204,7 @@ mod image_wire_bytes {
         where
             S: Serializer,
         {
-            serializer.serialize_newtype_struct(
-                IMAGE_WIRE_BYTES_V1_NEWTYPE,
-                &ByteSlice(self.0),
-            )
+            serializer.serialize_newtype_struct(IMAGE_WIRE_BYTES_V1_NEWTYPE, &ByteSlice(self.0))
         }
     }
 
@@ -404,14 +405,14 @@ mod image_wire_frames {
                 max_frames
             )));
         }
-        let total_bytes = frames.iter().try_fold(
-            0usize,
-            |total, frame| -> Result<usize, S::Error> {
-                total.checked_add(frame.len()).ok_or_else(|| {
-                    serde::ser::Error::custom("image frame byte accounting overflowed")
-                })
-            },
-        )?;
+        let total_bytes =
+            frames
+                .iter()
+                .try_fold(0usize, |total, frame| -> Result<usize, S::Error> {
+                    total.checked_add(frame.len()).ok_or_else(|| {
+                        serde::ser::Error::custom("image frame byte accounting overflowed")
+                    })
+                })?;
         if total_bytes > max_bytes {
             return Err(serde::ser::Error::custom(format_args!(
                 "image frames retain {total_bytes} bytes, exceeding the {max_bytes}-byte limit"
@@ -476,11 +477,12 @@ mod image_wire_frames {
                     })?;
                 let mut total_bytes = 0usize;
                 while frames.len() < self.max_frames {
-                    let remaining_bytes = self.max_bytes.checked_sub(total_bytes).ok_or_else(|| {
-                        serde::de::Error::custom("image frame byte accounting overflowed")
-                    })?;
-                    let Some(frame) = sequence
-                        .next_element_seed(image_wire_bytes::Seed::new(remaining_bytes))?
+                    let remaining_bytes =
+                        self.max_bytes.checked_sub(total_bytes).ok_or_else(|| {
+                            serde::de::Error::custom("image frame byte accounting overflowed")
+                        })?;
+                    let Some(frame) =
+                        sequence.next_element_seed(image_wire_bytes::Seed::new(remaining_bytes))?
                     else {
                         return Ok(frames);
                     };
@@ -583,9 +585,7 @@ mod image_wire_frames {
             )
             .unwrap_err();
             assert!(
-                encode_error
-                    .to_string()
-                    .contains("4096-item limit"),
+                encode_error.to_string().contains("4096-item limit"),
                 "{}",
                 encode_error
             );
@@ -599,9 +599,7 @@ mod image_wire_frames {
             )
             .unwrap_err();
             assert!(
-                decode_error
-                    .to_string()
-                    .contains("4096-item limit"),
+                decode_error.to_string().contains("4096-item limit"),
                 "{}",
                 decode_error
             );
@@ -638,7 +636,9 @@ mod image_wire_lease_bytes {
             .map_err(|_| S::Error::custom("lease-backed image length does not fit usize"))?;
         let mut data = Vec::new();
         data.try_reserve_exact(declared_len).map_err(|error| {
-            S::Error::custom(format_args!("reserving lease-backed image bytes failed: {error}"))
+            S::Error::custom(format_args!(
+                "reserving lease-backed image bytes failed: {error}"
+            ))
         })?;
         reader
             .take(u64::try_from(MAX_IMAGE_WIRE_BYTES).unwrap_or(u64::MAX) + 1)
@@ -823,20 +823,13 @@ impl ImageCell {
 pub enum ImageDataType {
     /// Data is in the native image file format
     /// (best for file formats that have animated content)
-    EncodedFile(
-        #[cfg_attr(feature = "use_serde", serde(with = "image_wire_bytes"))]
-        Vec<u8>,
-    ),
+    EncodedFile(#[cfg_attr(feature = "use_serde", serde(with = "image_wire_bytes"))] Vec<u8>),
     /// Data is in the native image file format,
     /// (best for file formats that have animated content)
     /// and is stored as a blob via the blob manager.
     #[cfg(feature = "std")]
     EncodedLease(
-        #[cfg_attr(
-            feature = "use_serde",
-            serde(with = "image_wire_lease_bytes")
-        )]
-        BlobLease,
+        #[cfg_attr(feature = "use_serde", serde(with = "image_wire_lease_bytes"))] BlobLease,
     ),
     /// Data is RGBA u8 data
     Rgba8 {
@@ -1214,10 +1207,7 @@ impl ImageDataType {
         }
     }
 
-    fn expected_rgba8_len(
-        width: u32,
-        height: u32,
-    ) -> Result<usize, ImageDataValidationError> {
+    fn expected_rgba8_len(width: u32, height: u32) -> Result<usize, ImageDataValidationError> {
         if width == 0 || height == 0 {
             return Err(ImageDataValidationError::ZeroDimensions { width, height });
         }
@@ -1362,15 +1352,13 @@ impl ImageDataType {
                     frames.iter().zip(durations.iter()).enumerate()
                 {
                     if frame.len() != expected {
-                        return Err(
-                            ImageDataValidationError::AnimationFrameByteLengthMismatch {
-                                frame_index,
-                                width: *width,
-                                height: *height,
-                                expected,
-                                actual: frame.len(),
-                            },
-                        );
+                        return Err(ImageDataValidationError::AnimationFrameByteLengthMismatch {
+                            frame_index,
+                            width: *width,
+                            height: *height,
+                            expected,
+                            actual: frame.len(),
+                        });
                     }
                     // The renderer schedules with `Instant + duration`, which
                     // panics when the duration is outside the platform range.
@@ -1378,11 +1366,9 @@ impl ImageDataType {
                     // root frame by the Kitty protocol and rendering clamps
                     // frame cadence to its configured minimum.
                     if *duration > max_frame_duration || now.checked_add(*duration).is_none() {
-                        return Err(
-                            ImageDataValidationError::AnimationFrameDurationOutOfRange {
-                                frame_index,
-                            },
-                        );
+                        return Err(ImageDataValidationError::AnimationFrameDurationOutOfRange {
+                            frame_index,
+                        });
                     }
                     decoded_bytes = decoded_bytes
                         .checked_add(frame.len())
@@ -1418,9 +1404,8 @@ impl ImageDataType {
         // trigger pathological atlas sizing and repeated scale attempts.
         decoder_limits.max_image_width = Some(limits.max_width);
         decoder_limits.max_image_height = Some(limits.max_height);
-        decoder_limits.max_alloc = Some(
-            u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX),
-        );
+        decoder_limits.max_alloc =
+            Some(u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX));
         decoder_limits
     }
 
@@ -1439,10 +1424,9 @@ impl ImageDataType {
     ) -> ImageDataValidationError {
         match source_kind {
             EncodedImageSource::InMemory => Self::bounded_decode_error(source),
-            EncodedImageSource::BlobLease => ImageDataValidationError::EncodedResourceIo {
-                operation,
-                source,
-            },
+            EncodedImageSource::BlobLease => {
+                ImageDataValidationError::EncodedResourceIo { operation, source }
+            }
         }
     }
 
@@ -1492,9 +1476,7 @@ impl ImageDataType {
     }
 
     #[cfg(all(feature = "use_image", feature = "std"))]
-    fn encoded_lease_error(
-        source: frankenterm_blob_leases::Error,
-    ) -> ImageDataValidationError {
+    fn encoded_lease_error(source: frankenterm_blob_leases::Error) -> ImageDataValidationError {
         ImageDataValidationError::EncodedLeaseUnavailable { source }
     }
 
@@ -1647,13 +1629,12 @@ impl ImageDataType {
             let Some(frame) = frames.next() else {
                 break;
             };
-            let next_frame_count = decoded_frames
-                .len()
-                .checked_add(1)
-                .ok_or(ImageDataValidationError::FrameCountLimitExceeded {
+            let next_frame_count = decoded_frames.len().checked_add(1).ok_or(
+                ImageDataValidationError::FrameCountLimitExceeded {
                     requested: usize::MAX,
                     limit: limits.max_frame_count,
-                })?;
+                },
+            )?;
             if next_frame_count > limits.max_frame_count {
                 return Err(ImageDataValidationError::FrameCountLimitExceeded {
                     requested: next_frame_count,
@@ -1685,9 +1666,9 @@ impl ImageDataType {
                     actual: data.len(),
                 });
             }
-            decoded_bytes = decoded_bytes.checked_add(data.len()).ok_or(
-                ImageDataValidationError::DecodedByteLengthOverflow,
-            )?;
+            decoded_bytes = decoded_bytes
+                .checked_add(data.len())
+                .ok_or(ImageDataValidationError::DecodedByteLengthOverflow)?;
             if decoded_bytes > limits.max_decoded_bytes {
                 return Err(ImageDataValidationError::DecodedByteLimitExceeded {
                     requested: decoded_bytes,
@@ -1726,11 +1707,7 @@ impl ImageDataType {
         let mut reader = image::ImageReader::new(reader)
             .with_guessed_format()
             .map_err(|source| {
-                Self::encoded_source_io_error(
-                    source_kind,
-                    "detecting encoded image format",
-                    source,
-                )
+                Self::encoded_source_io_error(source_kind, "detecting encoded image format", source)
             })?;
         let format = reader.format().ok_or_else(|| {
             Self::bounded_decode_error("encoded image format could not be identified")
@@ -1770,11 +1747,7 @@ impl ImageDataType {
                     decoder_limits,
                 )
                 .map_err(|source| {
-                    Self::classified_image_decode_error(
-                        source_kind,
-                        "opening PNG decoder",
-                        source,
-                    )
+                    Self::classified_image_decode_error(source_kind, "opening PNG decoder", source)
                 })?;
                 let (width, height) = decoder.dimensions();
                 if decoder.is_apng().map_err(|source| {
@@ -1800,12 +1773,7 @@ impl ImageDataType {
                         is_cancelled,
                     )
                 } else {
-                    Self::decoded_static_from_decoder(
-                        decoder,
-                        source_kind,
-                        limits,
-                        is_cancelled,
-                    )
+                    Self::decoded_static_from_decoder(decoder, source_kind, limits, is_cancelled)
                 }
             }
             ImageFormat::WebP => {
@@ -1843,12 +1811,7 @@ impl ImageDataType {
                         source,
                     )
                 })?;
-                Self::decoded_static_from_decoder(
-                    decoder,
-                    source_kind,
-                    limits,
-                    is_cancelled,
-                )
+                Self::decoded_static_from_decoder(decoder, source_kind, limits, is_cancelled)
             }
         }
     }
@@ -1865,14 +1828,10 @@ impl ImageDataType {
         let adjusted = Duration::try_from_secs_f64(
             duration.as_secs_f64() / f64::from(speed_factor),
         )
-        .map_err(|_| ImageDataValidationError::AdjustedFrameDurationOutOfRange {
-            frame_index,
-        })?;
+        .map_err(|_| ImageDataValidationError::AdjustedFrameDurationOutOfRange { frame_index })?;
         let max_frame_duration = Duration::from_millis(u64::from(u32::MAX));
         if adjusted > max_frame_duration || now.checked_add(adjusted).is_none() {
-            return Err(ImageDataValidationError::AdjustedFrameDurationOutOfRange {
-                frame_index,
-            });
+            return Err(ImageDataValidationError::AdjustedFrameDurationOutOfRange { frame_index });
         }
         Ok(adjusted)
     }
@@ -1884,10 +1843,7 @@ impl ImageDataType {
         Ok(())
     }
 
-    fn validate_speed_adjustment(
-        &self,
-        speed_factor: f32,
-    ) -> Result<(), ImageDataValidationError> {
+    fn validate_speed_adjustment(&self, speed_factor: f32) -> Result<(), ImageDataValidationError> {
         Self::validate_speed_factor(speed_factor)?;
         if let Self::AnimRgba8 { durations, .. } = self {
             let now = std::time::Instant::now();
@@ -1898,17 +1854,16 @@ impl ImageDataType {
         Ok(())
     }
 
-    pub fn adjust_speed(
-        &mut self,
-        speed_factor: f32,
-    ) -> Result<(), ImageDataValidationError> {
+    pub fn adjust_speed(&mut self, speed_factor: f32) -> Result<(), ImageDataValidationError> {
         Self::validate_speed_factor(speed_factor)?;
         match self {
             Self::AnimRgba8 { durations, .. } => {
                 let mut adjusted = Vec::new();
-                adjusted.try_reserve_exact(durations.len()).map_err(|source| {
-                    ImageDataValidationError::AnimationTimingAllocationFailed { source }
-                })?;
+                adjusted
+                    .try_reserve_exact(durations.len())
+                    .map_err(|source| {
+                        ImageDataValidationError::AnimationTimingAllocationFailed { source }
+                    })?;
                 let now = std::time::Instant::now();
                 for (frame_index, duration) in durations.iter().copied().enumerate() {
                     adjusted.push(Self::adjusted_frame_duration(
@@ -2011,7 +1966,6 @@ impl ImageDataType {
     pub fn decode(self) -> Self {
         self
     }
-
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -2231,13 +2185,10 @@ impl Drop for ImageDataFrameMutGuard<'_> {
             poisoned.into_inner()
         });
         *cached = Some(revision);
-        let mut authority = self
-            .validation_authority
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                self.validation_authority.clear_poison();
-                poisoned.into_inner()
-            });
+        let mut authority = self.validation_authority.lock().unwrap_or_else(|poisoned| {
+            self.validation_authority.clear_poison();
+            poisoned.into_inner()
+        });
         *authority = Some(ImageDataValidationAuthority {
             revision,
             summary: self.summary,
@@ -2273,13 +2224,10 @@ impl PreparedImageDataFrameAppend<'_> {
             *cached = None;
         }
         {
-            let mut authority = self
-                .validation_authority
-                .lock()
-                .unwrap_or_else(|poisoned| {
-                    self.validation_authority.clear_poison();
-                    poisoned.into_inner()
-                });
+            let mut authority = self.validation_authority.lock().unwrap_or_else(|poisoned| {
+                self.validation_authority.clear_poison();
+                poisoned.into_inner()
+            });
             *authority = None;
         }
 
@@ -2337,13 +2285,10 @@ impl PreparedImageDataFrameAppend<'_> {
             poisoned.into_inner()
         });
         *cached = Some(revision);
-        let mut authority = self
-            .validation_authority
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                self.validation_authority.clear_poison();
-                poisoned.into_inner()
-            });
+        let mut authority = self.validation_authority.lock().unwrap_or_else(|poisoned| {
+            self.validation_authority.clear_poison();
+            poisoned.into_inner()
+        });
         *authority = Some(ImageDataValidationAuthority {
             revision,
             summary: self.summary,
@@ -2377,13 +2322,10 @@ impl Drop for ImageDataMutGuard<'_> {
         });
         *cached = Some(revision);
         if let Some(summary) = self.validated_summary {
-            let mut authority = self
-                .validation_authority
-                .lock()
-                .unwrap_or_else(|poisoned| {
-                    self.validation_authority.clear_poison();
-                    poisoned.into_inner()
-                });
+            let mut authority = self.validation_authority.lock().unwrap_or_else(|poisoned| {
+                self.validation_authority.clear_poison();
+                poisoned.into_inner()
+            });
             *authority = Some(ImageDataValidationAuthority { revision, summary });
         }
     }
@@ -2457,7 +2399,9 @@ impl ImageData {
             ) {
                 Ok(decoded) => decoded,
                 Err(error) => {
-                    log::warn!("retaining undecoded raw image after bounded decode failed: {error}");
+                    log::warn!(
+                        "retaining undecoded raw image after bounded decode failed: {error}"
+                    );
                     ImageDataType::EncodedFile(data)
                 }
             }
@@ -2509,24 +2453,18 @@ impl ImageData {
         revision: [u8; 32],
         summary: ImageDataValidationSummary,
     ) {
-        let mut authority = self
-            .validation_authority
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                self.validation_authority.clear_poison();
-                poisoned.into_inner()
-            });
+        let mut authority = self.validation_authority.lock().unwrap_or_else(|poisoned| {
+            self.validation_authority.clear_poison();
+            poisoned.into_inner()
+        });
         *authority = Some(ImageDataValidationAuthority { revision, summary });
     }
 
     fn clear_validation_authority(&self) {
-        let mut authority = self
-            .validation_authority
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                self.validation_authority.clear_poison();
-                poisoned.into_inner()
-            });
+        let mut authority = self.validation_authority.lock().unwrap_or_else(|poisoned| {
+            self.validation_authority.clear_poison();
+            poisoned.into_inner()
+        });
         *authority = None;
     }
 
@@ -2556,13 +2494,10 @@ impl ImageData {
     ) -> Result<([u8; 32], ImageDataValidationSummary), ImageDataValidationError> {
         let revision = self.revision_for_locked_data(data);
         {
-            let authority = self
-                .validation_authority
-                .lock()
-                .unwrap_or_else(|poisoned| {
-                    self.validation_authority.clear_poison();
-                    poisoned.into_inner()
-                });
+            let authority = self.validation_authority.lock().unwrap_or_else(|poisoned| {
+                self.validation_authority.clear_poison();
+                poisoned.into_inner()
+            });
             if let Some(authority) = *authority
                 && authority.revision == revision
             {
@@ -2736,11 +2671,10 @@ impl ImageData {
                 // pixels. Structural validation below independently hashes
                 // every decoded buffer, so an untrusted peer cannot make that
                 // fast path authoritative by forging the inner hashes.
-                let summary = decoded
-                    .validate_decoded_structure_with_limits_and_cancellation(
-                        limits,
-                        is_cancelled,
-                    )?;
+                let summary = decoded.validate_decoded_structure_with_limits_and_cancellation(
+                    limits,
+                    is_cancelled,
+                )?;
                 // `data` remains locked here, so no mutable writer can change
                 // the payload between full validation and publication of the
                 // local revision-bound authority.
@@ -2756,10 +2690,8 @@ impl ImageData {
             }
         };
 
-        let summary = normalized.validate_decoded_structure_with_limits_and_cancellation(
-            limits,
-            is_cancelled,
-        )?;
+        let summary = normalized
+            .validate_decoded_structure_with_limits_and_cancellation(limits, is_cancelled)?;
         let replacement =
             Self::with_validated_source_revision(normalized, expected_revision, summary);
         debug_assert_eq!(replacement.hash(), expected_revision);
@@ -2849,13 +2781,10 @@ impl ImageData {
         if self.revision_for_locked_data(&data) != expected_revision {
             return None;
         }
-        let authority = self
-            .validation_authority
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                self.validation_authority.clear_poison();
-                poisoned.into_inner()
-            });
+        let authority = self.validation_authority.lock().unwrap_or_else(|poisoned| {
+            self.validation_authority.clear_poison();
+            poisoned.into_inner()
+        });
         let authority = authority.as_ref()?;
         if authority.revision != expected_revision
             || authority.summary.decoded_bytes > limits.max_decoded_bytes
@@ -2917,13 +2846,11 @@ impl ImageData {
                 height,
             } => {
                 if frames.len() != durations.len() || frames.len() != hashes.len() {
-                    return Err(
-                        ImageDataFrameMutationError::AnimationCardinalityMismatch {
-                            frames: frames.len(),
-                            durations: durations.len(),
-                            hashes: hashes.len(),
-                        },
-                    );
+                    return Err(ImageDataFrameMutationError::AnimationCardinalityMismatch {
+                        frames: frames.len(),
+                        durations: durations.len(),
+                        hashes: hashes.len(),
+                    });
                 }
                 let Some(frame) = frames.get(frame_index) else {
                     return Err(ImageDataFrameMutationError::FrameIndexOutOfRange {
@@ -3001,13 +2928,11 @@ impl ImageData {
                 } => (*width, *height, frames.len(), durations.len(), hashes.len()),
             };
             if frame_count != durations || frame_count != hashes {
-                return Err(
-                    ImageDataFrameMutationError::AnimationCardinalityMismatch {
-                        frames: frame_count,
-                        durations,
-                        hashes,
-                    },
-                );
+                return Err(ImageDataFrameMutationError::AnimationCardinalityMismatch {
+                    frames: frame_count,
+                    durations,
+                    hashes,
+                });
             }
             if frame_count >= max_frame_count {
                 return Err(ImageDataFrameMutationError::FrameCountLimitExceeded {
@@ -3035,7 +2960,8 @@ impl ImageData {
             validate_target(&data)?
         };
         let max_frame_duration = Duration::from_millis(u64::from(u32::MAX));
-        if duration > max_frame_duration || std::time::Instant::now().checked_add(duration).is_none()
+        if duration > max_frame_duration
+            || std::time::Instant::now().checked_add(duration).is_none()
         {
             return Err(ImageDataFrameMutationError::ValidationFailed {
                 source: ImageDataValidationError::AnimationFrameDurationOutOfRange {
@@ -3196,9 +3122,7 @@ impl ImageData {
     /// Acquire a guard for a proven structure-preserving metadata mutation.
     /// Pixel hashes may be retained only after full validation of this exact
     /// revision; the guard republishes that authority on every exit path.
-    fn validated_metadata_mut(
-        &self,
-    ) -> Result<ImageDataMutGuard<'_>, ImageDataValidationError> {
+    fn validated_metadata_mut(&self) -> Result<ImageDataMutGuard<'_>, ImageDataValidationError> {
         let data = self.data.lock().unwrap_or_else(|poisoned| {
             #[cfg(feature = "use_image")]
             log::warn!(
@@ -3740,15 +3664,13 @@ mod tests {
         };
         assert!(matches!(
             image.validate_decoded_structure(),
-            Err(
-                ImageDataValidationError::AnimationFrameByteLengthMismatch {
-                    frame_index: 0,
-                    width: 1,
-                    height: 1,
-                    expected: 4,
-                    actual: 3
-                }
-            )
+            Err(ImageDataValidationError::AnimationFrameByteLengthMismatch {
+                frame_index: 0,
+                width: 1,
+                height: 1,
+                expected: 4,
+                actual: 3
+            })
         ));
     }
 
@@ -3779,9 +3701,7 @@ mod tests {
         };
         assert!(matches!(
             image.validate_decoded_structure(),
-            Err(ImageDataValidationError::AnimationFrameDurationOutOfRange {
-                frame_index: 0
-            })
+            Err(ImageDataValidationError::AnimationFrameDurationOutOfRange { frame_index: 0 })
         ));
     }
 
@@ -3817,10 +3737,7 @@ mod tests {
             )),
         );
         match resource_io {
-            ImageDataValidationError::EncodedResourceIo {
-                operation,
-                source,
-            } => {
+            ImageDataValidationError::EncodedResourceIo { operation, source } => {
                 assert_eq!(operation, "test lease read");
                 assert_eq!(source.kind(), std::io::ErrorKind::WouldBlock);
             }
@@ -3839,10 +3756,7 @@ mod tests {
             )),
         );
         match wrapped_resource_io {
-            ImageDataValidationError::EncodedResourceIo {
-                operation,
-                source,
-            } => {
+            ImageDataValidationError::EncodedResourceIo { operation, source } => {
                 assert_eq!(operation, "test wrapped lease read");
                 assert_eq!(source.kind(), std::io::ErrorKind::Interrupted);
             }
@@ -3890,9 +3804,8 @@ mod tests {
             ImageDataValidationError::EncodedResourceLimit { .. }
         ));
 
-        let lease_unavailable = ImageDataType::encoded_lease_error(
-            frankenterm_blob_leases::Error::StorageNotInit,
-        );
+        let lease_unavailable =
+            ImageDataType::encoded_lease_error(frankenterm_blob_leases::Error::StorageNotInit);
         assert!(matches!(
             lease_unavailable,
             ImageDataValidationError::EncodedLeaseUnavailable { .. }
@@ -4027,11 +3940,7 @@ mod tests {
 
     #[test]
     fn mutable_image_guard_republishes_cached_content_revision() {
-        let image = ImageData::with_data(ImageDataType::new_single_frame(
-            1,
-            1,
-            vec![1, 2, 3, 4],
-        ));
+        let image = ImageData::with_data(ImageDataType::new_single_frame(1, 1, vec![1, 2, 3, 4]));
         let stable_identity = image.hash();
         let before = image.current_content_hash();
         {
@@ -4053,11 +3962,7 @@ mod tests {
 
     #[test]
     fn revision_validated_read_guard_rejects_stale_key_and_accepts_current_payload() {
-        let image = ImageData::with_data(ImageDataType::new_single_frame(
-            1,
-            1,
-            vec![1, 2, 3, 4],
-        ));
+        let image = ImageData::with_data(ImageDataType::new_single_frame(1, 1, vec![1, 2, 3, 4]));
         let stale_revision = image.current_content_hash();
 
         {
@@ -4083,11 +3988,7 @@ mod tests {
 
     #[test]
     fn cached_revision_probe_fails_closed_during_mutation_and_rebinds_after_drop() {
-        let image = ImageData::with_data(ImageDataType::new_single_frame(
-            1,
-            1,
-            vec![1, 2, 3, 4],
-        ));
+        let image = ImageData::with_data(ImageDataType::new_single_frame(1, 1, vec![1, 2, 3, 4]));
         let old_revision = image.current_content_hash();
         assert!(image.cached_content_revision_is(old_revision));
 
@@ -4243,11 +4144,7 @@ mod tests {
             .summary;
 
         let abandoned = image
-            .prepare_decoded_frame_append(
-                vec![5, 6, 7, 8],
-                Duration::from_millis(20),
-                4,
-            )
+            .prepare_decoded_frame_append(vec![5, 6, 7, 8], Duration::from_millis(20), 4)
             .expect("valid append prepares");
         assert_eq!(abandoned.additional_decoded_bytes(), 4);
         drop(abandoned);
@@ -4263,11 +4160,7 @@ mod tests {
         assert!(matches!(&*image.data(), ImageDataType::Rgba8 { .. }));
 
         image
-            .prepare_decoded_frame_append(
-                vec![9, 10, 11, 12],
-                Duration::from_millis(30),
-                4,
-            )
+            .prepare_decoded_frame_append(vec![9, 10, 11, 12], Duration::from_millis(30), 4)
             .expect("second valid append prepares")
             .commit();
         let committed_revision = image.current_content_hash();
@@ -4312,11 +4205,8 @@ mod tests {
         let revision = image.current_content_hash();
         let invalid_duration = Duration::from_millis(u64::from(u32::MAX) + 1);
 
-        let error = match image.prepare_decoded_frame_append(
-            vec![5, 6, 7, 8],
-            invalid_duration,
-            4,
-        ) {
+        let error = match image.prepare_decoded_frame_append(vec![5, 6, 7, 8], invalid_duration, 4)
+        {
             Ok(_) => panic!("an out-of-range frame duration must be rejected"),
             Err(error) => error,
         };
@@ -4459,11 +4349,7 @@ mod tests {
 
     #[test]
     fn speed_noop_and_rejection_preserve_revision_and_validation_authority() {
-        let image = ImageData::with_data(ImageDataType::new_single_frame(
-            1,
-            1,
-            vec![1, 2, 3, 4],
-        ));
+        let image = ImageData::with_data(ImageDataType::new_single_frame(1, 1, vec![1, 2, 3, 4]));
         let revision = image.current_content_hash();
         let summary = image
             .normalize_for_content_revision_with_limits(
@@ -4838,11 +4724,7 @@ mod tests {
     #[cfg(all(feature = "use_serde", feature = "use_image"))]
     #[test]
     fn image_data_validation_authority_never_crosses_serde_boundary() {
-        let image = ImageData::with_data(ImageDataType::new_single_frame(
-            1,
-            1,
-            vec![1, 2, 3, 4],
-        ));
+        let image = ImageData::with_data(ImageDataType::new_single_frame(1, 1, vec![1, 2, 3, 4]));
         let revision = image.current_content_hash();
         let limits = ImageDataValidationLimits {
             max_decoded_bytes: 4,

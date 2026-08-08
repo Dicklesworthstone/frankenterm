@@ -130,9 +130,7 @@ pub const DEFAULT_WORKSPACE: &str = "default";
 /// scope. A newly constructed mux always receives a fresh incarnation so a
 /// reconnect can distinguish a surviving session from a restarted server even
 /// when process-local numeric identifiers happen to repeat.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct MuxSessionIncarnation([u8; 16]);
 
 impl MuxSessionIncarnation {
@@ -269,8 +267,7 @@ pub const MAX_WINDOW_ORDER_RECEIPT_TAB_IDS: usize = 65_536;
 /// cannot silently drift to different digest grammars.
 pub const WINDOW_REORDER_PROTOCOL_VERSION_V1: u16 = 1;
 /// Domain separator for the mux-authoritative v1 reorder digest.
-pub const WINDOW_REORDER_DIGEST_DOMAIN_V1: &[u8] =
-    b"frankenterm.window-reorder.v1\0";
+pub const WINDOW_REORDER_DIGEST_DOMAIN_V1: &[u8] = b"frankenterm.window-reorder.v1\0";
 
 /// Idempotency identity unique within one client-owned random namespace.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -386,20 +383,39 @@ pub struct ReorderWindowTabsRequest {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowReorderMalformed {
-    UnsupportedProtocolVersion { actual: u16 },
+    UnsupportedProtocolVersion {
+        actual: u16,
+    },
     InvalidDomainBindingIdentity,
     InvalidSessionIncarnation,
     InvalidMutationIdentity,
-    WireIdDoesNotFitU64 { field: &'static str, value: usize },
-    ReservedWireId { field: &'static str, value: u64 },
+    WireIdDoesNotFitU64 {
+        field: &'static str,
+        value: usize,
+    },
+    ReservedWireId {
+        field: &'static str,
+        value: u64,
+    },
     ExpectedRevisionExhausted,
-    TooManyTabs { count: usize, max: usize },
-    DuplicateTabId { tab_id: TabId },
+    TooManyTabs {
+        count: usize,
+        max: usize,
+    },
+    DuplicateTabId {
+        tab_id: TabId,
+    },
     ActiveTabRequired,
-    ActiveTabNotInDesiredOrder { tab_id: TabId },
+    ActiveTabNotInDesiredOrder {
+        tab_id: TabId,
+    },
     InvalidCurrentState,
-    MissingTabId { tab_id: TabId },
-    ForeignTabId { tab_id: TabId },
+    MissingTabId {
+        tab_id: TabId,
+    },
+    ForeignTabId {
+        tab_id: TabId,
+    },
     ActiveTabChanged {
         current_active_tab_id: Option<TabId>,
         desired_active_tab_id: Option<TabId>,
@@ -410,10 +426,7 @@ pub enum WindowReorderMalformed {
     },
 }
 
-fn reorder_wire_id(
-    field: &'static str,
-    value: usize,
-) -> Result<u64, WindowReorderMalformed> {
+fn reorder_wire_id(field: &'static str, value: usize) -> Result<u64, WindowReorderMalformed> {
     let wire_value = u64::try_from(value)
         .map_err(|_| WindowReorderMalformed::WireIdDoesNotFitU64 { field, value })?;
     if wire_value == u64::MAX {
@@ -505,9 +518,7 @@ impl WindowOrderState {
         Self {
             window_id: window.window_id(),
             order_revision: window.order_revision(),
-            ordered_tab_ids: Arc::from(
-                window.iter().map(|tab| tab.tab_id()).collect::<Vec<_>>(),
-            ),
+            ordered_tab_ids: Arc::from(window.iter().map(|tab| tab.tab_id()).collect::<Vec<_>>()),
             active_tab_id: window.get_active().map(|tab| tab.tab_id()),
         }
     }
@@ -871,10 +882,7 @@ pub(crate) fn try_reserve_usize_ids(
 /// invariant failure: panicking before publication is strictly safer than
 /// returning `usize::MAX` repeatedly and aliasing live mux objects.
 #[track_caller]
-pub(crate) fn next_unique_usize_id(
-    counter: &AtomicUsize,
-    namespace: &'static str,
-) -> usize {
+pub(crate) fn next_unique_usize_id(counter: &AtomicUsize, namespace: &'static str) -> usize {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
         let Some(next) = current.checked_add(1) else {
@@ -896,12 +904,7 @@ fn try_increment_atomic_count(counter: &AtomicUsize) -> bool {
         let Some(next) = current.checked_add(1) else {
             return false;
         };
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return true,
             Err(observed) => current = observed,
         }
@@ -914,12 +917,7 @@ fn try_decrement_atomic_count(counter: &AtomicUsize) -> bool {
         let Some(next) = current.checked_sub(1) else {
             return false;
         };
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return true,
             Err(observed) => current = observed,
         }
@@ -1070,9 +1068,7 @@ impl Drop for PaneRemovalCleanupLease {
         let release = self.token.release();
         if release.is_some() {
             if let Some(owner) = &owner {
-                if !try_decrement_atomic_count(
-                    &owner.pane_removal_cleanup_outstanding_leases,
-                ) {
+                if !try_decrement_atomic_count(&owner.pane_removal_cleanup_outstanding_leases) {
                     log::error!(
                         "PaneRemoved global cleanup observability count underflow for pane {}; exact token release remains authoritative",
                         self.pane_id
@@ -2041,9 +2037,9 @@ mod pane_registration_handle {
             size: TerminalSize,
         ) -> anyhow::Result<SplitCommitReceipt> {
             anyhow::ensure!(
-                self.owner
-                    .get_window(window_id)
-                    .is_some_and(|window| window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab))),
+                self.owner.get_window(window_id).is_some_and(|window| window
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, &tab))),
                 "window {window_id} does not contain exact split tab {}",
                 tab.tab_id()
             );
@@ -2057,22 +2053,17 @@ mod pane_registration_handle {
                 self.pane_id()
             );
             anyhow::ensure!(
-                panes
-                    .iter()
-                    .any(|candidate| Arc::ptr_eq(candidate, &pane)),
+                panes.iter().any(|candidate| Arc::ptr_eq(candidate, &pane)),
                 "split tab {} does not contain exact committed pane {}",
                 tab.tab_id(),
                 pane.pane_id()
             );
-            let registration = self
-                .owner
-                .capture_pane_registration(&pane)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "committed split pane {} has no exact mux registration",
-                        pane.pane_id()
-                    )
-                })?;
+            let registration = self.owner.capture_pane_registration(&pane).ok_or_else(|| {
+                anyhow!(
+                    "committed split pane {} has no exact mux registration",
+                    pane.pane_id()
+                )
+            })?;
             Ok(SplitCommitReceipt::from_exact_parts(
                 pane,
                 registration,
@@ -2088,9 +2079,9 @@ mod pane_registration_handle {
             window_id: WindowId,
         ) -> anyhow::Result<MoveCommitReceipt> {
             anyhow::ensure!(
-                self.owner
-                    .get_window(window_id)
-                    .is_some_and(|window| window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab))),
+                self.owner.get_window(window_id).is_some_and(|window| window
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, &tab))),
                 "window {window_id} does not contain exact moved tab {}",
                 tab.tab_id()
             );
@@ -2174,9 +2165,7 @@ mod pane_registration_handle {
             f(self.pane.as_ref())
         }
 
-        pub(crate) fn into_legacy_parts(
-            self,
-        ) -> (Arc<dyn Pane>, TerminalSize, WindowId, TabId) {
+        pub(crate) fn into_legacy_parts(self) -> (Arc<dyn Pane>, TerminalSize, WindowId, TabId) {
             (self.pane, self.size, self.window_id, self.tab.tab_id())
         }
     }
@@ -2396,14 +2385,7 @@ mod pane_registration_handle {
             let target = self.operation_guard(expected_owner)?;
             Some(
                 expected_owner
-                    .split_pane_spawned(
-                        target,
-                        request,
-                        command,
-                        command_dir,
-                        domain,
-                        client_id,
-                    )
+                    .split_pane_spawned(target, request, command, command_dir, domain, client_id)
                     .await,
             )
         }
@@ -2910,8 +2892,8 @@ mod pane_registration_handle {
 }
 
 pub use pane_registration_handle::{
-    CurrentPane, CurrentPaneOutput, MoveCommitReceipt, PaneOperationGuard,
-    PaneRegistrationHandle, PaneRegistrationSlot, SplitCommitReceipt,
+    CurrentPane, CurrentPaneOutput, MoveCommitReceipt, PaneOperationGuard, PaneRegistrationHandle,
+    PaneRegistrationSlot, SplitCommitReceipt,
 };
 
 struct PanePreparation {
@@ -4892,10 +4874,7 @@ impl Mux {
         subscriber: F,
     ) -> Result<usize, IdAllocationError>
     where
-        F: Fn(MuxNotification, Option<PaneRemovalCleanupLease>) -> bool
-            + 'static
-            + Send
-            + Sync,
+        F: Fn(MuxNotification, Option<PaneRemovalCleanupLease>) -> bool + 'static + Send + Sync,
     {
         let owner = Arc::downgrade(self);
         self.subscribe(move |notification| {
@@ -4936,10 +4915,7 @@ impl Mux {
     pub fn subscribe_with_topology_fence<F>(
         &self,
         subscriber: F,
-    ) -> Result<
-        (usize, MuxSessionIncarnation, TopologyRevision),
-        TopologySubscriptionError,
-    >
+    ) -> Result<(usize, MuxSessionIncarnation, TopologyRevision), TopologySubscriptionError>
     where
         F: Fn(MuxNotificationEnvelope) -> bool + 'static + Send + Sync,
     {
@@ -5148,10 +5124,9 @@ impl Mux {
             std::ptr::eq(pending.owner.as_ptr(), self as *const Self),
             "window notifications require the exact owner to be bound before publication",
         );
-        pending.queue.push_back(PendingWindowAction::Notification {
-            envelope,
-            activity,
-        });
+        pending
+            .queue
+            .push_back(PendingWindowAction::Notification { envelope, activity });
     }
 
     fn flush_window_notifications(&self) {
@@ -5236,10 +5211,7 @@ impl Mux {
                 return;
             };
             match action {
-                PendingWindowAction::Notification {
-                    envelope,
-                    activity,
-                } => {
+                PendingWindowAction::Notification { envelope, activity } => {
                     self.dispatch_notification_envelope(envelope);
                     // The optional Activity deliberately remains live through
                     // subscriber fanout, then releases only after the
@@ -5502,11 +5474,7 @@ impl Mux {
         }
     }
 
-    fn finalize_pane_removal_cleanup(
-        &self,
-        pane_id: PaneId,
-        token: &Arc<PaneRemovalCleanupToken>,
-    ) {
+    fn finalize_pane_removal_cleanup(&self, pane_id: PaneId, token: &Arc<PaneRemovalCleanupToken>) {
         let _registration = self.pane_registration.lock();
         let mut retiring = self.retiring_pane_ids.lock();
         let mut fences = self.pane_removal_cleanup_fences.lock();
@@ -6147,12 +6115,8 @@ impl Mux {
     ///
     /// The returned guard owns the pane and mux and cannot be cloned.  Callers
     /// should capture it before scheduling or awaiting deferred mutation work.
-    pub fn capture_pane_operation(
-        self: &Arc<Self>,
-        pane_id: PaneId,
-    ) -> Option<PaneOperationGuard> {
-        self.capture_current_pane(pane_id)?
-            .operation_guard(self)
+    pub fn capture_pane_operation(self: &Arc<Self>, pane_id: PaneId) -> Option<PaneOperationGuard> {
+        self.capture_current_pane(pane_id)?.operation_guard(self)
     }
 
     #[cfg(test)]
@@ -7060,12 +7024,7 @@ impl Mux {
     ) -> bool {
         windows.iter().all(|(window_id, window)| {
             excluded_window == Some(*window_id)
-                || Self::window_can_detach_exact_tabs(
-                    *window_id,
-                    window,
-                    removals,
-                    operation,
-                )
+                || Self::window_can_detach_exact_tabs(*window_id, window, removals, operation)
         })
     }
 
@@ -7123,12 +7082,11 @@ impl Mux {
             ) {
                 return None;
             }
-            let result = expected
-                .with_exact_pane_operation(operation, |pane_snapshot| {
-                    let pane_candidates = self.resolve_tab_pane_candidates_locked(pane_snapshot);
-                    tabs.remove(&tab_id);
-                    self.take_tab_pane_candidates_for_removal_locked(pane_candidates)
-                })?;
+            let result = expected.with_exact_pane_operation(operation, |pane_snapshot| {
+                let pane_candidates = self.resolve_tab_pane_candidates_locked(pane_snapshot);
+                tabs.remove(&tab_id);
+                self.take_tab_pane_candidates_for_removal_locked(pane_candidates)
+            })?;
             for window in windows.values_mut() {
                 window.remove_tabs_by_exact_identity_set(&retired_identities);
             }
@@ -7213,9 +7171,8 @@ impl Mux {
             let provisional_windows = self.provisional_windows.lock();
             windows.retain(|window_id, window| {
                 let detached = window.remove_tabs_by_exact_identity_set(&retired_identities);
-                let remove = detached
-                    && window.is_empty()
-                    && !provisional_windows.contains(window_id);
+                let remove =
+                    detached && window.is_empty() && !provisional_windows.contains(window_id);
                 if remove {
                     self.queue_window_notification(MuxNotification::WindowRemoved(*window_id));
                 }
@@ -7310,8 +7267,8 @@ impl Mux {
                         .into_iter()
                         .zip(pane_candidate_batches)
                         .map(|(structural_panes, pane_candidates)| {
-                            let (removed_panes, output_batches) = self
-                                .take_tab_pane_candidates_for_removal_locked(pane_candidates);
+                            let (removed_panes, output_batches) =
+                                self.take_tab_pane_candidates_for_removal_locked(pane_candidates);
                             RemovedTabRegistration {
                                 structural_panes,
                                 removed_panes,
@@ -7596,8 +7553,7 @@ impl Mux {
     /// [`Mux::remove_empty_tab_local_only_if_same`] for transactions that own
     /// the staged tab from registration through publication.
     pub fn remove_tab_local_only_if_same(&self, expected: &Arc<Tab>) -> bool {
-        self
-            .remove_tab_internal_if_same_with_pane_disposition(expected, false)
+        self.remove_tab_internal_if_same_with_pane_disposition(expected, false)
             .is_some()
     }
 
@@ -7743,10 +7699,8 @@ impl Mux {
         let Some(operation) = witness.operation_guard(self) else {
             return false;
         };
-        let Some(removed_window) = self.take_window_and_tabs_for_removal(
-            window_id,
-            Some((expected_tab, &operation)),
-        )
+        let Some(removed_window) =
+            self.take_window_and_tabs_for_removal(window_id, Some((expected_tab, &operation)))
         else {
             return false;
         };
@@ -7872,10 +7826,9 @@ impl Mux {
                 return replay_or_equivocation;
             }
 
-            let outcome = match window.validate_exact_order(
-                &request.desired_tab_ids,
-                request.desired_active_tab_id,
-            ) {
+            let outcome = match window
+                .validate_exact_order(&request.desired_tab_ids, request.desired_active_tab_id)
+            {
                 Err(PrepareWindowOrderError::RevisionExhausted(_)) => {
                     WindowReorderTerminalOutcome::Exhausted
                 }
@@ -7890,14 +7843,14 @@ impl Mux {
                     )
                 }
                 Err(PrepareWindowOrderError::MissingTabId { tab_id }) => {
-                    WindowReorderTerminalOutcome::Malformed(
-                        WindowReorderMalformed::MissingTabId { tab_id },
-                    )
+                    WindowReorderTerminalOutcome::Malformed(WindowReorderMalformed::MissingTabId {
+                        tab_id,
+                    })
                 }
                 Err(PrepareWindowOrderError::ForeignTabId { tab_id }) => {
-                    WindowReorderTerminalOutcome::Malformed(
-                        WindowReorderMalformed::ForeignTabId { tab_id },
-                    )
+                    WindowReorderTerminalOutcome::Malformed(WindowReorderMalformed::ForeignTabId {
+                        tab_id,
+                    })
                 }
                 Err(PrepareWindowOrderError::ActiveTabChanged {
                     current_active_tab_id,
@@ -7908,8 +7861,7 @@ impl Mux {
                         desired_active_tab_id,
                     },
                 ),
-                Ok(_) if window.order_revision() != request.expected_order_revision =>
-                {
+                Ok(_) if window.order_revision() != request.expected_order_revision => {
                     WindowReorderTerminalOutcome::Conflict(WindowOrderCommit {
                         topology_revision: topology.current_revision(),
                         window: WindowOrderState::from_semantically_validated_window(window),
@@ -7942,11 +7894,7 @@ impl Mux {
                     },
                 },
             };
-            receipts.retain(
-                request.mutation_id,
-                request.request_digest,
-                outcome.clone(),
-            );
+            receipts.retain(request.mutation_id, request.request_digest, outcome.clone());
             outcome
         };
         if notification_queued {
@@ -8663,12 +8611,7 @@ impl Mux {
             .capture_pane_operation(pane_id)
             .ok_or_else(|| anyhow!("pane {pane_id} is not a current registration"))?;
         Ok(self
-            .move_pane_to_new_tab_guarded(
-                target,
-                window_id,
-                workspace_for_new_window,
-                None,
-            )
+            .move_pane_to_new_tab_guarded(target, window_id, workspace_for_new_window, None)
             .await?
             .into_legacy_parts())
     }
@@ -8692,22 +8635,15 @@ impl Mux {
             anyhow::bail!("client registration is no longer current");
         }
         let (domain_id, _src_window, src_tab) = target.exact_location()?;
-        let domain = self
-            .get_domain(domain_id)
-            .ok_or_else(|| {
-                anyhow!(
-                    "domain {domain_id} of exact pane registration {} not found",
-                    target.pane_id()
-                )
-            })?;
+        let domain = self.get_domain(domain_id).ok_or_else(|| {
+            anyhow!(
+                "domain {domain_id} of exact pane registration {} not found",
+                target.pane_id()
+            )
+        })?;
 
         if let Some(receipt) = domain
-            .move_pane_to_new_tab(
-                self,
-                &target,
-                window_id,
-                workspace_for_new_window.clone(),
-            )
+            .move_pane_to_new_tab(self, &target, window_id, workspace_for_new_window.clone())
             .await?
         {
             return Ok(receipt);
@@ -10470,8 +10406,7 @@ mod tests {
         for (pane_id, reuse_same_arc) in [(160, true), (161, false)] {
             let mux = Arc::new(Mux::new(None));
             let (pane, kills) = KillCountingPane::new(pane_id, test_size());
-            let (tab, window_id) =
-                register_attached_test_pane(&global_guard, &mux, &pane);
+            let (tab, window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
             let registration = mux
                 .capture_pane_registration(&pane)
                 .expect("attached pane should yield an exact registration");
@@ -10505,8 +10440,7 @@ mod tests {
                 assert!(tab.topology_lock_is_available_for_test());
             });
 
-            let (different_arc, different_kills) =
-                KillCountingPane::new(pane_id, test_size());
+            let (different_arc, different_kills) = KillCountingPane::new(pane_id, test_size());
             let replacement = if reuse_same_arc {
                 Arc::clone(&pane)
             } else {
@@ -10594,7 +10528,8 @@ mod tests {
         let executor = BoundedTestExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let (pane, kills) = KillCountingPane::new(163, test_size());
-        mux.add_pane(&pane).expect("guard cancellation registration");
+        mux.add_pane(&pane)
+            .expect("guard cancellation registration");
         let registration = mux
             .capture_pane_registration(&pane)
             .expect("guard cancellation handle");
@@ -10656,8 +10591,7 @@ mod tests {
         let weak_mux = Arc::downgrade(&mux);
         let (pane, kills) = KillCountingPane::new(165, test_size());
         let weak_pane = Arc::downgrade(&pane);
-        let (tab, _window_id) =
-            register_attached_test_pane(&global_guard, &mux, &pane);
+        let (tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
         let registration = mux
             .capture_pane_registration(&pane)
             .expect("collectability registration");
@@ -10685,22 +10619,20 @@ mod tests {
     fn prepared_split_pane_rolls_back_exact_registration_without_locks() {
         let mux = Arc::new(Mux::new(None));
         let weak_mux = Arc::downgrade(&mux);
-        let (pane, kills) =
-            KillCountingPane::new_with_kill_callback(166, test_size(), move || {
-                let mux = weak_mux
-                    .upgrade()
-                    .expect("rollback callback should observe the exact mux");
-                assert!(mux.pane_registration.try_lock().is_some());
-                assert!(mux.panes.try_write().is_some());
-                assert!(mux.pending_pane_lifecycle.try_lock().is_some());
-                assert!(mux.retiring_pane_ids.try_lock().is_some());
-            });
+        let (pane, kills) = KillCountingPane::new_with_kill_callback(166, test_size(), move || {
+            let mux = weak_mux
+                .upgrade()
+                .expect("rollback callback should observe the exact mux");
+            assert!(mux.pane_registration.try_lock().is_some());
+            assert!(mux.panes.try_write().is_some());
+            assert!(mux.pending_pane_lifecycle.try_lock().is_some());
+            assert!(mux.retiring_pane_ids.try_lock().is_some());
+        });
         mux.add_pane(&pane).expect("prepared pane registration");
         let registration = mux
             .capture_pane_registration(&pane)
             .expect("prepared pane handle");
-        let prepared =
-            domain::PreparedSplitPane::new(Arc::clone(&pane), registration.clone());
+        let prepared = domain::PreparedSplitPane::new(Arc::clone(&pane), registration.clone());
 
         drop(prepared);
 
@@ -10714,12 +10646,12 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let (original, original_kills) = KillCountingPane::new(167, test_size());
         let (replacement, replacement_kills) = KillCountingPane::new(167, test_size());
-        mux.add_pane(&original).expect("prepared original registration");
+        mux.add_pane(&original)
+            .expect("prepared original registration");
         let registration = mux
             .capture_pane_registration(&original)
             .expect("prepared original handle");
-        let prepared =
-            domain::PreparedSplitPane::new(Arc::clone(&original), registration.clone());
+        let prepared = domain::PreparedSplitPane::new(Arc::clone(&original), registration.clone());
 
         assert!(registration.detach_local_if_current());
         mux.add_pane(&replacement)
@@ -10876,12 +10808,10 @@ mod tests {
         assert!(receipt.registration().same_registration(&registration));
         receipt.with_pane(|current| assert!(std::ptr::eq(current, pane.as_ref())));
         assert!(mux.get_tab(source_tab.tab_id()).is_none());
-        assert!(mux
-            .get_tab(receipt.tab_id())
-            .is_some_and(|tab| tab
-                .iter_all_panes()
-                .iter()
-                .any(|current| Arc::ptr_eq(current, &pane))));
+        assert!(mux.get_tab(receipt.tab_id()).is_some_and(|tab| tab
+            .iter_all_panes()
+            .iter()
+            .any(|current| Arc::ptr_eq(current, &pane))));
         assert!(
             mux.get_pane(pane.pane_id()).is_none(),
             "commit must not reconstruct registry authority from the raw pane ID"
@@ -11523,11 +11453,9 @@ mod tests {
             !origin.remove_tab_if_same(&origin_tab, &witness),
             "the old witness must not remove a later registration of the same Arc<Tab>",
         );
-        assert!(
-            origin
-                .get_tab(origin_tab.tab_id())
-                .is_some_and(|tab| Arc::ptr_eq(&tab, &origin_tab))
-        );
+        assert!(origin
+            .get_tab(origin_tab.tab_id())
+            .is_some_and(|tab| Arc::ptr_eq(&tab, &origin_tab)));
         assert_eq!(successor_kills.load(Ordering::SeqCst), 0);
         assert!(origin.remove_tab_if_same(&origin_tab, &successor_witness));
         assert_eq!(successor_kills.load(Ordering::SeqCst), 1);
@@ -11825,9 +11753,7 @@ mod tests {
             .is_some_and(|registered| Arc::ptr_eq(&registered, &pane)));
         assert!(mux.get_window(window_id).is_some_and(|window| {
             window.order_revision().get() == u64::MAX - 1
-                && window
-                    .iter()
-                    .any(|candidate| Arc::ptr_eq(candidate, &tab))
+                && window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab))
         }));
         assert_eq!(kills.load(Ordering::SeqCst), 0);
 
@@ -11860,9 +11786,7 @@ mod tests {
             .is_some_and(|registered| Arc::ptr_eq(&registered, &tab)));
         assert!(mux.get_window(window_id).is_some_and(|window| {
             window.order_revision().get() == u64::MAX - 1
-                && window
-                    .iter()
-                    .any(|candidate| Arc::ptr_eq(candidate, &tab))
+                && window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab))
         }));
 
         Mux::shutdown();
@@ -11898,8 +11822,7 @@ mod tests {
             duplicate
                 .push(&tab)
                 .expect("a standalone window cannot detect another parent");
-            duplicate
-                .set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
+            duplicate.set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
         }
         drop(duplicate);
 
@@ -11910,9 +11833,7 @@ mod tests {
         assert!(mux.get_window(doomed_id).is_some());
         assert!(mux.get_window(duplicate_id).is_some_and(|window| {
             window.order_revision().get() == u64::MAX - 1
-                && window
-                    .iter()
-                    .any(|candidate| Arc::ptr_eq(candidate, &tab))
+                && window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab))
         }));
         assert!(mux
             .get_tab(tab.tab_id())
@@ -11948,9 +11869,7 @@ mod tests {
         assert!(mux.get_tab(tab.tab_id()).is_none());
         assert!(mux.get_window(window_id).is_some_and(|window| {
             window.order_revision().get() == u64::MAX - 1
-                && window
-                    .iter()
-                    .any(|candidate| Arc::ptr_eq(candidate, &tab))
+                && window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab))
         }));
 
         Mux::shutdown();
@@ -13073,7 +12992,9 @@ mod tests {
         let (pane, _) = KillCountingPane::new(194, test_size());
         let escaped_cleanup = Arc::new(Mutex::new(None));
 
-        old_mux.add_pane(&pane).expect("register old pane generation");
+        old_mux
+            .add_pane(&pane)
+            .expect("register old pane generation");
         let escaped_cleanup_for_subscriber = Arc::clone(&escaped_cleanup);
         old_mux
             .subscribe_with_pane_removal_cleanup(move |notification, cleanup| {
@@ -13989,8 +13910,7 @@ mod tests {
     #[test]
     fn workspace_rename_dispatches_only_after_new_window_state_is_visible() {
         let mux = Arc::new(Mux::new(None));
-        let window_builder =
-            mux.new_empty_window(Some("old-workspace".to_string()), None);
+        let window_builder = mux.new_empty_window(Some("old-workspace".to_string()), None);
         let window_id = *window_builder;
         drop(window_builder);
         let before = mux
@@ -14005,9 +13925,7 @@ mod tests {
                 MuxNotification::WindowWorkspaceChanged {
                     window_id: id,
                     workspace,
-                } if id == window_id && workspace == "new-workspace" => {
-                    Some("window")
-                }
+                } if id == window_id && workspace == "new-workspace" => Some("window"),
                 MuxNotification::WorkspaceRenamed { .. } => Some("rename"),
                 _ => None,
             };
@@ -14058,7 +13976,8 @@ mod tests {
             entered: detach_entered_tx,
             release: StdMutex::new(detach_release_rx),
         });
-        mux.add_domain(&domain).expect("register blocking test domain");
+        mux.add_domain(&domain)
+            .expect("register blocking test domain");
 
         let window_builder = mux.new_empty_window(None, None);
         let window_id = *window_builder;
@@ -16385,7 +16304,10 @@ mod tests {
             ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Applied(commit)) => {
                 commit
             }
-            other => panic!("expected first authoritative apply, got {other:?}", other = other),
+            other => panic!(
+                "expected first authoritative apply, got {other:?}",
+                other = other
+            ),
         };
         assert_eq!(
             applied.topology_revision.get(),
@@ -16444,12 +16366,12 @@ mod tests {
         match replay {
             ReorderWindowTabsResult::Replay(WindowReorderTerminalOutcome::Applied(commit)) => {
                 assert_eq!(commit.topology_revision, applied.topology_revision);
-                assert_eq!(
-                    commit.window.order_revision,
-                    applied.window.order_revision
-                );
+                assert_eq!(commit.window.order_revision, applied.window.order_revision);
             }
-            other => panic!("expected exact applied replay, got {other:?}", other = other),
+            other => panic!(
+                "expected exact applied replay, got {other:?}",
+                other = other
+            ),
         }
         let equivocation = test_window_reorder_request_for(
             request.session_incarnation(),
@@ -16565,15 +16487,15 @@ mod tests {
         );
 
         let duplicate_request = ReorderWindowTabsRequest::try_new_v1(
-                [0x62; 16],
-                session_incarnation,
-                window_id,
-                before.order_revision(),
-                vec![first.tab_id(), first.tab_id(), active.tab_id()],
-                Some(active.tab_id()),
-                WindowOrderMutationId::new([0x73; 16], 8),
-            )
-            .expect("bounded duplicate permutation reaches mux semantic authority");
+            [0x62; 16],
+            session_incarnation,
+            window_id,
+            before.order_revision(),
+            vec![first.tab_id(), first.tab_id(), active.tab_id()],
+            Some(active.tab_id()),
+            WindowOrderMutationId::new([0x73; 16], 8),
+        )
+        .expect("bounded duplicate permutation reaches mux semantic authority");
         assert!(matches!(
             mux.reorder_window_tabs(duplicate_request),
             ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::Malformed(
@@ -16632,7 +16554,10 @@ mod tests {
                 assert_eq!(commit.topology_revision, topology_before);
                 assert_eq!(commit.window.order_revision, before.order_revision());
             }
-            other => panic!("expected stale-revision conflict, got {other:?}", other = other),
+            other => panic!(
+                "expected stale-revision conflict, got {other:?}",
+                other = other
+            ),
         }
 
         let cases = [
@@ -16706,9 +16631,7 @@ mod tests {
         );
         assert!(matches!(
             mux.reorder_window_tabs(stale_session),
-            ReorderWindowTabsResult::Decision(
-                WindowReorderTerminalOutcome::StaleIncarnation
-            )
+            ReorderWindowTabsResult::Decision(WindowReorderTerminalOutcome::StaleIncarnation)
         ));
         assert_eq!(
             mux.window_order_receipts.lock().receipts.len(),
@@ -16722,14 +16645,21 @@ mod tests {
             .expect("final window");
         assert_eq!(after.order_revision(), before.order_revision());
         assert_eq!(
-            after.ordered_tabs().iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+            after
+                .ordered_tabs()
+                .iter()
+                .map(Arc::as_ptr)
+                .collect::<Vec<_>>(),
             before
                 .ordered_tabs()
                 .iter()
                 .map(Arc::as_ptr)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(after.active_tab().map(Arc::as_ptr), before.active_tab().map(Arc::as_ptr));
+        assert_eq!(
+            after.active_tab().map(Arc::as_ptr),
+            before.active_tab().map(Arc::as_ptr)
+        );
         assert_eq!(
             mux.topology_snapshot_authority()
                 .expect("topology after rejected requests")
@@ -16812,14 +16742,21 @@ mod tests {
             .expect("test window after exhaustion");
         assert_eq!(after.order_revision(), before.order_revision());
         assert_eq!(
-            after.ordered_tabs().iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+            after
+                .ordered_tabs()
+                .iter()
+                .map(Arc::as_ptr)
+                .collect::<Vec<_>>(),
             before
                 .ordered_tabs()
                 .iter()
                 .map(Arc::as_ptr)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(after.active_tab().map(Arc::as_ptr), before.active_tab().map(Arc::as_ptr));
+        assert_eq!(
+            after.active_tab().map(Arc::as_ptr),
+            before.active_tab().map(Arc::as_ptr)
+        );
         assert_eq!(notifications.load(Ordering::SeqCst), 0);
 
         drop(window_builder);
@@ -16910,9 +16847,7 @@ mod tests {
             .expect("insert before destination active");
         {
             let source = mux.get_window(source_id).expect("source window");
-            let destination = mux
-                .get_window(destination_id)
-                .expect("destination window");
+            let destination = mux.get_window(destination_id).expect("destination window");
             assert!(source
                 .get_active()
                 .is_some_and(|tab| Arc::ptr_eq(tab, &source_active)));
@@ -16948,9 +16883,7 @@ mod tests {
             let source = mux
                 .get_window(left_fallback_id)
                 .expect("left-fallback source window");
-            let destination = mux
-                .get_window(destination_id)
-                .expect("destination window");
+            let destination = mux.get_window(destination_id).expect("destination window");
             assert!(source
                 .get_active()
                 .is_some_and(|tab| Arc::ptr_eq(tab, &source_left)));
@@ -17010,9 +16943,7 @@ mod tests {
         assert!(same_error.to_string().contains("out of range"));
 
         let source = mux.get_window(source_id).expect("source window");
-        let destination = mux
-            .get_window(destination_id)
-            .expect("destination window");
+        let destination = mux.get_window(destination_id).expect("destination window");
         assert_eq!(
             source.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
             source_before,
@@ -17044,8 +16975,7 @@ mod tests {
         Mux::set_mux(&mux);
         let source_builder = mux.new_empty_window(Some("move-exhaustion".to_string()), None);
         let source_id = *source_builder;
-        let destination_builder =
-            mux.new_empty_window(Some("move-exhaustion".to_string()), None);
+        let destination_builder = mux.new_empty_window(Some("move-exhaustion".to_string()), None);
         let destination_id = *destination_builder;
         let source_tab = Arc::new(Tab::new(&test_size()));
         let destination_tab = Arc::new(Tab::new(&test_size()));

@@ -10,14 +10,16 @@ use crate::localpane::LocalPane;
 use crate::pane::{alloc_pane_id, Pane, PaneId};
 use crate::tab::{SplitRequest, Tab};
 use crate::window::WindowId;
-use crate::{MoveCommitReceipt, Mux, PaneOperationGuard, PaneRegistrationHandle, SplitCommitReceipt};
+use crate::{
+    MoveCommitReceipt, Mux, PaneOperationGuard, PaneRegistrationHandle, SplitCommitReceipt,
+};
 use anyhow::{anyhow, bail, Context, Error};
 use async_trait::async_trait;
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{configuration, ExecDomain, SerialDomain, ValueOrFunc, WslDomain};
 use downcast_rs::{impl_downcast, Downcast};
-use frankenterm_term::TerminalSize;
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
 use portable_pty::{
     native_pty_system, CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize, PtySystem,

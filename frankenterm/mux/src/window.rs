@@ -106,19 +106,14 @@ impl fmt::Debug for FrozenWindowOrder {
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum WindowOrderSnapshotError {
-    #[error(
-        "window {window_id} has {count} tabs, exceeding ordered-window limit {max}"
-    )]
+    #[error("window {window_id} has {count} tabs, exceeding ordered-window limit {max}")]
     TooManyTabs {
         window_id: WindowId,
         count: usize,
         max: usize,
     },
     #[error("window {window_id} contains duplicate tab id {tab_id}")]
-    DuplicateTabId {
-        window_id: WindowId,
-        tab_id: TabId,
-    },
+    DuplicateTabId { window_id: WindowId, tab_id: TabId },
     #[error("non-empty window {window_id} has no valid active tab")]
     MissingActiveTab { window_id: WindowId },
 }
@@ -301,9 +296,8 @@ impl Window {
     }
 
     fn next_order_revision_or_panic(&self) -> WindowOrderRevision {
-        self.next_order_revision().unwrap_or_else(|err| {
-            panic!("window {} cannot mutate ordered state: {err}", self.id)
-        })
+        self.next_order_revision()
+            .unwrap_or_else(|err| panic!("window {} cannot mutate ordered state: {err}", self.id))
     }
 
     /// Freeze the exact ordered `Arc<Tab>` identities and active identity.
@@ -398,14 +392,13 @@ impl Window {
             *already_used = true;
             ordered_tabs.push(Arc::clone(tab));
         }
-        if let Some(tab_id) = self.tabs.iter().map(|tab| tab.tab_id()).find(|tab_id| {
-            current_by_id
-                .get(tab_id)
-                .is_some_and(|(_, used)| !*used)
-        }) {
-            return Err(PrepareWindowOrderError::MissingTabId {
-                tab_id,
-            });
+        if let Some(tab_id) = self
+            .tabs
+            .iter()
+            .map(|tab| tab.tab_id())
+            .find(|tab_id| current_by_id.get(tab_id).is_some_and(|(_, used)| !*used))
+        {
+            return Err(PrepareWindowOrderError::MissingTabId { tab_id });
         }
 
         if desired_active_tab_id != current_active_tab_id {
@@ -436,7 +429,10 @@ impl Window {
         &self,
         validated: ValidatedWindowOrder,
     ) -> Result<PreparedWindowOrder, WindowOrderRevisionExhausted> {
-        assert_eq!(validated.window_id, self.id, "validated order changed windows");
+        assert_eq!(
+            validated.window_id, self.id,
+            "validated order changed windows"
+        );
         assert_eq!(
             validated.prior_revision, self.order_revision,
             "validated order revision changed before preparation"
@@ -460,7 +456,10 @@ impl Window {
             validated,
             next_revision,
         } = prepared;
-        assert_eq!(validated.window_id, self.id, "prepared order changed windows");
+        assert_eq!(
+            validated.window_id, self.id,
+            "prepared order changed windows"
+        );
         assert_eq!(
             validated.prior_revision, self.order_revision,
             "prepared order revision changed before commit"
@@ -1020,8 +1019,7 @@ mod tests {
                             window.revision.checked_add(1),
                         ) {
                             (Some(topology_revision), Some(window_revision))
-                                if topology_revision != u64::MAX
-                                    && window_revision != u64::MAX =>
+                                if topology_revision != u64::MAX && window_revision != u64::MAX =>
                             {
                                 ContractDecision::Applied {
                                     topology_revision,
@@ -1198,9 +1196,7 @@ mod tests {
         }
     }
 
-    fn validate_contract_snapshot(
-        windows: &[(u64, ContractWindow)],
-    ) -> Result<(), &'static str> {
+    fn validate_contract_snapshot(windows: &[(u64, ContractWindow)]) -> Result<(), &'static str> {
         if windows.len() > CONTRACT_MAX_WINDOWS {
             return Err("snapshot exceeds window bound");
         }
@@ -1722,9 +1718,7 @@ mod tests {
         assert_eq!(model.windows[&1].tabs, vec![10, 20]);
         assert_eq!(model.windows[&2].tabs, vec![30]);
 
-        model
-            .move_tab(20, 1, 2, 0)
-            .expect("cross-window move");
+        model.move_tab(20, 1, 2, 0).expect("cross-window move");
 
         assert_eq!(model.topology_revision, 4);
         assert_eq!(model.windows[&1].tabs, vec![10]);
@@ -1933,10 +1927,7 @@ mod tests {
             classify_order_authority(
                 &[
                     StableSlot::Remote(first),
-                    StableSlot::Local {
-                        session: 5,
-                        tab: 6,
-                    },
+                    StableSlot::Local { session: 5, tab: 6 },
                 ],
                 &complete,
             ),
@@ -1975,9 +1966,8 @@ mod tests {
         let persisted = [first, missing_active, right_neighbor];
         let live = [right_neighbor, first, unseen];
 
-        let (order, active) =
-            reconcile_mixed_overlay(&persisted, Some(missing_active), &live)
-                .expect("valid overlay");
+        let (order, active) = reconcile_mixed_overlay(&persisted, Some(missing_active), &live)
+            .expect("valid overlay");
 
         assert_eq!(order, vec![first, right_neighbor, unseen]);
         assert_eq!(
@@ -1989,10 +1979,7 @@ mod tests {
 
     #[test]
     fn contract_model_corrupt_overlay_and_legacy_peer_never_gain_authority() {
-        let slot = StableSlot::Local {
-            session: 1,
-            tab: 2,
-        };
+        let slot = StableSlot::Local { session: 1, tab: 2 };
         let live = vec![slot];
         let before = live.clone();
 
@@ -2068,7 +2055,10 @@ mod tests {
             .push(&active)
             .expect_err("duplicate append must fail without panicking");
         assert!(duplicate_error.to_string().contains("already attached"));
-        assert_eq!(window.iter().map(Arc::as_ptr).collect::<Vec<_>>(), prior_order);
+        assert_eq!(
+            window.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+            prior_order
+        );
         assert_eq!(window.get_active_idx(), prior_active_index);
         assert_eq!(window.order_revision(), prior_revision);
 
@@ -2115,11 +2105,9 @@ mod tests {
             )
             .expect("create stack before reorder");
 
-        assert!(
-            window
-                .reorder_tab_if_same(&first, 0, 2)
-                .expect("inactive reorder must validate")
-        );
+        assert!(window
+            .reorder_tab_if_same(&first, 0, 2)
+            .expect("inactive reorder must validate"));
         assert_eq!(
             window.iter().map(|tab| tab.tab_id()).collect::<Vec<_>>(),
             vec![active.tab_id(), third.tab_id(), first.tab_id()],
@@ -2128,11 +2116,9 @@ mod tests {
             .get_active()
             .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
 
-        assert!(
-            window
-                .reorder_tab_if_same(&active, 0, 2)
-                .expect("active reorder must validate")
-        );
+        assert!(window
+            .reorder_tab_if_same(&active, 0, 2)
+            .expect("active reorder must validate"));
         assert_eq!(
             window.iter().map(|tab| tab.tab_id()).collect::<Vec<_>>(),
             vec![third.tab_id(), first.tab_id(), active.tab_id()],
@@ -2312,7 +2298,11 @@ mod tests {
         let before = window.order_snapshot().expect("valid frozen order");
         assert_eq!(before.order_revision(), revision_before);
         assert_eq!(
-            before.ordered_tabs().iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+            before
+                .ordered_tabs()
+                .iter()
+                .map(Arc::as_ptr)
+                .collect::<Vec<_>>(),
             vec![
                 Arc::as_ptr(&first),
                 Arc::as_ptr(&active),
@@ -2331,10 +2321,7 @@ mod tests {
             .prepare_validated_order(validated)
             .expect("reserve exact permutation revision");
         let committed = window.commit_prepared_order(prepared);
-        assert_eq!(
-            committed.order_revision().get(),
-            revision_before.get() + 1
-        );
+        assert_eq!(committed.order_revision().get(), revision_before.get() + 1);
         assert_eq!(
             committed
                 .ordered_tabs()
@@ -2429,16 +2416,17 @@ mod tests {
         let insert_error = window
             .insert(window.len(), &added)
             .expect_err("terminal order revision must reject membership change");
-        assert!(insert_error.to_string().contains("revision space is exhausted"));
+        assert!(insert_error
+            .to_string()
+            .contains("revision space is exhausted"));
         let push_error = window
             .push(&added)
             .expect_err("fallible append must reject terminal order revision");
-        assert!(push_error.to_string().contains("revision space is exhausted"));
+        assert!(push_error
+            .to_string()
+            .contains("revision space is exhausted"));
         let validated = window
-            .validate_exact_order(
-                &[active.tab_id(), first.tab_id()],
-                Some(active.tab_id()),
-            )
+            .validate_exact_order(&[active.tab_id(), first.tab_id()], Some(active.tab_id()))
             .expect("terminal order revision does not outrank semantic validity");
         let prepare_error = window
             .prepare_validated_order(validated)

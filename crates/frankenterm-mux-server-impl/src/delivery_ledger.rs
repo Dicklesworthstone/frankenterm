@@ -1353,9 +1353,7 @@ impl DeliveryLedger {
             DeliveryState::Dirty if entry.ready_epoch != Some(self.ready_epoch) => {
                 DeliveryState::Clean
             }
-            DeliveryState::InFlight { token, .. }
-                if self.resync_all == DeliveryState::Dirty =>
-            {
+            DeliveryState::InFlight { token, .. } if self.resync_all == DeliveryState::Dirty => {
                 // Installing the fixed global obligation supersedes every
                 // redirty observed before that snapshot.  The physical bit can
                 // remain untouched because settlement is still fenced by the

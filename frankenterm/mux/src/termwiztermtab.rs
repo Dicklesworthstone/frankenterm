@@ -180,10 +180,8 @@ impl Pane for TermWizTerminalPane {
     ) -> (SequenceNo, RangeSet<StableRowIndex>) {
         let mut terminal = self.terminal.lock();
         let source_end = terminal.current_seqno();
-        let baseline = crate::pane::changed_since_query_baseline(
-            last_observed_source_end,
-            source_end,
-        );
+        let baseline =
+            crate::pane::changed_since_query_baseline(last_observed_source_end, source_end);
         let changed = terminal_get_dirty_lines(&mut terminal, lines, baseline);
         (source_end, changed)
     }

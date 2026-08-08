@@ -974,8 +974,8 @@ mod tests {
     #[test]
     fn event_clock_rejects_source_regression_and_process_change() {
         let origin = Instant::now();
-        let domain = EventClockDomain::new(Uuid::from_u128(2), 7)
-            .expect("fixture clock domain is non-nil");
+        let domain =
+            EventClockDomain::new(Uuid::from_u128(2), 7).expect("fixture clock domain is non-nil");
         let clock = EventClock { domain, origin };
         let before_origin = origin
             .checked_sub(Duration::from_nanos(1))
@@ -1039,14 +1039,12 @@ mod tests {
     #[test]
     fn timestamps_from_different_process_epochs_are_incomparable() {
         let earlier = EventTimestamp::from_parts(
-            EventClockDomain::new(Uuid::from_u128(5), 7)
-                .expect("fixture clock domain is non-nil"),
+            EventClockDomain::new(Uuid::from_u128(5), 7).expect("fixture clock domain is non-nil"),
             100,
             None,
         );
         let later = EventTimestamp::from_parts(
-            EventClockDomain::new(Uuid::from_u128(6), 7)
-                .expect("fixture clock domain is non-nil"),
+            EventClockDomain::new(Uuid::from_u128(6), 7).expect("fixture clock domain is non-nil"),
             200,
             None,
         );
