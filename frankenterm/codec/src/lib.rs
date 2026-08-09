@@ -18304,12 +18304,28 @@ mod test {
         );
         assert!(duplicate.encode_frame(703).is_err());
 
+        let duplicate_response = Pdu::GetPaneTieredScrollbackStatusesV1Response(
+            GetPaneTieredScrollbackStatusesV1Response {
+                entries: vec![
+                    PaneTieredScrollbackStatusEntryV1 {
+                        pane_id: 7,
+                        outcome: PaneTieredScrollbackStatusOutcomeV1::Unavailable,
+                    },
+                    PaneTieredScrollbackStatusEntryV1 {
+                        pane_id: 7,
+                        outcome: PaneTieredScrollbackStatusOutcomeV1::Missing,
+                    },
+                ],
+            },
+        );
+        assert!(duplicate_response.encode_frame(704).is_err());
+
         let oversized = Pdu::GetPaneTieredScrollbackStatusesV1(
             GetPaneTieredScrollbackStatusesV1 {
                 pane_ids: (0..=MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES).collect(),
             },
         );
-        assert!(oversized.encode_frame(704).is_err());
+        assert!(oversized.encode_frame(705).is_err());
 
         let (oversized_payload, compressed) = serialize_with_mode(
             &(vec![0_usize; MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES + 1],),
@@ -18320,7 +18336,7 @@ mod test {
         let mut hostile_frame = Vec::new();
         encode_raw(
             GetPaneTieredScrollbackStatusesV1::IDENT,
-            705,
+            706,
             &oversized_payload,
             false,
             &mut hostile_frame,
@@ -18330,7 +18346,37 @@ mod test {
             .expect_err("the 257th declared pane must fail bounded admission");
         assert!(
             format!("{error:#}").contains("maximum 256"),
-            "unexpected bounded-admission rejection: {error:#}"
+            "unexpected bounded-admission rejection: {error:#}",
+            error = error,
+        );
+
+        let hostile_entry = PaneTieredScrollbackStatusEntryV1 {
+            pane_id: 9,
+            outcome: PaneTieredScrollbackStatusOutcomeV1::Unavailable,
+        };
+        let (oversized_response_payload, compressed) = serialize_with_mode(
+            &(
+                vec![hostile_entry; MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES + 1],
+            ),
+            CompressionMode::Never,
+        )
+        .expect("hostile unbounded response tuple must serialize");
+        assert!(!compressed);
+        let mut hostile_response_frame = Vec::new();
+        encode_raw(
+            GetPaneTieredScrollbackStatusesV1Response::IDENT,
+            707,
+            &oversized_response_payload,
+            false,
+            &mut hostile_response_frame,
+        )
+        .expect("hostile declared-count response fixture must frame");
+        let error = Pdu::decode(hostile_response_frame.as_slice())
+            .expect_err("the 257th declared response entry must fail bounded admission");
+        assert!(
+            format!("{error:#}").contains("maximum 256"),
+            "unexpected response bounded-admission rejection: {error:#}",
+            error = error,
         );
     }
 
