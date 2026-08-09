@@ -34,8 +34,9 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use window::WindowState;
 
-const STORE_SCHEMA_VERSION: u32 = 3;
-const PREVIOUS_STORE_SCHEMA_VERSION: u32 = 2;
+const STORE_SCHEMA_VERSION: u32 = 4;
+const PREVIOUS_STORE_SCHEMA_VERSION: u32 = 3;
+const LEGACY_STORE_SCHEMA_VERSION: u32 = 2;
 const MAX_STATE_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_WORKSPACE_BYTES: usize = 1_024;
 const MAX_WORKSPACES: usize = 4_096;
@@ -103,8 +104,8 @@ pub enum PersistenceFailure {
         expected: Option<u64>,
         committed: Option<u64>,
     },
-    #[error("overlay identity was retired at local revision {last_revision}")]
-    RetiredOverlay { last_revision: u64 },
+    #[error("overlay identity is retired (last local revision: {last_revision:?})")]
+    RetiredOverlay { last_revision: Option<u64> },
     #[error("two different persisted states claim generation {revision}")]
     AmbiguousGeneration { revision: u64 },
     #[error("persistence worker recovered from an internal panic")]
@@ -235,30 +236,79 @@ impl StableMuxSessionId {
     }
 }
 
-/// Client-owned stable association for one mixed GUI window.
+/// Monotonic durable namespace for newly created mixed-layout window IDs.
+///
+/// Epoch zero is reserved for schema-v2/v3 identities migrated from the
+/// original UUID-only representation. New IDs are minted only in the current
+/// nonzero epoch published by [`LayoutStateSnapshot`].
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct LayoutWindowId([u8; 16]);
+pub struct LayoutCreationEpoch(u64);
 
-impl LayoutWindowId {
-    #[must_use]
-    pub fn new() -> Self {
-        Self(*uuid::Uuid::new_v4().as_bytes())
+impl LayoutCreationEpoch {
+    const LEGACY: Self = Self(0);
+    const INITIAL: Self = Self(1);
+
+    fn checked_next(self) -> Result<Self, PersistenceFailure> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or(PersistenceFailure::RevisionExhausted)
     }
 
     #[must_use]
-    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(bytes)
-    }
-
-    #[must_use]
-    pub const fn as_bytes(self) -> [u8; 16] {
+    pub const fn get(self) -> u64 {
         self.0
     }
 }
 
-impl Default for LayoutWindowId {
-    fn default() -> Self {
-        Self::new()
+/// Client-owned stable association for one mixed GUI window.
+///
+/// The creation epoch makes exact stale-create rejection bounded. Tombstones
+/// need cover only the current epoch: once that bounded set fills, the store
+/// advances the epoch atomically and every absent ID from an older epoch stays
+/// permanently retired without retaining one record per historical window.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LayoutWindowId {
+    creation_epoch: LayoutCreationEpoch,
+    nonce: [u8; 16],
+}
+
+impl LayoutWindowId {
+    fn new(creation_epoch: LayoutCreationEpoch) -> Self {
+        debug_assert!(creation_epoch != LayoutCreationEpoch::LEGACY);
+        Self {
+            creation_epoch,
+            nonce: *uuid::Uuid::new_v4().as_bytes(),
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self {
+            creation_epoch: LayoutCreationEpoch::INITIAL,
+            nonce: bytes,
+        }
+    }
+
+    const fn from_legacy_bytes(bytes: [u8; 16]) -> Self {
+        Self {
+            creation_epoch: LayoutCreationEpoch::LEGACY,
+            nonce: bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn creation_epoch(self) -> LayoutCreationEpoch {
+        self.creation_epoch
+    }
+
+    /// Return only the opaque nonce component. Equality and persistence must
+    /// always use the complete `LayoutWindowId`, including its creation epoch.
+    #[must_use]
+    pub const fn nonce_bytes(self) -> [u8; 16] {
+        self.nonce
     }
 }
 
@@ -526,11 +576,11 @@ impl MixedDomainLayoutOverlay {
 /// Durable proof that one stable mixed-layout window identity was retired.
 ///
 /// Tombstones deliberately retain only the last live local revision and the
-/// store generation that committed the retirement. A stable
-/// [`LayoutWindowId`] is never reusable and its tombstone is never pruned. The
-/// hard cap therefore fails a new distinct retirement closed before removing
-/// its live overlay; safe reuse beyond that cap requires a future durable
-/// identity-generation scheme rather than lossy eviction.
+/// store generation that committed the retirement. They cover the current
+/// creation epoch exactly. When the bounded collection fills, the store
+/// atomically advances the creation epoch and compacts the old records; the
+/// durable epoch fence then rejects every absent older identity without a
+/// false positive or stale-create resurrection.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OverlayTombstone {
@@ -701,6 +751,7 @@ pub struct LayoutStateSnapshot {
     pub source: StoreSource,
     pub degraded_recovery: bool,
     pub store_revision: u64,
+    pub layout_creation_epoch: LayoutCreationEpoch,
     pub window_states: BTreeMap<String, PersistedWindowState>,
     pub domain_bindings: Vec<DomainBindingRecord>,
     pub overlays: Vec<MixedDomainLayoutOverlay>,
@@ -732,6 +783,21 @@ impl LayoutStateSnapshot {
             .iter()
             .copied()
             .find(|tombstone| tombstone.window_id == window_id)
+    }
+
+    /// Mint a privacy-minimal ID in the exact durable namespace observed by
+    /// this snapshot. Allocation checks the bounded live/tombstone sets rather
+    /// than assuming random non-reuse. A concurrent process may still advance
+    /// the epoch before commit; that create fails closed and must refresh.
+    pub fn new_layout_window_id(&self) -> Result<LayoutWindowId, PersistenceFailure> {
+        (0..8)
+            .map(|_| LayoutWindowId::new(self.layout_creation_epoch))
+            .find(|candidate| {
+                self.overlay(*candidate).is_none() && self.tombstone(*candidate).is_none()
+            })
+            .ok_or_else(|| {
+                PersistenceFailure::invalid("could not allocate a unique layout window identity")
+            })
     }
 }
 
@@ -908,6 +974,7 @@ pub fn reconcile_overlay(
 struct PersistedState {
     schema_version: u32,
     store_revision: u64,
+    layout_creation_epoch: LayoutCreationEpoch,
     #[serde(default)]
     window_states: BTreeMap<String, PersistedWindowState>,
     #[serde(default)]
@@ -922,6 +989,7 @@ impl Default for PersistedState {
         Self {
             schema_version: STORE_SCHEMA_VERSION,
             store_revision: 0,
+            layout_creation_epoch: LayoutCreationEpoch::INITIAL,
             window_states: BTreeMap::new(),
             domain_bindings: Vec::new(),
             overlays: Vec::new(),
@@ -930,9 +998,89 @@ impl Default for PersistedState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+struct LegacyLayoutWindowId([u8; 16]);
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MixedDomainLayoutOverlayV3 {
+    window_id: LegacyLayoutWindowId,
+    workspace: String,
+    local_revision: u64,
+    slots: Vec<StableTabSlot>,
+    active: Option<StableTabSlot>,
+}
+
+impl MixedDomainLayoutOverlayV3 {
+    fn into_current(self) -> MixedDomainLayoutOverlay {
+        MixedDomainLayoutOverlay {
+            window_id: LayoutWindowId::from_legacy_bytes(self.window_id.0),
+            workspace: self.workspace,
+            local_revision: self.local_revision,
+            slots: self.slots,
+            active: self.active,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OverlayTombstoneV3 {
+    window_id: LegacyLayoutWindowId,
+    last_local_revision: u64,
+    retired_at_store_revision: u64,
+}
+
+impl OverlayTombstoneV3 {
+    fn into_current(self) -> OverlayTombstone {
+        OverlayTombstone {
+            window_id: LayoutWindowId::from_legacy_bytes(self.window_id.0),
+            last_local_revision: self.last_local_revision,
+            retired_at_store_revision: self.retired_at_store_revision,
+        }
+    }
+}
+
+/// Exact schema-v3 payload shape. Its checksum is verified over the legacy
+/// UUID-only identity representation before migration introduces the epoch
+/// field and compacts epoch-zero tombstones behind the durable fence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedStateV3 {
+    schema_version: u32,
+    store_revision: u64,
+    #[serde(default)]
+    window_states: BTreeMap<String, PersistedWindowState>,
+    #[serde(default)]
+    domain_bindings: Vec<DomainBindingRecord>,
+    #[serde(default)]
+    overlays: Vec<MixedDomainLayoutOverlayV3>,
+    tombstones: Vec<OverlayTombstoneV3>,
+}
+
+impl PersistedStateV3 {
+    fn into_current(self) -> PersistedState {
+        PersistedState {
+            schema_version: STORE_SCHEMA_VERSION,
+            store_revision: self.store_revision,
+            layout_creation_epoch: LayoutCreationEpoch::INITIAL,
+            window_states: self.window_states,
+            domain_bindings: self.domain_bindings,
+            overlays: self
+                .overlays
+                .into_iter()
+                .map(MixedDomainLayoutOverlayV3::into_current)
+                .collect(),
+            // Epoch zero is permanently closed by migration, so its exact
+            // tombstones become redundant after they have been validated.
+            tombstones: Vec::new(),
+        }
+    }
+}
+
 /// Exact schema-v2 payload shape. Keeping this type separate is essential:
 /// its checksum must be verified over the bytes produced by the v2 field set
-/// before an empty tombstone collection is introduced by migration.
+/// before tombstones and creation epochs are introduced by migration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedStateV2 {
@@ -943,7 +1091,7 @@ struct PersistedStateV2 {
     #[serde(default)]
     domain_bindings: Vec<DomainBindingRecord>,
     #[serde(default)]
-    overlays: Vec<MixedDomainLayoutOverlay>,
+    overlays: Vec<MixedDomainLayoutOverlayV3>,
 }
 
 impl PersistedStateV2 {
@@ -951,9 +1099,14 @@ impl PersistedStateV2 {
         PersistedState {
             schema_version: STORE_SCHEMA_VERSION,
             store_revision: self.store_revision,
+            layout_creation_epoch: LayoutCreationEpoch::INITIAL,
             window_states: self.window_states,
             domain_bindings: self.domain_bindings,
-            overlays: self.overlays,
+            overlays: self
+                .overlays
+                .into_iter()
+                .map(MixedDomainLayoutOverlayV3::into_current)
+                .collect(),
             tombstones: Vec::new(),
         }
     }
@@ -963,6 +1116,13 @@ impl PersistedStateV2 {
 #[serde(deny_unknown_fields)]
 struct DiskSlot {
     payload: PersistedState,
+    sha256: [u8; 32],
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DiskSlotV3 {
+    payload: PersistedStateV3,
     sha256: [u8; 32],
 }
 
@@ -988,6 +1148,7 @@ struct CorruptEvidence {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SlotSchema {
     Current,
+    V3,
     V2,
     LegacyGeometry,
 }
@@ -995,7 +1156,8 @@ enum SlotSchema {
 impl SlotSchema {
     const fn preference(self) -> u8 {
         match self {
-            Self::Current => 2,
+            Self::Current => 3,
+            Self::V3 => 2,
             Self::V2 => 1,
             Self::LegacyGeometry => 0,
         }
@@ -1026,6 +1188,7 @@ impl ReadSlot {
             Self::Missing => "missing",
             Self::Valid(validated) => match validated.schema {
                 SlotSchema::Current => "current",
+                SlotSchema::V3 => "schema_v3",
                 SlotSchema::V2 => "schema_v2",
                 SlotSchema::LegacyGeometry => "legacy_geometry",
             },
@@ -1151,7 +1314,7 @@ impl PendingBatch {
             Some(previous) if previous.desired == mutation.desired => Ok(EnqueueOutcome::Unchanged),
             Some(previous) if matches!(&previous.desired, DesiredOverlayState::Deleted { .. }) => {
                 Err(PersistenceFailure::RetiredOverlay {
-                    last_revision: previous.desired_revision(),
+                    last_revision: Some(previous.desired_revision()),
                 })
             }
             Some(previous) if mutation.base_revision == Some(previous.desired_revision()) => {
@@ -2426,6 +2589,11 @@ fn validate_state(state: &PersistedState) -> Result<(), PersistenceFailure> {
             current: STORE_SCHEMA_VERSION,
         });
     }
+    if state.layout_creation_epoch == LayoutCreationEpoch::LEGACY {
+        return Err(PersistenceFailure::invalid(
+            "current layout creation epoch uses reserved legacy value zero",
+        ));
+    }
     if state.window_states.len() > MAX_WORKSPACES {
         return Err(PersistenceFailure::quota(format!(
             "workspace count {} exceeds {}",
@@ -2485,6 +2653,11 @@ fn validate_state(state: &PersistedState) -> Result<(), PersistenceFailure> {
     let mut total_tabs = 0usize;
     for overlay in &state.overlays {
         validate_overlay(overlay)?;
+        if overlay.window_id.creation_epoch > state.layout_creation_epoch {
+            return Err(PersistenceFailure::invalid(
+                "live overlay identity is newer than the current creation epoch",
+            ));
+        }
         if !overlay_ids.insert(overlay.window_id) {
             return Err(PersistenceFailure::invalid(
                 "duplicate mixed-layout window identity",
@@ -2533,6 +2706,11 @@ fn validate_state(state: &PersistedState) -> Result<(), PersistenceFailure> {
     let mut tombstone_ids = HashSet::with_capacity(state.tombstones.len());
     for tombstone in &state.tombstones {
         validate_tombstone(tombstone)?;
+        if tombstone.window_id.creation_epoch != state.layout_creation_epoch {
+            return Err(PersistenceFailure::invalid(
+                "overlay tombstone is outside the current creation epoch",
+            ));
+        }
         if tombstone.retired_at_store_revision > state.store_revision {
             return Err(PersistenceFailure::invalid(
                 "overlay tombstone retirement is newer than its store generation",
@@ -2559,15 +2737,10 @@ fn canonicalize_state(state: &mut PersistedState) {
             record.binding_id.as_bytes(),
         )
     });
+    state.overlays.sort_by_key(|overlay| overlay.window_id);
     state
-        .overlays
-        .sort_by_key(|overlay| overlay.window_id.as_bytes());
-    state.tombstones.sort_by_key(|tombstone| {
-        (
-            tombstone.retired_at_store_revision,
-            tombstone.window_id.as_bytes(),
-        )
-    });
+        .tombstones
+        .sort_by_key(|tombstone| (tombstone.retired_at_store_revision, tombstone.window_id));
 }
 
 fn validate_published_state(state: &PersistedState) -> Result<(), PersistenceFailure> {
@@ -2697,6 +2870,7 @@ impl EncodedStateBudget {
     ) -> Result<Self, PersistenceFailure> {
         let empty = PersistedState {
             store_revision: published_revision,
+            layout_creation_epoch: state.layout_creation_epoch,
             ..PersistedState::default()
         };
         let empty_slot_bytes = encoded_json_len(&BorrowedDiskSlot {
@@ -2854,8 +3028,69 @@ fn corrupt_slot(path: &Path, bytes: Vec<u8>, failure: PersistenceFailure) -> Rea
     }
 }
 
-fn migrate_v2_state(state: PersistedStateV2) -> Result<PersistedState, PersistenceFailure> {
+fn validate_legacy_tombstones_before_compaction(
+    store_revision: u64,
+    overlays: &[MixedDomainLayoutOverlayV3],
+    tombstones: &[OverlayTombstoneV3],
+) -> Result<(), PersistenceFailure> {
+    if tombstones.len() > MAX_OVERLAY_TOMBSTONES {
+        return Err(PersistenceFailure::quota(format!(
+            "overlay tombstone count {} exceeds {}",
+            tombstones.len(),
+            MAX_OVERLAY_TOMBSTONES
+        )));
+    }
+    let live_ids = overlays
+        .iter()
+        .map(|overlay| overlay.window_id)
+        .collect::<HashSet<_>>();
+    let mut retired_ids = HashSet::with_capacity(tombstones.len());
+    for tombstone in tombstones.iter().copied() {
+        let current_tombstone = tombstone.into_current();
+        validate_tombstone(&current_tombstone)?;
+        if tombstone.retired_at_store_revision > store_revision {
+            return Err(PersistenceFailure::invalid(
+                "overlay tombstone retirement is newer than its store generation",
+            ));
+        }
+        if !retired_ids.insert(tombstone.window_id) {
+            return Err(PersistenceFailure::invalid(
+                "duplicate overlay tombstone identity",
+            ));
+        }
+        if live_ids.contains(&tombstone.window_id) {
+            return Err(PersistenceFailure::invalid(
+                "overlay identity is both live and tombstoned",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn migrate_v3_state(state: PersistedStateV3) -> Result<PersistedState, PersistenceFailure> {
     if state.schema_version != PREVIOUS_STORE_SCHEMA_VERSION {
+        return Err(PersistenceFailure::UnsupportedVersion {
+            found: state.schema_version,
+            current: STORE_SCHEMA_VERSION,
+        });
+    }
+    if state.store_revision == 0 {
+        return Err(PersistenceFailure::invalid(
+            "published schema-v3 state has revision zero",
+        ));
+    }
+    validate_legacy_tombstones_before_compaction(
+        state.store_revision,
+        &state.overlays,
+        &state.tombstones,
+    )?;
+    let current = state.into_current();
+    validate_state(&current)?;
+    Ok(current)
+}
+
+fn migrate_v2_state(state: PersistedStateV2) -> Result<PersistedState, PersistenceFailure> {
+    if state.schema_version != LEGACY_STORE_SCHEMA_VERSION {
         return Err(PersistenceFailure::UnsupportedVersion {
             found: state.schema_version,
             current: STORE_SCHEMA_VERSION,
@@ -2964,6 +3199,38 @@ fn read_slot(path: &Path, allow_legacy: bool) -> Result<ReadSlot, PersistenceFai
             }
         }
         PREVIOUS_STORE_SCHEMA_VERSION => {
+            let disk = match serde_json::from_value::<DiskSlotV3>(value) {
+                Ok(disk) => disk,
+                Err(_) => {
+                    return Ok(corrupt_slot(
+                        path,
+                        bytes,
+                        PersistenceFailure::corrupt("schema-v3 state slot is invalid"),
+                    ));
+                }
+            };
+            // Verify the exact v3 payload shape before replacing UUID-only
+            // identities with epoch-zero identities and compacting tombstones.
+            let payload = serde_json::to_vec(&disk.payload).map_err(|_| {
+                PersistenceFailure::corrupt("could not verify schema-v3 state payload")
+            })?;
+            let expected: [u8; 32] = Sha256::digest(&payload).into();
+            if expected != disk.sha256 {
+                return Ok(corrupt_slot(
+                    path,
+                    bytes,
+                    PersistenceFailure::corrupt("schema-v3 state slot checksum mismatch"),
+                ));
+            }
+            match migrate_v3_state(disk.payload) {
+                Ok(state) => Ok(ReadSlot::Valid(ValidatedSlot {
+                    state,
+                    schema: SlotSchema::V3,
+                })),
+                Err(failure) => Ok(corrupt_slot(path, bytes, failure)),
+            }
+        }
+        LEGACY_STORE_SCHEMA_VERSION => {
             let disk = match serde_json::from_value::<DiskSlotV2>(value) {
                 Ok(disk) => disk,
                 Err(_) => {
@@ -3224,6 +3491,7 @@ fn load_snapshot_unlocked(primary_path: &Path) -> Result<LayoutStateSnapshot, Pe
         source: loaded.source,
         degraded_recovery: loaded.degraded_recovery,
         store_revision: loaded.state.store_revision,
+        layout_creation_epoch: loaded.state.layout_creation_epoch,
         window_states: loaded.state.window_states,
         domain_bindings: loaded.state.domain_bindings,
         overlays: loaded.state.overlays,
@@ -3785,6 +4053,8 @@ struct AppliedBatch {
 }
 
 fn preflight_one_overlay_mutation(
+    current_creation_epoch: LayoutCreationEpoch,
+    grandfathered_creation_epoch: Option<LayoutCreationEpoch>,
     live: Option<&MixedDomainLayoutOverlay>,
     tombstone: Option<&OverlayTombstone>,
     mutation: &PendingOverlayMutation,
@@ -3808,8 +4078,45 @@ fn preflight_one_overlay_mutation(
         _ => {}
     }
 
+    if mutation.window_id().creation_epoch > current_creation_epoch {
+        return Err(PersistenceFailure::invalid(
+            "overlay identity creation epoch is newer than durable authority",
+        ));
+    }
+
     match (live, tombstone) {
-        (None, None) if mutation.base_revision.is_none() => Ok(true),
+        (None, None) if mutation.base_revision.is_none() => {
+            let incoming_epoch = mutation.window_id().creation_epoch;
+            if incoming_epoch == current_creation_epoch
+                || grandfathered_creation_epoch == Some(incoming_epoch)
+            {
+                Ok(true)
+            } else if incoming_epoch < current_creation_epoch {
+                Err(PersistenceFailure::RetiredOverlay {
+                    last_revision: None,
+                })
+            } else {
+                Err(PersistenceFailure::invalid(
+                    "overlay identity creation epoch is not admitted by this transaction",
+                ))
+            }
+        }
+        (None, None)
+            if matches!(&mutation.desired, DesiredOverlayState::Live(_))
+                && mutation.window_id().creation_epoch < current_creation_epoch =>
+        {
+            Err(PersistenceFailure::RetiredOverlay {
+                last_revision: None,
+            })
+        }
+        (None, None)
+            if matches!(&mutation.desired, DesiredOverlayState::Deleted { .. })
+                && mutation.window_id().creation_epoch < current_creation_epoch =>
+        {
+            // An exact older-epoch tombstone may have been compacted. Deletes
+            // are idempotent, so replaying that retirement is already done.
+            Ok(false)
+        }
         (None, None) => Err(PersistenceFailure::OverlayCasConflict {
             expected: mutation.base_revision,
             committed: None,
@@ -3834,7 +4141,7 @@ fn preflight_one_overlay_mutation(
             }
         }
         (None, Some(current)) => Err(PersistenceFailure::RetiredOverlay {
-            last_revision: current.last_local_revision,
+            last_revision: Some(current.last_local_revision),
         }),
         (Some(_), Some(_)) => Err(PersistenceFailure::invalid(
             "overlay identity is both live and tombstoned",
@@ -3883,6 +4190,7 @@ fn overlay_component_tabs_are_unique(
 fn preflight_overlay_mutations(
     state: &PersistedState,
     batch: &PendingBatch,
+    grandfathered_creation_epoch: Option<LayoutCreationEpoch>,
 ) -> Result<OverlayPreflight, PersistenceFailure> {
     validate_state(state)?;
     let live_by_id = state
@@ -3927,6 +4235,8 @@ fn preflight_overlay_mutations(
             continue;
         }
         match preflight_one_overlay_mutation(
+            state.layout_creation_epoch,
+            grandfathered_creation_epoch,
             live_by_id.get(window_id).copied(),
             tombstone_by_id.get(window_id).copied(),
             mutation,
@@ -4163,7 +4473,7 @@ fn build_byte_admission_candidates(
                     DesiredOverlayState::Deleted {
                         last_local_revision,
                         ..
-                    } => {
+                    } if window_id.creation_epoch == state.layout_creation_epoch => {
                         let tombstone = OverlayTombstone::new(
                             *window_id,
                             *last_local_revision,
@@ -4171,6 +4481,7 @@ fn build_byte_admission_candidates(
                         )?;
                         (None, Some(encoded_json_len(&tombstone)?))
                     }
+                    DesiredOverlayState::Deleted { .. } => (None, None),
                 };
             mutations.push(OverlayBudgetMutation {
                 old_overlay_bytes,
@@ -4183,10 +4494,7 @@ fn build_byte_admission_candidates(
                     &batch.overlay_mutations[window_id].desired,
                     DesiredOverlayState::Live(_)
                 ),
-                adds_tombstone: matches!(
-                    &batch.overlay_mutations[window_id].desired,
-                    DesiredOverlayState::Deleted { .. }
-                ),
+                adds_tombstone: new_tombstone_bytes.is_some(),
             });
         }
         let contains_delete = mutations.iter().any(|mutation| mutation.adds_tombstone);
@@ -4223,13 +4531,13 @@ fn byte_quota_failure(projected_upper_bound: u64, maximum_bytes: u64) -> Persist
 fn reject_overlay_admission_component(
     window_ids: &[LayoutWindowId],
     batch: &PendingBatch,
-    preflight: &mut BatchPreflight,
+    preflight: &mut OverlayPreflight,
     failure: PersistenceFailure,
 ) {
     for window_id in window_ids {
-        preflight.overlays.accepted_overlay_ids.remove(window_id);
-        preflight.overlays.apply_overlay_ids.remove(window_id);
-        preflight.overlays.rejected_overlay_mutations.insert(
+        preflight.accepted_overlay_ids.remove(window_id);
+        preflight.apply_overlay_ids.remove(window_id);
+        preflight.rejected_overlay_mutations.insert(
             *window_id,
             RejectedOverlayMutation {
                 mutation: batch.overlay_mutations[window_id].clone(),
@@ -4257,7 +4565,7 @@ fn reject_byte_admission_candidate(
             preflight.rejected_bindings.insert(*fingerprint, failure);
         }
         (ByteAdmissionKey::Overlay(_), ByteBudgetMutation::OverlayComponent { window_ids, .. }) => {
-            reject_overlay_admission_component(window_ids, batch, preflight, failure);
+            reject_overlay_admission_component(window_ids, batch, &mut preflight.overlays, failure);
         }
         _ => unreachable!("byte-admission key and mutation kind must agree"),
     }
@@ -4266,7 +4574,7 @@ fn reject_byte_admission_candidate(
 fn partition_overlay_ownership_components(
     state: &PersistedState,
     batch: &PendingBatch,
-    preflight: &mut BatchPreflight,
+    preflight: &mut OverlayPreflight,
 ) -> Vec<Vec<LayoutWindowId>> {
     let components = overlay_admission_components(state, batch);
     let current_owners = state
@@ -4295,7 +4603,6 @@ fn partition_overlay_ownership_components(
             .iter()
             .filter_map(|window_id| {
                 preflight
-                    .overlays
                     .rejected_overlay_mutations
                     .get(window_id)
                     .map(|rejected| {
@@ -4332,7 +4639,7 @@ fn partition_overlay_ownership_components(
 
         let applied_component = component
             .into_iter()
-            .filter(|window_id| preflight.overlays.apply_overlay_ids.contains(window_id))
+            .filter(|window_id| preflight.apply_overlay_ids.contains(window_id))
             .collect::<Vec<_>>();
         if !applied_component.is_empty() {
             valid_components.push(applied_component);
@@ -5194,7 +5501,8 @@ fn enforce_encoded_byte_admission(
     // needs a new store revision. A batch whose only apparent changes are a
     // rejected ownership component publishes nothing and therefore remains
     // admissible even when the revision namespace is already at its ceiling.
-    let overlay_components = partition_overlay_ownership_components(state, batch, preflight);
+    let overlay_components =
+        partition_overlay_ownership_components(state, batch, &mut preflight.overlays);
     let changing_workspace = preflight.accepted_workspaces.iter().any(|workspace| {
         state.window_states.get(workspace) != Some(&batch.window_states[workspace])
     });
@@ -5281,7 +5589,7 @@ fn enforce_encoded_byte_admission(
             matches!(
                 &batch.overlay_mutations[window_id].desired,
                 DesiredOverlayState::Deleted { .. }
-            )
+            ) && window_id.creation_epoch == state.layout_creation_epoch
         })
         .count();
     let encoded_upper_bound = projection.normalized_bytes.upper_bound()?;
@@ -5294,7 +5602,7 @@ fn preflight_batch(
     batch: &PendingBatch,
     force_write: bool,
 ) -> Result<BatchPreflight, PersistenceFailure> {
-    preflight_batch_with_byte_limit(state, batch, force_write, MAX_STATE_FILE_BYTES)
+    preflight_batch_with_byte_limit_and_epoch(state, batch, force_write, MAX_STATE_FILE_BYTES, None)
 }
 
 fn preflight_batch_with_byte_limit(
@@ -5303,7 +5611,17 @@ fn preflight_batch_with_byte_limit(
     force_write: bool,
     maximum_bytes: u64,
 ) -> Result<BatchPreflight, PersistenceFailure> {
-    let overlays = preflight_overlay_mutations(state, batch)?;
+    preflight_batch_with_byte_limit_and_epoch(state, batch, force_write, maximum_bytes, None)
+}
+
+fn preflight_batch_with_byte_limit_and_epoch(
+    state: &PersistedState,
+    batch: &PendingBatch,
+    force_write: bool,
+    maximum_bytes: u64,
+    grandfathered_creation_epoch: Option<LayoutCreationEpoch>,
+) -> Result<BatchPreflight, PersistenceFailure> {
+    let overlays = preflight_overlay_mutations(state, batch, grandfathered_creation_epoch)?;
     let accepted_workspaces = batch.window_states.keys().cloned().collect();
     let rejected_workspaces = BTreeMap::new();
     let accepted_bindings = batch.ensure_bindings.clone();
@@ -5320,6 +5638,117 @@ fn preflight_batch_with_byte_limit(
     };
     enforce_encoded_byte_admission(state, batch, &mut preflight, force_write, maximum_bytes)?;
     Ok(preflight)
+}
+
+#[derive(Debug, Default)]
+struct CreationEpochPreparation {
+    previous_creation_epoch: Option<LayoutCreationEpoch>,
+    compacted_tombstones: Vec<OverlayTombstone>,
+}
+
+impl CreationEpochPreparation {
+    const fn rotated(&self) -> bool {
+        self.previous_creation_epoch.is_some()
+    }
+
+    const fn grandfathered_creation_epoch(&self) -> Option<LayoutCreationEpoch> {
+        self.previous_creation_epoch
+    }
+
+    fn accepted_retirements_require_rotation(
+        &self,
+        batch: &PendingBatch,
+        preflight: &BatchPreflight,
+    ) -> Result<bool, PersistenceFailure> {
+        let Some(previous_epoch) = self.previous_creation_epoch else {
+            return Ok(false);
+        };
+        let accepted_retirements = preflight
+            .overlays
+            .apply_overlay_ids
+            .iter()
+            .filter(|window_id| {
+                window_id.creation_epoch == previous_epoch
+                    && matches!(
+                        &batch.overlay_mutations[window_id].desired,
+                        DesiredOverlayState::Deleted { .. }
+                    )
+            })
+            .count();
+        Ok(self
+            .compacted_tombstones
+            .len()
+            .checked_add(accepted_retirements)
+            .ok_or_else(|| PersistenceFailure::quota("overlay tombstone count overflowed"))?
+            > MAX_OVERLAY_TOMBSTONES)
+    }
+
+    fn rollback(&mut self, state: &mut PersistedState) -> Result<(), PersistenceFailure> {
+        let previous_epoch = self.previous_creation_epoch.take().ok_or_else(|| {
+            PersistenceFailure::corrupt("creation-epoch rollback had no previous epoch")
+        })?;
+        if !state.tombstones.is_empty() {
+            return Err(PersistenceFailure::corrupt(
+                "creation-epoch rollback found unexpected current tombstones",
+            ));
+        }
+        state.layout_creation_epoch = previous_epoch;
+        state.tombstones = std::mem::take(&mut self.compacted_tombstones);
+        Ok(())
+    }
+}
+
+fn prepare_creation_epoch_for_batch(
+    state: &mut PersistedState,
+    batch: &PendingBatch,
+) -> Result<CreationEpochPreparation, PersistenceFailure> {
+    let requested_current_epoch_retirements = batch
+        .overlay_mutations
+        .iter()
+        .filter(|(window_id, mutation)| {
+            window_id.creation_epoch == state.layout_creation_epoch
+                && matches!(&mutation.desired, DesiredOverlayState::Deleted { .. })
+        })
+        .count();
+    let requested_projection = state
+        .tombstones
+        .len()
+        .checked_add(requested_current_epoch_retirements)
+        .ok_or_else(|| PersistenceFailure::quota("overlay tombstone count overflowed"))?;
+    if requested_projection <= MAX_OVERLAY_TOMBSTONES {
+        return Ok(CreationEpochPreparation::default());
+    }
+
+    let mut preliminary = preflight_overlay_mutations(state, batch, None)?;
+    // An invalid ownership-transfer component must not be able to rotate the
+    // namespace merely by containing an otherwise plausible retirement.
+    let _ = partition_overlay_ownership_components(state, batch, &mut preliminary);
+    let potential_new_tombstones = preliminary
+        .apply_overlay_ids
+        .iter()
+        .filter(|window_id| {
+            matches!(
+                &batch.overlay_mutations[window_id].desired,
+                DesiredOverlayState::Deleted { .. }
+            ) && window_id.creation_epoch == state.layout_creation_epoch
+        })
+        .count();
+    let projected_tombstones = state
+        .tombstones
+        .len()
+        .checked_add(potential_new_tombstones)
+        .ok_or_else(|| PersistenceFailure::quota("overlay tombstone count overflowed"))?;
+    if projected_tombstones <= MAX_OVERLAY_TOMBSTONES {
+        return Ok(CreationEpochPreparation::default());
+    }
+
+    let previous_epoch = state.layout_creation_epoch;
+    state.layout_creation_epoch = previous_epoch.checked_next()?;
+    let compacted_tombstones = std::mem::take(&mut state.tombstones);
+    Ok(CreationEpochPreparation {
+        previous_creation_epoch: Some(previous_epoch),
+        compacted_tombstones,
+    })
 }
 
 fn apply_batch(
@@ -5418,19 +5847,26 @@ fn apply_batch(
                 ..
             } => {
                 overlays_by_id.remove(&window_id);
-                let retired_at_store_revision = retirement_store_revision.ok_or_else(|| {
-                    PersistenceFailure::invalid(
-                        "overlay retirement has no reserved store generation",
-                    )
-                })?;
-                tombstones_by_id.insert(
-                    window_id,
-                    OverlayTombstone::new(
+                if window_id.creation_epoch == state.layout_creation_epoch {
+                    let retired_at_store_revision = retirement_store_revision.ok_or_else(|| {
+                        PersistenceFailure::invalid(
+                            "current-epoch overlay retirement has no reserved store generation",
+                        )
+                    })?;
+                    tombstones_by_id.insert(
                         window_id,
-                        *last_local_revision,
-                        retired_at_store_revision,
-                    )?,
-                );
+                        OverlayTombstone::new(
+                            window_id,
+                            *last_local_revision,
+                            retired_at_store_revision,
+                        )?,
+                    );
+                } else {
+                    // The durable epoch fence already rejects recreation of an
+                    // absent older identity, so retaining a tombstone would be
+                    // redundant and would violate the bounded-state invariant.
+                    tombstones_by_id.remove(&window_id);
+                }
             }
         }
         changed = true;
@@ -5615,6 +6051,7 @@ struct PersistenceLockTelemetry {
     requested_at: Instant,
     acquired_at: Option<Instant>,
     byte_admission: Option<ByteAdmissionStats>,
+    creation_epoch_compaction: Option<usize>,
 }
 
 impl PersistenceLockTelemetry {
@@ -5623,6 +6060,7 @@ impl PersistenceLockTelemetry {
             requested_at: Instant::now(),
             acquired_at: None,
             byte_admission: None,
+            creation_epoch_compaction: None,
         }
     }
 
@@ -5632,6 +6070,10 @@ impl PersistenceLockTelemetry {
 
     fn byte_admission(&mut self, stats: ByteAdmissionStats) {
         self.byte_admission = Some(stats);
+    }
+
+    fn creation_epoch_compaction(&mut self, compacted_tombstones: usize) {
+        self.creation_epoch_compaction = Some(compacted_tombstones);
     }
 }
 
@@ -5662,6 +6104,11 @@ impl Drop for PersistenceLockTelemetry {
                 .record(as_u64(stats.backfill_index_rebuilds));
             metrics::histogram!("window_state.byte_admission.backfill_index_entries_peak")
                 .record(as_u64(stats.backfill_index_entries_peak));
+        }
+        if let Some(compacted_tombstones) = self.creation_epoch_compaction {
+            metrics::counter!("window_state.creation_epoch.compaction_attempts").increment(1);
+            metrics::histogram!("window_state.creation_epoch.compacted_tombstones")
+                .record(u64::try_from(compacted_tombstones).unwrap_or(u64::MAX));
         }
     }
 }
@@ -5694,12 +6141,33 @@ fn commit_batch_with_byte_limit(
     let requires_schema_upgrade = loaded.requires_schema_upgrade;
     let degraded_recovery = loaded.degraded_recovery;
     let mut state = loaded.state;
-    let preflight = preflight_batch_with_byte_limit(
+    let mut epoch_preparation = prepare_creation_epoch_for_batch(&mut state, batch)?;
+    let mut preflight = preflight_batch_with_byte_limit_and_epoch(
         &state,
         batch,
-        requires_schema_upgrade || degraded_recovery,
+        requires_schema_upgrade || degraded_recovery || epoch_preparation.rotated(),
         maximum_bytes,
+        epoch_preparation.grandfathered_creation_epoch(),
     )?;
+    if epoch_preparation.rotated()
+        && !epoch_preparation.accepted_retirements_require_rotation(batch, &preflight)?
+    {
+        // Byte/cardinality admission can reject enough of an atomic component
+        // that rollover is no longer necessary. Restore the exact authority
+        // and rerun admission so an invalid/oversized batch cannot advance the
+        // namespace as a side effect.
+        epoch_preparation.rollback(&mut state)?;
+        preflight = preflight_batch_with_byte_limit_and_epoch(
+            &state,
+            batch,
+            requires_schema_upgrade || degraded_recovery,
+            maximum_bytes,
+            None,
+        )?;
+    }
+    if epoch_preparation.rotated() {
+        lock_telemetry.creation_epoch_compaction(epoch_preparation.compacted_tombstones.len());
+    }
     lock_telemetry.byte_admission(preflight.byte_admission);
     let reserved_retirement_revision = if preflight.overlays.new_tombstones == 0 {
         None
@@ -5722,7 +6190,10 @@ fn commit_batch_with_byte_limit(
         .saturating_sub(allocation_rejections.len());
     let mut rejected_bindings = preflight.rejected_bindings;
     rejected_bindings.extend(allocation_rejections);
-    let changed = batch_changed || requires_schema_upgrade || degraded_recovery;
+    let changed = batch_changed
+        || requires_schema_upgrade
+        || degraded_recovery
+        || epoch_preparation.rotated();
     let committed_updates = preflight
         .accepted_workspaces
         .len()
@@ -6182,9 +6653,16 @@ mod tests {
     }
 
     fn window_id(number: u64) -> LayoutWindowId {
+        window_id_at_epoch(LayoutCreationEpoch::INITIAL, number)
+    }
+
+    fn window_id_at_epoch(creation_epoch: LayoutCreationEpoch, number: u64) -> LayoutWindowId {
         let mut bytes = [0u8; 16];
         bytes[..8].copy_from_slice(&number.to_le_bytes());
-        LayoutWindowId::from_bytes(bytes)
+        LayoutWindowId {
+            creation_epoch,
+            nonce: bytes,
+        }
     }
 
     fn local_overlay(
@@ -6195,6 +6673,11 @@ mod tests {
         let slot = local_slot(tab_value);
         MixedDomainLayoutOverlay::new(window_id, "default", local_revision, vec![slot], Some(slot))
             .expect("valid local overlay")
+    }
+
+    fn empty_overlay(window_id: LayoutWindowId, local_revision: u64) -> MixedDomainLayoutOverlay {
+        MixedDomainLayoutOverlay::new(window_id, "default", local_revision, Vec::new(), None)
+            .expect("valid empty overlay")
     }
 
     fn remote_slot(binding: DomainBindingId, session: u8, window: u64, tab: u64) -> StableTabSlot {
@@ -6390,8 +6873,10 @@ mod tests {
     }
 
     fn all_maxima_escaped_state() -> PersistedState {
+        let maximum_epoch = LayoutCreationEpoch(u64::MAX);
         let mut state = PersistedState {
             store_revision: u64::MAX,
+            layout_creation_epoch: maximum_epoch,
             ..PersistedState::default()
         };
 
@@ -6454,7 +6939,10 @@ mod tests {
             let active = slots.first().copied();
             state.overlays.push(
                 MixedDomainLayoutOverlay::new(
-                    LayoutWindowId::from_bytes(maximum_width_index_bytes(104, overlay_index)),
+                    LayoutWindowId {
+                        creation_epoch: maximum_epoch,
+                        nonce: maximum_width_index_bytes(104, overlay_index),
+                    },
                     &overlay_workspace,
                     u64::MAX,
                     slots,
@@ -6467,7 +6955,10 @@ mod tests {
         state.tombstones = (0..MAX_OVERLAY_TOMBSTONES)
             .map(|index| {
                 OverlayTombstone::new(
-                    LayoutWindowId::from_bytes(maximum_width_index_bytes(105, index)),
+                    LayoutWindowId {
+                        creation_epoch: maximum_epoch,
+                        nonce: maximum_width_index_bytes(105, index),
+                    },
                     u64::MAX,
                     u64::MAX,
                 )
@@ -6496,6 +6987,34 @@ mod tests {
         .expect("serialize schema-v2 slot")
     }
 
+    fn encode_v3_slot_for_test(state: PersistedStateV3) -> Vec<u8> {
+        let payload = serde_json::to_vec(&state).expect("serialize schema-v3 payload");
+        let sha256: [u8; 32] = Sha256::digest(&payload).into();
+        serde_json::to_vec(&DiskSlotV3 {
+            payload: state,
+            sha256,
+        })
+        .expect("serialize schema-v3 slot")
+    }
+
+    fn legacy_overlay(overlay: &MixedDomainLayoutOverlay) -> MixedDomainLayoutOverlayV3 {
+        MixedDomainLayoutOverlayV3 {
+            window_id: LegacyLayoutWindowId(overlay.window_id.nonce_bytes()),
+            workspace: overlay.workspace.clone(),
+            local_revision: overlay.local_revision,
+            slots: overlay.slots.clone(),
+            active: overlay.active,
+        }
+    }
+
+    fn legacy_tombstone(tombstone: OverlayTombstone) -> OverlayTombstoneV3 {
+        OverlayTombstoneV3 {
+            window_id: LegacyLayoutWindowId(tombstone.window_id.nonce_bytes()),
+            last_local_revision: tombstone.last_local_revision,
+            retired_at_store_revision: tombstone.retired_at_store_revision,
+        }
+    }
+
     fn ensure_binding_for_test(
         path: &Path,
         byte: u8,
@@ -6515,6 +7034,7 @@ mod tests {
             source: StoreSource::Empty,
             degraded_recovery: false,
             store_revision: 0,
+            layout_creation_epoch: LayoutCreationEpoch::INITIAL,
             window_states,
             domain_bindings: Vec::new(),
             overlays: Vec::new(),
@@ -6932,12 +7452,12 @@ mod tests {
     }
 
     #[test]
-    fn checksum_verified_v2_migrates_to_v3_on_an_empty_commit() {
+    fn checksum_verified_v2_migrates_to_v4_on_an_empty_commit() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
         let overlay = local_overlay(window_id(20), 1, 20);
         let v2 = PersistedStateV2 {
-            schema_version: PREVIOUS_STORE_SCHEMA_VERSION,
+            schema_version: LEGACY_STORE_SCHEMA_VERSION,
             store_revision: 7,
             window_states: BTreeMap::from([(
                 "default".to_string(),
@@ -6947,18 +7467,20 @@ mod tests {
                 },
             )]),
             domain_bindings: Vec::new(),
-            overlays: vec![overlay.clone()],
+            overlays: vec![legacy_overlay(&overlay)],
         };
         std::fs::write(&path, encode_v2_slot_for_test(v2)).expect("write schema-v2 slot");
 
         let before = load_snapshot_at(&path).expect("load schema-v2 authority");
         assert_eq!(before.source, StoreSource::Primary);
         assert_eq!(before.store_revision, 7);
-        assert_eq!(before.overlays, vec![overlay.clone()]);
+        let migrated_overlay = legacy_overlay(&overlay).into_current();
+        assert_eq!(before.overlays, vec![migrated_overlay.clone()]);
+        assert_eq!(before.layout_creation_epoch, LayoutCreationEpoch::INITIAL);
         assert!(before.tombstones.is_empty());
 
         let migration = commit_for_test(&path, &PendingBatch::default(), WriteInterruption::None)
-            .expect("publish schema-v3 generation");
+            .expect("publish schema-v4 generation");
         assert!(migration.receipt.wrote_new_generation);
         assert_eq!(migration.receipt.store_revision, 8);
         assert_eq!(migration.receipt.committed_updates, 0);
@@ -6966,7 +7488,7 @@ mod tests {
         let after = load_snapshot_at(&path).expect("load migrated authority");
         assert_eq!(after.store_revision, 8);
         assert_eq!(after.window_states, before.window_states);
-        assert_eq!(after.overlays, vec![overlay]);
+        assert_eq!(after.overlays, vec![migrated_overlay]);
         assert!(after.tombstones.is_empty());
         assert!(matches!(
             read_slot(&shadow_file_name(&path), false).expect("read migrated slot"),
@@ -6978,11 +7500,110 @@ mod tests {
     }
 
     #[test]
+    fn checksum_verified_v3_migration_compacts_legacy_tombstones_without_resurrection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let live = local_overlay(window_id(21), 1, 21);
+        let retired =
+            OverlayTombstone::new(window_id(22), 3, 11).expect("legacy tombstone source is valid");
+        let retired_id = LayoutWindowId::from_legacy_bytes(retired.window_id.nonce_bytes());
+        let v3 = PersistedStateV3 {
+            schema_version: PREVIOUS_STORE_SCHEMA_VERSION,
+            store_revision: 12,
+            window_states: BTreeMap::new(),
+            domain_bindings: Vec::new(),
+            overlays: vec![legacy_overlay(&live)],
+            tombstones: vec![legacy_tombstone(retired)],
+        };
+        std::fs::write(&path, encode_v3_slot_for_test(v3)).expect("write schema-v3 slot");
+
+        let before = load_snapshot_at(&path).expect("load schema-v3 authority");
+        assert_eq!(before.store_revision, 12);
+        assert_eq!(before.layout_creation_epoch, LayoutCreationEpoch::INITIAL);
+        assert_eq!(
+            before.overlays[0].window_id.creation_epoch,
+            LayoutCreationEpoch::LEGACY
+        );
+        assert!(before.tombstones.is_empty());
+
+        let mut stale_create = PendingBatch::default();
+        stale_create
+            .queue_overlay_live(None, local_overlay(retired_id, 1, 22))
+            .expect("queue stale schema-v3 identity");
+        let migration = commit_for_test(&path, &stale_create, WriteInterruption::None)
+            .expect("publish schema-v4 migration while rejecting stale create");
+        assert!(migration.receipt.wrote_new_generation);
+        assert_eq!(migration.receipt.store_revision, 13);
+        assert_eq!(migration.receipt.committed_updates, 0);
+        assert_eq!(migration.receipt.rejected_updates, 1);
+        assert_eq!(
+            migration.rejected_overlay_mutations[&retired_id].failure,
+            PersistenceFailure::RetiredOverlay {
+                last_revision: None,
+            }
+        );
+        let after = load_snapshot_at(&path).expect("load schema-v4 authority");
+        assert!(after.overlay(retired_id).is_none());
+        assert!(after.tombstones.is_empty());
+    }
+
+    #[test]
+    fn invalid_v3_checksum_and_live_tombstone_overlap_never_migrate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bad_checksum_path = temp.path().join("bad-checksum-v3.json");
+        let bad_checksum = DiskSlotV3 {
+            payload: PersistedStateV3 {
+                schema_version: PREVIOUS_STORE_SCHEMA_VERSION,
+                store_revision: 1,
+                window_states: BTreeMap::new(),
+                domain_bindings: Vec::new(),
+                overlays: Vec::new(),
+                tombstones: Vec::new(),
+            },
+            sha256: [0; 32],
+        };
+        std::fs::write(
+            &bad_checksum_path,
+            serde_json::to_vec(&bad_checksum).expect("serialize bad-checksum schema-v3 slot"),
+        )
+        .expect("write bad-checksum schema-v3 slot");
+        assert_eq!(
+            load_snapshot_at(&bad_checksum_path)
+                .expect_err("bad schema-v3 checksum must fail")
+                .code(),
+            PersistenceFailureCode::Corrupt
+        );
+
+        let overlap_path = temp.path().join("overlap-v3.json");
+        let live = local_overlay(window_id(23), 1, 23);
+        let overlapping_tombstone = OverlayTombstone::new(live.window_id, 1, 1)
+            .expect("construct overlapping legacy tombstone");
+        let overlap = PersistedStateV3 {
+            schema_version: PREVIOUS_STORE_SCHEMA_VERSION,
+            store_revision: 1,
+            window_states: BTreeMap::new(),
+            domain_bindings: Vec::new(),
+            overlays: vec![legacy_overlay(&live)],
+            tombstones: vec![legacy_tombstone(overlapping_tombstone)],
+        };
+        std::fs::write(&overlap_path, encode_v3_slot_for_test(overlap))
+            .expect("write overlapping schema-v3 slot");
+        assert_eq!(
+            load_snapshot_at(&overlap_path)
+                .expect_err("schema-v3 overlap must fail before compaction")
+                .code(),
+            PersistenceFailureCode::Invalid
+        );
+        assert!(!shadow_file_name(&bad_checksum_path).exists());
+        assert!(!shadow_file_name(&overlap_path).exists());
+    }
+
+    #[test]
     fn invalid_v2_checksum_never_migrates() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
         let payload = PersistedStateV2 {
-            schema_version: PREVIOUS_STORE_SCHEMA_VERSION,
+            schema_version: LEGACY_STORE_SCHEMA_VERSION,
             store_revision: 1,
             window_states: BTreeMap::new(),
             domain_bindings: Vec::new(),
@@ -7014,11 +7635,11 @@ mod tests {
     }
 
     #[test]
-    fn equal_generation_prefers_v3_only_when_logical_state_matches() {
+    fn equal_generation_prefers_v4_only_when_logical_state_matches() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
         let v2 = PersistedStateV2 {
-            schema_version: PREVIOUS_STORE_SCHEMA_VERSION,
+            schema_version: LEGACY_STORE_SCHEMA_VERSION,
             store_revision: 9,
             window_states: BTreeMap::from([(
                 "default".to_string(),
@@ -7033,9 +7654,9 @@ mod tests {
         std::fs::write(&path, encode_v2_slot_for_test(v2.clone())).expect("write schema-v2 slot");
         std::fs::write(
             shadow_file_name(&path),
-            encode_disk_slot(&v2.clone().into_current()).expect("encode matching schema-v3 slot"),
+            encode_disk_slot(&v2.clone().into_current()).expect("encode matching schema-v4 slot"),
         )
-        .expect("write matching schema-v3 slot");
+        .expect("write matching schema-v4 slot");
         assert_eq!(
             load_snapshot_at(&path)
                 .expect("load matching generations")
@@ -7054,9 +7675,9 @@ mod tests {
             .fullscreen = true;
         std::fs::write(
             shadow_file_name(&ambiguous_path),
-            encode_disk_slot(&different).expect("encode different schema-v3 slot"),
+            encode_disk_slot(&different).expect("encode different schema-v4 slot"),
         )
-        .expect("write different schema-v3 slot");
+        .expect("write different schema-v4 slot");
         assert_eq!(
             load_snapshot_at(&ambiguous_path)
                 .expect_err("different equal generations are ambiguous")
@@ -8002,6 +8623,7 @@ mod tests {
         let restored = PersistedState {
             schema_version: STORE_SCHEMA_VERSION,
             store_revision: snapshot.store_revision,
+            layout_creation_epoch: snapshot.layout_creation_epoch,
             window_states: snapshot.window_states.clone(),
             domain_bindings: snapshot.domain_bindings.clone(),
             overlays: snapshot.overlays.clone(),
@@ -8157,6 +8779,7 @@ mod tests {
             let restored = PersistedState {
                 schema_version: STORE_SCHEMA_VERSION,
                 store_revision: snapshot.store_revision,
+                layout_creation_epoch: snapshot.layout_creation_epoch,
                 window_states: snapshot.window_states,
                 domain_bindings: snapshot.domain_bindings,
                 overlays: snapshot.overlays,
@@ -8218,14 +8841,18 @@ mod tests {
         assert!(state.overlays.iter().all(|overlay| {
             overlay.workspace.len() == MAX_WORKSPACE_BYTES
                 && overlay.local_revision == u64::MAX
-                && overlay.window_id.as_bytes().iter().all(|byte| *byte >= 100)
+                && overlay
+                    .window_id
+                    .nonce_bytes()
+                    .iter()
+                    .all(|byte| *byte >= 100)
         }));
         assert!(state.tombstones.iter().all(|tombstone| {
             tombstone.last_local_revision == u64::MAX
                 && tombstone.retired_at_store_revision == u64::MAX
                 && tombstone
                     .window_id
-                    .as_bytes()
+                    .nonce_bytes()
                     .iter()
                     .all(|byte| *byte >= 100)
         }));
@@ -9864,7 +10491,7 @@ mod tests {
             )
             .expect("queue lexically later shrink");
 
-        let preflight = preflight_overlay_mutations(&state, &batch)
+        let preflight = preflight_overlay_mutations(&state, &batch, None)
             .expect("shrink must free tab capacity before growth admission");
         assert_eq!(
             preflight.accepted_overlay_ids,
@@ -9874,7 +10501,7 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_cap_rejects_only_retirement_and_preserves_unrelated_work() {
+    fn tombstone_cap_rotates_epoch_and_preserves_retirement_and_unrelated_work() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
         let mut state = PersistedState::default();
@@ -9922,27 +10549,17 @@ mod tests {
         batch.ensure_bindings.insert(fingerprint);
 
         let committed = commit_for_test(&path, &batch, WriteInterruption::None)
-            .expect("partition capped retirement");
+            .expect("compact capped tombstones and commit retirement");
         assert!(committed.receipt.wrote_new_generation);
-        assert_eq!(committed.receipt.rejected_updates, 1);
-        assert_eq!(
-            committed.rejected_overlay_mutations[&retiring_window]
-                .failure
-                .code(),
-            PersistenceFailureCode::Quota
-        );
+        assert_eq!(committed.receipt.rejected_updates, 0);
+        assert!(committed.accepted_overlay_ids.contains(&retiring_window));
         assert!(committed.accepted_overlay_ids.contains(&updating_window));
         assert!(committed.bindings.contains_key(&fingerprint));
 
-        let after = load_snapshot_at(&path).expect("load partial success");
-        assert_eq!(after.tombstones.len(), MAX_OVERLAY_TOMBSTONES);
-        assert_eq!(
-            after
-                .overlay(retiring_window)
-                .expect("rejected retirement remains live")
-                .local_revision(),
-            1
-        );
+        let after = load_snapshot_at(&path).expect("load compacted success");
+        assert_eq!(after.layout_creation_epoch.get(), 2);
+        assert!(after.tombstones.is_empty());
+        assert!(after.overlay(retiring_window).is_none());
         assert_eq!(
             after
                 .overlay(updating_window)
@@ -9962,10 +10579,594 @@ mod tests {
             .queue_overlay_delete(replay_window, Some(1))
             .expect("queue capped tombstone replay");
         let replay = commit_for_test(&path, &replay, WriteInterruption::None)
-            .expect("existing tombstone replay remains idempotent at cap");
+            .expect("compacted old-epoch retirement replay remains idempotent");
         assert!(!replay.receipt.wrote_new_generation);
         assert_eq!(replay.receipt.rejected_updates, 0);
         assert_eq!(replay.receipt.store_revision, after.store_revision);
+
+        let mut stale_recreate = PendingBatch::default();
+        stale_recreate
+            .queue_overlay_live(None, local_overlay(retiring_window, 1, 74))
+            .expect("queue stale old-epoch recreation");
+        let rejected = commit_for_test(&path, &stale_recreate, WriteInterruption::None)
+            .expect("reject stale recreation without aborting the transaction");
+        assert!(!rejected.receipt.wrote_new_generation);
+        assert_eq!(rejected.receipt.rejected_updates, 1);
+        assert_eq!(
+            rejected.rejected_overlay_mutations[&retiring_window].failure,
+            PersistenceFailure::RetiredOverlay {
+                last_revision: None,
+            }
+        );
+
+        let minted_window = after
+            .new_layout_window_id()
+            .expect("mint current-epoch layout identity");
+        assert_eq!(minted_window.creation_epoch(), after.layout_creation_epoch);
+        let fresh_window = window_id_at_epoch(after.layout_creation_epoch, 10_002);
+        let mut fresh_create = PendingBatch::default();
+        fresh_create
+            .queue_overlay_live(None, local_overlay(fresh_window, 1, 75))
+            .expect("queue current-epoch create");
+        let fresh = commit_for_test(&path, &fresh_create, WriteInterruption::None)
+            .expect("commit current-epoch create");
+        assert_eq!(fresh.receipt.committed_updates, 1);
+        assert!(
+            load_snapshot_at(&path)
+                .expect("load current-epoch create")
+                .overlay(fresh_window)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn epoch_rotation_grandfathers_same_snapshot_create_and_keeps_it_updateable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let mut state = PersistedState::default();
+        state.store_revision = 8_000;
+        state.tombstones = (1..=MAX_OVERLAY_TOMBSTONES)
+            .map(|index| {
+                OverlayTombstone::new(
+                    window_id(u64::try_from(index).expect("tombstone index fits u64")),
+                    1,
+                    u64::try_from(index).expect("tombstone revision fits u64"),
+                )
+                .expect("valid capped tombstone")
+            })
+            .collect();
+        let retiring_window = window_id(20_000);
+        state.overlays.push(local_overlay(retiring_window, 1, 76));
+        canonicalize_state(&mut state);
+        std::fs::write(
+            &path,
+            encode_disk_slot(&state).expect("encode grandfather base"),
+        )
+        .expect("write grandfather base");
+
+        let observed = load_snapshot_at(&path).expect("observe pre-rotation epoch");
+        let created_window = window_id_at_epoch(observed.layout_creation_epoch, 20_001);
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_overlay_delete(retiring_window, Some(1))
+            .expect("queue rotation-triggering retirement");
+        batch
+            .queue_overlay_live(None, local_overlay(created_window, 1, 77))
+            .expect("queue create minted from the same snapshot");
+        let committed = commit_for_test(&path, &batch, WriteInterruption::None)
+            .expect("commit rotation and same-snapshot create atomically");
+        assert_eq!(committed.receipt.committed_updates, 2);
+        assert_eq!(committed.receipt.rejected_updates, 0);
+
+        let rotated = load_snapshot_at(&path).expect("load grandfathered create");
+        assert_eq!(rotated.layout_creation_epoch.get(), 2);
+        assert_eq!(created_window.creation_epoch().get(), 1);
+        assert!(rotated.overlay(created_window).is_some());
+        assert!(rotated.overlay(retiring_window).is_none());
+        assert!(rotated.tombstones.is_empty());
+
+        let mut update = PendingBatch::default();
+        update
+            .queue_overlay_live(Some(1), local_overlay(created_window, 2, 78))
+            .expect("queue update to live older-epoch overlay");
+        let updated = commit_for_test(&path, &update, WriteInterruption::None)
+            .expect("live older-epoch overlay remains updateable");
+        assert_eq!(updated.receipt.committed_updates, 1);
+        assert_eq!(
+            load_snapshot_at(&path)
+                .expect("load updated older-epoch overlay")
+                .overlay(created_window)
+                .expect("grandfathered overlay remains live")
+                .local_revision(),
+            2
+        );
+    }
+
+    #[test]
+    fn creation_epoch_exhaustion_fails_before_retirement_or_publication() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let exhausted_epoch = LayoutCreationEpoch(u64::MAX);
+        let mut state = PersistedState::default();
+        state.store_revision = 9_000;
+        state.layout_creation_epoch = exhausted_epoch;
+        state.tombstones = (1..=MAX_OVERLAY_TOMBSTONES)
+            .map(|index| {
+                OverlayTombstone::new(
+                    window_id_at_epoch(
+                        exhausted_epoch,
+                        u64::try_from(index).expect("tombstone index fits u64"),
+                    ),
+                    1,
+                    u64::try_from(index).expect("tombstone revision fits u64"),
+                )
+                .expect("valid exhausted-epoch tombstone")
+            })
+            .collect();
+        let retiring_window = window_id_at_epoch(exhausted_epoch, 30_000);
+        state.overlays.push(local_overlay(retiring_window, 1, 79));
+        canonicalize_state(&mut state);
+        let encoded = encode_disk_slot(&state).expect("encode exhausted-epoch authority");
+        std::fs::write(&path, &encoded).expect("write exhausted-epoch authority");
+
+        let mut retirement = PendingBatch::default();
+        retirement
+            .queue_overlay_delete(retiring_window, Some(1))
+            .expect("queue retirement at exhausted epoch");
+        assert_eq!(
+            commit_for_test(&path, &retirement, WriteInterruption::None)
+                .expect_err("epoch exhaustion must fail closed"),
+            PersistenceFailure::RevisionExhausted
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read unchanged exhausted authority"),
+            encoded
+        );
+        let after = load_snapshot_at(&path).expect("reload unchanged exhausted authority");
+        assert_eq!(after.layout_creation_epoch, exhausted_epoch);
+        assert!(after.overlay(retiring_window).is_some());
+        assert_eq!(after.tombstones.len(), MAX_OVERLAY_TOMBSTONES);
+    }
+
+    #[test]
+    fn long_churn_exceeds_former_lifetime_cap_with_bounded_exact_absence_authority() {
+        let started = Instant::now();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let first_epoch = LayoutCreationEpoch::INITIAL;
+
+        let first_ids = (0..MAX_OVERLAY_TOMBSTONES)
+            .map(|index| {
+                window_id_at_epoch(
+                    first_epoch,
+                    u64::try_from(index).expect("first churn index fits u64"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut first_create = PendingBatch::default();
+        for window_id in &first_ids {
+            first_create
+                .queue_overlay_live(None, empty_overlay(*window_id, 1))
+                .expect("queue first churn generation");
+        }
+        let first_create_receipt = commit_for_test(&path, &first_create, WriteInterruption::None)
+            .expect("commit first churn generation");
+        assert_eq!(
+            first_create_receipt.receipt.committed_updates,
+            MAX_OVERLAY_TOMBSTONES
+        );
+
+        let mut first_delete = PendingBatch::default();
+        for window_id in &first_ids {
+            first_delete
+                .queue_overlay_delete(*window_id, Some(1))
+                .expect("queue first churn retirements");
+        }
+        commit_for_test(&path, &first_delete, WriteInterruption::None)
+            .expect("retire first churn generation");
+        let capped = load_snapshot_at(&path).expect("load capped churn generation");
+        assert_eq!(capped.layout_creation_epoch, first_epoch);
+        assert_eq!(capped.tombstones.len(), MAX_OVERLAY_TOMBSTONES);
+        assert!(capped.overlays.is_empty());
+
+        let second_ids = (0..MAX_OVERLAY_TOMBSTONES)
+            .map(|index| {
+                window_id_at_epoch(
+                    first_epoch,
+                    u64::try_from(MAX_OVERLAY_TOMBSTONES)
+                        .expect("former cap fits u64")
+                        .checked_add(u64::try_from(index).expect("second churn index fits u64"))
+                        .expect("second churn identity fits u64"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut second_create = PendingBatch::default();
+        for window_id in &second_ids {
+            second_create
+                .queue_overlay_live(None, empty_overlay(*window_id, 1))
+                .expect("queue post-cap churn generation");
+        }
+        commit_for_test(&path, &second_create, WriteInterruption::None)
+            .expect("valid windows continue after reaching the former cap");
+
+        let mut second_delete = PendingBatch::default();
+        for window_id in &second_ids {
+            second_delete
+                .queue_overlay_delete(*window_id, Some(1))
+                .expect("queue post-cap churn retirements");
+        }
+        commit_for_test(&path, &second_delete, WriteInterruption::None)
+            .expect("retiring post-cap windows rotates and compacts exactly");
+
+        let rotated = load_snapshot_at(&path).expect("load post-cap churn authority");
+        assert_eq!(rotated.layout_creation_epoch.get(), 2);
+        assert!(rotated.overlays.is_empty());
+        assert!(rotated.tombstones.is_empty());
+        assert!(
+            std::fs::metadata(&path)
+                .expect("stat bounded churn authority")
+                .len()
+                <= MAX_STATE_FILE_BYTES
+        );
+
+        let mut delayed_creates = PendingBatch::default();
+        for retired_id in [first_ids[0], second_ids[MAX_OVERLAY_TOMBSTONES - 1]] {
+            delayed_creates
+                .queue_overlay_live(None, empty_overlay(retired_id, 1))
+                .expect("queue exact delayed initial create");
+        }
+        let delayed_update_id = first_ids[1];
+        delayed_creates
+            .queue_overlay_live(Some(1), empty_overlay(delayed_update_id, 2))
+            .expect("queue exact delayed update");
+        let delayed = commit_for_test(&path, &delayed_creates, WriteInterruption::None)
+            .expect("partition delayed mutations without publication");
+        assert!(!delayed.receipt.wrote_new_generation);
+        assert_eq!(delayed.receipt.rejected_updates, 3);
+        for retired_id in [first_ids[0], second_ids[MAX_OVERLAY_TOMBSTONES - 1]] {
+            assert_eq!(
+                delayed.rejected_overlay_mutations[&retired_id].failure,
+                PersistenceFailure::RetiredOverlay {
+                    last_revision: None,
+                }
+            );
+        }
+        assert_eq!(
+            delayed.rejected_overlay_mutations[&delayed_update_id].failure,
+            PersistenceFailure::RetiredOverlay {
+                last_revision: None,
+            }
+        );
+
+        let fresh_id = window_id_at_epoch(rotated.layout_creation_epoch, 90_000);
+        let mut fresh = PendingBatch::default();
+        fresh
+            .queue_overlay_live(None, empty_overlay(fresh_id, 1))
+            .expect("queue fresh post-compaction window");
+        commit_for_test(&path, &fresh, WriteInterruption::None)
+            .expect("commit fresh post-compaction window");
+        assert!(
+            load_snapshot_at(&path)
+                .expect("load fresh post-compaction window")
+                .overlay(fresh_id)
+                .is_some()
+        );
+        eprintln!(
+            "window_state_persist epoch churn: retired={} former_cap={} final_epoch={} retained_tombstones={} elapsed_ms={}",
+            first_ids.len().saturating_add(second_ids.len()),
+            MAX_OVERLAY_TOMBSTONES,
+            rotated.layout_creation_epoch.get(),
+            rotated.tombstones.len(),
+            started.elapsed().as_millis()
+        );
+    }
+
+    #[test]
+    fn epoch_compaction_retry_is_deterministic_before_and_after_durable_publication() {
+        for interruption in [
+            WriteInterruption::AfterPartialWrite,
+            WriteInterruption::AfterDirectorySync,
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().join("window-state.json");
+            let mut state = PersistedState::default();
+            state.store_revision = 10_000;
+            state.tombstones = (1..=MAX_OVERLAY_TOMBSTONES)
+                .map(|index| {
+                    OverlayTombstone::new(
+                        window_id(u64::try_from(index).expect("tombstone index fits u64")),
+                        1,
+                        u64::try_from(index).expect("tombstone revision fits u64"),
+                    )
+                    .expect("valid crash-matrix tombstone")
+                })
+                .collect();
+            let retiring_window = window_id(60_000);
+            state.overlays.push(empty_overlay(retiring_window, 1));
+            canonicalize_state(&mut state);
+            std::fs::write(
+                &path,
+                encode_disk_slot(&state).expect("encode compaction crash base"),
+            )
+            .expect("write compaction crash base");
+
+            let mut retirement = PendingBatch::default();
+            retirement
+                .queue_overlay_delete(retiring_window, Some(1))
+                .expect("queue compaction crash retirement");
+            assert_eq!(
+                commit_for_test(&path, &retirement, interruption)
+                    .expect_err("inject compaction publication failure")
+                    .code(),
+                PersistenceFailureCode::Io
+            );
+            let replay = commit_for_test(&path, &retirement, WriteInterruption::None)
+                .expect("retry compaction transaction");
+            assert_eq!(replay.receipt.rejected_updates, 0);
+
+            let recovered = load_snapshot_at(&path).expect("load retried compaction authority");
+            assert_eq!(recovered.layout_creation_epoch.get(), 2);
+            assert!(recovered.overlay(retiring_window).is_none());
+            assert!(recovered.tombstones.is_empty());
+
+            let mut stale_create = PendingBatch::default();
+            stale_create
+                .queue_overlay_live(None, empty_overlay(retiring_window, 1))
+                .expect("queue delayed create after compaction crash retry");
+            let stale = commit_for_test(&path, &stale_create, WriteInterruption::None)
+                .expect("reject delayed create after compaction crash retry");
+            assert!(!stale.receipt.wrote_new_generation);
+            assert_eq!(stale.receipt.rejected_updates, 1);
+            assert_eq!(
+                stale.rejected_overlay_mutations[&retiring_window].failure,
+                PersistenceFailure::RetiredOverlay {
+                    last_revision: None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_stale_snapshot_rejects_create_but_rebases_live_old_epoch_update() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let mut state = PersistedState::default();
+        state.store_revision = 11_000;
+        state.tombstones = (1..=MAX_OVERLAY_TOMBSTONES)
+            .map(|index| {
+                OverlayTombstone::new(
+                    window_id(u64::try_from(index).expect("tombstone index fits u64")),
+                    1,
+                    u64::try_from(index).expect("tombstone revision fits u64"),
+                )
+                .expect("valid concurrent-writer tombstone")
+            })
+            .collect();
+        let retiring_window = window_id(70_000);
+        let survivor_window = window_id(70_001);
+        state.overlays = vec![
+            local_overlay(retiring_window, 1, 80),
+            local_overlay(survivor_window, 1, 81),
+        ];
+        canonicalize_state(&mut state);
+        std::fs::write(
+            &path,
+            encode_disk_slot(&state).expect("encode concurrent-writer base"),
+        )
+        .expect("write concurrent-writer base");
+
+        let writer_a_snapshot = load_snapshot_at(&path).expect("writer A snapshot");
+        let writer_b_snapshot = load_snapshot_at(&path).expect("writer B snapshot");
+        assert_eq!(
+            writer_a_snapshot.layout_creation_epoch,
+            writer_b_snapshot.layout_creation_epoch
+        );
+        let writer_a_create = window_id_at_epoch(writer_a_snapshot.layout_creation_epoch, 70_002);
+        let writer_b_create = window_id_at_epoch(writer_b_snapshot.layout_creation_epoch, 70_003);
+
+        let mut writer_a = PendingBatch::default();
+        writer_a
+            .queue_overlay_delete(retiring_window, Some(1))
+            .expect("writer A queues rotation-triggering retirement");
+        writer_a
+            .queue_overlay_live(None, empty_overlay(writer_a_create, 1))
+            .expect("writer A queues same-snapshot create");
+        let a = commit_for_test(&path, &writer_a, WriteInterruption::None)
+            .expect("writer A commits rotation");
+        assert_eq!(a.receipt.committed_updates, 2);
+        assert_eq!(a.receipt.rejected_updates, 0);
+
+        let mut writer_b = PendingBatch::default();
+        writer_b
+            .queue_overlay_live(None, empty_overlay(writer_b_create, 1))
+            .expect("writer B queues stale-snapshot create");
+        writer_b
+            .queue_overlay_live(Some(1), local_overlay(survivor_window, 2, 82))
+            .expect("writer B queues update to still-live overlay");
+        let b = commit_for_test(&path, &writer_b, WriteInterruption::None)
+            .expect("writer B deterministically rebases after rotation");
+        assert_eq!(b.receipt.committed_updates, 1);
+        assert_eq!(b.receipt.rejected_updates, 1);
+        assert_eq!(
+            b.rejected_overlay_mutations[&writer_b_create].failure,
+            PersistenceFailure::RetiredOverlay {
+                last_revision: None,
+            }
+        );
+
+        let after = load_snapshot_at(&path).expect("load concurrent-writer result");
+        assert_eq!(after.layout_creation_epoch.get(), 2);
+        assert!(after.overlay(retiring_window).is_none());
+        assert!(after.overlay(writer_a_create).is_some());
+        assert!(after.overlay(writer_b_create).is_none());
+        assert_eq!(
+            after
+                .overlay(survivor_window)
+                .expect("survivor remains live")
+                .local_revision(),
+            2
+        );
+    }
+
+    #[test]
+    fn rejected_ownership_component_cannot_force_creation_epoch_rotation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let mut state = PersistedState::default();
+        state.store_revision = 12_000;
+        state.tombstones = (1..=MAX_OVERLAY_TOMBSTONES)
+            .map(|index| {
+                OverlayTombstone::new(
+                    window_id(u64::try_from(index).expect("tombstone index fits u64")),
+                    1,
+                    u64::try_from(index).expect("tombstone revision fits u64"),
+                )
+                .expect("valid rotation-denial tombstone")
+            })
+            .collect();
+        let source_window = window_id(80_000);
+        let destination_window = window_id(80_001);
+        let transferred_slot = local_slot(83);
+        state.overlays = vec![
+            MixedDomainLayoutOverlay::new(
+                source_window,
+                "default",
+                1,
+                vec![transferred_slot],
+                Some(transferred_slot),
+            )
+            .expect("valid source ownership"),
+            empty_overlay(destination_window, 1),
+        ];
+        canonicalize_state(&mut state);
+        std::fs::write(
+            &path,
+            encode_disk_slot(&state).expect("encode rotation-denial base"),
+        )
+        .expect("write rotation-denial base");
+
+        let mut invalid_transfer = PendingBatch::default();
+        invalid_transfer
+            .queue_overlay_delete(source_window, Some(1))
+            .expect("queue plausible source retirement");
+        invalid_transfer
+            .queue_overlay_live(
+                Some(2),
+                MixedDomainLayoutOverlay::new(
+                    destination_window,
+                    "default",
+                    3,
+                    vec![transferred_slot],
+                    Some(transferred_slot),
+                )
+                .expect("construct wrong-base destination"),
+            )
+            .expect("queue wrong-base destination");
+        let rejected = commit_for_test(&path, &invalid_transfer, WriteInterruption::None)
+            .expect("reject ownership component without rotating");
+        assert!(!rejected.receipt.wrote_new_generation);
+        assert_eq!(rejected.receipt.committed_updates, 0);
+        assert_eq!(rejected.receipt.rejected_updates, 2);
+
+        let after = load_snapshot_at(&path).expect("load unrotated authority");
+        assert_eq!(after.layout_creation_epoch, LayoutCreationEpoch::INITIAL);
+        assert_eq!(after.tombstones.len(), MAX_OVERLAY_TOMBSTONES);
+        assert!(after.overlay(source_window).is_some());
+        assert!(after.overlay(destination_window).is_some());
+    }
+
+    #[test]
+    fn byte_rejected_retirement_component_rolls_back_provisional_epoch_rotation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let mut state = PersistedState::default();
+        state.store_revision = 13_000;
+        state.tombstones = (1..=MAX_OVERLAY_TOMBSTONES)
+            .map(|index| {
+                OverlayTombstone::new(
+                    window_id(u64::try_from(index).expect("tombstone index fits u64")),
+                    1,
+                    u64::try_from(index).expect("tombstone revision fits u64"),
+                )
+                .expect("valid byte-rollback tombstone")
+            })
+            .collect();
+        let source_window = window_id(81_000);
+        let destination_window = window_id(81_001);
+        let transferred_slot = local_slot(84);
+        state.overlays = vec![
+            MixedDomainLayoutOverlay::new(
+                source_window,
+                "default",
+                1,
+                vec![transferred_slot],
+                Some(transferred_slot),
+            )
+            .expect("valid byte-rollback source"),
+            empty_overlay(destination_window, 1),
+        ];
+        canonicalize_state(&mut state);
+
+        let mut destination_slots = vec![transferred_slot];
+        destination_slots.extend(local_slots(85, 128));
+        let mut oversized_transfer = PendingBatch::default();
+        oversized_transfer
+            .queue_overlay_delete(source_window, Some(1))
+            .expect("queue byte-rollback source retirement");
+        oversized_transfer
+            .queue_overlay_live(
+                Some(1),
+                MixedDomainLayoutOverlay::new(
+                    destination_window,
+                    "default",
+                    2,
+                    destination_slots.clone(),
+                    destination_slots.first().copied(),
+                )
+                .expect("valid growing byte-rollback destination"),
+            )
+            .expect("queue growing byte-rollback destination");
+
+        let mut rotated_model = state.clone();
+        let preparation = prepare_creation_epoch_for_batch(&mut rotated_model, &oversized_transfer)
+            .expect("model provisional rotation");
+        assert!(preparation.rotated());
+        let rotated_limit = EncodedStateBudget::from_state(
+            &rotated_model,
+            rotated_model
+                .store_revision
+                .checked_add(1)
+                .expect("model revision successor"),
+        )
+        .and_then(|budget| budget.upper_bound())
+        .expect("count provisional-rotation base");
+
+        let encoded = encode_disk_slot(&state).expect("encode byte-rollback base");
+        std::fs::write(&path, &encoded).expect("write byte-rollback primary");
+        std::fs::write(shadow_file_name(&path), encoded).expect("write byte-rollback shadow");
+        let rejected = commit_batch_with_byte_limit(
+            &path,
+            &oversized_transfer,
+            WriteInterruption::None,
+            rotated_limit,
+        )
+        .expect("reject growing component after rolling back provisional rotation");
+        assert!(!rejected.receipt.wrote_new_generation);
+        assert_eq!(rejected.receipt.committed_updates, 0);
+        assert_eq!(rejected.receipt.rejected_updates, 2);
+
+        let after = load_snapshot_at(&path).expect("load byte-rollback authority");
+        assert_eq!(after.layout_creation_epoch, LayoutCreationEpoch::INITIAL);
+        assert_eq!(after.tombstones.len(), MAX_OVERLAY_TOMBSTONES);
+        assert!(after.overlay(source_window).is_some());
+        assert_eq!(
+            after
+                .overlay(destination_window)
+                .expect("destination remains unchanged")
+                .slots()
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -12149,7 +13350,9 @@ mod tests {
         });
         waiter.remember_semantic_failure(&SemanticFailureOutcome {
             identity: Arc::new(()),
-            failure: PersistenceFailure::RetiredOverlay { last_revision: 4 },
+            failure: PersistenceFailure::RetiredOverlay {
+                last_revision: Some(4),
+            },
         });
         let later_receipt = CommitReceipt {
             store_revision: 9,
@@ -12180,7 +13383,9 @@ mod tests {
     #[test]
     fn stale_semantic_failure_identity_cannot_clear_a_new_identical_failure() {
         let mut pending = CoordinatorPending::default();
-        let failure = PersistenceFailure::RetiredOverlay { last_revision: 7 };
+        let failure = PersistenceFailure::RetiredOverlay {
+            last_revision: Some(7),
+        };
         let first = pending.record_semantic_failure(&failure);
         pending.clear_reported_semantic_failure(&first.identity);
         let second = pending.record_semantic_failure(&failure);
@@ -13302,6 +14507,37 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn creation_epoch_fence_classifies_arbitrary_absent_initial_create(
+            current_epoch in 1u64..=u64::MAX,
+            incoming_epoch in any::<u64>(),
+            nonce in any::<u64>(),
+        ) {
+            let window_id = window_id_at_epoch(LayoutCreationEpoch(incoming_epoch), nonce);
+            let mutation = PendingOverlayMutation::live(None, empty_overlay(window_id, 1))
+                .expect("construct arbitrary initial-create mutation");
+            let result = preflight_one_overlay_mutation(
+                LayoutCreationEpoch(current_epoch),
+                None,
+                None,
+                None,
+                &mutation,
+            );
+            match incoming_epoch.cmp(&current_epoch) {
+                std::cmp::Ordering::Less => prop_assert_eq!(
+                    result,
+                    Err(PersistenceFailure::RetiredOverlay {
+                        last_revision: None,
+                    })
+                ),
+                std::cmp::Ordering::Equal => prop_assert_eq!(result, Ok(true)),
+                std::cmp::Ordering::Greater => prop_assert!(matches!(
+                    result,
+                    Err(PersistenceFailure::Invalid { .. })
+                )),
+            }
+        }
+
         #[test]
         fn streaming_encoder_and_upper_bound_hold_for_varied_valid_states(
             workspace_seed in prop::collection::vec(any::<u8>(), 0..80),

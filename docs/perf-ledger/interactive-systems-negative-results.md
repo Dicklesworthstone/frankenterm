@@ -3498,6 +3498,38 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Replace the dominance selector only after another exact deterministic algorithm proves one-addition-maximal rejection, preserves normalized and physical byte authority plus every cardinality limit, and retains a strictly better worst-case bound with strict-remote tests and same-window 4,096-lineage measurements.
 
+### IS-N123 — Bounded eviction of arbitrary retired UUIDs cannot preserve exact absence
+
+- **Classification:** information-theoretic correctness rejection; monotonic
+  creation-epoch fence retained
+- **Bead:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.5.1`
+- **Rejected inference:** deterministic oldest-first tombstone eviction, a
+  probabilistic membership structure, or the practical rarity of UUID reuse is
+  enough to keep retired layout metadata bounded without permitting a delayed
+  initial-create to resurrect an exact retired `LayoutWindowId`.
+- **Negative evidence:** an unbounded sequence of arbitrary 128-bit identities
+  has more exact retired sets than any fixed-size absence representation can
+  distinguish. A delayed mutation carries the exact old identity, so random
+  non-reuse does not help; an eviction-based authority necessarily forgets at
+  least one retired member, while a probabilistic filter either admits false
+  negatives or eventually blocks valid new identities through false positives.
+- **Decision:** version the identity namespace instead. Schema v4 persists a
+  checked monotonic creation epoch in every new layout-window identity and in
+  the journal authority. Tombstones cover only the current epoch. When an
+  admitted retirement would exceed the 4,096-record cap, the same locked
+  journal transaction advances the epoch and compacts the old tombstones;
+  every absent older-epoch create is then rejected exactly, while a still-live
+  older-epoch overlay remains updateable and needs no tombstone when retired.
+  Schema-v2/v3 UUID-only identities migrate into permanently closed epoch zero
+  only after their exact legacy payload checksum and tombstone invariants are
+  validated. Source tests cover twice-the-former-cap churn, delayed create,
+  stale concurrent writers, crash-before/ack-loss retry, migration, and epoch
+  exhaustion. Strict-remote execution remains absent because RCH refused local
+  fallback while every worker was unreachable; no runtime durability or
+  performance claim follows yet.
+- **Primary retry condition:**
+  > Replace the monotonic epoch fence only after another bounded deterministic authority proves exact no-resurrection for every delayed create and update across unlimited churn, crash/restart, concurrent writers, migration, and namespace exhaustion without probabilistic false negatives or random-ID assumptions.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
