@@ -4960,7 +4960,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_shutdown_cancels_and_drains_native_discovery_owner() {
+    fn runtime_shutdown_drains_native_discovery_before_replacement_admission() {
         let _test_lock = native_discovery_lifecycle_test_lock();
         let before = native_discovery_runtime_metrics();
         let barrier = Arc::new(NativeDiscoveryTestBarrier::default());
@@ -5022,9 +5022,30 @@ mod tests {
                 && snapshot.active_observers == before.active_observers
         });
 
+        let replacement = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("replacement native discovery runtime");
+        replacement.block_on(async {
+            let replacement_cx = crate::cx::for_request();
+            let report = run_owned_native_discovery_with_cx(
+                &replacement_cx,
+                |_cancellation, _scan_cx| Ok(SessionDiscoveryResult::default()),
+            )
+            .await
+            .expect("replacement runtime must admit an independent native scan");
+            assert!(report.entries.is_empty());
+            wait_for_native_discovery_state(&replacement_cx, |snapshot| {
+                snapshot.active_scans == before.active_scans
+                    && snapshot.active_workers == before.active_workers
+                    && snapshot.active_observers == before.active_observers
+            })
+            .await;
+        });
+        drop(replacement);
+
         let after = native_discovery_runtime_metrics();
-        assert_eq!(after.admitted_total, before.admitted_total + 1);
-        assert_eq!(after.completed_total, before.completed_total + 1);
+        assert_eq!(after.admitted_total, before.admitted_total + 2);
+        assert_eq!(after.completed_total, before.completed_total + 2);
         assert_eq!(
             after.cancel_requested_total,
             before.cancel_requested_total + 1
